@@ -1,0 +1,1561 @@
+"""
+FX Portfolio Manager - Main Application
+========================================
+
+Main entry point for the FX Portfolio Manager.
+
+This application:
+1. Loads or optimizes strategy configurations for all symbols
+2. Monitors markets for entry signals on each bar close
+3. Executes trades based on optimized strategies
+4. Automatically retrains when retrain periods expire
+5. Logs all activity and trades
+
+Stateful Optimization:
+- Configs are persisted incrementally (never lost on interruption)
+- Valid configs are skipped (re-run resumes where it left off)
+- Use --overwrite to force re-optimization of all symbols
+
+Usage:
+    python pm_main.py --optimize              # Optimize (skip valid configs)
+    python pm_main.py --optimize --overwrite  # Force re-optimize all
+    python pm_main.py --trade                 # Live trading with existing configs
+    python pm_main.py --trade --paper         # Paper trading mode
+    python pm_main.py --trade --auto-retrain  # Live trading with auto-retraining
+    python pm_main.py --status                # Show current status
+
+Version: 3.1 (Portfolio Manager with Stateful Optimization)
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import signal
+import sys
+import time
+import threading
+import zlib
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, fields
+
+import pandas as pd
+import numpy as np
+
+# Import PM modules
+
+def _filter_dataclass_kwargs(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter dict keys to those accepted by a dataclass constructor."""
+    allowed = {f.name for f in fields(cls)}
+    return {k: v for k, v in (data or {}).items() if k in allowed}
+
+def load_config_json(path: str) -> Dict[str, Any]:
+    """Load config JSON. Returns empty dict if missing."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        raise RuntimeError(f"Failed to load config file '{path}': {e}")
+
+from pm_core import (
+    PipelineConfig,
+    DataLoader,
+    FeatureComputer,
+    Timer,
+    get_instrument_spec
+)
+from pm_strategies import StrategyRegistry, BaseStrategy
+from pm_position import PositionConfig, PositionManager, PositionCalculator
+from pm_pipeline import PortfolioManager, SymbolConfig
+from pm_mt5 import (
+    MT5_AVAILABLE,
+    MT5Config,
+    MT5Connector,
+    MT5Position,
+    OrderType
+)
+
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+
+def setup_logging(log_dir: str = "logs",
+                  log_level: str = "INFO",
+                  console_level: str = "INFO") -> logging.Logger:
+    """Setup logging configuration."""
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    log_filename = f"pm_{datetime.now().strftime('%Y%m%d')}.log"
+    log_path = os.path.join(log_dir, log_filename)
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    
+    # Clear existing handlers
+    logger.handlers.clear()
+    
+    # File handler
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setLevel(getattr(logging, log_level.upper()))
+    file_format = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_format)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(getattr(logging, console_level.upper()))
+    console_format = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    console_handler.setFormatter(console_format)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+
+# =============================================================================
+# DEFAULT SYMBOLS
+# =============================================================================
+
+DEFAULT_SYMBOLS = [
+    # Majors
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+    # Crosses
+    "AUDNZD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURAUD",
+    "EURCHF", "EURCAD", "EURNZD", "GBPAUD", "GBPCAD", "GBPCHF",
+    "CADJPY", "NZDJPY",
+    # Added Crosses / Minors
+    "AUDCAD", "AUDCHF", "CADCHF", "CHFJPY", "NZDCAD", "NZDCHF", "GBPNZD",
+    # Exotics (and USD minors)
+    "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN",
+    # Added Exotic / Minor
+    "USDSEK",
+    # Commodities
+    "XAUUSD", "XAGUSD",
+    # Indices
+    "US100", "US30", "DE30", "EU50", "UK100", "JP225",
+    # Crypto (CFDs)
+    "ETHUSD", "XRPUSD", "TONUSD", "BTCETH",
+]
+
+
+# =============================================================================
+# DECISION THROTTLE (per-symbol, bar-time-aware suppression)
+# =============================================================================
+
+@dataclass
+class DecisionRecord:
+    """
+    Immutable record of a decision that was made for one symbol on one bar.
+
+    Persisted to ``last_trade_log.json`` so state survives restarts.
+    """
+    symbol: str
+    decision_key: str          # hash that uniquely identifies the decision
+    bar_time: str              # ISO-8601 of the bar timestamp used for the signal
+    timeframe: str
+    regime: str
+    strategy_name: str
+    direction: int             # 1 = LONG, -1 = SHORT, 0 = no signal
+    action: str                # EXECUTED, PAPER, SKIPPED_RISK_CAP, SKIPPED_MIN_VOLUME,
+                               # SKIPPED_SPREAD, SKIPPED_NO_SIGNAL, FAILED, …
+    action_time: str           # ISO-8601 wall-clock time
+
+
+class DecisionThrottle:
+    """
+    Per-symbol decision cache with bar-time awareness.
+
+    **Rules enforced:**
+
+    1. If the current *decision_key* equals the cached one **and** the bar_time
+       is the same  →  suppress (do not re-attempt, do not re-log).
+    2. A new attempt is allowed only when:
+       a) a new bar arrives for that timeframe, **or**
+       b) the decision_key genuinely changes (different strategy, direction,
+          timeframe, regime).
+
+    The cache is flushed to ``last_trade_log.json`` on every write so that a
+    restart does not cause immediate re-spam.
+    
+    NOTE: There is NO cooldown/expiry mechanism. Suppression is strictly based
+    on (decision_key, bar_time) matching. A decision is evaluated exactly once
+    per bar per unique decision identity.
+    """
+
+    def __init__(self, log_path: str = "last_trade_log.json"):
+        self._log_path = log_path
+        # symbol → DecisionRecord
+        self._cache: Dict[str, DecisionRecord] = {}
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def make_decision_key(symbol: str, strategy_name: str, timeframe: str,
+                          regime: str, direction: int, bar_time_iso: str) -> str:
+        """
+        Create a deterministic, short hash that uniquely identifies a decision.
+
+        Components: symbol, strategy, timeframe, regime, direction, bar_time.
+        """
+        raw = f"{symbol}|{strategy_name}|{timeframe}|{regime}|{direction}|{bar_time_iso}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def should_suppress(self, symbol: str, decision_key: str,
+                        bar_time_iso: str) -> bool:
+        """
+        Return ``True`` if this decision should be suppressed (no action,
+        no log output).
+
+        A decision is suppressed when ALL of the following hold:
+        * We already have a cached record for this symbol.
+        * The cached decision_key matches the current one.
+        * The cached bar_time matches the current one.
+        
+        There is NO cooldown expiry - suppression is strictly bar-time based.
+        """
+        prev = self._cache.get(symbol)
+        if prev is None:
+            return False
+
+        # Different decision → allow
+        if prev.decision_key != decision_key:
+            return False
+
+        # Different bar → allow
+        if prev.bar_time != bar_time_iso:
+            return False
+
+        # Same key + same bar → suppress (already handled this exact decision)
+        return True
+
+    def record_decision(self, symbol: str, decision_key: str,
+                        bar_time_iso: str, timeframe: str, regime: str,
+                        strategy_name: str, direction: int, action: str,
+                        cooldown_seconds: int = 0) -> None:
+        """
+        Store a decision and persist to disk.
+
+        Parameters
+        ----------
+        cooldown_seconds : int
+            IGNORED - kept for backward compatibility but has no effect.
+            Suppression is purely bar-time based.
+        """
+        record = DecisionRecord(
+            symbol=symbol,
+            decision_key=decision_key,
+            bar_time=bar_time_iso,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_name=strategy_name,
+            direction=direction,
+            action=action,
+            action_time=datetime.now().isoformat(),
+        )
+        self._cache[symbol] = record
+        self._save()
+
+    def clear_symbol(self, symbol: str) -> None:
+        """Remove cached decision for a symbol (e.g. after position close)."""
+        if symbol in self._cache:
+            del self._cache[symbol]
+            self._save()
+
+    def clear_all(self) -> None:
+        """Wipe the entire cache."""
+        self._cache.clear()
+        self._save()
+
+    # ------------------------------------------------------------------
+    # Persistence (JSON file – not in-memory-only)
+    # ------------------------------------------------------------------
+
+    def _save(self) -> None:
+        """Persist cache to ``last_trade_log.json``."""
+        try:
+            data = {}
+            for sym, rec in self._cache.items():
+                data[sym] = {
+                    "symbol": rec.symbol,
+                    "decision_key": rec.decision_key,
+                    "bar_time": rec.bar_time,
+                    "timeframe": rec.timeframe,
+                    "regime": rec.regime,
+                    "strategy_name": rec.strategy_name,
+                    "direction": rec.direction,
+                    "action": rec.action,
+                    "action_time": rec.action_time,
+                }
+            with open(self._log_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                f"DecisionThrottle: failed to save cache: {exc}"
+            )
+
+    def _load(self) -> None:
+        """Load cache from ``last_trade_log.json`` if it exists."""
+        try:
+            with open(self._log_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for sym, rec_dict in data.items():
+                self._cache[sym] = DecisionRecord(
+                    symbol=rec_dict.get("symbol", sym),
+                    decision_key=rec_dict.get("decision_key", ""),
+                    bar_time=rec_dict.get("bar_time", ""),
+                    timeframe=rec_dict.get("timeframe", ""),
+                    regime=rec_dict.get("regime", ""),
+                    strategy_name=rec_dict.get("strategy_name", ""),
+                    direction=rec_dict.get("direction", 0),
+                    action=rec_dict.get("action", ""),
+                    action_time=rec_dict.get("action_time", ""),
+                )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                f"DecisionThrottle: failed to load cache: {exc}"
+            )
+
+
+# =============================================================================
+# LIVE TRADER CLASS
+# =============================================================================
+
+class LiveTrader:
+    """
+    Live trading engine.
+    
+    Monitors markets and executes trades based on optimized configurations.
+    """
+    
+    # Minimum seconds between orders for the same symbol
+    ORDER_RATE_LIMIT_SECONDS = 5
+    
+    def __init__(self,
+                 mt5_connector: MT5Connector,
+                 portfolio_manager: PortfolioManager,
+                 position_config: PositionConfig,
+                 enable_trading: bool = True,
+                 close_on_opposite_signal: bool = False,
+                 pipeline_config: 'PipelineConfig' = None):
+        """
+        Initialize live trader.
+        
+        Args:
+            mt5_connector: MT5 connection
+            portfolio_manager: Portfolio manager with configs
+            position_config: Position management configuration
+            enable_trading: Enable actual trade execution
+            close_on_opposite_signal: Close positions on opposite signal (default: False)
+            pipeline_config: Pipeline configuration (for regime params, etc.)
+        """
+        self.mt5 = mt5_connector
+        self.pm = portfolio_manager
+        self.position_config = position_config
+        self.enable_trading = enable_trading
+        self.close_on_opposite_signal = close_on_opposite_signal
+        self.pipeline_config = pipeline_config
+        
+        # Position management
+        self.position_manager = PositionManager(position_config)
+        self.position_calc = PositionCalculator(position_config)
+        
+        # State
+        self._running = False
+        self._shutdown_event = threading.Event()
+        self._last_bar_times: Dict[str, datetime] = {}
+        self._last_order_times: Dict[str, datetime] = {}  # For rate limiting
+        
+        # Decision throttle – prevents re-evaluation / re-logging of the
+        # same decision on the same bar (e.g. risk-cap skips for XAUUSD).
+        self._decision_throttle = DecisionThrottle(log_path="last_trade_log.json")
+        
+        # Feature/signal cache – avoids recomputing features and signals 
+        # when no new bar has arrived. Cache key: (symbol, timeframe, bar_time)
+        # Cache stores: {'features': df, 'signal': int, 'regime': str, 'regime_strength': float}
+        self._candidate_cache: Dict[str, Dict[str, Any]] = {}
+        
+        # Trade log
+        self.trade_log: List[Dict] = []
+        
+        # Cache statistics for monitoring
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._max_cache_size = 100  # Limit cache to prevent memory bloat
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def _prune_cache(self):
+        """Prune cache if it exceeds max size (LRU-style, just clear oldest)."""
+        if len(self._candidate_cache) > self._max_cache_size:
+            # Remove half the entries (oldest first by insertion order in Python 3.7+)
+            keys_to_remove = list(self._candidate_cache.keys())[:len(self._candidate_cache) // 2]
+            for k in keys_to_remove:
+                del self._candidate_cache[k]
+            self.logger.debug(f"Pruned feature cache: removed {len(keys_to_remove)} entries")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for monitoring."""
+        total = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / total * 100) if total > 0 else 0
+        return {
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate_pct': round(hit_rate, 1),
+            'cache_size': len(self._candidate_cache),
+        }
+    
+    def start(self):
+        """Start the trading loop."""
+        self._running = True
+        self._shutdown_event.clear()
+        
+        self.logger.info("Starting live trading loop...")
+        self.logger.info(f"Trading enabled: {self.enable_trading}")
+        self.logger.info(f"Symbols: {len(self.pm.symbols)}")
+        self.logger.info(f"Validated configs: {len(self.pm.get_validated_configs())}")
+        
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                # Check connection
+                if not self.mt5.is_connected():
+                    self.logger.warning("Lost MT5 connection, attempting reconnect...")
+                    if not self._reconnect():
+                        time.sleep(10)
+                        continue
+                
+                # Process each symbol
+                self._process_all_symbols()
+                
+                # Sleep until next check
+                time.sleep(1)
+                
+            except KeyboardInterrupt:
+                self.logger.info("Keyboard interrupt received")
+                break
+            except Exception as e:
+                self.logger.exception(f"Error in trading loop: {e}")
+                time.sleep(5)
+        
+        self.logger.info("Trading loop stopped")
+    
+    def stop(self):
+        """Stop the trading loop."""
+        self.logger.info("Stopping trader...")
+        self._running = False
+        self._shutdown_event.set()
+    
+    def _process_all_symbols(self):
+        """Process all symbols for signals."""
+        validated_configs = self.pm.get_validated_configs()
+        
+        for symbol, config in validated_configs.items():
+            try:
+                self._process_symbol(symbol, config)
+            except Exception as e:
+                self.logger.error(f"[{symbol}] Error: {e}")
+    
+    def _process_symbol(self, symbol: str, config: SymbolConfig):
+        """
+        Process a single symbol with regime-aware strategy selection.
+        
+        For each timeframe:
+        1. Check for new bar
+        2. Compute features (including regime)
+        3. Select best (tf, regime, strategy) based on strength * quality_score * freshness
+        4. Generate signal and execute if conditions met
+        
+        Hold-until-exit: if position exists for this symbol, skip new entries.
+        
+        Decision throttle: each (symbol, strategy, tf, regime, direction, bar)
+        combination is attempted at most once.  Skips/failures are cached and
+        suppressed until a new bar arrives or the decision key changes.
+        """
+        # Find broker symbol
+        broker_symbol = self.mt5.find_broker_symbol(symbol)
+        if broker_symbol is None:
+            return
+        
+        # HOLD-UNTIL-EXIT: Check if ANY position exists for this symbol
+        # Use symbol-level check, not magic-specific, to prevent multiple positions
+        all_positions = self.mt5.get_positions()
+        symbol_positions = [p for p in all_positions if p.symbol == broker_symbol]
+        
+        if symbol_positions:
+            # Already have a position - hold until exit, don't enter new
+            return
+        
+        # No position - evaluate candidates across timeframes
+        candidates = self._evaluate_regime_candidates(symbol, broker_symbol, config)
+        
+        if not candidates:
+            return
+        
+        # Select best candidate by selection score
+        best = max(candidates, key=lambda c: c['selection_score'])
+        
+        # Check for entry signal (0 = no signal)
+        if best['signal'] == 0:
+            # Record the no-signal decision so we don't re-evaluate until
+            # the bar/decision changes.
+            bar_time_iso = str(best.get('bar_time', ''))
+            dk = DecisionThrottle.make_decision_key(
+                symbol, best['strategy_name'], best['timeframe'],
+                best['regime'], 0, bar_time_iso
+            )
+            # No need to log – just cache silently
+            self._decision_throttle.record_decision(
+                symbol=symbol, decision_key=dk,
+                bar_time_iso=bar_time_iso,
+                timeframe=best['timeframe'], regime=best['regime'],
+                strategy_name=best['strategy_name'], direction=0,
+                action="SKIPPED_NO_SIGNAL",
+            )
+            return
+        
+        # ── Throttle check ──────────────────────────────────────────────
+        # Build a decision key from the candidate's identifying attributes
+        # so that the *same* signal on the *same* bar is only acted on once.
+        bar_time_iso = str(best.get('bar_time', ''))
+        decision_key = DecisionThrottle.make_decision_key(
+            symbol, best['strategy_name'], best['timeframe'],
+            best['regime'], int(best['signal']), bar_time_iso
+        )
+        
+        if self._decision_throttle.should_suppress(symbol, decision_key, bar_time_iso):
+            # Already handled this exact decision on this bar – stay quiet
+            return
+        # ────────────────────────────────────────────────────────────────
+        
+        # Get symbol info
+        symbol_info = self.mt5.get_symbol_info(broker_symbol)
+        if symbol_info is None:
+            return
+        spec = symbol_info.to_instrument_spec()
+        
+        # Create magic number for this specific trade
+        # Include timeframe and regime so we can identify the config used
+        magic = zlib.crc32(
+            f"{symbol}|{best['timeframe']}|{best['regime']}".encode('utf-8')
+        ) & 0x7FFFFFFF
+        
+        # Log selection
+        self.logger.info(
+            f"[{symbol}] Selected: {best['strategy_name']} @ {best['timeframe']}/{best['regime']} "
+            f"(strength={best['regime_strength']:.2f}, quality={best['quality_score']:.2f}, "
+            f"freshness={best['freshness']:.2f}, score={best['selection_score']:.3f})"
+        )
+        
+        # Execute entry (passes decision_key so _execute_entry can record
+        # the outcome into the throttle)
+        self._execute_entry(
+            symbol=broker_symbol,
+            signal=int(best['signal']),
+            strategy=best['strategy'],
+            features=best['features'],
+            spec=spec,
+            magic=magic,
+            config=config,
+            decision_key=decision_key,
+            bar_time_iso=bar_time_iso,
+            best_candidate=best,
+        )
+    
+    def _evaluate_regime_candidates(self, symbol: str, broker_symbol: str, 
+                                     config: SymbolConfig) -> List[Dict]:
+        """
+        Evaluate all (timeframe, regime) candidates for entry.
+        
+        Implements the fallback rules:
+        - If tf/regime winner exists: use it
+        - If CHOP and no winner: hard no-trade
+        - Otherwise: use default_config with penalty
+        
+        Performance optimization: caches features/signals per (symbol, tf, bar_time)
+        to avoid recomputing when no new bar has arrived.
+        
+        Returns list of candidate dicts with selection scores.
+        """
+        from pm_strategies import StrategyRegistry
+        
+        candidates = []
+        
+        # Check if config has regime configs
+        if not config.has_regime_configs():
+            # Fallback to legacy single-strategy mode
+            return self._evaluate_legacy_candidate(symbol, broker_symbol, config)
+        
+        available_timeframes = config.get_available_timeframes()
+        regime_params_file = getattr(self.pipeline_config, 'regime_params_file', 'regime_params.json') if hasattr(self, 'pipeline_config') else 'regime_params.json'
+        freshness_decay = getattr(self.pipeline_config, 'regime_freshness_decay', 0.85) if hasattr(self, 'pipeline_config') else 0.85
+        
+        for tf in available_timeframes:
+            # Get bars for this timeframe (need at least the latest bar time)
+            bars = self.mt5.get_bars(broker_symbol, tf, count=200)
+            if bars is None or len(bars) < 100:
+                continue
+            
+            # Check for new bar (freshness tracking)
+            current_bar_time = bars.index[-1]
+            cache_key = f"{symbol}_{tf}"
+            last_bar_time = self._last_bar_times.get(cache_key)
+            
+            # Determine if this is a new bar
+            is_new_bar = (last_bar_time is None or current_bar_time > last_bar_time)
+            freshness = 1.0 if is_new_bar else freshness_decay
+            
+            # ── Feature/Signal Cache Logic ───────────────────────────────────
+            # Build cache key including bar_time to ensure we invalidate on new bar
+            feature_cache_key = f"{symbol}_{tf}_{current_bar_time}"
+            cached = self._candidate_cache.get(feature_cache_key)
+            
+            if cached is not None and not is_new_bar:
+                # Cache HIT - use cached features and signal (skip expensive computation)
+                self._cache_hits += 1
+                features = cached['features']
+                current_regime = cached['regime']
+                regime_strength = cached['regime_strength']
+                current_signal = cached['signal']
+                strategy = cached['strategy']
+                regime_config = cached['regime_config']
+                
+                # Still need to check if regime_config exists (it was cached)
+                if regime_config is None:
+                    continue
+            else:
+                # Cache MISS - compute features and signal
+                self._cache_misses += 1
+                
+                if is_new_bar:
+                    self._last_bar_times[cache_key] = current_bar_time
+                    # Clear old cache entries for this symbol/tf
+                    old_keys = [k for k in self._candidate_cache.keys() 
+                               if k.startswith(f"{symbol}_{tf}_")]
+                    for k in old_keys:
+                        del self._candidate_cache[k]
+                
+                # Compute features with regime detection
+                features = FeatureComputer.compute_all(
+                    bars, symbol=symbol, timeframe=tf,
+                    regime_params_file=regime_params_file
+                )
+                
+                # Get current regime from last closed bar
+                # Use index -2 because -1 is the forming bar
+                if 'REGIME' not in features.columns or len(features) < 2:
+                    continue
+                
+                current_regime = features['REGIME'].iloc[-2]
+                regime_strength = features['REGIME_STRENGTH'].iloc[-2] if 'REGIME_STRENGTH' in features.columns else 0.5
+                
+                if current_regime is None or pd.isna(current_regime):
+                    continue
+                
+                # Get config for this (tf, regime)
+                regime_config = config.get_regime_config(tf, current_regime)
+                
+                if regime_config is None:
+                    # No winner for this regime
+                    if current_regime == 'CHOP':
+                        # CHOP with no winner = hard no-trade, skip this timeframe
+                        # Cache the "no config" result to avoid recomputing
+                        self._candidate_cache[feature_cache_key] = {
+                            'features': features,
+                            'regime': current_regime,
+                            'regime_strength': float(regime_strength),
+                            'signal': 0,
+                            'strategy': None,
+                            'regime_config': None,
+                        }
+                        self._prune_cache()  # Prevent unbounded growth
+                        continue
+                    elif config.default_config:
+                        # Use default config with penalty
+                        regime_config = config.default_config
+                        regime_strength *= 0.7  # Penalty for using fallback
+                    else:
+                        continue
+                
+                # Get strategy instance
+                try:
+                    strategy = StrategyRegistry.get(regime_config.strategy_name, **regime_config.parameters)
+                except Exception as e:
+                    self.logger.warning(f"[{symbol}] Failed to get strategy {regime_config.strategy_name}: {e}")
+                    continue
+                
+                # Generate signal
+                signals = strategy.generate_signals(features, symbol)
+                current_signal = signals.iloc[-2] if len(signals) > 1 else 0
+                
+                # Cache the computed result
+                self._candidate_cache[feature_cache_key] = {
+                    'features': features,
+                    'regime': current_regime,
+                    'regime_strength': float(regime_strength),
+                    'signal': int(current_signal),
+                    'strategy': strategy,
+                    'regime_config': regime_config,
+                }
+                self._prune_cache()  # Prevent unbounded growth
+            # ─────────────────────────────────────────────────────────────────
+            
+            # Compute selection score = strength * quality_score * freshness
+            quality_score = float(regime_config.quality_score) if regime_config.quality_score else 0.5
+            selection_score = float(regime_strength) * quality_score * float(freshness)
+            
+            candidates.append({
+                'timeframe': tf,
+                'regime': current_regime,
+                'regime_strength': float(regime_strength),
+                'quality_score': quality_score,
+                'freshness': freshness,
+                'selection_score': selection_score,
+                'strategy': strategy,
+                'strategy_name': regime_config.strategy_name,
+                'signal': int(current_signal),
+                'features': features,
+                'regime_config': regime_config,
+                'bar_time': str(features.index[-2]) if len(features) > 1 else '',
+            })
+        
+        return candidates
+    
+    def _evaluate_legacy_candidate(self, symbol: str, broker_symbol: str,
+                                    config: SymbolConfig) -> List[Dict]:
+        """
+        Fallback for legacy configs without regime_configs.
+        
+        Uses the single strategy_name/timeframe/parameters from config.
+        """
+        from pm_strategies import StrategyRegistry
+        
+        timeframe = config.timeframe
+        if not timeframe:
+            return []
+        
+        # Get bars
+        bars = self.mt5.get_bars(broker_symbol, timeframe, count=200)
+        if bars is None or len(bars) < 50:
+            return []
+        
+        # Check for new bar
+        current_bar_time = bars.index[-1]
+        cache_key = f"{symbol}_{timeframe}"
+        last_bar_time = self._last_bar_times.get(cache_key)
+        
+        if last_bar_time is not None and current_bar_time <= last_bar_time:
+            return []  # Not a new bar
+        
+        self._last_bar_times[cache_key] = current_bar_time
+        
+        # Get strategy
+        try:
+            strategy = StrategyRegistry.get(config.strategy_name, **config.parameters)
+        except Exception as e:
+            self.logger.warning(f"[{symbol}] Failed to get strategy {config.strategy_name}: {e}")
+            return []
+        
+        # Compute features
+        features = FeatureComputer.compute_all(bars, symbol=symbol, timeframe=timeframe)
+        
+        # Generate signal
+        signals = strategy.generate_signals(features, symbol)
+        current_signal = signals.iloc[-2] if len(signals) > 1 else 0
+        
+        return [{
+            'timeframe': timeframe,
+            'regime': 'LEGACY',
+            'regime_strength': 1.0,
+            'quality_score': config.composite_score / 100 if config.composite_score else 0.5,
+            'freshness': 1.0,
+            'selection_score': 1.0,
+            'strategy': strategy,
+            'strategy_name': config.strategy_name,
+            'signal': int(current_signal),
+            'features': features,
+            'regime_config': None,
+            'bar_time': str(features.index[-2]) if len(features) > 1 else '',
+        }]
+    
+    def _execute_entry(self,
+                       symbol: str,
+                       signal: int,
+                       strategy: BaseStrategy,
+                       features: pd.DataFrame,
+                       spec,
+                       magic: int,
+                       config: SymbolConfig,
+                       decision_key: str = "",
+                       bar_time_iso: str = "",
+                       best_candidate: Dict = None):
+        """
+        Execute an entry trade.
+        
+        Records every outcome (success, skip, failure) into the decision
+        throttle so that the same signal on the same bar is never re-attempted
+        or re-logged.
+        """
+        is_long = signal == 1
+        direction = "LONG" if is_long else "SHORT"
+        
+        # Helper to extract throttle metadata from the best_candidate dict
+        _tf = best_candidate.get('timeframe', '') if best_candidate else ''
+        _regime = best_candidate.get('regime', '') if best_candidate else ''
+        _strat_name = best_candidate.get('strategy_name', '') if best_candidate else ''
+        
+        def _record_throttle(action: str, cooldown: int = 0) -> None:
+            """Record this decision outcome into the throttle."""
+            if decision_key:
+                self._decision_throttle.record_decision(
+                    symbol=symbol, decision_key=decision_key,
+                    bar_time_iso=bar_time_iso,
+                    timeframe=_tf, regime=_regime,
+                    strategy_name=_strat_name,
+                    direction=signal, action=action,
+                    cooldown_seconds=cooldown,
+                )
+        
+        # Check rate limit - prevent rapid order submission
+        last_order_time = self._last_order_times.get(symbol)
+        if last_order_time:
+            time_since_last = (datetime.now() - last_order_time).total_seconds()
+            if time_since_last < self.ORDER_RATE_LIMIT_SECONDS:
+                self.logger.debug(f"[{symbol}] Rate limited, {self.ORDER_RATE_LIMIT_SECONDS - time_since_last:.1f}s remaining")
+                return
+        
+        # Re-verify no position exists right before execution (race condition prevention)
+        existing = self.mt5.get_position_by_symbol_magic(symbol, magic)
+        if existing:
+            self.logger.debug(f"[{symbol}] Position already exists, skipping entry")
+            _record_throttle("SKIPPED_POSITION_EXISTS")
+            return
+        
+        # Calculate stops (use MT5-derived spec for live parity)
+        sl_pips, tp_pips = strategy.calculate_stops(features, signal, symbol, spec=spec)
+
+        # Get symbol info for sizing and broker constraints
+        symbol_info = self.mt5.get_symbol_info(symbol)
+        if symbol_info is None:
+            return
+
+        # Risk basis (balance/equity)
+        account = self.mt5.get_account_info()
+        if account is None:
+            return
+        basis_pref = getattr(self.position_config, "risk_basis", "balance")
+        basis_value = account.balance if basis_pref == "balance" else account.equity
+        if basis_value <= 0:
+            self.logger.warning(f"[{symbol}] Invalid risk basis value ({basis_value}); skipping trade")
+            _record_throttle("SKIPPED_INVALID_BASIS")
+            return
+
+        # Get current price (same basis used for execution)
+        tick = self.mt5.get_symbol_tick(symbol)
+        if tick is None:
+            return
+        entry_price = tick.ask if is_long else tick.bid
+
+        # Calculate stop prices from pips
+        sl_price, tp_price = self.position_calc.calculate_stop_prices(entry_price, sl_pips, tp_pips, is_long, spec)
+
+        # Enforce broker minimum stop distance (auto widen SL if too close)
+        min_stop_dist = float(symbol_info.trade_stops_level) * float(symbol_info.point) if symbol_info.trade_stops_level else 0.0
+        if min_stop_dist > 0 and abs(entry_price - sl_price) < min_stop_dist and getattr(self.position_config, "auto_widen_sl", True):
+            if is_long:
+                sl_price = entry_price - min_stop_dist
+            else:
+                sl_price = entry_price + min_stop_dist
+            self.logger.debug(f"[{symbol}] Widened SL to satisfy min stop distance ({min_stop_dist})")
+
+        # Target risk (deposit currency)
+        target_risk_pct = float(self.position_config.risk_per_trade_pct)
+        target_risk_amount = basis_value * (target_risk_pct / 100.0)
+
+        # Volume bounds (combine config + broker)
+        min_vol = max(float(self.position_config.min_position_size), float(symbol_info.volume_min))
+        # max_position_size = 0 means no config limit, use broker max only
+        config_max = float(self.position_config.max_position_size)
+        broker_max = float(symbol_info.volume_max)
+        max_vol = min(config_max, broker_max) if config_max > 0 else broker_max
+
+        order_type = OrderType.BUY if is_long else OrderType.SELL
+
+        # Compute loss per 1.0 lot using MT5 contract math (robust for indices/metals)
+        loss_per_lot = self.mt5.calc_loss_amount(order_type.value, symbol, 1.0, entry_price, sl_price)
+        
+        # Fallback hierarchy if MT5 calc fails:
+        # 1. Tick-based math from broker symbol info (reliable for CFDs/indices)
+        # 2. Pip-value math (last resort)
+        if loss_per_lot is None or loss_per_lot <= 0:
+            # Tick-based fallback using broker-provided symbol specs
+            price_diff = abs(entry_price - sl_price)
+            if symbol_info.trade_tick_size > 0 and symbol_info.trade_tick_value > 0:
+                ticks = price_diff / symbol_info.trade_tick_size
+                loss_per_lot = ticks * symbol_info.trade_tick_value
+                self.logger.info(f"[{symbol}] Using tick-based fallback: loss_per_lot=${loss_per_lot:.2f}")
+            else:
+                # Only now fall back to pip-value (with warning)
+                loss_per_lot = abs(float(sl_pips)) * float(spec.pip_value)
+                self.logger.warning(f"[{symbol}] Using pip-value fallback (less reliable): loss_per_lot=${loss_per_lot:.2f}")
+
+        if loss_per_lot <= 0:
+            self.logger.warning(f"[{symbol}] Could not compute loss_per_lot; skipping trade")
+            _record_throttle("SKIPPED_NO_LOSS_CALC")
+            return
+
+        # Raw volume for target risk
+        volume_raw = target_risk_amount / loss_per_lot
+
+        # If volume exceeds max_vol, optionally widen SL to fit within max volume (keeps risk constant)
+        if volume_raw > max_vol and getattr(self.position_config, "auto_widen_sl", True):
+            widen_factor = 1.25
+            max_iters = 6
+            for _ in range(max_iters):
+                dist = abs(entry_price - sl_price) * widen_factor
+                sl_price = (entry_price - dist) if is_long else (entry_price + dist)
+                loss_try = self.mt5.calc_loss_amount(order_type.value, symbol, 1.0, entry_price, sl_price)
+                if loss_try is None or loss_try <= 0:
+                    break
+                loss_per_lot = loss_try
+                volume_raw = target_risk_amount / loss_per_lot
+                if volume_raw <= max_vol:
+                    self.logger.debug(f"[{symbol}] Widened SL to fit max volume constraint (max_vol={max_vol})")
+                    break
+
+        # Clamp and normalize volume (risk-safe floor to step)
+        volume_raw = max(min_vol, min(max_vol, volume_raw))
+        volume = self.mt5.normalize_volume(volume_raw, symbol_info)
+
+        # If normalization pushed below min, force to min_vol (may exceed target; enforce cap below)
+        if volume < min_vol:
+            volume = min_vol
+
+        # Recompute actual risk after normalization, enforce hard cap
+        # Use same fallback hierarchy as initial sizing
+        actual_risk_amount = self.mt5.calc_loss_amount(order_type.value, symbol, volume, entry_price, sl_price)
+        if actual_risk_amount is None or actual_risk_amount <= 0:
+            # Tick-based fallback using broker-provided symbol specs
+            price_diff = abs(entry_price - sl_price)
+            if symbol_info.trade_tick_size > 0 and symbol_info.trade_tick_value > 0:
+                ticks = price_diff / symbol_info.trade_tick_size
+                actual_risk_amount = ticks * symbol_info.trade_tick_value * float(volume)
+            else:
+                # Pip-value fallback
+                actual_risk_amount = abs(float(sl_pips)) * float(spec.pip_value) * float(volume)
+
+        actual_risk_pct = (actual_risk_amount / basis_value) * 100.0 if basis_value > 0 else float('inf')
+        max_risk_pct = float(getattr(self.position_config, "max_risk_pct", 5.0))
+        if actual_risk_pct > max_risk_pct + 1e-9:
+            self.logger.warning(
+                f"[{symbol}] Skipping trade; risk {actual_risk_pct:.2f}% exceeds cap {max_risk_pct:.2f}% "
+                f"(vol={volume:.4f}, sl={sl_price:.5f})"
+            )
+            # ── Record into throttle so this is not repeated ─────────
+            _record_throttle("SKIPPED_RISK_CAP")
+            return
+
+        # Log risk details for auditability
+        self.logger.info(
+            f"[{symbol}] {order_type.name} | basis={basis_value:.2f} ({basis_pref}) | "
+            f"target_risk={target_risk_pct:.2f}% (${target_risk_amount:.2f}) | "
+            f"actual_risk={actual_risk_pct:.2f}% (${actual_risk_amount:.2f}) | "
+            f"vol_raw={volume_raw:.4f} | vol={volume:.4f} | entry={entry_price:.5f} | sl={sl_price:.5f} | tp={tp_price:.5f}"
+        )
+
+        if not self.enable_trading:
+            self.logger.info(
+                f"[{symbol}] [PAPER] Would execute {direction}: "
+                f"{volume:.4f} lots @ {entry_price:.5f} | SL={sl_price:.5f} | TP={tp_price:.5f}"
+            )
+            self._log_trade(symbol, direction, volume, entry_price,
+                            sl_price, tp_price, magic, "PAPER")
+            _record_throttle("PAPER")
+            return
+
+        # Execute order
+        result = self.mt5.send_market_order(
+            symbol=symbol,
+            order_type=order_type,
+            volume=volume,
+            sl=sl_price,
+            tp=tp_price,
+            deviation=30,
+            magic=magic,
+            comment=f"PM_{config.strategy_name[:10]}"
+        )
+        
+        if result.success:
+            self.logger.info(
+                f"[OK] [{symbol}] {direction} executed: "
+                f"{result.volume} lots @ {result.price:.5f}"
+            )
+            self._log_trade(symbol, direction, result.volume, result.price,
+                           sl_price, tp_price, magic, "EXECUTED")
+            # Record order time for rate limiting
+            self._last_order_times[symbol] = datetime.now()
+            _record_throttle("EXECUTED")
+        else:
+            self.logger.warning(
+                f"[FAIL] [{symbol}] Order failed: {result.retcode} - {result.retcode_description}"
+            )
+            self._log_trade(symbol, direction, volume, entry_price,
+                           sl_price, tp_price, magic, f"FAILED: {result.retcode_description}")
+            _record_throttle(f"FAILED_{result.retcode}")
+    
+    def _close_position_on_signal(self, position: MT5Position, features: pd.DataFrame, spec):
+        """Close position on opposite signal."""
+        if not self.enable_trading:
+            self.logger.info(f"[{position.symbol}] [PAPER] Would close position")
+            return
+        
+        result = self.mt5.close_position(
+            position=position,
+            deviation=30,
+            comment="PM_SignalExit"
+        )
+        
+        if result.success:
+            self.logger.info(f"[OK] [{position.symbol}] Position closed on signal reversal")
+        else:
+            self.logger.warning(f"[FAIL] [{position.symbol}] Close failed: {result.retcode_description}")
+    
+    def _log_trade(self, symbol: str, direction: str, volume: float,
+                   price: float, sl: float, tp: float, magic: int, status: str):
+        """Log trade to history."""
+        self.trade_log.append({
+            'timestamp': datetime.now().isoformat(),
+            'symbol': symbol,
+            'direction': direction,
+            'volume': volume,
+            'price': price,
+            'sl': sl,
+            'tp': tp,
+            'magic': magic,
+            'status': status
+        })
+    
+    def _reconnect(self) -> bool:
+        """Attempt to reconnect to MT5."""
+        for attempt in range(5):
+            self.logger.info(f"Reconnection attempt {attempt + 1}/5")
+            self.mt5.disconnect()
+            time.sleep(2)
+            if self.mt5.connect():
+                self.logger.info("Reconnected successfully")
+                return True
+            time.sleep(5)
+        return False
+    
+    def save_trade_log(self, filepath: str):
+        """Save trade log to file."""
+        with open(filepath, 'w') as f:
+            json.dump(self.trade_log, f, indent=2)
+        self.logger.info(f"Saved {len(self.trade_log)} trades to {filepath}")
+    
+    def print_status(self):
+        """Print current trading status."""
+        print("\n" + "=" * 60)
+        print("LIVE TRADER STATUS")
+        print("=" * 60)
+        print(f"Running: {self._running}")
+        print(f"Trading enabled: {self.enable_trading}")
+        print(f"Trades executed: {len(self.trade_log)}")
+        
+        # Account info
+        if self.mt5 and self.mt5.is_connected():
+            account = self.mt5.get_account_info()
+            if account:
+                print(f"\nAccount: {account.login}")
+                print(f"Balance: {account.balance:.2f} {account.currency}")
+                print(f"Equity: {account.equity:.2f} {account.currency}")
+            
+            # Open positions
+            positions = self.mt5.get_positions()
+            print(f"\nOpen positions: {len(positions)}")
+            for pos in positions:
+                direction = "LONG" if pos.type == 0 else "SHORT"
+                print(f"  {pos.symbol} | {direction} | {pos.volume} lots | P/L: {pos.profit:.2f}")
+        
+        print("=" * 60)
+
+
+# =============================================================================
+# MAIN APPLICATION
+# =============================================================================
+
+class FXPortfolioManagerApp:
+    """
+    Main application class.
+    
+    Orchestrates the entire Portfolio Manager:
+    - Initial optimization
+    - Live trading
+    - Automatic retraining
+    """
+    
+    def __init__(self,
+                 symbols: List[str] = None,
+                 config: PipelineConfig = None,
+                 pipeline_config: PipelineConfig = None,
+                 mt5_config: MT5Config = None,
+                 position_config: PositionConfig = None,
+                 data_dir: str = "./data",
+                 output_dir: str = "./pm_outputs",
+                 config_file: str = "pm_configs.json"):
+        """
+        Initialize application.
+        
+        Args:
+            symbols: List of symbols to trade
+            config: Pipeline configuration (alias for pipeline_config)
+            pipeline_config: Pipeline configuration
+            mt5_config: MT5 connection configuration
+            position_config: Position management configuration
+            data_dir: Directory for data files
+            output_dir: Directory for output files
+            config_file: Name of saved configurations file
+        """
+        # Accept either name (keeps full compatibility)
+        if config is None and pipeline_config is not None:
+            config = pipeline_config
+        
+        self.symbols = symbols or DEFAULT_SYMBOLS
+        
+        # Configurations
+        self.pipeline_config = config or PipelineConfig(
+            data_dir=Path(data_dir),
+            output_dir=Path(output_dir)
+        )
+        self.mt5_config = mt5_config or MT5Config()
+        self.position_config = position_config or PositionConfig()
+        
+        # Paths
+        self.data_dir = Path(data_dir)
+        self.output_dir = Path(output_dir)
+        self.config_file = config_file
+        
+        # Create directories
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Components
+        self.mt5: Optional[MT5Connector] = None
+        self.portfolio_manager: Optional[PortfolioManager] = None
+        self.trader: Optional[LiveTrader] = None
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def initialize(self) -> bool:
+        """Initialize all components."""
+        self.logger.info("=" * 60)
+        self.logger.info("FX PORTFOLIO MANAGER v3.0")
+        self.logger.info("=" * 60)
+        
+        # Check MT5 availability
+        if not MT5_AVAILABLE:
+            self.logger.warning("MetaTrader5 package not available")
+            self.logger.warning("Running in offline/optimization-only mode")
+        else:
+            # Connect to MT5
+            self.logger.info("Connecting to MetaTrader 5...")
+            self.mt5 = MT5Connector(self.mt5_config)
+            
+            if not self.mt5.connect():
+                self.logger.warning("Failed to connect to MT5 - running in offline mode")
+            else:
+                self.logger.info("[OK] Connected to MT5")
+        
+        # Initialize portfolio manager
+        self.portfolio_manager = PortfolioManager(
+            config=self.pipeline_config,
+            symbols=self.symbols,
+            config_file=self.config_file
+        )
+        
+        self.logger.info(f"[OK] Portfolio Manager initialized")
+        self.logger.info(f"  Symbols: {len(self.symbols)}")
+        self.logger.info(f"  Strategies: {StrategyRegistry.count()}")
+        self.logger.info(f"  Existing configs: {len(self.portfolio_manager.symbol_configs)}")
+        
+        return True
+    
+    def run_optimization(self, overwrite: bool = False) -> bool:
+        """
+        Run optimization for all symbols with stateful skip/resume support.
+        
+        Args:
+            overwrite: If True, re-optimize all symbols ignoring validity
+            
+        Returns:
+            True if any valid configs exist after optimization
+        """
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("RUNNING OPTIMIZATION")
+        if overwrite:
+            self.logger.info("MODE: OVERWRITE (re-optimizing all symbols)")
+        else:
+            self.logger.info("MODE: INCREMENTAL (skipping valid configs)")
+        self.logger.info("=" * 60)
+        
+        # Fetch data if MT5 connected
+        if self.mt5 and self.mt5.is_connected():
+            self._fetch_historical_data()
+        else:
+            self.logger.info("Using existing data files (MT5 not connected)")
+        
+        # Run optimization with stateful persistence
+        results = self.portfolio_manager.initial_optimization(overwrite=overwrite)
+        
+        # Save results (legacy - now handled incrementally by ledger)
+        self._save_results(results)
+        
+        # Print summary
+        self.portfolio_manager.print_status()
+        
+        return len(self.portfolio_manager.get_validated_configs()) > 0
+    
+    def run_trading(self, 
+                    enable_trading: bool = True,
+                    auto_retrain: bool = False,
+                    close_on_opposite_signal: bool = False):
+        """
+        Run live trading loop.
+        """
+        if not self.mt5 or not self.mt5.is_connected():
+            self.logger.error("MT5 not connected. Cannot run live trading.")
+            return
+        
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("STARTING LIVE TRADING")
+        self.logger.info(f"Trading enabled: {enable_trading}")
+        self.logger.info(f"Auto-retrain: {auto_retrain}")
+        self.logger.info(f"Close on opposite signal: {close_on_opposite_signal}")
+        self.logger.info("=" * 60)
+        
+        # Check for validated configs
+        if not self.portfolio_manager.get_validated_configs():
+            self.logger.warning("No validated configurations. Run optimization first.")
+            return
+        
+        # Create trader
+        self.trader = LiveTrader(
+            mt5_connector=self.mt5,
+            portfolio_manager=self.portfolio_manager,
+            position_config=self.position_config,
+            enable_trading=enable_trading,
+            close_on_opposite_signal=close_on_opposite_signal,
+            pipeline_config=self.pipeline_config,
+        )
+        
+        # Main loop with reconnection handling
+        last_retrain_check = datetime.now()
+        retrain_check_interval = timedelta(hours=1)
+        
+        try:
+            while True:
+                # Check MT5 connection
+                if not self.mt5.is_connected():
+                    self.logger.warning("Lost MT5 connection, attempting reconnect...")
+                    reconnected = False
+                    for attempt in range(5):
+                        self.logger.info(f"Reconnection attempt {attempt + 1}/5")
+                        self.mt5.disconnect()
+                        time.sleep(2)
+                        if self.mt5.connect():
+                            self.logger.info("Reconnected successfully")
+                            reconnected = True
+                            break
+                        time.sleep(5)
+                    if not reconnected:
+                        self.logger.error("Failed to reconnect after 5 attempts")
+                        time.sleep(30)
+                        continue
+                
+                # Check for retraining
+                if auto_retrain and datetime.now() - last_retrain_check > retrain_check_interval:
+                    symbols_to_retrain = self.portfolio_manager.get_symbols_needing_retrain()
+                    if symbols_to_retrain:
+                        self.logger.info(f"Retraining {len(symbols_to_retrain)} symbols...")
+                        self._fetch_historical_data(symbols_to_retrain)
+                        self.portfolio_manager.retrain_all_needed()
+                    last_retrain_check = datetime.now()
+                
+                # Run trading iteration
+                try:
+                    self.trader._process_all_symbols()
+                except Exception as e:
+                    self.logger.error(f"Error in trading loop: {e}")
+                
+                # Sleep
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            self.logger.info("Shutdown requested...")
+        finally:
+            self.shutdown()
+    
+    def _fetch_historical_data(self, symbols: List[str] = None):
+        """Fetch historical data from MT5 and save to data directory."""
+        if not self.mt5 or not self.mt5.is_connected():
+            return
+        
+        symbols = symbols or self.symbols
+        
+        self.logger.info(f"Fetching historical data for {len(symbols)} symbols...")
+        
+        for symbol in symbols:
+            broker_symbol = self.mt5.find_broker_symbol(symbol)
+            if broker_symbol is None:
+                self.logger.warning(f"Symbol not found: {symbol}")
+                continue
+            
+            # Fetch M5 data (base timeframe) - approximately 4.8 years crypto 6.89 years
+            bars_to_fetch = int(getattr(self.pipeline_config, "max_bars", 300000))
+            bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch)
+
+            if bars is not None and len(bars) > 0:
+                filepath = self.data_dir / f"{symbol}_M5.csv"
+                bars.to_csv(filepath)
+                self.logger.info(f"  {symbol}: {len(bars)} bars saved")
+            else:
+                self.logger.warning(f"  {symbol}: No data available")
+    
+    def _save_results(self, results: Dict):
+        """Save optimization results."""
+        summary = []
+        for symbol, result in results.items():
+            if result.success and result.config:
+                summary.append({
+                    'symbol': symbol,
+                    'strategy': result.config.strategy_name,
+                    'timeframe': result.config.timeframe,
+                    'score': result.config.composite_score,
+                    'validated': result.config.is_validated,
+                    'retrain_days': result.config.retrain_days,
+                    'train_trades': result.config.train_metrics.get('total_trades', 0),
+                    'train_win_rate': result.config.train_metrics.get('win_rate', 0),
+                    'val_trades': result.config.val_metrics.get('total_trades', 0),
+                    'val_win_rate': result.config.val_metrics.get('win_rate', 0),
+                })
+        
+        summary_df = pd.DataFrame(summary)
+        summary_path = self.output_dir / "optimization_summary.csv"
+        summary_df.to_csv(summary_path, index=False)
+        self.logger.info(f"Saved optimization summary to {summary_path}")
+    
+    def shutdown(self):
+        """Shutdown the application."""
+        self.logger.info("Shutting down...")
+        
+        if self.trader:
+            self.trader.stop()
+            
+            # Save trade log
+            log_path = self.output_dir / f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            self.trader.save_trade_log(str(log_path))
+        
+        if self.mt5:
+            self.mt5.disconnect()
+        
+        self.logger.info("Shutdown complete")
+    
+    def print_status(self):
+        """Print application status."""
+        if self.portfolio_manager:
+            self.portfolio_manager.print_status()
+        
+        if self.trader:
+            self.trader.print_status()
+
+
+# =============================================================================
+# SIGNAL HANDLERS
+# =============================================================================
+
+_app_instance: Optional[FXPortfolioManagerApp] = None
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals."""
+    global _app_instance
+    print("\nShutdown signal received...")
+    if _app_instance:
+        _app_instance.shutdown()
+    sys.exit(0)
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main():
+    """Main entry point."""
+    global _app_instance
+    
+    parser = argparse.ArgumentParser(
+        description="FX Portfolio Manager - Automated Trading System"
+    )
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config.json',
+        help='Path to config JSON (default: config.json)'
+    )
+
+    parser.add_argument(
+        '--optimize',
+        action='store_true',
+        help='Run initial optimization'
+    )
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Force re-optimization of all symbols (ignore valid configs)'
+    )
+    parser.add_argument(
+        '--trade',
+        action='store_true',
+        help='Start live trading'
+    )
+    parser.add_argument(
+        '--paper',
+        action='store_true',
+        help='Paper trading mode (no real trades)'
+    )
+    parser.add_argument(
+        '--auto-retrain',
+        action='store_true',
+        help='Enable automatic retraining'
+    )
+    parser.add_argument(
+        '--close-on-opposite-signal',
+        action='store_true',
+        help='Close open positions when an opposite signal appears (default: disabled)'
+    )
+
+    parser.add_argument(
+        '--symbols',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Symbols to trade (default: all)'
+    )
+    parser.add_argument(
+        '--data-dir',
+        type=str,
+        default='./data',
+        help='Data directory'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='./pm_outputs',
+        help='Output directory'
+    )
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='Logging level'
+    )
+    parser.add_argument(
+        '--status',
+        action='store_true',
+        help='Print current status and exit'
+    )
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(log_level=args.log_level)
+    logger = logging.getLogger(__name__)
+    
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Create application
+    symbols = args.symbols or DEFAULT_SYMBOLS
+    
+    # Load runtime configuration
+    config_data = load_config_json(args.config)
+
+    pipeline_config = PipelineConfig(**_filter_dataclass_kwargs(PipelineConfig, config_data.get("pipeline", {})))
+    position_config = PositionConfig(**_filter_dataclass_kwargs(PositionConfig, config_data.get("position", {})))
+    mt5_config = MT5Config(**_filter_dataclass_kwargs(MT5Config, config_data.get("mt5", {})))
+
+    # If position risk not set explicitly, inherit from pipeline risk (backward compatible)
+    if "risk_per_trade_pct" not in (config_data.get("position") or {}) and hasattr(pipeline_config, "risk_per_trade_pct"):
+        position_config.risk_per_trade_pct = pipeline_config.risk_per_trade_pct
+
+    _app_instance = FXPortfolioManagerApp(
+        symbols=symbols,
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        pipeline_config=pipeline_config,
+        position_config=position_config,
+        mt5_config=mt5_config
+    )
+    
+    try:
+        # Initialize
+        if not _app_instance.initialize():
+            logger.error("Initialization failed")
+            return 1
+        
+        # Status only
+        if args.status:
+            _app_instance.print_status()
+            return 0
+        
+        # Run optimization
+        if args.optimize:
+            if not _app_instance.run_optimization(overwrite=args.overwrite):
+                logger.warning("Optimization produced no valid configs")
+        
+        # Run trading
+        if args.trade:
+            _app_instance.run_trading(
+                enable_trading=not args.paper,
+                auto_retrain=args.auto_retrain,
+                close_on_opposite_signal=args.close_on_opposite_signal
+            )
+        
+        # Default: show status
+        if not args.optimize and not args.trade:
+            _app_instance.print_status()
+            print("\nUsage:")
+            print("  python pm_main.py --optimize              # Run optimization (skip valid)")
+            print("  python pm_main.py --optimize --overwrite  # Force re-optimize all")
+            print("  python pm_main.py --trade                 # Start live trading")
+            print("  python pm_main.py --trade --paper         # Paper trading")
+            print("  python pm_main.py --trade --auto-retrain  # With auto-retraining")
+        
+        return 0
+        
+    except Exception as e:
+        logger.exception(f"Application error: {e}")
+        return 1
+    finally:
+        if _app_instance:
+            _app_instance.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

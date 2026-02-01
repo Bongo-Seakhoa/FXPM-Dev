@@ -1,0 +1,24 @@
+[
+  {
+    "timestamp": "2026-01-30T20:35:34.262053",
+    "symbol": "NZDUSD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 0.60314,
+    "sl": 0.6142928571428572,
+    "tp": 0.5921271428571429,
+    "magic": 1350581678,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-01-30T20:35:44.119199",
+    "symbol": "USDMXN",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 17.4161,
+    "sl": 17.537142857142857,
+    "tp": 17.294657142857144,
+    "magic": 1086590548,
+    "status": "EXECUTED"
+  }
+]
