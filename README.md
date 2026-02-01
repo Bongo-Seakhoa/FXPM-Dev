@@ -1,6 +1,6 @@
-# FX Portfolio Manager v3.0
+# FX Portfolio Manager v3.3
 
-A production-ready automated trading system featuring regime-aware strategy selection, hyperparameter optimization, and live execution via MetaTrader 5.
+A production-ready automated trading system featuring regime-aware strategy selection, stateful optimization with incremental persistence, Numba-accelerated backtesting, and live execution via MetaTrader 5.
 
 ---
 
@@ -16,10 +16,13 @@ A production-ready automated trading system featuring regime-aware strategy sele
 - [Trading Strategies](#trading-strategies)
 - [Regime Detection](#regime-detection)
 - [Risk Management](#risk-management)
+- [Stateful Optimization](#stateful-optimization)
+- [Performance Optimizations](#performance-optimizations)
 - [Output Files](#output-files)
 - [Performance Metrics](#performance-metrics)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Version History](#version-history)
 
 ---
 
@@ -29,10 +32,11 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 
 1. **Detects Market Regimes** - Classifies markets as TREND, RANGE, BREAKOUT, or CHOP
 2. **Selects Strategies** - Tests 28 strategies across 6 timeframes per regime
-3. **Optimizes Parameters** - Grid search with validation-aware scoring
+3. **Optimizes Parameters** - Grid/Optuna search with validation-aware scoring
 4. **Validates Robustness** - Gap penalty and robustness ratio enforcement
-5. **Executes Trades** - Live MT5 execution with broker-accurate risk management
-6. **Adapts Continuously** - Auto-retraining when configurations expire
+5. **Persists Incrementally** - Never loses optimization progress (atomic saves)
+6. **Executes Trades** - Live MT5 execution with broker-accurate risk management
+7. **Adapts Continuously** - Auto-retraining when configurations expire
 
 ### What Makes It Different
 
@@ -40,14 +44,28 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 |---------|---------------------|-------------|
 | Strategy Selection | Single strategy | 28 strategies compete per regime |
 | Market Adaptation | Static | Regime-aware (TREND/RANGE/BREAKOUT/CHOP) |
-| Parameter Tuning | Manual or random | Systematic grid search with validation |
+| Parameter Tuning | Manual or random | Systematic grid/Optuna with validation |
 | Overfitting Prevention | None/minimal | Gap penalty + robustness ratio |
-| Risk Calculation | Pip-based (inaccurate for CFDs) | MT5 contract math (broker-accurate) |
+| Risk Calculation | Pip-based (inaccurate) | MT5 tick-based math (broker-accurate) |
 | Execution Timing | Often has lookahead bias | Signal bar → next bar entry (verified) |
+| Optimization State | Lost on interrupt | **Stateful ledger with atomic saves** |
+| Position Sizing | Fixed or simple | **Live-equity compounding** |
+| Backtesting Speed | Pure Python | **Numba JIT (3-10x faster)** |
 
 ---
 
 ## Key Features
+
+### Stateful Optimization Ledger (NEW in v3.3)
+- **Skip Valid Configs**: Re-running optimization only processes symbols that need it
+- **Incremental Persistence**: Saves after each symbol (never loses progress)
+- **Atomic Writes**: Config file is never corrupted, even on interruption
+- **Explicit Overwrite**: Use `--overwrite` flag to force re-optimization
+
+### Numba-Accelerated Backtesting (NEW in v3.3)
+- **3-10x Speedup**: JIT-compiled main loop
+- **Live-Equity Sizing**: Position sizes compound with equity changes
+- **Quality Preserved**: Same SL/TP ordering, float64 precision, no fastmath
 
 ### Regime-Aware Strategy Selection
 - **4 Market Regimes**: TREND, RANGE, BREAKOUT, CHOP
@@ -81,14 +99,15 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 
 ```
 FX_Portfolio_Manager/
-├── pm_core.py           # Configuration, data loading, backtesting, scoring (2,142 lines)
-├── pm_strategies.py     # 28 trading strategies with param grids (2,279 lines)
-├── pm_pipeline.py       # Optimization pipeline, regime optimizer (1,975 lines)
-├── pm_main.py           # Application entry, live trading loop (1,535 lines)
-├── pm_mt5.py            # MetaTrader 5 integration (1,117 lines)
-├── pm_position.py       # Position management and sizing (795 lines)
-├── pm_regime.py         # Market regime detection (964 lines)
-├── pm_regime_tuner.py   # Regime parameter optimization (490 lines)
+├── pm_core.py           # Configuration, data loading, backtesting, scoring
+├── pm_strategies.py     # 28 trading strategies with param grids
+├── pm_pipeline.py       # Optimization pipeline, ConfigLedger, PortfolioManager
+├── pm_main.py           # Application entry, live trading loop
+├── pm_mt5.py            # MetaTrader 5 integration
+├── pm_position.py       # Position management and sizing
+├── pm_regime.py         # Market regime detection (Numba-accelerated)
+├── pm_regime_tuner.py   # Regime parameter optimization
+├── pm_optuna.py         # Optuna TPE optimizer (optional)
 ├── config.json          # Runtime configuration
 ├── pm_configs.json      # Saved strategy configurations (auto-generated)
 ├── regime_params.json   # Tuned regime parameters (optional)
@@ -101,23 +120,27 @@ FX_Portfolio_Manager/
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        OPTIMIZATION PHASE                            │
+│                    STATEFUL OPTIMIZATION PHASE                       │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  MT5 Data ──► DataLoader ──► FeatureComputer ──► RegimeDetector     │
-│                                     │                                │
-│                                     ▼                                │
-│              ┌─────────────────────────────────────┐                │
-│              │      RegimeOptimizer                 │                │
-│              │  ┌─────────────────────────────┐    │                │
-│              │  │ Phase 1: Screen all strategies │    │                │
-│              │  │ Phase 2: Tune top-K per regime │    │                │
-│              │  │ Phase 3: Validate winners      │    │                │
-│              │  └─────────────────────────────┘    │                │
-│              └─────────────────────────────────────┘                │
-│                                     │                                │
-│                                     ▼                                │
-│                            pm_configs.json                           │
+│  pm_configs.json ◄── ConfigLedger ──► PortfolioManager              │
+│        │                                      │                      │
+│        ▼                                      │                      │
+│  Check: Valid?  ──YES──► SKIP (log reason)   │                      │
+│        │                                      │                      │
+│        NO                                     │                      │
+│        │                                      ▼                      │
+│        └────────────────────► OptimizationPipeline                  │
+│                                      │                               │
+│                                      ▼                               │
+│                              RegimeOptimizer                         │
+│                              ├─ Screen strategies                    │
+│                              ├─ Tune top-K per regime                │
+│                              └─ Validate winners                     │
+│                                      │                               │
+│                                      ▼                               │
+│                         SAVE (atomic) ──► pm_configs.json            │
+│                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -148,6 +171,7 @@ FX_Portfolio_Manager/
 │                           ▼                                          │
 │                    Risk Management                                   │
 │                    ├─ MT5 contract math                             │
+│                    ├─ Live-equity sizing                            │
 │                    ├─ Volume normalization                          │
 │                    └─ Hard cap check                                │
 │                           │                                          │
@@ -169,7 +193,12 @@ FX_Portfolio_Manager/
 ### Step 1: Install Python Dependencies
 
 ```bash
+# Required packages
 pip install pandas numpy MetaTrader5
+
+# Optional (for better performance)
+pip install numba    # 3-10x faster backtesting
+pip install optuna   # Bayesian hyperparameter optimization
 ```
 
 Or with a virtual environment (recommended):
@@ -182,7 +211,7 @@ python -m venv .venv
 .venv\Scripts\activate
 
 # Install dependencies
-pip install pandas numpy MetaTrader5
+pip install pandas numpy MetaTrader5 numba optuna
 ```
 
 ### Step 2: Download Files
@@ -199,6 +228,7 @@ FX_Portfolio_Manager/
 ├── pm_position.py
 ├── pm_regime.py
 ├── pm_regime_tuner.py
+├── pm_optuna.py
 ├── config.json
 └── data/              ← Create this folder
 ```
@@ -209,21 +239,32 @@ FX_Portfolio_Manager/
 2. Enable **AutoTrading** (Ctrl+E or click the AutoTrading button)
 3. Ensure the terminal stays open while the script runs
 
+### Step 4: Verify Installation
+
+```bash
+python -c "from pm_main import FXPortfolioManagerApp; print('Installation verified!')"
+```
+
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Run optimization (required first time, takes 10-30 minutes)
+# 1. Run optimization (required first time)
+#    - Skips symbols with valid configs
+#    - Saves progress after each symbol
 python pm_main.py --optimize
 
-# 2. Paper trade to verify (run for a few days)
+# 2. Force re-optimization (if needed)
+python pm_main.py --optimize --overwrite
+
+# 3. Paper trade to verify (run for a few days)
 python pm_main.py --trade --paper
 
-# 3. Go live when confident
+# 4. Go live when confident
 python pm_main.py --trade
 
-# 4. Full autonomous mode (auto-retrains when configs expire)
+# 5. Full autonomous mode (auto-retrains when configs expire)
 python pm_main.py --trade --auto-retrain
 ```
 
@@ -236,310 +277,290 @@ python pm_main.py --trade --auto-retrain
 ```json
 {
   "pipeline": {
-    // Data settings
     "data_dir": "./data",
     "output_dir": "./pm_outputs",
-    "max_bars": 500000,           // ~5 years of M5 data
+    "max_bars": 500000,
     
-    // Train/validation split
     "train_pct": 80.0,
     "val_pct": 30.0,
     "overlap_pct": 10.0,
     
-    // Backtest settings
     "initial_capital": 10000.0,
     "risk_per_trade_pct": 1.0,
+    
     "use_spread": true,
     "use_commission": true,
     "use_slippage": true,
     "slippage_pips": 0.5,
     
-    // Scoring mode: "pm_weighted" or "fx_backtester"
+    "max_param_combos": 150,
+    "min_trades": 25,
+    "min_robustness": 0.20,
+    
+    "optimization_valid_days": 14,
+    
     "scoring_mode": "fx_backtester",
     
-    // Generalization controls (fx_backtester mode)
-    "fx_gap_penalty_lambda": 0.70,     // Penalty for train→val gap
-    "fx_min_robustness_ratio": 0.80,   // Min val/train score ratio
-    "fx_val_min_trades": 15,           // Min validation trades
-    "fx_val_max_drawdown": 20.0,       // Max validation drawdown %
+    "fx_opt_min_trades": 15,
+    "fx_val_min_trades": 15,
+    "fx_val_max_drawdown": 20.0,
+    "fx_gap_penalty_lambda": 0.70,
+    "fx_min_robustness_ratio": 0.80,
     
-    // Regime optimization
+    "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
+    "retrain_periods": [14, 30, 60, 90, 120],
+    
     "use_regime_optimization": true,
     "regime_min_train_trades": 25,
     "regime_min_val_trades": 15,
-    "regime_enable_hyperparam_tuning": true,
-    "regime_hyperparam_top_k": 3,      // Top K strategies to tune
-    "regime_hyperparam_max_combos": 500,
-    
-    // Timeframes and retrain periods
-    "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
-    "retrain_periods": [7, 14, 30, 60, 90, 120, 180]
+    "regime_chop_no_trade": true
   },
-  
+
   "position": {
     "risk_per_trade_pct": 1.0,
-    "risk_basis": "balance",           // "balance" or "equity"
-    "max_risk_pct": 5.0,               // Hard safety cap
-    "auto_widen_sl": true,             // Widen SL for broker minimums
-    "min_position_size": 0.01,
-    "max_position_size": 0.0           // 0 = use broker max
+    "risk_basis": "balance",
+    "max_risk_pct": 5.0,
+    "auto_widen_sl": true
   },
-  
+
   "mt5": {
-    "login": 0,                        // 0 = use existing session
+    "login": 0,
     "password": "",
     "server": "",
     "path": ""
   },
-  
+
   "symbols": [
-    "EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "US30"
-    // ... add your symbols
+    "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"
   ]
 }
 ```
 
-### Key Configuration Options Explained
+### Key Configuration Options
 
-| Option | Description | Recommended |
-|--------|-------------|-------------|
-| `scoring_mode` | `fx_backtester` penalizes overfitting | `fx_backtester` |
-| `fx_gap_penalty_lambda` | Higher = more penalty for train/val gap | 0.5-0.8 |
-| `fx_min_robustness_ratio` | Minimum val_score/train_score | 0.75-0.85 |
-| `risk_per_trade_pct` | Target risk per trade | 0.5-2.0% |
-| `max_risk_pct` | Hard cap (skips trade if exceeded) | 5.0% |
-| `regime_hyperparam_max_combos` | Param combinations to test | 100-500 |
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `optimization_valid_days` | Days before config expires | 14 |
+| `risk_per_trade_pct` | Risk per trade as % of equity | 1.0 |
+| `max_risk_pct` | Hard cap on risk (safety) | 5.0 |
+| `fx_min_robustness_ratio` | Minimum val/train score ratio | 0.80 |
+| `regime_chop_no_trade` | Block trades in CHOP regime | true |
 
 ---
 
 ## Usage
 
-### Command Reference
-
-| Command | Description |
-|---------|-------------|
-| `--optimize` | Run full optimization pipeline |
-| `--trade` | Start live trading |
-| `--trade --paper` | Paper trading (no real orders) |
-| `--trade --auto-retrain` | Live trading with auto-retraining |
-| `--status` | Show current configuration status |
-
-### Optional Flags
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--config FILE` | Configuration file path | `config.json` |
-| `--symbols SYM1 SYM2` | Trade specific symbols only | All configured |
-| `--data-dir PATH` | Data directory | `./data` |
-| `--output-dir PATH` | Output directory | `./pm_outputs` |
-| `--log-level LEVEL` | DEBUG, INFO, WARNING, ERROR | `INFO` |
-
-### Examples
+### Command Line Interface
 
 ```bash
-# Optimize specific symbols only
-python pm_main.py --optimize --symbols EURUSD GBPUSD XAUUSD
+# Optimization
+python pm_main.py --optimize              # Skip valid configs
+python pm_main.py --optimize --overwrite  # Force re-optimize all
 
-# Paper trade with debug logging
-python pm_main.py --trade --paper --log-level DEBUG
+# Trading
+python pm_main.py --trade                 # Live trading
+python pm_main.py --trade --paper         # Paper trading (no real orders)
+python pm_main.py --trade --auto-retrain  # With automatic retraining
 
-# Use custom config file
-python pm_main.py --trade --config my_settings.json
+# Status
+python pm_main.py --status                # Show current portfolio status
 
-# Check status of existing configurations
-python pm_main.py --status
+# Options
+python pm_main.py --symbols EURUSD GBPUSD # Specific symbols only
+python pm_main.py --log-level DEBUG       # Verbose logging
+python pm_main.py --config myconfig.json  # Custom config file
 ```
+
+### CLI Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--optimize` | Run optimization |
+| `--overwrite` | Force re-optimization (ignore validity) |
+| `--trade` | Start live trading loop |
+| `--paper` | Paper trading mode (no real orders) |
+| `--auto-retrain` | Auto-retrain when configs expire |
+| `--status` | Print portfolio status |
+| `--symbols` | Specific symbols to process |
+| `--config` | Path to config JSON file |
+| `--data-dir` | Data directory path |
+| `--output-dir` | Output directory path |
+| `--log-level` | Logging level (DEBUG/INFO/WARNING/ERROR) |
 
 ---
 
 ## Trading Strategies
 
-### 28 Strategies Across 3 Categories
+### Available Strategies (28)
 
-#### Trend Following (10 strategies)
+| Category | Strategies |
+|----------|------------|
+| **Trend Following** | EMACrossoverStrategy, MACDTrendStrategy, ADXTrendStrategy, SupertrendStrategy, HullMATrendStrategy, TrendContinuationStrategy, TrendStrengthStrategy, DirectionalMomentumStrategy, ChoppinessBreakoutStrategy, KeltnerTrendStrategy |
+| **Mean Reversion** | RSIReversalStrategy, RSIExtremesStrategy, BollingerBounceStrategy, CCIReversionStrategy, StochasticReversalStrategy |
+| **Breakout/Momentum** | DonchianBreakoutStrategy, SqueezeBreakoutStrategy, PriceChannelStrategy, MomentumBreakoutStrategy, VolatilityBreakoutStrategy |
+| **Volatility** | ATRBreakoutStrategy, BollingerSqueezeStrategy, VolatilityClusterStrategy |
+| **Hybrid** | MultiIndicatorStrategy, AdaptiveTrendStrategy, RegimeAdaptiveStrategy |
+| **Advanced** | MeanReversionBandsStrategy, IchimokuTrendStrategy |
 
-| Strategy | Description |
-|----------|-------------|
-| EMACrossoverStrategy | Fast/slow EMA crossover |
-| SupertrendStrategy | ATR-based trend bands |
-| MACDTrendStrategy | MACD line/signal crossover |
-| ADXTrendStrategy | ADX strength + DI direction |
-| IchimokuStrategy | Cloud-based trend following |
-| HullMATrendStrategy | Hull Moving Average direction |
-| EMARibbonADXStrategy | EMA ribbon with ADX filter |
-| AroonTrendStrategy | Aroon oscillator signals |
-| ADXDIStrengthStrategy | ADX + DI strength confluence |
-| KeltnerPullbackStrategy | Keltner channel pullbacks |
+### Strategy Selection Process
 
-#### Mean Reversion (10 strategies)
-
-| Strategy | Description |
-|----------|-------------|
-| RSIExtremesStrategy | RSI overbought/oversold |
-| BollingerBounceStrategy | Bollinger Band mean reversion |
-| ZScoreMRStrategy | Statistical Z-score extremes |
-| StochasticReversalStrategy | Stochastic %K/%D crossover |
-| CCIReversalStrategy | CCI extreme reversals |
-| WilliamsRStrategy | Williams %R extremes |
-| RSITrendFilteredMRStrategy | RSI MR with trend filter |
-| StochRSITrendGateStrategy | Stochastic RSI with trend gate |
-| VWAPDeviationReversionStrategy | VWAP deviation mean reversion |
-| FisherTransformMRStrategy | Fisher transform reversals |
-| ZScoreVWAPReversionStrategy | Z-score of VWAP deviation |
-
-#### Breakout/Momentum (8 strategies)
-
-| Strategy | Description |
-|----------|-------------|
-| DonchianBreakoutStrategy | Donchian channel breakouts |
-| VolatilityBreakoutStrategy | ATR-based volatility breakouts |
-| MomentumBurstStrategy | ROC momentum bursts |
-| SqueezeBreakoutStrategy | Bollinger/Keltner squeeze breakouts |
-| KeltnerBreakoutStrategy | Keltner channel breakouts |
-| PivotBreakoutStrategy | Pivot point breakouts |
-| MACDHistogramMomentumStrategy | MACD histogram momentum |
-
-### Standardized Stop Loss / Take Profit
-
-All strategies use standardized ATR-based SL/TP grids:
-
-```python
-SL_ATR_MULTIPLIER = [1.5, 2.0, 2.5, 3.0]
-TP_ATR_MULTIPLIER = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0]
-```
+1. **Screen all strategies** on training data
+2. **Select top-K** per (timeframe, regime) combination
+3. **Hyperparameter tune** the top candidates
+4. **Validate** on out-of-sample data
+5. **Rank by quality score** (robustness-adjusted)
 
 ---
 
 ## Regime Detection
 
-### Four Market Regimes
+### Market Regimes
 
-| Regime | Characteristics | Typical Strategies |
-|--------|-----------------|-------------------|
-| **TREND** | Strong directional movement, high ADX | Trend following |
-| **RANGE** | Bounded price action, low ADX | Mean reversion |
-| **BREAKOUT** | Volatility expansion, structure breaks | Breakout/momentum |
-| **CHOP** | No clear direction, high noise | No trade (optional) |
+| Regime | Description | Typical Strategies |
+|--------|-------------|-------------------|
+| **TREND** | Clear directional move | Supertrend, EMA Crossover, MACD |
+| **RANGE** | Sideways, mean-reverting | RSI Reversal, Bollinger Bounce |
+| **BREAKOUT** | Volatility expansion | Squeeze Breakout, Donchian |
+| **CHOP** | Noisy, no clear direction | No trade (optional) |
 
 ### Regime Scoring Components
 
-Each regime is scored 0-1 based on multiple factors:
-
-**TREND Score:**
-- ADX strength (40%)
-- Directional efficiency (35%)
-- Price slope (25%)
-
-**RANGE Score:**
-- Low ADX (35%)
-- Low directional efficiency (30%)
-- Price containment (35%)
-
-**BREAKOUT Score:**
-- Bollinger squeeze (35%)
-- ATR expansion (30%)
-- Structure break (35%)
-
-**CHOP Score:**
-- Low ADX (30%)
-- Low efficiency (30%)
-- High whipsaw rate (40%)
+- **Trend Score**: ADX, EMA slope alignment
+- **Range Score**: Bollinger bandwidth compression
+- **Breakout Score**: Squeeze release, structure breaks
+- **Chop Score**: Whipsaw frequency, direction flips
 
 ### Hysteresis State Machine
 
-Prevents rapid regime flipping:
-
-```
-Parameters:
-- k_confirm: Bars to confirm switch (default: 3)
-- gap_min: Minimum score gap to switch (default: 0.10)
-- k_hold: Minimum bars to hold regime (default: 5)
-
-Switch occurs only when:
-1. New regime leads for k_confirm consecutive bars
-2. Score gap >= gap_min
-3. Current regime held for >= k_hold bars
-```
-
-### REGIME_LIVE Parity
-
-Ensures backtest and live trading use identical information:
-
-```python
-# Backtest: uses REGIME_LIVE (shifted by 1)
-trade_regime = features['REGIME_LIVE'].iloc[entry_bar]
-
-# Live: uses REGIME from last closed bar (index -2)
-current_regime = features['REGIME'].iloc[-2]
-
-# These are equivalent: REGIME_LIVE[i] = REGIME[i-1]
-```
+Prevents rapid regime switching:
+- `k_confirm`: Bars to confirm regime switch
+- `gap_min`: Minimum score gap to switch
+- `k_hold`: Minimum bars to hold regime
 
 ---
 
 ## Risk Management
 
-### Position Sizing Flow
+### Position Sizing (Live-Equity Compounding)
 
 ```
-1. Target Risk Calculation
-   target_risk = balance × (risk_per_trade_pct / 100)
-
-2. Loss-per-Lot Calculation (MT5 contract math)
-   loss_per_lot = mt5.order_calc_profit(SELL/BUY, symbol, 1.0, entry, sl)
-   
-   Fallback chain:
-   a) MT5 order_calc_profit (preferred)
-   b) Tick-based: (entry - sl) / tick_size × tick_value
-   c) Pip-based: sl_pips × pip_value (last resort, with warning)
-
-3. Raw Volume
-   volume_raw = target_risk / loss_per_lot
-
-4. Normalization
-   volume = floor(volume_raw / volume_step) × volume_step
-   volume = clamp(volume, volume_min, volume_max)
-
-5. Hard Cap Check
-   actual_risk = loss_per_lot × volume
-   actual_risk_pct = actual_risk / balance × 100
-   
-   if actual_risk_pct > max_risk_pct:
-       SKIP TRADE
+risk_amount = current_equity × (risk_per_trade_pct / 100)
+loss_per_lot = distance_to_stop × tick_value
+position_size = floor(risk_amount / loss_per_lot, volume_step)
 ```
+
+The system uses **live equity** for sizing, meaning:
+- Winning streaks → larger positions (compounding)
+- Losing streaks → smaller positions (risk reduction)
 
 ### Safety Features
 
 | Feature | Description |
 |---------|-------------|
-| **Hard Cap** | Skips trade if risk > max_risk_pct (default 5%) |
+| **Hard Cap** | Skips trade if risk > max_risk_pct |
 | **Auto-Widen SL** | Widens SL to meet broker minimum stop distance |
 | **Volume Floor** | Uses floor() not round() to avoid exceeding target |
 | **Position Check** | Verifies no existing position before entry |
 | **Rate Limiting** | Prevents rapid order submission |
 
-### Risk Audit Logging
+---
 
-Every trade logs complete risk details:
+## Stateful Optimization
 
+### How It Works
+
+1. **Load existing configs** from `pm_configs.json`
+2. **Check validity** for each symbol:
+   - Valid (not expired, validated) → **SKIP**
+   - Expired/missing/invalid → **OPTIMIZE**
+3. **Save incrementally** after each symbol (atomic write)
+4. **Never lose progress** even on interruption
+
+### CLI Behavior
+
+```bash
+# Default: Skip valid configs
+python pm_main.py --optimize
+# Output:
+# SKIP EURUSD: valid until 2026-02-14 (13 days remaining)
+# OPTIMIZE USDJPY: expired 3 days ago
+# OPTIMIZE AUDUSD: missing
+
+# Force re-optimization
+python pm_main.py --optimize --overwrite
+# Output:
+# OVERWRITE MODE: ignoring validity checks
+# OPTIMIZE EURUSD: overwrite enabled
+# OPTIMIZE USDJPY: overwrite enabled
 ```
-[EURUSD] BUY | basis=10000.00 (balance) | target_risk=1.00% ($100.00) | 
-actual_risk=0.98% ($98.00) | vol_raw=0.1523 | vol=0.15 | 
-entry=1.08520 | sl=1.08020 | tp=1.09520
+
+### Atomic Write Pattern
+
+Configs are saved using temp file + rename to prevent corruption:
 ```
+1. Write to pm_configs.json.tmp
+2. fsync for durability
+3. Atomic rename to pm_configs.json
+```
+
+---
+
+## Performance Optimizations
+
+### Numba JIT Compilation
+
+The backtester main loop is JIT-compiled for 3-10x speedup:
+
+```bash
+# Automatic when numba is installed
+pip install numba
+```
+
+Features:
+- **Live-equity sizing** inside JIT loop (compounding preserved)
+- **SL/TP ordering preserved** (SL checked first)
+- **Float64 precision** (no fastmath)
+- **Graceful fallback** to pure Python if numba unavailable
+
+### Lazy Feature Loading
+
+Only computes features needed by each strategy:
+```python
+# Instead of computing all 66 features:
+features = FeatureComputer.compute_all(df)  # ~2.1s
+
+# Compute only what's needed:
+features = FeatureComputer.compute_required(df, required_features)  # ~0.007s
+```
+
+### Performance Comparison
+
+| Component | Before v3.3 | After v3.3 | Speedup |
+|-----------|-------------|------------|---------|
+| Full feature computation | 2.15s | 2.15s | baseline |
+| Lazy feature computation | 2.15s | 0.007s | **307x** |
+| Backtester loop (Numba) | ~0.5s | ~0.05s | **~10x** |
+| Regime detection (Numba) | ~9s | ~1.8s | **5x** |
 
 ---
 
 ## Output Files
 
-### After Optimization
+### Directory Structure
 
 ```
-pm_configs.json              # Strategy configurations (IMPORTANT!)
-pm_outputs/
-├── optimization_summary.csv # Summary of all results
-└── logs/
-    └── pm_YYYYMMDD.log      # Daily log files
+FX_Portfolio_Manager/
+├── pm_configs.json              # Strategy configurations (IMPORTANT!)
+├── regime_params.json           # Tuned regime parameters (optional)
+├── last_trade_log.json          # Decision throttle state
+├── data/
+│   ├── EURUSD_M5.csv           # Historical data cache
+│   ├── EURUSD_H1.csv
+│   └── ...
+└── pm_outputs/
+    ├── optimization_summary.csv # Summary of all results
+    └── logs/
+        └── pm_YYYYMMDD.log      # Daily log files
 ```
 
 ### pm_configs.json Structure
@@ -548,33 +569,23 @@ pm_outputs/
 {
   "EURUSD": {
     "symbol": "EURUSD",
+    "strategy_name": "SupertrendStrategy",
+    "timeframe": "H1",
+    "parameters": {"atr_period": 10, "multiplier": 3.0},
+    "is_validated": true,
+    "validation_reason": "passed all checks",
+    "optimized_at": "2026-02-01T10:30:00",
+    "valid_until": "2026-02-15T10:30:00",
+    "composite_score": 75.5,
+    "robustness_ratio": 0.85,
     "regime_configs": {
       "H1": {
-        "TREND": {
-          "strategy_name": "SupertrendStrategy",
-          "parameters": {"atr_period": 10, "multiplier": 3.0, ...},
-          "quality_score": 0.75,
-          "regime_train_trades": 145,
-          "regime_val_trades": 52
-        },
-        "RANGE": {...},
-        "BREAKOUT": {...}
-      },
-      "H4": {...}
-    },
-    "default_config": {...},
-    "is_validated": true,
-    "validation_reason": "12 validated winners (3 rejected) across 4 timeframes"
+        "TREND": {"strategy_name": "SupertrendStrategy", ...},
+        "RANGE": {"strategy_name": "BollingerBounceStrategy", ...}
+      }
+    }
   }
 }
-```
-
-### After Trading
-
-```
-pm_outputs/
-├── trades_YYYYMMDD_HHMMSS.json  # Trade log (on stop)
-└── last_trade_log.json          # Decision throttle state
 ```
 
 ---
@@ -602,22 +613,6 @@ pm_outputs/
 | **% Positive R** | Percentage of trades with R > 0 |
 | **Worst 5% R** | Average R of worst 5% of trades |
 
-### Scoring Modes
-
-**pm_weighted** (Original):
-```
-score = Σ(weight_i × normalized_metric_i)
-```
-
-**fx_backtester** (Recommended):
-```
-train_score = f(sharpe, return, drawdown)
-val_score = f(sharpe, return, drawdown)
-gap = max(0, train_score - val_score)
-final_score = val_score - λ × gap
-final_score *= robustness_boost(val_score / train_score)
-```
-
 ---
 
 ## Troubleshooting
@@ -631,7 +626,7 @@ final_score *= robustness_boost(val_score / train_score)
 4. Try restarting MT5 and the script
 
 #### "Symbol not found: EURUSD"
-Your broker uses different symbol names. The system tries variants automatically, but if it fails:
+Your broker uses different symbol names. Check exact names:
 1. Open MT5 Market Watch
 2. Find the exact symbol name (e.g., `EURUSD.a`, `EURUSDm`)
 3. Use that name in your config
@@ -642,28 +637,24 @@ Your broker uses different symbol names. The system tries variants automatically
 - Ensure sufficient historical data exists
 
 #### "SKIP: min lot would exceed max_risk_pct"
-Broker minimum lot size exceeds your risk budget. Options:
+Broker minimum lot size exceeds your risk budget:
 - Increase `risk_per_trade_pct`
 - Increase `max_risk_pct` (with caution)
 - Remove that symbol
 
-#### High validation rejection rate
-If many strategies fail validation:
-- Reduce `fx_min_robustness_ratio` (try 0.70-0.75)
-- Reduce `regime_min_val_trades` (try 10)
-- Check if data quality issues exist
+#### "Corrupted JSON in pm_configs.json"
+Config file was corrupted (rare). Fix or remove:
+```bash
+# Backup and restart
+mv pm_configs.json pm_configs.json.bak
+python pm_main.py --optimize
+```
 
 ### Debug Mode
 
 ```bash
 python pm_main.py --trade --paper --log-level DEBUG
 ```
-
-This shows:
-- Feature computation details
-- Regime detection scores
-- Cache hit/miss statistics
-- Full risk calculation audit
 
 ---
 
@@ -686,24 +677,23 @@ class MyNewStrategy(BaseStrategy):
     def get_default_params(self) -> Dict[str, Any]:
         return {
             'period': 20,
-            'threshold': 0.5,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0
         }
     
+    def get_required_features(self) -> Set[str]:
+        return {f'EMA_{self.params.get("period", 20)}', 'ATR_14'}
+    
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         signals = pd.Series(0, index=features.index)
         # Your signal logic here
-        # signals[condition_long] = 1
-        # signals[condition_short] = -1
         return signals
     
     def get_param_grid(self) -> Dict[str, List]:
         return {
             'period': [10, 15, 20, 25, 30],
-            'threshold': [0.3, 0.5, 0.7],
-            'sl_atr_mult': _GLOBAL_SL_GRID,
-            'tp_atr_mult': _GLOBAL_TP_GRID
+            'sl_atr_mult': [1.5, 2.0, 2.5],
+            'tp_atr_mult': [2.0, 3.0, 4.0]
         }
 ```
 
@@ -720,11 +710,24 @@ class MyNewStrategy(BaseStrategy):
 python -m py_compile pm_core.py pm_strategies.py pm_pipeline.py pm_main.py
 
 # Test imports
-python -c "from pm_main import FXPortfolioManager; print('OK')"
+python -c "from pm_main import FXPortfolioManagerApp; print('OK')"
 
-# Dry run optimization (single symbol)
+# Test single symbol
 python pm_main.py --optimize --symbols EURUSD --log-level DEBUG
 ```
+
+---
+
+## Version History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| **3.3** | Feb 2026 | Stateful optimization ledger, Numba JIT backtester, live-equity sizing, atomic saves |
+| 3.2 | Feb 2026 | Efficiency improvements v2, lazy feature loading |
+| 3.1 | Jan 2026 | Optuna TPE optimization, enhanced validation |
+| 3.0 | Jan 2026 | Regime-aware optimization, hyperparameter tuning |
+| 2.0 | 2025 | fx_backtester scoring mode, generalization controls |
+| 1.0 | 2024 | Initial release |
 
 ---
 
@@ -747,12 +750,4 @@ MIT License - Use at your own risk.
 
 ---
 
-## Version History
-
-| Version | Date | Changes |
-|---------|------|---------|
-| 3.0 | Jan 2026 | Regime-aware optimization, hyperparameter tuning, validation enforcement |
-| 2.0 | 2025 | fx_backtester scoring mode, generalization controls |
-| 1.0 | 2024 | Initial release |
-
-~Bongo
+*FX Portfolio Manager v3.3 - Quality First, Efficiency Second*

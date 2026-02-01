@@ -1,4 +1,4 @@
-# FX Portfolio Manager - Complete Setup and Run Guide
+# FX Portfolio Manager v3.3 - Complete Setup and Run Guide
 
 This guide walks you through every step from installation to live trading.
 
@@ -81,12 +81,22 @@ source .venv/Scripts/activate
 ### 2.3 Install Dependencies
 
 ```bash
+# Required packages
 pip install pandas numpy MetaTrader5
+
+# Optional (recommended for better performance)
+pip install numba    # 3-10x faster backtesting
+pip install optuna   # Bayesian hyperparameter optimization
 ```
 
 Verify installation:
 ```bash
 python -c "import pandas, numpy, MetaTrader5; print('All packages installed successfully')"
+```
+
+Check Numba availability:
+```bash
+python -c "import numba; print(f'Numba {numba.__version__} installed')"
 ```
 
 ### 2.4 Download and Place Files
@@ -103,6 +113,7 @@ FX_Portfolio_Manager/
 ├── pm_position.py
 ├── pm_regime.py
 ├── pm_regime_tuner.py
+├── pm_optuna.py
 ├── config.json
 ├── data/                  ← Create this folder
 └── .venv/                 ← Created by venv
@@ -116,7 +127,20 @@ mkdir data
 ### 2.5 Verify Installation
 
 ```bash
-python -c "from pm_main import FXPortfolioManager; print('Installation verified!')"
+python -c "from pm_main import FXPortfolioManagerApp; print('Installation verified!')"
+```
+
+Check all components:
+```bash
+python -c "
+from pm_core import NUMBA_AVAILABLE
+from pm_pipeline import ConfigLedger
+from pm_optuna import OPTUNA_AVAILABLE
+print(f'Numba JIT: {\"enabled\" if NUMBA_AVAILABLE else \"disabled (install numba for 3-10x speedup)\"}')
+print(f'Optuna TPE: {\"enabled\" if OPTUNA_AVAILABLE else \"disabled (install optuna for Bayesian optimization)\"}')
+print(f'ConfigLedger: available')
+print('All components loaded successfully!')
+"
 ```
 
 ---
@@ -134,6 +158,7 @@ Open `config.json` in a text editor and configure:
   "pipeline": {
     "data_dir": "./data",
     "output_dir": "./pm_outputs",
+    "initial_capital": 10000.0,
     "risk_per_trade_pct": 1.0,
     "scoring_mode": "fx_backtester"
   },
@@ -176,7 +201,7 @@ Open `config.json` in a text editor and configure:
     "use_slippage": true,
     "slippage_pips": 0.5,
     
-    "max_param_combos": 500,
+    "max_param_combos": 150,
     "min_trades": 25,
     "min_robustness": 0.20,
     
@@ -198,9 +223,11 @@ Open `config.json` in a text editor and configure:
     "fx_min_robustness_ratio": 0.80,
     
     "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
-    "retrain_periods": [7, 14, 30, 60, 90, 120, 180],
+    "retrain_periods": [14, 30, 60, 90, 120],
     
     "max_bars": 500000,
+    
+    "optimization_valid_days": 14,
     
     "use_regime_optimization": true,
     "regime_min_train_trades": 25,
@@ -211,7 +238,7 @@ Open `config.json` in a text editor and configure:
     
     "regime_enable_hyperparam_tuning": true,
     "regime_hyperparam_top_k": 3,
-    "regime_hyperparam_max_combos": 500,
+    "regime_hyperparam_max_combos": 150,
     
     "score_weights": {
       "sharpe": 0.25,
@@ -321,73 +348,86 @@ Find your broker's exact symbol names:
 ### 4.2 Run Optimization
 
 ```bash
+# First time or after deleting pm_configs.json
 python pm_main.py --optimize
 ```
 
-### 4.3 What Happens During Optimization
+### 4.3 Stateful Optimization (NEW in v3.3)
+
+The optimization is now **stateful** - it remembers progress and skips valid configs:
+
+```bash
+# Default: Skip symbols with valid configs
+python pm_main.py --optimize
+# Output:
+# SKIP EURUSD: valid until 2026-02-14 (13 days remaining)
+# SKIP GBPUSD: valid until 2026-02-12 (11 days remaining)
+# OPTIMIZE USDJPY: expired 3 days ago
+# OPTIMIZE AUDUSD: missing
+
+# Force re-optimization of everything
+python pm_main.py --optimize --overwrite
+# Output:
+# OVERWRITE MODE: ignoring validity checks
+# OPTIMIZE EURUSD: overwrite enabled
+# OPTIMIZE GBPUSD: overwrite enabled
+# ...
+```
+
+### 4.4 What Happens During Optimization
 
 ```
 ============================================================
-FX PORTFOLIO MANAGER v3.0
+FX PORTFOLIO MANAGER v3.3
 ============================================================
 Connecting to MetaTrader 5...
 ✓ Connected to MT5
 ✓ Portfolio Manager initialized
   Symbols: 12
   Strategies: 28
-  Existing configs: 0
+  Existing configs: 4
 
 ============================================================
 RUNNING OPTIMIZATION
+MODE: INCREMENTAL (skipping valid configs)
 ============================================================
-Fetching historical data for 12 symbols...
-  EURUSD: 450000 bars saved
-  GBPUSD: 450000 bars saved
-  ...
+SKIP EURUSD: valid until 2026-02-14 (13 days remaining)
+SKIP GBPUSD: valid until 2026-02-12 (11 days remaining)
+OPTIMIZE USDJPY: expired 3 days ago
 
+Progress: 1/10
 ============================================================
-OPTIMIZING: EURUSD (Regime-Aware)
+OPTIMIZING: USDJPY (Regime-Aware)
 ============================================================
-[EURUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
-[EURUSD] [H1] Hyperparameter tuning 3 strategies
-[EURUSD] [H1] [TREND] Winner: SupertrendStrategy [TUNED] (quality=0.723, train=89, val=31) [VALIDATED: robustness=0.87]
-[EURUSD] [H1] [RANGE] Winner: BollingerBounceStrategy (quality=0.681, train=72, val=28) [VALIDATED: robustness=0.82]
-[EURUSD] [H1] [BREAKOUT] Winner: SqueezeBreakoutStrategy (quality=0.695, train=45, val=18) [VALIDATED: robustness=0.79]
-[EURUSD] [H1] [CHOP] Candidate RSIExtremesStrategy FAILED validation: Low robustness 0.62 < 0.80
+[USDJPY] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+[USDJPY] [H1] Hyperparameter tuning 3 strategies
+[USDJPY] [H1] [TREND] Winner: SupertrendStrategy [TUNED] (quality=0.723)
+[USDJPY] [H1] [RANGE] Winner: BollingerBounceStrategy (quality=0.681)
+SAVED USDJPY to pm_configs.json (atomic)
 ...
 
-[EURUSD] OPTIMIZATION COMPLETE
-  Timeframes:  4
-  Validated:   12
-  Rejected:    4
-  Best:        SupertrendStrategy @ H1/TREND
-  Retrain:     Every 60 days
-  Duration:    45.2s
+============================================================
+OPTIMIZATION COMPLETE
+============================================================
+Total time: 342.5s
+Optimized: 8/10
+Skipped: 2 (already valid)
+Total validated: 10/12
 ```
 
-### 4.4 Optimization Duration
+### 4.5 Interruption Recovery
 
-| Symbols | Estimated Time |
-|---------|---------------|
-| 5 | 5-10 minutes |
-| 15 | 15-30 minutes |
-| 40+ | 45-90 minutes |
-
-### 4.5 Verify Results
-
-Check that `pm_configs.json` was created:
+If optimization is interrupted (Ctrl+C, crash, power loss):
 
 ```bash
-# Windows
-type pm_configs.json
-
-# Or open in text editor
+# Simply re-run - it will resume where it left off
+python pm_main.py --optimize
+# Output:
+# Loaded 8 existing configs from pm_configs.json
+# SKIP EURUSD: valid until 2026-02-14
+# SKIP USDJPY: valid until 2026-02-15 (just optimized)
+# OPTIMIZE NZDUSD: missing (next in queue)
 ```
-
-Look for:
-- Each symbol has `regime_configs` populated
-- `is_validated: true` for symbols you want to trade
-- Reasonable `quality_score` values (0.5-0.9)
 
 ---
 
@@ -399,47 +439,35 @@ Look for:
 python pm_main.py --trade --paper
 ```
 
-### 5.2 What to Expect
+### 5.2 What Paper Trading Does
 
+- Receives real market data
+- Generates real signals
+- Calculates real position sizes
+- **Does NOT execute real orders**
+- Logs what WOULD have happened
+
+### 5.3 Monitor Paper Trading
+
+Watch the console output:
 ```
-============================================================
-STARTING LIVE TRADING
-Trading enabled: False
-Auto-retrain: False
-============================================================
-Starting live trading loop...
-Trading enabled: False
-Symbols: 12
-Validated configs: 10
-
-[EURUSD] Selected: SupertrendStrategy @ H1/TREND (strength=0.82, quality=0.72, freshness=1.00, score=0.591)
-[EURUSD] BUY | basis=10000.00 (balance) | target_risk=1.00% ($100.00) | actual_risk=0.98% ($98.00) | vol_raw=0.1523 | vol=0.15 | entry=1.08520 | sl=1.08020 | tp=1.09520
-[EURUSD] [PAPER] Would execute LONG: 0.15 lots @ 1.08520 | SL=1.08020 | TP=1.09520
-```
-
-### 5.3 Paper Trading Checklist
-
-Monitor for 1-2 weeks and verify:
-
-- [ ] Signals generated at expected frequency
-- [ ] Risk calculations match expectations
-- [ ] No errors in logs
-- [ ] Regime detection seems reasonable
-- [ ] No duplicate signals (throttle working)
-
-### 5.4 Review Logs
-
-```bash
-# View today's log
-type pm_outputs\logs\pm_20260131.log
-
-# Or use: tail -f (Git Bash)
-tail -f pm_outputs/logs/pm_*.log
+[EURUSD] Signal: LONG | Regime: TREND | Strategy: SupertrendStrategy
+[EURUSD] PAPER: Would BUY 0.15 lots @ 1.08520, SL: 1.08020, TP: 1.09520
+[EURUSD] Risk: $100.00 (1.00% of $10000.00)
 ```
 
-### 5.5 Stop Paper Trading
+### 5.4 Paper Trading Duration
 
-Press `Ctrl+C` to stop gracefully.
+Recommended paper trading period:
+- **Minimum**: 1 week
+- **Recommended**: 2-4 weeks
+- **Conservative**: 1-3 months
+
+Verify:
+- Signals match expected regime behavior
+- Position sizes are appropriate
+- No unexpected errors
+- System runs stably
 
 ---
 
@@ -447,131 +475,124 @@ Press `Ctrl+C` to stop gracefully.
 
 ### 6.1 Pre-Live Checklist
 
-Before going live, ensure:
+Before going live, verify:
 
-- [ ] Completed 1-2 weeks of paper trading
-- [ ] Reviewed all paper trade logs for issues
-- [ ] Account has sufficient margin
-- [ ] Risk settings are conservative
-- [ ] You understand the strategies being used
-- [ ] You're prepared for potential losses
+- [ ] Paper trading ran for sufficient period
+- [ ] No unexpected errors in logs
+- [ ] Position sizes look reasonable
+- [ ] MT5 account has sufficient margin
+- [ ] Risk settings are conservative enough
+- [ ] You understand the risks involved
 
-### 6.2 Conservative Start Settings
-
-For your first week of live trading:
-
-```json
-"position": {
-  "risk_per_trade_pct": 0.5,    // Half of normal
-  "max_risk_pct": 2.5           // Half of normal
-}
-```
-
-### 6.3 Start Live Trading
+### 6.2 Start Live Trading
 
 ```bash
+# Basic live trading
 python pm_main.py --trade
+
+# With automatic retraining (recommended for long-term)
+python pm_main.py --trade --auto-retrain
 ```
 
-### 6.4 What to Expect
+### 6.3 Live Trading Output
 
 ```
 ============================================================
 STARTING LIVE TRADING
-Trading enabled: True
-Auto-retrain: False
 ============================================================
+Trading enabled: True
+Auto-retrain: True
 
-[EURUSD] Selected: SupertrendStrategy @ H1/TREND (strength=0.82, quality=0.72, freshness=1.00, score=0.591)
-[EURUSD] BUY | basis=10000.00 (balance) | target_risk=0.50% ($50.00) | actual_risk=0.49% ($49.00) | vol_raw=0.0761 | vol=0.07 | entry=1.08520 | sl=1.08020 | tp=1.09520
-✓ [EURUSD] LONG executed: 0.07 lots @ 1.08523
+[EURUSD] New bar detected: 2026-02-01 14:00:00
+[EURUSD] Regime: TREND (score: 0.72)
+[EURUSD] Strategy: SupertrendStrategy
+[EURUSD] Signal: LONG
+
+[EURUSD] EXECUTING ORDER
+  Direction: BUY
+  Volume: 0.15
+  Entry: 1.08520
+  Stop Loss: 1.08020
+  Take Profit: 1.09520
+  Risk: $100.00 (1.00%)
+
+[EURUSD] ORDER FILLED
+  Ticket: 12345678
+  Fill Price: 1.08521
+  Commission: $3.50
 ```
 
-### 6.5 Autonomous Mode (Auto-Retrain)
+### 6.4 Stopping Live Trading
 
-For fully autonomous operation:
+Press **Ctrl+C** to gracefully stop:
 
-```bash
-python pm_main.py --trade --auto-retrain
+```
+^C
+Shutdown signal received
+Saving state...
+Closing connections...
+Trade log saved to pm_outputs/trades_20260201_143052.json
+Shutdown complete
 ```
 
-This will:
-- Trade based on current configurations
-- Check hourly if any symbol needs retraining
-- Automatically re-run optimization when retrain period expires
-- Update configurations and continue trading
+### 6.5 Running as a Background Service (Advanced)
 
-### 6.6 Running as Background Service
+For 24/7 operation, consider:
 
-#### Windows Task Scheduler
+**Windows Task Scheduler:**
+1. Create a batch file `run_trading.bat`:
+   ```batch
+   @echo off
+   cd /d C:\FX_Portfolio_Manager
+   call .venv\Scripts\activate.bat
+   python pm_main.py --trade --auto-retrain
+   ```
+2. Schedule via Task Scheduler to restart on failure
 
-1. Open Task Scheduler
-2. Create Basic Task → Name: "FX Portfolio Manager"
-3. Trigger: "When the computer starts"
-4. Action: Start a program
-   - Program: `C:\path\to\.venv\Scripts\python.exe`
-   - Arguments: `pm_main.py --trade --auto-retrain`
-   - Start in: `C:\path\to\FX_Portfolio_Manager`
-5. Check "Run whether user is logged on or not"
-
-#### Keep-Alive Script
-
-Create `run_forever.bat`:
-```batch
-@echo off
-:loop
-python pm_main.py --trade --auto-retrain
-echo Restarting in 10 seconds...
-timeout /t 10
-goto loop
-```
+**Or use a process manager like PM2 or NSSM**
 
 ---
 
 ## 7. Monitoring and Maintenance
 
-### 7.1 Daily Monitoring
+### 7.1 Daily Checks
 
-Check logs daily for:
+1. **Verify script is running**
+   - Check console or logs for recent activity
 
-```bash
-# View errors only
-findstr /i "error\|fail\|exception" pm_outputs\logs\pm_*.log
+2. **Review trade log**
+   - Check `pm_outputs/logs/pm_YYYYMMDD.log`
 
-# View trade executions
-findstr /i "executed\|LONG\|SHORT" pm_outputs\logs\pm_*.log
-```
+3. **Check MT5 positions**
+   - Verify positions match expected signals
 
-### 7.2 Key Metrics to Watch
+### 7.2 Weekly Maintenance
 
-| Metric | Warning Sign | Action |
-|--------|--------------|--------|
-| Validation rejection rate | > 50% | Lower fx_min_robustness_ratio |
-| Cache hit rate | < 80% | Check for issues |
-| Risk cap skips | Frequent | Review symbol/risk settings |
-| MT5 disconnections | Multiple/day | Check network/MT5 stability |
-
-### 7.3 Weekly Maintenance
-
-1. **Review trade logs**
-   ```bash
-   type pm_outputs\trades_*.json
-   ```
-
-2. **Check configuration expiry**
+1. **Check config validity**
    ```bash
    python pm_main.py --status
    ```
+   Output shows expiry dates:
+   ```
+   OK EURUSD   | SupertrendStrategy       | H1  | Score: 75.5 | Expires: 2026-02-14 (13d)
+   EX USDJPY   | BollingerBounceStrategy  | H4  | Score: 68.2 | EXPIRED 2d ago
+   ```
 
-3. **Review regime distribution**
-   - Are strategies being selected for expected regimes?
-   - Is CHOP blocking trades appropriately?
+2. **Re-optimize expired configs**
+   ```bash
+   python pm_main.py --optimize
+   ```
 
-### 7.4 Monthly Maintenance
+3. **Review logs for errors**
+   ```bash
+   grep -i "error\|warning\|failed" pm_outputs/logs/pm_*.log
+   ```
+
+### 7.3 Monthly Maintenance
 
 1. **Full re-optimization** (optional)
    ```bash
-   python pm_main.py --optimize
+   python pm_main.py --optimize --overwrite
    ```
 
 2. **Tune regime parameters** (optional)
@@ -583,13 +604,13 @@ findstr /i "executed\|LONG\|SHORT" pm_outputs\logs\pm_*.log
    - Compare actual vs backtested results
    - Adjust risk settings if needed
 
-### 7.5 Cache Statistics
+### 7.4 Cache Statistics
 
 Get cache performance:
 ```python
 # In Python shell
-from pm_main import FXPortfolioManager
-app = FXPortfolioManager()
+from pm_main import FXPortfolioManagerApp
+app = FXPortfolioManagerApp()
 app.initialize()
 # After running for a while:
 print(app.trader.get_cache_stats())
@@ -652,7 +673,18 @@ For more granular signals:
 "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"]
 ```
 
-### 8.5 Multiple Configurations
+### 8.5 Config Validity Duration
+
+Control how long configs remain valid before expiring:
+
+```json
+"optimization_valid_days": 14    // Default: 14 days
+```
+
+Shorter periods = more frequent re-optimization (more adaptive)
+Longer periods = less compute, more stable
+
+### 8.6 Multiple Configurations
 
 Create different configs for different purposes:
 
@@ -719,13 +751,6 @@ Specify the path explicitly:
    - Right-click Market Watch → Symbols
    - Find symbol → Show
 
-#### "Symbol not available for trading"
-
-Check if symbol is tradeable:
-- Market may be closed
-- Symbol may be view-only
-- Insufficient margin
-
 ### 9.3 Risk/Position Issues
 
 #### "SKIP: min lot would exceed max_risk_pct"
@@ -739,21 +764,8 @@ The broker's minimum lot size exceeds your risk budget.
    "max_risk_pct": 10.0
    ```
 
-2. Remove problematic symbol:
-   ```json
-   "symbols": ["EURUSD", "GBPUSD"]  // Remove US30
-   ```
-
+2. Remove problematic symbol
 3. Use a broker with smaller minimums
-
-#### "Could not compute loss_per_lot"
-
-MT5 failed to calculate loss. Usually temporary.
-
-**Check:**
-- Market is open
-- Symbol is tradeable
-- Spread is reasonable
 
 ### 9.4 Optimization Issues
 
@@ -769,50 +781,32 @@ All strategies failed minimum criteria.
    "fx_min_robustness_ratio": 0.65
    ```
 
-2. Check data quality:
-   ```bash
-   python -c "import pandas as pd; df = pd.read_csv('data/EURUSD_M5.csv'); print(len(df), df.isnull().sum().sum())"
-   ```
-
+2. Check data quality
 3. Try different timeframes
 
 #### Optimization is very slow
 
-1. Reduce symbols:
-   ```json
-   "symbols": ["EURUSD", "GBPUSD"]
-   ```
-
-2. Reduce param combinations:
-   ```json
-   "regime_hyperparam_max_combos": 100
-   ```
-
-3. Reduce timeframes:
-   ```json
-   "timeframes": ["H1", "H4"]
-   ```
-
-### 9.5 Runtime Errors
-
-#### "RuntimeWarning: Degrees of freedom <= 0"
-
-Too few trades for statistical calculations. Not an error - metrics default to 0.
-
-#### Memory errors
-
-Too much data loaded.
-
-**Solutions:**
-1. Reduce max_bars:
-   ```json
-   "max_bars": 200000
-   ```
-
-2. Process fewer symbols at once:
+1. Install Numba for 3-10x speedup:
    ```bash
-   python pm_main.py --optimize --symbols EURUSD GBPUSD
+   pip install numba
    ```
+
+2. Reduce symbols, param combinations, or timeframes
+
+### 9.5 Config File Issues
+
+#### "Corrupted JSON in pm_configs.json"
+
+Config file was corrupted (very rare due to atomic writes).
+
+**Fix:**
+```bash
+# Backup corrupted file
+mv pm_configs.json pm_configs.json.corrupt
+
+# Start fresh
+python pm_main.py --optimize
+```
 
 ### 9.6 Debug Mode
 
@@ -837,7 +831,7 @@ This shows:
 
 ```bash
 # First-time setup
-pip install pandas numpy MetaTrader5
+pip install pandas numpy MetaTrader5 numba optuna
 python pm_main.py --optimize
 
 # Daily usage
@@ -847,6 +841,8 @@ python pm_main.py --trade --auto-retrain   # Autonomous mode
 
 # Maintenance
 python pm_main.py --status                  # Check configs
+python pm_main.py --optimize                # Re-optimize expired only
+python pm_main.py --optimize --overwrite    # Force re-optimize all
 python pm_main.py --optimize --symbols EURUSD  # Re-optimize one symbol
 
 # Debugging
@@ -874,6 +870,21 @@ python pm_main.py --trade --paper --log-level DEBUG
 | `fx_min_robustness_ratio` | 0.85 | 0.80 | 0.70 |
 | `fx_gap_penalty_lambda` | 0.80 | 0.70 | 0.50 |
 | `regime_min_val_trades` | 20 | 15 | 10 |
+| `optimization_valid_days` | 7 | 14 | 30 |
+
+### CLI Arguments Reference
+
+| Argument | Description |
+|----------|-------------|
+| `--optimize` | Run optimization |
+| `--overwrite` | Force re-optimization (ignore validity) |
+| `--trade` | Start live trading loop |
+| `--paper` | Paper trading mode (no real orders) |
+| `--auto-retrain` | Auto-retrain when configs expire |
+| `--status` | Print portfolio status |
+| `--symbols` | Specific symbols to process |
+| `--config` | Path to config JSON file |
+| `--log-level` | DEBUG/INFO/WARNING/ERROR |
 
 ### Emergency Procedures
 
@@ -896,6 +907,11 @@ del last_trade_log.json
 ```bash
 del pm_configs.json
 python pm_main.py --optimize
+```
+
+**Check system health:**
+```bash
+python pm_main.py --status
 ```
 
 ---
@@ -921,3 +937,7 @@ For issues:
 - Start with conservative risk settings
 - Never risk more than you can afford to lose
 - The authors assume no liability for trading losses
+
+---
+
+*FX Portfolio Manager v3.3 - Complete Setup and Run Guide*
