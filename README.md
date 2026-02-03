@@ -294,6 +294,7 @@ python pm_main.py --trade --auto-retrain
     "slippage_pips": 0.5,
     
     "max_param_combos": 150,
+    "optimization_max_workers": 1,
     "min_trades": 25,
     "min_robustness": 0.20,
     
