@@ -1458,3 +1458,9 @@ Progress: 7/46
 2026-02-03 17:39:30 [INFO] pm_core: Loaded NZDUSD: 500000 bars from NZDUSD_M5.csv
 2026-02-03 17:42:42 [INFO] pm_pipeline: [NZDUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
 2026-02-03 17:45:48 [INFO] pm_pipeline: [NZDUSD] [M5] Hyperparameter tuning 12 strategies
+2026-02-03 19:21:39 [INFO] __main__: Shutting down...
+2026-02-03 19:21:39 [INFO] pm_mt5: Disconnected from MT5
+2026-02-03 19:21:39 [INFO] __main__: Shutdown complete
+2026-02-03 19:21:39 [INFO] pm_core: [TIME] [NZDUSD] Regime Optimization: 5936.77s
+2026-02-03 19:21:39 [INFO] __main__: Shutting down...
+2026-02-03 19:21:39 [INFO] __main__: Shutdown complete

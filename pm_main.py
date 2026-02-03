@@ -82,30 +82,32 @@ def log_resolved_config_summary(logger: logging.Logger,
         logger.info(
             "  pipeline: "
             f"scoring={getattr(p, 'scoring_mode', None)} | "
-            f"max_bars={getattr(p, 'max_bars', None)} | "
-            f"timeframes={tf_str} | "
-            f"live_bars={getattr(p, 'live_bars_count', None)}/{getattr(p, 'live_min_bars', None)} | "
-            f"risk_per_trade_pct={getattr(p, 'risk_per_trade_pct', None)} | "
-            f"fx_opt_min_trades={getattr(p, 'fx_opt_min_trades', None)} | "
-            f"fx_val_min_trades={getattr(p, 'fx_val_min_trades', None)} | "
-            f"fx_val_max_dd={getattr(p, 'fx_val_max_drawdown', None)} | "
-            f"regime_pf>={getattr(p, 'regime_min_val_profit_factor', None)} | "
-            f"regime_ret>={getattr(p, 'regime_min_val_return_pct', None)} | "
-            f"allow_d1_plus_lower={getattr(p, 'allow_d1_plus_lower_tf', None)} | "
-            f"max_combined_risk_pct={getattr(p, 'max_combined_risk_pct', None)} | "
-            f"optuna_val_obj={bool(getattr(p, 'optuna_use_val_in_objective', False))} | "
+            f"bars={getattr(p, 'max_bars', None)} | "
+            f"tfs={tf_str} | "
+            f"live={getattr(p, 'live_bars_count', None)}/{getattr(p, 'live_min_bars', None)} | "
+            f"risk={getattr(p, 'risk_per_trade_pct', None)}% | "
+            f"d1+lower={getattr(p, 'allow_d1_plus_lower_tf', None)} | "
+            f"max_sym_risk={getattr(p, 'max_combined_risk_pct', None)}% | "
             f"opt_workers={getattr(p, 'optimization_max_workers', None)}"
+        )
+        logger.info(
+            "            "
+            f"validation: opt_min={getattr(p, 'fx_opt_min_trades', None)} | "
+            f"val_min={getattr(p, 'fx_val_min_trades', None)} | "
+            f"val_dd<={getattr(p, 'fx_val_max_drawdown', None)} | "
+            f"pf>={getattr(p, 'regime_min_val_profit_factor', None)} | "
+            f"ret>={getattr(p, 'regime_min_val_return_pct', None)} | "
+            f"optuna_val_obj={bool(getattr(p, 'optuna_use_val_in_objective', False))}"
         )
 
         # Position config (risk + execution safety)
         pos_cfg = position_config
         logger.info(
             "  position: "
-            f"risk_per_trade_pct={getattr(pos_cfg, 'risk_per_trade_pct', None)} | "
-            f"risk_basis={getattr(pos_cfg, 'risk_basis', None)} | "
-            f"max_risk_pct={getattr(pos_cfg, 'max_risk_pct', None)} | "
-            f"max_pos_size={getattr(pos_cfg, 'max_position_size', None)} | "
-            f"min_pos_size={getattr(pos_cfg, 'min_position_size', None)} | "
+            f"risk={getattr(pos_cfg, 'risk_per_trade_pct', None)}% | "
+            f"basis={getattr(pos_cfg, 'risk_basis', None)} | "
+            f"max_risk={getattr(pos_cfg, 'max_risk_pct', None)}% | "
+            f"size={getattr(pos_cfg, 'min_position_size', None)}-{getattr(pos_cfg, 'max_position_size', None)} | "
             f"auto_widen_sl={getattr(pos_cfg, 'auto_widen_sl', None)}"
         )
 
@@ -122,14 +124,15 @@ def log_resolved_config_summary(logger: logging.Logger,
         spec_overrides = (config_data or {}).get("instrument_specs", {}) or {}
         spec_defaults = (config_data or {}).get("instrument_spec_defaults", {}) or {}
         broker_specs_path = (config_data or {}).get("broker_specs_path", None)
+        defaults_list = ",".join(spec_defaults.keys()) if spec_defaults else "none"
         logger.info(
             "  instruments: "
             f"overrides={len(spec_overrides)} | "
-            f"defaults={list(spec_defaults.keys()) if spec_defaults else 'none'} | "
-            f"broker_specs_path={broker_specs_path or 'n/a'}"
+            f"defaults={defaults_list} | "
+            f"broker_specs={broker_specs_path or 'n/a'}"
         )
 
-        logger.info("=" * 60)
+        logger.info("-" * 60)
     except Exception as e:
         logger.warning(f"Failed to log resolved config summary: {e}")
 

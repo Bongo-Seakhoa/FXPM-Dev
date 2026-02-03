@@ -1,57 +1,86 @@
 {
   "EURUSD": {
     "symbol": "EURUSD",
-    "decision_key": "3837445f96b76959",
-    "bar_time": "2026-02-03 18:30:00",
-    "timeframe": "M30",
-    "regime": "TREND",
-    "strategy_name": "KeltnerBreakoutStrategy",
-    "direction": 1,
-    "action": "EXECUTED",
-    "action_time": "2026-02-03T18:06:18.444362"
+    "decision_key": "e11b7c7c6eb30dec",
+    "decision_keys": [
+      "e11b7c7c6eb30dec"
+    ],
+    "bar_time": "2026-02-02 00:00:00",
+    "timeframe": "D1",
+    "regime": "BREAKOUT",
+    "strategy_name": "EMACrossoverStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-03T21:26:15.612887"
   },
   "GBPUSD": {
     "symbol": "GBPUSD",
-    "decision_key": "f7ade23489800225",
-    "bar_time": "2026-02-03 20:00:00",
-    "timeframe": "M15",
-    "regime": "TREND",
-    "strategy_name": "SqueezeBreakoutStrategy",
+    "decision_key": "97ff1696e4a6c002",
+    "decision_keys": [
+      "97ff1696e4a6c002"
+    ],
+    "bar_time": "2026-02-03 22:20:00",
+    "timeframe": "M5",
+    "regime": "RANGE",
+    "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
-    "action_time": "2026-02-03T19:17:20.270435"
+    "action_time": "2026-02-03T21:26:19.567769"
   },
   "USDJPY": {
     "symbol": "USDJPY",
-    "decision_key": "daaf9135a3699084",
-    "bar_time": "2026-02-03 16:30:00",
-    "timeframe": "M30",
-    "regime": "TREND",
-    "strategy_name": "VolatilityBreakoutStrategy",
-    "direction": -1,
-    "action": "EXECUTED",
-    "action_time": "2026-02-03T16:00:05.422080"
+    "decision_key": "a9ebb53c850b7155",
+    "decision_keys": [
+      "a9ebb53c850b7155"
+    ],
+    "bar_time": "2026-02-02 00:00:00",
+    "timeframe": "D1",
+    "regime": "BREAKOUT",
+    "strategy_name": "EMACrossoverStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-03T21:26:24.553305"
   },
   "USDCHF": {
     "symbol": "USDCHF",
-    "decision_key": "9675cb4fbddbd4c2",
-    "bar_time": "2026-02-03 05:00:00",
-    "timeframe": "H1",
-    "regime": "RANGE",
-    "strategy_name": "KeltnerPullbackStrategy",
-    "direction": -1,
-    "action": "EXECUTED",
-    "action_time": "2026-02-03T05:32:17.673315"
+    "decision_key": "9f162a4b46d2b309",
+    "decision_keys": [
+      "9f162a4b46d2b309"
+    ],
+    "bar_time": "2026-02-02 00:00:00",
+    "timeframe": "D1",
+    "regime": "BREAKOUT",
+    "strategy_name": "BollingerBounceStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-03T21:26:28.484277"
   },
   "USDCAD": {
     "symbol": "USDCAD",
-    "decision_key": "a4b74a1e7669bbed",
-    "bar_time": "2026-02-03 16:00:00",
-    "timeframe": "H4",
+    "decision_key": "e6eb4d7861dfdaf2",
+    "decision_keys": [
+      "e6eb4d7861dfdaf2"
+    ],
+    "bar_time": "2026-02-02 00:00:00",
+    "timeframe": "D1",
     "regime": "RANGE",
     "strategy_name": "MACDHistogramMomentumStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL",
-    "action_time": "2026-02-03T19:17:22.487724"
+    "action_time": "2026-02-03T21:26:33.536112"
+  },
+  "AUDUSD": {
+    "symbol": "AUDUSD",
+    "decision_key": "601bbd9d61dd0a31",
+    "decision_keys": [
+      "601bbd9d61dd0a31"
+    ],
+    "bar_time": "2026-02-03 21:00:00",
+    "timeframe": "H1",
+    "regime": "RANGE",
+    "strategy_name": "KeltnerBreakoutStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-03T21:26:37.654272"
   }
 }

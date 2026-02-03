@@ -939,7 +939,7 @@ def load_broker_specs(filepath: Optional[str] = None) -> Dict[str, Dict[str, Any
     Returns:
         Dict mapping symbol -> broker spec dict
     """
-    global _BROKER_SPECS_CACHE, _BROKER_SPECS_LOADED
+    global _BROKER_SPECS_CACHE, _BROKER_SPECS_LOADED, _BROKER_SPECS_LOADED_PATH
     
     if filepath is None:
         filepath = _BROKER_SPECS_PATH
