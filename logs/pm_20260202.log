@@ -1370,3 +1370,91 @@ Progress: 5/46
 2026-02-03 05:31:59 [INFO] __main__: Stopping trader...
 2026-02-03 05:31:59 [INFO] __main__: Saved 0 trades to pm_outputs\trades_20260203_053159.json
 2026-02-03 05:31:59 [INFO] __main__: Shutdown complete
+2026-02-03 09:41:50 [INFO] pm_pipeline: [USDCAD] [M15] Hyperparameter tuning 11 strategies
+2026-02-03 10:52:47 [INFO] pm_pipeline: [USDCAD] [M15] [CHOP] Winner: RSITrendFilteredMRStrategy (quality=0.269, train=45, val=18) [VALIDATED: Validated (PF=1.37, ret=2.5%, robustness=0.00, dd=2.6%)]
+2026-02-03 10:53:18 [INFO] pm_pipeline: [USDCAD] [M30] Hyperparameter tuning 12 strategies
+2026-02-03 11:28:13 [INFO] pm_pipeline: [USDCAD] [M30] [TREND] Winner: ADXDIStrengthStrategy [TUNED] (quality=0.386, train=59, val=25) [VALIDATED: Validated (PF=2.01, ret=13.3%, robustness=1.50, dd=3.7%)]
+2026-02-03 11:28:13 [INFO] pm_pipeline: [USDCAD] [M30] [RANGE] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.294, train=65, val=33) [VALIDATED: Validated (PF=1.20, ret=3.2%, robustness=2.00, dd=4.8%)]
+2026-02-03 11:28:13 [INFO] pm_pipeline: [USDCAD] [M30] [CHOP] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.193, train=65, val=19) [VALIDATED: Validated (PF=1.00, ret=0.0%, robustness=2.00, dd=3.8%)]
+2026-02-03 11:28:26 [INFO] pm_pipeline: [USDCAD] [H1] Hyperparameter tuning 9 strategies
+2026-02-03 11:30:49 [INFO] pm_pipeline: [USDCAD] [H1] [TREND] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.368, train=139, val=49) [VALIDATED: Validated (PF=1.69, ret=17.0%, robustness=1.09, dd=4.0%)]
+2026-02-03 11:30:49 [INFO] pm_pipeline: [USDCAD] [H1] [RANGE] Winner: StochRSITrendGateStrategy [TUNED] (quality=0.413, train=59, val=22) [VALIDATED: Validated (PF=2.05, ret=5.8%, robustness=1.61, dd=1.4%)]
+2026-02-03 11:30:49 [INFO] pm_pipeline: [USDCAD] [H1] [CHOP] Winner: StochRSITrendGateStrategy [TUNED] (quality=0.365, train=52, val=25) [VALIDATED: Validated (PF=1.67, ret=4.7%, robustness=1.26, dd=3.7%)]
+2026-02-03 11:30:53 [INFO] pm_pipeline: [USDCAD] [H4] Hyperparameter tuning 9 strategies
+2026-02-03 11:32:36 [INFO] pm_pipeline: [USDCAD] [H4] [TREND] Winner: DonchianBreakoutStrategy [TUNED] (quality=0.389, train=183, val=68) [VALIDATED: Validated (PF=1.76, ret=19.8%, robustness=1.39, dd=5.0%)]
+2026-02-03 11:32:36 [INFO] pm_pipeline: [USDCAD] [H4] [RANGE] Winner: MACDHistogramMomentumStrategy [TUNED] (quality=0.441, train=26, val=18) [VALIDATED: Validated (PF=3.98, ret=9.2%, robustness=1.07, dd=1.2%)]
+2026-02-03 11:32:36 [INFO] pm_pipeline: [USDCAD] [H4] [CHOP] Winner: EMACrossoverStrategy [TUNED] (quality=0.352, train=114, val=42) [VALIDATED: Validated (PF=1.51, ret=7.1%, robustness=1.69, dd=3.8%)]
+2026-02-03 11:32:37 [INFO] pm_pipeline: [USDCAD] [D1] Hyperparameter tuning 5 strategies
+2026-02-03 11:33:33 [INFO] pm_pipeline: [USDCAD] [D1] [CHOP] Winner: BollingerBounceStrategy (quality=0.392, train=44, val=16) [VALIDATED: Validated (PF=2.18, ret=5.7%, robustness=2.00, dd=1.9%)]
+2026-02-03 11:33:33 [INFO] pm_core: [TIME] [USDCAD] Regime Optimization: 22576.49s
+2026-02-03 11:33:36 [INFO] pm_pipeline: [USDCAD] Selected retrain period: 30 days
+2026-02-03 11:33:36 [INFO] pm_pipeline: 
+[USDCAD] OPTIMIZATION COMPLETE
+2026-02-03 11:33:36 [INFO] pm_pipeline:   Timeframes:  6
+2026-02-03 11:33:36 [INFO] pm_pipeline:   Validated:   11
+2026-02-03 11:33:36 [INFO] pm_pipeline:   Rejected:    1
+2026-02-03 11:33:36 [INFO] pm_pipeline:   Best:        MACDHistogramMomentumStrategy @ H4/RANGE
+2026-02-03 11:33:36 [INFO] pm_pipeline:   Retrain:     Every 30 days
+2026-02-03 11:33:36 [INFO] pm_pipeline:   Duration:    22709.4s
+2026-02-03 11:33:36 [INFO] pm_pipeline:   [D1] CHOP:BollingerBou
+2026-02-03 11:33:36 [INFO] pm_pipeline:   [H1] TREND:KeltnerBreak, RANGE:StochRSITren, CHOP:StochRSITren
+2026-02-03 11:33:36 [INFO] pm_pipeline:   [H4] TREND:DonchianBrea, RANGE:MACDHistogra, CHOP:EMACrossover
+2026-02-03 11:33:36 [INFO] pm_pipeline:   [M15] CHOP:RSITrendFilt
+2026-02-03 11:33:36 [INFO] pm_pipeline:   [M30] TREND:ADXDIStrengt, RANGE:VWAPDeviatio, CHOP:VWAPDeviatio
+2026-02-03 11:33:36 [INFO] pm_pipeline: SAVED USDCAD to pm_configs.json (atomic)
+2026-02-03 11:33:36 [INFO] pm_pipeline: 
+Progress: 6/46
+2026-02-03 11:33:36 [INFO] pm_pipeline: 
+============================================================
+2026-02-03 11:33:36 [INFO] pm_pipeline: OPTIMIZING: AUDUSD (Regime-Aware)
+2026-02-03 11:33:36 [INFO] pm_pipeline: ============================================================
+2026-02-03 11:33:37 [INFO] pm_core: Loaded AUDUSD: 500000 bars from AUDUSD_M5.csv
+2026-02-03 11:35:55 [INFO] pm_pipeline: [AUDUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-03 11:38:52 [INFO] pm_pipeline: [AUDUSD] [M5] Hyperparameter tuning 8 strategies
+2026-02-03 16:23:01 [INFO] pm_pipeline: [AUDUSD] [M5] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.257, train=142, val=37) [VALIDATED: Validated (PF=1.15, ret=1.9%, robustness=2.00, dd=5.0%)]
+2026-02-03 16:24:15 [INFO] pm_pipeline: [AUDUSD] [M15] Hyperparameter tuning 9 strategies
+2026-02-03 16:34:52 [INFO] pm_pipeline: [AUDUSD] [M15] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.299, train=250, val=49) [VALIDATED: Validated (PF=1.25, ret=4.0%, robustness=1.22, dd=3.2%)]
+2026-02-03 16:34:52 [INFO] pm_pipeline: [AUDUSD] [M15] [RANGE] Winner: ZScoreVWAPReversionStrategy [TUNED] (quality=0.297, train=124, val=43) [VALIDATED: Validated (PF=1.21, ret=3.9%, robustness=1.86, dd=2.4%)]
+2026-02-03 16:34:52 [INFO] pm_pipeline: [AUDUSD] [M15] [CHOP] Winner: ZScoreVWAPReversionStrategy [TUNED] (quality=0.303, train=35, val=17) [VALIDATED: Validated (PF=1.35, ret=2.4%, robustness=1.05, dd=4.5%)]
+2026-02-03 16:35:25 [INFO] pm_pipeline: [AUDUSD] [M30] Hyperparameter tuning 10 strategies
+2026-02-03 17:29:45 [INFO] pm_pipeline: [AUDUSD] [M30] [TREND] Winner: MomentumBurstStrategy (quality=0.308, train=131, val=31) [VALIDATED: Validated (PF=1.32, ret=5.2%, robustness=2.00, dd=4.0%)]
+2026-02-03 17:29:45 [INFO] pm_pipeline: [AUDUSD] [M30] [RANGE] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.387, train=47, val=20) [VALIDATED: Validated (PF=2.03, ret=9.5%, robustness=2.00, dd=3.2%)]
+2026-02-03 17:29:45 [INFO] pm_pipeline: [AUDUSD] [M30] [BREAKOUT] Winner: PivotBreakoutStrategy (quality=0.197, train=31, val=18) [VALIDATED: Validated (PF=1.12, ret=0.7%, robustness=0.00, dd=2.3%)]
+2026-02-03 17:29:45 [INFO] pm_pipeline: [AUDUSD] [M30] [CHOP] Winner: VWAPDeviationReversionStrategy (quality=0.229, train=72, val=30) [VALIDATED: Validated (PF=1.14, ret=2.0%, robustness=0.00, dd=3.5%)]
+2026-02-03 17:30:15 [INFO] pm_pipeline: [AUDUSD] [H1] Hyperparameter tuning 10 strategies
+2026-02-03 17:35:13 [INFO] pm_pipeline: [AUDUSD] [H1] [TREND] Winner: ZScoreMRStrategy [TUNED] (quality=0.329, train=164, val=79) [VALIDATED: Validated (PF=1.35, ret=12.8%, robustness=2.00, dd=5.0%)]
+2026-02-03 17:35:13 [INFO] pm_pipeline: [AUDUSD] [H1] [RANGE] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.386, train=77, val=43) [VALIDATED: Validated (PF=1.75, ret=7.9%, robustness=2.00, dd=3.8%)]
+2026-02-03 17:35:13 [INFO] pm_pipeline: [AUDUSD] [H1] [CHOP] Winner: ZScoreMRStrategy [TUNED] (quality=0.416, train=69, val=20) [VALIDATED: Validated (PF=2.72, ret=5.4%, robustness=2.00, dd=2.2%)]
+2026-02-03 17:35:20 [INFO] pm_pipeline: [AUDUSD] [H4] Hyperparameter tuning 8 strategies
+2026-02-03 17:37:57 [INFO] pm_pipeline: [AUDUSD] [H4] [TREND] Winner: ZScoreVWAPReversionStrategy [TUNED] (quality=0.363, train=53, val=23) [VALIDATED: Validated (PF=1.77, ret=10.6%, robustness=1.42, dd=3.2%)]
+2026-02-03 17:37:57 [INFO] pm_pipeline: [AUDUSD] [H4] [RANGE] Winner: VolatilityBreakoutStrategy [TUNED] (quality=0.375, train=98, val=39) [VALIDATED: Validated (PF=1.79, ret=9.7%, robustness=0.96, dd=2.5%)]
+2026-02-03 17:37:57 [INFO] pm_pipeline: [AUDUSD] [H4] [CHOP] Winner: ADXTrendStrategy (quality=0.310, train=57, val=29) [VALIDATED: Validated (PF=1.33, ret=4.7%, robustness=1.44, dd=3.1%)]
+2026-02-03 17:37:58 [INFO] pm_pipeline: [AUDUSD] [D1] Hyperparameter tuning 6 strategies
+2026-02-03 17:39:17 [INFO] pm_pipeline: [AUDUSD] [D1] [TREND] Winner: KeltnerPullbackStrategy [TUNED] (quality=0.409, train=74, val=17) [VALIDATED: Validated (PF=2.91, ret=3.6%, robustness=1.11, dd=1.5%)]
+2026-02-03 17:39:17 [INFO] pm_pipeline: [AUDUSD] [D1] [CHOP] Winner: ZScoreMRStrategy [TUNED] (quality=0.416, train=28, val=17) [VALIDATED: Validated (PF=3.30, ret=7.0%, robustness=1.96, dd=2.2%)]
+2026-02-03 17:39:17 [INFO] pm_core: [TIME] [AUDUSD] Regime Optimization: 21801.82s
+2026-02-03 17:39:28 [INFO] pm_pipeline: [AUDUSD] Selected retrain period: 30 days
+2026-02-03 17:39:28 [INFO] pm_pipeline: 
+[AUDUSD] OPTIMIZATION COMPLETE
+2026-02-03 17:39:28 [INFO] pm_pipeline:   Timeframes:  6
+2026-02-03 17:39:28 [INFO] pm_pipeline:   Validated:   16
+2026-02-03 17:39:28 [INFO] pm_pipeline:   Rejected:    0
+2026-02-03 17:39:28 [INFO] pm_pipeline:   Best:        ZScoreMRStrategy @ H1/TREND
+2026-02-03 17:39:28 [INFO] pm_pipeline:   Retrain:     Every 30 days
+2026-02-03 17:39:28 [INFO] pm_pipeline:   Duration:    21952.0s
+2026-02-03 17:39:28 [INFO] pm_pipeline:   [D1] TREND:KeltnerPullb, CHOP:ZScoreMRStra
+2026-02-03 17:39:28 [INFO] pm_pipeline:   [H1] TREND:ZScoreMRStra, RANGE:KeltnerBreak, CHOP:ZScoreMRStra
+2026-02-03 17:39:28 [INFO] pm_pipeline:   [H4] TREND:ZScoreVWAPRe, RANGE:VolatilityBr, CHOP:ADXTrendStra
+2026-02-03 17:39:28 [INFO] pm_pipeline:   [M15] TREND:MomentumBurs, RANGE:ZScoreVWAPRe, CHOP:ZScoreVWAPRe
+2026-02-03 17:39:28 [INFO] pm_pipeline:   [M30] TREND:MomentumBurs, RANGE:VWAPDeviatio, BREAKOUT:PivotBreakou, CHOP:VWAPDeviatio
+2026-02-03 17:39:28 [INFO] pm_pipeline:   [M5] TREND:MomentumBurs
+2026-02-03 17:39:28 [INFO] pm_pipeline: SAVED AUDUSD to pm_configs.json (atomic)
+2026-02-03 17:39:28 [INFO] pm_pipeline: 
+Progress: 7/46
+2026-02-03 17:39:28 [INFO] pm_pipeline: 
+============================================================
+2026-02-03 17:39:28 [INFO] pm_pipeline: OPTIMIZING: NZDUSD (Regime-Aware)
+2026-02-03 17:39:28 [INFO] pm_pipeline: ============================================================
+2026-02-03 17:39:30 [INFO] pm_core: Loaded NZDUSD: 500000 bars from NZDUSD_M5.csv
+2026-02-03 17:42:42 [INFO] pm_pipeline: [NZDUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-03 17:45:48 [INFO] pm_pipeline: [NZDUSD] [M5] Hyperparameter tuning 12 strategies

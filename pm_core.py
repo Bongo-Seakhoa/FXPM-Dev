@@ -23,9 +23,9 @@ import math
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, asdict
 from enum import Enum
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import Dict, List, Any, Optional, Tuple, Union, Set
 
 import numpy as np
 import pandas as pd
@@ -484,8 +484,10 @@ class PipelineConfig:
     data_dir: Path = field(default_factory=lambda: Path("./data"))
     output_dir: Path = field(default_factory=lambda: Path("./pm_outputs"))
     
-    # Data split ratios (with 10% overlap)
+    # Data split ratios (with overlap)
     # Training: 0-80%, Validation: 70-100% (10% overlap at 70-80%)
+    # NOTE: val_pct is informational only; actual validation window is
+    # derived from train_pct and overlap_pct.
     train_pct: float = 80.0
     val_pct: float = 30.0
     overlap_pct: float = 10.0
@@ -505,6 +507,7 @@ class PipelineConfig:
     max_param_combos: int = 50
     min_trades: int = 20
     min_robustness: float = 0.20
+    optimization_max_workers: int = 1  # 1 = sequential
     
     # Evaluation thresholds
     min_win_rate: float = 40.0
@@ -610,6 +613,11 @@ class PipelineConfig:
         self.output_dir = Path(self.output_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Clamp workers to sane minimum
+        try:
+            self.optimization_max_workers = max(1, int(self.optimization_max_workers))
+        except Exception:
+            self.optimization_max_workers = 1
         # Normalize scoring mode
         self.scoring_mode = str(self.scoring_mode).strip().lower()
         if self.scoring_mode not in {"pm_weighted", "fx_backtester"}:
@@ -908,9 +916,18 @@ INSTRUMENT_SPECS = {
 # Broker specs cache (loaded from broker_specs.json if available)
 _BROKER_SPECS_CACHE: Dict[str, Dict[str, Any]] = {}
 _BROKER_SPECS_LOADED = False
+_BROKER_SPECS_PATH = "broker_specs.json"
+_BROKER_SPECS_LOADED_PATH: Optional[str] = None
+
+# Config-provided instrument spec overrides (single source of truth)
+_CONFIG_INSTRUMENT_SPECS: Dict[str, InstrumentSpec] = {}
+_CONFIG_SPEC_DEFAULTS: Dict[str, Any] = {}
+
+# Warn once per symbol when spec is missing to avoid log spam
+_MISSING_SPEC_WARNED: Set[str] = set()
 
 
-def load_broker_specs(filepath: str = "broker_specs.json") -> Dict[str, Dict[str, Any]]:
+def load_broker_specs(filepath: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """
     Load broker specifications from JSON file.
     
@@ -924,7 +941,11 @@ def load_broker_specs(filepath: str = "broker_specs.json") -> Dict[str, Dict[str
     """
     global _BROKER_SPECS_CACHE, _BROKER_SPECS_LOADED
     
-    if _BROKER_SPECS_LOADED:
+    if filepath is None:
+        filepath = _BROKER_SPECS_PATH
+
+    # Return cached if already loaded from the same path
+    if _BROKER_SPECS_LOADED and _BROKER_SPECS_LOADED_PATH == filepath:
         return _BROKER_SPECS_CACHE
     
     try:
@@ -933,15 +954,160 @@ def load_broker_specs(filepath: str = "broker_specs.json") -> Dict[str, Dict[str
             specs = json.load(f)
         _BROKER_SPECS_CACHE = specs
         _BROKER_SPECS_LOADED = True
+        _BROKER_SPECS_LOADED_PATH = filepath
         logger.info(f"Loaded broker specs for {len(specs)} symbols from {filepath}")
     except FileNotFoundError:
-        logger.debug(f"No broker_specs.json found at {filepath}, using defaults")
+        logger.debug(f"No broker specs file found at {filepath}, using defaults")
         _BROKER_SPECS_LOADED = True
+        _BROKER_SPECS_LOADED_PATH = filepath
     except Exception as e:
         logger.warning(f"Failed to load broker_specs.json: {e}")
         _BROKER_SPECS_LOADED = True
+        _BROKER_SPECS_LOADED_PATH = filepath
     
     return _BROKER_SPECS_CACHE
+
+
+def set_broker_specs_path(filepath: str) -> None:
+    """
+    Set the broker specs JSON path and force reload on next access.
+
+    Args:
+        filepath: Path to broker specs JSON file
+    """
+    global _BROKER_SPECS_PATH, _BROKER_SPECS_LOADED, _BROKER_SPECS_LOADED_PATH
+    if filepath:
+        _BROKER_SPECS_PATH = filepath
+    _BROKER_SPECS_LOADED = False
+    _BROKER_SPECS_LOADED_PATH = None
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize symbol for lookup (remove suffixes, uppercase)."""
+    if not symbol:
+        return ""
+    return symbol.split('.')[0].split('#')[0].upper()
+
+
+def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
+                           defaults: Optional[Dict[str, Any]] = None) -> InstrumentSpec:
+    """
+    Build an InstrumentSpec from config dict with optional defaults and inheritance.
+    """
+    data = data or {}
+    merged: Dict[str, Any] = {}
+
+    # Inherit from another symbol if requested
+    inherit_symbol = data.get("inherit")
+    if inherit_symbol:
+        parent_key = _normalize_symbol(str(inherit_symbol))
+        parent_spec = _CONFIG_INSTRUMENT_SPECS.get(parent_key)
+        if parent_spec is None:
+            broker_specs = load_broker_specs()
+            if parent_key in broker_specs:
+                parent_spec = _create_spec_from_broker_data(parent_key, broker_specs[parent_key])
+            elif parent_key in INSTRUMENT_SPECS:
+                parent_spec = INSTRUMENT_SPECS[parent_key]
+        if parent_spec is not None:
+            merged.update(asdict(parent_spec))
+
+    # Apply defaults, then explicit overrides
+    if defaults:
+        merged.update(defaults)
+    merged.update({k: v for k, v in data.items() if k != "inherit"})
+
+    # Required fields
+    merged["symbol"] = symbol
+
+    # Infer pip_position if not provided
+    if "pip_position" not in merged or merged["pip_position"] in (None, ""):
+        digits = merged.get("digits")
+        if digits is not None:
+            try:
+                digits_i = int(digits)
+                merged["pip_position"] = digits_i - 1 if digits_i in (3, 5) else digits_i
+            except Exception:
+                merged["pip_position"] = 4
+        else:
+            merged["pip_position"] = 4
+
+    # Filter only valid InstrumentSpec fields
+    valid_keys = {f.name for f in fields(InstrumentSpec)}
+    filtered = {k: v for k, v in merged.items() if k in valid_keys}
+
+    # Coerce numeric types lightly (avoid strings in config)
+    float_fields = {
+        "pip_value", "spread_avg", "min_lot", "max_lot", "commission_per_lot",
+        "swap_long", "swap_short", "tick_size", "tick_value", "contract_size",
+        "volume_step", "point"
+    }
+    int_fields = {"pip_position", "stops_level", "digits"}
+    for k in float_fields:
+        if k in filtered and filtered[k] is not None:
+            try:
+                filtered[k] = float(filtered[k])
+            except Exception:
+                pass
+    for k in int_fields:
+        if k in filtered and filtered[k] is not None:
+            try:
+                filtered[k] = int(filtered[k])
+            except Exception:
+                pass
+
+    return InstrumentSpec(**filtered)
+
+
+def set_instrument_specs(specs: Optional[Dict[str, Any]] = None,
+                         defaults: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Set config-provided instrument specs and defaults.
+
+    Args:
+        specs: Dict of symbol -> spec dict (may include 'inherit')
+        defaults: Dict of default values applied to config specs
+
+    Returns:
+        Number of specs loaded
+    """
+    global _CONFIG_INSTRUMENT_SPECS, _CONFIG_SPEC_DEFAULTS
+    _CONFIG_SPEC_DEFAULTS = defaults or {}
+    _CONFIG_INSTRUMENT_SPECS = {}
+    if not specs:
+        return 0
+
+    # Two-pass load: first specs without inherit, then inherit-based
+    pending: Dict[str, Any] = {}
+    for sym, data in specs.items():
+        key = _normalize_symbol(sym)
+        if isinstance(data, dict) and data.get("inherit"):
+            pending[key] = data
+        else:
+            _CONFIG_INSTRUMENT_SPECS[key] = _spec_from_config_dict(key, data, _CONFIG_SPEC_DEFAULTS)
+
+    for sym, data in pending.items():
+        _CONFIG_INSTRUMENT_SPECS[sym] = _spec_from_config_dict(sym, data, _CONFIG_SPEC_DEFAULTS)
+
+    return len(_CONFIG_INSTRUMENT_SPECS)
+
+
+def _clone_spec(spec: InstrumentSpec, symbol_override: Optional[str] = None) -> InstrumentSpec:
+    """Return a shallow copy of an InstrumentSpec, optionally overriding symbol."""
+    spec_dict = asdict(spec)
+    if symbol_override:
+        spec_dict["symbol"] = symbol_override
+    return InstrumentSpec(**spec_dict)
+
+
+def _apply_spec_defaults(spec: InstrumentSpec) -> InstrumentSpec:
+    """Apply config-level default overrides to a spec (non-broker only)."""
+    if not _CONFIG_SPEC_DEFAULTS:
+        return spec
+    spec_dict = asdict(spec)
+    for k, v in _CONFIG_SPEC_DEFAULTS.items():
+        if k in spec_dict and v is not None:
+            spec_dict[k] = v
+    return InstrumentSpec(**spec_dict)
 
 
 def save_broker_specs(specs: Dict[str, Dict[str, Any]], filepath: str = "broker_specs.json"):
@@ -1055,9 +1221,10 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
     Get instrument specification for a symbol.
     
     Priority:
-    1. Broker specs from broker_specs.json (if available)
-    2. Default hardcoded specs
-    3. Generic fallback spec
+    1. Config-provided instrument_specs overrides
+    2. Broker specs from broker_specs.json (if available)
+    3. Default hardcoded specs
+    4. Generic fallback spec
     
     Args:
         symbol: Symbol name
@@ -1065,28 +1232,35 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
     Returns:
         InstrumentSpec for the symbol
     """
-    # Try broker specs first
-    broker_specs = load_broker_specs()
+    symbol_key = _normalize_symbol(symbol)
+
+    # 1) Config-provided overrides
+    if symbol_key in _CONFIG_INSTRUMENT_SPECS:
+        return _apply_spec_defaults(_clone_spec(_CONFIG_INSTRUMENT_SPECS[symbol_key], symbol_override=symbol))
     
-    # Try exact match in broker specs
+    # 2) Broker specs
+    broker_specs = load_broker_specs()
     if symbol in broker_specs:
         return _create_spec_from_broker_data(symbol, broker_specs[symbol])
     
-    # Try without suffix (e.g., EURUSD.a -> EURUSD)
-    base_symbol = symbol.split('.')[0].split('#')[0].upper()
-    if base_symbol in broker_specs:
-        return _create_spec_from_broker_data(symbol, broker_specs[base_symbol])
+    if symbol_key in broker_specs:
+        return _create_spec_from_broker_data(symbol, broker_specs[symbol_key])
     
-    # Fall back to hardcoded defaults
+    # 3) Hardcoded defaults
     if symbol in INSTRUMENT_SPECS:
-        return INSTRUMENT_SPECS[symbol]
+        return _apply_spec_defaults(_clone_spec(INSTRUMENT_SPECS[symbol]))
     
-    if base_symbol in INSTRUMENT_SPECS:
-        return INSTRUMENT_SPECS[base_symbol]
+    if symbol_key in INSTRUMENT_SPECS:
+        return _apply_spec_defaults(_clone_spec(INSTRUMENT_SPECS[symbol_key], symbol_override=symbol))
     
-    # Return default 4-digit forex spec
-    logger.warning(f"No spec found for {symbol}, using default")
-    return InstrumentSpec(symbol, 4, 10.0, 2.0)
+    # 4) Generic fallback (warn only once per symbol to avoid spam)
+    if symbol not in _MISSING_SPEC_WARNED:
+        logger.warning(
+            f"No spec found for {symbol}, using default. "
+            f"Add to config.json instrument_specs or provide broker specs."
+        )
+        _MISSING_SPEC_WARNED.add(symbol)
+    return _apply_spec_defaults(InstrumentSpec(symbol, 4, 10.0, 2.0))
 
 
 # =============================================================================
@@ -1125,7 +1299,7 @@ class DataLoader:
         'D1': 500,     # ~2 years of D1 data minimum
     }
     
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, cache_resampled: bool = True, cache_dir: Optional[Path] = None):
         """
         Initialize DataLoader.
         
@@ -1134,6 +1308,17 @@ class DataLoader:
         """
         self.data_dir = Path(data_dir)
         self._cache: Dict[str, pd.DataFrame] = {}
+        self._resample_cache: Dict[str, pd.DataFrame] = {}
+        self._resample_meta: Dict[str, Dict[str, Any]] = {}
+        self._source_meta: Dict[str, Dict[str, Any]] = {}
+
+        self.cache_resampled = bool(cache_resampled)
+        self.cache_dir = Path(cache_dir) if cache_dir else (self.data_dir / ".cache")
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # If cache dir can't be created, fall back to in-memory only
+            self.cache_resampled = False
     
     def load_symbol(self, symbol: str, base_timeframe: str = 'M5') -> Optional[pd.DataFrame]:
         """
@@ -1185,6 +1370,23 @@ class DataLoader:
             
             # Cache and return
             self._cache[cache_key] = df
+
+            # Track source metadata for resample cache validation
+            try:
+                stat = data_file.stat()
+                self._source_meta[cache_key] = {
+                    "path": str(data_file),
+                    "mtime": stat.st_mtime,
+                    "rows": len(df),
+                    "last_index": df.index[-1].isoformat() if len(df) else None,
+                }
+            except Exception:
+                self._source_meta[cache_key] = {
+                    "path": str(data_file),
+                    "mtime": None,
+                    "rows": len(df),
+                    "last_index": df.index[-1].isoformat() if len(df) else None,
+                }
             logger.info(f"Loaded {symbol}: {len(df)} bars from {data_file.name}")
             
             return df.copy()
@@ -1224,6 +1426,75 @@ class DataLoader:
             resampled['Spread'] = spread_resampled
         
         return resampled
+
+    def _resample_cache_key(self, symbol: str, timeframe: str) -> str:
+        return f"{symbol}_{timeframe}"
+
+    def _resample_cache_path(self, symbol: str, timeframe: str) -> Path:
+        safe_symbol = symbol.replace("/", "_").replace("\\", "_").replace(":", "_")
+        return self.cache_dir / f"{safe_symbol}_{timeframe}.pkl"
+
+    def _is_resample_cache_valid(self, meta: Dict[str, Any], source_meta: Dict[str, Any]) -> bool:
+        if not meta or not source_meta:
+            return False
+        return (
+            meta.get("source_mtime") == source_meta.get("mtime") and
+            meta.get("source_rows") == source_meta.get("rows") and
+            meta.get("source_last_index") == source_meta.get("last_index")
+        )
+
+    def _load_resample_cache(self, symbol: str, timeframe: str, source_meta: Dict[str, Any]) -> Optional[pd.DataFrame]:
+        cache_key = self._resample_cache_key(symbol, timeframe)
+
+        # In-memory cache
+        meta = self._resample_meta.get(cache_key)
+        if cache_key in self._resample_cache and self._is_resample_cache_valid(meta, source_meta):
+            return self._resample_cache[cache_key].copy()
+
+        if not self.cache_resampled:
+            return None
+
+        # Disk cache
+        path = self._resample_cache_path(symbol, timeframe)
+        if not path.exists():
+            return None
+
+        try:
+            payload = pd.read_pickle(path)
+            if not isinstance(payload, dict):
+                return None
+            meta = payload.get("meta", {})
+            if not self._is_resample_cache_valid(meta, source_meta):
+                return None
+            df = payload.get("data")
+            if isinstance(df, pd.DataFrame):
+                self._resample_cache[cache_key] = df
+                self._resample_meta[cache_key] = meta
+                return df.copy()
+        except Exception:
+            return None
+
+        return None
+
+    def _save_resample_cache(self, symbol: str, timeframe: str, source_meta: Dict[str, Any],
+                             df: pd.DataFrame) -> None:
+        cache_key = self._resample_cache_key(symbol, timeframe)
+        meta = {
+            "source_mtime": source_meta.get("mtime"),
+            "source_rows": source_meta.get("rows"),
+            "source_last_index": source_meta.get("last_index"),
+        }
+        self._resample_cache[cache_key] = df
+        self._resample_meta[cache_key] = meta
+
+        if not self.cache_resampled:
+            return
+        try:
+            path = self._resample_cache_path(symbol, timeframe)
+            payload = {"meta": meta, "data": df}
+            pd.to_pickle(payload, path)
+        except Exception:
+            pass
     
     def get_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """
@@ -1247,7 +1518,14 @@ class DataLoader:
         if timeframe == 'M5':
             return base_df
         
-        resampled = self.resample(base_df, timeframe)
+        # Try cache (memory/disk) keyed to the M5 source file state
+        base_meta = self._source_meta.get(f"{symbol}_M5", {})
+        cached = self._load_resample_cache(symbol, timeframe, base_meta)
+        if cached is not None:
+            resampled = cached
+        else:
+            resampled = self.resample(base_df, timeframe)
+            self._save_resample_cache(symbol, timeframe, base_meta, resampled)
         
         # Check minimum bars
         min_bars = self.MIN_BARS.get(timeframe, 100)
@@ -1341,6 +1619,9 @@ class DataLoader:
     def clear_cache(self):
         """Clear the data cache."""
         self._cache.clear()
+        self._resample_cache.clear()
+        self._resample_meta.clear()
+        self._source_meta.clear()
 
 
 # =============================================================================
@@ -1363,6 +1644,44 @@ class FeatureComputer:
     Supports lazy feature computation for efficiency when only specific
     features are needed.
     """
+
+    # In-memory feature cache (bounded to avoid memory bloat)
+    _FEATURE_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
+    _FEATURE_CACHE_ORDER: List[Tuple[Any, ...]] = []
+    _FEATURE_CACHE_MAX = 6
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clear in-memory feature cache (memory hygiene between symbols)."""
+        cls._FEATURE_CACHE.clear()
+        cls._FEATURE_CACHE_ORDER.clear()
+
+    @staticmethod
+    def _make_cache_key(df: pd.DataFrame, symbol: str, timeframe: str,
+                        regime_params_file: str, tag: str = "all") -> Tuple[Any, ...]:
+        try:
+            first_idx = df.index[0]
+            last_idx = df.index[-1]
+            first_key = first_idx.isoformat() if hasattr(first_idx, "isoformat") else str(first_idx)
+            last_key = last_idx.isoformat() if hasattr(last_idx, "isoformat") else str(last_idx)
+        except Exception:
+            first_key = "na"
+            last_key = "na"
+        return (tag, symbol, timeframe, regime_params_file, len(df), first_key, last_key)
+
+    @classmethod
+    def _cache_get(cls, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
+        if key in cls._FEATURE_CACHE:
+            return cls._FEATURE_CACHE[key]
+        return None
+
+    @classmethod
+    def _cache_put(cls, key: Tuple[Any, ...], value: pd.DataFrame) -> None:
+        cls._FEATURE_CACHE[key] = value
+        cls._FEATURE_CACHE_ORDER.append(key)
+        if len(cls._FEATURE_CACHE_ORDER) > cls._FEATURE_CACHE_MAX:
+            oldest = cls._FEATURE_CACHE_ORDER.pop(0)
+            cls._FEATURE_CACHE.pop(oldest, None)
     
     # Feature dependencies - maps feature names to their computation requirements
     _FEATURE_DEPS = {
@@ -1541,6 +1860,12 @@ class FeatureComputer:
             - REGIME_RAW, REGIME, REGIME_STRENGTH, REGIME_GAP
             - REGIME_LIVE, REGIME_STRENGTH_LIVE
         """
+        # In-memory cache lookup
+        cache_key = FeatureComputer._make_cache_key(df, symbol, timeframe, regime_params_file, tag="all")
+        cached = FeatureComputer._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         features = df.copy()
         
         # ATR (multiple periods)
@@ -1646,6 +1971,8 @@ class FeatureComputer:
         except Exception as e:
             logger.warning(f"Failed to compute regime features for {symbol} {timeframe}: {e}")
         
+        # Cache and return
+        FeatureComputer._cache_put(cache_key, features)
         return features
     
     @staticmethod
@@ -2949,6 +3276,8 @@ __all__ = [
     'INSTRUMENT_SPECS',
     'get_instrument_spec',
     'load_broker_specs',
+    'set_broker_specs_path',
+    'set_instrument_specs',
     'save_broker_specs',
     'DataLoader',
     'FeatureComputer',

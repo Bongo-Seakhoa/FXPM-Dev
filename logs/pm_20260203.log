@@ -304,3 +304,44 @@ Progress: 1/9
 2026-02-03 15:48:24 [INFO] pm_core: [TIME] [AUDCAD] Regime Optimization: 19.89s
 2026-02-03 15:48:24 [INFO] __main__: Shutting down...
 2026-02-03 15:48:24 [INFO] __main__: Shutdown complete
+2026-02-03 15:48:38 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-03 15:48:38 [INFO] __main__: Provided sections in JSON: ['mt5', 'pipeline', 'position', 'symbols']
+2026-02-03 15:48:38 [INFO] __main__: PipelineConfig: {'scoring_mode': 'fx_backtester', 'max_bars': 500000, 'timeframes': ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'], 'live_bars_count': 1500, 'live_min_bars': 300, 'risk_per_trade_pct': 1.0, 'fx_opt_min_trades': 15, 'fx_val_min_trades': 15, 'fx_val_max_drawdown': 20.0, 'regime_min_val_profit_factor': 1.0, 'regime_min_val_return_pct': 0.0, 'regime_allow_losing_winners': False, 'fallback_risk_multiplier': 1.0, 'fallback_max_risk_pct': 1.0, 'tier1_max_risk_pct': 5.0, 'tier23_max_risk_pct': 1.0, 'max_combined_risk_pct': 3.0, 'allow_d1_plus_lower_tf': True, 'secondary_trade_max_risk_pct': 1.0, 'regime_enable_hyperparam_tuning': True, 'regime_hyperparam_top_k': 3, 'regime_hyperparam_max_combos': 150, 'optuna_use_val_in_objective': False}
+2026-02-03 15:48:38 [INFO] __main__: PositionConfig: {'risk_per_trade_pct': 1.0, 'max_positions': None, 'allow_hedging': None}
+2026-02-03 15:48:38 [INFO] __main__: MT5Config: {'enabled': None, 'server': '', 'terminal_path': None}
+2026-02-03 15:48:38 [INFO] __main__: ============================================================
+2026-02-03 15:48:38 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-03 15:48:38 [INFO] __main__: ============================================================
+2026-02-03 15:48:38 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-03 15:48:38 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-03 15:48:38 [INFO] __main__: [OK] Connected to MT5
+2026-02-03 15:48:38 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-03 15:48:38 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-03 15:48:38 [INFO] __main__:   Symbols: 46
+2026-02-03 15:48:38 [INFO] __main__:   Strategies: 28
+2026-02-03 15:48:38 [INFO] __main__:   Existing configs: 37
+2026-02-03 15:48:39 [INFO] __main__: 
+============================================================
+2026-02-03 15:48:39 [INFO] __main__: STARTING LIVE TRADING
+2026-02-03 15:48:39 [INFO] __main__: Trading enabled: True
+2026-02-03 15:48:39 [INFO] __main__: Auto-retrain: False
+2026-02-03 15:48:39 [INFO] __main__: Close on opposite signal: False
+2026-02-03 15:48:39 [INFO] __main__: ============================================================
+2026-02-03 15:50:57 [INFO] __main__: [USDCAD] Selected: MACDHistogramMomentumStrategy @ M5/TREND (strength=0.34, quality=0.44, freshness=1.00, score=0.150)
+2026-02-03 15:50:57 [INFO] __main__: [USDCAD] Fallback tier 2: reduced risk to 1.00%
+2026-02-03 15:50:57 [INFO] __main__: [USDCAD] SELL | basis=1449.79 (balance) | target_risk=1.00% ($14.50) | actual_risk=0.97% ($14.05) | vol_raw=0.1032 | vol=0.1000 | entry=1.36606 | sl=1.36798 | tp=1.36446
+2026-02-03 15:50:57 [INFO] __main__: [OK] [USDCAD] SHORT executed: 0.1 lots @ 1.36607
+2026-02-03 16:00:05 [INFO] __main__: [USDJPY] Selected: VolatilityBreakoutStrategy @ M30/TREND (strength=0.43, quality=0.37, freshness=1.00, score=0.157)
+2026-02-03 16:00:05 [INFO] __main__: [USDJPY] SELL | basis=1449.79 (balance) | target_risk=1.00% ($14.50) | actual_risk=0.95% ($13.83) | vol_raw=0.0629 | vol=0.0600 | entry=155.86400 | sl=156.22400 | tp=155.32400
+2026-02-03 16:00:05 [INFO] __main__: [OK] [USDJPY] SHORT executed: 0.06 lots @ 155.86400
+2026-02-03 16:20:25 [INFO] __main__: [EURUSD] Selected: EMACrossoverStrategy @ M5/TREND (strength=0.31, quality=0.46, freshness=1.00, score=0.144)
+2026-02-03 16:20:25 [INFO] __main__: [EURUSD] Fallback tier 2: reduced risk to 1.00%
+2026-02-03 16:20:25 [INFO] __main__: [EURUSD] BUY | basis=1449.79 (balance) | target_risk=1.00% ($14.50) | actual_risk=1.00% ($14.45) | vol_raw=0.1004 | vol=0.1000 | entry=1.17977 | sl=1.17833 | tp=1.18077
+2026-02-03 16:20:25 [INFO] __main__: [OK] [EURUSD] LONG executed: 0.1 lots @ 1.17977
+2026-02-03 16:45:08 [INFO] __main__: [EURUSD] Selected: EMACrossoverStrategy @ M15/TREND (strength=0.33, quality=0.46, freshness=1.00, score=0.149)
+2026-02-03 16:45:08 [INFO] __main__: [EURUSD] Fallback tier 2: reduced risk to 1.00%
+2026-02-03 16:45:08 [INFO] __main__: [EURUSD] BUY | basis=1446.80 (balance) | target_risk=1.00% ($14.47) | actual_risk=0.93% ($13.45) | vol_raw=0.0646 | vol=0.0600 | entry=1.18055 | sl=1.17831 | tp=1.18155
+2026-02-03 16:45:08 [INFO] __main__: [OK] [EURUSD] LONG executed: 0.06 lots @ 1.18055
+2026-02-03 18:06:18 [INFO] __main__: [EURUSD] Selected: KeltnerBreakoutStrategy @ M30/TREND (strength=0.45, quality=0.34, freshness=0.85, score=0.129)
+2026-02-03 18:06:18 [INFO] __main__: [EURUSD] BUY | basis=1464.60 (balance) | target_risk=1.00% ($14.65) | actual_risk=0.88% ($12.93) | vol_raw=0.0453 | vol=0.0400 | entry=1.18233 | sl=1.17910 | tp=1.18502
+2026-02-03 18:06:18 [INFO] __main__: [OK] [EURUSD] LONG executed: 0.04 lots @ 1.18233

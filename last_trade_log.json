@@ -1,25 +1,25 @@
 {
   "EURUSD": {
     "symbol": "EURUSD",
-    "decision_key": "9291667d2f455b85",
-    "bar_time": "2026-02-03 12:00:00",
-    "timeframe": "H4",
+    "decision_key": "3837445f96b76959",
+    "bar_time": "2026-02-03 18:30:00",
+    "timeframe": "M30",
     "regime": "TREND",
-    "strategy_name": "SqueezeBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_SIGNAL",
-    "action_time": "2026-02-03T16:08:26.716568"
+    "strategy_name": "KeltnerBreakoutStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-02-03T18:06:18.444362"
   },
   "GBPUSD": {
     "symbol": "GBPUSD",
-    "decision_key": "faea52840a4fc868",
-    "bar_time": "2026-02-03 13:00:00",
-    "timeframe": "H1",
-    "regime": "TREND",
-    "strategy_name": "KeltnerBreakoutStrategy",
-    "direction": -1,
-    "action": "EXECUTED",
-    "action_time": "2026-02-03T13:00:22.806338"
+    "decision_key": "c0c310e306543d87",
+    "bar_time": "2026-02-03 19:45:00",
+    "timeframe": "M5",
+    "regime": "RANGE",
+    "strategy_name": "MomentumBurstStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-03T18:52:14.187154"
   },
   "USDJPY": {
     "symbol": "USDJPY",
@@ -45,13 +45,13 @@
   },
   "USDCAD": {
     "symbol": "USDCAD",
-    "decision_key": "8935520c16ea020a",
-    "bar_time": "2026-02-03 16:45:00",
-    "timeframe": "M5",
-    "regime": "TREND",
+    "decision_key": "f6cfdfc57c686c1f",
+    "bar_time": "2026-02-03 12:00:00",
+    "timeframe": "H4",
+    "regime": "RANGE",
     "strategy_name": "MACDHistogramMomentumStrategy",
-    "direction": -1,
-    "action": "EXECUTED",
-    "action_time": "2026-02-03T15:50:57.342566"
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-03T18:51:13.325139"
   }
 }

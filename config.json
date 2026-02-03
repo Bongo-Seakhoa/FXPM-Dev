@@ -108,6 +108,21 @@
     "timeout": 60000,
     "portable": false
   },
+  "broker_specs_path": "broker_specs.json",
+  "instrument_spec_defaults": {
+    "commission_per_lot": 7.0
+  },
+  "instrument_specs": {
+    "AUDCAD": { "inherit": "USDCAD" },
+    "AUDCHF": { "inherit": "EURCHF" },
+    "CADCHF": { "inherit": "EURCHF" },
+    "CHFJPY": { "inherit": "USDJPY" },
+    "NZDCAD": { "inherit": "USDCAD" },
+    "NZDCHF": { "inherit": "EURCHF" },
+    "GBPNZD": { "inherit": "EURNZD" },
+    "USDSEK": { "inherit": "USDNOK" },
+    "BTCETH": { "inherit": "ETHUSD" }
+  },
   "symbols": [
     "EURUSD",
     "GBPUSD",

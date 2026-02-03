@@ -19,8 +19,9 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import product
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import pandas as pd
 import numpy as np
@@ -65,6 +66,28 @@ except ImportError:
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+
+def _pipeline_config_to_dict(config: PipelineConfig) -> Dict[str, Any]:
+    """Serialize PipelineConfig to a plain dict for multiprocessing."""
+    cfg = {f.name: getattr(config, f.name) for f in fields(PipelineConfig)}
+    # Normalize Paths to strings for pickling and re-init
+    if isinstance(cfg.get("data_dir"), Path):
+        cfg["data_dir"] = str(cfg["data_dir"])
+    if isinstance(cfg.get("output_dir"), Path):
+        cfg["output_dir"] = str(cfg["output_dir"])
+    return cfg
+
+
+def _optimize_symbol_worker(config_dict: Dict[str, Any], symbol: str) -> Tuple[str, 'PipelineResult']:
+    """Worker for parallel optimization."""
+    try:
+        cfg = PipelineConfig(**config_dict)
+        pipeline = OptimizationPipeline(cfg)
+        result = pipeline.run_for_symbol(symbol)
+        return symbol, result
+    except Exception as exc:
+        return symbol, PipelineResult(symbol=symbol, success=False, error_message=str(exc))
 
 
 # =============================================================================
@@ -2196,17 +2219,18 @@ class OptimizationPipeline:
             regime_params_file = getattr(self.config, 'regime_params_file', 'regime_params.json')
             
             for tf, data in data_by_tf.items():
-                train_df, val_df = self.splitter.split(data)
-                
-                # Compute features with regime detection (passing symbol and timeframe)
-                train_features_by_tf[tf] = FeatureComputer.compute_all(
-                    train_df, symbol=symbol, timeframe=tf, 
+                # Compute features once on full data, then slice into train/val
+                # This preserves causality and avoids recomputation overhead.
+                split_idx = self.splitter.get_split_indices(len(data))
+                train_start, train_end = split_idx['train']
+                val_start, val_end = split_idx['val']
+
+                full_features = FeatureComputer.compute_all(
+                    data, symbol=symbol, timeframe=tf,
                     regime_params_file=regime_params_file
                 )
-                val_features_by_tf[tf] = FeatureComputer.compute_all(
-                    val_df, symbol=symbol, timeframe=tf,
-                    regime_params_file=regime_params_file
-                )
+                train_features_by_tf[tf] = full_features.iloc[train_start:train_end]
+                val_features_by_tf[tf] = full_features.iloc[val_start:val_end]
                 full_data_by_tf[tf] = data
             
             # Run regime-aware optimization
@@ -2547,30 +2571,70 @@ class PortfolioManager:
             logger.info("All symbols have valid configs. Nothing to optimize.")
             return results
         
-        # Process symbols needing optimization
-        for i, symbol in enumerate(to_optimize):
-            logger.info(f"\nProgress: {i+1}/{len(to_optimize)}")
-            
-            try:
-                result = self.pipeline.run_for_symbol(symbol)
-                results[symbol] = result
-                
-                # Incremental persistence: save immediately after each symbol
-                if result.success and result.config:
-                    self._save_symbol_config(symbol, result.config)
-                    logger.info(f"SAVED {symbol} to {self.config_file} (atomic)")
-                else:
-                    # Keep existing config on failure (if any)
-                    logger.warning(f"FAILED {symbol}: keeping existing config (if any)")
-                
-            except Exception as e:
-                logger.exception(f"[{symbol}] Optimization error: {e}")
-                # Create a failure result but don't overwrite existing config
-                from pm_pipeline import PipelineResult
-                results[symbol] = PipelineResult(symbol=symbol, error_message=str(e))
-            
-            # Clear data cache after each symbol to prevent memory leaks
+        max_workers = int(getattr(self.config, "optimization_max_workers", 1) or 1)
+
+        if max_workers > 1 and len(to_optimize) > 1:
+            cfg_dict = _pipeline_config_to_dict(self.config)
+            logger.info(f"Parallel optimization enabled: workers={max_workers}")
+
+            completed = 0
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(_optimize_symbol_worker, cfg_dict, symbol): symbol
+                    for symbol in to_optimize
+                }
+
+                for future in as_completed(future_map):
+                    symbol = future_map[future]
+                    completed += 1
+                    logger.info(f"\nProgress: {completed}/{len(to_optimize)}")
+
+                    try:
+                        sym, result = future.result()
+                        results[sym] = result
+                        symbol_for_save = sym
+                    except Exception as e:
+                        logger.exception(f"[{symbol}] Optimization error: {e}")
+                        results[symbol] = PipelineResult(symbol=symbol, success=False, error_message=str(e))
+                        symbol_for_save = symbol
+
+                    # Incremental persistence: save immediately after each symbol
+                    result = results.get(symbol_for_save)
+                    if result and result.success and result.config:
+                        self._save_symbol_config(symbol_for_save, result.config)
+                        logger.info(f"SAVED {symbol_for_save} to {self.config_file} (atomic)")
+                    else:
+                        logger.warning(f"FAILED {symbol_for_save}: keeping existing config (if any)")
+
+            # Clear any in-process cache after parallel run
             self.pipeline.data_loader.clear_cache()
+            FeatureComputer.clear_cache()
+        else:
+            # Process symbols needing optimization sequentially
+            for i, symbol in enumerate(to_optimize):
+                logger.info(f"\nProgress: {i+1}/{len(to_optimize)}")
+                
+                try:
+                    result = self.pipeline.run_for_symbol(symbol)
+                    results[symbol] = result
+                    
+                    # Incremental persistence: save immediately after each symbol
+                    if result.success and result.config:
+                        self._save_symbol_config(symbol, result.config)
+                        logger.info(f"SAVED {symbol} to {self.config_file} (atomic)")
+                    else:
+                        # Keep existing config on failure (if any)
+                        logger.warning(f"FAILED {symbol}: keeping existing config (if any)")
+                    
+                except Exception as e:
+                    logger.exception(f"[{symbol}] Optimization error: {e}")
+                    # Create a failure result but don't overwrite existing config
+                    from pm_pipeline import PipelineResult
+                    results[symbol] = PipelineResult(symbol=symbol, error_message=str(e))
+                
+                # Clear data cache after each symbol to prevent memory leaks
+                self.pipeline.data_loader.clear_cache()
+                FeatureComputer.clear_cache()
         
         # Summary
         total_time = time.time() - total_start

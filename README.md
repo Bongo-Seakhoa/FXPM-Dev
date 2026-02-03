@@ -330,11 +330,27 @@ python pm_main.py --trade --auto-retrain
     "path": ""
   },
 
+  "broker_specs_path": "broker_specs.json",
+  "instrument_spec_defaults": {
+    "commission_per_lot": 7.0
+  },
+  "instrument_specs": {
+    "AUDCAD": { "inherit": "USDCAD" },
+    "AUDCHF": { "inherit": "EURCHF" },
+    "CHFJPY": { "inherit": "USDJPY" }
+  },
+
   "symbols": [
     "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"
   ]
 }
 ```
+
+Note: `val_pct` is informational only. Actual validation size is controlled by
+`train_pct` and `overlap_pct`.
+
+`instrument_specs` entries can use `"inherit": "SYMBOL"` to clone an existing
+spec as a starting point (handy for new symbols before you export broker specs).
 
 ### Key Configuration Options
 
@@ -345,6 +361,9 @@ python pm_main.py --trade --auto-retrain
 | `max_risk_pct` | Hard cap on risk (safety) | 5.0 |
 | `fx_min_robustness_ratio` | Minimum val/train score ratio | 0.80 |
 | `regime_chop_no_trade` | Block trades in CHOP regime | true |
+| `broker_specs_path` | Path to MT5-exported broker specs (optional) | broker_specs.json |
+| `instrument_specs` | Per-symbol instrument overrides (supports `inherit`) | {} |
+| `optimization_max_workers` | Max parallel workers for optimization (1 = sequential) | 1 |
 
 ---
 

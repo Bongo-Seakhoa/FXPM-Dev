@@ -40,7 +40,7 @@ import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 import pandas as pd
 import numpy as np
@@ -68,62 +68,68 @@ def log_resolved_config_summary(logger: logging.Logger,
                                pipeline_config: "PipelineConfig",
                                position_config: "PositionConfig",
                                mt5_config: "MT5Config") -> None:
-    """Log a concise, sanitized summary of the resolved configuration.
-
-    This helps operators verify that config.json is the source of truth and that
-    defaults are only used when keys are missing.
-    """
+    """Log a concise, sanitized summary of the resolved configuration."""
     try:
-        # Show what sections were provided by the JSON (helps detect missing propagation)
         provided_sections = sorted((config_data or {}).keys())
+        sections_str = ", ".join(provided_sections) if provided_sections else "none"
+
         logger.info(f"Resolved config summary (source={config_path})")
-        logger.info(f"Provided sections in JSON: {provided_sections}")
+        logger.info(f"  sections: {sections_str}")
 
-        # Key pipeline settings that materially affect behavior
+        # Pipeline (most impactful runtime levers)
         p = pipeline_config
-        pipeline_summary = {
-            "scoring_mode": getattr(p, "scoring_mode", None),
-            "max_bars": getattr(p, "max_bars", None),
-            "timeframes": getattr(p, "timeframes", None),
-            "live_bars_count": getattr(p, "live_bars_count", None),
-            "live_min_bars": getattr(p, "live_min_bars", None),
-            "risk_per_trade_pct": getattr(p, "risk_per_trade_pct", None),
-            "fx_opt_min_trades": getattr(p, "fx_opt_min_trades", None),
-            "fx_val_min_trades": getattr(p, "fx_val_min_trades", None),
-            "fx_val_max_drawdown": getattr(p, "fx_val_max_drawdown", None),
-            "regime_min_val_profit_factor": getattr(p, "regime_min_val_profit_factor", None),
-            "regime_min_val_return_pct": getattr(p, "regime_min_val_return_pct", None),
-            "regime_allow_losing_winners": getattr(p, "regime_allow_losing_winners", None),
-            "fallback_risk_multiplier": getattr(p, "fallback_risk_multiplier", None),
-            "fallback_max_risk_pct": getattr(p, "fallback_max_risk_pct", None),
-            "tier1_max_risk_pct": getattr(p, "tier1_max_risk_pct", None),
-            "tier23_max_risk_pct": getattr(p, "tier23_max_risk_pct", None),
-            "max_combined_risk_pct": getattr(p, "max_combined_risk_pct", None),
-            "allow_d1_plus_lower_tf": getattr(p, "allow_d1_plus_lower_tf", None),
-            "secondary_trade_max_risk_pct": getattr(p, "secondary_trade_max_risk_pct", None),
-            "regime_enable_hyperparam_tuning": getattr(p, "regime_enable_hyperparam_tuning", None),
-            "regime_hyperparam_top_k": getattr(p, "regime_hyperparam_top_k", None),
-            "regime_hyperparam_max_combos": getattr(p, "regime_hyperparam_max_combos", None),
-            "optuna_use_val_in_objective": bool(getattr(p, "optuna_use_val_in_objective", False)),
-        }
-        logger.info(f"PipelineConfig: {pipeline_summary}")
+        tf_str = ",".join(getattr(p, "timeframes", []) or [])
+        logger.info(
+            "  pipeline: "
+            f"scoring={getattr(p, 'scoring_mode', None)} | "
+            f"max_bars={getattr(p, 'max_bars', None)} | "
+            f"timeframes={tf_str} | "
+            f"live_bars={getattr(p, 'live_bars_count', None)}/{getattr(p, 'live_min_bars', None)} | "
+            f"risk_per_trade_pct={getattr(p, 'risk_per_trade_pct', None)} | "
+            f"fx_opt_min_trades={getattr(p, 'fx_opt_min_trades', None)} | "
+            f"fx_val_min_trades={getattr(p, 'fx_val_min_trades', None)} | "
+            f"fx_val_max_dd={getattr(p, 'fx_val_max_drawdown', None)} | "
+            f"regime_pf>={getattr(p, 'regime_min_val_profit_factor', None)} | "
+            f"regime_ret>={getattr(p, 'regime_min_val_return_pct', None)} | "
+            f"allow_d1_plus_lower={getattr(p, 'allow_d1_plus_lower_tf', None)} | "
+            f"max_combined_risk_pct={getattr(p, 'max_combined_risk_pct', None)} | "
+            f"optuna_val_obj={bool(getattr(p, 'optuna_use_val_in_objective', False))} | "
+            f"opt_workers={getattr(p, 'optimization_max_workers', None)}"
+        )
 
-        # Position sizing / execution safety settings
+        # Position config (risk + execution safety)
         pos_cfg = position_config
-        position_summary = {
-            "risk_per_trade_pct": getattr(pos_cfg, "risk_per_trade_pct", None),
-            "max_positions": getattr(pos_cfg, "max_positions", None),
-            "allow_hedging": getattr(pos_cfg, "allow_hedging", None),
-        }
-        logger.info(f"PositionConfig: {position_summary}")
+        logger.info(
+            "  position: "
+            f"risk_per_trade_pct={getattr(pos_cfg, 'risk_per_trade_pct', None)} | "
+            f"risk_basis={getattr(pos_cfg, 'risk_basis', None)} | "
+            f"max_risk_pct={getattr(pos_cfg, 'max_risk_pct', None)} | "
+            f"max_pos_size={getattr(pos_cfg, 'max_position_size', None)} | "
+            f"min_pos_size={getattr(pos_cfg, 'min_position_size', None)} | "
+            f"auto_widen_sl={getattr(pos_cfg, 'auto_widen_sl', None)}"
+        )
 
         # MT5 summary (do not log credentials)
-        mt5_summary = {
-            "enabled": getattr(mt5_config, "enabled", None),
-            "server": getattr(mt5_config, "server", None),
-            "terminal_path": getattr(mt5_config, "terminal_path", None),
-        }
-        logger.info(f"MT5Config: {mt5_summary}")
+        logger.info(
+            "  mt5: "
+            f"server={getattr(mt5_config, 'server', '') or 'n/a'} | "
+            f"path={getattr(mt5_config, 'path', '') or 'n/a'} | "
+            f"timeout={getattr(mt5_config, 'timeout', None)} | "
+            f"portable={getattr(mt5_config, 'portable', None)}"
+        )
+
+        # Instrument specs config
+        spec_overrides = (config_data or {}).get("instrument_specs", {}) or {}
+        spec_defaults = (config_data or {}).get("instrument_spec_defaults", {}) or {}
+        broker_specs_path = (config_data or {}).get("broker_specs_path", None)
+        logger.info(
+            "  instruments: "
+            f"overrides={len(spec_overrides)} | "
+            f"defaults={list(spec_defaults.keys()) if spec_defaults else 'none'} | "
+            f"broker_specs_path={broker_specs_path or 'n/a'}"
+        )
+
+        logger.info("=" * 60)
     except Exception as e:
         logger.warning(f"Failed to log resolved config summary: {e}")
 
@@ -132,7 +138,10 @@ from pm_core import (
     DataLoader,
     FeatureComputer,
     Timer,
-    get_instrument_spec
+    get_instrument_spec,
+    set_broker_specs_path,
+    set_instrument_specs,
+    load_broker_specs
 )
 from pm_strategies import StrategyRegistry, BaseStrategy
 from pm_position import PositionConfig, PositionManager, PositionCalculator
@@ -236,6 +245,7 @@ class DecisionRecord:
     action: str                # EXECUTED, PAPER, SKIPPED_RISK_CAP, SKIPPED_MIN_VOLUME,
                                # SKIPPED_SPREAD, SKIPPED_NO_SIGNAL, FAILED, …
     action_time: str           # ISO-8601 wall-clock time
+    decision_keys: List[str] = field(default_factory=list)
 
 
 class DecisionThrottle:
@@ -244,8 +254,8 @@ class DecisionThrottle:
 
     **Rules enforced:**
 
-    1. If the current *decision_key* equals the cached one **and** the bar_time
-       is the same  →  suppress (do not re-attempt, do not re-log).
+    1. If the current *decision_key* has already been attempted on the same bar
+       → suppress (do not re-attempt, do not re-log).
     2. A new attempt is allowed only when:
        a) a new bar arrives for that timeframe, **or**
        b) the decision_key genuinely changes (different strategy, direction,
@@ -288,8 +298,8 @@ class DecisionThrottle:
 
         A decision is suppressed when ALL of the following hold:
         * We already have a cached record for this symbol.
-        * The cached decision_key matches the current one.
         * The cached bar_time matches the current one.
+        * The decision_key was already seen for that bar.
         
         There is NO cooldown expiry - suppression is strictly bar-time based.
         """
@@ -297,16 +307,15 @@ class DecisionThrottle:
         if prev is None:
             return False
 
-        # Different decision → allow
-        if prev.decision_key != decision_key:
-            return False
-
-        # Different bar → allow
+        # Different bar -> allow
         if prev.bar_time != bar_time_iso:
             return False
 
-        # Same key + same bar → suppress (already handled this exact decision)
-        return True
+        # Same bar: suppress only if this decision_key was already seen
+        if decision_key in (prev.decision_keys or []):
+            return True
+
+        return False
 
     def record_decision(self, symbol: str, decision_key: str,
                         bar_time_iso: str, timeframe: str, regime: str,
@@ -321,17 +330,32 @@ class DecisionThrottle:
             IGNORED - kept for backward compatibility but has no effect.
             Suppression is purely bar-time based.
         """
-        record = DecisionRecord(
-            symbol=symbol,
-            decision_key=decision_key,
-            bar_time=bar_time_iso,
-            timeframe=timeframe,
-            regime=regime,
-            strategy_name=strategy_name,
-            direction=direction,
-            action=action,
-            action_time=datetime.now().isoformat(),
-        )
+        # Update or create record. Keep a per-bar list of seen decision keys.
+        prev = self._cache.get(symbol)
+        if prev is not None and prev.bar_time == bar_time_iso:
+            if decision_key not in prev.decision_keys:
+                prev.decision_keys.append(decision_key)
+            prev.decision_key = decision_key
+            prev.timeframe = timeframe
+            prev.regime = regime
+            prev.strategy_name = strategy_name
+            prev.direction = direction
+            prev.action = action
+            prev.action_time = datetime.now().isoformat()
+            record = prev
+        else:
+            record = DecisionRecord(
+                symbol=symbol,
+                decision_key=decision_key,
+                bar_time=bar_time_iso,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_name=strategy_name,
+                direction=direction,
+                action=action,
+                action_time=datetime.now().isoformat(),
+                decision_keys=[decision_key],
+            )
         self._cache[symbol] = record
         self._save()
 
@@ -358,6 +382,7 @@ class DecisionThrottle:
                 data[sym] = {
                     "symbol": rec.symbol,
                     "decision_key": rec.decision_key,
+                    "decision_keys": rec.decision_keys,
                     "bar_time": rec.bar_time,
                     "timeframe": rec.timeframe,
                     "regime": rec.regime,
@@ -379,6 +404,10 @@ class DecisionThrottle:
             with open(self._log_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for sym, rec_dict in data.items():
+                decision_keys = rec_dict.get("decision_keys")
+                if not isinstance(decision_keys, list):
+                    dk = rec_dict.get("decision_key", "")
+                    decision_keys = [dk] if dk else []
                 self._cache[sym] = DecisionRecord(
                     symbol=rec_dict.get("symbol", sym),
                     decision_key=rec_dict.get("decision_key", ""),
@@ -389,6 +418,7 @@ class DecisionThrottle:
                     direction=rec_dict.get("direction", 0),
                     action=rec_dict.get("action", ""),
                     action_time=rec_dict.get("action_time", ""),
+                    decision_keys=decision_keys,
                 )
         except FileNotFoundError:
             pass
@@ -609,10 +639,16 @@ class LiveTrader:
                 allowed_timeframes = ['M5', 'M15', 'M30', 'H1', 'H4']  # Exclude D1
                 is_secondary_trade = True
                 self.logger.debug(f"[{symbol}] D1 trade open ({d1_position_direction}); allowing secondary non-D1 trade")
+            elif allow_d1_plus_lower and has_non_d1_position:
+                # Non-D1 position open - allow one additional D1 trade
+                can_open_trade = True
+                allowed_timeframes = ['D1']
+                is_secondary_trade = True
+                self.logger.debug(f"[{symbol}] Non-D1 trade open; allowing secondary D1 trade")
             else:
-                # Non-D1 position open - block new trades (old behavior)
+                # Fallback: block new trades if dual-trade mode is disabled
                 can_open_trade = False
-                block_reason = "Non-D1 position open; blocking additional trades"
+                block_reason = "Position open; blocking additional trades"
                 
         # If we can't open any trade, skip
         if not can_open_trade:
@@ -1869,15 +1905,40 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Create application
-    symbols = args.symbols or DEFAULT_SYMBOLS
-    
     # Load runtime configuration
     config_data = load_config_json(args.config)
 
+    # Prefer symbols from config.json unless CLI overrides
+    symbols = args.symbols or config_data.get("symbols") or DEFAULT_SYMBOLS
+
+    # Normalize MT5 config (allow terminal_path alias)
+    mt5_section = dict(config_data.get("mt5") or {})
+    if "terminal_path" in mt5_section and "path" not in mt5_section:
+        mt5_section["path"] = mt5_section["terminal_path"]
+    if "mt5" in config_data:
+        config_data["mt5"] = mt5_section
+
+    # Apply instrument spec config (single source of truth)
+    broker_specs_path = config_data.get("broker_specs_path")
+    if broker_specs_path:
+        set_broker_specs_path(broker_specs_path)
+        specs_loaded = {}
+        for attempt in range(1, 4):
+            # Force reload on each attempt
+            set_broker_specs_path(broker_specs_path)
+            specs_loaded = load_broker_specs(broker_specs_path)
+            if specs_loaded:
+                break
+        if not specs_loaded and os.path.exists(broker_specs_path):
+            logger.warning(f"Broker specs file found but empty/unreadable after 3 attempts: {broker_specs_path}")
+    set_instrument_specs(
+        specs=config_data.get("instrument_specs"),
+        defaults=config_data.get("instrument_spec_defaults")
+    )
+
     pipeline_config = PipelineConfig(**_filter_dataclass_kwargs(PipelineConfig, config_data.get("pipeline", {})))
     position_config = PositionConfig(**_filter_dataclass_kwargs(PositionConfig, config_data.get("position", {})))
-    mt5_config = MT5Config(**_filter_dataclass_kwargs(MT5Config, config_data.get("mt5", {})))
+    mt5_config = MT5Config(**_filter_dataclass_kwargs(MT5Config, mt5_section))
 
     # If position risk not set explicitly, inherit from pipeline risk (backward compatible)
     if "risk_per_trade_pct" not in (config_data.get("position") or {}) and hasattr(pipeline_config, "risk_per_trade_pct"):

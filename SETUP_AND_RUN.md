@@ -180,6 +180,15 @@ Open `config.json` in a text editor and configure:
 ```
 
 > **Note:** `mt5.login = 0` means use the currently logged-in MT5 session.
+>
+> Optional instrument specs (recommended for accuracy):
+> ```json
+> {
+>   "broker_specs_path": "broker_specs.json",
+>   "instrument_spec_defaults": { "commission_per_lot": 7.0 },
+>   "instrument_specs": { "AUDCAD": { "inherit": "USDCAD" } }
+> }
+> ```
 
 #### Full Configuration (Production)
 
@@ -288,12 +297,26 @@ Open `config.json` in a text editor and configure:
     "portable": false
   },
 
+  "broker_specs_path": "broker_specs.json",
+  "instrument_spec_defaults": {
+    "commission_per_lot": 7.0
+  },
+  "instrument_specs": {
+    "AUDCAD": { "inherit": "USDCAD" },
+    "AUDCHF": { "inherit": "EURCHF" },
+    "CHFJPY": { "inherit": "USDJPY" }
+  },
+
   "symbols": [
     "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
     "EURGBP", "EURJPY", "GBPJPY", "XAUUSD", "US30"
   ]
 }
 ```
+
+Note: `val_pct` is informational only. Actual validation size is controlled by
+`train_pct` and `overlap_pct`.
+Note: `optimization_max_workers` (default 1) enables parallel optimization when set > 1.
 
 ### 3.2 MT5 Connection Options
 
