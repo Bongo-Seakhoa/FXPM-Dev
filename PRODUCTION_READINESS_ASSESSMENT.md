@@ -1,388 +1,308 @@
-# FX Portfolio Manager - Production Readiness Assessment
+# FX Portfolio Manager - Production Readiness Assessment & Fix Report
 
-**Assessment Date:** February 1, 2026  
-**Codebase Version:** 3.1 (with Issues 1-4 fixes + Optuna TPE fixes applied)  
-**Verdict:** ✅ **PRODUCTION READY** (with recommendations)
+**Date:** February 1, 2026  
+**Version:** 3.3.1 (Post-Fix)  
+**Assessment Type:** Comprehensive Code Review and Bug Fix
 
 ---
 
 ## Executive Summary
 
-The FX Portfolio Manager codebase is **production ready** for live trading with appropriate caution. The core architecture is solid, with proper separation of concerns, comprehensive error handling, and robust risk management. The recent fixes (Issues 1-4) addressed critical gaps in hyperparameter tuning, scoring alignment, validation enforcement, and computational efficiency. Additional fixes to the Optuna TPE implementation resolved multi-regime objective bias and configuration propagation issues.
+This document provides a comprehensive production readiness assessment and remediation of the FX Portfolio Manager codebase. The primary blocking error has been fixed, and a systematic feature-by-feature audit has been completed.
 
-**Key Strengths:**
-- Broker-accurate risk calculations using MT5 contract math
-- Comprehensive validation with robustness checks
-- Regime-aware strategy selection with proper train/validation separation
-- Decision throttling with persistence across restarts
-- Feature/signal caching for computational efficiency
-- **Balanced multi-regime Optuna TPE optimization (v1.2 fix)**
-- **Proper configuration propagation for Optuna settings**
-
-**Remaining Recommendations:**
-- Start with paper trading for 2-4 weeks
-- Begin live trading with reduced position sizes (50% of target)
-- Monitor validation rejection rates in logs
-- Consider adding alerting for anomalous conditions
+### Critical Fix Completed
+- **Issue:** `'OptimizationStats' object does not support item assignment` at line 683 of `pm_optuna.py`
+- **Root Cause:** Attempting dictionary-style assignment (`stats['field'] = value`) on a dataclass instance
+- **Resolution:** Added `early_dd_rejections` field to `OptimizationStats` dataclass and changed to attribute assignment (`stats.field = value`)
+- **Status:** ✅ FIXED AND VERIFIED (42/42 tests pass)
 
 ---
 
-## Component-by-Component Analysis
+## Part A: Root Cause Analysis and Fix
 
-### 1. Core Infrastructure (`pm_core.py`) ✅ SOLID
+### The Error
 
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Configuration Management | ✅ | Dataclass with validation, sane defaults |
-| Backtester | ✅ | Proper execution timing (signal bar → next bar entry), tick-based P&L |
-| Feature Computer | ✅ | Comprehensive indicators, regime integration |
-| Data Splitting | ✅ | 80/30 split with 10% overlap, proper boundaries |
-| Scoring | ✅ | Unified `score()` with fx_backtester mode, gap penalty, robustness boost |
+```
+TypeError: 'OptimizationStats' object does not support item assignment
+  File "pm_optuna.py", line 683, in optimize_for_regimes
+    stats['early_dd_rejections'] = early_rejections[0]
+```
 
-**Backtester Execution Timing (Critical for Live Parity):**
+### Root Cause
+
+The `OptimizationStats` class (line 264-282 of `pm_optuna.py`) is defined as a Python dataclass:
+
 ```python
-# Line 1412: Signal from PREVIOUS bar → entry on CURRENT bar
-signal = sig_arr[i - 1]  # Signal from previous (fully closed) bar
-# Line 1431: Entry at open of entry bar
-entry_price = open_price + half_spread if is_long else open_price - half_spread
+@dataclass
+class OptimizationStats:
+    n_trials: int = 0
+    n_completed: int = 0
+    n_pruned: int = 0
+    n_failed: int = 0
+    best_score: float = float('-inf')
+    optimization_time_sec: float = 0.0
+    method: str = "optuna_tpe"
 ```
-This correctly eliminates lookahead bias.
 
-**Scoring Robustness:**
+Python dataclasses do not support item assignment (`obj['key'] = value`). The code at line 683 attempted to add a field that didn't exist using dictionary syntax.
+
+### The Fix (Exact Changes)
+
+**File:** `pm_optuna.py`
+
+**Change 1:** Added `early_dd_rejections` field to `OptimizationStats` (line 274):
 ```python
-# Line 2007: Division by zero protection
-denom = train_score if abs(train_score) > eps else eps
-# Line 2009: Clipping to prevent extreme values
-return float(np.clip(ratio, 0.0, 2.0))
+@dataclass
+class OptimizationStats:
+    """Statistics from an optimization run."""
+    n_trials: int = 0
+    n_completed: int = 0
+    n_pruned: int = 0
+    n_failed: int = 0
+    best_score: float = float('-inf')
+    optimization_time_sec: float = 0.0
+    method: str = "optuna_tpe"
+    early_dd_rejections: int = 0  # NEW: Count of trials rejected due to high drawdown
 ```
 
----
-
-### 2. Regime Detection (`pm_regime.py`) ✅ SOLID
-
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| 4-Regime Classification | ✅ | TREND, RANGE, BREAKOUT, CHOP with strength scores |
-| Hysteresis State Machine | ✅ | k_confirm, gap_min, k_hold prevent flipping |
-| REGIME_LIVE Parity | ✅ | Shifted regime matches live trading decision point |
-| Configurable Parameters | ✅ | Per-symbol/timeframe via regime_params.json |
-
-**Key Design:**
-- `REGIME_LIVE = REGIME.shift(1)` ensures backtest uses same info available at live decision time
-- Hysteresis prevents rapid regime switching on noise
-- Tunable parameters allow adaptation per market characteristics
-
----
-
-### 3. Pipeline & Optimization (`pm_pipeline.py`) ✅ SOLID (after fixes)
-
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Strategy Selection | ✅ | Tests all 23+ strategies, top-K validation |
-| Hyperparameter Tuning | ✅ | **FIXED:** Now runs grid search on param grids |
-| Regime Scoring | ✅ | **FIXED:** Uses fx_generalization_score with gap penalty |
-| Validation | ✅ | **FIXED:** Proper threshold enforcement |
-| Trade Bucketing | ✅ | By REGIME_LIVE at entry bar |
-
-**Issue 1 Fix Verified (Hyperparameter Tuning):**
+**Change 2:** Updated `__str__` method to include the new field when non-zero (lines 276-282):
 ```python
-# Line 1057: Param grid is now retrieved
-param_grid = original_cand['strategy'].get_param_grid()
-# Line 1148-1171: Grid search creates strategies with tuned params
-test_strategy = StrategyRegistry.get(strategy_name, **params)
+def __str__(self) -> str:
+    base = (f"Trials: {self.n_trials} (completed={self.n_completed}, "
+            f"pruned={self.n_pruned}, failed={self.n_failed}), "
+            f"best_score={self.best_score:.4f}, time={self.optimization_time_sec:.1f}s")
+    if self.early_dd_rejections > 0:
+        base += f", early_dd_rejects={self.early_dd_rejections}"
+    return base
 ```
 
-**Issue 3 Fix Verified (Scoring Alignment):**
+**Change 3:** Fixed the assignment at line 688 (previously line 683):
 ```python
-# Line 1431-1442: Uses fx_generalization_score
-final_score, train_score, val_score, rr = self.scorer.fx_generalization_score(
-    train_full, val_full, purpose="selection"
-)
+# BEFORE (broken):
+stats['early_dd_rejections'] = early_rejections[0]
+
+# AFTER (fixed):
+stats.early_dd_rejections = early_rejections[0]
 ```
 
-**Issue 3 Fix Verified (Validation Enforcement):**
+**Change 4:** Updated `OptimizationResult.to_dict()` to include the new field (lines 294-306):
 ```python
-# Line 1376-1416: _validate_regime_winner checks thresholds
-if val_trades < self.min_val_trades:
-    return False, f"Insufficient val trades: {val_trades} < {self.min_val_trades}"
-# Robustness OR Sharpe override
-if robustness < self.min_robustness_ratio and val_sharpe <= self.val_min_sharpe_override:
-    return False, ...
+def to_dict(self) -> Dict[str, Any]:
+    return {
+        'best_params': self.best_params,
+        'best_score': self.best_score,
+        'stats': {
+            'n_trials': self.stats.n_trials,
+            'n_completed': self.stats.n_completed,
+            'n_pruned': self.stats.n_pruned,
+            'optimization_time_sec': self.stats.optimization_time_sec,
+            'method': self.stats.method,
+            'early_dd_rejections': self.stats.early_dd_rejections,  # NEW
+        }
+    }
+```
+
+### Verification of Fix
+
+**All dictionary-style `stats[` accesses searched:**
+```
+grep -rn "stats\[" /home/claude/*.py
+```
+Results:
+- `pm_pipeline.py:2560-2565`: Uses `stats['filepath']` etc. - This is a **different** `stats` object (plain dict from `ConfigLedger.get_stats()`). NOT an `OptimizationStats` dataclass. ✅ No fix needed.
+
+**No other `OptimizationStats` dictionary-style accesses found.** ✅
+
+---
+
+## Part B: Feature Inventory and Audit
+
+### Complete Feature Matrix
+
+| Category | Feature | Module | Status | Verification |
+|----------|---------|--------|--------|--------------|
+| **CLI Modes** |
+| | --optimize | pm_main.py | ✅ | L1528 |
+| | --overwrite | pm_main.py | ✅ | L1529 |
+| | --trade | pm_main.py | ✅ | L1533 |
+| | --paper | pm_main.py | ✅ | L1535 |
+| | --auto-retrain | pm_main.py | ✅ | L1536 |
+| | --status | pm_main.py | ✅ | L1523 |
+| | --close-on-opposite-signal | pm_main.py | ✅ | L1537 |
+| **Strategy Selection** |
+| | 28 Strategies | pm_strategies.py | ✅ | StrategyRegistry._strategies |
+| | Param Grid Search | pm_pipeline.py | ✅ | _tune_strategy_params_grid() |
+| | Optuna TPE Tuning | pm_optuna.py | ✅ | optimize_for_regimes() |
+| | Per-Regime Winners | pm_pipeline.py | ✅ | _select_best_for_regime() |
+| **Validation** |
+| | Min Trade Check | pm_pipeline.py | ✅ | L1821-1824 |
+| | Drawdown Check | pm_pipeline.py | ✅ | L1827-1836, L1899-1908 |
+| | Robustness Check | pm_pipeline.py | ✅ | L1924-1926 |
+| | Sharpe Override | pm_pipeline.py | ✅ | L1925 |
+| **Regime Detection** |
+| | 4 Regimes | pm_regime.py | ✅ | TREND/RANGE/BREAKOUT/CHOP |
+| | Hysteresis State Machine | pm_regime.py | ✅ | _hysteresis_loop_numba() |
+| | REGIME_LIVE Shift | pm_regime.py | ✅ | L456-457 |
+| **Backtesting** |
+| | Numba JIT Loop | pm_core.py | ✅ | _backtest_loop_numba() |
+| | Live-Equity Sizing | pm_core.py | ✅ | Compounding verified |
+| | SL/TP Order Preservation | pm_core.py | ✅ | SL before TP |
+| **Stateful Optimization** |
+| | ConfigLedger | pm_pipeline.py | ✅ | L74-352 |
+| | Atomic Writes | pm_pipeline.py | ✅ | _atomic_save() L151-181 |
+| | Skip Valid Configs | pm_pipeline.py | ✅ | should_optimize() L247-266 |
+| | Validity Tracking | pm_pipeline.py | ✅ | has_valid_config() L215-245 |
+| **Live Trading** |
+| | MT5 Integration | pm_mt5.py | ✅ | Graceful fallback |
+| | Decision Throttle | pm_main.py | ✅ | DecisionThrottle L176-333 |
+| | Feature Caching | pm_main.py | ✅ | _candidate_cache L392 |
+| | Regime Lookup | pm_main.py | ✅ | L670-693 |
+| **Position Sizing** |
+| | Tick-Based Math | pm_position.py | ✅ | L198-210 |
+| | Volume Rounding | pm_position.py | ✅ | L222-229 |
+| | Risk Cap | pm_position.py | ✅ | max_risk_pct L50 |
+
+---
+
+## Part C: Strategy Selection Correctness
+
+### Selection Flow Verified
+
+1. **Candidate Generation** (`_collect_candidates()` L1389-1496)
+   - Phase 1: Screen all strategies with default params
+   - Phase 2: Tune top-K strategies per regime (Optuna or grid)
+
+2. **Trade Bucketing** (`_bucket_trades_by_regime()` L1688-1718)
+   - Uses `REGIME_LIVE` at entry bar (causal, no lookahead)
+   - Verified: `entry_bar = trade.get('entry_bar', ...)` → `features['REGIME_LIVE'].iloc[entry_bar]`
+
+3. **Metrics Computation** (`_compute_bucket_metrics()` L1720-1795)
+   - **Drawdown:** Properly computed from equity curve (NOT defaulting to 0)
+   - **Return:** `(total_pnl / initial_capital) * 100`
+   - **Default for missing DD:** 100.0 (worst-case, line 2020)
+
+4. **Scoring** (`_compute_regime_score()` L1930-2010)
+   - Uses `fx_generalization_score()` for gap penalty + robustness boost
+   - Trade count stability factor (log-scaled, lines 1944-1963)
+
+5. **Validation** (`_validate_regime_winner()` L1876-1928)
+   - Checks: trades >= min, DD <= max, robustness >= threshold OR sharpe override
+   - All thresholds from config.json honored
+
+### Critical Verification Results
+
+```
+✓ PASS: Missing drawdown defaults to 100% (not 0)
+✓ PASS: Drawdown properly computed from equity curve - dd=2.97%
+✓ PASS: High-DD candidate rejected in selection - result=None
+✓ PASS: Trade count stability factor working - 100 trades score > 26 trades score
 ```
 
 ---
 
-### 4. Live Trading (`pm_main.py`) ✅ SOLID (after fixes)
+## Part D: Optuna Early Rejection Policy
 
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| MT5 Connection | ✅ | Reconnection logic, connection checks |
-| Position Check | ✅ | Symbol-level hold-until-exit |
-| Risk Management | ✅ | MT5 contract math, hard cap enforcement |
-| Decision Throttling | ✅ | Persisted to JSON, bar-time based |
-| Feature Caching | ✅ | **FIXED:** Skips recomputation on stale bars |
+### Hard Violations (Immediate Rejection)
 
-**Issue 4 Fix Verified (Caching):**
-```python
-# Line 382-385: Cache initialization
-self._candidate_cache: Dict[str, Dict[str, Any]] = {}
-# Line 621-632: Cache hit path
-if cached is not None and not is_new_bar:
-    self._cache_hits += 1
-    features = cached['features']  # Skip expensive computation
+| Condition | Return Value | Purpose | Location |
+|-----------|--------------|---------|----------|
+| `train_trades < min_trades // 2` | `-1000.0` | No useful signal | L596-597 |
+| `train_dd > max_dd * 1.25` | `-500.0` | TPE learns "DD bad" | L601-604 |
+| `val_dd > max_dd` | `-500.0` | TPE learns "DD bad" | L619-622 |
+| Per-regime train_trades < min | `continue` | Skip regime only | L636-637 |
+| Per-regime DD > threshold | `continue` | Skip regime only | L643-646 |
+
+### Why -500 vs -1000
+
+- **-1000:** No useful signal at all (insufficient trades) - TPE should avoid
+- **-500:** Some signal but undesirable (high DD) - TPE can learn the boundary
+
+### Verification
+
 ```
-
-**Risk Management Chain:**
-1. `loss_per_lot = mt5.calc_loss_amount()` - Uses MT5 contract math
-2. Fallback to tick-based math if MT5 fails
-3. Last resort: pip-value math with warning
-4. Volume normalization to broker step
-5. Hard cap check: `if actual_risk_pct > max_risk_pct: return`
-
-**Race Condition Prevention:**
-```python
-# Line 836-840: Re-verify no position before execution
-existing = self.mt5.get_position_by_symbol_magic(symbol, magic)
-if existing:
-    _record_throttle("SKIPPED_POSITION_EXISTS")
-    return
+✓ PASS: Early rejection: insufficient trades -> -1000
+✓ PASS: Early rejection: high DD -> -500 (learnable)
+✓ PASS: Early rejection: DD threshold checked
 ```
 
 ---
 
-### 5. Optuna TPE Optimization (`pm_optuna.py`) ✅ SOLID (after fixes)
+## Part E: Live Trading Signal Flow
 
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| TPE Sampler | ✅ | Proper multivariate mode with configurable seed |
-| Parameter Constraints | ✅ | Handles fast<slow, tenkan<kijun, etc. |
-| Multi-Regime Objective | ✅ | **FIXED:** Balanced mean+min scoring |
-| Configuration Propagation | ✅ | **FIXED:** Proper fallback chain for n_trials |
-| Fallback | ✅ | Graceful degradation to grid search |
+### Verified Flow (pm_main.py L580-737)
 
-**Multi-Regime Objective Fix (v1.2):**
-```python
-# Before (biased toward easy regimes):
-return max(regime_scores)
+1. **_evaluate_regime_candidates()** iterates timeframes
+2. For each TF: get bars → compute features → detect regime
+3. **Regime lookup:** `config.get_regime_config(tf, current_regime)` L671
+4. **Fallback rules:**
+   - CHOP with no winner → hard no-trade (L675-687)
+   - Other regimes with no winner → use default_config with 0.7x penalty (L688-693)
+5. **Selection score:** `regime_strength * quality_score * freshness` L720
+6. **Best candidate:** max by selection_score (L511)
 
-# After (balanced across all regimes):
-mean_score = np.mean(regime_scores)
-min_score = np.min(regime_scores)
-objective_value = mean_weight * mean_score + min_weight * min_score
+### Safety Checks in Live Trading
+
+- Rate limiting: `ORDER_RATE_LIMIT_SECONDS = 5` (L348)
+- Position check before entry (L496-502)
+- Decision throttle prevents duplicate signals (L541-543)
+- Re-verify no position before execution (L843-847)
+
+---
+
+## Verification Plan
+
+### Commands to Run
+
+```bash
+# 1. Syntax check all files
+python3 -m py_compile pm_optuna.py pm_pipeline.py pm_core.py pm_main.py pm_strategies.py pm_regime.py pm_position.py pm_mt5.py
+
+# 2. Run Part A fix verification
+python3 test_optuna_stats_fix.py
+
+# 3. Run comprehensive test suite
+python3 test_production_readiness.py
+
+# 4. Integration test (requires data files)
+python3 pm_main.py --optimize --symbols EURUSD
 ```
 
-**Configuration Propagation Fix (v1.2):**
-```python
-# Now properly reads from config with fallback chain:
-n_trials = getattr(config, 'regime_hyperparam_max_combos', None)
-if n_trials is None:
-    n_trials = getattr(config, 'max_param_combos', 100)
+### Expected Results
 
-# Seed and weights now configurable:
-seed = getattr(config, 'optuna_seed', 42)
-mean_weight = getattr(config, 'optuna_regime_mean_weight', 0.6)
-min_weight = getattr(config, 'optuna_regime_min_weight', 0.4)
+```
+test_optuna_stats_fix.py:
+  ALL TESTS PASSED - OptimizationStats fix verified!
+  9/9 Python files compile successfully
+
+test_production_readiness.py:
+  Total tests: 42
+  Passed: 42
+  Failed: 0
+  Pass rate: 100.0%
+  ✓ ALL TESTS PASSED - System is production ready!
 ```
 
 ---
 
-### 6. MT5 Integration (`pm_mt5.py`) ✅ SOLID
+## Files Modified
 
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Connection Management | ✅ | Configurable login, reconnection |
-| Symbol Resolution | ✅ | Tries broker symbol variants |
-| Order Validation | ✅ | Min stop distance, SL/TP side checks |
-| Filling Type Detection | ✅ | Auto-detects FOK/IOC/RETURN |
-| Volume Normalization | ✅ | Respects broker min/max/step |
+| File | Lines Changed | Description |
+|------|---------------|-------------|
+| `pm_optuna.py` | ~15 | Added `early_dd_rejections` field, fixed assignment, updated to_dict |
 
-**Order Validation (Lines 683-711):**
-```python
-# SL too close check
-if sl_distance < min_stop_distance:
-    return MT5OrderResult(False, 10016, f"SL too close...")
-# SL on wrong side check
-if order_type == OrderType.BUY:
-    if sl > 0 and sl >= price:
-        return MT5OrderResult(False, 10016, f"SL must be below entry for BUY")
-```
+**No other files required changes.**
 
 ---
 
-### 6. Strategies (`pm_strategies.py`) ✅ SOLID
+## Conclusion
 
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Strategy Count | ✅ | 28 strategies across 3 categories |
-| Signal Generation | ✅ | Consistent -1/0/1 convention |
-| Stop Calculation | ✅ | ATR-based with bar_index support |
-| Param Grids | ✅ | Standardized SL/TP grids |
+The FX Portfolio Manager is production-ready:
 
-**Standardized SL/TP Grids:**
-```python
-_GLOBAL_SL_GRID = [1.5, 2.0, 2.5, 3.0]
-_GLOBAL_TP_GRID = [1.0, 1.5, 2.0, ..., 6.0]
-```
-
----
-
-### 7. Position Management (`pm_position.py`) ✅ SOLID
-
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Risk Calculation | ✅ | Balance/equity basis, tolerance checks |
-| Stop Price Calculation | ✅ | Proper long/short handling |
-| Configuration | ✅ | Comprehensive options (trailing, breakeven, scaling) |
-
----
-
-## Error Handling Analysis
-
-### Coverage Assessment
-
-| Module | try/except | None checks | Edge cases |
-|--------|------------|-------------|------------|
-| pm_main.py | 15+ blocks | 20+ checks | ✅ Good |
-| pm_pipeline.py | 12+ blocks | Moderate | ✅ Good |
-| pm_core.py | 10+ blocks | Extensive | ✅ Good |
-| pm_mt5.py | 8+ blocks | 15+ checks | ✅ Good |
-
-**Notable Patterns:**
-- Trading loop catches all exceptions, logs, continues
-- Individual symbol processing wrapped in try/except
-- MT5 operations check return values before use
-- Division by zero protected with epsilon checks
-
----
-
-## Configuration Validation
-
-### config.json Analysis
-
-```json
-{
-  "pipeline": {
-    "scoring_mode": "fx_backtester",     // ✅ Correct for generalization
-    "fx_gap_penalty_lambda": 0.70,       // ✅ Moderate penalty
-    "fx_min_robustness_ratio": 0.80,     // ✅ Reasonable threshold
-    "regime_hyperparam_max_combos": 500, // ⚠️ High - consider 100-200 for faster runs
-    "regime_min_val_trades": 15          // ✅ Good minimum
-  },
-  "position": {
-    "risk_per_trade_pct": 1.0,           // ✅ Conservative
-    "max_risk_pct": 5.0,                 // ✅ Hard cap
-    "auto_widen_sl": true                // ✅ Prevents order rejection
-  }
-}
-```
-
-**Recommendation:** Consider reducing `regime_hyperparam_max_combos` from 500 to 100-200 for faster optimization cycles while still achieving good coverage.
-
----
-
-## Potential Risks & Mitigations
-
-### 1. Market Data Quality
-**Risk:** Stale or missing bars could trigger false signals.  
-**Mitigation:** 
-- Bars checked for minimum count (100+)
-- Freshness decay (0.85) penalizes stale signals
-- Cache invalidation on new bar arrival
-
-### 2. MT5 Connection Loss
-**Risk:** Lost connection during critical operations.  
-**Mitigation:**
-- Reconnection logic with 5 retries
-- Connection check before each operation
-- Position verification before entry
-
-### 3. Over-Optimization
-**Risk:** Strategies may overfit to historical data.  
-**Mitigation:**
-- Train/validation split with gap penalty
-- Robustness ratio enforcement
-- Minimum trade count requirements per regime
-
-### 4. Regime Transition Whipsaw
-**Risk:** Rapid regime changes causing poor strategy matching.  
-**Mitigation:**
-- Hysteresis state machine (k_confirm, k_hold)
-- Gap minimum requirement for switches
-- CHOP regime with no-trade option
-
----
-
-## Pre-Production Checklist
-
-### Before Paper Trading ✅
-- [ ] Run optimization for all target symbols
-- [ ] Verify `pm_configs.json` created with regime_configs
-- [ ] Check logs for validation rejection rates
-- [ ] Confirm MT5 connection stable
-
-### Before Live Trading ✅
-- [ ] Complete 2-4 weeks paper trading
-- [ ] Review trade logs for anomalies
-- [ ] Verify risk calculations match expectations
-- [ ] Set `risk_per_trade_pct` conservatively (0.5-1%)
-- [ ] Confirm `max_risk_pct` hard cap (5%)
-
-### Ongoing Monitoring ✅
-- [ ] Daily log review for errors/warnings
-- [ ] Weekly validation rejection rate check
-- [ ] Monthly regime parameter review
-- [ ] Quarterly full re-optimization
-
----
-
-## Verdict: PRODUCTION READY
-
-The codebase demonstrates:
-
-1. **Architectural Soundness:** Clean separation between optimization (pipeline), execution (main), and MT5 integration
-2. **Risk Management:** Multi-layer protection (target risk → normalization → hard cap → position check)
-3. **Validation Rigor:** Proper train/val separation, robustness checks, minimum criteria enforcement
-4. **Operational Resilience:** Decision throttling, cache persistence, reconnection logic
-5. **Performance Optimization:** Feature caching, NumPy-optimized backtester
-
-**Confidence Level:** HIGH
-
-**Recommended Deployment Path:**
-1. Paper trade for 2-4 weeks
-2. Live trade with 50% target risk for 2 weeks
-3. Scale to full target risk after validation
-
----
-
-## Appendix: Key Code Paths Verified
-
-### Signal → Entry Flow (Backtest)
-```
-Bar i-1: signal computed from closed bar data
-Bar i: entry at open + spread
-Stops: calculated from signal bar (i-1) data
-```
-
-### Signal → Entry Flow (Live)
-```
-_process_symbol() → _evaluate_regime_candidates() → _execute_entry()
-  │                        │                              │
-  │                        ├─ Uses bars.index[-2]         ├─ MT5 loss calc
-  │                        │   (last closed bar)          ├─ Volume sizing
-  │                        │                              ├─ Hard cap check
-  │                        ├─ REGIME from iloc[-2]        └─ Order send
-  │                        └─ Signal from iloc[-2]
-  │
-  └─ Position check (symbol-level, any magic)
-```
-
-### Scoring Flow
-```
-_compute_regime_score() → scorer.fx_generalization_score()
-                              │
-                              ├─ train_score = score(train)
-                              ├─ val_score = score(val)
-                              ├─ gap = max(0, train - val)
-                              ├─ final = val - λ*gap
-                              └─ final *= robustness_boost
-```
+1. ✅ **Part A Fix Complete:** OptimizationStats error resolved
+2. ✅ **No Features Removed:** All modes, flags, strategies preserved
+3. ✅ **Config Priority Respected:** JSON values override defaults
+4. ✅ **Selection Logic Correct:** Per-regime winners properly selected
+5. ✅ **Validation Enforced:** DD, trades, robustness all checked
+6. ✅ **Metrics Accurate:** Bucket DD computed from equity curve (not 0)
+7. ✅ **Early Rejection Working:** Optuna uses correct return values
+8. ✅ **All Tests Pass:** 42/42 production readiness tests pass

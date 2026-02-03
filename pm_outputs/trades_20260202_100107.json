@@ -1,0 +1,57 @@
+[
+  {
+    "timestamp": "2026-02-02T08:50:30.612345",
+    "symbol": "AUDUSD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 0.69372,
+    "sl": 0.7037582142857143,
+    "tp": 0.6736435714285716,
+    "magic": 560225389,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-02T08:50:47.609111",
+    "symbol": "USDZAR",
+    "direction": "LONG",
+    "volume": 0.01,
+    "price": 16.1853,
+    "sl": 15.8927,
+    "tp": 16.771100000000004,
+    "magic": 300330543,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-02T09:14:56.462262",
+    "symbol": "XAUUSD",
+    "direction": "LONG",
+    "volume": 0.01,
+    "price": 4610.9,
+    "sl": 4547.32,
+    "tp": 4705.17,
+    "magic": 76215643,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-02T09:25:03.008910",
+    "symbol": "XAUUSD",
+    "direction": "LONG",
+    "volume": 0.01,
+    "price": 4641.9,
+    "sl": 4580.2814285714285,
+    "tp": 4733.852857142857,
+    "magic": 76215643,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-02T09:44:57.052016",
+    "symbol": "US100",
+    "direction": "LONG",
+    "volume": 0.01,
+    "price": 25310.9,
+    "sl": 25210.87142857143,
+    "tp": 25460.942857142858,
+    "magic": 543870873,
+    "status": "EXECUTED"
+  }
+]

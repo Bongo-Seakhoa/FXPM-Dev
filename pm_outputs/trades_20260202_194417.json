@@ -1,0 +1,13 @@
+[
+  {
+    "timestamp": "2026-02-02T17:00:14.705303",
+    "symbol": "USDJPY",
+    "direction": "LONG",
+    "volume": 0.04,
+    "price": 155.683,
+    "sl": 155.15900000000002,
+    "tp": 156.019,
+    "magic": 2029280669,
+    "status": "EXECUTED"
+  }
+]

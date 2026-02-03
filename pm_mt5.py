@@ -99,18 +99,32 @@ class MT5SymbolInfo:
     pip_value: float = 0.0
     
     def __post_init__(self):
-        """Calculate pip values."""
-        # Pip size based on digits
-        if self.digits == 5 or self.digits == 3:
-            self.pip_size = self.point * 10
+        """Calculate pip values (robust to MT5 edge cases)."""
+        # Some brokers/CFDs can report point=0 for certain symbols.
+        # We must never allow point/pip_size to be zero because it breaks spread
+        # conversion and downstream risk sizing.
+        if not self.point or self.point <= 0.0:
+            try:
+                self.point = float(10 ** (-self.digits)) if self.digits > 0 else 0.0001
+            except Exception:
+                self.point = 0.0001
+
+        # Pip size based on digits (MT5 convention)
+        if self.digits in (5, 3):
+            self.pip_size = self.point * 10.0
         else:
             self.pip_size = self.point
-        
-        # Pip value calculation
-        if self.trade_tick_size > 0:
+
+        # Ultimate fallback if point was still unusable
+        if not self.pip_size or self.pip_size <= 0.0:
+            pip_position = (self.digits - 1) if self.digits in (5, 3) else self.digits
+            self.pip_size = float(10 ** (-pip_position)) if pip_position >= 0 else 0.0001
+
+        # Pip value calculation (tick-math parity when available)
+        if self.trade_tick_size > 0.0 and self.trade_tick_value > 0.0:
             self.pip_value = (self.pip_size / self.trade_tick_size) * self.trade_tick_value
         else:
-            self.pip_value = self.trade_tick_value
+            self.pip_value = float(self.trade_tick_value or 0.0)
     
     def to_instrument_spec(self) -> InstrumentSpec:
         """Convert to InstrumentSpec for backtesting compatibility."""
@@ -120,7 +134,7 @@ class MT5SymbolInfo:
             symbol=self.symbol,
             pip_position=pip_position,
             pip_value=self.pip_value,
-            spread_avg=self.spread * self.point / self.pip_size,
+            spread_avg=(self.spread * self.point / self.pip_size) if self.pip_size > 0 else float(self.spread),
             min_lot=self.volume_min,
             max_lot=self.volume_max,
             commission_per_lot=7.0,  # Default, broker-specific

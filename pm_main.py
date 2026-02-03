@@ -62,6 +62,71 @@ def load_config_json(path: str) -> Dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"Failed to load config file '{path}': {e}")
 
+def log_resolved_config_summary(logger: logging.Logger,
+                               config_path: str,
+                               config_data: Dict[str, Any],
+                               pipeline_config: "PipelineConfig",
+                               position_config: "PositionConfig",
+                               mt5_config: "MT5Config") -> None:
+    """Log a concise, sanitized summary of the resolved configuration.
+
+    This helps operators verify that config.json is the source of truth and that
+    defaults are only used when keys are missing.
+    """
+    try:
+        # Show what sections were provided by the JSON (helps detect missing propagation)
+        provided_sections = sorted((config_data or {}).keys())
+        logger.info(f"Resolved config summary (source={config_path})")
+        logger.info(f"Provided sections in JSON: {provided_sections}")
+
+        # Key pipeline settings that materially affect behavior
+        p = pipeline_config
+        pipeline_summary = {
+            "scoring_mode": getattr(p, "scoring_mode", None),
+            "max_bars": getattr(p, "max_bars", None),
+            "timeframes": getattr(p, "timeframes", None),
+            "live_bars_count": getattr(p, "live_bars_count", None),
+            "live_min_bars": getattr(p, "live_min_bars", None),
+            "risk_per_trade_pct": getattr(p, "risk_per_trade_pct", None),
+            "fx_opt_min_trades": getattr(p, "fx_opt_min_trades", None),
+            "fx_val_min_trades": getattr(p, "fx_val_min_trades", None),
+            "fx_val_max_drawdown": getattr(p, "fx_val_max_drawdown", None),
+            "regime_min_val_profit_factor": getattr(p, "regime_min_val_profit_factor", None),
+            "regime_min_val_return_pct": getattr(p, "regime_min_val_return_pct", None),
+            "regime_allow_losing_winners": getattr(p, "regime_allow_losing_winners", None),
+            "fallback_risk_multiplier": getattr(p, "fallback_risk_multiplier", None),
+            "fallback_max_risk_pct": getattr(p, "fallback_max_risk_pct", None),
+            "tier1_max_risk_pct": getattr(p, "tier1_max_risk_pct", None),
+            "tier23_max_risk_pct": getattr(p, "tier23_max_risk_pct", None),
+            "max_combined_risk_pct": getattr(p, "max_combined_risk_pct", None),
+            "allow_d1_plus_lower_tf": getattr(p, "allow_d1_plus_lower_tf", None),
+            "secondary_trade_max_risk_pct": getattr(p, "secondary_trade_max_risk_pct", None),
+            "regime_enable_hyperparam_tuning": getattr(p, "regime_enable_hyperparam_tuning", None),
+            "regime_hyperparam_top_k": getattr(p, "regime_hyperparam_top_k", None),
+            "regime_hyperparam_max_combos": getattr(p, "regime_hyperparam_max_combos", None),
+            "optuna_use_val_in_objective": bool(getattr(p, "optuna_use_val_in_objective", False)),
+        }
+        logger.info(f"PipelineConfig: {pipeline_summary}")
+
+        # Position sizing / execution safety settings
+        pos_cfg = position_config
+        position_summary = {
+            "risk_per_trade_pct": getattr(pos_cfg, "risk_per_trade_pct", None),
+            "max_positions": getattr(pos_cfg, "max_positions", None),
+            "allow_hedging": getattr(pos_cfg, "allow_hedging", None),
+        }
+        logger.info(f"PositionConfig: {position_summary}")
+
+        # MT5 summary (do not log credentials)
+        mt5_summary = {
+            "enabled": getattr(mt5_config, "enabled", None),
+            "server": getattr(mt5_config, "server", None),
+            "terminal_path": getattr(mt5_config, "terminal_path", None),
+        }
+        logger.info(f"MT5Config: {mt5_summary}")
+    except Exception as e:
+        logger.warning(f"Failed to log resolved config summary: {e}")
+
 from pm_core import (
     PipelineConfig,
     DataLoader,
@@ -350,7 +415,7 @@ class LiveTrader:
     def __init__(self,
                  mt5_connector: MT5Connector,
                  portfolio_manager: PortfolioManager,
-                 position_config: PositionConfig,
+                 position_config: "PositionConfig",
                  enable_trading: bool = True,
                  close_on_opposite_signal: bool = False,
                  pipeline_config: 'PipelineConfig' = None):
@@ -481,54 +546,210 @@ class LiveTrader:
         3. Select best (tf, regime, strategy) based on strength * quality_score * freshness
         4. Generate signal and execute if conditions met
         
-        Hold-until-exit: if position exists for this symbol, skip new entries.
+        FIX #2: D1 + Lower-TF Dual Trade Logic:
+        - If no position exists: allow entry on any timeframe
+        - If exactly one D1 position exists: allow one additional non-D1 trade
+        - If exactly one non-D1 position exists: block new trades (old behavior)
+        - If two positions exist: block new trades
         
         Decision throttle: each (symbol, strategy, tf, regime, direction, bar)
         combination is attempted at most once.  Skips/failures are cached and
         suppressed until a new bar arrives or the decision key changes.
         """
+        from pm_position import TradeTagEncoder
+        
         # Find broker symbol
         broker_symbol = self.mt5.find_broker_symbol(symbol)
         if broker_symbol is None:
             return
         
-        # HOLD-UNTIL-EXIT: Check if ANY position exists for this symbol
-        # Use symbol-level check, not magic-specific, to prevent multiple positions
+        # ===== FIX #2: D1 + Lower-TF Position Analysis =====
         all_positions = self.mt5.get_positions()
         symbol_positions = [p for p in all_positions if p.symbol == broker_symbol]
         
-        if symbol_positions:
-            # Already have a position - hold until exit, don't enter new
+        # Check if D1+lower-TF mode is enabled
+        allow_d1_plus_lower = getattr(self.pipeline_config, 'allow_d1_plus_lower_tf', True) if self.pipeline_config else True
+        
+        # Analyze existing positions
+        has_d1_position = False
+        has_non_d1_position = False
+        d1_position_direction = None  # Track direction for logging
+        
+        for pos in symbol_positions:
+            # Try to decode comment to get timeframe
+            comment = getattr(pos, 'comment', '') or ''
+            pos_tf = TradeTagEncoder.get_timeframe_from_comment(comment)
+            
+            if pos_tf == 'D1':
+                has_d1_position = True
+                d1_position_direction = "LONG" if pos.type == 0 else "SHORT"  # 0=BUY, 1=SELL
+            elif pos_tf is not None:
+                has_non_d1_position = True
+            else:
+                # Unknown trade tag - assume it's a non-D1 trade for safety
+                has_non_d1_position = True
+        
+        # Determine if we can open a new trade and what constraints apply
+        can_open_trade = True
+        allowed_timeframes = None  # None = all timeframes allowed
+        is_secondary_trade = False
+        block_reason = None
+        
+        num_positions = len(symbol_positions)
+        
+        if num_positions >= 2:
+            # Two trades max per symbol
+            can_open_trade = False
+            block_reason = "2 positions already open"
+            
+        elif num_positions == 1:
+            if allow_d1_plus_lower and has_d1_position:
+                # D1 position open - allow one additional non-D1 trade
+                can_open_trade = True
+                allowed_timeframes = ['M5', 'M15', 'M30', 'H1', 'H4']  # Exclude D1
+                is_secondary_trade = True
+                self.logger.debug(f"[{symbol}] D1 trade open ({d1_position_direction}); allowing secondary non-D1 trade")
+            else:
+                # Non-D1 position open - block new trades (old behavior)
+                can_open_trade = False
+                block_reason = "Non-D1 position open; blocking additional trades"
+                
+        # If we can't open any trade, skip
+        if not can_open_trade:
+            if block_reason:
+                self.logger.debug(f"[{symbol}] {block_reason}")
             return
         
-        # No position - evaluate candidates across timeframes
+        # Evaluate candidates across timeframes
         candidates = self._evaluate_regime_candidates(symbol, broker_symbol, config)
         
         if not candidates:
             return
         
-        # Select best candidate by selection score
-        best = max(candidates, key=lambda c: c['selection_score'])
+        # ===== FIX #2: Filter candidates based on allowed timeframes =====
+        if allowed_timeframes is not None:
+            original_count = len(candidates)
+            candidates = [c for c in candidates if c['timeframe'] in allowed_timeframes]
+            if len(candidates) < original_count:
+                self.logger.debug(f"[{symbol}] Filtered out D1 candidates (secondary trade must be non-D1)")
         
-        # Check for entry signal (0 = no signal)
-        if best['signal'] == 0:
-            # Record the no-signal decision so we don't re-evaluate until
-            # the bar/decision changes.
-            bar_time_iso = str(best.get('bar_time', ''))
-            dk = DecisionThrottle.make_decision_key(
-                symbol, best['strategy_name'], best['timeframe'],
-                best['regime'], 0, bar_time_iso
-            )
-            # No need to log – just cache silently
-            self._decision_throttle.record_decision(
-                symbol=symbol, decision_key=dk,
-                bar_time_iso=bar_time_iso,
-                timeframe=best['timeframe'], regime=best['regime'],
-                strategy_name=best['strategy_name'], direction=0,
-                action="SKIPPED_NO_SIGNAL",
-            )
+        if not candidates:
+            self.logger.debug(f"[{symbol}] No valid non-D1 candidates for secondary trade")
             return
         
+        # Select the best feasible candidate using an "actionable-within-margin" policy.
+        
+        #
+        
+        # Rationale:
+        
+        # - The single top-ranked candidate can legitimately have signal==0 on a given bar.
+        
+        # - In that case, we should not abort immediately if another high-quality candidate
+        
+        #   has an actionable signal (LONG/SHORT) and is close in score to the best overall.
+        
+        #
+        
+        # Policy:
+        
+        # 1) Compute best_overall_score across all candidates (even if signal==0)
+        
+        # 2) Filter to actionable candidates (signal != 0)
+        
+        # 3) Choose the best actionable candidate with selection_score >= best_overall_score * margin
+        
+        # 4) If none qualify, record a throttled no-trade decision and return
+        
+        best_overall = max(candidates, key=lambda c: c['selection_score'])
+        
+        best_overall_score = float(best_overall.get('selection_score', 0.0))
+
+        
+        margin = float(getattr(self.pipeline_config, 'actionable_score_margin', 0.95) or 0.95)
+        
+        # Clamp margin defensively: [0.0, 1.0]
+        
+        if margin < 0.0:
+        
+            margin = 0.0
+        
+        if margin > 1.0:
+        
+            margin = 1.0
+
+        
+        actionable = [c for c in candidates if int(c.get('signal', 0)) != 0]
+        
+        if not actionable:
+        
+            # No actionable signals on any timeframe for this bar. Cache decision (quietly)
+        
+            bar_time_iso = str(best_overall.get('bar_time', ''))
+        
+            dk = DecisionThrottle.make_decision_key(
+        
+                symbol, best_overall['strategy_name'], best_overall['timeframe'],
+        
+                best_overall['regime'], 0, bar_time_iso
+        
+            )
+        
+            self._decision_throttle.record_decision(
+        
+                symbol=symbol, decision_key=dk,
+        
+                bar_time_iso=bar_time_iso,
+        
+                timeframe=best_overall['timeframe'], regime=best_overall['regime'],
+        
+                strategy_name=best_overall['strategy_name'], direction=0,
+        
+                action="NO_ACTIONABLE_SIGNAL",
+        
+            )
+        
+            return
+
+        
+        min_score = best_overall_score * margin
+        
+        eligible = [c for c in actionable if float(c.get('selection_score', 0.0)) >= min_score]
+        
+        if not eligible:
+        
+            # There were signals, but none were close enough to the best overall score.
+        
+            bar_time_iso = str(best_overall.get('bar_time', ''))
+        
+            dk = DecisionThrottle.make_decision_key(
+        
+                symbol, best_overall['strategy_name'], best_overall['timeframe'],
+        
+                best_overall['regime'], 0, bar_time_iso
+        
+            )
+        
+            self._decision_throttle.record_decision(
+        
+                symbol=symbol, decision_key=dk,
+        
+                bar_time_iso=bar_time_iso,
+        
+                timeframe=best_overall['timeframe'], regime=best_overall['regime'],
+        
+                strategy_name=best_overall['strategy_name'], direction=0,
+        
+                action="NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
+        
+            )
+        
+            return
+
+        
+        # Choose the best actionable candidate (highest selection score) within the margin band.
+        
+        best = max(eligible, key=lambda c: c['selection_score'])
         # ── Throttle check ──────────────────────────────────────────────
         # Build a decision key from the candidate's identifying attributes
         # so that the *same* signal on the *same* bar is only acted on once.
@@ -551,16 +772,20 @@ class LiveTrader:
         
         # Create magic number for this specific trade
         # Include timeframe and regime so we can identify the config used
-        magic = zlib.crc32(
-            f"{symbol}|{best['timeframe']}|{best['regime']}".encode('utf-8')
-        ) & 0x7FFFFFFF
+        magic = TradeTagEncoder.encode_magic(symbol, best['timeframe'], best['regime'])
+        
+        # ===== FIX #2: Log clearly if this is a secondary trade =====
+        trade_type_tag = "[SECONDARY] " if is_secondary_trade else ""
         
         # Log selection
         self.logger.info(
-            f"[{symbol}] Selected: {best['strategy_name']} @ {best['timeframe']}/{best['regime']} "
+            f"[{symbol}] {trade_type_tag}Selected: {best['strategy_name']} @ {best['timeframe']}/{best['regime']} "
             f"(strength={best['regime_strength']:.2f}, quality={best['quality_score']:.2f}, "
             f"freshness={best['freshness']:.2f}, score={best['selection_score']:.3f})"
         )
+        
+        if is_secondary_trade:
+            self.logger.info(f"[{symbol}] D1 trade open; allowed second trade on {best['timeframe']}")
         
         # Execute entry (passes decision_key so _execute_entry can record
         # the outcome into the throttle)
@@ -575,6 +800,7 @@ class LiveTrader:
             decision_key=decision_key,
             bar_time_iso=bar_time_iso,
             best_candidate=best,
+            is_secondary_trade=is_secondary_trade,
         )
     
     def _evaluate_regime_candidates(self, symbol: str, broker_symbol: str, 
@@ -582,10 +808,13 @@ class LiveTrader:
         """
         Evaluate all (timeframe, regime) candidates for entry.
         
-        Implements the fallback rules:
-        - If tf/regime winner exists: use it
-        - If CHOP and no winner: hard no-trade
-        - Otherwise: use default_config with penalty
+        Implements the tiered fallback ladder (FIX #1):
+        - Tier 1: Use regime winner if valid for live trading
+        - Tier 2: Fall back to default_config if it passes live quality gate
+        - Tier 3: Fall back to higher-timeframe default (H4 or D1) if valid
+        - Tier 4: No trade if none pass
+        
+        When using tier 2 or 3, applies risk reduction factor.
         
         Performance optimization: caches features/signals per (symbol, tf, bar_time)
         to avoid recomputing when no new bar has arrived.
@@ -602,13 +831,22 @@ class LiveTrader:
             return self._evaluate_legacy_candidate(symbol, broker_symbol, config)
         
         available_timeframes = config.get_available_timeframes()
-        regime_params_file = getattr(self.pipeline_config, 'regime_params_file', 'regime_params.json') if hasattr(self, 'pipeline_config') else 'regime_params.json'
-        freshness_decay = getattr(self.pipeline_config, 'regime_freshness_decay', 0.85) if hasattr(self, 'pipeline_config') else 0.85
+        regime_params_file = getattr(self.pipeline_config, 'regime_params_file', 'regime_params.json') if self.pipeline_config else 'regime_params.json'
+        freshness_decay = getattr(self.pipeline_config, 'regime_freshness_decay', 0.85) if self.pipeline_config else 0.85
+        
+        # Get live quality gate thresholds from config
+        min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
+        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 0.0) if self.pipeline_config else 0.0
+        max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
+        fallback_risk_mult = getattr(self.pipeline_config, 'fallback_risk_multiplier', 0.5) if self.pipeline_config else 0.5
+        
+        # Determine higher-TF fallback order (for tier 3)
+        higher_tf_priority = ['D1', 'H4', 'H1']  # Priority order for higher-TF fallback
         
         for tf in available_timeframes:
             # Get bars for this timeframe (need at least the latest bar time)
-            bars = self.mt5.get_bars(broker_symbol, tf, count=200)
-            if bars is None or len(bars) < 100:
+            bars = self.mt5.get_bars(broker_symbol, tf, count=int(getattr(self.pipeline_config, 'live_bars_count', 200)))
+            if bars is None or len(bars) < int(getattr(self.pipeline_config, 'live_min_bars', 100)):
                 continue
             
             # Check for new bar (freshness tracking)
@@ -634,6 +872,8 @@ class LiveTrader:
                 current_signal = cached['signal']
                 strategy = cached['strategy']
                 regime_config = cached['regime_config']
+                is_fallback = cached.get('is_fallback', False)
+                fallback_tier = cached.get('fallback_tier', 1)
                 
                 # Still need to check if regime_config exists (it was cached)
                 if regime_config is None:
@@ -667,30 +907,65 @@ class LiveTrader:
                 if current_regime is None or pd.isna(current_regime):
                     continue
                 
-                # Get config for this (tf, regime)
-                regime_config = config.get_regime_config(tf, current_regime)
+                # ===== TIERED FALLBACK LADDER (FIX #1) =====
+                regime_config = None
+                is_fallback = False
+                fallback_tier = 1
                 
-                if regime_config is None:
-                    # No winner for this regime
-                    if current_regime == 'CHOP':
-                        # CHOP with no winner = hard no-trade, skip this timeframe
-                        # Cache the "no config" result to avoid recomputing
-                        self._candidate_cache[feature_cache_key] = {
-                            'features': features,
-                            'regime': current_regime,
-                            'regime_strength': float(regime_strength),
-                            'signal': 0,
-                            'strategy': None,
-                            'regime_config': None,
-                        }
-                        self._prune_cache()  # Prevent unbounded growth
-                        continue
-                    elif config.default_config:
-                        # Use default config with penalty
-                        regime_config = config.default_config
-                        regime_strength *= 0.7  # Penalty for using fallback
+                # Tier 1: Check regime winner for this (tf, regime)
+                tier1_config = config.get_regime_config(tf, current_regime)
+                if tier1_config is not None:
+                    # Check if it passes live quality gate
+                    if tier1_config.is_valid_for_live(min_pf, min_return, max_dd):
+                        regime_config = tier1_config
+                        fallback_tier = 1
+                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 1: Using regime winner")
                     else:
-                        continue
+                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 1 FAILED live gate: "
+                                         f"PF={tier1_config.val_metrics.get('profit_factor', 0):.2f}, "
+                                         f"ret={tier1_config.val_metrics.get('total_return_pct', -100):.1f}%")
+                
+                # Tier 2: Fall back to default_config if available and valid
+                if regime_config is None and config.default_config:
+                    if config.default_config.is_valid_for_live(min_pf, min_return, max_dd):
+                        regime_config = config.default_config
+                        is_fallback = True
+                        fallback_tier = 2
+                        regime_strength *= fallback_risk_mult  # Apply penalty
+                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 2: Using default_config (risk reduced)")
+                    else:
+                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 2 FAILED: default_config invalid for live")
+                
+                # Tier 3: Fall back to higher-TF winner (D1 > H4 > H1)
+                if regime_config is None:
+                    for higher_tf in higher_tf_priority:
+                        if higher_tf == tf:
+                            continue  # Skip current timeframe
+                        higher_regime_cfg = config.get_regime_config(higher_tf, current_regime)
+                        if higher_regime_cfg and higher_regime_cfg.is_valid_for_live(min_pf, min_return, max_dd):
+                            regime_config = higher_regime_cfg
+                            is_fallback = True
+                            fallback_tier = 3
+                            regime_strength *= fallback_risk_mult * 0.8  # Extra penalty for cross-TF fallback
+                            self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 3: Using {higher_tf} winner (risk reduced)")
+                            break
+                
+                # Tier 4: No trade (hard no-trade for CHOP or no valid fallback)
+                if regime_config is None:
+                    self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 4: NO TRADE (no valid config)")
+                    # Cache the "no config" result to avoid recomputing
+                    self._candidate_cache[feature_cache_key] = {
+                        'features': features,
+                        'regime': current_regime,
+                        'regime_strength': float(regime_strength),
+                        'signal': 0,
+                        'strategy': None,
+                        'regime_config': None,
+                        'is_fallback': False,
+                        'fallback_tier': 4,
+                    }
+                    self._prune_cache()
+                    continue
                 
                 # Get strategy instance
                 try:
@@ -711,6 +986,8 @@ class LiveTrader:
                     'signal': int(current_signal),
                     'strategy': strategy,
                     'regime_config': regime_config,
+                    'is_fallback': is_fallback,
+                    'fallback_tier': fallback_tier,
                 }
                 self._prune_cache()  # Prevent unbounded growth
             # ─────────────────────────────────────────────────────────────────
@@ -732,6 +1009,8 @@ class LiveTrader:
                 'features': features,
                 'regime_config': regime_config,
                 'bar_time': str(features.index[-2]) if len(features) > 1 else '',
+                'is_fallback': is_fallback,
+                'fallback_tier': fallback_tier,
             })
         
         return candidates
@@ -750,7 +1029,7 @@ class LiveTrader:
             return []
         
         # Get bars
-        bars = self.mt5.get_bars(broker_symbol, timeframe, count=200)
+        bars = self.mt5.get_bars(broker_symbol, timeframe, count=int(getattr(self.pipeline_config, 'live_bars_count', 200)))
         if bars is None or len(bars) < 50:
             return []
         
@@ -803,14 +1082,21 @@ class LiveTrader:
                        config: SymbolConfig,
                        decision_key: str = "",
                        bar_time_iso: str = "",
-                       best_candidate: Dict = None):
+                       best_candidate: Dict = None,
+                       is_secondary_trade: bool = False):
         """
         Execute an entry trade.
         
         Records every outcome (success, skip, failure) into the decision
         throttle so that the same signal on the same bar is never re-attempted
         or re-logged.
+        
+        Args:
+            is_secondary_trade: If True, this is a secondary trade (D1 already open).
+                                Risk will be reduced according to config.
         """
+        from pm_position import TradeTagEncoder
+        
         is_long = signal == 1
         direction = "LONG" if is_long else "SHORT"
         
@@ -884,7 +1170,89 @@ class LiveTrader:
             self.logger.debug(f"[{symbol}] Widened SL to satisfy min stop distance ({min_stop_dist})")
 
         # Target risk (deposit currency)
-        target_risk_pct = float(self.position_config.risk_per_trade_pct)
+                # -------------------------------------------------------------
+        # Tiered risk policy (config-driven)
+        # Tier 1 (regime winner): can scale above base risk up to tier1_max_risk_pct
+        # Tier 2/3 (fallbacks): capped by tier23_max_risk_pct
+        # Secondary trade: additional cap + combined risk cap per symbol
+        # -------------------------------------------------------------
+        from pm_position import TradeTagEncoder
+
+        base_risk_pct = float(getattr(self.position_config, 'risk_per_trade_pct', 1.0))
+        fallback_tier = int(best_candidate.get('fallback_tier', 1) or 1)
+
+        # Pull tier policy from pipeline config (with safe defaults)
+        tier1_mult = float(getattr(self.pipeline_config, 'tier1_risk_multiplier', 1.0))
+        tier1_max = float(getattr(self.pipeline_config, 'tier1_max_risk_pct', 5.0))
+        tier23_max = float(getattr(self.pipeline_config, 'tier23_max_risk_pct', float(getattr(self.pipeline_config, 'fallback_max_risk_pct', 1.0))))
+        fallback_risk_mult = float(getattr(self.pipeline_config, 'fallback_risk_multiplier', 0.5))
+        fallback_max_risk = float(getattr(self.pipeline_config, 'fallback_max_risk_pct', 1.0))
+        min_trade_risk = float(getattr(self.pipeline_config, 'min_trade_risk_pct', 0.1))
+
+        # Start from tier-based target
+        if fallback_tier == 1:
+            target_risk_pct = min(base_risk_pct * tier1_mult, tier1_max)
+        else:
+            target_risk_pct = base_risk_pct * fallback_risk_mult
+            target_risk_pct = min(target_risk_pct, fallback_max_risk, tier23_max)
+
+        # Enforce PositionConfig max_risk_pct if present (hard safety)
+        max_risk_cap = float(getattr(self.position_config, 'max_risk_pct', target_risk_pct))
+        target_risk_pct = min(target_risk_pct, max_risk_cap)
+
+        if fallback_tier in (2, 3):
+            self.logger.info(f"[{symbol}] Fallback tier {fallback_tier}: reduced risk to {target_risk_pct:.2f}%")
+
+        # Secondary trade adjustments + combined risk cap per symbol
+        if is_secondary_trade:
+            original_risk = target_risk_pct
+            secondary_mult = float(getattr(self.pipeline_config, 'd1_secondary_risk_multiplier', 1.0))
+            secondary_cap = float(getattr(self.pipeline_config, 'secondary_trade_max_risk_pct', 1.0))
+            max_combined_risk = float(getattr(self.pipeline_config, 'max_combined_risk_pct', 3.0))
+
+            target_risk_pct = target_risk_pct * secondary_mult
+            target_risk_pct = min(target_risk_pct, secondary_cap)
+
+            # Sum existing risk for this symbol from tagged positions.
+            # If a position has no parseable risk tag, assume base_risk_pct for safety.
+            existing_risk = 0.0
+            try:
+                for pos in self.mt5.get_positions():
+                    if getattr(pos, 'symbol', None) != symbol:
+                        continue
+                    comment = getattr(pos, 'comment', '') or ''
+                    r = TradeTagEncoder.get_risk_pct_from_comment(comment)
+                    existing_risk += float(r) if r is not None else base_risk_pct
+            except Exception:
+                existing_risk = base_risk_pct
+
+            available = max_combined_risk - existing_risk
+            if available <= 0:
+                self.logger.info(f"[{symbol}] Secondary trade blocked: combined risk cap reached ({existing_risk:.2f}% >= {max_combined_risk:.2f}%)")
+                self._decision_throttle.record_decision(
+                    symbol=symbol, decision_key=decision_key,
+                    bar_time_iso=bar_time_iso,
+                    timeframe=best_candidate.get('timeframe'), regime=best_candidate.get('regime'),
+                    strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
+                    action="BLOCKED_RISK_CAP",
+                )
+                return
+
+            target_risk_pct = min(target_risk_pct, available)
+            self.logger.info(f"[{symbol}] Secondary trade: risk {original_risk:.2f}% -> {target_risk_pct:.2f}% (existing={existing_risk:.2f}%, cap={max_combined_risk:.2f}%)")
+
+        # Ensure non-zero (and not absurdly tiny) risk if we proceed
+        if target_risk_pct < min_trade_risk:
+            self.logger.info(f"[{symbol}] Trade blocked: computed risk {target_risk_pct:.3f}% below min_trade_risk_pct={min_trade_risk:.3f}%")
+            self._decision_throttle.record_decision(
+                symbol=symbol, decision_key=decision_key,
+                bar_time_iso=bar_time_iso,
+                timeframe=best_candidate.get('timeframe'), regime=best_candidate.get('regime'),
+                strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
+                action="BLOCKED_TOO_LOW_RISK",
+            )
+            return
+        
         target_risk_amount = basis_value * (target_risk_pct / 100.0)
 
         # Volume bounds (combine config + broker)
@@ -988,6 +1356,17 @@ class LiveTrader:
             _record_throttle("PAPER")
             return
 
+        # ===== FIX #2: Encode trade comment with full metadata =====
+        # This allows position analysis for D1 + lower-TF logic
+        trade_comment = TradeTagEncoder.encode_comment(
+            symbol=config.symbol,  # Use original symbol, not broker symbol
+            timeframe=_tf,
+            strategy_name=_strat_name,
+            direction=direction,
+            risk_pct=target_risk_pct,
+            tier=fallback_tier,
+        )
+
         # Execute order
         result = self.mt5.send_market_order(
             symbol=symbol,
@@ -997,7 +1376,7 @@ class LiveTrader:
             tp=tp_price,
             deviation=30,
             magic=magic,
-            comment=f"PM_{config.strategy_name[:10]}"
+            comment=trade_comment
         )
         
         if result.success:
@@ -1112,9 +1491,9 @@ class FXPortfolioManagerApp:
     def __init__(self,
                  symbols: List[str] = None,
                  config: PipelineConfig = None,
-                 pipeline_config: PipelineConfig = None,
-                 mt5_config: MT5Config = None,
-                 position_config: PositionConfig = None,
+                 pipeline_config: "PipelineConfig" = None,
+                 mt5_config: "MT5Config" = None,
+                 position_config: "PositionConfig" = None,
                  data_dir: str = "./data",
                  output_dir: str = "./pm_outputs",
                  config_file: str = "pm_configs.json"):
@@ -1503,6 +1882,8 @@ def main():
     # If position risk not set explicitly, inherit from pipeline risk (backward compatible)
     if "risk_per_trade_pct" not in (config_data.get("position") or {}) and hasattr(pipeline_config, "risk_per_trade_pct"):
         position_config.risk_per_trade_pct = pipeline_config.risk_per_trade_pct
+
+    log_resolved_config_summary(logger, args.config, config_data, pipeline_config, position_config, mt5_config)
 
     _app_instance = FXPortfolioManagerApp(
         symbols=symbols,

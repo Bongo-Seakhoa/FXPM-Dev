@@ -1,0 +1,13 @@
+[
+  {
+    "timestamp": "2026-02-02T16:12:17.026080",
+    "symbol": "EURUSD",
+    "direction": "SHORT",
+    "volume": 0.15,
+    "price": 1.18096,
+    "sl": 1.1853935714285715,
+    "tp": 1.177265357142857,
+    "magic": 601024760,
+    "status": "EXECUTED"
+  }
+]

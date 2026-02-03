@@ -972,3 +972,805 @@ Progress: 1/46
 2026-02-01 15:57:20 [INFO] pm_core: Loaded EURUSD: 500000 bars from EURUSD_M5.csv
 2026-02-01 15:59:29 [INFO] pm_pipeline: [EURUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
 2026-02-01 16:01:59 [INFO] pm_pipeline: [EURUSD] [M5] Hyperparameter tuning 9 strategies
+2026-02-01 17:31:48 [INFO] pm_pipeline: [EURUSD] [M5] [TREND] Winner: VolatilityBreakoutStrategy [TUNED] (quality=0.151, train=9746, val=3828) [VALIDATED: Validated (robustness=0.86, sharpe=-0.70)]
+2026-02-01 17:31:48 [INFO] pm_pipeline: [EURUSD] [M5] [RANGE] Winner: RSITrendFilteredMRStrategy [TUNED] (quality=0.333, train=69, val=17) [VALIDATED: Validated (robustness=1.90, sharpe=2.84)]
+2026-02-01 17:31:48 [INFO] pm_pipeline: [EURUSD] [M5] [BREAKOUT] Winner: StochasticReversalStrategy [TUNED] (quality=0.435, train=31, val=15) [VALIDATED: Validated (robustness=2.00, sharpe=4.26)]
+2026-02-01 17:31:48 [INFO] pm_pipeline: [EURUSD] [M5] [CHOP] Winner: MACDTrendStrategy [TUNED] (quality=0.227, train=1086, val=342) [VALIDATED: Validated (robustness=2.00, sharpe=0.45)]
+2026-02-01 17:32:36 [INFO] pm_pipeline: [EURUSD] [M15] Hyperparameter tuning 8 strategies
+2026-02-01 17:44:34 [INFO] pm_pipeline: [EURUSD] [M15] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.362, train=62, val=16) [VALIDATED: Validated (robustness=1.69, sharpe=3.42)]
+2026-02-01 17:44:34 [INFO] pm_pipeline: [EURUSD] [M15] [RANGE] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.346, train=811, val=354) [VALIDATED: Validated (robustness=0.97, sharpe=1.13)]
+2026-02-01 17:44:34 [INFO] pm_pipeline: [EURUSD] [M15] [CHOP] Winner: EMACrossoverStrategy [TUNED] (quality=0.441, train=428, val=176) [VALIDATED: Validated (robustness=2.00, sharpe=3.02)]
+2026-02-01 17:45:07 [INFO] pm_pipeline: [EURUSD] [M30] Hyperparameter tuning 10 strategies
+2026-02-01 18:16:18 [INFO] __main__: Shutting down...
+2026-02-01 18:16:18 [INFO] pm_mt5: Disconnected from MT5
+2026-02-01 18:16:18 [INFO] __main__: Shutdown complete
+2026-02-01 18:16:18 [INFO] pm_core: [TIME] [EURUSD] Regime Optimization: 8209.41s
+2026-02-01 18:16:18 [INFO] __main__: Shutting down...
+2026-02-01 18:16:18 [INFO] __main__: Shutdown complete
+2026-02-01 18:16:29 [INFO] __main__: ============================================================
+2026-02-01 18:16:29 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-01 18:16:29 [INFO] __main__: ============================================================
+2026-02-01 18:16:29 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-01 18:16:29 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-01 18:16:29 [INFO] __main__: [OK] Connected to MT5
+2026-02-01 18:16:29 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-01 18:16:29 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-01 18:16:29 [INFO] __main__:   Symbols: 46
+2026-02-01 18:16:29 [INFO] __main__:   Strategies: 28
+2026-02-01 18:16:29 [INFO] __main__:   Existing configs: 37
+2026-02-01 18:16:29 [INFO] __main__: 
+============================================================
+2026-02-01 18:16:29 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-01 18:16:29 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-01 18:16:29 [INFO] __main__: ============================================================
+2026-02-01 18:16:29 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-01 18:16:34 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-01 18:16:38 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-01 18:16:44 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-01 18:16:51 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-01 18:16:57 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-01 18:17:01 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-01 18:17:07 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-01 18:17:10 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-01 18:17:13 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-01 18:17:16 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-01 18:17:19 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-01 18:17:22 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-01 18:17:25 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-01 18:17:28 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-01 18:17:31 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-01 18:17:35 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-01 18:17:38 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-01 18:17:41 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-01 18:17:44 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-01 18:17:47 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-01 18:17:50 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-01 18:17:53 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-01 18:17:56 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-01 18:17:59 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-01 18:18:02 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-01 18:18:05 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-01 18:18:08 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-01 18:18:12 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-01 18:18:15 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-01 18:18:18 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-01 18:18:22 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-01 18:18:26 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-01 18:18:29 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-01 18:18:32 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-01 18:18:35 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-01 18:18:38 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-01 18:18:41 [INFO] __main__:   US100: 365635 bars saved
+2026-02-01 18:18:43 [INFO] __main__:   US30: 367270 bars saved
+2026-02-01 18:18:45 [INFO] __main__:   DE30: 351801 bars saved
+2026-02-01 18:18:47 [INFO] __main__:   EU50: 227713 bars saved
+2026-02-01 18:18:49 [INFO] __main__:   UK100: 356299 bars saved
+2026-02-01 18:18:52 [INFO] __main__:   JP225: 362244 bars saved
+2026-02-01 18:18:55 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-01 18:18:58 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-01 18:18:59 [INFO] __main__:   TONUSD: 156002 bars saved
+2026-02-01 18:19:02 [INFO] __main__:   BTCETH: 472541 bars saved
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-01 18:19:02 [INFO] pm_pipeline: 
+############################################################
+2026-02-01 18:19:02 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-01 18:19:02 [INFO] pm_pipeline: Total symbols: 46
+2026-02-01 18:19:02 [INFO] pm_pipeline: To optimize: 46
+2026-02-01 18:19:02 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-01 18:19:02 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-01 18:19:02 [INFO] pm_pipeline: Strategies: 28
+2026-02-01 18:19:02 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-01 18:19:02 [INFO] pm_pipeline: ############################################################
+2026-02-01 18:19:02 [INFO] pm_pipeline: 
+Progress: 1/46
+2026-02-01 18:19:02 [INFO] pm_pipeline: 
+============================================================
+2026-02-01 18:19:02 [INFO] pm_pipeline: OPTIMIZING: EURUSD (Regime-Aware)
+2026-02-01 18:19:02 [INFO] pm_pipeline: ============================================================
+2026-02-01 18:19:03 [INFO] pm_core: Loaded EURUSD: 500000 bars from EURUSD_M5.csv
+2026-02-01 18:21:21 [INFO] pm_pipeline: [EURUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-01 18:23:58 [INFO] pm_pipeline: [EURUSD] [M5] Hyperparameter tuning 9 strategies
+2026-02-01 19:49:39 [INFO] pm_pipeline: [EURUSD] [M5] [TREND] Winner: VolatilityBreakoutStrategy [TUNED] (quality=0.151, train=9746, val=3828) [VALIDATED: Validated (robustness=0.86, sharpe=-0.70)]
+2026-02-01 19:49:39 [INFO] pm_pipeline: [EURUSD] [M5] [RANGE] Winner: RSITrendFilteredMRStrategy [TUNED] (quality=0.333, train=69, val=17) [VALIDATED: Validated (robustness=1.90, sharpe=2.84)]
+2026-02-01 19:49:39 [INFO] pm_pipeline: [EURUSD] [M5] [BREAKOUT] Winner: StochasticReversalStrategy [TUNED] (quality=0.435, train=31, val=15) [VALIDATED: Validated (robustness=2.00, sharpe=4.26)]
+2026-02-01 19:49:39 [INFO] pm_pipeline: [EURUSD] [M5] [CHOP] Winner: MACDTrendStrategy [TUNED] (quality=0.227, train=1086, val=342) [VALIDATED: Validated (robustness=2.00, sharpe=0.45)]
+2026-02-01 19:50:26 [INFO] pm_pipeline: [EURUSD] [M15] Hyperparameter tuning 8 strategies
+2026-02-01 20:01:56 [INFO] pm_pipeline: [EURUSD] [M15] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.362, train=62, val=16) [VALIDATED: Validated (robustness=1.69, sharpe=3.42)]
+2026-02-01 20:01:56 [INFO] pm_pipeline: [EURUSD] [M15] [RANGE] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.346, train=811, val=354) [VALIDATED: Validated (robustness=0.97, sharpe=1.13)]
+2026-02-01 20:01:56 [INFO] pm_pipeline: [EURUSD] [M15] [CHOP] Winner: EMACrossoverStrategy [TUNED] (quality=0.441, train=428, val=176) [VALIDATED: Validated (robustness=2.00, sharpe=3.02)]
+2026-02-01 20:02:20 [INFO] pm_pipeline: [EURUSD] [M30] Hyperparameter tuning 10 strategies
+2026-02-01 20:43:26 [INFO] pm_pipeline: [EURUSD] [M30] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.447, train=94, val=30) [VALIDATED: Validated (robustness=2.00, sharpe=5.03)]
+2026-02-01 20:43:26 [INFO] pm_pipeline: [EURUSD] [M30] [RANGE] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.492, train=45, val=19) [VALIDATED: Validated (robustness=1.50, sharpe=12.78)]
+2026-02-01 20:43:26 [INFO] pm_pipeline: [EURUSD] [M30] [BREAKOUT] Winner: DonchianBreakoutStrategy [TUNED] (quality=0.496, train=38, val=15) [VALIDATED: Validated (robustness=2.00, sharpe=10.81)]
+2026-02-01 20:43:26 [INFO] pm_pipeline: [EURUSD] [M30] [CHOP] Winner: CCIReversalStrategy [TUNED] (quality=0.430, train=297, val=123) [VALIDATED: Validated (robustness=1.39, sharpe=2.75)]
+2026-02-01 20:43:40 [INFO] pm_pipeline: [EURUSD] [H1] Hyperparameter tuning 9 strategies
+2026-02-01 20:48:30 [INFO] pm_pipeline: [EURUSD] [H1] [TREND] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.442, train=504, val=158) [VALIDATED: Validated (robustness=1.34, sharpe=3.15)]
+2026-02-01 20:48:30 [INFO] pm_pipeline: [EURUSD] [H1] [RANGE] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.510, train=425, val=168) [VALIDATED: Validated (robustness=1.44, sharpe=4.49)]
+2026-02-01 20:48:30 [INFO] pm_pipeline: [EURUSD] [H1] [CHOP] Winner: RSIExtremesStrategy [TUNED] (quality=0.503, train=123, val=45) [VALIDATED: Validated (robustness=2.00, sharpe=5.78)]
+2026-02-01 20:48:33 [INFO] pm_pipeline: [EURUSD] [H4] Hyperparameter tuning 7 strategies
+2026-02-01 20:54:00 [INFO] pm_pipeline: [EURUSD] [H4] [TREND] Winner: EMACrossoverStrategy [TUNED] (quality=0.526, train=88, val=26) [VALIDATED: Validated (robustness=2.00, sharpe=15.53)]
+2026-02-01 20:54:00 [INFO] pm_pipeline: [EURUSD] [H4] [RANGE] Winner: EMACrossoverStrategy [TUNED] (quality=0.552, train=38, val=17) [VALIDATED: Validated (robustness=1.75, sharpe=487.00)]
+2026-02-01 20:54:00 [INFO] pm_pipeline: [EURUSD] [H4] [CHOP] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.463, train=46, val=22) [VALIDATED: Validated (robustness=1.31, sharpe=5.23)]
+2026-02-01 20:54:01 [INFO] pm_pipeline: [EURUSD] [D1] Hyperparameter tuning 5 strategies
+2026-02-01 20:54:15 [INFO] pm_pipeline: [EURUSD] [D1] [TREND] Winner: VolatilityBreakoutStrategy [TUNED] (quality=0.435, train=53, val=16) [VALIDATED: Validated (robustness=2.00, sharpe=7.48)]
+2026-02-01 20:54:15 [INFO] pm_pipeline: [EURUSD] [D1] [CHOP] Winner: EMACrossoverStrategy [TUNED] (quality=0.435, train=33, val=15) [VALIDATED: Validated (robustness=1.39, sharpe=7.04)]
+2026-02-01 20:54:15 [INFO] pm_core: [TIME] [EURUSD] Regime Optimization: 9174.94s
+2026-02-01 20:54:45 [INFO] pm_pipeline: [EURUSD] Selected retrain period: 120 days
+2026-02-01 20:54:45 [INFO] pm_pipeline: 
+[EURUSD] OPTIMIZATION COMPLETE
+2026-02-01 20:54:45 [INFO] pm_pipeline:   Timeframes:  6
+2026-02-01 20:54:45 [INFO] pm_pipeline:   Validated:   19
+2026-02-01 20:54:45 [INFO] pm_pipeline:   Rejected:    0
+2026-02-01 20:54:45 [INFO] pm_pipeline:   Best:        EMACrossoverStrategy @ M15/CHOP
+2026-02-01 20:54:45 [INFO] pm_pipeline:   Retrain:     Every 120 days
+2026-02-01 20:54:45 [INFO] pm_pipeline:   Duration:    9342.7s
+2026-02-01 20:54:45 [INFO] pm_pipeline:   [D1] TREND:VolatilityBr, CHOP:EMACrossover
+2026-02-01 20:54:45 [INFO] pm_pipeline:   [H1] TREND:KeltnerBreak, RANGE:KeltnerBreak, CHOP:RSIExtremesS
+2026-02-01 20:54:45 [INFO] pm_pipeline:   [H4] TREND:EMACrossover, RANGE:EMACrossover, CHOP:VWAPDeviatio
+2026-02-01 20:54:45 [INFO] pm_pipeline:   [M15] TREND:MomentumBurs, RANGE:KeltnerBreak, CHOP:EMACrossover
+2026-02-01 20:54:45 [INFO] pm_pipeline:   [M30] TREND:MomentumBurs, RANGE:VWAPDeviatio, BREAKOUT:DonchianBrea, CHOP:CCIReversalS
+2026-02-01 20:54:45 [INFO] pm_pipeline:   [M5] TREND:VolatilityBr, RANGE:RSITrendFilt, BREAKOUT:StochasticRe, CHOP:MACDTrendStr
+2026-02-01 20:54:45 [INFO] pm_pipeline: SAVED EURUSD to pm_configs.json (atomic)
+2026-02-01 20:54:45 [INFO] pm_pipeline: 
+Progress: 2/46
+2026-02-01 20:54:45 [INFO] pm_pipeline: 
+============================================================
+2026-02-01 20:54:45 [INFO] pm_pipeline: OPTIMIZING: GBPUSD (Regime-Aware)
+2026-02-01 20:54:45 [INFO] pm_pipeline: ============================================================
+2026-02-01 20:54:46 [INFO] pm_core: Loaded GBPUSD: 500000 bars from GBPUSD_M5.csv
+2026-02-01 20:57:00 [INFO] pm_pipeline: [GBPUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-01 20:59:14 [INFO] pm_pipeline: [GBPUSD] [M5] Hyperparameter tuning 10 strategies
+2026-02-01 21:47:58 [INFO] __main__: Shutting down...
+2026-02-01 21:47:58 [INFO] pm_mt5: Disconnected from MT5
+2026-02-01 21:47:58 [INFO] __main__: Shutdown complete
+2026-02-01 21:47:58 [INFO] pm_core: [TIME] [GBPUSD] Regime Optimization: 3058.23s
+2026-02-01 21:47:58 [INFO] __main__: Shutting down...
+2026-02-01 21:47:58 [INFO] __main__: Shutdown complete
+2026-02-01 21:50:34 [INFO] __main__: ============================================================
+2026-02-01 21:50:34 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-01 21:50:34 [INFO] __main__: ============================================================
+2026-02-01 21:50:34 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-01 21:50:34 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-01 21:50:34 [INFO] __main__: [OK] Connected to MT5
+2026-02-01 21:50:34 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-01 21:50:34 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-01 21:50:34 [INFO] __main__:   Symbols: 46
+2026-02-01 21:50:34 [INFO] __main__:   Strategies: 28
+2026-02-01 21:50:34 [INFO] __main__:   Existing configs: 37
+2026-02-01 21:50:34 [INFO] __main__: 
+============================================================
+2026-02-01 21:50:34 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-01 21:50:34 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-01 21:50:34 [INFO] __main__: ============================================================
+2026-02-01 21:50:34 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-01 21:50:37 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-01 21:50:40 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-01 21:50:43 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-01 21:50:46 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-01 21:50:49 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-01 21:50:52 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-01 21:50:55 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-01 21:50:58 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-01 21:51:00 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-01 21:51:03 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-01 21:51:06 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-01 21:51:09 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-01 21:51:12 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-01 21:51:15 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-01 21:51:18 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-01 21:51:21 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-01 21:51:24 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-01 21:51:27 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-01 21:51:30 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-01 21:51:33 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-01 21:51:36 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-01 21:51:39 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-01 21:51:42 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-01 21:51:45 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-01 21:51:48 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-01 21:51:50 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-01 21:51:53 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-01 21:51:56 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-01 21:51:59 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-01 21:52:02 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-01 21:52:05 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-01 21:52:08 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-01 21:52:11 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-01 21:52:14 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-01 21:52:17 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-01 21:52:19 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-01 21:52:22 [INFO] __main__:   US100: 365635 bars saved
+2026-02-01 21:52:24 [INFO] __main__:   US30: 367270 bars saved
+2026-02-01 21:52:26 [INFO] __main__:   DE30: 351801 bars saved
+2026-02-01 21:52:27 [INFO] __main__:   EU50: 227713 bars saved
+2026-02-01 21:52:29 [INFO] __main__:   UK100: 356299 bars saved
+2026-02-01 21:52:31 [INFO] __main__:   JP225: 362244 bars saved
+2026-02-01 21:52:34 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-01 21:52:37 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-01 21:52:38 [INFO] __main__:   TONUSD: 156045 bars saved
+2026-02-01 21:52:41 [INFO] __main__:   BTCETH: 472584 bars saved
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-01 21:52:41 [INFO] pm_pipeline: 
+############################################################
+2026-02-01 21:52:41 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-01 21:52:41 [INFO] pm_pipeline: Total symbols: 46
+2026-02-01 21:52:41 [INFO] pm_pipeline: To optimize: 46
+2026-02-01 21:52:41 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-01 21:52:41 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-01 21:52:41 [INFO] pm_pipeline: Strategies: 28
+2026-02-01 21:52:41 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-01 21:52:41 [INFO] pm_pipeline: ############################################################
+2026-02-01 21:52:41 [INFO] pm_pipeline: 
+Progress: 1/46
+2026-02-01 21:52:41 [INFO] pm_pipeline: 
+============================================================
+2026-02-01 21:52:41 [INFO] pm_pipeline: OPTIMIZING: EURUSD (Regime-Aware)
+2026-02-01 21:52:41 [INFO] pm_pipeline: ============================================================
+2026-02-01 21:52:41 [INFO] pm_core: Loaded EURUSD: 500000 bars from EURUSD_M5.csv
+2026-02-01 21:54:45 [INFO] pm_pipeline: [EURUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-01 21:56:58 [INFO] pm_pipeline: [EURUSD] [M5] Hyperparameter tuning 9 strategies
+2026-02-01 22:03:23 [INFO] pm_core: [TIME] [EURUSD] Regime Optimization: 518.54s
+2026-02-01 22:03:23 [ERROR] pm_pipeline: [EURUSD] Pipeline error: 'OptimizationStats' object does not support item assignment
+Traceback (most recent call last):
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 2144, in run_for_symbol
+    regime_configs, default_config, validated_count, unvalidated_count = self.regime_optimizer.optimize_symbol(
+                                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 1343, in optimize_symbol
+    tf_candidates = self._collect_candidates(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 1485, in _collect_candidates
+    tuned_results = self._tune_strategy_params(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 1550, in _tune_strategy_params
+    regime_results = self.optuna_optimizer.optimize_for_regimes(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_optuna.py", line 683, in optimize_for_regimes
+    stats['early_dd_rejections'] = early_rejections[0]
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'OptimizationStats' object does not support item assignment
+2026-02-01 22:03:23 [WARNING] pm_pipeline: FAILED EURUSD: keeping existing config (if any)
+2026-02-01 22:03:23 [INFO] pm_pipeline: 
+Progress: 2/46
+2026-02-01 22:03:23 [INFO] pm_pipeline: 
+============================================================
+2026-02-01 22:03:23 [INFO] pm_pipeline: OPTIMIZING: GBPUSD (Regime-Aware)
+2026-02-01 22:03:23 [INFO] pm_pipeline: ============================================================
+2026-02-01 22:03:24 [INFO] pm_core: Loaded GBPUSD: 500000 bars from GBPUSD_M5.csv
+2026-02-01 22:05:25 [INFO] pm_pipeline: [GBPUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-01 22:07:49 [INFO] pm_pipeline: [GBPUSD] [M5] Hyperparameter tuning 10 strategies
+2026-02-01 22:11:16 [INFO] pm_core: [TIME] [GBPUSD] Regime Optimization: 350.24s
+2026-02-01 22:11:16 [ERROR] pm_pipeline: [GBPUSD] Pipeline error: 'OptimizationStats' object does not support item assignment
+Traceback (most recent call last):
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 2144, in run_for_symbol
+    regime_configs, default_config, validated_count, unvalidated_count = self.regime_optimizer.optimize_symbol(
+                                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 1343, in optimize_symbol
+    tf_candidates = self._collect_candidates(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 1485, in _collect_candidates
+    tuned_results = self._tune_strategy_params(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_pipeline.py", line 1550, in _tune_strategy_params
+    regime_results = self.optuna_optimizer.optimize_for_regimes(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_optuna.py", line 683, in optimize_for_regimes
+    stats['early_dd_rejections'] = early_rejections[0]
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'OptimizationStats' object does not support item assignment
+2026-02-01 22:11:16 [WARNING] pm_pipeline: FAILED GBPUSD: keeping existing config (if any)
+2026-02-01 22:11:16 [INFO] pm_pipeline: 
+Progress: 3/46
+2026-02-01 22:11:16 [INFO] pm_pipeline: 
+============================================================
+2026-02-01 22:11:16 [INFO] pm_pipeline: OPTIMIZING: USDJPY (Regime-Aware)
+2026-02-01 22:11:16 [INFO] pm_pipeline: ============================================================
+2026-02-01 22:11:17 [INFO] pm_core: Loaded USDJPY: 500000 bars from USDJPY_M5.csv
+2026-02-01 22:13:37 [INFO] pm_pipeline: [USDJPY] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-01 22:15:25 [INFO] __main__: Shutting down...
+2026-02-01 22:15:25 [INFO] pm_mt5: Disconnected from MT5
+2026-02-01 22:15:25 [INFO] __main__: Shutdown complete
+2026-02-01 22:15:25 [INFO] pm_core: [TIME] [USDJPY] Regime Optimization: 108.62s
+2026-02-01 22:15:25 [INFO] __main__: Shutting down...
+2026-02-01 22:15:25 [INFO] __main__: Shutdown complete
+2026-02-01 22:35:05 [INFO] __main__: ============================================================
+2026-02-01 22:35:05 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-01 22:35:05 [INFO] __main__: ============================================================
+2026-02-01 22:35:05 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-01 22:35:05 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-01 22:35:05 [INFO] __main__: [OK] Connected to MT5
+2026-02-01 22:35:05 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-01 22:35:05 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-01 22:35:05 [INFO] __main__:   Symbols: 46
+2026-02-01 22:35:05 [INFO] __main__:   Strategies: 28
+2026-02-01 22:35:05 [INFO] __main__:   Existing configs: 37
+2026-02-01 22:35:05 [INFO] __main__: 
+============================================================
+2026-02-01 22:35:05 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-01 22:35:05 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-01 22:35:05 [INFO] __main__: ============================================================
+2026-02-01 22:35:05 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-01 22:35:08 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-01 22:35:11 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-01 22:35:13 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-01 22:35:16 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-01 22:35:19 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-01 22:35:22 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-01 22:35:25 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-01 22:35:27 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-01 22:35:31 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-01 22:35:34 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-01 22:35:36 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-01 22:35:39 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-01 22:35:42 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-01 22:35:45 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-01 22:35:48 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-01 22:35:51 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-01 22:35:54 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-01 22:35:58 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-01 22:36:01 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-01 22:36:04 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-01 22:36:06 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-01 22:36:09 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-01 22:36:12 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-01 22:36:15 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-01 22:36:18 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-01 22:36:23 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-01 22:36:26 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-01 22:36:29 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-01 22:36:32 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-01 22:36:35 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-01 22:36:38 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-01 22:36:40 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-01 22:36:43 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-01 22:36:46 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-01 22:36:49 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-01 22:36:52 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-01 22:36:54 [INFO] __main__:   US100: 365635 bars saved
+2026-02-01 22:36:56 [INFO] __main__:   US30: 367270 bars saved
+2026-02-01 22:36:58 [INFO] __main__:   DE30: 351801 bars saved
+2026-02-01 22:37:00 [INFO] __main__:   EU50: 227713 bars saved
+2026-02-01 22:37:02 [INFO] __main__:   UK100: 356299 bars saved
+2026-02-01 22:37:04 [INFO] __main__:   JP225: 362244 bars saved
+2026-02-01 22:37:07 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-01 22:37:10 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-01 22:37:11 [INFO] __main__:   TONUSD: 156054 bars saved
+2026-02-01 22:37:13 [INFO] __main__:   BTCETH: 472593 bars saved
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-01 22:37:13 [INFO] pm_pipeline: 
+############################################################
+2026-02-01 22:37:13 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-01 22:37:13 [INFO] pm_pipeline: Total symbols: 46
+2026-02-01 22:37:13 [INFO] pm_pipeline: To optimize: 46
+2026-02-01 22:37:13 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-01 22:37:13 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-01 22:37:13 [INFO] pm_pipeline: Strategies: 28
+2026-02-01 22:37:13 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-01 22:37:13 [INFO] pm_pipeline: ############################################################
+2026-02-01 22:37:13 [INFO] pm_pipeline: 
+Progress: 1/46
+2026-02-01 22:37:13 [INFO] pm_pipeline: 
+============================================================
+2026-02-01 22:37:13 [INFO] pm_pipeline: OPTIMIZING: EURUSD (Regime-Aware)
+2026-02-01 22:37:13 [INFO] pm_pipeline: ============================================================
+2026-02-01 22:37:14 [INFO] pm_core: Loaded EURUSD: 500000 bars from EURUSD_M5.csv
+2026-02-01 22:39:16 [INFO] pm_pipeline: [EURUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-01 22:41:32 [INFO] pm_pipeline: [EURUSD] [M5] Hyperparameter tuning 9 strategies
+2026-02-01 22:48:37 [INFO] __main__: Shutting down...
+2026-02-01 22:48:37 [INFO] pm_mt5: Disconnected from MT5
+2026-02-01 22:48:37 [INFO] __main__: Shutdown complete
+2026-02-01 22:48:37 [INFO] pm_core: [TIME] [EURUSD] Regime Optimization: 561.13s
+2026-02-01 22:48:37 [INFO] __main__: Shutting down...
+2026-02-01 22:48:37 [INFO] __main__: Shutdown complete
+2026-02-01 22:48:48 [INFO] __main__: ============================================================
+2026-02-01 22:48:48 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-01 22:48:48 [INFO] __main__: ============================================================
+2026-02-01 22:48:48 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-01 22:48:48 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-01 22:48:48 [INFO] __main__: [OK] Connected to MT5
+2026-02-01 22:48:48 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-01 22:48:48 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-01 22:48:48 [INFO] __main__:   Symbols: 46
+2026-02-01 22:48:48 [INFO] __main__:   Strategies: 28
+2026-02-01 22:48:48 [INFO] __main__:   Existing configs: 37
+2026-02-01 22:48:48 [INFO] __main__: 
+============================================================
+2026-02-01 22:48:48 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-01 22:48:48 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-01 22:48:48 [INFO] __main__: ============================================================
+2026-02-01 22:48:48 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-01 22:48:52 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-01 22:48:56 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-01 22:49:00 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-01 22:49:04 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-01 22:49:08 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-01 22:49:12 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-01 22:49:16 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-01 22:49:19 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-01 22:49:21 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-01 22:49:24 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-01 22:49:27 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-01 22:49:30 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-01 22:49:33 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-01 22:49:36 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-01 22:49:39 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-01 22:49:42 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-01 22:49:45 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-01 22:49:48 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-01 22:49:51 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-01 22:49:54 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-01 22:49:57 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-01 22:50:00 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-01 22:50:02 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-01 22:50:05 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-01 22:50:08 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-01 22:50:11 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-01 22:50:14 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-01 22:50:17 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-01 22:50:20 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-01 22:50:23 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-01 22:50:26 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-01 22:50:29 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-01 22:50:32 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-01 22:50:35 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-01 22:50:37 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-01 22:50:40 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-01 22:50:42 [INFO] __main__:   US100: 365635 bars saved
+2026-02-01 22:50:44 [INFO] __main__:   US30: 367270 bars saved
+2026-02-01 22:50:46 [INFO] __main__:   DE30: 351801 bars saved
+2026-02-01 22:50:47 [INFO] __main__:   EU50: 227713 bars saved
+2026-02-01 22:50:49 [INFO] __main__:   UK100: 356299 bars saved
+2026-02-01 22:50:51 [INFO] __main__:   JP225: 362244 bars saved
+2026-02-01 22:50:54 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-01 22:50:57 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-01 22:50:58 [INFO] __main__:   TONUSD: 156057 bars saved
+2026-02-01 22:51:01 [INFO] __main__:   BTCETH: 472596 bars saved
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-01 22:51:01 [INFO] pm_pipeline: 
+############################################################
+2026-02-01 22:51:01 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-01 22:51:01 [INFO] pm_pipeline: Total symbols: 46
+2026-02-01 22:51:01 [INFO] pm_pipeline: To optimize: 46
+2026-02-01 22:51:01 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-01 22:51:01 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-01 22:51:01 [INFO] pm_pipeline: Strategies: 28
+2026-02-01 22:51:01 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-01 22:51:01 [INFO] pm_pipeline: ############################################################
+2026-02-01 22:51:01 [INFO] pm_pipeline: 
+Progress: 1/46
+2026-02-01 22:51:01 [INFO] pm_pipeline: 
+============================================================
+2026-02-01 22:51:01 [INFO] pm_pipeline: OPTIMIZING: EURUSD (Regime-Aware)
+2026-02-01 22:51:01 [INFO] pm_pipeline: ============================================================
+2026-02-01 22:51:01 [INFO] pm_core: Loaded EURUSD: 500000 bars from EURUSD_M5.csv
+2026-02-01 22:53:01 [INFO] pm_pipeline: [EURUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-01 22:55:17 [INFO] pm_pipeline: [EURUSD] [M5] Hyperparameter tuning 9 strategies
+2026-02-01 23:51:46 [INFO] pm_pipeline: [EURUSD] [M5] [TREND] Winner: ADXDIStrengthStrategy (quality=0.018, train=139, val=48) [VALIDATED: Validated (robustness=2.00, sharpe=-6.10, dd=18.5%)]
+2026-02-01 23:51:46 [INFO] pm_pipeline: [EURUSD] [M5] [RANGE] Winner: RSITrendFilteredMRStrategy (quality=0.210, train=135, val=49) [VALIDATED: Validated (robustness=2.00, sharpe=0.45, dd=7.8%)]
+2026-02-01 23:51:46 [INFO] pm_pipeline: [EURUSD] [M5] [BREAKOUT] Winner: StochasticReversalStrategy (quality=0.144, train=46, val=21) [VALIDATED: Validated (robustness=0.88, sharpe=-4.72, dd=0.1%)]
+2026-02-01 23:51:46 [INFO] pm_pipeline: [EURUSD] [M5] [CHOP] Winner: AroonTrendStrategy (quality=0.158, train=1829, val=623) [VALIDATED: Validated (robustness=1.39, sharpe=-0.79, dd=14.7%)]
+2026-02-01 23:52:29 [INFO] pm_pipeline: [EURUSD] [M15] Hyperparameter tuning 7 strategies
+2026-02-02 00:42:27 [INFO] pm_pipeline: [EURUSD] [M15] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.337, train=62, val=16) [VALIDATED: Validated (robustness=1.73, sharpe=3.42, dd=3.1%)]
+2026-02-02 00:42:27 [INFO] pm_pipeline: [EURUSD] [M15] [RANGE] Winner: ZScoreMRStrategy (quality=0.213, train=975, val=351) [VALIDATED: Validated (robustness=2.00, sharpe=0.56, dd=4.3%)]
+2026-02-02 00:42:27 [INFO] pm_pipeline: [EURUSD] [M15] [CHOP] Winner: MomentumBurstStrategy [TUNED] (quality=0.309, train=61, val=20) [VALIDATED: Validated (robustness=1.09, sharpe=2.05, dd=2.8%)]
+2026-02-02 00:42:48 [INFO] pm_pipeline: [EURUSD] [M30] Hyperparameter tuning 10 strategies
+2026-02-02 01:09:12 [INFO] pm_pipeline: [EURUSD] [M30] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.384, train=62, val=19) [VALIDATED: Validated (robustness=2.00, sharpe=5.56, dd=3.1%)]
+2026-02-02 01:09:12 [INFO] pm_pipeline: [EURUSD] [M30] [RANGE] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.470, train=46, val=21) [VALIDATED: Validated (robustness=1.59, sharpe=11.56, dd=1.0%)]
+2026-02-02 01:09:12 [INFO] pm_pipeline: [EURUSD] [M30] [BREAKOUT] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.379, train=27, val=15) [VALIDATED: Validated (robustness=0.90, sharpe=9.29, dd=1.0%)]
+2026-02-02 01:09:12 [INFO] pm_pipeline: [EURUSD] [M30] [CHOP] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.342, train=93, val=36) [VALIDATED: Validated (robustness=2.00, sharpe=2.61, dd=2.4%)]
+2026-02-02 01:09:23 [INFO] pm_pipeline: [EURUSD] [H1] Hyperparameter tuning 10 strategies
+2026-02-02 01:12:09 [INFO] pm_pipeline: [EURUSD] [H1] [TREND] Winner: RSITrendFilteredMRStrategy [TUNED] (quality=0.323, train=112, val=42) [VALIDATED: Validated (robustness=2.00, sharpe=2.59, dd=6.3%)]
+2026-02-02 01:12:09 [INFO] pm_pipeline: [EURUSD] [H1] [RANGE] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.401, train=110, val=36) [VALIDATED: Validated (robustness=1.35, sharpe=5.20, dd=4.8%)]
+2026-02-02 01:12:09 [INFO] pm_pipeline: [EURUSD] [H1] [CHOP] Winner: PivotBreakoutStrategy [TUNED] (quality=0.318, train=133, val=54) [VALIDATED: Validated (robustness=2.00, sharpe=2.64, dd=7.3%)]
+2026-02-02 01:12:12 [INFO] pm_pipeline: [EURUSD] [H4] Hyperparameter tuning 7 strategies
+2026-02-02 01:16:46 [INFO] pm_pipeline: [EURUSD] [H4] [TREND] Winner: EMACrossoverStrategy [TUNED] (quality=0.493, train=83, val=25) [VALIDATED: Validated (robustness=2.00, sharpe=11.88, dd=1.0%)]
+2026-02-02 01:16:46 [INFO] pm_pipeline: [EURUSD] [H4] [RANGE] Winner: EMACrossoverStrategy [TUNED] (quality=0.531, train=39, val=17) [VALIDATED: Validated (robustness=1.17, sharpe=345.63, dd=0.0%)]
+2026-02-02 01:16:46 [INFO] pm_pipeline: [EURUSD] [H4] [CHOP] Winner: IchimokuStrategy [TUNED] (quality=0.441, train=57, val=30) [VALIDATED: Validated (robustness=1.74, sharpe=6.64, dd=1.2%)]
+2026-02-02 01:16:46 [INFO] pm_pipeline: [EURUSD] [D1] Hyperparameter tuning 5 strategies
+2026-02-02 01:16:58 [INFO] pm_pipeline: [EURUSD] [D1] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.400, train=77, val=18) [VALIDATED: Validated (robustness=1.33, sharpe=5.20, dd=1.4%)]
+2026-02-02 01:16:58 [INFO] pm_pipeline: [EURUSD] [D1] [CHOP] Winner: EMACrossoverStrategy [TUNED] (quality=0.407, train=33, val=15) [VALIDATED: Validated (robustness=1.47, sharpe=7.04, dd=1.2%)]
+2026-02-02 01:16:58 [INFO] pm_core: [TIME] [EURUSD] Regime Optimization: 8637.62s
+2026-02-02 01:17:00 [INFO] pm_pipeline: [EURUSD] Selected retrain period: 30 days
+2026-02-02 01:17:00 [INFO] pm_pipeline: 
+[EURUSD] OPTIMIZATION COMPLETE
+2026-02-02 01:17:00 [INFO] pm_pipeline:   Timeframes:  6
+2026-02-02 01:17:00 [INFO] pm_pipeline:   Validated:   19
+2026-02-02 01:17:00 [INFO] pm_pipeline:   Rejected:    0
+2026-02-02 01:17:00 [INFO] pm_pipeline:   Best:        EMACrossoverStrategy @ H4/TREND
+2026-02-02 01:17:00 [INFO] pm_pipeline:   Retrain:     Every 30 days
+2026-02-02 01:17:00 [INFO] pm_pipeline:   Duration:    8759.8s
+2026-02-02 01:17:00 [INFO] pm_pipeline:   [D1] TREND:MomentumBurs, CHOP:EMACrossover
+2026-02-02 01:17:00 [INFO] pm_pipeline:   [H1] TREND:RSITrendFilt, RANGE:KeltnerBreak, CHOP:PivotBreakou
+2026-02-02 01:17:00 [INFO] pm_pipeline:   [H4] TREND:EMACrossover, RANGE:EMACrossover, CHOP:IchimokuStra
+2026-02-02 01:17:00 [INFO] pm_pipeline:   [M15] TREND:MomentumBurs, RANGE:ZScoreMRStra, CHOP:MomentumBurs
+2026-02-02 01:17:00 [INFO] pm_pipeline:   [M30] TREND:MomentumBurs, RANGE:VWAPDeviatio, BREAKOUT:KeltnerBreak, CHOP:VWAPDeviatio
+2026-02-02 01:17:00 [INFO] pm_pipeline:   [M5] TREND:ADXDIStrengt, RANGE:RSITrendFilt, BREAKOUT:StochasticRe, CHOP:AroonTrendSt
+2026-02-02 01:17:01 [INFO] pm_pipeline: SAVED EURUSD to pm_configs.json (atomic)
+2026-02-02 01:17:01 [INFO] pm_pipeline: 
+Progress: 2/46
+2026-02-02 01:17:01 [INFO] pm_pipeline: 
+============================================================
+2026-02-02 01:17:01 [INFO] pm_pipeline: OPTIMIZING: GBPUSD (Regime-Aware)
+2026-02-02 01:17:01 [INFO] pm_pipeline: ============================================================
+2026-02-02 01:17:01 [INFO] pm_core: Loaded GBPUSD: 500000 bars from GBPUSD_M5.csv
+2026-02-02 01:18:59 [INFO] pm_pipeline: [GBPUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-02 01:21:14 [INFO] pm_pipeline: [GBPUSD] [M5] Hyperparameter tuning 10 strategies
+2026-02-02 04:37:23 [INFO] pm_pipeline: [GBPUSD] [M5] [TREND] Winner: FisherTransformMRStrategy [TUNED] (quality=0.305, train=120, val=20) [VALIDATED: Validated (robustness=2.00, sharpe=2.52, dd=6.6%)]
+2026-02-02 04:37:23 [INFO] pm_pipeline: [GBPUSD] [M5] [RANGE] Winner: MomentumBurstStrategy [TUNED] (quality=0.310, train=88, val=15) [VALIDATED: Validated (robustness=2.00, sharpe=2.23, dd=4.1%)]
+2026-02-02 04:38:07 [INFO] pm_pipeline: [GBPUSD] [M15] Hyperparameter tuning 8 strategies
+2026-02-02 04:44:21 [INFO] pm_pipeline: [GBPUSD] [M15] [TREND] Winner: ADXDIStrengthStrategy [TUNED] (quality=0.401, train=37, val=19) [VALIDATED: Validated (robustness=1.81, sharpe=6.19, dd=2.5%)]
+2026-02-02 04:44:21 [INFO] pm_pipeline: [GBPUSD] [M15] [RANGE] Winner: ZScoreVWAPReversionStrategy (quality=0.208, train=247, val=80) [VALIDATED: Validated (robustness=1.18, sharpe=0.34, dd=6.7%)]
+2026-02-02 04:44:21 [INFO] pm_pipeline: [GBPUSD] [M15] [CHOP] Winner: VolatilityBreakoutStrategy (quality=0.173, train=1829, val=725) [VALIDATED: Validated (robustness=0.96, sharpe=-0.16, dd=18.4%)]
+2026-02-02 04:44:43 [INFO] pm_pipeline: [GBPUSD] [M30] Hyperparameter tuning 11 strategies
+2026-02-02 04:49:42 [INFO] pm_pipeline: [GBPUSD] [M30] [TREND] Winner: RSITrendFilteredMRStrategy [TUNED] (quality=0.402, train=45, val=17) [VALIDATED: Validated (robustness=1.73, sharpe=6.41, dd=2.1%)]
+2026-02-02 04:49:42 [INFO] pm_pipeline: [GBPUSD] [M30] [RANGE] Winner: ZScoreVWAPReversionStrategy (quality=0.236, train=107, val=63) [VALIDATED: Validated (robustness=1.07, sharpe=0.72, dd=7.0%)]
+2026-02-02 04:49:42 [INFO] pm_pipeline: [GBPUSD] [M30] [CHOP] Winner: ZScoreVWAPReversionStrategy [TUNED] (quality=0.313, train=56, val=16) [VALIDATED: Validated (robustness=1.17, sharpe=3.25, dd=4.2%)]
+2026-02-02 04:49:53 [INFO] pm_pipeline: [GBPUSD] [H1] Hyperparameter tuning 10 strategies
+2026-02-02 05:04:58 [INFO] pm_pipeline: [GBPUSD] [H1] [TREND] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.442, train=39, val=20) [VALIDATED: Validated (robustness=2.00, sharpe=9.05, dd=1.0%)]
+2026-02-02 05:04:58 [INFO] pm_pipeline: [GBPUSD] [H1] [RANGE] Winner: MomentumBurstStrategy [TUNED] (quality=0.457, train=187, val=61) [VALIDATED: Validated (robustness=1.40, sharpe=5.77, dd=3.0%)]
+2026-02-02 05:04:58 [INFO] pm_pipeline: [GBPUSD] [H1] [CHOP] Winner: MomentumBurstStrategy [TUNED] (quality=0.341, train=107, val=22) [VALIDATED: Validated (robustness=1.41, sharpe=3.06, dd=4.3%)]
+2026-02-02 05:05:01 [INFO] pm_pipeline: [GBPUSD] [H4] Hyperparameter tuning 9 strategies
+2026-02-02 05:10:35 [INFO] pm_pipeline: [GBPUSD] [H4] [TREND] Winner: VWAPDeviationReversionStrategy [TUNED] (quality=0.493, train=95, val=28) [VALIDATED: Validated (robustness=1.29, sharpe=11.90, dd=1.0%)]
+2026-02-02 05:10:35 [INFO] pm_pipeline: [GBPUSD] [H4] [RANGE] Winner: HullMATrendStrategy [TUNED] (quality=0.429, train=46, val=16) [VALIDATED: Validated (robustness=1.56, sharpe=10.18, dd=1.6%)]
+2026-02-02 05:10:35 [INFO] pm_pipeline: [GBPUSD] [H4] [CHOP] Winner: CCIReversalStrategy [TUNED] (quality=0.453, train=116, val=48) [VALIDATED: Validated (robustness=2.00, sharpe=7.00, dd=1.4%)]
+2026-02-02 05:10:36 [INFO] pm_pipeline: [GBPUSD] [D1] Hyperparameter tuning 5 strategies
+2026-02-02 05:10:51 [INFO] pm_pipeline: [GBPUSD] [D1] [TREND] Winner: KeltnerPullbackStrategy [TUNED] (quality=0.553, train=34, val=16) [VALIDATED: Validated (robustness=2.00, sharpe=21.86, dd=0.9%)]
+2026-02-02 05:10:51 [INFO] pm_pipeline: [GBPUSD] [D1] [CHOP] Winner: MomentumBurstStrategy [TUNED] (quality=0.410, train=56, val=28) [VALIDATED: Validated (robustness=2.00, sharpe=5.01, dd=1.9%)]
+2026-02-02 05:10:51 [INFO] pm_core: [TIME] [GBPUSD] Regime Optimization: 13912.78s
+2026-02-02 05:10:52 [INFO] pm_pipeline: [GBPUSD] Selected retrain period: 30 days
+2026-02-02 05:10:52 [INFO] pm_pipeline: 
+[GBPUSD] OPTIMIZATION COMPLETE
+2026-02-02 05:10:52 [INFO] pm_pipeline:   Timeframes:  6
+2026-02-02 05:10:52 [INFO] pm_pipeline:   Validated:   16
+2026-02-02 05:10:52 [INFO] pm_pipeline:   Rejected:    2
+2026-02-02 05:10:52 [INFO] pm_pipeline:   Best:        KeltnerPullbackStrategy @ D1/TREND
+2026-02-02 05:10:52 [INFO] pm_pipeline:   Retrain:     Every 30 days
+2026-02-02 05:10:52 [INFO] pm_pipeline:   Duration:    14031.3s
+2026-02-02 05:10:52 [INFO] pm_pipeline:   [D1] TREND:KeltnerPullb, CHOP:MomentumBurs
+2026-02-02 05:10:52 [INFO] pm_pipeline:   [H1] TREND:VWAPDeviatio, RANGE:MomentumBurs, CHOP:MomentumBurs
+2026-02-02 05:10:52 [INFO] pm_pipeline:   [H4] TREND:VWAPDeviatio, RANGE:HullMATrendS, CHOP:CCIReversalS
+2026-02-02 05:10:52 [INFO] pm_pipeline:   [M15] TREND:ADXDIStrengt, RANGE:ZScoreVWAPRe, CHOP:VolatilityBr
+2026-02-02 05:10:52 [INFO] pm_pipeline:   [M30] TREND:RSITrendFilt, RANGE:ZScoreVWAPRe, CHOP:ZScoreVWAPRe
+2026-02-02 05:10:52 [INFO] pm_pipeline:   [M5] TREND:FisherTransf, RANGE:MomentumBurs
+2026-02-02 05:10:52 [INFO] pm_pipeline: SAVED GBPUSD to pm_configs.json (atomic)
+2026-02-02 05:10:52 [INFO] pm_pipeline: 
+Progress: 3/46
+2026-02-02 05:10:52 [INFO] pm_pipeline: 
+============================================================
+2026-02-02 05:10:52 [INFO] pm_pipeline: OPTIMIZING: USDJPY (Regime-Aware)
+2026-02-02 05:10:52 [INFO] pm_pipeline: ============================================================
+2026-02-02 05:10:53 [INFO] pm_core: Loaded USDJPY: 500000 bars from USDJPY_M5.csv
+2026-02-02 05:12:51 [INFO] pm_pipeline: [USDJPY] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-02 05:15:06 [INFO] pm_pipeline: [USDJPY] [M5] Hyperparameter tuning 10 strategies
+2026-02-02 08:14:42 [INFO] pm_pipeline: [USDJPY] [M5] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.395, train=54, val=24) [VALIDATED: Validated (robustness=0.93, sharpe=6.85, dd=1.2%)]
+2026-02-02 08:14:42 [INFO] pm_pipeline: [USDJPY] [M5] [RANGE] Winner: ADXDIStrengthStrategy (quality=0.205, train=97, val=22) [VALIDATED: Validated (robustness=0.00, sharpe=0.71, dd=4.4%)]
+2026-02-02 08:14:42 [INFO] pm_pipeline: [USDJPY] [M5] [CHOP] Winner: MomentumBurstStrategy [TUNED] (quality=0.422, train=85, val=45) [VALIDATED: Validated (robustness=1.42, sharpe=5.25, dd=2.8%)]
+2026-02-02 08:15:44 [INFO] pm_pipeline: [USDJPY] [M15] Hyperparameter tuning 7 strategies
+2026-02-02 08:23:20 [INFO] pm_pipeline: [USDJPY] [M15] [TREND] Winner: MomentumBurstStrategy [TUNED] (quality=0.425, train=41, val=19) [VALIDATED: Validated (robustness=2.00, sharpe=7.25, dd=1.0%)]
+2026-02-02 08:23:20 [INFO] pm_pipeline: [USDJPY] [M15] [RANGE] Winner: MomentumBurstStrategy [TUNED] (quality=0.387, train=34, val=17) [VALIDATED: Validated (robustness=1.24, sharpe=4.82, dd=1.6%)]
+2026-02-02 08:23:20 [INFO] pm_pipeline: [USDJPY] [M15] [CHOP] Winner: MomentumBurstStrategy [TUNED] (quality=0.529, train=53, val=23) [VALIDATED: Validated (robustness=1.24, sharpe=17.07, dd=1.0%)]
+2026-02-02 08:23:52 [INFO] pm_pipeline: [USDJPY] [M30] Hyperparameter tuning 9 strategies
+2026-02-02 08:29:55 [INFO] pm_pipeline: [USDJPY] [M30] [TREND] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.440, train=2931, val=1252) [VALIDATED: Validated (robustness=1.17, sharpe=2.30, dd=17.1%)]
+2026-02-02 08:29:55 [INFO] pm_pipeline: [USDJPY] [M30] [RANGE] Winner: ADXTrendStrategy [TUNED] (quality=0.334, train=118, val=44) [VALIDATED: Validated (robustness=2.00, sharpe=3.42, dd=9.7%)]
+2026-02-02 08:29:55 [INFO] pm_pipeline: [USDJPY] [M30] [CHOP] Winner: SqueezeBreakoutStrategy [TUNED] (quality=0.532, train=76, val=17) [VALIDATED: Validated (robustness=2.00, sharpe=16.16, dd=3.3%)]
+2026-02-02 08:30:10 [INFO] pm_pipeline: [USDJPY] [H1] Hyperparameter tuning 10 strategies
+2026-02-02 09:01:10 [INFO] pm_pipeline: [USDJPY] [H1] [TREND] Winner: SqueezeBreakoutStrategy [TUNED] (quality=0.505, train=128, val=29) [VALIDATED: Validated (robustness=1.55, sharpe=8.44, dd=2.1%)]
+2026-02-02 09:01:10 [INFO] pm_pipeline: [USDJPY] [H1] [RANGE] Winner: IchimokuStrategy [TUNED] (quality=0.469, train=57, val=18) [VALIDATED: Validated (robustness=2.00, sharpe=11.85, dd=1.0%)]
+2026-02-02 09:01:10 [INFO] pm_pipeline: [USDJPY] [H1] [CHOP] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.445, train=40, val=16) [VALIDATED: Validated (robustness=1.40, sharpe=9.46, dd=2.1%)]
+2026-02-02 09:01:14 [INFO] pm_pipeline: [USDJPY] [H4] Hyperparameter tuning 9 strategies
+2026-02-02 09:03:53 [INFO] pm_pipeline: [USDJPY] [H4] [TREND] Winner: ADXTrendStrategy [TUNED] (quality=0.577, train=53, val=19) [VALIDATED: Validated (robustness=2.00, sharpe=24.14, dd=1.0%)]
+2026-02-02 09:03:53 [INFO] pm_pipeline: [USDJPY] [H4] [CHOP] Winner: MACDTrendStrategy [TUNED] (quality=0.462, train=101, val=34) [VALIDATED: Validated (robustness=1.49, sharpe=7.92, dd=2.0%)]
+2026-02-02 09:03:54 [INFO] pm_pipeline: [USDJPY] [D1] Hyperparameter tuning 5 strategies
+2026-02-02 09:04:21 [INFO] pm_pipeline: [USDJPY] [D1] [TREND] Winner: KeltnerBreakoutStrategy [TUNED] (quality=0.457, train=84, val=17) [VALIDATED: Validated (robustness=1.38, sharpe=11.70, dd=0.8%)]
+2026-02-02 09:04:21 [INFO] pm_pipeline: [USDJPY] [D1] [CHOP] Winner: VolatilityBreakoutStrategy [TUNED] (quality=0.522, train=29, val=21) [VALIDATED: Validated (robustness=1.68, sharpe=16.67, dd=1.0%)]
+2026-02-02 09:04:21 [INFO] pm_core: [TIME] [USDJPY] Regime Optimization: 13890.68s
+2026-02-02 09:04:38 [INFO] pm_pipeline: [USDJPY] Selected retrain period: 30 days
+2026-02-02 09:04:38 [INFO] pm_pipeline: 
+[USDJPY] OPTIMIZATION COMPLETE
+2026-02-02 09:04:38 [INFO] pm_pipeline:   Timeframes:  6
+2026-02-02 09:04:38 [INFO] pm_pipeline:   Validated:   16
+2026-02-02 09:04:38 [INFO] pm_pipeline:   Rejected:    0
+2026-02-02 09:04:38 [INFO] pm_pipeline:   Best:        ADXTrendStrategy @ M30/RANGE
+2026-02-02 09:04:38 [INFO] pm_pipeline:   Retrain:     Every 30 days
+2026-02-02 09:04:38 [INFO] pm_pipeline:   Duration:    14026.0s
+2026-02-02 09:04:38 [INFO] pm_pipeline:   [D1] TREND:KeltnerBreak, CHOP:VolatilityBr
+2026-02-02 09:04:38 [INFO] pm_pipeline:   [H1] TREND:SqueezeBreak, RANGE:IchimokuStra, CHOP:KeltnerBreak
+2026-02-02 09:04:38 [INFO] pm_pipeline:   [H4] TREND:ADXTrendStra, CHOP:MACDTrendStr
+2026-02-02 09:04:38 [INFO] pm_pipeline:   [M15] TREND:MomentumBurs, RANGE:MomentumBurs, CHOP:MomentumBurs
+2026-02-02 09:04:38 [INFO] pm_pipeline:   [M30] TREND:KeltnerBreak, RANGE:ADXTrendStra, CHOP:SqueezeBreak
+2026-02-02 09:04:38 [INFO] pm_pipeline:   [M5] TREND:MomentumBurs, RANGE:ADXDIStrengt, CHOP:MomentumBurs
+2026-02-02 09:04:38 [INFO] pm_pipeline: SAVED USDJPY to pm_configs.json (atomic)
+2026-02-02 09:04:38 [INFO] pm_pipeline: 
+Progress: 4/46
+2026-02-02 09:04:38 [INFO] pm_pipeline: 
+============================================================
+2026-02-02 09:04:38 [INFO] pm_pipeline: OPTIMIZING: USDCHF (Regime-Aware)
+2026-02-02 09:04:38 [INFO] pm_pipeline: ============================================================
+2026-02-02 09:04:40 [INFO] pm_core: Loaded USDCHF: 500000 bars from USDCHF_M5.csv
+2026-02-02 09:07:16 [INFO] pm_pipeline: [USDCHF] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-02 09:10:45 [INFO] pm_pipeline: [USDCHF] [M5] Hyperparameter tuning 11 strategies
+2026-02-02 10:39:51 [INFO] __main__: Shutting down...
+2026-02-02 10:39:51 [INFO] pm_mt5: Disconnected from MT5
+2026-02-02 10:39:51 [INFO] __main__: Shutdown complete
+2026-02-02 10:39:51 [INFO] pm_core: [TIME] [USDCHF] Regime Optimization: 5555.53s
+2026-02-02 10:39:51 [INFO] __main__: Shutting down...
+2026-02-02 10:39:51 [INFO] __main__: Shutdown complete

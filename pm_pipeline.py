@@ -379,6 +379,37 @@ class RegimeConfig:
     trained_at: Optional[datetime] = None
     valid_until: Optional[datetime] = None
     
+    def is_no_trade_marker(self) -> bool:
+        """Check if this config is a NO_TRADE marker (no valid strategy found)."""
+        return self.strategy_name == "NO_TRADE" or self.strategy_name == ""
+    
+    def is_valid_for_live(self, min_pf: float = 1.0, min_return: float = 0.0, max_dd: float = 35.0) -> bool:
+        """
+        Check if this config passes the live quality gate.
+        
+        A config is valid for live trading if:
+        - It's not a NO_TRADE marker
+        - Validation profit_factor >= min_pf
+        - Validation return >= min_return
+        - Validation drawdown <= max_dd
+        
+        Args:
+            min_pf: Minimum validation profit factor (default 1.0)
+            min_return: Minimum validation return % (default 0.0)
+            max_dd: Maximum validation drawdown % (default 35.0)
+            
+        Returns:
+            True if this config is valid for live trading
+        """
+        if self.is_no_trade_marker():
+            return False
+        
+        val_pf = self.val_metrics.get('profit_factor', 0.0)
+        val_return = self.val_metrics.get('total_return_pct', -100.0)
+        val_dd = self.val_metrics.get('max_drawdown_pct', 100.0)
+        
+        return val_pf >= min_pf and val_return >= min_return and val_dd <= max_dd
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -1274,6 +1305,13 @@ class RegimeOptimizer:
         self.val_min_sharpe_override = getattr(config, 'fx_val_sharpe_override', 0.3)
         self.min_robustness_ratio = getattr(config, 'fx_min_robustness_ratio', 0.75)
         
+        # ===== PROFITABILITY GATES (FIX #1) =====
+        # These prevent storing losing strategies as "regime winners"
+        self.min_val_profit_factor = getattr(config, 'regime_min_val_profit_factor', 1.0)
+        self.min_val_return_pct = getattr(config, 'regime_min_val_return_pct', 0.0)
+        self.allow_losing_winners = getattr(config, 'regime_allow_losing_winners', False)
+        self.no_winner_marker = getattr(config, 'regime_no_winner_marker', 'NO_TRADE')
+        
         # Use fx_backtester scoring mode
         self.use_fx_scoring = getattr(config, 'scoring_mode', 'pm_weighted') == 'fx_backtester'
         
@@ -1558,6 +1596,7 @@ class RegimeOptimizer:
                 bucket_trades_fn=self._bucket_trades_by_regime,
                 compute_score_fn=self._compute_regime_score,
                 min_train_trades=self.min_train_trades,
+                max_drawdown_pct=self.val_max_drawdown,  # Pass DD threshold for early rejection
             )
             
             # Convert to candidate list format
@@ -1716,10 +1755,23 @@ class RegimeOptimizer:
         
         return regime_metrics
     
-    def _compute_bucket_metrics(self, trades: List[Dict]) -> Dict[str, Any]:
-        """Compute metrics for a bucket of trades."""
+    def _compute_bucket_metrics(self, trades: List[Dict], initial_capital: float = None) -> Dict[str, Any]:
+        """
+        Compute metrics for a bucket of trades including proper drawdown.
+        
+        Args:
+            trades: List of trade dicts with pnl_dollars, entry_bar, etc.
+            initial_capital: Starting capital for return calculation (from config)
+            
+        Returns:
+            Dict with comprehensive metrics including max_drawdown_pct
+        """
         if not trades:
-            return {'total_trades': 0}
+            return {'total_trades': 0, 'max_drawdown_pct': 0.0, 'total_return_pct': 0.0}
+        
+        # Get initial capital from config if not provided
+        if initial_capital is None:
+            initial_capital = getattr(self.config, 'initial_capital', 10000.0)
         
         n = len(trades)
         winners = [t for t in trades if t.get('pnl_dollars', 0) > 0]
@@ -1741,6 +1793,31 @@ class RegimeOptimizer:
         std_return = np.std(returns, ddof=1) if len(returns) > 1 else 0
         sharpe_approx = (avg_return / std_return * np.sqrt(252)) if std_return > 0 else 0
         
+        # ===== FIX: Compute proper total_return_pct =====
+        total_return_pct = (total_pnl / initial_capital) * 100 if initial_capital > 0 else 0.0
+        
+        # ===== FIX: Compute proper max_drawdown_pct from bucket equity curve =====
+        # Sort trades by entry time to build correct equity curve
+        sorted_trades = sorted(trades, key=lambda t: t.get('entry_bar', t.get('signal_bar', 0)))
+        
+        # Build cumulative equity curve for this bucket
+        equity = initial_capital
+        peak_equity = initial_capital
+        max_drawdown_pct = 0.0
+        
+        for trade in sorted_trades:
+            pnl = trade.get('pnl_dollars', 0)
+            equity += pnl
+            
+            # Track peak and drawdown
+            if equity > peak_equity:
+                peak_equity = equity
+            
+            if peak_equity > 0:
+                current_dd_pct = ((peak_equity - equity) / peak_equity) * 100
+                if current_dd_pct > max_drawdown_pct:
+                    max_drawdown_pct = current_dd_pct
+        
         return {
             'total_trades': n,
             'win_rate': round(win_rate, 2),
@@ -1751,6 +1828,8 @@ class RegimeOptimizer:
             'avg_win': round(avg_win, 2),
             'avg_loss': round(avg_loss, 2),
             'sharpe_approx': round(sharpe_approx, 3),
+            'max_drawdown_pct': round(max_drawdown_pct, 2),  # FIX: Now properly computed
+            'total_return_pct': round(total_return_pct, 2),  # FIX: Now properly computed
         }
     
     def _select_best_for_regime(self,
@@ -1761,13 +1840,15 @@ class RegimeOptimizer:
         """
         Select best candidate for a specific regime with validation.
         
-        Applies minimum trade thresholds, scores candidates, and validates winner.
+        Applies minimum trade thresholds, profitability gates, scores candidates, 
+        and validates winner.
         
         Returns:
             Tuple of (RegimeConfig or None, is_validated, validation_reason)
         """
         best_score = -float('inf')
         best_candidate = None
+        rejection_reasons = []  # Track why candidates were rejected
         
         for cand in candidates:
             train_metrics = cand['train_regime_metrics'].get(regime, {})
@@ -1782,6 +1863,31 @@ class RegimeOptimizer:
             if val_trades < self.min_val_trades:
                 continue
             
+            # ===== EARLY REJECTION: Check drawdown before scoring (saves compute) =====
+            train_dd = train_metrics.get('max_drawdown_pct', 100.0)
+            val_dd = val_metrics.get('max_drawdown_pct', 100.0)
+            
+            # Reject if validation drawdown exceeds threshold
+            if val_dd > self.val_max_drawdown:
+                continue
+            
+            # Reject if training drawdown is excessively high (1.25x threshold)
+            if train_dd > self.val_max_drawdown * 1.25:
+                continue
+            
+            # ===== FIX #1: EARLY REJECTION - Profitability gates =====
+            # Reject candidates that are clearly losing BEFORE scoring
+            val_pf = val_metrics.get('profit_factor', 0.0)
+            val_return = val_metrics.get('total_return_pct', -100.0)
+            
+            if not self.allow_losing_winners:
+                if val_pf < self.min_val_profit_factor:
+                    rejection_reasons.append(f"{cand['strategy_name']}: PF={val_pf:.2f} < {self.min_val_profit_factor}")
+                    continue
+                if val_return < self.min_val_return_pct:
+                    rejection_reasons.append(f"{cand['strategy_name']}: return={val_return:.1f}% < {self.min_val_return_pct}")
+                    continue
+            
             # Score based on validation metrics (with train as fallback)
             score = self._compute_regime_score(train_metrics, val_metrics)
             
@@ -1790,7 +1896,10 @@ class RegimeOptimizer:
                 best_candidate = cand
         
         if best_candidate is None:
-            return None, False, "No candidates met minimum trade thresholds"
+            reason = "No candidates met minimum trade/drawdown/profitability thresholds"
+            if rejection_reasons:
+                reason += f" (rejected: {len(rejection_reasons)} candidates for profitability)"
+            return None, False, reason
         
         # Build RegimeConfig
         train_metrics = best_candidate['train_regime_metrics'].get(regime, {})
@@ -1827,9 +1936,11 @@ class RegimeOptimizer:
         """
         Validate a regime winner against fx_backtester thresholds.
         
-        Checks:
+        Checks (ALL enforced unless allow_losing_winners=True):
         - Validation trade count >= fx_val_min_trades
-        - Validation drawdown < fx_val_max_drawdown (if available)
+        - Validation drawdown < fx_val_max_drawdown
+        - Validation profit_factor >= regime_min_val_profit_factor (default 1.0)
+        - Validation return_pct >= regime_min_val_return_pct (default 0.0)
         - Robustness ratio >= fx_min_robustness_ratio OR val_sharpe > override
         
         Returns:
@@ -1837,10 +1948,35 @@ class RegimeOptimizer:
         """
         val_trades = val_metrics.get('total_trades', 0)
         val_sharpe = val_metrics.get('sharpe_approx', 0)
+        val_drawdown = val_metrics.get('max_drawdown_pct', 100.0)  # Default to worst-case
+        val_pf = val_metrics.get('profit_factor', 0.0)
+        val_return = val_metrics.get('total_return_pct', -100.0)
         
         # Check minimum validation trades
         if val_trades < self.min_val_trades:
             return False, f"Insufficient val trades: {val_trades} < {self.min_val_trades}"
+        
+        # ===== FIX #1: Check validation drawdown =====
+        if val_drawdown > self.val_max_drawdown:
+            return False, f"Excessive val drawdown: {val_drawdown:.1f}% > {self.val_max_drawdown}%"
+        
+        # Also check training drawdown as early rejection
+        train_drawdown = train_metrics.get('max_drawdown_pct', 100.0)
+        # Allow slightly higher train DD (1.25x) since we expect some overfitting
+        train_dd_threshold = self.val_max_drawdown * 1.25
+        if train_drawdown > train_dd_threshold:
+            return False, f"Excessive train drawdown: {train_drawdown:.1f}% > {train_dd_threshold:.1f}%"
+        
+        # ===== FIX #1: PROFITABILITY GATES (Critical new checks) =====
+        # These prevent storing losing strategies as "regime winners"
+        if not self.allow_losing_winners:
+            # Check profit factor >= threshold (default 1.0 = must be profitable)
+            if val_pf < self.min_val_profit_factor:
+                return False, f"Unprofitable: val PF {val_pf:.3f} < {self.min_val_profit_factor:.2f}"
+            
+            # Check return >= threshold (default 0.0 = must be non-negative)
+            if val_return < self.min_val_return_pct:
+                return False, f"Negative return: val return {val_return:.2f}% < {self.min_val_return_pct:.1f}%"
         
         # Compute robustness ratio
         train_full = self._bucket_to_full_metrics(train_metrics)
@@ -1853,14 +1989,13 @@ class RegimeOptimizer:
         else:
             # Simple profit factor ratio
             train_pf = train_metrics.get('profit_factor', 1.0)
-            val_pf = val_metrics.get('profit_factor', 1.0)
             robustness = val_pf / (train_pf + 0.1) if train_pf > 0 else 0.5
         
         # Check robustness OR Sharpe override
         if robustness < self.min_robustness_ratio and val_sharpe <= self.val_min_sharpe_override:
             return False, f"Low robustness {robustness:.2f} < {self.min_robustness_ratio} and Sharpe {val_sharpe:.2f} <= {self.val_min_sharpe_override}"
         
-        return True, f"Validated (robustness={robustness:.2f}, sharpe={val_sharpe:.2f})"
+        return True, f"Validated (PF={val_pf:.2f}, ret={val_return:.1f}%, robustness={robustness:.2f}, dd={val_drawdown:.1f}%)"
     
     def _compute_regime_score(self,
                                train_metrics: Dict[str, Any],
@@ -1872,28 +2007,51 @@ class RegimeOptimizer:
         - Gap penalty for train->val degradation
         - Robustness ratio boost
         - Validation-first scoring
+        - Trade count stability factor (Gap C fix)
         
         Falls back to simple composite for pm_weighted mode.
         """
+        # ===== FIX Gap C: Trade count stability factor =====
+        # Prefer candidates with more trades (more statistical confidence)
+        # Uses log scaling: log1p(trades) / log1p(target) capped at 1.0
+        train_trades = train_metrics.get('total_trades', 0)
+        val_trades = val_metrics.get('total_trades', 0)
+        
+        # Target trade counts for full stability bonus
+        # (2x minimum is considered "healthy")
+        target_train = self.min_train_trades * 2
+        target_val = self.min_val_trades * 2
+        
+        # Calculate stability factors using log scaling
+        import math
+        train_stability = min(1.0, math.log1p(train_trades) / math.log1p(target_train)) if target_train > 0 else 0.5
+        val_stability = min(1.0, math.log1p(val_trades) / math.log1p(target_val)) if target_val > 0 else 0.5
+        
+        # Combined stability factor (weighted average favoring validation)
+        stability_factor = 0.3 * train_stability + 0.7 * val_stability
+        # Clamp to reasonable range [0.7, 1.0] - don't over-penalize low counts
+        stability_factor = 0.7 + 0.3 * stability_factor
+        
         if self.use_fx_scoring:
             # Build pseudo-metrics dicts for the scorer (regime bucket metrics -> full metrics format)
             train_full = self._bucket_to_full_metrics(train_metrics)
             val_full = self._bucket_to_full_metrics(val_metrics)
             
             # Use validation metrics if sufficient trades
-            if val_metrics.get('total_trades', 0) >= self.min_val_trades:
+            if val_trades >= self.min_val_trades:
                 # Use fx_generalization_score for proper gap penalty + robustness boost
                 final_score, train_score, val_score, rr = self.scorer.fx_generalization_score(
                     train_full, val_full, purpose="selection"
                 )
-                return final_score
+                # Apply stability factor (Gap C fix)
+                return final_score * stability_factor
             else:
                 # Not enough validation trades - use train score with discount
                 train_score = self.scorer.score(train_full, purpose="selection")
-                return train_score * 0.7  # Discount for no validation
+                return train_score * 0.7 * stability_factor  # Discount for no validation
         
         # Legacy pm_weighted scoring (original behavior)
-        if val_metrics.get('total_trades', 0) >= self.min_val_trades:
+        if val_trades >= self.min_val_trades:
             metrics = val_metrics
             train_pf = train_metrics.get('profit_factor', 1.0)
             val_pf = metrics.get('profit_factor', 1.0)
@@ -1918,21 +2076,27 @@ class RegimeOptimizer:
             robustness * 20
         )
         
-        return score
+        # Apply stability factor (Gap C fix)
+        return score * stability_factor
     
     def _bucket_to_full_metrics(self, bucket_metrics: Dict[str, Any]) -> Dict[str, Any]:
         """
         Convert regime bucket metrics to full metrics format expected by StrategyScorer.
         
         Maps bucket fields to standard backtest result fields.
+        Now uses properly computed max_drawdown_pct and total_return_pct from bucket.
         """
+        # Get properly computed values (now available from _compute_bucket_metrics)
+        max_dd = bucket_metrics.get('max_drawdown_pct', 100.0)  # Default to worst-case, not 0
+        total_return = bucket_metrics.get('total_return_pct', 0.0)  # Now properly computed
+        
         return {
             'total_trades': bucket_metrics.get('total_trades', 0),
             'win_rate': bucket_metrics.get('win_rate', 0),
             'profit_factor': bucket_metrics.get('profit_factor', 0),
-            'total_return_pct': bucket_metrics.get('total_pnl', 0) / 100,  # Approximate
+            'total_return_pct': total_return,  # FIX: Use properly computed value
             'sharpe_ratio': bucket_metrics.get('sharpe_approx', 0),
-            'max_drawdown_pct': bucket_metrics.get('max_drawdown_pct', 0),  # May not exist in bucket
+            'max_drawdown_pct': max_dd,  # FIX: Use properly computed value (default worst-case)
             'gross_profit': bucket_metrics.get('gross_profit', 0),
             'gross_loss': bucket_metrics.get('gross_loss', 0),
             'total_pnl': bucket_metrics.get('total_pnl', 0),

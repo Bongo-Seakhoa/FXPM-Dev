@@ -19,6 +19,7 @@ Version: 3.0 (Portfolio Manager)
 """
 
 import logging
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -34,7 +35,163 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# TRADE TAG UTILITIES (FIX #2: D1 + Lower-TF Support)
+# =============================================================================
+
+class TradeTagEncoder:
+    """
+    Encodes and decodes trade metadata in MT5 magic numbers and comments.
+
+    Magic number encoding:
+        Deterministic CRC32 of symbol|timeframe|regime for unique identification.
+
+    Comment encoding goals:
+        - Must fit within MT5's practical comment length limits.
+        - Must be machine-parseable and backwards compatible with the older "PM:" format.
+        - Must support extracting at least: symbol, timeframe, direction, (optional) tier and risk_pct.
+
+    Formats
+    --------
+    v1 (legacy):
+        "PM:{symbol}:{timeframe}:{strategy}:{direction}"
+
+    v2 (preferred):
+        "PM2:{symbol}:{timeframe}:{scode}:{dir}:{tier}:{risk_tenths}"
+
+        where:
+            scode        = short strategy code (base36 CRC32, 4-5 chars)
+            dir          = 'L' or 'S'
+            tier         = 1..4
+            risk_tenths  = int(round(risk_pct * 10))
+    """
+
+    COMMENT_PREFIX_V1 = "PM:"
+    COMMENT_PREFIX_V2 = "PM2:"
+
+    @staticmethod
+    def _base36(n: int) -> str:
+        chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        if n == 0:
+            return "0"
+        out = []
+        while n > 0:
+            n, r = divmod(n, 36)
+            out.append(chars[r])
+        return "".join(reversed(out))
+
+    @staticmethod
+    def encode_magic(symbol: str, timeframe: str, regime: str) -> int:
+        """Generate deterministic magic number for a (symbol, timeframe, regime) tuple."""
+        key = f"{symbol}|{timeframe}|{regime}"
+        return zlib.crc32(key.encode('utf-8')) & 0x7FFFFFFF
+
+    @staticmethod
+    def _strategy_code(strategy_name: str, max_len: int = 5) -> str:
+        """Short stable code for a strategy name (CRC32 base36)."""
+        try:
+            crc = zlib.crc32(str(strategy_name).encode("utf-8")) & 0xFFFFFFFF
+            code = TradeTagEncoder._base36(crc)
+            return code[-max_len:].rjust(max_len, "0")
+        except Exception:
+            return "00000"[-max_len:]
+
+    @staticmethod
+    def encode_comment(symbol: str,
+                       timeframe: str,
+                       strategy_name: str,
+                       direction: str,
+                       risk_pct: float = None,
+                       tier: int = None) -> str:
+        """
+        Encode trade metadata into MT5 comment string.
+
+        If risk_pct and tier are provided, emits v2 (PM2:...) otherwise falls back to legacy v1.
+        """
+        # Normalize direction for compactness
+        dir_norm = str(direction).upper()
+        dir_short = "L" if dir_norm.startswith("L") else "S" if dir_norm.startswith("S") else dir_norm[:1]
+
+        if risk_pct is not None and tier is not None:
+            scode = TradeTagEncoder._strategy_code(strategy_name, max_len=5)
+            risk_tenths = int(round(float(risk_pct) * 10.0))
+            tier_i = int(tier)
+            return f"{TradeTagEncoder.COMMENT_PREFIX_V2}{symbol}:{timeframe}:{scode}:{dir_short}:{tier_i}:{risk_tenths}"
+
+        # Legacy v1
+        return f"{TradeTagEncoder.COMMENT_PREFIX_V1}{symbol}:{timeframe}:{strategy_name}:{str(direction).upper()}"
+
+    @staticmethod
+    def decode_comment(comment: str) -> Optional[Dict[str, Any]]:
+        """
+        Decode trade metadata from MT5 comment string.
+
+        Returns dict with keys:
+            symbol, timeframe, direction, (optional) strategy_code, tier, risk_pct
+        """
+        if not comment:
+            return None
+
+        try:
+            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V2):
+                parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V2):].split(':')
+                # PM2:symbol:tf:scode:dir:tier:risk_tenths
+                if len(parts) >= 6:
+                    symbol, tf, scode, dir_short, tier_s, risk_tenths_s = parts[:6]
+                    risk_pct = float(int(risk_tenths_s)) / 10.0
+                    direction = "LONG" if dir_short.upper() == "L" else "SHORT" if dir_short.upper() == "S" else dir_short
+                    return {
+                        "symbol": symbol,
+                        "timeframe": tf,
+                        "strategy_code": scode,
+                        "direction": direction,
+                        "tier": int(tier_s),
+                        "risk_pct": risk_pct,
+                    }
+
+            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V1):
+                parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V1):].split(':')
+                # PM:symbol:tf:strategy:direction
+                if len(parts) >= 4:
+                    return {
+                        'symbol': parts[0],
+                        'timeframe': parts[1],
+                        'strategy_name': parts[2],
+                        'direction': parts[3],
+                    }
+        except Exception:
+            return None
+
+        return None
+
+    @staticmethod
+    def is_d1_trade(comment: str) -> bool:
+        decoded = TradeTagEncoder.decode_comment(comment)
+        return decoded is not None and decoded.get('timeframe') == 'D1'
+
+    @staticmethod
+    def get_timeframe_from_comment(comment: str) -> Optional[str]:
+        decoded = TradeTagEncoder.decode_comment(comment)
+        return decoded.get('timeframe') if decoded else None
+
+    @staticmethod
+    def get_risk_pct_from_comment(comment: str) -> Optional[float]:
+        decoded = TradeTagEncoder.decode_comment(comment)
+        if not decoded:
+            return None
+        return decoded.get('risk_pct')
+
+    @staticmethod
+    def get_tier_from_comment(comment: str) -> Optional[int]:
+        decoded = TradeTagEncoder.decode_comment(comment)
+        if not decoded:
+            return None
+        t = decoded.get('tier')
+        return int(t) if t is not None else None
+
+
+# =============================================================================
 # DATA CLASSES
+
 # =============================================================================
 
 @dataclass

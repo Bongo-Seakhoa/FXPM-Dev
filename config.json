@@ -2,95 +2,104 @@
   "pipeline": {
     "data_dir": "./data",
     "output_dir": "./pm_outputs",
-    
     "train_pct": 80.0,
     "val_pct": 30.0,
     "overlap_pct": 10.0,
-    
     "initial_capital": 10000.0,
     "risk_per_trade_pct": 1.0,
-    
     "use_spread": true,
     "use_commission": true,
     "use_slippage": true,
     "slippage_pips": 0.5,
-    
     "max_param_combos": 150,
     "min_trades": 25,
-    "min_robustness": 0.20,
-    
+    "min_robustness": 0.2,
     "min_win_rate": 45.0,
     "min_profit_factor": 1.2,
     "min_sharpe": 0.5,
     "max_drawdown": 15.0,
-    
     "scoring_mode": "fx_backtester",
-    
     "fx_opt_min_trades": 15,
     "fx_val_min_trades": 15,
     "fx_val_max_drawdown": 20.0,
     "fx_val_sharpe_override": 0.3,
     "fx_selection_top_k": 5,
     "fx_opt_top_k": 5,
-    "fx_gap_penalty_lambda": 0.70,
+    "fx_gap_penalty_lambda": 0.7,
     "fx_robustness_boost": 0.15,
-    "fx_min_robustness_ratio": 0.80,
-    
-    "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
-    "retrain_periods": [14, 30, 60, 90, 120],
-    
+    "fx_min_robustness_ratio": 0.8,
+    "timeframes": [
+      "M5",
+      "M15",
+      "M30",
+      "H1",
+      "H4",
+      "D1"
+    ],
+    "retrain_periods": [
+      14,
+      30,
+      60,
+      90,
+      120
+    ],
     "max_bars": 500000,
-    
     "use_regime_optimization": true,
     "regime_min_train_trades": 25,
     "regime_min_val_trades": 15,
     "regime_freshness_decay": 0.85,
-    "regime_chop_no_trade": true,
+    "regime_chop_no_trade": false,
     "regime_params_file": "regime_params.json",
-    
     "regime_enable_hyperparam_tuning": true,
     "regime_hyperparam_top_k": 3,
     "regime_hyperparam_max_combos": 150,
-    
     "score_weights": {
       "sharpe": 0.25,
-      "profit_factor": 0.20,
+      "profit_factor": 0.2,
       "win_rate": 0.15,
       "total_return": 0.15,
       "max_drawdown": 0.15,
-      "trade_count": 0.10
-    }
+      "trade_count": 0.1
+    },
+    "live_bars_count": 1500,
+    "live_min_bars": 300,
+    "fallback_risk_multiplier": 1.0,
+    "fallback_max_risk_pct": 1.0,
+    "tier1_risk_multiplier": 1.0,
+    "tier1_max_risk_pct": 5.0,
+    "tier23_max_risk_pct": 1.0,
+    "min_trade_risk_pct": 0.1,
+    "allow_d1_plus_lower_tf": true,
+    "d1_secondary_risk_multiplier": 1.0,
+    "secondary_trade_max_risk_pct": 1.0,
+    "max_combined_risk_pct": 3.0,
+    "regime_min_val_profit_factor": 1.0,
+    "regime_min_val_return_pct": 0.0,
+    "optuna_use_val_in_objective": false,
+    "actionable_score_margin": 0.95
   },
-
   "position": {
     "risk_per_trade_pct": 1.0,
     "max_position_size": 0.0,
     "min_position_size": 0.01,
-    
     "risk_basis": "balance",
     "max_risk_pct": 5.0,
     "risk_tolerance_pct": 2.0,
     "auto_widen_sl": true,
-    
     "use_trailing_stop": false,
     "trailing_stop_pips": 0.0,
     "trailing_activation_pips": 0.0,
-    
     "use_breakeven_stop": false,
     "breakeven_trigger_pips": 0.0,
     "breakeven_offset_pips": 1.0,
-    
     "allow_scaling": false,
     "max_scale_ins": 3,
     "scale_in_pct": 50.0,
-    
     "max_trade_duration_bars": 0,
-    
     "use_spread": true,
     "use_slippage": true,
     "slippage_pips": 0.5
   },
-
   "mt5": {
     "login": 0,
     "password": "",
@@ -99,17 +108,52 @@
     "timeout": 60000,
     "portable": false
   },
-
   "symbols": [
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
-    "AUDNZD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURAUD",
-    "EURCHF", "EURCAD", "EURNZD", "GBPAUD", "GBPCAD", "GBPCHF",
-    "CADJPY", "NZDJPY",
-    "AUDCAD", "AUDCHF", "CADCHF", "CHFJPY", "NZDCAD", "NZDCHF", "GBPNZD",
-    "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+    "NZDUSD",
+    "AUDNZD",
+    "EURGBP",
+    "EURJPY",
+    "GBPJPY",
+    "AUDJPY",
+    "EURAUD",
+    "EURCHF",
+    "EURCAD",
+    "EURNZD",
+    "GBPAUD",
+    "GBPCAD",
+    "GBPCHF",
+    "CADJPY",
+    "NZDJPY",
+    "AUDCAD",
+    "AUDCHF",
+    "CADCHF",
+    "CHFJPY",
+    "NZDCAD",
+    "NZDCHF",
+    "GBPNZD",
+    "USDNOK",
+    "USDMXN",
+    "USDSGD",
+    "USDZAR",
+    "USDPLN",
     "USDSEK",
-    "XAUUSD", "XAGUSD",
-    "US100", "US30", "DE30", "EU50", "UK100", "JP225",
-    "ETHUSD", "XRPUSD", "TONUSD", "BTCETH"
+    "XAUUSD",
+    "XAGUSD",
+    "US100",
+    "US30",
+    "DE30",
+    "EU50",
+    "UK100",
+    "JP225",
+    "ETHUSD",
+    "XRPUSD",
+    "TONUSD",
+    "BTCETH"
   ]
 }

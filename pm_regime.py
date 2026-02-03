@@ -35,7 +35,7 @@ try:
     from numba import jit, prange
     NUMBA_AVAILABLE = True
     logger.debug("Numba JIT compilation available - using optimized loops")
-except ImportError:
+except Exception:
     NUMBA_AVAILABLE = False
     logger.debug("Numba not available - using pure Python loops")
     

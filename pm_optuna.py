@@ -80,6 +80,12 @@ class OptunaConfig:
     
     # Timeout (optional)
     timeout_seconds: Optional[float] = None
+
+    # Objective definition
+    # If True, Optuna maximizes a score that includes validation metrics. This can overfit
+    # to the holdout split because the same validation set is later used for selection.
+    # Default is False to avoid train/val leakage: tune on train, validate on val.
+    use_validation_in_objective: bool = False
     
     # Logging
     log_interval: int = 25  # Log progress every N trials
@@ -92,6 +98,7 @@ class OptunaConfig:
             n_startup_trials=min(10, getattr(config, 'regime_hyperparam_max_combos', 100) // 10),
             seed=42,
             multivariate=True,
+            use_validation_in_objective=bool(getattr(config, 'optuna_use_val_in_objective', False)),
         )
 
 
@@ -271,11 +278,15 @@ class OptimizationStats:
     best_score: float = float('-inf')
     optimization_time_sec: float = 0.0
     method: str = "optuna_tpe"
+    early_dd_rejections: int = 0  # Count of trials rejected due to high drawdown
     
     def __str__(self) -> str:
-        return (f"Trials: {self.n_trials} (completed={self.n_completed}, "
+        base = (f"Trials: {self.n_trials} (completed={self.n_completed}, "
                 f"pruned={self.n_pruned}, failed={self.n_failed}), "
                 f"best_score={self.best_score:.4f}, time={self.optimization_time_sec:.1f}s")
+        if self.early_dd_rejections > 0:
+            base += f", early_dd_rejects={self.early_dd_rejections}"
+        return base
 
 
 @dataclass
@@ -297,6 +308,7 @@ class OptimizationResult:
                 'n_pruned': self.stats.n_pruned,
                 'optimization_time_sec': self.stats.optimization_time_sec,
                 'method': self.stats.method,
+                'early_dd_rejections': self.stats.early_dd_rejections,
             }
         }
 
@@ -347,9 +359,10 @@ class OptunaTPEOptimizer:
                  train_features: pd.DataFrame,
                  val_features: Optional[pd.DataFrame],
                  scoring_fn: Callable[[Dict, Dict], float],
-                 min_trades: int = 10) -> OptimizationResult:
+                 min_trades: int = 10,
+                 max_drawdown_pct: float = 30.0) -> OptimizationResult:
         """
-        Optimize strategy parameters using Optuna TPE.
+        Optimize strategy parameters using Optuna TPE with early rejection.
         
         Args:
             symbol: Trading symbol
@@ -359,6 +372,7 @@ class OptunaTPEOptimizer:
             val_features: Validation data (can be None)
             scoring_fn: Function(train_metrics, val_metrics) -> score
             min_trades: Minimum trades required for valid evaluation
+            max_drawdown_pct: Maximum drawdown threshold for early rejection
             
         Returns:
             OptimizationResult with best parameters and metrics
@@ -366,7 +380,7 @@ class OptunaTPEOptimizer:
         if not OPTUNA_AVAILABLE:
             return self._fallback_random_search(
                 symbol, strategy_name, param_grid, train_features, 
-                val_features, scoring_fn, min_trades
+                val_features, scoring_fn, min_trades, max_drawdown_pct
             )
         
         start_time = time.time()
@@ -400,11 +414,12 @@ class OptunaTPEOptimizer:
             'val_metrics': {},
         }
         
-        # Trial counter for logging
+        # Trial counter and early rejection counter for logging
         trial_count = [0]
+        early_rejections = [0]
         
         def objective(trial: optuna.Trial) -> float:
-            """Optuna objective function."""
+            """Optuna objective function with drawdown-based early rejection."""
             trial_count[0] += 1
             
             # Suggest parameters
@@ -420,24 +435,35 @@ class OptunaTPEOptimizer:
                     train_features, signals, symbol, strategy
                 )
                 
-                # Check minimum trades
+                # EARLY REJECTION 1: Minimum trades
                 if train_metrics.get('total_trades', 0) < min_trades:
-                    # Return very low score but don't prune - TPE needs the feedback
                     return -1000.0
                 
-                # Evaluate on validation if available
+                # EARLY REJECTION 2: Training drawdown
+                train_dd = train_metrics.get('max_drawdown_pct', 100.0)
+                if train_dd > max_drawdown_pct * 1.25:
+                    early_rejections[0] += 1
+                    return -500.0  # Bad score but TPE can learn from it
+                
+                # CONDITIONAL VALIDATION: Only run if training passed
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_metrics = self.backtester.run(
                         val_features, val_signals, symbol, strategy
                     )
+                    
+                    # EARLY REJECTION 3: Validation drawdown
+                    val_dd = val_metrics.get('max_drawdown_pct', 100.0)
+                    if val_dd > max_drawdown_pct:
+                        early_rejections[0] += 1
+                        return -500.0
                 else:
                     val_metrics = self._empty_val_metrics()
                 
                 # Compute score
                 score = scoring_fn(train_metrics, val_metrics)
                 
-                # Update best if improved
+                # Update best if improved (only if passes DD check)
                 if score > best_result['score']:
                     best_result['score'] = score
                     best_result['params'] = self._clean_params(params)
@@ -447,7 +473,8 @@ class OptunaTPEOptimizer:
                 # Log progress
                 if trial_count[0] % self.config.log_interval == 0:
                     logger.debug(f"[{symbol}] Trial {trial_count[0]}/{n_trials}: "
-                               f"score={score:.4f}, best={best_result['score']:.4f}")
+                               f"score={score:.4f}, best={best_result['score']:.4f}, "
+                               f"dd_rejects={early_rejections[0]}")
                 
                 return score
                 
@@ -501,13 +528,15 @@ class OptunaTPEOptimizer:
                              regimes: List[str],
                              bucket_trades_fn: Callable,
                              compute_score_fn: Callable,
-                             min_train_trades: int = 25) -> Dict[str, Dict[str, Any]]:
+                             min_train_trades: int = 25,
+                             max_drawdown_pct: float = 25.0) -> Dict[str, Dict[str, Any]]:
         """
         Optimize strategy parameters for multiple regimes simultaneously.
         
         This is more efficient than per-regime optimization because:
         1. Each backtest produces trades for all regimes
         2. TPE learns parameter-regime relationships
+        3. Early rejection of high-drawdown candidates (saves compute)
         
         Args:
             symbol: Trading symbol
@@ -520,6 +549,7 @@ class OptunaTPEOptimizer:
             bucket_trades_fn: Function to bucket trades by regime
             compute_score_fn: Function to compute regime score
             min_train_trades: Minimum trades per regime
+            max_drawdown_pct: Maximum allowed drawdown (early rejection threshold)
             
         Returns:
             Dict mapping regime -> best candidate dict
@@ -528,7 +558,8 @@ class OptunaTPEOptimizer:
             return self._fallback_regime_search(
                 symbol, timeframe, strategy_name, param_grid,
                 train_features, val_features, regimes,
-                bucket_trades_fn, compute_score_fn, min_train_trades
+                bucket_trades_fn, compute_score_fn, min_train_trades,
+                max_drawdown_pct
             )
         
         start_time = time.time()
@@ -550,10 +581,12 @@ class OptunaTPEOptimizer:
             r: (float('-inf'), None) for r in regimes
         }
         
+        # Track early rejections for logging
+        early_rejections = [0]
         trial_count = [0]
         
         def objective(trial: optuna.Trial) -> float:
-            """Multi-regime objective - returns max score across regimes."""
+            """Multi-regime objective with drawdown-based early rejection."""
             trial_count[0] += 1
             params = param_space.suggest(trial)
             
@@ -566,20 +599,35 @@ class OptunaTPEOptimizer:
                     train_features, signals, symbol, strategy
                 )
                 
+                # ===== EARLY REJECTION 1: Minimum trades =====
                 if train_result.get('total_trades', 0) < min_train_trades // 2:
                     return -1000.0
+                
+                # ===== EARLY REJECTION 2: Training drawdown =====
+                # If overall training DD exceeds threshold, skip validation entirely
+                train_dd = train_result.get('max_drawdown_pct', 100.0)
+                if train_dd > max_drawdown_pct * 1.25:  # Allow 25% margin for training
+                    early_rejections[0] += 1
+                    return -500.0  # Bad but not as bad as no trades - TPE can learn from this
                 
                 # Bucket trades by regime
                 train_trades = train_result.get('trades', [])
                 train_regime_metrics = bucket_trades_fn(train_trades, train_features)
                 
-                # Validation
+                # ===== CONDITIONAL VALIDATION: Only if training passed DD check =====
                 val_regime_metrics = {}
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_result = self.backtester.run(
                         val_features, val_signals, symbol, strategy
                     )
+                    
+                    # Early rejection if validation DD too high
+                    val_dd = val_result.get('max_drawdown_pct', 100.0)
+                    if val_dd > max_drawdown_pct:
+                        early_rejections[0] += 1
+                        return -500.0
+                    
                     val_trades = val_result.get('trades', [])
                     val_regime_metrics = bucket_trades_fn(val_trades, val_features)
                 
@@ -591,13 +639,23 @@ class OptunaTPEOptimizer:
                     train_m = train_regime_metrics.get(regime, {})
                     val_m = val_regime_metrics.get(regime, {})
                     
+                    # ===== EARLY REJECTION 3: Per-regime minimum trades =====
                     if train_m.get('total_trades', 0) < min_train_trades:
                         continue
                     
-                    score = compute_score_fn(train_m, val_m)
+                    # ===== EARLY REJECTION 4: Per-regime drawdown =====
+                    regime_train_dd = train_m.get('max_drawdown_pct', 100.0)
+                    regime_val_dd = val_m.get('max_drawdown_pct', 100.0)
+                    
+                    if regime_val_dd > max_drawdown_pct:
+                        continue  # Skip this regime but continue with others
+                    if regime_train_dd > max_drawdown_pct * 1.25:
+                        continue
+                    
+                    score = compute_score_fn(train_m, val_m) if self.config.use_validation_in_objective else compute_score_fn(train_m, {})
                     regime_scores.append(score)
                     
-                    # Update best for this regime
+                    # Update best for this regime (only if passes DD check)
                     if score > best_by_regime[regime][0]:
                         best_by_regime[regime] = (score, {
                             'strategy': strategy,
@@ -634,6 +692,7 @@ class OptunaTPEOptimizer:
         
         elapsed = time.time() - start_time
         stats = self._compile_stats(study, elapsed)
+        stats.early_dd_rejections = early_rejections[0]
         
         logger.debug(f"[{symbol}] [{timeframe}] {strategy_name} regime tuning: {stats}")
         
@@ -691,8 +750,9 @@ class OptunaTPEOptimizer:
                                 train_features: pd.DataFrame,
                                 val_features: Optional[pd.DataFrame],
                                 scoring_fn: Callable,
-                                min_trades: int) -> OptimizationResult:
-        """Fallback to random search when Optuna unavailable."""
+                                min_trades: int,
+                                max_drawdown_pct: float = 30.0) -> OptimizationResult:
+        """Fallback to random search when Optuna unavailable (with drawdown early rejection)."""
         from itertools import product
         
         start_time = time.time()
@@ -724,6 +784,7 @@ class OptunaTPEOptimizer:
         best_train_metrics = {}
         best_val_metrics = {}
         completed = 0
+        early_rejections = 0
         
         for combo in combos:
             params = {**default_params, **dict(zip(param_names, combo))}
@@ -736,14 +797,28 @@ class OptunaTPEOptimizer:
                     train_features, signals, symbol, strategy
                 )
                 
+                # EARLY REJECTION 1: Minimum trades
                 if train_metrics.get('total_trades', 0) < min_trades:
                     continue
                 
+                # EARLY REJECTION 2: Training drawdown
+                train_dd = train_metrics.get('max_drawdown_pct', 100.0)
+                if train_dd > max_drawdown_pct * 1.25:
+                    early_rejections += 1
+                    continue
+                
+                # CONDITIONAL VALIDATION
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_metrics = self.backtester.run(
                         val_features, val_signals, symbol, strategy
                     )
+                    
+                    # EARLY REJECTION 3: Validation drawdown
+                    val_dd = val_metrics.get('max_drawdown_pct', 100.0)
+                    if val_dd > max_drawdown_pct:
+                        early_rejections += 1
+                        continue
                 else:
                     val_metrics = self._empty_val_metrics()
                 
@@ -758,6 +833,9 @@ class OptunaTPEOptimizer:
                     
             except Exception:
                 continue
+        
+        if early_rejections > 0:
+            logger.debug(f"[{symbol}] Random search: {early_rejections} early DD rejections")
         
         elapsed = time.time() - start_time
         
@@ -790,8 +868,9 @@ class OptunaTPEOptimizer:
                                 regimes: List[str],
                                 bucket_trades_fn: Callable,
                                 compute_score_fn: Callable,
-                                min_train_trades: int) -> Dict[str, Dict[str, Any]]:
-        """Fallback regime search when Optuna unavailable."""
+                                min_train_trades: int,
+                                max_drawdown_pct: float = 25.0) -> Dict[str, Dict[str, Any]]:
+        """Fallback regime search when Optuna unavailable (with drawdown-based early rejection)."""
         from itertools import product
         
         base_strategy = self.strategy_registry.get(strategy_name)
@@ -813,6 +892,7 @@ class OptunaTPEOptimizer:
             combos = all_combos
         
         best_by_regime = {r: (float('-inf'), None) for r in regimes}
+        early_rejections = 0
         
         for combo in combos:
             params = {**default_params, **dict(zip(param_names, combo))}
@@ -825,18 +905,33 @@ class OptunaTPEOptimizer:
                     train_features, signals, symbol, strategy
                 )
                 
+                # EARLY REJECTION 1: Minimum trades
                 if train_result.get('total_trades', 0) < min_train_trades // 2:
+                    continue
+                
+                # EARLY REJECTION 2: Training drawdown
+                train_dd = train_result.get('max_drawdown_pct', 100.0)
+                if train_dd > max_drawdown_pct * 1.25:
+                    early_rejections += 1
                     continue
                 
                 train_trades = train_result.get('trades', [])
                 train_regime_metrics = bucket_trades_fn(train_trades, train_features)
                 
+                # CONDITIONAL VALIDATION: Only if training passed DD check
                 val_regime_metrics = {}
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_result = self.backtester.run(
                         val_features, val_signals, symbol, strategy
                     )
+                    
+                    # Early rejection if validation DD too high
+                    val_dd = val_result.get('max_drawdown_pct', 100.0)
+                    if val_dd > max_drawdown_pct:
+                        early_rejections += 1
+                        continue
+                    
                     val_trades = val_result.get('trades', [])
                     val_regime_metrics = bucket_trades_fn(val_trades, val_features)
                 
@@ -846,10 +941,20 @@ class OptunaTPEOptimizer:
                     train_m = train_regime_metrics.get(regime, {})
                     val_m = val_regime_metrics.get(regime, {})
                     
+                    # EARLY REJECTION 3: Per-regime minimum trades
                     if train_m.get('total_trades', 0) < min_train_trades:
                         continue
                     
-                    score = compute_score_fn(train_m, val_m)
+                    # EARLY REJECTION 4: Per-regime drawdown
+                    regime_train_dd = train_m.get('max_drawdown_pct', 100.0)
+                    regime_val_dd = val_m.get('max_drawdown_pct', 100.0)
+                    
+                    if regime_val_dd > max_drawdown_pct:
+                        continue
+                    if regime_train_dd > max_drawdown_pct * 1.25:
+                        continue
+                    
+                    score = compute_score_fn(train_m, val_m) if self.config.use_validation_in_objective else compute_score_fn(train_m, {})
                     
                     if score > best_by_regime[regime][0]:
                         best_by_regime[regime] = (score, {
@@ -864,6 +969,9 @@ class OptunaTPEOptimizer:
                         
             except Exception:
                 continue
+        
+        if early_rejections > 0:
+            logger.debug(f"[{symbol}] [{timeframe}] Grid search: {early_rejections} early DD rejections")
         
         results = {}
         for regime, (score, candidate) in best_by_regime.items():

@@ -531,9 +531,19 @@ class PipelineConfig:
     fx_robustness_boost: float = 0.15    # robustness multiplier weight (0..0.5 recommended)
     fx_min_robustness_ratio: float = 0.85  # minimum val_score/train_score ratio for validation
 
+    # Optuna objective behavior
+    # If True, Optuna's trial objective includes validation metrics (may overfit to holdout split).
+    # Default False: tune on train-only, validate on val during selection.
+    optuna_use_val_in_objective: bool = False
+
     # Timeframes to evaluate
     timeframes: List[str] = field(default_factory=lambda: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'])
     
+    
+    # Live trading data window
+    live_bars_count: int = 1500      # bars loaded per timeframe during live trading
+    live_min_bars: int = 300         # minimum bars required to evaluate a timeframe in live trading
+
     # Retrain periods to evaluate (in days)
     retrain_periods: List[int] = field(default_factory=lambda: [7, 14, 30, 60, 90])
     
@@ -545,13 +555,41 @@ class PipelineConfig:
     regime_min_train_trades: int = 25  # Minimum trades per regime bucket in training
     regime_min_val_trades: int = 10    # Minimum trades per regime bucket in validation
     regime_freshness_decay: float = 0.85  # Freshness decay for stale timeframe signals
-    regime_chop_no_trade: bool = True  # Hard no-trade when in CHOP with no winner
+    regime_chop_no_trade: bool = False  # Hard no-trade when in CHOP with no winner
     regime_params_file: str = "regime_params.json"  # Path to tuned regime params
     
     # Hyperparameter tuning settings for regime optimization
     regime_enable_hyperparam_tuning: bool = True  # Enable hyperparameter tuning in regime optimization
     regime_hyperparam_top_k: int = 3  # Top K strategies to tune per regime (screening phase)
     regime_hyperparam_max_combos: int = 30  # Max param combinations to test per strategy
+    
+    # ===== REGIME WINNER PROFITABILITY GATES (FIX #1) =====
+    # These thresholds ensure regime winners are actually profitable, not just "best loser"
+    regime_min_val_profit_factor: float = 1.2    # Minimum validation PF to be stored as winner
+    regime_min_val_return_pct: float = 0.0       # Minimum validation return % (0 = breakeven)
+    regime_allow_losing_winners: bool = False    # If True, allows PF < 1 (not recommended)
+    regime_no_winner_marker: str = "NO_TRADE"    # Strategy name for "no valid winner" state
+    
+    # ===== LIVE TRADING FALLBACK RISK REDUCTION =====
+    # When using fallback configs (tier 2/3), reduce risk to reflect lower confidence
+    fallback_risk_multiplier: float = 0.5       # Risk multiplier when using fallback (0.5 = 50%)
+    fallback_max_risk_pct: float = 1.0          # Hard cap on risk when in fallback mode
+
+    # ===== TIERED LIVE RISK POLICY (TIER 1..3) =====
+    # Tier 1 (regime winner): can scale above base risk, capped by tier1_max_risk_pct.
+    # Tier 2/3 (fallbacks): capped by tier23_max_risk_pct.
+    tier1_risk_multiplier: float = 5.0     # multiplies base risk_per_trade_pct in tier 1
+    tier1_max_risk_pct: float = 5.0        # hard cap for tier 1 risk
+    tier23_max_risk_pct: float = 1.0       # hard cap for tier 2/3 risk
+    min_trade_risk_pct: float = 0.1        # minimum non-zero risk for a placed trade
+
+    
+    # ===== DUAL-TRADE D1 + LOWER-TF SETTINGS (FIX #2) =====
+    # Allow up to 2 concurrent trades: one D1 + one lower-TF
+    allow_d1_plus_lower_tf: bool = True          # Enable D1 + lower-TF concurrent trades
+    d1_secondary_risk_multiplier: float = 1.0   # Risk for second trade when D1 is open
+    max_combined_risk_pct: float = 3.0          # Max combined risk per symbol (D1 + lower)
+    secondary_trade_max_risk_pct: float = 1.0  # hard cap for the secondary (non-D1) trade
     
     # Optimization validity and persistence settings
     optimization_valid_days: int = 14  # Default validity period for optimized configs
@@ -921,53 +959,94 @@ def save_broker_specs(specs: Dict[str, Dict[str, Any]], filepath: str = "broker_
 
 
 def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> InstrumentSpec:
-    """
-    Create InstrumentSpec from broker spec data.
-    
+    """Create an InstrumentSpec from broker spec data.
+
+    This function must be robust to broker/MT5 edge-cases where certain fields
+    can be missing or zero for CFDs/crypto/indices (e.g., point=0, tick_size=0,
+    pip_size=0). When this happens we should *not* crash; we should sanitize
+    values and allow the system to fall back to safe defaults.
+
     Args:
         symbol: Symbol name
         broker_data: Dict with MT5 symbol info fields
-        
+
     Returns:
-        InstrumentSpec populated with broker-real values
+        InstrumentSpec populated with broker-real values (sanitized)
     """
+    # Digits / point
     digits = int(broker_data.get('digits', 5))
-    point = float(broker_data.get('point', 10 ** (-digits)))
-    
+    point = float(broker_data.get('point', 0.0) or 0.0)
+
+    # Derive point if broker returned 0/None
+    if point <= 0.0:
+        # Best-effort: MT5 point is usually 10**(-digits)
+        try:
+            point = float(10 ** (-digits)) if digits > 0 else 0.0001
+        except Exception:
+            point = 0.0001
+
     # Determine pip_position from digits
-    if digits in [3, 5]:
+    if digits in (3, 5):
         pip_position = digits - 1
     else:
         pip_position = digits
-    
-    # Calculate pip_value from tick data
-    tick_size = float(broker_data.get('tick_size', broker_data.get('trade_tick_size', point)))
-    tick_value = float(broker_data.get('tick_value', broker_data.get('trade_tick_value', 1.0)))
-    pip_size = 10 ** (-pip_position)
-    
-    # pip_value = tick_value * (pip_size / tick_size)
-    if tick_size > 0:
-        pip_value = tick_value * (pip_size / tick_size)
+
+    # Compute a safe pip_size for spread conversion
+    # Priority:
+    # 1) explicit broker pip_size if valid
+    # 2) derive from digits/point (MT5-style)
+    # 3) derive from pip_position
+    pip_size = float(broker_data.get('pip_size', 0.0) or 0.0)
+    if pip_size <= 0.0:
+        if digits in (3, 5):
+            pip_size = point * 10.0
+        else:
+            pip_size = point
+    if pip_size <= 0.0:
+        pip_size = float(10 ** (-pip_position)) if pip_position >= 0 else 0.0001
+
+    # Tick fields (sanitize zeros)
+    tick_size = float(broker_data.get('tick_size', 0.0) or 0.0)
+    if tick_size <= 0.0:
+        tick_size = point
+
+    tick_value = float(broker_data.get('tick_value', 0.0) or 0.0)
+    contract_size = float(broker_data.get('contract_size', 0.0) or 0.0)
+
+    # Pip value (if broker provides it, trust it; otherwise infer from tick fields)
+    pip_value = float(broker_data.get('pip_value', 0.0) or 0.0)
+    if pip_value <= 0.0:
+        if tick_size > 0.0 and tick_value > 0.0:
+            pip_value = (pip_size / tick_size) * tick_value
+        else:
+            # Safe fallback used historically in the PM
+            pip_value = 10.0
+
+    # Spread conversion to pips (guard against division by zero)
+    spread_raw = float(broker_data.get('spread', 2.0) or 2.0)
+    if pip_size > 0.0:
+        spread_avg = spread_raw * point / pip_size
     else:
-        pip_value = 10.0  # Default
-    
+        spread_avg = 2.0
+
     return InstrumentSpec(
         symbol=symbol,
         pip_position=pip_position,
         pip_value=pip_value,
-        spread_avg=float(broker_data.get('spread', broker_data.get('spread_avg', 1.0))) * point / pip_size if pip_size > 0 else 1.0,
-        min_lot=float(broker_data.get('volume_min', 0.01)),
-        max_lot=float(broker_data.get('volume_max', 100.0)),
-        commission_per_lot=float(broker_data.get('commission_per_lot', 7.0)),
-        swap_long=float(broker_data.get('swap_long', 0.0)),
-        swap_short=float(broker_data.get('swap_short', 0.0)),
+        spread_avg=spread_avg,
+        min_lot=float(broker_data.get('volume_min', 0.01) or 0.01),
+        max_lot=float(broker_data.get('volume_max', 100.0) or 100.0),
+        volume_step=float(broker_data.get('volume_step', 0.01) or 0.01),
+        commission_per_lot=float(broker_data.get('commission_per_lot', 7.0) or 7.0),
+        swap_long=float(broker_data.get('swap_long', 0.0) or 0.0),
+        swap_short=float(broker_data.get('swap_short', 0.0) or 0.0),
+        # Broker-real fields (used for MT5-parity sizing/P&L)
+        digits=digits,
+        point=point,
         tick_size=tick_size,
         tick_value=tick_value,
-        contract_size=float(broker_data.get('contract_size', broker_data.get('trade_contract_size', 100000.0))),
-        volume_step=float(broker_data.get('volume_step', 0.01)),
-        stops_level=int(broker_data.get('stops_level', broker_data.get('trade_stops_level', 0))),
-        point=point,
-        digits=digits
+        contract_size=contract_size,
+        trade_stops_level=int(broker_data.get('stops_level', broker_data.get('trade_stops_level', 0)) or 0),
     )
 
 
