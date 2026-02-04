@@ -178,8 +178,9 @@ class DashboardWatcher(threading.Thread):
                 entries = parse_entries_from_file(
                     primary_file, text, self.config, self.state.instrument_specs, mtime
                 )
-                entries = enrich_entries(entries, pm_configs, self._load_trade_map())
-                entries.extend(self._load_log_entries())
+                entries = enrich_entries(entries, pm_configs, self._load_trade_map(), self.config)
+                if not is_actionable_primary(primary_file):
+                    entries.extend(self._load_log_entries())
                 entries = normalize_action_flags(entries, self.config)
                 return entries
 
@@ -197,7 +198,7 @@ class DashboardWatcher(threading.Thread):
                 entries.extend(parse_entries_from_file(path, text, self.config, self.state.instrument_specs, mtime))
             except Exception:
                 continue
-        entries = enrich_entries(entries, pm_configs, self._load_trade_map())
+        entries = enrich_entries(entries, pm_configs, self._load_trade_map(), self.config)
         entries.extend(self._load_log_entries())
         entries = normalize_action_flags(entries, self.config)
         return entries
@@ -440,10 +441,18 @@ def find_primary_file(pm_root: str, patterns: List[str]) -> Optional[str]:
     return None
 
 
+def is_actionable_primary(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    base = os.path.basename(path).lower()
+    return "actionable" in base
+
+
 def enrich_entries(
     entries: List[SignalEntry],
     pm_configs: Dict[str, Any],
     trade_map: Dict[str, Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
 ) -> List[SignalEntry]:
     for entry in entries:
         symbol = normalize_symbol(entry.symbol)
@@ -456,6 +465,12 @@ def enrich_entries(
             action_value = str(entry.reason).upper()
 
         trade = trade_map.get(symbol)
+        if action_value == "EXECUTED" and trade:
+            trade_dir = direction_from_value(trade.get("direction"))
+            if entry.signal_direction and trade_dir and trade_dir != entry.signal_direction:
+                trade = None
+            if trade and not trade_map_is_fresh(entry, trade, config):
+                trade = None
         if action_value == "EXECUTED" and trade:
             if entry.entry_price is None:
                 entry.entry_price = trade.get("price")
@@ -473,6 +488,29 @@ def enrich_entries(
 
         entry = enrich_from_pm_configs(entry, pm_configs.get(symbol))
     return entries
+
+
+def trade_map_is_fresh(
+    entry: SignalEntry,
+    trade: Dict[str, Any],
+    config: Optional[Dict[str, Any]],
+) -> bool:
+    max_age = 30.0
+    if config is not None:
+        try:
+            max_age = float(config.get("trade_map_max_age_minutes", max_age))
+        except (TypeError, ValueError):
+            max_age = 30.0
+
+    trade_ts = parse_timestamp(trade.get("timestamp"))
+    if trade_ts is None:
+        return False
+
+    entry_ts = parse_timestamp(entry.timestamp) if entry.timestamp else None
+    if entry_ts is not None:
+        return abs((trade_ts - entry_ts).total_seconds()) <= max_age * 60.0
+
+    return is_recent(trade_ts, max_age)
 
 
 def enrich_from_pm_configs(entry: SignalEntry, pm_config: Optional[Dict[str, Any]]) -> SignalEntry:

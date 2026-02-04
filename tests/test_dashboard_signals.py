@@ -4,7 +4,7 @@ from copy import deepcopy
 from pm_dashboard.models import SignalEntry
 from pm_dashboard.parsers import parse_pm_execution_log
 from pm_dashboard.utils import DEFAULT_CONFIG
-from pm_dashboard.watcher import normalize_action_flags, should_display_entry
+from pm_dashboard.watcher import enrich_entries, normalize_action_flags, should_display_entry
 
 
 class TestDashboardSignalDesk(unittest.TestCase):
@@ -81,6 +81,40 @@ class TestDashboardSignalDesk(unittest.TestCase):
         )
         normalize_action_flags([entry], config)
         self.assertFalse(entry.valid_now)
+
+    def test_enrich_entries_respects_direction_and_freshness(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["trade_map_max_age_minutes"] = 30
+
+        entry = SignalEntry(
+            symbol="XAUUSD",
+            signal_direction="sell",
+            entry_price=None,
+            stop_loss_price=None,
+            take_profit_price=None,
+            timestamp="2026-02-04T12:30:00",
+            raw={"action": "EXECUTED"},
+        )
+
+        trade_map = {
+            "XAUUSD": {
+                "price": 5091.05,
+                "sl": 5024.05,
+                "tp": 5135.71,
+                "direction": "BUY",  # mismatch
+                "timestamp": "2026-02-04T12:30:10",
+                "status": "EXECUTED",
+            }
+        }
+
+        enriched = enrich_entries([entry], {}, trade_map, config)
+        self.assertIsNone(enriched[0].entry_price)
+
+        # Now with matching direction but stale timestamp (beyond max age)
+        trade_map["XAUUSD"]["direction"] = "SELL"
+        trade_map["XAUUSD"]["timestamp"] = "2026-02-04T10:00:00"
+        enriched = enrich_entries([entry], {}, trade_map, config)
+        self.assertIsNone(enriched[0].entry_price)
 
 
 if __name__ == "__main__":

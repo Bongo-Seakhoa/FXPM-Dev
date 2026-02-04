@@ -432,6 +432,55 @@ class DecisionThrottle:
 
 
 # =============================================================================
+# ACTIONABLE DECISION LOG (EXECUTED + RISK CAP ONLY)
+# =============================================================================
+
+class ActionableDecisionLog:
+    """
+    Persist only actionable outcomes (EXECUTED / risk-cap skips) so the
+    dashboard can always show the most recent actionable decision per symbol.
+
+    This log is *not* used for throttling. It is purely a read-only feed for
+    the dashboard and is never overwritten by NO_ACTIONABLE_SIGNAL events.
+    """
+
+    def __init__(self, log_path: str = "last_actionable_log.json") -> None:
+        self._log_path = log_path
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    def record(self, symbol: str, record: Dict[str, Any]) -> None:
+        if not symbol:
+            return
+        self._cache[symbol] = record
+        self._save()
+
+    def _save(self) -> None:
+        try:
+            tmp_path = f"{self._log_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._cache, f, indent=2)
+            os.replace(tmp_path, self._log_path)
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                f"ActionableDecisionLog: failed to save cache: {exc}"
+            )
+
+    def _load(self) -> None:
+        try:
+            with open(self._log_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._cache = data
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                f"ActionableDecisionLog: failed to load cache: {exc}"
+            )
+
+
+# =============================================================================
 # LIVE TRADER CLASS
 # =============================================================================
 
@@ -483,6 +532,7 @@ class LiveTrader:
         # Decision throttle – prevents re-evaluation / re-logging of the
         # same decision on the same bar (e.g. risk-cap skips for XAUUSD).
         self._decision_throttle = DecisionThrottle(log_path="last_trade_log.json")
+        self._actionable_log = ActionableDecisionLog(log_path="last_actionable_log.json")
         
         # Feature/signal cache – avoids recomputing features and signals 
         # when no new bar has arrived. Cache key: (symbol, timeframe, bar_time)
@@ -1138,6 +1188,7 @@ class LiveTrader:
         
         is_long = signal == 1
         direction = "LONG" if is_long else "SHORT"
+        direction_label = "BUY" if is_long else "SELL"
         
         # Helper to extract throttle metadata from the best_candidate dict
         _tf = best_candidate.get('timeframe', '') if best_candidate else ''
@@ -1155,6 +1206,58 @@ class LiveTrader:
                     direction=signal, action=action,
                     cooldown_seconds=cooldown,
                 )
+
+        def _safe_float(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        selection_score = _safe_float(best_candidate.get('selection_score')) if best_candidate else None
+        quality_score = _safe_float(best_candidate.get('quality_score')) if best_candidate else None
+        freshness_score = _safe_float(best_candidate.get('freshness')) if best_candidate else None
+        regime_strength_score = _safe_float(best_candidate.get('regime_strength')) if best_candidate else None
+
+        def _record_actionable(action: str,
+                               entry_price_value: Optional[float] = None,
+                               sl_value: Optional[float] = None,
+                               tp_value: Optional[float] = None,
+                               volume_value: Optional[float] = None,
+                               target_risk_pct_value: Optional[float] = None,
+                               actual_risk_pct_value: Optional[float] = None,
+                               fallback_tier_value: Optional[int] = None) -> None:
+            """Persist actionable outcomes for dashboard consumption."""
+            if not decision_key:
+                return
+            try:
+                self._actionable_log.record(
+                    symbol,
+                    {
+                        "symbol": symbol,
+                        "decision_key": decision_key,
+                        "bar_time": bar_time_iso,
+                        "timeframe": _tf,
+                        "regime": _regime,
+                        "strategy_name": _strat_name,
+                        "direction": direction_label,
+                        "action": action,
+                        "action_time": datetime.now().isoformat(),
+                        "entry_price": entry_price_value,
+                        "stop_loss_price": sl_value,
+                        "take_profit_price": tp_value,
+                        "volume": volume_value,
+                        "target_risk_pct": target_risk_pct_value,
+                        "actual_risk_pct": actual_risk_pct_value,
+                        "fallback_tier": fallback_tier_value,
+                        "secondary_trade": bool(is_secondary_trade),
+                        "score": selection_score,
+                        "quality": quality_score,
+                        "freshness": freshness_score,
+                        "regime_strength": regime_strength_score,
+                    },
+                )
+            except Exception as exc:
+                self.logger.debug(f"[{symbol}] Actionable log failed: {exc}")
         
         # Check rate limit - prevent rapid order submission
         last_order_time = self._last_order_times.get(symbol)
@@ -1275,6 +1378,16 @@ class LiveTrader:
                     strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
                     action="BLOCKED_RISK_CAP",
                 )
+                _record_actionable(
+                    action="BLOCKED_RISK_CAP",
+                    entry_price_value=entry_price,
+                    sl_value=sl_price,
+                    tp_value=tp_price,
+                    volume_value=None,
+                    target_risk_pct_value=target_risk_pct,
+                    actual_risk_pct_value=None,
+                    fallback_tier_value=fallback_tier,
+                )
                 return
 
             target_risk_pct = min(target_risk_pct, available)
@@ -1375,6 +1488,16 @@ class LiveTrader:
             )
             # ── Record into throttle so this is not repeated ─────────
             _record_throttle("SKIPPED_RISK_CAP")
+            _record_actionable(
+                action="SKIPPED_RISK_CAP",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+                fallback_tier_value=fallback_tier,
+            )
             return
 
         # Log risk details for auditability
@@ -1428,6 +1551,23 @@ class LiveTrader:
             # Record order time for rate limiting
             self._last_order_times[symbol] = datetime.now()
             _record_throttle("EXECUTED")
+            actual_risk_pct_exec = actual_risk_pct
+            try:
+                risk_exec = self.mt5.calc_loss_amount(order_type.value, symbol, result.volume, result.price, sl_price)
+                if risk_exec is not None and risk_exec > 0 and basis_value > 0:
+                    actual_risk_pct_exec = (risk_exec / basis_value) * 100.0
+            except Exception:
+                pass
+            _record_actionable(
+                action="EXECUTED",
+                entry_price_value=result.price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=result.volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct_exec,
+                fallback_tier_value=fallback_tier,
+            )
         else:
             self.logger.warning(
                 f"[FAIL] [{symbol}] Order failed: {result.retcode} - {result.retcode_description}"

@@ -111,7 +111,8 @@ FX_Portfolio_Manager/
 ├── config.json          # Runtime configuration
 ├── pm_configs.json      # Saved strategy configurations (auto-generated)
 ├── regime_params.json   # Tuned regime parameters (optional)
-├── last_trade_log.json  # Decision throttle state (auto-generated)
+├── last_trade_log.json      # Decision throttle state (auto-generated)
+├── last_actionable_log.json # Last actionable decision feed (auto-generated)
 ├── data/                # Historical data cache
 └── pm_outputs/          # Logs and reports
 ```
@@ -573,6 +574,7 @@ FX_Portfolio_Manager/
 ├── pm_configs.json              # Strategy configurations (IMPORTANT!)
 ├── regime_params.json           # Tuned regime parameters (optional)
 ├── last_trade_log.json          # Decision throttle state
+├── last_actionable_log.json     # Last actionable decision feed
 ├── data/
 │   ├── EURUSD_M5.csv           # Historical data cache
 │   ├── EURUSD_H1.csv

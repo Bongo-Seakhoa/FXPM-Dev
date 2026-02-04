@@ -357,3 +357,42 @@
 2026-02-04 12:31:22 [INFO] __main__: [XAUUSD] D1 trade open; allowed second trade on D1
 2026-02-04 12:31:22 [INFO] __main__: [XAUUSD] Secondary trade: risk 1.00% -> 1.00% (existing=1.00%, cap=3.00%)
 2026-02-04 12:31:22 [WARNING] __main__: [XAUUSD] Skipping trade; risk 35.99% exceeds cap 5.00% (vol=0.0100, sl=4528.02714)
+2026-02-04 13:12:47 [INFO] __main__: Shutting down...
+2026-02-04 13:12:47 [INFO] __main__: Stopping trader...
+2026-02-04 13:12:47 [INFO] __main__: Saved 2 trades to pm_outputs\trades_20260204_131247.json
+2026-02-04 13:12:47 [INFO] pm_mt5: Disconnected from MT5
+2026-02-04 13:12:47 [INFO] __main__: Shutdown complete
+2026-02-04 13:12:47 [INFO] __main__: Shutting down...
+2026-02-04 13:12:47 [INFO] __main__: Stopping trader...
+2026-02-04 13:12:47 [INFO] __main__: Saved 2 trades to pm_outputs\trades_20260204_131247.json
+2026-02-04 13:12:47 [INFO] __main__: Shutdown complete
+2026-02-04 13:12:47 [INFO] __main__: Shutting down...
+2026-02-04 13:12:47 [INFO] __main__: Stopping trader...
+2026-02-04 13:12:47 [INFO] __main__: Saved 2 trades to pm_outputs\trades_20260204_131247.json
+2026-02-04 13:12:47 [INFO] __main__: Shutdown complete
+2026-02-04 13:12:54 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-04 13:12:54 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-04 13:12:54 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=2
+2026-02-04 13:12:54 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=20.0 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-04 13:12:54 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-04 13:12:54 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-04 13:12:54 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-04 13:12:54 [INFO] __main__: ------------------------------------------------------------
+2026-02-04 13:12:54 [INFO] __main__: ============================================================
+2026-02-04 13:12:54 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-04 13:12:54 [INFO] __main__: ============================================================
+2026-02-04 13:12:54 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-04 13:12:54 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-04 13:12:54 [INFO] __main__: [OK] Connected to MT5
+2026-02-04 13:12:54 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-04 13:12:54 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-04 13:12:54 [INFO] __main__:   Symbols: 46
+2026-02-04 13:12:54 [INFO] __main__:   Strategies: 28
+2026-02-04 13:12:54 [INFO] __main__:   Existing configs: 37
+2026-02-04 13:12:54 [INFO] __main__: 
+============================================================
+2026-02-04 13:12:54 [INFO] __main__: STARTING LIVE TRADING
+2026-02-04 13:12:54 [INFO] __main__: Trading enabled: True
+2026-02-04 13:12:54 [INFO] __main__: Auto-retrain: False
+2026-02-04 13:12:54 [INFO] __main__: Close on opposite signal: False
+2026-02-04 13:12:54 [INFO] __main__: ============================================================

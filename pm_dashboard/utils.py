@@ -21,11 +21,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "**/*signals*.csv",
         "**/*trades*.json",
         "**/*trade*log*.json",
+        "**/*last_actionable_log*.json",
         "**/*last_trade_log*.json",
         "**/*portfolio*.json",
         "**/*.log",
     ],
     "primary_sources": [
+        "last_actionable_log.json",
         "last_trade_log.json",
     ],
     "log_sources": [
@@ -34,6 +36,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     ],
     "log_max_files": 2,
     "trade_files_pattern": "**/trades_*.json",
+    "trade_map_max_age_minutes": 30,
     "pm_configs_path": "pm_configs.json",
     "explicit_files": [],
     "exclude_patterns": [
@@ -52,6 +55,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "display_actions": [
         "EXECUTED",
         "SKIPPED_RISK_CAP",
+        "BLOCKED_RISK_CAP",
     ],
     "exclude_actions": [
         "NO_ACTIONABLE_SIGNAL",
@@ -67,6 +71,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     ],
     "display_allow_if_actions": [
         "SKIPPED_RISK_CAP",
+        "BLOCKED_RISK_CAP",
     ],
     "alert": {
         "enabled": True,

@@ -45,10 +45,11 @@ Primary config lives in `pm_dashboard/dashboard_config.json`.
 Key settings:
 - `pm_root`: PM project path (can also be passed via `--pm-root`)
 - `file_patterns`: glob patterns for PM artifacts (signals, recommendations, trades, logs)
-- `primary_sources`: primary files used as the source of truth (default: `last_trade_log.json`)
+- `primary_sources`: primary files used as the source of truth (default: `last_actionable_log.json`, fallback `last_trade_log.json`)
 - `log_sources`: log file patterns used to detect EXECUTED trades when trade files lag
 - `log_max_files`: number of most recent logs to scan
 - `trade_files_pattern`: trade files used to enrich EXECUTED entries with entry/SL/TP
+- `trade_map_max_age_minutes`: discard stale trade-map enrichment (prevents mismatched prices)
 - `pm_configs_path`: PM strategy config file used to enrich timeframe/regime/strategy
 - `explicit_files`: exact file paths if you want to pin specific outputs
 - `min_strength`: filter for valid entries
@@ -68,3 +69,4 @@ If your PM outputs use different file names or schemas:
 - Desktop notifications may require OS permissions.
 - If a file is partially written while being read, the dashboard skips it and retries on the next poll.
 - Position sizing uses PM `instrument_specs` when available (from the PM `config.json`).
+- If present, `last_actionable_log.json` provides the latest EXECUTED / risk-cap decisions and is treated as the primary source.

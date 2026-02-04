@@ -881,6 +881,7 @@ python pm_main.py --trade --paper --log-level DEBUG
 | `pm_configs.json` | Strategy configurations (auto-generated) |
 | `regime_params.json` | Tuned regime params (optional) |
 | `last_trade_log.json` | Decision throttle state |
+| `last_actionable_log.json` | Last actionable decision feed |
 | `data/*.csv` | Historical data cache |
 | `pm_outputs/logs/*.log` | Daily log files |
 | `pm_outputs/trades_*.json` | Trade records |
@@ -925,6 +926,7 @@ Ctrl+C in terminal
 **Reset decision throttle:**
 ```bash
 del last_trade_log.json
+del last_actionable_log.json
 ```
 
 **Reset all configurations:**
