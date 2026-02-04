@@ -126,6 +126,11 @@
     "**/*portfolio*.json",
     "**/*.log"
   ],
+  "log_max_files": 2,
+  "log_sources": [
+    "logs/*.log",
+    "**/pm_*.log"
+  ],
   "max_signal_age_minutes": 1440,
   "min_strength": 0,
   "pm_configs_path": "pm_configs.json",
@@ -134,12 +139,7 @@
     "last_actionable_log.json",
     "last_trade_log.json"
   ],
-  "log_sources": [
-    "logs/*.log",
-    "**/pm_*.log"
-  ],
-  "log_max_files": 2,
-  "refresh_interval_sec": 5,
+  "refresh_interval_sec": 60,
   "trade_files_pattern": "**/trades_*.json",
   "trade_map_max_age_minutes": 30,
   "valid_action_prefixes": [

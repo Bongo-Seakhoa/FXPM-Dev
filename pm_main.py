@@ -709,10 +709,18 @@ class LiveTrader:
                 self.logger.debug(f"[{symbol}] {block_reason}")
             return
         
-        # Evaluate candidates across timeframes
-        candidates = self._evaluate_regime_candidates(symbol, broker_symbol, config)
+        # Evaluate candidates across timeframes (winners-only)
+        candidates, eval_stats = self._evaluate_regime_candidates(symbol, broker_symbol, config)
         
         if not candidates:
+            if eval_stats:
+                self.logger.debug(
+                    f"[{symbol}] Winners-only eval: tfs={eval_stats.get('timeframes_evaluated', 0)}/"
+                    f"{eval_stats.get('timeframes_total', 0)} | winners=0 | actionable=0 "
+                    f"(no_winner={eval_stats.get('no_winner', 0)}, "
+                    f"failed_gate={eval_stats.get('winner_failed_gate', 0)}, "
+                    f"insufficient_bars={eval_stats.get('insufficient_bars', 0)})"
+                )
             return
         
         # ===== FIX #2: Filter candidates based on allowed timeframes =====
@@ -723,7 +731,7 @@ class LiveTrader:
                 self.logger.debug(f"[{symbol}] Filtered out D1 candidates (secondary trade must be non-D1)")
         
         if not candidates:
-            self.logger.debug(f"[{symbol}] No valid non-D1 candidates for secondary trade")
+            self.logger.debug(f"[{symbol}] No valid candidates after timeframe constraints (secondary trade filter)")
             return
         
         # Select the best feasible candidate using an "actionable-within-margin" policy.
@@ -769,10 +777,15 @@ class LiveTrader:
 
         
         actionable = [c for c in candidates if int(c.get('signal', 0)) != 0]
+        self.logger.debug(
+            f"[{symbol}] Winners-only eval: tfs={eval_stats.get('timeframes_evaluated', 0)}/"
+            f"{eval_stats.get('timeframes_total', 0)} | winners={len(candidates)} | "
+            f"actionable={len(actionable)}"
+        )
         
         if not actionable:
         
-            # No actionable signals on any timeframe for this bar. Cache decision (quietly)
+            # No actionable winner signals on any timeframe for this bar.
         
             bar_time_iso = str(best_overall.get('bar_time', ''))
         
@@ -794,9 +807,10 @@ class LiveTrader:
         
                 strategy_name=best_overall['strategy_name'], direction=0,
         
-                action="NO_ACTIONABLE_SIGNAL",
+                action="NO_ACTIONABLE_WINNER_SIGNAL",
         
             )
+            self.logger.debug(f"[{symbol}] NO_ACTIONABLE_WINNER_SIGNAL (no actionable winners)")
         
             return
 
@@ -832,6 +846,7 @@ class LiveTrader:
                 action="NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
         
             )
+            self.logger.debug(f"[{symbol}] NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN (actionable below margin)")
         
             return
 
@@ -874,7 +889,7 @@ class LiveTrader:
         )
         
         if is_secondary_trade:
-            self.logger.info(f"[{symbol}] D1 trade open; allowed second trade on {best['timeframe']}")
+            self.logger.debug(f"[{symbol}] D1 trade open; allowed second trade on {best['timeframe']}")
         
         # Execute entry (passes decision_key so _execute_entry can record
         # the outcome into the throttle)
@@ -892,34 +907,41 @@ class LiveTrader:
             is_secondary_trade=is_secondary_trade,
         )
     
-    def _evaluate_regime_candidates(self, symbol: str, broker_symbol: str, 
-                                     config: SymbolConfig) -> List[Dict]:
+    def _evaluate_regime_candidates(self, symbol: str, broker_symbol: str,
+                                     config: SymbolConfig) -> tuple:
         """
         Evaluate all (timeframe, regime) candidates for entry.
         
-        Implements the tiered fallback ladder (FIX #1):
-        - Tier 1: Use regime winner if valid for live trading
-        - Tier 2: Fall back to default_config if it passes live quality gate
-        - Tier 3: Fall back to higher-timeframe default (H4 or D1) if valid
-        - Tier 4: No trade if none pass
-        
-        When using tier 2 or 3, applies risk reduction factor.
+        Winners-only policy (production correctness):
+        - Tiered fallbacks are NOT allowed in live trading.
+        - Only a validated winner for the exact (timeframe, regime) may trade.
+        - If no winner exists for that (tf, regime), skip that timeframe.
+        - If a winner exists but fails the live gate, skip that timeframe.
         
         Performance optimization: caches features/signals per (symbol, tf, bar_time)
         to avoid recomputing when no new bar has arrived.
         
-        Returns list of candidate dicts with selection scores.
+        Returns (candidates, stats).
         """
         from pm_strategies import StrategyRegistry
         
-        candidates = []
+        candidates: List[Dict[str, Any]] = []
+        stats = {
+            "timeframes_total": 0,
+            "timeframes_evaluated": 0,
+            "winner_candidates": 0,
+            "no_winner": 0,
+            "winner_failed_gate": 0,
+            "insufficient_bars": 0,
+        }
         
         # Check if config has regime configs
         if not config.has_regime_configs():
             # Fallback to legacy single-strategy mode
-            return self._evaluate_legacy_candidate(symbol, broker_symbol, config)
+            return self._evaluate_legacy_candidate(symbol, broker_symbol, config), stats
         
         available_timeframes = config.get_available_timeframes()
+        stats["timeframes_total"] = len(available_timeframes)
         regime_params_file = getattr(self.pipeline_config, 'regime_params_file', 'regime_params.json') if self.pipeline_config else 'regime_params.json'
         freshness_decay = getattr(self.pipeline_config, 'regime_freshness_decay', 0.85) if self.pipeline_config else 0.85
         
@@ -927,16 +949,14 @@ class LiveTrader:
         min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
         min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 0.0) if self.pipeline_config else 0.0
         max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
-        fallback_risk_mult = getattr(self.pipeline_config, 'fallback_risk_multiplier', 0.5) if self.pipeline_config else 0.5
-        
-        # Determine higher-TF fallback order (for tier 3)
-        higher_tf_priority = ['D1', 'H4', 'H1']  # Priority order for higher-TF fallback
         
         for tf in available_timeframes:
             # Get bars for this timeframe (need at least the latest bar time)
             bars = self.mt5.get_bars(broker_symbol, tf, count=int(getattr(self.pipeline_config, 'live_bars_count', 200)))
             if bars is None or len(bars) < int(getattr(self.pipeline_config, 'live_min_bars', 100)):
+                stats["insufficient_bars"] += 1
                 continue
+            stats["timeframes_evaluated"] += 1
             
             # Check for new bar (freshness tracking)
             current_bar_time = bars.index[-1]
@@ -996,52 +1016,14 @@ class LiveTrader:
                 if current_regime is None or pd.isna(current_regime):
                     continue
                 
-                # ===== TIERED FALLBACK LADDER (FIX #1) =====
-                regime_config = None
-                is_fallback = False
-                fallback_tier = 1
-                
-                # Tier 1: Check regime winner for this (tf, regime)
-                tier1_config = config.get_regime_config(tf, current_regime)
-                if tier1_config is not None:
-                    # Check if it passes live quality gate
-                    if tier1_config.is_valid_for_live(min_pf, min_return, max_dd):
-                        regime_config = tier1_config
-                        fallback_tier = 1
-                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 1: Using regime winner")
-                    else:
-                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 1 FAILED live gate: "
-                                         f"PF={tier1_config.val_metrics.get('profit_factor', 0):.2f}, "
-                                         f"ret={tier1_config.val_metrics.get('total_return_pct', -100):.1f}%")
-                
-                # Tier 2: Fall back to default_config if available and valid
-                if regime_config is None and config.default_config:
-                    if config.default_config.is_valid_for_live(min_pf, min_return, max_dd):
-                        regime_config = config.default_config
-                        is_fallback = True
-                        fallback_tier = 2
-                        regime_strength *= fallback_risk_mult  # Apply penalty
-                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 2: Using default_config (risk reduced)")
-                    else:
-                        self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 2 FAILED: default_config invalid for live")
-                
-                # Tier 3: Fall back to higher-TF winner (D1 > H4 > H1)
+                # ===== WINNERS-ONLY LADDER =====
+                # Only use the validated winner for this exact (tf, regime).
+                regime_config = config.get_regime_config(tf, current_regime)
                 if regime_config is None:
-                    for higher_tf in higher_tf_priority:
-                        if higher_tf == tf:
-                            continue  # Skip current timeframe
-                        higher_regime_cfg = config.get_regime_config(higher_tf, current_regime)
-                        if higher_regime_cfg and higher_regime_cfg.is_valid_for_live(min_pf, min_return, max_dd):
-                            regime_config = higher_regime_cfg
-                            is_fallback = True
-                            fallback_tier = 3
-                            regime_strength *= fallback_risk_mult * 0.8  # Extra penalty for cross-TF fallback
-                            self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 3: Using {higher_tf} winner (risk reduced)")
-                            break
-                
-                # Tier 4: No trade (hard no-trade for CHOP or no valid fallback)
-                if regime_config is None:
-                    self.logger.debug(f"[{symbol}] [{tf}] [{current_regime}] Tier 4: NO TRADE (no valid config)")
+                    stats["no_winner"] += 1
+                    self.logger.debug(
+                        f"[{symbol}] [{tf}] [{current_regime}] No validated winner for timeframe/regime; skipping"
+                    )
                     # Cache the "no config" result to avoid recomputing
                     self._candidate_cache[feature_cache_key] = {
                         'features': features,
@@ -1051,10 +1033,33 @@ class LiveTrader:
                         'strategy': None,
                         'regime_config': None,
                         'is_fallback': False,
-                        'fallback_tier': 4,
+                        'fallback_tier': 0,
                     }
                     self._prune_cache()
                     continue
+                if not regime_config.is_valid_for_live(min_pf, min_return, max_dd):
+                    stats["winner_failed_gate"] += 1
+                    self.logger.debug(
+                        f"[{symbol}] [{tf}] [{current_regime}] Winner failed live gate "
+                        f"(PF={regime_config.val_metrics.get('profit_factor', 0):.2f}, "
+                        f"ret={regime_config.val_metrics.get('total_return_pct', -100):.1f}%, "
+                        f"dd={regime_config.val_metrics.get('max_drawdown_pct', 100):.1f}%)"
+                    )
+                    self._candidate_cache[feature_cache_key] = {
+                        'features': features,
+                        'regime': current_regime,
+                        'regime_strength': float(regime_strength),
+                        'signal': 0,
+                        'strategy': None,
+                        'regime_config': None,
+                        'is_fallback': False,
+                        'fallback_tier': 0,
+                    }
+                    self._prune_cache()
+                    continue
+                
+                is_fallback = False
+                fallback_tier = 1
                 
                 # Get strategy instance
                 try:
@@ -1101,8 +1106,9 @@ class LiveTrader:
                 'is_fallback': is_fallback,
                 'fallback_tier': fallback_tier,
             })
+            stats["winner_candidates"] += 1
         
-        return candidates
+        return candidates, stats
     
     def _evaluate_legacy_candidate(self, symbol: str, broker_symbol: str,
                                     config: SymbolConfig) -> List[Dict]:
@@ -1112,6 +1118,20 @@ class LiveTrader:
         Uses the single strategy_name/timeframe/parameters from config.
         """
         from pm_strategies import StrategyRegistry
+        
+        # Winners-only live gate for legacy configs
+        min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
+        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 0.0) if self.pipeline_config else 0.0
+        max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
+        val_pf = config.val_metrics.get('profit_factor', 0.0)
+        val_return = config.val_metrics.get('total_return_pct', -100.0)
+        val_dd = config.val_metrics.get('max_drawdown_pct', 100.0)
+        if not config.is_validated or val_pf < min_pf or val_return < min_return or val_dd > max_dd:
+            self.logger.debug(
+                f"[{symbol}] Legacy config failed live gate "
+                f"(validated={config.is_validated}, PF={val_pf:.2f}, ret={val_return:.1f}%, dd={val_dd:.1f}%)"
+            )
+            return []
         
         timeframe = config.timeframe
         if not timeframe:

@@ -1,0 +1,123 @@
+[
+  {
+    "timestamp": "2026-02-04T14:24:57.389374",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 21.32,
+    "price": 1.3839000000000001,
+    "sl": 1.3904357142857144,
+    "tp": 1.3786714285714288,
+    "magic": 689119540,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T14:35:57.819734",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 21.56,
+    "price": 1.3838,
+    "sl": 1.3901214285714285,
+    "tp": 1.378742857142857,
+    "magic": 689119540,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T14:39:53.843540",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 22.79,
+    "price": 1.3832,
+    "sl": 1.3890571428571428,
+    "tp": 1.3785142857142858,
+    "magic": 689119540,
+    "status": "FAILED: Invalid stops"
+  },
+  {
+    "timestamp": "2026-02-04T14:40:13.984369",
+    "symbol": "EURGBP",
+    "direction": "LONG",
+    "volume": 0.11,
+    "price": 0.86222,
+    "sl": 0.8613842857142857,
+    "tp": 0.86322,
+    "magic": 1881358203,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T14:51:04.154088",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 19.48,
+    "price": 1.3782,
+    "sl": 1.3851107142857144,
+    "tp": 1.3726714285714285,
+    "magic": 689119540,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T15:01:02.949011",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 16.62,
+    "price": 1.3754,
+    "sl": 1.3834,
+    "tp": 1.369,
+    "magic": 916245488,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T15:05:16.345506",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 14.99,
+    "price": 1.3789,
+    "sl": 1.3876142857142857,
+    "tp": 1.3719285714285714,
+    "magic": 916245488,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T15:05:40.534767",
+    "symbol": "EURJPY",
+    "direction": "SHORT",
+    "volume": 0.08,
+    "price": 184.882,
+    "sl": 185.11128571428574,
+    "tp": 184.49985714285714,
+    "magic": 1582477959,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T15:09:58.373185",
+    "symbol": "AUDJPY",
+    "direction": "SHORT",
+    "volume": 0.11,
+    "price": 109.887,
+    "sl": 110.05646428571428,
+    "tp": 109.787,
+    "magic": 618362240,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T15:10:52.412405",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 13.73,
+    "price": 1.3763,
+    "sl": 1.385657142857143,
+    "tp": 1.3688142857142858,
+    "magic": 916245488,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-04T15:16:40.222240",
+    "symbol": "TONUSD",
+    "direction": "SHORT",
+    "volume": 0.57,
+    "price": 1.3780999999999999,
+    "sl": 1.5915285714285714,
+    "tp": 1.3069571428571427,
+    "magic": 1570567368,
+    "status": "EXECUTED"
+  }
+]

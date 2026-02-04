@@ -318,6 +318,7 @@ Open `config.json` in a text editor and configure:
 Note: `val_pct` is informational only. Actual validation size is controlled by
 `train_pct` and `overlap_pct`.
 Note: `optimization_max_workers` (default 1) enables parallel optimization when set > 1.
+Note: Live trading is **winners-only**. `default_config` is not used for live entries, and fallback risk keys (e.g. `fallback_risk_multiplier`, `fallback_max_risk_pct`, `tier23_max_risk_pct`) are removed/ignored.
 
 ### 3.2 MT5 Connection Options
 
@@ -507,6 +508,15 @@ Before going live, verify:
 - [ ] MT5 account has sufficient margin
 - [ ] Risk settings are conservative enough
 - [ ] You understand the risks involved
+
+### 6.1a Live Readiness Checklist (Recommended)
+
+1. Run a paper session for at least 1-2 weeks on the same symbols/timeframes.
+2. Confirm MT5 has full history for each symbol/timeframe (open chart and scroll back or use History Center).
+3. Verify winners-only behavior in logs: only validated winners produce `Selected` lines.
+4. Ensure risk caps and stop rules behave as expected (no unexpected `SKIPPED_RISK_CAP` spikes).
+5. Check that `pm_configs.json` is up to date and not expired for your symbols.
+6. Keep MT5 terminal open, logged in, and AutoTrading enabled.
 
 ### 6.2 Start Live Trading
 
