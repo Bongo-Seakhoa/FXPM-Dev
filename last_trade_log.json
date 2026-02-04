@@ -1,86 +1,226 @@
 {
   "EURUSD": {
     "symbol": "EURUSD",
-    "decision_key": "e11b7c7c6eb30dec",
+    "decision_key": "ab25fb8538f37f55",
     "decision_keys": [
-      "e11b7c7c6eb30dec"
+      "ab25fb8538f37f55"
     ],
-    "bar_time": "2026-02-02 00:00:00",
+    "bar_time": "2026-02-03 00:00:00",
     "timeframe": "D1",
-    "regime": "BREAKOUT",
+    "regime": "CHOP",
     "strategy_name": "EMACrossoverStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL",
-    "action_time": "2026-02-03T21:26:15.612887"
+    "action_time": "2026-02-04T12:45:32.748536"
   },
   "GBPUSD": {
     "symbol": "GBPUSD",
-    "decision_key": "97ff1696e4a6c002",
+    "decision_key": "424093d5e4314ddb",
     "decision_keys": [
-      "97ff1696e4a6c002"
+      "424093d5e4314ddb"
     ],
-    "bar_time": "2026-02-03 22:20:00",
+    "bar_time": "2026-02-04 13:40:00",
     "timeframe": "M5",
     "regime": "RANGE",
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
-    "action_time": "2026-02-03T21:26:19.567769"
+    "action_time": "2026-02-04T12:45:36.203077"
   },
   "USDJPY": {
     "symbol": "USDJPY",
-    "decision_key": "a9ebb53c850b7155",
+    "decision_key": "f61bd4cc4dd31d2e",
     "decision_keys": [
-      "a9ebb53c850b7155"
+      "f61bd4cc4dd31d2e"
     ],
-    "bar_time": "2026-02-02 00:00:00",
-    "timeframe": "D1",
-    "regime": "BREAKOUT",
-    "strategy_name": "EMACrossoverStrategy",
+    "bar_time": "2026-02-04 12:00:00",
+    "timeframe": "H1",
+    "regime": "TREND",
+    "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL",
-    "action_time": "2026-02-03T21:26:24.553305"
+    "action_time": "2026-02-04T12:45:41.072121"
   },
   "USDCHF": {
     "symbol": "USDCHF",
-    "decision_key": "9f162a4b46d2b309",
+    "decision_key": "c04a75d53070888d",
     "decision_keys": [
-      "9f162a4b46d2b309"
+      "c04a75d53070888d"
     ],
-    "bar_time": "2026-02-02 00:00:00",
+    "bar_time": "2026-02-03 00:00:00",
     "timeframe": "D1",
     "regime": "BREAKOUT",
     "strategy_name": "BollingerBounceStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL",
-    "action_time": "2026-02-03T21:26:28.484277"
+    "action_time": "2026-02-04T12:45:44.088490"
   },
   "USDCAD": {
     "symbol": "USDCAD",
-    "decision_key": "e6eb4d7861dfdaf2",
+    "decision_key": "1dc523cc790cecda",
     "decision_keys": [
-      "e6eb4d7861dfdaf2"
+      "1dc523cc790cecda"
     ],
-    "bar_time": "2026-02-02 00:00:00",
-    "timeframe": "D1",
+    "bar_time": "2026-02-04 08:00:00",
+    "timeframe": "H4",
     "regime": "RANGE",
     "strategy_name": "MACDHistogramMomentumStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL",
-    "action_time": "2026-02-03T21:26:33.536112"
+    "action_time": "2026-02-04T12:45:47.202213"
   },
   "AUDUSD": {
     "symbol": "AUDUSD",
-    "decision_key": "601bbd9d61dd0a31",
+    "decision_key": "9ebe5d9dd5aedc75",
     "decision_keys": [
-      "601bbd9d61dd0a31"
+      "9ebe5d9dd5aedc75"
     ],
-    "bar_time": "2026-02-03 21:00:00",
-    "timeframe": "H1",
-    "regime": "RANGE",
-    "strategy_name": "KeltnerBreakoutStrategy",
+    "bar_time": "2026-02-04 13:40:00",
+    "timeframe": "M5",
+    "regime": "CHOP",
+    "strategy_name": "ZScoreMRStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL",
-    "action_time": "2026-02-03T21:26:37.654272"
+    "action_time": "2026-02-04T12:45:52.377821"
+  },
+  "NZDUSD": {
+    "symbol": "NZDUSD",
+    "decision_key": "3715244f2a636407",
+    "decision_keys": [
+      "3715244f2a636407"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "TREND",
+    "strategy_name": "DonchianBreakoutStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-04T12:45:55.920556"
+  },
+  "AUDNZD": {
+    "symbol": "AUDNZD",
+    "decision_key": "5d366a19cc65e5dd",
+    "decision_keys": [
+      "5d366a19cc65e5dd"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "CHOP",
+    "strategy_name": "MomentumBurstStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-04T12:46:00.339424"
+  },
+  "EURGBP": {
+    "symbol": "EURGBP",
+    "decision_key": "62be11457b0f9aa7",
+    "decision_keys": [
+      "62be11457b0f9aa7"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "CHOP",
+    "strategy_name": "VolatilityBreakoutStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-04T12:46:03.806036"
+  },
+  "EURJPY": {
+    "symbol": "EURJPY",
+    "decision_key": "4c769c35de5e7215",
+    "decision_keys": [
+      "4c769c35de5e7215"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "CHOP",
+    "strategy_name": "VolatilityBreakoutStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-04T12:46:08.931796"
+  },
+  "GBPJPY": {
+    "symbol": "GBPJPY",
+    "decision_key": "313ec1ecebccebb7",
+    "decision_keys": [
+      "313ec1ecebccebb7"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "CHOP",
+    "strategy_name": "KeltnerPullbackStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-02-04T09:03:18.908839"
+  },
+  "AUDJPY": {
+    "symbol": "AUDJPY",
+    "decision_key": "31c5672490b443d1",
+    "decision_keys": [
+      "31c5672490b443d1"
+    ],
+    "bar_time": "2026-02-04 13:40:00",
+    "timeframe": "M5",
+    "regime": "RANGE",
+    "strategy_name": "AroonTrendStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-04T12:46:19.589793"
+  },
+  "USDMXN": {
+    "symbol": "USDMXN",
+    "decision_key": "37286319fb58c0e2",
+    "decision_keys": [
+      "37286319fb58c0e2"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "TREND",
+    "strategy_name": "MomentumBurstStrategy",
+    "direction": -1,
+    "action": "EXECUTED",
+    "action_time": "2026-02-04T07:15:13.519475"
+  },
+  "XAUUSD": {
+    "symbol": "XAUUSD",
+    "decision_key": "5ec20aa404b4829c",
+    "decision_keys": [
+      "5ec20aa404b4829c"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "CHOP",
+    "strategy_name": "VolatilityBreakoutStrategy",
+    "direction": 1,
+    "action": "SKIPPED_RISK_CAP",
+    "action_time": "2026-02-04T12:31:22.076179"
+  },
+  "XAGUSD": {
+    "symbol": "XAGUSD",
+    "decision_key": "92f4e89a2d0ad1a0",
+    "decision_keys": [
+      "92f4e89a2d0ad1a0"
+    ],
+    "bar_time": "2026-02-04 12:00:00",
+    "timeframe": "H1",
+    "regime": "TREND",
+    "strategy_name": "VolatilityBreakoutStrategy",
+    "direction": 1,
+    "action": "SKIPPED_RISK_CAP",
+    "action_time": "2026-02-04T12:00:16.586895"
+  },
+  "USDZAR": {
+    "symbol": "USDZAR",
+    "decision_key": "3e86f92affe6a564",
+    "decision_keys": [
+      "3e86f92affe6a564"
+    ],
+    "bar_time": "2026-02-03 00:00:00",
+    "timeframe": "D1",
+    "regime": "TREND",
+    "strategy_name": "VolatilityBreakoutStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_SIGNAL",
+    "action_time": "2026-02-04T12:44:45.650163"
   }
 }

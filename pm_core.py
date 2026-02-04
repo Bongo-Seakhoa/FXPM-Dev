@@ -922,6 +922,8 @@ _BROKER_SPECS_LOADED_PATH: Optional[str] = None
 # Config-provided instrument spec overrides (single source of truth)
 _CONFIG_INSTRUMENT_SPECS: Dict[str, InstrumentSpec] = {}
 _CONFIG_SPEC_DEFAULTS: Dict[str, Any] = {}
+_CONFIG_SPECS_LOADED: bool = False
+_CONFIG_SPECS_LOADED_PATH: Optional[str] = None
 
 # Warn once per symbol when spec is missing to avoid log spam
 _MISSING_SPEC_WARNED: Set[str] = set()
@@ -987,6 +989,52 @@ def _normalize_symbol(symbol: str) -> str:
     if not symbol:
         return ""
     return symbol.split('.')[0].split('#')[0].upper()
+
+
+def _maybe_load_config_specs(config_path: Optional[str] = None) -> None:
+    """Lazy-load instrument specs from config.json for child processes."""
+    global _CONFIG_SPECS_LOADED, _CONFIG_SPECS_LOADED_PATH
+    if _CONFIG_INSTRUMENT_SPECS:
+        return
+
+    path = config_path or os.environ.get("PM_CONFIG_PATH") or "config.json"
+    if not path:
+        _CONFIG_SPECS_LOADED = True
+        _CONFIG_SPECS_LOADED_PATH = path
+        return
+
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+
+    if _CONFIG_SPECS_LOADED and _CONFIG_SPECS_LOADED_PATH == path:
+        return
+
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        _CONFIG_SPECS_LOADED = True
+        _CONFIG_SPECS_LOADED_PATH = path
+        return
+    except Exception as exc:
+        logger.warning(f"Failed to load config specs from {path}: {exc}")
+        _CONFIG_SPECS_LOADED = True
+        _CONFIG_SPECS_LOADED_PATH = path
+        return
+
+    broker_specs_path = data.get("broker_specs_path")
+    if broker_specs_path:
+        if not os.path.isabs(broker_specs_path):
+            broker_specs_path = os.path.join(os.path.dirname(path), broker_specs_path)
+        set_broker_specs_path(broker_specs_path)
+
+    set_instrument_specs(
+        specs=data.get("instrument_specs"),
+        defaults=data.get("instrument_spec_defaults"),
+    )
+    _CONFIG_SPECS_LOADED = True
+    _CONFIG_SPECS_LOADED_PATH = path
 
 
 def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
@@ -1232,6 +1280,8 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
     Returns:
         InstrumentSpec for the symbol
     """
+    if not _CONFIG_INSTRUMENT_SPECS:
+        _maybe_load_config_specs()
     symbol_key = _normalize_symbol(symbol)
 
     # 1) Config-provided overrides

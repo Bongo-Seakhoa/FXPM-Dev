@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PM Dashboard</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='20260204d') }}" />
+  </head>
+  <body>
+    <div class="bg-grid"></div>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <div class="logo">PM</div>
+          <div>
+            <h1>Signal Desk</h1>
+            <p>Read-only view of PM signals for manual execution.</p>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link active" href="/">Signal Desk</a>
+          <a class="nav-link" href="/strategies">Strategies</a>
+        </nav>
+        <div class="stat-card">
+          <div class="stat-label">Valid Entries Now</div>
+          <div class="stat-value" id="valid-count">0</div>
+          <div class="stat-meta">Last updated: <span id="last-updated">--</span></div>
+          <div class="stat-meta">Files scanned: <span id="source-files">0</span></div>
+        </div>
+      </header>
+
+      <section class="card controls fade-in">
+        <div class="filters">
+          <div>
+            <label>Symbol</label>
+            <select id="filter-symbol"></select>
+          </div>
+          <div>
+            <label>Timeframe</label>
+            <select id="filter-timeframe"></select>
+          </div>
+          <div>
+            <label>Regime</label>
+            <select id="filter-regime"></select>
+          </div>
+          <div>
+            <label>Direction</label>
+            <select id="filter-direction"></select>
+          </div>
+          <div>
+            <label>Strategy</label>
+            <select id="filter-strategy"></select>
+          </div>
+        </div>
+        <div>
+          <button class="btn" id="refresh-btn">Refresh Now</button>
+        </div>
+      </section>
+
+      <main class="grid">
+        <section class="card table-wrap fade-in">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>TF</th>
+                <th>Regime</th>
+                <th>Dir</th>
+                <th>SL</th>
+                <th>Entry</th>
+                <th>TP</th>
+                <th>Strength</th>
+                <th>Time</th>
+                <th>Strategy</th>
+              </tr>
+            </thead>
+            <tbody id="entries-body"></tbody>
+          </table>
+        </section>
+
+        <section class="card details fade-in" id="sizing-section">
+          <h3>Position Sizing</h3>
+          <button class="btn btn-secondary" id="use-entry-btn" type="button">Use Selected Entry</button>
+          <div class="signal-strip">
+            <div class="signal-cell signal-sl">
+              <span>SL</span>
+              <strong id="signal-sl-display">N/A</strong>
+            </div>
+            <div class="signal-cell signal-entry">
+              <span>Entry</span>
+              <strong id="signal-entry-display">N/A</strong>
+            </div>
+            <div class="signal-cell signal-tp">
+              <span>TP</span>
+              <strong id="signal-tp-display">N/A</strong>
+            </div>
+          </div>
+          <div class="signal-meta">
+            <div>Symbol: <strong id="signal-symbol-display">N/A</strong></div>
+            <div>Direction: <strong id="signal-direction-display">N/A</strong></div>
+          </div>
+          <form id="sizing-form" class="detail-grid">
+            <div class="detail-item">
+              <span>Equity</span>
+              <input id="equity" type="number" step="0.01" placeholder="Account equity" />
+            </div>
+            <div class="detail-item">
+              <span>Leverage</span>
+              <input id="leverage" type="number" step="1" placeholder="e.g. 100" />
+            </div>
+            <div class="detail-item">
+              <span>Risk %</span>
+              <input id="risk-pct" type="number" step="0.01" value="1" />
+            </div>
+            <div class="detail-item">
+              <span>Risk Fixed</span>
+              <input id="risk-fixed" type="number" step="0.01" placeholder="Currency amount" />
+            </div>
+            <div class="detail-item">
+              <span>Risk Mode</span>
+              <div>
+                <label><input type="radio" name="risk-mode" value="percent" checked /> Percent</label>
+                <label><input type="radio" name="risk-mode" value="fixed" /> Fixed</label>
+              </div>
+            </div>
+            <input id="sizing-symbol" type="hidden" />
+            <input id="sizing-entry" type="hidden" />
+            <input id="sizing-sl" type="hidden" />
+            <input id="sizing-tp" type="hidden" />
+          </form>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span>Volume</span>
+              <strong id="lot-output">N/A</strong>
+            </div>
+            <div class="detail-item">
+              <span>Pip Distance</span>
+              <strong id="pip-output">N/A</strong>
+            </div>
+            <div class="detail-item">
+              <span>Risk Amount</span>
+              <strong id="risk-output">N/A</strong>
+            </div>
+            <div class="detail-item">
+              <span>Margin Used</span>
+              <strong id="margin-output">N/A</strong>
+            </div>
+          </div>
+          <h3>Ticket Output</h3>
+          <div class="ticket-box" id="ticket-box">Select an entry to generate a ticket.</div>
+        </section>
+      </main>
+
+      <section class="card settings fade-in">
+        <h3>Settings</h3>
+        <form id="settings-form">
+          <div class="settings-grid">
+            <div>
+              <label>PM Root Path</label>
+              <input id="cfg-pm-root" type="text" />
+            </div>
+            <div>
+              <label>Refresh Interval (sec)</label>
+              <input id="cfg-refresh" type="number" step="1" />
+            </div>
+            <div>
+              <label>Min Strength (filter)</label>
+              <input id="cfg-min-strength" type="number" step="0.01" />
+            </div>
+            <div>
+              <label>Max Signal Age (min)</label>
+              <input id="cfg-max-age" type="number" step="1" />
+            </div>
+            <div>
+              <label>Alert Min Strength</label>
+              <input id="cfg-alert-min" type="number" step="0.01" />
+            </div>
+            <div>
+              <label>Alerts Enabled</label>
+              <input id="cfg-alert-enabled" type="checkbox" />
+            </div>
+            <div>
+              <label>Sound Alerts</label>
+              <input id="cfg-sound" type="checkbox" />
+            </div>
+          </div>
+          <div style="margin-top: 12px;">
+            <label>File Patterns (one per line)</label>
+            <textarea id="cfg-patterns"></textarea>
+          </div>
+          <div style="margin-top: 14px;">
+            <button class="btn" type="submit">Save Settings</button>
+          </div>
+          <div class="footer-note" id="js-error" style="color: #b83333; display: none;"></div>
+          <div class="footer-note">
+            Advanced parsing controls (valid actions, field aliases) live in `pm_dashboard/dashboard_config.json`.
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <aside class="drawer" id="drawer">
+      <div class="drawer-header">
+        <h2 id="drawer-title">Entry</h2>
+        <button class="close-btn" id="close-drawer">x</button>
+      </div>
+      <div class="details" style="margin-top: 14px;">
+        <div class="detail-grid" id="details-grid"></div>
+      </div>
+      <div style="margin-top: 12px;">
+        <button class="btn" id="drawer-use-entry" type="button">Use For Sizing</button>
+      </div>
+      <div style="margin-top: 16px;">
+        <h3>Copy Actions</h3>
+        <div class="detail-grid">
+          <div class="detail-item">
+            <span>Copy</span>
+            <button class="btn btn-secondary" id="copy-entry">Entry + Symbol</button>
+          </div>
+          <div class="detail-item">
+            <span>Copy</span>
+            <button class="btn btn-secondary" id="copy-sl">Stop Loss</button>
+          </div>
+          <div class="detail-item">
+            <span>Copy</span>
+            <button class="btn btn-secondary" id="copy-tp">Take Profit</button>
+          </div>
+          <div class="detail-item">
+            <span>Copy</span>
+            <button class="btn btn-secondary" id="copy-ticket">Full Ticket</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <script src="{{ url_for('static', filename='app.js', v='20260204c') }}"></script>
+  </body>
+</html>

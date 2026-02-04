@@ -1910,6 +1910,7 @@ def main():
     
     # Load runtime configuration
     config_data = load_config_json(args.config)
+    os.environ["PM_CONFIG_PATH"] = args.config
 
     # Prefer symbols from config.json unless CLI overrides
     symbols = args.symbols or config_data.get("symbols") or DEFAULT_SYMBOLS

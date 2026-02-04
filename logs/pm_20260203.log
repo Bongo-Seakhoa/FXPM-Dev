@@ -621,3 +621,258 @@ Progress: 1/2
 2026-02-03 21:14:02 [INFO] pm_core: [TIME] [AUDUSD] Regime Optimization: 4281.34s
 2026-02-03 21:14:02 [INFO] __main__: Shutting down...
 2026-02-03 21:14:02 [INFO] __main__: Shutdown complete
+2026-02-03 21:19:13 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-03 21:19:13 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-03 21:19:13 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=1
+2026-02-03 21:19:13 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=20.0 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-03 21:19:13 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-03 21:19:13 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-03 21:19:13 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-03 21:19:13 [INFO] __main__: ------------------------------------------------------------
+2026-02-03 21:19:13 [INFO] __main__: ============================================================
+2026-02-03 21:19:13 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-03 21:19:13 [INFO] __main__: ============================================================
+2026-02-03 21:19:13 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-03 21:19:13 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-03 21:19:13 [INFO] __main__: [OK] Connected to MT5
+2026-02-03 21:19:13 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-03 21:19:13 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-03 21:19:13 [INFO] __main__:   Symbols: 6
+2026-02-03 21:19:13 [INFO] __main__:   Strategies: 28
+2026-02-03 21:19:13 [INFO] __main__:   Existing configs: 37
+2026-02-03 21:19:13 [INFO] __main__: 
+============================================================
+2026-02-03 21:19:13 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-03 21:19:13 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-03 21:19:13 [INFO] __main__: ============================================================
+2026-02-03 21:19:13 [INFO] __main__: Fetching historical data for 6 symbols...
+2026-02-03 21:19:22 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-03 21:19:28 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-03 21:19:35 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-03 21:19:41 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-03 21:19:47 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-03 21:19:54 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-03 21:19:54 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-03 21:19:54 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-03 21:19:54 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-03 21:19:54 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-03 21:19:54 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-03 21:19:54 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-03 21:19:54 [INFO] pm_pipeline: 
+############################################################
+2026-02-03 21:19:54 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-03 21:19:54 [INFO] pm_pipeline: Total symbols: 6
+2026-02-03 21:19:54 [INFO] pm_pipeline: To optimize: 6
+2026-02-03 21:19:54 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-03 21:19:54 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-03 21:19:54 [INFO] pm_pipeline: Strategies: 28
+2026-02-03 21:19:54 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-03 21:19:54 [INFO] pm_pipeline: ############################################################
+2026-02-03 21:19:54 [INFO] pm_pipeline: 
+Progress: 1/6
+2026-02-03 21:19:54 [INFO] pm_pipeline: 
+============================================================
+2026-02-03 21:19:54 [INFO] pm_pipeline: OPTIMIZING: NZDUSD (Regime-Aware)
+2026-02-03 21:19:54 [INFO] pm_pipeline: ============================================================
+2026-02-03 21:19:56 [INFO] pm_core: Loaded NZDUSD: 500000 bars from NZDUSD_M5.csv
+2026-02-03 21:24:29 [INFO] pm_pipeline: [NZDUSD] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+2026-02-03 21:29:56 [INFO] pm_pipeline: [NZDUSD] [M5] Hyperparameter tuning 11 strategies
+2026-02-03 22:04:00 [INFO] __main__: Shutting down...
+2026-02-03 22:04:00 [INFO] pm_mt5: Disconnected from MT5
+2026-02-03 22:04:00 [INFO] __main__: Shutdown complete
+2026-02-03 22:04:00 [INFO] pm_core: [TIME] [NZDUSD] Regime Optimization: 2371.33s
+2026-02-03 22:04:00 [INFO] __main__: Shutting down...
+2026-02-03 22:04:00 [INFO] __main__: Shutdown complete
+2026-02-03 22:04:08 [INFO] __main__: Shutting down...
+2026-02-03 22:04:08 [INFO] __main__: Stopping trader...
+2026-02-03 22:04:08 [INFO] __main__: Saved 1 trades to pm_outputs\trades_20260203_220408.json
+2026-02-03 22:04:08 [INFO] pm_mt5: Disconnected from MT5
+2026-02-03 22:04:08 [INFO] __main__: Shutdown complete
+2026-02-03 22:04:08 [INFO] __main__: Shutting down...
+2026-02-03 22:04:08 [INFO] __main__: Stopping trader...
+2026-02-03 22:04:08 [INFO] __main__: Saved 1 trades to pm_outputs\trades_20260203_220408.json
+2026-02-03 22:04:08 [INFO] __main__: Shutdown complete
+2026-02-03 22:04:08 [INFO] __main__: Shutting down...
+2026-02-03 22:04:08 [INFO] __main__: Stopping trader...
+2026-02-03 22:04:08 [INFO] __main__: Saved 1 trades to pm_outputs\trades_20260203_220408.json
+2026-02-03 22:04:08 [INFO] __main__: Shutdown complete
+2026-02-03 22:12:59 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-03 22:12:59 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-03 22:12:59 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-03 22:12:59 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=20.0 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-03 22:12:59 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-03 22:12:59 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-03 22:12:59 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-03 22:12:59 [INFO] __main__: ------------------------------------------------------------
+2026-02-03 22:12:59 [INFO] __main__: ============================================================
+2026-02-03 22:12:59 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-03 22:12:59 [INFO] __main__: ============================================================
+2026-02-03 22:12:59 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-03 22:12:59 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-03 22:12:59 [INFO] __main__: [OK] Connected to MT5
+2026-02-03 22:12:59 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-03 22:12:59 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-03 22:12:59 [INFO] __main__:   Symbols: 10
+2026-02-03 22:12:59 [INFO] __main__:   Strategies: 28
+2026-02-03 22:12:59 [INFO] __main__:   Existing configs: 37
+2026-02-03 22:12:59 [INFO] __main__: 
+============================================================
+2026-02-03 22:12:59 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-03 22:12:59 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-03 22:12:59 [INFO] __main__: ============================================================
+2026-02-03 22:12:59 [INFO] __main__: Fetching historical data for 10 symbols...
+2026-02-03 22:13:02 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-03 22:13:05 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-03 22:13:08 [INFO] __main__: Shutting down...
+2026-02-03 22:13:08 [INFO] pm_mt5: Disconnected from MT5
+2026-02-03 22:13:08 [INFO] __main__: Shutdown complete
+2026-02-03 22:13:08 [INFO] __main__: Shutting down...
+2026-02-03 22:13:08 [INFO] __main__: Shutdown complete
+2026-02-03 22:13:16 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-03 22:13:16 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-03 22:13:16 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=5
+2026-02-03 22:13:16 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=20.0 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-03 22:13:16 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-03 22:13:16 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-03 22:13:16 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-03 22:13:16 [INFO] __main__: ------------------------------------------------------------
+2026-02-03 22:13:16 [INFO] __main__: ============================================================
+2026-02-03 22:13:16 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-03 22:13:16 [INFO] __main__: ============================================================
+2026-02-03 22:13:16 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-03 22:13:16 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-03 22:13:16 [INFO] __main__: [OK] Connected to MT5
+2026-02-03 22:13:16 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-03 22:13:16 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-03 22:13:16 [INFO] __main__:   Symbols: 10
+2026-02-03 22:13:16 [INFO] __main__:   Strategies: 28
+2026-02-03 22:13:16 [INFO] __main__:   Existing configs: 37
+2026-02-03 22:13:16 [INFO] __main__: 
+============================================================
+2026-02-03 22:13:16 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-03 22:13:16 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-03 22:13:16 [INFO] __main__: ============================================================
+2026-02-03 22:13:16 [INFO] __main__: Fetching historical data for 10 symbols...
+2026-02-03 22:13:19 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-03 22:13:22 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-03 22:13:25 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-03 22:13:25 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-03 22:13:25 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-03 22:13:25 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=5
+2026-02-03 22:13:25 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=20.0 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-03 22:13:25 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-03 22:13:25 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-03 22:13:25 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-03 22:13:25 [INFO] __main__: ------------------------------------------------------------
+2026-02-03 22:13:25 [INFO] __main__: ============================================================
+2026-02-03 22:13:25 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-03 22:13:25 [INFO] __main__: ============================================================
+2026-02-03 22:13:25 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-03 22:13:26 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-03 22:13:26 [INFO] __main__: [OK] Connected to MT5
+2026-02-03 22:13:26 [INFO] pm_pipeline: Loaded 37 existing configs from pm_configs.json
+2026-02-03 22:13:26 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-03 22:13:26 [INFO] __main__:   Symbols: 46
+2026-02-03 22:13:26 [INFO] __main__:   Strategies: 28
+2026-02-03 22:13:26 [INFO] __main__:   Existing configs: 37
+2026-02-03 22:13:26 [INFO] __main__: 
+============================================================
+2026-02-03 22:13:26 [INFO] __main__: STARTING LIVE TRADING
+2026-02-03 22:13:26 [INFO] __main__: Trading enabled: True
+2026-02-03 22:13:26 [INFO] __main__: Auto-retrain: False
+2026-02-03 22:13:26 [INFO] __main__: Close on opposite signal: False
+2026-02-03 22:13:26 [INFO] __main__: ============================================================
+2026-02-03 22:13:29 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-03 22:13:33 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-03 22:13:37 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-03 22:13:41 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-03 22:13:44 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-03 22:13:47 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-03 22:13:50 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-03 22:13:50 [INFO] pm_pipeline: 
+############################################################
+2026-02-03 22:13:50 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-03 22:13:50 [INFO] pm_pipeline: Total symbols: 10
+2026-02-03 22:13:50 [INFO] pm_pipeline: To optimize: 10
+2026-02-03 22:13:50 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-03 22:13:50 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-03 22:13:50 [INFO] pm_pipeline: Strategies: 28
+2026-02-03 22:13:50 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-03 22:13:50 [INFO] pm_pipeline: ############################################################
+2026-02-03 22:13:50 [INFO] pm_pipeline: Parallel optimization enabled: workers=5
+2026-02-03 22:25:01 [INFO] __main__: [USDCAD] Selected: MACDHistogramMomentumStrategy @ M5/TREND (strength=0.39, quality=0.44, freshness=1.00, score=0.170)
+2026-02-03 22:25:01 [INFO] __main__: [USDCAD] Fallback tier 2: reduced risk to 1.00%
+2026-02-03 22:25:01 [INFO] __main__: [USDCAD] BUY | basis=1450.16 (balance) | target_risk=1.00% ($14.50) | actual_risk=0.99% ($14.31) | vol_raw=0.2027 | vol=0.2000 | entry=1.36396 | sl=1.36299 | tp=1.36496
+2026-02-03 22:25:01 [INFO] __main__: [OK] [USDCAD] LONG executed: 0.2 lots @ 1.36395
+2026-02-04 00:43:38 [INFO] pm_pipeline: 
+Progress: 1/10
+2026-02-04 00:43:38 [INFO] pm_pipeline: SAVED AUDNZD to pm_configs.json (atomic)
+2026-02-04 01:24:10 [INFO] pm_pipeline: 
+Progress: 2/10
+2026-02-04 01:24:10 [INFO] pm_pipeline: SAVED NZDUSD to pm_configs.json (atomic)
+2026-02-04 01:38:40 [INFO] pm_pipeline: 
+Progress: 3/10
+2026-02-04 01:38:40 [INFO] pm_pipeline: SAVED EURGBP to pm_configs.json (atomic)
+2026-02-04 02:40:55 [INFO] pm_pipeline: 
+Progress: 4/10
+2026-02-04 02:40:56 [INFO] pm_pipeline: SAVED XAUUSD to pm_configs.json (atomic)
+2026-02-04 02:41:46 [INFO] pm_pipeline: 
+Progress: 5/10
+2026-02-04 02:41:47 [INFO] pm_pipeline: SAVED XAGUSD to pm_configs.json (atomic)
+2026-02-04 02:45:17 [INFO] pm_pipeline: 
+Progress: 6/10
+2026-02-04 02:45:17 [INFO] pm_pipeline: SAVED AUDJPY to pm_configs.json (atomic)
+2026-02-04 03:59:58 [INFO] __main__: [USDJPY] Selected: VolatilityBreakoutStrategy @ M30/TREND (strength=0.47, quality=0.37, freshness=1.00, score=0.173)
+2026-02-04 03:59:58 [INFO] __main__: [USDJPY] BUY | basis=1412.72 (balance) | target_risk=1.00% ($14.13) | actual_risk=0.91% ($12.87) | vol_raw=0.0769 | vol=0.0700 | entry=156.28200 | sl=155.99529 | tp=156.71207
+2026-02-04 03:59:58 [INFO] __main__: [OK] [USDJPY] LONG executed: 0.07 lots @ 156.28200
+2026-02-04 04:42:52 [INFO] pm_pipeline: 
+Progress: 7/10
+2026-02-04 04:42:52 [INFO] pm_pipeline: SAVED EURJPY to pm_configs.json (atomic)
+2026-02-04 04:50:39 [INFO] __main__: [USDCAD] Selected: MACDHistogramMomentumStrategy @ M5/RANGE (strength=0.42, quality=0.44, freshness=1.00, score=0.184)
+2026-02-04 04:50:39 [INFO] __main__: [USDCAD] Fallback tier 2: reduced risk to 1.00%
+2026-02-04 04:50:39 [INFO] __main__: [USDCAD] SELL | basis=1427.35 (balance) | target_risk=1.00% ($14.27) | actual_risk=0.95% ($13.62) | vol_raw=0.2934 | vol=0.2800 | entry=1.36470 | sl=1.36536 | tp=1.36370
+2026-02-04 04:50:39 [INFO] __main__: [OK] [USDCAD] SHORT executed: 0.28 lots @ 1.36470
+2026-02-04 05:05:08 [INFO] pm_pipeline: 
+Progress: 8/10
+2026-02-04 05:05:08 [INFO] pm_pipeline: SAVED GBPJPY to pm_configs.json (atomic)
+2026-02-04 07:10:34 [INFO] pm_pipeline: 
+Progress: 9/10
+2026-02-04 07:10:34 [INFO] pm_pipeline: SAVED USDMXN to pm_configs.json (atomic)
+2026-02-04 07:14:06 [INFO] __main__: Shutting down...
+2026-02-04 07:14:06 [INFO] __main__: Stopping trader...
+2026-02-04 07:14:06 [INFO] __main__: Saved 3 trades to pm_outputs\trades_20260204_071406.json
+2026-02-04 07:14:06 [INFO] pm_mt5: Disconnected from MT5
+2026-02-04 07:14:06 [INFO] __main__: Shutdown complete
+2026-02-04 07:14:06 [INFO] __main__: Shutting down...
+2026-02-04 07:14:06 [INFO] __main__: Stopping trader...
+2026-02-04 07:14:06 [INFO] __main__: Saved 3 trades to pm_outputs\trades_20260204_071406.json
+2026-02-04 07:14:06 [INFO] __main__: Shutdown complete
+2026-02-04 07:14:06 [INFO] __main__: Shutting down...
+2026-02-04 07:14:06 [INFO] __main__: Stopping trader...
+2026-02-04 07:14:06 [INFO] __main__: Saved 3 trades to pm_outputs\trades_20260204_071406.json
+2026-02-04 07:14:06 [INFO] __main__: Shutdown complete
+2026-02-04 08:58:07 [INFO] pm_pipeline: 
+Progress: 10/10
+2026-02-04 08:58:08 [INFO] pm_pipeline: SAVED USDZAR to pm_configs.json (atomic)
+2026-02-04 08:58:15 [INFO] pm_pipeline: 
+############################################################
+2026-02-04 08:58:15 [INFO] pm_pipeline: OPTIMIZATION COMPLETE
+2026-02-04 08:58:15 [INFO] pm_pipeline: Total time: 38664.5s
+2026-02-04 08:58:15 [INFO] pm_pipeline: Optimized: 10/10
+2026-02-04 08:58:15 [INFO] pm_pipeline: Skipped: 0 (already valid)
+2026-02-04 08:58:15 [INFO] pm_pipeline: Total validated: 37/10
+2026-02-04 08:58:15 [INFO] pm_pipeline: ############################################################
+2026-02-04 08:58:15 [INFO] __main__: Saved optimization summary to pm_outputs\optimization_summary.csv
+2026-02-04 08:58:15 [INFO] __main__: Shutting down...
+2026-02-04 08:58:15 [INFO] pm_mt5: Disconnected from MT5
+2026-02-04 08:58:15 [INFO] __main__: Shutdown complete

@@ -1,0 +1,146 @@
+{
+  "alert": {
+    "enabled": true,
+    "min_strength": 0,
+    "sound": true
+  },
+  "display_actions": [
+    "EXECUTED",
+    "SKIPPED_RISK_CAP"
+  ],
+  "display_allow_if_actions": [
+    "SKIPPED_RISK_CAP"
+  ],
+  "display_require_fields": [
+    "signal_direction",
+    "entry_price",
+    "stop_loss_price",
+    "take_profit_price"
+  ],
+  "exclude_actions": [
+    "NO_ACTIONABLE_SIGNAL",
+    "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
+    "SKIPPED_NO_SIGNAL",
+    "FAILED"
+  ],
+  "exclude_patterns": [
+    "**/pm_dashboard/**",
+    "**/__pycache__/**",
+    "**/*.pyc"
+  ],
+  "explicit_files": [],
+  "field_aliases": {
+    "entry_price": [
+      "entry",
+      "entry_price",
+      "price",
+      "entryPrice",
+      "open_price",
+      "signal_price"
+    ],
+    "notes": [
+      "reason",
+      "notes",
+      "comment",
+      "message"
+    ],
+    "regime": [
+      "regime",
+      "market_regime"
+    ],
+    "signal_direction": [
+      "direction",
+      "side",
+      "signal",
+      "action",
+      "trade_direction"
+    ],
+    "signal_strength": [
+      "strength",
+      "signal_strength",
+      "score",
+      "confidence",
+      "probability"
+    ],
+    "stop_loss_price": [
+      "sl",
+      "stop",
+      "stop_loss",
+      "stop_loss_price"
+    ],
+    "strategy_name": [
+      "strategy",
+      "strategy_name",
+      "signal_source",
+      "model",
+      "algo"
+    ],
+    "symbol": [
+      "symbol",
+      "pair",
+      "instrument",
+      "ticker"
+    ],
+    "take_profit_price": [
+      "tp",
+      "take_profit",
+      "take_profit_price"
+    ],
+    "timeframe": [
+      "timeframe",
+      "tf",
+      "interval",
+      "frame"
+    ],
+    "timestamp": [
+      "timestamp",
+      "time",
+      "datetime",
+      "date",
+      "ts",
+      "action_time",
+      "bar_time",
+      "bar_timestamp"
+    ],
+    "valid_now": [
+      "valid",
+      "is_valid",
+      "actionable",
+      "allow_trade",
+      "allow"
+    ]
+  },
+  "file_patterns": [
+    "**/*recommendation*.json",
+    "**/*recommendations*.json",
+    "**/*signal*.json",
+    "**/*signals*.json",
+    "**/*signal*.csv",
+    "**/*signals*.csv",
+    "**/*trades*.json",
+    "**/*trade*log*.json",
+    "**/*last_trade_log*.json",
+    "**/*portfolio*.json",
+    "**/*.log"
+  ],
+  "max_signal_age_minutes": 1440,
+  "min_strength": 0,
+  "pm_configs_path": "pm_configs.json",
+  "pm_root": "C:\\Users\\Bongo\\OneDrive\\Desktop\\FxPM 1.4 - Obtimized",
+  "primary_sources": [
+    "last_trade_log.json"
+  ],
+  "log_sources": [
+    "logs/*.log",
+    "**/pm_*.log"
+  ],
+  "log_max_files": 2,
+  "refresh_interval_sec": 5,
+  "trade_files_pattern": "**/trades_*.json",
+  "valid_action_prefixes": [
+    "EXECUTED"
+  ],
+  "valid_actions": [
+    "EXECUTED"
+  ]
+}

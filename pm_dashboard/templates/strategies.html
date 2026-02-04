@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PM Dashboard - Strategies</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='20260204d') }}" />
+  </head>
+  <body>
+    <div class="bg-grid"></div>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <div class="logo">PM</div>
+          <div>
+            <h1>Strategy Vault</h1>
+            <p>Validated strategy view with drill-down metrics.</p>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/">Signal Desk</a>
+          <a class="nav-link active" href="/strategies">Strategies</a>
+        </nav>
+        <div class="stat-card">
+          <div class="stat-label">Strategies Loaded</div>
+          <div class="stat-value" id="strategy-count">0</div>
+          <div class="stat-meta">Validated: <span id="strategy-valid-count">0</span></div>
+          <div class="stat-meta">Invalid: <span id="strategy-invalid-count">0</span></div>
+        </div>
+      </header>
+
+      <section class="card controls fade-in">
+        <div class="filters">
+          <div>
+            <label>Symbol</label>
+            <select id="strategy-filter-symbol"></select>
+          </div>
+          <div>
+            <label>Timeframe</label>
+            <select id="strategy-filter-timeframe"></select>
+          </div>
+          <div>
+            <label>Regime</label>
+            <select id="strategy-filter-regime"></select>
+          </div>
+          <div>
+            <label>Strategy</label>
+            <select id="strategy-filter-name"></select>
+          </div>
+        </div>
+        <div class="toggle-group">
+          <label class="toggle">
+            <input type="checkbox" id="strategy-include-invalid" />
+            <span>Show Invalid</span>
+          </label>
+        </div>
+      </section>
+
+      <main class="grid strategy-layout">
+        <section class="card table-wrap fade-in">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>TF</th>
+                <th>Regime</th>
+                <th>Strategy</th>
+                <th>Quality</th>
+                <th>Train Trades</th>
+                <th>Val Trades</th>
+                <th>Val Win%</th>
+                <th>Val PF</th>
+                <th>Val Return%</th>
+                <th>Max DD%</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="strategy-body"></tbody>
+          </table>
+          <div class="pagination" id="strategy-pagination">
+            <button class="btn btn-secondary" id="strategy-prev" type="button">Prev</button>
+            <span id="strategy-page-info">Page 1 of 1</span>
+            <button class="btn btn-secondary" id="strategy-next" type="button">Next</button>
+          </div>
+        </section>
+
+        <section class="card details fade-in">
+          <h3>Strategy Drill-Down</h3>
+          <div class="detail-grid" id="strategy-details"></div>
+          <h3>Parameters</h3>
+          <div class="ticket-box" id="strategy-params">Select a row to view parameters.</div>
+          <h3>Train Metrics</h3>
+          <div class="metrics-grid" id="strategy-train"></div>
+          <h3>Validation Metrics</h3>
+          <div class="metrics-grid" id="strategy-val"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='strategies.js', v='20260204d') }}"></script>
+  </body>
+</html>
