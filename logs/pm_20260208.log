@@ -1,0 +1,25 @@
+2026-02-08 03:45:17 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 03:45:17 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 03:45:17 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=5
+2026-02-08 03:45:17 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=12.5 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 03:45:17 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 03:45:17 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 03:45:17 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 03:45:17 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 03:45:17 [INFO] __main__: ============================================================
+2026-02-08 03:45:17 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 03:45:17 [INFO] __main__: ============================================================
+2026-02-08 03:45:17 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 03:45:17 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 03:45:17 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 03:45:17 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 03:45:17 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 03:45:17 [INFO] __main__:   Symbols: 46
+2026-02-08 03:45:17 [INFO] __main__:   Strategies: 42
+2026-02-08 03:45:17 [INFO] __main__:   Existing configs: 46
+2026-02-08 03:45:17 [INFO] __main__: 
+============================================================
+2026-02-08 03:45:17 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-08 03:45:17 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-08 03:45:17 [INFO] __main__: ============================================================
+2026-02-08 03:45:17 [INFO] __main__: Fetching historical data for 46 symbols...

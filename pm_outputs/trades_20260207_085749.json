@@ -1,0 +1,156 @@
+[
+  {
+    "timestamp": "2026-02-06T07:00:44.949225",
+    "symbol": "EURGBP",
+    "direction": "SHORT",
+    "volume": 0.02,
+    "price": 0.86938,
+    "sl": 0.8736746428571429,
+    "tp": 0.8590728571428572,
+    "magic": 515127979,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T07:15:57.065667",
+    "symbol": "XAUUSD",
+    "direction": "LONG",
+    "volume": 0.01,
+    "price": 4870.59,
+    "sl": 4801.086428571429,
+    "tp": 4916.925714285714,
+    "magic": 2003954697,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T13:00:22.832047",
+    "symbol": "DE30",
+    "direction": "LONG",
+    "volume": 0.01,
+    "price": 24647.1,
+    "sl": 24451.660714285714,
+    "tp": 24940.258928571428,
+    "magic": 1548312233,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T13:00:26.662247",
+    "symbol": "JP225",
+    "direction": "LONG",
+    "volume": 0.2,
+    "price": 55362.0,
+    "sl": 54295.5,
+    "tp": 57495.0,
+    "magic": 1489404372,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T14:43:04.653560",
+    "symbol": "XRPUSD",
+    "direction": "LONG",
+    "volume": 0.02,
+    "price": 1.436,
+    "sl": 1.3011392857142856,
+    "tp": 1.5708607142857143,
+    "magic": 1349496382,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T14:44:26.740320",
+    "symbol": "XRPUSD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 1.43359,
+    "sl": 1.6522792857142856,
+    "tp": 0.9233149999999999,
+    "magic": 130071409,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T15:00:14.058315",
+    "symbol": "USDCAD",
+    "direction": "SHORT",
+    "volume": 0.02,
+    "price": 1.36541,
+    "sl": 1.3735464285714287,
+    "tp": 1.3586296428571427,
+    "magic": 1697350230,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T16:31:04.375138",
+    "symbol": "EURUSD",
+    "direction": "LONG",
+    "volume": 0.06,
+    "price": 1.18091,
+    "sl": 1.1786471428571428,
+    "tp": 1.1827957142857142,
+    "magic": 601024760,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T19:00:06.978943",
+    "symbol": "EURAUD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 1.68299,
+    "sl": 1.7018942857142858,
+    "tp": 1.660935,
+    "magic": 1605478307,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T19:00:52.499501",
+    "symbol": "USDSGD",
+    "direction": "SHORT",
+    "volume": 0.07,
+    "price": 1.27107,
+    "sl": 1.2734357142857142,
+    "tp": 1.266732857142857,
+    "magic": 2144317794,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T20:00:40.236075",
+    "symbol": "ETHUSD",
+    "direction": "LONG",
+    "volume": 0.01,
+    "price": 2047.9,
+    "sl": 1922.8257142857142,
+    "tp": 2256.117142857143,
+    "magic": 2126871932,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T20:00:48.322257",
+    "symbol": "CHFJPY",
+    "direction": "LONG",
+    "volume": 0.03,
+    "price": 202.602,
+    "sl": 201.91757142857142,
+    "tp": 203.17235714285715,
+    "magic": 1604327083,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T20:01:01.988032",
+    "symbol": "USDSEK",
+    "direction": "SHORT",
+    "volume": 0.02,
+    "price": 9.01706,
+    "sl": 9.061914285714286,
+    "tp": 8.949778571428572,
+    "magic": 2061068290,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-06T20:02:34.461540",
+    "symbol": "USDSEK",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 9.01632,
+    "sl": 9.304471785714284,
+    "tp": 8.843428928571429,
+    "magic": 1242174626,
+    "status": "EXECUTED"
+  }
+]

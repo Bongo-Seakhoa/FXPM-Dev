@@ -429,11 +429,16 @@ class MarketRegimeDetector:
     def __init__(self, params: Optional[RegimeParams] = None):
         """
         Initialize detector.
-        
+
         Args:
             params: Regime parameters (uses defaults if None)
         """
         self.params = params or RegimeParams()
+
+    @property
+    def warmup_bars(self) -> int:
+        """Number of bars required for warmup before regime scores are meaningful."""
+        return max(self.params.bb_squeeze_lookback, self.params.atr_lookback, 50)
     
     def compute_regime_scores(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -627,11 +632,13 @@ class MarketRegimeDetector:
         result['REGIME'] = regime_final
         result['REGIME_STRENGTH'] = regime_strength
         result['REGIME_GAP'] = regime_gap
-        
+        result['REGIME_WARMUP'] = False
+        result.iloc[:warmup, result.columns.get_loc('REGIME_WARMUP')] = True
+
         # REGIME_LIVE = REGIME.shift(1) for decision-time parity
         result['REGIME_LIVE'] = result['REGIME'].shift(1)
         result['REGIME_STRENGTH_LIVE'] = result['REGIME_STRENGTH'].shift(1)
-        
+
         return result
     
     def _create_empty_regime_df(self, index: pd.Index) -> pd.DataFrame:
@@ -646,6 +653,7 @@ class MarketRegimeDetector:
         result['REGIME'] = RegimeType.CHOP
         result['REGIME_STRENGTH'] = 0.25
         result['REGIME_GAP'] = 0.0
+        result['REGIME_WARMUP'] = True  # All bars are warmup when data insufficient
         result['REGIME_LIVE'] = RegimeType.CHOP
         result['REGIME_STRENGTH_LIVE'] = 0.25
         return result

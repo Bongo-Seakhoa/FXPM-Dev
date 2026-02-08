@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(du:*)",
+      "Bash(cd:*)",
+      "Bash(python -c:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -m unittest:*)",
+      "Bash(del:*)",
+      "Bash(del EFFICIENCY_IMPROVEMENTS.md)",
+      "Bash(del EFFICIENCY_ANALYSIS.md)",
+      "Bash(del STATEFUL_OPTIMIZATION.md)",
+      "Bash(del GAP_FIXES_V34.md)"
+    ]
+  }
+}

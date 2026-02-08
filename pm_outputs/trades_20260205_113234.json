@@ -1,0 +1,35 @@
+[
+  {
+    "timestamp": "2026-02-05T07:05:42.488648",
+    "symbol": "EURCAD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 1.6132499999999999,
+    "sl": 1.638912857142857,
+    "tp": 1.6046957142857141,
+    "magic": 1056293943,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-05T07:06:22.475697",
+    "symbol": "ETHUSD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 2080.34,
+    "sl": 2243.0,
+    "tp": 1809.2400000000002,
+    "magic": 2126871932,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-05T11:01:02.213276",
+    "symbol": "GBPCAD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 1.85798,
+    "sl": 1.868277857142857,
+    "tp": 1.8459875000000001,
+    "magic": 1638978609,
+    "status": "EXECUTED"
+  }
+]

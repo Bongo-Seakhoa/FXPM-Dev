@@ -4,6 +4,9 @@ var strategyState = {
   pageSize: 20,
   currentPage: 1,
   totalPages: 1,
+  preselect: null,
+  preselectApplied: false,
+  preselectedRow: null
 };
 
 var strategyElements = {
@@ -27,21 +30,93 @@ var strategyElements = {
   },
 };
 
-function strategyUniqueValues(rows, key) {
-  var values = {};
-  for (var i = 0; i < rows.length; i += 1) {
-    var val = rows[i][key];
-    if (val) values[val] = true;
+function parseQueryParams() {
+  var params = {};
+  if (!window.location || !window.location.search) return params;
+  var query = window.location.search.substring(1);
+  if (!query) return params;
+  var pairs = query.split("&");
+  for (var i = 0; i < pairs.length; i += 1) {
+    var part = pairs[i];
+    if (!part) continue;
+    var idx = part.indexOf("=");
+    var key = idx >= 0 ? part.slice(0, idx) : part;
+    var value = idx >= 0 ? part.slice(idx + 1) : "";
+    key = decodeURIComponent(key || "");
+    value = decodeURIComponent(value || "");
+    if (key) params[key] = value;
   }
-  return Object.keys(values).sort();
+  return params;
 }
+
+function parseStrategyPreselect() {
+  var params = parseQueryParams();
+  var preselect = {};
+  if (params.symbol) preselect.symbol = params.symbol;
+  if (params.timeframe) preselect.timeframe = params.timeframe;
+  if (params.regime) preselect.regime = params.regime;
+  if (params.strategy) preselect.strategy = params.strategy;
+  if (params.strategy_name && !preselect.strategy) preselect.strategy = params.strategy_name;
+  return preselect;
+}
+
+function hasPreselect(preselect) {
+  if (!preselect) return false;
+  return !!(preselect.symbol || preselect.timeframe || preselect.regime || preselect.strategy);
+}
+
+function normalizeValue(value) {
+  return String(value || "").toLowerCase();
+}
+
+function matchesPreselect(row, preselect) {
+  if (preselect.symbol && normalizeValue(row.symbol) !== normalizeValue(preselect.symbol)) return false;
+  if (preselect.timeframe && normalizeValue(row.timeframe) !== normalizeValue(preselect.timeframe)) return false;
+  if (preselect.regime && normalizeValue(row.regime) !== normalizeValue(preselect.regime)) return false;
+  if (preselect.strategy && normalizeValue(row.strategy_name) !== normalizeValue(preselect.strategy)) return false;
+  return true;
+}
+
+function findPreselectedRow(rows, preselect) {
+  for (var i = 0; i < rows.length; i += 1) {
+    if (matchesPreselect(rows[i], preselect)) return rows[i];
+  }
+  return null;
+}
+
+function applyStrategyPreselect(preselect) {
+  if (preselect.symbol && strategyElements.filters.symbol) {
+    strategyElements.filters.symbol.value = preselect.symbol;
+  }
+  if (preselect.timeframe && strategyElements.filters.timeframe) {
+    strategyElements.filters.timeframe.value = preselect.timeframe;
+  }
+  if (preselect.regime && strategyElements.filters.regime) {
+    strategyElements.filters.regime.value = preselect.regime;
+  }
+  if (preselect.strategy && strategyElements.filters.strategy) {
+    strategyElements.filters.strategy.value = preselect.strategy;
+  }
+
+  applyStrategyFilters();
+  var match = findPreselectedRow(strategyState.filtered, preselect);
+  strategyState.preselectedRow = match;
+  if (match) {
+    var idx = strategyState.filtered.indexOf(match);
+    if (idx >= 0) {
+      strategyState.currentPage = Math.floor(idx / strategyState.pageSize) + 1;
+    }
+  }
+}
+
+strategyState.preselect = parseStrategyPreselect();
 
 function updateStrategyFilters() {
   var options = {
-    symbol: strategyUniqueValues(strategyState.rows, "symbol"),
-    timeframe: strategyUniqueValues(strategyState.rows, "timeframe"),
-    regime: strategyUniqueValues(strategyState.rows, "regime"),
-    strategy: strategyUniqueValues(strategyState.rows, "strategy_name"),
+    symbol: PMCommon.uniqueValues(strategyState.rows, "symbol"),
+    timeframe: PMCommon.uniqueValues(strategyState.rows, "timeframe"),
+    regime: PMCommon.uniqueValues(strategyState.rows, "regime"),
+    strategy: PMCommon.uniqueValues(strategyState.rows, "strategy_name"),
   };
 
   for (var key in strategyElements.filters) {
@@ -103,7 +178,12 @@ function renderStrategyTable() {
     body.appendChild(tr);
   });
   if (pageRows.length) {
-    showStrategyDetails(pageRows[0]);
+    var preselected = strategyState.preselectedRow;
+    if (preselected && pageRows.indexOf(preselected) !== -1) {
+      showStrategyDetails(preselected);
+    } else {
+      showStrategyDetails(pageRows[0]);
+    }
   }
 }
 
@@ -161,7 +241,7 @@ function renderMetrics(metrics) {
 function fetchStrategies() {
   var includeInvalid = strategyElements.includeInvalid && strategyElements.includeInvalid.checked;
   var url = "/api/strategies?include_invalid=" + (includeInvalid ? "1" : "0");
-  return fetch(url)
+  return PMCommon.fetchWithRetry(url)
     .then(function (response) { return response.json(); })
     .then(function (data) {
       strategyState.rows = data.rows || [];
@@ -171,7 +251,12 @@ function fetchStrategies() {
       if (strategyElements.validCount) strategyElements.validCount.textContent = data.summary ? data.summary.validated : 0;
       if (strategyElements.invalidCount) strategyElements.invalidCount.textContent = data.summary ? data.summary.invalid : 0;
       updateStrategyFilters();
-      applyStrategyFilters();
+      if (strategyState.preselect && !strategyState.preselectApplied && hasPreselect(strategyState.preselect)) {
+        applyStrategyPreselect(strategyState.preselect);
+        strategyState.preselectApplied = true;
+      } else {
+        applyStrategyFilters();
+      }
       renderStrategyTable();
     });
 }
@@ -181,6 +266,8 @@ for (var key in strategyElements.filters) {
   var select = strategyElements.filters[key];
   if (!select) continue;
   select.addEventListener("change", function () {
+    strategyState.preselect = null;
+    strategyState.preselectedRow = null;
     applyStrategyFilters();
     renderStrategyTable();
   });
@@ -188,6 +275,8 @@ for (var key in strategyElements.filters) {
 
 if (strategyElements.includeInvalid) {
   strategyElements.includeInvalid.addEventListener("change", function () {
+    strategyState.preselect = null;
+    strategyState.preselectedRow = null;
     fetchStrategies();
   });
 }
@@ -211,6 +300,7 @@ if (strategyElements.nextBtn) {
 }
 
 window.addEventListener("load", function () {
+  PMCommon.initTheme();
   fetchStrategies();
 });
 

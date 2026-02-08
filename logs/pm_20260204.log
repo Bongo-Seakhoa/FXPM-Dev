@@ -1012,3 +1012,24 @@ Progress: 9/12
 2026-02-05 07:04:31 [INFO] __main__: Stopping trader...
 2026-02-05 07:04:31 [INFO] __main__: Saved 5 trades to pm_outputs\trades_20260205_070431.json
 2026-02-05 07:04:31 [INFO] __main__: Shutdown complete
+2026-02-05 07:26:35 [INFO] pm_pipeline: 
+Progress: 10/12
+2026-02-05 07:26:35 [INFO] pm_pipeline: SAVED NZDJPY to pm_configs.json (atomic)
+2026-02-05 08:40:37 [INFO] pm_pipeline: 
+Progress: 11/12
+2026-02-05 08:40:37 [INFO] pm_pipeline: SAVED XRPUSD to pm_configs.json (atomic)
+2026-02-05 09:07:59 [INFO] pm_pipeline: 
+Progress: 12/12
+2026-02-05 09:08:00 [INFO] pm_pipeline: SAVED BTCETH to pm_configs.json (atomic)
+2026-02-05 09:08:02 [INFO] pm_pipeline: 
+############################################################
+2026-02-05 09:08:02 [INFO] pm_pipeline: OPTIMIZATION COMPLETE
+2026-02-05 09:08:02 [INFO] pm_pipeline: Total time: 55187.5s
+2026-02-05 09:08:02 [INFO] pm_pipeline: Optimized: 12/12
+2026-02-05 09:08:02 [INFO] pm_pipeline: Skipped: 0 (already valid)
+2026-02-05 09:08:02 [INFO] pm_pipeline: Total validated: 39/12
+2026-02-05 09:08:02 [INFO] pm_pipeline: ############################################################
+2026-02-05 09:08:02 [INFO] __main__: Saved optimization summary to pm_outputs\optimization_summary.csv
+2026-02-05 09:08:02 [INFO] __main__: Shutting down...
+2026-02-05 09:08:02 [INFO] pm_mt5: Disconnected from MT5
+2026-02-05 09:08:02 [INFO] __main__: Shutdown complete

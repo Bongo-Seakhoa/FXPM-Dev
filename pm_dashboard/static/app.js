@@ -1,9 +1,13 @@
 var state = {
   entries: [],
   filtered: [],
+  displayed: [],
   selected: null,
   instrumentSpecs: {},
   config: {},
+  pageSize: 20,
+  currentPage: 1,
+  totalPages: 1
 };
 
 var elements = {
@@ -24,6 +28,11 @@ var elements = {
   signalSymbol: document.getElementById("signal-symbol-display"),
   signalDirection: document.getElementById("signal-direction-display"),
   jsError: document.getElementById("js-error"),
+  pageInfo: document.getElementById("page-info"),
+  pageCount: document.getElementById("page-count"),
+  pageSize: document.getElementById("page-size"),
+  pagePrev: document.getElementById("page-prev"),
+  pageNext: document.getElementById("page-next"),
   filters: {
     symbol: document.getElementById("filter-symbol"),
     timeframe: document.getElementById("filter-timeframe"),
@@ -48,50 +57,72 @@ window.addEventListener("unhandledrejection", function (event) {
   showJsError(event.reason ? String(event.reason) : "Unhandled promise rejection");
 });
 
-function formatNumber(value, decimals) {
-  if (decimals === undefined) decimals = 5;
-  if (value === null || value === undefined || Number.isNaN(value)) return "N/A";
-  var num = Number(value);
-  if (!Number.isFinite(num)) return "N/A";
-  if (Math.abs(num) >= 1000) return num.toFixed(2);
-  return num.toFixed(decimals);
-}
-
 function parseDate(value) {
   if (!value) return null;
   var date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+function entryTimeValue(entry) {
+  var date = parseDate(entry.timestamp);
+  return date ? date.getTime() : 0;
+}
+
 function sortEntries(entries) {
   return entries.sort(function (a, b) {
+    var timeA = entryTimeValue(a);
+    var timeB = entryTimeValue(b);
+    if (timeA !== timeB) return timeB - timeA;
     var strengthA = a.signal_strength !== undefined && a.signal_strength !== null ? a.signal_strength : 0;
     var strengthB = b.signal_strength !== undefined && b.signal_strength !== null ? b.signal_strength : 0;
-    if (strengthA !== strengthB) return strengthB - strengthA;
-    var dateA = parseDate(a.timestamp);
-    var dateB = parseDate(b.timestamp);
-    var timeA = dateA ? dateA.getTime() : 0;
-    var timeB = dateB ? dateB.getTime() : 0;
-    return timeB - timeA;
+    return strengthB - strengthA;
   });
 }
 
-function uniqueValues(entries, key) {
-  var values = {};
+function isDailyTimeframe(timeframe) {
+  var value = timeframe ? String(timeframe).toUpperCase() : "";
+  return value === "D1" || value === "1D";
+}
+
+function pickLatest(entries) {
+  if (!entries || !entries.length) return null;
+  var sorted = sortEntries(entries.slice());
+  return sorted[0];
+}
+
+function reduceEntries(entries) {
+  var bySymbol = {};
   for (var i = 0; i < entries.length; i += 1) {
-    var val = entries[i][key];
-    if (val) values[val] = true;
+    var entry = entries[i];
+    var symbol = entry.symbol || "N/A";
+    if (!bySymbol[symbol]) {
+      bySymbol[symbol] = { d1: [], other: [] };
+    }
+    if (isDailyTimeframe(entry.timeframe)) {
+      bySymbol[symbol].d1.push(entry);
+    } else {
+      bySymbol[symbol].other.push(entry);
+    }
   }
-  return Object.keys(values).sort();
+  var reduced = [];
+  var symbols = Object.keys(bySymbol);
+  for (var j = 0; j < symbols.length; j += 1) {
+    var bucket = bySymbol[symbols[j]];
+    var d1 = pickLatest(bucket.d1);
+    var other = pickLatest(bucket.other);
+    if (d1) reduced.push(d1);
+    if (other) reduced.push(other);
+  }
+  return reduced;
 }
 
 function updateFilterOptions() {
   var options = {
-    symbol: uniqueValues(state.entries, "symbol"),
-    timeframe: uniqueValues(state.entries, "timeframe"),
-    regime: uniqueValues(state.entries, "regime"),
-    direction: uniqueValues(state.entries, "signal_direction"),
-    strategy: uniqueValues(state.entries, "strategy_name"),
+    symbol: PMCommon.uniqueValues(state.entries, "symbol"),
+    timeframe: PMCommon.uniqueValues(state.entries, "timeframe"),
+    regime: PMCommon.uniqueValues(state.entries, "regime"),
+    direction: PMCommon.uniqueValues(state.entries, "signal_direction"),
+    strategy: PMCommon.uniqueValues(state.entries, "strategy_name"),
   };
 
   for (var key in elements.filters) {
@@ -118,16 +149,84 @@ function applyFilters() {
     if (filters.strategy && filters.strategy.value && entry.strategy_name !== filters.strategy.value) return false;
     return true;
   });
+  state.currentPage = 1;
+  state.displayed = reduceEntries(state.filtered);
+}
+
+function updatePagination() {
+  var total = state.displayed.length;
+  state.totalPages = Math.max(1, Math.ceil(total / state.pageSize));
+  if (state.currentPage > state.totalPages) {
+    state.currentPage = state.totalPages;
+  }
+  if (elements.pageInfo) {
+    elements.pageInfo.textContent = "Page " + state.currentPage + " of " + state.totalPages;
+  }
+  if (elements.pageCount) {
+    elements.pageCount.textContent = total + " rows";
+  }
+  if (elements.pagePrev) {
+    elements.pagePrev.disabled = state.currentPage <= 1;
+  }
+  if (elements.pageNext) {
+    elements.pageNext.disabled = state.currentPage >= state.totalPages;
+  }
+}
+
+function getPagedEntries() {
+  var sorted = sortEntries(state.displayed.slice());
+  var start = (state.currentPage - 1) * state.pageSize;
+  return sorted.slice(start, start + state.pageSize);
+}
+
+function updateCounts() {
+  if (!elements.validCount) return;
+  var count = 0;
+  for (var i = 0; i < state.displayed.length; i += 1) {
+    if (state.displayed[i].valid_now) count += 1;
+  }
+  elements.validCount.textContent = count;
+}
+
+function buildStrategyCell(entry) {
+  if (!entry.strategy_name) return "N/A";
+  var params = [];
+  if (entry.symbol) params.push("symbol=" + encodeURIComponent(entry.symbol));
+  if (entry.timeframe) params.push("timeframe=" + encodeURIComponent(entry.timeframe));
+  if (entry.regime) params.push("regime=" + encodeURIComponent(entry.regime));
+  if (entry.strategy_name) params.push("strategy=" + encodeURIComponent(entry.strategy_name));
+  var href = "/strategies" + (params.length ? "?" + params.join("&") : "");
+  return '<a class="strategy-link" href="' + href + '">' + entry.strategy_name + "</a>";
+}
+
+function getNewestIds(entries, count) {
+  var newestIds = {};
+  if (!entries || !entries.length) return newestIds;
+  var sorted = sortEntries(entries.slice());
+  var limit = count || 3;
+  for (var i = 0; i < sorted.length && i < limit; i += 1) {
+    if (sorted[i].entry_id) {
+      newestIds[sorted[i].entry_id] = true;
+    }
+  }
+  return newestIds;
 }
 
 function renderTable() {
   var tbody = elements.tableBody;
   if (!tbody) return;
   tbody.innerHTML = "";
-  sortEntries(state.filtered).forEach(function (entry) {
+  updatePagination();
+  updateCounts();
+  var pageEntries = getPagedEntries();
+  var newestIds = getNewestIds(state.displayed, 3);
+  pageEntries.forEach(function (entry) {
     var row = document.createElement("tr");
     row.dataset.entryId = entry.entry_id;
     row.classList.add(entry.valid_now ? "row-valid" : "row-invalid");
+    if (entry.valid_now && entry.entry_id && newestIds[entry.entry_id]) {
+      row.classList.add("row-newest");
+    }
     var dirClass = entry.signal_direction === "buy" ? "dir-buy" : "dir-sell";
     var dirText = entry.signal_direction ? entry.signal_direction.toUpperCase() : "N/A";
     row.innerHTML =
@@ -135,22 +234,26 @@ function renderTable() {
       "<td>" + (entry.timeframe || "N/A") + "</td>" +
       "<td>" + (entry.regime || "N/A") + "</td>" +
       '<td class="' + dirClass + '">' + dirText + "</td>" +
-      "<td>" + formatNumber(entry.stop_loss_price) + "</td>" +
-      "<td>" + formatNumber(entry.entry_price) + "</td>" +
-      "<td>" + formatNumber(entry.take_profit_price) + "</td>" +
+      "<td>" + PMCommon.formatNumber(entry.stop_loss_price) + "</td>" +
+      "<td>" + PMCommon.formatNumber(entry.entry_price) + "</td>" +
+      "<td>" + PMCommon.formatNumber(entry.take_profit_price) + "</td>" +
       "<td>" + (entry.signal_strength !== undefined && entry.signal_strength !== null ? entry.signal_strength : "N/A") + "</td>" +
       "<td>" + (entry.timestamp ? new Date(entry.timestamp).toLocaleString() : "N/A") + "</td>" +
-      "<td>" + (entry.strategy_name || "N/A") + "</td>";
+      "<td>" + buildStrategyCell(entry) + "</td>";
     row.addEventListener("click", function () { openDrawer(entry); });
+    var strategyLink = row.querySelector(".strategy-link");
+    if (strategyLink) {
+      strategyLink.addEventListener("click", function (event) {
+        event.stopPropagation();
+      });
+    }
     tbody.appendChild(row);
   });
 }
 
 function openDrawer(entry) {
   state.selected = entry;
-  if (elements.drawer) {
-    elements.drawer.classList.add("open");
-  }
+  PMCommon.openDrawer(elements.drawer);
   if (elements.drawerTitle) {
     elements.drawerTitle.textContent = (entry.symbol || "Entry") + " " + (entry.signal_direction ? entry.signal_direction.toUpperCase() : "");
   }
@@ -160,9 +263,7 @@ function openDrawer(entry) {
 }
 
 function closeDrawer() {
-  if (elements.drawer) {
-    elements.drawer.classList.remove("open");
-  }
+  PMCommon.closeDrawer(elements.drawer);
 }
 
 function renderDetails(entry) {
@@ -173,9 +274,9 @@ function renderDetails(entry) {
     ["Regime", entry.regime],
     ["Strategy", entry.strategy_name],
     ["Direction", entry.signal_direction],
-    ["Stop Loss", formatNumber(entry.stop_loss_price)],
-    ["Take Profit", formatNumber(entry.take_profit_price)],
-    ["Entry", formatNumber(entry.entry_price)],
+    ["Stop Loss", PMCommon.formatNumber(entry.stop_loss_price)],
+    ["Take Profit", PMCommon.formatNumber(entry.take_profit_price)],
+    ["Entry", PMCommon.formatNumber(entry.entry_price)],
     ["Strength", entry.signal_strength !== undefined && entry.signal_strength !== null ? entry.signal_strength : "N/A"],
     ["Timestamp", entry.timestamp ? new Date(entry.timestamp).toLocaleString() : "N/A"],
     ["Reason", entry.reason || "N/A"],
@@ -186,30 +287,12 @@ function renderDetails(entry) {
   }).join("");
 }
 
-function copyToClipboard(text) {
-  if (!text) return;
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).catch(function () { fallbackCopy(text); });
-  } else {
-    fallbackCopy(text);
-  }
-}
-
-function fallbackCopy(text) {
-  var temp = document.createElement("textarea");
-  temp.value = text;
-  document.body.appendChild(temp);
-  temp.select();
-  document.execCommand("copy");
-  document.body.removeChild(temp);
-}
-
 function updateTicket(entry) {
   var lot = calculateLot(entry);
   var lines = [
     "Symbol: " + (entry.symbol || "N/A"),
     "Direction: " + (entry.signal_direction ? entry.signal_direction.toUpperCase() : "N/A"),
-    "SL: " + formatNumber(entry.stop_loss_price) + " | Entry: " + formatNumber(entry.entry_price) + " | TP: " + formatNumber(entry.take_profit_price),
+    "SL: " + PMCommon.formatNumber(entry.stop_loss_price) + " | Entry: " + PMCommon.formatNumber(entry.entry_price) + " | TP: " + PMCommon.formatNumber(entry.take_profit_price),
     "Lot: " + (lot ? lot.lotSize : "N/A"),
     "Timeframe: " + (entry.timeframe || "N/A"),
     "Regime: " + (entry.regime || "N/A"),
@@ -280,13 +363,13 @@ function syncSizingInputs(entry) {
   document.getElementById("sizing-sl").value = entry.stop_loss_price !== undefined && entry.stop_loss_price !== null ? entry.stop_loss_price : "";
   document.getElementById("sizing-tp").value = entry.take_profit_price !== undefined && entry.take_profit_price !== null ? entry.take_profit_price : "";
   if (elements.signalSl) {
-    elements.signalSl.textContent = formatNumber(entry.stop_loss_price);
+    elements.signalSl.textContent = PMCommon.formatNumber(entry.stop_loss_price);
   }
   if (elements.signalEntry) {
-    elements.signalEntry.textContent = formatNumber(entry.entry_price);
+    elements.signalEntry.textContent = PMCommon.formatNumber(entry.entry_price);
   }
   if (elements.signalTp) {
-    elements.signalTp.textContent = formatNumber(entry.take_profit_price);
+    elements.signalTp.textContent = PMCommon.formatNumber(entry.take_profit_price);
   }
   if (elements.signalSymbol) {
     elements.signalSymbol.textContent = entry.symbol || "N/A";
@@ -306,15 +389,11 @@ function updateSizingOutputs(entry) {
 }
 
 function fetchEntries() {
-  return fetch("/api/entries")
+  return PMCommon.fetchWithRetry("/api/entries")
     .then(function (response) { return response.json(); })
     .then(function (data) {
       state.entries = data.entries || [];
       state.instrumentSpecs = data.instrument_specs || {};
-
-      if (elements.validCount) {
-        elements.validCount.textContent = data.stats && data.stats.valid !== undefined ? data.stats.valid : 0;
-      }
       if (elements.lastUpdated) {
         elements.lastUpdated.textContent = data.last_updated ? new Date(data.last_updated).toLocaleTimeString() : "N/A";
       }
@@ -330,7 +409,7 @@ function fetchEntries() {
 }
 
 function fetchConfig() {
-  return fetch("/api/config")
+  return PMCommon.fetchWithRetry("/api/config")
     .then(function (response) { return response.json(); })
     .then(function (data) {
       state.config = data;
@@ -377,16 +456,21 @@ function saveConfig(event) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   })
-    .then(function () { return fetchConfig(); })
+    .then(function () { PMCommon.showToast("Config saved"); return fetchConfig(); })
     .then(function () { return fetchEntries(); })
     .then(function () { startAutoRefresh(state.config.refresh_interval_sec || 5); })
     .catch(function (err) { showJsError(err ? String(err) : "Failed to save config"); });
 }
 
 function init() {
+  PMCommon.initTheme();
+  PMCommon.initEscapeClose(elements.drawer);
   if (!elements.tableBody || !elements.validCount) {
     showJsError("Required DOM elements missing. Reload the page.");
     return;
+  }
+  if (elements.pageSize && elements.pageSize.value) {
+    state.pageSize = Number(elements.pageSize.value || 20);
   }
   fetchConfig()
     .then(fetchEntries)
@@ -411,6 +495,32 @@ for (var key in elements.filters) {
   });
 }
 
+if (elements.pagePrev) {
+  elements.pagePrev.addEventListener("click", function () {
+    if (state.currentPage > 1) {
+      state.currentPage -= 1;
+      renderTable();
+    }
+  });
+}
+
+if (elements.pageNext) {
+  elements.pageNext.addEventListener("click", function () {
+    if (state.currentPage < state.totalPages) {
+      state.currentPage += 1;
+      renderTable();
+    }
+  });
+}
+
+if (elements.pageSize) {
+  elements.pageSize.addEventListener("change", function () {
+    state.pageSize = Number(elements.pageSize.value || 20);
+    state.currentPage = 1;
+    renderTable();
+  });
+}
+
 if (elements.sizingForm) {
   elements.sizingForm.addEventListener("input", function () {
     updateSizingOutputs(state.selected);
@@ -424,14 +534,14 @@ var copySl = document.getElementById("copy-sl");
 if (copySl) {
   copySl.addEventListener("click", function () {
     var value = state.selected && state.selected.stop_loss_price !== undefined ? state.selected.stop_loss_price : "";
-    copyToClipboard(String(value));
+    PMCommon.copyToClipboard(String(value), "Stop Loss");
   });
 }
 var copyTp = document.getElementById("copy-tp");
 if (copyTp) {
   copyTp.addEventListener("click", function () {
     var value = state.selected && state.selected.take_profit_price !== undefined ? state.selected.take_profit_price : "";
-    copyToClipboard(String(value));
+    PMCommon.copyToClipboard(String(value), "Take Profit");
   });
 }
 var copyEntry = document.getElementById("copy-entry");
@@ -439,13 +549,13 @@ if (copyEntry) {
   copyEntry.addEventListener("click", function () {
     var symbol = state.selected && state.selected.symbol ? state.selected.symbol : "";
     var entry = state.selected && state.selected.entry_price !== undefined ? state.selected.entry_price : "";
-    copyToClipboard(symbol + " " + entry);
+    PMCommon.copyToClipboard(symbol + " " + entry, "Entry");
   });
 }
 var copyTicket = document.getElementById("copy-ticket");
 if (copyTicket) {
   copyTicket.addEventListener("click", function () {
-    copyToClipboard(elements.ticketBox ? elements.ticketBox.textContent : "");
+    PMCommon.copyToClipboard(elements.ticketBox ? elements.ticketBox.textContent : "", "Ticket");
   });
 }
 

@@ -3,10 +3,10 @@ FX Portfolio Manager - Trading Strategies
 ==========================================
 
 Contains all trading strategy implementations.
-Includes 28 strategies across categories:
-- Trend Following (10 strategies)
-- Mean Reversion (10 strategies)
-- Breakout/Momentum (8 strategies)
+Includes 42 strategies across categories:
+- Trend Following (14 strategies)
+- Mean Reversion (17 strategies)
+- Breakout/Momentum (11 strategies)
 
 Each strategy provides:
 - Signal generation (returns -1, 0, 1)
@@ -42,49 +42,153 @@ _GLOBAL_TP_GRID: List[float] = list(np.arange(1.0, 6.5, 0.5))   # [1.0 .. 6.0]
 # =============================================================================
 
 def _get_ema(features: pd.DataFrame, period: int) -> pd.Series:
-    """Get EMA from precomputed features or compute if missing."""
+    """Get EMA from precomputed features or compute if missing (C3: memoize)."""
     col = f'EMA_{period}'
     if col in features.columns:
         return features[col]
-    return features['Close'].ewm(span=period, adjust=False).mean()
+    result = features['Close'].ewm(span=period, adjust=False).mean()
+    features.loc[:, col] = result
+    return result
 
 
 def _get_sma(features: pd.DataFrame, period: int) -> pd.Series:
-    """Get SMA from precomputed features or compute if missing."""
+    """Get SMA from precomputed features or compute if missing (C3: memoize)."""
     col = f'SMA_{period}'
     if col in features.columns:
         return features[col]
-    return features['Close'].rolling(period).mean()
+    result = features['Close'].rolling(period).mean()
+    features.loc[:, col] = result
+    return result
+
+
+def _get_tr(features: pd.DataFrame) -> pd.Series:
+    """Get True Range (C2: consolidated helper). Memoized into features."""
+    col = '_TR'
+    if col in features.columns:
+        return features[col]
+    high_low = features['High'] - features['Low']
+    high_close = (features['High'] - features['Close'].shift(1)).abs()
+    low_close = (features['Low'] - features['Close'].shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    features.loc[:, col] = tr
+    return tr
 
 
 def _get_atr(features: pd.DataFrame, period: int) -> pd.Series:
-    """Get ATR from precomputed features or compute if missing."""
+    """Get ATR from precomputed features or compute if missing (C3: memoize)."""
     col = f'ATR_{period}'
     if col in features.columns:
         return features[col]
-    # Fallback computation
-    high_low = features['High'] - features['Low']
-    high_close = abs(features['High'] - features['Close'].shift(1))
-    low_close = abs(features['Low'] - features['Close'].shift(1))
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    tr = _get_tr(features)
+    result = tr.rolling(period).mean()
+    features.loc[:, col] = result
+    return result
 
 
 def _get_rsi(features: pd.DataFrame, period: int) -> pd.Series:
-    """Get RSI from precomputed features or compute if missing."""
+    """Get RSI from precomputed features or compute if missing (C3: memoize)."""
     col = f'RSI_{period}'
     if col in features.columns:
         return features[col]
-    return FeatureComputer.rsi(features['Close'], period)
+    result = FeatureComputer.rsi(features['Close'], period)
+    features.loc[:, col] = result
+    return result
+
+
+def _get_keltner(features: pd.DataFrame, ema_period: int = 20,
+                 atr_period: int = 14, mult: float = 2.0
+                 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """Get Keltner Channel (mid, upper, lower). C2 consolidation."""
+    mid = _get_ema(features, ema_period)
+    atr = _get_atr(features, atr_period)
+    upper = mid + mult * atr
+    lower = mid - mult * atr
+    return mid, upper, lower
+
+
+def _detect_swing_points(series: pd.Series, order: int = 5
+                         ) -> Tuple[pd.Series, pd.Series]:
+    """Detect swing highs and lows using rolling window comparison (D0 helper).
+
+    Returns boolean Series pair (swing_highs, swing_lows).
+    A swing high at bar i means series[i] >= all values in [i-order, i+order].
+    Shifted by `order` to avoid lookahead.
+    """
+    swing_highs = pd.Series(False, index=series.index)
+    swing_lows = pd.Series(False, index=series.index)
+    vals = series.values
+    n = len(vals)
+    for i in range(order, n - order):
+        window = vals[i - order: i + order + 1]
+        if np.all(np.isnan(window)):
+            continue
+        if vals[i] == np.nanmax(window):
+            swing_highs.iloc[i + order] = True  # delayed by order bars
+        if vals[i] == np.nanmin(window):
+            swing_lows.iloc[i + order] = True
+    return swing_highs, swing_lows
+
+
+def _rolling_percentile_rank(series: pd.Series, window: int) -> pd.Series:
+    """Rolling percentile rank (0-100) of current value within its window (D0 helper)."""
+    def _pct_rank(arr):
+        if len(arr) < 2:
+            return 50.0
+        current = arr[-1]
+        return (np.sum(arr[:-1] < current) / (len(arr) - 1)) * 100.0
+    return series.rolling(window, min_periods=window).apply(_pct_rank, raw=True)
+
+
+def _get_adx_di(features: pd.DataFrame, period: int = 14
+                ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """Get ADX, +DI, -DI from precomputed features or compute if missing (memoized).
+
+    Uses Wilder-style EMA (alpha=1/period) and reuses _get_tr() for True Range
+    to avoid redundant TR computation across strategies.
+    """
+    adx_col = f'_ADX_{period}'
+    pdi_col = f'_PLUS_DI_{period}'
+    mdi_col = f'_MINUS_DI_{period}'
+
+    # Return cached if available
+    if adx_col in features.columns:
+        return features[adx_col], features[pdi_col], features[mdi_col]
+
+    # Also accept standard column names for period=14
+    if period == 14 and {'ADX', 'PLUS_DI', 'MINUS_DI'}.issubset(features.columns):
+        return features['ADX'], features['PLUS_DI'], features['MINUS_DI']
+
+    high = features['High']
+    low = features['Low']
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = _get_tr(features)
+    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / (atr + 1e-10))
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / (atr + 1e-10))
+
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    adx = dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    features.loc[:, adx_col] = adx
+    features.loc[:, pdi_col] = plus_di
+    features.loc[:, mdi_col] = minus_di
+    return adx, plus_di, minus_di
 
 
 def _get_hull_ma(features: pd.DataFrame, period: int) -> pd.Series:
-    """Get Hull MA from precomputed features or compute if missing."""
-    # Check for precomputed (only period 20 is precomputed by default)
-    if period == 20 and 'HULL_MA' in features.columns:
-        return features['HULL_MA']
-    # Use the optimized FeatureComputer method with caching
-    return FeatureComputer.hull_ma(features['Close'], period)
+    """Get Hull MA from precomputed features or compute if missing (C3: memoize)."""
+    col = f'HULL_MA_{period}' if period != 20 else 'HULL_MA'
+    if col in features.columns:
+        return features[col]
+    result = FeatureComputer.hull_ma(features['Close'], period)
+    features.loc[:, col] = result
+    return result
 
 
 def _get_bb(features: pd.DataFrame, period: int, std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
@@ -176,13 +280,22 @@ class BaseStrategy(ABC):
         """
         pass
     
+    MIN_BARS: int = 50
+
+    @staticmethod
+    def _zero_warmup(signals: pd.Series, warmup: int) -> pd.Series:
+        """Zero out the first ``warmup`` bars to prevent NaN-derived signals."""
+        if warmup > 0 and len(signals) > warmup:
+            signals.iloc[:warmup] = 0
+        return signals
+
     def get_required_features(self) -> Set[str]:
         """
         Get set of feature columns this strategy requires.
-        
+
         Override in subclasses for lazy feature loading optimization.
         Returns empty set by default (compute all features).
-        
+
         Returns:
             Set of column names required by this strategy
         """
@@ -741,45 +854,13 @@ class ADXDIStrengthStrategy(BaseStrategy):
             'tp_atr_mult': 3.0,
         }
 
-    @staticmethod
-    def _compute_adx_di(df: pd.DataFrame, period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """Compute ADX, +DI, -DI (Wilder-style EMA)."""
-        high = df['High']
-        low = df['Low']
-        close = df['Close']
-
-        up_move = high.diff()
-        down_move = -low.diff()
-
-        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-        atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-        plus_di = 100.0 * (plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / (atr + 1e-10))
-        minus_di = 100.0 * (minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / (atr + 1e-10))
-
-        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
-        adx = dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-        return adx, plus_di, minus_di
-
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = int(self.params.get('adx_period', 14))
         adx_th = float(self.params.get('adx_threshold', 20))
         spread_min = float(self.params.get('di_spread_min', 5.0))
         adx_rising = bool(self.params.get('require_adx_rising', True))
 
-        # Prefer precomputed columns when available
-        if {'ADX', 'PLUS_DI', 'MINUS_DI'}.issubset(features.columns):
-            adx = features['ADX']
-            plus_di = features['PLUS_DI']
-            minus_di = features['MINUS_DI']
-        else:
-            adx, plus_di, minus_di = self._compute_adx_di(features, period)
+        adx, plus_di, minus_di = _get_adx_di(features, period)
 
         # DI crosses
         cross_up = (plus_di > minus_di) & (plus_di.shift(1) <= minus_di.shift(1))
@@ -848,16 +929,7 @@ class KeltnerPullbackStrategy(BaseStrategy):
 
         close = features['Close']
 
-        # Keltner Channel
-        high_low = features['High'] - features['Low']
-        high_close = (features['High'] - close.shift(1)).abs()
-        low_close = (features['Low'] - close.shift(1)).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(kc_period).mean()
-
-        mid = close.ewm(span=kc_period, adjust=False).mean()
-        upper = mid + (kc_mult * atr)
-        lower = mid - (kc_mult * atr)
+        mid, upper, lower = _get_keltner(features, kc_period, kc_period, kc_mult)
 
         # Trend filter: EMA rising/falling and price on correct side
         ema_rising = mid > mid.shift(slope_bars)
@@ -915,12 +987,8 @@ class RSIExtremesStrategy(BaseStrategy):
         period = self.params.get('rsi_period', 14)
         oversold = self.params.get('oversold', 30)
         overbought = self.params.get('overbought', 70)
-        
-        delta = features['Close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-        rs = gain / (loss + 1e-10)
-        rsi = 100 - (100 / (1 + rs))
+
+        rsi = _get_rsi(features, period)
         
         signals = pd.Series(0, index=features.index)
         buy_signal = (rsi > oversold) & (rsi.shift(1) <= oversold)
@@ -1060,7 +1128,10 @@ class StochasticReversalStrategy(BaseStrategy):
         
         low_min = features['Low'].rolling(k_period).min()
         high_max = features['High'].rolling(k_period).max()
-        stoch_k = 100 * (features['Close'] - low_min) / (high_max - low_min + 1e-10)
+        denom = high_max - low_min
+        stoch_k = pd.Series(50.0, index=features.index)
+        valid = denom > 1e-8
+        stoch_k[valid] = 100 * (features['Close'][valid] - low_min[valid]) / denom[valid]
         stoch_d = stoch_k.rolling(d_period).mean()
         
         signals = pd.Series(0, index=features.index)
@@ -1159,7 +1230,10 @@ class WilliamsRStrategy(BaseStrategy):
         
         high_max = features['High'].rolling(period).max()
         low_min = features['Low'].rolling(period).min()
-        willr = -100 * (high_max - features['Close']) / (high_max - low_min + 1e-10)
+        denom = high_max - low_min
+        willr = pd.Series(-50.0, index=features.index)
+        valid = denom > 1e-8
+        willr[valid] = -100 * (high_max[valid] - features['Close'][valid]) / denom[valid]
         
         signals = pd.Series(0, index=features.index)
         buy_signal = (willr > oversold) & (willr.shift(1) <= oversold)
@@ -1537,22 +1611,11 @@ class SqueezeBreakoutStrategy(BaseStrategy):
         kc_period = self.params.get('kc_period', 20)
         kc_mult = self.params.get('kc_mult', 1.5)
         
-        # Bollinger Bands
-        bb_mid = features['Close'].rolling(bb_period).mean()
-        bb_std_val = features['Close'].rolling(bb_period).std()
-        bb_upper = bb_mid + (bb_std * bb_std_val)
-        bb_lower = bb_mid - (bb_std * bb_std_val)
-        
-        # Keltner Channels
-        high_low = features['High'] - features['Low']
-        high_close = abs(features['High'] - features['Close'].shift(1))
-        low_close = abs(features['Low'] - features['Close'].shift(1))
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(kc_period).mean()
-        
-        kc_mid = features['Close'].ewm(span=kc_period, adjust=False).mean()
-        kc_upper = kc_mid + (kc_mult * atr)
-        kc_lower = kc_mid - (kc_mult * atr)
+        # Bollinger Bands (shared helper)
+        bb_mid, bb_upper, bb_lower = _get_bb(features, bb_period, bb_std)
+
+        # Keltner Channels (shared helper)
+        kc_mid, kc_upper, kc_lower = _get_keltner(features, kc_period, kc_period, kc_mult)
         
         # Squeeze detection: BB inside KC
         squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
@@ -1602,23 +1665,13 @@ class KeltnerBreakoutStrategy(BaseStrategy):
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = self.params.get('period', 20)
         mult = self.params.get('atr_mult', 2.0)
-        
-        # Calculate ATR
-        high_low = features['High'] - features['Low']
-        high_close = abs(features['High'] - features['Close'].shift(1))
-        low_close = abs(features['Low'] - features['Close'].shift(1))
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(period).mean()
-        
-        # Keltner Channels
-        mid = features['Close'].ewm(span=period, adjust=False).mean()
-        upper = mid + (mult * atr)
-        lower = mid - (mult * atr)
-        
+
+        mid, upper, lower = _get_keltner(features, period, period, mult)
+
         signals = pd.Series(0, index=features.index)
         signals[features['Close'] > upper] = 1
         signals[features['Close'] < lower] = -1
-        
+
         return signals
     
     def get_param_grid(self) -> Dict[str, List]:
@@ -1798,32 +1851,6 @@ class EMARibbonADXStrategy(BaseStrategy):
             "tp_atr_mult": 3.0,
         }
 
-    @staticmethod
-    def _compute_adx_di(df: pd.DataFrame, period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """Compute ADX, +DI, -DI (Wilder-style). Used only as a fallback when columns are missing."""
-        high = df["High"]
-        low = df["Low"]
-        close = df["Close"]
-
-        up_move = high.diff()
-        down_move = -low.diff()
-
-        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-        atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        plus_di = 100.0 * (plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / (atr + 1e-10))
-        minus_di = 100.0 * (minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / (atr + 1e-10))
-
-        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
-        adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        return adx, plus_di, minus_di
-
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         ema_fast_p = int(self.params.get("ema_fast", 8))
         ema_mid_p = int(self.params.get("ema_mid", 21))
@@ -1832,26 +1859,10 @@ class EMARibbonADXStrategy(BaseStrategy):
         adx_th = float(self.params.get("adx_threshold", 20))
         use_di = bool(self.params.get("use_di_confirmation", True))
 
-        close = features["Close"]
-
-        ema_fast = features.get(f"EMA_{ema_fast_p}")
-        if ema_fast is None:
-            ema_fast = close.ewm(span=ema_fast_p, adjust=False).mean()
-
-        ema_mid = features.get(f"EMA_{ema_mid_p}")
-        if ema_mid is None:
-            ema_mid = close.ewm(span=ema_mid_p, adjust=False).mean()
-
-        ema_slow = features.get(f"EMA_{ema_slow_p}")
-        if ema_slow is None:
-            ema_slow = close.ewm(span=ema_slow_p, adjust=False).mean()
-
-        if {"ADX", "PLUS_DI", "MINUS_DI"}.issubset(features.columns):
-            adx = features["ADX"]
-            plus_di = features["PLUS_DI"]
-            minus_di = features["MINUS_DI"]
-        else:
-            adx, plus_di, minus_di = self._compute_adx_di(features, adx_period)
+        ema_fast = _get_ema(features, ema_fast_p)
+        ema_mid = _get_ema(features, ema_mid_p)
+        ema_slow = _get_ema(features, ema_slow_p)
+        adx, plus_di, minus_di = _get_adx_di(features, adx_period)
 
         long_state = (ema_fast > ema_mid) & (ema_mid > ema_slow) & (adx > adx_th)
         short_state = (ema_fast < ema_mid) & (ema_mid < ema_slow) & (adx > adx_th)
@@ -1920,16 +1931,6 @@ class RSITrendFilteredMRStrategy(BaseStrategy):
             "tp_atr_mult": 2.0,
         }
 
-    @staticmethod
-    def _rsi(close: pd.Series, period: int) -> pd.Series:
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta.where(delta < 0, 0.0))
-        avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        rs = avg_gain / (avg_loss + 1e-10)
-        return 100 - (100 / (1 + rs))
-
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         rsi_p = int(self.params.get("rsi_period", 14))
         oversold = float(self.params.get("oversold", 30))
@@ -1937,13 +1938,8 @@ class RSITrendFilteredMRStrategy(BaseStrategy):
         ema_p = int(self.params.get("ema_trend_period", 200))
 
         close = features["Close"]
-        rsi = features.get(f"RSI_{rsi_p}")
-        if rsi is None:
-            rsi = self._rsi(close, rsi_p)
-
-        ema = features.get(f"EMA_{ema_p}")
-        if ema is None:
-            ema = close.ewm(span=ema_p, adjust=False).mean()
+        rsi = _get_rsi(features, rsi_p)
+        ema = _get_ema(features, ema_p)
 
         trend_up = close > ema
         trend_down = close < ema
@@ -2002,14 +1998,7 @@ class MACDHistogramMomentumStrategy(BaseStrategy):
 
         close = features["Close"]
 
-        if {"MACD", "MACD_SIGNAL", "MACD_HIST"}.issubset(features.columns) and (fast, slow, sig) == (12, 26, 9):
-            hist = features["MACD_HIST"]
-        else:
-            ema_fast = close.ewm(span=fast, adjust=False).mean()
-            ema_slow = close.ewm(span=slow, adjust=False).mean()
-            macd = ema_fast - ema_slow
-            signal_line = macd.ewm(span=sig, adjust=False).mean()
-            hist = macd - signal_line
+        _, _, hist = _get_macd(features, fast, slow, sig)
 
         cross_up = (hist > 0) & (hist.shift(1) <= 0)
         cross_down = (hist < 0) & (hist.shift(1) >= 0)
@@ -2017,9 +2006,7 @@ class MACDHistogramMomentumStrategy(BaseStrategy):
         # Filters
         if bool(self.params.get("use_ema_filter", True)):
             ema_p = int(self.params.get("ema_filter_period", 50))
-            ema = features.get(f"EMA_{ema_p}")
-            if ema is None:
-                ema = close.ewm(span=ema_p, adjust=False).mean()
+            ema = _get_ema(features, ema_p)
             cross_up = cross_up & (close > ema)
             cross_down = cross_down & (close < ema)
 
@@ -2080,20 +2067,14 @@ class StochRSITrendGateStrategy(BaseStrategy):
         }
 
     @staticmethod
-    def _stoch_rsi(close: pd.Series, rsi_period: int, stoch_period: int,
-                   smooth_k: int, smooth_d: int) -> Tuple[pd.Series, pd.Series]:
-        # RSI (Wilder)
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta.where(delta < 0, 0.0))
-        avg_gain = gain.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
-        rs = avg_gain / (avg_loss + 1e-10)
-        rsi = 100 - (100 / (1 + rs))
-
+    def _stoch_rsi_from_rsi(rsi: pd.Series, stoch_period: int,
+                            smooth_k: int, smooth_d: int) -> Tuple[pd.Series, pd.Series]:
         rsi_min = rsi.rolling(stoch_period).min()
         rsi_max = rsi.rolling(stoch_period).max()
-        stoch = 100 * (rsi - rsi_min) / (rsi_max - rsi_min + 1e-10)
+        rsi_denom = rsi_max - rsi_min
+        stoch = pd.Series(50.0, index=rsi.index)
+        rsi_valid = rsi_denom > 1e-8
+        stoch[rsi_valid] = 100 * (rsi[rsi_valid] - rsi_min[rsi_valid]) / rsi_denom[rsi_valid]
 
         k = stoch.rolling(smooth_k).mean()
         d = k.rolling(smooth_d).mean()
@@ -2109,16 +2090,15 @@ class StochRSITrendGateStrategy(BaseStrategy):
         ema_p = int(self.params.get("ema_trend_period", 200))
 
         close = features["Close"]
-        ema = features.get(f"EMA_{ema_p}")
-        if ema is None:
-            ema = close.ewm(span=ema_p, adjust=False).mean()
+        ema = _get_ema(features, ema_p)
 
         # Prefer precomputed if available
         if "STOCH_RSI_K" in features.columns and "STOCH_RSI_D" in features.columns:
             k = features["STOCH_RSI_K"]
             d = features["STOCH_RSI_D"]
         else:
-            k, d = self._stoch_rsi(close, rsi_p, stoch_p, smooth_k, smooth_d)
+            rsi = _get_rsi(features, rsi_p)
+            k, d = self._stoch_rsi_from_rsi(rsi, stoch_p, smooth_k, smooth_d)
 
         cross_up = (k > d) & (k.shift(1) <= d.shift(1)) & (k < lower) & (d < lower)
         cross_down = (k < d) & (k.shift(1) >= d.shift(1)) & (k > upper) & (d > upper)
@@ -2132,7 +2112,8 @@ class StochRSITrendGateStrategy(BaseStrategy):
         return {
             "rsi_period": [5, 7, 10, 14, 21],
             "stoch_period": [10, 14, 20],
-            "stoch_smooth": [3, 5],
+            "smooth_k": [3, 5],
+            "smooth_d": [3, 5],
             "lower_band": [10, 15, 20, 30],
             "upper_band": [70, 80, 85, 90],
             "ema_trend_period": [50, 100, 150, 200],
@@ -2140,89 +2121,716 @@ class StochRSITrendGateStrategy(BaseStrategy):
         }
 
 
-class VWAPDeviationReversionStrategy(BaseStrategy):
-    """VWAP Deviation Mean Reversion Strategy (uses tick volume if available).
+# VWAPDeviationReversionStrategy retired — near-duplicate of ZScoreVWAPReversionStrategy.
+# Existing configs are migrated to ZScoreVWAPReversionStrategy on load.
 
-    Implementation details:
-      - Rolling VWAP over vwap_window using typical price (H+L+C)/3 weighted by Volume.
-      - z-score of deviation (Close - VWAP) over z_window.
-      - Entry on cross back inside threshold to avoid catching extreme momentum moves.
 
-    Long entry:
-      z crosses up through -entry_z (previous <= -entry_z and current > -entry_z)
+# =============================================================================
+# NEW STRATEGIES (D1-D15)
+# =============================================================================
 
-    Short entry:
-      z crosses down through +entry_z (previous >= entry_z and current < entry_z)
 
-    Optional ADX filter to prefer range regimes (ADX < adx_threshold).
-    """
+class InsideBarBreakoutStrategy(BaseStrategy):
+    """Inside bar breakout: mother bar engulfs child bar(s), breakout of mother range."""
 
     @property
     def name(self) -> str:
-        return "VWAPDeviationReversionStrategy"
+        return "InsideBarBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'min_inside_bars': 1, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        min_ib = int(self.params.get('min_inside_bars', 1))
+        h, l, c = features['High'], features['Low'], features['Close']
+        # Inside bar: current H < prev H AND current L > prev L
+        inside = (h < h.shift(1)) & (l > l.shift(1))
+        # Count consecutive inside bars
+        consec = inside.astype(int)
+        for i in range(1, min_ib):
+            consec = consec + inside.shift(i, fill_value=False).astype(int)
+        qualified = consec >= min_ib
+        # Mother bar is the bar before the inside bar sequence
+        mother_h = h.shift(min_ib)
+        mother_l = l.shift(min_ib)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[qualified & (c > mother_h)] = 1
+        signals[qualified & (c < mother_l)] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'min_inside_bars': [1, 2, 3], **self._base_sl_tp_grid()}
+
+
+class NarrowRangeBreakoutStrategy(BaseStrategy):
+    """Narrow range breakout: bar range is narrowest in N bars, trade breakout."""
+
+    @property
+    def name(self) -> str:
+        return "NarrowRangeBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'nr_lookback': 7, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        lookback = int(self.params.get('nr_lookback', 7))
+        bar_range = features['High'] - features['Low']
+        min_range = bar_range.rolling(lookback).min()
+        is_nr = (bar_range == min_range) & (bar_range > 0)
+        # Breakout on next bar
+        nr_h = features['High'].shift(1)
+        nr_l = features['Low'].shift(1)
+        nr_flag = is_nr.shift(1, fill_value=False)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[nr_flag & (features['Close'] > nr_h)] = 1
+        signals[nr_flag & (features['Close'] < nr_l)] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'nr_lookback': [4, 7, 10], **self._base_sl_tp_grid()}
+
+
+class TurtleSoupReversalStrategy(BaseStrategy):
+    """Turtle soup: fade failed Donchian breakouts that close back inside the channel."""
+
+    @property
+    def name(self) -> str:
+        return "TurtleSoupReversalStrategy"
 
     @property
     def category(self) -> StrategyCategory:
         return StrategyCategory.MEAN_REVERSION
 
     def get_default_params(self) -> Dict[str, Any]:
-        return {
-            "vwap_window": 50,
-            "z_window": 50,
-            "entry_z": 2.0,
-            "use_adx_filter": True,
-            "adx_threshold": 20,
-            "sl_atr_mult": 2.0,
-            "tp_atr_mult": 2.0,
-        }
+        return {'channel_period': 20, 'reclaim_window': 2,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
-    @staticmethod
-    def _rolling_vwap(df: pd.DataFrame, window: int) -> pd.Series:
-        col = f"VWAP_{window}"
-        if col in df.columns:
-            return df[col]
-
-        vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0) if "Volume" in df.columns else pd.Series(1.0, index=df.index)
-        tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
-        pv = tp * vol
-        vol_sum = vol.rolling(window=window, min_periods=window).sum()
-        pv_sum = pv.rolling(window=window, min_periods=window).sum()
-        return pv_sum / (vol_sum + 1e-10)
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
-        vwap_w = int(self.params.get("vwap_window", 50))
-        z_w = int(self.params.get("z_window", 50))
-        entry_z = float(self.params.get("entry_z", 2.0))
-
-        vwap = self._rolling_vwap(features, vwap_w)
-        dev = features["Close"] - vwap
-
-        mu = dev.rolling(window=z_w, min_periods=z_w).mean()
-        sd = dev.rolling(window=z_w, min_periods=z_w).std()
-        z = (dev - mu) / (sd + 1e-10)
-
-        if bool(self.params.get("use_adx_filter", True)) and "ADX" in features.columns:
-            allow = features["ADX"] < float(self.params.get("adx_threshold", 20))
-        else:
-            allow = pd.Series(True, index=features.index)
-
-        long_entry = allow & (z > -entry_z) & (z.shift(1) <= -entry_z)
-        short_entry = allow & (z < entry_z) & (z.shift(1) >= entry_z)
-
+        ch = int(self.params.get('channel_period', 20))
+        rw = int(self.params.get('reclaim_window', 2))
+        h, l, c = features['High'], features['Low'], features['Close']
+        don_h = h.rolling(ch).max().shift(1)
+        don_l = l.rolling(ch).min().shift(1)
+        # Broke above channel high within last rw bars
+        broke_high = pd.Series(False, index=features.index)
+        broke_low = pd.Series(False, index=features.index)
+        for lag in range(1, rw + 1):
+            broke_high = broke_high | (h.shift(lag) > don_h.shift(lag))
+            broke_low = broke_low | (l.shift(lag) < don_l.shift(lag))
+        # Reclaimed (closed back inside)
         signals = pd.Series(0, index=features.index, dtype=int)
-        signals[long_entry] = 1
-        signals[short_entry] = -1
+        signals[broke_high & (c < don_h)] = -1  # Failed upside breakout → short
+        signals[broke_low & (c > don_l)] = 1    # Failed downside breakout → long
         return signals
 
     def get_param_grid(self) -> Dict[str, List]:
-        return {
-            "vwap_window": [20, 50, 100, 150, 200],
-            "z_window": [20, 30, 50, 100],
-            "entry_z": [1.5, 1.75, 2.0, 2.25, 2.5],
-            "use_adx_filter": [True, False],
-            "adx_threshold": [15, 20, 25, 30],
-            **self._base_sl_tp_grid(),
-        }
+        return {'channel_period': [10, 15, 20, 25],
+                'reclaim_window': [1, 2, 3], **self._base_sl_tp_grid()}
+
+
+class PinBarReversalStrategy(BaseStrategy):
+    """Pin bar reversal: wick/body ratio detection with location filter."""
+
+    @property
+    def name(self) -> str:
+        return "PinBarReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'wick_ratio': 2.5, 'proximity_atr': 1.0,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14', 'BB_LOWER_20', 'BB_UPPER_20'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        wick_r = float(self.params.get('wick_ratio', 2.5))
+        prox = float(self.params.get('proximity_atr', 1.0))
+        o, h, l, c = features['Open'], features['High'], features['Low'], features['Close']
+        body = (c - o).abs()
+        upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
+        lower_wick = pd.concat([o, c], axis=1).min(axis=1) - l
+        body_safe = body.clip(lower=1e-10)
+        atr = _get_atr(features, 14)
+        _, bb_upper, bb_lower = _get_bb(features, 20)
+        # Bullish pin: long lower wick near BB lower band
+        bull_pin = (lower_wick / body_safe > wick_r) & (l <= bb_lower + prox * atr)
+        # Bearish pin: long upper wick near BB upper band
+        bear_pin = (upper_wick / body_safe > wick_r) & (h >= bb_upper - prox * atr)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[bull_pin.shift(1, fill_value=False)] = 1
+        signals[bear_pin.shift(1, fill_value=False)] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'wick_ratio': [2.0, 2.5, 3.0],
+                'proximity_atr': [0.5, 1.0, 1.5], **self._base_sl_tp_grid()}
+
+
+class EngulfingPatternStrategy(BaseStrategy):
+    """Engulfing pattern with location filter (BB/Donchian proximity)."""
+
+    @property
+    def name(self) -> str:
+        return "EngulfingPatternStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'lookback_level': 20, 'use_adx_filter': True,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14', 'BB_LOWER_20', 'BB_UPPER_20', 'ADX'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        o, c = features['Open'], features['Close']
+        o1, c1 = o.shift(1), c.shift(1)
+        body = (c - o)
+        body1 = (c1 - o1)
+        # Bullish engulfing: prior bar bearish, current bar bullish, body engulfs
+        bull_eng = (body1 < 0) & (body > 0) & (o <= c1) & (c >= o1)
+        # Bearish engulfing
+        bear_eng = (body1 > 0) & (body < 0) & (o >= c1) & (c <= o1)
+        _, bb_upper, bb_lower = _get_bb(features, 20)
+        atr = _get_atr(features, 14)
+        near_lower = features['Low'] <= bb_lower + atr
+        near_upper = features['High'] >= bb_upper - atr
+        # ADX filter (prefer range)
+        if bool(self.params.get('use_adx_filter', True)) and 'ADX' in features.columns:
+            allow = features['ADX'] < 30
+        else:
+            allow = pd.Series(True, index=features.index)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[bull_eng & near_lower & allow] = 1
+        signals[bear_eng & near_upper & allow] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'lookback_level': [10, 20, 30],
+                'use_adx_filter': [True, False], **self._base_sl_tp_grid()}
+
+
+class VolumeSpikeMomentumStrategy(BaseStrategy):
+    """Volume spike + directional close: breakout on unusual volume."""
+
+    @property
+    def name(self) -> str:
+        return "VolumeSpikeMomentumStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'vol_mult': 2.0, 'vol_lookback': 20,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        vm = float(self.params.get('vol_mult', 2.0))
+        vl = int(self.params.get('vol_lookback', 20))
+        vol = pd.to_numeric(features.get('Volume', pd.Series(0, index=features.index)),
+                            errors='coerce').fillna(0)
+        avg_vol = vol.rolling(vl, min_periods=vl).mean()
+        spike = vol > vm * avg_vol
+        bar_range = features['High'] - features['Low']
+        close_pos = (features['Close'] - features['Low']) / (bar_range + 1e-10)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[spike & (close_pos > 0.7)] = 1   # Close in upper 30%
+        signals[spike & (close_pos < 0.3)] = -1  # Close in lower 30%
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'vol_mult': [1.5, 2.0, 2.5, 3.0],
+                'vol_lookback': [10, 20, 30], **self._base_sl_tp_grid()}
+
+
+class RSIDivergenceStrategy(BaseStrategy):
+    """RSI divergence: swing point divergence between price and RSI."""
+
+    @property
+    def name(self) -> str:
+        return "RSIDivergenceStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'rsi_period': 14, 'swing_order': 5,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        rsi_p = int(self.params.get('rsi_period', 14))
+        order = int(self.params.get('swing_order', 5))
+        rsi = _get_rsi(features, rsi_p)
+        close = features['Close']
+        _, price_lows = _detect_swing_points(close, order)
+        price_highs, _ = _detect_swing_points(close, order)
+        _, rsi_lows = _detect_swing_points(rsi, order)
+        rsi_highs, _ = _detect_swing_points(rsi, order)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        # Bullish divergence: price lower low, RSI higher low
+        for i in range(2 * order + 1, len(features)):
+            if price_lows.iloc[i]:
+                # Find previous swing low
+                prev_lows = price_lows.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_lows[prev_lows].index
+                if len(prev_idx) > 0:
+                    j = features.index.get_loc(prev_idx[-1])
+                    if close.iloc[i] < close.iloc[j] and rsi.iloc[i] > rsi.iloc[j]:
+                        signals.iloc[i] = 1
+            if price_highs.iloc[i]:
+                prev_highs = price_highs.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_highs[prev_highs].index
+                if len(prev_idx) > 0:
+                    j = features.index.get_loc(prev_idx[-1])
+                    if close.iloc[i] > close.iloc[j] and rsi.iloc[i] < rsi.iloc[j]:
+                        signals.iloc[i] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'rsi_period': [7, 14, 21], 'swing_order': [3, 5, 7],
+                **self._base_sl_tp_grid()}
+
+
+class MACDDivergenceStrategy(BaseStrategy):
+    """MACD histogram divergence with price."""
+
+    @property
+    def name(self) -> str:
+        return "MACDDivergenceStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'swing_order': 5, 'macd_fast': 12, 'macd_slow': 26,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14', 'MACD_HIST'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        order = int(self.params.get('swing_order', 5))
+        fast = int(self.params.get('macd_fast', 12))
+        slow = int(self.params.get('macd_slow', 26))
+        _, _, hist = _get_macd(features, fast, slow)
+        close = features['Close']
+        _, price_lows = _detect_swing_points(close, order)
+        price_highs, _ = _detect_swing_points(close, order)
+        _, hist_lows = _detect_swing_points(hist, order)
+        hist_highs, _ = _detect_swing_points(hist, order)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        for i in range(2 * order + 1, len(features)):
+            if price_lows.iloc[i]:
+                prev_lows = price_lows.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_lows[prev_lows].index
+                if len(prev_idx) > 0:
+                    j = features.index.get_loc(prev_idx[-1])
+                    if close.iloc[i] < close.iloc[j] and hist.iloc[i] > hist.iloc[j]:
+                        signals.iloc[i] = 1
+            if price_highs.iloc[i]:
+                prev_highs = price_highs.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_highs[prev_highs].index
+                if len(prev_idx) > 0:
+                    j = features.index.get_loc(prev_idx[-1])
+                    if close.iloc[i] > close.iloc[j] and hist.iloc[i] < hist.iloc[j]:
+                        signals.iloc[i] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'swing_order': [3, 5, 7], 'macd_fast': [8, 12],
+                'macd_slow': [21, 26], **self._base_sl_tp_grid()}
+
+
+class OBVDivergenceStrategy(BaseStrategy):
+    """On-Balance Volume divergence with price."""
+
+    @property
+    def name(self) -> str:
+        return "OBVDivergenceStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'swing_order': 5, 'obv_smooth': 5,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        order = int(self.params.get('swing_order', 5))
+        smooth = int(self.params.get('obv_smooth', 5))
+        vol = pd.to_numeric(features.get('Volume', pd.Series(0, index=features.index)),
+                            errors='coerce').fillna(0)
+        direction = features['Close'].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        obv = (vol * direction).cumsum()
+        if smooth > 0:
+            obv = obv.rolling(smooth, min_periods=1).mean()
+        close = features['Close']
+        _, price_lows = _detect_swing_points(close, order)
+        price_highs, _ = _detect_swing_points(close, order)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        for i in range(2 * order + 1, len(features)):
+            if price_lows.iloc[i]:
+                prev_lows = price_lows.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_lows[prev_lows].index
+                if len(prev_idx) > 0:
+                    j = features.index.get_loc(prev_idx[-1])
+                    if close.iloc[i] < close.iloc[j] and obv.iloc[i] > obv.iloc[j]:
+                        signals.iloc[i] = 1
+            if price_highs.iloc[i]:
+                prev_highs = price_highs.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_highs[prev_highs].index
+                if len(prev_idx) > 0:
+                    j = features.index.get_loc(prev_idx[-1])
+                    if close.iloc[i] > close.iloc[j] and obv.iloc[i] < obv.iloc[j]:
+                        signals.iloc[i] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'swing_order': [3, 5, 7], 'obv_smooth': [0, 5, 10],
+                **self._base_sl_tp_grid()}
+
+
+class KeltnerFadeStrategy(BaseStrategy):
+    """Fade outer Keltner Channel band back to midline."""
+
+    @property
+    def name(self) -> str:
+        return "KeltnerFadeStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'kc_ema': 20, 'kc_mult': 2.0, 'adx_threshold': 25,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14', 'EMA_20', 'ADX'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ema_p = int(self.params.get('kc_ema', 20))
+        mult = float(self.params.get('kc_mult', 2.0))
+        adx_t = float(self.params.get('adx_threshold', 25))
+        mid, upper, lower = _get_keltner(features, ema_p, 14, mult)
+        c = features['Close']
+        # Touch upper KC then next bar closes inside → short
+        touched_upper = (features['High'].shift(1) >= upper.shift(1)) & (c < upper)
+        touched_lower = (features['Low'].shift(1) <= lower.shift(1)) & (c > lower)
+        allow = pd.Series(True, index=features.index)
+        if 'ADX' in features.columns:
+            allow = features['ADX'] < adx_t
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[touched_lower & allow] = 1
+        signals[touched_upper & allow] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'kc_ema': [15, 20, 25], 'kc_mult': [1.5, 2.0, 2.5],
+                'adx_threshold': [20, 25, 30], **self._base_sl_tp_grid()}
+
+
+class ROCExhaustionReversalStrategy(BaseStrategy):
+    """Rate of Change exhaustion: ROC reaches extreme percentile then reverses."""
+
+    @property
+    def name(self) -> str:
+        return "ROCExhaustionReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'roc_period': 10, 'pct_lookback': 100, 'extreme_pct': 10,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        roc_p = int(self.params.get('roc_period', 10))
+        pct_lb = int(self.params.get('pct_lookback', 100))
+        ext_pct = float(self.params.get('extreme_pct', 10))
+        roc = features['Close'].pct_change(roc_p) * 100
+        pct_rank = _rolling_percentile_rank(roc, pct_lb)
+        # Extreme high ROC crossing back below threshold
+        was_extreme_high = (pct_rank.shift(1) >= (100 - ext_pct))
+        now_normal_high = (pct_rank < (100 - ext_pct))
+        was_extreme_low = (pct_rank.shift(1) <= ext_pct)
+        now_normal_low = (pct_rank > ext_pct)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[was_extreme_low & now_normal_low] = 1    # Oversold bounce
+        signals[was_extreme_high & now_normal_high] = -1  # Overbought fade
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'roc_period': [5, 10, 14, 20], 'pct_lookback': [50, 100, 200],
+                'extreme_pct': [5, 10, 15], **self._base_sl_tp_grid()}
+
+
+class EMAPullbackContinuationStrategy(BaseStrategy):
+    """EMA crossover confirms trend, enter on pullback to fast EMA."""
+
+    @property
+    def name(self) -> str:
+        return "EMAPullbackContinuationStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'fast_period': 10, 'slow_period': 30, 'touch_atr': 0.5,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        fp = int(self.params.get('fast_period', 10))
+        sp = int(self.params.get('slow_period', 30))
+        touch = float(self.params.get('touch_atr', 0.5))
+        fast_ema = _get_ema(features, fp)
+        slow_ema = _get_ema(features, sp)
+        atr = _get_atr(features, 14)
+        uptrend = fast_ema > slow_ema
+        downtrend = fast_ema < slow_ema
+        # Pullback to fast EMA (within touch_atr * ATR)
+        near_fast = (features['Low'] <= fast_ema + touch * atr) & (features['Close'] > fast_ema)
+        near_fast_short = (features['High'] >= fast_ema - touch * atr) & (features['Close'] < fast_ema)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[uptrend & near_fast] = 1
+        signals[downtrend & near_fast_short] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'fast_period': [8, 10, 13], 'slow_period': [20, 30, 50],
+                'touch_atr': [0.3, 0.5, 0.7], **self._base_sl_tp_grid()}
+
+
+class ParabolicSARTrendStrategy(BaseStrategy):
+    """Parabolic SAR trend-following with optional ADX filter."""
+
+    @property
+    def name(self) -> str:
+        return "ParabolicSARTrendStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'af_start': 0.02, 'af_max': 0.20, 'adx_threshold': 20,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14', 'ADX'}
+
+    @staticmethod
+    def _compute_psar(high: np.ndarray, low: np.ndarray,
+                      af_start: float, af_max: float) -> np.ndarray:
+        """Compute Parabolic SAR."""
+        n = len(high)
+        psar = np.zeros(n)
+        bull = True
+        af = af_start
+        ep = low[0]
+        psar[0] = high[0]
+        for i in range(1, n):
+            if bull:
+                psar[i] = psar[i - 1] + af * (ep - psar[i - 1])
+                psar[i] = min(psar[i], low[i - 1], low[max(0, i - 2)])
+                if low[i] < psar[i]:
+                    bull = False
+                    psar[i] = ep
+                    ep = low[i]
+                    af = af_start
+                else:
+                    if high[i] > ep:
+                        ep = high[i]
+                        af = min(af + af_start, af_max)
+            else:
+                psar[i] = psar[i - 1] + af * (ep - psar[i - 1])
+                psar[i] = max(psar[i], high[i - 1], high[max(0, i - 2)])
+                if high[i] > psar[i]:
+                    bull = True
+                    psar[i] = ep
+                    ep = high[i]
+                    af = af_start
+                else:
+                    if low[i] < ep:
+                        ep = low[i]
+                        af = min(af + af_start, af_max)
+        return psar
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        af_s = float(self.params.get('af_start', 0.02))
+        af_m = float(self.params.get('af_max', 0.20))
+        adx_t = float(self.params.get('adx_threshold', 20))
+        psar = self._compute_psar(features['High'].values, features['Low'].values,
+                                  af_s, af_m)
+        psar_s = pd.Series(psar, index=features.index)
+        c = features['Close']
+        # PSAR flip signals
+        above = c > psar_s
+        flip_long = above & ~above.shift(1, fill_value=False)
+        flip_short = ~above & above.shift(1, fill_value=True)
+        allow = pd.Series(True, index=features.index)
+        if 'ADX' in features.columns:
+            allow = features['ADX'] > adx_t
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[flip_long & allow] = 1
+        signals[flip_short & allow] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'af_start': [0.01, 0.02, 0.03], 'af_max': [0.15, 0.20, 0.25],
+                'adx_threshold': [15, 20, 25], **self._base_sl_tp_grid()}
+
+
+class ATRPercentileBreakoutStrategy(BaseStrategy):
+    """ATR compression→expansion breakout: low ATR percentile followed by rise."""
+
+    @property
+    def name(self) -> str:
+        return "ATRPercentileBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'pct_lookback': 100, 'compress_pct': 20, 'expand_pct': 70,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        pct_lb = int(self.params.get('pct_lookback', 100))
+        comp = float(self.params.get('compress_pct', 20))
+        exp = float(self.params.get('expand_pct', 70))
+        atr = _get_atr(features, 14)
+        atr_pct = _rolling_percentile_rank(atr, pct_lb)
+        # Was compressed, now expanding
+        was_low = atr_pct.shift(1) <= comp
+        now_high = atr_pct >= exp
+        trigger = was_low & now_high
+        bar_range = features['High'] - features['Low']
+        close_pos = (features['Close'] - features['Low']) / (bar_range + 1e-10)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[trigger & (close_pos > 0.6)] = 1
+        signals[trigger & (close_pos < 0.4)] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'pct_lookback': [50, 100, 200], 'compress_pct': [10, 20, 30],
+                'expand_pct': [60, 70, 80], **self._base_sl_tp_grid()}
+
+
+class KaufmanAMATrendStrategy(BaseStrategy):
+    """Kaufman Adaptive Moving Average: efficiency ratio adjusts smoothing speed."""
+
+    @property
+    def name(self) -> str:
+        return "KaufmanAMATrendStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {'er_period': 10, 'fast_period': 2, 'slow_period': 30,
+                'signal_mode': 'direction', 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {'ATR_14'}
+
+    @staticmethod
+    def _kaufman_ama(close: np.ndarray, er_period: int,
+                     fast_period: int, slow_period: int) -> np.ndarray:
+        """Compute Kaufman Adaptive Moving Average."""
+        n = len(close)
+        ama = np.full(n, np.nan)
+        fast_sc = 2.0 / (fast_period + 1)
+        slow_sc = 2.0 / (slow_period + 1)
+        if er_period >= n:
+            return ama
+        ama[er_period] = close[er_period]
+        for i in range(er_period + 1, n):
+            direction = abs(close[i] - close[i - er_period])
+            volatility = 0.0
+            for j in range(i - er_period + 1, i + 1):
+                volatility += abs(close[j] - close[j - 1])
+            er = direction / volatility if volatility > 0 else 0.0
+            sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+            ama[i] = ama[i - 1] + sc * (close[i] - ama[i - 1])
+        return ama
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        er_p = int(self.params.get('er_period', 10))
+        fast_p = int(self.params.get('fast_period', 2))
+        slow_p = int(self.params.get('slow_period', 30))
+        mode = str(self.params.get('signal_mode', 'direction'))
+        close = features['Close'].values
+        ama = self._kaufman_ama(close, er_p, fast_p, slow_p)
+        ama_s = pd.Series(ama, index=features.index)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        if mode == 'crossover':
+            # Price crosses above/below AMA
+            above = features['Close'] > ama_s
+            prev_above = above.shift(1, fill_value=False)
+            signals[above & ~prev_above] = 1
+            signals[~above & prev_above] = -1
+        else:
+            # AMA direction change
+            ama_diff = ama_s.diff()
+            signals[(ama_diff > 0) & (ama_diff.shift(1) <= 0)] = 1
+            signals[(ama_diff < 0) & (ama_diff.shift(1) >= 0)] = -1
+        return signals
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {'er_period': [5, 10, 20], 'fast_period': [2, 3],
+                'slow_period': [20, 30, 50],
+                'signal_mode': ['direction', 'crossover'],
+                **self._base_sl_tp_grid()}
 
 
 # =============================================================================
@@ -2262,7 +2870,6 @@ class StrategyRegistry:
         'WilliamsRStrategy': WilliamsRStrategy,
         'RSITrendFilteredMRStrategy': RSITrendFilteredMRStrategy,
         'StochRSITrendGateStrategy': StochRSITrendGateStrategy,
-        'VWAPDeviationReversionStrategy': VWAPDeviationReversionStrategy,
         'FisherTransformMRStrategy': FisherTransformMRStrategy,
         'ZScoreVWAPReversionStrategy': ZScoreVWAPReversionStrategy,
         
@@ -2274,6 +2881,26 @@ class StrategyRegistry:
         'KeltnerBreakoutStrategy': KeltnerBreakoutStrategy,
         'PivotBreakoutStrategy': PivotBreakoutStrategy,
         'MACDHistogramMomentumStrategy': MACDHistogramMomentumStrategy,
+
+        # New strategies (D1-D15)
+        # Breakout
+        'InsideBarBreakoutStrategy': InsideBarBreakoutStrategy,
+        'NarrowRangeBreakoutStrategy': NarrowRangeBreakoutStrategy,
+        'VolumeSpikeMomentumStrategy': VolumeSpikeMomentumStrategy,
+        'ATRPercentileBreakoutStrategy': ATRPercentileBreakoutStrategy,
+        # Mean Reversion
+        'TurtleSoupReversalStrategy': TurtleSoupReversalStrategy,
+        'PinBarReversalStrategy': PinBarReversalStrategy,
+        'EngulfingPatternStrategy': EngulfingPatternStrategy,
+        'RSIDivergenceStrategy': RSIDivergenceStrategy,
+        'MACDDivergenceStrategy': MACDDivergenceStrategy,
+        'KeltnerFadeStrategy': KeltnerFadeStrategy,
+        'ROCExhaustionReversalStrategy': ROCExhaustionReversalStrategy,
+        # Trend Following
+        'OBVDivergenceStrategy': OBVDivergenceStrategy,
+        'EMAPullbackContinuationStrategy': EMAPullbackContinuationStrategy,
+        'ParabolicSARTrendStrategy': ParabolicSARTrendStrategy,
+        'KaufmanAMATrendStrategy': KaufmanAMATrendStrategy,
     }
     
     @classmethod
@@ -2346,7 +2973,6 @@ __all__ = [
     'WilliamsRStrategy',
     'RSITrendFilteredMRStrategy',
     'StochRSITrendGateStrategy',
-    'VWAPDeviationReversionStrategy',
     'FisherTransformMRStrategy',
     'ZScoreVWAPReversionStrategy',
     # Breakout/Momentum
@@ -2357,7 +2983,28 @@ __all__ = [
     'KeltnerBreakoutStrategy',
     'PivotBreakoutStrategy',
     'MACDHistogramMomentumStrategy',
+    # New strategies (D1-D15)
+    'InsideBarBreakoutStrategy',
+    'NarrowRangeBreakoutStrategy',
+    'TurtleSoupReversalStrategy',
+    'PinBarReversalStrategy',
+    'EngulfingPatternStrategy',
+    'VolumeSpikeMomentumStrategy',
+    'RSIDivergenceStrategy',
+    'MACDDivergenceStrategy',
+    'OBVDivergenceStrategy',
+    'KeltnerFadeStrategy',
+    'ROCExhaustionReversalStrategy',
+    'EMAPullbackContinuationStrategy',
+    'ParabolicSARTrendStrategy',
+    'ATRPercentileBreakoutStrategy',
+    'KaufmanAMATrendStrategy',
 ]
+
+# Migration map for retired strategy names → current names
+_STRATEGY_MIGRATION = {
+    'VWAPDeviationReversionStrategy': 'ZScoreVWAPReversionStrategy',
+}
 
 
 if __name__ == "__main__":

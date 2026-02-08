@@ -378,7 +378,7 @@ class DecisionThrottle:
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
-        """Persist cache to ``last_trade_log.json``."""
+        """Persist cache to ``last_trade_log.json`` (atomic write)."""
         try:
             data = {}
             for sym, rec in self._cache.items():
@@ -394,10 +394,12 @@ class DecisionThrottle:
                     "action": rec.action,
                     "action_time": rec.action_time,
                 }
-            with open(self._log_path, "w", encoding="utf-8") as f:
+            tmp_path = f"{self._log_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp_path, self._log_path)
         except Exception as exc:
-            logging.getLogger(__name__).debug(
+            logging.getLogger(__name__).warning(
                 f"DecisionThrottle: failed to save cache: {exc}"
             )
 
@@ -478,6 +480,85 @@ class ActionableDecisionLog:
             logging.getLogger(__name__).debug(
                 f"ActionableDecisionLog: failed to load cache: {exc}"
             )
+
+
+# =============================================================================
+# DRIFT MONITOR (E3)
+# =============================================================================
+
+class DriftMonitor:
+    """
+    Tracks live performance vs backtest validation metrics and warns on drift.
+
+    Compares rolling live win rate, avg R-multiple, and max drawdown against
+    the stored val_metrics for each symbol. Logs WARNING when drift exceeds
+    configurable thresholds.
+    """
+
+    def __init__(self, logger: logging.Logger,
+                 win_rate_threshold: float = 15.0,
+                 r_mult_threshold: float = 0.5,
+                 dd_threshold: float = 10.0):
+        """
+        Args:
+            logger: Logger instance
+            win_rate_threshold: Warn if live win rate deviates by this many pct points
+            r_mult_threshold: Warn if live avg R-multiple deviates by this amount
+            dd_threshold: Warn if live max DD exceeds backtest DD + this
+        """
+        self.logger = logger
+        self.win_rate_threshold = win_rate_threshold
+        self.r_mult_threshold = r_mult_threshold
+        self.dd_threshold = dd_threshold
+        # Per-symbol rolling trade stats
+        self._trades: Dict[str, List[Dict[str, Any]]] = {}
+
+    def record_trade(self, symbol: str, pnl_pips: float, r_multiple: float):
+        """Record a completed trade for drift tracking."""
+        if symbol not in self._trades:
+            self._trades[symbol] = []
+        self._trades[symbol].append({
+            'pnl_pips': pnl_pips,
+            'r_multiple': r_multiple,
+            'time': datetime.now(),
+        })
+
+    def check_drift(self, symbol: str, val_metrics: Dict[str, Any]):
+        """Compare live performance against validation metrics. Log warnings."""
+        trades = self._trades.get(symbol, [])
+        if len(trades) < 5:
+            return  # Not enough data to judge
+
+        wins = sum(1 for t in trades if t['pnl_pips'] > 0)
+        live_wr = (wins / len(trades)) * 100
+        live_avg_r = np.mean([t['r_multiple'] for t in trades])
+
+        val_wr = val_metrics.get('win_rate', 50.0)
+        val_avg_r = val_metrics.get('avg_r_multiple', 1.0)
+        val_dd = val_metrics.get('max_drawdown_pct', 0.0)
+
+        if abs(live_wr - val_wr) > self.win_rate_threshold:
+            self.logger.warning(
+                f"[DRIFT] [{symbol}] Win rate drift: live={live_wr:.1f}% vs "
+                f"backtest={val_wr:.1f}% (threshold={self.win_rate_threshold}%)"
+            )
+        if abs(live_avg_r - val_avg_r) > self.r_mult_threshold:
+            self.logger.warning(
+                f"[DRIFT] [{symbol}] R-multiple drift: live={live_avg_r:.2f} vs "
+                f"backtest={val_avg_r:.2f} (threshold={self.r_mult_threshold})"
+            )
+
+    def get_summary(self, symbol: str) -> Dict[str, Any]:
+        """Get drift monitoring summary for a symbol."""
+        trades = self._trades.get(symbol, [])
+        if not trades:
+            return {'trade_count': 0}
+        wins = sum(1 for t in trades if t['pnl_pips'] > 0)
+        return {
+            'trade_count': len(trades),
+            'live_win_rate': (wins / len(trades)) * 100,
+            'live_avg_r': np.mean([t['r_multiple'] for t in trades]),
+        }
 
 
 # =============================================================================
@@ -579,14 +660,24 @@ class LiveTrader:
         self.logger.info(f"Symbols: {len(self.pm.symbols)}")
         self.logger.info(f"Validated configs: {len(self.pm.get_validated_configs())}")
         
+        _reconnect_failures = 0
+        _MAX_RECONNECT_CYCLES = 12
+
         while self._running and not self._shutdown_event.is_set():
             try:
                 # Check connection
                 if not self.mt5.is_connected():
-                    self.logger.warning("Lost MT5 connection, attempting reconnect...")
+                    self.logger.warning(f"Lost MT5 connection (cycle {_reconnect_failures + 1}/{_MAX_RECONNECT_CYCLES})")
                     if not self._reconnect():
+                        _reconnect_failures += 1
+                        if _reconnect_failures >= _MAX_RECONNECT_CYCLES:
+                            self.logger.error(
+                                f"MT5 reconnection failed after {_MAX_RECONNECT_CYCLES} cycles. Stopping trader."
+                            )
+                            break
                         time.sleep(10)
                         continue
+                    _reconnect_failures = 0
                 
                 # Process each symbol
                 self._process_all_symbols()
@@ -763,7 +854,7 @@ class LiveTrader:
         best_overall_score = float(best_overall.get('selection_score', 0.0))
 
         
-        margin = float(getattr(self.pipeline_config, 'actionable_score_margin', 0.95) or 0.95)
+        margin = float(self.pipeline_config.actionable_score_margin)
         
         # Clamp margin defensively: [0.0, 1.0]
         
@@ -981,9 +1072,6 @@ class LiveTrader:
                 current_signal = cached['signal']
                 strategy = cached['strategy']
                 regime_config = cached['regime_config']
-                is_fallback = cached.get('is_fallback', False)
-                fallback_tier = cached.get('fallback_tier', 1)
-                
                 # Still need to check if regime_config exists (it was cached)
                 if regime_config is None:
                     continue
@@ -1032,8 +1120,6 @@ class LiveTrader:
                         'signal': 0,
                         'strategy': None,
                         'regime_config': None,
-                        'is_fallback': False,
-                        'fallback_tier': 0,
                     }
                     self._prune_cache()
                     continue
@@ -1052,14 +1138,9 @@ class LiveTrader:
                         'signal': 0,
                         'strategy': None,
                         'regime_config': None,
-                        'is_fallback': False,
-                        'fallback_tier': 0,
                     }
                     self._prune_cache()
                     continue
-                
-                is_fallback = False
-                fallback_tier = 1
                 
                 # Get strategy instance
                 try:
@@ -1071,7 +1152,9 @@ class LiveTrader:
                 # Generate signal
                 signals = strategy.generate_signals(features, symbol)
                 current_signal = signals.iloc[-2] if len(signals) > 1 else 0
-                
+                if pd.isna(current_signal):
+                    current_signal = 0
+
                 # Cache the computed result
                 self._candidate_cache[feature_cache_key] = {
                     'features': features,
@@ -1080,8 +1163,6 @@ class LiveTrader:
                     'signal': int(current_signal),
                     'strategy': strategy,
                     'regime_config': regime_config,
-                    'is_fallback': is_fallback,
-                    'fallback_tier': fallback_tier,
                 }
                 self._prune_cache()  # Prevent unbounded growth
             # ─────────────────────────────────────────────────────────────────
@@ -1103,8 +1184,6 @@ class LiveTrader:
                 'features': features,
                 'regime_config': regime_config,
                 'bar_time': str(features.index[-2]) if len(features) > 1 else '',
-                'is_fallback': is_fallback,
-                'fallback_tier': fallback_tier,
             })
             stats["winner_candidates"] += 1
         
@@ -1165,7 +1244,9 @@ class LiveTrader:
         # Generate signal
         signals = strategy.generate_signals(features, symbol)
         current_signal = signals.iloc[-2] if len(signals) > 1 else 0
-        
+        if pd.isna(current_signal):
+            current_signal = 0
+
         return [{
             'timeframe': timeframe,
             'regime': 'LEGACY',
@@ -1244,8 +1325,7 @@ class LiveTrader:
                                tp_value: Optional[float] = None,
                                volume_value: Optional[float] = None,
                                target_risk_pct_value: Optional[float] = None,
-                               actual_risk_pct_value: Optional[float] = None,
-                               fallback_tier_value: Optional[int] = None) -> None:
+                               actual_risk_pct_value: Optional[float] = None) -> None:
             """Persist actionable outcomes for dashboard consumption."""
             if not decision_key:
                 return
@@ -1268,7 +1348,6 @@ class LiveTrader:
                         "volume": volume_value,
                         "target_risk_pct": target_risk_pct_value,
                         "actual_risk_pct": actual_risk_pct_value,
-                        "fallback_tier": fallback_tier_value,
                         "secondary_trade": bool(is_secondary_trade),
                         "score": selection_score,
                         "quality": quality_score,
@@ -1332,38 +1411,20 @@ class LiveTrader:
             self.logger.debug(f"[{symbol}] Widened SL to satisfy min stop distance ({min_stop_dist})")
 
         # Target risk (deposit currency)
-                # -------------------------------------------------------------
-        # Tiered risk policy (config-driven)
-        # Tier 1 (regime winner): can scale above base risk up to tier1_max_risk_pct
-        # Tier 2/3 (fallbacks): capped by tier23_max_risk_pct
-        # Secondary trade: additional cap + combined risk cap per symbol
+        # -------------------------------------------------------------
+        # Winners-only risk policy: use base risk directly.
+        # PositionConfig.max_risk_pct acts as the hard safety cap.
+        # Secondary trade: additional cap + combined risk cap per symbol.
         # -------------------------------------------------------------
         from pm_position import TradeTagEncoder
 
         base_risk_pct = float(getattr(self.position_config, 'risk_per_trade_pct', 1.0))
-        fallback_tier = int(best_candidate.get('fallback_tier', 1) or 1)
-
-        # Pull tier policy from pipeline config (with safe defaults)
-        tier1_mult = float(getattr(self.pipeline_config, 'tier1_risk_multiplier', 1.0))
-        tier1_max = float(getattr(self.pipeline_config, 'tier1_max_risk_pct', 5.0))
-        tier23_max = float(getattr(self.pipeline_config, 'tier23_max_risk_pct', float(getattr(self.pipeline_config, 'fallback_max_risk_pct', 1.0))))
-        fallback_risk_mult = float(getattr(self.pipeline_config, 'fallback_risk_multiplier', 0.5))
-        fallback_max_risk = float(getattr(self.pipeline_config, 'fallback_max_risk_pct', 1.0))
         min_trade_risk = float(getattr(self.pipeline_config, 'min_trade_risk_pct', 0.1))
+        target_risk_pct = base_risk_pct
 
-        # Start from tier-based target
-        if fallback_tier == 1:
-            target_risk_pct = min(base_risk_pct * tier1_mult, tier1_max)
-        else:
-            target_risk_pct = base_risk_pct * fallback_risk_mult
-            target_risk_pct = min(target_risk_pct, fallback_max_risk, tier23_max)
-
-        # Enforce PositionConfig max_risk_pct if present (hard safety)
+        # Enforce PositionConfig max_risk_pct (hard safety cap)
         max_risk_cap = float(getattr(self.position_config, 'max_risk_pct', target_risk_pct))
         target_risk_pct = min(target_risk_pct, max_risk_cap)
-
-        if fallback_tier in (2, 3):
-            self.logger.info(f"[{symbol}] Fallback tier {fallback_tier}: reduced risk to {target_risk_pct:.2f}%")
 
         # Secondary trade adjustments + combined risk cap per symbol
         if is_secondary_trade:
@@ -1406,7 +1467,6 @@ class LiveTrader:
                     volume_value=None,
                     target_risk_pct_value=target_risk_pct,
                     actual_risk_pct_value=None,
-                    fallback_tier_value=fallback_tier,
                 )
                 return
 
@@ -1516,7 +1576,6 @@ class LiveTrader:
                 volume_value=volume,
                 target_risk_pct_value=target_risk_pct,
                 actual_risk_pct_value=actual_risk_pct,
-                fallback_tier_value=fallback_tier,
             )
             return
 
@@ -1546,7 +1605,6 @@ class LiveTrader:
             strategy_name=_strat_name,
             direction=direction,
             risk_pct=target_risk_pct,
-            tier=fallback_tier,
         )
 
         # Execute order
@@ -1586,7 +1644,6 @@ class LiveTrader:
                 volume_value=result.volume,
                 target_risk_pct_value=target_risk_pct,
                 actual_risk_pct_value=actual_risk_pct_exec,
-                fallback_tier_value=fallback_tier,
             )
         else:
             self.logger.warning(

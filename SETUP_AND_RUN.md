@@ -409,7 +409,7 @@ Connecting to MetaTrader 5...
 ✓ Connected to MT5
 ✓ Portfolio Manager initialized
   Symbols: 12
-  Strategies: 28
+  Strategies: 42
   Existing configs: 4
 
 ============================================================
@@ -424,7 +424,7 @@ Progress: 1/10
 ============================================================
 OPTIMIZING: USDJPY (Regime-Aware)
 ============================================================
-[USDJPY] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+[USDJPY] Regime Optimization: 42 strategies x 6 timeframes x 4 regimes
 [USDJPY] [H1] Hyperparameter tuning 3 strategies
 [USDJPY] [H1] [TREND] Winner: SupertrendStrategy [TUNED] (quality=0.723)
 [USDJPY] [H1] [RANGE] Winner: BollingerBounceStrategy (quality=0.681)

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PM Dashboard - Strategies</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='20260204d') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260207a') }}" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -18,9 +18,14 @@
             <p>Validated strategy view with drill-down metrics.</p>
           </div>
         </div>
-        <nav class="nav">
+        <nav class="nav" role="navigation" aria-label="Main navigation">
           <a class="nav-link" href="/">Signal Desk</a>
           <a class="nav-link active" href="/strategies">Strategies</a>
+          <a class="nav-link" href="/analytics">Analytics</a>
+          <a class="nav-link" href="/trades">Trade History</a>
+          <div class="theme-toggle" id="theme-toggle" title="Toggle Dark Mode">
+            <span class="theme-toggle-icon">🌙</span>
+          </div>
         </nav>
         <div class="stat-card">
           <div class="stat-label">Strategies Loaded</div>
@@ -33,20 +38,20 @@
       <section class="card controls fade-in">
         <div class="filters">
           <div>
-            <label>Symbol</label>
-            <select id="strategy-filter-symbol"></select>
+            <label for="strategy-filter-symbol">Symbol</label>
+            <select id="strategy-filter-symbol" aria-label="Filter by symbol"></select>
           </div>
           <div>
-            <label>Timeframe</label>
-            <select id="strategy-filter-timeframe"></select>
+            <label for="strategy-filter-timeframe">Timeframe</label>
+            <select id="strategy-filter-timeframe" aria-label="Filter by timeframe"></select>
           </div>
           <div>
-            <label>Regime</label>
-            <select id="strategy-filter-regime"></select>
+            <label for="strategy-filter-regime">Regime</label>
+            <select id="strategy-filter-regime" aria-label="Filter by regime"></select>
           </div>
           <div>
-            <label>Strategy</label>
-            <select id="strategy-filter-name"></select>
+            <label for="strategy-filter-name">Strategy</label>
+            <select id="strategy-filter-name" aria-label="Filter by strategy"></select>
           </div>
         </div>
         <div class="toggle-group">
@@ -98,6 +103,7 @@
       </main>
     </div>
 
-    <script src="{{ url_for('static', filename='strategies.js', v='20260204d') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v='20260207b') }}"></script>
+    <script src="{{ url_for('static', filename='strategies.js', v='20260207b') }}"></script>
   </body>
 </html>

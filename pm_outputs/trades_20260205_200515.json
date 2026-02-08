@@ -1,0 +1,35 @@
+[
+  {
+    "timestamp": "2026-02-05T18:01:09.344492",
+    "symbol": "EURUSD",
+    "direction": "LONG",
+    "volume": 0.03,
+    "price": 1.18018,
+    "sl": 1.1765735714285714,
+    "tp": 1.1849885714285715,
+    "magic": 1484434428,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-05T19:59:55.111694",
+    "symbol": "XRPUSD",
+    "direction": "SHORT",
+    "volume": 0.02,
+    "price": 1.25939,
+    "sl": 1.37536,
+    "tp": 1.14382,
+    "magic": 1349496382,
+    "status": "EXECUTED"
+  },
+  {
+    "timestamp": "2026-02-05T20:01:50.085502",
+    "symbol": "XRPUSD",
+    "direction": "SHORT",
+    "volume": 0.01,
+    "price": 1.25629,
+    "sl": 1.4405114285714284,
+    "tp": 0.8264399999999998,
+    "magic": 130071409,
+    "status": "EXECUTED"
+  }
+]

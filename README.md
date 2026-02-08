@@ -31,7 +31,7 @@ A production-ready automated trading system featuring regime-aware strategy sele
 The FX Portfolio Manager is a fully automated trading pipeline that:
 
 1. **Detects Market Regimes** - Classifies markets as TREND, RANGE, BREAKOUT, or CHOP
-2. **Selects Strategies** - Tests 28 strategies across 6 timeframes per regime
+2. **Selects Strategies** - Tests 42 strategies across 6 timeframes per regime
 3. **Optimizes Parameters** - Grid/Optuna search with validation-aware scoring
 4. **Validates Robustness** - Gap penalty and robustness ratio enforcement
 5. **Persists Incrementally** - Never loses optimization progress (atomic saves)
@@ -42,7 +42,7 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 
 | Feature | Traditional Systems | This System |
 |---------|---------------------|-------------|
-| Strategy Selection | Single strategy | 28 strategies compete per regime |
+| Strategy Selection | Single strategy | 42 strategies compete per regime |
 | Market Adaptation | Static | Regime-aware (TREND/RANGE/BREAKOUT/CHOP) |
 | Parameter Tuning | Manual or random | Systematic grid/Optuna with validation |
 | Overfitting Prevention | None/minimal | Gap penalty + robustness ratio |
@@ -101,7 +101,7 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 ```
 FX_Portfolio_Manager/
 ├── pm_core.py           # Configuration, data loading, backtesting, scoring
-├── pm_strategies.py     # 28 trading strategies with param grids
+├── pm_strategies.py     # 42 trading strategies with param grids
 ├── pm_pipeline.py       # Optimization pipeline, ConfigLedger, PortfolioManager
 ├── pm_main.py           # Application entry, live trading loop
 ├── pm_mt5.py            # MetaTrader 5 integration
@@ -425,16 +425,18 @@ python pm_main.py --config myconfig.json  # Custom config file
 
 ## Trading Strategies
 
-### Available Strategies (28)
+### Available Strategies (42)
 
 | Category | Strategies |
 |----------|------------|
-| **Trend Following** | EMACrossoverStrategy, MACDTrendStrategy, ADXTrendStrategy, SupertrendStrategy, HullMATrendStrategy, TrendContinuationStrategy, TrendStrengthStrategy, DirectionalMomentumStrategy, ChoppinessBreakoutStrategy, KeltnerTrendStrategy |
-| **Mean Reversion** | RSIReversalStrategy, RSIExtremesStrategy, BollingerBounceStrategy, CCIReversionStrategy, StochasticReversalStrategy |
-| **Breakout/Momentum** | DonchianBreakoutStrategy, SqueezeBreakoutStrategy, PriceChannelStrategy, MomentumBreakoutStrategy, VolatilityBreakoutStrategy |
-| **Volatility** | ATRBreakoutStrategy, BollingerSqueezeStrategy, VolatilityClusterStrategy |
-| **Hybrid** | MultiIndicatorStrategy, AdaptiveTrendStrategy, RegimeAdaptiveStrategy |
-| **Advanced** | MeanReversionBandsStrategy, IchimokuTrendStrategy |
+| **Trend Following (10)** | EMACrossoverStrategy, SupertrendStrategy, MACDTrendStrategy, ADXTrendStrategy, IchimokuStrategy, HullMATrendStrategy, EMARibbonADXStrategy, AroonTrendStrategy, ADXDIStrengthStrategy, KeltnerPullbackStrategy |
+| **Mean Reversion (10)** | RSIExtremesStrategy, BollingerBounceStrategy, ZScoreMRStrategy, StochasticReversalStrategy, CCIReversalStrategy, WilliamsRStrategy, RSITrendFilteredMRStrategy, StochRSITrendGateStrategy, FisherTransformMRStrategy, ZScoreVWAPReversionStrategy |
+| **Breakout/Momentum (7)** | DonchianBreakoutStrategy, VolatilityBreakoutStrategy, MomentumBurstStrategy, SqueezeBreakoutStrategy, KeltnerBreakoutStrategy, PivotBreakoutStrategy, MACDHistogramMomentumStrategy |
+| **Price Action (4)** | InsideBarBreakoutStrategy, NarrowRangeBreakoutStrategy, TurtleSoupReversalStrategy, PinBarReversalStrategy |
+| **Candlestick/Volume (3)** | EngulfingPatternStrategy, VolumeSpikeMomentumStrategy, ATRPercentileBreakoutStrategy |
+| **Divergence (3)** | RSIDivergenceStrategy, MACDDivergenceStrategy, OBVDivergenceStrategy |
+| **Exhaustion/Fade (2)** | KeltnerFadeStrategy, ROCExhaustionReversalStrategy |
+| **Continuation/Adaptive (3)** | EMAPullbackContinuationStrategy, ParabolicSARTrendStrategy, KaufmanAMATrendStrategy |
 
 ### Strategy Selection Process
 

@@ -498,6 +498,15 @@ class PipelineConfig:
     position_size_pct: float = 1.0  # Alias for risk_per_trade_pct
     
     # Cost modeling
+    # - Spread: fixed/average per-symbol from config.json (use_spread=True).
+    #   Broker-provided spread_avg in pips. Applied to every entry.
+    # - Commission: per-lot fee (use_commission=True). Set to False for
+    #   spread-only accounts where commission is embedded in the spread.
+    # - Slippage: applied only to SL exits (market orders). TP exits are
+    #   limit fills and do not incur slippage (correct by design).
+    # - Swap: defined in config.json (swap_long/swap_short) but NOT applied
+    #   in backtest. This is a known simplification; impact is <5% for H4 and
+    #   below. D1 strategies with multi-week holds may see up to 20% impact.
     use_spread: bool = True
     use_commission: bool = True
     use_slippage: bool = True
@@ -539,6 +548,11 @@ class PipelineConfig:
     # Default False: tune on train-only, validate on val during selection.
     optuna_use_val_in_objective: bool = False
 
+    # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
+    # to be considered actionable in live trading. Signals below this are logged but
+    # not executed. Default 0.95 is strict; lower values (e.g. 0.9) allow more trades.
+    actionable_score_margin: float = 0.95
+
     # Timeframes to evaluate
     timeframes: List[str] = field(default_factory=lambda: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'])
     
@@ -573,17 +587,9 @@ class PipelineConfig:
     regime_allow_losing_winners: bool = False    # If True, allows PF < 1 (not recommended)
     regime_no_winner_marker: str = "NO_TRADE"    # Strategy name for "no valid winner" state
     
-    # ===== LIVE TRADING FALLBACK RISK REDUCTION =====
-    # When using fallback configs (tier 2/3), reduce risk to reflect lower confidence
-    fallback_risk_multiplier: float = 0.5       # Risk multiplier when using fallback (0.5 = 50%)
-    fallback_max_risk_pct: float = 1.0          # Hard cap on risk when in fallback mode
-
-    # ===== TIERED LIVE RISK POLICY (TIER 1..3) =====
-    # Tier 1 (regime winner): can scale above base risk, capped by tier1_max_risk_pct.
-    # Tier 2/3 (fallbacks): capped by tier23_max_risk_pct.
-    tier1_risk_multiplier: float = 5.0     # multiplies base risk_per_trade_pct in tier 1
-    tier1_max_risk_pct: float = 5.0        # hard cap for tier 1 risk
-    tier23_max_risk_pct: float = 1.0       # hard cap for tier 2/3 risk
+    # ===== LIVE RISK POLICY (WINNERS-ONLY) =====
+    # Risk per trade comes from PositionConfig.risk_per_trade_pct.
+    # PositionConfig.max_risk_pct acts as the hard safety cap.
     min_trade_risk_pct: float = 0.1        # minimum non-zero risk for a placed trade
 
     
@@ -1243,25 +1249,32 @@ def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> I
     else:
         spread_avg = 2.0
 
-    return InstrumentSpec(
-        symbol=symbol,
-        pip_position=pip_position,
-        pip_value=pip_value,
-        spread_avg=spread_avg,
-        min_lot=float(broker_data.get('volume_min', 0.01) or 0.01),
-        max_lot=float(broker_data.get('volume_max', 100.0) or 100.0),
-        volume_step=float(broker_data.get('volume_step', 0.01) or 0.01),
-        commission_per_lot=float(broker_data.get('commission_per_lot', 7.0) or 7.0),
-        swap_long=float(broker_data.get('swap_long', 0.0) or 0.0),
-        swap_short=float(broker_data.get('swap_short', 0.0) or 0.0),
-        # Broker-real fields (used for MT5-parity sizing/P&L)
-        digits=digits,
-        point=point,
-        tick_size=tick_size,
-        tick_value=tick_value,
-        contract_size=contract_size,
-        trade_stops_level=int(broker_data.get('stops_level', broker_data.get('trade_stops_level', 0)) or 0),
-    )
+    try:
+        return InstrumentSpec(
+            symbol=symbol,
+            pip_position=pip_position,
+            pip_value=pip_value,
+            spread_avg=spread_avg,
+            min_lot=float(broker_data.get('volume_min', 0.01) or 0.01),
+            max_lot=float(broker_data.get('volume_max', 100.0) or 100.0),
+            volume_step=float(broker_data.get('volume_step', 0.01) or 0.01),
+            commission_per_lot=float(broker_data.get('commission_per_lot', 7.0) or 7.0),
+            swap_long=float(broker_data.get('swap_long', 0.0) or 0.0),
+            swap_short=float(broker_data.get('swap_short', 0.0) or 0.0),
+            # Broker-real fields (used for MT5-parity sizing/P&L)
+            digits=digits,
+            point=point,
+            tick_size=tick_size,
+            tick_value=tick_value,
+            contract_size=contract_size,
+            stops_level=int(broker_data.get('stops_level', broker_data.get('trade_stops_level', 0)) or 0),
+        )
+    except (TypeError, ValueError, KeyError) as e:
+        logger.warning(
+            f"InstrumentSpec construction failed for {symbol}: {e}. "
+            f"Broker data keys: {list(broker_data.keys())}. Using safe defaults."
+        )
+        return InstrumentSpec(symbol=symbol)
 
 
 def get_instrument_spec(symbol: str) -> InstrumentSpec:
@@ -1722,7 +1735,7 @@ class FeatureComputer:
     @classmethod
     def _cache_get(cls, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
         if key in cls._FEATURE_CACHE:
-            return cls._FEATURE_CACHE[key]
+            return cls._FEATURE_CACHE[key].copy()
         return None
 
     @classmethod
@@ -1791,104 +1804,104 @@ class FeatureComputer:
         for period in [7, 10, 14, 20]:
             col = f'ATR_{period}'
             if col in to_compute and col not in computed:
-                features[col] = FeatureComputer.atr(features, period)
+                features.loc[:, col] = FeatureComputer.atr(features, period)
                 computed.add(col)
-        
+
         # Compute SMAs if needed
         for period in [5, 8, 10, 13, 20, 21, 30, 50, 100, 200]:
             col = f'SMA_{period}'
             if col in to_compute and col not in computed:
-                features[col] = features['Close'].rolling(period).mean()
+                features.loc[:, col] = features['Close'].rolling(period).mean()
                 computed.add(col)
-        
+
         # Compute EMAs if needed
         for period in [5, 8, 10, 13, 20, 21, 30, 50, 100, 200]:
             col = f'EMA_{period}'
             if col in to_compute and col not in computed:
-                features[col] = features['Close'].ewm(span=period, adjust=False).mean()
+                features.loc[:, col] = features['Close'].ewm(span=period, adjust=False).mean()
                 computed.add(col)
-        
+
         # RSI
         for period in [7, 14, 21]:
             col = f'RSI_{period}'
             if col in to_compute and col not in computed:
-                features[col] = FeatureComputer.rsi(features['Close'], period)
+                features.loc[:, col] = FeatureComputer.rsi(features['Close'], period)
                 computed.add(col)
-        
+
         # Bollinger Bands
         bb_cols = {'BB_MID_20', 'BB_UPPER_20', 'BB_LOWER_20'}
         if bb_cols & to_compute:
             bb_mid, bb_upper, bb_lower = FeatureComputer.bollinger_bands(features['Close'], 20, 2.0)
             if 'BB_MID_20' in to_compute:
-                features['BB_MID_20'] = bb_mid
+                features.loc[:, 'BB_MID_20'] = bb_mid
             if 'BB_UPPER_20' in to_compute:
-                features['BB_UPPER_20'] = bb_upper
+                features.loc[:, 'BB_UPPER_20'] = bb_upper
             if 'BB_LOWER_20' in to_compute:
-                features['BB_LOWER_20'] = bb_lower
+                features.loc[:, 'BB_LOWER_20'] = bb_lower
             computed.update(bb_cols)
-        
+
         # MACD
         macd_cols = {'MACD', 'MACD_SIGNAL', 'MACD_HIST'}
         if macd_cols & to_compute:
             macd, signal, hist = FeatureComputer.macd(features['Close'])
-            features['MACD'] = macd
-            features['MACD_SIGNAL'] = signal
-            features['MACD_HIST'] = hist
+            features.loc[:, 'MACD'] = macd
+            features.loc[:, 'MACD_SIGNAL'] = signal
+            features.loc[:, 'MACD_HIST'] = hist
             computed.update(macd_cols)
-        
+
         # Stochastic
         stoch_cols = {'STOCH_K', 'STOCH_D'}
         if stoch_cols & to_compute:
             stoch_k, stoch_d = FeatureComputer.stochastic(features)
-            features['STOCH_K'] = stoch_k
-            features['STOCH_D'] = stoch_d
+            features.loc[:, 'STOCH_K'] = stoch_k
+            features.loc[:, 'STOCH_D'] = stoch_d
             computed.update(stoch_cols)
-        
+
         # ADX family (uses cached ATR)
         adx_cols = {'ADX', 'PLUS_DI', 'MINUS_DI'}
         if adx_cols & to_compute:
             atr_14 = features.get('ATR_14', FeatureComputer.atr(features, 14))
             if 'ADX' in to_compute:
-                features['ADX'] = FeatureComputer.adx(features, 14, atr_cache=atr_14)
+                features.loc[:, 'ADX'] = FeatureComputer.adx(features, 14, atr_cache=atr_14)
             if 'PLUS_DI' in to_compute:
-                features['PLUS_DI'] = FeatureComputer.plus_di(features, 14, atr_cache=atr_14)
+                features.loc[:, 'PLUS_DI'] = FeatureComputer.plus_di(features, 14, atr_cache=atr_14)
             if 'MINUS_DI' in to_compute:
-                features['MINUS_DI'] = FeatureComputer.minus_di(features, 14, atr_cache=atr_14)
+                features.loc[:, 'MINUS_DI'] = FeatureComputer.minus_di(features, 14, atr_cache=atr_14)
             computed.update(adx_cols)
-        
+
         # CCI
         if 'CCI' in to_compute and 'CCI' not in computed:
-            features['CCI'] = FeatureComputer.cci(features, 20)
+            features.loc[:, 'CCI'] = FeatureComputer.cci(features, 20)
             computed.add('CCI')
-        
+
         # Williams %R
         if 'WILLR' in to_compute and 'WILLR' not in computed:
-            features['WILLR'] = FeatureComputer.williams_r(features, 14)
+            features.loc[:, 'WILLR'] = FeatureComputer.williams_r(features, 14)
             computed.add('WILLR')
-        
+
         # Donchian
         for period in [20, 50]:
             high_col = f'DONCHIAN_HIGH_{period}'
             low_col = f'DONCHIAN_LOW_{period}'
             if high_col in to_compute and high_col not in computed:
-                features[high_col] = features['High'].rolling(period).max()
+                features.loc[:, high_col] = features['High'].rolling(period).max()
                 computed.add(high_col)
             if low_col in to_compute and low_col not in computed:
-                features[low_col] = features['Low'].rolling(period).min()
+                features.loc[:, low_col] = features['Low'].rolling(period).min()
                 computed.add(low_col)
-        
+
         # Hull MA
         if 'HULL_MA' in to_compute and 'HULL_MA' not in computed:
-            features['HULL_MA'] = FeatureComputer.hull_ma(features['Close'], 20)
+            features.loc[:, 'HULL_MA'] = FeatureComputer.hull_ma(features['Close'], 20)
             computed.add('HULL_MA')
-        
+
         # Simple derived features
         if 'CHANGE' in to_compute and 'CHANGE' not in computed:
-            features['CHANGE'] = features['Close'].diff()
+            features.loc[:, 'CHANGE'] = features['Close'].diff()
         if 'CHANGE_PCT' in to_compute and 'CHANGE_PCT' not in computed:
-            features['CHANGE_PCT'] = features['Close'].pct_change() * 100
+            features.loc[:, 'CHANGE_PCT'] = features['Close'].pct_change() * 100
         if 'VOLATILITY' in to_compute and 'VOLATILITY' not in computed:
-            features['VOLATILITY'] = features['Close'].rolling(20).std()
+            features.loc[:, 'VOLATILITY'] = features['Close'].rolling(20).std()
         
         return features
     
@@ -1920,70 +1933,70 @@ class FeatureComputer:
         
         # ATR (multiple periods)
         for period in [7, 10, 14, 20]:
-            features[f'ATR_{period}'] = FeatureComputer.atr(features, period)
-        
+            features.loc[:, f'ATR_{period}'] = FeatureComputer.atr(features, period)
+
         # Moving Averages
         for period in [5, 8, 10, 13, 20, 21, 30, 50, 100, 200]:
-            features[f'SMA_{period}'] = features['Close'].rolling(period).mean()
-            features[f'EMA_{period}'] = features['Close'].ewm(span=period, adjust=False).mean()
-        
+            features.loc[:, f'SMA_{period}'] = features['Close'].rolling(period).mean()
+            features.loc[:, f'EMA_{period}'] = features['Close'].ewm(span=period, adjust=False).mean()
+
         # RSI
         for period in [7, 14, 21]:
-            features[f'RSI_{period}'] = FeatureComputer.rsi(features['Close'], period)
-        
+            features.loc[:, f'RSI_{period}'] = FeatureComputer.rsi(features['Close'], period)
+
         # Bollinger Bands
         for period in [20]:
             bb_mid, bb_upper, bb_lower = FeatureComputer.bollinger_bands(
                 features['Close'], period, 2.0
             )
-            features[f'BB_MID_{period}'] = bb_mid
-            features[f'BB_UPPER_{period}'] = bb_upper
-            features[f'BB_LOWER_{period}'] = bb_lower
-        
+            features.loc[:, f'BB_MID_{period}'] = bb_mid
+            features.loc[:, f'BB_UPPER_{period}'] = bb_upper
+            features.loc[:, f'BB_LOWER_{period}'] = bb_lower
+
         # MACD
         macd, signal, hist = FeatureComputer.macd(features['Close'])
-        features['MACD'] = macd
-        features['MACD_SIGNAL'] = signal
-        features['MACD_HIST'] = hist
-        
+        features.loc[:, 'MACD'] = macd
+        features.loc[:, 'MACD_SIGNAL'] = signal
+        features.loc[:, 'MACD_HIST'] = hist
+
         # Stochastic
         stoch_k, stoch_d = FeatureComputer.stochastic(features)
-        features['STOCH_K'] = stoch_k
-        features['STOCH_D'] = stoch_d
-        
+        features.loc[:, 'STOCH_K'] = stoch_k
+        features.loc[:, 'STOCH_D'] = stoch_d
+
         # ADX, +DI, -DI (optimized: compute ATR once, share across all three)
         atr_14_cached = features['ATR_14']  # Already computed above
-        features['ADX'] = FeatureComputer.adx(features, 14, atr_cache=atr_14_cached)
-        features['PLUS_DI'] = FeatureComputer.plus_di(features, 14, atr_cache=atr_14_cached)
-        features['MINUS_DI'] = FeatureComputer.minus_di(features, 14, atr_cache=atr_14_cached)
-        
+        features.loc[:, 'ADX'] = FeatureComputer.adx(features, 14, atr_cache=atr_14_cached)
+        features.loc[:, 'PLUS_DI'] = FeatureComputer.plus_di(features, 14, atr_cache=atr_14_cached)
+        features.loc[:, 'MINUS_DI'] = FeatureComputer.minus_di(features, 14, atr_cache=atr_14_cached)
+
         # CCI
-        features['CCI'] = FeatureComputer.cci(features, 20)
-        
+        features.loc[:, 'CCI'] = FeatureComputer.cci(features, 20)
+
         # Williams %R
-        features['WILLR'] = FeatureComputer.williams_r(features, 14)
-        
+        features.loc[:, 'WILLR'] = FeatureComputer.williams_r(features, 14)
+
         # Donchian Channels
         for period in [20, 50]:
-            features[f'DONCHIAN_HIGH_{period}'] = features['High'].rolling(period).max()
-            features[f'DONCHIAN_LOW_{period}'] = features['Low'].rolling(period).min()
-        
+            features.loc[:, f'DONCHIAN_HIGH_{period}'] = features['High'].rolling(period).max()
+            features.loc[:, f'DONCHIAN_LOW_{period}'] = features['Low'].rolling(period).min()
+
         # Keltner Channels (use cached ATR_20 if available)
         atr_20_cached = features.get('ATR_20')
         kc_mid, kc_upper, kc_lower = FeatureComputer.keltner_channels(features, 20, 2.0)
-        features['KC_MID'] = kc_mid
-        features['KC_UPPER'] = kc_upper
-        features['KC_LOWER'] = kc_lower
-        
+        features.loc[:, 'KC_MID'] = kc_mid
+        features.loc[:, 'KC_UPPER'] = kc_upper
+        features.loc[:, 'KC_LOWER'] = kc_lower
+
         # Hull MA
-        features['HULL_MA'] = FeatureComputer.hull_ma(features['Close'], 20)
-        
+        features.loc[:, 'HULL_MA'] = FeatureComputer.hull_ma(features['Close'], 20)
+
         # Price changes
-        features['CHANGE'] = features['Close'].diff()
-        features['CHANGE_PCT'] = features['Close'].pct_change() * 100
-        
+        features.loc[:, 'CHANGE'] = features['Close'].diff()
+        features.loc[:, 'CHANGE_PCT'] = features['Close'].pct_change() * 100
+
         # Volatility
-        features['VOLATILITY'] = features['Close'].rolling(20).std()
+        features.loc[:, 'VOLATILITY'] = features['Close'].rolling(20).std()
         
         # =====================================================================
         # REGIME DETECTION
@@ -2012,7 +2025,7 @@ class FeatureComputer:
             
             for col in regime_columns:
                 if col in regime_df.columns:
-                    features[col] = regime_df[col]
+                    features.loc[:, col] = regime_df[col]
             
             logger.debug(f"Added regime features for {symbol} {timeframe}")
                     
@@ -2326,12 +2339,13 @@ class Backtester:
         """
         self.config = config
     
-    def run(self, 
+    def run(self,
             features: pd.DataFrame,
             signals: pd.Series,
             symbol: str,
             strategy: Any,
-            spec: Optional[InstrumentSpec] = None) -> Dict[str, Any]:
+            spec: Optional[InstrumentSpec] = None,
+            timeframe: str = "") -> Dict[str, Any]:
         """
         Run backtest on a dataset with signals.
         
@@ -2513,7 +2527,7 @@ class Backtester:
             )
         
         # Calculate full metrics
-        return self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features)
+        return self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
     
     def _run_python_loop(self, features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                          sl_prices, tp_prices, entry_prices,
@@ -2737,32 +2751,49 @@ class Backtester:
         
         return trades, equity, max_drawdown, equity_curve
     
-    def _calculate_metrics(self, 
+    # Bars-per-year lookup for known timeframes (252 trading days assumed)
+    _TF_BARS_PER_YEAR = {
+        'M1': 252 * 24 * 60, 'M5': 252 * 24 * 12, 'M15': 252 * 24 * 4,
+        'M30': 252 * 24 * 2, 'H1': 252 * 24, 'H4': 252 * 6,
+        'D1': 252, 'W1': 52, 'MN1': 12,
+    }
+
+    def _calculate_metrics(self,
                            trades: List[Dict],
                            final_equity: float,
                            equity_curve: List[float],
                            max_dd: float,
-                           features: pd.DataFrame = None) -> Dict[str, Any]:
+                           features: pd.DataFrame = None,
+                           timeframe: str = "",
+                           warmup_bars: int = 0) -> Dict[str, Any]:
         """
         Calculate complete performance metrics.
-        
+
         Sharpe/Sortino ratios are now computed from equity curve returns (per bar),
         annualized based on timeframe. This provides more accurate risk-adjusted
         returns compared to per-trade calculations.
-        
+
         Args:
             trades: List of trade dictionaries
             final_equity: Final account equity
             equity_curve: List of equity values
             max_dd: Maximum drawdown percentage
             features: Optional features DataFrame (for timeframe detection)
-            
+            timeframe: Timeframe string for annualization (e.g. 'H1', 'M15')
+            warmup_bars: Exclude trades whose entry_bar < warmup_bars
+
         Returns:
             Dict with all performance metrics including R-multiple stats
         """
         if not trades:
             return self._empty_result()
-        
+
+        # Exclude trades entered during regime warmup period
+        if warmup_bars > 0:
+            trades = [t for t in trades if t.get('entry_bar', 0) >= warmup_bars]
+            if not trades:
+                return self._empty_result()
+
         # Basic counts
         total_trades = len(trades)
         wins = [t for t in trades if t['pnl_pips'] > 0]
@@ -2811,24 +2842,27 @@ class Backtester:
             bar_returns = np.diff(equity_arr) / np.where(equity_arr[:-1] != 0, equity_arr[:-1], 1.0)
             
             # Determine annualization factor based on timeframe
-            # Default: assume H1 (24 bars/day, ~252 trading days)
-            bars_per_year = 252 * 24  # Default H1
-            
-            if features is not None and len(features) > 1:
-                # Try to infer timeframe from data frequency
+            # Priority: explicit timeframe string → data inference → H1 default
+            bars_per_year = self._TF_BARS_PER_YEAR.get(timeframe, 0)
+
+            if bars_per_year <= 0 and features is not None and len(features) > 1:
                 try:
                     time_diff = (features.index[1] - features.index[0]).total_seconds()
-                    bars_per_day = 86400 / max(time_diff, 60)  # Avoid div by zero
-                    bars_per_year = bars_per_day * 252
-                except:
-                    pass  # Use default
+                    if time_diff > 0:
+                        bars_per_day = 86400 / time_diff
+                        bars_per_year = bars_per_day * 252
+                except Exception:
+                    pass
+
+            if bars_per_year <= 0:
+                bars_per_year = 252 * 24  # H1 default
             
             # Sharpe ratio (annualized from per-bar returns)
             # Need at least 2 returns for ddof=1 std calculation
             if len(bar_returns) >= 2:
                 returns_mean = np.mean(bar_returns)
                 returns_std = np.std(bar_returns, ddof=1) if len(bar_returns) > 1 else 0.0
-                if returns_std > 1e-10:
+                if returns_std > 1e-8:
                     sharpe = (returns_mean / returns_std) * np.sqrt(bars_per_year)
             
             # Sortino ratio (annualized, using downside deviation)
@@ -2838,12 +2872,12 @@ class Backtester:
                 # Need at least 2 negative returns for ddof=1 std calculation
                 if len(negative_returns) >= 2:
                     downside_std = np.std(negative_returns, ddof=1)
-                    if downside_std > 1e-10:
+                    if downside_std > 1e-8:
                         sortino = (np.mean(bar_returns) / downside_std) * np.sqrt(bars_per_year)
                 elif len(negative_returns) == 1:
                     # Single negative return - use its absolute value as downside deviation proxy
                     downside_std = abs(negative_returns[0])
-                    if downside_std > 1e-10:
+                    if downside_std > 1e-8:
                         sortino = (np.mean(bar_returns) / downside_std) * np.sqrt(bars_per_year)
                 else:
                     # No negative returns - very high sortino but not infinity

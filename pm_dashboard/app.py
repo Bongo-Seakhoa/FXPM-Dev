@@ -11,6 +11,7 @@ from .utils import load_dashboard_config, save_dashboard_config
 from .watcher import DashboardState, DashboardWatcher
 from .utils import parse_timestamp
 from .utils import load_instrument_specs
+from .analytics import build_analytics_payload, load_trade_history
 
 
 def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flask:
@@ -37,6 +38,14 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
     @app.route("/strategies")
     def strategies() -> str:
         return render_template("strategies.html")
+
+    @app.route("/analytics")
+    def analytics() -> str:
+        return render_template("analytics.html")
+
+    @app.route("/trades")
+    def trades() -> str:
+        return render_template("trades.html")
 
     @app.route("/api/entries", methods=["GET"])
     def api_entries() -> Any:
@@ -67,6 +76,39 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
         pm_configs = state.get_pm_configs()
         payload = build_strategy_payload(pm_configs, include_invalid)
         return jsonify(payload)
+
+    @app.route("/api/analytics", methods=["GET"])
+    def api_analytics() -> Any:
+        pm_root = config.get("pm_root") or ""
+        initial_capital = float(request.args.get("initial_capital", 10000.0))
+        payload = build_analytics_payload(pm_root, initial_capital=initial_capital)
+        return jsonify(payload)
+
+    @app.route("/api/trades", methods=["GET"])
+    def api_trades() -> Any:
+        pm_root = config.get("pm_root") or ""
+        limit = int(request.args.get("limit", 200))
+        trades = load_trade_history(pm_root, max_files=100)
+
+        filtered_trades = []
+        for trade in trades[:limit]:
+            filtered_trades.append({
+                "timestamp": trade.get("timestamp"),
+                "symbol": trade.get("symbol"),
+                "direction": trade.get("direction"),
+                "volume": trade.get("volume"),
+                "price": trade.get("price"),
+                "sl": trade.get("sl"),
+                "tp": trade.get("tp"),
+                "pnl": trade.get("pnl", 0.0) or trade.get("profit", 0.0) or 0.0,
+                "status": trade.get("status"),
+                "timeframe": trade.get("timeframe"),
+                "regime": trade.get("regime"),
+                "strategy": trade.get("strategy"),
+                "magic": trade.get("magic")
+            })
+
+        return jsonify({"trades": filtered_trades, "total": len(trades)})
 
     return app
 

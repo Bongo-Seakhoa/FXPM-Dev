@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PM Dashboard - Trade History</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260207a') }}" />
+  </head>
+  <body>
+    <div class="bg-grid"></div>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <div class="logo">PM</div>
+          <div>
+            <h1>Trade History</h1>
+            <p>Complete trade log with advanced filtering and export.</p>
+          </div>
+        </div>
+        <nav class="nav" role="navigation" aria-label="Main navigation">
+          <a class="nav-link" href="/">Signal Desk</a>
+          <a class="nav-link" href="/strategies">Strategies</a>
+          <a class="nav-link" href="/analytics">Analytics</a>
+          <a class="nav-link active" href="/trades">Trade History</a>
+          <div class="theme-toggle" id="theme-toggle" title="Toggle Dark Mode">
+            <span class="theme-toggle-icon">🌙</span>
+          </div>
+        </nav>
+        <div class="stat-card">
+          <div class="stat-label">Total Trades</div>
+          <div class="stat-value" id="total-trades">0</div>
+          <div class="stat-meta">Showing: <span id="showing-count">0</span></div>
+        </div>
+      </header>
+
+      <!-- Filters & Search -->
+      <section class="card controls fade-in">
+        <div class="filters">
+          <div class="search-box">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="search-input" placeholder="Search symbol, strategy..." />
+          </div>
+          <div>
+            <label for="filter-symbol">Symbol</label>
+            <select id="filter-symbol" aria-label="Filter by symbol"></select>
+          </div>
+          <div>
+            <label for="filter-direction">Direction</label>
+            <select id="filter-direction" aria-label="Filter by direction"></select>
+          </div>
+          <div>
+            <label for="filter-status">Status</label>
+            <select id="filter-status" aria-label="Filter by status"></select>
+          </div>
+          <div>
+            <label for="filter-timeframe">Timeframe</label>
+            <select id="filter-timeframe" aria-label="Filter by timeframe"></select>
+          </div>
+          <div>
+            <label for="filter-regime">Regime</label>
+            <select id="filter-regime" aria-label="Filter by regime"></select>
+          </div>
+        </div>
+        <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+          <button class="btn btn-secondary" id="reset-filters-btn">
+            <span>Clear Filters</span>
+          </button>
+          <button class="btn export-btn" id="export-csv-btn">
+            <span>📊 Export CSV</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- Trade Table -->
+      <section class="card fade-in">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="sortable" data-sort="timestamp">Timestamp</th>
+                <th class="sortable" data-sort="symbol">Symbol</th>
+                <th class="sortable" data-sort="direction">Direction</th>
+                <th class="sortable" data-sort="volume">Volume</th>
+                <th class="sortable" data-sort="price">Entry Price</th>
+                <th class="sortable" data-sort="sl">Stop Loss</th>
+                <th class="sortable" data-sort="tp">Take Profit</th>
+                <th class="sortable" data-sort="pnl">P&L</th>
+                <th>Timeframe</th>
+                <th>Regime</th>
+                <th>Strategy</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="trades-body"></tbody>
+          </table>
+        </div>
+
+        <!-- Pagination -->
+        <div class="table-footer">
+          <div class="page-meta">
+            <span id="page-info">Page 1 of 1</span>
+            <span class="page-meta-sep">•</span>
+            <span id="row-count">0 rows</span>
+          </div>
+          <div class="page-controls">
+            <label for="page-size">Rows</label>
+            <select id="page-size">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+            </select>
+            <button class="btn btn-secondary" id="page-prev">Prev</button>
+            <button class="btn btn-secondary" id="page-next">Next</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Summary Stats -->
+      <section class="grid four-col mt-3 fade-in">
+        <div class="card metric-card">
+          <span>Displayed Trades</span>
+          <strong id="summary-trades">0</strong>
+        </div>
+        <div class="card metric-card">
+          <span>Total P&L</span>
+          <strong id="summary-pnl">$0.00</strong>
+        </div>
+        <div class="card metric-card">
+          <span>Win Rate</span>
+          <strong id="summary-winrate">0.00%</strong>
+        </div>
+        <div class="card metric-card">
+          <span>Avg P&L</span>
+          <strong id="summary-avg">$0.00</strong>
+        </div>
+      </section>
+    </div>
+
+    <!-- Scroll to Top -->
+    <div class="scroll-top" id="scroll-top">↑</div>
+
+    <!-- Trade Details Drawer -->
+    <aside class="drawer" id="drawer" role="dialog" aria-label="Trade details">
+      <div class="drawer-header">
+        <h2 id="drawer-title">Trade Details</h2>
+        <button class="close-btn" id="close-drawer">×</button>
+      </div>
+      <div class="details">
+        <div class="detail-grid" id="details-grid"></div>
+      </div>
+      <div class="mt-2">
+        <button class="btn btn-secondary" id="copy-trade-data">
+          <span>📋 Copy Trade Data</span>
+        </button>
+      </div>
+    </aside>
+
+    <script src="{{ url_for('static', filename='common.js', v='20260207b') }}"></script>
+    <script src="{{ url_for('static', filename='trades.js', v='20260207b') }}"></script>
+  </body>
+</html>

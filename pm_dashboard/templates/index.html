@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PM Dashboard</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='20260204d') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260207a') }}" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -18,9 +18,14 @@
             <p>Read-only view of PM signals for manual execution.</p>
           </div>
         </div>
-        <nav class="nav">
+        <nav class="nav" role="navigation" aria-label="Main navigation">
           <a class="nav-link active" href="/">Signal Desk</a>
           <a class="nav-link" href="/strategies">Strategies</a>
+          <a class="nav-link" href="/analytics">Analytics</a>
+          <a class="nav-link" href="/trades">Trade History</a>
+          <div class="theme-toggle" id="theme-toggle" title="Toggle Dark Mode">
+            <span class="theme-toggle-icon">🌙</span>
+          </div>
         </nav>
         <div class="stat-card">
           <div class="stat-label">Valid Entries Now</div>
@@ -33,24 +38,24 @@
       <section class="card controls fade-in">
         <div class="filters">
           <div>
-            <label>Symbol</label>
-            <select id="filter-symbol"></select>
+            <label for="filter-symbol">Symbol</label>
+            <select id="filter-symbol" aria-label="Filter by symbol"></select>
           </div>
           <div>
-            <label>Timeframe</label>
-            <select id="filter-timeframe"></select>
+            <label for="filter-timeframe">Timeframe</label>
+            <select id="filter-timeframe" aria-label="Filter by timeframe"></select>
           </div>
           <div>
-            <label>Regime</label>
-            <select id="filter-regime"></select>
+            <label for="filter-regime">Regime</label>
+            <select id="filter-regime" aria-label="Filter by regime"></select>
           </div>
           <div>
-            <label>Direction</label>
-            <select id="filter-direction"></select>
+            <label for="filter-direction">Direction</label>
+            <select id="filter-direction" aria-label="Filter by direction"></select>
           </div>
           <div>
-            <label>Strategy</label>
-            <select id="filter-strategy"></select>
+            <label for="filter-strategy">Strategy</label>
+            <select id="filter-strategy" aria-label="Filter by strategy"></select>
           </div>
         </div>
         <div>
@@ -77,6 +82,24 @@
             </thead>
             <tbody id="entries-body"></tbody>
           </table>
+          <div class="table-footer">
+            <div class="page-meta">
+              <span id="page-info">Page 1 of 1</span>
+              <span class="page-meta-sep">•</span>
+              <span id="page-count">0 rows</span>
+            </div>
+            <div class="page-controls">
+              <label for="page-size">Rows</label>
+              <select id="page-size">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="30">30</option>
+                <option value="50">50</option>
+              </select>
+              <button class="btn btn-secondary" id="page-prev" type="button">Prev</button>
+              <button class="btn btn-secondary" id="page-next" type="button">Next</button>
+            </div>
+          </div>
         </section>
 
         <section class="card details fade-in" id="sizing-section">
@@ -200,7 +223,7 @@
       </section>
     </div>
 
-    <aside class="drawer" id="drawer">
+    <aside class="drawer" id="drawer" role="dialog" aria-label="Entry details">
       <div class="drawer-header">
         <h2 id="drawer-title">Entry</h2>
         <button class="close-btn" id="close-drawer">x</button>
@@ -234,6 +257,7 @@
       </div>
     </aside>
 
-    <script src="{{ url_for('static', filename='app.js', v='20260204c') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v='20260207b') }}"></script>
+    <script src="{{ url_for('static', filename='app.js', v='20260207b') }}"></script>
   </body>
 </html>

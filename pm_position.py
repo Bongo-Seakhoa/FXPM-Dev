@@ -55,18 +55,21 @@ class TradeTagEncoder:
     v1 (legacy):
         "PM:{symbol}:{timeframe}:{strategy}:{direction}"
 
-    v2 (preferred):
+    v2 (deprecated):
         "PM2:{symbol}:{timeframe}:{scode}:{dir}:{tier}:{risk_tenths}"
+
+    v3 (current — winners-only, no tier field):
+        "PM3:{symbol}:{timeframe}:{scode}:{dir}:{risk_tenths}"
 
         where:
             scode        = short strategy code (base36 CRC32, 4-5 chars)
             dir          = 'L' or 'S'
-            tier         = 1..4
             risk_tenths  = int(round(risk_pct * 10))
     """
 
     COMMENT_PREFIX_V1 = "PM:"
     COMMENT_PREFIX_V2 = "PM2:"
+    COMMENT_PREFIX_V3 = "PM3:"
 
     @staticmethod
     def _base36(n: int) -> str:
@@ -100,22 +103,20 @@ class TradeTagEncoder:
                        timeframe: str,
                        strategy_name: str,
                        direction: str,
-                       risk_pct: float = None,
-                       tier: int = None) -> str:
+                       risk_pct: float = None) -> str:
         """
         Encode trade metadata into MT5 comment string.
 
-        If risk_pct and tier are provided, emits v2 (PM2:...) otherwise falls back to legacy v1.
+        If risk_pct is provided, emits v3 (PM3:...) otherwise falls back to legacy v1.
         """
         # Normalize direction for compactness
         dir_norm = str(direction).upper()
         dir_short = "L" if dir_norm.startswith("L") else "S" if dir_norm.startswith("S") else dir_norm[:1]
 
-        if risk_pct is not None and tier is not None:
+        if risk_pct is not None:
             scode = TradeTagEncoder._strategy_code(strategy_name, max_len=5)
             risk_tenths = int(round(float(risk_pct) * 10.0))
-            tier_i = int(tier)
-            return f"{TradeTagEncoder.COMMENT_PREFIX_V2}{symbol}:{timeframe}:{scode}:{dir_short}:{tier_i}:{risk_tenths}"
+            return f"{TradeTagEncoder.COMMENT_PREFIX_V3}{symbol}:{timeframe}:{scode}:{dir_short}:{risk_tenths}"
 
         # Legacy v1
         return f"{TradeTagEncoder.COMMENT_PREFIX_V1}{symbol}:{timeframe}:{strategy_name}:{str(direction).upper()}"
@@ -126,17 +127,18 @@ class TradeTagEncoder:
         Decode trade metadata from MT5 comment string.
 
         Returns dict with keys:
-            symbol, timeframe, direction, (optional) strategy_code, tier, risk_pct
+            symbol, timeframe, direction, (optional) strategy_code, risk_pct
+        Supports v3 (current), v2 (backward compat), and v1 (legacy).
         """
         if not comment:
             return None
 
         try:
-            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V2):
-                parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V2):].split(':')
-                # PM2:symbol:tf:scode:dir:tier:risk_tenths
-                if len(parts) >= 6:
-                    symbol, tf, scode, dir_short, tier_s, risk_tenths_s = parts[:6]
+            # v3: PM3:symbol:tf:scode:dir:risk_tenths (winners-only, no tier)
+            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V3):
+                parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V3):].split(':')
+                if len(parts) >= 5:
+                    symbol, tf, scode, dir_short, risk_tenths_s = parts[:5]
                     risk_pct = float(int(risk_tenths_s)) / 10.0
                     direction = "LONG" if dir_short.upper() == "L" else "SHORT" if dir_short.upper() == "S" else dir_short
                     return {
@@ -144,13 +146,27 @@ class TradeTagEncoder:
                         "timeframe": tf,
                         "strategy_code": scode,
                         "direction": direction,
-                        "tier": int(tier_s),
                         "risk_pct": risk_pct,
                     }
 
+            # v2 (backward compat): PM2:symbol:tf:scode:dir:tier:risk_tenths
+            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V2):
+                parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V2):].split(':')
+                if len(parts) >= 6:
+                    symbol, tf, scode, dir_short, _tier_s, risk_tenths_s = parts[:6]
+                    risk_pct = float(int(risk_tenths_s)) / 10.0
+                    direction = "LONG" if dir_short.upper() == "L" else "SHORT" if dir_short.upper() == "S" else dir_short
+                    return {
+                        "symbol": symbol,
+                        "timeframe": tf,
+                        "strategy_code": scode,
+                        "direction": direction,
+                        "risk_pct": risk_pct,
+                    }
+
+            # v1 (legacy): PM:symbol:tf:strategy:direction
             if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V1):
                 parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V1):].split(':')
-                # PM:symbol:tf:strategy:direction
                 if len(parts) >= 4:
                     return {
                         'symbol': parts[0],
@@ -180,13 +196,6 @@ class TradeTagEncoder:
             return None
         return decoded.get('risk_pct')
 
-    @staticmethod
-    def get_tier_from_comment(comment: str) -> Optional[int]:
-        decoded = TradeTagEncoder.decode_comment(comment)
-        if not decoded:
-            return None
-        t = decoded.get('tier')
-        return int(t) if t is not None else None
 
 
 # =============================================================================
@@ -367,6 +376,23 @@ class PositionCalculator:
         else:
             volume = self.config.min_position_size
         
+        # If risk-based volume is below min_lot, the trade is not viable
+        # (clamping up to min_lot would take far more risk than intended)
+        if volume < spec.min_lot:
+            logger.warning(
+                f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot} "
+                f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
+            )
+            return PositionSizeResult(
+                volume=0.0,
+                risk_amount=risk_amount,
+                sl_pips=sl_pips,
+                pip_value=pip_value,
+                equity=equity,
+                details=(f"Equity: {equity:.2f}, Risk: {risk_amount:.2f}, "
+                         f"SL: {sl_pips:.1f} pips — volume below min_lot, skipped"),
+            )
+
         # Apply limits
         volume = max(spec.min_lot, volume)
         volume = min(spec.max_lot, volume)
@@ -380,10 +406,15 @@ class PositionCalculator:
         # This is essential for CFDs/indices which may have different volume_step
         volume_step = spec.volume_step if spec.volume_step > 0 else 0.01
         volume = math.floor(volume / volume_step) * volume_step
-        volume = max(0.0, volume)
-        
-        # Round to avoid floating point issues
         volume = round(volume, 8)
+
+        # If rounding pushed volume below min_lot, the trade is not viable
+        if volume < spec.min_lot:
+            logger.warning(
+                f"Volume {volume:.8f} below min_lot {spec.min_lot} after rounding "
+                f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
+            )
+            volume = 0.0
         
         details = (f"Equity: {equity:.2f}, Risk: {risk_amount:.2f} "
                   f"({self.config.risk_per_trade_pct}%), SL: {sl_pips:.1f} pips, "

@@ -1,0 +1,16 @@
+# FX Portfolio Manager v1.4 - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core (required)
+pandas>=2.0,<3.0
+numpy>=1.24,<2.0
+MetaTrader5>=5.0.45
+
+# Performance (optional but recommended)
+numba>=0.58              # 3-10x faster backtesting via JIT compilation
+optuna>=3.4              # Bayesian hyperparameter optimization (TPE)
+tqdm>=4.60               # Progress bars for optimization loops
+
+# Dashboard (optional)
+Flask>=2.3,<3.0
+plyer>=2.1.0

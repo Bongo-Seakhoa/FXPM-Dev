@@ -37,7 +37,7 @@ from pm_core import (
     get_instrument_spec,
     InstrumentSpec
 )
-from pm_strategies import StrategyRegistry, BaseStrategy
+from pm_strategies import StrategyRegistry, BaseStrategy, _STRATEGY_MIGRATION
 from pm_position import PositionConfig, PositionManager
 
 # Import Optuna TPE optimizer
@@ -63,6 +63,13 @@ except ImportError:
         return "Grid Search (fallback)"
     def create_optimizer(*args, **kwargs):
         return None
+
+# Progress bar (optional)
+try:
+    from tqdm import tqdm
+    _TQDM = True
+except ImportError:
+    _TQDM = False
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -267,23 +274,30 @@ class ConfigLedger:
         days_remaining = (config.valid_until - now).days
         return True, f"valid until {config.valid_until.strftime('%Y-%m-%d')} ({days_remaining} days remaining)"
     
-    def should_optimize(self, symbol: str, overwrite: bool = False) -> Tuple[bool, str]:
+    def should_optimize(self, symbol: str, overwrite: bool = False,
+                        current_regime_version: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """
         Determine if a symbol should be optimized.
-        
+
         Args:
             symbol: Symbol to check
             overwrite: If True, always optimize (ignore validity)
-            
+            current_regime_version: Current regime detection params dict (for version mismatch check)
+
         Returns:
             Tuple of (should_optimize, reason_string)
         """
         if overwrite:
             return True, "overwrite enabled"
-        
+
         is_valid, reason = self.has_valid_config(symbol)
-        
+
         if is_valid:
+            # Extra check: regime detection params changed since optimization
+            if current_regime_version and symbol in self.configs:
+                stored = self.configs[symbol].regime_detection_version
+                if stored and stored != current_regime_version:
+                    return True, "regime detection params changed"
             return False, reason  # Skip - config is valid
         else:
             return True, reason  # Optimize - config is missing/expired/invalid
@@ -451,9 +465,13 @@ class RegimeConfig:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'RegimeConfig':
-        """Create from dictionary."""
+        """Create from dictionary (applies strategy name migration for retired strategies)."""
+        raw_name = data['strategy_name']
+        strategy_name = _STRATEGY_MIGRATION.get(raw_name, raw_name)
+        if strategy_name != raw_name:
+            logger.info(f"Migrated retired strategy {raw_name} → {strategy_name}")
         config = cls(
-            strategy_name=data['strategy_name'],
+            strategy_name=strategy_name,
             parameters=data['parameters'],
             quality_score=data.get('quality_score', 0.0),
             train_metrics=data.get('train_metrics', {}),
@@ -504,6 +522,9 @@ class SymbolConfig:
     is_validated: bool = False
     validation_reason: str = ""
     
+    # Regime detection version stamp (for invalidation when params change)
+    regime_detection_version: Optional[Dict[str, Any]] = None
+
     # Timestamps
     optimized_at: Optional[datetime] = None
     valid_until: Optional[datetime] = None
@@ -556,6 +577,10 @@ class SymbolConfig:
                           if k not in ['equity_curve', 'trades']},
         }
         
+        # Regime detection version stamp
+        if self.regime_detection_version:
+            result['regime_detection_version'] = self.regime_detection_version
+
         # Add regime configs
         if self.regime_configs:
             result['regime_configs'] = {}
@@ -572,10 +597,12 @@ class SymbolConfig:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'SymbolConfig':
-        """Create from dictionary."""
+        """Create from dictionary (applies strategy name migration for retired strategies)."""
+        raw_name = data.get('strategy_name', '')
+        strategy_name = _STRATEGY_MIGRATION.get(raw_name, raw_name)
         config = cls(
             symbol=data['symbol'],
-            strategy_name=data.get('strategy_name', ''),
+            strategy_name=strategy_name,
             timeframe=data.get('timeframe', ''),
             parameters=data.get('parameters', {}),
             retrain_days=data.get('retrain_days', 30),
@@ -591,6 +618,7 @@ class SymbolConfig:
             config.optimized_at = datetime.fromisoformat(data['optimized_at'])
         if data.get('valid_until'):
             config.valid_until = datetime.fromisoformat(data['valid_until'])
+        config.regime_detection_version = data.get('regime_detection_version')
         
         # Load regime configs
         if 'regime_configs' in data and data['regime_configs']:
@@ -1326,7 +1354,7 @@ class RegimeOptimizer:
         # Validation thresholds (from fx_backtester config)
         self.val_max_drawdown = getattr(config, 'fx_val_max_drawdown', 20.0)
         self.val_min_sharpe_override = getattr(config, 'fx_val_sharpe_override', 0.3)
-        self.min_robustness_ratio = getattr(config, 'fx_min_robustness_ratio', 0.75)
+        self.min_robustness_ratio = getattr(config, 'fx_min_robustness_ratio', 0.85)
         
         # ===== PROFITABILITY GATES (FIX #1) =====
         # These prevent storing losing strategies as "regime winners"
@@ -1386,7 +1414,8 @@ class RegimeOptimizer:
         validated_winners = 0
         unvalidated_winners = 0
         
-        for tf, train_features in train_features_by_tf.items():
+        tf_iter = tqdm(train_features_by_tf.items(), desc=f"[{symbol}] Timeframes", unit="tf", leave=False) if _TQDM else train_features_by_tf.items()
+        for tf, train_features in tf_iter:
             val_features = val_features_by_tf.get(tf)
             
             if train_features is None or len(train_features) < 200:
@@ -2584,10 +2613,12 @@ class PortfolioManager:
                     for symbol in to_optimize
                 }
 
-                for future in as_completed(future_map):
+                future_iter = tqdm(as_completed(future_map), total=len(future_map), desc="Optimizing", unit="sym") if _TQDM else as_completed(future_map)
+                for future in future_iter:
                     symbol = future_map[future]
                     completed += 1
-                    logger.info(f"\nProgress: {completed}/{len(to_optimize)}")
+                    if not _TQDM:
+                        logger.info(f"\nProgress: {completed}/{len(to_optimize)}")
 
                     try:
                         sym, result = future.result()
@@ -2611,8 +2642,10 @@ class PortfolioManager:
             FeatureComputer.clear_cache()
         else:
             # Process symbols needing optimization sequentially
-            for i, symbol in enumerate(to_optimize):
-                logger.info(f"\nProgress: {i+1}/{len(to_optimize)}")
+            symbol_iter = tqdm(to_optimize, desc="Optimizing", unit="sym") if _TQDM else to_optimize
+            for i, symbol in enumerate(symbol_iter):
+                if not _TQDM:
+                    logger.info(f"\nProgress: {i+1}/{len(to_optimize)}")
                 
                 try:
                     result = self.pipeline.run_for_symbol(symbol)
