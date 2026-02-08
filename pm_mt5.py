@@ -960,12 +960,14 @@ class MT5Connector:
         """Normalize volume to valid lot size."""
         volume = max(symbol_info.volume_min, volume)
         volume = min(symbol_info.volume_max, volume)
-        
-        # Round to volume step
+
+        # Round to volume step (guard against broker returning 0)
         step = symbol_info.volume_step
+        if step <= 0:
+            step = 0.01
         volume = math.floor(volume / step) * step  # floor-to-step (risk-safe)
         volume = math.floor(volume * 100) / 100.0  # avoid rounding up
-        
+
         return volume
     
     

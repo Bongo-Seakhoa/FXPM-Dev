@@ -11,7 +11,15 @@
       "Bash(del EFFICIENCY_IMPROVEMENTS.md)",
       "Bash(del EFFICIENCY_ANALYSIS.md)",
       "Bash(del STATEFUL_OPTIMIZATION.md)",
-      "Bash(del GAP_FIXES_V34.md)"
+      "Bash(del GAP_FIXES_V34.md)",
+      "Bash(pip show:*)",
+      "Bash(where:*)",
+      "Bash(pip install:*)",
+      "Bash(find \"c:/Users/Bongo/OneDrive/Desktop/FxPM 1.4 - Obtimized/pm_outputs\" -name \"trades_*.json\" -type f -exec sh -c 'size=$\\(stat -c%s \"\"$1\"\" 2>/dev/null || wc -c < \"\"$1\"\"\\); if [ $size -gt 10 ]; then echo \"\"$1: $size bytes\"\"; fi' _ {} ;)",
+      "Bash(ls:*)",
+      "Bash(pytest:*)",
+      "Bash(set:*)",
+      "Bash(git status:*)"
     ]
   }
 }

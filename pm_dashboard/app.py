@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -11,7 +12,31 @@ from .utils import load_dashboard_config, save_dashboard_config
 from .watcher import DashboardState, DashboardWatcher
 from .utils import parse_timestamp
 from .utils import load_instrument_specs
-from .analytics import build_analytics_payload, load_trade_history
+from .analytics import (
+    build_analytics_payload,
+    load_trade_history,
+    reconstruct_trade_outcomes,
+    compute_equity_curve,
+    compute_drawdown_curve,
+    compute_performance_metrics
+)
+
+logger = logging.getLogger(__name__)
+
+# Try to import data jobs (optional dependency)
+try:
+    from .jobs import initialize_data_jobs
+    JOBS_AVAILABLE = True
+except ImportError:
+    JOBS_AVAILABLE = False
+    logger.warning("Data jobs module not available - simulation features disabled")
+
+# Try to import MT5 connector
+try:
+    from pm_mt5 import MT5Connector, MT5_AVAILABLE
+except ImportError:
+    MT5_AVAILABLE = False
+    MT5Connector = None
 
 
 def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flask:
@@ -30,6 +55,30 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
     app.config["dashboard_watcher"] = watcher
     app.config["dashboard_config"] = config
     app.config["dashboard_config_path"] = config_path
+
+    # Initialize MT5 connector and data jobs (optional)
+    mt5_connector = None
+    data_downloader = None
+    data_scheduler = None
+
+    if MT5_AVAILABLE and JOBS_AVAILABLE:
+        try:
+            mt5_connector = MT5Connector()
+            if mt5_connector.connect():
+                logger.info("MT5 connector initialized for data downloads")
+                data_downloader, data_scheduler = initialize_data_jobs(
+                    pm_root,
+                    mt5_connector,
+                    enable_scheduler=False  # Manual control for now
+                )
+                app.config["data_downloader"] = data_downloader
+                app.config["data_scheduler"] = data_scheduler
+            else:
+                logger.warning("Failed to connect MT5 - data download features disabled")
+        except Exception as e:
+            logger.error(f"Failed to initialize MT5/data jobs: {e}")
+    else:
+        logger.info("MT5 or jobs not available - simulation features will be limited")
 
     @app.route("/")
     def index() -> str:
@@ -109,6 +158,152 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
             })
 
         return jsonify({"trades": filtered_trades, "total": len(trades)})
+
+    @app.route("/api/simulate", methods=["POST"])
+    def api_simulate() -> Any:
+        """
+        Simulate trade outcomes with historical data reconstruction.
+
+        Request body:
+            - initial_capital: Starting capital (default: 10000)
+            - start_date: Start date for simulation (ISO format)
+            - end_date: End date for simulation (ISO format)
+            - return_basis: "dollar", "pip", or "trade" (default: "dollar")
+            - max_trades: Max trades to simulate (default: 1000)
+        """
+        pm_root = config.get("pm_root") or ""
+        data_downloader = app.config.get("data_downloader")
+
+        payload = request.get_json(silent=True) or {}
+
+        initial_capital = float(payload.get("initial_capital", 10000.0))
+        start_date_str = payload.get("start_date")
+        end_date_str = payload.get("end_date")
+        return_basis = payload.get("return_basis", "dollar")
+        max_trades = int(payload.get("max_trades", 1000))
+
+        # Parse dates
+        start_date = parse_timestamp(start_date_str) if start_date_str else None
+        end_date = parse_timestamp(end_date_str) if end_date_str else datetime.now()
+
+        # Load trades
+        all_trades = load_trade_history(pm_root, max_files=100)
+
+        if not all_trades:
+            return jsonify({
+                "success": False,
+                "error": "No trade data available",
+                "trades": [],
+                "metrics": {},
+                "equity_curve": [],
+                "drawdown_curve": []
+            })
+
+        # Filter by date range
+        if start_date:
+            filtered_trades = [
+                t for t in all_trades
+                if t.get("_parsed_timestamp") and start_date <= t["_parsed_timestamp"] <= end_date
+            ]
+        else:
+            filtered_trades = all_trades
+
+        # Check if data downloader is available
+        if not data_downloader:
+            logger.warning("Data downloader not available - returning existing trade data")
+            # Use existing PnL data if available
+            metrics = compute_performance_metrics(filtered_trades[:max_trades], initial_capital)
+            equity_curve = compute_equity_curve(filtered_trades[:max_trades], initial_capital)
+            drawdown_curve = compute_drawdown_curve(equity_curve)
+
+            return jsonify({
+                "success": True,
+                "simulated": False,
+                "message": "Using existing trade data (MT5 not available for simulation)",
+                "trades": filtered_trades[:50],  # Return first 50 for display
+                "metrics": metrics,
+                "equity_curve": equity_curve,
+                "drawdown_curve": drawdown_curve,
+                "total_trades": len(filtered_trades)
+            })
+
+        # Define data loader function for reconstruction
+        def load_historical_data(symbol, timeframe, start, end):
+            return data_downloader.load_historical_data(symbol, timeframe, start, end)
+
+        # Reconstruct trade outcomes
+        logger.info(f"Reconstructing {len(filtered_trades)} trade outcomes...")
+        reconstructed_trades = reconstruct_trade_outcomes(
+            filtered_trades,
+            load_historical_data,
+            max_trades=max_trades
+        )
+
+        if not reconstructed_trades:
+            return jsonify({
+                "success": False,
+                "error": "Failed to reconstruct any trades (missing historical data)",
+                "trades": [],
+                "metrics": {},
+                "equity_curve": [],
+                "drawdown_curve": []
+            })
+
+        # Calculate metrics based on return_basis
+        if return_basis == "pip":
+            # Convert PnL to pips
+            for trade in reconstructed_trades:
+                trade["pnl"] = trade.get("pnl_pips", 0)
+        elif return_basis == "trade":
+            # Binary: +1 for win, -1 for loss
+            for trade in reconstructed_trades:
+                pnl = trade.get("pnl", 0)
+                trade["pnl"] = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
+
+        # Compute metrics
+        metrics = compute_performance_metrics(reconstructed_trades, initial_capital)
+        equity_curve = compute_equity_curve(reconstructed_trades, initial_capital)
+        drawdown_curve = compute_drawdown_curve(equity_curve)
+
+        return jsonify({
+            "success": True,
+            "simulated": True,
+            "message": f"Reconstructed {len(reconstructed_trades)} trades",
+            "trades": reconstructed_trades[:50],  # Return first 50 for display
+            "metrics": metrics,
+            "equity_curve": equity_curve,
+            "drawdown_curve": drawdown_curve,
+            "total_trades": len(reconstructed_trades),
+            "return_basis": return_basis
+        })
+
+    @app.route("/api/download_historical_data", methods=["POST"])
+    def api_download_historical_data() -> Any:
+        """Trigger manual historical data download."""
+        data_scheduler = app.config.get("data_scheduler")
+
+        if not data_scheduler:
+            return jsonify({
+                "success": False,
+                "error": "Data scheduler not available (MT5 not connected)"
+            })
+
+        try:
+            # Run download in background
+            import threading
+            thread = threading.Thread(target=data_scheduler.run_now, daemon=True)
+            thread.start()
+
+            return jsonify({
+                "success": True,
+                "message": "Historical data download started"
+            })
+        except Exception as e:
+            logger.error(f"Failed to start data download: {e}")
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            })
 
     return app
 

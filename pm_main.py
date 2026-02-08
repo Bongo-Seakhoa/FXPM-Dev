@@ -39,7 +39,7 @@ import threading
 import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field, fields
 
 import pandas as pd
@@ -627,9 +627,65 @@ class LiveTrader:
         self._cache_hits = 0
         self._cache_misses = 0
         self._max_cache_size = 100  # Limit cache to prevent memory bloat
-        
+
         self.logger = logging.getLogger(__name__)
-    
+
+        # === MT5 SPEC SYNCHRONIZATION ===
+        # Update InstrumentSpec with live MT5 values for accurate position sizing
+        if self.mt5 and self.mt5.is_connected():
+            self.logger.info("Synchronizing instrument specs from MT5...")
+
+            sync_count = 0
+            fail_count = 0
+
+            for symbol in self.pm.symbols:
+                broker_symbol = self.mt5.find_broker_symbol(symbol)
+
+                if not broker_symbol:
+                    self.logger.warning(f"[{symbol}] Broker symbol not found, using config values")
+                    fail_count += 1
+                    continue
+
+                mt5_info = self.mt5.get_symbol_info(broker_symbol)
+
+                if not mt5_info:
+                    self.logger.warning(f"[{symbol}] MT5 info not available, using config values")
+                    fail_count += 1
+                    continue
+
+                # Get spec and sync
+                spec = self.pm.get_instrument_spec(symbol)
+
+                # Store original values for comparison
+                orig_tick_value = spec.tick_value
+                orig_volume_step = spec.volume_step
+                orig_spread = spec.spread_avg
+
+                # Sync from MT5
+                from pm_core import sync_instrument_spec_from_mt5
+                sync_instrument_spec_from_mt5(spec, mt5_info)
+
+                # Log changes
+                self.logger.info(
+                    f"[{symbol}] Synced from MT5: "
+                    f"tick_value={spec.tick_value:.4f} (was {orig_tick_value:.4f}), "
+                    f"volume_step={spec.volume_step} (was {orig_volume_step}), "
+                    f"spread={spec.spread_avg:.1f}pips (was {orig_spread:.1f}pips), "
+                    f"min_lot={spec.min_lot}, max_lot={spec.max_lot}"
+                )
+
+                sync_count += 1
+
+            self.logger.info(
+                f"MT5 spec sync complete: {sync_count} synced, {fail_count} failed/unavailable"
+            )
+        else:
+            self.logger.warning(
+                "MT5 not connected, using config.json instrument specs "
+                "(may be inaccurate for cross pairs and crypto)"
+            )
+        # === END SYNCHRONIZATION ===
+
     def _prune_cache(self):
         """Prune cache if it exceeds max size (LRU-style, just clear oldest)."""
         if len(self._candidate_cache) > self._max_cache_size:
@@ -649,7 +705,160 @@ class LiveTrader:
             'hit_rate_pct': round(hit_rate, 1),
             'cache_size': len(self._candidate_cache),
         }
-    
+
+    def _log_no_actionable_signal(self, symbol: str, message: str,
+                                   best_candidate: Dict, bar_time_iso: str,
+                                   action_type: str) -> None:
+        """
+        Log no actionable signal with throttle suppression to prevent duplicate logs.
+
+        This helper prevents log spam when the same no-signal decision occurs
+        multiple times within the same bar (common in high-frequency tick scenarios).
+
+        Args:
+            symbol: Trading symbol
+            message: Log message to display
+            best_candidate: Dictionary containing candidate info (strategy_name, timeframe, regime)
+            bar_time_iso: Bar time in ISO format
+            action_type: Action type for throttle record (e.g., "NO_ACTIONABLE_WINNER_SIGNAL")
+        """
+        # Build decision key with direction=0 for no-signal cases
+        dk = DecisionThrottle.make_decision_key(
+            symbol,
+            best_candidate.get('strategy_name', 'UNKNOWN'),
+            best_candidate.get('timeframe', '?'),
+            best_candidate.get('regime', '?'),
+            0,  # direction=0 is correct for no-signal
+            bar_time_iso
+        )
+
+        # Check if we should suppress this log (already logged in this bar)
+        if self._decision_throttle.should_suppress(symbol, dk, bar_time_iso):
+            return  # Silent return - already logged this decision for this bar
+
+        # Log the message
+        self.logger.debug(f"[{symbol}] {message}")
+
+        # Record the decision in throttle
+        self._decision_throttle.record_decision(
+            symbol=symbol,
+            decision_key=dk,
+            bar_time_iso=bar_time_iso,
+            timeframe=best_candidate.get('timeframe', '?'),
+            regime=best_candidate.get('regime', '?'),
+            strategy_name=best_candidate.get('strategy_name', 'UNKNOWN'),
+            direction=0,
+            action=action_type,
+        )
+
+    def _check_portfolio_risk_cap(self, symbol: str, new_trade_risk_pct: float,
+                                   broker_symbol: str) -> Tuple[bool, str]:
+        """
+        Enforce max_combined_risk_pct across all open positions on this symbol.
+        Handles D1 + lower TF scenario where multiple orders on same symbol exist.
+
+        Args:
+            symbol: Canonical symbol (e.g., "EURUSD")
+            new_trade_risk_pct: Risk % for proposed new trade
+            broker_symbol: Broker-specific symbol (e.g., "EURUSD.a")
+
+        Returns:
+            (can_trade: bool, reason: str)
+        """
+        from pm_position import TradeTagEncoder
+
+        # Get max combined risk from config (defaults to 3.0%)
+        max_combined = float(getattr(self.pipeline_config, 'max_combined_risk_pct', 3.0))
+
+        # Get current equity
+        account_info = self.mt5.get_account_info()
+        if not account_info:
+            return False, "Cannot get account info"
+
+        equity = account_info.equity
+        if equity <= 0:
+            return False, "Zero equity"
+
+        # Sum existing risk for THIS SYMBOL across all timeframes
+        existing_risk_pct = 0.0
+        position_details = []
+
+        # Get all positions for this broker symbol
+        positions = self.mt5.get_positions(symbol=broker_symbol)
+
+        for pos in positions:
+            # Decode metadata from comment
+            comment = getattr(pos, 'comment', '') or ''
+
+            # Skip if not our position (no PM comment prefix)
+            if not (comment.startswith('PM1:') or comment.startswith('PM2:') or
+                    comment.startswith('PM3:')):
+                continue
+
+            metadata = TradeTagEncoder.decode_comment(comment)
+
+            if metadata:
+                # Verify same canonical symbol
+                pos_symbol = metadata.get('symbol', '')
+                if pos_symbol == symbol:
+                    pos_risk_pct = metadata.get('risk_pct', 0.0)
+                    pos_tf = metadata.get('timeframe', '?')
+                    pos_direction = metadata.get('direction', '?')
+
+                    existing_risk_pct += pos_risk_pct
+
+                    position_details.append({
+                        'timeframe': pos_tf,
+                        'direction': pos_direction,
+                        'risk_pct': pos_risk_pct,
+                        'ticket': pos.ticket
+                    })
+
+                    self.logger.debug(
+                        f"[{symbol}] Open position: {pos_tf} {pos_direction} "
+                        f"risk={pos_risk_pct:.2f}% (ticket={pos.ticket})"
+                    )
+            else:
+                # Fallback: estimate risk if comment unreadable
+                # Calculate from position size * SL distance
+                sl = getattr(pos, 'sl', 0)
+                entry = getattr(pos, 'price_open', 0)
+                volume = getattr(pos, 'volume', 0)
+
+                if sl > 0 and entry > 0 and volume > 0:
+                    spec = self.pm.get_instrument_spec(symbol)
+                    sl_pips = abs(entry - sl) / spec.pip_size
+                    risk_amount = sl_pips * spec.pip_value * volume
+                    pos_risk_pct = (risk_amount / equity) * 100
+
+                    existing_risk_pct += pos_risk_pct
+
+                    self.logger.warning(
+                        f"[{symbol}] Could not decode comment for ticket {pos.ticket}, "
+                        f"estimated risk={pos_risk_pct:.2f}%"
+                    )
+
+        # Check if new trade would breach cap FOR THIS SYMBOL
+        total_risk_pct = existing_risk_pct + new_trade_risk_pct
+
+        if total_risk_pct > max_combined:
+            details_str = ', '.join(
+                f"{p['timeframe']}:{p['direction']}={p['risk_pct']:.2f}%"
+                for p in position_details
+            )
+
+            return False, (
+                f"Symbol risk cap exceeded for {symbol}: "
+                f"existing {existing_risk_pct:.2f}% ({len(position_details)} positions: {details_str}) + "
+                f"new {new_trade_risk_pct:.2f}% = {total_risk_pct:.2f}% > "
+                f"max {max_combined:.2f}%"
+            )
+
+        return True, (
+            f"Symbol risk OK for {symbol}: {total_risk_pct:.2f}% / {max_combined:.2f}% "
+            f"({len(position_details)} open positions, adding 1 new)"
+        )
+
     def start(self):
         """Start the trading loop."""
         self._running = True
@@ -875,34 +1084,20 @@ class LiveTrader:
         )
         
         if not actionable:
-        
+
             # No actionable winner signals on any timeframe for this bar.
-        
+            # Use helper to prevent duplicate log spam within same bar.
+
             bar_time_iso = str(best_overall.get('bar_time', ''))
-        
-            dk = DecisionThrottle.make_decision_key(
-        
-                symbol, best_overall['strategy_name'], best_overall['timeframe'],
-        
-                best_overall['regime'], 0, bar_time_iso
-        
-            )
-        
-            self._decision_throttle.record_decision(
-        
-                symbol=symbol, decision_key=dk,
-        
+
+            self._log_no_actionable_signal(
+                symbol=symbol,
+                message="NO_ACTIONABLE_WINNER_SIGNAL (no actionable winners)",
+                best_candidate=best_overall,
                 bar_time_iso=bar_time_iso,
-        
-                timeframe=best_overall['timeframe'], regime=best_overall['regime'],
-        
-                strategy_name=best_overall['strategy_name'], direction=0,
-        
-                action="NO_ACTIONABLE_WINNER_SIGNAL",
-        
+                action_type="NO_ACTIONABLE_WINNER_SIGNAL"
             )
-            self.logger.debug(f"[{symbol}] NO_ACTIONABLE_WINNER_SIGNAL (no actionable winners)")
-        
+
             return
 
         
@@ -911,34 +1106,20 @@ class LiveTrader:
         eligible = [c for c in actionable if float(c.get('selection_score', 0.0)) >= min_score]
         
         if not eligible:
-        
+
             # There were signals, but none were close enough to the best overall score.
-        
+            # Use helper to prevent duplicate log spam within same bar.
+
             bar_time_iso = str(best_overall.get('bar_time', ''))
-        
-            dk = DecisionThrottle.make_decision_key(
-        
-                symbol, best_overall['strategy_name'], best_overall['timeframe'],
-        
-                best_overall['regime'], 0, bar_time_iso
-        
-            )
-        
-            self._decision_throttle.record_decision(
-        
-                symbol=symbol, decision_key=dk,
-        
+
+            self._log_no_actionable_signal(
+                symbol=symbol,
+                message="NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN (actionable below margin)",
+                best_candidate=best_overall,
                 bar_time_iso=bar_time_iso,
-        
-                timeframe=best_overall['timeframe'], regime=best_overall['regime'],
-        
-                strategy_name=best_overall['strategy_name'], direction=0,
-        
-                action="NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
-        
+                action_type="NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN"
             )
-            self.logger.debug(f"[{symbol}] NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN (actionable below margin)")
-        
+
             return
 
         
@@ -1578,6 +1759,38 @@ class LiveTrader:
                 actual_risk_pct_value=actual_risk_pct,
             )
             return
+
+        # ===== PORTFOLIO RISK CAP CHECK (Multi-Timeframe) =====
+        # Check if adding this trade would exceed max_combined_risk_pct for this symbol
+        # This applies to ALL trades (not just secondary), preventing excessive exposure
+        # when multiple positions exist on same symbol across different timeframes
+        broker_symbol = self.mt5.find_broker_symbol(symbol)
+        if not broker_symbol:
+            self.logger.error(f"[{symbol}] Cannot find broker symbol")
+            _record_throttle("SKIPPED_NO_BROKER_SYMBOL")
+            return
+
+        can_trade, risk_reason = self._check_portfolio_risk_cap(
+            symbol,
+            actual_risk_pct,  # Use actual risk (post-normalization) not target
+            broker_symbol
+        )
+
+        if not can_trade:
+            self.logger.warning(f"[{symbol}] {risk_reason}")
+            _record_throttle('BLOCKED_SYMBOL_RISK_CAP')
+            _record_actionable(
+                action="BLOCKED_SYMBOL_RISK_CAP",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+            )
+            return
+
+        self.logger.info(f"[{symbol}] {risk_reason}")
 
         # Log risk details for auditability
         self.logger.info(

@@ -2,7 +2,9 @@
 
 var analyticsState = {
   data: null,
-  charts: {}
+  charts: {},
+  simulatedData: null,
+  currentReturnBasis: 'dollar'
 };
 
 var chartColors = {
@@ -720,11 +722,124 @@ function exportToCSV() {
   PMCommon.showToast('CSV exported');
 }
 
+function runSimulation() {
+  var capital = parseFloat(document.getElementById('sim-capital').value) || 10000;
+  var startDate = document.getElementById('sim-start-date').value;
+  var endDate = document.getElementById('sim-end-date').value;
+  var returnBasis = document.getElementById('sim-return-basis').value || 'dollar';
+  var statusEl = document.getElementById('sim-status');
+  var simBtn = document.getElementById('simulate-btn');
+
+  if (statusEl) statusEl.textContent = 'Running simulation...';
+  if (simBtn) simBtn.disabled = true;
+
+  var payload = {
+    initial_capital: capital,
+    start_date: startDate || null,
+    end_date: endDate || null,
+    return_basis: returnBasis,
+    max_trades: 1000
+  };
+
+  fetch('/api/simulate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+    .then(function(response) { return response.json(); })
+    .then(function(data) {
+      if (simBtn) simBtn.disabled = false;
+
+      if (!data.success) {
+        if (statusEl) statusEl.textContent = 'Error: ' + (data.error || 'Unknown error');
+        PMCommon.showToast('Simulation failed: ' + (data.error || 'Unknown error'));
+        return;
+      }
+
+      if (statusEl) {
+        statusEl.textContent = data.message + ' (' + data.total_trades + ' trades)';
+      }
+
+      // Store simulated data
+      analyticsState.simulatedData = data;
+      analyticsState.currentReturnBasis = returnBasis;
+
+      // Update dashboard with simulated results
+      renderKPIs(data.metrics);
+      renderEquityChart(data.equity_curve);
+      renderDrawdownChart(data.drawdown_curve);
+      renderTradeStats(data.metrics);
+
+      if (data.trades && data.trades.length > 0) {
+        renderRecentTrades(data.trades);
+      }
+
+      PMCommon.showToast('Simulation complete: ' + data.total_trades + ' trades');
+    })
+    .catch(function(err) {
+      if (simBtn) simBtn.disabled = false;
+      if (statusEl) statusEl.textContent = 'Error: ' + err.message;
+      console.error('Simulation error:', err);
+      PMCommon.showToast('Simulation failed');
+    });
+}
+
+function downloadHistoricalData() {
+  var statusEl = document.getElementById('sim-status');
+  var downloadBtn = document.getElementById('download-data-btn');
+
+  if (statusEl) statusEl.textContent = 'Starting data download...';
+  if (downloadBtn) downloadBtn.disabled = true;
+
+  fetch('/api/download_historical_data', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  })
+    .then(function(response) { return response.json(); })
+    .then(function(data) {
+      if (downloadBtn) downloadBtn.disabled = false;
+
+      if (data.success) {
+        if (statusEl) statusEl.textContent = data.message || 'Download started';
+        PMCommon.showToast('Historical data download started (may take a few minutes)');
+      } else {
+        if (statusEl) statusEl.textContent = 'Error: ' + (data.error || 'Unknown error');
+        PMCommon.showToast('Download failed: ' + (data.error || 'Unknown error'));
+      }
+    })
+    .catch(function(err) {
+      if (downloadBtn) downloadBtn.disabled = false;
+      if (statusEl) statusEl.textContent = 'Error: ' + err.message;
+      console.error('Download error:', err);
+      PMCommon.showToast('Download failed');
+    });
+}
+
+function setDefaultDates() {
+  var today = new Date();
+  var oneMonthAgo = new Date();
+  oneMonthAgo.setMonth(today.getMonth() - 1);
+
+  var endDateEl = document.getElementById('sim-end-date');
+  var startDateEl = document.getElementById('sim-start-date');
+
+  if (endDateEl && !endDateEl.value) {
+    endDateEl.value = today.toISOString().split('T')[0];
+  }
+
+  if (startDateEl && !startDateEl.value) {
+    startDateEl.value = oneMonthAgo.toISOString().split('T')[0];
+  }
+}
+
 function init() {
   PMCommon.initTheme();
   PMCommon.onThemeChange(function() { updateAllCharts(); });
   PMCommon.initScrollToTop();
   fetchAnalytics();
+
+  // Set default dates
+  setDefaultDates();
 
   var refreshBtn = document.getElementById('refresh-btn');
   if (refreshBtn) {
@@ -734,6 +849,27 @@ function init() {
   var exportBtn = document.getElementById('export-btn');
   if (exportBtn) {
     exportBtn.addEventListener('click', exportToCSV);
+  }
+
+  var simulateBtn = document.getElementById('simulate-btn');
+  if (simulateBtn) {
+    simulateBtn.addEventListener('click', runSimulation);
+  }
+
+  var downloadDataBtn = document.getElementById('download-data-btn');
+  if (downloadDataBtn) {
+    downloadDataBtn.addEventListener('click', downloadHistoricalData);
+  }
+
+  // Return basis selector change
+  var returnBasisSelect = document.getElementById('sim-return-basis');
+  if (returnBasisSelect) {
+    returnBasisSelect.addEventListener('change', function() {
+      if (analyticsState.simulatedData) {
+        // Re-run simulation with new basis if we have simulated data
+        PMCommon.showToast('Changing return basis - please re-run simulation');
+      }
+    });
   }
 }
 

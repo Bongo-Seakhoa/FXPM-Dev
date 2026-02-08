@@ -999,9 +999,10 @@ class HyperparameterOptimizer:
                         "train_metrics": train_metrics,
                         "train_score": train_score
                     })
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[{symbol}] Grid opt {strategy_name} combo failed: {e}")
                     continue
-            
+
             if not candidates:
                 candidates.append({
                     "params": dict(default_params),
@@ -1027,9 +1028,10 @@ class HyperparameterOptimizer:
                     try:
                         signals = test_strategy.generate_signals(train_features, symbol)
                         train_metrics = self.backtester.run(train_features, signals, symbol, test_strategy)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"[{symbol}] Val-shortlist train {strategy_name} failed: {e}")
                         continue
-                
+
                 if val_features is None or len(val_features) < 50:
                     val_metrics = {'total_return_pct': 0.0, 'sharpe_ratio': 0.0,
                                    'max_drawdown_pct': 0.0, 'total_trades': 0}
@@ -1037,7 +1039,8 @@ class HyperparameterOptimizer:
                     try:
                         signals = test_strategy.generate_signals(val_features, symbol)
                         val_metrics = self.backtester.run(val_features, signals, symbol, test_strategy)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"[{symbol}] Val-shortlist val {strategy_name} failed: {e}")
                         continue
                 
                 val_trades = int(val_metrics.get("total_trades", 0))
@@ -1210,8 +1213,8 @@ class RetrainPeriodSelector:
                 
                 try:
                     # OPTIMIZATION: Slice from precomputed features instead of recomputing
-                    train_features = full_features.iloc[train_start:train_end]
-                    test_features = full_features.iloc[start:test_end]
+                    train_features = full_features.iloc[train_start:train_end].copy()
+                    test_features = full_features.iloc[start:test_end].copy()
                     
                     strategy = StrategyRegistry.get(strategy_name, **params)
                     
@@ -1223,9 +1226,10 @@ class RetrainPeriodSelector:
                     if metrics.get('total_trades', 0) >= self.config.min_trades and score is not None:
                         scores.append(score)
                 
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[{symbol}] Walk-forward window {strategy_name} failed: {e}")
                     continue
-            
+
             if scores:
                 avg_score = np.mean(scores)
                 # Need at least 2 scores for meaningful std calculation
@@ -1443,27 +1447,27 @@ class RegimeOptimizer:
                 best_config, is_valid, val_reason = self._select_best_for_regime(
                     symbol, tf, regime, tf_candidates
                 )
-                
+
                 if best_config is not None:
                     # Only include validated winners (or all if validation disabled)
                     if is_valid:
                         regime_configs[tf][regime] = best_config
                         validated_winners += 1
-                        
+
                         # Track best overall (only from validated)
                         if best_config.quality_score > best_overall_score:
                             best_overall_score = best_config.quality_score
                             best_overall_config = best_config
-                        
+
                         # Check if this was a tuned candidate
                         is_tuned = any(
-                            c.get('is_tuned', False) and 
+                            c.get('is_tuned', False) and
                             c['strategy_name'] == best_config.strategy_name and
                             c['params'] == best_config.parameters
                             for c in tf_candidates
                         )
                         tuned_tag = " [TUNED]" if is_tuned else ""
-                        
+
                         logger.info(f"[{symbol}] [{tf}] [{regime}] Winner: {best_config.strategy_name}{tuned_tag} "
                                    f"(quality={best_config.quality_score:.3f}, "
                                    f"train={best_config.regime_train_trades}, "
@@ -1473,9 +1477,82 @@ class RegimeOptimizer:
                         unvalidated_winners += 1
                         logger.debug(f"[{symbol}] [{tf}] [{regime}] Candidate {best_config.strategy_name} "
                                     f"FAILED validation: {val_reason}")
+                else:
+                    # NO WINNER - No fallback to best train
+                    unvalidated_winners += 1
+                    logger.warning(
+                        f"[{symbol}] [{tf}] [{regime}] No validated winner - {val_reason}. "
+                        f"NO TRADE for this regime (no fallback to best train)."
+                    )
         
         return regime_configs, best_overall_config, validated_winners, unvalidated_winners
-    
+
+    def _apply_training_eligibility_gates(self,
+                                          candidates: List[Dict[str, Any]],
+                                          symbol: str,
+                                          timeframe: str) -> List[Dict[str, Any]]:
+        """
+        Hard thresholds that strategies must pass on TRAINING data before screening.
+        Prevents "obviously bad" strategies from entering the optimization pool.
+
+        This is applied BEFORE hyperparameter tuning to save compute on losing strategies.
+
+        Checks (applied to full training backtest, NOT regime buckets):
+        - train_min_profit_factor: Default 0.95 (nearly breakeven)
+        - train_min_return_pct: Default 0.0% (non-negative)
+        - train_max_drawdown: Default 40.0% (not catastrophic)
+
+        Args:
+            candidates: List of candidate dicts from screening
+            symbol: Symbol name for logging
+            timeframe: Timeframe for logging
+
+        Returns:
+            Filtered list of eligible candidates
+        """
+        eligible = []
+        rejected_reasons = []
+
+        # Get configurable thresholds
+        train_pf_floor = float(getattr(self.config, 'train_min_profit_factor', 0.95))
+        train_return_floor = float(getattr(self.config, 'train_min_return_pct', 0.0))
+        train_dd_ceiling = float(getattr(self.config, 'train_max_drawdown', 40.0))
+
+        for cand in candidates:
+            # Use FULL training metrics (not regime buckets)
+            train_result = cand.get('train_result', {})
+
+            train_pf = float(train_result.get('profit_factor', 0))
+            train_return = float(train_result.get('total_return_pct', 0))
+            train_dd = float(train_result.get('max_drawdown_pct', 100))
+
+            # Check training eligibility
+            rejected = False
+            reason = None
+
+            if train_pf < train_pf_floor:
+                rejected = True
+                reason = f"train PF {train_pf:.2f} < {train_pf_floor}"
+            elif train_return < train_return_floor:
+                rejected = True
+                reason = f"train return {train_return:.1f}% < {train_return_floor}"
+            elif train_dd > train_dd_ceiling:
+                rejected = True
+                reason = f"train DD {train_dd:.1f}% > {train_dd_ceiling}"
+
+            if rejected:
+                rejected_reasons.append(f"{cand['strategy_name']}: {reason}")
+            else:
+                eligible.append(cand)
+
+        if rejected_reasons:
+            logger.info(
+                f"[{symbol}] [{timeframe}] Training eligibility rejected {len(rejected_reasons)}/{len(candidates)}: "
+                f"{rejected_reasons[:3]}{'...' if len(rejected_reasons) > 3 else ''}"
+            )
+
+        return eligible
+
     def _collect_candidates(self,
                             symbol: str,
                             timeframe: str,
@@ -1536,14 +1613,29 @@ class RegimeOptimizer:
             except Exception as e:
                 logger.debug(f"[{symbol}] [{timeframe}] {strategy.name} failed: {e}")
                 continue
-        
+
+        # ===== NEW: Apply training eligibility gates =====
+        # Filter out strategies that are "obviously bad" on training data
+        # This saves compute by avoiding hyperparameter tuning on losing strategies
+        eligible_candidates = self._apply_training_eligibility_gates(
+            screening_candidates, symbol, timeframe
+        )
+
+        if not eligible_candidates:
+            logger.warning(
+                f"[{symbol}] [{timeframe}] No strategies passed training eligibility gates. "
+                f"All {len(screening_candidates)} candidates rejected. Skipping optimization."
+            )
+            return []  # Return empty list - no candidates to optimize
+
         if not self.enable_hyperparam_tuning:
-            return screening_candidates
-        
+            return eligible_candidates
+
         # Phase 2: Hyperparameter tuning for top-K strategies per regime
         # Identify top-K strategies for each regime based on screening scores
+        # Use ELIGIBLE candidates (post-gates) instead of all screening candidates
         regime_top_strategies = self._identify_top_strategies_per_regime(
-            screening_candidates, top_k=self.hyperparam_top_k
+            eligible_candidates, top_k=self.hyperparam_top_k
         )
         
         # Collect all unique strategies that need tuning
@@ -1553,36 +1645,36 @@ class RegimeOptimizer:
         
         if not strategies_to_tune:
             logger.debug(f"[{symbol}] [{timeframe}] No strategies eligible for hyperparameter tuning")
-            return screening_candidates
-        
+            return eligible_candidates
+
         logger.info(f"[{symbol}] [{timeframe}] Hyperparameter tuning {len(strategies_to_tune)} strategies")
-        
+
         # Run hyperparameter tuning for each strategy
         tuned_candidates = []
         for strategy_name in strategies_to_tune:
-            # Find the original strategy from screening
-            original_cand = next((c for c in screening_candidates if c['strategy_name'] == strategy_name), None)
+            # Find the original strategy from eligible candidates (post-gates)
+            original_cand = next((c for c in eligible_candidates if c['strategy_name'] == strategy_name), None)
             if original_cand is None:
                 continue
-            
+
             # Get param grid
             param_grid = original_cand['strategy'].get_param_grid()
             if not param_grid:
                 # No params to tune, keep original
                 continue
-            
+
             # Run grid search
             tuned_results = self._tune_strategy_params(
                 symbol, timeframe, strategy_name, param_grid,
                 train_features, val_features
             )
-            
+
             tuned_candidates.extend(tuned_results)
-        
-        # Combine screening candidates with tuned candidates
+
+        # Combine eligible candidates with tuned candidates
         # The tuned candidates may replace or augment the defaults
-        all_candidates = screening_candidates + tuned_candidates
-        
+        all_candidates = eligible_candidates + tuned_candidates
+
         return all_candidates
     
     def _identify_top_strategies_per_regime(self,
@@ -1959,7 +2051,7 @@ class RegimeOptimizer:
         
         # Validate the winner using fx_backtester rules
         is_validated, validation_reason = self._validate_regime_winner(
-            train_metrics, val_metrics, regime
+            train_metrics, val_metrics, regime, best_candidate['strategy_name']
         )
         
         # Normalize quality score to 0-1 using sigmoid mapping
@@ -1984,17 +2076,33 @@ class RegimeOptimizer:
     def _validate_regime_winner(self,
                                  train_metrics: Dict[str, Any],
                                  val_metrics: Dict[str, Any],
-                                 regime: str) -> Tuple[bool, str]:
+                                 regime: str,
+                                 candidate_name: str = "Unknown") -> Tuple[bool, str]:
         """
         Validate a regime winner against fx_backtester thresholds.
-        
+
+        NEW: Supports weak train exception - allows train PF < 1.0 or train return < 0
+        ONLY if validation is exceptional (configurable thresholds).
+
         Checks (ALL enforced unless allow_losing_winners=True):
         - Validation trade count >= fx_val_min_trades
         - Validation drawdown < fx_val_max_drawdown
         - Validation profit_factor >= regime_min_val_profit_factor (default 1.0)
         - Validation return_pct >= regime_min_val_return_pct (default 0.0)
         - Robustness ratio >= fx_min_robustness_ratio OR val_sharpe > override
-        
+
+        Exception for weak train:
+        - If train PF < 1.0 OR train return < 0, require:
+          - val_pf >= exceptional_val_profit_factor (default 1.3)
+          - val_return >= exceptional_val_return_pct (default 2.0%)
+          - val_trades >= 2x min_val_trades
+
+        Args:
+            train_metrics: Training regime bucket metrics
+            val_metrics: Validation regime bucket metrics
+            regime: Regime name for logging
+            candidate_name: Strategy name for logging
+
         Returns:
             (is_valid, reason)
         """
@@ -2003,29 +2111,63 @@ class RegimeOptimizer:
         val_drawdown = val_metrics.get('max_drawdown_pct', 100.0)  # Default to worst-case
         val_pf = val_metrics.get('profit_factor', 0.0)
         val_return = val_metrics.get('total_return_pct', -100.0)
-        
+
+        train_pf = train_metrics.get('profit_factor', 0.0)
+        train_return = train_metrics.get('total_return_pct', -100.0)
+
         # Check minimum validation trades
         if val_trades < self.min_val_trades:
             return False, f"Insufficient val trades: {val_trades} < {self.min_val_trades}"
-        
+
         # ===== FIX #1: Check validation drawdown =====
         if val_drawdown > self.val_max_drawdown:
             return False, f"Excessive val drawdown: {val_drawdown:.1f}% > {self.val_max_drawdown}%"
-        
+
         # Also check training drawdown as early rejection
         train_drawdown = train_metrics.get('max_drawdown_pct', 100.0)
         # Allow slightly higher train DD (1.25x) since we expect some overfitting
         train_dd_threshold = self.val_max_drawdown * 1.25
         if train_drawdown > train_dd_threshold:
             return False, f"Excessive train drawdown: {train_drawdown:.1f}% > {train_dd_threshold:.1f}%"
-        
+
+        # ===== NEW: Weak Train Exception =====
+        # Check if training was weak (losing on train data)
+        weak_train = train_pf < 1.0 or train_return < 0
+
+        if weak_train:
+            # Require EXCEPTIONAL validation to allow weak train
+            exceptional_val_pf = float(getattr(self.config, 'exceptional_val_profit_factor', 1.3))
+            exceptional_val_return = float(getattr(self.config, 'exceptional_val_return_pct', 2.0))
+            exceptional_val_min_trades = self.min_val_trades * 2
+
+            if (val_pf >= exceptional_val_pf and
+                val_return >= exceptional_val_return and
+                val_trades >= exceptional_val_min_trades):
+
+                logger.info(
+                    f"[{regime}] {candidate_name}: Allowing weak train "
+                    f"(train PF {train_pf:.2f}, train return {train_return:.1f}%) "
+                    f"due to exceptional validation "
+                    f"(val PF {val_pf:.2f}, val return {val_return:.1f}%, "
+                    f"val trades {val_trades})"
+                )
+                # Continue to other validation checks below
+            else:
+                return False, (
+                    f"Weak train rejected: train PF {train_pf:.2f}, "
+                    f"train return {train_return:.1f}% "
+                    f"(validation not exceptional: val PF {val_pf:.2f} < {exceptional_val_pf}, "
+                    f"val return {val_return:.1f}% < {exceptional_val_return}%, "
+                    f"or val trades {val_trades} < {exceptional_val_min_trades})"
+                )
+
         # ===== FIX #1: PROFITABILITY GATES (Critical new checks) =====
         # These prevent storing losing strategies as "regime winners"
         if not self.allow_losing_winners:
             # Check profit factor >= threshold (default 1.0 = must be profitable)
             if val_pf < self.min_val_profit_factor:
                 return False, f"Unprofitable: val PF {val_pf:.3f} < {self.min_val_profit_factor:.2f}"
-            
+
             # Check return >= threshold (default 0.0 = must be non-negative)
             if val_return < self.min_val_return_pct:
                 return False, f"Negative return: val return {val_return:.2f}% < {self.min_val_return_pct:.1f}%"
@@ -2258,8 +2400,8 @@ class OptimizationPipeline:
                     data, symbol=symbol, timeframe=tf,
                     regime_params_file=regime_params_file
                 )
-                train_features_by_tf[tf] = full_features.iloc[train_start:train_end]
-                val_features_by_tf[tf] = full_features.iloc[val_start:val_end]
+                train_features_by_tf[tf] = full_features.iloc[train_start:train_end].copy()
+                val_features_by_tf[tf] = full_features.iloc[val_start:val_end].copy()
                 full_data_by_tf[tf] = data
             
             # Run regime-aware optimization

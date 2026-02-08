@@ -1,45 +1,45 @@
 {
   "EURUSD": {
     "symbol": "EURUSD",
-    "decision_key": "78a8ac967cfba1f9",
+    "decision_key": "fb8470146bc3de2a",
     "decision_keys": [
-      "78a8ac967cfba1f9"
+      "fb8470146bc3de2a"
     ],
-    "bar_time": "2026-02-05 00:00:00",
-    "timeframe": "D1",
-    "regime": "CHOP",
-    "strategy_name": "EMACrossoverStrategy",
+    "bar_time": "2026-02-08T14:00:00",
+    "timeframe": "H4",
+    "regime": "TRENDING",
+    "strategy_name": "RSI_TREND",
     "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:59:02.756417"
+    "action": "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
+    "action_time": "2026-02-08T18:06:51.235802"
   },
   "GBPUSD": {
     "symbol": "GBPUSD",
-    "decision_key": "620f136b2a0994d8",
+    "decision_key": "606a7758e3d47c04",
     "decision_keys": [
-      "620f136b2a0994d8"
+      "606a7758e3d47c04"
     ],
-    "bar_time": "2026-02-05 00:00:00",
-    "timeframe": "D1",
-    "regime": "TREND",
-    "strategy_name": "MomentumBurstStrategy",
-    "direction": -1,
-    "action": "SKIPPED_POSITION_EXISTS",
-    "action_time": "2026-02-05T23:05:47.747882"
+    "bar_time": "2026-02-08T12:00:00",
+    "timeframe": "M15",
+    "regime": "RANGING",
+    "strategy_name": "MACD_CROSS",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-02-08T18:06:51.219805"
   },
   "USDJPY": {
     "symbol": "USDJPY",
-    "decision_key": "8b71368078b55532",
+    "decision_key": "08a00968382568b1",
     "decision_keys": [
-      "8b71368078b55532"
+      "08a00968382568b1"
     ],
-    "bar_time": "2026-02-05 14:30:00",
-    "timeframe": "M30",
-    "regime": "TREND",
-    "strategy_name": "VolatilityBreakoutStrategy",
-    "direction": -1,
-    "action": "EXECUTED",
-    "action_time": "2026-02-05T13:59:51.005021"
+    "bar_time": "2026-02-08T15:00:00",
+    "timeframe": "H1",
+    "regime": "TRENDING",
+    "strategy_name": "MACD_CROSS",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-02-08T18:06:51.254797"
   },
   "USDCHF": {
     "symbol": "USDCHF",
@@ -71,32 +71,32 @@
   },
   "AUDUSD": {
     "symbol": "AUDUSD",
-    "decision_key": "9fe6c8aeeb0fa301",
+    "decision_key": "2e2b3316c6073017",
     "decision_keys": [
-      "7218e4885849e2e1",
-      "9fe6c8aeeb0fa301"
+      "2e2b3316c6073017"
     ],
-    "bar_time": "2026-02-06 23:00:00",
-    "timeframe": "M30",
-    "regime": "RANGE",
-    "strategy_name": "ZScoreVWAPReversionStrategy",
+    "bar_time": "2026-02-06 22:00:00",
+    "timeframe": "H1",
+    "regime": "TREND",
+    "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:57:38.874493"
+    "action_time": "2026-02-08T12:14:32.566405"
   },
   "NZDUSD": {
     "symbol": "NZDUSD",
-    "decision_key": "404ac65697a76e60",
+    "decision_key": "c718ea78b6bf6f6e",
     "decision_keys": [
-      "404ac65697a76e60"
+      "404ac65697a76e60",
+      "c718ea78b6bf6f6e"
     ],
     "bar_time": "2026-02-05 00:00:00",
     "timeframe": "D1",
     "regime": "TREND",
-    "strategy_name": "DonchianBreakoutStrategy",
+    "strategy_name": "StochasticReversalStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:57:41.324411"
+    "action_time": "2026-02-08T12:14:35.298018"
   },
   "AUDNZD": {
     "symbol": "AUDNZD",
@@ -110,7 +110,7 @@
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:57:43.669747"
+    "action_time": "2026-02-08T12:14:38.329646"
   },
   "EURGBP": {
     "symbol": "EURGBP",
@@ -128,17 +128,17 @@
   },
   "EURJPY": {
     "symbol": "EURJPY",
-    "decision_key": "c3a01a691b723ae4",
+    "decision_key": "335262bca0fe72f4",
     "decision_keys": [
-      "c3a01a691b723ae4"
+      "335262bca0fe72f4"
     ],
-    "bar_time": "2026-02-05 14:00:00",
-    "timeframe": "H1",
-    "regime": "CHOP",
-    "strategy_name": "VolatilityBreakoutStrategy",
-    "direction": -1,
-    "action": "EXECUTED",
-    "action_time": "2026-02-05T14:00:08.792899"
+    "bar_time": "2026-02-08T16:05:00",
+    "timeframe": "M5",
+    "regime": "RANGING",
+    "strategy_name": "RSI_TREND",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-02-08T17:58:20.044938"
   },
   "GBPJPY": {
     "symbol": "GBPJPY",
@@ -152,7 +152,7 @@
     "strategy_name": "KeltnerPullbackStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:57:50.703322"
+    "action_time": "2026-02-08T12:14:46.449147"
   },
   "AUDJPY": {
     "symbol": "AUDJPY",
@@ -180,7 +180,7 @@
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:14.482999"
+    "action_time": "2026-02-08T12:13:13.789441"
   },
   "XAUUSD": {
     "symbol": "XAUUSD",
@@ -250,7 +250,7 @@
     "strategy_name": "HullMATrendStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:57:54.499592"
+    "action_time": "2026-02-08T12:14:52.516656"
   },
   "EURCAD": {
     "symbol": "EURCAD",
@@ -278,7 +278,7 @@
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:57:59.118884"
+    "action_time": "2026-02-08T12:12:57.456589"
   },
   "GBPAUD": {
     "symbol": "GBPAUD",
@@ -292,7 +292,7 @@
     "strategy_name": "HullMATrendStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:02.534568"
+    "action_time": "2026-02-08T12:13:00.428870"
   },
   "GBPCAD": {
     "symbol": "GBPCAD",
@@ -306,7 +306,7 @@
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:05.276790"
+    "action_time": "2026-02-08T12:13:03.283883"
   },
   "CADJPY": {
     "symbol": "CADJPY",
@@ -320,21 +320,21 @@
     "strategy_name": "RSITrendFilteredMRStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:07.821225"
+    "action_time": "2026-02-08T12:13:05.952237"
   },
   "ETHUSD": {
     "symbol": "ETHUSD",
-    "decision_key": "603e4b0335d1d0c5",
+    "decision_key": "2ac4dcd44fafefdd",
     "decision_keys": [
-      "603e4b0335d1d0c5"
+      "2ac4dcd44fafefdd"
     ],
-    "bar_time": "2026-02-06 00:00:00",
+    "bar_time": "2026-02-07 00:00:00",
     "timeframe": "D1",
     "regime": "TREND",
     "strategy_name": "KeltnerPullbackStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:40.422836"
+    "action_time": "2026-02-08T12:13:45.972305"
   },
   "AUDCAD": {
     "symbol": "AUDCAD",
@@ -349,7 +349,7 @@
     "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:43.742814"
+    "action_time": "2026-02-08T12:13:50.946659"
   },
   "NZDJPY": {
     "symbol": "NZDJPY",
@@ -377,7 +377,7 @@
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
-    "action_time": "2026-02-07T21:58:27.012291"
+    "action_time": "2026-02-08T12:13:29.656209"
   },
   "US30": {
     "symbol": "US30",
@@ -391,7 +391,7 @@
     "strategy_name": "EMACrossoverStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
-    "action_time": "2026-02-07T21:58:29.386012"
+    "action_time": "2026-02-08T12:13:32.013149"
   },
   "XRPUSD": {
     "symbol": "XRPUSD",
@@ -409,17 +409,17 @@
   },
   "BTCETH": {
     "symbol": "BTCETH",
-    "decision_key": "f1c338ab860d0812",
+    "decision_key": "44261f6982315c99",
     "decision_keys": [
-      "f1c338ab860d0812"
+      "44261f6982315c99"
     ],
-    "bar_time": "2026-02-06 00:00:00",
+    "bar_time": "2026-02-07 00:00:00",
     "timeframe": "D1",
     "regime": "TREND",
     "strategy_name": "MomentumBurstStrategy",
     "direction": 1,
     "action": "SKIPPED_POSITION_EXISTS",
-    "action_time": "2026-02-06T22:59:51.036078"
+    "action_time": "2026-02-08T11:02:35.518897"
   },
   "EU50": {
     "symbol": "EU50",
@@ -433,7 +433,7 @@
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:33.745759"
+    "action_time": "2026-02-08T12:13:37.377053"
   },
   "DE30": {
     "symbol": "DE30",
@@ -490,7 +490,7 @@
     "strategy_name": "KeltnerPullbackStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T20:17:45.224671"
+    "action_time": "2026-02-08T12:13:57.152498"
   },
   "CADCHF": {
     "symbol": "CADCHF",
@@ -504,7 +504,7 @@
     "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:48.646168"
+    "action_time": "2026-02-08T12:13:59.662852"
   },
   "NZDCHF": {
     "symbol": "NZDCHF",
@@ -518,7 +518,7 @@
     "strategy_name": "RSIExtremesStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:50.486277"
+    "action_time": "2026-02-08T12:14:02.799162"
   },
   "USDNOK": {
     "symbol": "USDNOK",
@@ -532,7 +532,7 @@
     "strategy_name": "ZScoreMRStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:12.406703"
+    "action_time": "2026-02-08T12:13:11.483045"
   },
   "USDSGD": {
     "symbol": "USDSGD",
@@ -546,7 +546,7 @@
     "strategy_name": "ADXDIStrengthStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:16.736103"
+    "action_time": "2026-02-08T12:13:16.874953"
   },
   "NZDCAD": {
     "symbol": "NZDCAD",
@@ -561,7 +561,7 @@
     "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:52.475717"
+    "action_time": "2026-02-08T12:14:06.750878"
   },
   "AUDCHF": {
     "symbol": "AUDCHF",
@@ -575,7 +575,7 @@
     "strategy_name": "ZScoreMRStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:55.033153"
+    "action_time": "2026-02-08T12:14:10.263805"
   },
   "GBPNZD": {
     "symbol": "GBPNZD",
@@ -589,7 +589,7 @@
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:58.370527"
+    "action_time": "2026-02-08T12:14:12.796462"
   },
   "USDPLN": {
     "symbol": "USDPLN",
@@ -603,7 +603,7 @@
     "strategy_name": "AroonTrendStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-02-07T21:58:20.880068"
+    "action_time": "2026-02-08T12:13:22.266075"
   },
   "USDSEK": {
     "symbol": "USDSEK",

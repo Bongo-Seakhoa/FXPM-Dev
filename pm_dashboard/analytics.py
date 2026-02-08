@@ -4,12 +4,18 @@ Analytics module for computing performance metrics, equity curves, and statistic
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+import numpy as np
+
 from .utils import parse_timestamp, normalize_symbol
+
+logger = logging.getLogger(__name__)
 
 
 def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any]]:
@@ -380,6 +386,231 @@ def compute_strategy_ranking(trades: List[Dict[str, Any]], top_n: int = 10) -> L
     return ranking[:top_n]
 
 
+def get_pip_size(symbol: str) -> float:
+    """
+    Get pip size for a symbol.
+
+    Args:
+        symbol: Symbol name
+
+    Returns:
+        Pip size (default: 0.0001 for most FX pairs)
+    """
+    # JPY pairs use 0.01
+    if 'JPY' in symbol.upper():
+        return 0.01
+    # Metals and indices
+    if symbol.upper() in ['XAUUSD', 'XAGUSD', 'US30', 'US100', 'EU50', 'UK100', 'DE30', 'JP225']:
+        return 0.1
+    # Crypto
+    if symbol.upper() in ['BTCUSD', 'ETHUSD', 'XRPUSD', 'TONUSD', 'BTCETH']:
+        return 1.0
+    # Default FX
+    return 0.0001
+
+
+def reconstruct_trade_outcome(trade_entry: Dict[str, Any],
+                              historical_bars: pd.DataFrame,
+                              timeout_bars: int = 1000) -> Dict[str, Any]:
+    """
+    Simulate trade execution using historical bars.
+
+    Walks through bars after entry to determine when SL or TP was hit.
+
+    Args:
+        trade_entry: Trade entry dict with timestamp, price, sl, tp, direction
+        historical_bars: DataFrame with OHLC data (index = datetime)
+        timeout_bars: Maximum bars to simulate before timeout
+
+    Returns:
+        Dict with exit_price, exit_timestamp, pnl_pips, close_reason, duration_minutes
+    """
+    try:
+        # Extract trade details
+        entry_time = trade_entry.get('_parsed_timestamp')
+        if not entry_time:
+            entry_time = parse_timestamp(trade_entry.get('timestamp'))
+        if not entry_time:
+            return {
+                'exit_timestamp': None,
+                'exit_price': None,
+                'close_reason': 'INVALID_ENTRY_TIME',
+                'pnl_pips': 0,
+                'duration_minutes': None
+            }
+
+        entry_price = trade_entry.get('entry_price') or trade_entry.get('price')
+        sl = trade_entry.get('sl') or trade_entry.get('stop_loss_price')
+        tp = trade_entry.get('tp') or trade_entry.get('take_profit_price')
+        direction_str = trade_entry.get('direction', '').upper()
+        symbol = trade_entry.get('symbol', '')
+
+        # Map direction
+        if direction_str in ('LONG', 'BUY', '1'):
+            direction = 'LONG'
+        elif direction_str in ('SHORT', 'SELL', '-1'):
+            direction = 'SHORT'
+        else:
+            return {
+                'exit_timestamp': None,
+                'exit_price': None,
+                'close_reason': 'INVALID_DIRECTION',
+                'pnl_pips': 0,
+                'duration_minutes': None
+            }
+
+        if not entry_price or not sl or not tp:
+            return {
+                'exit_timestamp': None,
+                'exit_price': None,
+                'close_reason': 'MISSING_PRICES',
+                'pnl_pips': 0,
+                'duration_minutes': None
+            }
+
+        pip_size = get_pip_size(symbol)
+
+        # Filter bars after entry
+        bars_after_entry = historical_bars[historical_bars.index > entry_time].head(timeout_bars)
+
+        if len(bars_after_entry) == 0:
+            return {
+                'exit_timestamp': None,
+                'exit_price': None,
+                'close_reason': 'NO_DATA',
+                'pnl_pips': 0,
+                'duration_minutes': None
+            }
+
+        # Walk through bars to find SL/TP hit
+        for idx, bar in bars_after_entry.iterrows():
+            if direction == 'LONG':
+                # Check SL first (conservative)
+                if bar['Low'] <= sl:
+                    pnl_pips = (sl - entry_price) / pip_size if pip_size > 0 else 0
+                    duration = (idx - entry_time).total_seconds() / 60
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': sl,
+                        'close_reason': 'SL_HIT',
+                        'pnl_pips': pnl_pips,
+                        'duration_minutes': duration
+                    }
+                # Check TP
+                elif bar['High'] >= tp:
+                    pnl_pips = (tp - entry_price) / pip_size if pip_size > 0 else 0
+                    duration = (idx - entry_time).total_seconds() / 60
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': tp,
+                        'close_reason': 'TP_HIT',
+                        'pnl_pips': pnl_pips,
+                        'duration_minutes': duration
+                    }
+
+            else:  # SHORT
+                # Check SL first (conservative)
+                if bar['High'] >= sl:
+                    pnl_pips = (entry_price - sl) / pip_size if pip_size > 0 else 0
+                    duration = (idx - entry_time).total_seconds() / 60
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': sl,
+                        'close_reason': 'SL_HIT',
+                        'pnl_pips': (entry_price - sl) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration
+                    }
+                # Check TP
+                elif bar['Low'] <= tp:
+                    pnl_pips = (entry_price - tp) / pip_size if pip_size > 0 else 0
+                    duration = (idx - entry_time).total_seconds() / 60
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': tp,
+                        'close_reason': 'TP_HIT',
+                        'pnl_pips': pnl_pips,
+                        'duration_minutes': duration
+                    }
+
+        # Timeout: no SL/TP hit within available data
+        return {
+            'exit_timestamp': None,
+            'exit_price': None,
+            'close_reason': 'TIMEOUT',
+            'pnl_pips': 0,
+            'duration_minutes': None
+        }
+
+    except Exception as e:
+        logger.error(f"Error reconstructing trade outcome: {e}")
+        return {
+            'exit_timestamp': None,
+            'exit_price': None,
+            'close_reason': 'ERROR',
+            'pnl_pips': 0,
+            'duration_minutes': None
+        }
+
+
+def reconstruct_trade_outcomes(trades: List[Dict[str, Any]],
+                               data_loader_func,
+                               max_trades: int = 1000) -> List[Dict[str, Any]]:
+    """
+    Reconstruct outcomes for multiple trades.
+
+    Args:
+        trades: List of trade entries
+        data_loader_func: Function(symbol, timeframe, start_date, end_date) -> DataFrame
+        max_trades: Maximum number of trades to process
+
+    Returns:
+        List of trades with reconstructed outcomes
+    """
+    reconstructed = []
+
+    for trade in trades[:max_trades]:
+        try:
+            symbol = trade.get('symbol')
+            timeframe = trade.get('timeframe')
+            timestamp = trade.get('_parsed_timestamp')
+
+            if not timestamp:
+                timestamp = parse_timestamp(trade.get('timestamp'))
+
+            if not symbol or not timeframe or not timestamp:
+                continue
+
+            # Load historical data (30 days should be enough for most trades)
+            end_date = timestamp + timedelta(days=30)
+            historical_bars = data_loader_func(symbol, timeframe, timestamp, end_date)
+
+            if historical_bars is None or len(historical_bars) == 0:
+                logger.warning(f"No historical data for {symbol} {timeframe} at {timestamp}")
+                continue
+
+            # Reconstruct outcome
+            outcome = reconstruct_trade_outcome(trade, historical_bars)
+
+            # Merge outcome into trade
+            trade_with_outcome = dict(trade)
+            trade_with_outcome.update(outcome)
+
+            # Calculate pnl in dollars (simplified - assumes $10/pip for FX)
+            if outcome['pnl_pips'] != 0:
+                pip_value = 10.0  # Default assumption
+                trade_with_outcome['pnl'] = outcome['pnl_pips'] * pip_value
+            else:
+                trade_with_outcome['pnl'] = 0.0
+
+            reconstructed.append(trade_with_outcome)
+
+        except Exception as e:
+            logger.error(f"Failed to reconstruct trade: {e}")
+            continue
+
+    return reconstructed
+
+
 def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> Dict[str, Any]:
     """Build complete analytics payload for the frontend."""
     trades = load_trade_history(pm_root, max_files=100)
@@ -427,7 +658,10 @@ def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> D
             "status": trade.get("status"),
             "timeframe": trade.get("timeframe"),
             "regime": trade.get("regime"),
-            "strategy": trade.get("strategy")
+            "strategy": trade.get("strategy"),
+            "close_reason": trade.get("close_reason"),
+            "exit_price": trade.get("exit_price"),
+            "pnl_pips": trade.get("pnl_pips")
         })
 
     return {

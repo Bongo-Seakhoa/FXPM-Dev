@@ -858,6 +858,54 @@ class InstrumentSpec:
         return 0.0
 
 
+def sync_instrument_spec_from_mt5(spec: InstrumentSpec, mt5_symbol_info) -> InstrumentSpec:
+    """
+    Update InstrumentSpec with live MT5 broker values.
+    Call this during LiveTrader initialization for all symbols.
+
+    This ensures position sizing uses real-time broker values instead of stale config.json values,
+    which is critical for cross pairs and instruments with broker-specific contract sizes.
+
+    Args:
+        spec: Existing InstrumentSpec from config
+        mt5_symbol_info: MT5SymbolInfo object from get_symbol_info()
+
+    Returns:
+        Updated InstrumentSpec (modified in-place)
+    """
+    if not mt5_symbol_info:
+        return spec
+
+    # Update critical tick-based values from MT5
+    spec.tick_value = mt5_symbol_info.trade_tick_value
+    spec.tick_size = mt5_symbol_info.trade_tick_size
+    spec.volume_step = mt5_symbol_info.volume_step
+    spec.min_lot = mt5_symbol_info.volume_min
+    spec.max_lot = mt5_symbol_info.volume_max
+
+    # Update spread (convert MT5 points to pips)
+    if mt5_symbol_info.spread > 0:
+        # spread is in points, convert to pips
+        spec.spread_avg = mt5_symbol_info.spread * mt5_symbol_info.point / spec.pip_size
+
+    # Update contract size
+    if mt5_symbol_info.trade_contract_size > 0:
+        spec.contract_size = mt5_symbol_info.trade_contract_size
+
+    # Update point and digits
+    spec.point = mt5_symbol_info.point
+    spec.digits = mt5_symbol_info.digits
+
+    # Update stops level
+    spec.stops_level = mt5_symbol_info.trade_stops_level
+
+    # Update swap rates
+    spec.swap_long = mt5_symbol_info.swap_long
+    spec.swap_short = mt5_symbol_info.swap_short
+
+    return spec
+
+
 # Default instrument specifications
 # These are used when MT5 data is not available (e.g., backtesting from CSV)
 # Live trading will override these with actual broker values
@@ -1649,7 +1697,7 @@ class DataLoader:
             if ncol in df.columns:
                 df[ncol] = pd.to_numeric(df[ncol], errors='coerce')
 
-        # Drop rows with missing critical OHLC values (use drop instead of inplace to avoid modifying cached data)
+        # Drop rows with missing critical OHLC values (safe: called on fresh DataFrames before caching)
         before = len(df)
         mask = df[['Open', 'High', 'Low', 'Close']].notna().all(axis=1)
         rows_to_drop = (~mask).sum()
