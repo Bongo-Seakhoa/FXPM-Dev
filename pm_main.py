@@ -1320,7 +1320,7 @@ class LiveTrader:
         
         # Get live quality gate thresholds from config
         min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
-        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 0.0) if self.pipeline_config else 0.0
+        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 5.0) if self.pipeline_config else 5.0
         max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
         
         for tf in available_timeframes:
@@ -1481,7 +1481,7 @@ class LiveTrader:
         
         # Winners-only live gate for legacy configs
         min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
-        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 0.0) if self.pipeline_config else 0.0
+        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 5.0) if self.pipeline_config else 5.0
         max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
         val_pf = config.val_metrics.get('profit_factor', 0.0)
         val_return = config.val_metrics.get('total_return_pct', -100.0)

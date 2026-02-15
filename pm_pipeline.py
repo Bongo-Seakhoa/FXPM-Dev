@@ -1,4 +1,4 @@
-"""
+﻿"""
 FX Portfolio Manager - Pipeline Module
 =======================================
 
@@ -15,6 +15,7 @@ Version: 3.1 (Portfolio Manager with Optuna TPE Optimization)
 
 import json
 import logging
+import math
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -418,7 +419,7 @@ class RegimeConfig:
         """Check if this config is a NO_TRADE marker (no valid strategy found)."""
         return self.strategy_name == "NO_TRADE" or self.strategy_name == ""
     
-    def is_valid_for_live(self, min_pf: float = 1.0, min_return: float = 0.0, max_dd: float = 35.0) -> bool:
+    def is_valid_for_live(self, min_pf: float = 1.0, min_return: float = 5.0, max_dd: float = 35.0) -> bool:
         """
         Check if this config passes the live quality gate.
         
@@ -430,7 +431,7 @@ class RegimeConfig:
         
         Args:
             min_pf: Minimum validation profit factor (default 1.0)
-            min_return: Minimum validation return % (default 0.0)
+            min_return: Minimum validation return % (default 5.0)
             max_dd: Maximum validation drawdown % (default 35.0)
             
         Returns:
@@ -1353,9 +1354,13 @@ class RegimeOptimizer:
         # ===== PROFITABILITY GATES (FIX #1) =====
         # These prevent storing losing strategies as "regime winners"
         self.min_val_profit_factor = getattr(config, 'regime_min_val_profit_factor', 1.0)
-        self.min_val_return_pct = getattr(config, 'regime_min_val_return_pct', 0.0)
+        self.min_val_return_pct = getattr(config, 'regime_min_val_return_pct', 5.0)
         self.allow_losing_winners = getattr(config, 'regime_allow_losing_winners', False)
         self.no_winner_marker = getattr(config, 'regime_no_winner_marker', 'NO_TRADE')
+
+        # Return-to-DD efficiency gate (unconditional hard gate)
+        _raw_ratio = float(getattr(config, 'regime_min_val_return_dd_ratio', 1.0))
+        self.min_val_return_dd_ratio = _raw_ratio if math.isfinite(_raw_ratio) and _raw_ratio > 0 else 1.0
         
         # Use fx_backtester scoring mode
         self.use_fx_scoring = getattr(config, 'scoring_mode', 'pm_weighted') == 'fx_backtester'
@@ -1374,6 +1379,11 @@ class RegimeOptimizer:
             if self.enable_hyperparam_tuning:
                 logger.debug("RegimeOptimizer using: Grid Search (Optuna not available)")
     
+    @staticmethod
+    def _compute_return_dd_ratio(val_return: float, val_dd: float, eps: float = 0.5) -> float:
+        """Return-to-drawdown efficiency ratio with epsilon floor."""
+        return val_return / max(val_dd, eps)
+
     def optimize_symbol(self,
                         symbol: str,
                         train_features_by_tf: Dict[str, pd.DataFrame],
@@ -2018,7 +2028,7 @@ class RegimeOptimizer:
             if val_trades < self.min_val_trades:
                 continue
 
-            # ===== EARLY REJECTION: Check drawdown before scoring (saves compute) =====
+            # ===== EARLY REJECTION: Check drawdown before scoring =====
             train_dd = train_metrics.get('max_drawdown_pct', 100.0)
             val_dd = val_metrics.get('max_drawdown_pct', 100.0)
 
@@ -2028,6 +2038,16 @@ class RegimeOptimizer:
 
             # Reject if training drawdown is excessively high (1.25x threshold)
             if train_dd > self.val_max_drawdown * 1.25:
+                continue
+
+            # Return-to-DD efficiency gate (unconditional, same category as DD caps)
+            val_return_early = val_metrics.get('total_return_pct', -100.0)
+            val_return_dd_ratio = self._compute_return_dd_ratio(val_return_early, val_dd)
+            if val_return_dd_ratio < self.min_val_return_dd_ratio:
+                rejection_reasons.append(
+                    f"{cand['strategy_name']}: return/DD={val_return_dd_ratio:.2f} < "
+                    f"{self.min_val_return_dd_ratio:.2f} (ret={val_return_early:.1f}%, dd={val_dd:.1f}%)"
+                )
                 continue
 
             # ===== FIX #1: EARLY REJECTION - Profitability gates =====
@@ -2048,9 +2068,9 @@ class RegimeOptimizer:
             scored_candidates.append((score, cand))
 
         if not scored_candidates:
-            reason = "No candidates met minimum trade/drawdown/profitability thresholds"
+            reason = "No candidates met minimum trade/drawdown/ratio/profitability thresholds"
             if rejection_reasons:
-                reason += f" (rejected: {len(rejection_reasons)} candidates for profitability)"
+                reason += f" (rejected: {len(rejection_reasons)} candidates by gate checks)"
             return None, False, reason
 
         # Sort descending by score
@@ -2151,11 +2171,14 @@ class RegimeOptimizer:
         """
         Validate a regime winner against fx_backtester thresholds.
         
-        Checks (ALL enforced unless allow_losing_winners=True):
-        - Validation trade count >= fx_val_min_trades
-        - Validation drawdown < fx_val_max_drawdown
-        - Validation profit_factor >= regime_min_val_profit_factor (default 1.0)
-        - Validation return_pct >= regime_min_val_return_pct (default 0.0)
+        Checks:
+        - Always enforced:
+          - Validation trade count >= fx_val_min_trades
+          - Validation drawdown < fx_val_max_drawdown
+          - Validation return/DD ratio >= regime_min_val_return_dd_ratio
+        - Enforced when allow_losing_winners=False:
+          - Validation profit_factor >= regime_min_val_profit_factor (default 1.0)
+          - Validation return_pct >= regime_min_val_return_pct (default 5.0)
         - Robustness ratio >= fx_min_robustness_ratio OR val_sharpe > override
         
         Returns:
@@ -2193,25 +2216,30 @@ class RegimeOptimizer:
 
             val_dd_limit = self.val_max_drawdown * 0.75
             val_win_rate = val_metrics.get('win_rate', 0)
+            wt_return_dd_ratio = self._compute_return_dd_ratio(val_return, val_drawdown)
+            wt_min_ratio = self.min_val_return_dd_ratio
 
             if (val_pf >= exceptional_val_pf and
                 val_return >= exceptional_val_return and
                 val_trades >= exceptional_val_min_trades and
                 val_drawdown < val_dd_limit and
-                val_win_rate > 50.0):
+                val_win_rate > 50.0 and
+                wt_return_dd_ratio >= wt_min_ratio):
                 logger.info(
                     f"[{regime}] {candidate_name}: allowing weak-train winner "
                     f"(train PF {train_pf:.2f}, train return {train_return:.1f}%) "
                     f"due to exceptional validation "
                     f"(val PF {val_pf:.2f}, val return {val_return:.1f}%, val trades {val_trades}, "
-                    f"val DD {val_drawdown:.1f}%, val WR {val_win_rate:.1f}%)"
+                    f"val DD {val_drawdown:.1f}%, val WR {val_win_rate:.1f}%, "
+                    f"return/DD {wt_return_dd_ratio:.2f})"
                 )
             else:
                 return False, (
                     f"Weak train rejected: train PF {train_pf:.2f}, train return {train_return:.1f}% "
                     f"(requires val PF>={exceptional_val_pf:.2f}, val return>={exceptional_val_return:.1f}%, "
                     f"val trades>={exceptional_val_min_trades}, "
-                    f"val DD<{val_dd_limit:.1f}%, val WR>50%)"
+                    f"val DD<{val_dd_limit:.1f}%, val WR>50%, "
+                    f"return/DD>={wt_min_ratio:.2f})"
                 )
         
         # ===== FIX #1: PROFITABILITY GATES (Critical new checks) =====
@@ -2221,10 +2249,20 @@ class RegimeOptimizer:
             if val_pf < self.min_val_profit_factor:
                 return False, f"Unprofitable: val PF {val_pf:.3f} < {self.min_val_profit_factor:.2f}"
             
-            # Check return >= threshold (default 0.0 = must be non-negative)
+            # Check return >= threshold (default 5.0)
             if val_return < self.min_val_return_pct:
                 return False, f"Negative return: val return {val_return:.2f}% < {self.min_val_return_pct:.1f}%"
-        
+
+        # Return-to-DD efficiency gate (unconditional risk-efficiency rule, same category as DD cap)
+        val_return_dd_ratio = self._compute_return_dd_ratio(val_return, val_drawdown)
+        min_return_dd = self.min_val_return_dd_ratio
+        if val_return_dd_ratio < min_return_dd:
+            return False, (
+                f"Poor return/DD efficiency: {val_return_dd_ratio:.2f} "
+                f"(return {val_return:.1f}% / DD {val_drawdown:.1f}%) "
+                f"< {min_return_dd:.2f}"
+            )
+
         # Compute robustness ratio
         train_full = self._bucket_to_full_metrics(train_metrics)
         val_full = self._bucket_to_full_metrics(val_metrics)
@@ -3071,3 +3109,4 @@ if __name__ == "__main__":
     
     pm.print_status()
     print("\npm_pipeline.py loaded successfully!")
+

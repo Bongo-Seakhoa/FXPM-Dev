@@ -2,6 +2,54 @@
 Scope: Comprehensive change history for this repository.
 Status: Canonical patch note file (single source of truth).
 
+## 2026-02-15 - DD/Return Validation Hard Gate
+### Validation quality upgrade
+- Added hard validation efficiency gate for regime winners:
+  - `val_return_dd_ratio = val_return_pct / max(val_drawdown_pct, 0.5)`
+  - required: `val_return_dd_ratio >= regime_min_val_return_dd_ratio` (default `1.0`)
+- Keeps the `regime_min_val_return_pct = 5.0` floor as policy baseline.
+- Gate is applied in both:
+  - early candidate rejection in `_select_best_for_regime` (before scoring)
+  - final validation in `_validate_regime_winner` (before robustness)
+- Weak-train exceptional path now also requires ratio compliance.
+
+### Config and hardening
+- Added `pipeline.regime_min_val_return_dd_ratio` to `config.json` with default `1.0`.
+- Added `PipelineConfig` field in `pm_core.py`.
+- Added config hardening clamp in `PipelineConfig.__post_init__`:
+  - invalid/non-finite/non-positive values fallback to `1.0`
+- Added finite-safe read path in `RegimeOptimizer` initialization.
+
+### Quality and clarity cleanups
+- Updated validation docstring and gate comments in `pm_pipeline.py` to reflect unconditional ratio enforcement.
+- Improved candidate rejection summary wording:
+  - now reports `trade/drawdown/ratio/profitability` gate coverage
+  - rejection count text no longer implies profitability-only rejection.
+
+### Tests and verification
+- Added `tests/test_return_dd_ratio.py` (14 tests), covering:
+  - 5% return floor interaction
+  - ratio gate pass/fail
+  - unconditional behavior when `regime_allow_losing_winners=True`
+  - weak-train exception ratio enforcement
+  - candidate descent behavior when rank-1 fails ratio
+  - epsilon stability for near-zero DD
+  - config/default hardening behaviors
+- Targeted verification:
+  - `tests/test_return_dd_ratio.py`: `14 passed`
+  - `tests/test_scoring_audit.py::TestConfigHardening` + `tests/test_winners_only.py`: `3 passed`
+- Full suite verification:
+  - `232 passed, 2 skipped, 11 subtests passed`
+
+## 2026-02-15 - Validation Return Floor Tightening
+### Validation gate hardening
+- Raised minimum validation return floor for regime winners from `0.0%` to `5.0%`.
+- Propagated across:
+  - runtime config baseline (`config.json`)
+  - pipeline defaults (`pm_core.py`, `pm_pipeline.py`)
+  - live-gate fallback thresholds (`pm_main.py`)
+- Intent: prevent low-return, high-drawdown candidates from being accepted as validated winners.
+
 ## 2026-02-15 - Repository Hygiene and Documentation Polish
 ### Repository hygiene baseline
 - Added root `.gitignore` to prevent generated/runtime artifacts from polluting commits:

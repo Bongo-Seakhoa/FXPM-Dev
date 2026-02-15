@@ -580,10 +580,11 @@ class PipelineConfig:
     # ===== REGIME WINNER PROFITABILITY GATES (FIX #1) =====
     # These thresholds ensure regime winners are actually profitable, not just "best loser"
     regime_min_val_profit_factor: float = 1.05   # Minimum validation PF to be stored as winner
-    regime_min_val_return_pct: float = 0.0       # Minimum validation return % (0 = breakeven)
+    regime_min_val_return_pct: float = 5.0       # Minimum validation return % floor for validated winners
     regime_allow_losing_winners: bool = False    # If True, allows PF < 1 (not recommended)
     regime_no_winner_marker: str = "NO_TRADE"    # Strategy name for "no valid winner" state
     regime_validation_top_k: int = 5             # Max candidates to validate in descent order
+    regime_min_val_return_dd_ratio: float = 1.0  # Hard gate: val return must >= val DD (ratio >= 1.0)
 
     # ===== SCORING CALIBRATION FLAGS (Scoring Audit Workstream C) =====
     # Feature flags for new scoring terms; all operate inside DD-passing set only.
@@ -660,6 +661,13 @@ class PipelineConfig:
             self.regime_validation_top_k = max(1, int(self.regime_validation_top_k))
         except Exception:
             self.regime_validation_top_k = 5
+
+        # Clamp return/DD hard gate threshold to a safe positive value.
+        try:
+            ratio = float(self.regime_min_val_return_dd_ratio)
+            self.regime_min_val_return_dd_ratio = ratio if math.isfinite(ratio) and ratio > 0 else 1.0
+        except Exception:
+            self.regime_min_val_return_dd_ratio = 1.0
 
         # Normalize Optuna objective blend weights for robustness against config typos.
         try:
