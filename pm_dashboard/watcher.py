@@ -93,6 +93,9 @@ def entry_to_dict(entry: SignalEntry) -> Dict[str, Any]:
         "timestamp": entry.timestamp,
         "valid_now": entry.valid_now,
         "reason": entry.reason,
+        "secondary_trade": entry.secondary_trade,
+        "secondary_reason": entry.secondary_reason,
+        "position_context": entry.position_context,
         "source": entry.source,
     }
 
@@ -171,6 +174,7 @@ class DashboardWatcher(threading.Thread):
     def _load_primary_entries(self, source_files: List[str], pm_configs: Dict[str, Any]) -> List[SignalEntry]:
         primary_patterns = self.config.get("primary_sources") or ["last_trade_log.json"]
         primary_file = find_primary_file(self.pm_root, primary_patterns)
+        trade_map = self._load_trade_map()
         if primary_file:
             text = safe_read_text(primary_file)
             if text:
@@ -178,9 +182,12 @@ class DashboardWatcher(threading.Thread):
                 entries = parse_entries_from_file(
                     primary_file, text, self.config, self.state.instrument_specs, mtime
                 )
-                entries = enrich_entries(entries, pm_configs, self._load_trade_map(), self.config)
-                if not is_actionable_primary(primary_file):
-                    entries.extend(self._load_log_entries())
+                log_entries = self._load_log_entries()
+                if is_actionable_primary(primary_file):
+                    entries = merge_actionable_with_log_executions(entries, log_entries)
+                else:
+                    entries.extend(log_entries)
+                entries = enrich_entries(entries, pm_configs, trade_map, self.config)
                 entries = normalize_action_flags(entries, self.config)
                 return entries
 
@@ -198,8 +205,8 @@ class DashboardWatcher(threading.Thread):
                 entries.extend(parse_entries_from_file(path, text, self.config, self.state.instrument_specs, mtime))
             except Exception:
                 continue
-        entries = enrich_entries(entries, pm_configs, self._load_trade_map(), self.config)
         entries.extend(self._load_log_entries())
+        entries = enrich_entries(entries, pm_configs, trade_map, self.config)
         entries = normalize_action_flags(entries, self.config)
         return entries
 
@@ -358,14 +365,97 @@ def entry_alert_key(entry: SignalEntry) -> str:
     )
 
 
-def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
+def entry_action_value(entry: SignalEntry) -> str:
     action_value = pick_action_value(entry.raw).upper() if entry.raw else ""
     if not action_value and entry.reason:
         action_value = str(entry.reason).upper()
+    return action_value
+
+
+def entry_timestamp_rank(entry: SignalEntry) -> float:
+    ts = parse_timestamp(entry.timestamp) if entry.timestamp else None
+    if ts is None:
+        return 0.0
+    try:
+        return float(ts.timestamp())
+    except Exception:
+        return 0.0
+
+
+def merge_actionable_with_log_executions(
+    primary_entries: List[SignalEntry],
+    log_entries: List[SignalEntry],
+) -> List[SignalEntry]:
+    """
+    Keep actionable primary decisions, but backfill with the latest actionable log
+    outcome per symbol when logs are newer or missing in primary.
+    """
+    if not log_entries:
+        return primary_entries
+
+    latest_primary_action_by_symbol: Dict[str, str] = {}
+    latest_primary_rank_by_symbol: Dict[str, float] = {}
+    for entry in primary_entries:
+        symbol = normalize_symbol(entry.symbol)
+        if not symbol:
+            continue
+        rank = entry_timestamp_rank(entry)
+        prev_rank = latest_primary_rank_by_symbol.get(symbol)
+        if prev_rank is None or rank >= prev_rank:
+            latest_primary_rank_by_symbol[symbol] = rank
+            latest_primary_action_by_symbol[symbol] = entry_action_value(entry)
+
+    latest_log_action_by_symbol: Dict[str, SignalEntry] = {}
+    latest_log_rank_by_symbol: Dict[str, float] = {}
+
+    def _is_actionable_log_outcome(action_value: str) -> bool:
+        if not action_value:
+            return False
+        if action_value == "EXECUTED":
+            return True
+        if action_value.startswith("SKIPPED_"):
+            return True
+        if action_value.startswith("BLOCKED_"):
+            return True
+        if action_value.startswith("FAILED_"):
+            return True
+        if action_value == "PAPER":
+            return True
+        return False
+
+    for entry in log_entries:
+        action_value = entry_action_value(entry)
+        if not _is_actionable_log_outcome(action_value):
+            continue
+        symbol = normalize_symbol(entry.symbol)
+        if not symbol:
+            continue
+        rank = entry_timestamp_rank(entry)
+        prev_rank = latest_log_rank_by_symbol.get(symbol)
+        if prev_rank is None or rank >= prev_rank:
+            latest_log_rank_by_symbol[symbol] = rank
+            latest_log_action_by_symbol[symbol] = entry
+
+    merged = list(primary_entries)
+    for symbol, log_entry in latest_log_action_by_symbol.items():
+        log_rank = latest_log_rank_by_symbol.get(symbol, 0.0)
+        primary_rank = latest_primary_rank_by_symbol.get(symbol, 0.0)
+        if primary_rank > 0 and primary_rank >= log_rank:
+            continue
+        merged.append(log_entry)
+    return merged
+
+
+def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
+    action_value = entry_action_value(entry)
 
     display_actions = {str(item).upper() for item in config.get("display_actions", [])}
-    if display_actions and action_value not in display_actions:
-        return False
+    display_prefixes = [str(item).upper() for item in config.get("display_action_prefixes", [])]
+    if display_actions or display_prefixes:
+        exact_match = action_value in display_actions
+        prefix_match = any(action_value.startswith(prefix) for prefix in display_prefixes if prefix)
+        if not (exact_match or prefix_match):
+            return False
 
     required_fields = config.get("display_require_fields") or [
         "signal_direction",
@@ -386,7 +476,10 @@ def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
         return True
 
     allow_actions = {str(item).upper() for item in config.get("display_allow_if_actions", [])}
-    return action_value in allow_actions
+    allow_prefixes = [str(item).upper() for item in config.get("display_allow_if_action_prefixes", [])]
+    if action_value in allow_actions:
+        return True
+    return any(action_value.startswith(prefix) for prefix in allow_prefixes if prefix)
 
 
 def send_desktop_alert(title: str, message: str, play_sound: bool) -> None:
@@ -460,9 +553,7 @@ def enrich_entries(
             continue
         entry.symbol = symbol
 
-        action_value = pick_action_value(entry.raw).upper() if entry.raw else ""
-        if not action_value and entry.reason:
-            action_value = str(entry.reason).upper()
+        action_value = entry_action_value(entry)
 
         trade = trade_map.get(symbol)
         if action_value == "EXECUTED" and trade:
@@ -535,12 +626,19 @@ def enrich_from_pm_configs(entry: SignalEntry, pm_config: Optional[Dict[str, Any
 
 def normalize_action_flags(entries: List[SignalEntry], config: Dict[str, Any]) -> List[SignalEntry]:
     valid_actions = {str(item).upper() for item in config.get("valid_actions", [])}
+    valid_prefixes = [str(item).upper() for item in config.get("valid_action_prefixes", [])]
+    exclude_actions = {str(item).upper() for item in config.get("exclude_actions", [])}
     max_age = config.get("max_signal_age_minutes")
     for entry in entries:
-        action_value = pick_action_value(entry.raw).upper() if entry.raw else ""
-        if not action_value and entry.reason:
-            action_value = str(entry.reason).upper()
-        is_valid_action = action_value in valid_actions
+        action_value = entry_action_value(entry)
+        is_valid_action = False
+        if action_value:
+            if action_value in exclude_actions:
+                is_valid_action = False
+            elif action_value in valid_actions:
+                is_valid_action = True
+            else:
+                is_valid_action = any(action_value.startswith(prefix) for prefix in valid_prefixes if prefix)
         if entry.timestamp:
             ts = parse_timestamp(entry.timestamp)
         else:

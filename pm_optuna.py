@@ -86,6 +86,21 @@ class OptunaConfig:
     # to the holdout split because the same validation set is later used for selection.
     # Default is False to avoid train/val leakage: tune on train, validate on val.
     use_validation_in_objective: bool = False
+
+    # Blended objective weights (train-first with bounded val influence)
+    objective_blend_enabled: bool = True
+    objective_train_weight: float = 0.80
+    objective_val_weight: float = 0.20
+
+    # Early rejection thresholds (configurable)
+    train_dd_multiplier: float = 1.25
+    val_dd_multiplier: float = 1.0
+    penalty_dd_rejection: float = -500.0
+    penalty_no_trades: float = -1000.0
+    # Progressive rejection: relax thresholds during early exploration
+    progressive_rejection: bool = True
+    progressive_warmup_frac: float = 0.20
+    progressive_warmup_multiplier: float = 1.5
     
     # Logging
     log_interval: int = 25  # Log progress every N trials
@@ -99,6 +114,9 @@ class OptunaConfig:
             seed=42,
             multivariate=True,
             use_validation_in_objective=bool(getattr(config, 'optuna_use_val_in_objective', False)),
+            objective_blend_enabled=bool(getattr(config, 'optuna_objective_blend_enabled', True)),
+            objective_train_weight=float(getattr(config, 'optuna_objective_train_weight', 0.80)),
+            objective_val_weight=float(getattr(config, 'optuna_objective_val_weight', 0.20)),
         )
 
 
@@ -431,19 +449,29 @@ class OptunaTPEOptimizer:
                 
                 # Evaluate on training data
                 signals = strategy.generate_signals(train_features, symbol)
+                if signals.abs().sum() == 0:
+                    return self.config.penalty_no_trades
                 train_metrics = self.backtester.run(
                     train_features, signals, symbol, strategy
                 )
                 
                 # EARLY REJECTION 1: Minimum trades
                 if train_metrics.get('total_trades', 0) < min_trades:
-                    return -1000.0
+                    return self.config.penalty_no_trades
+
+                progress = trial_count[0] / max(n_trials, 1)
+                if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
+                    dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
+                    dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
+                else:
+                    dd_train_mult = self.config.train_dd_multiplier
+                    dd_val_mult = self.config.val_dd_multiplier
                 
                 # EARLY REJECTION 2: Training drawdown
                 train_dd = train_metrics.get('max_drawdown_pct', 100.0)
-                if train_dd > max_drawdown_pct * 1.25:
+                if train_dd > max_drawdown_pct * dd_train_mult:
                     early_rejections[0] += 1
-                    return -500.0  # Bad score but TPE can learn from it
+                    return self.config.penalty_dd_rejection
                 
                 # CONDITIONAL VALIDATION: Only run if training passed
                 if val_features is not None and len(val_features) >= 50:
@@ -454,9 +482,9 @@ class OptunaTPEOptimizer:
                     
                     # EARLY REJECTION 3: Validation drawdown
                     val_dd = val_metrics.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct:
+                    if val_dd > max_drawdown_pct * dd_val_mult:
                         early_rejections[0] += 1
-                        return -500.0
+                        return self.config.penalty_dd_rejection
                 else:
                     val_metrics = self._empty_val_metrics()
                 
@@ -595,20 +623,30 @@ class OptunaTPEOptimizer:
                 
                 # Backtest on training data
                 signals = strategy.generate_signals(train_features, symbol)
+                if signals.abs().sum() == 0:
+                    return self.config.penalty_no_trades
                 train_result = self.backtester.run(
                     train_features, signals, symbol, strategy
                 )
                 
                 # ===== EARLY REJECTION 1: Minimum trades =====
                 if train_result.get('total_trades', 0) < min_train_trades // 2:
-                    return -1000.0
+                    return self.config.penalty_no_trades
+
+                progress = trial_count[0] / max(n_trials, 1)
+                if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
+                    dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
+                    dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
+                else:
+                    dd_train_mult = self.config.train_dd_multiplier
+                    dd_val_mult = self.config.val_dd_multiplier
                 
                 # ===== EARLY REJECTION 2: Training drawdown =====
                 # If overall training DD exceeds threshold, skip validation entirely
                 train_dd = train_result.get('max_drawdown_pct', 100.0)
-                if train_dd > max_drawdown_pct * 1.25:  # Allow 25% margin for training
+                if train_dd > max_drawdown_pct * dd_train_mult:
                     early_rejections[0] += 1
-                    return -500.0  # Bad but not as bad as no trades - TPE can learn from this
+                    return self.config.penalty_dd_rejection
                 
                 # Bucket trades by regime
                 train_trades = train_result.get('trades', [])
@@ -624,9 +662,9 @@ class OptunaTPEOptimizer:
                     
                     # Early rejection if validation DD too high
                     val_dd = val_result.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct:
+                    if val_dd > max_drawdown_pct * dd_val_mult:
                         early_rejections[0] += 1
-                        return -500.0
+                        return self.config.penalty_dd_rejection
                     
                     val_trades = val_result.get('trades', [])
                     val_regime_metrics = bucket_trades_fn(val_trades, val_features)
@@ -647,12 +685,20 @@ class OptunaTPEOptimizer:
                     regime_train_dd = train_m.get('max_drawdown_pct', 100.0)
                     regime_val_dd = val_m.get('max_drawdown_pct', 100.0)
                     
-                    if regime_val_dd > max_drawdown_pct:
+                    if regime_val_dd > max_drawdown_pct * dd_val_mult:
                         continue  # Skip this regime but continue with others
-                    if regime_train_dd > max_drawdown_pct * 1.25:
+                    if regime_train_dd > max_drawdown_pct * dd_train_mult:
                         continue
                     
-                    score = compute_score_fn(train_m, val_m) if self.config.use_validation_in_objective else compute_score_fn(train_m, {})
+                    if self.config.use_validation_in_objective:
+                        score = compute_score_fn(train_m, val_m)
+                    elif self.config.objective_blend_enabled and val_m.get('total_trades', 0) >= min_train_trades:
+                        train_score = compute_score_fn(train_m, {})
+                        gen_score = compute_score_fn(train_m, val_m)
+                        score = (self.config.objective_train_weight * train_score +
+                                 self.config.objective_val_weight * gen_score)
+                    else:
+                        score = compute_score_fn(train_m, {})
                     regime_scores.append(score)
                     
                     # Update best for this regime (only if passes DD check)
@@ -786,8 +832,16 @@ class OptunaTPEOptimizer:
         completed = 0
         early_rejections = 0
         
-        for combo in combos:
+        for idx, combo in enumerate(combos):
             params = {**default_params, **dict(zip(param_names, combo))}
+
+            progress = (idx + 1) / max(len(combos), 1)
+            if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
+                dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
+                dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
+            else:
+                dd_train_mult = self.config.train_dd_multiplier
+                dd_val_mult = self.config.val_dd_multiplier
             
             try:
                 strategy = self.strategy_registry.get(strategy_name, **params)
@@ -803,7 +857,7 @@ class OptunaTPEOptimizer:
                 
                 # EARLY REJECTION 2: Training drawdown
                 train_dd = train_metrics.get('max_drawdown_pct', 100.0)
-                if train_dd > max_drawdown_pct * 1.25:
+                if train_dd > max_drawdown_pct * dd_train_mult:
                     early_rejections += 1
                     continue
                 
@@ -816,7 +870,7 @@ class OptunaTPEOptimizer:
                     
                     # EARLY REJECTION 3: Validation drawdown
                     val_dd = val_metrics.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct:
+                    if val_dd > max_drawdown_pct * dd_val_mult:
                         early_rejections += 1
                         continue
                 else:
@@ -894,8 +948,16 @@ class OptunaTPEOptimizer:
         best_by_regime = {r: (float('-inf'), None) for r in regimes}
         early_rejections = 0
         
-        for combo in combos:
+        for idx, combo in enumerate(combos):
             params = {**default_params, **dict(zip(param_names, combo))}
+
+            progress = (idx + 1) / max(len(combos), 1)
+            if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
+                dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
+                dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
+            else:
+                dd_train_mult = self.config.train_dd_multiplier
+                dd_val_mult = self.config.val_dd_multiplier
             
             try:
                 strategy = self.strategy_registry.get(strategy_name, **params)
@@ -911,7 +973,7 @@ class OptunaTPEOptimizer:
                 
                 # EARLY REJECTION 2: Training drawdown
                 train_dd = train_result.get('max_drawdown_pct', 100.0)
-                if train_dd > max_drawdown_pct * 1.25:
+                if train_dd > max_drawdown_pct * dd_train_mult:
                     early_rejections += 1
                     continue
                 
@@ -928,7 +990,7 @@ class OptunaTPEOptimizer:
                     
                     # Early rejection if validation DD too high
                     val_dd = val_result.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct:
+                    if val_dd > max_drawdown_pct * dd_val_mult:
                         early_rejections += 1
                         continue
                     
@@ -949,13 +1011,21 @@ class OptunaTPEOptimizer:
                     regime_train_dd = train_m.get('max_drawdown_pct', 100.0)
                     regime_val_dd = val_m.get('max_drawdown_pct', 100.0)
                     
-                    if regime_val_dd > max_drawdown_pct:
+                    if regime_val_dd > max_drawdown_pct * dd_val_mult:
                         continue
-                    if regime_train_dd > max_drawdown_pct * 1.25:
+                    if regime_train_dd > max_drawdown_pct * dd_train_mult:
                         continue
                     
-                    score = compute_score_fn(train_m, val_m) if self.config.use_validation_in_objective else compute_score_fn(train_m, {})
-                    
+                    if self.config.use_validation_in_objective:
+                        score = compute_score_fn(train_m, val_m)
+                    elif self.config.objective_blend_enabled and val_m.get('total_trades', 0) >= min_train_trades:
+                        train_score = compute_score_fn(train_m, {})
+                        gen_score = compute_score_fn(train_m, val_m)
+                        score = (self.config.objective_train_weight * train_score +
+                                 self.config.objective_val_weight * gen_score)
+                    else:
+                        score = compute_score_fn(train_m, {})
+
                     if score > best_by_regime[regime][0]:
                         best_by_regime[regime] = (score, {
                             'strategy': strategy,

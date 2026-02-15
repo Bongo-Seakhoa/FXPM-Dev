@@ -115,8 +115,8 @@ FX_Portfolio_Manager/
 ├── pm_regime_tuner.py
 ├── pm_optuna.py
 ├── config.json
-├── data/                  ← Create this folder
-└── .venv/                 ← Created by venv
+├── data/                  (create this folder)
+└── .venv/                 (created by venv)
 ```
 
 Create the data folder:
@@ -189,6 +189,12 @@ Open `config.json` in a text editor and configure:
 >   "instrument_specs": { "AUDCAD": { "inherit": "USDCAD" } }
 > }
 > ```
+>
+> Margin protection (black-swan guard) is active in live trading.
+> Uses MT5-native `margin_level` with cycle-based gating:
+> entry block `<100%`, forced recovery `<80%`, panic deleveraging `<65%`.
+> Policy is documented in `README.md` (Risk Management -> Margin Protection).
+> Thresholds are configurable in the `config.json` pipeline section.
 
 #### Full Configuration (Production)
 
@@ -224,7 +230,7 @@ Open `config.json` in a text editor and configure:
     
     "fx_opt_min_trades": 15,
     "fx_val_min_trades": 15,
-    "fx_val_max_drawdown": 20.0,
+    "fx_val_max_drawdown": 18.0,
     "fx_val_sharpe_override": 0.3,
     "fx_selection_top_k": 5,
     "fx_opt_top_k": 5,
@@ -257,7 +263,14 @@ Open `config.json` in a text editor and configure:
       "total_return": 0.15,
       "max_drawdown": 0.15,
       "trade_count": 0.10
-    }
+    },
+
+    "margin_entry_block_level": 100.0,
+    "margin_recovery_start_level": 80.0,
+    "margin_panic_level": 65.0,
+    "margin_reopen_level": 100.0,
+    "margin_recovery_closes_per_cycle": 1,
+    "margin_panic_closes_per_cycle": 3
   },
 
   "position": {
@@ -318,7 +331,11 @@ Open `config.json` in a text editor and configure:
 Note: `val_pct` is informational only. Actual validation size is controlled by
 `train_pct` and `overlap_pct`.
 Note: `optimization_max_workers` (default 1) enables parallel optimization when set > 1.
-Note: Live trading is **winners-only**. `default_config` is not used for live entries, and fallback risk keys (e.g. `fallback_risk_multiplier`, `fallback_max_risk_pct`, `tier23_max_risk_pct`) are removed/ignored.
+Note: Live trading is **winners-only** and non-tiered. `default_config` is not used for live entries. Use `live_risk_multiplier` and `live_max_risk_pct` for live risk sizing.
+Note: Current production `config.json` symbol universe is **77 symbols**.
+Note: Scoring-audit controls are now available (`regime_validation_top_k`, `scoring_use_*`, `optuna_objective_*`).
+Note: Keep the split contract `train_pct=80.0`, `val_pct=30.0`, `overlap_pct=10.0` unless you are explicitly redesigning split policy.
+Objective blending changes scoring weight only; it does not alter train/validation windows.
 
 ### 3.2 MT5 Connection Options
 
@@ -409,7 +426,7 @@ Connecting to MetaTrader 5...
 ✓ Connected to MT5
 ✓ Portfolio Manager initialized
   Symbols: 12
-  Strategies: 28
+  Strategies: 50
   Existing configs: 4
 
 ============================================================
@@ -424,7 +441,7 @@ Progress: 1/10
 ============================================================
 OPTIMIZING: USDJPY (Regime-Aware)
 ============================================================
-[USDJPY] Regime Optimization: 28 strategies x 6 timeframes x 4 regimes
+[USDJPY] Regime Optimization: 50 strategies x 6 timeframes x 4 regimes
 [USDJPY] [H1] Hyperparameter tuning 3 strategies
 [USDJPY] [H1] [TREND] Winner: SupertrendStrategy [TUNED] (quality=0.723)
 [USDJPY] [H1] [RANGE] Winner: BollingerBounceStrategy (quality=0.681)
@@ -517,6 +534,7 @@ Before going live, verify:
 4. Ensure risk caps and stop rules behave as expected (no unexpected `SKIPPED_RISK_CAP` spikes).
 5. Check that `pm_configs.json` is up to date and not expired for your symbols.
 6. Keep MT5 terminal open, logged in, and AutoTrading enabled.
+7. Confirm margin-protection thresholds in `config.json` (`margin_entry_block_level`, `margin_recovery_start_level`, `margin_panic_level`) match your broker's margin-call and stop-out rules.
 
 ### 6.2 Start Live Trading
 
@@ -773,7 +791,7 @@ Specify the path explicitly:
 
 1. **Check exact name in MT5**
    - Open Market Watch (Ctrl+M)
-   - Right-click → Symbols (Ctrl+U)
+   - Right-click -> Symbols (Ctrl+U)
    - Find exact name (e.g., `EURUSD`, `EURUSD.a`, `EURUSDm`)
 
 2. **Update config.json**
@@ -782,8 +800,8 @@ Specify the path explicitly:
    ```
 
 3. **Enable symbol in Market Watch**
-   - Right-click Market Watch → Symbols
-   - Find symbol → Show
+   - Right-click Market Watch -> Symbols
+   - Find symbol -> Show
 
 ### 9.3 Risk/Position Issues
 
@@ -931,7 +949,7 @@ Ctrl+C in terminal
 **Close all positions manually:**
 1. Open MetaTrader 5
 2. Go to Trade tab
-3. Right-click each position → Close
+3. Right-click each position -> Close
 
 **Reset decision throttle:**
 ```bash
@@ -950,6 +968,12 @@ python pm_main.py --optimize
 python pm_main.py --status
 ```
 
+**Review margin protection activity:**
+```bash
+grep "MARGIN" pm_outputs/logs/pm_*.log
+```
+Look for `MARGIN_STATE_CHANGE`, `MARGIN BLOCKED`, and `MARGIN_FORCE_CLOSE` entries.
+
 ---
 
 ## Support
@@ -964,7 +988,7 @@ For issues:
 
 ## Disclaimer
 
-⚠️ **IMPORTANT RISK WARNING**
+**IMPORTANT RISK WARNING**
 
 - Trading forex and CFDs involves substantial risk of loss
 - Past performance is not indicative of future results

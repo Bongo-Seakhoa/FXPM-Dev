@@ -4,6 +4,16 @@ A production-ready automated trading system featuring regime-aware strategy sele
 
 ---
 
+## Documentation Notes
+
+- Primary run/setup guide: `SETUP_AND_RUN.md`
+- Dashboard guide: `pm_dashboard/README.md`
+- Margin protection policy: `README.md` (Risk Management -> Margin Protection)
+- Patch notes: `PATCH_NOTES.md`
+- Archived historical analysis notes: `docs/archive/`
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -20,6 +30,7 @@ A production-ready automated trading system featuring regime-aware strategy sele
 - [Performance Optimizations](#performance-optimizations)
 - [Output Files](#output-files)
 - [Performance Metrics](#performance-metrics)
+- [Repository Hygiene](#repository-hygiene)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 - [Version History](#version-history)
@@ -31,7 +42,7 @@ A production-ready automated trading system featuring regime-aware strategy sele
 The FX Portfolio Manager is a fully automated trading pipeline that:
 
 1. **Detects Market Regimes** - Classifies markets as TREND, RANGE, BREAKOUT, or CHOP
-2. **Selects Strategies** - Tests 28 strategies across 6 timeframes per regime
+2. **Selects Strategies** - Tests 50 strategies across 6 timeframes per regime
 3. **Optimizes Parameters** - Grid/Optuna search with validation-aware scoring
 4. **Validates Robustness** - Gap penalty and robustness ratio enforcement
 5. **Persists Incrementally** - Never loses optimization progress (atomic saves)
@@ -42,15 +53,36 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 
 | Feature | Traditional Systems | This System |
 |---------|---------------------|-------------|
-| Strategy Selection | Single strategy | 28 strategies compete per regime |
+| Strategy Selection | Single strategy | 50 strategies compete per regime |
 | Market Adaptation | Static | Regime-aware (TREND/RANGE/BREAKOUT/CHOP) |
 | Parameter Tuning | Manual or random | Systematic grid/Optuna with validation |
 | Overfitting Prevention | None/minimal | Gap penalty + robustness ratio |
 | Risk Calculation | Pip-based (inaccurate) | MT5 tick-based math (broker-accurate) |
-| Execution Timing | Often has lookahead bias | Signal bar → next bar entry (verified) |
+| Execution Timing | Often has lookahead bias | Signal bar -> next bar entry (verified) |
 | Optimization State | Lost on interrupt | **Stateful ledger with atomic saves** |
 | Position Sizing | Fixed or simple | **Live-equity compounding** |
 | Backtesting Speed | Pure Python | **Numba JIT (3-10x faster)** |
+
+---
+
+## Repository Hygiene
+
+The repository now treats runtime artifacts as non-source outputs.
+
+- Ignored by default (`.gitignore`): caches, logs, generated trade outputs, and downloaded market data files.
+- Already tracked artifacts were removed from the git index with `git rm --cached` (local files remain on disk).
+
+If a clone still tracks runtime files, run:
+
+```bash
+git rm -r --cached -f --ignore-unmatch __pycache__ pm_dashboard/__pycache__ tests/__pycache__ logs pm_outputs data/.cache data/*.csv last_trade_log.json last_actionable_log.json
+```
+
+Optional local cleanup of ignored artifacts (destructive for ignored files only):
+
+```bash
+git clean -fdX
+```
 
 ---
 
@@ -81,7 +113,7 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 - **Hard Safety Cap**: Configurable maximum risk per trade (default 5%)
 
 ### Generalization-Focused Validation
-- **Gap Penalty**: Penalizes train→validation performance degradation
+- **Gap Penalty**: Penalizes train->validation performance degradation
 - **Robustness Ratio**: Validates val_score/train_score ratio
 - **Minimum Trade Thresholds**: Per-regime trade count requirements
 - **Top-K Validation**: Only validates promising candidates
@@ -101,7 +133,7 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 ```
 FX_Portfolio_Manager/
 ├── pm_core.py           # Configuration, data loading, backtesting, scoring
-├── pm_strategies.py     # 28 trading strategies with param grids
+├── pm_strategies.py     # 50 trading strategies with param grids
 ├── pm_pipeline.py       # Optimization pipeline, ConfigLedger, PortfolioManager
 ├── pm_main.py           # Application entry, live trading loop
 ├── pm_mt5.py            # MetaTrader 5 integration
@@ -232,7 +264,7 @@ FX_Portfolio_Manager/
 ├── pm_regime_tuner.py
 ├── pm_optuna.py
 ├── config.json
-└── data/              ← Create this folder
+└── data/              (create this folder)
 ```
 
 ### Step 3: Configure MetaTrader 5
@@ -306,7 +338,7 @@ python pm_main.py --trade --auto-retrain
     
     "fx_opt_min_trades": 15,
     "fx_val_min_trades": 15,
-    "fx_val_max_drawdown": 20.0,
+    "fx_val_max_drawdown": 18.0,
     "fx_gap_penalty_lambda": 0.70,
     "fx_min_robustness_ratio": 0.80,
     
@@ -351,7 +383,8 @@ python pm_main.py --trade --auto-retrain
 
 Note: `val_pct` is informational only. Actual validation size is controlled by
 `train_pct` and `overlap_pct`.
-Note: Live trading is **winners-only**. `default_config` is not used for live entries, and fallback risk keys (e.g. `fallback_risk_multiplier`, `fallback_max_risk_pct`, `tier23_max_risk_pct`) are removed/ignored.
+Note: Live trading is **winners-only** and non-tiered. `default_config` is not used for live entries. Use `live_risk_multiplier` and `live_max_risk_pct` for live risk sizing.
+Note: Current production `config.json` symbol universe is **77 symbols**.
 
 `instrument_specs` entries can use `"inherit": "SYMBOL"` to clone an existing
 spec as a starting point (handy for new symbols before you export broker specs).
@@ -368,6 +401,29 @@ spec as a starting point (handy for new symbols before you export broker specs).
 | `broker_specs_path` | Path to MT5-exported broker specs (optional) | broker_specs.json |
 | `instrument_specs` | Per-symbol instrument overrides (supports `inherit`) | {} |
 | `optimization_max_workers` | Max parallel workers for optimization (1 = sequential) | 1 |
+| `margin_entry_block_level` | Block new entries below this margin level % | 100.0 |
+| `margin_recovery_start_level` | Start forced closures below this % | 80.0 |
+| `margin_panic_level` | Aggressive forced closures below this % | 65.0 |
+
+### Scoring Audit Controls
+
+These controls were added for scoring-audit implementation and are all configurable in `pipeline`.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `regime_validation_top_k` | Max ranked regime candidates to validate in descent order | 5 |
+| `scoring_use_continuous_dd` | Use smooth DD penalty instead of legacy DD buckets | true |
+| `scoring_use_sortino_blend` | Blend Sortino into risk-adjusted scoring | true |
+| `scoring_use_tail_risk` | Penalize severe left-tail outcomes (`worst_5pct_r`) | true |
+| `scoring_use_consistency` | Penalize excessive losing streaks | true |
+| `scoring_use_trade_frequency_bonus` | Apply conservative trade-count confidence bonus | true |
+| `optuna_objective_blend_enabled` | Enable bounded train/val blend in Optuna objective | true |
+| `optuna_objective_train_weight` | Train weight in Optuna objective blend | 0.80 |
+| `optuna_objective_val_weight` | Validation weight in Optuna objective blend | 0.20 |
+
+Data split contract:
+- Keep `train_pct=80.0`, `val_pct=30.0`, `overlap_pct=10.0` unless doing a dedicated split-policy redesign.
+- Optuna objective blending does **not** change split windows; it only changes objective weighting.
 
 ---
 
@@ -425,16 +481,13 @@ python pm_main.py --config myconfig.json  # Custom config file
 
 ## Trading Strategies
 
-### Available Strategies (28)
+### Available Strategies (50)
 
 | Category | Strategies |
 |----------|------------|
-| **Trend Following** | EMACrossoverStrategy, MACDTrendStrategy, ADXTrendStrategy, SupertrendStrategy, HullMATrendStrategy, TrendContinuationStrategy, TrendStrengthStrategy, DirectionalMomentumStrategy, ChoppinessBreakoutStrategy, KeltnerTrendStrategy |
-| **Mean Reversion** | RSIReversalStrategy, RSIExtremesStrategy, BollingerBounceStrategy, CCIReversionStrategy, StochasticReversalStrategy |
-| **Breakout/Momentum** | DonchianBreakoutStrategy, SqueezeBreakoutStrategy, PriceChannelStrategy, MomentumBreakoutStrategy, VolatilityBreakoutStrategy |
-| **Volatility** | ATRBreakoutStrategy, BollingerSqueezeStrategy, VolatilityClusterStrategy |
-| **Hybrid** | MultiIndicatorStrategy, AdaptiveTrendStrategy, RegimeAdaptiveStrategy |
-| **Advanced** | MeanReversionBandsStrategy, IchimokuTrendStrategy |
+| **Trend Following (18)** | EMACrossoverStrategy, SupertrendStrategy, MACDTrendStrategy, ADXTrendStrategy, IchimokuStrategy, HullMATrendStrategy, EMARibbonADXStrategy, AroonTrendStrategy, ADXDIStrengthStrategy, KeltnerPullbackStrategy, OBVDivergenceStrategy, EMAPullbackContinuationStrategy, ParabolicSARTrendStrategy, KaufmanAMATrendStrategy, VortexTrendStrategy, ElderRayBullBearStrategy, MarketStructureBOSPullbackStrategy, FibonacciRetracementPullbackStrategy |
+| **Mean Reversion (18)** | RSIExtremesStrategy, BollingerBounceStrategy, ZScoreMRStrategy, StochasticReversalStrategy, CCIReversalStrategy, WilliamsRStrategy, RSITrendFilteredMRStrategy, StochRSITrendGateStrategy, FisherTransformMRStrategy, ZScoreVWAPReversionStrategy, TurtleSoupReversalStrategy, PinBarReversalStrategy, EngulfingPatternStrategy, RSIDivergenceStrategy, MACDDivergenceStrategy, KeltnerFadeStrategy, ROCExhaustionReversalStrategy, LiquiditySweepReversalStrategy |
+| **Breakout/Momentum (14)** | DonchianBreakoutStrategy, VolatilityBreakoutStrategy, MomentumBurstStrategy, SqueezeBreakoutStrategy, KeltnerBreakoutStrategy, PivotBreakoutStrategy, MACDHistogramMomentumStrategy, InsideBarBreakoutStrategy, NarrowRangeBreakoutStrategy, VolumeSpikeMomentumStrategy, ATRPercentileBreakoutStrategy, TRIXMomentumStrategy, FractalSRZoneBreakRetestStrategy, SupplyDemandImpulseRetestStrategy |
 
 ### Strategy Selection Process
 
@@ -484,8 +537,8 @@ position_size = floor(risk_amount / loss_per_lot, volume_step)
 ```
 
 The system uses **live equity** for sizing, meaning:
-- Winning streaks → larger positions (compounding)
-- Losing streaks → smaller positions (risk reduction)
+- Winning streaks -> larger positions (compounding)
+- Losing streaks -> smaller positions (risk reduction)
 
 ### Safety Features
 
@@ -496,6 +549,21 @@ The system uses **live equity** for sizing, meaning:
 | **Volume Floor** | Uses floor() not round() to avoid exceeding target |
 | **Position Check** | Verifies no existing position before entry |
 | **Rate Limiting** | Prevents rapid order submission |
+| **Margin Guard** | Blocks entries and force-closes losers under margin stress |
+
+### Margin Protection (Black Swan Guard)
+
+Cycle-based margin protection integrated into the live trading loop.
+Uses MT5-native `margin_level` for broker-accurate gating:
+
+| State | Margin Level | Behavior |
+|---|---|---|
+| NORMAL | >= 100% | Full operation, no restrictions |
+| BLOCKED | 80-99% | New entries blocked, existing positions untouched |
+| RECOVERY | 65-79% | Entries blocked + 1 worst-loser closed per cycle |
+| PANIC | < 65% | Entries blocked + up to 3 closures per cycle |
+
+Configured via the `config.json` pipeline section. Policy summary is in this section and in `SETUP_AND_RUN.md`.
 
 ---
 
@@ -505,8 +573,8 @@ The system uses **live equity** for sizing, meaning:
 
 1. **Load existing configs** from `pm_configs.json`
 2. **Check validity** for each symbol:
-   - Valid (not expired, validated) → **SKIP**
-   - Expired/missing/invalid → **OPTIMIZE**
+   - Valid (not expired, validated) -> **SKIP**
+   - Expired/missing/invalid -> **OPTIMIZE**
 3. **Save incrementally** after each symbol (atomic write)
 4. **Never lose progress** even on interruption
 
@@ -774,7 +842,7 @@ MIT License - Use at your own risk.
 
 ## Disclaimer
 
-⚠️ **IMPORTANT RISK WARNING**
+**IMPORTANT RISK WARNING**
 
 - Trading forex, CFDs, and derivatives involves substantial risk of loss
 - Past performance is not indicative of future results

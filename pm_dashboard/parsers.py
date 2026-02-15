@@ -135,13 +135,28 @@ def parse_entries_from_log(
 
 _RE_TS = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
 _RE_SELECTED = re.compile(
-    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Selected:\s+(?P<strategy>[^@]+)\s+@\s+(?P<tf>[^/]+)/(?P<regime>[A-Z0-9_]+)"
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+(?:\[(?P<trade_type>SECONDARY)\]\s+)?Selected:\s+(?P<strategy>[^@]+)\s+@\s+(?P<tf>[^/]+)/(?P<regime>[A-Z0-9_]+)"
 )
 _RE_ORDER = re.compile(
     r"\[(?P<symbol>[A-Z0-9_]+)\]\s+(?P<side>BUY|SELL)\s+\|.*?entry=(?P<entry>[0-9.]+)\s+\|\s+sl=(?P<sl>[0-9.]+)\s+\|\s+tp=(?P<tp>[0-9.]+)"
 )
 _RE_EXECUTED = re.compile(
     r"\[OK\]\s+\[(?P<symbol>[A-Z0-9_]+)\]\s+(?P<side>LONG|SHORT)\s+executed.*?@\s+(?P<price>[0-9.]+)"
+)
+_RE_FAILED_ORDER = re.compile(
+    r"\[FAIL\]\s+\[(?P<symbol>[A-Z0-9_]+)\]\s+Order failed:\s+(?P<retcode>\d+)\s*-\s*(?P<description>.+)"
+)
+_RE_SKIPPED_RISK_CAP = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Skipping trade;\s+risk\s+(?P<actual_risk>[0-9.]+)%\s+exceeds cap\s+(?P<cap_risk>[0-9.]+)%\s+\(vol=(?P<volume>[0-9.]+),\s*sl=(?P<sl>[0-9.]+)\)"
+)
+_RE_BLOCKED_RISK_CAP = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Secondary trade blocked:\s+combined risk cap reached\s+\((?P<existing_risk>[0-9.]+)%\s*>=\s*(?P<cap_risk>[0-9.]+)%\)"
+)
+_RE_BLOCKED_SYMBOL_RISK_CAP = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Symbol risk cap exceeded for (?P<canonical>[A-Z0-9_]+):.*?new (?P<new_risk>[0-9.]+)%\s*=\s*(?P<total_risk>[0-9.]+)%\s*>\s*max (?P<cap_risk>[0-9.]+)%"
+)
+_RE_SKIPPED_POSITION_EXISTS = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Skipping trade;\s+position already exists for magic\s+(?P<magic>\d+)(?:\s+\(ticket=(?P<ticket>\d+),\s*tf=(?P<timeframe>[A-Z0-9_]+)\))?"
 )
 
 
@@ -169,6 +184,7 @@ def parse_pm_execution_log(
             ctx["strategy_name"] = sel.group("strategy").strip()
             ctx["timeframe"] = sel.group("tf").strip().upper()
             ctx["regime"] = sel.group("regime").strip().upper()
+            ctx["secondary_trade"] = bool(sel.group("trade_type"))
             ctx["timestamp"] = ts_val
             continue
 
@@ -204,6 +220,7 @@ def parse_pm_execution_log(
                 timestamp=format_timestamp(parse_timestamp(ts_val)) if ts_val else None,
                 valid_now=True,
                 reason="EXECUTED",
+                secondary_trade=bool(ctx.get("secondary_trade")) if ctx.get("secondary_trade") is not None else None,
                 source=source,
                 raw={
                     "symbol": symbol,
@@ -215,6 +232,246 @@ def parse_pm_execution_log(
                     "timeframe": ctx.get("timeframe"),
                     "regime": ctx.get("regime"),
                     "strategy_name": ctx.get("strategy_name"),
+                    "secondary_trade": bool(ctx.get("secondary_trade")),
+                },
+            )
+            entry.entry_id = build_entry_id(
+                (
+                    entry.symbol,
+                    entry.timeframe,
+                    entry.regime,
+                    entry.strategy_name,
+                    entry.signal_direction,
+                    entry.entry_price,
+                    entry.stop_loss_price,
+                    entry.take_profit_price,
+                    entry.timestamp,
+                )
+            )
+            entries.append(entry)
+            continue
+
+        failed = _RE_FAILED_ORDER.search(line)
+        if failed:
+            symbol = normalize_symbol(failed.group("symbol"))
+            ctx = context.setdefault(symbol, {})
+            reason = f"FAILED_{failed.group('retcode')}"
+            entry = SignalEntry(
+                symbol=symbol,
+                timeframe=ctx.get("timeframe", ""),
+                regime=ctx.get("regime", ""),
+                strategy_name=ctx.get("strategy_name", ""),
+                signal_direction=ctx.get("signal_direction", ""),
+                entry_price=ctx.get("entry_price"),
+                stop_loss_price=ctx.get("stop_loss_price"),
+                take_profit_price=ctx.get("take_profit_price"),
+                signal_strength=None,
+                timestamp=format_timestamp(parse_timestamp(ts_val)) if ts_val else None,
+                valid_now=False,
+                reason=reason,
+                secondary_trade=bool(ctx.get("secondary_trade")) if ctx.get("secondary_trade") is not None else None,
+                source=source,
+                raw={
+                    "symbol": symbol,
+                    "action": reason,
+                    "retcode": failed.group("retcode"),
+                    "retcode_description": failed.group("description").strip(),
+                    "timeframe": ctx.get("timeframe"),
+                    "regime": ctx.get("regime"),
+                    "strategy_name": ctx.get("strategy_name"),
+                    "secondary_trade": bool(ctx.get("secondary_trade")),
+                },
+            )
+            entry.entry_id = build_entry_id(
+                (
+                    entry.symbol,
+                    entry.timeframe,
+                    entry.regime,
+                    entry.strategy_name,
+                    entry.signal_direction,
+                    entry.entry_price,
+                    entry.stop_loss_price,
+                    entry.take_profit_price,
+                    entry.timestamp,
+                )
+            )
+            entries.append(entry)
+            continue
+
+        skipped_risk = _RE_SKIPPED_RISK_CAP.search(line)
+        if skipped_risk:
+            symbol = normalize_symbol(skipped_risk.group("symbol"))
+            ctx = context.setdefault(symbol, {})
+            sl_price = coerce_float(skipped_risk.group("sl"))
+            if sl_price is not None and ctx.get("stop_loss_price") is None:
+                ctx["stop_loss_price"] = sl_price
+            entry = SignalEntry(
+                symbol=symbol,
+                timeframe=ctx.get("timeframe", ""),
+                regime=ctx.get("regime", ""),
+                strategy_name=ctx.get("strategy_name", ""),
+                signal_direction=ctx.get("signal_direction", ""),
+                entry_price=ctx.get("entry_price"),
+                stop_loss_price=ctx.get("stop_loss_price"),
+                take_profit_price=ctx.get("take_profit_price"),
+                signal_strength=None,
+                timestamp=format_timestamp(parse_timestamp(ts_val)) if ts_val else None,
+                valid_now=False,
+                reason="SKIPPED_RISK_CAP",
+                secondary_trade=bool(ctx.get("secondary_trade")) if ctx.get("secondary_trade") is not None else None,
+                source=source,
+                raw={
+                    "symbol": symbol,
+                    "action": "SKIPPED_RISK_CAP",
+                    "actual_risk_pct": coerce_float(skipped_risk.group("actual_risk")),
+                    "cap_risk_pct": coerce_float(skipped_risk.group("cap_risk")),
+                    "volume": coerce_float(skipped_risk.group("volume")),
+                    "sl": sl_price,
+                    "timeframe": ctx.get("timeframe"),
+                    "regime": ctx.get("regime"),
+                    "strategy_name": ctx.get("strategy_name"),
+                    "secondary_trade": bool(ctx.get("secondary_trade")),
+                },
+            )
+            entry.entry_id = build_entry_id(
+                (
+                    entry.symbol,
+                    entry.timeframe,
+                    entry.regime,
+                    entry.strategy_name,
+                    entry.signal_direction,
+                    entry.entry_price,
+                    entry.stop_loss_price,
+                    entry.take_profit_price,
+                    entry.timestamp,
+                )
+            )
+            entries.append(entry)
+            continue
+
+        blocked_risk = _RE_BLOCKED_RISK_CAP.search(line)
+        if blocked_risk:
+            symbol = normalize_symbol(blocked_risk.group("symbol"))
+            ctx = context.setdefault(symbol, {})
+            entry = SignalEntry(
+                symbol=symbol,
+                timeframe=ctx.get("timeframe", ""),
+                regime=ctx.get("regime", ""),
+                strategy_name=ctx.get("strategy_name", ""),
+                signal_direction=ctx.get("signal_direction", ""),
+                entry_price=ctx.get("entry_price"),
+                stop_loss_price=ctx.get("stop_loss_price"),
+                take_profit_price=ctx.get("take_profit_price"),
+                signal_strength=None,
+                timestamp=format_timestamp(parse_timestamp(ts_val)) if ts_val else None,
+                valid_now=False,
+                reason="BLOCKED_RISK_CAP",
+                secondary_trade=True,
+                source=source,
+                raw={
+                    "symbol": symbol,
+                    "action": "BLOCKED_RISK_CAP",
+                    "existing_risk_pct": coerce_float(blocked_risk.group("existing_risk")),
+                    "cap_risk_pct": coerce_float(blocked_risk.group("cap_risk")),
+                    "timeframe": ctx.get("timeframe"),
+                    "regime": ctx.get("regime"),
+                    "strategy_name": ctx.get("strategy_name"),
+                    "secondary_trade": True,
+                },
+            )
+            entry.entry_id = build_entry_id(
+                (
+                    entry.symbol,
+                    entry.timeframe,
+                    entry.regime,
+                    entry.strategy_name,
+                    entry.signal_direction,
+                    entry.entry_price,
+                    entry.stop_loss_price,
+                    entry.take_profit_price,
+                    entry.timestamp,
+                )
+            )
+            entries.append(entry)
+            continue
+
+        blocked_symbol_risk = _RE_BLOCKED_SYMBOL_RISK_CAP.search(line)
+        if blocked_symbol_risk:
+            symbol = normalize_symbol(blocked_symbol_risk.group("symbol"))
+            ctx = context.setdefault(symbol, {})
+            entry = SignalEntry(
+                symbol=symbol,
+                timeframe=ctx.get("timeframe", ""),
+                regime=ctx.get("regime", ""),
+                strategy_name=ctx.get("strategy_name", ""),
+                signal_direction=ctx.get("signal_direction", ""),
+                entry_price=ctx.get("entry_price"),
+                stop_loss_price=ctx.get("stop_loss_price"),
+                take_profit_price=ctx.get("take_profit_price"),
+                signal_strength=None,
+                timestamp=format_timestamp(parse_timestamp(ts_val)) if ts_val else None,
+                valid_now=False,
+                reason="BLOCKED_SYMBOL_RISK_CAP",
+                secondary_trade=bool(ctx.get("secondary_trade")) if ctx.get("secondary_trade") is not None else None,
+                source=source,
+                raw={
+                    "symbol": symbol,
+                    "canonical_symbol": blocked_symbol_risk.group("canonical"),
+                    "action": "BLOCKED_SYMBOL_RISK_CAP",
+                    "new_risk_pct": coerce_float(blocked_symbol_risk.group("new_risk")),
+                    "total_risk_pct": coerce_float(blocked_symbol_risk.group("total_risk")),
+                    "cap_risk_pct": coerce_float(blocked_symbol_risk.group("cap_risk")),
+                    "timeframe": ctx.get("timeframe"),
+                    "regime": ctx.get("regime"),
+                    "strategy_name": ctx.get("strategy_name"),
+                    "secondary_trade": bool(ctx.get("secondary_trade")) if ctx.get("secondary_trade") is not None else None,
+                },
+            )
+            entry.entry_id = build_entry_id(
+                (
+                    entry.symbol,
+                    entry.timeframe,
+                    entry.regime,
+                    entry.strategy_name,
+                    entry.signal_direction,
+                    entry.entry_price,
+                    entry.stop_loss_price,
+                    entry.take_profit_price,
+                    entry.timestamp,
+                )
+            )
+            entries.append(entry)
+            continue
+
+        skipped_exists = _RE_SKIPPED_POSITION_EXISTS.search(line)
+        if skipped_exists:
+            symbol = normalize_symbol(skipped_exists.group("symbol"))
+            ctx = context.setdefault(symbol, {})
+            timeframe = skipped_exists.group("timeframe") or ctx.get("timeframe", "")
+            entry = SignalEntry(
+                symbol=symbol,
+                timeframe=str(timeframe).upper() if timeframe else "",
+                regime=ctx.get("regime", ""),
+                strategy_name=ctx.get("strategy_name", ""),
+                signal_direction=ctx.get("signal_direction", ""),
+                entry_price=ctx.get("entry_price"),
+                stop_loss_price=ctx.get("stop_loss_price"),
+                take_profit_price=ctx.get("take_profit_price"),
+                signal_strength=None,
+                timestamp=format_timestamp(parse_timestamp(ts_val)) if ts_val else None,
+                valid_now=False,
+                reason="SKIPPED_POSITION_EXISTS",
+                secondary_trade=bool(ctx.get("secondary_trade")) if ctx.get("secondary_trade") is not None else None,
+                source=source,
+                raw={
+                    "symbol": symbol,
+                    "action": "SKIPPED_POSITION_EXISTS",
+                    "existing_magic": skipped_exists.group("magic"),
+                    "existing_ticket": skipped_exists.group("ticket"),
+                    "timeframe": str(timeframe).upper() if timeframe else None,
+                    "regime": ctx.get("regime"),
+                    "strategy_name": ctx.get("strategy_name"),
+                    "secondary_trade": bool(ctx.get("secondary_trade")),
                 },
             )
             entry.entry_id = build_entry_id(
@@ -270,6 +527,25 @@ def normalize_record(
     if action_value and not notes:
         notes = action_value
 
+    secondary_trade_raw = extract_field(record, aliases.get("secondary_trade", []))
+    secondary_trade: Optional[bool] = None
+    if secondary_trade_raw is not None:
+        if isinstance(secondary_trade_raw, bool):
+            secondary_trade = secondary_trade_raw
+        elif isinstance(secondary_trade_raw, (int, float)):
+            secondary_trade = bool(secondary_trade_raw)
+        elif isinstance(secondary_trade_raw, str):
+            lowered = secondary_trade_raw.strip().lower()
+            if lowered in ("true", "1", "yes", "y"):
+                secondary_trade = True
+            elif lowered in ("false", "0", "no", "n"):
+                secondary_trade = False
+
+    secondary_reason = extract_field(record, aliases.get("secondary_reason", [])) or ""
+    position_context = record.get("position_context")
+    if not isinstance(position_context, dict):
+        position_context = {}
+
     if entry_price is None:
         entry_price = coerce_float(record.get("entry"))
 
@@ -301,6 +577,9 @@ def normalize_record(
         timestamp=format_timestamp(timestamp),
         valid_now=valid_now,
         reason=str(notes).strip(),
+        secondary_trade=secondary_trade,
+        secondary_reason=str(secondary_reason).strip(),
+        position_context=position_context,
         source=source,
         raw=record,
     )

@@ -39,6 +39,7 @@ from pm_core import (
 )
 from pm_strategies import StrategyRegistry, BaseStrategy
 from pm_position import PositionConfig, PositionManager
+from pm_regime import load_regime_params
 
 # Import Optuna TPE optimizer
 try:
@@ -267,7 +268,10 @@ class ConfigLedger:
         days_remaining = (config.valid_until - now).days
         return True, f"valid until {config.valid_until.strftime('%Y-%m-%d')} ({days_remaining} days remaining)"
     
-    def should_optimize(self, symbol: str, overwrite: bool = False) -> Tuple[bool, str]:
+    def should_optimize(self,
+                        symbol: str,
+                        overwrite: bool = False,
+                        current_regime_version: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """
         Determine if a symbol should be optimized.
         
@@ -284,11 +288,18 @@ class ConfigLedger:
         is_valid, reason = self.has_valid_config(symbol)
         
         if is_valid:
+            if current_regime_version and symbol in self.configs:
+                stored = getattr(self.configs[symbol], "regime_detection_version", None)
+                if stored and stored != current_regime_version:
+                    return True, "regime detection params changed"
             return False, reason  # Skip - config is valid
-        else:
-            return True, reason  # Optimize - config is missing/expired/invalid
+
+        return True, reason  # Optimize - config is missing/expired/invalid
     
-    def get_symbols_to_optimize(self, symbols: List[str], overwrite: bool = False) -> Tuple[List[str], List[str]]:
+    def get_symbols_to_optimize(self,
+                                symbols: List[str],
+                                overwrite: bool = False,
+                                current_regime_versions: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[List[str], List[str]]:
         """
         Partition symbols into those needing optimization and those to skip.
         
@@ -306,7 +317,8 @@ class ConfigLedger:
         to_skip = []
         
         for symbol in symbols:
-            should_opt, reason = self.should_optimize(symbol, overwrite)
+            version = (current_regime_versions or {}).get(symbol)
+            should_opt, reason = self.should_optimize(symbol, overwrite, current_regime_version=version)
             if should_opt:
                 to_optimize.append(symbol)
                 logger.info(f"OPTIMIZE {symbol}: {reason}")
@@ -503,6 +515,9 @@ class SymbolConfig:
     # Validation status
     is_validated: bool = False
     validation_reason: str = ""
+
+    # Regime detection version stamp for invalidation when params change.
+    regime_detection_version: Optional[Dict[str, Any]] = None
     
     # Timestamps
     optimized_at: Optional[datetime] = None
@@ -555,6 +570,9 @@ class SymbolConfig:
             'val_metrics': {k: v for k, v in self.val_metrics.items() 
                           if k not in ['equity_curve', 'trades']},
         }
+
+        if self.regime_detection_version:
+            result['regime_detection_version'] = self.regime_detection_version
         
         # Add regime configs
         if self.regime_configs:
@@ -591,6 +609,7 @@ class SymbolConfig:
             config.optimized_at = datetime.fromisoformat(data['optimized_at'])
         if data.get('valid_until'):
             config.valid_until = datetime.fromisoformat(data['valid_until'])
+        config.regime_detection_version = data.get('regime_detection_version')
         
         # Load regime configs
         if 'regime_configs' in data and data['regime_configs']:
@@ -1328,6 +1347,9 @@ class RegimeOptimizer:
         self.val_min_sharpe_override = getattr(config, 'fx_val_sharpe_override', 0.3)
         self.min_robustness_ratio = getattr(config, 'fx_min_robustness_ratio', 0.75)
         
+        # Max candidates to attempt validation on (descent through scored list)
+        self.regime_validation_top_k = getattr(config, 'regime_validation_top_k', 5)
+
         # ===== PROFITABILITY GATES (FIX #1) =====
         # These prevent storing losing strategies as "regime winners"
         self.min_val_profit_factor = getattr(config, 'regime_min_val_profit_factor', 1.0)
@@ -1444,8 +1466,69 @@ class RegimeOptimizer:
                         unvalidated_winners += 1
                         logger.debug(f"[{symbol}] [{tf}] [{regime}] Candidate {best_config.strategy_name} "
                                     f"FAILED validation: {val_reason}")
+                else:
+                    unvalidated_winners += 1
+                    logger.warning(
+                        f"[{symbol}] [{tf}] [{regime}] No validated winner - {val_reason}. "
+                        f"NO TRADE for this regime."
+                    )
         
+        # --- Reason-coded summary telemetry ---
+        total_slots = sum(len(self.REGIMES) for _ in train_features_by_tf)
+        logger.info(
+            f"[{symbol}] Regime optimization summary: "
+            f"{validated_winners}/{total_slots} validated, "
+            f"{unvalidated_winners} unvalidated/no-winner, "
+            f"{total_slots - validated_winners - unvalidated_winners} skipped (data)"
+        )
+
         return regime_configs, best_overall_config, validated_winners, unvalidated_winners
+
+    def _apply_training_eligibility_gates(self,
+                                          candidates: List[Dict[str, Any]],
+                                          symbol: str,
+                                          timeframe: str) -> List[Dict[str, Any]]:
+        """
+        Filter catastrophic training candidates before expensive tuning.
+        """
+        eligible: List[Dict[str, Any]] = []
+        rejected_reasons: List[str] = []
+
+        train_pf_floor = float(getattr(self.config, "train_min_profit_factor", 0.5))
+        train_return_floor = float(getattr(self.config, "train_min_return_pct", -30.0))
+        train_dd_ceiling = float(getattr(self.config, "train_max_drawdown", 60.0))
+
+        for cand in candidates:
+            train_result = cand.get("train_result", {})
+            train_pf = float(train_result.get("profit_factor", 0))
+            train_return = float(train_result.get("total_return_pct", 0))
+            train_dd = float(train_result.get("max_drawdown_pct", 100))
+
+            rejected = False
+            reason = ""
+            if train_pf < train_pf_floor:
+                rejected = True
+                reason = f"train PF {train_pf:.2f} < {train_pf_floor:.2f}"
+            elif train_return < train_return_floor:
+                rejected = True
+                reason = f"train return {train_return:.1f}% < {train_return_floor:.1f}%"
+            elif train_dd > train_dd_ceiling:
+                rejected = True
+                reason = f"train DD {train_dd:.1f}% > {train_dd_ceiling:.1f}%"
+
+            if rejected:
+                rejected_reasons.append(f"{cand['strategy_name']}: {reason}")
+            else:
+                eligible.append(cand)
+
+        if rejected_reasons:
+            logger.info(
+                f"[{symbol}] [{timeframe}] Training eligibility rejected "
+                f"{len(rejected_reasons)}/{len(candidates)}: "
+                f"{rejected_reasons[:3]}{'...' if len(rejected_reasons) > 3 else ''}"
+            )
+
+        return eligible
     
     def _collect_candidates(self,
                             symbol: str,
@@ -1507,14 +1590,24 @@ class RegimeOptimizer:
             except Exception as e:
                 logger.debug(f"[{symbol}] [{timeframe}] {strategy.name} failed: {e}")
                 continue
-        
+
+        eligible_candidates = self._apply_training_eligibility_gates(
+            screening_candidates, symbol, timeframe
+        )
+        if not eligible_candidates:
+            logger.warning(
+                f"[{symbol}] [{timeframe}] No strategies passed training eligibility gates. "
+                f"All {len(screening_candidates)} candidates rejected."
+            )
+            return []
+
         if not self.enable_hyperparam_tuning:
-            return screening_candidates
+            return eligible_candidates
         
         # Phase 2: Hyperparameter tuning for top-K strategies per regime
         # Identify top-K strategies for each regime based on screening scores
         regime_top_strategies = self._identify_top_strategies_per_regime(
-            screening_candidates, top_k=self.hyperparam_top_k
+            eligible_candidates, top_k=self.hyperparam_top_k
         )
         
         # Collect all unique strategies that need tuning
@@ -1524,15 +1617,15 @@ class RegimeOptimizer:
         
         if not strategies_to_tune:
             logger.debug(f"[{symbol}] [{timeframe}] No strategies eligible for hyperparameter tuning")
-            return screening_candidates
+            return eligible_candidates
         
         logger.info(f"[{symbol}] [{timeframe}] Hyperparameter tuning {len(strategies_to_tune)} strategies")
         
         # Run hyperparameter tuning for each strategy
         tuned_candidates = []
         for strategy_name in strategies_to_tune:
-            # Find the original strategy from screening
-            original_cand = next((c for c in screening_candidates if c['strategy_name'] == strategy_name), None)
+            # Find the original strategy from eligible candidate set.
+            original_cand = next((c for c in eligible_candidates if c['strategy_name'] == strategy_name), None)
             if original_cand is None:
                 continue
             
@@ -1550,9 +1643,9 @@ class RegimeOptimizer:
             
             tuned_candidates.extend(tuned_results)
         
-        # Combine screening candidates with tuned candidates
+        # Combine eligibility-filtered candidates with tuned candidates.
         # The tuned candidates may replace or augment the defaults
-        all_candidates = screening_candidates + tuned_candidates
+        all_candidates = eligible_candidates + tuned_candidates
         
         return all_candidates
     
@@ -1840,7 +1933,42 @@ class RegimeOptimizer:
                 current_dd_pct = ((peak_equity - equity) / peak_equity) * 100
                 if current_dd_pct > max_drawdown_pct:
                     max_drawdown_pct = current_dd_pct
-        
+
+        # ===== Step D: Expanded regime bucket metrics for scoring calibration =====
+
+        # Max consecutive losses
+        max_consec_losses = 0
+        current_streak = 0
+        for trade in sorted_trades:
+            if trade.get('pnl_dollars', 0) < 0:
+                current_streak += 1
+                max_consec_losses = max(max_consec_losses, current_streak)
+            else:
+                current_streak = 0
+
+        # Calmar ratio
+        calmar_ratio = (total_return_pct / max_drawdown_pct) if max_drawdown_pct > 0 else 0.0
+
+        # R-multiple stats (from trade data if available)
+        r_multiples = [t.get('r_multiple', 0.0) for t in trades if 'r_multiple' in t]
+        if r_multiples:
+            mean_r = float(np.mean(r_multiples))
+            worst_5pct_r = float(np.percentile(r_multiples, 5)) if len(r_multiples) >= 20 else min(r_multiples)
+        else:
+            mean_r = 0.0
+            worst_5pct_r = 0.0
+
+        # Sortino ratio proxy (from trade returns)
+        if len(returns) > 1:
+            negative_returns = [r for r in returns if r < 0]
+            if len(negative_returns) >= 2:
+                downside_std = np.std(negative_returns, ddof=1)
+                sortino_approx = (avg_return / downside_std * np.sqrt(252)) if downside_std > 1e-10 else 0.0
+            else:
+                sortino_approx = sharpe_approx * 1.5 if avg_return > 0 else 0.0
+        else:
+            sortino_approx = 0.0
+
         return {
             'total_trades': n,
             'win_rate': round(win_rate, 2),
@@ -1853,6 +1981,11 @@ class RegimeOptimizer:
             'sharpe_approx': round(sharpe_approx, 3),
             'max_drawdown_pct': round(max_drawdown_pct, 2),  # FIX: Now properly computed
             'total_return_pct': round(total_return_pct, 2),  # FIX: Now properly computed
+            'max_consecutive_losses': max_consec_losses,
+            'calmar_ratio': round(calmar_ratio, 2),
+            'mean_r': round(mean_r, 3),
+            'worst_5pct_r': round(worst_5pct_r, 3),
+            'sortino_approx': round(sortino_approx, 3),
         }
     
     def _select_best_for_regime(self,
@@ -1869,40 +2002,39 @@ class RegimeOptimizer:
         Returns:
             Tuple of (RegimeConfig or None, is_validated, validation_reason)
         """
-        best_score = -float('inf')
-        best_candidate = None
-        rejection_reasons = []  # Track why candidates were rejected
-        
+        scored_candidates = []  # List of (score, candidate) tuples
+        rejection_reasons = []  # Track why candidates were rejected at gate level
+
         for cand in candidates:
             train_metrics = cand['train_regime_metrics'].get(regime, {})
             val_metrics = cand['val_regime_metrics'].get(regime, {})
-            
+
             train_trades = train_metrics.get('total_trades', 0)
             val_trades = val_metrics.get('total_trades', 0)
-            
+
             # Check minimum trades
             if train_trades < self.min_train_trades:
                 continue
             if val_trades < self.min_val_trades:
                 continue
-            
+
             # ===== EARLY REJECTION: Check drawdown before scoring (saves compute) =====
             train_dd = train_metrics.get('max_drawdown_pct', 100.0)
             val_dd = val_metrics.get('max_drawdown_pct', 100.0)
-            
+
             # Reject if validation drawdown exceeds threshold
             if val_dd > self.val_max_drawdown:
                 continue
-            
+
             # Reject if training drawdown is excessively high (1.25x threshold)
             if train_dd > self.val_max_drawdown * 1.25:
                 continue
-            
+
             # ===== FIX #1: EARLY REJECTION - Profitability gates =====
             # Reject candidates that are clearly losing BEFORE scoring
             val_pf = val_metrics.get('profit_factor', 0.0)
             val_return = val_metrics.get('total_return_pct', -100.0)
-            
+
             if not self.allow_losing_winners:
                 if val_pf < self.min_val_profit_factor:
                     rejection_reasons.append(f"{cand['strategy_name']}: PF={val_pf:.2f} < {self.min_val_profit_factor}")
@@ -1910,34 +2042,83 @@ class RegimeOptimizer:
                 if val_return < self.min_val_return_pct:
                     rejection_reasons.append(f"{cand['strategy_name']}: return={val_return:.1f}% < {self.min_val_return_pct}")
                     continue
-            
+
             # Score based on validation metrics (with train as fallback)
             score = self._compute_regime_score(train_metrics, val_metrics)
-            
-            if score > best_score:
-                best_score = score
-                best_candidate = cand
-        
-        if best_candidate is None:
+            scored_candidates.append((score, cand))
+
+        if not scored_candidates:
             reason = "No candidates met minimum trade/drawdown/profitability thresholds"
             if rejection_reasons:
                 reason += f" (rejected: {len(rejection_reasons)} candidates for profitability)"
             return None, False, reason
-        
-        # Build RegimeConfig
+
+        # Sort descending by score
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # Cap the number of validation attempts
+        top_k = min(self.regime_validation_top_k, len(scored_candidates))
+
+        logger.debug(
+            f"[{symbol}] [{timeframe}] [{regime}] Candidate descent: "
+            f"{len(scored_candidates)} gate-passed, validating top-{top_k}"
+        )
+
+        # Iterate top-K candidates, return first that passes validation
+        validation_failures = []
+        for rank, (score, cand) in enumerate(scored_candidates[:top_k], start=1):
+            train_metrics = cand['train_regime_metrics'].get(regime, {})
+            val_metrics = cand['val_regime_metrics'].get(regime, {})
+            strategy_name = cand.get('strategy_name', 'Unknown')
+
+            is_validated, validation_reason = self._validate_regime_winner(
+                train_metrics, val_metrics, regime, strategy_name
+            )
+
+            if is_validated:
+                if rank > 1:
+                    logger.info(
+                        f"[{symbol}] [{timeframe}] [{regime}] Descent: "
+                        f"rank #{rank} {strategy_name} passed validation "
+                        f"(top {rank - 1} failed)"
+                    )
+                else:
+                    logger.debug(
+                        f"[{symbol}] [{timeframe}] [{regime}] Descent: "
+                        f"rank #1 {strategy_name} passed validation"
+                    )
+
+                quality_score = self._normalize_score(score)
+                now = datetime.now()
+
+                config = RegimeConfig(
+                    strategy_name=strategy_name,
+                    parameters=cand['params'],
+                    quality_score=quality_score,
+                    train_metrics=train_metrics,
+                    val_metrics=val_metrics,
+                    regime_train_trades=train_metrics.get('total_trades', 0),
+                    regime_val_trades=val_metrics.get('total_trades', 0),
+                    trained_at=now,
+                    valid_until=now + timedelta(days=60),
+                )
+
+                return config, True, validation_reason
+            else:
+                validation_failures.append(f"#{rank} {strategy_name}: {validation_reason}")
+                logger.debug(
+                    f"[{symbol}] [{timeframe}] [{regime}] Descent: "
+                    f"rank #{rank} {strategy_name} FAILED: {validation_reason}"
+                )
+
+        # All top-K candidates failed validation - return the best one as unvalidated
+        best_score, best_candidate = scored_candidates[0]
         train_metrics = best_candidate['train_regime_metrics'].get(regime, {})
         val_metrics = best_candidate['val_regime_metrics'].get(regime, {})
-        
-        # Validate the winner using fx_backtester rules
-        is_validated, validation_reason = self._validate_regime_winner(
-            train_metrics, val_metrics, regime
-        )
-        
-        # Normalize quality score to 0-1 using sigmoid mapping
+
         quality_score = self._normalize_score(best_score)
-        
         now = datetime.now()
-        
+
         config = RegimeConfig(
             strategy_name=best_candidate['strategy_name'],
             parameters=best_candidate['params'],
@@ -1949,13 +2130,24 @@ class RegimeOptimizer:
             trained_at=now,
             valid_until=now + timedelta(days=60),
         )
-        
-        return config, is_validated, validation_reason
+
+        descent_summary = "; ".join(validation_failures)
+        final_reason = (
+            f"All {len(validation_failures)} descent candidates failed validation "
+            f"[{descent_summary}]"
+        )
+        logger.info(
+            f"[{symbol}] [{timeframe}] [{regime}] Descent exhausted: "
+            f"{len(validation_failures)}/{top_k} candidates failed validation"
+        )
+
+        return config, False, final_reason
     
     def _validate_regime_winner(self,
                                  train_metrics: Dict[str, Any],
                                  val_metrics: Dict[str, Any],
-                                 regime: str) -> Tuple[bool, str]:
+                                 regime: str,
+                                 candidate_name: str = "Unknown") -> Tuple[bool, str]:
         """
         Validate a regime winner against fx_backtester thresholds.
         
@@ -1974,6 +2166,8 @@ class RegimeOptimizer:
         val_drawdown = val_metrics.get('max_drawdown_pct', 100.0)  # Default to worst-case
         val_pf = val_metrics.get('profit_factor', 0.0)
         val_return = val_metrics.get('total_return_pct', -100.0)
+        train_pf = train_metrics.get('profit_factor', 0.0)
+        train_return = train_metrics.get('total_return_pct', -100.0)
         
         # Check minimum validation trades
         if val_trades < self.min_val_trades:
@@ -1989,6 +2183,36 @@ class RegimeOptimizer:
         train_dd_threshold = self.val_max_drawdown * 1.25
         if train_drawdown > train_dd_threshold:
             return False, f"Excessive train drawdown: {train_drawdown:.1f}% > {train_dd_threshold:.1f}%"
+
+        # Weak-train exception: only allow if validation is exceptional.
+        weak_train = train_pf < 1.0 or train_return < 0
+        if weak_train:
+            exceptional_val_pf = float(getattr(self.config, "exceptional_val_profit_factor", 1.15))
+            exceptional_val_return = float(getattr(self.config, "exceptional_val_return_pct", 5.0))
+            exceptional_val_min_trades = self.min_val_trades * 2
+
+            val_dd_limit = self.val_max_drawdown * 0.75
+            val_win_rate = val_metrics.get('win_rate', 0)
+
+            if (val_pf >= exceptional_val_pf and
+                val_return >= exceptional_val_return and
+                val_trades >= exceptional_val_min_trades and
+                val_drawdown < val_dd_limit and
+                val_win_rate > 50.0):
+                logger.info(
+                    f"[{regime}] {candidate_name}: allowing weak-train winner "
+                    f"(train PF {train_pf:.2f}, train return {train_return:.1f}%) "
+                    f"due to exceptional validation "
+                    f"(val PF {val_pf:.2f}, val return {val_return:.1f}%, val trades {val_trades}, "
+                    f"val DD {val_drawdown:.1f}%, val WR {val_win_rate:.1f}%)"
+                )
+            else:
+                return False, (
+                    f"Weak train rejected: train PF {train_pf:.2f}, train return {train_return:.1f}% "
+                    f"(requires val PF>={exceptional_val_pf:.2f}, val return>={exceptional_val_return:.1f}%, "
+                    f"val trades>={exceptional_val_min_trades}, "
+                    f"val DD<{val_dd_limit:.1f}%, val WR>50%)"
+                )
         
         # ===== FIX #1: PROFITABILITY GATES (Critical new checks) =====
         # These prevent storing losing strategies as "regime winners"
@@ -2123,24 +2347,32 @@ class RegimeOptimizer:
             'gross_profit': bucket_metrics.get('gross_profit', 0),
             'gross_loss': bucket_metrics.get('gross_loss', 0),
             'total_pnl': bucket_metrics.get('total_pnl', 0),
-            'expectancy_pips': bucket_metrics.get('avg_win', 0) * bucket_metrics.get('win_rate', 0) / 100 
+            'expectancy_pips': bucket_metrics.get('avg_win', 0) * bucket_metrics.get('win_rate', 0) / 100
                              - bucket_metrics.get('avg_loss', 0) * (1 - bucket_metrics.get('win_rate', 0) / 100),
+            'sortino_ratio': bucket_metrics.get('sortino_approx', 0),
+            'calmar_ratio': bucket_metrics.get('calmar_ratio', 0),
+            'mean_r': bucket_metrics.get('mean_r', 0),
+            'worst_5pct_r': bucket_metrics.get('worst_5pct_r', 0),
+            'max_consecutive_losses': bucket_metrics.get('max_consecutive_losses', 0),
         }
     
     def _normalize_score(self, score: float) -> float:
         """
         Normalize score to 0-1 range using sigmoid mapping.
-        
+
         This prevents saturation at extreme scores.
+        Calibrated for the continuous-DD scoring distribution where
+        typical scores land in the 25-55 range.
         """
-        # Sigmoid centered at 80 with scale 40
-        # score=0 -> ~0.12, score=80 -> 0.5, score=160 -> ~0.88
+        # Sigmoid centered at 45 with scale 30
+        # score=15 -> ~0.27, score=30 -> ~0.38, score=45 -> 0.5,
+        # score=60 -> ~0.62, score=80 -> ~0.76
         import math
         try:
-            normalized = 1.0 / (1.0 + math.exp(-(score - 80) / 40))
+            normalized = 1.0 / (1.0 + math.exp(-(score - 45) / 30))
         except OverflowError:
             normalized = 0.0 if score < 0 else 1.0
-        
+
         return max(0.0, min(1.0, normalized))
 
 
@@ -2173,6 +2405,38 @@ class OptimizationPipeline:
         
         # Regime-aware optimizer
         self.regime_optimizer = RegimeOptimizer(config)
+
+    def build_regime_detection_version(self, symbol: str) -> Dict[str, Any]:
+        """
+        Build a version stamp for regime detection inputs used by a symbol.
+
+        Stored in SymbolConfig and compared in ConfigLedger to trigger
+        re-optimization when regime logic inputs change.
+        """
+        regime_params_file = getattr(self.config, "regime_params_file", "regime_params.json")
+        params_path = Path(regime_params_file)
+        if not params_path.is_absolute():
+            params_path = Path.cwd() / params_path
+
+        file_meta: Dict[str, Any] = {"path": str(params_path)}
+        try:
+            if params_path.exists():
+                file_meta["mtime_ns"] = int(params_path.stat().st_mtime_ns)
+        except Exception:
+            pass
+
+        by_timeframe: Dict[str, Dict[str, Any]] = {}
+        for tf in self.config.timeframes:
+            try:
+                params = load_regime_params(symbol, tf, regime_params_file)
+                by_timeframe[tf] = params.to_dict()
+            except Exception:
+                by_timeframe[tf] = {}
+
+        return {
+            "file": file_meta,
+            "timeframes": by_timeframe,
+        }
     
     def run_for_symbol(self, symbol: str) -> PipelineResult:
         """
@@ -2296,6 +2560,7 @@ class OptimizationPipeline:
                 robustness_ratio=0.0,
                 is_validated=total_winners > 0,  # Now only True if at least one winner passed validation
                 validation_reason=f"{total_winners} validated winners ({unvalidated_count} rejected) across {len(regime_configs)} timeframes",
+                regime_detection_version=self.build_regime_detection_version(symbol),
                 optimized_at=now,
                 valid_until=now + timedelta(days=retrain_days),
             )
@@ -2474,8 +2739,16 @@ class PortfolioManager:
         
         Uses ledger validity check.
         """
-        is_valid, _ = self.ledger.has_valid_config(symbol)
-        return not is_valid
+        try:
+            current_version = self.pipeline.build_regime_detection_version(symbol)
+        except Exception:
+            current_version = None
+        should_optimize, _ = self.ledger.should_optimize(
+            symbol,
+            overwrite=False,
+            current_regime_version=current_version,
+        )
+        return should_optimize
     
     def get_symbols_needing_retrain(self) -> List[str]:
         """Get list of symbols that need retraining."""
@@ -2494,8 +2767,16 @@ class PortfolioManager:
         """
         # Check if we should skip
         if not force:
-            is_valid, reason = self.ledger.has_valid_config(symbol)
-            if is_valid:
+            try:
+                current_version = self.pipeline.build_regime_detection_version(symbol)
+            except Exception:
+                current_version = None
+            should_optimize, reason = self.ledger.should_optimize(
+                symbol,
+                overwrite=False,
+                current_regime_version=current_version,
+            )
+            if not should_optimize:
                 logger.info(f"SKIP {symbol}: {reason}")
                 return True  # Already valid
         
@@ -2554,7 +2835,18 @@ class PortfolioManager:
         total_start = time.time()
         
         # Determine which symbols to optimize
-        to_optimize, to_skip = self.ledger.get_symbols_to_optimize(self.symbols, overwrite=overwrite)
+        current_regime_versions: Dict[str, Dict[str, Any]] = {}
+        if not overwrite:
+            for sym in self.symbols:
+                try:
+                    current_regime_versions[sym] = self.pipeline.build_regime_detection_version(sym)
+                except Exception:
+                    current_regime_versions[sym] = {}
+        to_optimize, to_skip = self.ledger.get_symbols_to_optimize(
+            self.symbols,
+            overwrite=overwrite,
+            current_regime_versions=current_regime_versions,
+        )
         
         logger.info(f"\n{'#'*60}")
         logger.info(f"PORTFOLIO MANAGER - STATEFUL OPTIMIZATION")

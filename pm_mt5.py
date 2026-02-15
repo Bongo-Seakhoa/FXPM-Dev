@@ -139,7 +139,14 @@ class MT5SymbolInfo:
             max_lot=self.volume_max,
             commission_per_lot=7.0,  # Default, broker-specific
             swap_long=self.swap_long,
-            swap_short=self.swap_short
+            swap_short=self.swap_short,
+            tick_size=self.trade_tick_size,
+            tick_value=self.trade_tick_value,
+            contract_size=self.trade_contract_size,
+            volume_step=self.volume_step,
+            stops_level=self.trade_stops_level,
+            point=self.point,
+            digits=self.digits,
         )
 
 

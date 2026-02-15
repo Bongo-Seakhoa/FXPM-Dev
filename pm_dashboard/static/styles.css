@@ -194,6 +194,55 @@ textarea {
   overflow-x: auto;
 }
 
+.table-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.page-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.page-meta-sep {
+  opacity: 0.6;
+}
+
+.page-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.page-controls label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.page-controls select {
+  width: auto;
+  min-width: 70px;
+}
+
+.strategy-link {
+  color: var(--accent-3);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.strategy-link:hover {
+  text-decoration: underline;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -212,6 +261,10 @@ th {
   text-transform: uppercase;
   letter-spacing: 0.8px;
   color: var(--muted);
+  position: sticky;
+  top: 0;
+  background: var(--card);
+  z-index: 1;
 }
 
 tbody tr {
@@ -221,6 +274,15 @@ tbody tr {
 
 tbody tr:hover {
   background: rgba(11, 110, 110, 0.08);
+}
+
+.row-newest {
+  background: linear-gradient(90deg, rgba(31, 60, 136, 0.18), rgba(11, 110, 110, 0.04));
+  box-shadow: inset 4px 0 0 rgba(31, 60, 136, 0.55);
+}
+
+.row-newest:hover {
+  background: linear-gradient(90deg, rgba(31, 60, 136, 0.22), rgba(11, 110, 110, 0.08));
 }
 
 .row-invalid {

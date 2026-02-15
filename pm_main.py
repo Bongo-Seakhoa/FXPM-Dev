@@ -39,7 +39,7 @@ import threading
 import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass, field, fields
 
 import pandas as pd
@@ -142,6 +142,7 @@ from pm_core import (
     FeatureComputer,
     Timer,
     get_instrument_spec,
+    sync_instrument_spec_from_mt5,
     set_broker_specs_path,
     set_instrument_specs,
     load_broker_specs
@@ -215,15 +216,19 @@ DEFAULT_SYMBOLS = [
     # Added Crosses / Minors
     "AUDCAD", "AUDCHF", "CADCHF", "CHFJPY", "NZDCAD", "NZDCHF", "GBPNZD",
     # Exotics (and USD minors)
-    "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN",
+    "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN", "USDSEK",
     # Added Exotic / Minor
-    "USDSEK",
-    # Commodities
-    "XAUUSD", "XAGUSD",
+    "EURZAR", "GBPZAR", "USDCNH", "EURPLN",
+    # Added Nordic + TRY crosses
+    "EURNOK", "EURSEK", "EURDKK", "GBPNOK", "GBPSEK", "EURTRY",
+    # Commodities (Metals + Energy)
+    "XAUUSD", "XAGUSD", "XAUEUR", "XAUGBP", "XAUAUD", "XAGEUR", "XRX", "XTIUSD", "XBRUSD", "XNGUSD",
     # Indices
     "US100", "US30", "DE30", "EU50", "UK100", "JP225",
+    "US500", "FR40", "ES35", "HK50", "AU200",
     # Crypto (CFDs)
-    "ETHUSD", "XRPUSD", "TONUSD", "BTCETH",
+    "BTCUSD", "ETHUSD", "LTCUSD", "SOLUSD", "BCHUSD",
+    "DOGUSD", "TRXUSD", "XRPUSD", "TONUSD", "BTCETH", "GBXUSD", "BTCXAU",
 ]
 
 
@@ -249,6 +254,7 @@ class DecisionRecord:
                                # SKIPPED_SPREAD, SKIPPED_NO_SIGNAL, FAILED, …
     action_time: str           # ISO-8601 wall-clock time
     decision_keys: List[str] = field(default_factory=list)
+    context: Dict[str, Any] = field(default_factory=dict)
 
 
 class DecisionThrottle:
@@ -323,7 +329,8 @@ class DecisionThrottle:
     def record_decision(self, symbol: str, decision_key: str,
                         bar_time_iso: str, timeframe: str, regime: str,
                         strategy_name: str, direction: int, action: str,
-                        cooldown_seconds: int = 0) -> None:
+                        cooldown_seconds: int = 0,
+                        context: Optional[Dict[str, Any]] = None) -> None:
         """
         Store a decision and persist to disk.
 
@@ -335,6 +342,7 @@ class DecisionThrottle:
         """
         # Update or create record. Keep a per-bar list of seen decision keys.
         prev = self._cache.get(symbol)
+        ctx = context or {}
         if prev is not None and prev.bar_time == bar_time_iso:
             if decision_key not in prev.decision_keys:
                 prev.decision_keys.append(decision_key)
@@ -345,6 +353,7 @@ class DecisionThrottle:
             prev.direction = direction
             prev.action = action
             prev.action_time = datetime.now().isoformat()
+            prev.context = ctx
             record = prev
         else:
             record = DecisionRecord(
@@ -358,6 +367,7 @@ class DecisionThrottle:
                 action=action,
                 action_time=datetime.now().isoformat(),
                 decision_keys=[decision_key],
+                context=ctx,
             )
         self._cache[symbol] = record
         self._save()
@@ -378,7 +388,7 @@ class DecisionThrottle:
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
-        """Persist cache to ``last_trade_log.json``."""
+        """Persist cache to ``last_trade_log.json`` (atomic write)."""
         try:
             data = {}
             for sym, rec in self._cache.items():
@@ -393,11 +403,14 @@ class DecisionThrottle:
                     "direction": rec.direction,
                     "action": rec.action,
                     "action_time": rec.action_time,
+                    "context": rec.context,
                 }
-            with open(self._log_path, "w", encoding="utf-8") as f:
+            tmp_path = f"{self._log_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp_path, self._log_path)
         except Exception as exc:
-            logging.getLogger(__name__).debug(
+            logging.getLogger(__name__).warning(
                 f"DecisionThrottle: failed to save cache: {exc}"
             )
 
@@ -422,6 +435,7 @@ class DecisionThrottle:
                     action=rec_dict.get("action", ""),
                     action_time=rec_dict.get("action_time", ""),
                     decision_keys=decision_keys,
+                    context=rec_dict.get("context", {}) or {},
                 )
         except FileNotFoundError:
             pass
@@ -432,13 +446,13 @@ class DecisionThrottle:
 
 
 # =============================================================================
-# ACTIONABLE DECISION LOG (EXECUTED + RISK CAP ONLY)
+# ACTIONABLE DECISION LOG (DASHBOARD FEED)
 # =============================================================================
 
 class ActionableDecisionLog:
     """
-    Persist only actionable outcomes (EXECUTED / risk-cap skips) so the
-    dashboard can always show the most recent actionable decision per symbol.
+    Persist dashboard-relevant trade outcomes so the dashboard can always show
+    the most recent decision per symbol.
 
     This log is *not* used for throttling. It is purely a read-only feed for
     the dashboard and is never overwritten by NO_ACTIONABLE_SIGNAL events.
@@ -528,6 +542,7 @@ class LiveTrader:
         self._shutdown_event = threading.Event()
         self._last_bar_times: Dict[str, datetime] = {}
         self._last_order_times: Dict[str, datetime] = {}  # For rate limiting
+        self._unknown_tf_position_warnings: Set[int] = set()
         
         # Decision throttle – prevents re-evaluation / re-logging of the
         # same decision on the same bar (e.g. risk-cap skips for XAUUSD).
@@ -541,6 +556,9 @@ class LiveTrader:
         
         # Trade log
         self.trade_log: List[Dict] = []
+
+        # Margin protection state (updated each cycle by _run_margin_protection_cycle)
+        self._margin_state: str = "NORMAL"
         
         # Cache statistics for monitoring
         self._cache_hits = 0
@@ -548,6 +566,44 @@ class LiveTrader:
         self._max_cache_size = 100  # Limit cache to prevent memory bloat
         
         self.logger = logging.getLogger(__name__)
+
+        # Synchronize instrument specs from live MT5 metadata when connected.
+        if self.mt5 and self.mt5.is_connected():
+            self.logger.info("Synchronizing instrument specs from MT5...")
+            sync_count = 0
+            fail_count = 0
+
+            for symbol in self.pm.symbols:
+                broker_symbol = self.mt5.find_broker_symbol(symbol)
+                if not broker_symbol:
+                    self.logger.warning(f"[{symbol}] Broker symbol not found; using config spec defaults")
+                    fail_count += 1
+                    continue
+
+                mt5_info = self.mt5.get_symbol_info(broker_symbol)
+                if not mt5_info:
+                    self.logger.warning(f"[{symbol}] MT5 symbol info unavailable; using config spec defaults")
+                    fail_count += 1
+                    continue
+
+                spec = get_instrument_spec(symbol)
+                old_tick_value = spec.tick_value
+                old_volume_step = spec.volume_step
+                old_spread = spec.spread_avg
+
+                sync_instrument_spec_from_mt5(spec, mt5_info)
+
+                self.logger.info(
+                    f"[{symbol}] MT5 sync: tick_value={spec.tick_value:.4f} (was {old_tick_value:.4f}), "
+                    f"volume_step={spec.volume_step} (was {old_volume_step}), "
+                    f"spread={spec.spread_avg:.2f}p (was {old_spread:.2f}p), "
+                    f"min_lot={spec.min_lot}, max_lot={spec.max_lot}"
+                )
+                sync_count += 1
+
+            self.logger.info(f"MT5 spec sync complete: {sync_count} synced, {fail_count} unavailable")
+        else:
+            self.logger.warning("MT5 not connected; using config instrument specs only")
     
     def _prune_cache(self):
         """Prune cache if it exceeds max size (LRU-style, just clear oldest)."""
@@ -568,7 +624,307 @@ class LiveTrader:
             'hit_rate_pct': round(hit_rate, 1),
             'cache_size': len(self._candidate_cache),
         }
+
+    def _infer_position_timeframe(self, symbol: str, config: SymbolConfig, position: MT5Position) -> Optional[str]:
+        """
+        Infer a position timeframe from comment first, then from magic.
+
+        Some brokers trim/alter comments, which can make comment-only decoding
+        unreliable for D1+lower-TF secondary trade logic.
+        """
+        from pm_position import TradeTagEncoder
+
+        try:
+            pos_ticket = int(getattr(position, "ticket", 0) or 0)
+        except (TypeError, ValueError):
+            pos_ticket = 0
+        try:
+            pos_magic = int(getattr(position, "magic", 0) or 0)
+        except (TypeError, ValueError):
+            pos_magic = 0
+
+        # Optional explicit overrides for legacy positions that carry no timeframe
+        # metadata in comment/magic (for example old PM_* comments).
+        overrides = getattr(getattr(self, "pipeline_config", None), "position_timeframe_overrides", None) or {}
+        if isinstance(overrides, dict) and (pos_ticket > 0 or pos_magic > 0):
+            key_candidates = []
+            if pos_ticket > 0:
+                key_candidates.extend([str(pos_ticket), f"ticket:{pos_ticket}", f"{symbol}:{pos_ticket}"])
+            if pos_magic > 0:
+                key_candidates.extend([str(pos_magic), f"magic:{pos_magic}", f"{symbol}:{pos_magic}"])
+            for key in key_candidates:
+                tf_override = overrides.get(key)
+                if tf_override:
+                    return str(tf_override).upper()
+
+        comment = getattr(position, "comment", "") or ""
+        tf_from_comment = TradeTagEncoder.get_timeframe_from_comment(comment)
+        if tf_from_comment:
+            return str(tf_from_comment).upper()
+
+        # Backward compatibility for very old "PM_<strategy_tag>" comments:
+        # if the strategy tag maps to exactly one timeframe in current config,
+        # infer that timeframe conservatively.
+        decoded_comment = TradeTagEncoder.decode_comment(comment) or {}
+        strategy_tag = decoded_comment.get("strategy_tag")
+        if strategy_tag:
+            def _norm(text: Any) -> str:
+                return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+            tag_norm = _norm(strategy_tag)
+            matched_timeframes = set()
+            if tag_norm:
+                try:
+                    if config.has_regime_configs():
+                        for timeframe, regime_map in (config.regime_configs or {}).items():
+                            if not isinstance(regime_map, dict):
+                                continue
+                            for rc in regime_map.values():
+                                strategy_name = getattr(rc, "strategy_name", "")
+                                strategy_norm = _norm(strategy_name)
+                                if tag_norm in strategy_norm or strategy_norm in tag_norm:
+                                    matched_timeframes.add(str(timeframe).upper())
+                                    break
+                except Exception:
+                    matched_timeframes.clear()
+
+                # Legacy single-strategy fallback
+                legacy_strategy_norm = _norm(getattr(config, "strategy_name", ""))
+                legacy_timeframe = str(getattr(config, "timeframe", "") or "").upper()
+                if legacy_timeframe and (tag_norm in legacy_strategy_norm or legacy_strategy_norm in tag_norm):
+                    matched_timeframes.add(legacy_timeframe)
+
+            if len(matched_timeframes) == 1:
+                return next(iter(matched_timeframes))
+
+        if pos_magic <= 0:
+            return None
+
+        matched_timeframes = set()
+
+        try:
+            if config.has_regime_configs():
+                for timeframe, regime_map in (config.regime_configs or {}).items():
+                    if not isinstance(regime_map, dict):
+                        continue
+                    for regime in regime_map.keys():
+                        if TradeTagEncoder.encode_magic(symbol, timeframe, regime) == pos_magic:
+                            matched_timeframes.add(str(timeframe).upper())
+                            break
+        except Exception:
+            pass
+
+        legacy_timeframe = str(getattr(config, "timeframe", "") or "").upper()
+        if legacy_timeframe:
+            try:
+                if TradeTagEncoder.encode_magic(symbol, legacy_timeframe, "LEGACY") == pos_magic:
+                    matched_timeframes.add(legacy_timeframe)
+            except Exception:
+                pass
+
+        if len(matched_timeframes) == 1:
+            return next(iter(matched_timeframes))
+
+        return None
     
+    def _check_portfolio_risk_cap(self,
+                                  canonical_symbol: str,
+                                  new_trade_risk_pct: float,
+                                  broker_symbol: str) -> tuple[bool, str]:
+        """
+        Enforce max_combined_risk_pct across all open positions on this symbol.
+        """
+        from pm_position import TradeTagEncoder
+
+        max_combined = float(getattr(self.pipeline_config, 'max_combined_risk_pct', 3.0))
+        account_info = self.mt5.get_account_info()
+        if not account_info:
+            return False, "Cannot get account info"
+        equity = float(account_info.equity)
+        if equity <= 0:
+            return False, "Zero equity"
+
+        existing_risk_pct = 0.0
+        position_details: List[str] = []
+
+        def _estimate_position_risk_pct(position) -> float:
+            sl = float(getattr(position, 'sl', 0) or 0)
+            entry = float(getattr(position, 'price_open', 0) or 0)
+            volume = float(getattr(position, 'volume', 0) or 0)
+            if sl > 0 and entry > 0 and volume > 0:
+                spec = get_instrument_spec(canonical_symbol)
+                if spec.pip_size > 0:
+                    sl_pips = abs(entry - sl) / spec.pip_size
+                    risk_amount = sl_pips * spec.pip_value * volume
+                    return (risk_amount / equity) * 100.0
+            return float(getattr(self.position_config, "risk_per_trade_pct", 1.0))
+
+        for pos in self.mt5.get_positions(symbol=broker_symbol):
+            comment = getattr(pos, 'comment', '') or ''
+            metadata = TradeTagEncoder.decode_comment(comment)
+
+            if metadata and metadata.get('symbol', '') == canonical_symbol:
+                pos_risk_pct = float(metadata.get('risk_pct', 0.0) or 0.0)
+                if pos_risk_pct <= 0.0:
+                    pos_risk_pct = _estimate_position_risk_pct(pos)
+                pos_tf = str(metadata.get('timeframe', '?'))
+                pos_direction = str(metadata.get('direction', '?'))
+                existing_risk_pct += pos_risk_pct
+                position_details.append(f"{pos_tf}:{pos_direction}={pos_risk_pct:.2f}%")
+                continue
+
+            pos_risk_pct = _estimate_position_risk_pct(pos)
+            existing_risk_pct += pos_risk_pct
+
+        total_risk_pct = existing_risk_pct + float(new_trade_risk_pct)
+        if total_risk_pct > max_combined:
+            details = ", ".join(position_details) if position_details else "unlabeled positions"
+            return False, (
+                f"Symbol risk cap exceeded for {canonical_symbol}: "
+                f"existing {existing_risk_pct:.2f}% ({details}) + new {new_trade_risk_pct:.2f}% "
+                f"= {total_risk_pct:.2f}% > max {max_combined:.2f}%"
+            )
+
+        return True, (
+            f"Symbol risk OK for {canonical_symbol}: {total_risk_pct:.2f}% / {max_combined:.2f}%"
+        )
+
+    # -----------------------------------------------------------------
+    # Margin protection (black-swan guard), configured via PipelineConfig thresholds.
+    # -----------------------------------------------------------------
+
+    def _classify_margin_state(self, margin_level: float) -> str:
+        """Classify current margin level into an operating state.
+
+        States (from configured margin thresholds):
+            NORMAL   – margin_level >= entry_block_level (default 100%)
+            BLOCKED  – recovery_start <= margin_level < entry_block_level
+            RECOVERY – panic_level <= margin_level < recovery_start
+            PANIC    – margin_level < panic_level
+        """
+        cfg = self.pipeline_config
+        entry_block = float(getattr(cfg, 'margin_entry_block_level', 100.0))
+        recovery_start = float(getattr(cfg, 'margin_recovery_start_level', 80.0))
+        panic = float(getattr(cfg, 'margin_panic_level', 65.0))
+
+        if margin_level >= entry_block:
+            return "NORMAL"
+        if margin_level >= recovery_start:
+            return "BLOCKED"
+        if margin_level >= panic:
+            return "RECOVERY"
+        return "PANIC"
+
+    def _run_margin_protection_cycle(self):
+        """Run one cycle of margin protection (entry block + forced deleveraging).
+
+        Called once at the start of each ``_process_all_symbols()`` iteration.
+        Sets ``self._margin_state`` which the entry gate reads later.
+        """
+        cfg = self.pipeline_config
+        acct = self.mt5.get_account_info()
+        if acct is None:
+            # Cannot determine margin – assume worst-case to protect account.
+            self._margin_state = "BLOCKED"
+            self.logger.warning("MARGIN: account info unavailable – blocking entries this cycle")
+            return
+
+        ml = float(getattr(acct, 'margin_level', 0.0) or 0.0)
+
+        # margin_level == 0 means no open positions (margin used is 0, level undefined).
+        # Treat as unrestricted.
+        if ml == 0:
+            self._margin_state = "NORMAL"
+            return
+
+        state = self._classify_margin_state(ml)
+        prev_state = getattr(self, '_margin_state', "NORMAL")
+
+        # Log state transitions.
+        if state != prev_state:
+            pos_count = len(self.mt5.get_positions() or [])
+            self.logger.warning(
+                f"MARGIN STATE CHANGE: {prev_state} -> {state} | "
+                f"margin_level={ml:.1f}% | open_positions={pos_count}"
+            )
+
+        self._margin_state = state
+
+        if state in ("NORMAL", "BLOCKED"):
+            # BLOCKED: no forced closures, entries will be gated later.
+            return
+
+        # --- RECOVERY or PANIC: attempt forced deleveraging ---
+        positions = self.mt5.get_positions()
+        if not positions:
+            return
+
+        max_closes = int(getattr(cfg, 'margin_panic_closes_per_cycle', 3)) if state == "PANIC" \
+            else int(getattr(cfg, 'margin_recovery_closes_per_cycle', 1))
+
+        # Sort candidates: losers first (most negative profit), then largest volume.
+        losers = [p for p in positions if float(getattr(p, 'profit', 0.0)) < 0.0]
+        if losers:
+            ordered = sorted(
+                losers,
+                key=lambda p: (float(getattr(p, 'profit', 0.0)),
+                               -float(getattr(p, 'volume', 0.0)))
+            )
+        elif state == "PANIC":
+            # Panic fallback: close largest positions even if profitable.
+            ordered = sorted(
+                positions,
+                key=lambda p: -float(getattr(p, 'volume', 0.0))
+            )
+        else:
+            # RECOVERY with no losers – nothing safe to close.
+            ordered = []
+
+        closed = 0
+        for pos in ordered:
+            if closed >= max_closes:
+                break
+
+            ticket = getattr(pos, 'ticket', '?')
+            symbol = getattr(pos, 'symbol', '?')
+            profit = float(getattr(pos, 'profit', 0.0))
+            volume = float(getattr(pos, 'volume', 0.0))
+
+            self.logger.warning(
+                f"MARGIN_FORCE_CLOSE: attempting close | ticket={ticket} "
+                f"symbol={symbol} profit={profit:.2f} volume={volume}"
+            )
+
+            result = self.mt5.close_position(pos, deviation=30, comment="PM_MARGIN_PROTECT")
+            if result and result.success:
+                closed += 1
+                self.logger.warning(
+                    f"MARGIN_FORCE_CLOSE: SUCCESS | ticket={ticket} symbol={symbol}"
+                )
+            else:
+                err = getattr(result, 'comment', 'unknown') if result else 'no result'
+                self.logger.error(
+                    f"MARGIN_FORCE_CLOSE: FAILED | ticket={ticket} symbol={symbol} error={err}"
+                )
+
+            # Re-check margin after each close – stop if recovered.
+            acct2 = self.mt5.get_account_info()
+            if acct2:
+                ml2 = float(getattr(acct2, 'margin_level', 0.0) or 0.0)
+                reopen = float(getattr(cfg, 'margin_reopen_level', 100.0))
+                if ml2 > 0 and ml2 >= reopen:
+                    self.logger.info(
+                        f"MARGIN: recovered to {ml2:.1f}% (>= {reopen}%) – "
+                        f"stopping forced closures ({closed} closed this cycle)"
+                    )
+                    self._margin_state = self._classify_margin_state(ml2)
+                    break
+
+        if closed > 0:
+            self.logger.warning(
+                f"MARGIN: forced {closed} closure(s) this cycle in {state} mode"
+            )
+
     def start(self):
         """Start the trading loop."""
         self._running = True
@@ -611,8 +967,11 @@ class LiveTrader:
     
     def _process_all_symbols(self):
         """Process all symbols for signals."""
+        # --- Margin protection: evaluate once per cycle ---
+        self._run_margin_protection_cycle()
+
         validated_configs = self.pm.get_validated_configs()
-        
+
         for symbol, config in validated_configs.items():
             try:
                 self._process_symbol(symbol, config)
@@ -657,20 +1016,29 @@ class LiveTrader:
         has_d1_position = False
         has_non_d1_position = False
         d1_position_direction = None  # Track direction for logging
-        
+        has_unknown_position_timeframe = False
+
         for pos in symbol_positions:
-            # Try to decode comment to get timeframe
-            comment = getattr(pos, 'comment', '') or ''
-            pos_tf = TradeTagEncoder.get_timeframe_from_comment(comment)
-            
+            pos_tf = self._infer_position_timeframe(symbol, config, pos)
+
             if pos_tf == 'D1':
                 has_d1_position = True
                 d1_position_direction = "LONG" if pos.type == 0 else "SHORT"  # 0=BUY, 1=SELL
-            elif pos_tf is not None:
+            elif pos_tf:
                 has_non_d1_position = True
             else:
-                # Unknown trade tag - assume it's a non-D1 trade for safety
-                has_non_d1_position = True
+                has_unknown_position_timeframe = True
+                ticket = int(getattr(pos, "ticket", 0) or 0)
+                if ticket not in self._unknown_tf_position_warnings:
+                    comment_preview = (getattr(pos, "comment", "") or "").strip()
+                    if len(comment_preview) > 48:
+                        comment_preview = f"{comment_preview[:45]}..."
+                    self.logger.info(
+                        f"[{symbol}] Existing position metadata incomplete "
+                        f"(ticket={ticket or '?'}, magic={getattr(pos, 'magic', '?')}, "
+                        f"comment={comment_preview!r}); cannot infer timeframe"
+                    )
+                    self._unknown_tf_position_warnings.add(ticket)
         
         # Determine if we can open a new trade and what constraints apply
         can_open_trade = True
@@ -686,7 +1054,12 @@ class LiveTrader:
             block_reason = "2 positions already open"
             
         elif num_positions == 1:
-            if allow_d1_plus_lower and has_d1_position:
+            if allow_d1_plus_lower and has_unknown_position_timeframe:
+                # Avoid inconsistent state where a trade is selected but then blocked
+                # later by magic-level duplicate checks.
+                can_open_trade = False
+                block_reason = "Position timeframe unknown; blocking secondary trade"
+            elif allow_d1_plus_lower and has_d1_position:
                 # D1 position open - allow one additional non-D1 trade
                 can_open_trade = True
                 allowed_timeframes = ['M5', 'M15', 'M30', 'H1', 'H4']  # Exclude D1
@@ -981,8 +1354,6 @@ class LiveTrader:
                 current_signal = cached['signal']
                 strategy = cached['strategy']
                 regime_config = cached['regime_config']
-                is_fallback = cached.get('is_fallback', False)
-                fallback_tier = cached.get('fallback_tier', 1)
                 
                 # Still need to check if regime_config exists (it was cached)
                 if regime_config is None:
@@ -1032,8 +1403,6 @@ class LiveTrader:
                         'signal': 0,
                         'strategy': None,
                         'regime_config': None,
-                        'is_fallback': False,
-                        'fallback_tier': 0,
                     }
                     self._prune_cache()
                     continue
@@ -1052,14 +1421,9 @@ class LiveTrader:
                         'signal': 0,
                         'strategy': None,
                         'regime_config': None,
-                        'is_fallback': False,
-                        'fallback_tier': 0,
                     }
                     self._prune_cache()
                     continue
-                
-                is_fallback = False
-                fallback_tier = 1
                 
                 # Get strategy instance
                 try:
@@ -1080,8 +1444,6 @@ class LiveTrader:
                     'signal': int(current_signal),
                     'strategy': strategy,
                     'regime_config': regime_config,
-                    'is_fallback': is_fallback,
-                    'fallback_tier': fallback_tier,
                 }
                 self._prune_cache()  # Prevent unbounded growth
             # ─────────────────────────────────────────────────────────────────
@@ -1103,8 +1465,6 @@ class LiveTrader:
                 'features': features,
                 'regime_config': regime_config,
                 'bar_time': str(features.index[-2]) if len(features) > 1 else '',
-                'is_fallback': is_fallback,
-                'fallback_tier': fallback_tier,
             })
             stats["winner_candidates"] += 1
         
@@ -1225,6 +1585,7 @@ class LiveTrader:
                     strategy_name=_strat_name,
                     direction=signal, action=action,
                     cooldown_seconds=cooldown,
+                    context=decision_context,
                 )
 
         def _safe_float(value: Any) -> Optional[float]:
@@ -1237,6 +1598,13 @@ class LiveTrader:
         quality_score = _safe_float(best_candidate.get('quality_score')) if best_candidate else None
         freshness_score = _safe_float(best_candidate.get('freshness')) if best_candidate else None
         regime_strength_score = _safe_float(best_candidate.get('regime_strength')) if best_candidate else None
+        decision_context: Dict[str, Any] = {
+            "secondary_trade": bool(is_secondary_trade),
+            "selection_score": selection_score,
+            "quality_score": quality_score,
+            "freshness": freshness_score,
+            "regime_strength": regime_strength_score,
+        }
 
         def _record_actionable(action: str,
                                entry_price_value: Optional[float] = None,
@@ -1244,8 +1612,7 @@ class LiveTrader:
                                tp_value: Optional[float] = None,
                                volume_value: Optional[float] = None,
                                target_risk_pct_value: Optional[float] = None,
-                               actual_risk_pct_value: Optional[float] = None,
-                               fallback_tier_value: Optional[int] = None) -> None:
+                               actual_risk_pct_value: Optional[float] = None) -> None:
             """Persist actionable outcomes for dashboard consumption."""
             if not decision_key:
                 return
@@ -1268,7 +1635,6 @@ class LiveTrader:
                         "volume": volume_value,
                         "target_risk_pct": target_risk_pct_value,
                         "actual_risk_pct": actual_risk_pct_value,
-                        "fallback_tier": fallback_tier_value,
                         "secondary_trade": bool(is_secondary_trade),
                         "score": selection_score,
                         "quality": quality_score,
@@ -1284,14 +1650,23 @@ class LiveTrader:
         if last_order_time:
             time_since_last = (datetime.now() - last_order_time).total_seconds()
             if time_since_last < self.ORDER_RATE_LIMIT_SECONDS:
-                self.logger.debug(f"[{symbol}] Rate limited, {self.ORDER_RATE_LIMIT_SECONDS - time_since_last:.1f}s remaining")
+                remaining = max(0.0, self.ORDER_RATE_LIMIT_SECONDS - time_since_last)
+                self.logger.info(f"[{symbol}] Skipping trade; rate limited ({remaining:.1f}s remaining)")
+                _record_throttle("SKIPPED_RATE_LIMIT", cooldown=int(max(1.0, remaining)))
+                _record_actionable(action="SKIPPED_RATE_LIMIT")
                 return
         
         # Re-verify no position exists right before execution (race condition prevention)
         existing = self.mt5.get_position_by_symbol_magic(symbol, magic)
         if existing:
-            self.logger.debug(f"[{symbol}] Position already exists, skipping entry")
+            existing_comment = getattr(existing, "comment", "") or ""
+            existing_tf = TradeTagEncoder.get_timeframe_from_comment(existing_comment) or "UNKNOWN"
+            self.logger.info(
+                f"[{symbol}] Skipping trade; position already exists for magic {magic} "
+                f"(ticket={getattr(existing, 'ticket', '?')}, tf={existing_tf})"
+            )
             _record_throttle("SKIPPED_POSITION_EXISTS")
+            _record_actionable(action="SKIPPED_POSITION_EXISTS")
             return
         
         # Calculate stops (use MT5-derived spec for live parity)
@@ -1300,22 +1675,47 @@ class LiveTrader:
         # Get symbol info for sizing and broker constraints
         symbol_info = self.mt5.get_symbol_info(symbol)
         if symbol_info is None:
+            self.logger.warning(f"[{symbol}] Skipping trade; symbol info unavailable")
+            _record_throttle("SKIPPED_NO_SYMBOL_INFO")
+            _record_actionable(action="SKIPPED_NO_SYMBOL_INFO")
             return
 
         # Risk basis (balance/equity)
         account = self.mt5.get_account_info()
         if account is None:
+            self.logger.warning(f"[{symbol}] Skipping trade; account info unavailable")
+            _record_throttle("SKIPPED_NO_ACCOUNT_INFO")
+            _record_actionable(action="SKIPPED_NO_ACCOUNT_INFO")
             return
+
+        # --- Margin protection entry gate (black-swan guard) ---
+        margin_level = float(getattr(account, 'margin_level', 0.0) or 0.0)
+        margin_block = float(getattr(
+            self.pipeline_config, 'margin_entry_block_level', 100.0))
+        # margin_level == 0 means no positions open (undefined, not stressed).
+        if margin_level > 0 and margin_level < margin_block:
+            self.logger.info(
+                f"[{symbol}] MARGIN BLOCKED: margin_level={margin_level:.1f}% "
+                f"< {margin_block:.0f}% — entry blocked"
+            )
+            _record_throttle("SKIPPED_MARGIN_BLOCKED")
+            _record_actionable(action="SKIPPED_MARGIN_BLOCKED")
+            return
+
         basis_pref = getattr(self.position_config, "risk_basis", "balance")
         basis_value = account.balance if basis_pref == "balance" else account.equity
         if basis_value <= 0:
             self.logger.warning(f"[{symbol}] Invalid risk basis value ({basis_value}); skipping trade")
             _record_throttle("SKIPPED_INVALID_BASIS")
+            _record_actionable(action="SKIPPED_INVALID_BASIS")
             return
 
         # Get current price (same basis used for execution)
         tick = self.mt5.get_symbol_tick(symbol)
         if tick is None:
+            self.logger.warning(f"[{symbol}] Skipping trade; tick data unavailable")
+            _record_throttle("SKIPPED_NO_TICK")
+            _record_actionable(action="SKIPPED_NO_TICK")
             return
         entry_price = tick.ask if is_long else tick.bid
 
@@ -1332,38 +1732,35 @@ class LiveTrader:
             self.logger.debug(f"[{symbol}] Widened SL to satisfy min stop distance ({min_stop_dist})")
 
         # Target risk (deposit currency)
-                # -------------------------------------------------------------
-        # Tiered risk policy (config-driven)
-        # Tier 1 (regime winner): can scale above base risk up to tier1_max_risk_pct
-        # Tier 2/3 (fallbacks): capped by tier23_max_risk_pct
-        # Secondary trade: additional cap + combined risk cap per symbol
         # -------------------------------------------------------------
-        from pm_position import TradeTagEncoder
-
+        # Winners-only live risk policy (single-path, non-tiered):
+        # 1) start from base risk
+        # 2) apply live multiplier
+        # 3) cap by live max risk
+        # 4) hard-cap by PositionConfig max_risk_pct
+        # -------------------------------------------------------------
         base_risk_pct = float(getattr(self.position_config, 'risk_per_trade_pct', 1.0))
-        fallback_tier = int(best_candidate.get('fallback_tier', 1) or 1)
-
-        # Pull tier policy from pipeline config (with safe defaults)
-        tier1_mult = float(getattr(self.pipeline_config, 'tier1_risk_multiplier', 1.0))
-        tier1_max = float(getattr(self.pipeline_config, 'tier1_max_risk_pct', 5.0))
-        tier23_max = float(getattr(self.pipeline_config, 'tier23_max_risk_pct', float(getattr(self.pipeline_config, 'fallback_max_risk_pct', 1.0))))
-        fallback_risk_mult = float(getattr(self.pipeline_config, 'fallback_risk_multiplier', 0.5))
-        fallback_max_risk = float(getattr(self.pipeline_config, 'fallback_max_risk_pct', 1.0))
+        live_risk_mult = float(
+            getattr(
+                self.pipeline_config,
+                'live_risk_multiplier',
+                1.0,
+            )
+        )
+        live_max_risk = float(
+            getattr(
+                self.pipeline_config,
+                'live_max_risk_pct',
+                5.0,
+            )
+        )
         min_trade_risk = float(getattr(self.pipeline_config, 'min_trade_risk_pct', 0.1))
 
-        # Start from tier-based target
-        if fallback_tier == 1:
-            target_risk_pct = min(base_risk_pct * tier1_mult, tier1_max)
-        else:
-            target_risk_pct = base_risk_pct * fallback_risk_mult
-            target_risk_pct = min(target_risk_pct, fallback_max_risk, tier23_max)
+        target_risk_pct = min(base_risk_pct * live_risk_mult, live_max_risk)
 
         # Enforce PositionConfig max_risk_pct if present (hard safety)
         max_risk_cap = float(getattr(self.position_config, 'max_risk_pct', target_risk_pct))
         target_risk_pct = min(target_risk_pct, max_risk_cap)
-
-        if fallback_tier in (2, 3):
-            self.logger.info(f"[{symbol}] Fallback tier {fallback_tier}: reduced risk to {target_risk_pct:.2f}%")
 
         # Secondary trade adjustments + combined risk cap per symbol
         if is_secondary_trade:
@@ -1391,13 +1788,7 @@ class LiveTrader:
             available = max_combined_risk - existing_risk
             if available <= 0:
                 self.logger.info(f"[{symbol}] Secondary trade blocked: combined risk cap reached ({existing_risk:.2f}% >= {max_combined_risk:.2f}%)")
-                self._decision_throttle.record_decision(
-                    symbol=symbol, decision_key=decision_key,
-                    bar_time_iso=bar_time_iso,
-                    timeframe=best_candidate.get('timeframe'), regime=best_candidate.get('regime'),
-                    strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
-                    action="BLOCKED_RISK_CAP",
-                )
+                _record_throttle("BLOCKED_RISK_CAP")
                 _record_actionable(
                     action="BLOCKED_RISK_CAP",
                     entry_price_value=entry_price,
@@ -1406,7 +1797,6 @@ class LiveTrader:
                     volume_value=None,
                     target_risk_pct_value=target_risk_pct,
                     actual_risk_pct_value=None,
-                    fallback_tier_value=fallback_tier,
                 )
                 return
 
@@ -1416,12 +1806,15 @@ class LiveTrader:
         # Ensure non-zero (and not absurdly tiny) risk if we proceed
         if target_risk_pct < min_trade_risk:
             self.logger.info(f"[{symbol}] Trade blocked: computed risk {target_risk_pct:.3f}% below min_trade_risk_pct={min_trade_risk:.3f}%")
-            self._decision_throttle.record_decision(
-                symbol=symbol, decision_key=decision_key,
-                bar_time_iso=bar_time_iso,
-                timeframe=best_candidate.get('timeframe'), regime=best_candidate.get('regime'),
-                strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
+            _record_throttle("BLOCKED_TOO_LOW_RISK")
+            _record_actionable(
                 action="BLOCKED_TOO_LOW_RISK",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=None,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=None,
             )
             return
         
@@ -1457,6 +1850,15 @@ class LiveTrader:
         if loss_per_lot <= 0:
             self.logger.warning(f"[{symbol}] Could not compute loss_per_lot; skipping trade")
             _record_throttle("SKIPPED_NO_LOSS_CALC")
+            _record_actionable(
+                action="SKIPPED_NO_LOSS_CALC",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=None,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=None,
+            )
             return
 
         # Raw volume for target risk
@@ -1516,9 +1918,30 @@ class LiveTrader:
                 volume_value=volume,
                 target_risk_pct_value=target_risk_pct,
                 actual_risk_pct_value=actual_risk_pct,
-                fallback_tier_value=fallback_tier,
             )
             return
+
+        # Enforce symbol-level combined risk cap across all open positions.
+        can_trade, risk_reason = self._check_portfolio_risk_cap(
+            config.symbol,      # canonical symbol (for PM comment metadata)
+            actual_risk_pct,    # post-normalization actual risk
+            symbol,             # broker symbol (for MT5 lookup)
+        )
+        if not can_trade:
+            self.logger.warning(f"[{symbol}] {risk_reason}")
+            _record_throttle("BLOCKED_SYMBOL_RISK_CAP")
+            _record_actionable(
+                action="BLOCKED_SYMBOL_RISK_CAP",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+            )
+            return
+
+        self.logger.info(f"[{symbol}] {risk_reason}")
 
         # Log risk details for auditability
         self.logger.info(
@@ -1536,6 +1959,15 @@ class LiveTrader:
             self._log_trade(symbol, direction, volume, entry_price,
                             sl_price, tp_price, magic, "PAPER")
             _record_throttle("PAPER")
+            _record_actionable(
+                action="PAPER",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+            )
             return
 
         # ===== FIX #2: Encode trade comment with full metadata =====
@@ -1546,7 +1978,6 @@ class LiveTrader:
             strategy_name=_strat_name,
             direction=direction,
             risk_pct=target_risk_pct,
-            tier=fallback_tier,
         )
 
         # Execute order
@@ -1586,7 +2017,6 @@ class LiveTrader:
                 volume_value=result.volume,
                 target_risk_pct_value=target_risk_pct,
                 actual_risk_pct_value=actual_risk_pct_exec,
-                fallback_tier_value=fallback_tier,
             )
         else:
             self.logger.warning(
@@ -1595,6 +2025,15 @@ class LiveTrader:
             self._log_trade(symbol, direction, volume, entry_price,
                            sl_price, tp_price, magic, f"FAILED: {result.retcode_description}")
             _record_throttle(f"FAILED_{result.retcode}")
+            _record_actionable(
+                action=f"FAILED_{result.retcode}",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+            )
     
     def _close_position_on_signal(self, position: MT5Position, features: pd.DataFrame, spec):
         """Close position on opposite signal."""

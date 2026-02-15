@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 DEFAULT_CONFIG: Dict[str, Any] = {
     "pm_root": "",
     "refresh_interval_sec": 5,
+    "enable_data_maintenance_scheduler": True,
+    "data_maintenance_time": "00:00",
     "file_patterns": [
         "**/*recommendation*.json",
         "**/*recommendations*.json",
@@ -48,14 +50,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_signal_age_minutes": 1440,
     "valid_actions": [
         "EXECUTED",
+        "SKIPPED_RISK_CAP",
+        "BLOCKED_RISK_CAP",
+        "SKIPPED_POSITION_EXISTS",
     ],
     "valid_action_prefixes": [
         "EXECUTED",
+        "SKIPPED_RISK_CAP",
+        "BLOCKED_RISK_CAP",
+        "SKIPPED_POSITION_EXISTS",
     ],
     "display_actions": [
         "EXECUTED",
         "SKIPPED_RISK_CAP",
         "BLOCKED_RISK_CAP",
+        "SKIPPED_POSITION_EXISTS",
+    ],
+    "display_action_prefixes": [
+        "EXECUTED",
+        "SKIPPED_",
+        "BLOCKED_",
+        "FAILED_",
+        "PAPER",
     ],
     "exclude_actions": [
         "NO_ACTIONABLE_SIGNAL",
@@ -72,6 +88,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "display_allow_if_actions": [
         "SKIPPED_RISK_CAP",
         "BLOCKED_RISK_CAP",
+        "SKIPPED_POSITION_EXISTS",
+    ],
+    "display_allow_if_action_prefixes": [
+        "SKIPPED_",
+        "BLOCKED_",
+        "FAILED_",
+        "PAPER",
     ],
     "alert": {
         "enabled": True,
@@ -84,6 +107,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "regime": ["regime", "market_regime"],
         "strategy_name": ["strategy", "strategy_name", "signal_source", "model", "algo"],
         "signal_direction": ["direction", "side", "signal", "action", "trade_direction"],
+        "secondary_trade": ["secondary_trade", "is_secondary", "secondary"],
+        "secondary_reason": ["secondary_reason", "secondary_trade_reason"],
         "entry_price": ["entry", "entry_price", "price", "entryPrice", "open_price", "signal_price"],
         "stop_loss_price": ["sl", "stop", "stop_loss", "stop_loss_price"],
         "take_profit_price": ["tp", "take_profit", "take_profit_price"],

@@ -1,0 +1,42 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.nbc
+*.nbi
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE/editor/project-local folders
+.vscode/
+.idea/
+.claude/
+.codex_tmp/
+*.code-workspace
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project runtime outputs and logs
+logs/
+pm_outputs/
+data/.cache/
+data/*.csv
+last_trade_log.json
+last_actionable_log.json
+
+# Optional local broker export
+broker_specs.json
