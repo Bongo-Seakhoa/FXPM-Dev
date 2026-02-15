@@ -1344,8 +1344,7 @@ class LiveTrader:
             # Determine if this is a new bar
             is_new_bar = (last_bar_time is None or current_bar_time > last_bar_time)
             freshness = 1.0 if is_new_bar else freshness_decay
-            
-            # ── Feature/Signal Cache Logic ───────────────────────────────────
+            # Feature/signal cache logic
             # Build cache key including bar_time to ensure we invalidate on new bar
             feature_cache_key = f"{symbol}_{tf}_{current_bar_time}"
             cached = self._candidate_cache.get(feature_cache_key)
@@ -1412,12 +1411,16 @@ class LiveTrader:
                     self._prune_cache()
                     continue
                 if not regime_config.is_valid_for_live(min_pf, min_return, max_dd, min_return_dd_ratio):
+                    val_ret = regime_config.val_metrics.get('total_return_pct', -100)
+                    val_dd = regime_config.val_metrics.get('max_drawdown_pct', 100)
+                    val_ratio = val_ret / max(val_dd, 0.5)
                     stats["winner_failed_gate"] += 1
                     self.logger.debug(
                         f"[{symbol}] [{tf}] [{current_regime}] Winner failed live gate "
                         f"(PF={regime_config.val_metrics.get('profit_factor', 0):.2f}, "
-                        f"ret={regime_config.val_metrics.get('total_return_pct', -100):.1f}%, "
-                        f"dd={regime_config.val_metrics.get('max_drawdown_pct', 100):.1f}%)"
+                        f"ret={val_ret:.1f}%, "
+                        f"dd={val_dd:.1f}%, "
+                        f"ret/dd={val_ratio:.2f})"
                     )
                     self._candidate_cache[feature_cache_key] = {
                         'features': features,

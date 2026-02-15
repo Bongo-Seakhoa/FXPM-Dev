@@ -103,7 +103,7 @@ class TestReturnDDRatioGate(unittest.TestCase):
         # Exceptional val: high PF, high return, but DD > return
         val = _make_val_metrics(
             total_return_pct=9.0,
-            max_drawdown_pct=12.0,  # ratio=0.75 — fails ratio gate
+            max_drawdown_pct=12.0,  # ratio=0.75 - fails ratio gate
             profit_factor=1.5,
             total_trades=60,
             win_rate=55.0,
@@ -122,7 +122,7 @@ class TestReturnDDRatioGate(unittest.TestCase):
         train = _make_train_metrics(profit_factor=0.8, total_return_pct=-5.0)
         val = _make_val_metrics(
             total_return_pct=14.0,
-            max_drawdown_pct=10.0,  # ratio=1.4 — passes
+            max_drawdown_pct=10.0,  # ratio=1.4 - passes
             profit_factor=1.5,
             total_trades=60,
             win_rate=55.0,

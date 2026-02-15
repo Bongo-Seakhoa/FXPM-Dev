@@ -2,6 +2,22 @@
 Scope: Comprehensive change history for this repository.
 Status: Canonical patch note file (single source of truth).
 
+## 2026-02-15 - Audit Pass Hardening and Quality Cleanup
+### Configuration integrity
+- Restored `pipeline.regime_min_val_return_pct` in `config.json` to `5.0` (from `4.0`) to preserve the validated-winner floor policy.
+
+### Live-gate observability
+- Enhanced regime live-gate rejection logging in `pm_main.py` to include computed `ret/dd` ratio alongside PF/return/DD values.
+- Outcome: faster diagnosis when a candidate fails due to return-to-drawdown inefficiency.
+
+### Code hygiene
+- Normalized one non-ASCII cache-section comment in `pm_main.py` to ASCII-safe text.
+- Normalized two non-ASCII dash characters in `tests/test_return_dd_ratio.py` comments.
+
+### Verification
+- Full regression suite rerun after cleanup:
+  - `232 passed, 2 skipped, 11 subtests passed`
+
 ## 2026-02-15 - DD/Return Validation Hard Gate
 ### Validation quality upgrade
 - Added hard validation efficiency gate for regime winners:
