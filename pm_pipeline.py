@@ -1,4 +1,4 @@
-﻿"""
+"""
 FX Portfolio Manager - Pipeline Module
 =======================================
 
@@ -419,7 +419,13 @@ class RegimeConfig:
         """Check if this config is a NO_TRADE marker (no valid strategy found)."""
         return self.strategy_name == "NO_TRADE" or self.strategy_name == ""
     
-    def is_valid_for_live(self, min_pf: float = 1.0, min_return: float = 5.0, max_dd: float = 35.0) -> bool:
+    def is_valid_for_live(
+        self,
+        min_pf: float = 1.0,
+        min_return: float = 5.0,
+        max_dd: float = 35.0,
+        min_return_dd_ratio: float = 1.0,
+    ) -> bool:
         """
         Check if this config passes the live quality gate.
         
@@ -428,11 +434,13 @@ class RegimeConfig:
         - Validation profit_factor >= min_pf
         - Validation return >= min_return
         - Validation drawdown <= max_dd
+        - Validation return/DD ratio >= min_return_dd_ratio
         
         Args:
             min_pf: Minimum validation profit factor (default 1.0)
             min_return: Minimum validation return % (default 5.0)
             max_dd: Maximum validation drawdown % (default 35.0)
+            min_return_dd_ratio: Minimum validation return/DD ratio (default 1.0)
             
         Returns:
             True if this config is valid for live trading
@@ -443,8 +451,14 @@ class RegimeConfig:
         val_pf = self.val_metrics.get('profit_factor', 0.0)
         val_return = self.val_metrics.get('total_return_pct', -100.0)
         val_dd = self.val_metrics.get('max_drawdown_pct', 100.0)
-        
-        return val_pf >= min_pf and val_return >= min_return and val_dd <= max_dd
+
+        ratio = val_return / max(val_dd, 0.5)
+        return (
+            val_pf >= min_pf and
+            val_return >= min_return and
+            val_dd <= max_dd and
+            ratio >= min_return_dd_ratio
+        )
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""

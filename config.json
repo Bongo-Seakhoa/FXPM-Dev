@@ -59,7 +59,7 @@
     "secondary_trade_max_risk_pct": 1.0,
     "max_combined_risk_pct": 3.0,
     "regime_min_val_profit_factor": 1.05,
-    "regime_min_val_return_pct": 5.0,
+    "regime_min_val_return_pct": 4.0,
     "regime_min_val_return_dd_ratio": 1.0,
     "train_min_profit_factor": 0.75,
     "train_min_return_pct": -20.0,

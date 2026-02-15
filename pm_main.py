@@ -97,6 +97,7 @@ def log_resolved_config_summary(logger: logging.Logger,
             f"val_dd<={getattr(p, 'fx_val_max_drawdown', None)} | "
             f"pf>={getattr(p, 'regime_min_val_profit_factor', None)} | "
             f"ret>={getattr(p, 'regime_min_val_return_pct', None)} | "
+            f"ret/dd>={getattr(p, 'regime_min_val_return_dd_ratio', None)} | "
             f"optuna_val_obj={bool(getattr(p, 'optuna_use_val_in_objective', False))}"
         )
 
@@ -1322,6 +1323,10 @@ class LiveTrader:
         min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
         min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 5.0) if self.pipeline_config else 5.0
         max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
+        min_return_dd_ratio = (
+            getattr(self.pipeline_config, 'regime_min_val_return_dd_ratio', 1.0)
+            if self.pipeline_config else 1.0
+        )
         
         for tf in available_timeframes:
             # Get bars for this timeframe (need at least the latest bar time)
@@ -1406,7 +1411,7 @@ class LiveTrader:
                     }
                     self._prune_cache()
                     continue
-                if not regime_config.is_valid_for_live(min_pf, min_return, max_dd):
+                if not regime_config.is_valid_for_live(min_pf, min_return, max_dd, min_return_dd_ratio):
                     stats["winner_failed_gate"] += 1
                     self.logger.debug(
                         f"[{symbol}] [{tf}] [{current_regime}] Winner failed live gate "
@@ -1483,13 +1488,25 @@ class LiveTrader:
         min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
         min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 5.0) if self.pipeline_config else 5.0
         max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
+        min_return_dd_ratio = (
+            getattr(self.pipeline_config, 'regime_min_val_return_dd_ratio', 1.0)
+            if self.pipeline_config else 1.0
+        )
         val_pf = config.val_metrics.get('profit_factor', 0.0)
         val_return = config.val_metrics.get('total_return_pct', -100.0)
         val_dd = config.val_metrics.get('max_drawdown_pct', 100.0)
-        if not config.is_validated or val_pf < min_pf or val_return < min_return or val_dd > max_dd:
+        val_return_dd_ratio = val_return / max(val_dd, 0.5)
+        if (
+            not config.is_validated or
+            val_pf < min_pf or
+            val_return < min_return or
+            val_dd > max_dd or
+            val_return_dd_ratio < min_return_dd_ratio
+        ):
             self.logger.debug(
                 f"[{symbol}] Legacy config failed live gate "
-                f"(validated={config.is_validated}, PF={val_pf:.2f}, ret={val_return:.1f}%, dd={val_dd:.1f}%)"
+                f"(validated={config.is_validated}, PF={val_pf:.2f}, ret={val_return:.1f}%, "
+                f"dd={val_dd:.1f}%, ret/dd={val_return_dd_ratio:.2f})"
             )
             return []
         
