@@ -383,7 +383,7 @@ python pm_main.py --trade --auto-retrain
 
 Note: `val_pct` is informational only. Actual validation size is controlled by
 `train_pct` and `overlap_pct`.
-Note: Live trading is **winners-only** and non-tiered. `default_config` is not used for live entries. Use `live_risk_multiplier` and `live_max_risk_pct` for live risk sizing.
+Note: Live trading is **winners-only** and non-tiered. `default_config` is not used for live entries. Live risk sizing is sourced from pipeline settings: `risk_per_trade_pct`, `live_risk_multiplier`, and `live_max_risk_pct`.
 Note: Current production `config.json` symbol universe is **80 symbols**.
 
 `instrument_specs` entries can use `"inherit": "SYMBOL"` to clone an existing
@@ -395,7 +395,7 @@ spec as a starting point (handy for new symbols before you export broker specs).
 |---------|-------------|---------|
 | `optimization_valid_days` | Days before config expires | 14 |
 | `risk_per_trade_pct` | Risk per trade as % of equity | 1.0 |
-| `max_risk_pct` | Hard cap on risk (safety) | 5.0 |
+| `max_risk_pct` | Hard cap for non-live fallback sizing paths | 5.0 |
 | `fx_min_robustness_ratio` | Minimum val/train score ratio | 0.80 |
 | `regime_chop_no_trade` | Block trades in CHOP regime | true |
 | `broker_specs_path` | Path to MT5-exported broker specs (optional) | broker_specs.json |
@@ -531,8 +531,9 @@ Prevents rapid regime switching:
 ### Position Sizing (Live-Equity Compounding)
 
 ```
-risk_amount = current_equity × (risk_per_trade_pct / 100)
-loss_per_lot = distance_to_stop × tick_value
+live_risk_pct = min(risk_per_trade_pct * live_risk_multiplier, live_max_risk_pct)
+risk_amount = current_equity x (live_risk_pct / 100)
+loss_per_lot = distance_to_stop x tick_value
 position_size = floor(risk_amount / loss_per_lot, volume_step)
 ```
 
@@ -544,7 +545,7 @@ The system uses **live equity** for sizing, meaning:
 
 | Feature | Description |
 |---------|-------------|
-| **Hard Cap** | Skips trade if risk > max_risk_pct |
+| **Hard Cap** | Skips trade if risk > live_max_risk_pct (live path) |
 | **Auto-Widen SL** | Widens SL to meet broker minimum stop distance |
 | **Volume Floor** | Uses floor() not round() to avoid exceeding target |
 | **Position Check** | Verifies no existing position before entry |
@@ -739,10 +740,10 @@ Your broker uses different symbol names. Check exact names:
 - Lower `fx_min_robustness_ratio` (try 0.70)
 - Ensure sufficient historical data exists
 
-#### "SKIP: min lot would exceed max_risk_pct"
+#### "SKIP: min lot would exceed live_max_risk_pct"
 Broker minimum lot size exceeds your risk budget:
-- Increase `risk_per_trade_pct`
-- Increase `max_risk_pct` (with caution)
+- Increase `risk_per_trade_pct` (or `live_risk_multiplier`)
+- Increase `live_max_risk_pct` (with caution)
 - Remove that symbol
 
 #### "Corrupted JSON in pm_configs.json"

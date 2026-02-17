@@ -85,7 +85,9 @@ def log_resolved_config_summary(logger: logging.Logger,
             f"bars={getattr(p, 'max_bars', None)} | "
             f"tfs={tf_str} | "
             f"live={getattr(p, 'live_bars_count', None)}/{getattr(p, 'live_min_bars', None)} | "
-            f"risk={getattr(p, 'risk_per_trade_pct', None)}% | "
+            f"risk(base*mult/cap)={getattr(p, 'risk_per_trade_pct', None)}%*"
+            f"{getattr(p, 'live_risk_multiplier', None)}/"
+            f"{getattr(p, 'live_max_risk_pct', None)}% | "
             f"d1+lower={getattr(p, 'allow_d1_plus_lower_tf', None)} | "
             f"max_sym_risk={getattr(p, 'max_combined_risk_pct', None)}% | "
             f"opt_workers={getattr(p, 'optimization_max_workers', None)}"
@@ -107,7 +109,7 @@ def log_resolved_config_summary(logger: logging.Logger,
             "  position: "
             f"risk={getattr(pos_cfg, 'risk_per_trade_pct', None)}% | "
             f"basis={getattr(pos_cfg, 'risk_basis', None)} | "
-            f"max_risk={getattr(pos_cfg, 'max_risk_pct', None)}% | "
+            f"max_risk={getattr(pos_cfg, 'max_risk_pct', None)}% (non-live fallback) | "
             f"size={getattr(pos_cfg, 'min_position_size', None)}-{getattr(pos_cfg, 'max_position_size', None)} | "
             f"auto_widen_sl={getattr(pos_cfg, 'auto_widen_sl', None)}"
         )
@@ -759,7 +761,13 @@ class LiveTrader:
                     sl_pips = abs(entry - sl) / spec.pip_size
                     risk_amount = sl_pips * spec.pip_value * volume
                     return (risk_amount / equity) * 100.0
-            return float(getattr(self.position_config, "risk_per_trade_pct", 1.0))
+            return float(
+                getattr(
+                    self.pipeline_config,
+                    "risk_per_trade_pct",
+                    getattr(self.position_config, "risk_per_trade_pct", 1.0),
+                )
+            )
 
         for pos in self.mt5.get_positions(symbol=broker_symbol):
             comment = getattr(pos, 'comment', '') or ''
@@ -1755,12 +1763,18 @@ class LiveTrader:
         # Target risk (deposit currency)
         # -------------------------------------------------------------
         # Winners-only live risk policy (single-path, non-tiered):
-        # 1) start from base risk
+        # 1) start from base risk (pipeline-config source of truth)
         # 2) apply live multiplier
         # 3) cap by live max risk
-        # 4) hard-cap by PositionConfig max_risk_pct
+        # 4) enforce live hard cap after volume normalization
         # -------------------------------------------------------------
-        base_risk_pct = float(getattr(self.position_config, 'risk_per_trade_pct', 1.0))
+        base_risk_pct = float(
+            getattr(
+                self.pipeline_config,
+                'risk_per_trade_pct',
+                getattr(self.position_config, 'risk_per_trade_pct', 1.0),
+            )
+        )
         live_risk_mult = float(
             getattr(
                 self.pipeline_config,
@@ -1778,10 +1792,6 @@ class LiveTrader:
         min_trade_risk = float(getattr(self.pipeline_config, 'min_trade_risk_pct', 0.1))
 
         target_risk_pct = min(base_risk_pct * live_risk_mult, live_max_risk)
-
-        # Enforce PositionConfig max_risk_pct if present (hard safety)
-        max_risk_cap = float(getattr(self.position_config, 'max_risk_pct', target_risk_pct))
-        target_risk_pct = min(target_risk_pct, max_risk_cap)
 
         # Secondary trade adjustments + combined risk cap per symbol
         if is_secondary_trade:
@@ -1923,7 +1933,7 @@ class LiveTrader:
                 actual_risk_amount = abs(float(sl_pips)) * float(spec.pip_value) * float(volume)
 
         actual_risk_pct = (actual_risk_amount / basis_value) * 100.0 if basis_value > 0 else float('inf')
-        max_risk_pct = float(getattr(self.position_config, "max_risk_pct", 5.0))
+        max_risk_pct = float(getattr(self.pipeline_config, "live_max_risk_pct", target_risk_pct))
         if actual_risk_pct > max_risk_pct + 1e-9:
             self.logger.warning(
                 f"[{symbol}] Skipping trade; risk {actual_risk_pct:.2f}% exceeds cap {max_risk_pct:.2f}% "

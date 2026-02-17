@@ -22,7 +22,7 @@ class MockAccountInfo:
 
 
 class PortfolioRiskCapTests(unittest.TestCase):
-    def _make_trader(self, positions, max_combined=3.0):
+    def _make_trader(self, positions, max_combined=3.0, pipeline_risk_per_trade=1.0):
         from pm_main import LiveTrader
         from pm_position import PositionConfig
 
@@ -36,6 +36,7 @@ class PortfolioRiskCapTests(unittest.TestCase):
 
         pipeline_config = Mock()
         pipeline_config.max_combined_risk_pct = max_combined
+        pipeline_config.risk_per_trade_pct = pipeline_risk_per_trade
 
         return LiveTrader(
             mt5_connector=mt5,
@@ -105,6 +106,17 @@ class PortfolioRiskCapTests(unittest.TestCase):
         trader = self._make_trader([pos], max_combined=3.0)
         can_trade, _ = trader._check_portfolio_risk_cap("EURUSD", 1.5, "EURUSD")
         self.assertTrue(can_trade)
+
+    def test_fallback_risk_estimate_uses_pipeline_risk_source(self):
+        # Position has no parseable risk tag and no SL info, so fallback estimate is used.
+        # Pipeline risk should be used as the source-of-truth for this estimate.
+        pos = MockPosition(ticket=1, symbol="EURUSD", comment="")
+        trader = self._make_trader([pos], max_combined=3.0, pipeline_risk_per_trade=2.5)
+
+        # Existing fallback risk 2.5% + new 1.0% -> 3.5% (must be blocked).
+        can_trade, reason = trader._check_portfolio_risk_cap("EURUSD", 1.0, "EURUSD")
+        self.assertFalse(can_trade)
+        self.assertIn("exceeded", reason)
 
 
 if __name__ == "__main__":
