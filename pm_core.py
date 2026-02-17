@@ -970,19 +970,24 @@ INSTRUMENT_SPECS = {
     'USDMXN': InstrumentSpec('USDMXN', 4, 0.55, 30.0, 0.01, 100.0, 12.0, 20.0, -45.0),
     'USDPLN': InstrumentSpec('USDPLN', 4, 2.5, 25.0, 0.01, 100.0, 10.0, 3.0, -12.0),
     'USDNOK': InstrumentSpec('USDNOK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
+    'USDSEK': InstrumentSpec('USDSEK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
     'USDSGD': InstrumentSpec('USDSGD', 4, 7.5, 2.0, 0.01, 100.0, 8.0, 1.5, -6.0),
     'USDTRY': InstrumentSpec('USDTRY', 4, 0.035, 100.0, 0.01, 100.0, 20.0, 50.0, -150.0),
     'USDZAR': InstrumentSpec('USDZAR', 4, 0.55, 50.0, 0.01, 100.0, 15.0, 12.0, -35.0),
     'EURZAR': InstrumentSpec('EURZAR', 4, 0.55, 70.0, 0.01, 100.0, 15.0, 10.0, -30.0),
     'GBPZAR': InstrumentSpec('GBPZAR', 4, 0.55, 80.0, 0.01, 100.0, 15.0, 12.0, -35.0),
     'USDCNH': InstrumentSpec('USDCNH', 4, 1.4, 20.0, 0.01, 100.0, 10.0, 2.0, -10.0),
+    'EURCNH': InstrumentSpec('EURCNH', 4, 1.4, 10.0, 0.01, 100.0, 10.0, 2.0, -10.0),
     'EURPLN': InstrumentSpec('EURPLN', 4, 2.5, 25.0, 0.01, 100.0, 10.0, 3.0, -12.0),
     'EURNOK': InstrumentSpec('EURNOK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
     'EURSEK': InstrumentSpec('EURSEK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
-    'EURDKK': InstrumentSpec('EURDKK', 4, 1.4, 10.0, 0.01, 100.0, 8.0, 1.0, -5.0),
     'GBPNOK': InstrumentSpec('GBPNOK', 4, 0.95, 35.0, 0.01, 100.0, 10.0, 2.0, -12.0),
     'GBPSEK': InstrumentSpec('GBPSEK', 4, 0.95, 35.0, 0.01, 100.0, 10.0, 2.0, -12.0),
     'EURTRY': InstrumentSpec('EURTRY', 4, 0.035, 120.0, 0.01, 100.0, 20.0, 45.0, -130.0),
+    'Platinum': InstrumentSpec('Platinum', 2, 1.0, 8.0, 0.01, 100.0, 5.0, -5.0, -3.0),
+    'Palladium': InstrumentSpec('Palladium', 2, 1.0, 8.0, 0.01, 100.0, 5.0, -6.0, -4.0),
+    'EURMXN': InstrumentSpec('EURMXN', 4, 0.55, 140.0, 0.01, 100.0, 12.0, 20.0, -45.0),
+    'NOKJPY': InstrumentSpec('NOKJPY', 2, 9.0, 2.0, 0.01, 100.0, 8.0, -1.0, -2.0),
     
     # Commodities
     # XAUUSD: 1 lot = 100 troy oz, pip_size = 0.01, pip_value = $1.00
@@ -1011,6 +1016,13 @@ INSTRUMENT_SPECS = {
     'GBPCHF': InstrumentSpec('GBPCHF', 4, 11.0, 2.5, 0.01, 100.0, 7.0, -5.0, 0.8),
     'CADJPY': InstrumentSpec('CADJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -2.0, 0.5),
     'NZDJPY': InstrumentSpec('NZDJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -2.0, 0.5),
+    'AUDCAD': InstrumentSpec('AUDCAD', 4, 7.5, 1.5, 0.01, 100.0, 7.0, 2.5, -8.0),
+    'AUDCHF': InstrumentSpec('AUDCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
+    'CADCHF': InstrumentSpec('CADCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
+    'CHFJPY': InstrumentSpec('CHFJPY', 2, 9.0, 1.0, 0.01, 100.0, 7.0, 8.5, -15.0),
+    'NZDCAD': InstrumentSpec('NZDCAD', 4, 7.5, 1.5, 0.01, 100.0, 7.0, 2.5, -8.0),
+    'NZDCHF': InstrumentSpec('NZDCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
+    'GBPNZD': InstrumentSpec('GBPNZD', 4, 6.0, 3.0, 0.01, 100.0, 7.0, -4.0, 0.5),
 
     # Crypto (CFDs) - defaults used mainly for offline backtests; live trading overrides via broker specs
     'BTCUSD': InstrumentSpec('BTCUSD', 2, 1.0, 20.0, 0.01, 100.0, 0.0, 0.0, 0.0),
@@ -1022,7 +1034,7 @@ INSTRUMENT_SPECS = {
     'TRXUSD': InstrumentSpec('TRXUSD', 4, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'XRPUSD': InstrumentSpec('XRPUSD', 4, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'TONUSD': InstrumentSpec('TONUSD', 3, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'GBXUSD': InstrumentSpec('GBXUSD', 4, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'BTCETH': InstrumentSpec('BTCETH', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'BTCXAU': InstrumentSpec('BTCXAU', 2, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
 
     # Indices - point-based instruments; defaults used mainly for offline backtests; live trading overrides via broker specs

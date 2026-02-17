@@ -505,15 +505,15 @@
     "EURSEK": {
       "inherit": "USDSEK"
     },
-    "EURDKK": {
+    "EURCNH": {
       "pip_position": 4,
       "pip_value": 1.4,
       "spread_avg": 10.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 8.0,
-      "swap_long": 1.0,
-      "swap_short": -5.0
+      "commission_per_lot": 10.0,
+      "swap_long": 2.0,
+      "swap_short": -10.0
     },
     "GBPNOK": {
       "pip_position": 4,
@@ -821,15 +821,55 @@
       "swap_long": 0.0,
       "swap_short": 0.0
     },
-    "GBXUSD": {
-      "pip_position": 4,
+    "Platinum": {
+      "pip_position": 2,
       "pip_value": 1.0,
-      "spread_avg": 12.0,
+      "spread_avg": 8.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
-      "swap_long": 0.0,
-      "swap_short": 0.0
+      "commission_per_lot": 5.0,
+      "swap_long": -5.0,
+      "swap_short": -3.0
+    },
+    "Palladium": {
+      "pip_position": 2,
+      "pip_value": 1.0,
+      "spread_avg": 8.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 5.0,
+      "swap_long": -6.0,
+      "swap_short": -4.0
+    },
+    "EURMXN": {
+      "pip_position": 4,
+      "pip_value": 0.55,
+      "spread_avg": 140.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 12.0,
+      "swap_long": 20.0,
+      "swap_short": -45.0
+    },
+    "NOKJPY": {
+      "pip_position": 2,
+      "pip_value": 9.0,
+      "spread_avg": 2.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 8.0,
+      "swap_long": -1.0,
+      "swap_short": -2.0
+    },
+    "USDTRY": {
+      "pip_position": 4,
+      "pip_value": 0.3,
+      "spread_avg": 96.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 12.0,
+      "swap_long": 25.0,
+      "swap_short": -55.0
     },
     "BTCXAU": {
       "pip_position": 2,
@@ -848,10 +888,11 @@
     "GBPAUD", "GBPCAD", "GBPCHF", "CADJPY", "NZDJPY", "AUDCAD", "AUDCHF", "CADCHF",
     "CHFJPY", "NZDCAD", "NZDCHF", "GBPNZD", "USDNOK", "USDMXN", "USDSGD", "USDZAR",
     "USDPLN", "USDSEK", "EURZAR", "GBPZAR", "USDCNH", "EURPLN", "EURNOK", "EURSEK",
-    "EURDKK", "GBPNOK", "GBPSEK", "EURTRY", "XAUUSD", "XAGUSD", "XAUEUR", "XAUGBP",
+    "EURCNH", "GBPNOK", "GBPSEK", "EURTRY", "Platinum", "Palladium", "EURMXN", "NOKJPY",
+    "XAUUSD", "XAGUSD", "XAUEUR", "XAUGBP",
     "XAUAUD", "XAGEUR", "XRX", "XTIUSD", "XBRUSD", "XNGUSD", "US100", "US30",
     "DE30", "EU50", "UK100", "JP225", "US500", "FR40", "ES35", "HK50", "AU200",
     "BTCUSD", "ETHUSD", "LTCUSD", "SOLUSD", "BCHUSD", "DOGUSD", "TRXUSD", "XRPUSD",
-    "TONUSD", "BTCETH", "GBXUSD", "BTCXAU"
+    "TONUSD", "BTCETH", "BTCXAU"
   ]
 }

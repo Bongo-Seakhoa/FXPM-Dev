@@ -145,7 +145,7 @@ The dashboard includes a background data scheduler (`jobs.py`) for root market-d
 - Manual trigger via the `/api/download_historical_data` endpoint
 - Refreshes `data/<SYMBOL>_M5.csv` using the same MT5 call path as PM main app (`get_bars(..., "M5", count=max_bars)`)
 - Uses `config.json` symbols and `pipeline.max_bars` for maintenance depth
-- Current production baseline uses a 77-symbol universe from root `config.json`
+- Current production baseline uses an 80-symbol universe from root `config.json`
 - Analytics simulation resamples M5 locally to M15/M30/H1/H4/D1 as needed
 
 Requires MT5 connection only for refresh operations. Simulation itself reads local root data.

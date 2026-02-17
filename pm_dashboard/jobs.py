@@ -53,10 +53,10 @@ class HistoricalDataDownloader:
         "NZDCAD", "NZDCHF", "GBPNZD",
         "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN", "USDSEK",
         "EURZAR", "GBPZAR", "USDCNH", "EURPLN",
-        "EURNOK", "EURSEK", "EURDKK", "GBPNOK", "GBPSEK", "EURTRY",
+        "EURNOK", "EURSEK", "EURCNH", "GBPNOK", "GBPSEK", "EURTRY", "Platinum", "Palladium", "EURMXN", "NOKJPY",
         "XAUUSD", "XAGUSD", "XAUEUR", "XAUGBP", "XAUAUD", "XAGEUR", "XRX", "XTIUSD", "XBRUSD", "XNGUSD",
         "US100", "US30", "DE30", "EU50", "UK100", "JP225", "US500", "FR40", "ES35", "HK50", "AU200",
-        "BTCUSD", "ETHUSD", "LTCUSD", "SOLUSD", "BCHUSD", "DOGUSD", "TRXUSD", "XRPUSD", "TONUSD", "BTCETH", "GBXUSD", "BTCXAU",
+        "BTCUSD", "ETHUSD", "LTCUSD", "SOLUSD", "BCHUSD", "DOGUSD", "TRXUSD", "XRPUSD", "TONUSD", "BTCETH", "BTCXAU",
     ]
 
     def __init__(self, pm_root: str, mt5_connector: Optional[MT5Connector] = None):

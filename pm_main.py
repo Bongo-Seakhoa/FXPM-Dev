@@ -220,8 +220,9 @@ DEFAULT_SYMBOLS = [
     "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN", "USDSEK",
     # Added Exotic / Minor
     "EURZAR", "GBPZAR", "USDCNH", "EURPLN",
-    # Added Nordic + TRY crosses
-    "EURNOK", "EURSEK", "EURDKK", "GBPNOK", "GBPSEK", "EURTRY",
+    # Added Nordic + selected replacements
+    "EURNOK", "EURSEK", "EURCNH", "GBPNOK", "GBPSEK", "EURTRY",
+    "Platinum", "Palladium", "EURMXN", "NOKJPY",
     # Commodities (Metals + Energy)
     "XAUUSD", "XAGUSD", "XAUEUR", "XAUGBP", "XAUAUD", "XAGEUR", "XRX", "XTIUSD", "XBRUSD", "XNGUSD",
     # Indices
@@ -229,7 +230,7 @@ DEFAULT_SYMBOLS = [
     "US500", "FR40", "ES35", "HK50", "AU200",
     # Crypto (CFDs)
     "BTCUSD", "ETHUSD", "LTCUSD", "SOLUSD", "BCHUSD",
-    "DOGUSD", "TRXUSD", "XRPUSD", "TONUSD", "BTCETH", "GBXUSD", "BTCXAU",
+    "DOGUSD", "TRXUSD", "XRPUSD", "TONUSD", "BTCETH", "BTCXAU",
 ]
 
 

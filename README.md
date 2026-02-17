@@ -384,7 +384,7 @@ python pm_main.py --trade --auto-retrain
 Note: `val_pct` is informational only. Actual validation size is controlled by
 `train_pct` and `overlap_pct`.
 Note: Live trading is **winners-only** and non-tiered. `default_config` is not used for live entries. Use `live_risk_multiplier` and `live_max_risk_pct` for live risk sizing.
-Note: Current production `config.json` symbol universe is **77 symbols**.
+Note: Current production `config.json` symbol universe is **80 symbols**.
 
 `instrument_specs` entries can use `"inherit": "SYMBOL"` to clone an existing
 spec as a starting point (handy for new symbols before you export broker specs).
