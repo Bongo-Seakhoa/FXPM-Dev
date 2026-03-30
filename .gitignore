@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+.pytest_cache/
+_test_tmp/
+.tmp_pytest/
+.tmp_test/
+*.tmp.*
+.claude/
+logs/
+data/.cache/
+last_actionable_log.json
+last_trade_log.json
+pm_outputs/historical_data/
+pm_outputs/trades_*.json

@@ -1,359 +1,392 @@
 """
-PM Dashboard Background Jobs
-=============================
+PM Dashboard Data Jobs
+======================
 
-Daily data download scheduler and background tasks for historical data management.
+Maintains PM market data in the existing root `data/` folder and provides
+historical data loading for analytics simulation.
+
+Design:
+- Single source of truth: `data/*_M5.csv`
+- Refresh path mirrors PM main flow (`MT5Connector.get_bars(..., "M5", count=max_bars)`)
+- Higher timeframes for analytics are derived by resampling M5 data locally
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Import MT5 connector with fallback
+# MT5 connector is optional for simulation (local data works without it).
 try:
     from pm_mt5 import MT5Connector, MT5_AVAILABLE
 except ImportError:
     MT5_AVAILABLE = False
     MT5Connector = None
 
+try:
+    from pm_core import DataLoader
+except ImportError:
+    DataLoader = None
+
 
 class HistoricalDataDownloader:
     """
-    Manages historical data downloads for PM dashboard analytics.
-
-    Downloads OHLC data for all symbols and timeframes used in the PM system.
-    Stores data in pm_outputs/historical_data/ directory.
+    Maintains root `data/` M5 datasets and serves resampled historical data.
     """
 
-    # Timeframes to download
-    TIMEFRAMES = ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
-
-    # Default symbols (will be overridden by config)
+    MAINTENANCE_TIMEFRAME = "M5"
+    DEFAULT_MAX_BARS = 500000
     DEFAULT_SYMBOLS = [
-        'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'USDCAD',
-        'AUDUSD', 'NZDUSD', 'AUDNZD', 'EURGBP', 'EURJPY',
-        'GBPJPY', 'AUDJPY', 'XAUUSD', 'XAGUSD', 'US30', 'US100'
+        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD",
+        "AUDUSD", "NZDUSD", "AUDNZD", "EURGBP", "EURJPY",
+        "GBPJPY", "AUDJPY", "XAUUSD", "XAGUSD", "US30", "US100",
     ]
 
     def __init__(self, pm_root: str, mt5_connector: Optional[MT5Connector] = None):
-        """
-        Initialize historical data downloader.
-
-        Args:
-            pm_root: Root directory of PM project
-            mt5_connector: Optional MT5 connector instance
-        """
         self.pm_root = pm_root
-        self.data_dir = os.path.join(pm_root, "pm_outputs", "historical_data")
+        self.data_dir = os.path.join(pm_root, "data")
         self.mt5 = mt5_connector
+        self._data_loader: Optional[DataLoader] = None
+        self._config_cache_signature: Optional[Tuple[str, int, int]] = None
+        self._config_cache: Dict[str, object] = {}
         self._ensure_data_dir()
 
-    def _ensure_data_dir(self):
-        """Create historical data directory if it doesn't exist."""
-        if not os.path.exists(self.data_dir):
-            os.makedirs(self.data_dir, exist_ok=True)
-            logger.info(f"Created historical data directory: {self.data_dir}")
+    def _ensure_data_dir(self) -> None:
+        os.makedirs(self.data_dir, exist_ok=True)
+
+    def _get_data_loader(self) -> Optional[DataLoader]:
+        if DataLoader is None:
+            return None
+        if self._data_loader is None:
+            self._data_loader = DataLoader(Path(self.data_dir))
+        return self._data_loader
+
+    def _available_data_symbols(self) -> List[str]:
+        symbols: List[str] = []
+        try:
+            for name in os.listdir(self.data_dir):
+                if not name.upper().endswith("_M5.CSV"):
+                    continue
+                sym = name[:-7]  # strip "_M5.csv"
+                sym = str(sym).strip().upper()
+                if sym:
+                    symbols.append(sym)
+        except Exception:
+            return []
+        return sorted(set(symbols))
+
+    def _resolve_symbol_name(self, symbol: str) -> str:
+        requested = str(symbol or "").strip().upper()
+        if not requested:
+            return requested
+
+        available = set(self._available_data_symbols())
+        if requested in available:
+            return requested
+
+        if "." in requested:
+            left = requested.split(".", 1)[0].strip()
+            if left in available:
+                return left
+
+        if len(requested) >= 6:
+            prefix6 = requested[:6]
+            if prefix6 in available:
+                return prefix6
+
+        startswith_matches = [sym for sym in available if requested.startswith(sym)]
+        if len(startswith_matches) == 1:
+            return startswith_matches[0]
+
+        prefix_matches = [sym for sym in available if sym.startswith(requested)]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+
+        return requested
+
+    def _clear_data_loader_cache(self) -> None:
+        if self._data_loader is not None:
+            try:
+                self._data_loader.clear_cache()
+            except Exception:
+                pass
+
+    def _load_root_config(self) -> Dict[str, object]:
+        config_path = os.path.join(self.pm_root, "config.json")
+        if not os.path.isfile(config_path):
+            self._config_cache_signature = None
+            self._config_cache = {}
+            return {}
+
+        try:
+            stat = os.stat(config_path)
+            signature = (config_path, int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            return self._config_cache
+
+        if self._config_cache_signature != signature:
+            try:
+                with open(config_path, "r", encoding="utf-8") as handle:
+                    config = json.load(handle)
+                if isinstance(config, dict):
+                    self._config_cache = config
+                else:
+                    self._config_cache = {}
+            except Exception as exc:
+                logger.warning("Failed to load config.json: %s", exc)
+                self._config_cache = {}
+            self._config_cache_signature = signature
+
+        return self._config_cache
 
     def get_symbols_from_config(self) -> List[str]:
         """
-        Get list of symbols from PM configuration.
-
-        Returns:
-            List of symbol strings
+        Read symbols from root config.json.
+        Preference: `symbols` list -> `instrument_specs` keys -> defaults.
         """
         try:
-            import json
-            config_path = os.path.join(self.pm_root, "config.json")
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-                    instrument_specs = config.get('instrument_specs', {})
-                    if instrument_specs:
-                        return list(instrument_specs.keys())
-        except Exception as e:
-            logger.warning(f"Failed to load symbols from config: {e}")
+            config = self._load_root_config()
+            symbols = config.get("symbols")
+            if isinstance(symbols, list) and symbols:
+                return [str(s).strip().upper() for s in symbols if str(s).strip()]
 
-        return self.DEFAULT_SYMBOLS
+            specs = config.get("instrument_specs")
+            if isinstance(specs, dict) and specs:
+                return [str(s).strip().upper() for s in specs.keys() if str(s).strip()]
+        except Exception as exc:
+            logger.warning("Failed to load symbols from config.json: %s", exc)
 
-    def get_data_filepath(self, symbol: str, timeframe: str, date: datetime) -> str:
-        """
-        Get filepath for historical data file.
+        return list(self.DEFAULT_SYMBOLS)
 
-        Args:
-            symbol: Symbol name
-            timeframe: Timeframe string
-            date: Date for data
-
-        Returns:
-            Absolute file path
-        """
-        date_str = date.strftime("%Y%m%d")
-        filename = f"{symbol}_{timeframe}_{date_str}.csv"
-        return os.path.join(self.data_dir, filename)
-
-    def is_data_cached(self, symbol: str, timeframe: str, date: datetime) -> bool:
-        """
-        Check if data is already cached locally.
-
-        Args:
-            symbol: Symbol name
-            timeframe: Timeframe string
-            date: Date to check
-
-        Returns:
-            True if data exists and is valid
-        """
-        filepath = self.get_data_filepath(symbol, timeframe, date)
-        if not os.path.exists(filepath):
-            return False
-
-        # Check if file is not empty
+    def get_max_bars_from_config(self) -> int:
+        """Read maintenance bar depth from root pipeline config."""
         try:
-            df = pd.read_csv(filepath)
-            return len(df) > 0
+            config = self._load_root_config()
+            pipeline = config.get("pipeline", {})
+            if isinstance(pipeline, dict):
+                value = int(pipeline.get("max_bars", self.DEFAULT_MAX_BARS))
+                return max(1000, value)
         except Exception:
+            pass
+        return self.DEFAULT_MAX_BARS
+
+    def _ensure_mt5_connection(self) -> bool:
+        if not MT5_AVAILABLE or self.mt5 is None:
+            return False
+        try:
+            if self.mt5.is_connected():
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(self.mt5.connect())
+        except Exception as exc:
+            logger.warning("MT5 reconnect failed for data maintenance: %s", exc)
             return False
 
-    def download_day_data(self, symbol: str, timeframe: str, date: datetime) -> Optional[pd.DataFrame]:
+    def can_refresh_from_mt5(self) -> bool:
+        return self._ensure_mt5_connection()
+
+    def refresh_symbol_m5(self, symbol: str, max_bars: int) -> bool:
         """
-        Download one day of data for symbol/timeframe.
-
-        Args:
-            symbol: Symbol to download
-            timeframe: Timeframe to download
-            date: Date to download (will get full day)
-
-        Returns:
-            DataFrame with OHLCV data or None
+        Refresh one symbol's root M5 file using the same MT5 path as PM main app.
         """
-        if not MT5_AVAILABLE or not self.mt5:
-            logger.error("MT5 not available for data download")
-            return None
+        if not self._ensure_mt5_connection():
+            logger.warning("Cannot refresh %s: MT5 not connected", symbol)
+            return False
 
+        broker_symbol = self.mt5.find_broker_symbol(symbol)
+        if not broker_symbol:
+            logger.warning("Cannot refresh %s: broker symbol not found", symbol)
+            return False
+
+        bars = self.mt5.get_bars(broker_symbol, self.MAINTENANCE_TIMEFRAME, count=max_bars)
+        if bars is None or len(bars) == 0:
+            logger.warning("No M5 data returned for %s (%s)", symbol, broker_symbol)
+            return False
+
+        filepath = os.path.join(self.data_dir, f"{symbol}_M5.csv")
         try:
-            # Calculate date range for the day
-            start_date = date.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_date = start_date + timedelta(days=1)
+            bars.to_csv(filepath)
+            logger.info("Updated %s with %d bars", filepath, len(bars))
+            return True
+        except Exception as exc:
+            logger.error("Failed writing %s: %s", filepath, exc)
+            return False
 
-            # Download data from MT5
-            df = self.mt5.get_bars_range(symbol, timeframe, start_date, end_date)
-
-            if df is None or len(df) == 0:
-                logger.warning(f"No data downloaded for {symbol} {timeframe} on {date.strftime('%Y-%m-%d')}")
-                return None
-
-            # Save to cache
-            filepath = self.get_data_filepath(symbol, timeframe, date)
-            df.to_csv(filepath)
-            logger.debug(f"Saved {len(df)} bars to {filepath}")
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Failed to download data for {symbol} {timeframe}: {e}")
-            return None
-
-    def download_historical_range(self,
-                                  symbol: str,
-                                  timeframe: str,
-                                  start_date: datetime,
-                                  end_date: datetime) -> Optional[pd.DataFrame]:
+    def refresh_all_m5_data(self,
+                            symbols: Optional[List[str]] = None,
+                            max_bars: Optional[int] = None) -> dict:
         """
-        Download historical data for a date range.
-
-        Args:
-            symbol: Symbol to download
-            timeframe: Timeframe to download
-            start_date: Start date
-            end_date: End date
-
-        Returns:
-            Combined DataFrame or None
+        Refresh root M5 data files for configured symbols.
         """
-        if not MT5_AVAILABLE or not self.mt5:
-            return None
+        symbols_to_refresh = symbols or self.get_symbols_from_config()
+        bars = max_bars if max_bars is not None else self.get_max_bars_from_config()
 
-        try:
-            df = self.mt5.get_bars_range(symbol, timeframe, start_date, end_date)
-            return df
-        except Exception as e:
-            logger.error(f"Failed to download historical range for {symbol}: {e}")
-            return None
+        logger.info(
+            "Starting root data maintenance: symbols=%d, timeframe=%s, bars=%d",
+            len(symbols_to_refresh),
+            self.MAINTENANCE_TIMEFRAME,
+            bars,
+        )
 
-    def download_all_symbols(self, date: datetime = None):
-        """
-        Download data for all symbols and timeframes.
+        success = 0
+        failed = 0
+        for symbol in symbols_to_refresh:
+            if self.refresh_symbol_m5(symbol, bars):
+                success += 1
+            else:
+                failed += 1
+            time.sleep(0.05)
 
-        Args:
-            date: Date to download (default: yesterday)
-        """
-        if date is None:
-            date = datetime.now() - timedelta(days=1)
+        self._clear_data_loader_cache()
 
-        symbols = self.get_symbols_from_config()
-        logger.info(f"Starting download for {len(symbols)} symbols on {date.strftime('%Y-%m-%d')}")
+        logger.info(
+            "Root data maintenance complete: %d updated, %d failed",
+            success,
+            failed,
+        )
+        return {
+            "success": failed == 0,
+            "updated": success,
+            "failed": failed,
+            "symbols_total": len(symbols_to_refresh),
+            "bars": bars,
+            "timeframe": self.MAINTENANCE_TIMEFRAME,
+        }
 
-        success_count = 0
-        fail_count = 0
-        skip_count = 0
+    # Backward-compatible alias used by existing callers.
+    def download_all_symbols(self, date: datetime = None):  # noqa: ARG002
+        return self.refresh_all_m5_data()
 
-        for symbol in symbols:
-            for timeframe in self.TIMEFRAMES:
-                # Check cache first
-                if self.is_data_cached(symbol, timeframe, date):
-                    logger.debug(f"Skipping {symbol} {timeframe} - already cached")
-                    skip_count += 1
-                    continue
-
-                # Download
-                df = self.download_day_data(symbol, timeframe, date)
-
-                if df is not None:
-                    success_count += 1
-                else:
-                    fail_count += 1
-
-                # Small delay to avoid overwhelming MT5
-                time.sleep(0.1)
-
-        logger.info(f"Download complete: {success_count} succeeded, {fail_count} failed, {skip_count} cached")
+    def _normalize_range(self, start_date: datetime, end_date: datetime) -> Tuple[datetime, datetime]:
+        start = start_date
+        end = end_date
+        if getattr(start, "tzinfo", None) is not None:
+            start = start.replace(tzinfo=None)
+        if getattr(end, "tzinfo", None) is not None:
+            end = end.replace(tzinfo=None)
+        return start, end
 
     def load_historical_data(self,
-                            symbol: str,
-                            timeframe: str,
-                            start_date: datetime,
-                            end_date: datetime = None) -> Optional[pd.DataFrame]:
+                             symbol: str,
+                             timeframe: str,
+                             start_date: datetime,
+                             end_date: datetime = None) -> Optional[pd.DataFrame]:
         """
-        Load historical data from cache or download if needed.
-
-        Args:
-            symbol: Symbol name
-            timeframe: Timeframe string
-            start_date: Start date
-            end_date: End date (default: now)
-
-        Returns:
-            DataFrame with OHLCV data or None
+        Load simulation data from root `data/` folder, resampling from M5 as needed.
         """
         if end_date is None:
             end_date = datetime.now()
+        start_date, end_date = self._normalize_range(start_date, end_date)
 
-        # Try to load from cached files
-        all_dfs = []
-        current_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        loader = self._get_data_loader()
+        if loader is None:
+            logger.error("pm_core.DataLoader unavailable; cannot load historical data")
+            return None
 
-        while current_date <= end_date:
-            filepath = self.get_data_filepath(symbol, timeframe, current_date)
+        symbol = self._resolve_symbol_name(symbol)
+        tf = str(timeframe or "M5").strip().upper()
+        if not symbol:
+            return None
 
-            if os.path.exists(filepath):
-                try:
-                    df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-                    all_dfs.append(df)
-                except Exception as e:
-                    logger.warning(f"Failed to load cached file {filepath}: {e}")
+        base = loader.load_symbol(symbol, "M5")
+        if base is None or len(base) == 0:
+            return None
 
-            current_date += timedelta(days=1)
+        if tf == "M5":
+            frame = base
+        else:
+            try:
+                frame = loader.resample(base, tf)
+            except Exception as exc:
+                logger.warning("Failed resample %s %s from M5: %s", symbol, tf, exc)
+                return None
 
-        if all_dfs:
-            combined_df = pd.concat(all_dfs, axis=0)
-            # Filter to exact date range
-            combined_df = combined_df[(combined_df.index >= start_date) & (combined_df.index <= end_date)]
-            return combined_df
-
-        # No cached data, try to download from MT5
-        logger.info(f"No cached data found, downloading {symbol} {timeframe} from MT5")
-        return self.download_historical_range(symbol, timeframe, start_date, end_date)
+        sliced = frame[(frame.index >= start_date) & (frame.index <= end_date)]
+        if len(sliced) == 0:
+            return None
+        return sliced
 
 
 class DataDownloadScheduler:
     """
-    Background scheduler for daily data downloads.
-
-    Runs data downloads at specified time each day (default: 00:05).
+    Scheduler for root-data maintenance (default: daily at midnight).
     """
 
-    def __init__(self, downloader: HistoricalDataDownloader, run_time: str = "00:05"):
-        """
-        Initialize scheduler.
-
-        Args:
-            downloader: HistoricalDataDownloader instance
-            run_time: Time to run downloads (HH:MM format)
-        """
+    def __init__(self, downloader: HistoricalDataDownloader, run_time: str = "00:00"):
         self.downloader = downloader
         self.run_time = run_time
         self._running = False
         self._thread = None
+        self._last_run_date = None
+
+    def _parse_run_time(self) -> Tuple[int, int]:
+        try:
+            hh_str, mm_str = str(self.run_time).split(":")
+            hh = max(0, min(23, int(hh_str)))
+            mm = max(0, min(59, int(mm_str)))
+            return hh, mm
+        except Exception:
+            return 0, 0
 
     def start(self):
-        """Start the background scheduler thread."""
         if self._running:
-            logger.warning("Scheduler already running")
+            logger.warning("Data maintenance scheduler already running")
             return
-
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.info(f"Data download scheduler started (runs daily at {self.run_time})")
+        logger.info("Data maintenance scheduler started (daily at %s)", self.run_time)
 
     def stop(self):
-        """Stop the background scheduler."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
-        logger.info("Data download scheduler stopped")
+        logger.info("Data maintenance scheduler stopped")
+
+    def _should_run_now(self, now: datetime, target_hour: int, target_minute: int) -> bool:
+        if self._last_run_date == now.date():
+            return False
+        if now.hour > target_hour:
+            return True
+        if now.hour == target_hour and now.minute >= target_minute:
+            return True
+        return False
 
     def _run_loop(self):
-        """Main scheduler loop."""
+        target_hour, target_minute = self._parse_run_time()
         while self._running:
             try:
-                # Check if it's time to run
                 now = datetime.now()
-                target_hour, target_minute = map(int, self.run_time.split(':'))
-
-                if now.hour == target_hour and now.minute == target_minute:
-                    logger.info("Starting scheduled data download")
-                    self.downloader.download_all_symbols()
-                    # Sleep for 60 seconds to avoid running multiple times in same minute
-                    time.sleep(60)
-                else:
-                    # Check every 30 seconds
-                    time.sleep(30)
-
-            except Exception as e:
-                logger.error(f"Error in scheduler loop: {e}", exc_info=True)
+                if self._should_run_now(now, target_hour, target_minute):
+                    self.run_now()
+                    self._last_run_date = now.date()
+                time.sleep(30)
+            except Exception as exc:
+                logger.error("Error in data maintenance scheduler: %s", exc, exc_info=True)
                 time.sleep(60)
 
     def run_now(self):
-        """Trigger an immediate download (for testing/manual runs)."""
-        logger.info("Manual data download triggered")
-        self.downloader.download_all_symbols()
+        logger.info("Manual/root data maintenance triggered")
+        return self.downloader.refresh_all_m5_data()
 
 
 def initialize_data_jobs(pm_root: str,
-                        mt5_connector: Optional[MT5Connector] = None,
-                        enable_scheduler: bool = False) -> tuple:
-    """
-    Initialize data download jobs.
-
-    Args:
-        pm_root: PM root directory
-        mt5_connector: Optional MT5 connector
-        enable_scheduler: Whether to start the scheduler
-
-    Returns:
-        Tuple of (downloader, scheduler)
-    """
+                         mt5_connector: Optional[MT5Connector] = None,
+                         enable_scheduler: bool = False,
+                         run_time: str = "00:00") -> tuple:
     downloader = HistoricalDataDownloader(pm_root, mt5_connector)
-    scheduler = DataDownloadScheduler(downloader)
+    scheduler = DataDownloadScheduler(downloader, run_time=run_time)
 
     if enable_scheduler:
         scheduler.start()
@@ -362,7 +395,7 @@ def initialize_data_jobs(pm_root: str,
 
 
 __all__ = [
-    'HistoricalDataDownloader',
-    'DataDownloadScheduler',
-    'initialize_data_jobs',
+    "HistoricalDataDownloader",
+    "DataDownloadScheduler",
+    "initialize_data_jobs",
 ]

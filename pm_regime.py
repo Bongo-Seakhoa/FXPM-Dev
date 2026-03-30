@@ -913,13 +913,14 @@ class MarketRegimeDetector:
         percentile = np.zeros(n)
         
         for i in range(lookback, n):
-            window = atr[max(0, i-lookback+1):i+1]
+            # Exclude current bar from percentile window to avoid self-reference bias
+            window = atr[max(0, i-lookback+1):i]
             window = window[window > 0]
-            
+
             if len(window) > 10 and atr[i] > 0:
                 rank = np.sum(window <= atr[i]) / len(window)
                 percentile[i] = rank
-        
+
         return percentile
     
     def _compute_structure_break(self, df: pd.DataFrame, atr: np.ndarray,

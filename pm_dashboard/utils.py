@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 DEFAULT_CONFIG: Dict[str, Any] = {
     "pm_root": "",
     "refresh_interval_sec": 5,
+    "enable_data_maintenance_scheduler": True,
+    "data_maintenance_time": "00:00",
     "file_patterns": [
         "**/*recommendation*.json",
         "**/*recommendations*.json",
@@ -48,9 +50,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_signal_age_minutes": 1440,
     "valid_actions": [
         "EXECUTED",
+        "SKIPPED_RISK_CAP",
+        "BLOCKED_RISK_CAP",
     ],
     "valid_action_prefixes": [
         "EXECUTED",
+        "SKIPPED_RISK_CAP",
+        "BLOCKED_RISK_CAP",
     ],
     "display_actions": [
         "EXECUTED",
@@ -84,6 +90,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "regime": ["regime", "market_regime"],
         "strategy_name": ["strategy", "strategy_name", "signal_source", "model", "algo"],
         "signal_direction": ["direction", "side", "signal", "action", "trade_direction"],
+        "secondary_trade": ["secondary_trade", "is_secondary", "secondary"],
+        "secondary_reason": ["secondary_reason", "secondary_trade_reason"],
         "entry_price": ["entry", "entry_price", "price", "entryPrice", "open_price", "signal_price"],
         "stop_loss_price": ["sl", "stop", "stop_loss", "stop_loss_price"],
         "take_profit_price": ["tp", "take_profit", "take_profit_price"],
@@ -130,8 +138,15 @@ def load_dashboard_config(path: Optional[str]) -> Dict[str, Any]:
 def save_dashboard_config(path: str, config: Dict[str, Any]) -> None:
     payload = deepcopy(config)
     payload.pop("_runtime", None)
-    with open(path, "w", encoding="utf-8") as handle:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
 
 
 def safe_read_text(path: str) -> Optional[str]:
@@ -309,9 +324,13 @@ def is_recent(timestamp: Optional[datetime], max_age_minutes: Optional[float]) -
     if timestamp is None or max_age_minutes is None:
         return True
     try:
-        age = datetime.now() - timestamp
+        if timestamp.tzinfo is None:
+            now = datetime.now()
+        else:
+            now = datetime.now(timestamp.tzinfo)
+        age = now - timestamp
     except Exception:
-        return True
+        return False
     return age <= timedelta(minutes=max_age_minutes)
 
 

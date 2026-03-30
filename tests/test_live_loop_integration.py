@@ -11,8 +11,8 @@ import unittest
 import sys
 import os
 import json
-import tempfile
 import datetime
+from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pandas as pd
@@ -43,7 +43,8 @@ class LiveLoopIntegrationTests(unittest.TestCase):
     def setUp(self):
         """Set up mocked components for the live trading loop."""
         self.bars = _make_ohlcv(300)
-        self.tmp_dir = tempfile.mkdtemp()
+        self.tmp_dir = os.path.join(os.getcwd(), "_test_tmp", "live_loop", self._testMethodName)
+        os.makedirs(self.tmp_dir, exist_ok=True)
         self.configs_path = os.path.join(self.tmp_dir, "pm_configs.json")
 
         now = datetime.datetime.now()
@@ -165,6 +166,165 @@ class LiveLoopIntegrationTests(unittest.TestCase):
         # New bar: allowed again
         next_bar = "2025-06-01T15:00:00"
         self.assertFalse(throttle.should_suppress("EURUSD", dk, next_bar))
+
+    def test_live_trader_uses_single_positions_snapshot_per_iteration(self):
+        """The live runtime should fetch one positions snapshot and reuse it."""
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+
+        mock_mt5 = Mock()
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.get_positions.return_value = [Mock(symbol="EURUSD", magic=1)]
+        mock_mt5.get_account_info.return_value = Mock(trade_allowed=True, trade_expert=True)
+
+        mock_pm = Mock()
+        mock_pm.symbols = ["EURUSD", "GBPUSD"]
+        mock_pm.get_validated_configs.return_value = {
+            "EURUSD": Mock(),
+            "GBPUSD": Mock(),
+        }
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            enable_trading=False,
+        )
+        trader._process_symbol = MagicMock()
+
+        trader.process_all_symbols()
+
+        self.assertEqual(mock_mt5.get_positions.call_count, 1)
+        self.assertEqual(mock_mt5.get_account_info.call_count, 1)
+        self.assertEqual(trader._process_symbol.call_count, 2)
+        for call in trader._process_symbol.call_args_list:
+            self.assertIs(call.kwargs["positions_snapshot"], mock_mt5.get_positions.return_value)
+            self.assertIs(call.kwargs["account_info"], mock_mt5.get_account_info.return_value)
+
+    def test_live_trader_fails_closed_when_positions_snapshot_missing(self):
+        """Missing live positions should block the iteration instead of trading blind."""
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+
+        mock_mt5 = Mock()
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.get_positions.return_value = None
+        mock_mt5.get_account_info.return_value = Mock(trade_allowed=True, trade_expert=True)
+
+        mock_pm = Mock()
+        mock_pm.symbols = ["EURUSD"]
+        mock_pm.get_validated_configs.return_value = {
+            "EURUSD": Mock(),
+        }
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            enable_trading=False,
+        )
+        trader._process_symbol = MagicMock()
+
+        trader.process_all_symbols()
+
+        self.assertEqual(mock_mt5.get_positions.call_count, 1)
+        self.assertEqual(mock_mt5.get_account_info.call_count, 0)
+        trader._process_symbol.assert_not_called()
+
+    def test_drift_monitor_sync_records_new_closing_deals(self):
+        """Recent closing deals should feed the live drift monitor once."""
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+
+        mock_mt5 = Mock()
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.get_recent_closing_deals.return_value = [{
+            "ticket": 101,
+            "symbol": "EURUSD",
+            "profit": 42.0,
+            "comment": "PM3:EURUSD:H1:abcd:L:10",
+        }]
+        mock_mt5.find_broker_symbol.side_effect = lambda symbol: symbol
+
+        mock_pm = Mock()
+        mock_pm.symbols = ["EURUSD"]
+        mock_pm.get_validated_configs.return_value = {
+            "EURUSD": Mock(val_metrics={"win_rate": 50.0, "mean_r": 0.5})
+        }
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            enable_trading=False,
+        )
+
+        trader._sync_drift_monitor()
+        trader._sync_drift_monitor()  # duplicate ticket should be ignored
+
+        summary = trader.drift_monitor.get_summary("EURUSD")
+        self.assertEqual(summary["trade_count"], 1)
+
+    def test_close_on_opposite_signal_closes_before_new_entry(self):
+        """Opposite-signal exit handling should close first and skip the new entry."""
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+        from pm_core import get_instrument_spec
+
+        mock_mt5 = Mock()
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.find_broker_symbol.return_value = "EURUSD"
+        mock_mt5.get_positions.return_value = [
+            Mock(symbol="EURUSD", type=1, magic=1, comment="PM3:EURUSD:H1:abc:L:10")
+        ]
+        mock_mt5.get_account_info.return_value = Mock(trade_allowed=True, trade_expert=True)
+        mock_mt5.get_symbol_info.return_value = Mock(
+            to_instrument_spec=Mock(return_value=get_instrument_spec("EURUSD"))
+        )
+
+        mock_pm = Mock()
+        mock_pm.symbols = ["EURUSD"]
+        mock_pm.get_validated_configs.return_value = {
+            "EURUSD": Mock(
+                has_regime_configs=Mock(return_value=False),
+                timeframe="H1",
+            )
+        }
+        mock_pipeline = Mock()
+        mock_pipeline.actionable_score_margin = 1.0
+        mock_pipeline.allow_d1_plus_lower_tf = True
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            enable_trading=False,
+            close_on_opposite_signal=True,
+            pipeline_config=mock_pipeline,
+        )
+        trader._evaluate_regime_candidates = MagicMock(return_value=(
+            [{
+                "strategy_name": "TrendStrategy",
+                "timeframe": "D1",
+                "regime": "TREND",
+                "signal": 1,
+                "selection_score": 1.0,
+                "quality_score": 1.0,
+                "freshness": 1.0,
+                "regime_strength": 1.0,
+                "features": self.bars.copy(),
+                "strategy": Mock(),
+                "bar_time": "2025-01-01T00:00:00",
+            }],
+            {},
+        ))
+        trader._close_position_on_signal = MagicMock()
+        trader._execute_entry = MagicMock()
+
+        trader.process_all_symbols()
+
+        trader._close_position_on_signal.assert_called_once()
+        trader._execute_entry.assert_not_called()
 
     def test_regime_detection_on_synthetic_bars(self):
         """MarketRegimeDetector should produce valid regime labels."""

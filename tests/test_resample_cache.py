@@ -1,7 +1,8 @@
 import os
-import tempfile
+import shutil
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -22,8 +23,10 @@ class ResampleCacheTests(unittest.TestCase):
         df.to_csv(path, index=False)
 
     def test_resample_cache_invalidates_on_source_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = tmp
+        data_dir = Path("artifact/fxpm_runtime/.tmp_pytest/test_resample_cache")
+        shutil.rmtree(data_dir, ignore_errors=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        try:
             csv_path = os.path.join(data_dir, "EURUSD_M5.csv")
             start = datetime(2024, 1, 1, 0, 0, 0)
 
@@ -57,6 +60,8 @@ class ResampleCacheTests(unittest.TestCase):
                 DataLoader.MIN_BARS["H1"] = original_min
             self.assertIsNotNone(h1_b)
             self.assertNotEqual(len(h1_a), len(h1_b))
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

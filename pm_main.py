@@ -8,7 +8,7 @@ This application:
 1. Loads or optimizes strategy configurations for all symbols
 2. Monitors markets for entry signals on each bar close
 3. Executes trades based on optimized strategies
-4. Automatically retrains when retrain periods expire
+4. Applies the fixed production retrain schedule from config.json
 5. Logs all activity and trades
 
 Stateful Optimization:
@@ -21,7 +21,6 @@ Usage:
     python pm_main.py --optimize --overwrite  # Force re-optimize all
     python pm_main.py --trade                 # Live trading with existing configs
     python pm_main.py --trade --paper         # Paper trading mode
-    python pm_main.py --trade --auto-retrain  # Live trading with auto-retraining
     python pm_main.py --status                # Show current status
 
 Version: 3.1 (Portfolio Manager with Stateful Optimization)
@@ -39,7 +38,7 @@ import threading
 import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Set
 from dataclasses import dataclass, field, fields
 
 import pandas as pd
@@ -99,6 +98,15 @@ def log_resolved_config_summary(logger: logging.Logger,
             f"ret>={getattr(p, 'regime_min_val_return_pct', None)} | "
             f"optuna_val_obj={bool(getattr(p, 'optuna_use_val_in_objective', False))}"
         )
+        logger.info(
+            "            "
+            f"retrain: mode={getattr(p, 'production_retrain_mode', None)} | "
+            f"schedule={p.describe_retrain_schedule()} | "
+            f"anchor={getattr(p, 'production_retrain_anchor_date', None)} | "
+            f"poll={getattr(p, 'production_retrain_poll_seconds', None)}s | "
+            f"data_dir={getattr(p, 'data_dir', None)} | "
+            f"output_dir={getattr(p, 'output_dir', None)}"
+        )
 
         # Position config (risk + execution safety)
         pos_cfg = position_config
@@ -147,8 +155,13 @@ from pm_core import (
     load_broker_specs
 )
 from pm_strategies import StrategyRegistry, BaseStrategy
-from pm_position import PositionConfig, PositionManager, PositionCalculator
+from pm_position import PositionConfig, PositionCalculator
 from pm_pipeline import PortfolioManager, SymbolConfig
+from pm_enhancement_seams import (
+    create_default_enhancement_seams,
+    RiskScalarContext,
+    ExecutionQualityContext,
+)
 from pm_mt5 import (
     MT5_AVAILABLE,
     MT5Config,
@@ -249,6 +262,7 @@ class DecisionRecord:
                                # SKIPPED_SPREAD, SKIPPED_NO_SIGNAL, FAILED, …
     action_time: str           # ISO-8601 wall-clock time
     decision_keys: List[str] = field(default_factory=list)
+    context: Dict[str, Any] = field(default_factory=dict)
 
 
 class DecisionThrottle:
@@ -323,7 +337,8 @@ class DecisionThrottle:
     def record_decision(self, symbol: str, decision_key: str,
                         bar_time_iso: str, timeframe: str, regime: str,
                         strategy_name: str, direction: int, action: str,
-                        cooldown_seconds: int = 0) -> None:
+                        cooldown_seconds: int = 0,
+                        context: Optional[Dict[str, Any]] = None) -> None:
         """
         Store a decision and persist to disk.
 
@@ -335,6 +350,7 @@ class DecisionThrottle:
         """
         # Update or create record. Keep a per-bar list of seen decision keys.
         prev = self._cache.get(symbol)
+        ctx = context or {}
         if prev is not None and prev.bar_time == bar_time_iso:
             if decision_key not in prev.decision_keys:
                 prev.decision_keys.append(decision_key)
@@ -345,6 +361,7 @@ class DecisionThrottle:
             prev.direction = direction
             prev.action = action
             prev.action_time = datetime.now().isoformat()
+            prev.context = ctx
             record = prev
         else:
             record = DecisionRecord(
@@ -358,6 +375,7 @@ class DecisionThrottle:
                 action=action,
                 action_time=datetime.now().isoformat(),
                 decision_keys=[decision_key],
+                context=ctx,
             )
         self._cache[symbol] = record
         self._save()
@@ -393,8 +411,12 @@ class DecisionThrottle:
                     "direction": rec.direction,
                     "action": rec.action,
                     "action_time": rec.action_time,
+                    "context": rec.context,
                 }
-            tmp_path = f"{self._log_path}.tmp"
+            parent_dir = os.path.dirname(self._log_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            tmp_path = f"{self._log_path}.tmp.{os.getpid()}.{threading.get_ident()}"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_path, self._log_path)
@@ -424,6 +446,7 @@ class DecisionThrottle:
                     action=rec_dict.get("action", ""),
                     action_time=rec_dict.get("action_time", ""),
                     decision_keys=decision_keys,
+                    context=rec_dict.get("context", {}) or {},
                 )
         except FileNotFoundError:
             pass
@@ -459,7 +482,10 @@ class ActionableDecisionLog:
 
     def _save(self) -> None:
         try:
-            tmp_path = f"{self._log_path}.tmp"
+            parent_dir = os.path.dirname(self._log_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            tmp_path = f"{self._log_path}.tmp.{os.getpid()}.{threading.get_ident()}"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self._cache, f, indent=2)
             os.replace(tmp_path, self._log_path)
@@ -513,11 +539,16 @@ class DriftMonitor:
         # Per-symbol rolling trade stats
         self._trades: Dict[str, List[Dict[str, Any]]] = {}
 
-    def record_trade(self, symbol: str, pnl_pips: float, r_multiple: float):
+    def record_trade(self,
+                     symbol: str,
+                     pnl_dollars: float,
+                     pnl_pips: Optional[float] = None,
+                     r_multiple: Optional[float] = None):
         """Record a completed trade for drift tracking."""
         if symbol not in self._trades:
             self._trades[symbol] = []
         self._trades[symbol].append({
+            'pnl_dollars': pnl_dollars,
             'pnl_pips': pnl_pips,
             'r_multiple': r_multiple,
             'time': datetime.now(),
@@ -529,20 +560,20 @@ class DriftMonitor:
         if len(trades) < 5:
             return  # Not enough data to judge
 
-        wins = sum(1 for t in trades if t['pnl_pips'] > 0)
+        wins = sum(1 for t in trades if t.get('pnl_dollars', 0.0) > 0)
         live_wr = (wins / len(trades)) * 100
-        live_avg_r = np.mean([t['r_multiple'] for t in trades])
+        live_r_values = [t['r_multiple'] for t in trades if t.get('r_multiple') is not None]
+        live_avg_r = np.mean(live_r_values) if live_r_values else None
 
         val_wr = val_metrics.get('win_rate', 50.0)
-        val_avg_r = val_metrics.get('avg_r_multiple', 1.0)
-        val_dd = val_metrics.get('max_drawdown_pct', 0.0)
+        val_avg_r = val_metrics.get('mean_r', val_metrics.get('avg_r_multiple', 1.0))
 
         if abs(live_wr - val_wr) > self.win_rate_threshold:
             self.logger.warning(
                 f"[DRIFT] [{symbol}] Win rate drift: live={live_wr:.1f}% vs "
                 f"backtest={val_wr:.1f}% (threshold={self.win_rate_threshold}%)"
             )
-        if abs(live_avg_r - val_avg_r) > self.r_mult_threshold:
+        if live_avg_r is not None and abs(live_avg_r - val_avg_r) > self.r_mult_threshold:
             self.logger.warning(
                 f"[DRIFT] [{symbol}] R-multiple drift: live={live_avg_r:.2f} vs "
                 f"backtest={val_avg_r:.2f} (threshold={self.r_mult_threshold})"
@@ -553,11 +584,12 @@ class DriftMonitor:
         trades = self._trades.get(symbol, [])
         if not trades:
             return {'trade_count': 0}
-        wins = sum(1 for t in trades if t['pnl_pips'] > 0)
+        wins = sum(1 for t in trades if t.get('pnl_dollars', 0.0) > 0)
+        live_r_values = [t['r_multiple'] for t in trades if t.get('r_multiple') is not None]
         return {
             'trade_count': len(trades),
             'live_win_rate': (wins / len(trades)) * 100,
-            'live_avg_r': np.mean([t['r_multiple'] for t in trades]),
+            'live_avg_r': np.mean(live_r_values) if live_r_values else None,
         }
 
 
@@ -600,8 +632,6 @@ class LiveTrader:
         self.close_on_opposite_signal = close_on_opposite_signal
         self.pipeline_config = pipeline_config
         
-        # Position management
-        self.position_manager = PositionManager(position_config)
         self.position_calc = PositionCalculator(position_config)
         
         # State
@@ -622,13 +652,19 @@ class LiveTrader:
         
         # Trade log
         self.trade_log: List[Dict] = []
+        self.drift_monitor = DriftMonitor(logging.getLogger(__name__))
+        self._seen_closing_deals: Set[int] = set()
         
         # Cache statistics for monitoring
         self._cache_hits = 0
         self._cache_misses = 0
         self._max_cache_size = 100  # Limit cache to prevent memory bloat
+        self._equity_peak = 0.0
 
         self.logger = logging.getLogger(__name__)
+
+        # Enhancement seams (risk scalars, spread filter, exit pack)
+        self._enhancement_seams = create_default_enhancement_seams()
 
         # === MT5 SPEC SYNCHRONIZATION ===
         # Update InstrumentSpec with live MT5 values for accurate position sizing
@@ -654,7 +690,7 @@ class LiveTrader:
                     continue
 
                 # Get spec and sync
-                spec = self.pm.get_instrument_spec(symbol)
+                spec = get_instrument_spec(symbol)
 
                 # Store original values for comparison
                 orig_tick_value = spec.tick_value
@@ -694,7 +730,103 @@ class LiveTrader:
             for k in keys_to_remove:
                 del self._candidate_cache[k]
             self.logger.debug(f"Pruned feature cache: removed {len(keys_to_remove)} entries")
-    
+
+    def invalidate_runtime_caches(self) -> None:
+        """Clear runtime caches that should not survive reconnect/retrain boundaries."""
+        self._candidate_cache.clear()
+        self._last_bar_times.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self.logger.debug("Cleared live runtime caches")
+
+    def process_all_symbols(self,
+                            positions_snapshot: Optional[List[Any]] = None,
+                            account_info: Optional[Any] = None) -> None:
+        """Process all validated symbols for one live iteration."""
+        validated_configs = self.pm.get_validated_configs()
+        if not validated_configs:
+            return
+
+        if positions_snapshot is None:
+            positions_snapshot = self.mt5.get_positions()
+        if positions_snapshot is None:
+            self.logger.warning("Live position snapshot unavailable; skipping this iteration.")
+            return
+
+        if account_info is None:
+            account_info = self.mt5.get_account_info()
+        if account_info is None:
+            self.logger.warning("Live account snapshot unavailable; skipping this iteration.")
+            return
+        try:
+            live_equity = float(getattr(account_info, "equity", 0.0) or 0.0)
+            if live_equity > 0:
+                self._equity_peak = max(self._equity_peak, live_equity)
+        except Exception:
+            pass
+        if not getattr(account_info, "trade_allowed", True) or not getattr(account_info, "trade_expert", True):
+            self.logger.warning("Live account is not tradable; skipping this iteration.")
+            return
+
+        for symbol, config in validated_configs.items():
+            try:
+                self._process_symbol(
+                    symbol,
+                    config,
+                    positions_snapshot=positions_snapshot,
+                    account_info=account_info,
+                )
+            except Exception as e:
+                self.logger.error(f"[{symbol}] Error: {e}")
+
+        self._sync_drift_monitor(validated_configs)
+
+    def _sync_drift_monitor(self, validated_configs: Optional[Dict[str, SymbolConfig]] = None) -> None:
+        """Pull recent closing deals into DriftMonitor and compare against validation metrics."""
+        validated = validated_configs or self.pm.get_validated_configs()
+        if not validated:
+            return
+
+        try:
+            deals = self.mt5.get_recent_closing_deals()
+        except Exception as exc:
+            self.logger.debug(f"Drift monitor sync skipped: {exc}")
+            return
+
+        if not deals:
+            return
+        if not isinstance(deals, (list, tuple)):
+            return
+
+        from pm_position import TradeTagEncoder
+
+        for deal in deals:
+            ticket = int(deal.get('ticket', 0) or 0)
+            if ticket <= 0 or ticket in self._seen_closing_deals:
+                continue
+            self._seen_closing_deals.add(ticket)
+
+            comment = deal.get('comment', '') or ''
+            metadata = TradeTagEncoder.decode_comment(comment) if comment else None
+            symbol = metadata.get('symbol') if metadata else None
+
+            if not symbol:
+                broker_symbol = deal.get('symbol', '')
+                for candidate in validated.keys():
+                    if self.mt5.find_broker_symbol(candidate) == broker_symbol:
+                        symbol = candidate
+                        break
+
+            if not symbol or symbol not in validated:
+                continue
+
+            self.drift_monitor.record_trade(
+                symbol=symbol,
+                pnl_dollars=float(deal.get('profit', 0.0) or 0.0),
+                r_multiple=None,
+            )
+            self.drift_monitor.check_drift(symbol, validated[symbol].val_metrics)
+
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics for monitoring."""
         total = self._cache_hits + self._cache_misses
@@ -705,6 +837,29 @@ class LiveTrader:
             'hit_rate_pct': round(hit_rate, 1),
             'cache_size': len(self._candidate_cache),
         }
+
+    def _build_magic_lookup(self, symbol: str, config: SymbolConfig) -> Tuple[Dict[int, str], Dict[int, str]]:
+        """Build magic->timeframe/regime lookup for fast position inference."""
+        from pm_position import TradeTagEncoder
+
+        magic_to_tf: Dict[int, str] = {}
+        magic_to_regime: Dict[int, str] = {}
+
+        try:
+            if config and config.has_regime_configs():
+                for tf in config.get_available_timeframes():
+                    for regime in config.get_regimes_for_timeframe(tf):
+                        magic = TradeTagEncoder.encode_magic(symbol, tf, regime)
+                        magic_to_tf[magic] = tf
+                        magic_to_regime[magic] = regime
+            elif config and config.timeframe:
+                magic = TradeTagEncoder.encode_magic(symbol, config.timeframe, "LEGACY")
+                magic_to_tf[magic] = config.timeframe
+                magic_to_regime[magic] = "LEGACY"
+        except Exception:
+            pass
+
+        return magic_to_tf, magic_to_regime
 
     def _log_no_actionable_signal(self, symbol: str, message: str,
                                    best_candidate: Dict, bar_time_iso: str,
@@ -752,7 +907,9 @@ class LiveTrader:
         )
 
     def _check_portfolio_risk_cap(self, symbol: str, new_trade_risk_pct: float,
-                                   broker_symbol: str) -> Tuple[bool, str]:
+                                   broker_symbol: str,
+                                   positions_snapshot: Optional[List[Any]] = None,
+                                   account_info: Optional[Any] = None) -> Tuple[bool, str]:
         """
         Enforce max_combined_risk_pct across all open positions on this symbol.
         Handles D1 + lower TF scenario where multiple orders on same symbol exist.
@@ -771,7 +928,7 @@ class LiveTrader:
         max_combined = float(getattr(self.pipeline_config, 'max_combined_risk_pct', 3.0))
 
         # Get current equity
-        account_info = self.mt5.get_account_info()
+        account_info = account_info or self.mt5.get_account_info()
         if not account_info:
             return False, "Cannot get account info"
 
@@ -783,17 +940,19 @@ class LiveTrader:
         existing_risk_pct = 0.0
         position_details = []
 
-        # Get all positions for this broker symbol
-        positions = self.mt5.get_positions(symbol=broker_symbol)
+        # Use the provided sweep snapshot when available; otherwise fetch once.
+        positions = positions_snapshot
+        if positions is None:
+            positions = self.mt5.get_positions(symbol=broker_symbol)
+        if positions is None:
+            return False, f"Position snapshot unavailable for {symbol}"
 
         for pos in positions:
+            if getattr(pos, 'symbol', None) != broker_symbol:
+                continue
+
             # Decode metadata from comment
             comment = getattr(pos, 'comment', '') or ''
-
-            # Skip if not our position (no PM comment prefix)
-            if not (comment.startswith('PM1:') or comment.startswith('PM2:') or
-                    comment.startswith('PM3:')):
-                continue
 
             metadata = TradeTagEncoder.decode_comment(comment)
 
@@ -826,7 +985,9 @@ class LiveTrader:
                 volume = getattr(pos, 'volume', 0)
 
                 if sl > 0 and entry > 0 and volume > 0:
-                    spec = self.pm.get_instrument_spec(symbol)
+                    spec = get_instrument_spec(symbol)
+                    if spec.pip_size <= 0:
+                        continue
                     sl_pips = abs(entry - sl) / spec.pip_size
                     risk_amount = sl_pips * spec.pip_value * volume
                     pos_risk_pct = (risk_amount / equity) * 100
@@ -859,67 +1020,24 @@ class LiveTrader:
             f"({len(position_details)} open positions, adding 1 new)"
         )
 
-    def start(self):
-        """Start the trading loop."""
-        self._running = True
-        self._shutdown_event.clear()
-        
-        self.logger.info("Starting live trading loop...")
-        self.logger.info(f"Trading enabled: {self.enable_trading}")
-        self.logger.info(f"Symbols: {len(self.pm.symbols)}")
-        self.logger.info(f"Validated configs: {len(self.pm.get_validated_configs())}")
-        
-        _reconnect_failures = 0
-        _MAX_RECONNECT_CYCLES = 12
-
-        while self._running and not self._shutdown_event.is_set():
-            try:
-                # Check connection
-                if not self.mt5.is_connected():
-                    self.logger.warning(f"Lost MT5 connection (cycle {_reconnect_failures + 1}/{_MAX_RECONNECT_CYCLES})")
-                    if not self._reconnect():
-                        _reconnect_failures += 1
-                        if _reconnect_failures >= _MAX_RECONNECT_CYCLES:
-                            self.logger.error(
-                                f"MT5 reconnection failed after {_MAX_RECONNECT_CYCLES} cycles. Stopping trader."
-                            )
-                            break
-                        time.sleep(10)
-                        continue
-                    _reconnect_failures = 0
-                
-                # Process each symbol
-                self._process_all_symbols()
-                
-                # Sleep until next check
-                time.sleep(1)
-                
-            except KeyboardInterrupt:
-                self.logger.info("Keyboard interrupt received")
-                break
-            except Exception as e:
-                self.logger.exception(f"Error in trading loop: {e}")
-                time.sleep(5)
-        
-        self.logger.info("Trading loop stopped")
-    
     def stop(self):
         """Stop the trading loop."""
         self.logger.info("Stopping trader...")
         self._running = False
         self._shutdown_event.set()
     
-    def _process_all_symbols(self):
-        """Process all symbols for signals."""
-        validated_configs = self.pm.get_validated_configs()
-        
-        for symbol, config in validated_configs.items():
-            try:
-                self._process_symbol(symbol, config)
-            except Exception as e:
-                self.logger.error(f"[{symbol}] Error: {e}")
+    def _process_all_symbols(self,
+                             positions_snapshot: Optional[List[Any]] = None,
+                             account_info: Optional[Any] = None):
+        """Compatibility wrapper for one live iteration."""
+        self.process_all_symbols(
+            positions_snapshot=positions_snapshot,
+            account_info=account_info,
+        )
     
-    def _process_symbol(self, symbol: str, config: SymbolConfig):
+    def _process_symbol(self, symbol: str, config: SymbolConfig,
+                        positions_snapshot: Optional[List[Any]] = None,
+                        account_info: Optional[Any] = None):
         """
         Process a single symbol with regime-aware strategy selection.
         
@@ -940,15 +1058,33 @@ class LiveTrader:
         suppressed until a new bar arrives or the decision key changes.
         """
         from pm_position import TradeTagEncoder
-        
+
         # Find broker symbol
         broker_symbol = self.mt5.find_broker_symbol(symbol)
         if broker_symbol is None:
             return
-        
+
+        # Use the sweep snapshot if provided; otherwise fetch once and fail closed.
+        all_positions = positions_snapshot
+        if all_positions is None:
+            all_positions = self.mt5.get_positions()
+        if all_positions is None:
+            self.logger.warning(f"[{symbol}] Position snapshot unavailable; skipping this iteration.")
+            return
+
+        if account_info is None:
+            account_info = self.mt5.get_account_info()
+        if account_info is None:
+            self.logger.warning(f"[{symbol}] Account snapshot unavailable; skipping this iteration.")
+            return
+        if not getattr(account_info, "trade_allowed", True) or not getattr(account_info, "trade_expert", True):
+            self.logger.warning(f"[{symbol}] Account is not tradable; skipping this iteration.")
+            return
+
         # ===== FIX #2: D1 + Lower-TF Position Analysis =====
-        all_positions = self.mt5.get_positions()
-        symbol_positions = [p for p in all_positions if p.symbol == broker_symbol]
+        symbol_positions = [p for p in all_positions if getattr(p, 'symbol', None) == broker_symbol]
+        magic_to_tf, magic_to_regime = self._build_magic_lookup(symbol, config)
+        open_magics = {int(getattr(p, 'magic', 0) or 0) for p in symbol_positions}
         
         # Check if D1+lower-TF mode is enabled
         allow_d1_plus_lower = getattr(self.pipeline_config, 'allow_d1_plus_lower_tf', True) if self.pipeline_config else True
@@ -956,13 +1092,31 @@ class LiveTrader:
         # Analyze existing positions
         has_d1_position = False
         has_non_d1_position = False
+        has_unknown_position = False
         d1_position_direction = None  # Track direction for logging
-        
+        open_timeframes = set()
+        tag_source_counts = {"comment": 0, "magic": 0, "unknown": 0}
+        position_details = []
+
         for pos in symbol_positions:
             # Try to decode comment to get timeframe
             comment = getattr(pos, 'comment', '') or ''
             pos_tf = TradeTagEncoder.get_timeframe_from_comment(comment)
-            
+            pos_regime = ""
+            tag_source = "comment"
+
+            if not pos_tf:
+                pos_tf = magic_to_tf.get(pos.magic)
+                if pos_tf:
+                    tag_source = "magic"
+                else:
+                    tag_source = "unknown"
+                    has_unknown_position = True
+
+            if pos_tf:
+                pos_regime = magic_to_regime.get(pos.magic, "")
+                open_timeframes.add(pos_tf)
+
             if pos_tf == 'D1':
                 has_d1_position = True
                 d1_position_direction = "LONG" if pos.type == 0 else "SHORT"  # 0=BUY, 1=SELL
@@ -971,6 +1125,15 @@ class LiveTrader:
             else:
                 # Unknown trade tag - assume it's a non-D1 trade for safety
                 has_non_d1_position = True
+
+            tag_source_counts[tag_source] = tag_source_counts.get(tag_source, 0) + 1
+            position_details.append({
+                "magic": int(getattr(pos, 'magic', 0)),
+                "timeframe": pos_tf or "",
+                "regime": pos_regime or "",
+                "tag_source": tag_source,
+                "direction": "LONG" if getattr(pos, 'type', 1) == 0 else "SHORT",
+            })
         
         # Determine if we can open a new trade and what constraints apply
         can_open_trade = True
@@ -979,6 +1142,16 @@ class LiveTrader:
         block_reason = None
         
         num_positions = len(symbol_positions)
+        position_context = {
+            "open_positions_total": num_positions,
+            "open_timeframes": sorted(open_timeframes),
+            "open_has_d1": has_d1_position,
+            "open_has_non_d1": has_non_d1_position,
+            "open_has_unknown": has_unknown_position,
+            "open_tag_sources": tag_source_counts,
+            "open_positions": position_details,
+        }
+        secondary_reason = ""
         
         if num_positions >= 2:
             # Two trades max per symbol
@@ -991,24 +1164,26 @@ class LiveTrader:
                 can_open_trade = True
                 allowed_timeframes = ['M5', 'M15', 'M30', 'H1', 'H4']  # Exclude D1
                 is_secondary_trade = True
+                secondary_reason = "d1_plus_lower"
                 self.logger.debug(f"[{symbol}] D1 trade open ({d1_position_direction}); allowing secondary non-D1 trade")
             elif allow_d1_plus_lower and has_non_d1_position:
                 # Non-D1 position open - allow one additional D1 trade
                 can_open_trade = True
                 allowed_timeframes = ['D1']
                 is_secondary_trade = True
+                secondary_reason = "unknown_existing_position" if has_unknown_position else "lower_plus_d1"
                 self.logger.debug(f"[{symbol}] Non-D1 trade open; allowing secondary D1 trade")
             else:
                 # Fallback: block new trades if dual-trade mode is disabled
                 can_open_trade = False
                 block_reason = "Position open; blocking additional trades"
-                
+
         # If we can't open any trade, skip
         if not can_open_trade:
             if block_reason:
                 self.logger.debug(f"[{symbol}] {block_reason}")
             return
-        
+
         # Evaluate candidates across timeframes (winners-only)
         candidates, eval_stats = self._evaluate_regime_candidates(symbol, broker_symbol, config)
         
@@ -1029,9 +1204,18 @@ class LiveTrader:
             candidates = [c for c in candidates if c['timeframe'] in allowed_timeframes]
             if len(candidates) < original_count:
                 self.logger.debug(f"[{symbol}] Filtered out D1 candidates (secondary trade must be non-D1)")
-        
+
+        if open_magics:
+            original_count = len(candidates)
+            candidates = [
+                c for c in candidates
+                if TradeTagEncoder.encode_magic(symbol, c['timeframe'], c['regime']) not in open_magics
+            ]
+            if len(candidates) < original_count:
+                self.logger.debug(f"[{symbol}] Filtered out candidates matching existing open position magic")
+
         if not candidates:
-            self.logger.debug(f"[{symbol}] No valid candidates after timeframe constraints (secondary trade filter)")
+            self.logger.debug(f"[{symbol}] No valid candidates after secondary/open-position constraints")
             return
         
         # Select the best feasible candidate using an "actionable-within-margin" policy.
@@ -1162,11 +1346,30 @@ class LiveTrader:
         
         if is_secondary_trade:
             self.logger.debug(f"[{symbol}] D1 trade open; allowed second trade on {best['timeframe']}")
-        
+
+        if self.close_on_opposite_signal and symbol_positions:
+            opposite_positions = []
+            best_signal = int(best.get('signal', 0))
+            for pos in symbol_positions:
+                if best_signal == 1 and getattr(pos, 'type', 1) == 1:
+                    opposite_positions.append(pos)
+                elif best_signal == -1 and getattr(pos, 'type', 1) == 0:
+                    opposite_positions.append(pos)
+
+            if opposite_positions:
+                self.logger.info(
+                    f"[{symbol}] Closing {len(opposite_positions)} opposite-signal position(s) "
+                    f"before new entry on {best['timeframe']}/{best['regime']}"
+                )
+                for pos in opposite_positions:
+                    self._close_position_on_signal(pos, best['features'], spec)
+                return
+
         # Execute entry (passes decision_key so _execute_entry can record
         # the outcome into the throttle)
         self._execute_entry(
-            symbol=broker_symbol,
+            symbol=symbol,
+            broker_symbol=broker_symbol,
             signal=int(best['signal']),
             strategy=best['strategy'],
             features=best['features'],
@@ -1177,6 +1380,10 @@ class LiveTrader:
             bar_time_iso=bar_time_iso,
             best_candidate=best,
             is_secondary_trade=is_secondary_trade,
+            position_context=position_context,
+            secondary_reason=secondary_reason,
+            positions_snapshot=all_positions,
+            account_info=account_info,
         )
     
     def _evaluate_regime_candidates(self, symbol: str, broker_symbol: str,
@@ -1454,7 +1661,12 @@ class LiveTrader:
                        decision_key: str = "",
                        bar_time_iso: str = "",
                        best_candidate: Dict = None,
-                       is_secondary_trade: bool = False):
+                       is_secondary_trade: bool = False,
+                       position_context: Optional[Dict[str, Any]] = None,
+                       secondary_reason: str = "",
+                       broker_symbol: str = "",
+                       positions_snapshot: Optional[List[Any]] = None,
+                       account_info: Optional[Any] = None):
         """
         Execute an entry trade.
         
@@ -1465,18 +1677,29 @@ class LiveTrader:
         Args:
             is_secondary_trade: If True, this is a secondary trade (D1 already open).
                                 Risk will be reduced according to config.
+            position_context: Snapshot of open-position context for downstream logs.
+            secondary_reason: Reason for secondary trade classification.
         """
         from pm_position import TradeTagEncoder
-        
+
+        broker_symbol = broker_symbol or symbol
         is_long = signal == 1
         direction = "LONG" if is_long else "SHORT"
         direction_label = "BUY" if is_long else "SELL"
+        position_context = position_context or {}
+        secondary_reason = secondary_reason or ""
         
         # Helper to extract throttle metadata from the best_candidate dict
         _tf = best_candidate.get('timeframe', '') if best_candidate else ''
         _regime = best_candidate.get('regime', '') if best_candidate else ''
         _strat_name = best_candidate.get('strategy_name', '') if best_candidate else ''
         
+        decision_context = {
+            "secondary_trade": bool(is_secondary_trade),
+            "secondary_reason": secondary_reason,
+            "position_context": position_context,
+        }
+
         def _record_throttle(action: str, cooldown: int = 0) -> None:
             """Record this decision outcome into the throttle."""
             if decision_key:
@@ -1487,6 +1710,7 @@ class LiveTrader:
                     strategy_name=_strat_name,
                     direction=signal, action=action,
                     cooldown_seconds=cooldown,
+                    context=decision_context,
                 )
 
         def _safe_float(value: Any) -> Optional[float]:
@@ -1511,13 +1735,14 @@ class LiveTrader:
             if not decision_key:
                 return
             try:
-                self._actionable_log.record(
-                    symbol,
-                    {
-                        "symbol": symbol,
-                        "decision_key": decision_key,
-                        "bar_time": bar_time_iso,
-                        "timeframe": _tf,
+                  self._actionable_log.record(
+                      symbol,
+                      {
+                          "symbol": symbol,
+                          "broker_symbol": broker_symbol,
+                          "decision_key": decision_key,
+                          "bar_time": bar_time_iso,
+                          "timeframe": _tf,
                         "regime": _regime,
                         "strategy_name": _strat_name,
                         "direction": direction_label,
@@ -1530,6 +1755,8 @@ class LiveTrader:
                         "target_risk_pct": target_risk_pct_value,
                         "actual_risk_pct": actual_risk_pct_value,
                         "secondary_trade": bool(is_secondary_trade),
+                        "secondary_reason": secondary_reason,
+                        "position_context": position_context,
                         "score": selection_score,
                         "quality": quality_score,
                         "freshness": freshness_score,
@@ -1548,22 +1775,47 @@ class LiveTrader:
                 return
         
         # Re-verify no position exists right before execution (race condition prevention)
-        existing = self.mt5.get_position_by_symbol_magic(symbol, magic)
+        existing = None
+        if positions_snapshot is not None:
+            for pos in positions_snapshot:
+                if getattr(pos, 'symbol', None) == broker_symbol and int(getattr(pos, 'magic', 0) or 0) == magic:
+                    existing = pos
+                    break
+        else:
+            existing = self.mt5.get_position_by_symbol_magic(broker_symbol, magic)
         if existing:
-            self.logger.debug(f"[{symbol}] Position already exists, skipping entry")
+            self.logger.info(
+                f"[{symbol}] Trade skipped: position exists for magic {magic} "
+                f"(tf={_tf}, regime={_regime})"
+            )
             _record_throttle("SKIPPED_POSITION_EXISTS")
             return
-        
+
         # Calculate stops (use MT5-derived spec for live parity)
-        sl_pips, tp_pips = strategy.calculate_stops(features, signal, symbol, spec=spec)
+        signal_bar_index = max(len(features) - 2, 0) if len(features) > 1 else max(len(features) - 1, 0)
+        sl_pips, tp_pips = strategy.calculate_stops(
+            features,
+            signal,
+            symbol,
+            spec=spec,
+            bar_index=signal_bar_index,
+        )
 
         # Get symbol info for sizing and broker constraints
-        symbol_info = self.mt5.get_symbol_info(symbol)
+        symbol_info = self.mt5.get_symbol_info(broker_symbol)
         if symbol_info is None:
             return
 
+        # D4: Symbol-level tradability gate — reject untradable symbols early
+        if not getattr(symbol_info, 'visible', True):
+            self.logger.warning(f"[{symbol}] Symbol not visible on broker; skipping trade")
+            return
+        if getattr(symbol_info, 'trade_mode', 2) == 0:  # SYMBOL_TRADE_MODE_DISABLED
+            self.logger.warning(f"[{symbol}] Symbol trade mode disabled; skipping trade")
+            return
+
         # Risk basis (balance/equity)
-        account = self.mt5.get_account_info()
+        account = account_info or self.mt5.get_account_info()
         if account is None:
             return
         basis_pref = getattr(self.position_config, "risk_basis", "balance")
@@ -1574,13 +1826,51 @@ class LiveTrader:
             return
 
         # Get current price (same basis used for execution)
-        tick = self.mt5.get_symbol_tick(symbol)
+        tick = self.mt5.get_symbol_tick(broker_symbol)
         if tick is None:
             return
         entry_price = tick.ask if is_long else tick.bid
 
+        # G5: Spread-aware execution overlay — reject trades in unfavourable spread conditions
+        _spread_overlay = self._enhancement_seams.execution_quality_overlay
+        _execution_risk_mult = 1.0
+        if hasattr(_spread_overlay, 'enabled') and _spread_overlay.enabled:
+            _pip_size = spec.pip_size if spec.pip_size > 0 else 1e-5
+            _spread_pips = (tick.ask - tick.bid) / _pip_size
+            _atr_val = 0.0
+            if features is not None and 'ATR_14' in features.columns and len(features) > 1:
+                _atr_val = float(features['ATR_14'].iloc[-2]) / _pip_size
+            _rolling_spread_median = float(spec.spread_avg)
+            if features is not None and 'Spread' in features.columns and len(features) > 2:
+                _spread_window = pd.to_numeric(features['Spread'].iloc[:-1], errors='coerce').dropna().tail(50)
+                if not _spread_window.empty:
+                    _rolling_spread_median = float((_spread_window * float(spec.point) / _pip_size).median())
+            _eq_ctx = ExecutionQualityContext(
+                symbol=symbol, timeframe=_tf,
+                spread_pips=_spread_pips,
+                atr_pips=_atr_val,
+                rolling_spread_median=_rolling_spread_median,
+            )
+            _eq_decision = _spread_overlay.evaluate(_eq_ctx)
+            if not _eq_decision.allow_trade:
+                self.logger.info(f"[{symbol}] Trade blocked by spread filter: {'; '.join(_eq_decision.notes)}")
+                _record_throttle("BLOCKED_SPREAD_FILTER")
+                _record_actionable(
+                    action="BLOCKED_SPREAD_FILTER",
+                    entry_price_value=entry_price,
+                )
+                return
+            _execution_risk_mult = float(max(0.0, min(1.0, _eq_decision.score_multiplier)))
+            if _eq_decision.notes:
+                self.logger.debug(f"[{symbol}] Spread overlay: {'; '.join(_eq_decision.notes)}")
+
         # Calculate stop prices from pips
         sl_price, tp_price = self.position_calc.calculate_stop_prices(entry_price, sl_pips, tp_pips, is_long, spec)
+
+        # Capture original R-multiple for preservation when SL is widened
+        original_sl_dist = abs(entry_price - sl_price)
+        original_tp_dist = abs(tp_price - entry_price)
+        original_r_multiple = (original_tp_dist / original_sl_dist) if original_sl_dist > 0 else 0.0
 
         # Enforce broker minimum stop distance (auto widen SL if too close)
         min_stop_dist = float(symbol_info.trade_stops_level) * float(symbol_info.point) if symbol_info.trade_stops_level else 0.0
@@ -1589,7 +1879,12 @@ class LiveTrader:
                 sl_price = entry_price - min_stop_dist
             else:
                 sl_price = entry_price + min_stop_dist
-            self.logger.debug(f"[{symbol}] Widened SL to satisfy min stop distance ({min_stop_dist})")
+            # Preserve validated R-multiple: recalculate TP to match original reward:risk
+            if original_r_multiple > 0:
+                new_sl_dist = abs(entry_price - sl_price)
+                new_tp_dist = original_r_multiple * new_sl_dist
+                tp_price = (entry_price + new_tp_dist) if is_long else (entry_price - new_tp_dist)
+            self.logger.debug(f"[{symbol}] Widened SL to satisfy min stop distance ({min_stop_dist}), TP adjusted to preserve R={original_r_multiple:.2f}")
 
         # Target risk (deposit currency)
         # -------------------------------------------------------------
@@ -1607,6 +1902,56 @@ class LiveTrader:
         max_risk_cap = float(getattr(self.position_config, 'max_risk_pct', target_risk_pct))
         target_risk_pct = min(target_risk_pct, max_risk_cap)
 
+        # G1: Risk scalar stack — adjust risk for vol-targeting, exposure, Kelly, drawdown
+        _risk_stack = self._enhancement_seams.risk_scalar_stack
+        if _risk_stack.overlays:
+            _atr_price = 0.0
+            if features is not None and 'ATR_14' in features.columns and len(features) > 1:
+                _atr_price = float(features['ATR_14'].iloc[-2])
+            _open_count = len(positions_snapshot) if positions_snapshot else 0
+            _peak_equity = max(float(getattr(account, 'equity', 0.0) or 0.0), float(self._equity_peak or 0.0))
+            _open_exposure_pct = 0.0
+            if positions_snapshot:
+                for _pos in positions_snapshot:
+                    _comment = getattr(_pos, 'comment', '') or ''
+                    _risk_pct = TradeTagEncoder.get_risk_pct_from_comment(_comment)
+                    if _risk_pct is not None:
+                        _open_exposure_pct += float(_risk_pct)
+            _regime_metrics = {}
+            _regime_cfg = best_candidate.get('regime_config') if best_candidate else None
+            if _regime_cfg is not None:
+                _regime_metrics = dict(getattr(_regime_cfg, 'val_metrics', {}) or {})
+                if not _regime_metrics:
+                    _regime_metrics = dict(getattr(_regime_cfg, 'train_metrics', {}) or {})
+            _rs_ctx = RiskScalarContext(
+                symbol=symbol, timeframe=_tf, regime=_regime,
+                base_risk_pct=target_risk_pct,
+                account_equity=float(account.equity),
+                account_peak_equity=_peak_equity,
+                current_atr=_atr_price,
+                current_price=float(entry_price),
+                target_annual_vol=float(getattr(self.pipeline_config, 'target_annual_vol', 0.10)),
+                open_position_count=_open_count,
+                open_exposure_pct=_open_exposure_pct,
+                historical_win_rate=float(_regime_metrics.get('win_rate', 0.0)) / 100.0,
+                historical_avg_win=float(_regime_metrics.get('avg_win_dollars', _regime_metrics.get('avg_win', 0.0))),
+                historical_avg_loss=float(_regime_metrics.get('avg_loss_dollars', _regime_metrics.get('avg_loss', 0.0))),
+                metrics=_regime_metrics,
+            )
+            pre_scalar_risk = target_risk_pct
+            target_risk_pct = _risk_stack.apply(target_risk_pct, _rs_ctx)
+            if abs(target_risk_pct - pre_scalar_risk) > 1e-6:
+                self.logger.debug(
+                    f"[{symbol}] Risk scalar stack: {pre_scalar_risk:.3f}% -> {target_risk_pct:.3f}%"
+                )
+        if _execution_risk_mult < 1.0 and target_risk_pct > 0:
+            pre_overlay_risk = target_risk_pct
+            target_risk_pct *= _execution_risk_mult
+            self.logger.debug(
+                f"[{symbol}] Spread overlay risk scaling: {pre_overlay_risk:.3f}% -> "
+                f"{target_risk_pct:.3f}% (mult={_execution_risk_mult:.2f})"
+            )
+
         # Secondary trade adjustments + combined risk cap per symbol
         if is_secondary_trade:
             original_risk = target_risk_pct
@@ -1621,8 +1966,24 @@ class LiveTrader:
             # If a position has no parseable risk tag, assume base_risk_pct for safety.
             existing_risk = 0.0
             try:
-                for pos in self.mt5.get_positions():
-                    if getattr(pos, 'symbol', None) != symbol:
+                source_positions = positions_snapshot
+                if source_positions is None:
+                    source_positions = self.mt5.get_positions(symbol=broker_symbol)
+                if source_positions is None:
+                    self.logger.warning(f"[{symbol}] Position snapshot unavailable for secondary risk check; skipping trade")
+                    _record_throttle("BLOCKED_POSITION_SNAPSHOT_UNAVAILABLE")
+                    _record_actionable(
+                        action="BLOCKED_POSITION_SNAPSHOT_UNAVAILABLE",
+                        entry_price_value=entry_price,
+                        sl_value=sl_price,
+                        tp_value=tp_price,
+                        volume_value=volume,
+                        target_risk_pct_value=target_risk_pct,
+                        actual_risk_pct_value=actual_risk_pct,
+                    )
+                    return
+                for pos in source_positions:
+                    if getattr(pos, 'symbol', None) != broker_symbol:
                         continue
                     comment = getattr(pos, 'comment', '') or ''
                     r = TradeTagEncoder.get_risk_pct_from_comment(comment)
@@ -1639,6 +2000,7 @@ class LiveTrader:
                     timeframe=best_candidate.get('timeframe'), regime=best_candidate.get('regime'),
                     strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
                     action="BLOCKED_RISK_CAP",
+                    context=decision_context,
                 )
                 _record_actionable(
                     action="BLOCKED_RISK_CAP",
@@ -1663,6 +2025,7 @@ class LiveTrader:
                 timeframe=best_candidate.get('timeframe'), regime=best_candidate.get('regime'),
                 strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
                 action="BLOCKED_TOO_LOW_RISK",
+                context=decision_context,
             )
             return
         
@@ -1710,13 +2073,17 @@ class LiveTrader:
             for _ in range(max_iters):
                 dist = abs(entry_price - sl_price) * widen_factor
                 sl_price = (entry_price - dist) if is_long else (entry_price + dist)
+                # Preserve validated R-multiple: adjust TP proportionally
+                if original_r_multiple > 0:
+                    new_tp_dist = original_r_multiple * dist
+                    tp_price = (entry_price + new_tp_dist) if is_long else (entry_price - new_tp_dist)
                 loss_try = self.mt5.calc_loss_amount(order_type.value, symbol, 1.0, entry_price, sl_price)
                 if loss_try is None or loss_try <= 0:
                     break
                 loss_per_lot = loss_try
                 volume_raw = target_risk_amount / loss_per_lot
                 if volume_raw <= max_vol:
-                    self.logger.debug(f"[{symbol}] Widened SL to fit max volume constraint (max_vol={max_vol})")
+                    self.logger.debug(f"[{symbol}] Widened SL to fit max volume constraint (max_vol={max_vol}), TP adjusted to preserve R={original_r_multiple:.2f}")
                     break
 
         # Clamp and normalize volume (risk-safe floor to step)
@@ -1764,16 +2131,12 @@ class LiveTrader:
         # Check if adding this trade would exceed max_combined_risk_pct for this symbol
         # This applies to ALL trades (not just secondary), preventing excessive exposure
         # when multiple positions exist on same symbol across different timeframes
-        broker_symbol = self.mt5.find_broker_symbol(symbol)
-        if not broker_symbol:
-            self.logger.error(f"[{symbol}] Cannot find broker symbol")
-            _record_throttle("SKIPPED_NO_BROKER_SYMBOL")
-            return
-
         can_trade, risk_reason = self._check_portfolio_risk_cap(
-            symbol,
+            config.symbol,    # Canonical symbol for PM3: comment matching
             actual_risk_pct,  # Use actual risk (post-normalization) not target
-            broker_symbol
+            broker_symbol,    # Broker symbol for MT5 position lookup
+            positions_snapshot=positions_snapshot,
+            account_info=account,
         )
 
         if not can_trade:
@@ -1822,7 +2185,7 @@ class LiveTrader:
 
         # Execute order
         result = self.mt5.send_market_order(
-            symbol=symbol,
+            symbol=broker_symbol,
             order_type=order_type,
             volume=volume,
             sl=sl_price,
@@ -1906,6 +2269,7 @@ class LiveTrader:
             time.sleep(2)
             if self.mt5.connect():
                 self.logger.info("Reconnected successfully")
+                self.invalidate_runtime_caches()
                 return True
             time.sleep(5)
         return False
@@ -1932,13 +2296,16 @@ class LiveTrader:
                 print(f"\nAccount: {account.login}")
                 print(f"Balance: {account.balance:.2f} {account.currency}")
                 print(f"Equity: {account.equity:.2f} {account.currency}")
-            
+
             # Open positions
             positions = self.mt5.get_positions()
-            print(f"\nOpen positions: {len(positions)}")
-            for pos in positions:
-                direction = "LONG" if pos.type == 0 else "SHORT"
-                print(f"  {pos.symbol} | {direction} | {pos.volume} lots | P/L: {pos.profit:.2f}")
+            if positions is None:
+                print("\nOpen positions: unavailable (snapshot failed)")
+            else:
+                print(f"\nOpen positions: {len(positions)}")
+                for pos in positions:
+                    direction = "LONG" if pos.type == 0 else "SHORT"
+                    print(f"  {pos.symbol} | {direction} | {pos.volume} lots | P/L: {pos.profit:.2f}")
         
         print("=" * 60)
 
@@ -1963,8 +2330,8 @@ class FXPortfolioManagerApp:
                  pipeline_config: "PipelineConfig" = None,
                  mt5_config: "MT5Config" = None,
                  position_config: "PositionConfig" = None,
-                 data_dir: str = "./data",
-                 output_dir: str = "./pm_outputs",
+                 data_dir: Optional[str] = None,
+                 output_dir: Optional[str] = None,
                  config_file: str = "pm_configs.json"):
         """
         Initialize application.
@@ -1975,8 +2342,8 @@ class FXPortfolioManagerApp:
             pipeline_config: Pipeline configuration
             mt5_config: MT5 connection configuration
             position_config: Position management configuration
-            data_dir: Directory for data files
-            output_dir: Directory for output files
+            data_dir: Optional explicit override for data directory
+            output_dir: Optional explicit override for output directory
             config_file: Name of saved configurations file
         """
         # Accept either name (keeps full compatibility)
@@ -1987,15 +2354,21 @@ class FXPortfolioManagerApp:
         
         # Configurations
         self.pipeline_config = config or PipelineConfig(
-            data_dir=Path(data_dir),
-            output_dir=Path(output_dir)
+            data_dir=Path(data_dir or "./data"),
+            output_dir=Path(output_dir or "./pm_outputs")
         )
+        if data_dir is not None:
+            self.pipeline_config.data_dir = Path(data_dir)
+            self.pipeline_config.data_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir is not None:
+            self.pipeline_config.output_dir = Path(output_dir)
+            self.pipeline_config.output_dir.mkdir(parents=True, exist_ok=True)
         self.mt5_config = mt5_config or MT5Config()
         self.position_config = position_config or PositionConfig()
         
-        # Paths
-        self.data_dir = Path(data_dir)
-        self.output_dir = Path(output_dir)
+        # Paths follow the resolved pipeline config unless explicitly overridden above.
+        self.data_dir = Path(self.pipeline_config.data_dir)
+        self.output_dir = Path(self.pipeline_config.output_dir)
         self.config_file = config_file
         
         # Create directories
@@ -2006,13 +2379,14 @@ class FXPortfolioManagerApp:
         self.mt5: Optional[MT5Connector] = None
         self.portfolio_manager: Optional[PortfolioManager] = None
         self.trader: Optional[LiveTrader] = None
+        self._last_retrain_schedule_notice: str = ""
         
         self.logger = logging.getLogger(__name__)
     
     def initialize(self) -> bool:
         """Initialize all components."""
         self.logger.info("=" * 60)
-        self.logger.info("FX PORTFOLIO MANAGER v3.0")
+        self.logger.info("FX PORTFOLIO MANAGER v3.1")
         self.logger.info("=" * 60)
         
         # Check MT5 availability
@@ -2077,10 +2451,45 @@ class FXPortfolioManagerApp:
         self.portfolio_manager.print_status()
         
         return len(self.portfolio_manager.get_validated_configs()) > 0
+
+    def _check_production_retrain_schedule(self) -> None:
+        """Run or announce the config-driven production retrain schedule."""
+        if not self.portfolio_manager:
+            return
+        mode = str(getattr(self.pipeline_config, "production_retrain_mode", "auto") or "auto").strip().lower()
+        if mode == "off":
+            return
+
+        symbols_to_retrain = self.portfolio_manager.get_symbols_needing_retrain()
+        if not symbols_to_retrain:
+            return
+
+        now = datetime.now()
+        due_slot = self.pipeline_config.get_last_retrain_slot(now)
+        due_str = due_slot.strftime("%Y-%m-%d %H:%M")
+
+        if mode == "notify":
+            if self._last_retrain_schedule_notice == due_str:
+                return
+            self.logger.warning(
+                f"Production retrain due since {due_str} for {len(symbols_to_retrain)} symbols. "
+                f"Please run: python pm_main.py --optimize --config {os.environ.get('PM_CONFIG_PATH', 'config.json')}"
+            )
+            self._last_retrain_schedule_notice = due_str
+            return
+
+        self.logger.info(
+            f"Production retrain due since {due_str}; refreshing {len(symbols_to_retrain)} symbols "
+            f"on the fixed schedule ({self.pipeline_config.describe_retrain_schedule()})"
+        )
+        self._fetch_historical_data(symbols_to_retrain)
+        self.portfolio_manager.retrain_all_needed()
+        self._last_retrain_schedule_notice = due_str
+        if self.trader:
+            self.trader.invalidate_runtime_caches()
     
     def run_trading(self, 
                     enable_trading: bool = True,
-                    auto_retrain: bool = False,
                     close_on_opposite_signal: bool = False):
         """
         Run live trading loop.
@@ -2092,7 +2501,10 @@ class FXPortfolioManagerApp:
         self.logger.info("\n" + "=" * 60)
         self.logger.info("STARTING LIVE TRADING")
         self.logger.info(f"Trading enabled: {enable_trading}")
-        self.logger.info(f"Auto-retrain: {auto_retrain}")
+        self.logger.info(
+            f"Production retrain: {self.pipeline_config.production_retrain_mode} "
+            f"({self.pipeline_config.describe_retrain_schedule()})"
+        )
         self.logger.info(f"Close on opposite signal: {close_on_opposite_signal}")
         self.logger.info("=" * 60)
         
@@ -2112,8 +2524,10 @@ class FXPortfolioManagerApp:
         )
         
         # Main loop with reconnection handling
-        last_retrain_check = datetime.now()
-        retrain_check_interval = timedelta(hours=1)
+        last_retrain_check = datetime.min
+        retrain_check_interval = timedelta(
+            seconds=int(getattr(self.pipeline_config, "production_retrain_poll_seconds", 60))
+        )
         
         try:
             while True:
@@ -2127,6 +2541,8 @@ class FXPortfolioManagerApp:
                         time.sleep(2)
                         if self.mt5.connect():
                             self.logger.info("Reconnected successfully")
+                            if self.trader:
+                                self.trader.invalidate_runtime_caches()
                             reconnected = True
                             break
                         time.sleep(5)
@@ -2135,18 +2551,14 @@ class FXPortfolioManagerApp:
                         time.sleep(30)
                         continue
                 
-                # Check for retraining
-                if auto_retrain and datetime.now() - last_retrain_check > retrain_check_interval:
-                    symbols_to_retrain = self.portfolio_manager.get_symbols_needing_retrain()
-                    if symbols_to_retrain:
-                        self.logger.info(f"Retraining {len(symbols_to_retrain)} symbols...")
-                        self._fetch_historical_data(symbols_to_retrain)
-                        self.portfolio_manager.retrain_all_needed()
+                # Check the fixed production retrain schedule from config.json.
+                if datetime.now() - last_retrain_check >= retrain_check_interval:
+                    self._check_production_retrain_schedule()
                     last_retrain_check = datetime.now()
-                
+
                 # Run trading iteration
                 try:
-                    self.trader._process_all_symbols()
+                    self.trader.process_all_symbols()
                 except Exception as e:
                     self.logger.error(f"Error in trading loop: {e}")
                 
@@ -2195,7 +2607,7 @@ class FXPortfolioManagerApp:
                     'timeframe': result.config.timeframe,
                     'score': result.config.composite_score,
                     'validated': result.config.is_validated,
-                    'retrain_days': result.config.retrain_days,
+                    'valid_until': result.config.valid_until.isoformat() if result.config.valid_until else "",
                     'train_trades': result.config.train_metrics.get('total_trades', 0),
                     'train_win_rate': result.config.train_metrics.get('win_rate', 0),
                     'val_trades': result.config.val_metrics.get('total_trades', 0),
@@ -2286,11 +2698,6 @@ def main():
         help='Paper trading mode (no real trades)'
     )
     parser.add_argument(
-        '--auto-retrain',
-        action='store_true',
-        help='Enable automatic retraining'
-    )
-    parser.add_argument(
         '--close-on-opposite-signal',
         action='store_true',
         help='Close open positions when an opposite signal appears (default: disabled)'
@@ -2306,14 +2713,14 @@ def main():
     parser.add_argument(
         '--data-dir',
         type=str,
-        default='./data',
-        help='Data directory'
+        default=None,
+        help='Optional override for data directory (defaults to config.json)'
     )
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='./pm_outputs',
-        help='Output directory'
+        default=None,
+        help='Optional override for output directory (defaults to config.json)'
     )
     parser.add_argument(
         '--log-level',
@@ -2380,6 +2787,13 @@ def main():
 
     log_resolved_config_summary(logger, args.config, config_data, pipeline_config, position_config, mt5_config)
 
+    if args.data_dir:
+        pipeline_config.data_dir = Path(args.data_dir)
+        pipeline_config.data_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir:
+        pipeline_config.output_dir = Path(args.output_dir)
+        pipeline_config.output_dir.mkdir(parents=True, exist_ok=True)
+
     _app_instance = FXPortfolioManagerApp(
         symbols=symbols,
         data_dir=args.data_dir,
@@ -2409,7 +2823,6 @@ def main():
         if args.trade:
             _app_instance.run_trading(
                 enable_trading=not args.paper,
-                auto_retrain=args.auto_retrain,
                 close_on_opposite_signal=args.close_on_opposite_signal
             )
         
@@ -2421,7 +2834,7 @@ def main():
             print("  python pm_main.py --optimize --overwrite  # Force re-optimize all")
             print("  python pm_main.py --trade                 # Start live trading")
             print("  python pm_main.py --trade --paper         # Paper trading")
-            print("  python pm_main.py --trade --auto-retrain  # With auto-retraining")
+            print(f"  production retrain schedule: {pipeline_config.describe_retrain_schedule()}")
         
         return 0
         

@@ -176,10 +176,11 @@ def test_log_reduction_scenario():
 
     Expected: Only the first tick should log, subsequent ticks suppressed.
     """
-    import tempfile
     import os
     # Use a temporary file to avoid state contamination
-    tmp_file = tempfile.mktemp(suffix=".json")
+    tmp_dir = os.path.join(os.getcwd(), "_test_tmp", "no_actionable_suppression")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_file = os.path.join(tmp_dir, "last_trade_log.json")
     throttle = DecisionThrottle(log_path=tmp_file)
 
     symbol = "EURJPY"

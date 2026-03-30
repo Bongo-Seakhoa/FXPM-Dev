@@ -82,7 +82,7 @@ function updateFilterOptions() {
     var current = select.value;
     select.innerHTML = '<option value="">All</option>' +
       options[key].map(function(val) {
-        return '<option>' + val + '</option>';
+        return '<option value="' + PMCommon.escapeHtml(val) + '">' + PMCommon.escapeHtml(val) + '</option>';
       }).join('');
     if (options[key].indexOf(current) !== -1) {
       select.value = current;
@@ -201,21 +201,26 @@ function renderTable() {
     var row = document.createElement('tr');
     var pnl = trade.pnl || 0;
     var pnlClass = pnl >= 0 ? 'text-success' : 'text-danger';
-    var dirClass = trade.direction === 'LONG' ? 'dir-buy' : 'dir-sell';
+    var direction = String(trade.direction || '').toUpperCase();
+    var dirClass = (direction === 'LONG' || direction === 'BUY' || direction === '1') ? 'dir-buy' : 'dir-sell';
+
+    if (tradesState.selectedTrade && tradesState.selectedTrade.timestamp === trade.timestamp && tradesState.selectedTrade.symbol === trade.symbol) {
+      row.classList.add('selected');
+    }
 
     row.innerHTML =
-      '<td style="font-size: 12px;">' + formatTimestamp(trade.timestamp) + '</td>' +
-      '<td><strong>' + (trade.symbol || 'N/A') + '</strong></td>' +
-      '<td class="' + dirClass + '">' + (trade.direction || 'N/A') + '</td>' +
+      '<td style="font-size: 12px;">' + PMCommon.escapeHtml(formatTimestamp(trade.timestamp)) + '</td>' +
+      '<td><strong>' + PMCommon.escapeHtml(trade.symbol || 'N/A') + '</strong></td>' +
+      '<td class="' + dirClass + '">' + PMCommon.escapeHtml(trade.direction || 'N/A') + '</td>' +
       '<td>' + PMCommon.formatNumber(trade.volume, 2) + '</td>' +
       '<td>' + PMCommon.formatNumber(trade.price, 5) + '</td>' +
       '<td>' + PMCommon.formatNumber(trade.sl, 5) + '</td>' +
       '<td>' + PMCommon.formatNumber(trade.tp, 5) + '</td>' +
       '<td class="' + pnlClass + '"><strong>' + PMCommon.formatCurrency(pnl) + '</strong></td>' +
-      '<td>' + (trade.timeframe || 'N/A') + '</td>' +
-      '<td>' + (trade.regime || 'N/A') + '</td>' +
-      '<td style="font-size: 12px;">' + (trade.strategy || 'N/A') + '</td>' +
-      '<td>' + (trade.status || 'N/A') + '</td>';
+      '<td>' + PMCommon.escapeHtml(trade.timeframe || 'N/A') + '</td>' +
+      '<td>' + PMCommon.escapeHtml(trade.regime || 'N/A') + '</td>' +
+      '<td style="font-size: 12px;">' + PMCommon.escapeHtml(trade.strategy || 'N/A') + '</td>' +
+      '<td>' + PMCommon.escapeHtml(trade.status || 'N/A') + '</td>';
 
     row.style.cursor = 'pointer';
     row.addEventListener('click', function() { openDrawer(trade); });
@@ -269,6 +274,7 @@ function updateSummary() {
 
 function openDrawer(trade) {
   tradesState.selectedTrade = trade;
+  renderTable();
   PMCommon.openDrawer(elements.drawer);
 
   if (elements.drawerTitle) {
@@ -293,7 +299,7 @@ function openDrawer(trade) {
     ];
 
     elements.detailsGrid.innerHTML = details.map(function(item) {
-      return '<div class="detail-item"><span>' + item[0] + '</span><strong>' + item[1] + '</strong></div>';
+      return '<div class="detail-item"><span>' + PMCommon.escapeHtml(item[0]) + '</span><strong>' + PMCommon.escapeHtml(String(item[1])) + '</strong></div>';
     }).join('');
   }
 }
@@ -327,7 +333,7 @@ function exportToCSV() {
       trade.strategy || '',
       trade.magic || ''
     ];
-    rows.push(row.join(','));
+    rows.push(row.map(function(value) { return PMCommon.csvEscape(value); }).join(','));
   });
 
   var csv = rows.join('\n');

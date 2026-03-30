@@ -20,7 +20,7 @@ Usage:
 This script is separate from the main optimization flow and should be run
 periodically (e.g., weekly) to calibrate regime detection parameters.
 
-Version: 3.0 (Portfolio Manager)
+Version: 3.1 (Portfolio Manager)
 """
 
 import argparse
@@ -173,7 +173,8 @@ class TunerDataLoader:
 
 def compute_regime_quality_metrics(regime_series: pd.Series, 
                                     gap_series: pd.Series,
-                                    price_series: pd.Series) -> Dict[str, Any]:
+                                    price_series: pd.Series,
+                                    warmup_bars: int = 0) -> Dict[str, Any]:
     """
     Compute quality metrics for a regime detection configuration.
     
@@ -186,11 +187,16 @@ def compute_regime_quality_metrics(regime_series: pd.Series,
     Returns:
         Dict with quality metrics
     """
+    if warmup_bars > 0:
+        regime_series = regime_series.iloc[warmup_bars:]
+        gap_series = gap_series.iloc[warmup_bars:]
+        price_series = price_series.iloc[warmup_bars:]
+
     n = len(regime_series)
     
     if n < 100:
         return {
-            'stability': 0.0, 'avg_gap': 0.0, 'balance_score': 0.0,
+            'stability': 0.0, 'avg_gap': 0.0, 'balance_score': 1.0,
             'trend_return_ratio': 1.0, 'regime_counts': {}, 'total_changes': 0
         }
     
@@ -209,16 +215,8 @@ def compute_regime_quality_metrics(regime_series: pd.Series,
     # Regime distribution
     regime_counts = regime_valid.value_counts(normalize=True)
     
-    # Balance score: penalize if any regime > 60% or < 5%
+    # Natural concentration is acceptable if it reflects genuine market structure.
     balance_score = 1.0
-    if len(regime_counts) > 0:
-        max_pct = regime_counts.max()
-        min_pct = regime_counts.min()
-        
-        if max_pct > 0.60:
-            balance_score *= 0.8
-        if min_pct < 0.05:
-            balance_score *= 0.9
     
     # Trend return ratio: do TREND periods show larger moves?
     returns = price_series.pct_change().abs()
@@ -251,14 +249,12 @@ def compute_tuning_score(metrics: Dict[str, Any]) -> float:
     Higher = better regime detection configuration.
     """
     # Weights
-    w_stability = 0.25
+    w_stability = 0.35
     w_gap = 0.25
-    w_balance = 0.20
-    w_trend_ratio = 0.30
+    w_trend_ratio = 0.40
     
     stability = metrics.get('stability', 0.0)
     avg_gap = metrics.get('avg_gap', 0.0)
-    balance = metrics.get('balance_score', 0.0)
     trend_ratio = metrics.get('trend_return_ratio', 1.0)
     
     # Normalize gap to 0-1 (gaps typically range 0-0.2)
@@ -270,7 +266,6 @@ def compute_tuning_score(metrics: Dict[str, Any]) -> float:
     score = (
         w_stability * stability +
         w_gap * gap_normalized +
-        w_balance * balance +
         w_trend_ratio * trend_bonus
     )
     
@@ -310,11 +305,23 @@ class RegimeParamTuner:
         
         # Resample
         df = self.data_loader.resample(df_m5, timeframe)
-        
+
         if len(df) < 500:
             logger.warning(f"{symbol} {timeframe}: Only {len(df)} bars, need 500+, using defaults")
             return DEFAULT_PARAMS_BY_TIMEFRAME.get(timeframe, RegimeParams()), {}
-        
+
+        # ----- Train / Holdout split (B8: evaluate on holdout, not training data) -----
+        holdout_pct = 0.20  # 20% most-recent bars reserved for evaluation
+        split_idx = int(len(df) * (1.0 - holdout_pct))
+        df_train = df.iloc[:split_idx]
+        df_holdout = df.iloc[split_idx:]
+
+        default_detector = MarketRegimeDetector()
+        min_eval_bars = max(default_detector.warmup_bars + 25, 100)
+        if len(df_train) < max(300, min_eval_bars) or len(df_holdout) < min_eval_bars:
+            logger.warning(f"{symbol} {timeframe}: Insufficient bars for train/holdout split, using defaults")
+            return DEFAULT_PARAMS_BY_TIMEFRAME.get(timeframe, RegimeParams()), {}
+
         # Get param search space
         if param_space is None:
             param_space = PARAM_SEARCH_SPACE.get(timeframe, {
@@ -322,47 +329,72 @@ class RegimeParamTuner:
                 'gap_min': [0.08, 0.10, 0.12],
                 'k_hold': [3, 4, 5]
             })
-        
+
         # Generate combinations
         param_names = list(param_space.keys())
         param_values = list(param_space.values())
         combinations = list(product(*param_values))
-        
-        logger.info(f"[{symbol}] [{timeframe}] Testing {len(combinations)} param combinations")
-        
+
+        logger.info(f"[{symbol}] [{timeframe}] Testing {len(combinations)} param combinations "
+                     f"(train={len(df_train)}, holdout={len(df_holdout)} bars)")
+
         best_score = -float('inf')
         best_params = DEFAULT_PARAMS_BY_TIMEFRAME.get(timeframe, RegimeParams())
         best_metrics = {}
-        
+
         for combo in combinations:
             params_dict = dict(zip(param_names, combo))
-            
+
             # Create params object
             params = RegimeParams(
                 k_confirm=params_dict.get('k_confirm', 2),
                 gap_min=params_dict.get('gap_min', 0.10),
                 k_hold=params_dict.get('k_hold', 3)
             )
-            
+
             try:
-                # Run regime detection
+                # Evaluate on both train and holdout while heavily weighting holdout.
                 detector = MarketRegimeDetector(params)
-                result = detector.compute_regime_scores(df)
-                
-                # Compute quality metrics
-                metrics = compute_regime_quality_metrics(
-                    result['REGIME'],
-                    result['REGIME_GAP'],
-                    df['Close']
+                warmup_bars = detector.warmup_bars
+                if len(df_train) < warmup_bars + 25 or len(df_holdout) < warmup_bars + 25:
+                    continue
+
+                train_result = detector.compute_regime_scores(df_train)
+
+                holdout_result = detector.compute_regime_scores(df_holdout)
+
+                train_metrics = compute_regime_quality_metrics(
+                    train_result['REGIME'],
+                    train_result['REGIME_GAP'],
+                    df_train['Close'],
+                    warmup_bars=warmup_bars,
                 )
-                
-                score = compute_tuning_score(metrics)
-                
+                holdout_metrics = compute_regime_quality_metrics(
+                    holdout_result['REGIME'],
+                    holdout_result['REGIME_GAP'],
+                    df_holdout['Close'],
+                    warmup_bars=warmup_bars,
+                )
+                train_score = compute_tuning_score(train_metrics)
+                holdout_score = compute_tuning_score(holdout_metrics)
+                dominant_score = max(train_score, holdout_score)
+                consistency = (min(train_score, holdout_score) / dominant_score) if dominant_score > 0 else 0.0
+                score = (0.30 * train_score + 0.70 * holdout_score) * (0.90 + 0.10 * consistency)
+                metrics = {
+                    'train_score': float(train_score),
+                    'holdout_score': float(holdout_score),
+                    'consistency': float(consistency),
+                    'combined_score': float(score),
+                    'warmup_bars': int(warmup_bars),
+                    'train_metrics': train_metrics,
+                    'holdout_metrics': holdout_metrics,
+                }
+
                 if score > best_score:
                     best_score = score
                     best_params = params
                     best_metrics = metrics
-                    
+
             except Exception as e:
                 logger.debug(f"Combo {params_dict} failed: {e}")
                 continue

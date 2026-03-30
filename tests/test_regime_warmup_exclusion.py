@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 import numpy as np
 from pm_regime import MarketRegimeDetector, RegimeParams
+from pm_regime_tuner import compute_regime_quality_metrics
 
 
 class RegimeWarmupTests(unittest.TestCase):
@@ -49,6 +50,27 @@ class RegimeWarmupTests(unittest.TestCase):
         wb = detector.warmup_bars
         post_warmup = result['REGIME_WARMUP'].iloc[wb:]
         self.assertFalse(post_warmup.any(), "Expected all False after warmup")
+
+    def test_tuner_quality_metrics_exclude_warmup_region(self):
+        regime_series = pd.Series(["CHOP"] * 50 + ["TREND"] * 120)
+        gap_series = pd.Series([0.0] * 50 + [0.2] * 120)
+        price_series = pd.Series(np.linspace(100.0, 120.0, len(regime_series)))
+
+        with_warmup = compute_regime_quality_metrics(
+            regime_series,
+            gap_series,
+            price_series,
+            warmup_bars=50,
+        )
+        without_warmup = compute_regime_quality_metrics(
+            regime_series,
+            gap_series,
+            price_series,
+            warmup_bars=0,
+        )
+
+        self.assertLess(with_warmup["total_changes"], without_warmup["total_changes"])
+        self.assertGreater(without_warmup["total_changes"], 0)
 
 
 if __name__ == "__main__":

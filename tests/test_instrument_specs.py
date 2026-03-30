@@ -1,6 +1,7 @@
-import tempfile
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
+import shutil
 
 from pm_core import (
     set_instrument_specs,
@@ -13,13 +14,14 @@ from pm_core import (
 
 class InstrumentSpecTests(unittest.TestCase):
     def setUp(self):
-        # Ensure broker specs path points to a temp location (no file)
-        tmp = tempfile.TemporaryDirectory()
-        self._tmpdir = tmp
-        set_broker_specs_path(tmp.name + "/no_broker_specs.json")
+        path = Path("artifact/fxpm_runtime/.tmp_pytest/test_instrument_specs")
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True, exist_ok=True)
+        self._tmpdir = path
+        set_broker_specs_path(str(path / "no_broker_specs.json"))
 
     def tearDown(self):
-        self._tmpdir.cleanup()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         set_instrument_specs({}, {})
 
     def test_config_override_and_defaults(self):

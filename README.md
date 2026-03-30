@@ -1,6 +1,8 @@
-# FX Portfolio Manager v3.3
+# FX Portfolio Manager v3.1
 
 A production-ready automated trading system featuring regime-aware strategy selection, stateful optimization with incremental persistence, Numba-accelerated backtesting, and live execution via MetaTrader 5.
+
+Archived audit/specification documents are stored in `documentation_archive/`.
 
 ---
 
@@ -31,18 +33,18 @@ A production-ready automated trading system featuring regime-aware strategy sele
 The FX Portfolio Manager is a fully automated trading pipeline that:
 
 1. **Detects Market Regimes** - Classifies markets as TREND, RANGE, BREAKOUT, or CHOP
-2. **Selects Strategies** - Tests 42 strategies across 6 timeframes per regime
+2. **Selects Strategies** - Tests 47 strategies across 6 timeframes per regime
 3. **Optimizes Parameters** - Grid/Optuna search with validation-aware scoring
 4. **Validates Robustness** - Gap penalty and robustness ratio enforcement
 5. **Persists Incrementally** - Never loses optimization progress (atomic saves)
 6. **Executes Trades** - Live MT5 execution with broker-accurate risk management
-7. **Adapts Continuously** - Auto-retraining when configurations expire
+7. **Adapts Continuously** - Fixed production retraining on the calendar schedule defined in `config.json`
 
 ### What Makes It Different
 
 | Feature | Traditional Systems | This System |
 |---------|---------------------|-------------|
-| Strategy Selection | Single strategy | 42 strategies compete per regime |
+| Strategy Selection | Single strategy | 47 strategies compete per regime |
 | Market Adaptation | Static | Regime-aware (TREND/RANGE/BREAKOUT/CHOP) |
 | Parameter Tuning | Manual or random | Systematic grid/Optuna with validation |
 | Overfitting Prevention | None/minimal | Gap penalty + robustness ratio |
@@ -56,13 +58,13 @@ The FX Portfolio Manager is a fully automated trading pipeline that:
 
 ## Key Features
 
-### Stateful Optimization Ledger (NEW in v3.3)
+### Stateful Optimization Ledger (NEW in v3.1)
 - **Skip Valid Configs**: Re-running optimization only processes symbols that need it
 - **Incremental Persistence**: Saves after each symbol (never loses progress)
 - **Atomic Writes**: Config file is never corrupted, even on interruption
 - **Explicit Overwrite**: Use `--overwrite` flag to force re-optimization
 
-### Numba-Accelerated Backtesting (NEW in v3.3)
+### Numba-Accelerated Backtesting (NEW in v3.1)
 - **3-10x Speedup**: JIT-compiled main loop
 - **Live-Equity Sizing**: Position sizes compound with equity changes
 - **Quality Preserved**: Same SL/TP ordering, float64 precision, no fastmath
@@ -266,8 +268,9 @@ python pm_main.py --trade --paper
 # 4. Go live when confident
 python pm_main.py --trade
 
-# 5. Full autonomous mode (auto-retrains when configs expire)
-python pm_main.py --trade --auto-retrain
+# 5. Full autonomous mode
+# Retrain timing is read from config.json (default: every 2 weeks on Sunday 00:01)
+python pm_main.py --trade
 ```
 
 ---
@@ -300,8 +303,6 @@ python pm_main.py --trade --auto-retrain
     "min_trades": 25,
     "min_robustness": 0.20,
     
-    "optimization_valid_days": 14,
-    
     "scoring_mode": "fx_backtester",
     
     "fx_opt_min_trades": 15,
@@ -311,7 +312,12 @@ python pm_main.py --trade --auto-retrain
     "fx_min_robustness_ratio": 0.80,
     
     "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
-    "retrain_periods": [14, 30, 60, 90, 120],
+    "production_retrain_mode": "auto",
+    "production_retrain_interval_weeks": 2,
+    "production_retrain_weekday": "sunday",
+    "production_retrain_time": "00:01",
+    "production_retrain_anchor_date": "2026-03-29",
+    "production_retrain_poll_seconds": 60,
     
     "use_regime_optimization": true,
     "regime_min_train_trades": 25,
@@ -360,7 +366,11 @@ spec as a starting point (handy for new symbols before you export broker specs).
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `optimization_valid_days` | Days before config expires | 14 |
+| `production_retrain_mode` | Scheduled retrain behavior (`auto`/`notify`/`off`) | auto |
+| `production_retrain_interval_weeks` | Weeks between scheduled retrains | 2 |
+| `production_retrain_weekday` | Scheduled retrain weekday | sunday |
+| `production_retrain_time` | Scheduled retrain local time | 00:01 |
+| `production_retrain_anchor_date` | Calendar anchor for the fixed biweekly schedule | 2026-03-29 |
 | `risk_per_trade_pct` | Risk per trade as % of equity | 1.0 |
 | `max_risk_pct` | Hard cap on risk (safety) | 5.0 |
 | `fx_min_robustness_ratio` | Minimum val/train score ratio | 0.80 |
@@ -381,9 +391,8 @@ python pm_main.py --optimize              # Skip valid configs
 python pm_main.py --optimize --overwrite  # Force re-optimize all
 
 # Trading
-python pm_main.py --trade                 # Live trading
+python pm_main.py --trade                 # Live trading (retrain schedule comes from config.json)
 python pm_main.py --trade --paper         # Paper trading (no real orders)
-python pm_main.py --trade --auto-retrain  # With automatic retraining
 
 # Status
 python pm_main.py --status                # Show current portfolio status
@@ -402,12 +411,11 @@ python pm_main.py --config myconfig.json  # Custom config file
 | `--overwrite` | Force re-optimization (ignore validity) |
 | `--trade` | Start live trading loop |
 | `--paper` | Paper trading mode (no real orders) |
-| `--auto-retrain` | Auto-retrain when configs expire |
 | `--status` | Print portfolio status |
 | `--symbols` | Specific symbols to process |
 | `--config` | Path to config JSON file |
-| `--data-dir` | Data directory path |
-| `--output-dir` | Output directory path |
+| `--data-dir` | Optional explicit override for pipeline `data_dir` |
+| `--output-dir` | Optional explicit override for pipeline `output_dir` |
 | `--log-level` | Logging level (DEBUG/INFO/WARNING/ERROR) |
 
 ---
@@ -571,7 +579,7 @@ features = FeatureComputer.compute_required(df, required_features)  # ~0.007s
 
 ### Performance Comparison
 
-| Component | Before v3.3 | After v3.3 | Speedup |
+| Component | Before Upgrade | After v3.1 | Speedup |
 |-----------|-------------|------------|---------|
 | Full feature computation | 2.15s | 2.15s | baseline |
 | Lazy feature computation | 2.15s | 0.007s | **307x** |
@@ -787,4 +795,4 @@ MIT License - Use at your own risk.
 
 ---
 
-*FX Portfolio Manager v3.3 - Quality First, Efficiency Second*
+*FX Portfolio Manager v3.1 - Quality First, Efficiency Second*

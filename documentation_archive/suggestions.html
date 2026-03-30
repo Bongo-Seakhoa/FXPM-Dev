@@ -1,0 +1,2024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FxPM 1.4 - Definitive Upgrade Path</title>
+<style>
+:root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-muted: #8b949e;
+    --heading: #f0f6fc;
+    --accent: #58a6ff;
+    --accent-green: #3fb950;
+    --accent-red: #f85149;
+    --accent-yellow: #d29922;
+    --code-bg: #1c2128;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+    max-width: 960px;
+    margin: 0 auto;
+}
+h1 { color: var(--heading); font-size: 2rem; margin: 2rem 0 1rem; border-bottom: 2px solid var(--accent); padding-bottom: 0.5rem; }
+h2 { color: var(--accent); font-size: 1.5rem; margin: 2.5rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+h3 { color: var(--accent-green); font-size: 1.2rem; margin: 1.8rem 0 0.8rem; }
+h4 { color: var(--accent-yellow); font-size: 1.05rem; margin: 1.2rem 0 0.6rem; }
+p { margin: 0.6rem 0; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { color: var(--heading); }
+code {
+    background: var(--code-bg);
+    color: var(--accent-green);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.9em;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+}
+pre code {
+    background: none;
+    padding: 0;
+    color: var(--text);
+}
+blockquote {
+    border-left: 4px solid var(--accent);
+    padding: 0.5rem 1rem;
+    margin: 1rem 0;
+    background: var(--surface);
+    border-radius: 0 6px 6px 0;
+    color: var(--text-muted);
+}
+ul, ol { margin: 0.6rem 0 0.6rem 1.5rem; }
+li { margin: 0.3rem 0; }
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.92em;
+}
+th {
+    background: var(--surface);
+    color: var(--accent);
+    text-align: left;
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--border);
+    font-weight: 600;
+}
+td {
+    padding: 0.5rem 0.8rem;
+    border: 1px solid var(--border);
+}
+tr:nth-child(even) { background: rgba(22, 27, 34, 0.5); }
+tr:hover { background: rgba(88, 166, 255, 0.05); }
+hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2rem 0;
+}
+.codehilite { background: var(--code-bg); border-radius: 8px; padding: 1rem; margin: 1rem 0; overflow-x: auto; }
+.codehilite pre { border: none; padding: 0; margin: 0; }
+</style>
+</head>
+<body>
+<h1 id="fxpm-14-definitive-upgrade-path">FxPM 1.4 - Definitive Upgrade Path</h1>
+<p>This document merges findings from deep codebase analysis (6 research agents across all modules), an independent audit, and verification passes against the live code. Every suggestion has been checked against the actual implementation. Where the audit and original analysis disagreed, the code was re-read to settle the question.</p>
+<blockquote>
+<p>Archive note (2026-03-30): this document is retained as the finalized audit baseline. The implementation was completed afterward; final completion status and post-audit amendments are tracked in <code>technical_upgrade_checklist.md</code> and <code>UPGRADE_PROGRESS.md</code> in the same archive folder. Early strategy-count references describe the pre-G7 baseline unless they explicitly state the upgraded total of 47.</p>
+</blockquote>
+<p><strong>Design constraints applied throughout:</strong></p>
+<ul>
+<li>Candle-based execution is accepted as a given. The system trades on bar close, signals execute on next bar open. The gap between signal and fill is inherent to the architecture and empirically negligible.</li>
+<li>Concurrent exposure is theoretically uncapped across symbols, but in practice signals are rare enough that 20+ simultaneous positions almost never occur. Suggestions address exposure awareness without overengineering circuit breakers.</li>
+<li>The only circuit breakers included are last-resort protections where the broker would otherwise intervene on its own terms.</li>
+<li>Backtesting priority: correctness first, accuracy second, efficiency third. Where two approaches produce the same result at the same quality, the more efficient one wins.</li>
+<li>Trade frequency and volume are preserved. Filters target negative-expectancy trades; sizing changes scale dollars, not signal count.</li>
+</ul>
+<p><strong>Repo evidence snapshot (from audit):</strong></p>
+<ul>
+<li><code>pm_configs.json</code>: 62 validated symbol configs</li>
+<li>Regime storage: 365 regime winners</li>
+<li>117 / 365 regime winners have fewer than 20 validation trades</li>
+<li>75 / 365 regime winners use <code>MomentumBurstStrategy</code></li>
+<li>Only 2 / 365 stored winners are in <code>BREAKOUT</code></li>
+<li><code>InsideBarBreakoutStrategy</code> is structurally broken (verified -- see Section 8.2)</li>
+</ul>
+<hr />
+<h2 id="table-of-contents">Table of Contents</h2>
+<ul>
+<li><a href="#priority-0-fix-measurement-before-more-optimization">Priority 0: Fix Measurement Before More Optimization</a></li>
+<li><a href="#priority-0-fix-the-validation-protocol">Priority 0: Fix the Validation Protocol</a></li>
+<li><a href="#priority-1-risk-execution--live-parity">Priority 1: Risk, Execution &amp; Live Parity</a></li>
+<li><a href="#priority-1-fix-the-search-objective">Priority 1: Fix the Search Objective</a></li>
+<li><a href="#priority-2-position-sizing--drawdown-control">Priority 2: Position Sizing &amp; Drawdown Control</a></li>
+<li><a href="#priority-2-exit-management-upgrades">Priority 2: Exit Management Upgrades</a></li>
+<li><a href="#priority-2-portfolio-construction">Priority 2: Portfolio Construction</a></li>
+<li><a href="#priority-2-regime-detection-enhancement">Priority 2: Regime Detection Enhancement</a></li>
+<li><a href="#priority-2-execution-quality">Priority 2: Execution Quality</a></li>
+<li><a href="#priority-2-dashboard-config--tests">Priority 2: Dashboard, Config &amp; Tests</a></li>
+<li><a href="#priority-3-recovery-factor--strategy-rotation">Priority 3: Recovery Factor &amp; Strategy Rotation</a></li>
+<li><a href="#appendix-a-strategy-robustness-analysis">Appendix A: Strategy Robustness Analysis</a></li>
+<li><a href="#appendix-b-scoring--configuration-tuning">Appendix B: Scoring &amp; Configuration Tuning</a></li>
+<li><a href="#implementation-roadmap">Implementation Roadmap</a></li>
+<li><a href="#academic-references">Academic References</a></li>
+<li><a href="#appendix-c-validation-design--freshness">Appendix C: Validation Design &amp; Freshness</a></li>
+<li><a href="#appendix-d-additional-verified-code-findings">Appendix D: Additional Verified Code Findings</a></li>
+<li><a href="#appendix-e-dashboard-monitoring-and-operational-addendum">Appendix E: Dashboard &amp; Monitoring Addendum</a></li>
+<li><a href="#appendix-f-final-notes-watchlist-and-priority-re-rank">Appendix F: Watchlist &amp; Priority Re-Rank</a></li>
+<li><a href="#appendix-g-strategy--efficiency-sweep">Appendix G: Strategy &amp; Efficiency Sweep</a></li>
+<li><a href="#appendix-h-option-pricing-model-adaptations">Appendix H: Option-Pricing Model Adaptations</a></li>
+<li><a href="#appendix-i-recommended-new-strategy-additions">Appendix I: Recommended New Strategy Additions</a></li>
+<li><a href="#appendix-j-critical-correctness-issues-final-audit">Appendix J: Critical Correctness Issues (Final Audit)</a></li>
+<li><a href="#appendix-k-live-trading-robustness-final-audit">Appendix K: Live Trading Robustness (Final Audit)</a></li>
+<li><a href="#appendix-l-pipeline--optimizer-edge-cases-final-audit">Appendix L: Pipeline &amp; Optimizer Edge Cases (Final Audit)</a></li>
+<li><a href="#appendix-m-strategy-signal-quality-final-audit">Appendix M: Strategy Signal Quality (Final Audit)</a></li>
+<li><a href="#appendix-n-performance-hotspots-summary">Appendix N: Performance Hotspots Summary</a></li>
+<li><a href="#appendix-o-revised-strategy-trust-table">Appendix O: Revised Strategy Trust Table</a></li>
+<li><a href="#appendix-p-final-implementation-priority">Appendix P: Final Implementation Priority</a></li>
+</ul>
+<hr />
+<h2 id="priority-0-fix-measurement-before-more-optimization">Priority 0: Fix Measurement Before More Optimization</h2>
+<p>These issues directly distort profit factor, win rate, drawdown, Sharpe, and recovery factor. Optimizing on distorted metrics is the fastest path to lower live profitability. <strong>Do not run more optimization until these are fixed.</strong></p>
+<h3 id="1-bar-level-equity-curve-for-sharpesortino">1. Bar-Level Equity Curve for Sharpe/Sortino</h3>
+<p><strong>File</strong>: <code>pm_core.py:2604-2975</code></p>
+<p>The equity curve is built from trades only (length = num_trades + 1), not from bars. When Sharpe/Sortino are computed on this compressed curve, the returns variance is underestimated because flat periods are excluded. A strategy with 50 trades over 1000 bars generates 50 return observations, annualized as if they were 50 consecutive bars.</p>
+<p><strong>Impact</strong>: Sharpe inflation of +0.5-1.5 depending on trade frequency.</p>
+<p><strong>Fix</strong>: Return the full bar-level equity curve from both the Numba and Python paths. Compute Sharpe, Sortino, and Calmar from bar returns with proper annualization.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Build equity per-bar, not per-trade:</span>
+<span class="n">equity_curve</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">num_bars</span><span class="p">,</span> <span class="n">initial_capital</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">trades</span><span class="p">:</span>
+    <span class="n">equity_curve</span><span class="p">[</span><span class="n">t</span><span class="p">[</span><span class="s1">&#39;exit_bar&#39;</span><span class="p">]:]</span> <span class="o">+=</span> <span class="n">t</span><span class="p">[</span><span class="s1">&#39;pnl_dollars&#39;</span><span class="p">]</span>
+<span class="n">bar_returns</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">diff</span><span class="p">(</span><span class="n">equity_curve</span><span class="p">)</span> <span class="o">/</span> <span class="n">equity_curve</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+<span class="n">sharpe</span> <span class="o">=</span> <span class="p">(</span><span class="n">bar_returns</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span> <span class="o">/</span> <span class="n">bar_returns</span><span class="o">.</span><span class="n">std</span><span class="p">())</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">bars_per_year</span><span class="p">)</span>
+</code></pre></div>
+
+<p>This is the highest-value single fix. It changes the correctness of the optimization target itself.</p>
+<h3 id="2-mark-to-market-drawdown">2. Mark-to-Market Drawdown</h3>
+<p><strong>File</strong>: <code>pm_core.py:2787-2789, 380-382</code></p>
+<p>Drawdown is updated at trade exit only. If a position enters at bar 100, dips 20% at bar 105, but recovers and exits at bar 110 with +5%, the 20% intrabar drawdown is invisible.</p>
+<p><strong>Fix</strong>: Track mark-to-market equity every bar while a position is open. Use the worst adverse excursion during each bar:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Inside the bar loop, when position is open:</span>
+<span class="k">if</span> <span class="n">is_long</span><span class="p">:</span>
+    <span class="n">unrealized</span> <span class="o">=</span> <span class="p">(</span><span class="n">bid_low</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">-</span> <span class="n">entry_price</span><span class="p">)</span> <span class="o">*</span> <span class="n">volume</span> <span class="o">*</span> <span class="n">tick_value</span> <span class="o">/</span> <span class="n">tick_size</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">unrealized</span> <span class="o">=</span> <span class="p">(</span><span class="n">entry_price</span> <span class="o">-</span> <span class="n">ask_high</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="o">*</span> <span class="n">volume</span> <span class="o">*</span> <span class="n">tick_value</span> <span class="o">/</span> <span class="n">tick_size</span>
+<span class="n">mark_to_market</span> <span class="o">=</span> <span class="n">equity</span> <span class="o">+</span> <span class="n">unrealized</span>
+<span class="n">peak</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">peak</span><span class="p">,</span> <span class="n">mark_to_market</span><span class="p">)</span>
+<span class="n">dd</span> <span class="o">=</span> <span class="p">(</span><span class="n">peak</span> <span class="o">-</span> <span class="n">mark_to_market</span><span class="p">)</span> <span class="o">/</span> <span class="n">peak</span> <span class="o">*</span> <span class="mi">100</span>
+<span class="n">max_dd</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_dd</span><span class="p">,</span> <span class="n">dd</span><span class="p">)</span>
+</code></pre></div>
+
+<h3 id="3-entry-bar-exit-impossibility">3. Entry-Bar Exit Impossibility</h3>
+<p><strong>Found by audit.</strong> Entry-bar exits are impossible in both backtest loops because exits are checked before entries and never re-checked after a fill. A trade opened on bar <code>i</code> cannot hit SL/TP until bar <code>i+1</code>.</p>
+<p>In most cases this is a minor effect, but for strategies with tight stops (1-1.5 ATR) on volatile instruments, it understates both losses and wins on the entry bar.</p>
+<p><strong>Fix</strong>: After opening a position on bar <code>i</code>, re-check SL/TP against bar <code>i</code>'s remaining price action (High/Low after Open) under a deterministic fill hierarchy: SL checked first, then TP.</p>
+<h3 id="4-gap-through-stop-modeling">4. Gap-Through-Stop Modeling</h3>
+<p>Stop fills currently cap losses at <code>stop +/- slippage</code>, even when the market gaps through the stop. This understates tail loss.</p>
+<p><strong>Fix</strong>: When price gaps through SL (bar Low &lt; SL for longs, bar High &gt; SL for shorts), fill at the worst tradable price (the gap extreme), not the stop price. This produces more realistic tail-loss statistics.</p>
+<h3 id="5-entry-slippage-symmetry">5. Entry Slippage Symmetry</h3>
+<p><strong>File</strong>: <code>pm_core.py:2529-2533</code></p>
+<p>SL exits include adverse slippage, but entries do not. Both are market orders live. The cost model is inconsistent.</p>
+<p><strong>Fix</strong>: Apply symmetric adverse slippage to entries:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">is_long</span><span class="p">:</span>
+    <span class="n">entry_price</span> <span class="o">=</span> <span class="n">open_price</span> <span class="o">+</span> <span class="n">half_spread</span> <span class="o">+</span> <span class="n">slippage</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">entry_price</span> <span class="o">=</span> <span class="n">open_price</span> <span class="o">-</span> <span class="n">half_spread</span> <span class="o">-</span> <span class="n">slippage</span>
+</code></pre></div>
+
+<h3 id="6-net-dollar-winloss-classification">6. Net-Dollar Win/Loss Classification</h3>
+<p>Wins and losses are currently classified by <code>pnl_pips</code>, not net dollars after commission. A trade that wins 2 pips but loses $3 in commission is counted as a "win."</p>
+<p><strong>Fix</strong>: Classify wins/losses and compute expectancy on net dollar P&amp;L after all costs (spread, commission, slippage, swap).</p>
+<h3 id="7-swap-cost-application">7. Swap Cost Application</h3>
+<p><strong>File</strong>: <code>pm_core.py:507-509, 732-733</code></p>
+<p><code>swap_long</code>/<code>swap_short</code> exist in <code>InstrumentSpec</code> but are never applied. For D1 strategies holding positions for days/weeks, overnight swap costs can erode 5-20% of profits on exotic/cross pairs.</p>
+<p><strong>Fix</strong>: Accrue swap cost by nights held, including the broker's triple-swap day (typically Wednesday):</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">timeframe</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">&#39;H4&#39;</span><span class="p">,</span> <span class="s1">&#39;D1&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">use_swap</span><span class="p">:</span>
+    <span class="n">swap_rate</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">swap_long</span> <span class="k">if</span> <span class="n">is_long</span> <span class="k">else</span> <span class="n">spec</span><span class="o">.</span><span class="n">swap_short</span>
+    <span class="n">nights</span> <span class="o">=</span> <span class="n">count_overnight_bars</span><span class="p">(</span><span class="n">entry_bar</span><span class="p">,</span> <span class="n">exit_bar</span><span class="p">,</span> <span class="n">timeframe</span><span class="p">)</span>
+    <span class="n">pnl_dollars</span> <span class="o">-=</span> <span class="n">swap_rate</span> <span class="o">*</span> <span class="n">volume</span> <span class="o">*</span> <span class="n">nights</span>
+</code></pre></div>
+
+<h3 id="8-live-stop-placement-reads-the-forming-bar">8. Live Stop Placement Reads the Forming Bar</h3>
+<p><strong>Found by audit (Appendix D1).</strong> Live entries are decided from <code>signals.iloc[-2]</code> (the closed bar), but <code>calculate_stops(..., bar_index=None)</code> defaults to reading <code>.iloc[-1]</code> (the forming candle). This means the stop distance in live trading is based on a different bar than the signal bar -- a real, avoidable backtest/live parity defect.</p>
+<p><strong>Fix</strong>: Pass <code>bar_index=-2</code> (or the equivalent closed-bar index) to <code>calculate_stops()</code> in the live path so stops are computed from the same bar that generated the signal. This aligns live behavior with backtest behavior where stops are always computed from the signal bar.</p>
+<h3 id="9-a-post-rounding-risk-enforcement">9-a. Post-Rounding Risk Enforcement</h3>
+<p>Risk can exceed the intended target after min-lot clamping and volume rounding. Currently, the system logs this but may not reject the trade.</p>
+<p><strong>Fix</strong>: After volume rounding, recompute actual risk. If it exceeds the target risk tolerance by more than a configurable margin (e.g., 20%), reject the trade rather than silently oversizing.</p>
+<hr />
+<h2 id="priority-0-fix-the-validation-protocol">Priority 0: Fix the Validation Protocol</h2>
+<h3 id="9-clean-up-the-scored-overlap">9. Clean Up the Scored Overlap</h3>
+<p><strong>File</strong>: <code>pm_core.py</code> (DataSplitter), <code>config.json</code></p>
+<p><code>DataSplitter</code> trains on <code>[:80%]</code> and validates on <code>[70%:]</code>. The 70-80% region is both fitted and "validated." This is explicitly tested and asserted in <code>tests/test_data_splitter.py</code>.</p>
+<p>The overlap exists intentionally -- empirical testing on this PM has shown that keeping training and validation data close to current market conditions improves live outcomes. Models trained on stale data degrade faster than models with a freshness-preserving split. This is a real and valid concern, and it is the reason walk-forward validation has been avoided in the production path.</p>
+<p>However, the current implementation scores the overlap region as if it were clean out-of-sample data. That makes validation scores optimistic even though the freshness goal itself is sound.</p>
+<p><strong>Fix (freshness-preserving clean validation)</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="nl">Train:</span><span class="w">   </span><span class="p">[</span><span class="mh">0</span><span class="p">,</span><span class="w"> </span><span class="n">train_end</span><span class="p">]</span><span class="w">                          </span><span class="p">(</span><span class="n">keep</span><span class="w"> </span><span class="n">recent</span><span class="p">,</span><span class="w"> </span><span class="n">close</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">deployment</span><span class="p">)</span>
+<span class="nl">Warmup:</span><span class="w">  </span><span class="p">[</span><span class="n">train_end</span><span class="p">,</span><span class="w"> </span><span class="n">train_end</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_lookback</span><span class="p">]</span><span class="w">   </span><span class="p">(</span><span class="n">indicator</span><span class="o">/</span><span class="n">regime</span><span class="w"> </span><span class="n">warm</span><span class="o">-</span><span class="n">up</span><span class="w"> </span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">NOT</span><span class="w"> </span><span class="n">scored</span><span class="p">)</span>
+<span class="nl">Val:</span><span class="w">     </span><span class="p">[</span><span class="n">train_end</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_lookback</span><span class="p">,</span><span class="w"> </span><span class="k">end</span><span class="p">]</span><span class="w">          </span><span class="p">(</span><span class="n">clean</span><span class="w"> </span><span class="n">recent</span><span class="w"> </span><span class="n">holdout</span><span class="p">,</span><span class="w"> </span><span class="n">scored</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>Allow backward overlap <strong>only</strong> as a warm-up buffer for indicator state -- never as part of the scored validation region.</li>
+<li>If freshness should dominate, use <strong>recency-weighted validation scoring</strong> across clean buckets rather than overlapping the scored region.</li>
+<li>Use walk-forward / rolling-origin evaluation as a <strong>research audit tool</strong> and periodic methodology check (e.g., quarterly), not as a mandatory step before every deployment.</li>
+</ul>
+<p><strong>Note on feature computation:</strong> Features are computed on the full dataset before splitting (<code>pm_pipeline.py:2392-2404</code>). All indicators (EMA, RSI, MACD, ATR, etc.) are causal (backward-looking) filters, so this is equivalent to computing on each slice separately. The scored overlap is the real problem, not the feature computation order.</p>
+<h3 id="10-stop-reusing-the-same-holdout-for-everything">10. Stop Reusing the Same Holdout for Everything</h3>
+<p>The same validation slice is reused for strategy screening, parameter tuning, winner selection, final validation, and retrain-period choice. There is no untouched final holdout.</p>
+<p>This is repeated holdout peeking. It makes stored winners look better than they really are.</p>
+<p><strong>Fix</strong>: Reserve a small but genuinely untouched recent holdout for final accept/reject:</p>
+<div class="codehilite"><pre><span></span><code><span class="o">~</span><span class="mi">65</span><span class="o">%</span><span class="w"> </span><span class="n">Training</span><span class="w">    </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">Optuna</span><span class="w"> </span><span class="n">parameter</span><span class="w"> </span><span class="n">optimization</span>
+<span class="o">~</span><span class="mi">20</span><span class="o">%</span><span class="w"> </span><span class="n">Validation</span><span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">Strategy</span><span class="o">/</span><span class="n">parameter</span><span class="w"> </span><span class="n">selection</span><span class="w"> </span><span class="p">(</span><span class="n">clean</span><span class="p">,</span><span class="w"> </span><span class="n">no</span><span class="w"> </span><span class="n">overlap</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="n">training</span><span class="p">)</span>
+<span class="o">~</span><span class="mi">15</span><span class="o">%</span><span class="w"> </span><span class="n">Holdout</span><span class="w">     </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">Final</span><span class="w"> </span><span class="n">accept</span><span class="o">/</span><span class="n">reject</span><span class="w"> </span><span class="kr">only</span><span class="w"> </span><span class="p">(</span><span class="n">never</span><span class="w"> </span><span class="n">seen</span><span class="w"> </span><span class="n">during</span><span class="w"> </span><span class="n">optimization</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Do not use the final holdout to choose retrain cadence. Retrain cadence is fixed at <strong>biweekly Sunday</strong> (see item 33).</p>
+<h3 id="11-add-multiple-testing-control">11. Add Multiple-Testing Control</h3>
+<p>At the time of the original audit, the system evaluated a large search space (42 strategies x 40+ symbols x 30 Optuna trials = ~50,000+ tests) with no explicit correction for selection bias. The current upgraded roster is 47 strategies.</p>
+<p><strong>Fix (Deflated Sharpe Ratio)</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">SE_SR</span> <span class="o">=</span> <span class="n">sqrt</span><span class="p">((</span><span class="mi">1</span> <span class="o">+</span> <span class="mf">0.5</span><span class="o">*</span><span class="n">SR</span><span class="o">^</span><span class="mi">2</span> <span class="o">-</span> <span class="n">skew</span><span class="o">*</span><span class="n">SR</span> <span class="o">+</span> <span class="p">(</span><span class="n">kurt</span><span class="o">-</span><span class="mi">3</span><span class="p">)</span><span class="o">/</span><span class="mi">4</span><span class="o">*</span><span class="n">SR</span><span class="o">^</span><span class="mi">2</span><span class="p">)</span> <span class="o">/</span> <span class="n">T</span><span class="p">)</span>
+<span class="n">SR_threshold</span> <span class="o">=</span> <span class="n">SE_SR</span> <span class="o">*</span> <span class="n">Phi_inv</span><span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="mi">1</span><span class="o">/</span><span class="p">(</span><span class="n">N_trials</span> <span class="o">*</span> <span class="n">e</span><span class="p">))</span>
+<span class="c1"># Reject if SR_observed &lt; SR_threshold</span>
+</code></pre></div>
+
+<p>Track the full number of trials attempted per symbol/timeframe/regime. Compute DSR on finalists. Run PBO/CSCV on shortlisted candidates (not the full universe) to keep runtime manageable.</p>
+<p><strong>Volume preservation</strong>: Do not solve this by cranking <code>fx_val_min_trades</code> way up and killing half the book. Better approach: keep a moderate minimum (15-20, up from 5), then score edges using <strong>confidence-adjusted lower-bound metrics</strong> so uncertain winners are down-weighted rather than automatically removed. This preserves trade frequency while penalizing unreliable edges.</p>
+<hr />
+<h2 id="priority-1-risk-execution-live-parity">Priority 1: Risk, Execution &amp; Live Parity</h2>
+<h3 id="12-portfolio-risk-awareness">12. Portfolio Risk Awareness</h3>
+<p><strong>File</strong>: <code>pm_main.py:784-892</code></p>
+<p>Each symbol is capped at <code>max_combined_risk_pct</code> (default 3%), but there is no portfolio-wide view. Correlated risk can accumulate across symbols.</p>
+<p><strong>Fix</strong>: Add a portfolio-wide gross risk budget and exposure buckets for at least: USD, JPY, metals, crypto, equity indices, energy. This doesn't need to be a hard circuit breaker -- it should be a <strong>risk-aware sizing adjustment</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Decompose each position into currency exposure</span>
+<span class="c1"># EURUSD long = +EUR, -USD</span>
+<span class="c1"># Track net currency exposure</span>
+<span class="c1"># When USD exposure &gt; threshold, reduce size on new USD-correlated trades</span>
+<span class="c1"># rather than blocking them outright</span>
+</code></pre></div>
+
+<p>Also: recompute actual risk after fill and persist the actual value, not the pre-send estimate. Parse both legacy and current trade comment formats for existing positions.</p>
+<p>For portfolio allocation, use shrinkage covariance estimation + HRP (Section on Portfolio Construction below) to redistribute risk across correlated positions. This reduces cluster drawdowns without trading less.</p>
+<h3 id="13-wire-live-exits-to-match-research-assumptions">13. Wire Live Exits to Match Research Assumptions</h3>
+<p><strong>Found by audit.</strong> <code>PositionManager</code> supports trailing stop, breakeven stop, time exits, and exit-condition helpers. The live trader instantiates it, but those paths are not wired into the live loop. <code>close_on_opposite_signal</code> exists as config but is effectively unused.</p>
+<p>If backtests assume richer exit behavior than live execution applies, live drawdown and recovery will be worse than expected.</p>
+<p><strong>Fix</strong>: Either wire trailing/breakeven/time/opposite-signal exits into the live loop, or remove them from the research surface until live support exists. Add parity tests between backtest and live exit logic.</p>
+<h3 id="14-preserve-r-multiple-when-sl-is-widened">14. Preserve R-Multiple When SL Is Widened</h3>
+<p><strong>Found by audit.</strong> Live execution may widen SL to satisfy stop-level or max-volume constraints, but TP is not adjusted to preserve the validated reward/risk ratio.</p>
+<p>This quietly degrades expectancy and profit factor.</p>
+<p><strong>Fix</strong>: When SL is widened for broker or sizing reasons, recalculate TP to preserve the validated target R-multiple unless explicitly configured otherwise.</p>
+<h3 id="15-harden-the-mt5-order-path">15. Harden the MT5 Order Path</h3>
+<p><strong>Found by audit.</strong> No <code>order_check</code> / margin pre-check before send. Partial fills (<code>10010</code>) are not treated as live success. Decision throttle can suppress retry on a failed attempt even when the failure is transient.</p>
+<p><strong>Fix</strong>:<br />
+- Run <code>order_check</code> and free-margin check before send<br />
+- Treat partial fills as a live execution state, not a pure failure<br />
+- Separate transient retcodes from structural failures; allow limited retry only for the transient set</p>
+<h3 id="16-live-trading-reliability">16. Live Trading Reliability</h3>
+<p><strong>Reconnection</strong> (<code>pm_main.py:914-918</code>): After 12 failed MT5 reconnection cycles (~2 minutes), the trader completely stops. No automatic recovery.</p>
+<p><strong>Fix</strong>: Implement exponential backoff with persistent retry + alerting. This is a broker-level last-resort protection -- exactly the kind of circuit breaker that should exist:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">reconnect_delays</span> <span class="o">=</span> <span class="p">[</span><span class="mi">10</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="mi">30</span><span class="p">,</span> <span class="mi">30</span><span class="p">,</span> <span class="mi">60</span><span class="p">,</span> <span class="mi">60</span><span class="p">,</span> <span class="mi">120</span><span class="p">,</span> <span class="mi">120</span><span class="p">,</span> <span class="mi">300</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+<span class="n">max_backoff</span> <span class="o">=</span> <span class="mi">600</span>  <span class="c1"># 10 minutes max between retries</span>
+<span class="c1"># After 12 attempts: send alert (email/Telegram) but keep trying</span>
+</code></pre></div>
+
+<p><strong>Trade log persistence</strong> (<code>pm_main.py:2317</code>): In-memory trade log only saved at shutdown. Process crash = trades lost. Fix: write immediately after each execution.</p>
+<p><strong>DriftMonitor</strong> (<code>pm_main.py:496-569</code>): Defined but never instantiated. Wire it in and log warnings when live performance drifts from validation metrics.</p>
+<p><strong>MT5 spec refresh</strong> (<code>pm_main.py:641-693</code>): Specs synced once at startup. Refresh hourly or at session transitions.</p>
+<hr />
+<h2 id="priority-1-fix-the-search-objective">Priority 1: Fix the Search Objective</h2>
+<h3 id="17-stop-discarding-regime-specialists-before-tuning">17. Stop Discarding Regime Specialists Before Tuning</h3>
+<p><strong>Found by audit.</strong> <code>_apply_training_eligibility_gates()</code> filters on full-sample training metrics before per-regime tuning. A strategy that is strong in RANGE but poor in TREND gets rejected before it ever gets tuned for RANGE.</p>
+<p><strong>Fix</strong>: Move pre-tuning gates to regime-local metrics, or use a blended test. Keep a strategy alive if it is strong in one regime and not catastrophic elsewhere.</p>
+<h3 id="18-fix-the-optuna-regime-objective">18. Fix the Optuna Regime Objective</h3>
+<p><strong>Verified at <code>pm_optuna.py:708</code>.</strong> The multi-regime objective returns <code>max(regime_scores)</code>. This biases Optuna's TPE sampler toward parameter combinations that spike one regime, even if they are poor elsewhere.</p>
+<p><strong>Fix</strong>: Replace with a balanced objective:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Option A: Weighted mean (prefer balanced performance)</span>
+<span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">regime_scores</span><span class="p">)</span> <span class="k">if</span> <span class="n">regime_scores</span> <span class="k">else</span> <span class="o">-</span><span class="mf">1000.0</span>
+
+<span class="c1"># Option B: Lower-quantile (reward worst-case robustness)</span>
+<span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">percentile</span><span class="p">(</span><span class="n">regime_scores</span><span class="p">,</span> <span class="mi">25</span><span class="p">)</span> <span class="k">if</span> <span class="n">regime_scores</span> <span class="k">else</span> <span class="o">-</span><span class="mf">1000.0</span>
+
+<span class="c1"># Option C: Mean with diversity bonus</span>
+<span class="n">mean_score</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">regime_scores</span><span class="p">)</span>
+<span class="n">diversity</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">-</span> <span class="n">np</span><span class="o">.</span><span class="n">std</span><span class="p">(</span><span class="n">regime_scores</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="nb">abs</span><span class="p">(</span><span class="n">mean_score</span><span class="p">)</span> <span class="o">+</span> <span class="mf">1e-10</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">mean_score</span> <span class="o">*</span> <span class="p">(</span><span class="mf">0.8</span> <span class="o">+</span> <span class="mf">0.2</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">diversity</span><span class="p">))</span>
+</code></pre></div>
+
+<h3 id="19-fix-strategy-concentration">19. Fix Strategy Concentration</h3>
+<p>75 out of 365 stored winners use <code>MomentumBurstStrategy</code> -- a strategy that scored 2/10 on robustness analysis (single oscillator, no confirmation, 6.7x parameter spread). Only 2 winners are in BREAKOUT.</p>
+<p><strong>Important clarification</strong>: concentration is <strong>not</strong> automatically a defect. If one strategy genuinely wins many <code>(timeframe, regime)</code> buckets after clean testing, that is acceptable. The bug is <strong>methodology-driven concentration</strong>, not concentration itself.</p>
+<p><strong>What to fix first</strong>: remove the known selection distortions that can manufacture false "winners":</p>
+<ul>
+<li>overlapping scored validation</li>
+<li>repeated reuse of the same validation slice for screening, tuning, winner selection, and approval</li>
+<li><code>max(regime_scores)</code> in the Optuna multi-regime objective</li>
+<li>pre-tuning full-sample eligibility gates that can kill regime specialists</li>
+<li>broken / misaligned / dead-parameter strategies (for example <code>InsideBarBreakoutStrategy</code>, <code>PinBarReversalStrategy</code>, <code>ParabolicSARTrendStrategy</code>, <code>SqueezeBreakoutStrategy</code>, <code>EngulfingPatternStrategy</code>, <code>FisherTransformMRStrategy</code>)</li>
+</ul>
+<p><strong>Revised fix</strong>:</p>
+<ul>
+<li>Do <strong>not</strong> impose hard diversification quotas or force equal strategy representation.</li>
+<li>Re-run the full selection after the methodology flaws above are corrected.</li>
+<li>Then test whether concentration persists on <strong>clean recent holdouts</strong> and survives <strong>DSR / PBO-style robustness checks</strong>.</li>
+<li>If a strategy still dominates after that, <strong>accept the concentration</strong> as a natural pattern.</li>
+<li>Only use strategy-family correlation or redundancy analysis as a <strong>diagnostic / tie-breaker</strong>, not as a mechanism to handicap real winners.</li>
+</ul>
+<p>This keeps the PM aligned with your stated goal: the best strategy should win each regime/timeframe/signal on merit, not because the framework nudged it there and not because the framework forcibly diversified it away.</p>
+<h3 id="20-make-optimization-artifacts-version-aware">20. Make Optimization Artifacts Version-Aware</h3>
+<p><strong>Found by audit.</strong> Config validity depends mostly on <code>is_validated</code> and <code>valid_until</code>. Version mismatch checks exist but are not consistently stamped.</p>
+<p><strong>Fix</strong>: Stamp each saved config with a fingerprint: scorer version + cost-model version + regime-parameter version + split/validation version + strategy code hash. Invalidate configs automatically when any component changes.</p>
+<hr />
+<h2 id="priority-2-position-sizing-drawdown-control">Priority 2: Position Sizing &amp; Drawdown Control</h2>
+<p>These improvements are scientifically validated, produce measurable gains, and do not affect trade frequency. They change <em>how much</em> you risk, not <em>whether</em> you trade.</p>
+<h3 id="21-volatility-targeted-sizing">21. Volatility-Targeted Sizing</h3>
+<p><strong>Academic basis</strong>: Moskowitz, Ooi, Pedersen (2012), "Time Series Momentum", Journal of Financial Economics. Validated across 58 instruments.</p>
+<p>Current: Fixed risk-per-trade (1% of equity). A D1 EURUSD trade (low vol) and an M5 XAUUSD trade (high vol) get the same risk allocation despite vastly different return distributions.</p>
+<p><strong>Fix</strong>: Scale position size to target constant realized volatility per position:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">sigma_target</span> <span class="o">=</span> <span class="mf">0.10</span> <span class="o">/</span> <span class="n">sqrt</span><span class="p">(</span><span class="mi">252</span><span class="p">)</span>  <span class="c1"># 10% annualized target</span>
+<span class="n">sigma_realized</span> <span class="o">=</span> <span class="n">realized_vol</span><span class="p">(</span><span class="n">returns</span><span class="p">,</span> <span class="n">lookback</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<span class="n">scale</span> <span class="o">=</span> <span class="n">sigma_target</span> <span class="o">/</span> <span class="n">sigma_realized</span>
+<span class="n">position_size</span> <span class="o">=</span> <span class="n">base_size</span> <span class="o">*</span> <span class="n">scale</span>
+</code></pre></div>
+
+<p><strong>Expected impact</strong>: Reduces drawdowns by 15-30% while maintaining similar returns.</p>
+<h3 id="22-fractional-kelly-overlay">22. Fractional Kelly Overlay</h3>
+<p><strong>Academic basis</strong>: Kelly (1956), Thorp (2006).</p>
+<p>Use quarter-Kelly (f = 0.25 * f*) as a sizing cap. Full Kelly has ~50% probability of 50% drawdown; quarter-Kelly achieves 75% of the growth rate with dramatically lower drawdown.</p>
+<div class="codehilite"><pre><span></span><code><span class="n">p</span> <span class="o">=</span> <span class="n">rolling_win_rate</span><span class="p">(</span><span class="n">last_50_trades</span><span class="p">)</span>
+<span class="n">b</span> <span class="o">=</span> <span class="n">rolling_avg_win</span><span class="p">(</span><span class="n">last_50_trades</span><span class="p">)</span> <span class="o">/</span> <span class="n">rolling_avg_loss</span><span class="p">(</span><span class="n">last_50_trades</span><span class="p">)</span>
+<span class="n">f_kelly</span> <span class="o">=</span> <span class="p">(</span><span class="n">p</span> <span class="o">*</span> <span class="n">b</span> <span class="o">-</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">p</span><span class="p">))</span> <span class="o">/</span> <span class="n">b</span>
+<span class="n">f_adj</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="mf">0.25</span> <span class="o">*</span> <span class="n">f_kelly</span><span class="p">,</span> <span class="mf">0.02</span><span class="p">))</span>  <span class="c1"># Quarter Kelly, capped at 2%</span>
+<span class="n">final_risk_pct</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">vol_target_risk</span><span class="p">,</span> <span class="n">f_adj</span> <span class="o">*</span> <span class="mi">100</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Expected impact</strong>: +20-40% improvement in risk-adjusted returns vs. fixed fractional sizing.</p>
+<h3 id="23-drawdown-based-position-scaling">23. Drawdown-Based Position Scaling</h3>
+<p><strong>Academic basis</strong>: Grossman &amp; Zhou (1993), Chekhlov et al. (2005).</p>
+<p>This is a <strong>sizing overlay</strong>, not a circuit breaker. Every signal still enters; only the dollars-at-risk change:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">dd</span> <span class="o">=</span> <span class="n">current_drawdown_pct</span>
+<span class="n">dd_limit</span> <span class="o">=</span> <span class="n">max_drawdown_tolerance</span>  <span class="c1"># e.g., 20%</span>
+
+<span class="k">if</span> <span class="n">dd</span> <span class="o">&lt;</span> <span class="n">dd_limit</span> <span class="o">*</span> <span class="mf">0.33</span><span class="p">:</span>     <span class="k">return</span> <span class="mf">1.0</span>   <span class="c1"># Full size</span>
+<span class="k">elif</span> <span class="n">dd</span> <span class="o">&lt;</span> <span class="n">dd_limit</span> <span class="o">*</span> <span class="mf">0.66</span><span class="p">:</span>   <span class="k">return</span> <span class="mf">0.5</span>   <span class="c1"># Half size</span>
+<span class="k">elif</span> <span class="n">dd</span> <span class="o">&lt;</span> <span class="n">dd_limit</span><span class="p">:</span>           <span class="k">return</span> <span class="mf">0.25</span>  <span class="c1"># Quarter size</span>
+<span class="k">else</span><span class="p">:</span>                         <span class="k">return</span> <span class="mf">0.0</span>   <span class="c1"># Last resort: broker-level protection</span>
+</code></pre></div>
+
+<p>The 0.0 at the end is the only true halt, and it only triggers at catastrophic drawdown levels where the broker would intervene anyway. Under normal conditions (DD &lt; 7%), zero impact on trading.</p>
+<p><strong>Expected impact</strong>: +20-40% recovery factor improvement.</p>
+<hr />
+<h2 id="priority-2-exit-management-upgrades">Priority 2: Exit Management Upgrades</h2>
+<h3 id="24-partial-profit-taking-scale-out">24. Partial Profit Taking (Scale-Out)</h3>
+<p><strong>Academic basis</strong>: Kaufman (2013), <em>Trading Systems and Methods</em>.</p>
+<p>Currently all-or-nothing exits. Partial profit taking improves win rate by 10-15 percentage points with modest reduction in average win size.</p>
+<p><strong>Fix</strong>: Close 50% at TP1 (1.0 * ATR), move SL to breakeven + buffer, hold remaining for TP2 (2.5 * ATR):</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">unrealized_profit</span> <span class="o">&gt;=</span> <span class="mf">1.0</span> <span class="o">*</span> <span class="n">atr</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">partial_closed</span><span class="p">:</span>
+    <span class="n">close_half_position</span><span class="p">()</span>
+    <span class="n">move_sl_to_breakeven_plus_buffer</span><span class="p">(</span><span class="mf">0.1</span> <span class="o">*</span> <span class="n">atr</span><span class="p">)</span>
+    <span class="n">partial_closed</span> <span class="o">=</span> <span class="kc">True</span>
+</code></pre></div>
+
+<p>This must be wired into both the backtest loop and the live exit path (see item 13).</p>
+<h3 id="25-atr-trailing-stop-trend-strategies-only">25. ATR Trailing Stop (Trend Strategies Only)</h3>
+<p><strong>Academic basis</strong>: Clenow (2013), <em>Following the Trend</em>.</p>
+<p>For trend-following strategies (Supertrend, EMA Ribbon, Donchian), replace fixed TP with a trailing stop that captures more of trending moves:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">trail_distance</span> <span class="o">=</span> <span class="mf">2.5</span> <span class="o">*</span> <span class="n">ATR</span><span class="p">(</span><span class="mi">14</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">is_long</span><span class="p">:</span>
+    <span class="n">new_sl</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">current_sl</span><span class="p">,</span> <span class="n">highest_high_20</span> <span class="o">-</span> <span class="n">trail_distance</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">new_sl</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">current_sl</span><span class="p">,</span> <span class="n">lowest_low_20</span> <span class="o">+</span> <span class="n">trail_distance</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Expected impact</strong>: +30-50% average win size for trend strategies, slight win-rate reduction. Net: higher profit factor.</p>
+<hr />
+<h2 id="priority-2-portfolio-construction">Priority 2: Portfolio Construction</h2>
+<h3 id="27-hierarchical-risk-parity-hrp">27. Hierarchical Risk Parity (HRP)</h3>
+<p><strong>Academic basis</strong>: Lopez de Prado (2016), "Building Diversified Portfolios that Outperform Out-of-Sample", Journal of Portfolio Management.</p>
+<p>Currently equal risk allocation across all validated pairs. Correlated strategies (e.g., 5 EMA-based trend strategies on correlated pairs) get 5x the capital of a single uncorrelated strategy.</p>
+<p><strong>Fix</strong>: After optimization, collect OOS return series for all active strategy-symbol pairs. Apply HRP:</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">scipy.cluster.hierarchy</span><span class="w"> </span><span class="kn">import</span> <span class="n">linkage</span><span class="p">,</span> <span class="n">leaves_list</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">scipy.spatial.distance</span><span class="w"> </span><span class="kn">import</span> <span class="n">squareform</span>
+
+<span class="c1"># Use Ledoit-Wolf shrinkage for stable covariance estimation</span>
+<span class="n">dist</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="mf">0.5</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">corr_matrix</span><span class="p">))</span>
+<span class="n">link</span> <span class="o">=</span> <span class="n">linkage</span><span class="p">(</span><span class="n">squareform</span><span class="p">(</span><span class="n">dist</span><span class="p">),</span> <span class="n">method</span><span class="o">=</span><span class="s1">&#39;single&#39;</span><span class="p">)</span>
+<span class="c1"># Recursive bisection for weights (inversely proportional to cluster variance)</span>
+<span class="c1"># Cap any single pair at 10% of total risk budget</span>
+</code></pre></div>
+
+<p>HRP does not require matrix inversion (unlike Markowitz), so it is stable with noisy covariance estimates. It naturally down-weights correlated strategies rather than removing them, preserving trade frequency.</p>
+<p><strong>Expected impact</strong>: +15-25% Sharpe ratio vs. equal-weight allocation.</p>
+<hr />
+<h2 id="priority-2-regime-detection-enhancement">Priority 2: Regime Detection Enhancement</h2>
+<h3 id="28-hidden-markov-model-hmm-upgrade">28. Hidden Markov Model (HMM) Upgrade</h3>
+<p><strong>Academic basis</strong>: Hamilton (1989), Econometrica.</p>
+<p>Current: 4-regime hysteresis state machine using threshold-based rules. Threshold-based detection is brittle -- small parameter changes flip regime labels.</p>
+<p><strong>Upgrade</strong>: Fit a 3-state Gaussian HMM on rolling 500-bar returns:</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">hmmlearn</span><span class="w"> </span><span class="kn">import</span> <span class="n">GaussianHMM</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">GaussianHMM</span><span class="p">(</span><span class="n">n_components</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">covariance_type</span><span class="o">=</span><span class="s2">&quot;full&quot;</span><span class="p">,</span> <span class="n">n_iter</span><span class="o">=</span><span class="mi">100</span><span class="p">)</span>
+<span class="n">returns</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">diff</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">close</span><span class="p">[</span><span class="o">-</span><span class="mi">500</span><span class="p">:]))</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">returns</span><span class="p">)</span>
+<span class="n">probs</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">predict_proba</span><span class="p">(</span><span class="n">returns</span><span class="p">)</span>
+
+<span class="c1"># Map states by statistical properties, not index</span>
+<span class="n">state_means</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">means_</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+<span class="n">trend_state</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">state_means</span><span class="p">))</span>
+<span class="n">range_state</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">argmin</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">covars_</span><span class="o">.</span><span class="n">flatten</span><span class="p">())</span>
+</code></pre></div>
+
+<p>Key advantage: HMM provides posterior probabilities. Use P(TREND) &gt; 0.7 to deploy trend strategies, P(RANGE) &gt; 0.7 for mean-reversion. Ambiguous regimes (no state &gt; 0.7) = reduce size. This naturally handles regime transitions instead of hard flips.</p>
+<p><strong>Expected impact</strong>: 15-30% better strategy selection vs. threshold-based detection.</p>
+<h3 id="29-garch-volatility-overlay">29. GARCH Volatility Overlay</h3>
+<p><strong>Academic basis</strong>: Bollerslev (1986).</p>
+<p>Add GARCH(1,1) volatility estimate as an additional regime feature to capture volatility clustering:</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">arch</span><span class="w"> </span><span class="kn">import</span> <span class="n">arch_model</span>
+<span class="n">garch</span> <span class="o">=</span> <span class="n">arch_model</span><span class="p">(</span><span class="n">returns</span><span class="p">,</span> <span class="n">vol</span><span class="o">=</span><span class="s1">&#39;Garch&#39;</span><span class="p">,</span> <span class="n">p</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">q</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">mean</span><span class="o">=</span><span class="s1">&#39;Zero&#39;</span><span class="p">)</span>
+<span class="n">result</span> <span class="o">=</span> <span class="n">garch</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">disp</span><span class="o">=</span><span class="s1">&#39;off&#39;</span><span class="p">)</span>
+<span class="n">vol_ratio</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">conditional_volatility</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">/</span> <span class="n">returns</span><span class="o">.</span><span class="n">std</span><span class="p">()</span>
+<span class="c1"># vol_ratio &gt; 1.5: HIGH_VOL boost, vol_ratio &lt; 0.7: LOW_VOL boost</span>
+</code></pre></div>
+
+<hr />
+<h2 id="priority-2-execution-quality">Priority 2: Execution Quality</h2>
+<h3 id="30-spread-aware-signal-filter">30. Spread-Aware Signal Filter</h3>
+<p><strong>Academic basis</strong>: Almgren &amp; Chriss (2001), "Optimal Execution".</p>
+<p>A trade's expected move must exceed transaction costs for positive expectancy:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">min_edge</span> <span class="o">=</span> <span class="mf">1.5</span> <span class="o">*</span> <span class="n">current_spread</span>
+<span class="k">if</span> <span class="n">ATR</span><span class="p">(</span><span class="mi">14</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">min_edge</span><span class="p">:</span>
+    <span class="n">skip_trade</span><span class="p">(</span><span class="s2">&quot;ATR &lt; 1.5x spread: insufficient edge&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Volume preservation</strong>: This only filters trades where the expected move is smaller than costs -- trades that would have been net losers anyway. For wide-spread instruments (XAUUSD, DE30, exotics), this alone improves net profitability by 10-20%.</p>
+<h3 id="31-spread-spike-detection">31. Spread Spike Detection</h3>
+<p>Track rolling spread median. Skip trades when current spread &gt; 2x median:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">current_spread</span> <span class="o">&gt;</span> <span class="mf">2.0</span> <span class="o">*</span> <span class="n">rolling_spread_median</span><span class="p">[</span><span class="n">symbol</span><span class="p">]:</span>
+    <span class="n">skip_trade</span><span class="p">(</span><span class="s2">&quot;Spread spike detected&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h2 id="priority-2-dashboard-config-tests">Priority 2: Dashboard, Config &amp; Tests</h2>
+<h3 id="32-separate-orders-fills-and-closed-trades">32. Separate Orders, Fills, and Closed Trades</h3>
+<p><strong>Found by audit.</strong> <code>trades_*.json</code> stores entry attempts, not realized outcomes. Dashboard analytics read these as trade history. Failed orders are counted as trades.</p>
+<p><strong>Fix</strong>: Split logging into: order attempts, fills, active positions, closed trades. Base analytics on realized closed-trade outcomes or MT5 history. Filter failed/cancelled orders from metrics.</p>
+<h3 id="33-standardize-on-biweekly-sunday-retrain">33. Standardize on Biweekly Sunday Retrain</h3>
+<p>The current <code>RetrainPeriodSelector.select_period()</code> scores fixed params on rolling windows without simulating real re-optimization cadence. It is a weak proxy that does not justify the extra complexity or the risk of choosing a bad cadence.</p>
+<p><strong>Fix</strong>: Demote or remove the retrain-period optimizer. Standardize on a <strong>fixed biweekly Sunday retrain</strong> for all symbols. This is operationally simpler, empirically sufficient for this PM's timeframe mix, and avoids a selection layer that is not robust enough to trust with cadence decisions. The selector can be preserved as a research-only diagnostic tool for periodic methodology audits, but it should not sit on the production critical path.</p>
+<h3 id="34-missing-analytics-metrics">34. Missing Analytics Metrics</h3>
+<p>Add to <code>pm_dashboard/analytics.py</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Formula</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Drawdown Duration</td>
+<td>Max bars spent in drawdown</td>
+<td>Patience assessment</td>
+</tr>
+<tr>
+<td>Recovery Time</td>
+<td>Bars to recover from max DD</td>
+<td>Capital efficiency</td>
+</tr>
+<tr>
+<td>Ulcer Index</td>
+<td><code>sqrt(mean(DD^2))</code></td>
+<td>Better risk metric than StdDev</td>
+</tr>
+</tbody>
+</table>
+<h3 id="35-test-coverage-gaps">35. Test Coverage Gaps</h3>
+<p>Highest-value missing tests:<br />
+- Same-bar entry/exit behavior<br />
+- Gap-through-stop fills<br />
+- Mark-to-market drawdown<br />
+- Numba vs Python metric parity<br />
+- Swap application<br />
+- Net-dollar win/loss classification<br />
+- Post-rounding actual-risk enforcement<br />
+- Purged split / embargo invariants<br />
+- Optuna multi-regime objective behavior<br />
+- Dashboard outcome vs order-attempt accounting</p>
+<p>Also: add <code>pytest.ini</code> so plain <code>pytest</code> works from repo root.</p>
+<hr />
+<h2 id="priority-3-recovery-factor-strategy-rotation">Priority 3: Recovery Factor &amp; Strategy Rotation</h2>
+<h3 id="36-equity-curve-trading">36. Equity Curve Trading</h3>
+<p><strong>Academic basis</strong>: Faber (2007), Journal of Wealth Management.</p>
+<p>Apply a moving average to each strategy's equity curve. Trade at reduced size when equity is below its MA:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">equity_ma</span> <span class="o">=</span> <span class="n">EMA</span><span class="p">(</span><span class="n">strategy_equity_curve</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="mi">25</span><span class="n">_trades</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">strategy_equity</span> <span class="o">&lt;</span> <span class="n">equity_ma</span><span class="p">:</span>
+    <span class="n">scale</span> <span class="o">=</span> <span class="mf">0.5</span>  <span class="c1"># Half size while underperforming</span>
+<span class="k">if</span> <span class="n">strategy_equity</span> <span class="o">&lt;</span> <span class="n">equity_ma</span> <span class="o">*</span> <span class="mf">0.95</span><span class="p">:</span>
+    <span class="n">scale</span> <span class="o">=</span> <span class="mf">0.25</span>  <span class="c1"># Quarter size</span>
+</code></pre></div>
+
+<p><strong>Volume preservation</strong>: This reduces size, not frequency. Every signal still enters. Number of trades stays identical.</p>
+<h3 id="37-strategy-rotation-sizing-based">37. Strategy Rotation (Sizing-Based)</h3>
+<p>Score each strategy-symbol pair on rolling OOS performance:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">score</span> <span class="o">=</span> <span class="mf">0.6</span> <span class="o">*</span> <span class="n">normalize</span><span class="p">(</span><span class="n">rolling_sharpe_60</span><span class="p">)</span> <span class="o">+</span> <span class="mf">0.4</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">rolling_dd</span> <span class="o">/</span> <span class="n">threshold</span><span class="p">)</span>
+<span class="c1"># Top 25%:    100% allocation</span>
+<span class="c1"># 25-50%:     75% allocation</span>
+<span class="c1"># 50-75%:     50% allocation</span>
+<span class="c1"># Bottom 25%: 25% allocation (reduced, NOT zero)</span>
+</code></pre></div>
+
+<p>No strategy is fully benched. Trade count stays constant; only sizing distribution changes.</p>
+<p><strong>Caution</strong>: Short-term strategy performance is often mean-reverting (Clenow 2013). Use 6-12 month lookback for allocation weights. Only use short-term performance for drawdown protection.</p>
+<hr />
+<h2 id="appendix-a-strategy-robustness-analysis">Appendix A: Strategy Robustness Analysis</h2>
+<p>Deep analysis of the original 42-strategy roster scored on signal quality, parameter space, mathematical robustness, and edge-case behavior. This informs which strategies to trust, demote, or fix. The upgraded live roster is now 47 after the 5 G7 additions.</p>
+<h3 id="tier-1-highest-robustness-8-910-core-portfolio">Tier 1: Highest Robustness (8-9/10) -- Core Portfolio</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Score</th>
+<th>Why Robust</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SupertrendStrategy</td>
+<td>9/10</td>
+<td>Mechanically sound band continuation, few parameters, decades of validation</td>
+</tr>
+<tr>
+<td>DonchianBreakoutStrategy</td>
+<td>9/10</td>
+<td>Simplest logic = hardest to overfit, pure structural</td>
+</tr>
+<tr>
+<td>PivotBreakoutStrategy</td>
+<td>8/10</td>
+<td>Two-stage confirmation (breakout + retest), stateful</td>
+</tr>
+<tr>
+<td>EMARibbonADXStrategy</td>
+<td>8/10</td>
+<td>Multi-indicator confirmation, state-transition logic</td>
+</tr>
+<tr>
+<td>FisherTransformMRStrategy</td>
+<td>8/10</td>
+<td>Mathematically rigorous recursive smoothing. <strong>Caveat: dead <code>signal_period</code> param (Appendix D2) -- fix before trusting tuned params.</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="tier-2-good-robustness-7-7510-reliable">Tier 2: Good Robustness (7-7.5/10) -- Reliable</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Score</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ZScoreVWAPReversionStrategy</td>
+<td>7.5/10</td>
+<td>Fair-value based, strong concept. Reduce param space (17,600 combos is excessive).</td>
+</tr>
+<tr>
+<td>SqueezeBreakoutStrategy</td>
+<td>7.5/10</td>
+<td>Multi-indicator, squeeze is a measurable volatility state. <strong>Caveat: fake <code>bb_std</code> grid (Appendix D2) -- fix before trusting tuned params.</strong></td>
+</tr>
+<tr>
+<td>KeltnerPullbackStrategy</td>
+<td>7.5/10</td>
+<td>4-part logic reduces false signals</td>
+</tr>
+<tr>
+<td>ZScoreMRStrategy</td>
+<td>7/10</td>
+<td>Statistical basis is sound, Z-score is distribution-aware</td>
+</tr>
+<tr>
+<td>VolumeSpikeMomentumStrategy</td>
+<td>7/10</td>
+<td>Volume is orthogonal to price -- genuine additional information</td>
+</tr>
+<tr>
+<td>KeltnerFadeStrategy</td>
+<td>7/10</td>
+<td>Good mean-reversion to midline logic</td>
+</tr>
+<tr>
+<td>ROCExhaustionReversalStrategy</td>
+<td>7/10</td>
+<td>Percentile-based, good noise resistance</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tier-3-moderate-55-6510-use-with-caution">Tier 3: Moderate (5.5-6.5/10) -- Use With Caution</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Score</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ADXDIStrengthStrategy</td>
+<td>6.5/10</td>
+<td>Good regime filter, better than ADXTrendStrategy</td>
+</tr>
+<tr>
+<td>HullMATrendStrategy</td>
+<td>6.5/10</td>
+<td>Hull MA responsive but parameter-sensitive</td>
+</tr>
+<tr>
+<td>RSITrendFilteredMRStrategy</td>
+<td>6.5/10</td>
+<td>Good directional filter</td>
+</tr>
+<tr>
+<td>StochRSITrendGateStrategy</td>
+<td>6.5/10</td>
+<td>Two indicators + trend filter</td>
+</tr>
+<tr>
+<td>EngulfingPatternStrategy</td>
+<td>6.5/10</td>
+<td>Pattern + location + ADX confirmation. <strong>Caveat: dead <code>lookback_level</code> param (Appendix D2).</strong></td>
+</tr>
+<tr>
+<td>TurtleSoupReversalStrategy</td>
+<td>6/10</td>
+<td>Fade failed breakouts; reclaim_window is key</td>
+</tr>
+<tr>
+<td>PinBarReversalStrategy</td>
+<td>6/10</td>
+<td>Pattern recognition solid; proximity filter good. <strong>Caveat: double-shifted entry delay (Appendix D2) -- entries are 2 bars late, not 1.</strong></td>
+</tr>
+<tr>
+<td>EMACrossoverStrategy</td>
+<td>5.5/10</td>
+<td>Too simple, whipsaw-prone in ranges</td>
+</tr>
+<tr>
+<td>MACDTrendStrategy</td>
+<td>5.5/10</td>
+<td>Standard but prone to false signals</td>
+</tr>
+<tr>
+<td>ADXTrendStrategy</td>
+<td>5.5/10</td>
+<td>ADX lags; use ADXDIStrength instead. <strong>Caveat: discards precomputed indicators, re-warms per slice (Appendix D2).</strong></td>
+</tr>
+<tr>
+<td>KeltnerBreakoutStrategy</td>
+<td>5.5/10</td>
+<td>Simple but effective</td>
+</tr>
+<tr>
+<td>BollingerBounceStrategy</td>
+<td>5.5/10</td>
+<td>Band touches without momentum confirmation</td>
+</tr>
+<tr>
+<td>NarrowRangeBreakoutStrategy</td>
+<td>5.5/10</td>
+<td>Simple range logic</td>
+</tr>
+<tr>
+<td>VolatilityBreakoutStrategy</td>
+<td>5.5/10</td>
+<td>Price-change vs ATR; prone to noise</td>
+</tr>
+<tr>
+<td>WilliamsRStrategy</td>
+<td>5.5/10</td>
+<td>Straightforward but oscillator limitation</td>
+</tr>
+<tr>
+<td>IchimokuStrategy</td>
+<td>5/10</td>
+<td>Complex, Senkou B 52-period lag delays signals</td>
+</tr>
+<tr>
+<td>KaufmanAMATrendStrategy</td>
+<td>5/10</td>
+<td>Adaptive speed good but signal mode choice adds complexity</td>
+</tr>
+<tr>
+<td>ParabolicSARTrendStrategy</td>
+<td>5/10</td>
+<td>Classic but whipsaws in ranges. <strong>Caveat: can fabricate a short on first bar of sliced window (Appendix D2).</strong></td>
+</tr>
+<tr>
+<td>MACDHistogramMomentumStrategy</td>
+<td>5/10</td>
+<td>Basic but has filter options</td>
+</tr>
+<tr>
+<td>EMAPullbackContinuationStrategy</td>
+<td>5/10</td>
+<td>Good concept, moderate execution</td>
+</tr>
+<tr>
+<td>OBVDivergenceStrategy</td>
+<td>5/10</td>
+<td>Divergence detection complex</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tier-4-high-curve-fit-risk-2-410-demote-to-probation">Tier 4: High Curve-Fit Risk (2-4/10) -- Demote to Probation</h3>
+<p>These strategies should not be deleted but should face a stricter gate (DSR + minimum 25 validation trades):</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Score</th>
+<th>Problem</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MomentumBurstStrategy</td>
+<td>2/10</td>
+<td>Single oscillator, no confirmation, 6.7x parameter spread. Currently 75/365 winners.</td>
+</tr>
+<tr>
+<td>AroonTrendStrategy</td>
+<td>3/10</td>
+<td>Inherently noisy (time-since-extreme), excessive false signals</td>
+</tr>
+<tr>
+<td>StochasticReversalStrategy</td>
+<td>3/10</td>
+<td>Zone overlap logic (oversold + 10) creates ambiguous signals</td>
+</tr>
+<tr>
+<td>CCIReversalStrategy</td>
+<td>4/10</td>
+<td>Arbitrary MAD scaling (0.015), uncalibrated thresholds</td>
+</tr>
+<tr>
+<td>RSIDivergenceStrategy</td>
+<td>4/10</td>
+<td>O(n^2) swing detection, magic numbers, edge cases uncaught</td>
+</tr>
+<tr>
+<td>MACDDivergenceStrategy</td>
+<td>4/10</td>
+<td>Divergence of a derivative = high-order noise</td>
+</tr>
+</tbody>
+</table>
+<h3 id="broken-strategy">Broken Strategy</h3>
+<p><strong>InsideBarBreakoutStrategy</strong> -- <strong>structurally broken</strong> (verified). The signal requires the current bar to be an inside bar (High &lt; prev High, Low &gt; prev Low) AND close outside the mother bar's range. This is impossible on valid OHLC data because Close &lt;= High &lt; Mother High. This strategy generates zero trades. <strong>Fix the logic</strong> so signals trigger on the bar after the inside bar sequence, not on the inside bar itself.</p>
+<hr />
+<h2 id="appendix-b-scoring-configuration-tuning">Appendix B: Scoring &amp; Configuration Tuning</h2>
+<h3 id="score-weight-rebalancing">Score Weight Rebalancing</h3>
+<p>Current:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;sharpe&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.25</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;profit_factor&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.20</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;win_rate&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.15</span><span class="p">,</span>
+<span class="w"> </span><span class="nt">&quot;total_return&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.15</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;max_drawdown&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.15</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;trade_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.10</span><span class="p">}</span>
+</code></pre></div>
+
+<p>Recommended (after fixing Sharpe calculation):</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;sharpe&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.20</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;profit_factor&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.25</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;max_drawdown&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.25</span><span class="p">,</span>
+<span class="w"> </span><span class="nt">&quot;total_return&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.10</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;win_rate&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.10</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;trade_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.10</span><span class="p">}</span>
+</code></pre></div>
+
+<p>Rationale: Profit factor and max drawdown are the most robust predictors of live performance. Win rate is the weakest predictor.</p>
+<h3 id="config-threshold-adjustments">Config Threshold Adjustments</h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Current</th>
+<th>Recommended</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>regime_min_val_profit_factor</code></td>
+<td>1.05</td>
+<td>1.15</td>
+<td>PF 1.05 is net-negative after real costs</td>
+</tr>
+<tr>
+<td><code>train_min_profit_factor</code></td>
+<td>0.50</td>
+<td>0.80</td>
+<td>PF 0.50 wastes Optuna budget on hopeless candidates</td>
+</tr>
+<tr>
+<td><code>fx_gap_penalty_lambda</code></td>
+<td>0.50</td>
+<td>0.70</td>
+<td>Current penalty insufficient for train-optimized params</td>
+</tr>
+<tr>
+<td><code>fx_val_min_trades</code></td>
+<td>5</td>
+<td>15</td>
+<td>5 trades = zero statistical power (graduate to 25 as data grows)</td>
+</tr>
+<tr>
+<td><code>regime_min_val_trades</code></td>
+<td>10</td>
+<td>15</td>
+<td>Paired with confidence-adjusted scoring (not hard cutoff)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="implementation-roadmap">Implementation Roadmap</h2>
+<h3 id="phase-1-fix-measurement-strategy-bugs-week-1-2">Phase 1: Fix Measurement &amp; Strategy Bugs (Week 1-2)</h3>
+<p>Items 1-8 (backtest parity), plus strategy implementation fixes from Appendix D2 (dead params, fabricated signals, double-shifted entries). Re-run optimization on 5 symbols after. Expect headline metrics to drop ~20-30%. This is accuracy, not degradation.</p>
+<h3 id="phase-2-fix-validation-data-integrity-week-2-3">Phase 2: Fix Validation &amp; Data Integrity (Week 2-3)</h3>
+<p>Items 9-11, 20. Clean up scored overlap (warm-up only, don't score it). Add clean holdout. Add DSR. Fix data freshness/cache issues from Appendix D1 (stale cache during retrain, path divergence).</p>
+<h3 id="phase-3-risk-execution-parity-week-3-4">Phase 3: Risk &amp; Execution Parity (Week 3-4)</h3>
+<p>Items 12-16. Portfolio risk awareness, live exit wiring, MT5 hardening, live stop bar-alignment fix. Standardize biweekly Sunday retrain (item 33).</p>
+<h3 id="phase-4-search-selection-week-4-5">Phase 4: Search &amp; Selection (Week 4-5)</h3>
+<p>Items 17-19. Fix Optuna objective, regime specialist preservation. Re-run full selection after methodology fixes -- then assess whether concentration persists on clean holdouts.</p>
+<h3 id="phase-5-performance-enhancement-week-5-8">Phase 5: Performance Enhancement (Week 5-8)</h3>
+<p>Items 21-31. Position sizing, exits, HRP, regime detection, execution quality. Test these after measurement defects are fixed so improvements are measured honestly.</p>
+<h3 id="phase-6-dashboard-infrastructure-week-8-10">Phase 6: Dashboard &amp; Infrastructure (Week 8-10)</h3>
+<p>Items 32-37. Fix dashboard realized-performance model (Appendix E), tests, equity curve trading.</p>
+<hr />
+<h2 id="academic-references">Academic References</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Reference</th>
+<th>Topic</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Bailey &amp; Lopez de Prado (2014), "The Deflated Sharpe Ratio", J. Portfolio Management</td>
+<td>Overfitting detection</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Bailey, Borwein, Lopez de Prado, Zhu (2017), "Probability of Backtest Overfitting", J. Computational Finance</td>
+<td>PBO/CPCV</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Pardo (2008), <em>Evaluation and Optimization of Trading Strategies</em>, Wiley</td>
+<td>Walk-forward methodology</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Lopez de Prado (2018), <em>Advances in Financial Machine Learning</em>, Wiley</td>
+<td>ML for finance</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Lopez de Prado (2016), "Building Diversified Portfolios that Outperform OOS", J. Portfolio Management</td>
+<td>HRP</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Hamilton (1989), "A New Approach to Nonstationary Time Series", Econometrica</td>
+<td>HMM regime detection</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Moskowitz, Ooi, Pedersen (2012), "Time Series Momentum", J. Financial Economics</td>
+<td>Volatility targeting</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Kelly (1956), "A New Interpretation of Information Rate", Bell System Technical Journal</td>
+<td>Kelly criterion</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Grossman &amp; Zhou (1993), "Optimal Investment Strategies for Controlling Drawdowns", Mathematical Finance</td>
+<td>Drawdown control</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Chekhlov, Uryasev, Zabarankin (2005), "Drawdown Measure in Portfolio Optimization", IJTAF</td>
+<td>CDaR</td>
+</tr>
+<tr>
+<td>11</td>
+<td>White (2000), "A Reality Check for Data Snooping", Econometrica</td>
+<td>Multiple testing</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Hansen (2005), "A Test for Superior Predictive Ability", J. Business &amp; Economic Statistics</td>
+<td>SPA test</td>
+</tr>
+<tr>
+<td>13</td>
+<td>Harvey, Liu, Zhu (2016), "...and the Cross-Section of Expected Returns", Rev. Financial Studies</td>
+<td>t &gt; 3.0 rule</td>
+</tr>
+<tr>
+<td>14</td>
+<td>Almgren &amp; Chriss (2001), "Optimal Execution of Portfolio Transactions", J. Risk</td>
+<td>Execution quality</td>
+</tr>
+<tr>
+<td>15</td>
+<td>Kaufman (2013), <em>Trading Systems and Methods</em> (5th ed.), Wiley</td>
+<td>Exits, trailing stops</td>
+</tr>
+<tr>
+<td>16</td>
+<td>Clenow (2013), <em>Following the Trend</em>, Wiley</td>
+<td>ATR exits</td>
+</tr>
+<tr>
+<td>17</td>
+<td>Faber (2007), "Quantitative Approach to Tactical Asset Allocation", J. Wealth Management</td>
+<td>Equity curve trading</td>
+</tr>
+<tr>
+<td>18</td>
+<td>Bollerslev (1986), "Generalized Autoregressive Conditional Heteroskedasticity", J. Econometrics</td>
+<td>GARCH</td>
+</tr>
+<tr>
+<td>19</td>
+<td>Thorp (2006), "The Kelly Criterion in Blackjack, Sports Betting, and the Stock Market"</td>
+<td>Fractional Kelly</td>
+</tr>
+<tr>
+<td>20</td>
+<td>Ledoit &amp; Wolf (2012), "Nonlinear Shrinkage Estimation of Large-Dimensional Covariance Matrices"</td>
+<td>Covariance shrinkage</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p><em>Merged from deep analysis of ~14,000 lines across all core modules, independently audited, and verified against the live codebase. Every claim was checked against actual code with line numbers.</em></p>
+<hr />
+<h2 id="appendix-c-validation-design-freshness">Appendix C: Validation Design &amp; Freshness</h2>
+<p>This appendix addresses the validation split design directly and honestly.</p>
+<h3 id="c1-the-core-question">C1. The Core Question</h3>
+<p>Should the PM add walk-forward validation? After deep consideration of the specific operating constraints, <strong>no</strong>.</p>
+<h3 id="c2-why-walk-forward-does-not-fit-this-pm">C2. Why Walk-Forward Does Not Fit This PM</h3>
+<p>Walk-forward validation was designed for systems that optimize once and deploy for months or years. It answers: "will this configuration survive across multiple unseen market periods?" That is a valid concern when your deployment horizon is long.</p>
+<p>This PM retrains every two weeks. Each configuration lives for exactly one biweekly window before being replaced. The question is not "will this config work six months from now?" -- it will not even be deployed then. The question is: "is this the best config for the next two weeks, given the freshest data available?"</p>
+<p>Walk-forward would split the ~500,000 bars (~7-9 years of M5 data) into multiple smaller training and testing windows. Each window would have less data for training, less data for validation, and the test windows would include older market conditions that are less relevant to the next two-week deployment. This directly undermines the freshness goal that drives the entire retrain cadence.</p>
+<p>The biweekly retrain cycle <strong>is itself a form of walk-forward</strong> -- it just happens in production rather than in backtest. Every two weeks, the PM faces genuinely unseen data. If a configuration was overfit, it fails in the next window and gets replaced. Over months of operation, the PM accumulates exactly the kind of multi-period evidence that walk-forward tries to simulate.</p>
+<p>The 80/30 split on ~500k bars gives ~400k training bars (~5+ years) and ~150k validation bars (~2+ years). That validation window is already massive relative to the 2-week deployment horizon. The problem is not the amount of validation data. The problem is the scored overlap.</p>
+<h3 id="c3-what-actually-needs-to-change">C3. What Actually Needs to Change</h3>
+<p>The real issue is simpler and more specific than walk-forward: <strong>the 70-80% overlap region is both trained on and scored as validation</strong>. This makes validation scores optimistic regardless of any other design choice. Fix this without adding walk-forward:</p>
+<ol>
+<li><strong>Train on <code>[0, 80%]</code></strong> -- keep the full training window for maximum learning.</li>
+<li><strong>Allow a short backward overlap only as an indicator/regime warm-up buffer</strong> -- typically <code>max_lookback</code> bars (200-500 bars). This overlap is NOT scored.</li>
+<li><strong>Score candidates on <code>[80% + warmup, 100%]</code> only</strong> -- a clean recent holdout that was never fitted.</li>
+<li><strong>Reserve a small final holdout</strong> (~15% of the validation window) that is used only for accept/reject, never for screening or tuning.</li>
+</ol>
+<p>Concrete example with 500k bars:</p>
+<div class="codehilite"><pre><span></span><code>Train:     [0, 400000]            ~5.5 years   (parameter fitting)
+Warmup:    [400000, 400500]        ~500 bars    (indicator state, NOT scored)
+Validation:[400500, 485000]        ~84k bars    (screening, tuning, selection)
+Holdout:   [485000, 500000]        ~15k bars    (final accept/reject ONLY)
+</code></pre></div>
+
+<p>This preserves freshness (validation and holdout are the most recent data), preserves statistical power (84k + 15k clean bars is substantial), and eliminates the scored-overlap optimism.</p>
+<h3 id="c4-why-this-is-sufficient">C4. Why This Is Sufficient</h3>
+<ul>
+<li>The deployment horizon is 2 weeks. The validation window covers ~1.2 years of recent data. That is more than enough to assess a 2-week config.</li>
+<li>The biweekly retrain provides natural walk-forward protection in production. If a strategy is overfit, it gets replaced.</li>
+<li>Adding DSR (item 11) and a clean holdout provides the overfitting protection that walk-forward would give, without fragmenting the training data or compromising freshness.</li>
+<li>The current retrain-period selector should still be demoted to research-only (item 33). The biweekly cadence is the right operational default.</li>
+</ul>
+<h3 id="c5-where-i-agree-with-the-current-design">C5. Where I Agree With the Current Design</h3>
+<ul>
+<li><strong>Freshness is a real concern.</strong> Models trained on stale data degrade faster than the selection process can detect. The biweekly retrain on the most recent data is the right response.</li>
+<li><strong>Candle-based next-bar execution lag is an accepted design constraint.</strong> The correct target is to eliminate avoidable parity errors, not to pretend tick-perfect execution is available.</li>
+<li><strong>Hard circuit breakers should stay minimal.</strong> Broker-protective last-resort controls only.</li>
+<li><strong>Correctness &gt; accuracy &gt; efficiency.</strong> Where two methods produce the same result, the more efficient one wins.</li>
+</ul>
+<h3 id="c6-what-i-would-not-change">C6. What I Would Not Change</h3>
+<ul>
+<li>I would <strong>not</strong> add walk-forward as a production requirement.</li>
+<li>I would <strong>not</strong> reduce the training window to create more test windows.</li>
+<li>I would <strong>not</strong> add any structural layer that compromises data freshness for theoretical purity.</li>
+<li>Walk-forward can be kept as an <strong>occasional research audit</strong> (e.g., quarterly methodology check) but should never sit on the critical production path.</li>
+</ul>
+<hr />
+<h2 id="appendix-d-additional-verified-code-findings">Appendix D: Additional Verified Code Findings</h2>
+<p>These are additive findings beyond the earlier core list. Some are outright correctness bugs; others are high-confidence integrity risks that can distort selection, retraining freshness, or live parity.</p>
+<h3 id="d1-backtest-live-parity-and-pipeline-integrity">D1. Backtest / Live Parity and Pipeline Integrity</h3>
+<ul>
+<li><strong>Live stop placement can read the forming bar instead of the closed signal bar</strong> (<code>pm_main.py:1419</code>, <code>pm_main.py:1660</code>, <code>pm_strategies.py:304-330</code>). Live entries are decided from <code>signals.iloc[-2]</code>, but <code>calculate_stops(..., bar_index=None)</code> defaults to reading <code>.iloc[-1]</code>. Impact: stop distance can be based on the forming candle while the signal came from the prior closed candle. This is a real avoidable parity defect and should be fixed before spending effort on generic slippage debates.</li>
+<li><strong>Auto-retrain can optimize stale cached data</strong> (<code>pm_core.py:1486-1489</code>, <code>pm_pipeline.py:2675</code>, <code>pm_pipeline.py:2810-2812</code>). The retrain path calls <code>run_for_symbol()</code> without clearing the data cache first, unlike the initial optimization loop. Freshly fetched files can therefore be ignored during retrain.</li>
+<li><strong>Fetch path and optimization path can diverge</strong> (<code>pm_main.py:2280</code>, <code>pm_main.py:2482-2485</code>, <code>pm_pipeline.py:2334-2337</code>). Historical downloads are written to <code>args.data_dir</code> / <code>self.data_dir</code>, while the pipeline reads <code>config.data_dir</code>. If those differ, retrain can silently use stale on-disk data.</li>
+<li><strong>Missing M5 data can silently fall back to the wrong timeframe file</strong> (<code>pm_core.py:1492-1504</code>). The final pattern fallback <code>f"{symbol}*.csv"</code> can pick an H1 or D1 file and treat it as base M5 data, poisoning all downstream resampling.</li>
+<li><strong>Auto-retrain does not fully invalidate same-bar live decision state</strong> (<code>pm_main.py:1327-1333</code>, <code>pm_main.py:2238-2244</code>, <code>pm_main.py:286-320</code>). Candidate caching and per-bar decision suppression can continue using pre-retrain state until the next bar boundary.</li>
+<li><strong>Regime parameter caching can freeze after the first miss</strong> (<code>pm_regime.py:362-378</code>, <code>pm_regime.py:408-412</code>). <code>_REGIME_PARAMS_LOADED</code> is set even on <code>FileNotFoundError</code>, so later file creation or updates are ignored unless the cache is manually cleared.</li>
+<li><strong>Offline and live higher-timeframe construction are not identical</strong> (<code>pm_core.py:1679</code>, <code>pm_regime_tuner.py:312</code>, <code>pm_main.py:1311</code>). Optimization uses locally resampled M5 data; live uses broker-native timeframe bars. This is not automatically a bug, but it is a real regime/indicator parity risk at session boundaries and should be tolerance-tested or standardized.</li>
+</ul>
+<h3 id="d2-strategy-specific-verified-issues">D2. Strategy-Specific Verified Issues</h3>
+<ul>
+<li><strong><code>ParabolicSARTrendStrategy</code> can fabricate a short on the first bar of a sliced window</strong> (<code>pm_strategies.py:2675</code>, <code>pm_strategies.py:2714</code>, <code>pm_pipeline.py:2399</code>, <code>pm_core.py:2500</code>). Because <code>_compute_psar()</code> seeds <code>psar[0] = high[0]</code>, valid OHLC data makes <code>above[0] = False</code>, while <code>above.shift(1, fill_value=True)</code> can force a first-bar <code>flip_short</code>. Impact: boundary trades that are artifacts of slicing, not real market events.</li>
+<li><strong><code>PinBarReversalStrategy</code> is delayed by two bars, not one</strong> (<code>pm_strategies.py:2281</code>, <code>pm_core.py:2500</code>). The strategy already shifts pin bars forward one bar, and the backtester then enters on the next bar again. Impact: reversal entries are systematically late and materially change the intended pattern behavior.</li>
+<li><strong><code>SqueezeBreakoutStrategy</code> has a partly fake <code>bb_std</code> grid</strong> (<code>pm_strategies.py:1615</code>, <code>pm_core.py:2037</code>). The shared BB helper is keyed only by period, and <code>compute_all()</code> precomputes <code>BB_*_20</code> at <code>std=2.0</code>, so many <code>bb_period=20</code> trials ignore the requested <code>bb_std</code>. Impact: duplicated / mislabeled Optuna trials.</li>
+<li><strong><code>ADXTrendStrategy</code> throws away valid precomputed full-history indicators and re-warms inside each slice</strong> (<code>pm_pipeline.py:2399</code>, <code>pm_core.py:2056</code>, <code>pm_strategies.py:600-624</code>). Impact: the opening bars of each train/validation slice are artificially ineligible for signals even though the full series already contains enough history. This is both a correctness and efficiency violation relative to your stated lens.</li>
+<li><strong><code>EngulfingPatternStrategy</code> has a dead optimization parameter</strong> (<code>pm_strategies.py:2302</code>, <code>pm_strategies.py:2308-2329</code>, <code>pm_strategies.py:2332</code>). <code>lookback_level</code> is in defaults and the grid, but <code>generate_signals()</code> never uses it. The advertised Donchian/location concept is therefore not implemented as tuned.</li>
+<li><strong><code>FisherTransformMRStrategy</code> has a dead optimization parameter</strong> (<code>pm_strategies.py:1284</code>, <code>pm_strategies.py:1330-1345</code>, <code>pm_strategies.py:1352</code>). <code>signal_period</code> changes <code>fisher_signal</code>, but the entry rules never use <code>fisher_signal</code>. Impact: duplicated trials and misleading "best" parameters.</li>
+</ul>
+<h3 id="d3-implication-for-appendix-a-robustness-rankings">D3. Implication For Appendix A Robustness Rankings</h3>
+<p>Until the above are fixed, treat the robustness scores for the following as <strong>provisional rather than trustworthy</strong>:</p>
+<ul>
+<li><code>ParabolicSARTrendStrategy</code></li>
+<li><code>PinBarReversalStrategy</code></li>
+<li><code>SqueezeBreakoutStrategy</code></li>
+<li><code>ADXTrendStrategy</code></li>
+<li><code>EngulfingPatternStrategy</code></li>
+<li><code>FisherTransformMRStrategy</code></li>
+</ul>
+<p>In other words: these are no longer just "moderate robustness" cases. They are "fix before trusting optimization output" cases.</p>
+<hr />
+<h2 id="appendix-e-dashboard-monitoring-and-operational-addendum">Appendix E: Dashboard, Monitoring, and Operational Addendum</h2>
+<p>Several monitoring defects deserve to stay in the document even if they feel "secondary", because they directly affect what the team will believe is working.</p>
+<h3 id="e1-additional-verified-dashboard-api-issues">E1. Additional Verified Dashboard / API Issues</h3>
+<ul>
+<li><strong>The dashboard still does not measure realized performance on current repo data</strong> (<code>pm_outputs/trades_20260210_001901.json</code>, <code>pm_dashboard/analytics.py:162-175</code>, <code>pm_dashboard/analytics.py:309-315</code>, <code>pm_dashboard/analytics.py:812</code>). Entry logs without realized <code>pnl/profit</code> are loaded as trades, and missing PnL is treated as <code>0.0</code>. Impact: the current analytics page can show 113 trades with zero winners, losers, PnL, and drawdown.</li>
+<li><strong>Non-FX simulation/reconstruction is materially wrong</strong> (<code>pm_dashboard/analytics.py:553-568</code>, <code>pm_dashboard/analytics.py:764-770</code>, <code>config.json:457</code>, <code>config.json:597</code>, <code>tests/test_dashboard_trade_enrichment.py:117</code>). Pip size and pip value are hardcoded heuristics instead of instrument specs. Verified example: <code>US500</code> can be reconstructed at absurd pip and dollar values.</li>
+<li><strong><code>/api/simulate</code> ignores <code>end_date</code> unless <code>start_date</code> is also present</strong> (<code>pm_dashboard/app.py:241-262</code>). Users can believe they are capping the backtest window when they are not.</li>
+<li><strong><code>/api/simulate</code> can return a <code>500</code> on invalid JSON input</strong> (<code>pm_dashboard/app.py:234</code>, <code>pm_dashboard/app.py:238</code>). Raw <code>float()</code> / <code>int()</code> parsing should return a handled validation error instead.</li>
+<li><strong>Breakdown and monthly panels hardcode <code>10000.0</code> initial capital</strong> (<code>pm_dashboard/analytics.py:452</code>, <code>pm_dashboard/analytics.py:472</code>) even when the top-level metrics use caller-supplied capital. Impact: inconsistent return percentages across panels.</li>
+<li><strong>Timezone-aware timestamps can remain indefinitely "recent"</strong> (<code>pm_dashboard/utils.py:316-323</code>, <code>pm_dashboard/watcher.py:620</code>). <code>is_recent()</code> mixes naive <code>datetime.now()</code> with offset-aware timestamps; the exception path returns <code>True</code>, so stale signals can remain <code>valid_now=True</code>.</li>
+<li><strong>Dashboard regression tests are not runnable from a plain repo-root <code>pytest</code> invocation</strong> (<code>tests/test_dashboard_signals.py:4</code>, <code>tests/test_dashboard_trade_enrichment.py:10</code>, <code>tests/test_dashboard_data_jobs.py:9</code>). This leaves exactly the sort of measurement bugs above under-protected.</li>
+</ul>
+<h3 id="e2-why-these-matter-strategically">E2. Why These Matter Strategically</h3>
+<ul>
+<li>A bad dashboard does not just misreport outcomes; it changes future optimization priorities by telling the team the wrong story.</li>
+<li>If realized PnL, risk, drawdown, and recency are wrong in the monitoring layer, it becomes impossible to know whether subsequent strategy, sizing, or execution upgrades are genuinely helping.</li>
+<li>For that reason, these issues belong much earlier in the upgrade path than a typical "UI bug" would.</li>
+</ul>
+<h3 id="e3-telemetry-worth-promoting-into-first-class-monitoring">E3. Telemetry Worth Promoting Into First-Class Monitoring</h3>
+<p>The live trader already records useful fields that the dashboard should expose consistently:</p>
+<ul>
+<li><code>actual_risk_pct</code></li>
+<li><code>target_risk_pct</code></li>
+<li><code>score</code></li>
+<li><code>quality</code></li>
+<li><code>freshness</code></li>
+<li><code>regime_strength</code></li>
+<li><code>secondary_trade</code></li>
+<li><code>secondary_reason</code></li>
+<li><code>position_context</code></li>
+</ul>
+<p>These are valuable because they let you diagnose <em>why</em> a trade was taken or skipped without adding new circuit breakers.</p>
+<hr />
+<h2 id="appendix-f-final-notes-watchlist-and-priority-re-rank">Appendix F: Final Notes, Watchlist, and Priority Re-Rank</h2>
+<h3 id="f1-watchlist-items-not-yet-elevated-to-hard-bugs">F1. Watchlist Items (Not Yet Elevated To Hard Bugs)</h3>
+<ul>
+<li><strong>Strategy inactivity watchlist</strong>: sampled runs suggest <code>SupertrendStrategy</code>, <code>ATRPercentileBreakoutStrategy</code>, and at times <code>FisherTransformMRStrategy</code> may have unusually low signal density on some symbol/timeframe combinations. I am not classifying that as a bug yet, but it is worth a systematic signal-density audit after the dead-parameter and bar-alignment issues are fixed.</li>
+<li><strong><code>PositionManager</code> parity watchlist</strong>: if live exit management is ever routed through <code>pm_position.py</code>, the pip-value style math there should be rechecked against MT5 tick-value/tick-size conventions and commission treatment before trusting it for PnL parity.</li>
+</ul>
+<h3 id="f2-revised-practical-priority-under-your-constraints">F2. Revised Practical Priority Under Your Constraints</h3>
+<p>If I were translating the full document into the next implementation sequence under <em>your</em> stated rules, I would now prioritize:</p>
+<ol>
+<li>Fix all <strong>measurement/parity defects</strong> that change what bar is read, what trade is counted, or what result is attributed.</li>
+<li>Replace <strong>scored overlap</strong> with <strong>warm-up-only overlap + clean recent holdout buckets</strong>.</li>
+<li>Remove or demote <strong>retrain-period optimization</strong> and standardize on the <strong>biweekly Sunday retrain</strong>.</li>
+<li>Fix <strong>data freshness / cache / path integrity</strong> so retraining actually uses the data you just fetched.</li>
+<li>Fix <strong>strategy implementation bugs and dead parameters</strong> before trusting any strategy-level rankings.</li>
+<li>Fix the <strong>dashboard realized-performance model</strong> so future improvement work is measured honestly.</li>
+<li>Only then lean harder into <strong>sizing, exits, HRP, HMM, and spread-aware execution</strong>.</li>
+</ol>
+<p>This ordering is designed to improve profitability and reliability <em>without sacrificing trade frequency</em>. Most items above do not reduce trade count at all; they improve the correctness of what the system thinks it is doing.</p>
+<h3 id="f3-additional-research-links-used-in-this-reassessment">F3. Additional Research Links Used In This Reassessment</h3>
+<ul>
+<li>Tashman (2000), <em>Out-of-sample tests of forecasting accuracy: an analysis and review</em>: https://www.sciencedirect.com/science/article/abs/pii/S0169207000000650</li>
+<li>Caparrini &amp; Castellano (2011), <em>Forecasting model selection through out-of-sample rolling horizon weighted errors</em>: https://www.sciencedirect.com/science/article/abs/pii/S0957417411008566</li>
+<li>Bailey &amp; Lopez de Prado (2014), <em>The Deflated Sharpe Ratio</em>: https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf</li>
+<li>Bailey, Borwein, Lopez de Prado, Zhu (2017), <em>The Probability of Backtest Overfitting</em>: https://scholarworks.wmich.edu/math_pubs/42/</li>
+<li>Ledoit &amp; Wolf (2012), <em>Nonlinear Shrinkage Estimation of Large-Dimensional Covariance Matrices</em>: https://arxiv.org/abs/1207.5322</li>
+</ul>
+<h3 id="f4-bottom-line">F4. Bottom Line</h3>
+<ul>
+<li>I <strong>agree with your practical freshness concern</strong>.</li>
+<li>I <strong>disagree with scored overlap as the right way to buy freshness</strong>.</li>
+<li>I <strong>agree with fixed biweekly Sunday retraining</strong>.</li>
+<li>I <strong>do not agree that the current retrain-period search should remain in the critical path</strong>.</li>
+<li>I <strong>strongly agree</strong> that, once correctness is equal, the faster precomputed implementation should win. Several strategy and pipeline issues above violate exactly that principle and are therefore worth fixing even before they are framed as performance improvements.</li>
+</ul>
+<hr />
+<h2 id="appendix-g-strategy-efficiency-sweep">Appendix G: Strategy &amp; Efficiency Sweep</h2>
+<p>Consolidated findings from multiple sweep passes on strategy quality, dead-work code, and processing that can be removed without changing intended outputs.</p>
+<h3 id="g1-additional-strategy-layer-findings">G1. Additional Strategy-Layer Findings</h3>
+<ul>
+<li><strong><code>SupertrendStrategy</code> appears effectively inert in the current implementation / search space</strong> (<code>pm_strategies.py:456-510</code>). Direct repo-data spot checks on <code>EURUSD</code>, <code>GBPUSD</code>, <code>BTCUSD</code>, <code>XAUUSD</code>, <code>DE30</code>, and <code>AUDJPY</code> at <code>M5</code> and <code>H1</code> produced <strong>zero default signals</strong>. On <code>EURUSD_M5</code>, the full default search grid (<code>atr_period</code> in <code>[7, 10, 14, 20, 25]</code>, <code>multiplier</code> in <code>[1.5, 2.0, 2.5, 3.0, 4.0]</code>) also produced zero signals. This looks much more like a structural implementation/search-space problem than a healthy low-frequency trend strategy. It should be moved from the current "Tier 1 core" framing into the <strong>fix-audit list</strong> until proven otherwise.</li>
+<li><strong><code>RSIDivergenceStrategy</code> computes RSI swing points and never uses them</strong> (<code>pm_strategies.py:2394-2399</code>, <code>pm_strategies.py:2402-2417</code>). The strategy pays for two <code>_detect_swing_points()</code> passes on RSI, but the entry logic only compares RSI values at price swing bars. Impact: wasted compute and looser semantics than the strategy name suggests.</li>
+<li><strong><code>MACDDivergenceStrategy</code> computes histogram swing points and never uses them</strong> (<code>pm_strategies.py:2447-2452</code>, <code>pm_strategies.py:2454-2468</code>). Same pattern as the RSI divergence strategy: extra swing-point work is performed, but the final rule uses only histogram values at price swings. Impact: dead work and weaker "true divergence" semantics than advertised.</li>
+<li><strong>Low-signal watchlist strengthened by direct repo-data sampling</strong>. In the same spot checks, <code>ATRPercentileBreakoutStrategy</code> and <code>FisherTransformMRStrategy</code> remained extremely sparse across multiple symbols/timeframes. That is not enough to call them broken on its own, but it is enough to keep them on the audit watchlist rather than assuming they are healthy specialists.</li>
+</ul>
+<h3 id="g2-dead-work-processing-findings">G2. Dead-Work / Processing Findings</h3>
+<ul>
+<li><strong>The lazy-feature path is mostly dormant in production optimization</strong> (<code>pm_strategies.py:16</code>, <code>pm_strategies.py:231</code>, <code>pm_core.py:1866-1995</code>, <code>pm_pipeline.py:716</code>, <code>pm_pipeline.py:776</code>, <code>pm_pipeline.py:1189</code>, <code>pm_pipeline.py:2399</code>). The codebase already has <code>get_required_features()</code> and <code>FeatureComputer.compute_required()</code>, but the real optimization paths still call <code>compute_all()</code> almost everywhere. Impact: broad indicator computation even when a strategy only needs a small subset of columns. This is a direct candidate for "same outputs, less work."</li>
+<li><strong><code>RetrainPeriodSelector</code> copies training slices it never uses</strong> (<code>pm_pipeline.py:1216-1217</code>, <code>pm_pipeline.py:1221-1224</code>). Inside the window loop, <code>train_features</code> is sliced and copied but never enters the scoring logic. This is exactly the sort of loose work that should be removed if the selector remains at all.</li>
+<li><strong><code>CCIReversalStrategy</code> manually recomputes CCI in a slow path even though <code>FeatureComputer.cci()</code> already exists</strong> (<code>pm_strategies.py:1183-1186</code>, <code>pm_core.py:2261</code>). In a direct <code>EURUSD_M5</code> 50k-bar sample, this was the slowest strategy by a wide margin at roughly <code>10.7s</code>. If the same output can be preserved through precomputation or helper reuse, it should be.</li>
+<li><strong><code>AroonTrendStrategy</code> uses a Python loop over every bar/window</strong> (<code>pm_strategies.py:778-799</code>). In the same sample it took roughly <code>1.9s</code>, far slower than most simple trend strategies. This is not the highest-priority optimization, but it is a clear place where equivalent vectorized / lower-level computation would better match the stated efficiency rule.</li>
+<li><strong><code>KaufmanAMATrendStrategy</code> uses a nested loop for volatility accumulation</strong> (<code>pm_strategies.py:2797-2803</code>). It is not currently catastrophic, but the inner summation can be replaced by a rolling sum of absolute differences with no intended change in output.</li>
+<li><strong>The divergence family is a real compute hotspot</strong> (<code>pm_strategies.py:2391-2518</code>). On the same <code>EURUSD_M5</code> sample, <code>MACDDivergenceStrategy</code> took roughly <code>7.7s</code>, <code>RSIDivergenceStrategy</code> <code>7.2s</code>, and <code>OBVDivergenceStrategy</code> <code>4.7s</code>. The dominant cost is repeated swing detection plus repeated per-bar backward searches in Python. If these strategies remain in the active search space, they deserve either a stronger edge justification or a more efficient implementation.</li>
+</ul>
+<p><strong>Additional efficiency findings</strong>:</p>
+<ul>
+<li><strong>Both grid-search paths materialize the full Cartesian product before subsampling</strong> (<code>pm_pipeline.py:967-976</code>, <code>pm_pipeline.py:1778-1787</code>). Large grids pay peak memory and object creation costs even when <code>max_param_combos</code> will discard most combinations.</li>
+<li><strong><code>ZScoreVWAPReversionStrategy</code> has a dead "prefer precomputed VWAP" branch</strong> (<code>pm_strategies.py:1393-1405</code>). No other module produces <code>VWAP_{window}</code> columns. The helper always falls through to recomputation and does not memoize the result.</li>
+<li><strong><code>MarketRegimeDetector.compute_regime_scores()</code> recomputes band statistics inside containment</strong> (<code>pm_regime.py:499-509</code>, <code>pm_regime.py:832-856</code>). Duplicate rolling mean/std work on every symbol/timeframe full history.</li>
+<li><strong><code>OBVDivergenceStrategy</code> uses a row-wise lambda for sign detection</strong> (<code>pm_strategies.py:2497-2500</code>). Should be <code>np.sign(features['Close'].diff())</code>.</li>
+<li><strong>Several Keltner-based strategies request full <code>(mid, upper, lower)</code> tuples when they use only part of them</strong> (<code>pm_strategies.py:932</code>, <code>pm_strategies.py:1669</code>, <code>pm_strategies.py:2551</code>).</li>
+</ul>
+<h3 id="g2-local-runtime-hotspots">G2. Local Runtime Hotspots</h3>
+<p>On a local timing pass over a 5,000-bar <code>AUDCAD M5</code> snapshot, the slowest strategies were approximately:</p>
+<ul>
+<li><code>CCIReversalStrategy</code>: ~1128 ms</li>
+<li><code>RSIDivergenceStrategy</code>: ~795 ms</li>
+<li><code>MACDDivergenceStrategy</code>: ~781 ms</li>
+<li><code>OBVDivergenceStrategy</code>: ~474 ms</li>
+<li><code>AroonTrendStrategy</code>: ~220 ms</li>
+<li>most other strategies: generally below ~50 ms</li>
+</ul>
+<p>These timings are machine-specific, but the ranking is still useful. The main message is that the divergence family and <code>CCIReversalStrategy</code> are the obvious compute hotspots if the goal is to keep optimization fast without changing outputs.</p>
+<h3 id="g3-important-caveat-if-lazy-features-are-activated">G3. Important Caveat If Lazy Features Are Activated</h3>
+<p>If you decide to activate true lazy feature computation later, do <strong>not</strong> wire it in blindly.</p>
+<ul>
+<li>Many <code>get_required_features()</code> implementations are static and describe only default columns.</li>
+<li>Several strategies have parameterized periods / channel widths that are currently handled by helper fallbacks, not by parameter-aware feature declarations.</li>
+<li>That means the right solution is not just "swap in <code>compute_required()</code> everywhere." The right solution is a <strong>parameter-aware requested-feature builder</strong> or deeper helper memoization keyed by <code>(indicator, params)</code>.</li>
+</ul>
+<h3 id="g4-final-strategy-tier-adjustment-from-this-sweep">G4. Final Strategy-Tier Adjustment From This Sweep</h3>
+<p>After this last pass, I would now treat the following as the main strategy-level "fix before trust" set:</p>
+<ul>
+<li><code>InsideBarBreakoutStrategy</code></li>
+<li><code>SupertrendStrategy</code></li>
+<li><code>PinBarReversalStrategy</code></li>
+<li><code>ParabolicSARTrendStrategy</code></li>
+<li><code>SqueezeBreakoutStrategy</code></li>
+<li><code>ADXTrendStrategy</code></li>
+<li><code>EngulfingPatternStrategy</code></li>
+<li><code>FisherTransformMRStrategy</code></li>
+<li><code>RSIDivergenceStrategy</code></li>
+<li><code>MACDDivergenceStrategy</code></li>
+</ul>
+<p>That does <strong>not</strong> mean all should be deleted. It means their current implementations should not be allowed to shape portfolio conclusions as if they were clean, mature strategies.</p>
+<hr />
+<h2 id="appendix-h-option-pricing-model-adaptations">Appendix H: Option-Pricing Model Adaptations</h2>
+<h3 id="h1-executive-conclusion">H1. Executive Conclusion</h3>
+<ul>
+<li><strong>Do not add Black-Scholes, binomial, and Heston as three standalone "pricing strategies".</strong></li>
+<li><strong>Do add, at most, one lightweight Black-Scholes-style expected-move / probability feature and optionally one discrete binomial barrier-feasibility feature.</strong></li>
+<li><strong>Keep Heston as a research-appendix / offline regime-feature idea unless you later decide the extra calibration cost is justified.</strong></li>
+</ul>
+<p><strong>Inference from the primary sources</strong>: without an options chain, these models do <strong>not</strong> give you an option-mispricing edge. They reduce to different ways of transforming assumptions about drift, volatility, horizon, and path structure into probabilities or expected moves. That can still be useful, but it belongs as a <strong>feature / filter / ranking overlay</strong>, not as a core alpha source by itself.</p>
+<h3 id="h2-black-scholes-adaptation">H2. Black-Scholes Adaptation</h3>
+<p><strong>What is scientifically valid here</strong>:</p>
+<ul>
+<li>Use Black-Scholes logic as a <strong>cheap expected-move / sigma-distance / expiry-probability proxy</strong> for a fixed horizon in bars.</li>
+<li>Feed it with an OHLC-based realized-volatility estimator rather than option-implied volatility.</li>
+<li>Use it to rank or filter <strong>existing</strong> signals, not to generate independent "Black-Scholes trades".</li>
+</ul>
+<p><strong>What is not scientifically valid here</strong>:</p>
+<ul>
+<li>Pricing a synthetic option with Black-Scholes and treating the resulting number as a tradable edge when there is <strong>no observed option market price to compare against</strong>.</li>
+<li>Claiming implied-volatility information when no option surface exists in the input data.</li>
+</ul>
+<p><strong>Best low-cost implementation</strong>:</p>
+<ol>
+<li>Estimate volatility from candles using a range-based estimator such as Garman-Klass / Parkinson rather than plain close-to-close volatility.</li>
+<li>Define a small set of fixed trading horizons, for example <code>H = {12, 24, 48}</code> bars.</li>
+<li>Convert the distance to TP / SL into volatility-normalized horizon units:</li>
+</ol>
+<div class="codehilite"><pre><span></span><code><span class="n">sigma</span> <span class="o">=</span> <span class="n">realized_vol_ohlc</span><span class="p">(</span><span class="n">lookback</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>          <span class="c1"># annualized or per-bar, but consistent</span>
+<span class="n">T</span> <span class="o">=</span> <span class="n">horizon_bars</span> <span class="o">/</span> <span class="n">bars_per_year</span>
+<span class="n">sigma_T</span> <span class="o">=</span> <span class="n">sigma</span> <span class="o">*</span> <span class="n">sqrt</span><span class="p">(</span><span class="n">T</span><span class="p">)</span>
+<span class="n">tp_sigma</span> <span class="o">=</span> <span class="nb">abs</span><span class="p">(</span><span class="n">log</span><span class="p">(</span><span class="n">tp_price</span> <span class="o">/</span> <span class="n">spot</span><span class="p">))</span> <span class="o">/</span> <span class="p">(</span><span class="n">sigma_T</span> <span class="o">+</span> <span class="mf">1e-12</span><span class="p">)</span>
+<span class="n">sl_sigma</span> <span class="o">=</span> <span class="nb">abs</span><span class="p">(</span><span class="n">log</span><span class="p">(</span><span class="n">spot</span> <span class="o">/</span> <span class="n">sl_price</span><span class="p">))</span> <span class="o">/</span> <span class="p">(</span><span class="n">sigma_T</span> <span class="o">+</span> <span class="mf">1e-12</span><span class="p">)</span>
+<span class="n">bs_move_score</span> <span class="o">=</span> <span class="n">sl_sigma</span> <span class="o">-</span> <span class="n">tp_sigma</span>
+</code></pre></div>
+
+<ol>
+<li>Use the result as a <strong>feasibility / asymmetry feature</strong>.<br />
+Lower <code>tp_sigma</code> means the target is easier to reach, higher <code>sl_sigma</code> means there is more room before invalidation, and a better <code>bs_move_score</code> means more favorable horizon-normalized trade geometry.</li>
+</ol>
+<p><strong>Recommended role</strong>: feature or ranker, not standalone strategy.</p>
+<p><strong>Processing cost</strong>: very low. This is the cheapest of the three models and fits your efficiency lens best.</p>
+<h3 id="h3-binomial-crr-adaptation">H3. Binomial / CRR Adaptation</h3>
+<p><strong>What is scientifically valid here</strong>:</p>
+<ul>
+<li>Use a small-step Cox-Ross-Rubinstein tree as a <strong>discrete barrier-feasibility engine</strong> when you specifically care about path dependency over a finite candle horizon.</li>
+<li>This is more defensible than Black-Scholes when the question is "how likely is TP versus SL to be reached over the next N bars under a volatility assumption?" because the tree is naturally discrete and can model path-dependent first-hit logic more directly.</li>
+</ul>
+<p><strong>What is not scientifically valid here</strong>:</p>
+<ul>
+<li>Treating binomial pricing as a completely separate alpha family from Black-Scholes. In many settings it is just a discrete numerical approximation to the same underlying idea.</li>
+</ul>
+<p><strong>Best implementation in this PM</strong>:</p>
+<ul>
+<li>Only evaluate the binomial feature for <strong>candidate trades that already have a signal</strong>.</li>
+<li>Keep the tree shallow, for example <code>8-16</code> steps over the chosen horizon.</li>
+<li>Use it to estimate <strong>TP-vs-SL feasibility</strong> or an expected-value proxy, not to create a separate full-strategy family.</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="n">dt</span> <span class="o">=</span> <span class="n">T</span> <span class="o">/</span> <span class="n">steps</span>
+<span class="n">u</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">sigma</span> <span class="o">*</span> <span class="n">sqrt</span><span class="p">(</span><span class="n">dt</span><span class="p">))</span>
+<span class="n">d</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">/</span> <span class="n">u</span>
+<span class="n">p</span> <span class="o">=</span> <span class="n">clip</span><span class="p">((</span><span class="n">exp</span><span class="p">(</span><span class="n">mu</span> <span class="o">*</span> <span class="n">dt</span><span class="p">)</span> <span class="o">-</span> <span class="n">d</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">u</span> <span class="o">-</span> <span class="n">d</span><span class="p">),</span> <span class="mf">0.0</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+<span class="c1"># propagate probability mass; accumulate first-hit TP / SL states</span>
+</code></pre></div>
+
+<p><strong>Recommended role</strong>: optional feature, only if the discrete barrier logic gives meaningfully different decisions from the simpler Black-Scholes-style expected-move feature.</p>
+<p><strong>Processing cost</strong>: moderate. Acceptable if computed only on shortlisted candidates, not on every bar for every symbol.</p>
+<p><strong>Important efficiency note</strong>: if the binomial output does not materially outperform the simpler Black-Scholes-style feature, prefer the Black-Scholes feature and do not keep both. That follows your stated rule exactly.</p>
+<h3 id="h4-heston-adaptation">H4. Heston Adaptation</h3>
+<p><strong>What is scientifically valid here</strong>:</p>
+<ul>
+<li>Use Heston as a <strong>stochastic-volatility regime model</strong>, not as a standalone option-pricing strategy.</li>
+<li>The most plausible adaptation is to estimate latent variance / vol-of-vol state from the underlying price series only, then use those states as regime or sizing inputs.</li>
+</ul>
+<p><strong>What is not a good fit here</strong>:</p>
+<ul>
+<li>A full Heston option-pricing strategy with no option chain.</li>
+<li>Frequent re-calibration on every symbol / timeframe / bar.</li>
+<li>Treating Heston parameter estimates as a cheap indicator. They are not.</li>
+</ul>
+<p><strong>Best implementation if you want it anyway</strong>:</p>
+<ul>
+<li>Re-estimate only <strong>offline</strong> or on the <strong>biweekly retrain cycle</strong>, not intrabar.</li>
+<li>Use the parameter/state outputs as slow features such as latent variance level <code>v_t</code>, variance mean-reversion gap <code>(v_t - theta)</code>, volatility-of-volatility proxy <code>xi</code>, and correlation / leverage proxy <code>rho</code>.</li>
+<li>Then feed those into regime selection, sizing, or a "do not fight high vol-of-vol" filter.</li>
+</ul>
+<p><strong>Recommended role</strong>: research appendix / later-stage regime feature, not core strategy.</p>
+<p><strong>Processing cost</strong>: materially higher than the other two, especially if done properly from underlying-only data.</p>
+<h3 id="h5-best-inclusion-order">H5. Best Inclusion Order</h3>
+<p>If these models are added at all, the recommended order is:</p>
+<ol>
+<li><strong>Black-Scholes-style expected-move / sigma-distance feature</strong></li>
+<li><strong>Optional CRR barrier-feasibility feature for candidate trades only</strong></li>
+<li><strong>Heston-inspired stochastic-volatility regime feature much later, if still justified</strong></li>
+</ol>
+<p>This order preserves the PM's trading frequency and avoids turning the repo into a heavy option-model research project before the core trading engine is fully cleaned up.</p>
+<h3 id="h6-recommended-document-stance">H6. Recommended Document Stance</h3>
+<p>The document should treat these additions as:</p>
+<ul>
+<li><strong>Black-Scholes</strong>: worth adding as a lightweight feature layer</li>
+<li><strong>Binomial / CRR</strong>: worth considering as an optional discrete feasibility feature</li>
+<li><strong>Heston</strong>: worth recording, but only as a later research path unless a strong practical reason emerges</li>
+</ul>
+<h3 id="h7-primary-research-links-for-these-additions">H7. Primary Research Links For These Additions</h3>
+<ul>
+<li>Black &amp; Scholes (1973), <em>The Pricing of Options and Corporate Liabilities</em>: https://www.princeton.edu/~hsshin/www517/options.pdf</li>
+<li>Cox, Ross, Rubinstein (1979), <em>Option Pricing: A Simplified Approach</em>: https://bpb-us-w2.wpmucdn.com/u.osu.edu/dist/7/36891/files/2017/07/CRR79-1yy8av8.pdf</li>
+<li>Heston (1993), <em>A Closed-Form Solution for Options with Stochastic Volatility, with Applications to Bond and Currency Options</em>: https://academic.oup.com/rfs/article-abstract/6/2/327/1574747</li>
+<li>Gruszka &amp; Szwabinski (2023), <em>Parameter Estimation of the Heston Volatility Model with Jumps in the Asset Prices</em>: https://www.mdpi.com/2225-1146/11/2/15</li>
+<li>Garman &amp; Klass (1980), <em>On the Estimation of Security Price Volatilities from Historical Data</em>: https://digicoll.lib.berkeley.edu/record/86287/files/b120984374_C070425770.pdf</li>
+</ul>
+<hr />
+<h2 id="appendix-i-recommended-new-strategy-additions">Appendix I: Recommended New Strategy Additions</h2>
+<p>This appendix answers the final "should we add more strategies?" question directly.</p>
+<h3 id="i1-count-reality-check">I1. Count Reality Check</h3>
+<ul>
+<li>The current codebase has <strong>42</strong> concrete strategies.</li>
+<li>Adding <strong>5</strong> more brings the total to <strong>47</strong>, not <strong>55</strong>.</li>
+<li>Reaching <strong>55</strong> would require <strong>13</strong> net-new additions.</li>
+<li>I do <strong>not</strong> recommend forcing the roster to 55 before the already-documented correctness, validation, and measurement issues are cleaned up.</li>
+</ul>
+<p>So the right question is not "can we inflate the count?" but "are there a few additional families that are genuinely differentiated, cheap enough to run, and scientifically coherent for this PM?" I think the answer to that is <strong>yes</strong>, but only for a short list.</p>
+<h3 id="i2-five-worthwhile-additions">I2. Five Worthwhile Additions</h3>
+<h4 id="1-vortextrendstrategy">1. <code>VortexTrendStrategy</code></h4>
+<p><strong>Why it fits</strong>:</p>
+<ul>
+<li>Very low computational cost.</li>
+<li>Trend-following family that is close enough to DMI/ADX to be interpretable, but different enough in construction to add signal diversity.</li>
+<li>Clean implementation path: <code>+VI</code> / <code>-VI</code> cross, optional ADX or regime-strength confirmation, ATR-based stops.</li>
+</ul>
+<p><strong>Best implementation here</strong>:</p>
+<ul>
+<li>Entry on <code>+VI &gt; -VI</code> cross for long and reverse for short.</li>
+<li>Optional confirmation with <code>ADX</code> or existing regime <code>TREND_SCORE</code>.</li>
+<li>Favor longer default windows over very short ones to avoid noise.</li>
+</ul>
+<p><strong>Priority</strong>: highest of the five.</p>
+<h4 id="2-trixsignalstrategy">2. <code>TRIXSignalStrategy</code></h4>
+<p><strong>Why it fits</strong>:</p>
+<ul>
+<li>Cheap to compute.</li>
+<li>Smoother momentum/trend logic than the current MACD-heavy family.</li>
+<li>Triple smoothing helps reduce false churn without becoming as slow/heavy as more complex filters.</li>
+</ul>
+<p><strong>Best implementation here</strong>:</p>
+<ul>
+<li>Use either zero-line cross or TRIX / signal-line cross.</li>
+<li>Optional trend gate with EMA slope or <code>TREND_SCORE</code>.</li>
+<li>Keep it as a trend/momentum specialist, not a mean-reversion hybrid.</li>
+</ul>
+<p><strong>Priority</strong>: high.</p>
+<h4 id="3-relativevigorindexstrategy">3. <code>RelativeVigorIndexStrategy</code></h4>
+<p><strong>Why it fits</strong>:</p>
+<ul>
+<li>Uses open-close location within the bar, which is underrepresented in the current roster.</li>
+<li>Cheap to compute.</li>
+<li>Can serve as either a trend-confirmation or reversal-timing family depending on implementation, but should be kept simple.</li>
+</ul>
+<p><strong>Best implementation here</strong>:</p>
+<ul>
+<li>Use classic RVI / signal cross.</li>
+<li>Add a light trend filter so it does not become another noisy standalone oscillator.</li>
+<li>Keep parameter space narrow.</li>
+</ul>
+<p><strong>Priority</strong>: high-medium.</p>
+<h4 id="4-vidyabandtrendstrategy">4. <code>VIDYABandTrendStrategy</code></h4>
+<p><strong>Why it fits</strong>:</p>
+<ul>
+<li>Gives you one adaptive-trend family that is conceptually different from <code>KaufmanAMATrendStrategy</code>.</li>
+<li>More relevant than adding yet another fixed-period crossover variant.</li>
+<li>Can be implemented cheaply enough if kept to one adaptive moving average plus band or slope logic.</li>
+</ul>
+<p><strong>Best implementation here</strong>:</p>
+<ul>
+<li>Use a VIDYA centerline or band.</li>
+<li>Trigger on price/band confirmation plus directional-strength confirmation.</li>
+<li>Do <strong>not</strong> explode the parameter grid; keep it tighter than the current large adaptive families.</li>
+</ul>
+<p><strong>Priority</strong>: medium, but worthwhile.</p>
+<h4 id="5-choppinesscompressionbreakoutstrategy">5. <code>ChoppinessCompressionBreakoutStrategy</code></h4>
+<p><strong>Why it fits</strong>:</p>
+<ul>
+<li>Best added as a practical adaptation, not as a pure named-indicator clone.</li>
+<li>Fits the PM's existing regime-aware design very well: identify consolidation/compression, then hand off to a breakout trigger.</li>
+<li>Cheap if implemented with one choppiness-style state measure plus an existing breakout trigger such as Donchian, NR, or ATR expansion.</li>
+</ul>
+<p><strong>Best implementation here</strong>:</p>
+<ul>
+<li>Setup: market is in a high-chop / compression state.</li>
+<li>Trigger: breakout of a short recent range or channel as chop starts to release.</li>
+<li>Use it as a breakout specialist, not a universal strategy.</li>
+</ul>
+<p><strong>Priority</strong>: lowest of the five, but still acceptable.</p>
+<h3 id="i3-recommended-order">I3. Recommended Order</h3>
+<p>If these are added, the implementation order should be:</p>
+<ol>
+<li><code>VortexTrendStrategy</code></li>
+<li><code>TRIXSignalStrategy</code></li>
+<li><code>RelativeVigorIndexStrategy</code></li>
+<li><code>VIDYABandTrendStrategy</code></li>
+<li><code>ChoppinessCompressionBreakoutStrategy</code></li>
+</ol>
+<p>That order balances distinctiveness, implementation simplicity, and expected usefulness inside the current PM architecture.</p>
+<h3 id="i4-what-i-would-not-do">I4. What I Would Not Do</h3>
+<ul>
+<li>I would <strong>not</strong> add 13 new strategies just to hit 55.</li>
+<li>I would <strong>not</strong> add more raw oscillator clones unless they bring a genuinely different signal source.</li>
+<li>I would <strong>not</strong> expand the roster further until the currently broken / distorted strategies are fixed and the selection process is re-run cleanly.</li>
+</ul>
+<h3 id="i5-source-basis-for-these-recommendations">I5. Source Basis For These Recommendations</h3>
+<ul>
+<li>Vortex Indicator: Botes &amp; Siepman, <em>The Vortex Indicator</em>: https://technical.traders.com/free/V28C01005BOTE.pdf</li>
+<li>TRIX: Hutson, <em>Good Trix</em>: https://technical.traders.com/archive/display2-2014.asp?mo=JUL&amp;yr=1983</li>
+<li>Relative Vigor Index: Ehlers, <em>Relative Vigor Index</em>: https://technical.traders.com/archive/combo/title/keyword.asp?keyword=JOHN</li>
+<li>VIDYA / adaptive moving averages: Chande, <em>Adapting Moving Averages To Market Volatility</em>: https://technical.traders.com/archive/combo/display5.asp?author=Tushar+S+Chande+PhD</li>
+<li>Breakout adaptation / Chande context: Chande, <em>Identifying Powerful Breakouts Early</em>: https://technical.traders.com/archive/combo/display5.asp?author=Tushar+S+Chande+PhD</li>
+<li>Choppiness / Dreiss context: Dreiss Research: https://dreissresearch.com/system.html</li>
+</ul>
+<h3 id="i6-bottom-line">I6. Bottom Line</h3>
+<p>Yes, there are <strong>5</strong> additional strategies worth shortlisting for this repo.</p>
+<p>No, I do <strong>not</strong> think you should force the strategy book to <strong>55</strong> yet.</p>
+<p>The highest-quality path is to:</p>
+<ol>
+<li>fix the existing strategy and validation defects,</li>
+<li>re-run clean selection,</li>
+<li>then add the five families above if you still want more breadth.</li>
+</ol>
+<hr />
+<h2 id="appendix-j-final-comprehensive-audit-critical-correctness-issues">Appendix J: Final Comprehensive Audit - Critical Correctness Issues</h2>
+<p>This is the definitive final sweep. Six parallel audit agents examined every core module (~14,000 lines) with verification passes on all flagged items. Findings below are <strong>new</strong> -- not duplicates of anything already in the main body or prior appendices. Each has been verified against the actual code with line numbers.</p>
+<h3 id="j1-supertrend-first-trade-bug-confirmed-high">J1. Supertrend First-Trade Bug (CONFIRMED -- HIGH)</h3>
+<p><strong>File</strong>: <code>pm_strategies.py:482, 507-510</code></p>
+<p>The Supertrend direction array is initialized to 0: <code>direction = np.zeros(n, dtype=np.int32)</code>. Signals fire only on <code>dir_change == 2</code> (short-to-long: -1 to +1) or <code>dir_change == -2</code> (long-to-short: +1 to -1). The initial transition from 0 to +1 or 0 to -1 produces <code>dir_change</code> of +1 or -1, which is <strong>never caught</strong>.</p>
+<p><strong>Impact</strong>: The very first trend entry on every backtest window is silently dropped. Combined with the Appendix G finding that Supertrend produces zero signals on multiple major pairs, this strategy is currently <strong>non-functional or near-non-functional</strong> despite being rated Tier 1 (9/10) in Appendix A.</p>
+<p><strong>Fix</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Option A: Also catch initial transitions</span>
+<span class="n">signals</span><span class="p">[</span><span class="n">dir_change</span> <span class="o">==</span> <span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
+<span class="n">signals</span><span class="p">[</span><span class="n">dir_change</span> <span class="o">==</span> <span class="o">-</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+<span class="n">signals</span><span class="p">[(</span><span class="n">dir_change</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">direction</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)]</span> <span class="o">=</span> <span class="mi">1</span>    <span class="c1"># 0 → +1</span>
+<span class="n">signals</span><span class="p">[(</span><span class="n">dir_change</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">direction</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)]</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>   <span class="c1"># 0 → -1</span>
+
+<span class="c1"># Option B (simpler): Initialize direction[0] from the first valid comparison</span>
+<span class="k">if</span> <span class="n">n</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">direction</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">close</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">final_upper</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">else</span> <span class="o">-</span><span class="mi">1</span>
+</code></pre></div>
+
+<p><strong>Appendix A correction</strong>: Downgrade SupertrendStrategy from 9/10 to <strong>fix-before-trust</strong> until this and the zero-signal issue from Appendix G are resolved.</p>
+<h3 id="j2-adx-di-di-precomputed-values-are-wrong-confirmed-critical">J2. ADX / +DI / -DI Precomputed Values Are Wrong (CONFIRMED -- CRITICAL)</h3>
+<p><strong>File</strong>: <code>pm_core.py:2220-2258</code> (FeatureComputer), <code>pm_strategies.py:142-181</code> (_get_adx_di)</p>
+<p>Three separate findings combine into one critical bug:</p>
+<p><strong>a) <code>FeatureComputer.minus_di()</code> treats ALL low changes as directional movement</strong> (<code>pm_core.py:2256</code>):</p>
+<div class="codehilite"><pre><span></span><code><span class="n">minus_dm</span> <span class="o">=</span> <span class="n">df</span><span class="p">[</span><span class="s1">&#39;Low&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">diff</span><span class="p">()</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span>  <span class="c1"># Rising lows incorrectly count as -DM</span>
+</code></pre></div>
+
+<p>Wilder's -DM should only be positive when lows are <em>falling</em>. The correct formula is <code>-df['Low'].diff()</code> (negate first, then filter positive). This function counts rising lows as downward movement.</p>
+<p><strong>b) <code>FeatureComputer.adx()</code> has a trivially-true condition</strong> (<code>pm_core.py:2220, 2223</code>):</p>
+<div class="codehilite"><pre><span></span><code><span class="n">minus_dm</span> <span class="o">=</span> <span class="n">df</span><span class="p">[</span><span class="s1">&#39;Low&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">diff</span><span class="p">()</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span> <span class="o">*</span> <span class="o">-</span><span class="mi">1</span>  <span class="c1"># ALWAYS negative</span>
+<span class="c1"># ...</span>
+<span class="n">minus_dm</span> <span class="o">=</span> <span class="n">minus_dm</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">where</span><span class="p">((</span><span class="n">minus_dm</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">plus_dm</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">minus_dm</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">),</span> <span class="mi">0</span><span class="p">)</span>
+<span class="c1">#                                                              ^^^^^^^^^^^^^ always True</span>
+</code></pre></div>
+
+<p>The <code>minus_dm &lt; 0</code> check is redundant because line 2220 guarantees minus_dm is always negative.</p>
+<p><strong>c) The correct <code>_get_adx_di()</code> helper is bypassed when precomputed columns exist</strong> (<code>pm_strategies.py:158-159</code>):</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">period</span> <span class="o">==</span> <span class="mi">14</span> <span class="ow">and</span> <span class="p">{</span><span class="s1">&#39;ADX&#39;</span><span class="p">,</span> <span class="s1">&#39;PLUS_DI&#39;</span><span class="p">,</span> <span class="s1">&#39;MINUS_DI&#39;</span><span class="p">}</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span><span class="n">features</span><span class="o">.</span><span class="n">columns</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">features</span><span class="p">[</span><span class="s1">&#39;ADX&#39;</span><span class="p">],</span> <span class="n">features</span><span class="p">[</span><span class="s1">&#39;PLUS_DI&#39;</span><span class="p">],</span> <span class="n">features</span><span class="p">[</span><span class="s1">&#39;MINUS_DI&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<p>Since <code>FeatureComputer.compute_all()</code> populates <code>ADX</code>, <code>PLUS_DI</code>, <code>MINUS_DI</code> using the <strong>buggy</strong> standalone functions, the correct Wilder EMA implementation in <code>_get_adx_di()</code> is silently bypassed for the default period=14.</p>
+<p><strong>d) ADXTrendStrategy uses SMA smoothing, not Wilder EMA</strong> (<code>pm_strategies.py:616-624</code>): Even if the precomputed columns were bypassed, this strategy manually recomputes ADX with <code>rolling().mean()</code> (SMA), producing different values from the Wilder EMA used in <code>_get_adx_di()</code>.</p>
+<p><strong>Strategies affected</strong>: ALL strategies that use ADX, +DI, or -DI at the default period=14:<br />
+- <code>ADXDIStrengthStrategy</code><br />
+- <code>EMARibbonADXStrategy</code><br />
+- <code>ADXTrendStrategy</code> (doubly wrong: SMA + no Wilder)<br />
+- <code>EngulfingPatternStrategy</code> (uses ADX for confirmation)<br />
+- Any strategy using precomputed <code>ADX</code> column for regime filtering</p>
+<p><strong>Fix</strong>: Make <code>FeatureComputer.plus_di()</code> and <code>minus_di()</code> use the same Wilder-style directional-movement logic as <code>_get_adx_di()</code>, or stop trusting the precomputed columns and always recompute via the correct helper.</p>
+<h3 id="j3-pipelineresult-missing-required-argument-will-crash-confirmed-critical">J3. PipelineResult Missing Required Argument -- Will Crash (CONFIRMED -- CRITICAL)</h3>
+<p><strong>File</strong>: <code>pm_pipeline.py:642, 2808</code></p>
+<p><code>PipelineResult.success</code> is a required field with no default value. At line 2808, the exception handler constructs:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">results</span><span class="p">[</span><span class="n">symbol</span><span class="p">]</span> <span class="o">=</span> <span class="n">PipelineResult</span><span class="p">(</span><span class="n">symbol</span><span class="o">=</span><span class="n">symbol</span><span class="p">,</span> <span class="n">error_message</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
+</code></pre></div>
+
+<p>This is missing <code>success=False</code> and will raise <code>TypeError</code> at runtime. All 3 other PipelineResult constructions correctly pass <code>success=False</code>.</p>
+<p><strong>Fix</strong>: Add <code>success=False</code> to the constructor call at line 2808.</p>
+<h3 id="j4-position-sizing-clamps-up-to-min-lot-risk-overrun-high">J4. Position Sizing Clamps UP to Min-Lot -- Risk Overrun (HIGH)</h3>
+<p><strong>File</strong>: <code>pm_core.py:84-85</code> (Numba path), <code>pm_core.py:2773</code> (Python path)</p>
+<p>When calculated position size is smaller than <code>min_lot</code>, the volume is clamped <strong>upward</strong> to <code>min_lot</code>. No check verifies whether the resulting actual risk exceeds the intended <code>risk_amount_at_entry</code>. For small accounts or wide-stop trades, this can produce actual risk many multiples of the target.</p>
+<p><strong>Impact</strong>: A trade targeting $10 risk could execute with $50+ actual risk if min_lot implies a larger position than the risk model requests.</p>
+<p><strong>Fix</strong>: After rounding to min_lot, recompute actual risk. If it exceeds target by more than a configurable margin (e.g., 50%), skip the trade. This aligns with item 9-a in the main body but is distinct: 9-a addresses post-rounding drift, this addresses the min-lot floor forcing a risk overrun.</p>
+<h3 id="j5-stochastic-and-williams-r-division-by-zero-medium">J5. Stochastic and Williams %R Division by Zero (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_core.py:2202</code> (Stochastic), <code>pm_core.py:2283</code> (Williams %R)</p>
+<p>Neither indicator guards against <code>high_max == low_min</code> (flat market over the lookback window):</p>
+<div class="codehilite"><pre><span></span><code><span class="n">stoch_k</span> <span class="o">=</span> <span class="mi">100</span> <span class="o">*</span> <span class="p">(</span><span class="n">df</span><span class="p">[</span><span class="s1">&#39;Close&#39;</span><span class="p">]</span> <span class="o">-</span> <span class="n">low_min</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">high_max</span> <span class="o">-</span> <span class="n">low_min</span><span class="p">)</span>    <span class="c1"># inf/NaN</span>
+<span class="n">wr</span> <span class="o">=</span> <span class="o">-</span><span class="mi">100</span> <span class="o">*</span> <span class="p">(</span><span class="n">high_max</span> <span class="o">-</span> <span class="n">df</span><span class="p">[</span><span class="s1">&#39;Close&#39;</span><span class="p">])</span> <span class="o">/</span> <span class="p">(</span><span class="n">high_max</span> <span class="o">-</span> <span class="n">low_min</span><span class="p">)</span>        <span class="c1"># inf/NaN</span>
+</code></pre></div>
+
+<p><strong>Fix</strong>: Add epsilon guard: <code>/ (high_max - low_min + 1e-10)</code>, consistent with RSI, CCI, and other indicators in the same file.</p>
+<h3 id="j6-numba-vs-python-equity-curves-are-structurally-different-high">J6. Numba vs Python Equity Curves Are Structurally Different (HIGH)</h3>
+<p><strong>File</strong>: <code>pm_core.py:2604-2608</code> (Numba), <code>pm_core.py:2634-2786</code> (Python)</p>
+<p>The Numba path builds equity from trades only (length = <code>len(trades) + 1</code>). The Python path builds per-bar equity (length = <code>n_bars</code>). Both pass their equity arrays to <code>_calculate_metrics()</code>, which computes Sharpe/Sortino from <code>np.diff(equity) / equity[:-1]</code>. On the Numba path, each "return" actually spans multiple bars, making the annualization factor wrong.</p>
+<p><strong>Impact</strong>: The same strategy/data produces different Sharpe values depending on which code path executes. The Numba path inflates Sharpe.</p>
+<p><strong>Note</strong>: The Numba kernel <em>does</em> compute a per-bar equity array internally (<code>line 169</code>) but discards it at line 448. The fix is to return the per-bar array from Numba (aligns with item 1 in the main body).</p>
+<h3 id="j7-commission-semantics-ambiguous-medium">J7. Commission Semantics Ambiguous (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_core.py:267, 731</code></p>
+<p><code>commission_per_lot</code> is documented as "USD per round trip per lot" (line 731) and is applied once per trade (line 267). However, the default of 7.0 is the typical <strong>per-side</strong> ECN rate, which would make round-trip 14.0. If the broker charges $7 per side, the backtest is under-counting costs by 50%.</p>
+<p><strong>Fix</strong>: Verify against actual broker schedule. If $7 is per-side, either double the default to 14.0 or apply it twice (entry + exit).</p>
+<hr />
+<h2 id="appendix-k-final-comprehensive-audit-live-trading-robustness">Appendix K: Final Comprehensive Audit - Live Trading Robustness</h2>
+<h3 id="k1-stale-price-between-signal-and-execution-high">K1. Stale Price Between Signal and Execution (HIGH)</h3>
+<p><strong>File</strong>: <code>pm_main.py:1311</code> (bar fetch), <code>pm_main.py:1660</code> (stop calc), <code>pm_main.py:1679</code> (tick fetch)</p>
+<p>Bars are fetched at line 1311. Signals and stops are computed from those bars. But the actual execution price comes from <code>get_symbol_tick()</code> at line 1679, potentially much later (after evaluating all candidate strategies). In volatile markets, the price can move significantly between signal evaluation and execution, making the SL distance computed from old features materially wrong relative to the actual fill price.</p>
+<p><strong>Fix</strong>: Re-fetch the tick immediately before execution. If the price has moved beyond a configurable threshold from the signal bar's close, either recalculate stops from the current price or defer the trade to the next bar.</p>
+<h3 id="k2-dual-trading-loops-livetraderstart-is-dead-code-high">K2. Dual Trading Loops -- LiveTrader.start() Is Dead Code (HIGH)</h3>
+<p><strong>File</strong>: <code>pm_main.py:894-936</code> (LiveTrader.start), <code>pm_main.py:2180-2253</code> (run_trading)</p>
+<p><code>FXPortfolioManagerApp.run_trading()</code> calls <code>trader._process_all_symbols()</code> directly (line 2248), completely bypassing <code>LiveTrader.start()</code>. This means:<br />
+- <code>_running</code> flag is never set to True<br />
+- <code>_shutdown_event</code> is never cleared<br />
+- The 12-cycle reconnection logic in <code>start()</code> is dead code<br />
+- <code>stop()</code> is a no-op (sets <code>_running = False</code>, but it was never True)</p>
+<p><strong>Impact</strong>: Confusing architecture that can lead to maintenance errors. The actual reconnection logic lives in <code>run_trading()</code> (lines 2220-2235) with a different approach (5 attempts, then sleep 30 and retry forever).</p>
+<p><strong>Fix</strong>: Remove the dead <code>start()</code> method or refactor so only one entry point exists. Consolidate reconnection logic.</p>
+<h3 id="k3-close_on_opposite_signal-is-non-functional-dead-code-medium">K3. <code>close_on_opposite_signal</code> Is Non-Functional Dead Code (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_main.py:600, 607, 1968, 2393</code></p>
+<p><code>self.close_on_opposite_signal</code> is set in <code>__init__</code> and exposed as a CLI flag (<code>--close-on-opposite-signal</code>), but <code>_close_position_on_signal()</code> is <strong>never called</strong> anywhere in the trading loop. The feature is entirely non-functional.</p>
+<p><strong>Fix</strong>: Either wire it into the live loop (checking for existing positions with opposite direction before entering) or remove the flag and dead method.</p>
+<h3 id="k4-rate-limited-signals-silently-retry-without-throttle-recording-medium">K4. Rate-Limited Signals Silently Retry Without Throttle Recording (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_main.py:1642-1647</code></p>
+<p>When a signal is rate-limited, the function returns without calling <code>_record_throttle()</code>. This means the decision is not recorded as attempted, so on the next 1-second iteration it will be re-evaluated, hit the rate limit again, and loop indefinitely until <code>ORDER_RATE_LIMIT_SECONDS</code> (5s) expires. Wastes compute on repeated evaluation.</p>
+<p><strong>Fix</strong>: Record rate-limited decisions in the throttle so they are suppressed until the next bar.</p>
+<h3 id="k5-retrain-blocks-the-trading-loop-synchronously-medium">K5. Retrain Blocks the Trading Loop Synchronously (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_main.py:2242</code></p>
+<p><code>_fetch_historical_data(symbols_to_retrain)</code> runs synchronously in the same thread as the trading loop. For many symbols, this can block signal processing for minutes.</p>
+<p><strong>Fix</strong>: Run data fetching and retrain in a background thread, or at minimum schedule it during off-market hours.</p>
+<h3 id="k6-state-not-recovered-after-reconnection-medium">K6. State Not Recovered After Reconnection (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_main.py:2222-2235</code></p>
+<p>After reconnecting to MT5, the code resumes calling <code>_process_all_symbols()</code> without invalidating <code>_candidate_cache</code>, <code>_last_bar_times</code>, or re-syncing instrument specs. Cached data from before the disconnection could be stale.</p>
+<p><strong>Fix</strong>: Clear feature/signal caches and re-fetch instrument specs after any reconnection.</p>
+<h3 id="k7-no-retry-on-transient-mt5-order-failures-medium">K7. No Retry on Transient MT5 Order Failures (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_main.py:1922-1966</code></p>
+<p><code>send_market_order</code> is called once. On failure, the result is logged and throttled as <code>FAILED_{retcode}</code>. There is no distinction between transient failures (requote, timeout, trade context busy) and structural failures (invalid stops, insufficient margin). The throttle prevents retry on the same bar even for transient errors.</p>
+<p><strong>Fix</strong>: Maintain a set of retryable retcodes (<code>TRADE_RETCODE_REQUOTE</code>, <code>TRADE_RETCODE_TIMEOUT</code>, <code>TRADE_RETCODE_BUSY</code>) and allow 1-2 retries with a short delay for those specific codes only.</p>
+<h3 id="k8-silent-returns-without-throttle-recording-medium">K8. Silent Returns Without Throttle Recording (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_main.py:1663, 1668, 1679</code></p>
+<p>When <code>symbol_info</code>, <code>account_info</code>, or <code>tick</code> fetch returns None, the function returns without recording to the decision throttle. The same signal will be retried on the next 1-second iteration, potentially hundreds of times if the MT5 connection is degraded but not fully down.</p>
+<p><strong>Fix</strong>: Record these failures in the throttle with a short suppression window to avoid hammering a degraded connection.</p>
+<h3 id="k9-excessive-mt5-api-calls-per-symbol-loop-low">K9. Excessive MT5 API Calls Per Symbol Loop (LOW)</h3>
+<p><strong>File</strong>: <code>pm_main.py:982, 817, 1726</code></p>
+<p><code>get_positions()</code> is called inside each symbol's processing (line 982 for all positions, line 817 filtered for risk cap, line 1726 again for all). For 40+ symbols processed sequentially, this is 120+ MT5 API calls per sweep just for position checks.</p>
+<p><strong>Fix</strong>: Fetch positions once per sweep in <code>_process_all_symbols()</code> and pass the snapshot to each symbol's processing.</p>
+<h3 id="k10-version-string-inconsistency-low">K10. Version String Inconsistency (LOW)</h3>
+<p><strong>File</strong>: <code>pm_main.py:27, 2114</code></p>
+<p>Line 27: "Version: 3.1". Line 2114: "FX PORTFOLIO MANAGER v3.0". MEMORY.md says v1.4.4. Three different version claims.</p>
+<hr />
+<h2 id="appendix-l-final-comprehensive-audit-pipeline-optimizer-edge-cases">Appendix L: Final Comprehensive Audit - Pipeline &amp; Optimizer Edge Cases</h2>
+<h3 id="l1-train-fallback-contradicts-no-fallback-policy-medium">L1. Train Fallback Contradicts No-Fallback Policy (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_pipeline.py:810-815</code>, <code>pm_pipeline.py:1063-1073</code></p>
+<p>Two separate code paths fall back to the best-training-scored candidate when all validation candidates fail. This contradicts the stated "no-fallback policy" (validation failure = no trade):</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Line 811-815: Strategy selection fallback</span>
+<span class="n">best_train</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">candidates</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">d</span><span class="p">:</span> <span class="n">d</span><span class="p">[</span><span class="s2">&quot;train_score&quot;</span><span class="p">])</span>
+
+<span class="c1"># Line 1063-1073: Grid search fallback</span>
+<span class="n">best_params</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">shortlist</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="s2">&quot;params&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<p><strong>Fix</strong>: Remove both fallbacks. If no candidate passes validation, return None / empty result for that symbol/regime cell.</p>
+<h3 id="l2-no-validation-dd-check-kills-all-regime-candidates-medium">L2. No-Validation DD Check Kills All Regime Candidates (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_optuna.py:686-689</code></p>
+<p>When <code>val_features</code> is None, <code>val_regime_metrics</code> is <code>{}</code>. The DD check defaults to <code>val_m.get('max_drawdown_pct', 100.0)</code>, which returns 100.0. This almost always exceeds the threshold, silently rejecting every regime candidate when running without validation data.</p>
+<p><strong>Fix</strong>: Skip the validation DD check when <code>val_m</code> is empty:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">val_m</span> <span class="ow">and</span> <span class="n">regime_val_dd</span> <span class="o">&gt;</span> <span class="n">max_drawdown_pct</span> <span class="o">*</span> <span class="n">dd_val_mult</span><span class="p">:</span>
+    <span class="k">continue</span>
+</code></pre></div>
+
+<h3 id="l3-regime-tuner-evaluates-on-training-data-no-holdout-medium">L3. Regime Tuner Evaluates on Training Data -- No Holdout (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_regime_tuner.py:306-369</code></p>
+<p>The regime tuner scores detection quality on the same data used to select parameters. This is in-sample overfitting of the regime detection layer.</p>
+<p><strong>Fix</strong>: Split the data and evaluate regime quality metrics on an unseen test portion.</p>
+<h3 id="l4-regime-percentile-self-reference-bias-low">L4. Regime Percentile Self-Reference Bias (LOW)</h3>
+<p><strong>File</strong>: <code>pm_regime.py:870-871, 916</code></p>
+<p>BB squeeze percentile and ATR percentile include the current bar in their reference window: <code>window = bb_width[max(0, i-lookback+1):i+1]</code>. The current bar's value is compared against a window that contains itself.</p>
+<p><strong>Fix</strong>: Use <code>bb_width[max(0, i-lookback):i]</code> to exclude the current bar from the reference window.</p>
+<h3 id="l5-default_config-lookup-matches-only-strategy-name-low">L5. <code>default_config</code> Lookup Matches Only Strategy Name (LOW)</h3>
+<p><strong>File</strong>: <code>pm_pipeline.py:2431</code></p>
+<p>When searching for the default config among regime winners, only <code>strategy_name</code> is compared. If the same strategy wins multiple (timeframe, regime) cells with different parameters, an arbitrary one is picked.</p>
+<p><strong>Fix</strong>: Match on both <code>strategy_name</code> and <code>parameters</code>, or use reference equality.</p>
+<h3 id="l6-random-seed-reuse-across-optimizer-calls-low">L6. Random Seed Reuse Across Optimizer Calls (LOW)</h3>
+<p><strong>File</strong>: <code>pm_optuna.py:812-814</code>, <code>pm_pipeline.py:974, 1785</code></p>
+<p><code>np.random.seed(42)</code> is called inside fallback search methods. If called sequentially for different strategies, each call resets the global RNG to the same seed, producing identical random subsets.</p>
+<p><strong>Fix</strong>: Use <code>np.random.default_rng(42)</code> for a local RNG instance.</p>
+<hr />
+<h2 id="appendix-m-final-comprehensive-audit-strategy-signal-quality">Appendix M: Final Comprehensive Audit - Strategy Signal Quality</h2>
+<h3 id="m1-level-signal-strategies-mitigated-in-backtest-wasteful-in-optimization-medium">M1. Level-Signal Strategies -- Mitigated in Backtest, Wasteful in Optimization (MEDIUM)</h3>
+<p>Five strategies fire on <strong>every bar</strong> where a condition is met (level signal), not just the crossover bar (event signal):</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Signal Type</th>
+<th>Lines</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KeltnerBreakoutStrategy</code></td>
+<td>Every bar above/below channel</td>
+<td><code>pm_strategies.py:1672-1673</code></td>
+</tr>
+<tr>
+<td><code>MomentumBurstStrategy</code></td>
+<td>Every bar momentum &gt; threshold</td>
+<td><code>pm_strategies.py:1569-1570</code></td>
+</tr>
+<tr>
+<td><code>VolatilityBreakoutStrategy</code></td>
+<td>Every bar price change &gt; threshold</td>
+<td><code>pm_strategies.py:1530-1531</code></td>
+</tr>
+<tr>
+<td><code>VolumeSpikeMomentumStrategy</code></td>
+<td>Every bar with volume spike</td>
+<td><code>pm_strategies.py:2363-2365</code></td>
+</tr>
+<tr>
+<td><code>EMAPullbackContinuationStrategy</code></td>
+<td>Every bar during pullback</td>
+<td><code>pm_strategies.py:2639-2640</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Backtester mitigation</strong>: The <code>in_position</code> flag (<code>pm_core.py:292</code>) prevents re-entry while already in a trade. The live trader's position check (<code>pm_main.py:1650</code>) provides similar protection. So <strong>backtest results are accurate</strong>.</p>
+<p><strong>Why it still matters</strong>:<br />
+- During Optuna optimization, the backtester processes every bar's signal even when position is open, wasting cycles on signals that can never trigger<br />
+- Signal density metrics (trades per bar, signal frequency) are inflated, potentially misleading<br />
+- If exit-and-re-enter logic is ever added, these strategies would re-enter immediately on the same bar</p>
+<p><strong>Fix</strong>: Convert to crossover/event signals:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Instead of:</span>
+<span class="n">signals</span><span class="p">[</span><span class="n">features</span><span class="p">[</span><span class="s1">&#39;Close&#39;</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">upper</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
+
+<span class="c1"># Use:</span>
+<span class="n">broke_above</span> <span class="o">=</span> <span class="p">(</span><span class="n">features</span><span class="p">[</span><span class="s1">&#39;Close&#39;</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">upper</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">features</span><span class="p">[</span><span class="s1">&#39;Close&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">shift</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">upper</span><span class="p">)</span>
+<span class="n">signals</span><span class="p">[</span><span class="n">broke_above</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
+</code></pre></div>
+
+<h3 id="m2-_get_bb-cache-key-ignores-std-parameter-root-cause-medium">M2. <code>_get_bb</code> Cache Key Ignores Std Parameter -- Root Cause (MEDIUM)</h3>
+<p><strong>File</strong>: <code>pm_strategies.py:196-198</code></p>
+<p>The <code>_get_bb()</code> helper checks for precomputed columns using only <code>f'BB_MID_{period}'</code>, without incorporating the <code>std</code> parameter:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="sa">f</span><span class="s1">&#39;BB_MID_</span><span class="si">{</span><span class="n">period</span><span class="si">}</span><span class="s1">&#39;</span> <span class="ow">in</span> <span class="n">features</span><span class="o">.</span><span class="n">columns</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">features</span><span class="p">[</span><span class="sa">f</span><span class="s1">&#39;BB_MID_</span><span class="si">{</span><span class="n">period</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">],</span> <span class="n">features</span><span class="p">[</span><span class="sa">f</span><span class="s1">&#39;BB_UPPER_</span><span class="si">{</span><span class="n">period</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">],</span> <span class="n">features</span><span class="p">[</span><span class="sa">f</span><span class="s1">&#39;BB_LOWER_</span><span class="si">{</span><span class="n">period</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<p>This means <code>_get_bb(features, 20, 1.5)</code> and <code>_get_bb(features, 20, 2.5)</code> both return the cached <code>BB_*_20</code> columns (precomputed at <code>std=2.0</code>). This is the <strong>root cause</strong> of the <code>SqueezeBreakoutStrategy</code> bb_std grid issue documented in Appendix D2.</p>
+<p><strong>Additional</strong>: <code>_get_bb</code> also does NOT memoize its results back into the DataFrame when falling back to <code>FeatureComputer.bollinger_bands()</code>, unlike <code>_get_ema</code>, <code>_get_rsi</code>, etc. Every non-cached call recomputes from scratch.</p>
+<p><strong>Fix</strong>: Include std in the cache key: <code>f'BB_MID_{period}_{std}'</code>, and memoize computed results.</p>
+<h3 id="m3-_get_stochastic-cache-only-matches-k_period14-low">M3. <code>_get_stochastic</code> Cache Only Matches k_period==14 (LOW)</h3>
+<p><strong>File</strong>: <code>pm_strategies.py:202-206</code></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="s1">&#39;STOCH_K&#39;</span> <span class="ow">in</span> <span class="n">features</span><span class="o">.</span><span class="n">columns</span> <span class="ow">and</span> <span class="n">k_period</span> <span class="o">==</span> <span class="mi">14</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">features</span><span class="p">[</span><span class="s1">&#39;STOCH_K&#39;</span><span class="p">],</span> <span class="n">features</span><span class="p">[</span><span class="s1">&#39;STOCH_D&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<p>For any <code>k_period != 14</code>, the cache is never hit and the result is not memoized. Strategies tuning stochastic period will recompute every time.</p>
+<h3 id="m4-bollingerbouncestrategy-and-volatilitybreakoutstrategy-bypass-shared-helpers-low">M4. <code>BollingerBounceStrategy</code> and <code>VolatilityBreakoutStrategy</code> Bypass Shared Helpers (LOW)</h3>
+<p><strong>File</strong>: <code>pm_strategies.py:1034-1037</code> (BollingerBounce), <code>pm_strategies.py:1518-1523</code> (VolatilityBreakout)</p>
+<p>Both manually compute BB and ATR respectively instead of using <code>_get_bb()</code> and <code>_get_atr()</code>. This bypasses memoization and may produce slightly different results (population vs sample std).</p>
+<p><strong>Fix</strong>: Use the shared helpers for consistency and caching.</p>
+<h3 id="m5-fishertransformmrstrategy-nan-to-zero-warm-up-transition-low">M5. <code>FisherTransformMRStrategy</code> NaN-to-Zero Warm-Up Transition (LOW)</h3>
+<p><strong>File</strong>: <code>pm_strategies.py:1319</code></p>
+<p>During warm-up bars, NaN values are replaced with 0.0 in the Fisher Transform. The transition from artificial 0 to real values could trigger a false signal if the first real Fisher value crosses the entry threshold from 0.</p>
+<hr />
+<h2 id="appendix-n-final-comprehensive-audit-performance-hotspots-summary">Appendix N: Final Comprehensive Audit - Performance Hotspots Summary</h2>
+<p>This is the consolidated compute-cost picture after the full audit. Items are ranked by actual measured or estimated impact.</p>
+<h3 id="n1-worst-offenders-by-estimated-wall-clock-cost">N1. Worst Offenders by Estimated Wall-Clock Cost</h3>
+<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th>Location</th>
+<th>Cost Driver</th>
+<th>Estimated Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Divergence family (3 strategies)</td>
+<td>Python loops + <code>_detect_swing_points</code> O(n*order) per call, 12+ calls per strategy</td>
+<td>5-10s per strategy on 50k bars</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>CCIReversalStrategy</code></td>
+<td>Rolling <code>.apply(lambda)</code> for MAD</td>
+<td>1-10s depending on data length</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>KaufmanAMATrendStrategy</code></td>
+<td>Nested Python loop for volatility</td>
+<td>O(n * er_period)</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>AroonTrendStrategy</code></td>
+<td>Python loop with <code>argmax</code> per window</td>
+<td>O(n * period)</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>FeatureComputer.compute_all()</code></td>
+<td>Computes all ~40 indicators when strategy needs 3-5</td>
+<td>Multiplied across every Optuna trial</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>MarketRegimeDetector.compute_regime_scores()</code></td>
+<td>Raw regime loop is pure Python</td>
+<td>O(n) Python loop, vectorizable</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>_get_keltner</code> / <code>_get_bb</code></td>
+<td>No memoization / incomplete memoization</td>
+<td>Recomputed on each call</td>
+</tr>
+</tbody>
+</table>
+<h3 id="n2-quick-wins-same-output-less-work">N2. Quick Wins (Same Output, Less Work)</h3>
+<ol>
+<li><strong>Make CCI strategy consume precomputed CCI</strong> when period matches default -- eliminates the rolling lambda</li>
+<li><strong>Remove dead swing-point computations</strong> from RSI/MACD divergence strategies</li>
+<li><strong>Remove unused <code>train_features</code> copy</strong> from <code>RetrainPeriodSelector</code></li>
+<li><strong>Remove dead <code>atr_20_cached</code></strong> assignment from <code>FeatureComputer.compute_all()</code></li>
+<li><strong>Vectorize <code>OBVDivergenceStrategy</code> sign detection</strong> with <code>np.sign()</code></li>
+<li><strong>Vectorize regime raw determination loop</strong> in <code>pm_regime.py:591-611</code></li>
+<li><strong>Hoist positions snapshot</strong> in live trading loop (fetch once, filter per symbol)</li>
+</ol>
+<h3 id="n3-medium-effort-high-value">N3. Medium Effort / High Value</h3>
+<ol>
+<li><strong>Wire lazy feature path</strong> for single-strategy evaluation contexts (verify parity first)</li>
+<li><strong>Vectorize <code>_detect_swing_points</code></strong> or replace with a rolling-extrema approach</li>
+<li><strong>Replace <code>KaufmanAMA</code> inner loop</strong> with rolling sum of absolute differences</li>
+<li><strong>Add std to <code>_get_bb</code> cache key</strong> and memoize computed results</li>
+<li><strong>Memoize <code>_get_keltner</code> results</strong> back into the DataFrame</li>
+</ol>
+<hr />
+<h2 id="appendix-o-revised-strategy-trust-table-after-final-audit">Appendix O: Revised Strategy Trust Table After Final Audit</h2>
+<p>This replaces the robustness rankings in Appendix A for affected strategies, incorporating all findings from Appendices D, G, K, M, and P.</p>
+<h3 id="strategies-that-must-be-fixed-before-trusting-optimization-output">Strategies That Must Be Fixed Before Trusting Optimization Output</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Issues Found</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SupertrendStrategy</code></td>
+<td>First-trade dropped (J1), zero signals on multiple pairs (G1)</td>
+<td><strong>Non-functional</strong> -- was rated 9/10, now fix-before-trust</td>
+</tr>
+<tr>
+<td><code>InsideBarBreakoutStrategy</code></td>
+<td>Impossible signal conditions (main body item 19/Appendix A)</td>
+<td><strong>Structurally broken</strong></td>
+</tr>
+<tr>
+<td><code>ADXTrendStrategy</code></td>
+<td>Uses SMA not Wilder EMA (J2d), re-warms per slice (D2), buggy precomputed DI (J2)</td>
+<td><strong>Three compounding bugs</strong></td>
+</tr>
+<tr>
+<td><code>ADXDIStrengthStrategy</code></td>
+<td>Consumes buggy precomputed PLUS_DI/MINUS_DI at period=14 (J2c)</td>
+<td><strong>Wrong indicator values</strong></td>
+</tr>
+<tr>
+<td><code>EMARibbonADXStrategy</code></td>
+<td>Same precomputed DI bug (J2c)</td>
+<td><strong>Wrong indicator values</strong></td>
+</tr>
+<tr>
+<td><code>SqueezeBreakoutStrategy</code></td>
+<td>bb_std grid ignored by cache (P2/D2), partial fake parameter space</td>
+<td><strong>Optimization partially fake</strong></td>
+</tr>
+<tr>
+<td><code>ParabolicSARTrendStrategy</code></td>
+<td>First-bar fabricated short (D2)</td>
+<td><strong>Boundary artifact</strong></td>
+</tr>
+<tr>
+<td><code>PinBarReversalStrategy</code></td>
+<td>Double-shifted, 2 bars late (D2)</td>
+<td><strong>Systematic late entry</strong></td>
+</tr>
+<tr>
+<td><code>EngulfingPatternStrategy</code></td>
+<td>Dead lookback_level param (D2), buggy precomputed ADX for confirmation</td>
+<td><strong>Partial dead tuning + wrong ADX</strong></td>
+</tr>
+<tr>
+<td><code>FisherTransformMRStrategy</code></td>
+<td>Dead signal_period param (D2)</td>
+<td><strong>Duplicated Optuna trials</strong></td>
+</tr>
+<tr>
+<td><code>RSIDivergenceStrategy</code></td>
+<td>Dead RSI swing computation (G2/I), O(n^2) performance (N1)</td>
+<td><strong>Dead work + slow</strong></td>
+</tr>
+<tr>
+<td><code>MACDDivergenceStrategy</code></td>
+<td>Dead histogram swing computation (G2/I), O(n^2) performance (N1)</td>
+<td><strong>Dead work + slow</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="strategies-with-minor-issues-functional-but-imperfect">Strategies With Minor Issues (Functional but Imperfect)</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Issue</th>
+<th>Severity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KeltnerBreakoutStrategy</code></td>
+<td>Level signals, not events (M1 signal)</td>
+<td>Low -- mitigated by backtester</td>
+</tr>
+<tr>
+<td><code>MomentumBurstStrategy</code></td>
+<td>Level signals (M1 signal) + single oscillator (Appendix A)</td>
+<td>Low + design weakness</td>
+</tr>
+<tr>
+<td><code>VolatilityBreakoutStrategy</code></td>
+<td>Level signals (M1 signal) + bypasses shared ATR helper (M4 signal)</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><code>VolumeSpikeMomentumStrategy</code></td>
+<td>Level signals (M1 signal)</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><code>EMAPullbackContinuationStrategy</code></td>
+<td>Level signals (M1 signal)</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><code>StochasticReversalStrategy</code></td>
+<td>Zone overlap +10/-10 hardcoded (D2)</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><code>BollingerBounceStrategy</code></td>
+<td>Bypasses shared BB helper (M4 signal)</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><code>CCIReversalStrategy</code></td>
+<td>Slow lambda MAD (N1), could use precomputed CCI</td>
+<td>Performance only</td>
+</tr>
+</tbody>
+</table>
+<h3 id="strategies-confirmed-clean-after-full-audit">Strategies Confirmed Clean After Full Audit</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DonchianBreakoutStrategy</code></td>
+<td>Simple, robust, no issues found</td>
+</tr>
+<tr>
+<td><code>PivotBreakoutStrategy</code></td>
+<td>Stateful, well-structured</td>
+</tr>
+<tr>
+<td><code>ZScoreVWAPReversionStrategy</code></td>
+<td>Sound concept, large param space (noted)</td>
+</tr>
+<tr>
+<td><code>KeltnerPullbackStrategy</code></td>
+<td>4-part logic, clean</td>
+</tr>
+<tr>
+<td><code>ZScoreMRStrategy</code></td>
+<td>Statistical basis sound</td>
+</tr>
+<tr>
+<td><code>KeltnerFadeStrategy</code></td>
+<td>Clean mean-reversion logic</td>
+</tr>
+<tr>
+<td><code>ROCExhaustionReversalStrategy</code></td>
+<td>Percentile-based, good noise resistance</td>
+</tr>
+<tr>
+<td><code>HullMATrendStrategy</code></td>
+<td>Responsive, parameter-sensitive (noted)</td>
+</tr>
+<tr>
+<td><code>RSITrendFilteredMRStrategy</code></td>
+<td>Good directional filter</td>
+</tr>
+<tr>
+<td><code>StochRSITrendGateStrategy</code></td>
+<td>Two indicators + trend filter</td>
+</tr>
+<tr>
+<td><code>TurtleSoupReversalStrategy</code></td>
+<td>Fade failed breakouts, clean</td>
+</tr>
+<tr>
+<td><code>EMACrossoverStrategy</code></td>
+<td>Simple, whipsaw-prone (noted)</td>
+</tr>
+<tr>
+<td><code>MACDTrendStrategy</code></td>
+<td>Standard, false-signal-prone (noted)</td>
+</tr>
+<tr>
+<td><code>NarrowRangeBreakoutStrategy</code></td>
+<td>Simple range logic, clean</td>
+</tr>
+<tr>
+<td><code>WilliamsRStrategy</code></td>
+<td>Straightforward, needs div-by-zero fix (J5)</td>
+</tr>
+<tr>
+<td><code>IchimokuStrategy</code></td>
+<td>Complex but structurally clean</td>
+</tr>
+<tr>
+<td><code>MACDHistogramMomentumStrategy</code></td>
+<td>Basic, clean</td>
+</tr>
+<tr>
+<td><code>OBVDivergenceStrategy</code></td>
+<td>Slow (N1), needs np.sign fix, but logic correct</td>
+</tr>
+<tr>
+<td><code>AroonTrendStrategy</code></td>
+<td>Slow (N1), noisy (noted), but structurally correct</td>
+</tr>
+<tr>
+<td><code>ATRPercentileBreakoutStrategy</code></td>
+<td>Rarely fires (noted), but logic correct</td>
+</tr>
+<tr>
+<td><code>KaufmanAMATrendStrategy</code></td>
+<td>Slow inner loop (N1), but logic correct</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="appendix-p-implementation-priority-after-final-audit">Appendix P: Implementation Priority After Final Audit</h2>
+<p>This is the recommended implementation sequence incorporating ALL findings from the full document (main body + Appendices A through R).</p>
+<h3 id="immediate-before-next-optimization-run">Immediate (Before Next Optimization Run)</h3>
+<ol>
+<li><strong>Fix ADX/DI precomputed values</strong> (J2) -- affects 5+ strategies, corrupts optimization</li>
+<li><strong>Fix Supertrend first-trade bug</strong> (J1) -- currently non-functional Tier 1 strategy</li>
+<li><strong>Fix PipelineResult crash</strong> (J3) -- will crash on any optimization exception</li>
+<li><strong>Fix live stop bar alignment</strong> (main body item 8) -- real backtest/live parity defect</li>
+<li><strong>Add div-by-zero guards</strong> to Stochastic and Williams %R (J5)</li>
+<li><strong>Remove train fallback paths</strong> (L1) -- contradicts no-fallback policy</li>
+</ol>
+<h3 id="phase-1-measurement-integrity-week-1-2">Phase 1: Measurement Integrity (Week 1-2)</h3>
+<ol>
+<li>Bar-level equity curve (main body item 1, M6)</li>
+<li>Mark-to-market drawdown (main body item 2)</li>
+<li>Entry slippage symmetry (main body item 5)</li>
+<li>Net-dollar win/loss classification (main body item 6)</li>
+<li>Swap cost application (main body item 7)</li>
+<li>Min-lot risk overrun protection (J4)</li>
+<li>Commission rate verification (J7)</li>
+</ol>
+<h3 id="phase-2-strategy-bug-fixes-week-2-3">Phase 2: Strategy Bug Fixes (Week 2-3)</h3>
+<ol>
+<li>Fix all 12 strategies in the "fix-before-trust" table (Appendix R)</li>
+<li>Convert level-signal strategies to event signals (M1 signal)</li>
+<li>Fix <code>_get_bb</code> cache key to include std (P2)</li>
+<li>Remove dead swing computations from divergence strategies (N2)</li>
+</ol>
+<h3 id="phase-3-validation-selection-week-3-4">Phase 3: Validation &amp; Selection (Week 3-4)</h3>
+<ol>
+<li>Clean up scored overlap (main body item 9)</li>
+<li>Add clean holdout (main body item 10)</li>
+<li>Add DSR multiple-testing control (main body item 11)</li>
+<li>Fix Optuna <code>max(regime_scores)</code> objective (main body item 18)</li>
+<li>Fix no-validation DD check (L2)</li>
+<li>Fix regime tuner data leakage (L3)</li>
+</ol>
+<h3 id="phase-4-live-trading-hardening-week-4-5">Phase 4: Live Trading Hardening (Week 4-5)</h3>
+<ol>
+<li>Fix stale price issue (K1)</li>
+<li>Remove dead LiveTrader.start() / consolidate trading loops (K2)</li>
+<li>Wire or remove close_on_opposite_signal (K3)</li>
+<li>Fix rate-limit throttle recording (K4)</li>
+<li>Add transient-failure retry logic (K7)</li>
+<li>Clear caches after reconnection (K6)</li>
+<li>Hoist positions snapshot (N9, Q2)</li>
+</ol>
+<h3 id="phase-5-performance-enhancement-week-5-8_1">Phase 5: Performance &amp; Enhancement (Week 5-8)</h3>
+<ol>
+<li>Volatility-targeted sizing (main body item 21)</li>
+<li>Fractional Kelly overlay (main body item 22)</li>
+<li>Partial profit taking (main body item 24)</li>
+<li>ATR trailing stop for trend strategies (main body item 25)</li>
+<li>HRP portfolio construction (main body item 27)</li>
+<li>Wire lazy feature path (N3)</li>
+<li>Vectorize performance hotspots (Q1, Q2, Q3)</li>
+</ol>
+<h3 id="phase-6-dashboard-infrastructure-week-8-10_1">Phase 6: Dashboard &amp; Infrastructure (Week 8-10)</h3>
+<ol>
+<li>Fix dashboard realized-performance model (Appendix E)</li>
+<li>Add missing analytics metrics (main body item 34)</li>
+<li>Fill test coverage gaps (main body item 35)</li>
+<li>Equity curve trading (main body item 36)</li>
+</ol>
+<hr />
+<p><em>Final audit completed across all core modules (~14,000 lines). Six parallel verification agents confirmed every finding against actual code with line numbers. This document is now comprehensive enough to serve as the definitive upgrade roadmap.</em></p>
+</body>
+</html>

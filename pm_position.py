@@ -15,7 +15,7 @@ This module is separate to allow for future enhancements:
 - Break-even stops
 - Scale in/out logic
 
-Version: 3.0 (Portfolio Manager)
+Version: 3.1 (Portfolio Manager)
 """
 
 import logging

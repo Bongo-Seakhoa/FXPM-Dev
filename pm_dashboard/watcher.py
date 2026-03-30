@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import glob
 import json
 import os
@@ -18,6 +19,8 @@ from .utils import (
     load_instrument_specs,
     load_pm_configs,
     normalize_symbol,
+    normalize_regime,
+    normalize_timeframe,
     parse_timestamp,
     pick_action_value,
     safe_read_text,
@@ -93,6 +96,9 @@ def entry_to_dict(entry: SignalEntry) -> Dict[str, Any]:
         "timestamp": entry.timestamp,
         "valid_now": entry.valid_now,
         "reason": entry.reason,
+        "secondary_trade": entry.secondary_trade,
+        "secondary_reason": entry.secondary_reason,
+        "position_context": entry.position_context,
         "source": entry.source,
     }
 
@@ -108,6 +114,9 @@ class DashboardWatcher(threading.Thread):
         self._last_alert_strongest: str = ""
         self._pm_configs_mtime: Optional[float] = None
         self._pm_configs_cache: Dict[str, Any] = {}
+        self._parsed_file_cache: Dict[str, tuple] = {}
+        self._trade_map_cache_signature: Optional[tuple] = None
+        self._trade_map_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -124,6 +133,9 @@ class DashboardWatcher(threading.Thread):
 
     def update_config(self, config: Dict[str, Any]) -> None:
         self.config = config
+        self._parsed_file_cache.clear()
+        self._trade_map_cache_signature = None
+        self._trade_map_cache = {}
         if self.pm_root != config.get("pm_root"):
             self.pm_root = config.get("pm_root") or self.pm_root
             self.state.update(
@@ -143,7 +155,7 @@ class DashboardWatcher(threading.Thread):
         patterns = self.config.get("file_patterns", [])
         explicit_files = self.config.get("explicit_files", [])
         exclude_patterns = self.config.get("exclude_patterns", [])
-        source_files = iter_candidate_files(self.pm_root, patterns, explicit_files, exclude_patterns)
+        source_files = sorted(iter_candidate_files(self.pm_root, patterns, explicit_files, exclude_patterns))
 
         entries: List[SignalEntry] = []
         last_error = ""
@@ -171,16 +183,17 @@ class DashboardWatcher(threading.Thread):
     def _load_primary_entries(self, source_files: List[str], pm_configs: Dict[str, Any]) -> List[SignalEntry]:
         primary_patterns = self.config.get("primary_sources") or ["last_trade_log.json"]
         primary_file = find_primary_file(self.pm_root, primary_patterns)
+        trade_map = self._load_trade_map()
         if primary_file:
             text = safe_read_text(primary_file)
             if text:
-                mtime = os.path.getmtime(primary_file) if os.path.exists(primary_file) else None
-                entries = parse_entries_from_file(
-                    primary_file, text, self.config, self.state.instrument_specs, mtime
-                )
-                entries = enrich_entries(entries, pm_configs, self._load_trade_map(), self.config)
-                if not is_actionable_primary(primary_file):
-                    entries.extend(self._load_log_entries())
+                entries = self._parse_entries_cached(primary_file, text)
+                log_entries = self._load_log_entries()
+                if is_actionable_primary(primary_file):
+                    entries = merge_actionable_with_log_executions(entries, log_entries)
+                else:
+                    entries.extend(log_entries)
+                entries = enrich_entries(entries, pm_configs, trade_map, self.config)
                 entries = normalize_action_flags(entries, self.config)
                 return entries
 
@@ -190,17 +203,31 @@ class DashboardWatcher(threading.Thread):
                 text = safe_read_text(path)
                 if text is None:
                     continue
-                mtime = None
-                try:
-                    mtime = os.path.getmtime(path)
-                except OSError:
-                    pass
-                entries.extend(parse_entries_from_file(path, text, self.config, self.state.instrument_specs, mtime))
+                entries.extend(self._parse_entries_cached(path, text))
             except Exception:
                 continue
-        entries = enrich_entries(entries, pm_configs, self._load_trade_map(), self.config)
         entries.extend(self._load_log_entries())
+        entries = enrich_entries(entries, pm_configs, trade_map, self.config)
         entries = normalize_action_flags(entries, self.config)
+        return entries
+
+    def _file_signature(self, path: str) -> Optional[tuple]:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _parse_entries_cached(self, path: str, text: str) -> List[SignalEntry]:
+        signature = self._file_signature(path)
+        if signature is not None:
+            cached = self._parsed_file_cache.get(path)
+            if cached and cached[0] == signature:
+                return [copy.deepcopy(item) for item in cached[1]]
+        mtime = os.path.getmtime(path) if os.path.exists(path) else None
+        entries = parse_entries_from_file(path, text, self.config, self.state.instrument_specs, mtime)
+        if signature is not None:
+            self._parsed_file_cache[path] = (signature, [copy.deepcopy(item) for item in entries])
         return entries
 
     def _load_pm_configs(self) -> Dict[str, Any]:
@@ -222,12 +249,23 @@ class DashboardWatcher(threading.Thread):
             self._pm_configs_mtime = mtime
         return self._pm_configs_cache
 
-    def _load_trade_map(self) -> Dict[str, Dict[str, Any]]:
+    def _load_trade_map(self) -> Dict[str, List[Dict[str, Any]]]:
         pattern = self.config.get("trade_files_pattern", "**/trades_*.json")
         trade_files = []
         if self.pm_root:
             trade_files = [path for path in glob_paths(self.pm_root, pattern)]
-        trade_map: Dict[str, Dict[str, Any]] = {}
+        trade_files = sorted(set(trade_files))
+        signature_parts: List[tuple] = []
+        for path in trade_files:
+            file_signature = self._file_signature(path)
+            if file_signature is None:
+                continue
+            signature_parts.append((path, file_signature))
+        signature: tuple = tuple(signature_parts)
+        if self._trade_map_cache_signature == signature:
+            return self._trade_map_cache
+
+        trade_map: Dict[str, List[Dict[str, Any]]] = {}
         for path in trade_files:
             text = safe_read_text(path)
             if not text:
@@ -246,18 +284,36 @@ class DashboardWatcher(threading.Thread):
                     continue
                 timestamp = parse_timestamp(record.get("timestamp"))
                 ts_value = timestamp.timestamp() if timestamp else 0.0
-                existing = trade_map.get(symbol)
-                if existing and existing.get("_ts", 0.0) > ts_value:
-                    continue
-                trade_map[symbol] = {
+                candidate = {
                     "_ts": ts_value,
+                    "symbol": symbol,
+                    "timeframe": str(record.get("timeframe") or "").strip().upper(),
+                    "regime": str(record.get("regime") or "").strip().upper(),
+                    "strategy": str(record.get("strategy") or record.get("strategy_name") or "").strip(),
+                    "direction": direction_from_value(record.get("direction") or record.get("side") or record.get("signal_direction")),
+                    "magic": record.get("magic"),
                     "price": record.get("price") or record.get("entry") or record.get("entry_price"),
                     "sl": record.get("sl") or record.get("stop_loss") or record.get("stop_loss_price"),
                     "tp": record.get("tp") or record.get("take_profit") or record.get("take_profit_price"),
-                    "direction": record.get("direction"),
                     "timestamp": record.get("timestamp"),
                     "status": record.get("status"),
                 }
+                trade_map.setdefault(symbol, []).append(candidate)
+
+        for symbol, candidates in trade_map.items():
+            candidates.sort(
+                key=lambda item: (
+                    item.get("_ts", 0.0),
+                    str(item.get("strategy") or ""),
+                    str(item.get("timeframe") or ""),
+                    str(item.get("regime") or ""),
+                    str(item.get("direction") or ""),
+                ),
+                reverse=True,
+            )
+
+        self._trade_map_cache_signature = signature
+        self._trade_map_cache = trade_map
         return trade_map
 
     def _load_log_entries(self) -> List[SignalEntry]:
@@ -275,8 +331,7 @@ class DashboardWatcher(threading.Thread):
             text = safe_read_text(path)
             if not text:
                 continue
-            mtime = os.path.getmtime(path) if os.path.exists(path) else None
-            entries.extend(parse_entries_from_file(path, text, self.config, self.state.instrument_specs, mtime))
+            entries.extend(self._parse_entries_cached(path, text))
         return entries
 
     def maybe_alert(self, valid_entries: List[SignalEntry]) -> None:
@@ -358,10 +413,80 @@ def entry_alert_key(entry: SignalEntry) -> str:
     )
 
 
-def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
+def entry_match_key(entry: SignalEntry) -> tuple:
+    return (
+        normalize_symbol(entry.symbol),
+        normalize_timeframe(entry.timeframe),
+        normalize_regime(entry.regime),
+        str(entry.strategy_name or "").strip(),
+        direction_from_value(entry.signal_direction),
+    )
+
+
+def entry_action_value(entry: SignalEntry) -> str:
     action_value = pick_action_value(entry.raw).upper() if entry.raw else ""
     if not action_value and entry.reason:
         action_value = str(entry.reason).upper()
+    return action_value
+
+
+def entry_timestamp_rank(entry: SignalEntry) -> float:
+    ts = parse_timestamp(entry.timestamp) if entry.timestamp else None
+    if ts is None:
+        return 0.0
+    try:
+        return float(ts.timestamp())
+    except Exception:
+        return 0.0
+
+
+def merge_actionable_with_log_executions(
+    primary_entries: List[SignalEntry],
+    log_entries: List[SignalEntry],
+) -> List[SignalEntry]:
+    """
+    Keep actionable primary decisions, but add latest executed log entries for symbols
+    whose latest actionable state is not EXECUTED.
+    """
+    if not log_entries:
+        return primary_entries
+
+    latest_primary_action_by_key: Dict[tuple, str] = {}
+    latest_primary_rank_by_key: Dict[tuple, float] = {}
+    for entry in primary_entries:
+        key = entry_match_key(entry)
+        if not key[0]:
+            continue
+        rank = entry_timestamp_rank(entry)
+        prev_rank = latest_primary_rank_by_key.get(key)
+        if prev_rank is None or rank >= prev_rank:
+            latest_primary_rank_by_key[key] = rank
+            latest_primary_action_by_key[key] = entry_action_value(entry)
+
+    latest_log_execution_by_key: Dict[tuple, SignalEntry] = {}
+    latest_log_rank_by_key: Dict[tuple, float] = {}
+    for entry in log_entries:
+        if entry_action_value(entry) != "EXECUTED":
+            continue
+        key = entry_match_key(entry)
+        if not key[0]:
+            continue
+        rank = entry_timestamp_rank(entry)
+        prev_rank = latest_log_rank_by_key.get(key)
+        if prev_rank is None or rank >= prev_rank:
+            latest_log_rank_by_key[key] = rank
+            latest_log_execution_by_key[key] = entry
+
+    merged = list(primary_entries)
+    for key, log_entry in latest_log_execution_by_key.items():
+        if latest_primary_action_by_key.get(key) == "EXECUTED":
+            continue
+        merged.append(log_entry)
+    return merged
+
+
+def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
+    action_value = entry_action_value(entry)
 
     display_actions = {str(item).upper() for item in config.get("display_actions", [])}
     if display_actions and action_value not in display_actions:
@@ -451,7 +576,7 @@ def is_actionable_primary(path: Optional[str]) -> bool:
 def enrich_entries(
     entries: List[SignalEntry],
     pm_configs: Dict[str, Any],
-    trade_map: Dict[str, Dict[str, Any]],
+    trade_map: Dict[str, List[Dict[str, Any]]],
     config: Optional[Dict[str, Any]] = None,
 ) -> List[SignalEntry]:
     for entry in entries:
@@ -460,11 +585,9 @@ def enrich_entries(
             continue
         entry.symbol = symbol
 
-        action_value = pick_action_value(entry.raw).upper() if entry.raw else ""
-        if not action_value and entry.reason:
-            action_value = str(entry.reason).upper()
+        action_value = entry_action_value(entry)
 
-        trade = trade_map.get(symbol)
+        trade = select_trade_candidate(entry, trade_map.get(symbol, []), config)
         if action_value == "EXECUTED" and trade:
             trade_dir = direction_from_value(trade.get("direction"))
             if entry.signal_direction and trade_dir and trade_dir != entry.signal_direction:
@@ -490,6 +613,65 @@ def enrich_entries(
     return entries
 
 
+def select_trade_candidate(
+    entry: SignalEntry,
+    candidates: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not candidates:
+        return None
+
+    entry_symbol = normalize_symbol(entry.symbol)
+    entry_timeframe = normalize_timeframe(entry.timeframe)
+    entry_regime = normalize_regime(entry.regime)
+    entry_strategy = str(entry.strategy_name or "").strip()
+    entry_direction = direction_from_value(entry.signal_direction)
+    entry_magic = None
+    if entry.raw:
+        try:
+            raw_magic = entry.raw.get("magic")
+            entry_magic = int(raw_magic) if raw_magic is not None else None
+        except (TypeError, ValueError):
+            entry_magic = None
+
+    def _score(candidate: Dict[str, Any]) -> tuple:
+        score = 0
+        if normalize_symbol(candidate.get("symbol")) == entry_symbol:
+            score += 100
+        if entry_timeframe and normalize_timeframe(candidate.get("timeframe")) == entry_timeframe:
+            score += 30
+        if entry_regime and normalize_regime(candidate.get("regime")) == entry_regime:
+            score += 20
+        if entry_strategy and str(candidate.get("strategy") or "").strip() == entry_strategy:
+            score += 20
+        if entry_direction and direction_from_value(candidate.get("direction")) == entry_direction:
+            score += 10
+        if entry_magic is not None and candidate.get("magic") is not None:
+            try:
+                if int(candidate.get("magic")) == entry_magic:
+                    score += 40
+            except (TypeError, ValueError):
+                pass
+        return score, candidate.get("_ts", 0.0)
+
+    ranked = sorted(candidates, key=_score, reverse=True)
+    for candidate in ranked:
+        if entry_symbol and normalize_symbol(candidate.get("symbol")) != entry_symbol:
+            continue
+        if entry_timeframe and normalize_timeframe(candidate.get("timeframe")) not in ("", entry_timeframe):
+            continue
+        if entry_regime and normalize_regime(candidate.get("regime")) not in ("", entry_regime):
+            continue
+        if entry_strategy and str(candidate.get("strategy") or "").strip() not in ("", entry_strategy):
+            continue
+        if entry_direction and direction_from_value(candidate.get("direction")) not in ("", entry_direction):
+            continue
+        if trade_map_is_fresh(entry, candidate, config):
+            return candidate
+
+    return ranked[0]
+
+
 def trade_map_is_fresh(
     entry: SignalEntry,
     trade: Dict[str, Any],
@@ -508,7 +690,16 @@ def trade_map_is_fresh(
 
     entry_ts = parse_timestamp(entry.timestamp) if entry.timestamp else None
     if entry_ts is not None:
-        return abs((trade_ts - entry_ts).total_seconds()) <= max_age * 60.0
+        try:
+            if trade_ts.tzinfo is None and entry_ts.tzinfo is not None:
+                trade_ts = trade_ts.replace(tzinfo=entry_ts.tzinfo)
+            elif trade_ts.tzinfo is not None and entry_ts.tzinfo is None:
+                entry_ts = entry_ts.replace(tzinfo=trade_ts.tzinfo)
+        except Exception:
+            return False
+        if trade_ts < entry_ts:
+            return False
+        return (trade_ts - entry_ts).total_seconds() <= max_age * 60.0
 
     return is_recent(trade_ts, max_age)
 
@@ -535,12 +726,19 @@ def enrich_from_pm_configs(entry: SignalEntry, pm_config: Optional[Dict[str, Any
 
 def normalize_action_flags(entries: List[SignalEntry], config: Dict[str, Any]) -> List[SignalEntry]:
     valid_actions = {str(item).upper() for item in config.get("valid_actions", [])}
+    valid_prefixes = [str(item).upper() for item in config.get("valid_action_prefixes", [])]
+    exclude_actions = {str(item).upper() for item in config.get("exclude_actions", [])}
     max_age = config.get("max_signal_age_minutes")
     for entry in entries:
-        action_value = pick_action_value(entry.raw).upper() if entry.raw else ""
-        if not action_value and entry.reason:
-            action_value = str(entry.reason).upper()
-        is_valid_action = action_value in valid_actions
+        action_value = entry_action_value(entry)
+        is_valid_action = False
+        if action_value:
+            if action_value in exclude_actions:
+                is_valid_action = False
+            elif action_value in valid_actions:
+                is_valid_action = True
+            else:
+                is_valid_action = any(action_value.startswith(prefix) for prefix in valid_prefixes if prefix)
         if entry.timestamp:
             ts = parse_timestamp(entry.timestamp)
         else:

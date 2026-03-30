@@ -1,11 +1,11 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PM Dashboard</title>
+    <title>PM Dashboard - Signal Desk</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260207a') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260208a') }}" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -15,7 +15,7 @@
           <div class="logo">PM</div>
           <div>
             <h1>Signal Desk</h1>
-            <p>Read-only view of PM signals for manual execution.</p>
+            <p>Read-only monitor of PM entries for manual execution.</p>
           </div>
         </div>
         <nav class="nav" role="navigation" aria-label="Main navigation">
@@ -23,20 +23,34 @@
           <a class="nav-link" href="/strategies">Strategies</a>
           <a class="nav-link" href="/analytics">Analytics</a>
           <a class="nav-link" href="/trades">Trade History</a>
-          <div class="theme-toggle" id="theme-toggle" title="Toggle Dark Mode">
-            <span class="theme-toggle-icon">🌙</span>
-          </div>
+          <button class="theme-toggle" id="theme-toggle" type="button" title="Switch theme">
+            <span class="theme-toggle-icon">DARK</span>
+          </button>
         </nav>
-        <div class="stat-card">
-          <div class="stat-label">Valid Entries Now</div>
-          <div class="stat-value" id="valid-count">0</div>
-          <div class="stat-meta">Last updated: <span id="last-updated">--</span></div>
+        <div class="stat-card stat-card-wide">
+          <div class="metrics-inline">
+            <div>
+              <span class="stat-label">Actionable</span>
+              <strong class="stat-value-inline" id="valid-count">0</strong>
+            </div>
+            <div>
+              <span class="stat-label">Total</span>
+              <strong class="stat-value-inline" id="total-count">0</strong>
+            </div>
+            <div>
+              <span class="stat-label">Shown</span>
+              <strong class="stat-value-inline" id="filtered-count">0</strong>
+            </div>
+          </div>
+          <div class="stat-meta">Last updated: <span id="last-updated">--</span> (<span id="staleness">--</span>)</div>
           <div class="stat-meta">Files scanned: <span id="source-files">0</span></div>
         </div>
       </header>
 
+      <section class="status-banner hidden" id="status-banner" aria-live="polite"></section>
+
       <section class="card controls fade-in">
-        <div class="filters">
+        <div class="filters filters-wide">
           <div>
             <label for="filter-symbol">Symbol</label>
             <select id="filter-symbol" aria-label="Filter by symbol"></select>
@@ -57,13 +71,32 @@
             <label for="filter-strategy">Strategy</label>
             <select id="filter-strategy" aria-label="Filter by strategy"></select>
           </div>
+          <div>
+            <label for="filter-search">Search</label>
+            <input id="filter-search" type="text" placeholder="Symbol, strategy, regime" />
+          </div>
+          <div>
+            <label for="sort-by">Sort</label>
+            <select id="sort-by">
+              <option value="recent">Most Recent</option>
+              <option value="strength">Strongest</option>
+              <option value="symbol">Symbol</option>
+            </select>
+          </div>
+          <div class="toggle-control">
+            <label class="toggle">
+              <input type="checkbox" id="latest-only" checked />
+              <span>Latest per symbol/timeframe</span>
+            </label>
+          </div>
         </div>
-        <div>
-          <button class="btn" id="refresh-btn">Refresh Now</button>
+        <div class="control-actions">
+          <button class="btn btn-secondary" id="clear-filters-btn" type="button">Clear Filters</button>
+          <button class="btn" id="refresh-btn" type="button">Refresh</button>
         </div>
       </section>
 
-      <main class="grid">
+      <main class="grid dashboard-grid">
         <section class="card table-wrap fade-in">
           <table>
             <thead>
@@ -72,11 +105,12 @@
                 <th>TF</th>
                 <th>Regime</th>
                 <th>Dir</th>
-                <th>SL</th>
                 <th>Entry</th>
+                <th>SL</th>
                 <th>TP</th>
+                <th>R:R</th>
                 <th>Strength</th>
-                <th>Time</th>
+                <th>Age</th>
                 <th>Strategy</th>
               </tr>
             </thead>
@@ -85,7 +119,7 @@
           <div class="table-footer">
             <div class="page-meta">
               <span id="page-info">Page 1 of 1</span>
-              <span class="page-meta-sep">•</span>
+              <span class="page-meta-sep">|</span>
               <span id="page-count">0 rows</span>
             </div>
             <div class="page-controls">
@@ -104,7 +138,13 @@
 
         <section class="card details fade-in" id="sizing-section">
           <h3>Position Sizing</h3>
-          <button class="btn btn-secondary" id="use-entry-btn" type="button">Use Selected Entry</button>
+          <div class="selection-head">
+            <div class="selection-summary" id="selected-summary">No entry selected.</div>
+            <div class="selection-actions">
+              <button class="btn btn-secondary" id="use-entry-btn" type="button">Use Selected</button>
+              <button class="btn btn-secondary" id="clear-selection-btn" type="button">Clear</button>
+            </div>
+          </div>
           <div class="signal-strip">
             <div class="signal-cell signal-sl">
               <span>SL</span>
@@ -140,9 +180,9 @@
               <span>Risk Fixed</span>
               <input id="risk-fixed" type="number" step="0.01" placeholder="Currency amount" />
             </div>
-            <div class="detail-item">
+            <div class="detail-item detail-item-span-2">
               <span>Risk Mode</span>
-              <div>
+              <div class="radio-inline">
                 <label><input type="radio" name="risk-mode" value="percent" checked /> Percent</label>
                 <label><input type="radio" name="risk-mode" value="fixed" /> Fixed</label>
               </div>
@@ -152,7 +192,7 @@
             <input id="sizing-sl" type="hidden" />
             <input id="sizing-tp" type="hidden" />
           </form>
-          <div class="detail-grid">
+          <div class="detail-grid detail-grid-outputs">
             <div class="detail-item">
               <span>Volume</span>
               <strong id="lot-output">N/A</strong>
@@ -169,6 +209,10 @@
               <span>Margin Used</span>
               <strong id="margin-output">N/A</strong>
             </div>
+            <div class="detail-item detail-item-span-2">
+              <span>R:R Ratio</span>
+              <strong id="rr-output">N/A</strong>
+            </div>
           </div>
           <h3>Ticket Output</h3>
           <div class="ticket-box" id="ticket-box">Select an entry to generate a ticket.</div>
@@ -176,88 +220,92 @@
       </main>
 
       <section class="card settings fade-in">
-        <h3>Settings</h3>
+        <h3>Dashboard Settings</h3>
         <form id="settings-form">
           <div class="settings-grid">
             <div>
-              <label>PM Root Path</label>
+              <label for="cfg-pm-root">PM Root Path</label>
               <input id="cfg-pm-root" type="text" />
             </div>
             <div>
-              <label>Refresh Interval (sec)</label>
+              <label for="cfg-refresh">Refresh Interval (sec)</label>
               <input id="cfg-refresh" type="number" step="1" />
             </div>
             <div>
-              <label>Min Strength (filter)</label>
+              <label for="cfg-min-strength">Min Strength</label>
               <input id="cfg-min-strength" type="number" step="0.01" />
             </div>
             <div>
-              <label>Max Signal Age (min)</label>
+              <label for="cfg-max-age">Max Signal Age (min)</label>
               <input id="cfg-max-age" type="number" step="1" />
             </div>
             <div>
-              <label>Alert Min Strength</label>
+              <label for="cfg-alert-min">Alert Min Strength</label>
               <input id="cfg-alert-min" type="number" step="0.01" />
             </div>
-            <div>
-              <label>Alerts Enabled</label>
-              <input id="cfg-alert-enabled" type="checkbox" />
+            <div class="toggle-control">
+              <label class="toggle">
+                <input id="cfg-alert-enabled" type="checkbox" />
+                <span>Alerts Enabled</span>
+              </label>
             </div>
-            <div>
-              <label>Sound Alerts</label>
-              <input id="cfg-sound" type="checkbox" />
+            <div class="toggle-control">
+              <label class="toggle">
+                <input id="cfg-sound" type="checkbox" />
+                <span>Sound Alerts</span>
+              </label>
             </div>
           </div>
-          <div style="margin-top: 12px;">
-            <label>File Patterns (one per line)</label>
+          <div class="settings-textarea-wrap">
+            <label for="cfg-patterns">File Patterns (one per line)</label>
             <textarea id="cfg-patterns"></textarea>
           </div>
-          <div style="margin-top: 14px;">
+          <div class="settings-actions">
             <button class="btn" type="submit">Save Settings</button>
           </div>
-          <div class="footer-note" id="js-error" style="color: #b83333; display: none;"></div>
+          <div class="footer-note error-note" id="js-error" style="display: none;"></div>
           <div class="footer-note">
-            Advanced parsing controls (valid actions, field aliases) live in `pm_dashboard/dashboard_config.json`.
+            Advanced parsing controls remain in <code>pm_dashboard/dashboard_config.json</code>.
           </div>
         </form>
       </section>
     </div>
 
-    <aside class="drawer" id="drawer" role="dialog" aria-label="Entry details">
+    <aside class="drawer" id="drawer" role="dialog" aria-label="Entry details" aria-modal="true">
       <div class="drawer-header">
-        <h2 id="drawer-title">Entry</h2>
-        <button class="close-btn" id="close-drawer">x</button>
+        <h2 id="drawer-title">Entry Details</h2>
+        <button class="close-btn" id="close-drawer" type="button">X</button>
       </div>
-      <div class="details" style="margin-top: 14px;">
+      <div class="details">
         <div class="detail-grid" id="details-grid"></div>
       </div>
-      <div style="margin-top: 12px;">
+      <div class="drawer-actions">
         <button class="btn" id="drawer-use-entry" type="button">Use For Sizing</button>
       </div>
-      <div style="margin-top: 16px;">
+      <div class="drawer-actions">
         <h3>Copy Actions</h3>
         <div class="detail-grid">
           <div class="detail-item">
             <span>Copy</span>
-            <button class="btn btn-secondary" id="copy-entry">Entry + Symbol</button>
+            <button class="btn btn-secondary" id="copy-entry" type="button">Entry</button>
           </div>
           <div class="detail-item">
             <span>Copy</span>
-            <button class="btn btn-secondary" id="copy-sl">Stop Loss</button>
+            <button class="btn btn-secondary" id="copy-sl" type="button">Stop Loss</button>
           </div>
           <div class="detail-item">
             <span>Copy</span>
-            <button class="btn btn-secondary" id="copy-tp">Take Profit</button>
+            <button class="btn btn-secondary" id="copy-tp" type="button">Take Profit</button>
           </div>
           <div class="detail-item">
             <span>Copy</span>
-            <button class="btn btn-secondary" id="copy-ticket">Full Ticket</button>
+            <button class="btn btn-secondary" id="copy-ticket" type="button">Full Ticket</button>
           </div>
         </div>
       </div>
     </aside>
 
-    <script src="{{ url_for('static', filename='common.js', v='20260207b') }}"></script>
-    <script src="{{ url_for('static', filename='app.js', v='20260207b') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v='20260208a') }}"></script>
+    <script src="{{ url_for('static', filename='app.js', v='20260208a') }}"></script>
   </body>
 </html>

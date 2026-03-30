@@ -42,7 +42,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertIn('sharpe_ratio', result)
 
     def test_new_strategies_produce_signals(self):
-        """All 15 new strategies should produce at least some non-zero signals on sample data."""
+        """All additive strategy extensions should instantiate and generate signal series."""
         df = self._make_trending_data(n=1000)
         features = FeatureComputer.compute_required(
             df, {'ATR_14', 'EMA_20', 'RSI_14', 'BB_LOWER_20', 'BB_UPPER_20',
@@ -56,7 +56,9 @@ class PipelineIntegrationTests(unittest.TestCase):
             'OBVDivergenceStrategy', 'KeltnerFadeStrategy',
             'ROCExhaustionReversalStrategy', 'EMAPullbackContinuationStrategy',
             'ParabolicSARTrendStrategy', 'ATRPercentileBreakoutStrategy',
-            'KaufmanAMATrendStrategy',
+            'KaufmanAMATrendStrategy', 'VortexTrendStrategy',
+            'TRIXSignalStrategy', 'RelativeVigorIndexStrategy',
+            'VIDYABandTrendStrategy', 'ChoppinessCompressionBreakoutStrategy',
         ]
         for name in new_strategies:
             with self.subTest(strategy=name):
@@ -65,6 +67,25 @@ class PipelineIntegrationTests(unittest.TestCase):
                 self.assertEqual(len(signals), len(features))
                 # At least check it runs without error
                 # Some strategies may produce 0 signals on synthetic data
+
+    def test_reworked_strategy_layer_smoke(self):
+        """Core strategy-layer fixes should still run end-to-end on a feature-rich sample."""
+        df = self._make_trending_data(n=600)
+        features = FeatureComputer.compute_required(
+            df, {'ATR_14', 'ADX', 'MACD_HIST', 'BB_LOWER_20', 'BB_UPPER_20'}
+        )
+        for name in [
+            'SupertrendStrategy',
+            'ADXTrendStrategy',
+            'AroonTrendStrategy',
+            'KeltnerPullbackStrategy',
+            'MACDHistogramMomentumStrategy',
+            'ZScoreVWAPReversionStrategy',
+        ]:
+            with self.subTest(strategy=name):
+                strat = StrategyRegistry.get(name)
+                signals = strat.generate_signals(features.copy(), 'TEST')
+                self.assertEqual(len(signals), len(features))
 
 
 if __name__ == "__main__":

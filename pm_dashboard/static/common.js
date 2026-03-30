@@ -1,225 +1,368 @@
-/* PMCommon — shared dashboard utilities */
+﻿/* PMCommon - shared dashboard utilities */
 var PMCommon = (function () {
-  'use strict';
+  "use strict";
 
-  // ── Theme ──────────────────────────────────────────────────────────
   var _isDark = false;
   var _themeChangeCallbacks = [];
+  var _toastContainer = null;
 
   function initTheme() {
-    var saved = localStorage.getItem('pm-theme') || 'light';
-    _isDark = saved === 'dark';
+    var savedTheme = null;
+    try {
+      savedTheme = localStorage.getItem("pm-theme");
+    } catch (err) {
+      savedTheme = null;
+    }
+
+    if (savedTheme === "dark" || savedTheme === "light") {
+      _isDark = savedTheme === "dark";
+    } else if (typeof window !== "undefined" && window.matchMedia) {
+      _isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    }
+
     _applyTheme();
-    var toggle = document.getElementById('theme-toggle');
-    if (toggle) toggle.addEventListener('click', toggleTheme);
+
+    var toggle = document.getElementById("theme-toggle");
+    if (!toggle) return;
+
+    toggle.addEventListener("click", toggleTheme);
+    toggle.setAttribute("role", "button");
+    toggle.setAttribute("tabindex", "0");
+    toggle.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        toggleTheme();
+      }
+    });
   }
 
   function toggleTheme() {
     _isDark = !_isDark;
-    localStorage.setItem('pm-theme', _isDark ? 'dark' : 'light');
+    try {
+      localStorage.setItem("pm-theme", _isDark ? "dark" : "light");
+    } catch (err) {
+      // Ignore storage failures (private browsing, strict policies).
+    }
     _applyTheme();
-    for (var i = 0; i < _themeChangeCallbacks.length; i++) {
+    for (var i = 0; i < _themeChangeCallbacks.length; i += 1) {
       _themeChangeCallbacks[i](_isDark);
     }
   }
 
   function _applyTheme() {
-    document.documentElement.setAttribute('data-theme', _isDark ? 'dark' : 'light');
-    var icon = document.querySelector('.theme-toggle-icon');
-    if (icon) icon.textContent = _isDark ? '\u2600\uFE0F' : '\uD83C\uDF19';
+    document.documentElement.setAttribute("data-theme", _isDark ? "dark" : "light");
+
+    var toggle = document.getElementById("theme-toggle");
+    if (toggle) {
+      toggle.setAttribute("aria-pressed", _isDark ? "true" : "false");
+      toggle.setAttribute("title", _isDark ? "Switch to light mode" : "Switch to dark mode");
+    }
+
+    var icon = document.querySelector(".theme-toggle-icon");
+    if (icon) {
+      icon.textContent = _isDark ? "LIGHT" : "DARK";
+    }
+
+    var label = document.querySelector(".theme-toggle-label");
+    if (label) {
+      label.textContent = _isDark ? "Light mode" : "Dark mode";
+    }
   }
 
-  function isDark() { return _isDark; }
+  function isDark() {
+    return _isDark;
+  }
 
-  function onThemeChange(cb) { _themeChangeCallbacks.push(cb); }
+  function onThemeChange(callback) {
+    if (typeof callback === "function") {
+      _themeChangeCallbacks.push(callback);
+    }
+  }
 
-  // ── Formatting ─────────────────────────────────────────────────────
   function formatNumber(value, decimals) {
     if (decimals === undefined) decimals = 5;
-    if (value === null || value === undefined || Number.isNaN(value)) return 'N/A';
+    if (value === null || value === undefined || Number.isNaN(value)) return "N/A";
     var num = Number(value);
-    if (!Number.isFinite(num)) return 'N/A';
-    if (Math.abs(num) >= 1000 && decimals > 2) return num.toFixed(2);
+    if (!Number.isFinite(num)) return "N/A";
     return num.toFixed(decimals);
   }
 
-  function formatCurrency(value) {
-    if (value === null || value === undefined || Number.isNaN(value)) return '$0.00';
+  function formatCurrency(value, decimals) {
+    if (decimals === undefined) decimals = 2;
+    if (value === null || value === undefined || Number.isNaN(value)) return "$0.00";
     var num = Number(value);
-    if (!Number.isFinite(num)) return '$0.00';
-    return '$' + num.toFixed(2);
+    if (!Number.isFinite(num)) return "$0.00";
+    return "$" + num.toFixed(decimals);
   }
 
-  function formatPercentage(value) {
-    if (value === null || value === undefined || Number.isNaN(value)) return '0.00%';
+  function formatPercentage(value, decimals) {
+    if (decimals === undefined) decimals = 2;
+    if (value === null || value === undefined || Number.isNaN(value)) return "0.00%";
     var num = Number(value);
-    if (!Number.isFinite(num)) return '0.00%';
-    return num.toFixed(2) + '%';
+    if (!Number.isFinite(num)) return "0.00%";
+    return num.toFixed(decimals) + "%";
   }
 
-  // ── Data helpers ───────────────────────────────────────────────────
+  function formatDateTime(value) {
+    if (!value) return "N/A";
+    var date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  }
+
+  function formatRelativeTime(value) {
+    if (!value) return "N/A";
+    var date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "N/A";
+
+    var diffMs = Date.now() - date.getTime();
+    var diffSec = Math.floor(Math.abs(diffMs) / 1000);
+
+    var unit = "second";
+    var amount = diffSec;
+    if (diffSec >= 60) {
+      unit = "minute";
+      amount = Math.floor(diffSec / 60);
+    }
+    if (diffSec >= 3600) {
+      unit = "hour";
+      amount = Math.floor(diffSec / 3600);
+    }
+    if (diffSec >= 86400) {
+      unit = "day";
+      amount = Math.floor(diffSec / 86400);
+    }
+
+    var suffix = diffMs >= 0 ? "ago" : "from now";
+    return amount + " " + unit + (amount === 1 ? "" : "s") + " " + suffix;
+  }
+
+  function escapeHtml(value) {
+    var text = String(value === null || value === undefined ? "" : value);
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   function uniqueValues(items, key) {
     var values = {};
-    for (var i = 0; i < items.length; i++) {
-      var val = items[i][key];
-      if (val) values[val] = true;
+    for (var i = 0; i < items.length; i += 1) {
+      var value = items[i] && items[i][key];
+      if (value !== null && value !== undefined && String(value).trim() !== "") {
+        values[String(value)] = true;
+      }
     }
-    return Object.keys(values).sort();
+    return Object.keys(values).sort(function (a, b) {
+      return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+    });
   }
 
-  // ── Pagination ─────────────────────────────────────────────────────
-  function updatePagination(state, els) {
+  function updatePagination(state, elements) {
     var total = (state.items || []).length;
     state.totalPages = Math.max(1, Math.ceil(total / state.pageSize));
     if (state.currentPage > state.totalPages) state.currentPage = state.totalPages;
-    if (els.pageInfo) {
-      els.pageInfo.textContent = 'Page ' + state.currentPage + ' of ' + state.totalPages;
+
+    if (elements.pageInfo) {
+      elements.pageInfo.textContent = "Page " + state.currentPage + " of " + state.totalPages;
     }
-    if (els.rowCount) {
-      els.rowCount.textContent = total + ' rows';
+    if (elements.rowCount) {
+      elements.rowCount.textContent = total + " rows";
     }
-    if (els.prevBtn) {
-      els.prevBtn.disabled = state.currentPage <= 1;
+    if (elements.prevBtn) {
+      elements.prevBtn.disabled = state.currentPage <= 1;
     }
-    if (els.nextBtn) {
-      els.nextBtn.disabled = state.currentPage >= state.totalPages;
+    if (elements.nextBtn) {
+      elements.nextBtn.disabled = state.currentPage >= state.totalPages;
     }
   }
 
-  // ── Clipboard + Toast ──────────────────────────────────────────────
   function copyToClipboard(text, label) {
-    if (!text) return;
-    var doCopy = function () { _fallbackCopy(text); };
+    var value = text === null || text === undefined ? "" : String(text);
+    if (!value) return;
+
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text)
-        .then(function () { showToast(label ? label + ' copied' : 'Copied'); })
-        .catch(function () { doCopy(); showToast(label ? label + ' copied' : 'Copied'); });
-    } else {
-      doCopy();
-      showToast(label ? label + ' copied' : 'Copied');
+      navigator.clipboard.writeText(value)
+        .then(function () {
+          showToast((label || "Value") + " copied");
+        })
+        .catch(function () {
+          _fallbackCopy(value);
+          showToast((label || "Value") + " copied");
+        });
+      return;
     }
+
+    _fallbackCopy(value);
+    showToast((label || "Value") + " copied");
   }
 
   function _fallbackCopy(text) {
-    var temp = document.createElement('textarea');
-    temp.value = text;
-    temp.style.position = 'fixed';
-    temp.style.opacity = '0';
-    document.body.appendChild(temp);
-    temp.select();
-    document.execCommand('copy');
-    document.body.removeChild(temp);
+    var input = document.createElement("textarea");
+    input.value = text;
+    input.setAttribute("readonly", "readonly");
+    input.style.position = "fixed";
+    input.style.left = "-9999px";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    document.body.removeChild(input);
   }
-
-  var _toastContainer = null;
 
   function showToast(message, durationMs) {
     if (!durationMs) durationMs = 2200;
+
     if (!_toastContainer) {
-      _toastContainer = document.createElement('div');
-      _toastContainer.className = 'pm-toast-container';
+      _toastContainer = document.createElement("div");
+      _toastContainer.className = "pm-toast-container";
       document.body.appendChild(_toastContainer);
     }
-    var el = document.createElement('div');
-    el.className = 'pm-toast';
-    el.textContent = message;
-    _toastContainer.appendChild(el);
-    // trigger reflow then add visible class for animation
-    el.offsetHeight; // eslint-disable-line no-unused-expressions
-    el.classList.add('pm-toast-show');
+
+    var toast = document.createElement("div");
+    toast.className = "pm-toast";
+    toast.textContent = String(message || "Done");
+    _toastContainer.appendChild(toast);
+
+    // Trigger transition.
+    toast.offsetHeight;
+    toast.classList.add("pm-toast-show");
+
     setTimeout(function () {
-      el.classList.remove('pm-toast-show');
-      el.classList.add('pm-toast-hide');
+      toast.classList.remove("pm-toast-show");
+      toast.classList.add("pm-toast-hide");
       setTimeout(function () {
-        if (el.parentNode) el.parentNode.removeChild(el);
-      }, 350);
+        if (toast.parentNode) {
+          toast.parentNode.removeChild(toast);
+        }
+      }, 320);
     }, durationMs);
   }
 
-  // ── Drawer ─────────────────────────────────────────────────────────
-  function closeDrawer(drawerEl) {
-    if (drawerEl) drawerEl.classList.remove('open');
-  }
-
   function openDrawer(drawerEl) {
-    if (drawerEl) drawerEl.classList.add('open');
+    if (!drawerEl) return;
+    drawerEl.classList.add("open");
+    document.body.classList.add("drawer-open");
   }
 
-  function initEscapeClose(drawerEl) {
-    document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && drawerEl && drawerEl.classList.contains('open')) {
+  function closeDrawer(drawerEl) {
+    if (!drawerEl) return;
+    drawerEl.classList.remove("open");
+    document.body.classList.remove("drawer-open");
+  }
+
+  function initEscapeClose(drawerEl, closeHandler) {
+    document.addEventListener("keydown", function (event) {
+      if (event.key !== "Escape") return;
+      if (!drawerEl || !drawerEl.classList.contains("open")) return;
+      if (typeof closeHandler === "function") {
+        closeHandler();
+      } else {
         closeDrawer(drawerEl);
       }
     });
   }
 
-  // ── Debounce ───────────────────────────────────────────────────────
   function debounce(fn, delay) {
     var timer = null;
     return function () {
-      var ctx = this;
+      var context = this;
       var args = arguments;
       if (timer) clearTimeout(timer);
-      timer = setTimeout(function () { fn.apply(ctx, args); }, delay);
+      timer = setTimeout(function () {
+        fn.apply(context, args);
+      }, delay);
     };
   }
 
-  // ── Fetch with retry ───────────────────────────────────────────────
-  function fetchWithRetry(url, options, retries) {
+  function fetchWithRetry(url, options, retries, timeoutMs) {
     if (retries === undefined) retries = 3;
-    var attempt = 0;
-    var timeoutMs = 10000;
+    if (timeoutMs === undefined) timeoutMs = 10000;
 
-    function doFetch() {
-      attempt++;
+    function attempt(remainingRetries) {
       return new Promise(function (resolve, reject) {
-        var controller = null;
-        var timer = null;
-        if (typeof AbortController !== 'undefined') {
-          controller = new AbortController();
-          var opts = Object.assign({}, options || {}, { signal: controller.signal });
+        var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        var requestOptions = Object.assign({}, options || {});
+        if (controller) {
+          requestOptions.signal = controller.signal;
         }
-        timer = setTimeout(function () {
+
+        var timeout = setTimeout(function () {
           if (controller) controller.abort();
         }, timeoutMs);
 
-        fetch(url, controller ? opts : (options || {}))
+        fetch(url, requestOptions)
           .then(function (response) {
-            clearTimeout(timer);
-            if (!response.ok) throw new Error('HTTP ' + response.status);
+            clearTimeout(timeout);
+            if (!response.ok) {
+              throw new Error("HTTP " + response.status);
+            }
             resolve(response);
           })
-          .catch(function (err) {
-            clearTimeout(timer);
-            if (attempt < retries) {
-              var backoff = Math.pow(2, attempt) * 300;
-              setTimeout(function () { doFetch().then(resolve).catch(reject); }, backoff);
+          .catch(function (error) {
+            clearTimeout(timeout);
+            if (remainingRetries > 1) {
+              var attemptNumber = retries - remainingRetries + 1;
+              var delay = Math.pow(2, attemptNumber) * 250;
+              setTimeout(function () {
+                attempt(remainingRetries - 1).then(resolve).catch(reject);
+              }, delay);
             } else {
-              reject(err);
+              reject(error);
             }
           });
       });
     }
-    return doFetch();
+
+    return attempt(retries);
   }
 
-  // ── Scroll to top ─────────────────────────────────────────────────
   function initScrollToTop() {
-    var scrollBtn = document.getElementById('scroll-top');
-    if (!scrollBtn) return;
-    window.addEventListener('scroll', function () {
-      if (window.scrollY > 300) {
-        scrollBtn.classList.add('visible');
+    var button = document.getElementById("scroll-top");
+    if (!button) return;
+
+    window.addEventListener("scroll", function () {
+      if (window.scrollY > 280) {
+        button.classList.add("visible");
       } else {
-        scrollBtn.classList.remove('visible');
+        button.classList.remove("visible");
       }
     });
-    scrollBtn.addEventListener('click', function () {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    button.addEventListener("click", function () {
+      window.scrollTo({ top: 0, behavior: "smooth" });
     });
   }
 
-  // ── Public API ─────────────────────────────────────────────────────
+  function saveJSON(key, value) {
+    if (!key) return;
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      // Ignore storage failures.
+    }
+  }
+
+  function loadJSON(key, fallback) {
+    if (!key) return fallback;
+    try {
+      var raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      return JSON.parse(raw);
+    } catch (err) {
+      return fallback;
+    }
+  }
+
+  function csvEscape(value) {
+    var text = value === null || value === undefined ? "" : String(value);
+    if (text.indexOf(",") !== -1 || text.indexOf("\n") !== -1 || text.indexOf("\"") !== -1) {
+      return '"' + text.replace(/\"/g, '""') + '"';
+    }
+    return text;
+  }
+
   return {
     initTheme: initTheme,
     toggleTheme: toggleTheme,
@@ -228,15 +371,21 @@ var PMCommon = (function () {
     formatNumber: formatNumber,
     formatCurrency: formatCurrency,
     formatPercentage: formatPercentage,
+    formatDateTime: formatDateTime,
+    formatRelativeTime: formatRelativeTime,
+    escapeHtml: escapeHtml,
     uniqueValues: uniqueValues,
     updatePagination: updatePagination,
     copyToClipboard: copyToClipboard,
     showToast: showToast,
-    closeDrawer: closeDrawer,
     openDrawer: openDrawer,
+    closeDrawer: closeDrawer,
     initEscapeClose: initEscapeClose,
     debounce: debounce,
     fetchWithRetry: fetchWithRetry,
-    initScrollToTop: initScrollToTop
+    initScrollToTop: initScrollToTop,
+    saveJSON: saveJSON,
+    loadJSON: loadJSON,
+    csvEscape: csvEscape
   };
 })();

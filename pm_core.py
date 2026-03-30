@@ -20,6 +20,7 @@ Version: 3.1 (Portfolio Manager - Numba backtester optimization)
 import os
 import time
 import math
+import hashlib
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -32,6 +33,17 @@ import pandas as pd
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+
+_WEEKDAY_NAME_TO_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
 
 
 # =============================================================================
@@ -90,6 +102,45 @@ def _round_volume_numba(volume: float, min_lot: float, max_lot: float, step: flo
 
 
 @jit(nopython=True, cache=True)
+def _calc_trade_pnl_numba(entry_px: float,
+                          exit_px: float,
+                          direction: int,
+                          size: float,
+                          tick_size: float,
+                          tick_value: float,
+                          pip_size: float,
+                          pip_value: float,
+                          use_commission: bool,
+                          commission_per_lot: float) -> Tuple[float, float]:
+    """Numba-safe trade PnL helper used by the backtest kernel."""
+    if tick_size > 0.0 and tick_value > 0.0:
+        price_diff = (exit_px - entry_px) * direction
+        ticks = price_diff / tick_size
+        pnl_dollars_local = ticks * tick_value * size
+    else:
+        pnl_dollars_local = 0.0
+        if pip_size > 0.0 and pip_value > 0.0:
+            if direction == 1:
+                pnl_pips_local = (exit_px - entry_px) / pip_size
+            else:
+                pnl_pips_local = (entry_px - exit_px) / pip_size
+            pnl_dollars_local = pnl_pips_local * size * pip_value
+
+    if pip_size > 0.0:
+        if direction == 1:
+            pnl_pips_local = (exit_px - entry_px) / pip_size
+        else:
+            pnl_pips_local = (entry_px - exit_px) / pip_size
+    else:
+        pnl_pips_local = 0.0
+
+    if use_commission:
+        pnl_dollars_local -= commission_per_lot * size
+
+    return pnl_dollars_local, pnl_pips_local
+
+
+@jit(nopython=True, cache=True)
 def _backtest_loop_numba(
     # OHLC arrays (float64 for precision)
     open_arr: np.ndarray,
@@ -120,19 +171,19 @@ def _backtest_loop_numba(
     min_lot: float,
     max_lot: float,
     volume_step: float,
+    warmup_bars: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           np.ndarray, np.ndarray, np.ndarray, float, float]:
+           np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     """
     Numba JIT-compiled backtest loop for 3-10x speedup.
     
-    CRITICAL: This function preserves EXACT semantics of the Python backtester:
-    - SL is checked BEFORE TP (order matters for same-bar hits)
-    - Long: exits at BID, checks if bid_low <= SL first, then if bid_high >= TP
-    - Short: exits at ASK, checks if ask_high >= SL first, then if ask_low <= TP
-    - Position sizing uses LIVE EQUITY (compounding preserved)
-    - No fastmath to preserve floating-point precision
-    - All arrays are float64 for precision
+    CRITICAL: This function preserves the Python backtester semantics:
+    - SL is checked before TP
+    - Entry happens on bar i open from bar i-1 signal
+    - Same-bar exits are allowed after entry
+    - Gap-through stops exit at the worst tradable open
+    - Position sizing uses live equity
     
     Args:
         OHLC arrays, signals, pre-computed stops (entry_prices, sl_prices, tp_prices)
@@ -192,83 +243,58 @@ def _backtest_loop_numba(
         high_price = high_arr[i]
         low_price = low_arr[i]
         close_price = close_arr[i]
+
+        if use_spread:
+            bid_open = open_price - half_spread
+            ask_open = open_price + half_spread
+            bid_high = high_price - half_spread
+            bid_low = low_price - half_spread
+            ask_high = high_price + half_spread
+            ask_low = low_price + half_spread
+            bid_close = close_price - half_spread
+            ask_close = close_price + half_spread
+        else:
+            bid_open = open_price
+            ask_open = open_price
+            bid_high = high_price
+            bid_low = low_price
+            ask_high = high_price
+            ask_low = low_price
+            bid_close = close_price
+            ask_close = close_price
         
-        # ================================================================
-        # CHECK EXITS FOR OPEN POSITIONS
-        # ================================================================
         if in_position:
-            exit_price = -1.0  # Sentinel for "no exit"
+            exit_price = -1.0
             exit_reason = EXIT_NONE
-            
-            # Calculate bid/ask for this bar
-            if use_spread:
-                bid_high = high_price - half_spread
-                bid_low = low_price - half_spread
-                ask_high = high_price + half_spread
-                ask_low = low_price + half_spread
-            else:
-                bid_high = high_price
-                bid_low = low_price
-                ask_high = high_price
-                ask_low = low_price
-            
-            if position_direction == 1:  # Long position
-                # CRITICAL: Check SL FIRST (exact same order as Python version)
-                # Exit at BID price
-                if bid_low <= stop_loss:
-                    # Apply adverse slippage on stop exit only
-                    if use_slippage:
-                        exit_price = stop_loss - slippage_price
-                    else:
-                        exit_price = stop_loss
+
+            if position_direction == 1:
+                if bid_open <= stop_loss:
+                    exit_price = bid_open
                     exit_reason = EXIT_SL
-                # Check TP (only if SL not hit)
+                elif bid_low <= stop_loss:
+                    exit_price = stop_loss - slippage_price if use_slippage else stop_loss
+                    exit_reason = EXIT_SL
                 elif bid_high >= take_profit:
                     exit_price = take_profit
                     exit_reason = EXIT_TP
-                    
-            else:  # Short position (position_direction == -1)
-                # CRITICAL: Check SL FIRST (exact same order as Python version)
-                # Exit at ASK price
-                if ask_high >= stop_loss:
-                    # Apply adverse slippage on stop exit only
-                    if use_slippage:
-                        exit_price = stop_loss + slippage_price
-                    else:
-                        exit_price = stop_loss
+            else:
+                if ask_open >= stop_loss:
+                    exit_price = ask_open
                     exit_reason = EXIT_SL
-                # Check TP (only if SL not hit)
+                elif ask_high >= stop_loss:
+                    exit_price = stop_loss + slippage_price if use_slippage else stop_loss
+                    exit_reason = EXIT_SL
                 elif ask_low <= take_profit:
                     exit_price = take_profit
                     exit_reason = EXIT_TP
             
             if exit_reason != EXIT_NONE:
-                # Calculate P&L using tick-based math (MT5 parity)
-                if tick_size > 0 and tick_value > 0:
-                    price_diff = (exit_price - entry_price) * position_direction
-                    ticks = price_diff / tick_size
-                    pnl_dollars = ticks * tick_value * position_size
-                else:
-                    # Fallback to pip-based calculation
-                    if position_direction == 1:
-                        pnl_pips_calc = (exit_price - entry_price) / pip_size
-                    else:
-                        pnl_pips_calc = (entry_price - exit_price) / pip_size
-                    pnl_dollars = pnl_pips_calc * position_size * pip_value
-                
-                # Calculate pips for reporting
-                if position_direction == 1:
-                    pnl_pips = (exit_price - entry_price) / pip_size
-                else:
-                    pnl_pips = (entry_price - exit_price) / pip_size
-                
-                # Deduct commission
-                if use_commission:
-                    pnl_dollars -= commission_per_lot * position_size
-                
+                pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
+                    entry_price, exit_price, position_direction, position_size,
+                    tick_size, tick_value, pip_size, pip_value,
+                    use_commission, commission_per_lot
+                )
                 equity += pnl_dollars
-                
-                # Record trade
                 trade_signal_bars[trade_count] = signal_bar
                 trade_entry_bars[trade_count] = entry_bar
                 trade_exit_bars[trade_count] = i
@@ -282,141 +308,125 @@ def _backtest_loop_numba(
                 trade_pnl_pips[trade_count] = pnl_pips
                 trade_exit_reasons[trade_count] = exit_reason
                 trade_risk_amounts[trade_count] = risk_amount_at_entry
-                
                 trade_count += 1
                 in_position = False
-        
-        # ================================================================
-        # CHECK ENTRIES
-        # ================================================================
-        if not in_position:
-            # Use signal from PREVIOUS bar (i-1)
+
+        if (not in_position) and i >= warmup_bars:
             signal = sig_arr[i - 1]
-            
             if signal != 0:
                 direction = signal
                 signal_bar_index = i - 1
-                
-                # Get pre-computed entry/stop prices
                 entry_price_candidate = entry_prices[i]
                 stop_loss_candidate = sl_prices[i]
                 take_profit_candidate = tp_prices[i]
-                
-                # Skip if any pre-computed value is NaN (indicates invalid entry)
                 if np.isnan(entry_price_candidate) or np.isnan(stop_loss_candidate) or np.isnan(take_profit_candidate):
-                    # Update equity curve even when skipping
-                    equity_curve[i] = equity
-                    if equity > peak_equity:
-                        peak_equity = equity
-                    if peak_equity > 0:
-                        dd = (peak_equity - equity) / peak_equity * 100.0
-                        if dd > max_drawdown:
-                            max_drawdown = dd
                     continue
-                
-                # ============================================================
-                # POSITION SIZING FROM LIVE EQUITY (compounding preserved)
-                # ============================================================
-                # Risk amount based on CURRENT equity (not initial capital)
+
                 risk_amount_at_entry = equity * (position_size_pct / 100.0)
-                
-                # Calculate loss per lot at stop using tick math (or pip fallback)
-                # distance to stop in price terms (should be positive)
-                if direction == 1:  # Long: SL is below entry
+                if direction == 1:
                     dist = entry_price_candidate - stop_loss_candidate
-                else:  # Short: SL is above entry
+                else:
                     dist = stop_loss_candidate - entry_price_candidate
-                
+
                 loss_per_lot = 0.0
                 if tick_size > 0.0 and tick_value > 0.0:
                     ticks = dist / tick_size
-                    loss_per_lot = ticks * tick_value  # Loss for 1.0 lot
-                else:
-                    if pip_size > 0.0 and pip_value > 0.0:
-                        pips = dist / pip_size
-                        loss_per_lot = pips * pip_value
-                
+                    loss_per_lot = ticks * tick_value
+                elif pip_size > 0.0 and pip_value > 0.0:
+                    pips = dist / pip_size
+                    loss_per_lot = pips * pip_value
                 if loss_per_lot <= 0.0:
-                    # Cannot size safely - skip this entry
-                    equity_curve[i] = equity
-                    if equity > peak_equity:
-                        peak_equity = equity
-                    if peak_equity > 0:
-                        dd = (peak_equity - equity) / peak_equity * 100.0
-                        if dd > max_drawdown:
-                            max_drawdown = dd
                     continue
-                
-                # Calculate position size
+
                 raw_size = risk_amount_at_entry / loss_per_lot
                 position_size = _round_volume_numba(raw_size, min_lot, max_lot, volume_step)
-                
                 if position_size <= 0.0:
-                    # Invalid position size - skip
-                    equity_curve[i] = equity
-                    if equity > peak_equity:
-                        peak_equity = equity
-                    if peak_equity > 0:
-                        dd = (peak_equity - equity) / peak_equity * 100.0
-                        if dd > max_drawdown:
-                            max_drawdown = dd
                     continue
-                
-                # Valid entry - set position state
+
                 entry_price = entry_price_candidate
                 stop_loss = stop_loss_candidate
                 take_profit = take_profit_candidate
-                
                 in_position = True
                 position_direction = direction
                 entry_bar = i
                 signal_bar = signal_bar_index
-        
-        # Track equity
-        equity_curve[i] = equity
-        if equity > peak_equity:
-            peak_equity = equity
+
+                # Same-bar exit: check gap-through at open FIRST, then intra-bar
+                exit_price = -1.0
+                exit_reason = EXIT_NONE
+                if position_direction == 1:
+                    if bid_open <= stop_loss:
+                        exit_price = bid_open
+                        exit_reason = EXIT_SL
+                    elif bid_low <= stop_loss:
+                        exit_price = stop_loss - slippage_price if use_slippage else stop_loss
+                        exit_reason = EXIT_SL
+                    elif bid_high >= take_profit:
+                        exit_price = take_profit
+                        exit_reason = EXIT_TP
+                else:
+                    if ask_open >= stop_loss:
+                        exit_price = ask_open
+                        exit_reason = EXIT_SL
+                    elif ask_high >= stop_loss:
+                        exit_price = stop_loss + slippage_price if use_slippage else stop_loss
+                        exit_reason = EXIT_SL
+                    elif ask_low <= take_profit:
+                        exit_price = take_profit
+                        exit_reason = EXIT_TP
+
+                if exit_reason != EXIT_NONE:
+                    pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
+                        entry_price, exit_price, position_direction, position_size,
+                        tick_size, tick_value, pip_size, pip_value,
+                        use_commission, commission_per_lot
+                    )
+                    equity += pnl_dollars
+                    trade_signal_bars[trade_count] = signal_bar
+                    trade_entry_bars[trade_count] = entry_bar
+                    trade_exit_bars[trade_count] = i
+                    trade_directions[trade_count] = position_direction
+                    trade_entry_prices[trade_count] = entry_price
+                    trade_exit_prices[trade_count] = exit_price
+                    trade_sl_prices[trade_count] = stop_loss
+                    trade_tp_prices[trade_count] = take_profit
+                    trade_sizes[trade_count] = position_size
+                    trade_pnl_dollars[trade_count] = pnl_dollars
+                    trade_pnl_pips[trade_count] = pnl_pips
+                    trade_exit_reasons[trade_count] = exit_reason
+                    trade_risk_amounts[trade_count] = risk_amount_at_entry
+                    trade_count += 1
+                    in_position = False
+
+        current_equity = equity
+        if in_position:
+            mark_exit_price = bid_close if position_direction == 1 else ask_close
+            unrealized_pnl, _ = _calc_trade_pnl_numba(
+                entry_price, mark_exit_price, position_direction, position_size,
+                tick_size, tick_value, pip_size, pip_value,
+                use_commission, commission_per_lot
+            )
+            current_equity = equity + unrealized_pnl
+
+        equity_curve[i] = current_equity
+        if current_equity > peak_equity:
+            peak_equity = current_equity
         if peak_equity > 0:
-            dd = (peak_equity - equity) / peak_equity * 100.0
+            dd = (peak_equity - current_equity) / peak_equity * 100.0
             if dd > max_drawdown:
                 max_drawdown = dd
-    
-    # ================================================================
-    # CLOSE ANY REMAINING POSITION AT END
-    # ================================================================
+
     if in_position:
-        # Exit at close of last bar
         if use_spread:
-            if position_direction == 1:
-                exit_price = close_arr[n_bars - 1] - half_spread
-            else:
-                exit_price = close_arr[n_bars - 1] + half_spread
+            exit_price = close_arr[n_bars - 1] - half_spread if position_direction == 1 else close_arr[n_bars - 1] + half_spread
         else:
             exit_price = close_arr[n_bars - 1]
-        
-        # Calculate P&L
-        if tick_size > 0 and tick_value > 0:
-            price_diff = (exit_price - entry_price) * position_direction
-            ticks = price_diff / tick_size
-            pnl_dollars = ticks * tick_value * position_size
-        else:
-            if position_direction == 1:
-                pnl_pips_calc = (exit_price - entry_price) / pip_size
-            else:
-                pnl_pips_calc = (entry_price - exit_price) / pip_size
-            pnl_dollars = pnl_pips_calc * position_size * pip_value
-        
-        if position_direction == 1:
-            pnl_pips = (exit_price - entry_price) / pip_size
-        else:
-            pnl_pips = (entry_price - exit_price) / pip_size
-        
-        if use_commission:
-            pnl_dollars -= commission_per_lot * position_size
-        
+        pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
+            entry_price, exit_price, position_direction, position_size,
+            tick_size, tick_value, pip_size, pip_value,
+            use_commission, commission_per_lot
+        )
         equity += pnl_dollars
-        
-        # Record final trade
         trade_signal_bars[trade_count] = signal_bar
         trade_entry_bars[trade_count] = entry_bar
         trade_exit_bars[trade_count] = n_bars - 1
@@ -430,12 +440,7 @@ def _backtest_loop_numba(
         trade_pnl_pips[trade_count] = pnl_pips
         trade_exit_reasons[trade_count] = EXIT_EOD
         trade_risk_amounts[trade_count] = risk_amount_at_entry
-        
         trade_count += 1
-        
-        # ============================================================
-        # FIX: Update equity curve and drawdown after EOD close
-        # ============================================================
         equity_curve[n_bars - 1] = equity
         if equity > peak_equity:
             peak_equity = equity
@@ -459,6 +464,7 @@ def _backtest_loop_numba(
         trade_pnl_pips[:trade_count],
         trade_exit_reasons[:trade_count],
         trade_risk_amounts[:trade_count],
+        equity_curve,
         equity,
         max_drawdown
     )
@@ -484,13 +490,14 @@ class PipelineConfig:
     data_dir: Path = field(default_factory=lambda: Path("./data"))
     output_dir: Path = field(default_factory=lambda: Path("./pm_outputs"))
     
-    # Data split ratios (with overlap)
-    # Training: 0-80%, Validation: 70-100% (10% overlap at 70-80%)
-    # NOTE: val_pct is informational only; actual validation window is
-    # derived from train_pct and overlap_pct.
+    # Data split ratios
+    # - Training remains the freshest large in-sample window.
+    # - overlap_pct is now warmup-only overlap, never scored.
+    # - holdout_pct reserves the freshest scored tail for final checks.
     train_pct: float = 80.0
     val_pct: float = 30.0
     overlap_pct: float = 10.0
+    holdout_pct: Optional[float] = None
     
     # Backtest settings
     initial_capital: float = 10000.0
@@ -561,8 +568,15 @@ class PipelineConfig:
     live_bars_count: int = 1500      # bars loaded per timeframe during live trading
     live_min_bars: int = 300         # minimum bars required to evaluate a timeframe in live trading
 
-    # Retrain periods to evaluate (in days)
+    # Retrain periods to evaluate (research-only; production uses the fixed calendar schedule below)
     retrain_periods: List[int] = field(default_factory=lambda: [7, 14, 30, 60, 90])
+    fixed_retrain_days: int = 14
+    production_retrain_mode: str = "auto"
+    production_retrain_interval_weeks: int = 2
+    production_retrain_weekday: str = "sunday"
+    production_retrain_time: str = "00:01"
+    production_retrain_anchor_date: str = "2026-03-29"
+    production_retrain_poll_seconds: int = 60
     
     # Maximum bars to load per symbol (5 years of M5 data = ~500k bars)
     max_bars: int = 500000
@@ -586,7 +600,21 @@ class PipelineConfig:
     regime_min_val_return_pct: float = 0.0       # Minimum validation return % (0 = breakeven)
     regime_allow_losing_winners: bool = False    # If True, allows PF < 1 (not recommended)
     regime_no_winner_marker: str = "NO_TRADE"    # Strategy name for "no valid winner" state
-    
+
+    # ===== PRE-TUNING ELIGIBILITY GATES =====
+    # Applied BEFORE hyperparameter tuning on DEFAULT-param training results.
+    # Purpose: skip truly catastrophic strategies to save compute.
+    # Must be LENIENT — default params are not optimized yet.
+    train_min_profit_factor: float = 0.5     # Reject only extremely bad PF
+    train_min_return_pct: float = -30.0      # Allow moderate losses (tuning may fix)
+    train_max_drawdown: float = 60.0         # Reject only catastrophic blowups
+
+    # ===== WEAK-TRAIN EXCEPTIONAL VALIDATION =====
+    # When training PF < 1.0 or negative return, require exceptional validation
+    # to still allow the strategy as a winner.
+    exceptional_val_profit_factor: float = 1.3  # Min val PF to override weak train
+    exceptional_val_return_pct: float = 2.0     # Min val return % to override weak train
+
     # ===== LIVE RISK POLICY (WINNERS-ONLY) =====
     # Risk per trade comes from PositionConfig.risk_per_trade_pct.
     # PositionConfig.max_risk_pct acts as the hard safety cap.
@@ -600,8 +628,9 @@ class PipelineConfig:
     max_combined_risk_pct: float = 3.0          # Max combined risk per symbol (D1 + lower)
     secondary_trade_max_risk_pct: float = 1.0  # hard cap for the secondary (non-D1) trade
     
-    # Optimization validity and persistence settings
-    optimization_valid_days: int = 14  # Default validity period for optimized configs
+    # Compatibility alias for older artifacts/metrics. Production validity now
+    # comes from the fixed calendar schedule above.
+    optimization_valid_days: int = 14
     
     # Scoring weights for strategy selection
     score_weights: Dict[str, float] = field(default_factory=lambda: {
@@ -629,6 +658,112 @@ class PipelineConfig:
         if self.scoring_mode not in {"pm_weighted", "fx_backtester"}:
             raise ValueError(f"Invalid scoring_mode: {self.scoring_mode}. Use 'pm_weighted' or 'fx_backtester'.")
         self.position_size_pct = self.risk_per_trade_pct
+        self.production_retrain_mode = str(self.production_retrain_mode or "auto").strip().lower()
+        if self.production_retrain_mode not in {"auto", "notify", "off"}:
+            raise ValueError(
+                f"Invalid production_retrain_mode: {self.production_retrain_mode}. "
+                "Use 'auto', 'notify', or 'off'."
+            )
+        try:
+            self.production_retrain_interval_weeks = max(1, int(self.production_retrain_interval_weeks))
+        except Exception:
+            self.production_retrain_interval_weeks = 2
+        self.production_retrain_weekday = str(self.production_retrain_weekday or "sunday").strip().lower()
+        if self.production_retrain_weekday not in _WEEKDAY_NAME_TO_INDEX:
+            raise ValueError(
+                f"Invalid production_retrain_weekday: {self.production_retrain_weekday}. "
+                "Use a weekday name such as 'sunday'."
+            )
+        try:
+            parsed_time = datetime.strptime(str(self.production_retrain_time or "00:01").strip(), "%H:%M")
+            self.production_retrain_time = parsed_time.strftime("%H:%M")
+        except Exception as exc:
+            raise ValueError(f"Invalid production_retrain_time: {self.production_retrain_time}") from exc
+        try:
+            anchor_date = datetime.strptime(str(self.production_retrain_anchor_date), "%Y-%m-%d")
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid production_retrain_anchor_date: {self.production_retrain_anchor_date}"
+            ) from exc
+        if anchor_date.weekday() != self.retrain_weekday_index:
+            raise ValueError(
+                "production_retrain_anchor_date must fall on the configured production_retrain_weekday"
+            )
+        try:
+            self.production_retrain_poll_seconds = max(1, int(self.production_retrain_poll_seconds))
+        except Exception:
+            self.production_retrain_poll_seconds = 60
+        try:
+            self.fixed_retrain_days = max(
+                1,
+                int(self.production_retrain_interval_weeks * 7),
+            )
+        except Exception:
+            self.fixed_retrain_days = 14
+        self.optimization_valid_days = self.fixed_retrain_days
+
+        oos_pct = 100.0 - float(self.train_pct)
+        if oos_pct <= 0.0:
+            raise ValueError("train_pct must leave room for scored out-of-sample data")
+        if self.holdout_pct is not None:
+            if float(self.holdout_pct) <= 0.0 or float(self.holdout_pct) >= oos_pct:
+                raise ValueError("holdout_pct must be positive and smaller than the out-of-sample share")
+        if float(self.overlap_pct) < 0.0 or float(self.overlap_pct) > float(self.train_pct):
+            raise ValueError("overlap_pct must be between 0 and train_pct")
+
+    @property
+    def retrain_weekday_index(self) -> int:
+        """Configured weekday index for the production retrain schedule."""
+        return _WEEKDAY_NAME_TO_INDEX[self.production_retrain_weekday]
+
+    @property
+    def retrain_interval(self) -> timedelta:
+        """Timedelta for one production retrain interval."""
+        return timedelta(weeks=int(self.production_retrain_interval_weeks))
+
+    def get_retrain_anchor_datetime(self) -> datetime:
+        """Calendar anchor for the fixed production retrain schedule."""
+        anchor = datetime.strptime(str(self.production_retrain_anchor_date), "%Y-%m-%d")
+        hh, mm = self.get_retrain_time_components()
+        return anchor.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    def get_retrain_time_components(self) -> Tuple[int, int]:
+        """Parsed production retrain time as (hour, minute)."""
+        parsed = datetime.strptime(str(self.production_retrain_time), "%H:%M")
+        return parsed.hour, parsed.minute
+
+    def get_next_retrain_at(self, from_dt: Optional[datetime] = None) -> datetime:
+        """
+        Return the next scheduled retrain slot strictly after `from_dt`.
+
+        This keeps production retraining calendar-anchored instead of using
+        rolling `now + N days` expiry.
+        """
+        probe = from_dt or datetime.now()
+        anchor = self.get_retrain_anchor_datetime()
+        interval = self.retrain_interval
+        if probe < anchor:
+            return anchor
+        elapsed = probe - anchor
+        steps = int(elapsed // interval) + 1
+        return anchor + (interval * steps)
+
+    def get_last_retrain_slot(self, at_dt: Optional[datetime] = None) -> datetime:
+        """Return the most recent scheduled retrain slot at or before `at_dt`."""
+        probe = at_dt or datetime.now()
+        anchor = self.get_retrain_anchor_datetime()
+        interval = self.retrain_interval
+        if probe <= anchor:
+            return anchor
+        elapsed = probe - anchor
+        steps = int(elapsed // interval)
+        return anchor + (interval * steps)
+
+    def describe_retrain_schedule(self) -> str:
+        """Human-readable production retrain schedule."""
+        weekday = self.production_retrain_weekday.capitalize()
+        weeks = int(self.production_retrain_interval_weeks)
+        return f"every {weeks} week{'s' if weeks != 1 else ''} on {weekday} {self.production_retrain_time}"
 
 
 # =============================================================================
@@ -749,6 +884,8 @@ class InstrumentSpec:
     
     def price_to_pips(self, price_diff: float) -> float:
         """Convert price difference to pips."""
+        if self.pip_size <= 0:
+            return 0.0
         return price_diff / self.pip_size
     
     def pips_to_price(self, pips: float) -> float:
@@ -884,7 +1021,7 @@ def sync_instrument_spec_from_mt5(spec: InstrumentSpec, mt5_symbol_info) -> Inst
     spec.max_lot = mt5_symbol_info.volume_max
 
     # Update spread (convert MT5 points to pips)
-    if mt5_symbol_info.spread > 0:
+    if mt5_symbol_info.spread > 0 and spec.pip_size > 0:
         # spread is in points, convert to pips
         spec.spread_avg = mt5_symbol_info.spread * mt5_symbol_info.point / spec.pip_size
 
@@ -957,13 +1094,38 @@ INSTRUMENT_SPECS = {
     'XRPUSD': InstrumentSpec('XRPUSD', 4, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'TONUSD': InstrumentSpec('TONUSD', 3, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
 
+    # Exotic FX Crosses (ZAR)
+    'EURZAR': InstrumentSpec('EURZAR', 4, 0.55, 60.0, 0.01, 100.0, 15.0, 10.0, -30.0),
+    'GBPZAR': InstrumentSpec('GBPZAR', 4, 0.55, 70.0, 0.01, 100.0, 15.0, 8.0, -28.0),
+
     # Indices - point-based instruments; defaults used mainly for offline backtests; live trading overrides via broker specs
     'US100': InstrumentSpec('US100', 0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'US30':  InstrumentSpec('US30',  0, 1.0, 3.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'US500': InstrumentSpec('US500', 0, 1.0, 1.5, 0.01, 100.0, 0.0, 0.0, 0.0),
     'DE30':  InstrumentSpec('DE30',  0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'EU50':  InstrumentSpec('EU50',  0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'UK100': InstrumentSpec('UK100', 0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'JP225': InstrumentSpec('JP225', 0, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'FR40':  InstrumentSpec('FR40',  0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'ES35':  InstrumentSpec('ES35',  0, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'HK50':  InstrumentSpec('HK50',  0, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'AU200': InstrumentSpec('AU200', 0, 1.0, 3.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+
+    # Crypto (CFDs) - defaults used mainly for offline backtests; live trading overrides via broker specs
+    'BTCUSD': InstrumentSpec('BTCUSD', 2, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'ETHUSD': InstrumentSpec('ETHUSD', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'XRPUSD': InstrumentSpec('XRPUSD', 4, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'TONUSD': InstrumentSpec('TONUSD', 3, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'LTCUSD': InstrumentSpec('LTCUSD', 2, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'SOLUSD': InstrumentSpec('SOLUSD', 2, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'BCHUSD': InstrumentSpec('BCHUSD', 2, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'DOGUSD': InstrumentSpec('DOGUSD', 4, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'TRXUSD': InstrumentSpec('TRXUSD', 4, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+
+    # Energy Commodities
+    'XTIUSD': InstrumentSpec('XTIUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -5.0, -3.0),
+    'XBRUSD': InstrumentSpec('XBRUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -5.0, -3.0),
+    'XNGUSD': InstrumentSpec('XNGUSD', 3, 1.0, 5.0, 0.01, 100.0, 5.0, -3.0, -2.0),
 }
 
 
@@ -1430,7 +1592,36 @@ class DataLoader:
         except Exception:
             # If cache dir can't be created, fall back to in-memory only
             self.cache_resampled = False
-    
+
+    def _resolve_data_file(self, symbol: str, base_timeframe: str) -> Optional[Path]:
+        """Resolve a single unambiguous CSV for a symbol/timeframe pair."""
+        exact_candidates = [
+            self.data_dir / f"{symbol}_{base_timeframe}.csv",
+            self.data_dir / f"{symbol.upper()}_{base_timeframe}.csv",
+            self.data_dir / f"{symbol.lower()}_{base_timeframe}.csv",
+        ]
+        for candidate in exact_candidates:
+            if candidate.exists():
+                return candidate
+
+        matches: Dict[str, Path] = {}
+        for pattern in (
+            f"{symbol}_{base_timeframe}*.csv",
+            f"{symbol.upper()}_{base_timeframe}*.csv",
+            f"{symbol.lower()}_{base_timeframe}*.csv",
+        ):
+            for match in sorted(self.data_dir.glob(pattern)):
+                matches[str(match.resolve())] = match
+
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        if len(matches) > 1:
+            logger.error(
+                f"{symbol} {base_timeframe}: ambiguous source files: "
+                f"{', '.join(p.name for p in matches.values())}"
+            )
+        return None
+
     def load_symbol(self, symbol: str, base_timeframe: str = 'M5') -> Optional[pd.DataFrame]:
         """
         Load data for a symbol from CSV.
@@ -1447,20 +1638,7 @@ class DataLoader:
         if cache_key in self._cache:
             return self._cache[cache_key].copy()
         
-        # Find data file
-        patterns = [
-            f"{symbol}_{base_timeframe}*.csv",
-            f"{symbol.upper()}_{base_timeframe}*.csv",
-            f"{symbol.lower()}_{base_timeframe}*.csv",
-            f"{symbol}*.csv",
-        ]
-        
-        data_file = None
-        for pattern in patterns:
-            matches = list(self.data_dir.glob(pattern))
-            if matches:
-                data_file = matches[0]
-                break
+        data_file = self._resolve_data_file(symbol, base_timeframe)
         
         if not data_file:
             logger.warning(f"No data file found for {symbol} in {self.data_dir}")
@@ -1698,27 +1876,29 @@ class DataLoader:
                 df[ncol] = pd.to_numeric(df[ncol], errors='coerce')
 
         # Drop rows with missing critical OHLC values (safe: called on fresh DataFrames before caching)
-        before = len(df)
         mask = df[['Open', 'High', 'Low', 'Close']].notna().all(axis=1)
         rows_to_drop = (~mask).sum()
         if rows_to_drop > 0:
-            # Get indices to drop and drop them
             indices_to_drop = df.index[~mask]
             df.drop(indices_to_drop, inplace=True)
             logger.warning(f"{symbol}: Dropped {rows_to_drop} rows with non-numeric/missing OHLC")
 
-        
         # Check for valid OHLC relationships
-        invalid_bars = (
+        invalid_mask = (
             (df['High'] < df['Low']) |
             (df['High'] < df['Open']) |
             (df['High'] < df['Close']) |
             (df['Low'] > df['Open']) |
             (df['Low'] > df['Close'])
-        ).sum()
-        
+        )
+        invalid_bars = int(invalid_mask.sum())
         if invalid_bars > 0:
-            logger.warning(f"{symbol}: {invalid_bars} bars with invalid OHLC")
+            df.drop(df.index[invalid_mask], inplace=True)
+            logger.warning(f"{symbol}: Dropped {invalid_bars} bars with invalid OHLC relationships")
+
+        if df.empty:
+            logger.error(f"{symbol}: No usable rows remain after validation")
+            return False
         
         # Check for Volume
         if 'Volume' not in df.columns:
@@ -1760,12 +1940,37 @@ class FeatureComputer:
     _FEATURE_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
     _FEATURE_CACHE_ORDER: List[Tuple[Any, ...]] = []
     _FEATURE_CACHE_MAX = 6
+    FEATURE_CACHE_VERSION = "2026-03-29a"
 
     @classmethod
     def clear_cache(cls) -> None:
         """Clear in-memory feature cache (memory hygiene between symbols)."""
         cls._FEATURE_CACHE.clear()
         cls._FEATURE_CACHE_ORDER.clear()
+
+    @staticmethod
+    def _regime_params_fingerprint(regime_params_file: str) -> Tuple[Any, ...]:
+        try:
+            path = Path(regime_params_file)
+            resolved = str(path.resolve())
+            stat = path.stat()
+            return resolved, stat.st_mtime_ns, stat.st_size
+        except Exception:
+            return str(regime_params_file), None, None
+
+    @staticmethod
+    def _data_fingerprint(df: pd.DataFrame) -> str:
+        try:
+            sample_rows = [0, len(df) - 1]
+            if len(df) > 2:
+                sample_rows.insert(1, len(df) // 2)
+            sample = df.iloc[sorted(set(sample_rows))].copy()
+            sample = sample[[c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in sample.columns]]
+            hashed = pd.util.hash_pandas_object(sample, index=True).to_numpy(dtype=np.uint64)
+            digest = hashlib.sha1(hashed.tobytes()).hexdigest()
+            return digest
+        except Exception:
+            return "na"
 
     @staticmethod
     def _make_cache_key(df: pd.DataFrame, symbol: str, timeframe: str,
@@ -1778,7 +1983,18 @@ class FeatureComputer:
         except Exception:
             first_key = "na"
             last_key = "na"
-        return (tag, symbol, timeframe, regime_params_file, len(df), first_key, last_key)
+        return (
+            tag,
+            FeatureComputer.FEATURE_CACHE_VERSION,
+            symbol,
+            timeframe,
+            FeatureComputer._regime_params_fingerprint(regime_params_file),
+            len(df),
+            first_key,
+            last_key,
+            tuple(str(c) for c in df.columns),
+            FeatureComputer._data_fingerprint(df),
+        )
 
     @classmethod
     def _cache_get(cls, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
@@ -1788,7 +2004,7 @@ class FeatureComputer:
 
     @classmethod
     def _cache_put(cls, key: Tuple[Any, ...], value: pd.DataFrame) -> None:
-        cls._FEATURE_CACHE[key] = value
+        cls._FEATURE_CACHE[key] = value.copy()
         cls._FEATURE_CACHE_ORDER.append(key)
         if len(cls._FEATURE_CACHE_ORDER) > cls._FEATURE_CACHE_MAX:
             oldest = cls._FEATURE_CACHE_ORDER.pop(0)
@@ -1820,6 +2036,11 @@ class FeatureComputer:
         'CHANGE': set(), 'CHANGE_PCT': set(),
         'VOLATILITY': set(),
     }
+    _REGIME_FEATURE_COLUMNS = {
+        'TREND_SCORE', 'RANGE_SCORE', 'BREAKOUT_SCORE', 'CHOP_SCORE',
+        'REGIME_RAW', 'REGIME', 'REGIME_STRENGTH', 'REGIME_GAP',
+        'REGIME_LIVE', 'REGIME_STRENGTH_LIVE',
+    }
     
     @staticmethod
     def compute_required(df: pd.DataFrame, required_features: set,
@@ -1839,6 +2060,13 @@ class FeatureComputer:
         Returns:
             DataFrame with only the required features computed
         """
+        requested = tuple(sorted(str(feat) for feat in required_features))
+        request_hash = hashlib.sha1(",".join(requested).encode("utf-8")).hexdigest()[:12]
+        cache_key = FeatureComputer._make_cache_key(df, symbol, timeframe, "", tag=f"required:{request_hash}")
+        cached = FeatureComputer._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         features = df.copy()
         computed = set(features.columns)
         
@@ -1938,6 +2166,21 @@ class FeatureComputer:
                 features.loc[:, low_col] = features['Low'].rolling(period).min()
                 computed.add(low_col)
 
+        # Keltner Channels
+        kc_cols = {'KC_MID', 'KC_UPPER', 'KC_LOWER'}
+        if kc_cols & to_compute:
+            atr_20 = features.get('ATR_20', FeatureComputer.atr(features, 20))
+            kc_mid, kc_upper, kc_lower = FeatureComputer.keltner_channels(
+                features, 20, 2.0, atr_cache=atr_20
+            )
+            if 'KC_MID' in to_compute:
+                features.loc[:, 'KC_MID'] = kc_mid
+            if 'KC_UPPER' in to_compute:
+                features.loc[:, 'KC_UPPER'] = kc_upper
+            if 'KC_LOWER' in to_compute:
+                features.loc[:, 'KC_LOWER'] = kc_lower
+            computed.update(kc_cols)
+
         # Hull MA
         if 'HULL_MA' in to_compute and 'HULL_MA' not in computed:
             features.loc[:, 'HULL_MA'] = FeatureComputer.hull_ma(features['Close'], 20)
@@ -1951,7 +2194,38 @@ class FeatureComputer:
         if 'VOLATILITY' in to_compute and 'VOLATILITY' not in computed:
             features.loc[:, 'VOLATILITY'] = features['Close'].rolling(20).std()
         
+        FeatureComputer._cache_put(cache_key, features)
         return features
+
+    @staticmethod
+    def compute_for_strategy(df: pd.DataFrame, strategy: Any,
+                             symbol: str = "", timeframe: str = "H1",
+                             regime_params_file: str = "regime_params.json") -> pd.DataFrame:
+        """Build a parameter-aware feature frame for a single strategy context."""
+        if strategy is None:
+            return FeatureComputer.compute_all(df, symbol=symbol, timeframe=timeframe,
+                                               regime_params_file=regime_params_file)
+
+        request: Set[str] = set()
+        if hasattr(strategy, "get_feature_request"):
+            request.update(set(strategy.get_feature_request() or set()))
+        elif hasattr(strategy, "get_required_features"):
+            request.update(set(strategy.get_required_features() or set()))
+            if hasattr(strategy, "calculate_stops"):
+                request.add("ATR_14")
+
+        if not request:
+            return df.copy()
+
+        if request & FeatureComputer._REGIME_FEATURE_COLUMNS:
+            return FeatureComputer.compute_all(
+                df,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime_params_file=regime_params_file,
+            )
+
+        return FeatureComputer.compute_required(df, request, symbol=symbol, timeframe=timeframe)
     
     @staticmethod
     def compute_all(df: pd.DataFrame, symbol: str = "", timeframe: str = "H1",
@@ -2031,7 +2305,9 @@ class FeatureComputer:
 
         # Keltner Channels (use cached ATR_20 if available)
         atr_20_cached = features.get('ATR_20')
-        kc_mid, kc_upper, kc_lower = FeatureComputer.keltner_channels(features, 20, 2.0)
+        kc_mid, kc_upper, kc_lower = FeatureComputer.keltner_channels(
+            features, 20, 2.0, atr_cache=atr_20_cached
+        )
         features.loc[:, 'KC_MID'] = kc_mid
         features.loc[:, 'KC_UPPER'] = kc_upper
         features.loc[:, 'KC_LOWER'] = kc_lower
@@ -2050,37 +2326,7 @@ class FeatureComputer:
         # REGIME DETECTION
         # Compute regime features using symbol/timeframe-specific parameters
         # =====================================================================
-        try:
-            from pm_regime import (
-                MarketRegimeDetector, 
-                load_regime_params,
-                RegimeType
-            )
-            
-            # Load symbol/timeframe-specific regime parameters
-            params = load_regime_params(symbol, timeframe, regime_params_file)
-            
-            # Create detector and compute regime scores
-            detector = MarketRegimeDetector(params)
-            regime_df = detector.compute_regime_scores(features)
-            
-            # Merge all regime columns into features
-            regime_columns = [
-                'TREND_SCORE', 'RANGE_SCORE', 'BREAKOUT_SCORE', 'CHOP_SCORE',
-                'REGIME_RAW', 'REGIME', 'REGIME_STRENGTH', 'REGIME_GAP',
-                'REGIME_LIVE', 'REGIME_STRENGTH_LIVE'
-            ]
-            
-            for col in regime_columns:
-                if col in regime_df.columns:
-                    features.loc[:, col] = regime_df[col]
-            
-            logger.debug(f"Added regime features for {symbol} {timeframe}")
-                    
-        except ImportError:
-            logger.warning("pm_regime module not available, skipping regime features")
-        except Exception as e:
-            logger.warning(f"Failed to compute regime features for {symbol} {timeframe}: {e}")
+        FeatureComputer._append_regime_features(features, symbol, timeframe, regime_params_file)
         
         # Cache and return
         FeatureComputer._cache_put(cache_key, features)
@@ -2157,64 +2403,49 @@ class FeatureComputer:
         """Calculate Stochastic Oscillator."""
         low_min = df['Low'].rolling(window=k_period).min()
         high_max = df['High'].rolling(window=k_period).max()
-        
-        stoch_k = 100 * (df['Close'] - low_min) / (high_max - low_min)
+        span = (high_max - low_min).replace(0, np.nan)
+
+        stoch_k = 100 * (df['Close'] - low_min) / span
         stoch_d = stoch_k.rolling(window=d_period).mean()
         
         return stoch_k, stoch_d
-    
+
+    @staticmethod
+    def _directional_indicators(df: pd.DataFrame, period: int = 14,
+                                atr_cache: Optional[pd.Series] = None
+                                ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+        high = pd.to_numeric(df['High'], errors='coerce')
+        low = pd.to_numeric(df['Low'], errors='coerce')
+        up_move = high.diff()
+        down_move = -low.diff()
+
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+        atr = atr_cache if atr_cache is not None else FeatureComputer.atr(df, period)
+        plus_di = 100 * (plus_dm.rolling(window=period, min_periods=period).mean() / (atr + 1e-10))
+        minus_di = 100 * (minus_dm.rolling(window=period, min_periods=period).mean() / (atr + 1e-10))
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+        adx = dx.rolling(window=period, min_periods=period).mean()
+        return plus_di, minus_di, dx, adx
+
     @staticmethod
     def adx(df: pd.DataFrame, period: int = 14, atr_cache: pd.Series = None) -> pd.Series:
-        """Calculate Average Directional Index.
-        
-        Optimized to accept pre-computed ATR for efficiency when computing
-        multiple directional indicators.
-        
-        Args:
-            df: DataFrame with OHLCV
-            period: ADX period
-            atr_cache: Pre-computed ATR series (optional, computed if None)
-        """
-        plus_dm = df['High'].diff()
-        minus_dm = df['Low'].diff().abs() * -1
-        
-        plus_dm = plus_dm.where((plus_dm > minus_dm.abs()) & (plus_dm > 0), 0)
-        minus_dm = minus_dm.abs().where((minus_dm.abs() > plus_dm) & (minus_dm < 0), 0)
-        
-        # Use cached ATR if provided, otherwise compute
-        if atr_cache is not None:
-            atr = atr_cache
-        else:
-            atr = FeatureComputer.atr(df, period)
-        
-        plus_di = 100 * (plus_dm.rolling(period).mean() / (atr + 1e-10))
-        minus_di = 100 * (minus_dm.rolling(period).mean() / (atr + 1e-10))
-        
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-        adx = dx.rolling(window=period).mean()
-        
+        """Calculate Average Directional Index."""
+        _, _, _, adx = FeatureComputer._directional_indicators(df, period, atr_cache=atr_cache)
         return adx
-    
+
     @staticmethod
     def plus_di(df: pd.DataFrame, period: int = 14, atr_cache: pd.Series = None) -> pd.Series:
-        """Calculate +DI.
-        
-        Optimized to accept pre-computed ATR.
-        """
-        plus_dm = df['High'].diff()
-        plus_dm = plus_dm.where(plus_dm > 0, 0)
-        atr = atr_cache if atr_cache is not None else FeatureComputer.atr(df, period)
-        return 100 * (plus_dm.rolling(period).mean() / (atr + 1e-10))
-    
+        """Calculate +DI."""
+        plus_di, _, _, _ = FeatureComputer._directional_indicators(df, period, atr_cache=atr_cache)
+        return plus_di
+
     @staticmethod
     def minus_di(df: pd.DataFrame, period: int = 14, atr_cache: pd.Series = None) -> pd.Series:
-        """Calculate -DI.
-        
-        Optimized to accept pre-computed ATR.
-        """
-        minus_dm = df['Low'].diff().abs()
-        atr = atr_cache if atr_cache is not None else FeatureComputer.atr(df, period)
-        return 100 * (minus_dm.rolling(period).mean() / (atr + 1e-10))
+        """Calculate -DI."""
+        _, minus_di, _, _ = FeatureComputer._directional_indicators(df, period, atr_cache=atr_cache)
+        return minus_di
     
     @staticmethod
     def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
@@ -2238,21 +2469,49 @@ class FeatureComputer:
         """Calculate Williams %R."""
         high_max = df['High'].rolling(window=period).max()
         low_min = df['Low'].rolling(window=period).min()
-        
-        wr = -100 * (high_max - df['Close']) / (high_max - low_min)
+        span = (high_max - low_min).replace(0, np.nan)
+
+        wr = -100 * (high_max - df['Close']) / span
         
         return wr
     
     @staticmethod
-    def keltner_channels(df: pd.DataFrame, period: int = 20, 
-                         mult: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    def keltner_channels(df: pd.DataFrame, period: int = 20,
+                         mult: float = 2.0,
+                         atr_cache: Optional[pd.Series] = None) -> Tuple[pd.Series, pd.Series, pd.Series]:
         """Calculate Keltner Channels."""
         mid = df['Close'].ewm(span=period, adjust=False).mean()
-        atr = FeatureComputer.atr(df, period)
+        atr = atr_cache if atr_cache is not None else FeatureComputer.atr(df, period)
         upper = mid + (mult * atr)
         lower = mid - (mult * atr)
         
         return mid, upper, lower
+
+    @staticmethod
+    def _append_regime_features(features: pd.DataFrame,
+                                symbol: str,
+                                timeframe: str,
+                                regime_params_file: str) -> None:
+        """Append regime features through the single canonical detector path."""
+        try:
+            from pm_regime import MarketRegimeDetector, load_regime_params
+
+            params = load_regime_params(symbol, timeframe, regime_params_file)
+            detector = MarketRegimeDetector(params)
+            regime_df = detector.compute_regime_scores(features)
+            regime_columns = [
+                'TREND_SCORE', 'RANGE_SCORE', 'BREAKOUT_SCORE', 'CHOP_SCORE',
+                'REGIME_RAW', 'REGIME', 'REGIME_STRENGTH', 'REGIME_GAP',
+                'REGIME_LIVE', 'REGIME_STRENGTH_LIVE'
+            ]
+            for col in regime_columns:
+                if col in regime_df.columns:
+                    features.loc[:, col] = regime_df[col]
+            logger.debug(f"Added regime features for {symbol} {timeframe}")
+        except ImportError:
+            logger.warning("pm_regime module not available, skipping regime features")
+        except Exception as e:
+            logger.warning(f"Failed to compute regime features for {symbol} {timeframe}: {e}")
     
     @staticmethod
     def hull_ma(series: pd.Series, period: int = 20) -> pd.Series:
@@ -2288,12 +2547,11 @@ class FeatureComputer:
 
 class DataSplitter:
     """
-    Splits data into training and validation sets.
-    
-    Implements 80/30 split with 10% overlap:
-    - Training: First 80% of data
-    - Validation: Last 30% of data (overlaps with last 10% of training)
+    Split data into train, warmup, validation, and holdout regions.
+
+    The overlap window is warmup-only and is never scored.
     """
+    SPLIT_CONTRACT_VERSION = "2026-03-29a"
     
     def __init__(self, config: PipelineConfig):
         """
@@ -2304,31 +2562,25 @@ class DataSplitter:
         """
         self.config = config
     
-    def split(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def _holdout_bars(self, n: int, scored_oos_bars: int) -> int:
+        if scored_oos_bars <= 1:
+            return 0
+        if self.config.holdout_pct is not None:
+            return min(scored_oos_bars - 1, int(n * (float(self.config.holdout_pct) / 100.0)))
+        return max(1, scored_oos_bars // 2)
+
+    def split(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         """
-        Split data into training and validation sets.
+        Split data into training and scored out-of-sample regions.
         
         Args:
             df: Full dataset
             
         Returns:
-            Tuple of (train_df, val_df)
+            Dict of named split DataFrames
         """
-        n = len(df)
-        
-        # Training: 0 to 80%
-        train_end = int(n * (self.config.train_pct / 100.0))
-        
-        # Validation: 70% to 100% (10% overlap)
-        val_start = int(n * ((self.config.train_pct - self.config.overlap_pct) / 100.0))
-        
-        train_df = df.iloc[:train_end].copy()
-        val_df = df.iloc[val_start:].copy()
-        
-        logger.debug(f"Split: Total={n}, Train={len(train_df)} (0:{train_end}), "
-                    f"Val={len(val_df)} ({val_start}:{n})")
-        
-        return train_df, val_df
+        indices = self.get_split_indices(len(df))
+        return {name: df.iloc[start:end].copy() for name, (start, end) in indices.items()}
     
     def get_split_indices(self, n: int) -> Dict[str, Tuple[int, int]]:
         """
@@ -2338,14 +2590,26 @@ class DataSplitter:
             n: Total number of rows
             
         Returns:
-            Dict with 'train' and 'val' index tuples
+            Dict with named train/warmup/validation/holdout windows
         """
         train_end = int(n * (self.config.train_pct / 100.0))
-        val_start = int(n * ((self.config.train_pct - self.config.overlap_pct) / 100.0))
-        
+        warmup_bars = int(n * (self.config.overlap_pct / 100.0))
+        warmup_start = max(0, train_end - warmup_bars)
+
+        scored_oos_start = train_end
+        scored_oos_bars = max(0, n - scored_oos_start)
+        holdout_bars = self._holdout_bars(n, scored_oos_bars)
+        holdout_start = max(scored_oos_start, n - holdout_bars)
+        validation_end = holdout_start
+        holdout_warmup_start = max(scored_oos_start, holdout_start - warmup_bars)
+
         return {
             'train': (0, train_end),
-            'val': (val_start, n)
+            'warmup': (warmup_start, train_end),
+            'validation': (scored_oos_start, validation_end),
+            'validation_with_warmup': (warmup_start, validation_end),
+            'holdout': (holdout_start, n),
+            'holdout_with_warmup': (holdout_warmup_start, n),
         }
 
 
@@ -2393,15 +2657,14 @@ class Backtester:
             symbol: str,
             strategy: Any,
             spec: Optional[InstrumentSpec] = None,
-            timeframe: str = "") -> Dict[str, Any]:
+            timeframe: str = "",
+            warmup_bars: int = 0) -> Dict[str, Any]:
         """
         Run backtest on a dataset with signals.
         
-        Uses Numba JIT-compiled loop when available for 3-10x speedup.
-        Falls back to pure Python if Numba is not installed.
-        
-        IMPORTANT: Position sizing uses LIVE EQUITY (compounding preserved).
-        Only entry/SL/TP prices are precomputed; sizing happens inside the loop.
+        Uses the same entry/exit/sizing semantics in both Python and Numba paths.
+        `warmup_bars` allows a prepended warmup window while preventing scored trades
+        from starting before the scored validation/holdout region.
         
         Args:
             features: DataFrame with OHLCV and indicators
@@ -2415,23 +2678,35 @@ class Backtester:
         """
         if spec is None:
             spec = get_instrument_spec(symbol)
+        strategy_name = getattr(strategy, "name", strategy.__class__.__name__)
 
         # ----------------------------------------------------------------
-        # Signal contract validation (prevents silent misalignment)
+        # Signal contract validation (never silently repair broken signals)
         # ----------------------------------------------------------------
-        if not isinstance(signals, pd.Series):
-            signals = pd.Series(signals, index=features.index)
+        if isinstance(signals, pd.Series):
+            signal_series = signals.copy()
+        else:
+            if len(signals) != len(features):
+                raise ValueError(
+                    f"Signal length mismatch for {strategy_name} on {symbol}: "
+                    f"{len(signals)} vs {len(features)} bars"
+                )
+            signal_series = pd.Series(signals, index=features.index)
 
-        # Align index strictly; if misaligned, reindex and fill flat.
-        if not signals.index.equals(features.index):
-            signals = signals.reindex(features.index)
+        if not signal_series.index.equals(features.index):
+            raise ValueError(f"Signal index mismatch for {strategy_name} on {symbol}")
 
-        if signals.isna().any():
-            signals = signals.fillna(0)
+        signal_numeric = pd.to_numeric(signal_series, errors='coerce')
+        if signal_numeric.isna().any():
+            raise ValueError(f"Signal series contains NaN/non-numeric values for {strategy_name} on {symbol}")
 
-        # Ensure numeric int signals in {-1,0,1}
-        signals = pd.to_numeric(signals, errors='coerce').fillna(0)
-        signals = signals.clip(-1, 1).astype(int)
+        invalid_signal_mask = ~signal_numeric.isin([-1, 0, 1])
+        if invalid_signal_mask.any():
+            invalid_values = sorted(signal_numeric[invalid_signal_mask].unique().tolist())
+            raise ValueError(
+                f"Signal series contains invalid values for {strategy_name} on {symbol}: {invalid_values}"
+            )
+        signal_numeric = signal_numeric.astype(np.int32)
         
         # ----------------------------------------------------------------
         # Pre-extract arrays for performance (avoid repeated .iloc calls)
@@ -2440,7 +2715,7 @@ class Backtester:
         high_arr = features['High'].to_numpy().astype(np.float64)
         low_arr = features['Low'].to_numpy().astype(np.float64)
         close_arr = features['Close'].to_numpy().astype(np.float64)
-        sig_arr = signals.to_numpy().astype(np.int32)
+        sig_arr = signal_numeric.to_numpy().astype(np.int32)
         
         # Cache spread-related constants
         half_spread = spec.get_half_spread_price() if self.config.use_spread else 0.0
@@ -2456,7 +2731,7 @@ class Backtester:
         tp_prices = np.full(n_bars, np.nan, dtype=np.float64)
         entry_prices = np.full(n_bars, np.nan, dtype=np.float64)
         
-        for i in range(1, n_bars):
+        for i in range(max(1, warmup_bars), n_bars):
             signal = sig_arr[i - 1]  # Signal from previous bar
             
             if signal != 0:
@@ -2475,14 +2750,20 @@ class Backtester:
                         sl_pips, tp_pips = strategy.calculate_stops(
                             features.iloc[:signal_bar_index + 1], direction, symbol
                         )
-                    except Exception:
-                        continue
-                except Exception:
-                    continue
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"{strategy_name} stop calculation failed at bar {signal_bar_index} on {symbol}"
+                        ) from exc
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{strategy_name} stop calculation failed at bar {signal_bar_index} on {symbol}"
+                    ) from exc
                 
-                # Skip if stops are invalid (NaN from indicator warmup)
                 if np.isnan(sl_pips) or np.isnan(tp_pips) or sl_pips <= 0 or tp_pips <= 0:
-                    continue
+                    raise ValueError(
+                        f"{strategy_name} produced invalid stops at bar {signal_bar_index} on {symbol}: "
+                        f"sl={sl_pips}, tp={tp_pips}"
+                    )
                 
                 # Entry price: Open of ENTRY bar (i) + spread
                 open_price = open_arr[i]
@@ -2514,7 +2795,7 @@ class Backtester:
                 trade_directions, trade_entry_prices, trade_exit_prices,
                 trade_sl_prices, trade_tp_prices, trade_sizes,
                 trade_pnl_dollars, trade_pnl_pips, trade_exit_reasons,
-                trade_risk_amounts, final_equity, max_drawdown
+                trade_risk_amounts, equity_curve, final_equity, max_drawdown
             ) = _backtest_loop_numba(
                 open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
@@ -2524,7 +2805,8 @@ class Backtester:
                 self.config.use_spread, self.config.use_slippage,
                 self.config.use_commission, spec.commission_per_lot,
                 spec.tick_size, spec.tick_value, spec.pip_size, spec.pip_value,
-                spec.min_lot, spec.max_lot, spec.volume_step
+                spec.min_lot, spec.max_lot, spec.volume_step,
+                warmup_bars,
             )
             
             # Convert JIT results to trade dicts
@@ -2559,27 +2841,21 @@ class Backtester:
                     'r_multiple': round(r_multiple, 3),
                 })
             
-            # Build equity curve from trades
-            equity_curve = [self.config.initial_capital]
-            running_equity = self.config.initial_capital
-            for t in trades:
-                running_equity += t['pnl_dollars']
-                equity_curve.append(running_equity)
+            equity_curve = equity_curve.tolist()
             
         else:
-            # Fallback to pure Python implementation with live-equity sizing
             trades, final_equity, max_drawdown, equity_curve = self._run_python_loop(
                 features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
-                half_spread, slippage_price, spec
+                half_spread, slippage_price, spec, warmup_bars
             )
         
-        # Calculate full metrics
         return self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
     
     def _run_python_loop(self, features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                          sl_prices, tp_prices, entry_prices,
-                         half_spread, slippage_price, spec) -> Tuple[List[Dict], float, float, List[float]]:
+                         half_spread, slippage_price, spec,
+                         warmup_bars: int = 0) -> Tuple[List[Dict], float, float, List[float]]:
         """
         Pure Python backtest loop (fallback when Numba not available).
         
@@ -2610,40 +2886,49 @@ class Backtester:
             high_price = high_arr[i]
             low_price = low_arr[i]
             close_price = close_arr[i]
+
+            if self.config.use_spread:
+                bid_open = open_price - half_spread
+                ask_open = open_price + half_spread
+                bid_high = high_price - half_spread
+                bid_low = low_price - half_spread
+                ask_high = high_price + half_spread
+                ask_low = low_price + half_spread
+                bid_close = close_price - half_spread
+                ask_close = close_price + half_spread
+            else:
+                bid_open = open_price
+                ask_open = open_price
+                bid_high = high_price
+                bid_low = low_price
+                ask_high = high_price
+                ask_low = low_price
+                bid_close = close_price
+                ask_close = close_price
             
             # CHECK EXITS FOR OPEN POSITIONS
             if in_position:
                 exit_price = None
                 exit_reason = None
                 
-                # Calculate bid/ask for this bar
-                if self.config.use_spread:
-                    bid_high = high_price - half_spread
-                    bid_low = low_price - half_spread
-                    ask_high = high_price + half_spread
-                    ask_low = low_price + half_spread
-                else:
-                    bid_high = high_price
-                    bid_low = low_price
-                    ask_high = high_price
-                    ask_low = low_price
-                
                 if position_direction == 1:  # Long position
-                    # Check SL (exit at BID, apply adverse slippage)
-                    if bid_low <= stop_loss:
+                    if bid_open <= stop_loss:
+                        exit_price = bid_open
+                        exit_reason = TradeStatus.CLOSED_SL.value
+                    elif bid_low <= stop_loss:
                         exit_price = stop_loss - slippage_price
                         exit_reason = TradeStatus.CLOSED_SL.value
-                    # Check TP (exit at BID, no slippage)
                     elif bid_high >= take_profit:
                         exit_price = take_profit
                         exit_reason = TradeStatus.CLOSED_TP.value
                         
                 else:  # Short position
-                    # Check SL (exit at ASK, apply adverse slippage)
-                    if ask_high >= stop_loss:
+                    if ask_open >= stop_loss:
+                        exit_price = ask_open
+                        exit_reason = TradeStatus.CLOSED_SL.value
+                    elif ask_high >= stop_loss:
                         exit_price = stop_loss + slippage_price
                         exit_reason = TradeStatus.CLOSED_SL.value
-                    # Check TP (exit at ASK, no slippage)
                     elif ask_low <= take_profit:
                         exit_price = take_profit
                         exit_reason = TradeStatus.CLOSED_TP.value
@@ -2693,7 +2978,7 @@ class Backtester:
                     in_position = False
             
             # CHECK ENTRIES
-            if not in_position:
+            if not in_position and i >= warmup_bars:
                 signal = sig_arr[i - 1]
                 
                 if signal != 0:
@@ -2718,15 +3003,7 @@ class Backtester:
                         if loss_per_lot > 0:
                             raw_size = risk_amount_at_entry / loss_per_lot
                         else:
-                            # Fallback to pip-based sizing
-                            if direction == 1:
-                                dist_pips = spec.price_to_pips(entry_price_candidate - stop_loss_candidate)
-                            else:
-                                dist_pips = spec.price_to_pips(stop_loss_candidate - entry_price_candidate)
-                            if dist_pips > 0 and spec.pip_value > 0:
-                                raw_size = risk_amount_at_entry / (dist_pips * spec.pip_value)
-                            else:
-                                raw_size = spec.min_lot
+                            continue
                         
                         # Round volume
                         position_size = spec.round_volume(raw_size)
@@ -2740,11 +3017,77 @@ class Backtester:
                             position_direction = direction
                             entry_bar = i
                             signal_bar = i - 1
+
+                            # Same-bar exit: check gap-through at open FIRST, then intra-bar
+                            exit_price = None
+                            exit_reason = None
+                            if position_direction == 1:
+                                if bid_open <= stop_loss:
+                                    exit_price = bid_open
+                                    exit_reason = TradeStatus.CLOSED_SL.value
+                                elif bid_low <= stop_loss:
+                                    exit_price = stop_loss - slippage_price
+                                    exit_reason = TradeStatus.CLOSED_SL.value
+                                elif bid_high >= take_profit:
+                                    exit_price = take_profit
+                                    exit_reason = TradeStatus.CLOSED_TP.value
+                            else:
+                                if ask_open >= stop_loss:
+                                    exit_price = ask_open
+                                    exit_reason = TradeStatus.CLOSED_SL.value
+                                elif ask_high >= stop_loss:
+                                    exit_price = stop_loss + slippage_price
+                                    exit_reason = TradeStatus.CLOSED_SL.value
+                                elif ask_low <= take_profit:
+                                    exit_price = take_profit
+                                    exit_reason = TradeStatus.CLOSED_TP.value
+
+                            if exit_price is not None:
+                                pnl_dollars = spec.calculate_tick_profit(
+                                    entry_price, exit_price, position_size, position_direction
+                                )
+                                if position_direction == 1:
+                                    pnl_pips = spec.price_to_pips(exit_price - entry_price)
+                                else:
+                                    pnl_pips = spec.price_to_pips(entry_price - exit_price)
+                                if self.config.use_commission:
+                                    pnl_dollars -= spec.commission_per_lot * position_size
+                                r_multiple = pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
+                                equity += pnl_dollars
+                                trades.append({
+                                    'signal_bar': signal_bar,
+                                    'entry_bar': entry_bar,
+                                    'exit_bar': i,
+                                    'signal_time': features.index[signal_bar],
+                                    'entry_time': features.index[entry_bar],
+                                    'exit_time': features.index[i],
+                                    'direction': 'LONG' if position_direction == 1 else 'SHORT',
+                                    'entry_price': entry_price,
+                                    'exit_price': exit_price,
+                                    'stop_loss': stop_loss,
+                                    'take_profit': take_profit,
+                                    'position_size': position_size,
+                                    'pnl_pips': round(pnl_pips, 2),
+                                    'pnl_dollars': round(pnl_dollars, 2),
+                                    'exit_reason': exit_reason,
+                                    'risk_amount': round(risk_amount_at_entry, 2),
+                                    'r_multiple': round(r_multiple, 3),
+                                })
+                                in_position = False
             
-            # Track equity
-            equity_curve.append(equity)
-            peak_equity = max(peak_equity, equity)
-            dd = (peak_equity - equity) / peak_equity * 100 if peak_equity > 0 else 0
+            current_equity = equity
+            if in_position:
+                mark_exit_price = bid_close if position_direction == 1 else ask_close
+                unrealized = spec.calculate_tick_profit(
+                    entry_price, mark_exit_price, position_size, position_direction
+                )
+                if self.config.use_commission:
+                    unrealized -= spec.commission_per_lot * position_size
+                current_equity = equity + unrealized
+
+            equity_curve.append(current_equity)
+            peak_equity = max(peak_equity, current_equity)
+            dd = (peak_equity - current_equity) / peak_equity * 100 if peak_equity > 0 else 0
             max_drawdown = max(max_drawdown, dd)
         
         # CLOSE ANY REMAINING POSITION AT END
@@ -2791,8 +3134,7 @@ class Backtester:
                 'r_multiple': round(r_multiple, 3),
             })
             
-            # Update equity curve and drawdown after EOD close
-            equity_curve[-1] = equity  # Update last point with final equity
+            equity_curve[-1] = equity
             peak_equity = max(peak_equity, equity)
             dd = (peak_equity - equity) / peak_equity * 100 if peak_equity > 0 else 0
             max_drawdown = max(max_drawdown, dd)
@@ -2836,17 +3178,11 @@ class Backtester:
         if not trades:
             return self._empty_result()
 
-        # Exclude trades entered during regime warmup period
-        if warmup_bars > 0:
-            trades = [t for t in trades if t.get('entry_bar', 0) >= warmup_bars]
-            if not trades:
-                return self._empty_result()
-
         # Basic counts
         total_trades = len(trades)
-        wins = [t for t in trades if t['pnl_pips'] > 0]
-        losses = [t for t in trades if t['pnl_pips'] < 0]
-        breakeven = [t for t in trades if t['pnl_pips'] == 0]
+        wins = [t for t in trades if t['pnl_dollars'] > 0]
+        losses = [t for t in trades if t['pnl_dollars'] < 0]
+        breakeven = [t for t in trades if t['pnl_dollars'] == 0]
         
         # P&L calculations
         total_pnl = sum(t['pnl_dollars'] for t in trades)
@@ -2857,8 +3193,7 @@ class Backtester:
         win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
         
         # Profit factor
-        profit_factor = win_pnl / loss_pnl if loss_pnl > 0 else 99.0
-        profit_factor = min(profit_factor, 99.0)  # Cap at 99
+        profit_factor = win_pnl / loss_pnl if loss_pnl > 0 else (float('inf') if win_pnl > 0 else 0.0)
         
         # Average trade metrics
         avg_win_pips = sum(t['pnl_pips'] for t in wins) / len(wins) if wins else 0
@@ -2928,9 +3263,8 @@ class Backtester:
                     if downside_std > 1e-8:
                         sortino = (np.mean(bar_returns) / downside_std) * np.sqrt(bars_per_year)
                 else:
-                    # No negative returns - very high sortino but not infinity
                     if np.mean(bar_returns) > 0:
-                        sortino = float(sharpe * 2) if sharpe > 0 else 0.0  # Rough approximation
+                        sortino = float('inf')
         
         # ================================================================
         # R-Multiple Statistics (risk-normalized performance)
@@ -2972,8 +3306,8 @@ class Backtester:
         long_trades = [t for t in trades if t['direction'] == 'LONG']
         short_trades = [t for t in trades if t['direction'] == 'SHORT']
         
-        long_win_rate = len([t for t in long_trades if t['pnl_pips'] > 0]) / len(long_trades) * 100 if long_trades else 0
-        short_win_rate = len([t for t in short_trades if t['pnl_pips'] > 0]) / len(short_trades) * 100 if short_trades else 0
+        long_win_rate = len([t for t in long_trades if t['pnl_dollars'] > 0]) / len(long_trades) * 100 if long_trades else 0
+        short_win_rate = len([t for t in short_trades if t['pnl_dollars'] > 0]) / len(short_trades) * 100 if short_trades else 0
         
         return {
             # Core metrics
@@ -2988,7 +3322,7 @@ class Backtester:
             'total_return_pct': round(total_return_pct, 2),
             'gross_profit': round(win_pnl, 2),
             'gross_loss': round(loss_pnl, 2),
-            'profit_factor': round(profit_factor, 2),
+            'profit_factor': round(profit_factor, 2) if math.isfinite(profit_factor) else profit_factor,
             
             # Average trade metrics
             'avg_win_pips': round(avg_win_pips, 2),
@@ -3002,7 +3336,7 @@ class Backtester:
             'max_drawdown_pct': round(max_dd, 2),
             'expectancy_pips': round(expectancy, 2),
             'sharpe_ratio': round(sharpe, 2),
-            'sortino_ratio': round(sortino, 2),  # No cap - let the metric speak
+            'sortino_ratio': round(sortino, 2) if math.isfinite(sortino) else sortino,
             'calmar_ratio': round(calmar, 2),
             
             # R-Multiple metrics (risk-normalized)
@@ -3039,7 +3373,7 @@ class Backtester:
         current_streak = 0
         
         for trade in trades:
-            is_win = trade['pnl_pips'] > 0
+            is_win = trade['pnl_dollars'] > 0
             if is_win == win:
                 current_streak += 1
                 max_streak = max(max_streak, current_streak)

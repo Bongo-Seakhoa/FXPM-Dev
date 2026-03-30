@@ -12,7 +12,7 @@ Handles all MetaTrader 5 integration:
 
 This module bridges the Portfolio Manager with MT5 for live trading.
 
-Version: 3.0 (Portfolio Manager)
+Version: 3.1 (Portfolio Manager)
 """
 
 import logging
@@ -74,6 +74,7 @@ class MT5Config:
     path: str = ""
     timeout: int = 60000
     portable: bool = False
+    preferred_filling_type: str = "broker"
 
 
 @dataclass
@@ -93,6 +94,11 @@ class MT5SymbolInfo:
     swap_long: float
     swap_short: float
     trade_stops_level: int
+    visible: bool = True
+    trade_mode: int = 2
+    filling_mode: int = 0
+    trade_exemode: int = 0
+    trade_freeze_level: int = 0
     
     # Calculated values
     pip_size: float = 0.0
@@ -211,6 +217,7 @@ class MT5OrderResult:
 
 # Return code descriptions
 RETCODE_DESCRIPTIONS = {
+    0: "Check passed",
     10004: "Requote",
     10006: "Request rejected",
     10007: "Request canceled by trader",
@@ -294,6 +301,7 @@ class MT5Connector:
         self.config = config or MT5Config()
         self._connected = False
         self._symbol_cache: Dict[str, MT5SymbolInfo] = {}
+        self._broker_symbol_cache: Dict[str, str] = {}
     
     # =========================================================================
     # Connection Management
@@ -335,6 +343,8 @@ class MT5Connector:
         if self.config.portable:
             init_kwargs['portable'] = self.config.portable
         
+        self._symbol_cache.clear()
+
         if not mt5.initialize(**init_kwargs):
             error = mt5.last_error()
             logger.error(f"MT5 initialization failed: {error}")
@@ -351,15 +361,17 @@ class MT5Connector:
             logger.info(f"Connected to MT5: {login}@{server}")
         else:
             logger.info("Connected to MT5 (using existing session)")
-        
+
         self._connected = True
+        self._symbol_cache.clear()
         return True
-    
+
     def disconnect(self):
         """Disconnect from MT5."""
         if MT5_AVAILABLE and self._connected:
             mt5.shutdown()
             self._connected = False
+            self._symbol_cache.clear()
             logger.info("Disconnected from MT5")
     
     def is_connected(self) -> bool:
@@ -419,6 +431,22 @@ class MT5Connector:
     # =========================================================================
     # Symbol Information
     # =========================================================================
+
+    def _resolve_symbol(self, symbol: str) -> Optional[str]:
+        """Resolve a canonical symbol to the broker-specific tradable symbol."""
+        cached = self._broker_symbol_cache.get(symbol)
+        if cached:
+            return cached
+        if not self._check_connection():
+            return None
+        if mt5.symbol_select(symbol, True):
+            self._broker_symbol_cache[symbol] = symbol
+            return symbol
+        resolved = self.find_broker_symbol(symbol)
+        if resolved:
+            self._broker_symbol_cache[symbol] = resolved
+            self._broker_symbol_cache[resolved] = resolved
+        return resolved
     
     def get_symbol_info(self, symbol: str) -> Optional[MT5SymbolInfo]:
         """
@@ -434,19 +462,16 @@ class MT5Connector:
         if symbol in self._symbol_cache:
             return self._symbol_cache[symbol]
         
-        if not self._check_connection():
+        resolved_symbol = self._resolve_symbol(symbol)
+        if resolved_symbol is None:
+            logger.warning(f"Failed to resolve symbol: {symbol}")
             return None
-        
-        # Enable symbol
-        if not mt5.symbol_select(symbol, True):
-            # Try to find broker variant
-            broker_symbol = self.find_broker_symbol(symbol)
-            if broker_symbol and broker_symbol != symbol:
-                return self.get_symbol_info(broker_symbol)
-            logger.warning(f"Failed to select symbol: {symbol}")
-            return None
-        
-        info = mt5.symbol_info(symbol)
+        if resolved_symbol in self._symbol_cache:
+            info_cached = self._symbol_cache[resolved_symbol]
+            self._symbol_cache[symbol] = info_cached
+            return info_cached
+
+        info = mt5.symbol_info(resolved_symbol)
         if info is None:
             return None
         
@@ -464,11 +489,19 @@ class MT5Connector:
             spread_float=info.spread_float,
             swap_long=info.swap_long,
             swap_short=info.swap_short,
-            trade_stops_level=info.trade_stops_level
+            trade_stops_level=info.trade_stops_level,
+            visible=bool(getattr(info, "visible", True)),
+            trade_mode=int(getattr(info, "trade_mode", 2) or 0),
+            filling_mode=int(getattr(info, "filling_mode", 0) or 0),
+            trade_exemode=int(getattr(info, "trade_exemode", 0) or 0),
+            trade_freeze_level=int(getattr(info, "trade_freeze_level", 0) or 0),
         )
         
-        # Cache it
+        # Cache it under both the requested alias and the broker symbol.
         self._symbol_cache[symbol] = symbol_info
+        self._symbol_cache[resolved_symbol] = symbol_info
+        self._broker_symbol_cache[symbol] = resolved_symbol
+        self._broker_symbol_cache[resolved_symbol] = resolved_symbol
         
         return symbol_info
     
@@ -487,8 +520,13 @@ class MT5Connector:
         if not self._check_connection():
             return None
         
+        cached = self._broker_symbol_cache.get(base_symbol)
+        if cached:
+            return cached
+
         # Try exact match first
         if mt5.symbol_select(base_symbol, True):
+            self._broker_symbol_cache[base_symbol] = base_symbol
             return base_symbol
         
         # Get all symbols
@@ -496,32 +534,33 @@ class MT5Connector:
         if all_symbols is None:
             return None
         
-        # Common suffixes to try
+        # Common broker suffixes. We intentionally avoid loose prefix matching
+        # because it can bind the PM to the wrong custom symbol/feed.
         suffixes = ['', '.a', '.pro', 'm', '.std', '.raw', '.ecn', '#', '.i']
         
         for suffix in suffixes:
             test_symbol = base_symbol + suffix
             for sym in all_symbols:
+                if getattr(sym, "custom", False):
+                    continue
                 if sym.name.upper() == test_symbol.upper():
                     if mt5.symbol_select(sym.name, True):
                         logger.debug(f"Found broker symbol: {sym.name} for {base_symbol}")
+                        self._broker_symbol_cache[base_symbol] = sym.name
+                        self._broker_symbol_cache[sym.name] = sym.name
                         return sym.name
-        
-        # Try prefix match
-        for sym in all_symbols:
-            if sym.name.upper().startswith(base_symbol.upper()):
-                if mt5.symbol_select(sym.name, True):
-                    logger.debug(f"Found broker symbol: {sym.name} for {base_symbol}")
-                    return sym.name
-        
         return None
     
     def get_tick(self, symbol: str) -> Optional[MT5Tick]:
         """Get current tick for symbol."""
         if not self._check_connection():
             return None
-        
-        tick = mt5.symbol_info_tick(symbol)
+
+        resolved_symbol = self._resolve_symbol(symbol)
+        if resolved_symbol is None:
+            return None
+
+        tick = mt5.symbol_info_tick(resolved_symbol)
         if tick is None:
             return None
         
@@ -673,14 +712,18 @@ class MT5Connector:
         """
         if not self._check_connection():
             return MT5OrderResult(False, -1, "Not connected")
-        
+
+        broker_symbol = self._resolve_symbol(symbol)
+        if broker_symbol is None:
+            return MT5OrderResult(False, -1, f"Symbol not available: {symbol}")
+
         # Get symbol info
-        symbol_info = self.get_symbol_info(symbol)
+        symbol_info = self.get_symbol_info(broker_symbol)
         if symbol_info is None:
-            return MT5OrderResult(False, -1, f"Symbol info not available: {symbol}")
+            return MT5OrderResult(False, -1, f"Symbol info not available: {broker_symbol}")
         
         # Get current price
-        tick = self.get_tick(symbol)
+        tick = self.get_tick(broker_symbol)
         if tick is None:
             return MT5OrderResult(False, -1, "No tick data")
         
@@ -696,7 +739,7 @@ class MT5Connector:
         volume = self._normalize_volume(volume, symbol_info)
         
         # Determine filling type
-        filling_type = self._get_filling_type(symbol)
+        filling_type = self._get_filling_type(broker_symbol, symbol_info=symbol_info)
         
         # Validate SL/TP against minimum stop level
         min_stop_distance = symbol_info.trade_stops_level * symbol_info.point
@@ -734,7 +777,7 @@ class MT5Connector:
         # Create request
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": broker_symbol,
             "volume": volume,
             "type": mt5_type,
             "price": round(price, symbol_info.digits),
@@ -750,6 +793,10 @@ class MT5Connector:
             request["sl"] = round(sl, symbol_info.digits)
         if tp > 0:
             request["tp"] = round(tp, symbol_info.digits)
+
+        preflight = self._preflight_order_request(request)
+        if preflight is not None:
+            return preflight
         
         # Send order
         result = mt5.order_send(request)
@@ -761,7 +808,7 @@ class MT5Connector:
         retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
         
         return MT5OrderResult(
-            success=(result.retcode in [10008, 10009]),
+            success=(result.retcode in [10008, 10009, 10010]),
             retcode=result.retcode,
             retcode_description=retcode_desc,
             deal=result.deal,
@@ -802,7 +849,8 @@ class MT5Connector:
             close_type = mt5.ORDER_TYPE_BUY
             price = tick.ask
         
-        filling_type = self._get_filling_type(position.symbol)
+        symbol_info = self.get_symbol_info(position.symbol)
+        filling_type = self._get_filling_type(position.symbol, symbol_info=symbol_info)
         
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -817,6 +865,10 @@ class MT5Connector:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_type,
         }
+
+        preflight = self._preflight_order_request(request)
+        if preflight is not None:
+            return preflight
         
         result = mt5.order_send(request)
         
@@ -827,7 +879,7 @@ class MT5Connector:
         retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
         
         return MT5OrderResult(
-            success=(result.retcode in [10008, 10009]),
+            success=(result.retcode in [10008, 10009, 10010]),
             retcode=result.retcode,
             retcode_description=retcode_desc,
             deal=result.deal,
@@ -853,14 +905,49 @@ class MT5Connector:
         """
         if not self._check_connection():
             return MT5OrderResult(False, -1, "Not connected")
+
+        symbol_info = self.get_symbol_info(position.symbol)
+        if symbol_info is None:
+            return MT5OrderResult(False, -1, f"Symbol info not available: {position.symbol}")
+        tick = self.get_tick(position.symbol)
+        if tick is None:
+            return MT5OrderResult(False, -1, "No tick data")
+
+        is_long = position.type == 0
+        reference_price = tick.bid if is_long else tick.ask
+        min_stop_distance = float(symbol_info.trade_stops_level or 0) * float(symbol_info.point)
+        freeze_distance = float(symbol_info.trade_freeze_level or 0) * float(symbol_info.point)
+        required_distance = max(min_stop_distance, freeze_distance)
+
+        new_sl = round(sl, symbol_info.digits) if sl is not None else position.sl
+        new_tp = round(tp, symbol_info.digits) if tp is not None else position.tp
+
+        if new_sl:
+            if is_long and new_sl >= reference_price:
+                return MT5OrderResult(False, 10016, "SL must be below current price for BUY")
+            if (not is_long) and new_sl <= reference_price:
+                return MT5OrderResult(False, 10016, "SL must be above current price for SELL")
+            if required_distance > 0 and abs(reference_price - new_sl) < required_distance:
+                return MT5OrderResult(False, 10016, "SL violates stop/freeze distance")
+        if new_tp:
+            if is_long and new_tp <= reference_price:
+                return MT5OrderResult(False, 10016, "TP must be above current price for BUY")
+            if (not is_long) and new_tp >= reference_price:
+                return MT5OrderResult(False, 10016, "TP must be below current price for SELL")
+            if required_distance > 0 and abs(reference_price - new_tp) < required_distance:
+                return MT5OrderResult(False, 10016, "TP violates stop/freeze distance")
         
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "symbol": position.symbol,
             "position": position.ticket,
-            "sl": sl if sl is not None else position.sl,
-            "tp": tp if tp is not None else position.tp,
+            "sl": new_sl,
+            "tp": new_tp,
         }
+
+        preflight = self._preflight_order_request(request)
+        if preflight is not None:
+            return preflight
         
         result = mt5.order_send(request)
         
@@ -869,7 +956,7 @@ class MT5Connector:
             return MT5OrderResult(False, error[0], str(error[1]))
         
         return MT5OrderResult(
-            success=(result.retcode in [10008, 10009]),
+            success=(result.retcode in [10008, 10009, 10010]),
             retcode=result.retcode,
             retcode_description=RETCODE_DESCRIPTIONS.get(result.retcode, "Unknown")
         )
@@ -878,7 +965,7 @@ class MT5Connector:
     # Position Management
     # =========================================================================
     
-    def get_positions(self, symbol: str = None, magic: int = None) -> List[MT5Position]:
+    def get_positions(self, symbol: str = None, magic: int = None) -> Optional[List[MT5Position]]:
         """
         Get open positions.
         
@@ -887,19 +974,20 @@ class MT5Connector:
             magic: Filter by magic number (optional)
             
         Returns:
-            List of MT5Position
+            List of MT5Position, or None if MT5 could not provide a snapshot
         """
         if not self._check_connection():
-            return []
-        
+            return None
+
         if symbol:
-            positions = mt5.positions_get(symbol=symbol)
+            resolved_symbol = self._resolve_symbol(symbol) or symbol
+            positions = mt5.positions_get(symbol=resolved_symbol)
         else:
             positions = mt5.positions_get()
-        
+
         if positions is None:
-            return []
-        
+            return None
+
         result = []
         for pos in positions:
             if magic is not None and pos.magic != magic:
@@ -926,19 +1014,61 @@ class MT5Connector:
     def get_position_by_ticket(self, ticket: int) -> Optional[MT5Position]:
         """Get position by ticket number."""
         positions = self.get_positions()
+        if positions is None:
+            return None
         for pos in positions:
             if pos.ticket == ticket:
                 return pos
         return None
-    
+
     def get_position_by_symbol_magic(self, symbol: str, magic: int) -> Optional[MT5Position]:
         """Get position by symbol and magic number."""
         positions = self.get_positions(symbol=symbol, magic=magic)
+        if positions is None:
+            return None
         return positions[0] if positions else None
-    
+
     def count_positions(self, symbol: str = None, magic: int = None) -> int:
         """Count open positions."""
-        return len(self.get_positions(symbol=symbol, magic=magic))
+        positions = self.get_positions(symbol=symbol, magic=magic)
+        return len(positions) if positions is not None else 0
+
+    def get_recent_closing_deals(self, lookback_hours: int = 48) -> List[Dict[str, Any]]:
+        """Fetch recent closing deals for drift-monitor integration."""
+        if not self._check_connection():
+            return []
+
+        from_time = datetime.now() - timedelta(hours=max(1, int(lookback_hours)))
+        to_time = datetime.now()
+
+        try:
+            deals = mt5.history_deals_get(from_time, to_time)
+        except Exception:
+            return []
+
+        if deals is None:
+            return []
+
+        result: List[Dict[str, Any]] = []
+        exit_entries = {
+            getattr(mt5, 'DEAL_ENTRY_OUT', 1),
+            getattr(mt5, 'DEAL_ENTRY_OUT_BY', 3),
+        }
+        for deal in deals:
+            entry_type = getattr(deal, 'entry', None)
+            if entry_type is not None and entry_type not in exit_entries:
+                continue
+            deal_time = getattr(deal, 'time', None)
+            result.append({
+                'ticket': int(getattr(deal, 'ticket', 0) or 0),
+                'position_id': int(getattr(deal, 'position_id', 0) or 0),
+                'symbol': getattr(deal, 'symbol', ''),
+                'profit': float(getattr(deal, 'profit', 0.0) or 0.0),
+                'comment': getattr(deal, 'comment', '') or '',
+                'magic': int(getattr(deal, 'magic', 0) or 0),
+                'time': datetime.fromtimestamp(deal_time) if deal_time else to_time,
+            })
+        return result
     
     # =========================================================================
     # Helper Methods
@@ -981,7 +1111,8 @@ class MT5Connector:
         if not MT5_AVAILABLE:
             return None
         try:
-            return mt5.order_calc_profit(order_type, symbol, volume, price_open, price_close)
+            resolved_symbol = self._resolve_symbol(symbol) or symbol
+            return mt5.order_calc_profit(order_type, resolved_symbol, volume, price_open, price_close)
         except Exception as e:
             logger.debug(f"order_calc_profit failed for {symbol}: {e}")
             return None
@@ -994,24 +1125,69 @@ class MT5Connector:
             return None
         return abs(float(profit))
 
-    def _get_filling_type(self, symbol: str) -> int:
+    def _preflight_order_request(self, request: Dict[str, Any]) -> Optional[MT5OrderResult]:
+        """Validate an MT5 trade request with order_check when available."""
+        if not MT5_AVAILABLE or not hasattr(mt5, "order_check"):
+            return None
+        try:
+            result = mt5.order_check(request)
+        except Exception as exc:
+            return MT5OrderResult(False, -1, f"order_check exception: {exc}")
+        if result is None:
+            error = mt5.last_error()
+            return MT5OrderResult(False, error[0], str(error[1]))
+        retcode = int(getattr(result, "retcode", 0) or 0)
+        if retcode == 0:
+            return None
+        description = (
+            getattr(result, "comment", "")
+            or RETCODE_DESCRIPTIONS.get(retcode, f"Order check failed ({retcode})")
+        )
+        return MT5OrderResult(False, retcode, str(description))
+
+    def _get_filling_type(self, symbol: str, symbol_info: Optional[MT5SymbolInfo] = None) -> int:
         """Get appropriate filling type for symbol."""
         if not MT5_AVAILABLE:
             return 0
-        
-        info = mt5.symbol_info(symbol)
+
+        info = symbol_info
+        if info is None:
+            info = mt5.symbol_info(symbol)
         if info is None:
             return mt5.ORDER_FILLING_IOC
-        
-        # Check what filling types are allowed
-        filling_modes = info.filling_mode
-        
-        if filling_modes & 1:  # FOK allowed
+
+        filling_modes = int(getattr(info, "filling_mode", 0) or 0)
+        trade_exemode = int(getattr(info, "trade_exemode", 0) or 0)
+        symbol_fok = int(getattr(mt5, "SYMBOL_FILLING_FOK", 1))
+        symbol_ioc = int(getattr(mt5, "SYMBOL_FILLING_IOC", 2))
+        market_execution = int(getattr(mt5, "SYMBOL_TRADE_EXECUTION_MARKET", 2))
+
+        def _broker_preferred_fill() -> int:
+            if filling_modes & symbol_fok:
+                return mt5.ORDER_FILLING_FOK
+            if filling_modes & symbol_ioc:
+                return mt5.ORDER_FILLING_IOC
+            if trade_exemode != market_execution:
+                return mt5.ORDER_FILLING_RETURN
             return mt5.ORDER_FILLING_FOK
-        elif filling_modes & 2:  # IOC allowed
-            return mt5.ORDER_FILLING_IOC
-        else:
-            return mt5.ORDER_FILLING_RETURN
+
+        policy = str(getattr(self.config, "preferred_filling_type", "broker") or "broker").strip().lower()
+        if policy in {"fok", "ioc", "return"}:
+            override_map = {
+                "fok": mt5.ORDER_FILLING_FOK,
+                "ioc": mt5.ORDER_FILLING_IOC,
+                "return": mt5.ORDER_FILLING_RETURN,
+            }
+            requested = override_map[policy]
+            if requested == mt5.ORDER_FILLING_RETURN and trade_exemode == market_execution:
+                logger.warning(
+                    f"{symbol}: ORDER_FILLING_RETURN requested but forbidden for market execution; "
+                    "falling back to broker-supported mode"
+                )
+                return _broker_preferred_fill()
+            return requested
+
+        return _broker_preferred_fill()
 
     def get_symbol_tick(self, symbol: str) -> Optional[MT5Tick]:
         """Alias for get_tick (used by pm_main.py)."""

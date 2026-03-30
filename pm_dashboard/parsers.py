@@ -134,14 +134,16 @@ def parse_entries_from_log(
 
 
 _RE_TS = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+_SYMBOL_TOKEN = r"[A-Z0-9_.#-]+"
 _RE_SELECTED = re.compile(
-    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Selected:\s+(?P<strategy>[^@]+)\s+@\s+(?P<tf>[^/]+)/(?P<regime>[A-Z0-9_]+)"
+    rf"\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?:\[(?P<secondary>SECONDARY)\]\s+)?Selected:\s+"
+    r"(?P<strategy>[^@]+)\s+@\s+(?P<tf>[^/]+)/(?P<regime>[A-Z0-9_]+)"
 )
 _RE_ORDER = re.compile(
-    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+(?P<side>BUY|SELL)\s+\|.*?entry=(?P<entry>[0-9.]+)\s+\|\s+sl=(?P<sl>[0-9.]+)\s+\|\s+tp=(?P<tp>[0-9.]+)"
+    rf"\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?P<side>BUY|SELL)\s+\|.*?entry=(?P<entry>[0-9.]+)\s+\|\s+sl=(?P<sl>[0-9.]+)\s+\|\s+tp=(?P<tp>[0-9.]+)"
 )
 _RE_EXECUTED = re.compile(
-    r"\[OK\]\s+\[(?P<symbol>[A-Z0-9_]+)\]\s+(?P<side>LONG|SHORT)\s+executed.*?@\s+(?P<price>[0-9.]+)"
+    rf"\[OK\]\s+\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?P<side>LONG|SHORT)\s+executed.*?@\s+(?P<price>[0-9.]+)"
 )
 
 
@@ -170,6 +172,9 @@ def parse_pm_execution_log(
             ctx["timeframe"] = sel.group("tf").strip().upper()
             ctx["regime"] = sel.group("regime").strip().upper()
             ctx["timestamp"] = ts_val
+            if sel.group("secondary"):
+                ctx["secondary_trade"] = True
+                ctx["secondary_reason"] = "log_tag"
             continue
 
         order = _RE_ORDER.search(line)
@@ -204,6 +209,9 @@ def parse_pm_execution_log(
                 timestamp=format_timestamp(parse_timestamp(ts_val)) if ts_val else None,
                 valid_now=True,
                 reason="EXECUTED",
+                secondary_trade=ctx.get("secondary_trade"),
+                secondary_reason=ctx.get("secondary_reason", ""),
+                position_context=ctx.get("position_context", {}),
                 source=source,
                 raw={
                     "symbol": symbol,
@@ -215,6 +223,8 @@ def parse_pm_execution_log(
                     "timeframe": ctx.get("timeframe"),
                     "regime": ctx.get("regime"),
                     "strategy_name": ctx.get("strategy_name"),
+                    "secondary_trade": ctx.get("secondary_trade"),
+                    "secondary_reason": ctx.get("secondary_reason", ""),
                 },
             )
             entry.entry_id = build_entry_id(
@@ -270,6 +280,25 @@ def normalize_record(
     if action_value and not notes:
         notes = action_value
 
+    secondary_trade_raw = extract_field(record, aliases.get("secondary_trade", []))
+    secondary_trade: Optional[bool] = None
+    if secondary_trade_raw is not None:
+        if isinstance(secondary_trade_raw, bool):
+            secondary_trade = secondary_trade_raw
+        elif isinstance(secondary_trade_raw, (int, float)):
+            secondary_trade = bool(secondary_trade_raw)
+        elif isinstance(secondary_trade_raw, str):
+            lowered = secondary_trade_raw.strip().lower()
+            if lowered in ("true", "1", "yes", "y"):
+                secondary_trade = True
+            elif lowered in ("false", "0", "no", "n"):
+                secondary_trade = False
+
+    secondary_reason = extract_field(record, aliases.get("secondary_reason", [])) or ""
+    position_context = record.get("position_context")
+    if not isinstance(position_context, dict):
+        position_context = {}
+
     if entry_price is None:
         entry_price = coerce_float(record.get("entry"))
 
@@ -301,6 +330,9 @@ def normalize_record(
         timestamp=format_timestamp(timestamp),
         valid_now=valid_now,
         reason=str(notes).strip(),
+        secondary_trade=secondary_trade,
+        secondary_reason=str(secondary_reason).strip(),
+        position_context=position_context,
         source=source,
         raw=record,
     )

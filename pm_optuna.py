@@ -22,6 +22,7 @@ Version: 1.1 (Updated with ExperimentalWarning suppression)
 """
 
 import logging
+import hashlib
 import time
 from typing import Dict, List, Any, Optional, Tuple, Callable, Union
 from dataclasses import dataclass, field
@@ -59,6 +60,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _stable_seed(*parts: Any) -> int:
+    """Deterministic non-negative seed derived from stable context parts."""
+    payload = "|".join(str(part) for part in parts).encode("utf-8", errors="replace")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, "big") & 0x7FFFFFFF
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -71,7 +79,7 @@ class OptunaConfig:
     
     # TPE sampler settings
     n_startup_trials: int = 10  # Random trials before TPE kicks in
-    seed: int = 42
+    seed: int = 0
     multivariate: bool = True  # Consider parameter correlations
     
     # Pruning settings
@@ -106,7 +114,7 @@ class OptunaConfig:
         return cls(
             n_trials=getattr(config, 'regime_hyperparam_max_combos', 100),
             n_startup_trials=min(10, getattr(config, 'regime_hyperparam_max_combos', 100) // 10),
-            seed=42,
+            seed=int(getattr(config, 'optimization_seed', 0) or 0),
             multivariate=True,
             use_validation_in_objective=bool(getattr(config, 'optuna_use_val_in_objective', False)),
         )
@@ -506,9 +514,19 @@ class OptunaTPEOptimizer:
                 logger.debug(f"[{symbol}] Trial {trial_count[0]} failed: {e}")
                 return -1000.0
         
-        # Create sampler
+        # Create sampler with deterministic context-specific seed.
+        sampler_seed = _stable_seed(
+            self.config.seed,
+            symbol,
+            strategy_name,
+            "optuna_single",
+            len(train_features),
+            str(train_features.index[0]) if len(train_features) else "",
+            str(train_features.index[-1]) if len(train_features) else "",
+            len(val_features) if val_features is not None else 0,
+        )
         sampler = TPESampler(
-            seed=self.config.seed,
+            seed=sampler_seed,
             n_startup_trials=min(self.config.n_startup_trials, n_trials // 2),
             multivariate=self.config.multivariate,
         )
@@ -553,7 +571,8 @@ class OptunaTPEOptimizer:
                              bucket_trades_fn: Callable,
                              compute_score_fn: Callable,
                              min_train_trades: int = 25,
-                             max_drawdown_pct: float = 25.0) -> Dict[str, Dict[str, Any]]:
+                             max_drawdown_pct: float = 25.0,
+                             val_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
         """
         Optimize strategy parameters for multiple regimes simultaneously.
         
@@ -583,7 +602,7 @@ class OptunaTPEOptimizer:
                 symbol, timeframe, strategy_name, param_grid,
                 train_features, val_features, regimes,
                 bucket_trades_fn, compute_score_fn, min_train_trades,
-                max_drawdown_pct
+                max_drawdown_pct, val_warmup_bars
             )
         
         start_time = time.time()
@@ -656,7 +675,7 @@ class OptunaTPEOptimizer:
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_result = self.backtester.run(
-                        val_features, val_signals, symbol, strategy
+                        val_features, val_signals, symbol, strategy, warmup_bars=val_warmup_bars
                     )
 
                     # Early rejection if validation DD too high
@@ -689,7 +708,7 @@ class OptunaTPEOptimizer:
                     if regime_train_dd > max_drawdown_pct * dd_train_mult:
                         continue
                     
-                    score = compute_score_fn(train_m, val_m) if self.config.use_validation_in_objective else compute_score_fn(train_m, {})
+                    score = compute_score_fn(train_m, {})
                     regime_scores.append(score)
                     
                     # Update best for this regime (only if passes DD check)
@@ -704,16 +723,27 @@ class OptunaTPEOptimizer:
                             'is_tuned': True,
                         })
                 
-                # Return max score for TPE guidance
-                return max(regime_scores) if regime_scores else -1000.0
+                # Return the mean score so a single lucky regime cannot dominate the search.
+                return float(np.mean(regime_scores)) if regime_scores else -1000.0
                 
             except Exception as e:
                 logger.debug(f"[{symbol}] [{timeframe}] Trial failed: {e}")
                 return -1000.0
         
         # Create and run study
+        sampler_seed = _stable_seed(
+            self.config.seed,
+            symbol,
+            timeframe,
+            strategy_name,
+            "optuna_regime",
+            len(train_features),
+            str(train_features.index[0]) if len(train_features) else "",
+            str(train_features.index[-1]) if len(train_features) else "",
+            len(val_features) if val_features is not None else 0,
+        )
         sampler = TPESampler(
-            seed=self.config.seed,
+            seed=sampler_seed,
             n_startup_trials=min(self.config.n_startup_trials, n_trials // 2),
             multivariate=self.config.multivariate,
         )
@@ -737,6 +767,7 @@ class OptunaTPEOptimizer:
         results = {}
         for regime, (score, candidate) in best_by_regime.items():
             if candidate is not None:
+                candidate['search_trials'] = int(n_trials)
                 results[regime] = candidate
         
         return results
@@ -810,12 +841,19 @@ class OptunaTPEOptimizer:
         
         n_trials = min(self.config.n_trials, len(all_combos))
         if len(all_combos) > n_trials:
-            np.random.seed(self.config.seed)
+            _seed = _stable_seed(
+                symbol,
+                strategy_name,
+                "grid_fallback",
+                len(train_features),
+                len(val_features) if val_features is not None else 0,
+            )
+            np.random.seed(_seed)
             indices = np.random.choice(len(all_combos), n_trials, replace=False)
             combos = [all_combos[i] for i in indices]
         else:
             combos = all_combos
-        
+
         best_score = float('-inf')
         best_params = default_params.copy()
         best_train_metrics = {}
@@ -915,7 +953,8 @@ class OptunaTPEOptimizer:
                                 bucket_trades_fn: Callable,
                                 compute_score_fn: Callable,
                                 min_train_trades: int,
-                                max_drawdown_pct: float = 25.0) -> Dict[str, Dict[str, Any]]:
+                                max_drawdown_pct: float = 25.0,
+                                val_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
         """Fallback regime search when Optuna unavailable (with drawdown-based early rejection)."""
         from itertools import product
         
@@ -931,12 +970,20 @@ class OptunaTPEOptimizer:
         
         n_trials = min(self.config.n_trials, len(all_combos))
         if len(all_combos) > n_trials:
-            np.random.seed(self.config.seed)
+            _seed = _stable_seed(
+                symbol,
+                timeframe,
+                strategy_name,
+                "regime_grid_fallback",
+                len(train_features),
+                len(val_features) if val_features is not None else 0,
+            )
+            np.random.seed(_seed)
             indices = np.random.choice(len(all_combos), n_trials, replace=False)
             combos = [all_combos[i] for i in indices]
         else:
             combos = all_combos
-        
+
         best_by_regime = {r: (float('-inf'), None) for r in regimes}
         early_rejections = 0
 
@@ -978,7 +1025,7 @@ class OptunaTPEOptimizer:
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_result = self.backtester.run(
-                        val_features, val_signals, symbol, strategy
+                        val_features, val_signals, symbol, strategy, warmup_bars=val_warmup_bars
                     )
 
                     # Early rejection if validation DD too high
@@ -1009,7 +1056,7 @@ class OptunaTPEOptimizer:
                     if regime_train_dd > max_drawdown_pct * dd_train_mult:
                         continue
                     
-                    score = compute_score_fn(train_m, val_m) if self.config.use_validation_in_objective else compute_score_fn(train_m, {})
+                    score = compute_score_fn(train_m, {})
                     
                     if score > best_by_regime[regime][0]:
                         best_by_regime[regime] = (score, {
@@ -1020,6 +1067,7 @@ class OptunaTPEOptimizer:
                             'train_regime_metrics': train_regime_metrics,
                             'val_regime_metrics': val_regime_metrics,
                             'is_tuned': True,
+                            'search_trials': int(len(combos)),
                         })
                         
             except Exception:

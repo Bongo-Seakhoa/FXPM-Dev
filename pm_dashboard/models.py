@@ -20,4 +20,7 @@ class SignalEntry:
     reason: str = ""
     source: str = ""
     entry_id: str = ""
+    secondary_trade: Optional[bool] = None
+    secondary_reason: str = ""
+    position_context: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)

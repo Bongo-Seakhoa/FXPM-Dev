@@ -4,6 +4,8 @@
     "min_strength": 0,
     "sound": true
   },
+  "data_maintenance_time": "00:00",
+  "enable_data_maintenance_scheduler": true,
   "display_actions": [
     "EXECUTED",
     "SKIPPED_RISK_CAP",
@@ -49,6 +51,15 @@
     "regime": [
       "regime",
       "market_regime"
+    ],
+    "secondary_reason": [
+      "secondary_reason",
+      "secondary_trade_reason"
+    ],
+    "secondary_trade": [
+      "secondary_trade",
+      "is_secondary",
+      "secondary"
     ],
     "signal_direction": [
       "direction",
@@ -143,9 +154,13 @@
   "trade_files_pattern": "**/trades_*.json",
   "trade_map_max_age_minutes": 30,
   "valid_action_prefixes": [
-    "EXECUTED"
+    "EXECUTED",
+    "SKIPPED_RISK_CAP",
+    "BLOCKED_RISK_CAP"
   ],
   "valid_actions": [
-    "EXECUTED"
+    "EXECUTED",
+    "SKIPPED_RISK_CAP",
+    "BLOCKED_RISK_CAP"
   ]
 }

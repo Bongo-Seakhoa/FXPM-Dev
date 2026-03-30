@@ -135,8 +135,33 @@ Default weights:
 |-----|------|---------|-------------|
 | `regime_min_val_profit_factor` | float | `1.0` | Minimum validation profit factor for a regime winner to be stored. Prevents "best loser" strategies from being selected. |
 | `regime_min_val_return_pct` | float | `0.0` | Minimum validation return % for a regime winner. `0.0` = breakeven minimum. |
+| `regime_allow_losing_winners` | bool | `false` | If `true`, allows strategies with PF < 1 to be stored as regime winners. Not recommended. |
+| `regime_no_winner_marker` | string | `"NO_TRADE"` | Strategy name used when no valid winner exists for a regime. |
 
-### 1.11 Live Trading Settings
+### 1.11 Pre-Tuning Eligibility Gates
+
+These gates filter strategies **before** Optuna hyperparameter tuning, based on training results with **default (untuned) parameters**. Their purpose is to save compute by skipping truly catastrophic strategies. Thresholds should be lenient since strategies improve significantly after tuning.
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `train_min_profit_factor` | float | `0.5` | 0.1-1.5 | Minimum training profit factor with default params. Strategies below this are skipped. `0.5` = very lenient (only reject terrible), `0.85` = moderate, `0.95` = strict (may reject too many). |
+| `train_min_return_pct` | float | `-30.0` | -50 to 5 | Minimum training return %. **Value is in percentage points**, not decimal. `-10.0` allows up to 10% loss. `0.0` = breakeven-or-better. |
+| `train_max_drawdown` | float | `60.0` | 10-80 | Maximum training drawdown %. Strategies exceeding this are skipped. `20.0` = moderate, `60.0` = lenient. |
+
+**Important:** These run on **default parameters** (before Optuna tuning). A strategy with PF=0.7 on defaults may become PF=1.8 after tuning. Set thresholds conservatively (lenient) to avoid rejecting good candidates prematurely. The real quality enforcement happens post-tuning via the regime winner profitability gates (Section 1.10).
+
+### 1.12 Weak-Train Exceptional Validation
+
+When a strategy has weak training metrics (PF < 1.0 or negative return), it can still be selected as a regime winner if its **validation** metrics are exceptionally strong. This handles strategies that happen to underperform on the specific training window but generalize well.
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `exceptional_val_profit_factor` | float | `1.3` | 1.0-3.0 | Minimum validation PF required to override weak training. Must also pass `exceptional_val_return_pct` and have 2x `regime_min_val_trades`. |
+| `exceptional_val_return_pct` | float | `2.0` | 0-20 | Minimum validation return % required to override weak training. |
+
+**Example:** A strategy with train PF=0.8 (weak) but val PF=1.5, val return=3%, and 30+ val trades would be allowed through the exceptional validation path.
+
+### 1.13 Live Trading Settings
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
@@ -144,9 +169,9 @@ Default weights:
 | `live_min_bars` | int | `300` | 100-1000 | Minimum bars required to evaluate a timeframe in live trading. Timeframes with fewer bars are skipped. |
 | `actionable_score_margin` | float | `0.9` | 0.0-1.0 | Minimum composite score (0-1) for a signal to be actionable. Signals below this are logged but not executed. `0.95` = strict, `0.9` = moderate, `0.8` = lenient. |
 
-### 1.12 Tiered Risk Policy
+### 1.14 Winners-Only Risk Policy
 
-Live trading uses a **winners-only** risk policy. Only validated regime winners may trade.
+Live trading uses a **winners-only** risk policy. Only validated regime winners may trade. No fallback to "best train" when validation fails.
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
@@ -154,7 +179,7 @@ Live trading uses a **winners-only** risk policy. Only validated regime winners 
 
 Risk per trade is determined by `position.risk_per_trade_pct`, capped by `position.max_risk_pct`.
 
-### 1.13 Dual-Trade D1 + Lower-TF
+### 1.15 Dual-Trade D1 + Lower-TF
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

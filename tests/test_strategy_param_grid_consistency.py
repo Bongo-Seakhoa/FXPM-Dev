@@ -1,4 +1,4 @@
-"""Test that all 42 strategies have consistent param grids matching default params."""
+"""Test that all 47 strategies have consistent param grids matching default params."""
 import unittest
 from pm_strategies import StrategyRegistry
 
@@ -18,8 +18,8 @@ class StrategyParamGridConsistencyTests(unittest.TestCase):
                         f"{name}: grid key '{key}' not in defaults {list(defaults.keys())}"
                     )
 
-    def test_strategy_count_is_42(self):
-        self.assertEqual(StrategyRegistry.count(), 42)
+    def test_strategy_count_is_47(self):
+        self.assertEqual(StrategyRegistry.count(), 47)
 
     def test_all_strategies_instantiate(self):
         """Every registered strategy can be instantiated with defaults."""

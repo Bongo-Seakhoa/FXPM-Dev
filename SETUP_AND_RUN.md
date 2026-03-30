@@ -1,4 +1,4 @@
-# FX Portfolio Manager v3.3 - Complete Setup and Run Guide
+# FX Portfolio Manager v3.1 - Complete Setup and Run Guide
 
 This guide walks you through every step from installation to live trading.
 
@@ -377,7 +377,7 @@ Find your broker's exact symbol names:
 python pm_main.py --optimize
 ```
 
-### 4.3 Stateful Optimization (NEW in v3.3)
+### 4.3 Stateful Optimization (NEW in v3.1)
 
 The optimization is now **stateful** - it remembers progress and skips valid configs:
 
@@ -403,7 +403,7 @@ python pm_main.py --optimize --overwrite
 
 ```
 ============================================================
-FX PORTFOLIO MANAGER v3.3
+FX PORTFOLIO MANAGER v3.1
 ============================================================
 Connecting to MetaTrader 5...
 ✓ Connected to MT5
@@ -424,7 +424,7 @@ Progress: 1/10
 ============================================================
 OPTIMIZING: USDJPY (Regime-Aware)
 ============================================================
-[USDJPY] Regime Optimization: 42 strategies x 6 timeframes x 4 regimes
+[USDJPY] Regime Optimization: 47 strategies x 6 timeframes x 4 regimes
 [USDJPY] [H1] Hyperparameter tuning 3 strategies
 [USDJPY] [H1] [TREND] Winner: SupertrendStrategy [TUNED] (quality=0.723)
 [USDJPY] [H1] [RANGE] Winner: BollingerBounceStrategy (quality=0.681)
@@ -524,8 +524,8 @@ Before going live, verify:
 # Basic live trading
 python pm_main.py --trade
 
-# With automatic retraining (recommended for long-term)
-python pm_main.py --trade --auto-retrain
+# The fixed production retrain schedule comes from config.json
+python pm_main.py --trade
 ```
 
 ### 6.3 Live Trading Output
@@ -535,7 +535,7 @@ python pm_main.py --trade --auto-retrain
 STARTING LIVE TRADING
 ============================================================
 Trading enabled: True
-Auto-retrain: True
+Production retrain: auto (every 2 weeks on Sunday 00:01)
 
 [EURUSD] New bar detected: 2026-02-01 14:00:00
 [EURUSD] Regime: TREND (score: 0.72)
@@ -579,7 +579,7 @@ For 24/7 operation, consider:
    @echo off
    cd /d C:\FX_Portfolio_Manager
    call .venv\Scripts\activate.bat
-   python pm_main.py --trade --auto-retrain
+   python pm_main.py --trade
    ```
 2. Schedule via Task Scheduler to restart on failure
 
@@ -871,11 +871,10 @@ python pm_main.py --optimize
 # Daily usage
 python pm_main.py --trade --paper          # Test mode
 python pm_main.py --trade                   # Live mode
-python pm_main.py --trade --auto-retrain   # Autonomous mode
 
 # Maintenance
 python pm_main.py --status                  # Check configs
-python pm_main.py --optimize                # Re-optimize expired only
+python pm_main.py --optimize                # Re-optimize symbols due on the fixed schedule
 python pm_main.py --optimize --overwrite    # Force re-optimize all
 python pm_main.py --optimize --symbols EURUSD  # Re-optimize one symbol
 
@@ -915,7 +914,6 @@ python pm_main.py --trade --paper --log-level DEBUG
 | `--overwrite` | Force re-optimization (ignore validity) |
 | `--trade` | Start live trading loop |
 | `--paper` | Paper trading mode (no real orders) |
-| `--auto-retrain` | Auto-retrain when configs expire |
 | `--status` | Print portfolio status |
 | `--symbols` | Specific symbols to process |
 | `--config` | Path to config JSON file |
@@ -976,4 +974,4 @@ For issues:
 
 ---
 
-*FX Portfolio Manager v3.3 - Complete Setup and Run Guide*
+*FX Portfolio Manager v3.1 - Complete Setup and Run Guide*

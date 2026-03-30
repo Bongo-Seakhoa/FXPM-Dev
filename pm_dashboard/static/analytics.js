@@ -7,6 +7,10 @@ var analyticsState = {
   currentReturnBasis: 'dollar'
 };
 
+function canUseCharts() {
+  return typeof Chart !== 'undefined';
+}
+
 var chartColors = {
   primary: '#0b6e6e',
   success: '#0f8a5f',
@@ -94,6 +98,7 @@ function renderKPIs(metrics) {
 }
 
 function renderEquityChart(equityCurve) {
+  if (!canUseCharts()) return;
   if (!equityCurve || !equityCurve.length) return;
 
   var colors = getChartColors();
@@ -171,6 +176,7 @@ function renderEquityChart(equityCurve) {
 }
 
 function renderDrawdownChart(drawdownCurve) {
+  if (!canUseCharts()) return;
   if (!drawdownCurve || !drawdownCurve.length) return;
 
   var colors = getChartColors();
@@ -248,6 +254,7 @@ function renderDrawdownChart(drawdownCurve) {
 }
 
 function renderSymbolChart(bySymbol) {
+  if (!canUseCharts()) return;
   if (!bySymbol) return;
 
   var colors = getChartColors();
@@ -309,6 +316,7 @@ function renderSymbolChart(bySymbol) {
 }
 
 function renderTimeframeChart(byTimeframe) {
+  if (!canUseCharts()) return;
   if (!byTimeframe) return;
 
   var colors = getChartColors();
@@ -366,6 +374,7 @@ function renderTimeframeChart(byTimeframe) {
 }
 
 function renderMonthlyChart(monthly) {
+  if (!canUseCharts()) return;
   if (!monthly) return;
 
   var colors = getChartColors();
@@ -423,6 +432,7 @@ function renderMonthlyChart(monthly) {
 }
 
 function renderDailyPnLChart(dailyPnL) {
+  if (!canUseCharts()) return;
   if (!dailyPnL) return;
 
   var colors = getChartColors();
@@ -510,7 +520,10 @@ function renderTradeStats(metrics) {
     { label: 'Gross Profit', value: PMCommon.formatCurrency(metrics.gross_profit) },
     { label: 'Gross Loss', value: PMCommon.formatCurrency(metrics.gross_loss) },
     { label: 'Avg Trade P&L', value: PMCommon.formatCurrency(metrics.avg_trade_pnl) },
-    { label: 'Max DD $', value: PMCommon.formatCurrency(metrics.max_drawdown_abs) }
+    { label: 'Max DD $', value: PMCommon.formatCurrency(metrics.max_drawdown_abs) },
+    { label: 'DD Duration', value: metrics.drawdown_duration || 0 },
+    { label: 'Recovery Time', value: metrics.recovery_time || 0 },
+    { label: 'Ulcer Index', value: PMCommon.formatNumber(metrics.ulcer_index, 4) }
   ];
 
   container.innerHTML = stats.map(function(stat) {
@@ -573,6 +586,7 @@ function renderRegimeBreakdown(byRegime) {
 }
 
 function renderStrategyRanking(ranking) {
+  if (!canUseCharts()) return;
   var ctx = document.getElementById('strategy-ranking-chart');
   if (!ctx || !ranking || !ranking.length) return;
 
@@ -659,7 +673,7 @@ function renderHeatmap(heatmap) {
       } else {
         bg = 'transparent';
       }
-      html += '<div class="heatmap-cell" style="background:' + bg + ';" title="' + days[di] + ' ' + hj + ':00 — ' + PMCommon.formatCurrency(val) + '"></div>';
+      html += '<div class="heatmap-cell" style="background:' + bg + ';" title="' + days[di] + ' ' + hj + ':00 - ' + PMCommon.formatCurrency(val) + '"></div>';
     }
     html += '</div>';
   }
@@ -675,6 +689,7 @@ function updateTradesCount(count) {
 }
 
 function updateAllCharts() {
+  if (!canUseCharts()) return;
   if (!analyticsState.data) return;
   var data = analyticsState.data;
   renderEquityChart(data.equity_curve);
@@ -708,7 +723,7 @@ function exportToCSV() {
       trade.pnl || 0,
       trade.status || ''
     ];
-    rows.push(row.join(','));
+    rows.push(row.map(function(value) { return PMCommon.csvEscape(value); }).join(','));
   });
 
   var csv = rows.join('\n');
@@ -788,7 +803,7 @@ function downloadHistoricalData() {
   var statusEl = document.getElementById('sim-status');
   var downloadBtn = document.getElementById('download-data-btn');
 
-  if (statusEl) statusEl.textContent = 'Starting data download...';
+  if (statusEl) statusEl.textContent = 'Starting root M5 data refresh...';
   if (downloadBtn) downloadBtn.disabled = true;
 
   fetch('/api/download_historical_data', {
@@ -800,18 +815,18 @@ function downloadHistoricalData() {
       if (downloadBtn) downloadBtn.disabled = false;
 
       if (data.success) {
-        if (statusEl) statusEl.textContent = data.message || 'Download started';
-        PMCommon.showToast('Historical data download started (may take a few minutes)');
+        if (statusEl) statusEl.textContent = data.message || 'Root data maintenance started';
+        PMCommon.showToast('Root M5 data maintenance started');
       } else {
         if (statusEl) statusEl.textContent = 'Error: ' + (data.error || 'Unknown error');
-        PMCommon.showToast('Download failed: ' + (data.error || 'Unknown error'));
+        PMCommon.showToast('Data maintenance failed: ' + (data.error || 'Unknown error'));
       }
     })
     .catch(function(err) {
       if (downloadBtn) downloadBtn.disabled = false;
       if (statusEl) statusEl.textContent = 'Error: ' + err.message;
       console.error('Download error:', err);
-      PMCommon.showToast('Download failed');
+      PMCommon.showToast('Data maintenance failed');
     });
 }
 
@@ -836,6 +851,9 @@ function init() {
   PMCommon.initTheme();
   PMCommon.onThemeChange(function() { updateAllCharts(); });
   PMCommon.initScrollToTop();
+  if (!canUseCharts()) {
+    PMCommon.showToast('Chart library unavailable - showing metrics/tables only');
+  }
   fetchAnalytics();
 
   // Set default dates

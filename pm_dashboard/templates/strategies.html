@@ -1,11 +1,11 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PM Dashboard - Strategies</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260207a') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260208a') }}" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -15,7 +15,7 @@
           <div class="logo">PM</div>
           <div>
             <h1>Strategy Vault</h1>
-            <p>Validated strategy view with drill-down metrics.</p>
+            <p>Validated strategy map with full regime drill-down.</p>
           </div>
         </div>
         <nav class="nav" role="navigation" aria-label="Main navigation">
@@ -23,20 +23,30 @@
           <a class="nav-link active" href="/strategies">Strategies</a>
           <a class="nav-link" href="/analytics">Analytics</a>
           <a class="nav-link" href="/trades">Trade History</a>
-          <div class="theme-toggle" id="theme-toggle" title="Toggle Dark Mode">
-            <span class="theme-toggle-icon">🌙</span>
-          </div>
+          <button class="theme-toggle" id="theme-toggle" type="button" title="Switch theme">
+            <span class="theme-toggle-icon">DARK</span>
+          </button>
         </nav>
-        <div class="stat-card">
-          <div class="stat-label">Strategies Loaded</div>
-          <div class="stat-value" id="strategy-count">0</div>
-          <div class="stat-meta">Validated: <span id="strategy-valid-count">0</span></div>
-          <div class="stat-meta">Invalid: <span id="strategy-invalid-count">0</span></div>
+        <div class="stat-card stat-card-wide">
+          <div class="metrics-inline">
+            <div>
+              <span class="stat-label">Loaded</span>
+              <strong class="stat-value-inline" id="strategy-count">0</strong>
+            </div>
+            <div>
+              <span class="stat-label">Validated</span>
+              <strong class="stat-value-inline" id="strategy-valid-count">0</strong>
+            </div>
+            <div>
+              <span class="stat-label">Invalid</span>
+              <strong class="stat-value-inline" id="strategy-invalid-count">0</strong>
+            </div>
+          </div>
         </div>
       </header>
 
       <section class="card controls fade-in">
-        <div class="filters">
+        <div class="filters filters-wide">
           <div>
             <label for="strategy-filter-symbol">Symbol</label>
             <select id="strategy-filter-symbol" aria-label="Filter by symbol"></select>
@@ -53,12 +63,16 @@
             <label for="strategy-filter-name">Strategy</label>
             <select id="strategy-filter-name" aria-label="Filter by strategy"></select>
           </div>
-        </div>
-        <div class="toggle-group">
-          <label class="toggle">
-            <input type="checkbox" id="strategy-include-invalid" />
-            <span>Show Invalid</span>
-          </label>
+          <div>
+            <label for="strategy-search">Search</label>
+            <input id="strategy-search" type="text" placeholder="Name, symbol, regime" />
+          </div>
+          <div class="toggle-control">
+            <label class="toggle">
+              <input type="checkbox" id="strategy-include-invalid" />
+              <span>Show Invalid</span>
+            </label>
+          </div>
         </div>
       </section>
 
@@ -103,7 +117,7 @@
       </main>
     </div>
 
-    <script src="{{ url_for('static', filename='common.js', v='20260207b') }}"></script>
-    <script src="{{ url_for('static', filename='strategies.js', v='20260207b') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v='20260208a') }}"></script>
+    <script src="{{ url_for('static', filename='strategies.js', v='20260208a') }}"></script>
   </body>
 </html>

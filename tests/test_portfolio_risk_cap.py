@@ -133,6 +133,39 @@ class TestPortfolioRiskCap:
         assert "0 open positions" in reason
         logging.disable(logging.NOTSET)  # Re-enable logging
 
+    def test_check_portfolio_risk_cap_snapshot_unavailable_fails_closed(self):
+        """Test risk cap check fails closed when the position snapshot is unavailable."""
+        mock_mt5 = Mock()
+        mock_mt5.get_account_info.return_value = MockAccountInfo(equity=10000, balance=10000)
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.get_positions.return_value = None
+
+        mock_pm = Mock()
+        mock_pm.symbols = []
+
+        mock_pipeline_config = Mock()
+        mock_pipeline_config.max_combined_risk_pct = 3.0
+
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            pipeline_config=mock_pipeline_config,
+            enable_trading=False
+        )
+
+        can_trade, reason = trader._check_portfolio_risk_cap(
+            symbol="EURUSD",
+            new_trade_risk_pct=1.0,
+            broker_symbol="EURUSD"
+        )
+
+        assert can_trade is False
+        assert "snapshot unavailable" in reason.lower()
+
     def test_check_portfolio_risk_cap_under_limit(self):
         """Test risk cap check with existing positions under limit."""
         # Create position with 1.2% risk

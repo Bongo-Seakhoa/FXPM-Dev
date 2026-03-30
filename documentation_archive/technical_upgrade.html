@@ -1,0 +1,1546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FxPM 1.4 - Technical Upgrade Specification</title>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --bg-card: #16213e;
+  --bg-table: #0f3460;
+  --text: #e0e0e0;
+  --text-muted: #a0a0b0;
+  --accent: #e94560;
+  --accent2: #0ea5e9;
+  --border: #2a2a4a;
+  --code-bg: #0d1117;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  padding: 2rem;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+h1 { color: var(--accent); font-size: 2rem; margin: 2rem 0 1rem; border-bottom: 2px solid var(--accent); padding-bottom: 0.5rem; }
+h2 { color: var(--accent2); font-size: 1.5rem; margin: 2rem 0 0.75rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+h3 { color: #f0c040; font-size: 1.2rem; margin: 1.5rem 0 0.5rem; }
+h4 { color: var(--text); font-size: 1.05rem; margin: 1rem 0 0.4rem; }
+p { margin: 0.6rem 0; }
+ul, ol { margin: 0.5rem 0 0.5rem 1.5rem; }
+li { margin: 0.3rem 0; }
+a { color: var(--accent2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { color: #fff; }
+code {
+  background: var(--code-bg);
+  color: #7ee787;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-family: "Cascadia Code", "Fira Code", monospace;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+  margin: 0.8rem 0;
+}
+pre code { background: none; padding: 0; color: #c9d1d9; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.92em;
+}
+th {
+  background: var(--bg-table);
+  color: var(--accent2);
+  padding: 0.6rem 0.8rem;
+  text-align: left;
+  border: 1px solid var(--border);
+  font-weight: 600;
+}
+td {
+  padding: 0.5rem 0.8rem;
+  border: 1px solid var(--border);
+  vertical-align: top;
+}
+tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+tr:hover { background: rgba(255,255,255,0.05); }
+hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 1rem;
+  color: var(--text-muted);
+  margin: 1rem 0;
+}
+</style>
+</head>
+<body>
+<h1 id="fxpm-14-technical-upgrade-specification">FxPM 1.4 - Technical Upgrade Specification</h1>
+<p>This document converts the finalized <code>suggestions.md</code> / <code>suggestions.html</code> audit into a concrete implementation plan. It is not another audit. It is the engineering specification for how to turn the current repo into a materially stronger PM codebase without regressing correctness, live parity, or trading usefulness.</p>
+<blockquote>
+<p>Archive note (2026-03-30): this specification has now been implemented and audited. It is retained as the canonical upgrade design record. Final completion status and post-audit amendments are tracked in <code>technical_upgrade_checklist.md</code> and <code>UPGRADE_PROGRESS.md</code> in the same archive folder.</p>
+</blockquote>
+<p>The working assumption is:</p>
+<ul>
+<li>invasive change is acceptable when it produces a better PM,</li>
+<li>no change is acceptable if it knowingly makes research, live trading, or monitoring less truthful,</li>
+<li>the upgrade must improve the codebase itself, not just layer new features on top of unresolved defects.</li>
+</ul>
+<hr />
+<h2 id="1-frozen-constraints">1. Frozen Constraints</h2>
+<p>These are not to be reopened during implementation unless live evidence later proves they are wrong:</p>
+<ul>
+<li>Candle-based next-bar execution remains the architecture.</li>
+<li>Production retraining remains <strong>fixed biweekly Sunday</strong>, not operational walk-forward.</li>
+<li>Validation freshness is preserved, but <strong>scored overlap is removed</strong>.</li>
+<li><code>Time-based exit</code> is <strong>not</strong> a core path.</li>
+<li>Strategy concentration is acceptable <strong>if it survives clean methodology</strong>.</li>
+<li>Trade frequency and volume are to be preserved wherever possible.</li>
+<li>Correctness first, accuracy second, efficiency third.</li>
+<li>Where two implementations are equivalent in output quality, the more efficient and lower-ambiguity one wins.</li>
+</ul>
+<hr />
+<h2 id="2-target-end-state">2. Target End State</h2>
+<p>The upgraded PM should have all of the following properties at the same time:</p>
+<ol>
+<li>Backtest and live logic agree on fills, stops, sizing, and candidate selection rules.</li>
+<li>Validation is recent but honest: no scored overlap, no repeated holdout peeking, no fake winner approval.</li>
+<li>Strategy optimization is performed on real parameter surfaces, not dead or duplicated search dimensions.</li>
+<li>Live trading fails closed on missing state, not open.</li>
+<li>Dashboard analytics reflect realized outcomes, not order attempts or mismatched enrichments.</li>
+<li>Cached or persisted artifacts become invalid automatically when the underlying model or data assumptions change.</li>
+<li>Performance work reduces compute without changing outputs.</li>
+<li>Post-stabilization enhancements improve profit quality without materially sacrificing trade count.</li>
+</ol>
+<hr />
+<h2 id="3-workstream-summary">3. Workstream Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Theme</th>
+<th>Primary Modules</th>
+<th>Dependency Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td>Research Kernel Correctness</td>
+<td><code>pm_core.py</code>, <code>pm_regime.py</code></td>
+<td>Must ship before any new full optimization run</td>
+</tr>
+<tr>
+<td>B</td>
+<td>Validation, Search, and Artifact Integrity</td>
+<td><code>pm_core.py</code>, <code>pm_pipeline.py</code>, <code>pm_optuna.py</code>, <code>pm_regime_tuner.py</code></td>
+<td>Must ship before trusting any new winners</td>
+</tr>
+<tr>
+<td>C</td>
+<td>Strategy Layer Remediation</td>
+<td><code>pm_strategies.py</code>, <code>pm_core.py</code></td>
+<td>Must ship before strategy re-ranking</td>
+</tr>
+<tr>
+<td>D</td>
+<td>Live Runtime Hardening</td>
+<td><code>pm_main.py</code>, <code>pm_mt5.py</code>, <code>pm_position.py</code></td>
+<td>Must ship before extended live/paper soak</td>
+</tr>
+<tr>
+<td>E</td>
+<td>Dashboard and Analytics Truthfulness</td>
+<td><code>pm_dashboard/*</code></td>
+<td>Must ship before trusting monitoring</td>
+</tr>
+<tr>
+<td>F</td>
+<td>Performance and Output-Preserving Optimization</td>
+<td><code>pm_core.py</code>, <code>pm_strategies.py</code>, <code>pm_pipeline.py</code></td>
+<td>Ships only after parity harness is green for parity-preserving changes</td>
+</tr>
+<tr>
+<td>G</td>
+<td>Quant Enhancement Layer</td>
+<td>sizing, exits, portfolio, regimes, execution overlays</td>
+<td>Default setting decided only after corrected validation/holdout proves the improvement</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="4-single-integrated-upgrade-rule">4. Single Integrated Upgrade Rule</h2>
+<p>This document is the <strong>single implementation scope</strong> for the upgrade. The packages below are <strong>not optional phases</strong> in the sense of "do some now and maybe do the rest later."</p>
+<p>They are:</p>
+<ul>
+<li>one integrated upgrade program,</li>
+<li>one document of record,</li>
+<li>one complete implementation scope.</li>
+</ul>
+<p>The sequencing only exists to manage dependency order, regression control, and rerun points inside the same overall upgrade effort.</p>
+<p>Nothing in <code>suggestions.md</code> or <code>suggestions.html</code> is intended to sit outside this document as a future "phase 2" roadmap.</p>
+<hr />
+<h2 id="5-suggestion-coverage-matrix">5. Suggestion Coverage Matrix</h2>
+<p>This matrix makes the scope explicit.</p>
+<table>
+<thead>
+<tr>
+<th>Finalized Suggestion Scope</th>
+<th>Covered In Technical Upgrade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Priority 0 measurement corrections</td>
+<td>Package A</td>
+</tr>
+<tr>
+<td>Priority 0 validation protocol</td>
+<td>Package B</td>
+</tr>
+<tr>
+<td>Risk, execution, and live parity</td>
+<td>Package D + Package G1 where sizing overlays are involved</td>
+</tr>
+<tr>
+<td>Search-objective and selection fixes</td>
+<td>Package B + Package C</td>
+</tr>
+<tr>
+<td>Position sizing and drawdown control</td>
+<td>Package G1</td>
+</tr>
+<tr>
+<td>Exit upgrades</td>
+<td>Package D + Package G2</td>
+</tr>
+<tr>
+<td>Portfolio construction</td>
+<td>Package G3</td>
+</tr>
+<tr>
+<td>Regime detection enhancement</td>
+<td>Package G4</td>
+</tr>
+<tr>
+<td>Execution quality overlays</td>
+<td>Package D + Package G5</td>
+</tr>
+<tr>
+<td>Dashboard, config, and tests</td>
+<td>Package E + Package B/F where infrastructure overlaps</td>
+</tr>
+<tr>
+<td>Recovery factor and strategy rotation</td>
+<td>Package G1 + Package G2 + Package G7</td>
+</tr>
+<tr>
+<td>Strategy robustness / trust-table implications</td>
+<td>Package C acceptance gate + post-fix rerank</td>
+</tr>
+<tr>
+<td>Scoring and config-threshold tuning</td>
+<td>Package B</td>
+</tr>
+<tr>
+<td>Validation freshness / Appendix C conclusions</td>
+<td>Package B + Frozen Constraints</td>
+</tr>
+<tr>
+<td>Additional verified code findings / Appendices D, J, K, L, M, N</td>
+<td>Packages A-F by domain</td>
+</tr>
+<tr>
+<td>Dashboard addendum / Appendix E</td>
+<td>Package E</td>
+</tr>
+<tr>
+<td>Option-pricing adaptations / Appendix H</td>
+<td>Package G6</td>
+</tr>
+<tr>
+<td>Recommended new strategy additions / Appendix I</td>
+<td>Package G7</td>
+</tr>
+<tr>
+<td>Final residual issues / Appendix T</td>
+<td>Packages A-E by domain</td>
+</tr>
+</tbody>
+</table>
+<p>In other words: the implementation document is now intended to cover the entire finalized suggestion set, not just the high-level categories.</p>
+<hr />
+<h2 id="6-global-implementation-rules">6. Global Implementation Rules</h2>
+<ul>
+<li>Any change to metric math, fill semantics, validation slicing, or search objective requires <strong>full config invalidation</strong> because previously stored winners are no longer comparable on the same scoring basis.</li>
+<li>Strategy breadth is intentional. Strategy-family regression tests exist to verify that each family still behaves correctly after a logic or search-space change; they are <strong>not</strong> a request to compress the roster, merge overlapping families, or stop a naturally dominant winner from winning.</li>
+<li>Any change to strategy signal semantics or parameter surfaces requires <strong>strategy-family correctness tests</strong> before re-optimization, after which the affected family goes back into the same best-per-<code>(symbol, timeframe, regime)</code> selection race.</li>
+<li>Any live-trading safety change must <strong>fail closed</strong> when account, position, or symbol state is unavailable.</li>
+<li>Pure performance refactors are not allowed to merge without a <strong>golden-fixture parity harness</strong> against the pre-refactor output. If a change is meant to improve outputs rather than merely compute them faster or more cleanly, it is not a pure refactor and should be judged on corrected PM objective metrics instead.</li>
+<li>New defaults should be the <strong>best validated settings for this PM</strong>, not legacy-safe placeholders. Compatibility or rollout toggles should only remain when needed for controlled comparison, rollback, or broker variance; bug fixes and proven improvements should become the new default.</li>
+<li>The comparison baseline is <strong>corrected, objective-aligned validation/holdout performance</strong>, weighted by PM priorities: profitability first, then drawdown/reliability quality, while preserving trade count and volume.</li>
+</ul>
+<hr />
+<h2 id="6a-single-phase-technical-change-map">6A. Single-Phase Technical Change Map</h2>
+<p>This section is the developer-facing implementation map for the <strong>single integrated upgrade</strong>. It is intentionally focused on:</p>
+<ul>
+<li><strong>where</strong> each change lands in the code,</li>
+<li><strong>why</strong> the change is necessary,</li>
+<li>which downstream modules and tests are coupled to that seam.</li>
+</ul>
+<p>The developer can choose the concrete implementation technique, but these are the entry points and technical reasons that define the scope.</p>
+<h3 id="change-block-a-research-kernel-and-data-contract">Change Block A: Research Kernel and Data Contract</h3>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Exact entry points</th>
+<th>Why it must change</th>
+<th>Coupled consumers/tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Exact source-file selection and raw-bar quarantine</td>
+<td><code>pm_core.py -&gt; DataLoader.load_symbol</code>, <code>DataLoader.get_data</code>, <code>DataLoader._validate_data</code>, <code>DataLoader.resample</code></td>
+<td><code>load_symbol()</code> still falls back to wildcard-first file selection and <code>_validate_data()</code> only warns on invalid OHLC relationships. That allows the wrong CSV or corrupted bars to flow into every higher-timeframe resample and every downstream backtest.</td>
+<td>All pipeline/live data loads; <code>tests/test_resample_cache.py</code>; new exact-source and invalid-OHLC tests</td>
+</tr>
+<tr>
+<td>Feature cache identity and feature-contract invalidation</td>
+<td><code>pm_core.py -&gt; FeatureComputer._make_cache_key</code>, <code>_cache_get</code>, <code>_cache_put</code>, <code>compute_all</code>, <code>compute_required</code></td>
+<td>Cache identity currently keys mostly on symbol/timeframe/index bounds plus regime params filename. It does not encode feature-version or semantic-contract changes, so stale derived columns can survive math or strategy-surface changes.</td>
+<td><code>OptimizationPipeline.run_for_symbol</code>, live <code>FeatureComputer.compute_all</code>, <code>tests/test_feature_cache.py</code></td>
+</tr>
+<tr>
+<td>Regime feature computation must stay on one canonical path</td>
+<td><code>pm_core.py -&gt; FeatureComputer.compute_all</code>; <code>pm_regime.py -&gt; load_regime_params</code>, <code>clear_regime_params_cache</code>, <code>MarketRegimeDetector.compute_regime_scores</code>, <code>compute_regime_for_features</code></td>
+<td>Regime columns are part of the feature contract. Parameter/cache invalidation, warmup flags, and <code>REGIME_LIVE</code> parity all have to be derived from the same detector path or the research/live split drifts silently.</td>
+<td><code>tests/test_regime_warmup_exclusion.py</code>, <code>tests/test_live_loop_integration.py</code></td>
+</tr>
+<tr>
+<td>Broken signal/stop contracts must fail explicitly</td>
+<td><code>pm_core.py -&gt; Backtester.run</code> signal coercion/reindex/fill block; stop precompute loop that calls <code>strategy.calculate_stops()</code></td>
+<td><code>Backtester.run()</code> currently repairs misaligned signals by reindexing/filling flat and skips invalid precomputed stop rows by turning them into non-entries. That hides broken strategies and turns structural defects into misleading weak metrics.</td>
+<td>All strategy evaluations; <code>tests/test_backtester.py</code>; strategy regression fixtures</td>
+</tr>
+<tr>
+<td>Python/Numba fill, slippage, and sizing semantics must be identical</td>
+<td><code>pm_core.py -&gt; _backtest_loop_numba</code>, <code>Backtester._run_python_loop</code>, <code>Backtester.run</code> precomputed <code>entry_prices</code> / <code>sl_prices</code> / <code>tp_prices</code> block</td>
+<td>Both execution paths feed selection and validation. Any difference in entry-bar exit handling, gap-stop fills, slippage symmetry, commission/swap handling, or unsafe stop-based sizing changes the search surface rather than just the runtime cost.</td>
+<td>All optimizer/scorer paths; <code>tests/test_backtester.py</code>; <code>tests/test_backtest_sl_exit.py</code></td>
+</tr>
+<tr>
+<td>Metric math must be driven by corrected equity and net PnL</td>
+<td><code>pm_core.py -&gt; Backtester._calculate_metrics</code>, <code>_max_consecutive</code>, <code>_empty_result</code></td>
+<td><code>_calculate_metrics()</code> still classifies wins/losses from <code>pnl_pips</code>, caps PF, and uses a proxy Sortino path. The corrected metric layer must classify from net dollar outcome and operate on the corrected equity path used for drawdown.</td>
+<td><code>StrategyScorer</code>, <code>RegimeOptimizer</code>, dashboard analytics, all score-based ranking</td>
+</tr>
+<tr>
+<td>Regime-bucket metrics must inherit the same corrected definitions as the kernel</td>
+<td><code>pm_pipeline.py -&gt; RegimeOptimizer._compute_bucket_metrics</code>, <code>_bucket_to_full_metrics</code>, <code>_compute_regime_score</code></td>
+<td>Regime bucket scoring currently reconstructs a parallel metric stack. If the kernel math is corrected but bucket math is not, regime selection still optimizes against stale definitions.</td>
+<td><code>RegimeOptimizer.optimize_symbol</code>, <code>pm_optuna.optimize_for_regimes</code>, regime validation gates</td>
+</tr>
+</tbody>
+</table>
+<h3 id="change-block-b-validation-search-and-artifact-integrity">Change Block B: Validation, Search, and Artifact Integrity</h3>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Exact entry points</th>
+<th>Why it must change</th>
+<th>Coupled consumers/tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Split contract must expose explicit train/warmup/validation/holdout regions</td>
+<td><code>pm_core.py -&gt; DataSplitter.split</code>, <code>DataSplitter.get_split_indices</code>; <code>pm_pipeline.py -&gt; OptimizationPipeline.run_for_symbol</code></td>
+<td>The current splitter still returns only <code>train</code> and <code>val</code>, with validation starting inside the trained region. The upgrade needs an explicit split contract so freshness can be preserved without scoring overlapped bars.</td>
+<td><code>tests/test_data_splitter.py</code>; all pipeline slicing; holdout reporting</td>
+</tr>
+<tr>
+<td>Holdout isolation and no fallback-to-train approval</td>
+<td><code>pm_pipeline.py -&gt; OptimizationPipeline.run_for_symbol</code>, <code>RegimeOptimizer.optimize_symbol</code>, <code>SymbolConfig.default_config</code>, legacy <code>StrategySelector</code> / <code>Validator</code> surfaces</td>
+<td>Winner approval must not fall back to <code>default_config</code> or training-only behavior when validation is weak. The current compatibility fields and legacy selector surfaces make that failure mode easier to reintroduce.</td>
+<td><code>tests/test_winners_only.py</code>; live candidate selection; config serialization</td>
+</tr>
+<tr>
+<td>Optuna objective leakage and regime-max bias</td>
+<td><code>pm_optuna.py -&gt; OptunaConfig.use_validation_in_objective</code>, <code>OptunaTPEOptimizer.optimize.objective</code>, <code>OptunaTPEOptimizer.optimize_for_regimes.objective</code>, <code>_empty_val_metrics</code></td>
+<td>Validation-aware tuning and <code>max(regime_scores)</code> turn one spiking regime or reused validation slice into search bias. <code>_empty_val_metrics()</code> also fabricates a zeroed validation object that can mask "no validation happened".</td>
+<td><code>RegimeOptimizer</code>, parameter selection, future optimizer comparisons</td>
+</tr>
+<tr>
+<td>Artifact fingerprinting must cover full model semantics, not only regime params</td>
+<td><code>pm_pipeline.py -&gt; ConfigLedger.LEDGER_VERSION</code>, <code>ConfigLedger.should_optimize</code>, <code>SymbolConfig.to_dict/from_dict</code>, <code>RegimeConfig.to_dict/from_dict</code>, <code>OptimizationPipeline.run_for_symbol</code></td>
+<td>Stored configs only carry timestamps plus optional <code>regime_detection_version</code>. They do not fingerprint split logic, metric math, strategy schema, scoring mode, or feature contract version, so stale winners can remain "valid" after semantic changes.</td>
+<td><code>pm_configs.json</code>, retrain-skipping behavior, live config loading</td>
+</tr>
+<tr>
+<td>Fixed biweekly retrain must replace research-only retrain window selection in production</td>
+<td><code>pm_core.py -&gt; PipelineConfig.retrain_periods</code>; <code>pm_pipeline.py -&gt; RetrainPeriodSelector</code>, <code>OptimizationPipeline.__init__</code>, <code>OptimizationPipeline.run_for_symbol</code></td>
+<td>The code still instantiates and uses <code>RetrainPeriodSelector</code>, while the operational decision is fixed biweekly Sunday retraining. Keeping the selector in the production path adds another optimization branch and more stale-window risk.</td>
+<td><code>run_for_symbol</code>, config expiry logic, production retrain cadence</td>
+</tr>
+<tr>
+<td>Regime parameter tuning must be invalidation-safe and clearly research-only</td>
+<td><code>pm_regime_tuner.py -&gt; RegimeParamTuner.tune_symbol_timeframe</code>, <code>tune_all</code>; <code>pm_regime.py -&gt; save_regime_params</code>, <code>clear_regime_params_cache</code>; <code>pm_pipeline.py -&gt; ConfigLedger.should_optimize</code></td>
+<td>Regime parameter changes are only partially tracked today. If regime params are tuned or replaced, cached regime features and stored winners need deterministic invalidation across research and production.</td>
+<td><code>regime_params.json</code>, <code>FeatureComputer.compute_all</code>, config reuse</td>
+</tr>
+<tr>
+<td>Expiry semantics must be centralized and not hard-coded per class</td>
+<td><code>pm_core.py -&gt; PipelineConfig.optimization_valid_days</code>; <code>pm_pipeline.py -&gt; RegimeOptimizer._select_regime_winner</code> (<code>valid_until=now + timedelta(days=60)</code>), <code>OptimizationPipeline.run_for_symbol</code> (<code>valid_until=now + timedelta(days=retrain_days)</code>)</td>
+<td>Validity windows are currently partly config-driven and partly hard-coded. The upgrade should anchor expiry to the single operational retrain model so stale configs are handled consistently.</td>
+<td><code>ConfigLedger.has_valid_config</code>, <code>PortfolioManager.needs_retraining</code>, live reload behavior</td>
+</tr>
+</tbody>
+</table>
+<h3 id="change-block-c-strategy-layer-remediation">Change Block C: Strategy Layer Remediation</h3>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Exact entry points</th>
+<th>Why it must change</th>
+<th>Coupled consumers/tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shared helper/precompute shortcuts must obey the real parameter surface</td>
+<td><code>pm_strategies.py -&gt; _get_adx_di</code>, <code>_get_bb</code>, <code>_get_keltner</code>, <code>_detect_swing_points</code>; <code>pm_core.py -&gt; FeatureComputer.adx</code>, <code>plus_di</code>, <code>minus_di</code>, <code>compute_all</code></td>
+<td>These helpers decide whether strategies see precomputed features or fresh calculations. If they ignore <code>std</code>, <code>period</code>, or DI construction differences, parameter dimensions become fake and strategy behavior stops matching the search surface.</td>
+<td>Strategy signal generation; <code>tests/test_strategy_param_grid_consistency.py</code>; <code>tests/test_feature_cache.py</code>; new helper-parity tests</td>
+</tr>
+<tr>
+<td>Broken or inconsistent trend families</td>
+<td><code>pm_strategies.py -&gt; SupertrendStrategy.generate_signals</code>, <code>ADXTrendStrategy.generate_signals</code>, <code>ADXDIStrengthStrategy.generate_signals</code>, <code>EMARibbonADXStrategy.generate_signals</code>, <code>AroonTrendStrategy._aroon</code> / <code>generate_signals</code></td>
+<td>These families have confirmed issues around first-transition handling, DI/ADX source consistency, suspect cached DI use, and tied-extreme handling. They directly affect trend winner selection and family-to-family comparability.</td>
+<td>Trend strategy rankings; new <code>tests/test_strategy_regressions.py</code>; pipeline integration tests</td>
+</tr>
+<tr>
+<td>Broken or misleading breakout/reversal families</td>
+<td><code>pm_strategies.py -&gt; InsideBarBreakoutStrategy.generate_signals</code>, <code>PinBarReversalStrategy.generate_signals</code>, <code>EngulfingPatternStrategy.get_default_params</code> / <code>generate_signals</code> / <code>get_param_grid</code>, <code>FisherTransformMRStrategy.get_default_params</code> / <code>generate_signals</code> / <code>get_param_grid</code>, <code>SqueezeBreakoutStrategy.generate_signals</code>, <code>KeltnerPullbackStrategy.generate_signals</code> / <code>get_param_grid</code>, <code>ParabolicSARTrendStrategy._compute_psar</code> / <code>generate_signals</code></td>
+<td>Several strategies either never fire correctly, add an unintended extra delay, expose dead parameters, or consume helper outputs that do not vary with the tuned surface. Those defects change both ranking quality and optimization efficiency.</td>
+<td><code>tests/test_pipeline_integration.py</code>; <code>tests/test_strategy_param_grid_consistency.py</code>; new strategy regression fixtures</td>
+</tr>
+<tr>
+<td>Event-vs-level emission cleanup and conditional dead dimensions</td>
+<td><code>pm_strategies.py -&gt; TurtleSoupReversalStrategy.generate_signals</code>, <code>ZScoreVWAPReversionStrategy.generate_signals</code> / <code>get_param_grid</code>, <code>MACDHistogramMomentumStrategy.generate_signals</code> / <code>get_param_grid</code>, <code>StochRSITrendGateStrategy._stoch_rsi_from_rsi</code> / <code>generate_signals</code></td>
+<td>These strategies can keep emitting inside a state window or expose tuned dimensions that go dead when filters are off. That inflates action opportunities, wastes optimizer budget, and can create fake signal freedom.</td>
+<td>Backtest trade counts; validation filters; feature-cache and param-grid tests</td>
+</tr>
+<tr>
+<td>Registry/schema integrity for the roster</td>
+<td><code>pm_strategies.py -&gt; StrategyRegistry</code>, <code>_STRATEGY_MIGRATION</code>, every affected <code>get_param_grid()</code> / <code>get_required_features()</code> implementation</td>
+<td>The registry is the production contract for strategy names, migrations, and param grids. Any broken grid dimension, stale migration entry, or missing feature contract contaminates both optimization and config loading.</td>
+<td><code>pm_pipeline.py</code>, <code>pm_configs.json</code>, <code>tests/test_strategy_param_grid_consistency.py</code>, new <code>tests/test_strategy_regressions.py</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="change-block-d-live-runtime-and-order-path">Change Block D: Live Runtime and Order Path</h3>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Exact entry points</th>
+<th>Why it must change</th>
+<th>Coupled consumers/tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Canonical decision identity vs broker symbol identity</td>
+<td><code>pm_main.py -&gt; DecisionThrottle.make_decision_key</code>, <code>DecisionThrottle.should_suppress</code>, <code>DecisionThrottle.record_decision</code>, <code>LiveTrader._process_symbol</code>, <code>LiveTrader._evaluate_regime_candidates</code>; <code>pm_position.py -&gt; TradeTagEncoder.encode_comment/decode_comment</code>; <code>pm_mt5.py -&gt; find_broker_symbol</code></td>
+<td>Throttle suppression, action logging, risk accounting, and trade tags must anchor to canonical PM identity while MT5 I/O uses broker symbols. If those identities drift, suffixed symbols can bypass same-bar suppression or poison risk aggregation.</td>
+<td><code>tests/test_decision_throttle.py</code>; <code>tests/test_live_loop_integration.py</code>; dashboard action-log consumers</td>
+</tr>
+<tr>
+<td>One authoritative live loop</td>
+<td><code>pm_main.py -&gt; LiveTrader.start</code>, <code>LiveTrader._process_all_symbols</code>, <code>LiveTrader._reconnect</code>, <code>FXPortfolioManagerApp.run_trading</code></td>
+<td>The repo currently has two loop owners: <code>LiveTrader.start()</code> and the app-level <code>run_trading()</code> loop. Reconnect policy, shutdown, retrain checks, and cache invalidation should have one runtime owner so live behavior is deterministic.</td>
+<td>Live soak behavior; reconnect handling; runtime integration tests</td>
+</tr>
+<tr>
+<td>Fail-closed tradability and position-state gates</td>
+<td><code>pm_mt5.py -&gt; MT5Connector.get_positions</code>, <code>get_account_info</code>, <code>get_symbol_info</code>, <code>_get_filling_type</code>; <code>pm_main.py -&gt; LiveTrader._process_symbol</code>, <code>_check_portfolio_risk_cap</code>, <code>_execute_entry</code></td>
+<td>Missing positions, account data, or symbol metadata must resolve to "state unavailable", not "safe to trade". The current runtime reads open positions in multiple places and treats failed fetches too similarly to true empty state.</td>
+<td><code>tests/test_live_loop_integration.py</code>; <code>tests/test_portfolio_risk_cap.py</code>; new fail-closed state tests</td>
+</tr>
+<tr>
+<td>Entry-stop parity and sizing/risk entry point</td>
+<td><code>pm_main.py -&gt; LiveTrader._process_symbol</code> closed-bar signal read, <code>LiveTrader._execute_entry</code>; <code>pm_position.py -&gt; PositionCalculator.calculate_stop_prices</code>, <code>TradeTagEncoder.get_risk_pct_from_comment</code>; <code>pm_mt5.py -&gt; calc_loss_amount</code>, <code>normalize_volume</code></td>
+<td><code>_execute_entry()</code> is the live seam where closed-bar signal timing, stop placement, broker min-stop widening, loss-per-lot math, and final volume/risk normalization all meet. This is the correct technical landing zone for parity fixes and the later scalar risk stack.</td>
+<td>Live order placement; secondary-trade logic; symbol-level risk-cap tests</td>
+</tr>
+<tr>
+<td>Dormant live exit surfaces must either be wired or removed</td>
+<td><code>pm_main.py -&gt; LiveTrader.close_on_opposite_signal</code>, <code>_close_position_on_signal</code>; <code>pm_position.py -&gt; PositionConfig</code>, <code>PositionManager.check_exit_conditions</code>, <code>apply_trailing_stop</code>, <code>apply_breakeven_stop</code></td>
+<td>Exit-management surfaces exist in config and helper code, but the live runtime does not consistently route open-position management through them. Leaving them half-wired creates false capability and invalid expectations around live exit behavior.</td>
+<td>Live runtime behavior; future exit-pack enablement; exit-parity tests</td>
+</tr>
+<tr>
+<td>Runtime cache and symbol-spec invalidation</td>
+<td><code>pm_main.py -&gt; LiveTrader._candidate_cache</code>, <code>_last_bar_times</code>, <code>_prune_cache</code>, <code>_reconnect</code>; <code>pm_mt5.py -&gt; MT5Connector._symbol_cache</code>, <code>get_symbol_info</code>, <code>to_instrument_spec</code></td>
+<td>Retrain events, reconnects, and symbol-spec changes must invalidate cached candidates, bar state, and broker specs or the runtime can trade on stale assumptions after state transitions.</td>
+<td>Long-running live session correctness; live cache/spec refresh tests</td>
+</tr>
+<tr>
+<td>Explicit fill policy and retcode handling</td>
+<td><code>pm_mt5.py -&gt; OrderFillingType</code>, <code>MT5Connector._get_filling_type</code>, <code>send_market_order</code>, <code>close_position</code>; <code>pm_main.py -&gt; LiveTrader._execute_entry</code> result handling</td>
+<td>Fill mode, stop-level validation, and retcode-to-success policy are centralized in the MT5 order path. This is the seam for broker-tested fill-policy control that preserves frequency better than a hidden FOK/IOC bias and makes partial-fill behavior explicit.</td>
+<td>Live execution quality; broker compatibility; order-path integration tests</td>
+</tr>
+</tbody>
+</table>
+<h3 id="change-block-e-dashboard-and-analytics-truthfulness">Change Block E: Dashboard and Analytics Truthfulness</h3>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Exact entry points</th>
+<th>Why it must change</th>
+<th>Coupled consumers/tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Realized trades must be separate from actionable/signal feeds</td>
+<td><code>pm_dashboard/analytics.py -&gt; load_trade_history</code>, <code>compute_performance_metrics</code>, <code>build_analytics_payload</code>; <code>pm_dashboard/app.py -&gt; /api/analytics</code>, <code>/api/trades</code>, <code>/api/simulate</code>; <code>pm_dashboard/watcher.py -&gt; _load_primary_entries</code>, <code>merge_actionable_with_log_executions</code></td>
+<td>The dashboard currently loads generic trade JSONs and operational logs into analytics as if they were realized closed trades, with missing <code>pnl/profit</code> often degrading to <code>0.0</code>. Monitoring cannot be trusted until realized outcomes and order-attempt feeds are separate products.</td>
+<td><code>tests/test_dashboard_signals.py</code>; <code>tests/test_dashboard_trade_enrichment.py</code>; frontend analytics/trades views</td>
+</tr>
+<tr>
+<td>Trade enrichment identity must be exact</td>
+<td><code>pm_dashboard/analytics.py -&gt; _build_magic_lookup</code>, <code>_enrich_trade_metadata</code>; <code>pm_dashboard/watcher.py -&gt; _load_trade_map</code>, <code>trade_map_is_fresh</code>, <code>merge_actionable_with_log_executions</code>; <code>pm_dashboard/parsers.py</code> execution-log regex path</td>
+<td>Symbol-only or loose recency enrichment can attach the wrong timeframe/regime/strategy to an executed trade, especially when multiple contexts exist for one symbol. Matching must key off magic/ticket plus forward time ordering and accept broker-suffixed symbols.</td>
+<td>Strategy breakdowns; trade tables; simulation inputs; enrichment tests</td>
+</tr>
+<tr>
+<td>Analytics metric consistency and simulation correctness</td>
+<td><code>pm_dashboard/analytics.py -&gt; compute_equity_curve</code>, <code>compute_drawdown_curve</code>, <code>compute_performance_metrics</code>, <code>compute_breakdown_by_field</code>, <code>compute_monthly_performance</code>, <code>reconstruct_trade_outcomes</code>; <code>pm_dashboard/app.py -&gt; api_simulate</code>, <code>/api/analytics</code></td>
+<td>Initial capital, end-date filtering, reconstruction PnL assumptions, and metric aggregation must be internally consistent or the dashboard tells a different PnL story than the research/live core.</td>
+<td>Dashboard analytics pages; API consumers; simulation tests</td>
+</tr>
+<tr>
+<td>Config persistence must be atomic and transparent on failure</td>
+<td><code>pm_dashboard/utils.py -&gt; load_dashboard_config</code>, <code>save_dashboard_config</code>; <code>pm_dashboard/app.py -&gt; api_config</code></td>
+<td>Dashboard config writes currently use a direct overwrite path and config load falls back quietly on parse errors. This is the seam for atomic temp-file replace and explicit failure surfacing instead of silent reset behavior.</td>
+<td>UI settings; config corruption handling</td>
+</tr>
+<tr>
+<td>Watcher lifecycle, freshness, and maintenance jobs must be deterministic</td>
+<td><code>pm_dashboard/watcher.py -&gt; DashboardWatcher.start</code>, <code>poll_once</code>, <code>update_config</code>, freshness helpers, PM-config/trade-map loaders; <code>pm_dashboard/jobs.py -&gt; initialize_data_jobs</code>, <code>Scheduler.start</code></td>
+<td>The dashboard test surface and recency logic depend on watcher startup behavior, timezone handling, and time-based freshness checks. Those need deterministic control or stale actionable signals can remain "valid now" for the wrong reasons.</td>
+<td><code>tests/test_dashboard_data_jobs.py</code>; date-sensitive dashboard tests</td>
+</tr>
+</tbody>
+</table>
+<h3 id="change-block-f-performance-and-output-preserving-optimization">Change Block F: Performance and Output-Preserving Optimization</h3>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Exact entry points</th>
+<th>Why it must change</th>
+<th>Coupled consumers/tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retire dead or duplicate production paths</td>
+<td><code>pm_pipeline.py -&gt; StrategySelector</code>, <code>HyperparameterOptimizer</code>, <code>Validator</code>, <code>RetrainPeriodSelector</code>, <code>OptimizationPipeline.__init__</code></td>
+<td>The regime-aware path is the real production path. Keeping older selector/validator/retrain surfaces live in the codebase expands the maintenance surface and makes future regressions harder to spot.</td>
+<td>Pipeline reasoning; future refactors; parity harness</td>
+</tr>
+<tr>
+<td>Dashboard analytics ingress should be cached by file identity</td>
+<td><code>pm_dashboard/analytics.py -&gt; load_trade_history</code>, <code>build_analytics_payload</code>; <code>pm_dashboard/app.py -&gt; /api/analytics</code>, <code>/api/trades</code>, <code>/api/simulate</code></td>
+<td>The dashboard repeatedly reloads and re-enriches the same trade files and config state across routes. An mtime-keyed parse cache is an output-preserving optimization seam that reduces cost without changing analytics semantics.</td>
+<td>Dashboard responsiveness; enrichment tests</td>
+</tr>
+<tr>
+<td>Watcher parsing should be incremental rather than full re-read</td>
+<td><code>pm_dashboard/watcher.py -&gt; poll_once</code>, <code>_load_primary_entries</code>, <code>_load_trade_map</code>, execution-log load path</td>
+<td><code>poll_once()</code> currently re-globs and re-parses the same files every refresh cycle. The correct output-preserving optimization is a per-file mtime/content cache inside the watcher.</td>
+<td>Dashboard refresh latency; watcher tests</td>
+</tr>
+<tr>
+<td>Lazy feature requests need one parameter-aware entry point</td>
+<td><code>pm_core.py -&gt; FeatureComputer.compute_required</code>, <code>FeatureComputer.compute_all</code>; <code>pm_strategies.py -&gt; BaseStrategy.get_required_features</code>; pipeline/live feature call sites</td>
+<td>Output-preserving optimization depends on asking for only the required columns without changing feature semantics. The requested-feature contract must be parameter-aware and shared.</td>
+<td><code>tests/test_feature_cache.py</code>; new helper-parity tests</td>
+</tr>
+<tr>
+<td>Trade reconstruction should batch by symbol/timeframe window</td>
+<td><code>pm_dashboard/analytics.py -&gt; reconstruct_trade_outcomes</code>; <code>pm_dashboard/jobs.py -&gt; HistoricalDataDownloader.load_historical_data</code></td>
+<td>Reconstruction currently loads historical bars trade-by-trade. Grouping requests by <code>(symbol, timeframe, window)</code> is the correct output-preserving seam to cut repeated I/O without altering reconstructed outcomes.</td>
+<td><code>/api/simulate</code>; dashboard reconstruction tests</td>
+</tr>
+<tr>
+<td>Verified hotspots for vectorization / low-level optimization</td>
+<td><code>pm_regime.py -&gt; _compute_atr_percentile</code>, <code>_compute_directional_efficiency</code>, <code>_compute_direction_flips</code>, <code>_compute_whipsaw</code>, <code>_compute_structure_break</code>; <code>pm_strategies.py -&gt; _detect_swing_points</code>, <code>AroonTrendStrategy._aroon</code>; <code>pm_core.py -&gt; CCI/rolling indicator paths</code></td>
+<td>These are the actual loop-heavy hotspots where performance can improve without changing output semantics. The document should point optimization work here, not at broad rewrites.</td>
+<td>Benchmark harness; parity tests</td>
+</tr>
+<tr>
+<td>Remove dead work and stale helper branches</td>
+<td><code>pm_pipeline.py -&gt; RetrainPeriodSelector</code> internal feature copies; <code>pm_core.py -&gt; dead cached ATR/Keltner branches</code>; <code>pm_strategies.py -&gt; stale helper fallbacks</code></td>
+<td>Several branches compute or carry state that is either unused or semantically dead. Removing only those branches lowers ambiguity without broad behavioral risk.</td>
+<td>Code maintainability; parity harness</td>
+</tr>
+<tr>
+<td>Central parity harness ownership</td>
+<td><code>pm_core.py -&gt; Backtester.validate_execution_timing</code>; mixed-basket benchmark/test harness files under <code>tests/</code></td>
+<td>Output-preserving optimization needs an owned parity gate, not ad hoc spot checks. This is the seam where pre/post fixtures and benchmark cases need to live.</td>
+<td><code>tests/test_backtester.py</code>; new parity smoke suite</td>
+</tr>
+</tbody>
+</table>
+<h3 id="change-block-g-quant-enhancement-insertion-points">Change Block G: Quant Enhancement Insertion Points</h3>
+<table>
+<thead>
+<tr>
+<th>Enhancement area</th>
+<th>Exact entry points</th>
+<th>Why this is the right seam</th>
+<th>Coupled consumers/tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Risk scalar stack</td>
+<td><code>pm_main.py -&gt; LiveTrader._execute_entry</code>; <code>pm_position.py -&gt; PositionCalculator.calculate_position_size</code>, <code>TradeTagEncoder.get_risk_pct_from_comment</code>; portfolio state in <code>MT5Connector.get_positions</code></td>
+<td>Risk scaling belongs at the live entry-sizing seam because it changes dollar exposure, not signal generation. That preserves trade count while making portfolio-aware risk transparent.</td>
+<td>Live risk-cap logic; position sizing tests</td>
+</tr>
+<tr>
+<td>Market-driven exit pack</td>
+<td><code>pm_position.py -&gt; PositionConfig</code>, <code>PositionManager.check_exit_conditions</code>, <code>apply_trailing_stop</code>, <code>apply_breakeven_stop</code>; <code>pm_main.py -&gt; _close_position_on_signal</code> and the live position-management loop</td>
+<td>Exit upgrades should land where stops and trade lifecycle are already managed, not inside strategy entry logic. That keeps exits market-driven and portable across families.</td>
+<td>Future exit-pack tests; live/backtest exit parity</td>
+</tr>
+<tr>
+<td>Portfolio construction / exposure redistribution</td>
+<td>Candidate ranking in <code>pm_main.py -&gt; LiveTrader._evaluate_regime_candidates</code> and entry sizing in <code>_execute_entry</code>; supporting risk helpers in <code>pm_position.py</code></td>
+<td>Portfolio overlays should scale or reprioritize candidates before order placement rather than veto the book upstream.</td>
+<td>Portfolio risk tests; live candidate selection</td>
+</tr>
+<tr>
+<td>Regime model upgrades (HMM/GARCH)</td>
+<td><code>pm_regime.py -&gt; MarketRegimeDetector.compute_regime_scores</code>, <code>compute_regime_for_features</code>; <code>pm_core.py -&gt; FeatureComputer.compute_all</code></td>
+<td>Regime upgrades belong at the regime-column generation seam so downstream selection still consumes a unified regime interface.</td>
+<td>Regime warmup/live parity tests; pipeline re-optimization</td>
+</tr>
+<tr>
+<td>Regime percentile self-reference bias</td>
+<td><code>pm_regime.py -&gt; _compute_bb_squeeze_score</code> (lines 870-871), <code>_compute_atr_percentile</code> (line 916)</td>
+<td>BB squeeze and ATR percentile features use in-sample percentile self-reference, making scores dependent on the window being analyzed rather than stable reference points. Use rolling or expanding-window percentiles anchored to historical distribution.</td>
+<td>Regime detection correctness; regime warmup tests</td>
+</tr>
+<tr>
+<td>Random seed reuse across optimizer paths</td>
+<td><code>pm_optuna.py -&gt; optimize()</code> (line 813), <code>optimize_for_regimes()</code> (line 934); <code>pm_pipeline.py -&gt; run_for_symbol()</code> (line 974), <code>_select_best_for_regime()</code> (line 1785)</td>
+<td>Multiple Optuna and pipeline paths reset <code>np.random.seed(42)</code> mid-execution, creating correlated search paths. Each optimizer run should use a deterministic but unique seed derived from <code>(symbol, timeframe, regime, run_id)</code>.</td>
+<td>Optimizer diversity; reproducibility tests</td>
+</tr>
+<tr>
+<td>Version string inconsistency</td>
+<td><code>pm_main.py</code> line 27 ("Version: 3.1") vs line 2114 ("FX PORTFOLIO MANAGER v3.0")</td>
+<td>Inconsistent version strings create confusion about which build is running. Centralize to one <code>__version__</code> constant.</td>
+<td>Logging/debugging clarity</td>
+</tr>
+<tr>
+<td>Execution quality overlays</td>
+<td><code>pm_main.py -&gt; LiveTrader._evaluate_regime_candidates</code>, <code>_execute_entry</code>; <code>pm_mt5.py -&gt; get_symbol_info</code>, spread/fill data access</td>
+<td>Spread/fill overlays should adjust ranking or risk close to order-time reality, not mutate strategy semantics.</td>
+<td>Live execution filters; trade-count preservation evidence</td>
+</tr>
+<tr>
+<td>Options-model adaptations</td>
+<td><code>pm_core.py -&gt; FeatureComputer.compute_all</code>, <code>compute_required</code>; optional new feature helper module</td>
+<td>Expected-move and volatility features should enter as derived features, not as a separate execution engine, so they remain lightweight and causal.</td>
+<td>Strategy features; benchmark/parity checks</td>
+</tr>
+<tr>
+<td>New strategy additions</td>
+<td><code>pm_strategies.py -&gt; new strategy classes</code>, <code>StrategyRegistry</code>, <code>get_required_features</code>, <code>get_param_grid</code>; <code>tests/test_pipeline_integration.py</code>, <code>tests/test_strategy_param_grid_consistency.py</code></td>
+<td>New strategies should join the existing strategy contract cleanly: registered, parameterized, feature-scoped, and regression-tested like the current roster.</td>
+<td>Full re-optimization; strategy smoke/parity tests</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7-package-a-research-kernel-correctness">7. Package A: Research Kernel Correctness</h2>
+<h3 id="objective">Objective</h3>
+<p>Make the research kernel mathematically and operationally honest. This is the foundation for every later decision.</p>
+<h3 id="primary-code-touchpoints">Primary code touchpoints</h3>
+<ul>
+<li><code>pm_core.py</code></li>
+<li><code>DataLoader</code></li>
+<li><code>FeatureComputer</code></li>
+<li><code>Backtester.run</code></li>
+<li>Python and Numba backtest loops</li>
+<li><code>_calculate_metrics()</code></li>
+<li><code>pm_regime.py</code></li>
+<li>ATR consumers used in regime detection</li>
+</ul>
+<h3 id="required-changes">Required changes</h3>
+<ol>
+<li><strong>Unify bar-level equity and drawdown</strong></li>
+<li>Both Python and Numba paths must produce per-bar equity, not per-trade equity.</li>
+<li>Drawdown must be mark-to-market while a trade is open.</li>
+<li>
+<p>Sharpe, Sortino, Calmar, and recovery metrics must operate on the corrected equity path.</p>
+</li>
+<li>
+<p><strong>Unify fill semantics between Python and Numba</strong></p>
+</li>
+<li>Entry-bar SL/TP recheck must exist in both paths.</li>
+<li>Gap-through-stop must fill at worst tradable bar price, not capped stop.</li>
+<li>Entry slippage must be applied symmetrically, not only on stop exits.</li>
+<li>
+<p>Unsafe stop-based sizing must resolve the same way in both paths: <strong>skip the trade</strong> if reliable loss-per-lot cannot be computed.</p>
+</li>
+<li>
+<p><strong>Fix cost and classification truthfulness</strong></p>
+</li>
+<li>Win/loss classification must use <strong>net dollar PnL after all costs</strong>.</li>
+<li>Swap accrual must be applied where holding periods justify it.</li>
+<li>
+<p>Metric outputs must clearly separate gross and net values where useful.</p>
+</li>
+<li>
+<p><strong>Stop hiding broken contracts</strong></p>
+</li>
+<li>Misaligned signal indexes must no longer be silently reindexed and flattened.</li>
+<li>Unexpected <code>calculate_stops()</code> failures must invalidate the candidate rather than silently turning into "weak" results.</li>
+<li>
+<p>Only known warm-up / NaN conditions should be tolerated and skipped.</p>
+</li>
+<li>
+<p><strong>Fix raw data and cache correctness</strong></p>
+</li>
+<li>Invalid OHLC bars must be quarantined or dropped, not only logged.</li>
+<li><code>DataLoader</code> must require an exact base-timeframe source instead of wildcard-first matching.</li>
+<li>
+<p><code>FeatureComputer</code> cache keys must include a source-data fingerprint and regime-parameter fingerprint or timestamp.</p>
+</li>
+<li>
+<p><strong>Standardize indicator primitives used across layers</strong></p>
+</li>
+<li>ATR must use one consistent definition repo-wide.</li>
+<li>DI / ADX precompute vs strategy helper logic must be made mathematically identical before those cached values are trusted.</li>
+</ol>
+<h3 id="implementation-notes">Implementation notes</h3>
+<ul>
+<li>Prefer extracting shared fill/exit logic into one internal semantic layer used by both execution paths instead of fixing Python and Numba independently.</li>
+<li>When a metric-model version changes, stamp it into config fingerprints so stale winners cannot survive.</li>
+<li>This package is expected to reduce some headline metrics. That is a correction, not a regression.</li>
+</ul>
+<h3 id="required-test-work">Required test work</h3>
+<ul>
+<li>Extend <code>tests/test_backtester.py</code></li>
+<li>Extend <code>tests/test_backtest_sl_exit.py</code></li>
+<li>Add <code>tests/test_backtester_contracts.py</code></li>
+<li>Add <code>tests/test_metric_engine.py</code></li>
+<li>Extend <code>tests/test_feature_cache.py</code></li>
+<li>Extend <code>tests/test_resample_cache.py</code></li>
+</ul>
+<h3 id="acceptance-gate">Acceptance gate</h3>
+<ul>
+<li>Python and Numba produce identical trades and summary metrics on deterministic fixtures.</li>
+<li>Same-bar stop/target fixtures pass.</li>
+<li>Gap-through-stop fixtures pass.</li>
+<li>Misaligned signals fail loudly during strategy evaluation.</li>
+<li>Invalid OHLC bars cannot silently contaminate backtests.</li>
+<li>Feature caches invalidate when data or regime parameters change.</li>
+</ul>
+<h3 id="artifact-impact">Artifact impact</h3>
+<ul>
+<li>Bump metric-model version.</li>
+<li>Bump cost-model version.</li>
+<li>Bump feature-cache version.</li>
+<li>Invalidate all persisted configs after merge.</li>
+</ul>
+<hr />
+<h2 id="8-package-b-validation-search-and-artifact-integrity">8. Package B: Validation, Search, and Artifact Integrity</h2>
+<h3 id="objective_1">Objective</h3>
+<p>Keep the PM fresh while making winner selection statistically honest and artifact invalidation automatic.</p>
+<h3 id="primary-code-touchpoints_1">Primary code touchpoints</h3>
+<ul>
+<li><code>pm_core.py</code></li>
+<li><code>DataSplitter</code></li>
+<li><code>pm_pipeline.py</code></li>
+<li><code>OptimizationPipeline</code></li>
+<li><code>RegimeOptimizer</code></li>
+<li><code>ConfigLedger</code></li>
+<li><code>SymbolConfig</code> / <code>PipelineResult</code></li>
+<li><code>pm_optuna.py</code></li>
+<li><code>pm_regime_tuner.py</code></li>
+<li><code>config.json</code></li>
+</ul>
+<h3 id="required-changes_1">Required changes</h3>
+<ol>
+<li><strong>Redesign the split contract</strong></li>
+<li><code>DataSplitter.get_split_indices()</code> should return explicit <code>train</code>, <code>warmup</code>, <code>validation</code>, and optional <code>holdout</code> regions.</li>
+<li>Overlap remains allowed only as a <strong>warm-up buffer</strong>, never as a scored region.</li>
+<li>
+<p><code>OptimizationPipeline.run_for_symbol()</code> must slice full-history features accordingly.</p>
+</li>
+<li>
+<p><strong>Stop reusing the same recent bars for everything</strong></p>
+</li>
+<li>Validation bucket: strategy/parameter selection.</li>
+<li>Holdout bucket: final accept/reject only.</li>
+<li>
+<p>No part of holdout may influence tuning, shortlist ranking, or retrain cadence.</p>
+</li>
+<li>
+<p><strong>Remove all fallback-to-train approval behavior</strong></p>
+</li>
+<li>If validation fails, the result is <code>no trade</code>, not "best train candidate".</li>
+<li>
+<p>This applies to both legacy selector paths and regime-aware selection paths.</p>
+</li>
+<li>
+<p><strong>Fix optimizer objective leakage</strong></p>
+</li>
+<li>Remove <code>max(regime_scores)</code> bias in regime tuning.</li>
+<li>Track per-regime best candidates from the same evaluated trial instead of allowing one regime spike to dominate unrelated regimes.</li>
+<li>
+<p>Ensure robustness scoring respects the requested optimization purpose end-to-end.</p>
+</li>
+<li>
+<p><strong>Demote retrain-period optimization out of production</strong></p>
+</li>
+<li>Production uses <code>retrain_days = 14</code>.</li>
+<li><code>RetrainPeriodSelector</code> becomes research-only or is retired entirely from the live pipeline.</li>
+<li>
+<p><code>valid_until</code> must align with the fixed biweekly cadence.</p>
+</li>
+<li>
+<p><strong>Make invalidation real, not nominal</strong></p>
+</li>
+<li>Persist a fingerprint containing at least:<ul>
+<li>scorer version,</li>
+<li>cost-model version,</li>
+<li>split/validation version,</li>
+<li>strategy-code version,</li>
+<li>regime-parameter version,</li>
+<li>data-source version.</li>
+</ul>
+</li>
+<li>Thread the current fingerprint through <code>ConfigLedger.get_symbols_to_optimize()</code>.</li>
+<li>
+<p>Do not let stale winners survive regime-parameter changes.</p>
+</li>
+<li>
+<p><strong>Fix stale retrain behavior</strong></p>
+</li>
+<li>Clear data/feature caches before retrain.</li>
+<li>
+<p>Ensure download path and optimization read path are the same configured directory.</p>
+</li>
+<li>
+<p><strong>Fix regime tuner leakage</strong></p>
+</li>
+<li>
+<p><code>pm_regime_tuner.py</code> must evaluate parameter choices on a recent holdout, not only on the same data used to choose them.</p>
+</li>
+<li>
+<p><strong>Optimize the pipeline surface</strong></p>
+</li>
+<li>The regime-aware path is the real production path.</li>
+<li>
+<p>Legacy <code>StrategySelector</code>, <code>HyperparameterOptimizer</code>, and <code>Validator</code> code should either be explicitly retained as offline/research-only or removed from the production path to reduce ambiguity.</p>
+</li>
+<li>
+<p><strong>Add Deflated Sharpe Ratio (DSR) multiple-testing control</strong></p>
+<ul>
+<li>Entry point: <code>pm_pipeline.py -&gt; RegimeOptimizer._select_best_for_regime()</code> (line 1980).</li>
+<li>At the time of the original spec, the system evaluated ~42 strategies x 40+ symbols x 30 Optuna trials with no explicit correction for selection bias. The current upgraded roster is 47, so the multiple-testing argument remains at least as important.</li>
+<li>Implement DSR per Bailey &amp; Lopez de Prado (2014):
+  <code>SE_SR = sqrt((1 + 0.5*SR^2 - skew*SR + (kurt-3)/4*SR^2) / T)
+  DSR = Phi((SR - SR_benchmark) / SE_SR)</code></li>
+<li>Track the full number of trials attempted per <code>(symbol, timeframe, regime)</code>. Compute DSR on finalists inside <code>_select_best_for_regime()</code>.</li>
+<li>Use DSR as a <strong>confidence-adjusted lower-bound</strong> on Sharpe, not a hard veto — this preserves trade frequency while penalizing unreliable edges.</li>
+<li>Optionally run PBO/CSCV on shortlisted candidates (not the full universe) to keep runtime manageable.</li>
+</ul>
+</li>
+<li>
+<p><strong>Move pre-tuning eligibility gates to regime-local metrics</strong></p>
+<ul>
+<li>Entry point: <code>pm_pipeline.py -&gt; RegimeOptimizer._apply_training_eligibility_gates()</code> (line 1490).</li>
+<li>Currently filters on full-sample training metrics before per-regime tuning. A strategy that is strong in RANGE but poor in TREND gets rejected before it ever gets tuned for RANGE.</li>
+<li>Fix: evaluate gates on regime-local training metrics, or use a blended test that keeps a strategy alive if it is strong in at least one regime and not catastrophic elsewhere.</li>
+<li>This directly preserves strategy breadth and regime specialization.</li>
+</ul>
+</li>
+<li>
+<p><strong>Adopt recommended scoring weights and config thresholds</strong></p>
+<ul>
+<li>Entry points: <code>pm_core.py -&gt; PipelineConfig.score_weights</code> (line 621), <code>fx_generalization_score()</code> (line 3348); <code>config.json</code> threshold fields.</li>
+<li>Current score weights: <code>{"sharpe": 0.25, "profit_factor": 0.20, "win_rate": 0.15, "total_return": 0.15, "max_drawdown": 0.15, "trade_count": 0.10}</code>.</li>
+<li>Recommended weights (after Sharpe correction): <code>{"sharpe": 0.20, "profit_factor": 0.25, "max_drawdown": 0.25, "total_return": 0.10, "win_rate": 0.10, "trade_count": 0.10}</code>.</li>
+<li>Rationale: Profit factor and max drawdown are the most robust predictors of live performance. Win rate is the weakest predictor.</li>
+<li>Config threshold adjustments:
+  | Parameter | Current | Recommended | Rationale |
+  |---|---|---|---|
+  | <code>regime_min_val_profit_factor</code> | 1.05 | 1.15 | PF 1.05 is net-negative after real costs |
+  | <code>train_min_profit_factor</code> | 0.50 | 0.80 | PF 0.50 wastes Optuna budget on hopeless candidates |
+  | <code>fx_gap_penalty_lambda</code> | 0.50 | 0.70 | Current penalty insufficient for train-optimized params |
+  | <code>fx_val_min_trades</code> | 5 | 15 | 5 trades = zero statistical power (graduate to 25 as data grows) |
+  | <code>regime_min_val_trades</code> | 10 | 15 | Paired with confidence-adjusted scoring (not hard cutoff) |</li>
+<li>These are best-validated defaults, not legacy-safe placeholders. Apply them as the new defaults after corrected validation is in place.</li>
+</ul>
+</li>
+</ol>
+<h3 id="required-test-work_1">Required test work</h3>
+<ul>
+<li>Update <code>tests/test_data_splitter.py</code></li>
+<li>Extend <code>tests/test_pipeline_integration.py</code></li>
+<li>Extend <code>tests/test_winners_only.py</code></li>
+<li>Add <code>tests/test_pipeline_validation_contract.py</code></li>
+<li>Add <code>tests/test_config_fingerprint_invalidation.py</code></li>
+<li>Add <code>tests/test_regime_tuner_holdout.py</code></li>
+</ul>
+<h3 id="acceptance-gate_1">Acceptance gate</h3>
+<ul>
+<li>No scored bar has been seen in fitting.</li>
+<li>No validation-failed candidate becomes a stored winner.</li>
+<li>Regime-parameter changes trigger re-optimization automatically.</li>
+<li>Production configs expire on the fixed biweekly schedule.</li>
+<li>Auto-retrain reads newly fetched data, not stale cached data.</li>
+</ul>
+<h3 id="artifact-impact_1">Artifact impact</h3>
+<ul>
+<li>Invalidate <code>pm_configs.json</code> and any stored winner sets.</li>
+<li>Re-run a smoke basket before full-universe optimization.</li>
+</ul>
+<hr />
+<h2 id="9-package-c-strategy-layer-remediation">9. Package C: Strategy Layer Remediation</h2>
+<h3 id="objective_2">Objective</h3>
+<p>Remove structurally broken strategies, fake parameter surfaces, and misleading helper shortcuts before the next ranking cycle.</p>
+<p>This package is about making each strategy family real, distinct, and trustworthy. It is not about reducing the number of strategies or forcing them to become more similar to one another.</p>
+<h3 id="primary-code-touchpoints_2">Primary code touchpoints</h3>
+<ul>
+<li><code>pm_strategies.py</code></li>
+<li><code>pm_core.py</code> helper/precompute functions used by strategies</li>
+</ul>
+<h3 id="tier-0-fixes-must-ship-before-re-optimization">Tier 0 fixes: must ship before re-optimization</h3>
+<table>
+<thead>
+<tr>
+<th>Strategy / Area</th>
+<th>Change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>InsideBarBreakoutStrategy</code></td>
+<td>Fix impossible signal conditions</td>
+</tr>
+<tr>
+<td><code>SupertrendStrategy</code></td>
+<td>Fix missed first transition / first-trade bug</td>
+</tr>
+<tr>
+<td><code>ADXTrendStrategy</code></td>
+<td>Fix DI/ADX source correctness and slice warm-up behavior</td>
+</tr>
+<tr>
+<td><code>ADXDIStrengthStrategy</code></td>
+<td>Stop consuming bad precomputed DI values</td>
+</tr>
+<tr>
+<td><code>EMARibbonADXStrategy</code></td>
+<td>Stop consuming bad precomputed DI values</td>
+</tr>
+<tr>
+<td><code>PinBarReversalStrategy</code></td>
+<td>Remove double delay</td>
+</tr>
+<tr>
+<td><code>ParabolicSARTrendStrategy</code></td>
+<td>Remove boundary-artifact first-bar short</td>
+</tr>
+<tr>
+<td><code>EngulfingPatternStrategy</code></td>
+<td>Remove dead <code>lookback_level</code> or implement it properly</td>
+</tr>
+<tr>
+<td><code>FisherTransformMRStrategy</code></td>
+<td>Remove dead <code>signal_period</code> or make it part of entries</td>
+</tr>
+<tr>
+<td><code>SqueezeBreakoutStrategy</code></td>
+<td>Make <code>bb_std</code> real by fixing BB cache behavior</td>
+</tr>
+<tr>
+<td><code>KeltnerPullbackStrategy</code></td>
+<td>Remove or truly use <code>kc_mult</code></td>
+</tr>
+<tr>
+<td><code>AroonTrendStrategy</code></td>
+<td>Use last tied extreme, not first tied extreme</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tier-1-fixes-important-before-trusting-search-quality">Tier 1 fixes: important before trusting search quality</h3>
+<ul>
+<li>Convert level-like strategies to one-shot event signals where the intended behavior is event-driven.</li>
+<li>Make <code>TurtleSoupReversalStrategy</code> reclaim logic one-shot instead of repeat-emitting inside the reclaim window.</li>
+<li>Remove or canonicalize conditional dead grid dimensions in:</li>
+<li><code>ZScoreVWAPReversionStrategy</code></li>
+<li><code>MACDHistogramMomentumStrategy</code></li>
+<li>Remove the future fake-parameter risk from <code>StochRSITrendGateStrategy</code> precomputed shortcuts unless they are keyed by the full parameter set.</li>
+</ul>
+<h3 id="helper-precompute-cleanup">Helper / precompute cleanup</h3>
+<ul>
+<li><code>_get_bb()</code> cache key must include <code>std</code>.</li>
+<li><code>_get_bb()</code> should memoize computed series.</li>
+<li><code>_get_keltner()</code> should memoize or stop relying on dead precompute.</li>
+<li>Stochastic cache behavior should be parameter-aware.</li>
+<li>Strategies should reuse precomputed CCI/ATR/BB values where outputs are equivalent.</li>
+<li>Dead swing-point computations in divergence strategies should be removed.</li>
+</ul>
+<h3 id="required-test-work_2">Required test work</h3>
+<ul>
+<li>Extend <code>tests/test_strategy_param_grid_consistency.py</code></li>
+<li>Add <code>tests/test_strategy_regressions.py</code></li>
+<li>Add <code>tests/test_strategy_signal_smoke.py</code></li>
+<li>Extend <code>tests/test_pipeline_integration.py</code></li>
+</ul>
+<h3 id="acceptance-gate_2">Acceptance gate</h3>
+<ul>
+<li>Every tuned parameter either changes signal behavior or stop behavior.</li>
+<li>No strategy in the "fix-before-trust" bucket remains unresolved.</li>
+<li>Smoke fixtures produce deterministic, non-degenerate signals for covered strategies.</li>
+<li>Re-optimization no longer repeats fake/duplicated search dimensions.</li>
+</ul>
+<h3 id="artifact-impact_2">Artifact impact</h3>
+<ul>
+<li>Full strategy re-optimization required after this package.</li>
+</ul>
+<hr />
+<h2 id="10-package-d-live-runtime-hardening">10. Package D: Live Runtime Hardening</h2>
+<h3 id="objective_3">Objective</h3>
+<p>Make live trading safer, more deterministic, and more faithful to the research assumptions.</p>
+<h3 id="primary-code-touchpoints_3">Primary code touchpoints</h3>
+<ul>
+<li><code>pm_main.py</code></li>
+<li><code>DecisionThrottle</code></li>
+<li><code>LiveTrader</code></li>
+<li>runtime orchestration</li>
+<li><code>pm_mt5.py</code></li>
+<li><code>MT5Connector</code></li>
+<li><code>pm_position.py</code></li>
+<li>tagging / comment decoding as needed</li>
+</ul>
+<h3 id="required-changes_2">Required changes</h3>
+<ol>
+<li><strong>Collapse to one authoritative trading loop</strong></li>
+<li>Remove the dead dual-loop arrangement.</li>
+<li>
+<p>The cleanest shape is:</p>
+<ul>
+<li>app owns outer loop, retrain schedule, and reconnect policy;</li>
+<li>trader owns one <code>run_iteration()</code> / <code>process_all_symbols()</code> unit of work.</li>
+</ul>
+</li>
+<li>
+<p><strong>Separate canonical symbol identity from broker symbol identity</strong></p>
+</li>
+<li>Canonical symbol must be used for:<ul>
+<li>decision throttle keys,</li>
+<li>action logs,</li>
+<li>risk accounting,</li>
+<li>trade intent identity.</li>
+</ul>
+</li>
+<li>
+<p>Broker symbol should be used only for MT5 I/O.</p>
+</li>
+<li>
+<p><strong>Make position snapshots fail closed</strong></p>
+</li>
+<li><code>MT5Connector.get_positions()</code> must distinguish <code>None</code> / fetch failure from true empty state.</li>
+<li>If the snapshot is unavailable, skip new entries for that iteration.</li>
+<li>
+<p>Hoist one positions snapshot per sweep and reuse it.</p>
+</li>
+<li>
+<p><strong>Create a stricter tradability gate</strong></p>
+</li>
+<li>Terminal connected is not enough.</li>
+<li>
+<p>Trading requires:</p>
+<ul>
+<li>terminal alive,</li>
+<li>account info available,</li>
+<li><code>trade_allowed</code>,</li>
+<li><code>trade_expert</code>,</li>
+<li>symbol selected and tradable.</li>
+</ul>
+</li>
+<li>
+<p><strong>Fix stop placement parity</strong></p>
+</li>
+<li>
+<p>Live stop placement must use the closed signal bar, not the forming bar.</p>
+</li>
+<li>
+<p><strong>Preserve validated R-multiple when SL is widened</strong></p>
+</li>
+<li>Entry point: <code>pm_main.py -&gt; LiveTrader._execute_entry()</code> (line 1530), specifically the broker min-stop widening block at lines 1687-1693.</li>
+<li>When SL is auto-widened to satisfy <code>trade_stops_level</code>, TP is currently left unchanged. This silently degrades the validated R-multiple (reward:risk ratio) that the optimizer selected.</li>
+<li>
+<p>Fix: when SL is widened for broker or sizing reasons, recalculate TP to preserve the validated target R-multiple unless explicitly configured otherwise. Formula: <code>new_tp_dist = original_R * new_sl_dist</code>.</p>
+</li>
+<li>
+<p><strong>Resolve dormant live-exit features</strong></p>
+</li>
+<li>
+<p>Either wire <code>close_on_opposite_signal</code>, trailing, and breakeven logic into the live path, or remove the misleading surface until implemented.</p>
+</li>
+<li>
+<p><strong>Invalidate runtime caches when state changes</strong></p>
+</li>
+<li>Clear candidate caches on retrain and reconnect.</li>
+<li>Clear MT5 symbol metadata cache on reconnect / disconnect.</li>
+<li>
+<p>Refresh symbol specs on a timed basis or session boundary.</p>
+</li>
+<li>
+<p><strong>Make filling policy explicit</strong></p>
+</li>
+<li>Defaulting blindly to <code>FOK</code> is too strict for trade-count preservation.</li>
+<li>
+<p>Make fill policy configurable and broker-tested.</p>
+</li>
+<li>
+<p><strong>Promote drift monitoring</strong></p>
+</li>
+<li><code>DriftMonitor</code> should be instantiated and fed realized-vs-validated deltas.</li>
+<li>This is monitoring, not a new circuit breaker.</li>
+</ol>
+<h3 id="required-test-work_3">Required test work</h3>
+<ul>
+<li>Extend <code>tests/test_live_loop_integration.py</code></li>
+<li>Extend <code>tests/test_decision_throttle.py</code></li>
+<li>Extend <code>tests/test_portfolio_risk_cap.py</code></li>
+<li>Add <code>tests/test_live_tradability_gate.py</code></li>
+<li>Add <code>tests/test_symbol_suffix_throttle.py</code></li>
+<li>Add <code>tests/test_live_state_fail_closed.py</code></li>
+</ul>
+<h3 id="acceptance-gate_3">Acceptance gate</h3>
+<ul>
+<li>No same-bar duplicate order attempts occur on broker-suffixed symbols.</li>
+<li>No new entry is attempted when positions or tradability state is unavailable.</li>
+<li>Live stop distances match the closed signal bar.</li>
+<li>Only one authoritative runtime loop remains in production code.</li>
+</ul>
+<hr />
+<h2 id="11-package-e-dashboard-and-analytics-truthfulness">11. Package E: Dashboard and Analytics Truthfulness</h2>
+<h3 id="objective_4">Objective</h3>
+<p>Make the dashboard report what actually happened, not what the PM attempted or what a loose enrichment heuristic guessed.</p>
+<h3 id="primary-code-touchpoints_4">Primary code touchpoints</h3>
+<ul>
+<li><code>pm_dashboard/app.py</code></li>
+<li><code>pm_dashboard/watcher.py</code></li>
+<li><code>pm_dashboard/analytics.py</code></li>
+<li><code>pm_dashboard/utils.py</code></li>
+<li>dashboard tests</li>
+</ul>
+<h3 id="required-changes_3">Required changes</h3>
+<ol>
+<li><strong>Separate realized trades from order-attempt logs</strong></li>
+<li>Dashboard performance must be computed from realized trade outcomes only.</li>
+<li>
+<p>Actionable/recommendation logs remain useful, but as a separate operational feed.</p>
+</li>
+<li>
+<p><strong>Fix enrichment identity</strong></p>
+</li>
+<li>Stop matching executed trades to signals by symbol alone.</li>
+<li>Prefer <code>magic</code>, ticket, or <code>symbol + timeframe + regime</code>.</li>
+<li>
+<p>Require <code>trade_ts &gt;= signal_ts</code>, not absolute time distance.</p>
+</li>
+<li>
+<p><strong>Make analytics internally consistent</strong></p>
+</li>
+<li>Equity curve, drawdown, return, Sharpe, and Sortino must operate on a consistent realized-trade set.</li>
+<li>Trades with unparseable timestamps must be either excluded everywhere or ordered consistently everywhere.</li>
+<li>
+<p>Risk-adjusted metrics should use daily equity returns or be explicitly labeled non-annualized if still trade-based.</p>
+</li>
+<li>
+<p><strong>Fix simulation and API input handling</strong></p>
+</li>
+<li><code>/api/simulate</code> must honor <code>end_date</code> independently.</li>
+<li>Invalid JSON should return a handled validation error.</li>
+<li>
+<p>Initial capital must be propagated consistently across breakdowns and monthly panels.</p>
+</li>
+<li>
+<p><strong>Make config persistence crash-safe</strong></p>
+</li>
+<li>Use atomic temp-file replace for dashboard config writes.</li>
+<li>
+<p>Surface corrupt-config fallback in logs/API rather than silently resetting to defaults.</p>
+</li>
+<li>
+<p><strong>Fix lifecycle and recency behavior</strong></p>
+</li>
+<li>Background watcher/scheduler startup should be controllable for tests.</li>
+<li>Timezone and freshness logic must be deterministic.</li>
+<li>
+<p>Date-sensitive dashboard tests should use relative timestamps or clock control.</p>
+</li>
+<li>
+<p><strong>Add missing analytics metrics</strong></p>
+</li>
+<li>Entry point: <code>pm_dashboard/analytics.py -&gt; compute_performance_metrics()</code> (line 283).</li>
+<li>Currently missing:
+     | Metric | Formula | Purpose |
+     |---|---|---|
+     | Drawdown Duration | Max bars spent in drawdown | Patience assessment |
+     | Recovery Time | Bars to recover from max DD | Capital efficiency |
+     | Ulcer Index | <code>sqrt(mean(DD^2))</code> | Better risk metric than StdDev |</li>
+<li>These metrics should be added to the same <code>compute_performance_metrics()</code> function and surfaced in the analytics API and frontend.</li>
+</ol>
+<h3 id="required-test-work_4">Required test work</h3>
+<ul>
+<li>Extend <code>tests/test_dashboard_trade_enrichment.py</code></li>
+<li>Extend <code>tests/test_dashboard_signals.py</code></li>
+<li>Extend <code>tests/test_dashboard_data_jobs.py</code></li>
+<li>Add <code>tests/test_dashboard_realized_metrics.py</code></li>
+<li>Add <code>tests/test_dashboard_config_persistence.py</code></li>
+</ul>
+<h3 id="acceptance-gate_4">Acceptance gate</h3>
+<ul>
+<li>Dashboard headline metrics reconcile with realized trade history.</li>
+<li>Enrichment no longer cross-links the wrong same-symbol trade.</li>
+<li>Config corruption cannot silently reset the dashboard without visibility.</li>
+<li>Dashboard tests are deterministic and do not depend on stale absolute dates.</li>
+<li>Drawdown Duration, Recovery Time, and Ulcer Index are computed and displayed.</li>
+</ul>
+<hr />
+<h2 id="12-package-f-performance-and-output-preserving-optimization">12. Package F: Performance and Output-Preserving Optimization</h2>
+<h3 id="objective_5">Objective</h3>
+<p>Reduce runtime and code ambiguity only after correctness is locked in.</p>
+<p>Package F is limited to parity-preserving cleanup. If a proposed "performance" change also changes signals, fills, ranking, or metrics because it is expected to make the PM better, then it belongs in the owning correctness or enhancement package and must be evaluated on corrected PM objectives rather than parity alone.</p>
+<h3 id="primary-code-touchpoints_5">Primary code touchpoints</h3>
+<ul>
+<li><code>pm_core.py</code></li>
+<li><code>pm_strategies.py</code></li>
+<li><code>pm_pipeline.py</code></li>
+<li>related tests/benchmarks</li>
+</ul>
+<h3 id="required-changes_4">Required changes</h3>
+<ol>
+<li><strong>Retire dead production paths</strong></li>
+<li>Remove or quarantine legacy selector/optimizer/validator surfaces if the regime-aware path is the only supported production path.</li>
+<li>
+<p>Remove production dependence on <code>RetrainPeriodSelector</code>.</p>
+</li>
+<li>
+<p><strong>Activate lazy features where outputs are unchanged</strong></p>
+</li>
+<li>Introduce a parameter-aware feature request builder for single-strategy evaluation contexts.</li>
+<li>
+<p>Do not blindly replace <code>compute_all()</code> everywhere; only use lazy computation where parity is proven.</p>
+</li>
+<li>
+<p><strong>Remove known dead work</strong></p>
+</li>
+<li>dead <code>train_features</code> copy in retrain selector if it is retained for research,</li>
+<li>dead Keltner precompute,</li>
+<li>unused <code>atr_20_cached</code>,</li>
+<li>
+<p>repeated indicator recomputation where exact cached equivalents exist.</p>
+</li>
+<li>
+<p><strong>Vectorize verified hotspots</strong></p>
+</li>
+<li>CCI rolling MAD path,</li>
+<li>Aroon loop,</li>
+<li>Kaufman AMA inner loop,</li>
+<li>regime raw-score loop,</li>
+<li>
+<p>divergence swing-point helpers where parity can be maintained.</p>
+</li>
+<li>
+<p><strong>Measure before and after</strong></p>
+</li>
+<li>Add a lightweight optimization benchmark on a mixed symbol basket.</li>
+<li>Runtime wins only count if signal/trade outputs remain unchanged.</li>
+</ol>
+<h3 id="required-test-work_5">Required test work</h3>
+<ul>
+<li>Extend <code>tests/test_feature_cache.py</code></li>
+<li>Add <code>tests/test_strategy_helper_parity.py</code></li>
+<li>Add <code>tests/test_pipeline_perf_smoke.py</code></li>
+</ul>
+<h3 id="acceptance-gate_5">Acceptance gate</h3>
+<ul>
+<li>Golden-fixture outputs are unchanged.</li>
+<li>Mixed-basket optimization runtime improves materially.</li>
+<li>The production path is easier to reason about after the cleanup, not harder.</li>
+</ul>
+<hr />
+<h2 id="13-package-g-quant-enhancement-layer">13. Package G: Quant Enhancement Layer</h2>
+<p>This package is <strong>not</strong> allowed to outrun Packages A-F. It sits on top of a corrected, honest baseline.</p>
+<h3 id="g1-risk-scalar-stack">G1. Risk Scalar Stack</h3>
+<p>Implement a layered position-risk scalar:</p>
+<p><code>base risk x volatility target x exposure/correlation scalar x fractional Kelly cap</code></p>
+<p>Requirements:</p>
+<ul>
+<li>signal count unchanged,</li>
+<li>sizing changes only dollar risk,</li>
+<li>portfolio and exposure awareness implemented as scalars before hard blocks.</li>
+<li>include drawdown-based position scaling as part of the same scalar stack rather than as an unrelated hard stop.</li>
+</ul>
+<p>Primary modules:</p>
+<ul>
+<li><code>pm_main.py</code></li>
+<li><code>pm_position.py</code></li>
+<li>portfolio/risk helpers as needed</li>
+</ul>
+<p>Acceptance for default enablement:</p>
+<ul>
+<li>trade count remains at least <strong>95%</strong> of corrected baseline,</li>
+<li>profit factor improves,</li>
+<li>drawdown does not worsen,</li>
+<li>live risk accounting remains transparent.</li>
+</ul>
+<h3 id="g2-market-driven-exit-upgrade-pack">G2. Market-Driven Exit Upgrade Pack</h3>
+<p>Allowed exits:</p>
+<ul>
+<li>ATR trailing by strategy family,</li>
+<li>partial profit taking,</li>
+<li>opposite-signal / structure exits where justified,</li>
+<li>breakeven logic where expectancy supports it.</li>
+</ul>
+<p>Not included as default:</p>
+<ul>
+<li>time-based exit.</li>
+</ul>
+<p>Acceptance for default enablement:</p>
+<ul>
+<li>no material trade-count collapse,</li>
+<li>win rate / profit factor / recovery factor improve on clean holdout,</li>
+<li>live parity path exists before research surface is widened.</li>
+</ul>
+<h3 id="g3-portfolio-construction-layer">G3. Portfolio Construction Layer</h3>
+<p>Introduce shrinkage covariance + HRP for active-position risk redistribution.</p>
+<p>Requirements:</p>
+<ul>
+<li>allocation layer must scale risk, not suppress large parts of the book by default,</li>
+<li>exposure buckets remain interpretable,</li>
+<li>live implementation must use the same risk worldview as research.</li>
+</ul>
+<h3 id="g4-regime-model-upgrade-track">G4. Regime Model Upgrade Track</h3>
+<p>Research-first branch:</p>
+<ul>
+<li>HMM regime detection,</li>
+<li>GARCH volatility overlay,</li>
+<li>optional stochastic-volatility overlays if kept lightweight,</li>
+<li>regime upgrades must preserve production freshness and runtime realism.</li>
+</ul>
+<p>Nothing in this track becomes default until the current regime layer is already correct and invalidation-safe.</p>
+<h3 id="g5-execution-quality-overlay">G5. Execution Quality Overlay</h3>
+<p>Entry points: <code>pm_main.py -&gt; LiveTrader._evaluate_regime_candidates()</code> (line 1266), <code>LiveTrader._execute_entry()</code> (line 1530); <code>pm_mt5.py -&gt; get_symbol_info()</code> for spread data access.</p>
+<p>Soft overlays first:</p>
+<ul>
+<li>
+<p><strong>Spread-aware signal filter</strong> (Almgren &amp; Chriss, 2001):
+  <code>min_edge = 1.5 * current_spread
+  if ATR(14) &lt; min_edge:
+      skip_trade("ATR &lt; 1.5x spread: insufficient edge")</code>
+  This only filters trades where the expected move is smaller than costs — trades that would have been net losers anyway. For wide-spread instruments (XAUUSD, DE30, exotics), this alone improves net profitability by 10-20%.</p>
+</li>
+<li>
+<p><strong>Spread spike detection</strong>:
+  <code>if current_spread &gt; 2.0 * rolling_spread_median[symbol]:
+      skip_trade("Spread spike detected")</code>
+  Track rolling spread median per symbol. Skip trades when current spread exceeds 2x median.</p>
+</li>
+<li>
+<p>fill-quality penalties,</p>
+</li>
+<li>marketability checks.</li>
+</ul>
+<p>These should first enter as <strong>ranking or sizing penalties</strong>, not hard trade vetoes, unless hard evidence later supports a stricter filter.</p>
+<h3 id="g6-options-model-adaptation-track">G6. Options-Model Adaptation Track</h3>
+<p>These are research overlays, not core blockers:</p>
+<ul>
+<li>Garman-Kohlhagen / Black-Scholes expected-move distance features,</li>
+<li>CRR barrier-feasibility features,</li>
+<li>Heston-lite stochastic-volatility regime modifiers.</li>
+</ul>
+<p>Implementation rule:</p>
+<ul>
+<li>keep them indicator-like and lightweight,</li>
+<li>no heavy options engine on the live critical path,</li>
+<li>no default rollout without clean incremental value over the corrected baseline.</li>
+</ul>
+<hr />
+<h3 id="g7-strategy-expansion-recovery-and-rotation-controls">G7. Strategy Expansion, Recovery, and Rotation Controls</h3>
+<p>This package also includes the finalized non-core but approved expansion items:</p>
+<ul>
+<li><code>VortexTrendStrategy</code></li>
+<li><code>TRIXSignalStrategy</code></li>
+<li><code>RelativeVigorIndexStrategy</code></li>
+<li><code>VIDYABandTrendStrategy</code></li>
+<li><code>ChoppinessCompressionBreakoutStrategy</code></li>
+</ul>
+<p>Implementation rules:</p>
+<ul>
+<li>these strategies are added only after Package C has cleaned the existing roster,</li>
+<li>they must be implemented as lightweight indicator-based strategies,</li>
+<li>they enter the same clean validation/search framework as the rest of the book,</li>
+<li>they are not allowed to bypass the corrected trust/ranking process just because they are new.</li>
+</ul>
+<p>This package also includes:</p>
+<ul>
+<li>equity curve trading overlays,</li>
+<li>strategy rotation as a sizing-based overlay,</li>
+<li>recovery-factor improvement logic that scales capital allocation rather than suppressing valid signal generation.</li>
+</ul>
+<p>Acceptance for default enablement:</p>
+<ul>
+<li>trade frequency remains materially preserved,</li>
+<li>clean-holdout profit factor and recovery factor improve,</li>
+<li>no hidden diversification-forcing logic is introduced.</li>
+</ul>
+<hr />
+<h2 id="14-dependency-constraints-inside-the-single-upgrade-program">14. Dependency Constraints Inside The Single Upgrade Program</h2>
+<p>These are <strong>dependency constraints</strong>, not implementation phases. The entire document remains one implementation scope.</p>
+<ul>
+<li>establish version/fingerprint constants and repair obviously date-fragile tests before using them as gates,</li>
+<li>complete Change Blocks A-C before trusting any new winner set,</li>
+<li>execute the first clean re-optimization only after A-C are in place,</li>
+<li>complete Change Blocks D-E before trusting live runtime behavior or dashboard monitoring,</li>
+<li>keep Change Block F parity-preserving and bounded by the parity harness,</li>
+<li>enable Change Block G items only after the corrected baseline exists, but still inside the same overall upgrade effort.</li>
+</ul>
+<hr />
+<h2 id="15-mandatory-re-optimization-and-migration-events">15. Mandatory Re-Optimization and Migration Events</h2>
+<p>The following events require full artifact invalidation and re-optimization:</p>
+<ul>
+<li>Package A merge</li>
+<li>Package B merge</li>
+<li>Package C merge</li>
+<li>any change to strategy signal semantics</li>
+<li>any change to metric math</li>
+<li>any change to scored split logic</li>
+<li>any change to cost model or fill semantics</li>
+<li>any change to regime-parameter fingerprinting</li>
+</ul>
+<p>The following events require at least dashboard rebuild / monitoring refresh:</p>
+<ul>
+<li>Package D merge</li>
+<li>Package E merge</li>
+</ul>
+<hr />
+<h2 id="16-definition-of-done">16. Definition of Done</h2>
+<p>The technical upgrade is only complete when all of the following are true:</p>
+<ul>
+<li>backtest metrics are computed on corrected equity and drawdown paths,</li>
+<li>validation is fresh and clean,</li>
+<li>stored winners are invalidated automatically when assumptions change,</li>
+<li>no known fake search dimensions remain in production strategies,</li>
+<li>live trading fails closed on missing state,</li>
+<li>monitoring reflects realized outcomes,</li>
+<li>performance refactors are parity-proven,</li>
+<li>enhancement layers are measured against the corrected baseline rather than the legacy one.</li>
+</ul>
+<p>If a change improves old metrics by relying on old distortions, it is not done.</p>
+<hr />
+<h2 id="17-developer-tickbox-order">17. Developer Tickbox Order</h2>
+<p>This is the intended <strong>single-program checklist order</strong> for the developer, not a multi-phase roadmap:</p>
+<ol>
+<li>lock version/fingerprint constants, split-contract constants, and corrected metric definitions</li>
+<li>implement Change Block A at its listed code seams</li>
+<li>implement Change Block B at its listed code seams</li>
+<li>implement Change Block C at its listed code seams</li>
+<li>run the first full corrected re-optimization and artifact rebuild</li>
+<li>implement Change Block D at its listed code seams</li>
+<li>implement Change Block E at its listed code seams</li>
+<li>implement Change Block F under the parity harness</li>
+<li>implement approved Change Block G overlays at their listed seams and validate them against the corrected baseline</li>
+</ol>
+<p>The point of the order is dependency control, not deferral. All listed blocks remain in scope for the same upgrade program.</p>
+<hr />
+<h2 id="18-required-evidence-pack-per-change-block">18. Required Evidence Pack Per Change Block</h2>
+<p>Every change block should ship with an evidence bundle stored alongside the branch or release notes.</p>
+<h3 id="for-change-blocks-a-c">For Change Blocks A-C</h3>
+<p>Capture, at minimum:</p>
+<ul>
+<li>smoke-basket metrics before and after,</li>
+<li>trade count,</li>
+<li>win rate,</li>
+<li>profit factor,</li>
+<li>max drawdown,</li>
+<li>total return,</li>
+<li>Sharpe / Sortino on corrected math,</li>
+<li>winner composition changes by strategy, timeframe, and regime,</li>
+<li>config fingerprint/version values used for the run.</li>
+</ul>
+<h3 id="for-change-block-d">For Change Block D</h3>
+<p>Capture, at minimum:</p>
+<ul>
+<li>paper/live-dry logs showing no duplicate same-bar entries,</li>
+<li>paper/live-dry logs showing no entries when positions snapshot is unavailable,</li>
+<li>paper/live-dry logs showing no entries when tradability is false,</li>
+<li>paper/live-dry logs showing correct signal-bar stop placement,</li>
+<li>reconnect behavior,</li>
+<li>symbol-spec refresh behavior,</li>
+<li>throttle behavior on suffixed broker symbols.</li>
+</ul>
+<h3 id="for-change-block-e">For Change Block E</h3>
+<p>Capture, at minimum:</p>
+<ul>
+<li>a reconciliation sample between realized trade history and dashboard analytics,</li>
+<li>evidence that actionable logs and realized trades are now distinct feeds,</li>
+<li>one enrichment sample proving the correct trade is matched to the correct signal.</li>
+</ul>
+<h3 id="for-change-blocks-f-g">For Change Blocks F-G</h3>
+<p>Capture, at minimum:</p>
+<ul>
+<li>parity comparison against the corrected baseline,</li>
+<li>runtime benchmark on the mixed basket,</li>
+<li>holdout comparison for each enhancement package enabled,</li>
+<li>trade-count preservation statistics.</li>
+</ul>
+<hr />
+<h2 id="19-suggested-review-boundaries">19. Suggested Review Boundaries</h2>
+<p>These are <strong>review boundaries only</strong>, not separate upgrade phases and not optional scope reductions:</p>
+<ol>
+<li><code>Kernel semantics</code>: Change Block A</li>
+<li><code>Validation contract</code>: Change Block B</li>
+<li><code>Strategy truthfulness</code>: Change Block C</li>
+<li><code>Runtime hardening</code>: Change Block D</li>
+<li><code>Dashboard truth model</code>: Change Block E</li>
+<li><code>Output-preserving optimization</code>: Change Block F</li>
+<li><code>Enhancement seams</code>: Change Block G</li>
+</ol>
+<p>If the developer chooses to deliver in smaller reviewable slices, the slices should follow these boundaries so each seam remains testable and rerunnable on its own.</p>
+</body>
+</html>

@@ -3,9 +3,11 @@ Analytics module for computing performance metrics, equity curves, and statistic
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
+import zlib
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,9 +15,271 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
-from .utils import parse_timestamp, normalize_symbol
+from .utils import (
+    parse_timestamp,
+    normalize_symbol,
+    normalize_timeframe,
+    normalize_regime,
+    load_pm_configs,
+)
 
 logger = logging.getLogger(__name__)
+
+_TRADE_HISTORY_CACHE: Dict[Tuple[str, int, Tuple[Tuple[str, int, int], ...], Tuple[str, int, int]], List[Dict[str, Any]]] = {}
+
+_REALIZED_STATUSES = {
+    "CLOSED",
+    "CLOSE",
+    "CLOSED_TP",
+    "CLOSED_SL",
+    "TP_HIT",
+    "SL_HIT",
+    "EXITED",
+    "FILLED",
+    "DONE",
+    "SETTLED",
+}
+
+_OPEN_STATUSES = {
+    "OPEN",
+    "PENDING",
+    "PLACED",
+    "ORDER_SENT",
+    "SUBMITTED",
+}
+
+
+def _coerce_magic(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _encode_magic(symbol: str, timeframe: str, regime: str) -> int:
+    key = f"{normalize_symbol(symbol)}|{normalize_timeframe(timeframe)}|{normalize_regime(regime)}"
+    return zlib.crc32(key.encode("utf-8")) & 0x7FFFFFFF
+
+
+def _strategy_from_pm_config(pm_cfg: Dict[str, Any], timeframe: str, regime: str) -> str:
+    tf = normalize_timeframe(timeframe)
+    rg = normalize_regime(regime)
+    regime_configs = pm_cfg.get("regime_configs", {})
+    if tf and rg and isinstance(regime_configs, dict):
+        tf_cfg = regime_configs.get(tf, {})
+        if isinstance(tf_cfg, dict):
+            reg_cfg = tf_cfg.get(rg, {})
+            if isinstance(reg_cfg, dict):
+                strategy_name = str(reg_cfg.get("strategy_name") or "").strip()
+                if strategy_name:
+                    return strategy_name
+    strategy_name = str(pm_cfg.get("strategy_name") or "").strip()
+    if strategy_name:
+        return strategy_name
+    default_cfg = pm_cfg.get("default_config", {})
+    if isinstance(default_cfg, dict):
+        return str(default_cfg.get("strategy_name") or "").strip()
+    return ""
+
+
+def _build_magic_lookup(pm_configs: Dict[str, Any]) -> Dict[str, Dict[int, Dict[str, str]]]:
+    """
+    Build mapping:
+      symbol -> magic -> {timeframe, regime, strategy}
+    """
+    lookup: Dict[str, Dict[int, Dict[str, str]]] = {}
+
+    for symbol_key, cfg in pm_configs.items():
+        if not isinstance(cfg, dict):
+            continue
+        symbol = normalize_symbol(cfg.get("symbol") or symbol_key)
+        if not symbol:
+            continue
+        symbol_map = lookup.setdefault(symbol, {})
+
+        regime_configs = cfg.get("regime_configs", {})
+        has_regime_rows = False
+        if isinstance(regime_configs, dict):
+            for tf_key, regimes in regime_configs.items():
+                tf = normalize_timeframe(tf_key)
+                if not tf or not isinstance(regimes, dict):
+                    continue
+                for regime_key, reg_cfg in regimes.items():
+                    if not isinstance(reg_cfg, dict):
+                        continue
+                    regime = normalize_regime(regime_key)
+                    if not regime:
+                        continue
+                    has_regime_rows = True
+                    magic = _encode_magic(symbol, tf, regime)
+                    symbol_map[magic] = {
+                        "timeframe": tf,
+                        "regime": regime,
+                        "strategy": str(reg_cfg.get("strategy_name") or "").strip(),
+                    }
+
+        # Legacy single-timeframe config fallback.
+        if not has_regime_rows:
+            tf = normalize_timeframe(cfg.get("timeframe"))
+            if tf:
+                magic = _encode_magic(symbol, tf, "LEGACY")
+                symbol_map[magic] = {
+                    "timeframe": tf,
+                    "regime": "LEGACY",
+                    "strategy": _strategy_from_pm_config(cfg, tf, "LEGACY"),
+                }
+
+    return lookup
+
+
+def _enrich_trade_metadata(
+    trade: Dict[str, Any],
+    pm_configs: Dict[str, Any],
+    magic_lookup: Dict[str, Dict[int, Dict[str, str]]],
+) -> None:
+    symbol = normalize_symbol(trade.get("symbol"))
+    if symbol:
+        trade["symbol"] = symbol
+    if not symbol:
+        return
+
+    timeframe = normalize_timeframe(trade.get("timeframe"))
+    regime = normalize_regime(trade.get("regime"))
+    strategy = str(trade.get("strategy") or trade.get("strategy_name") or "").strip()
+
+    magic = _coerce_magic(trade.get("magic"))
+    if magic is not None:
+        by_magic = magic_lookup.get(symbol, {})
+        mapped = by_magic.get(magic)
+        if mapped:
+            timeframe = timeframe or mapped.get("timeframe", "")
+            regime = regime or mapped.get("regime", "")
+            if not strategy:
+                strategy = mapped.get("strategy", "")
+
+    pm_cfg = pm_configs.get(symbol)
+    if isinstance(pm_cfg, dict):
+        if not timeframe:
+            timeframe = normalize_timeframe(pm_cfg.get("timeframe"))
+
+        if timeframe and not regime:
+            regime_configs = pm_cfg.get("regime_configs", {})
+            if isinstance(regime_configs, dict):
+                tf_cfg = regime_configs.get(timeframe, {})
+                if isinstance(tf_cfg, dict) and len(tf_cfg) == 1:
+                    regime = normalize_regime(next(iter(tf_cfg.keys())))
+
+        if not strategy:
+            strategy = _strategy_from_pm_config(pm_cfg, timeframe, regime)
+
+    if timeframe:
+        trade["timeframe"] = timeframe
+    if regime:
+        trade["regime"] = regime
+    if strategy:
+        trade["strategy"] = strategy
+        trade["strategy_name"] = strategy
+
+
+def _path_signature(path: str) -> Tuple[str, int, int]:
+    stat = os.stat(path)
+    return (path, int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _trade_file_signature(pm_root: str, max_files: int) -> Tuple[Tuple[str, int, int], ...]:
+    trades_dir = os.path.join(pm_root, "pm_outputs")
+    if not os.path.isdir(trades_dir):
+        return tuple()
+
+    trade_files: List[Tuple[str, float]] = []
+    for filename in os.listdir(trades_dir):
+        if filename.startswith("trades_") and filename.endswith(".json"):
+            filepath = os.path.join(trades_dir, filename)
+            if os.path.isfile(filepath):
+                try:
+                    trade_files.append((filepath, os.path.getmtime(filepath)))
+                except OSError:
+                    continue
+
+    trade_files.sort(key=lambda item: item[1], reverse=True)
+    selected = [path for path, _ in trade_files[:max_files]]
+
+    signature: List[Tuple[str, int, int]] = []
+    for path in selected:
+        try:
+            signature.append(_path_signature(path))
+        except OSError:
+            continue
+    return tuple(signature)
+
+
+def _pm_config_signature(pm_root: str) -> Tuple[str, int, int]:
+    path = os.path.join(pm_root, "pm_configs.json")
+    if not os.path.isfile(path):
+        return (path, 0, 0)
+    try:
+        return _path_signature(path)
+    except OSError:
+        return (path, 0, 0)
+
+
+def _trade_pnl_value(trade: Dict[str, Any]) -> float:
+    for key in ("pnl", "profit", "net_profit", "realized_pnl"):
+        value = trade.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _is_realized_trade(trade: Dict[str, Any]) -> bool:
+    if not isinstance(trade, dict):
+        return False
+
+    explicit = trade.get("realized")
+    if explicit is True:
+        return True
+    if explicit is False:
+        return False
+
+    explicit_flag = trade.get("is_realized")
+    if explicit_flag is True:
+        return True
+    if explicit_flag is False:
+        return False
+
+    if trade.get("exit_price") is not None or trade.get("exit_timestamp") is not None or trade.get("close_reason"):
+        return True
+
+    for key in ("pnl", "profit", "net_profit", "realized_pnl", "pnl_pips"):
+        value = trade.get(key)
+        if value is None:
+            continue
+        try:
+            if abs(float(value)) > 1e-12:
+                return True
+        except (TypeError, ValueError):
+            continue
+
+    status = str(trade.get("status") or trade.get("state") or "").strip().upper()
+    action = str(trade.get("action") or trade.get("reason") or "").strip().upper()
+    if status in _OPEN_STATUSES:
+        return False
+    if status in _REALIZED_STATUSES:
+        return True
+    if action in _REALIZED_STATUSES:
+        return True
+
+    return False
+
+
+def _realized_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [trade for trade in trades if _is_realized_trade(trade)]
 
 
 def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any]]:
@@ -27,37 +291,42 @@ def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any
     if not os.path.isdir(trades_dir):
         return []
 
+    trade_signature = _trade_file_signature(pm_root, max_files)
+    config_signature = _pm_config_signature(pm_root)
+    cache_key = (pm_root, max_files, trade_signature, config_signature)
+
+    cached = _TRADE_HISTORY_CACHE.get(cache_key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+
     all_trades: List[Dict[str, Any]] = []
-    trade_files = []
-
-    for filename in os.listdir(trades_dir):
-        if filename.startswith("trades_") and filename.endswith(".json"):
-            filepath = os.path.join(trades_dir, filename)
-            if os.path.isfile(filepath):
-                trade_files.append((filepath, os.path.getmtime(filepath)))
-
-    trade_files.sort(key=lambda x: x[1], reverse=True)
-    trade_files = trade_files[:max_files]
-
-    for filepath, _ in trade_files:
+    for filepath, _, _ in trade_signature:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, list):
-                    all_trades.extend(data)
+            if isinstance(data, list):
+                all_trades.extend(data)
         except Exception:
             continue
 
+    pm_configs = load_pm_configs(pm_root)
+    magic_lookup = _build_magic_lookup(pm_configs)
+
     for trade in all_trades:
+        if not isinstance(trade, dict):
+            continue
+        _enrich_trade_metadata(trade, pm_configs, magic_lookup)
         if "symbol" in trade:
             trade["symbol"] = normalize_symbol(trade["symbol"])
+        trade["realized"] = _is_realized_trade(trade)
+        trade["pnl"] = _trade_pnl_value(trade) if trade["realized"] else 0.0
         if "timestamp" in trade:
             ts = parse_timestamp(trade["timestamp"])
             if ts:
                 trade["_parsed_timestamp"] = ts
 
     all_trades.sort(key=lambda t: t.get("_parsed_timestamp") or datetime.min, reverse=True)
-
+    _TRADE_HISTORY_CACHE[cache_key] = copy.deepcopy(all_trades)
     return all_trades
 
 
@@ -69,10 +338,11 @@ def compute_equity_curve(trades: List[Dict[str, Any]], initial_capital: float = 
     if not trades:
         return []
 
-    sorted_trades = sorted(
-        [t for t in trades if t.get("_parsed_timestamp")],
-        key=lambda t: t["_parsed_timestamp"]
-    )
+    realized_trades = _realized_trades(trades)
+    sorted_trades = sorted([t for t in realized_trades if t.get("_parsed_timestamp")], key=lambda t: t["_parsed_timestamp"])
+
+    if not sorted_trades:
+        return []
 
     equity = initial_capital
     cumulative_pnl = 0.0
@@ -86,7 +356,7 @@ def compute_equity_curve(trades: List[Dict[str, Any]], initial_capital: float = 
     })
 
     for trade in sorted_trades:
-        pnl = trade.get("pnl", 0.0) or trade.get("profit", 0.0) or 0.0
+        pnl = _trade_pnl_value(trade)
         equity += pnl
         cumulative_pnl += pnl
 
@@ -130,9 +400,70 @@ def compute_drawdown_curve(equity_curve: List[Dict[str, Any]]) -> List[Dict[str,
     return drawdown_curve
 
 
+# ---------------------------------------------------------------------------
+# Extended risk metrics (Package E7)
+# ---------------------------------------------------------------------------
+
+def _compute_drawdown_duration(equity_curve: List[float]) -> int:
+    """Max consecutive trades spent in drawdown (equity below prior peak)."""
+    if len(equity_curve) < 2:
+        return 0
+    peak = equity_curve[0]
+    current_dd_len = 0
+    max_dd_len = 0
+    for eq in equity_curve[1:]:
+        if eq >= peak:
+            peak = eq
+            current_dd_len = 0
+        else:
+            current_dd_len += 1
+            max_dd_len = max(max_dd_len, current_dd_len)
+    return max_dd_len
+
+
+def _compute_recovery_time(equity_curve: List[float]) -> int:
+    """Trades taken to recover from the maximum drawdown trough back to peak."""
+    if len(equity_curve) < 2:
+        return 0
+    peak = equity_curve[0]
+    max_dd = 0.0
+    trough_idx = 0
+    for idx, eq in enumerate(equity_curve):
+        if eq > peak:
+            peak = eq
+        dd = peak - eq
+        if dd > max_dd:
+            max_dd = dd
+            trough_idx = idx
+    # Count trades from trough until equity recovers to or exceeds trough-era peak
+    recovery_peak = max(equity_curve[:trough_idx + 1]) if trough_idx > 0 else equity_curve[0]
+    for i in range(trough_idx, len(equity_curve)):
+        if equity_curve[i] >= recovery_peak:
+            return i - trough_idx
+    # Not yet recovered
+    return len(equity_curve) - 1 - trough_idx
+
+
+def _compute_ulcer_index(equity_curve: List[float]) -> float:
+    """Ulcer Index = sqrt(mean(drawdown_pct^2)).  Better risk metric than StdDev."""
+    if len(equity_curve) < 2:
+        return 0.0
+    peak = equity_curve[0]
+    dd_sq_sum = 0.0
+    count = 0
+    for eq in equity_curve[1:]:
+        if eq > peak:
+            peak = eq
+        dd_pct = ((peak - eq) / peak * 100.0) if peak > 0 else 0.0
+        dd_sq_sum += dd_pct ** 2
+        count += 1
+    return (dd_sq_sum / count) ** 0.5 if count > 0 else 0.0
+
+
 def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: float = 10000.0) -> Dict[str, Any]:
     """Compute comprehensive performance metrics from trade history."""
-    if not trades:
+    realized_trades = _realized_trades(trades)
+    if not realized_trades:
         return {
             "total_trades": 0,
             "winning_trades": 0,
@@ -145,18 +476,31 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
             "max_drawdown_pct": 0.0,
             "max_drawdown_abs": 0.0,
             "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "calmar_ratio": 0.0,
+            "recovery_factor": 0.0,
+            "expectancy": 0.0,
+            "max_consecutive_wins": 0,
+            "max_consecutive_losses": 0,
+            "long_profit_factor": 0.0,
+            "short_profit_factor": 0.0,
             "total_return_pct": 0.0,
             "avg_trade_pnl": 0.0,
             "best_trade": 0.0,
-            "worst_trade": 0.0
+            "worst_trade": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "drawdown_duration": 0,
+            "recovery_time": 0,
+            "ulcer_index": 0.0,
         }
 
     pnls = []
     wins = []
     losses = []
 
-    for trade in trades:
-        pnl = trade.get("pnl", 0.0) or trade.get("profit", 0.0) or 0.0
+    for trade in realized_trades:
+        pnl = _trade_pnl_value(trade)
         pnls.append(pnl)
 
         if pnl > 0:
@@ -164,7 +508,7 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
         elif pnl < 0:
             losses.append(pnl)
 
-    total_trades = len(trades)
+    total_trades = len(realized_trades)
     winning_trades = len(wins)
     losing_trades = len(losses)
     win_rate = (winning_trades / total_trades * 100.0) if total_trades > 0 else 0.0
@@ -177,7 +521,7 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
     gross_loss = abs(sum(losses)) if losses else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
 
-    equity_curve = compute_equity_curve(trades, initial_capital)
+    equity_curve = compute_equity_curve(realized_trades, initial_capital)
     drawdown_curve = compute_drawdown_curve(equity_curve)
 
     max_dd_pct = max((p["drawdown_pct"] for p in drawdown_curve), default=0.0)
@@ -235,12 +579,26 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
             cur_losses = 0
 
     # Long/Short profit factor
-    long_wins = sum(t.get("pnl", 0.0) or 0.0 for t in trades if (t.get("direction", "").upper() == "LONG" or t.get("direction", "").lower() == "buy") and (t.get("pnl", 0.0) or 0.0) > 0)
-    long_losses = abs(sum(t.get("pnl", 0.0) or 0.0 for t in trades if (t.get("direction", "").upper() == "LONG" or t.get("direction", "").lower() == "buy") and (t.get("pnl", 0.0) or 0.0) < 0))
-    short_wins = sum(t.get("pnl", 0.0) or 0.0 for t in trades if (t.get("direction", "").upper() == "SHORT" or t.get("direction", "").lower() == "sell") and (t.get("pnl", 0.0) or 0.0) > 0)
-    short_losses = abs(sum(t.get("pnl", 0.0) or 0.0 for t in trades if (t.get("direction", "").upper() == "SHORT" or t.get("direction", "").lower() == "sell") and (t.get("pnl", 0.0) or 0.0) < 0))
+    def _is_long(t):
+        d = (t.get("direction") or "").upper()
+        return d in ("LONG", "BUY", "1")
+
+    def _is_short(t):
+        d = (t.get("direction") or "").upper()
+        return d in ("SHORT", "SELL", "-1")
+
+    def _get_pnl(t):
+        return _trade_pnl_value(t)
+
+    long_wins = sum(_get_pnl(t) for t in realized_trades if _is_long(t) and _get_pnl(t) > 0)
+    long_losses = abs(sum(_get_pnl(t) for t in realized_trades if _is_long(t) and _get_pnl(t) < 0))
+    short_wins = sum(_get_pnl(t) for t in realized_trades if _is_short(t) and _get_pnl(t) > 0)
+    short_losses = abs(sum(_get_pnl(t) for t in realized_trades if _is_short(t) and _get_pnl(t) < 0))
     long_pf = (long_wins / long_losses) if long_losses > 0 else 0.0
     short_pf = (short_wins / short_losses) if short_losses > 0 else 0.0
+
+    # Extract equity as plain floats for extended risk metrics
+    _equity_floats = [p["equity"] for p in equity_curve] if equity_curve else [initial_capital]
 
     return {
         "total_trades": total_trades,
@@ -267,37 +625,48 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
         "best_trade": round(max(pnls, default=0.0), 2),
         "worst_trade": round(min(pnls, default=0.0), 2),
         "gross_profit": round(gross_profit, 2),
-        "gross_loss": round(gross_loss, 2)
+        "gross_loss": round(gross_loss, 2),
+        # --- Extended risk metrics (Package E7) ---
+        "drawdown_duration": _compute_drawdown_duration(_equity_floats),
+        "recovery_time": _compute_recovery_time(_equity_floats),
+        "ulcer_index": round(_compute_ulcer_index(_equity_floats), 4),
     }
 
 
-def compute_breakdown_by_field(trades: List[Dict[str, Any]], field: str) -> Dict[str, Dict[str, Any]]:
+def compute_breakdown_by_field(
+    trades: List[Dict[str, Any]],
+    field: str,
+    initial_capital: float = 10000.0,
+) -> Dict[str, Dict[str, Any]]:
     """
     Compute performance breakdown by a specific field (symbol, strategy, timeframe, regime).
     Returns dict mapping field_value -> performance metrics.
     """
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    for trade in trades:
+    for trade in _realized_trades(trades):
         value = trade.get(field, "N/A")
         if value:
             grouped[str(value)].append(trade)
 
     breakdown = {}
     for value, group_trades in grouped.items():
-        breakdown[value] = compute_performance_metrics(group_trades, initial_capital=10000.0)
+        breakdown[value] = compute_performance_metrics(group_trades, initial_capital=initial_capital)
 
     return breakdown
 
 
-def compute_monthly_performance(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def compute_monthly_performance(
+    trades: List[Dict[str, Any]],
+    initial_capital: float = 10000.0,
+) -> Dict[str, Dict[str, Any]]:
     """
     Compute monthly performance breakdown.
     Returns dict mapping "YYYY-MM" -> performance metrics.
     """
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    for trade in trades:
+    for trade in _realized_trades(trades):
         ts = trade.get("_parsed_timestamp")
         if ts:
             month_key = ts.strftime("%Y-%m")
@@ -305,7 +674,7 @@ def compute_monthly_performance(trades: List[Dict[str, Any]]) -> Dict[str, Dict[
 
     monthly = {}
     for month, group_trades in grouped.items():
-        monthly[month] = compute_performance_metrics(group_trades, initial_capital=10000.0)
+        monthly[month] = compute_performance_metrics(group_trades, initial_capital=initial_capital)
 
     return dict(sorted(monthly.items(), reverse=True))
 
@@ -320,11 +689,11 @@ def compute_daily_pnl(trades: List[Dict[str, Any]], days: int = 30) -> List[Dict
 
     daily: Dict[str, List[float]] = defaultdict(list)
 
-    for trade in trades:
+    for trade in _realized_trades(trades):
         ts = trade.get("_parsed_timestamp")
         if ts:
             date_key = ts.strftime("%Y-%m-%d")
-            pnl = trade.get("pnl", 0.0) or trade.get("profit", 0.0) or 0.0
+            pnl = _trade_pnl_value(trade)
             daily[date_key].append(pnl)
 
     result = []
@@ -348,11 +717,11 @@ def compute_hour_day_heatmap(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     heatmap: Dict[str, Dict[str, float]] = {d: {} for d in days}
 
-    for trade in trades:
+    for trade in _realized_trades(trades):
         ts = trade.get("_parsed_timestamp")
         if not ts:
             continue
-        pnl = trade.get("pnl", 0.0) or trade.get("profit", 0.0) or 0.0
+        pnl = _trade_pnl_value(trade)
         day_name = days[ts.weekday()]
         hour_str = str(ts.hour)
         heatmap[day_name][hour_str] = round(heatmap[day_name].get(hour_str, 0.0) + pnl, 2)
@@ -366,9 +735,9 @@ def compute_strategy_ranking(trades: List[Dict[str, Any]], top_n: int = 10) -> L
     Returns list of {strategy, total_pnl, trades, win_rate} sorted desc by P&L.
     """
     grouped: Dict[str, List[float]] = defaultdict(list)
-    for trade in trades:
-        strat = trade.get("strategy") or "Unknown"
-        pnl = trade.get("pnl", 0.0) or trade.get("profit", 0.0) or 0.0
+    for trade in _realized_trades(trades):
+        strat = trade.get("strategy") or trade.get("strategy_name") or "Unknown"
+        pnl = _trade_pnl_value(trade)
         grouped[strat].append(pnl)
 
     ranking = []
@@ -566,54 +935,61 @@ def reconstruct_trade_outcomes(trades: List[Dict[str, Any]],
     Returns:
         List of trades with reconstructed outcomes
     """
-    reconstructed = []
+    grouped: Dict[Tuple[str, str], List[Tuple[int, Dict[str, Any], datetime]]] = defaultdict(list)
+    for idx, trade in enumerate(trades[:max_trades]):
+        symbol = normalize_symbol(trade.get('symbol'))
+        timestamp = trade.get('_parsed_timestamp') or parse_timestamp(trade.get('timestamp'))
+        if not symbol or not timestamp:
+            continue
+        timeframe = normalize_timeframe(trade.get('timeframe')) or "M5"
+        grouped[(symbol, timeframe)].append((idx, trade, timestamp))
 
-    for trade in trades[:max_trades]:
+    reconstructed_by_index: Dict[int, Dict[str, Any]] = {}
+
+    for (symbol, timeframe), batch in grouped.items():
         try:
-            symbol = trade.get('symbol')
-            timeframe = trade.get('timeframe')
-            timestamp = trade.get('_parsed_timestamp')
-
-            if not timestamp:
-                timestamp = parse_timestamp(trade.get('timestamp'))
-
-            if not symbol or not timeframe or not timestamp:
-                continue
-
-            # Load historical data (30 days should be enough for most trades)
-            end_date = timestamp + timedelta(days=30)
-            historical_bars = data_loader_func(symbol, timeframe, timestamp, end_date)
-
-            if historical_bars is None or len(historical_bars) == 0:
-                logger.warning(f"No historical data for {symbol} {timeframe} at {timestamp}")
-                continue
-
-            # Reconstruct outcome
-            outcome = reconstruct_trade_outcome(trade, historical_bars)
-
-            # Merge outcome into trade
-            trade_with_outcome = dict(trade)
-            trade_with_outcome.update(outcome)
-
-            # Calculate pnl in dollars (simplified - assumes $10/pip for FX)
-            if outcome['pnl_pips'] != 0:
-                pip_value = 10.0  # Default assumption
-                trade_with_outcome['pnl'] = outcome['pnl_pips'] * pip_value
-            else:
-                trade_with_outcome['pnl'] = 0.0
-
-            reconstructed.append(trade_with_outcome)
-
-        except Exception as e:
-            logger.error(f"Failed to reconstruct trade: {e}")
+            start_date = min(item[2] for item in batch)
+            end_date = max(item[2] for item in batch) + timedelta(days=30)
+            historical_bars = data_loader_func(symbol, timeframe, start_date, end_date)
+        except Exception as exc:
+            logger.error("Failed to load historical data batch for %s %s: %s", symbol, timeframe, exc)
             continue
 
-    return reconstructed
+        if historical_bars is None or len(historical_bars) == 0:
+            logger.warning("No historical data for %s %s between %s and %s", symbol, timeframe, start_date, end_date)
+            continue
+
+        for idx, trade, _ in batch:
+            try:
+                outcome = reconstruct_trade_outcome(trade, historical_bars)
+                trade_with_outcome = dict(trade)
+                trade_with_outcome.update(outcome)
+
+                if outcome['pnl_pips'] != 0:
+                    volume = float(trade.get('volume', 0.0) or 1.0)
+                    trade_symbol = normalize_symbol(trade.get('symbol') or '')
+                    pip_value_per_lot = 10.0
+                    if trade_symbol in ('XAUUSD',):
+                        pip_value_per_lot = 1.0
+                    elif trade_symbol in ('BTCUSD', 'ETHUSD', 'XRPUSD', 'TONUSD', 'BTCETH'):
+                        pip_value_per_lot = 1.0
+                    elif trade_symbol in ('US30', 'US100', 'DE30', 'EU50', 'UK100', 'JP225'):
+                        pip_value_per_lot = 1.0
+                    trade_with_outcome['pnl'] = outcome['pnl_pips'] * pip_value_per_lot * volume
+                else:
+                    trade_with_outcome['pnl'] = 0.0
+
+                reconstructed_by_index[idx] = trade_with_outcome
+            except Exception as exc:
+                logger.error("Failed to reconstruct trade: %s", exc)
+
+    return [reconstructed_by_index[idx] for idx in sorted(reconstructed_by_index)]
 
 
 def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> Dict[str, Any]:
     """Build complete analytics payload for the frontend."""
     trades = load_trade_history(pm_root, max_files=100)
+    realized_trades = _realized_trades(trades)
 
     if not trades:
         return {
@@ -631,21 +1007,21 @@ def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> D
             "strategy_ranking": []
         }
 
-    equity_curve = compute_equity_curve(trades, initial_capital)
+    equity_curve = compute_equity_curve(realized_trades, initial_capital)
     drawdown_curve = compute_drawdown_curve(equity_curve)
-    metrics = compute_performance_metrics(trades, initial_capital)
+    metrics = compute_performance_metrics(realized_trades, initial_capital)
 
-    by_symbol = compute_breakdown_by_field(trades, "symbol")
-    by_timeframe = compute_breakdown_by_field(trades, "timeframe")
-    by_regime = compute_breakdown_by_field(trades, "regime")
+    by_symbol = compute_breakdown_by_field(realized_trades, "symbol", initial_capital=initial_capital)
+    by_timeframe = compute_breakdown_by_field(realized_trades, "timeframe", initial_capital=initial_capital)
+    by_regime = compute_breakdown_by_field(realized_trades, "regime", initial_capital=initial_capital)
 
-    monthly = compute_monthly_performance(trades)
-    daily_pnl = compute_daily_pnl(trades, days=30)
-    heatmap = compute_hour_day_heatmap(trades)
-    strategy_ranking = compute_strategy_ranking(trades, top_n=10)
+    monthly = compute_monthly_performance(realized_trades, initial_capital=initial_capital)
+    daily_pnl = compute_daily_pnl(realized_trades, days=30)
+    heatmap = compute_hour_day_heatmap(realized_trades)
+    strategy_ranking = compute_strategy_ranking(realized_trades, top_n=10)
 
     recent_trades = []
-    for trade in trades[:50]:
+    for trade in realized_trades[:50]:
         recent_trades.append({
             "timestamp": trade.get("timestamp"),
             "symbol": trade.get("symbol"),
@@ -654,14 +1030,15 @@ def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> D
             "price": trade.get("price"),
             "sl": trade.get("sl"),
             "tp": trade.get("tp"),
-            "pnl": trade.get("pnl", 0.0) or trade.get("profit", 0.0) or 0.0,
+            "pnl": _trade_pnl_value(trade),
             "status": trade.get("status"),
             "timeframe": trade.get("timeframe"),
             "regime": trade.get("regime"),
-            "strategy": trade.get("strategy"),
+            "strategy": trade.get("strategy") or trade.get("strategy_name"),
             "close_reason": trade.get("close_reason"),
             "exit_price": trade.get("exit_price"),
-            "pnl_pips": trade.get("pnl_pips")
+            "pnl_pips": trade.get("pnl_pips"),
+            "realized": True,
         })
 
     return {
@@ -676,6 +1053,7 @@ def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> D
         "daily_pnl": daily_pnl,
         "recent_trades": recent_trades,
         "total_trades_loaded": len(trades),
+        "realized_trades_loaded": len(realized_trades),
         "heatmap": heatmap,
         "strategy_ranking": strategy_ranking
     }

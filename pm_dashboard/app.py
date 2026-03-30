@@ -22,6 +22,7 @@ from .analytics import (
 )
 
 logger = logging.getLogger(__name__)
+BASE_DIR = os.path.dirname(__file__)
 
 # Try to import data jobs (optional dependency)
 try:
@@ -39,46 +40,124 @@ except ImportError:
     MT5Connector = None
 
 
-def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flask:
+def resolve_pm_root(pm_root_value: Optional[str], base_dir: str) -> str:
+    """
+    Resolve dashboard pm_root to a valid directory.
+
+    Fallback order:
+    1) Valid configured/updated path (absolute or project-relative)
+    2) Project root (parent of pm_dashboard package)
+    """
+    project_root = os.path.abspath(os.path.join(base_dir, os.pardir))
+    raw = str(pm_root_value or "").strip()
+
+    if raw:
+        candidate = raw
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(project_root, candidate)
+        candidate = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.isdir(candidate):
+            return candidate
+        logger.warning("Invalid dashboard pm_root '%s'; falling back to '%s'", raw, project_root)
+    return project_root
+
+
+def _stop_scheduler_if_running(app: Flask) -> None:
+    scheduler = app.config.get("data_scheduler")
+    if scheduler and hasattr(scheduler, "stop"):
+        try:
+            scheduler.stop()
+        except Exception as exc:
+            logger.warning("Failed to stop dashboard data scheduler: %s", exc)
+
+
+def _setup_runtime_services(
+    app: Flask,
+    config: Dict[str, Any],
+    base_dir: str,
+    start_background_workers: bool,
+) -> None:
+    _stop_scheduler_if_running(app)
+
+    mt5_connector = None
+    data_downloader = None
+    data_scheduler = None
+
+    if JOBS_AVAILABLE and start_background_workers:
+        scheduler_enabled = bool(config.get("enable_data_maintenance_scheduler", True))
+        scheduler_time = str(config.get("data_maintenance_time", "00:00") or "00:00")
+        pm_root = config.get("pm_root") or resolve_pm_root(config.get("pm_root"), base_dir)
+
+        if MT5_AVAILABLE:
+            try:
+                mt5_connector = MT5Connector()
+                if mt5_connector.connect():
+                    logger.info("MT5 connector initialized for root data maintenance")
+                else:
+                    logger.warning("MT5 initial connect failed; local-data simulation remains available")
+            except Exception as exc:
+                logger.error("Failed to initialize MT5 connector: %s", exc)
+                mt5_connector = None
+
+        try:
+            data_downloader, data_scheduler = initialize_data_jobs(
+                pm_root,
+                mt5_connector=mt5_connector,
+                enable_scheduler=scheduler_enabled and start_background_workers,
+                run_time=scheduler_time,
+            )
+            logger.info(
+                "Dashboard data jobs initialized (scheduler=%s @ %s)",
+                "enabled" if scheduler_enabled and start_background_workers else "disabled",
+                scheduler_time,
+            )
+        except Exception as exc:
+            logger.error("Failed to initialize data jobs: %s", exc)
+
+    app.config["mt5_connector"] = mt5_connector
+    app.config["data_downloader"] = data_downloader
+    app.config["data_scheduler"] = data_scheduler
+
+
+def create_app(
+    config_path: str,
+    pm_root_override: Optional[str] = None,
+    start_background_workers: bool = True,
+) -> Flask:
+    base_dir = os.path.dirname(__file__)
     config = load_dashboard_config(config_path)
     if pm_root_override:
         config["pm_root"] = pm_root_override
 
-    pm_root = config.get("pm_root") or ""
+    pm_root = resolve_pm_root(config.get("pm_root"), base_dir)
+    config["pm_root"] = pm_root
     instrument_specs = load_instrument_specs(pm_root)
     state = DashboardState(instrument_specs)
     watcher = DashboardWatcher(pm_root, config, state)
-    watcher.start()
+    try:
+        # Prime snapshot synchronously so the dashboard is populated at first load.
+        watcher.poll_once()
+    except Exception as exc:
+        logger.warning("Initial dashboard poll failed: %s", exc)
+    if start_background_workers:
+        watcher.start()
 
     app = Flask(__name__, static_folder="static", template_folder="templates")
     app.config["dashboard_state"] = state
     app.config["dashboard_watcher"] = watcher
     app.config["dashboard_config"] = config
     app.config["dashboard_config_path"] = config_path
+    app.config["start_background_workers"] = start_background_workers
 
-    # Initialize MT5 connector and data jobs (optional)
-    mt5_connector = None
-    data_downloader = None
-    data_scheduler = None
-
-    if MT5_AVAILABLE and JOBS_AVAILABLE:
-        try:
-            mt5_connector = MT5Connector()
-            if mt5_connector.connect():
-                logger.info("MT5 connector initialized for data downloads")
-                data_downloader, data_scheduler = initialize_data_jobs(
-                    pm_root,
-                    mt5_connector,
-                    enable_scheduler=False  # Manual control for now
-                )
-                app.config["data_downloader"] = data_downloader
-                app.config["data_scheduler"] = data_scheduler
-            else:
-                logger.warning("Failed to connect MT5 - data download features disabled")
-        except Exception as e:
-            logger.error(f"Failed to initialize MT5/data jobs: {e}")
+    if JOBS_AVAILABLE and start_background_workers:
+        _setup_runtime_services(app, config, base_dir, start_background_workers)
     else:
-        logger.info("MT5 or jobs not available - simulation features will be limited")
+        app.config["mt5_connector"] = None
+        app.config["data_downloader"] = None
+        app.config["data_scheduler"] = None
+
+    if not JOBS_AVAILABLE:
+        logger.info("Dashboard jobs module unavailable - simulation features will be limited")
 
     @app.route("/")
     def index() -> str:
@@ -112,11 +191,24 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
         if request.method == "GET":
             return jsonify(serialize_config(current_config))
 
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if payload is None and request.data:
+            return jsonify({"success": False, "error": "Invalid JSON payload"}), 400
+        payload = payload or {}
         updated = apply_config_updates(current_config, payload)
+        updated["pm_root"] = resolve_pm_root(updated.get("pm_root"), base_dir)
+        try:
+            save_dashboard_config(config_path, updated)
+        except Exception as exc:
+            logger.error("Failed to persist dashboard config: %s", exc)
+            return jsonify({"success": False, "error": "Failed to persist dashboard config"}), 500
+
         app.config["dashboard_config"] = updated
         app.config["dashboard_watcher"].update_config(updated)
-        save_dashboard_config(config_path, updated)
+        runtime_keys = ("pm_root", "enable_data_maintenance_scheduler", "data_maintenance_time")
+        runtime_changed = any(updated.get(key) != current_config.get(key) for key in runtime_keys)
+        if JOBS_AVAILABLE and app.config.get("start_background_workers", True) and runtime_changed:
+            _setup_runtime_services(app, updated, base_dir, True)
         return jsonify(serialize_config(updated))
 
     @app.route("/api/strategies", methods=["GET"])
@@ -128,15 +220,23 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
 
     @app.route("/api/analytics", methods=["GET"])
     def api_analytics() -> Any:
-        pm_root = config.get("pm_root") or ""
-        initial_capital = float(request.args.get("initial_capital", 10000.0))
+        current_config = app.config["dashboard_config"]
+        pm_root = current_config.get("pm_root") or ""
+        try:
+            initial_capital = float(request.args.get("initial_capital", 10000.0))
+        except (ValueError, TypeError):
+            initial_capital = 10000.0
         payload = build_analytics_payload(pm_root, initial_capital=initial_capital)
         return jsonify(payload)
 
     @app.route("/api/trades", methods=["GET"])
     def api_trades() -> Any:
-        pm_root = config.get("pm_root") or ""
-        limit = int(request.args.get("limit", 200))
+        current_config = app.config["dashboard_config"]
+        pm_root = current_config.get("pm_root") or ""
+        try:
+            limit = int(request.args.get("limit", 200))
+        except (ValueError, TypeError):
+            limit = 200
         trades = load_trade_history(pm_root, max_files=100)
 
         filtered_trades = []
@@ -153,8 +253,9 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
                 "status": trade.get("status"),
                 "timeframe": trade.get("timeframe"),
                 "regime": trade.get("regime"),
-                "strategy": trade.get("strategy"),
-                "magic": trade.get("magic")
+                "strategy": trade.get("strategy") or trade.get("strategy_name"),
+                "magic": trade.get("magic"),
+                "realized": bool(trade.get("realized")),
             })
 
         return jsonify({"trades": filtered_trades, "total": len(trades)})
@@ -171,20 +272,46 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
             - return_basis: "dollar", "pip", or "trade" (default: "dollar")
             - max_trades: Max trades to simulate (default: 1000)
         """
-        pm_root = config.get("pm_root") or ""
+        current_config = app.config["dashboard_config"]
+        pm_root = current_config.get("pm_root") or ""
         data_downloader = app.config.get("data_downloader")
 
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if payload is None and request.data:
+            return jsonify({
+                "success": False,
+                "error": "Invalid JSON payload",
+                "trades": [],
+                "metrics": {},
+                "equity_curve": [],
+                "drawdown_curve": [],
+            }), 400
+        payload = payload or {}
 
-        initial_capital = float(payload.get("initial_capital", 10000.0))
+        try:
+            initial_capital = float(payload.get("initial_capital", 10000.0))
+        except (TypeError, ValueError):
+            initial_capital = 10000.0
         start_date_str = payload.get("start_date")
         end_date_str = payload.get("end_date")
-        return_basis = payload.get("return_basis", "dollar")
-        max_trades = int(payload.get("max_trades", 1000))
+        return_basis = str(payload.get("return_basis", "dollar") or "dollar").strip().lower()
+        try:
+            max_trades = max(1, int(payload.get("max_trades", 1000)))
+        except (TypeError, ValueError):
+            max_trades = 1000
 
         # Parse dates
         start_date = parse_timestamp(start_date_str) if start_date_str else None
-        end_date = parse_timestamp(end_date_str) if end_date_str else datetime.now()
+        end_date = parse_timestamp(end_date_str) if end_date_str else None
+        if start_date and end_date and start_date > end_date:
+            return jsonify({
+                "success": False,
+                "error": "start_date must be earlier than end_date",
+                "trades": [],
+                "metrics": {},
+                "equity_curve": [],
+                "drawdown_curve": [],
+            }), 400
 
         # Load trades
         all_trades = load_trade_history(pm_root, max_files=100)
@@ -200,17 +327,20 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
             })
 
         # Filter by date range
-        if start_date:
-            filtered_trades = [
-                t for t in all_trades
-                if t.get("_parsed_timestamp") and start_date <= t["_parsed_timestamp"] <= end_date
-            ]
-        else:
-            filtered_trades = all_trades
+        filtered_trades = []
+        for trade in all_trades:
+            ts = trade.get("_parsed_timestamp")
+            if not ts:
+                continue
+            if start_date and ts < start_date:
+                continue
+            if end_date and ts > end_date:
+                continue
+            filtered_trades.append(trade)
 
-        # Check if data downloader is available
+        # Check if historical-data loader is available
         if not data_downloader:
-            logger.warning("Data downloader not available - returning existing trade data")
+            logger.warning("Local historical-data loader unavailable - returning existing trade data")
             # Use existing PnL data if available
             metrics = compute_performance_metrics(filtered_trades[:max_trades], initial_capital)
             equity_curve = compute_equity_curve(filtered_trades[:max_trades], initial_capital)
@@ -219,7 +349,7 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
             return jsonify({
                 "success": True,
                 "simulated": False,
-                "message": "Using existing trade data (MT5 not available for simulation)",
+                "message": "Using existing trade data (historical-data loader unavailable)",
                 "trades": filtered_trades[:50],  # Return first 50 for display
                 "metrics": metrics,
                 "equity_curve": equity_curve,
@@ -279,27 +409,34 @@ def create_app(config_path: str, pm_root_override: Optional[str] = None) -> Flas
 
     @app.route("/api/download_historical_data", methods=["POST"])
     def api_download_historical_data() -> Any:
-        """Trigger manual historical data download."""
+        """Trigger manual root-data M5 refresh."""
+        data_downloader = app.config.get("data_downloader")
         data_scheduler = app.config.get("data_scheduler")
 
-        if not data_scheduler:
+        if not data_downloader:
             return jsonify({
                 "success": False,
-                "error": "Data scheduler not available (MT5 not connected)"
+                "error": "Data maintenance service not available"
+            })
+        if not data_downloader.can_refresh_from_mt5():
+            return jsonify({
+                "success": False,
+                "error": "MT5 is not connected; cannot refresh root M5 data"
             })
 
         try:
-            # Run download in background
+            # Run maintenance in background
             import threading
-            thread = threading.Thread(target=data_scheduler.run_now, daemon=True)
+            run_target = data_scheduler.run_now if data_scheduler else data_downloader.refresh_all_m5_data
+            thread = threading.Thread(target=run_target, daemon=True)
             thread.start()
 
             return jsonify({
                 "success": True,
-                "message": "Historical data download started"
+                "message": "Root M5 data maintenance started"
             })
         except Exception as e:
-            logger.error(f"Failed to start data download: {e}")
+            logger.error(f"Failed to start data maintenance: {e}")
             return jsonify({
                 "success": False,
                 "error": str(e)
@@ -462,8 +599,7 @@ def main() -> None:
     parser.add_argument("--port", dest="port", type=int, default=8000, help="Bind port (default: 8000)")
     args = parser.parse_args()
 
-    base_dir = os.path.dirname(__file__)
-    config_path = args.config_path or os.path.join(base_dir, "dashboard_config.json")
+    config_path = args.config_path or os.path.join(BASE_DIR, "dashboard_config.json")
 
     app = create_app(config_path, pm_root_override=args.pm_root)
     app.run(host=args.host, port=args.port, debug=False)
