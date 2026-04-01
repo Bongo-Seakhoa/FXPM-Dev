@@ -48,7 +48,7 @@ class TradeTagEncoder:
     Comment encoding goals:
         - Must fit within MT5's practical comment length limits.
         - Must be machine-parseable and backwards compatible with the older "PM:" format.
-        - Must support extracting at least: symbol, timeframe, direction, (optional) tier and risk_pct.
+        - Must support extracting at least: symbol, timeframe, direction, and optional risk metadata.
 
     Formats
     --------
@@ -65,6 +65,15 @@ class TradeTagEncoder:
             scode        = short strategy code (base36 CRC32, 4-5 chars)
             dir          = 'L' or 'S'
             risk_tenths  = int(round(risk_pct * 10))
+
+    v3 (preferred, non-tiered):
+        "PM3:{symbol}:{timeframe}:{scode}:{dir}:{risk_tenths}"
+
+    v2/v3 short (backward compatibility):
+        "PM2:{symbol}:{timeframe}:{scode}"
+        "PM3:{symbol}:{timeframe}:{scode}"
+
+        Older live versions used these compact forms (no direction/tier/risk).
     """
 
     COMMENT_PREFIX_V1 = "PM:"
@@ -118,8 +127,25 @@ class TradeTagEncoder:
             risk_tenths = int(round(float(risk_pct) * 10.0))
             return f"{TradeTagEncoder.COMMENT_PREFIX_V3}{symbol}:{timeframe}:{scode}:{dir_short}:{risk_tenths}"
 
+        if risk_pct is not None:
+            scode = TradeTagEncoder._strategy_code(strategy_name, max_len=5)
+            risk_tenths = int(round(float(risk_pct) * 10.0))
+            return f"{TradeTagEncoder.COMMENT_PREFIX_V3}{symbol}:{timeframe}:{scode}:{dir_short}:{risk_tenths}"
+
         # Legacy v1
         return f"{TradeTagEncoder.COMMENT_PREFIX_V1}{symbol}:{timeframe}:{strategy_name}:{str(direction).upper()}"
+
+    @staticmethod
+    def _normalize_direction(direction_raw: Any) -> Optional[str]:
+        """Normalize compact direction tokens into LONG/SHORT."""
+        if direction_raw is None:
+            return None
+        d = str(direction_raw).strip().upper()
+        if d in {"L", "LONG", "BUY", "1"}:
+            return "LONG"
+        if d in {"S", "SHORT", "SELL", "-1"}:
+            return "SHORT"
+        return d or None
 
     @staticmethod
     def decode_comment(comment: str) -> Optional[Dict[str, Any]]:
@@ -168,11 +194,20 @@ class TradeTagEncoder:
             if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V1):
                 parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V1):].split(':')
                 if len(parts) >= 4:
+                    direction = TradeTagEncoder._normalize_direction(parts[3])
                     return {
                         'symbol': parts[0],
                         'timeframe': parts[1],
                         'strategy_name': parts[2],
-                        'direction': parts[3],
+                        'direction': direction or parts[3],
+                    }
+
+            # Very old shorthand comments carried strategy tag only (no timeframe).
+            if comment.startswith("PM_"):
+                strategy_tag = comment[3:].strip()
+                if strategy_tag:
+                    return {
+                        "strategy_tag": strategy_tag,
                     }
         except Exception:
             return None
@@ -213,7 +248,7 @@ class PositionConfig:
     
 
     risk_basis: str = "balance"  # "balance" or "equity"
-    max_risk_pct: float = 5.0  # hard safety cap (skip if exceeded)
+    max_risk_pct: float = 2.0  # hard safety cap (skip if exceeded)
     risk_tolerance_pct: float = 2.0  # allowed deviation vs target before logging/adjustment
     auto_widen_sl: bool = True  # widen SL only to satisfy broker min stop distance / constraints
 
@@ -375,6 +410,25 @@ class PositionCalculator:
             volume = risk_amount / (sl_pips * pip_value)
         else:
             volume = self.config.min_position_size
+
+        # If risk-based volume is below min_lot, the trade is not viable.
+        # Clamping up to min_lot could take materially more risk than intended.
+        if volume < spec.min_lot:
+            logger.warning(
+                f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot} "
+                f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
+            )
+            return PositionSizeResult(
+                volume=0.0,
+                risk_amount=risk_amount,
+                sl_pips=sl_pips,
+                pip_value=pip_value,
+                equity=equity,
+                details=(
+                    f"Equity: {equity:.2f}, Risk: {risk_amount:.2f}, "
+                    f"SL: {sl_pips:.1f} pips - volume below min_lot, skipped"
+                ),
+            )
         
         # If risk-based volume is below min_lot, the trade is not viable
         # (clamping up to min_lot would take far more risk than intended)

@@ -518,8 +518,12 @@ def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
     action_value = entry_action_value(entry)
 
     display_actions = {str(item).upper() for item in config.get("display_actions", [])}
-    if display_actions and action_value not in display_actions:
-        return False
+    display_prefixes = [str(item).upper() for item in config.get("display_action_prefixes", [])]
+    if display_actions or display_prefixes:
+        exact_match = action_value in display_actions
+        prefix_match = any(action_value.startswith(prefix) for prefix in display_prefixes if prefix)
+        if not (exact_match or prefix_match):
+            return False
 
     required_fields = config.get("display_require_fields") or [
         "signal_direction",
@@ -540,7 +544,10 @@ def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
         return True
 
     allow_actions = {str(item).upper() for item in config.get("display_allow_if_actions", [])}
-    return action_value in allow_actions
+    allow_prefixes = [str(item).upper() for item in config.get("display_allow_if_action_prefixes", [])]
+    if action_value in allow_actions:
+        return True
+    return any(action_value.startswith(prefix) for prefix in allow_prefixes if prefix)
 
 
 _NOTIFY_LOCK = threading.Lock()

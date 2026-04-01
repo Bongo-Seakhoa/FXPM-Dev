@@ -6,6 +6,16 @@ Archived audit and planning documents live in `documentation_archive/`.
 
 ---
 
+## Documentation Notes
+
+- Primary run/setup guide: `SETUP_AND_RUN.md`
+- Dashboard guide: `pm_dashboard/README.md`
+- Margin protection policy: `README.md` (Risk Management -> Margin Protection)
+- Patch notes: `PATCH_NOTES.md`
+- Archived historical analysis notes: `docs/archive/`
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -91,6 +101,27 @@ The checked-in `config.json` is deployment-specific and currently reflects a low
 | Live execution quality | basic entry gating | broker checks plus spread-quality filtering |
 | Retrain workflow | ad hoc or rolling expiry only | calendar-anchored schedule in config |
 | Monitoring | logs only | logs plus dashboard and actionable feed |
+
+---
+
+## Repository Hygiene
+
+The repository now treats runtime artifacts as non-source outputs.
+
+- Ignored by default (`.gitignore`): caches, logs, generated trade outputs, and downloaded market data files.
+- Already tracked artifacts were removed from the git index with `git rm --cached` (local files remain on disk).
+
+If a clone still tracks runtime files, run:
+
+```bash
+git rm -r --cached -f --ignore-unmatch __pycache__ pm_dashboard/__pycache__ tests/__pycache__ logs pm_outputs data/.cache data/*.csv last_trade_log.json last_actionable_log.json
+```
+
+Optional local cleanup of ignored artifacts (destructive for ignored files only):
+
+```bash
+git clean -fdX
+```
 
 ---
 

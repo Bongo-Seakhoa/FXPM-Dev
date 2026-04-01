@@ -4,8 +4,8 @@ from pathlib import Path
 import shutil
 
 from pm_core import (
-    set_instrument_specs,
-    set_broker_specs_path,
+    InstrumentSpec,
+    _create_spec_from_broker_data,
     get_instrument_spec,
     InstrumentSpec,
     sync_instrument_spec_from_mt5,

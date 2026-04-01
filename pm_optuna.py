@@ -94,6 +94,21 @@ class OptunaConfig:
     # to the holdout split because the same validation set is later used for selection.
     # Default is False to avoid train/val leakage: tune on train, validate on val.
     use_validation_in_objective: bool = False
+
+    # Blended objective weights (train-first with bounded val influence)
+    objective_blend_enabled: bool = True
+    objective_train_weight: float = 0.80
+    objective_val_weight: float = 0.20
+
+    # Early rejection thresholds (configurable)
+    train_dd_multiplier: float = 1.25
+    val_dd_multiplier: float = 1.0
+    penalty_dd_rejection: float = -500.0
+    penalty_no_trades: float = -1000.0
+    # Progressive rejection: relax thresholds during early exploration
+    progressive_rejection: bool = True
+    progressive_warmup_frac: float = 0.20
+    progressive_warmup_multiplier: float = 1.5
     
     # Early rejection thresholds (configurable)
     train_dd_multiplier: float = 1.25       # Training DD allowed = max_dd * this
@@ -117,6 +132,9 @@ class OptunaConfig:
             seed=int(getattr(config, 'optimization_seed', 0) or 0),
             multivariate=True,
             use_validation_in_objective=bool(getattr(config, 'optuna_use_val_in_objective', False)),
+            objective_blend_enabled=bool(getattr(config, 'optuna_objective_blend_enabled', True)),
+            objective_train_weight=float(getattr(config, 'optuna_objective_train_weight', 0.80)),
+            objective_val_weight=float(getattr(config, 'optuna_objective_val_weight', 0.20)),
         )
 
 

@@ -63,6 +63,35 @@ class ResampleCacheTests(unittest.TestCase):
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
+    def test_cached_frames_are_returned_as_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "EURUSD_M5.csv")
+            start = datetime(2024, 1, 1, 0, 0, 0)
+            self._write_csv(csv_path, start, 180)
+
+            loader = DataLoader(tmp)
+            original_h1_min = DataLoader.MIN_BARS.get("H1", 5000)
+            original_m5_min = DataLoader.MIN_BARS.get("M5", 50000)
+            DataLoader.MIN_BARS["H1"] = 1
+            DataLoader.MIN_BARS["M5"] = 1
+            try:
+                m5_a = loader.get_data("EURUSD", "M5")
+                h1_a = loader.get_data("EURUSD", "H1")
+                self.assertIsNotNone(m5_a)
+                self.assertIsNotNone(h1_a)
+
+                m5_a["TMP_COL"] = 1
+                h1_a["TMP_COL"] = 1
+
+                m5_b = loader.get_data("EURUSD", "M5")
+                h1_b = loader.get_data("EURUSD", "H1")
+            finally:
+                DataLoader.MIN_BARS["H1"] = original_h1_min
+                DataLoader.MIN_BARS["M5"] = original_m5_min
+
+            self.assertNotIn("TMP_COL", m5_b.columns)
+            self.assertNotIn("TMP_COL", h1_b.columns)
+
 
 if __name__ == "__main__":
     unittest.main()

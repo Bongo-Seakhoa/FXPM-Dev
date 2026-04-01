@@ -62,17 +62,17 @@
   },
   "USDCHF": {
     "symbol": "USDCHF",
-    "decision_key": "4b4ce6c0a3cc531a",
+    "decision_key": "3192ea5b694f3cea",
     "decision_keys": [
-      "4b4ce6c0a3cc531a"
+      "3192ea5b694f3cea"
     ],
-    "bar_time": "2026-04-01 04:00:00",
+    "bar_time": "2026-04-01 08:00:00",
     "timeframe": "H4",
     "regime": "TREND",
     "strategy_name": "InsideBarBreakoutStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T10:02:22.740982",
+    "action_time": "2026-04-01T10:59:59.543184",
     "context": {}
   },
   "USDCAD": {
@@ -92,47 +92,32 @@
   },
   "AUDUSD": {
     "symbol": "AUDUSD",
-    "decision_key": "6f48ae3f2c553f7c",
+    "decision_key": "74dbbe1a3caa8b50",
     "decision_keys": [
-      "6f48ae3f2c553f7c"
+      "74dbbe1a3caa8b50"
     ],
-    "bar_time": "2026-04-01 04:00:00",
-    "timeframe": "H4",
-    "regime": "TREND",
-    "strategy_name": "CCIReversalStrategy",
+    "bar_time": "2026-04-01 11:00:00",
+    "timeframe": "H1",
+    "regime": "CHOP",
+    "strategy_name": "KeltnerFadeStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T10:32:48.085759",
+    "action_time": "2026-04-01T11:00:03.572275",
     "context": {}
   },
   "NZDUSD": {
     "symbol": "NZDUSD",
-    "decision_key": "39bee5d054e1fd0b",
+    "decision_key": "d843163cacb8df45",
     "decision_keys": [
-      "39bee5d054e1fd0b"
+      "d843163cacb8df45"
     ],
-    "bar_time": "2026-04-01 04:00:00",
+    "bar_time": "2026-04-01 08:00:00",
     "timeframe": "H4",
     "regime": "TREND",
     "strategy_name": "DonchianBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T07:00:53.492241",
-    "context": {}
-  },
-  "AUDNZD": {
-    "symbol": "AUDNZD",
-    "decision_key": "5427993024417cc3",
-    "decision_keys": [
-      "5427993024417cc3"
-    ],
-    "bar_time": "2026-04-01 04:00:00",
-    "timeframe": "H4",
-    "regime": "TREND",
-    "strategy_name": "EMAPullbackContinuationStrategy",
     "direction": 1,
-    "action": "BLOCKED_SPREAD_FILTER",
-    "action_time": "2026-04-01T07:00:55.438550",
+    "action": "EXECUTED",
+    "action_time": "2026-04-01T11:00:05.554532",
     "context": {
       "secondary_trade": false,
       "secondary_reason": "",
@@ -150,6 +135,21 @@
         "open_positions": []
       }
     }
+  },
+  "AUDNZD": {
+    "symbol": "AUDNZD",
+    "decision_key": "676e45d160d667d7",
+    "decision_keys": [
+      "676e45d160d667d7"
+    ],
+    "bar_time": "2026-04-01 08:00:00",
+    "timeframe": "H4",
+    "regime": "CHOP",
+    "strategy_name": "NarrowRangeBreakoutStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-04-01T11:00:07.457305",
+    "context": {}
   },
   "EURGBP": {
     "symbol": "EURGBP",
@@ -324,32 +324,32 @@
   },
   "XAGUSD": {
     "symbol": "XAGUSD",
-    "decision_key": "56d3214e004dd182",
+    "decision_key": "417d4f535218fc15",
     "decision_keys": [
-      "56d3214e004dd182"
+      "417d4f535218fc15"
     ],
-    "bar_time": "2026-04-01 11:00:00",
+    "bar_time": "2026-04-01 11:30:00",
     "timeframe": "M30",
     "regime": "TREND",
     "strategy_name": "IchimokuStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T10:31:28.040243",
+    "action_time": "2026-04-01T11:00:51.952551",
     "context": {}
   },
   "USDZAR": {
     "symbol": "USDZAR",
-    "decision_key": "a072a7c9415d94b0",
+    "decision_key": "bf90ca5e1b940954",
     "decision_keys": [
-      "a072a7c9415d94b0"
+      "bf90ca5e1b940954"
     ],
-    "bar_time": "2026-04-01 10:00:00",
+    "bar_time": "2026-04-01 11:00:00",
     "timeframe": "H1",
     "regime": "CHOP",
     "strategy_name": "RSIDivergenceStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T10:01:18.706833",
+    "action_time": "2026-04-01T11:00:47.855033",
     "context": {}
   },
   "TONUSD": {
@@ -416,17 +416,17 @@
   },
   "EURCAD": {
     "symbol": "EURCAD",
-    "decision_key": "878b869acbf91d4c",
+    "decision_key": "967e8dda6da01772",
     "decision_keys": [
-      "878b869acbf91d4c"
+      "967e8dda6da01772"
     ],
-    "bar_time": "2026-04-01 10:00:00",
+    "bar_time": "2026-04-01 11:00:00",
     "timeframe": "H1",
     "regime": "TREND",
     "strategy_name": "MACDDivergenceStrategy",
     "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T10:00:49.742403",
+    "action": "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
+    "action_time": "2026-04-01T11:00:23.761359",
     "context": {}
   },
   "EURNZD": {
@@ -493,17 +493,17 @@
   },
   "GBPCAD": {
     "symbol": "GBPCAD",
-    "decision_key": "2f3410dbf9d2274a",
+    "decision_key": "14e57d2173b30f8f",
     "decision_keys": [
-      "2f3410dbf9d2274a"
+      "14e57d2173b30f8f"
     ],
-    "bar_time": "2026-04-01 04:00:00",
+    "bar_time": "2026-04-01 08:00:00",
     "timeframe": "H4",
     "regime": "CHOP",
     "strategy_name": "DonchianBreakoutStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T07:01:15.630404",
+    "action_time": "2026-04-01T11:00:31.274941",
     "context": {}
   },
   "CADJPY": {
@@ -647,17 +647,17 @@
   },
   "US30": {
     "symbol": "US30",
-    "decision_key": "e13e129a067fa7ad",
+    "decision_key": "f75d680f05746c31",
     "decision_keys": [
-      "e13e129a067fa7ad"
+      "f75d680f05746c31"
     ],
-    "bar_time": "2026-04-01 10:00:00",
+    "bar_time": "2026-04-01 11:00:00",
     "timeframe": "H1",
     "regime": "TREND",
     "strategy_name": "InsideBarBreakoutStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-01T10:01:30.313737",
+    "action_time": "2026-04-01T11:00:53.618566",
     "context": {}
   },
   "XRPUSD": {

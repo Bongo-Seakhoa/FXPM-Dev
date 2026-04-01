@@ -520,16 +520,16 @@ class PipelineConfig:
     slippage_pips: float = 0.5
     
     # Optimization settings
-    max_param_combos: int = 50
-    min_trades: int = 20
+    max_param_combos: int = 150
+    min_trades: int = 25
     min_robustness: float = 0.20
     optimization_max_workers: int = 1  # 1 = sequential
     
     # Evaluation thresholds
     min_win_rate: float = 40.0
-    min_profit_factor: float = 1.2
+    min_profit_factor: float = 1.1
     min_sharpe: float = 0.5
-    max_drawdown: float = 30.0
+    max_drawdown: float = 18.0
     
 
 
@@ -539,21 +539,27 @@ class PipelineConfig:
     scoring_mode: str = "fx_backtester"
 
     # FX backtester-aligned optimization/validation thresholds
-    fx_opt_min_trades: int = 10          # used during param search (train only)
-    fx_val_min_trades: int = 5           # minimum validation trades required
-    fx_val_max_drawdown: float = 35.0    # maximum validation drawdown (%)
+    fx_opt_min_trades: int = 15          # used during param search (train only)
+    fx_val_min_trades: int = 15          # minimum validation trades required
+    fx_val_max_drawdown: float = 18.0    # maximum validation drawdown (%)
     fx_val_sharpe_override: float = 0.3  # validation Sharpe can override robustness threshold
     # Generalization controls (fx_backtester)
     fx_selection_top_k: int = 5          # validate only top-K strategy/timeframe candidates
     fx_opt_top_k: int = 5                # validate only top-K parameter combos
-    fx_gap_penalty_lambda: float = 0.50  # penalty strength for train->val score gaps
+    fx_gap_penalty_lambda: float = 0.70  # penalty strength for train->val score gaps
     fx_robustness_boost: float = 0.15    # robustness multiplier weight (0..0.5 recommended)
-    fx_min_robustness_ratio: float = 0.85  # minimum val_score/train_score ratio for validation
+    fx_min_robustness_ratio: float = 0.80  # minimum val_score/train_score ratio for validation
 
     # Optuna objective behavior
     # If True, Optuna's trial objective includes validation metrics (may overfit to holdout split).
     # Default False: tune on train-only, validate on val during selection.
     optuna_use_val_in_objective: bool = False
+    # Blended objective: train_weight * train_score + val_weight * val_score
+    # Active only when optuna_use_val_in_objective is False and val data exists.
+    # This provides bounded val influence without full val optimization.
+    optuna_objective_blend_enabled: bool = True
+    optuna_objective_train_weight: float = 0.80
+    optuna_objective_val_weight: float = 0.20
 
     # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
     # to be considered actionable in live trading. Signals below this are logged but
@@ -588,7 +594,7 @@ class PipelineConfig:
     # Regime-aware optimization settings
     use_regime_optimization: bool = True
     regime_min_train_trades: int = 25  # Minimum trades per regime bucket in training
-    regime_min_val_trades: int = 10    # Minimum trades per regime bucket in validation
+    regime_min_val_trades: int = 15    # Minimum trades per regime bucket in validation
     regime_freshness_decay: float = 0.85  # Freshness decay for stale timeframe signals
     regime_chop_no_trade: bool = False  # Hard no-trade when in CHOP with no winner
     regime_params_file: str = "regime_params.json"  # Path to tuned regime params
@@ -596,12 +602,12 @@ class PipelineConfig:
     # Hyperparameter tuning settings for regime optimization
     regime_enable_hyperparam_tuning: bool = True  # Enable hyperparameter tuning in regime optimization
     regime_hyperparam_top_k: int = 3  # Top K strategies to tune per regime (screening phase)
-    regime_hyperparam_max_combos: int = 30  # Max param combinations to test per strategy
+    regime_hyperparam_max_combos: int = 150  # Max param combinations to test per strategy
     
     # ===== REGIME WINNER PROFITABILITY GATES (FIX #1) =====
     # These thresholds ensure regime winners are actually profitable, not just "best loser"
-    regime_min_val_profit_factor: float = 1.2    # Minimum validation PF to be stored as winner
-    regime_min_val_return_pct: float = 0.0       # Minimum validation return % (0 = breakeven)
+    regime_min_val_profit_factor: float = 1.05   # Minimum validation PF to be stored as winner
+    regime_min_val_return_pct: float = 5.0       # Minimum validation return % floor for validated winners
     regime_allow_losing_winners: bool = False    # If True, allows PF < 1 (not recommended)
     regime_no_winner_marker: str = "NO_TRADE"    # Strategy name for "no valid winner" state
 
@@ -624,13 +630,23 @@ class PipelineConfig:
     # PositionConfig.max_risk_pct acts as the hard safety cap.
     min_trade_risk_pct: float = 0.1        # minimum non-zero risk for a placed trade
 
+    # ===== MARGIN PROTECTION (BLACK SWAN GUARD) =====
+    # Cycle-based margin protection layer (thresholds are config-driven).
+    # Uses MT5-native margin_level (equity/margin*100). No sleep/cooldown logic.
+    margin_entry_block_level: float = 100.0       # block new entries below this margin level %
+    margin_recovery_start_level: float = 80.0     # start forced closures below this %
+    margin_panic_level: float = 65.0              # aggressive forced closures below this %
+    margin_reopen_level: float = 100.0            # resume entries above this %
+    margin_recovery_closes_per_cycle: int = 1     # max forced closes per cycle in RECOVERY
+    margin_panic_closes_per_cycle: int = 3        # max forced closes per cycle in PANIC
+
     
     # ===== DUAL-TRADE D1 + LOWER-TF SETTINGS (FIX #2) =====
     # Allow up to 2 concurrent trades: one D1 + one lower-TF
     allow_d1_plus_lower_tf: bool = True          # Enable D1 + lower-TF concurrent trades
     d1_secondary_risk_multiplier: float = 1.0   # Risk for second trade when D1 is open
     max_combined_risk_pct: float = 3.0          # Max combined risk per symbol (D1 + lower)
-    secondary_trade_max_risk_pct: float = 1.0  # hard cap for the secondary (non-D1) trade
+    secondary_trade_max_risk_pct: float = 0.9  # hard cap for the secondary (non-D1) trade
     
     # Compatibility alias for older artifacts/metrics. Production validity now
     # comes from the fixed calendar schedule above.
@@ -661,6 +677,34 @@ class PipelineConfig:
         self.scoring_mode = str(self.scoring_mode).strip().lower()
         if self.scoring_mode not in {"pm_weighted", "fx_backtester"}:
             raise ValueError(f"Invalid scoring_mode: {self.scoring_mode}. Use 'pm_weighted' or 'fx_backtester'.")
+
+        # Clamp regime validation descent depth to a safe minimum.
+        try:
+            self.regime_validation_top_k = max(1, int(self.regime_validation_top_k))
+        except Exception:
+            self.regime_validation_top_k = 5
+
+        # Clamp return/DD hard gate threshold to a safe positive value.
+        try:
+            ratio = float(self.regime_min_val_return_dd_ratio)
+            self.regime_min_val_return_dd_ratio = ratio if math.isfinite(ratio) and ratio > 0 else 1.0
+        except Exception:
+            self.regime_min_val_return_dd_ratio = 1.0
+
+        # Normalize Optuna objective blend weights for robustness against config typos.
+        try:
+            tw = float(self.optuna_objective_train_weight)
+            vw = float(self.optuna_objective_val_weight)
+            total = tw + vw
+            if total > 0:
+                self.optuna_objective_train_weight = tw / total
+                self.optuna_objective_val_weight = vw / total
+            else:
+                self.optuna_objective_train_weight = 0.80
+                self.optuna_objective_val_weight = 0.20
+        except Exception:
+            self.optuna_objective_train_weight = 0.80
+            self.optuna_objective_val_weight = 0.20
         self.position_size_pct = self.risk_per_trade_pct
         self.production_retrain_mode = str(self.production_retrain_mode or "auto").strip().lower()
         if self.production_retrain_mode not in {"auto", "notify", "off"}:
@@ -1084,15 +1128,40 @@ INSTRUMENT_SPECS = {
     'USDMXN': InstrumentSpec('USDMXN', 4, 0.55, 30.0, 0.01, 100.0, 12.0, 20.0, -45.0),
     'USDPLN': InstrumentSpec('USDPLN', 4, 2.5, 25.0, 0.01, 100.0, 10.0, 3.0, -12.0),
     'USDNOK': InstrumentSpec('USDNOK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
+    'USDSEK': InstrumentSpec('USDSEK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
     'USDSGD': InstrumentSpec('USDSGD', 4, 7.5, 2.0, 0.01, 100.0, 8.0, 1.5, -6.0),
     'USDTRY': InstrumentSpec('USDTRY', 4, 0.035, 100.0, 0.01, 100.0, 20.0, 50.0, -150.0),
     'USDZAR': InstrumentSpec('USDZAR', 4, 0.55, 50.0, 0.01, 100.0, 15.0, 12.0, -35.0),
+    'EURZAR': InstrumentSpec('EURZAR', 4, 0.55, 70.0, 0.01, 100.0, 15.0, 10.0, -30.0),
+    'GBPZAR': InstrumentSpec('GBPZAR', 4, 0.55, 80.0, 0.01, 100.0, 15.0, 12.0, -35.0),
+    'USDCNH': InstrumentSpec('USDCNH', 4, 1.4, 20.0, 0.01, 100.0, 10.0, 2.0, -10.0),
+    'EURCNH': InstrumentSpec('EURCNH', 4, 1.4, 10.0, 0.01, 100.0, 10.0, 2.0, -10.0),
+    'EURPLN': InstrumentSpec('EURPLN', 4, 2.5, 25.0, 0.01, 100.0, 10.0, 3.0, -12.0),
+    'EURNOK': InstrumentSpec('EURNOK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
+    'EURSEK': InstrumentSpec('EURSEK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
+    'GBPNOK': InstrumentSpec('GBPNOK', 4, 0.95, 35.0, 0.01, 100.0, 10.0, 2.0, -12.0),
+    'GBPSEK': InstrumentSpec('GBPSEK', 4, 0.95, 35.0, 0.01, 100.0, 10.0, 2.0, -12.0),
+    'EURTRY': InstrumentSpec('EURTRY', 4, 0.035, 120.0, 0.01, 100.0, 20.0, 45.0, -130.0),
+    'Platinum': InstrumentSpec('Platinum', 2, 1.0, 8.0, 0.01, 100.0, 5.0, -5.0, -3.0),
+    'Palladium': InstrumentSpec('Palladium', 2, 1.0, 8.0, 0.01, 100.0, 5.0, -6.0, -4.0),
+    'EURMXN': InstrumentSpec('EURMXN', 4, 0.55, 140.0, 0.01, 100.0, 12.0, 20.0, -45.0),
+    'NOKJPY': InstrumentSpec('NOKJPY', 2, 9.0, 2.0, 0.01, 100.0, 8.0, -1.0, -2.0),
     
     # Commodities
     # XAUUSD: 1 lot = 100 troy oz, pip_size = 0.01, pip_value = $1.00
     'XAUUSD': InstrumentSpec('XAUUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
     # XAGUSD: 1 lot = 5,000 oz, pip_size = 0.001, pip_value = $5.00
     'XAGUSD': InstrumentSpec('XAGUSD', 3, 5.0, 2.0, 0.01, 100.0, 5.0, -3.0, -2.0),
+    # Metal crosses
+    'XAUEUR': InstrumentSpec('XAUEUR', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
+    'XAUGBP': InstrumentSpec('XAUGBP', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
+    'XAUAUD': InstrumentSpec('XAUAUD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
+    'XAGEUR': InstrumentSpec('XAGEUR', 3, 5.0, 2.0, 0.01, 100.0, 5.0, -3.0, -2.0),
+    'XRX': InstrumentSpec('XRX', 3, 1.0, 5.0, 0.01, 100.0, 5.0, 0.0, 0.0),
+    # Energy CFDs
+    'XTIUSD': InstrumentSpec('XTIUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, 0.0, 0.0),
+    'XBRUSD': InstrumentSpec('XBRUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, 0.0, 0.0),
+    'XNGUSD': InstrumentSpec('XNGUSD', 3, 1.0, 4.0, 0.01, 100.0, 5.0, 0.0, 0.0),
 
     # Additional FX Pairs (aligned with config)
     'AUDJPY': InstrumentSpec('AUDJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -4.0, 1.0),
@@ -1105,11 +1174,26 @@ INSTRUMENT_SPECS = {
     'GBPCHF': InstrumentSpec('GBPCHF', 4, 11.0, 2.5, 0.01, 100.0, 7.0, -5.0, 0.8),
     'CADJPY': InstrumentSpec('CADJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -2.0, 0.5),
     'NZDJPY': InstrumentSpec('NZDJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -2.0, 0.5),
+    'AUDCAD': InstrumentSpec('AUDCAD', 4, 7.5, 1.5, 0.01, 100.0, 7.0, 2.5, -8.0),
+    'AUDCHF': InstrumentSpec('AUDCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
+    'CADCHF': InstrumentSpec('CADCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
+    'CHFJPY': InstrumentSpec('CHFJPY', 2, 9.0, 1.0, 0.01, 100.0, 7.0, 8.5, -15.0),
+    'NZDCAD': InstrumentSpec('NZDCAD', 4, 7.5, 1.5, 0.01, 100.0, 7.0, 2.5, -8.0),
+    'NZDCHF': InstrumentSpec('NZDCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
+    'GBPNZD': InstrumentSpec('GBPNZD', 4, 6.0, 3.0, 0.01, 100.0, 7.0, -4.0, 0.5),
 
     # Crypto (CFDs) - defaults used mainly for offline backtests; live trading overrides via broker specs
+    'BTCUSD': InstrumentSpec('BTCUSD', 2, 1.0, 20.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'ETHUSD': InstrumentSpec('ETHUSD', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'LTCUSD': InstrumentSpec('LTCUSD', 2, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'SOLUSD': InstrumentSpec('SOLUSD', 2, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'BCHUSD': InstrumentSpec('BCHUSD', 2, 1.0, 20.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'DOGUSD': InstrumentSpec('DOGUSD', 4, 1.0, 20.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'TRXUSD': InstrumentSpec('TRXUSD', 4, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'XRPUSD': InstrumentSpec('XRPUSD', 4, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'TONUSD': InstrumentSpec('TONUSD', 3, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'BTCETH': InstrumentSpec('BTCETH', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'BTCXAU': InstrumentSpec('BTCXAU', 2, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
 
     # Exotic FX Crosses (ZAR)
     'EURZAR': InstrumentSpec('EURZAR', 4, 0.55, 60.0, 0.01, 100.0, 15.0, 10.0, -30.0),
@@ -1774,7 +1858,7 @@ class DataLoader:
                 return None
             df = payload.get("data")
             if isinstance(df, pd.DataFrame):
-                self._resample_cache[cache_key] = df
+                self._resample_cache[cache_key] = df.copy()
                 self._resample_meta[cache_key] = meta
                 return df.copy()
         except Exception:
@@ -1790,14 +1874,15 @@ class DataLoader:
             "source_rows": source_meta.get("rows"),
             "source_last_index": source_meta.get("last_index"),
         }
-        self._resample_cache[cache_key] = df
+        df_copy = df.copy()
+        self._resample_cache[cache_key] = df_copy
         self._resample_meta[cache_key] = meta
 
         if not self.cache_resampled:
             return
         try:
             path = self._resample_cache_path(symbol, timeframe)
-            payload = {"meta": meta, "data": df}
+            payload = {"meta": meta, "data": df_copy}
             pd.to_pickle(payload, path)
         except Exception:
             pass
@@ -1822,7 +1907,7 @@ class DataLoader:
         
         # Resample if needed
         if timeframe == 'M5':
-            return base_df
+            return base_df.copy()
         
         # Try cache (memory/disk) keyed to the M5 source file state
         base_meta = self._source_meta.get(f"{symbol}_M5", {})
@@ -1839,7 +1924,7 @@ class DataLoader:
             logger.warning(f"{symbol} {timeframe}: Only {len(resampled)} bars, need {min_bars}")
             return None
         
-        return resampled
+        return resampled.copy()
     
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Standardize column names to Open, High, Low, Close, Volume."""
@@ -2765,7 +2850,7 @@ class Backtester:
                     # Fallback for strategies without bar_index support
                     try:
                         sl_pips, tp_pips = strategy.calculate_stops(
-                            features.iloc[:signal_bar_index + 1], direction, symbol
+                            features.iloc[:signal_bar_index + 1].copy(), direction, symbol
                         )
                     except Exception as exc:
                         raise RuntimeError(
@@ -3585,7 +3670,13 @@ class StrategyScorer:
     def calculate_fx_selection_score(self, metrics: Dict[str, Any]) -> float:
         """Backtester-aligned strategy selection score (training data only).
 
-        Mirrors fx_pipeline_main._calculate_score().
+        Mirrors fx_pipeline_main._calculate_score() with calibration extensions:
+        - Continuous DD penalty (replaces discrete buckets)
+        - Sortino/Sharpe blend for downside-aware risk scoring
+        - Tail-risk penalty via worst 5th-percentile R-multiple
+        - Consistency penalty via max consecutive losses
+        - Trade-frequency bonus (log-scaled statistical confidence)
+        All extensions gated by PipelineConfig feature flags.
         """
         sharpe = min(max(metrics.get('sharpe_ratio', 0.0), -2.0), 5.0)
         pf = min(max(metrics.get('profit_factor', 0.0), 0.0), 10.0)
@@ -3597,35 +3688,97 @@ class StrategyScorer:
         return_dd = min(max(return_dd, -5.0), 20.0)
 
         expectancy = float(metrics.get('expectancy_pips', 0.0))
+
+        # --- Sortino/Sharpe blend ---
+        risk_adj = sharpe
+        if getattr(self.config, 'scoring_use_sortino_blend', False):
+            sortino = min(max(metrics.get('sortino_ratio', sharpe), -2.0), 5.0)
+            risk_adj = 0.6 * sharpe + 0.4 * sortino
+
         score = (
-            ((sharpe + 2.0) / 7.0) * 25.0 +
+            ((risk_adj + 2.0) / 7.0) * 25.0 +
             (pf / 10.0) * 20.0 +
             (win_rate * 15.0) +
             ((return_dd + 5.0) / 25.0) * 25.0 +
             min(expectancy / 10.0, 1.0) * 15.0
         )
 
-        # Drawdown penalty buckets
-        if dd > 30.0:
-            score *= 0.6
-        elif dd > 25.0:
-            score *= 0.75
-        elif dd > 20.0:
-            score *= 0.9
+        # --- Drawdown penalty ---
+        if getattr(self.config, 'scoring_use_continuous_dd', False):
+            # Smooth exponential: dd=0 → 1.0, dd=15 → 0.64, dd=25 → 0.47, dd=35 → 0.35
+            dd_mult = math.exp(-0.03 * dd)
+            score *= dd_mult
+        else:
+            # Legacy discrete buckets
+            if dd > 30.0:
+                score *= 0.6
+            elif dd > 25.0:
+                score *= 0.75
+            elif dd > 20.0:
+                score *= 0.9
+
+        # --- Tail-risk penalty ---
+        if getattr(self.config, 'scoring_use_tail_risk', False):
+            worst_5 = float(metrics.get('worst_5pct_r', 0.0))
+            if worst_5 < -3.0:
+                # Severe tail: penalize proportionally, clamped
+                tail_penalty = max(0.70, 1.0 + 0.05 * worst_5)  # worst_5=-5 → 0.75
+                score *= tail_penalty
+
+        # --- Consistency penalty ---
+        if getattr(self.config, 'scoring_use_consistency', False):
+            max_consec = int(metrics.get('max_consecutive_losses', 0))
+            if max_consec > 8:
+                # Penalize fragile strategies with very long losing streaks
+                consec_penalty = max(0.75, 1.0 - 0.03 * (max_consec - 8))  # 12 → 0.88, 16+ → 0.75
+                score *= consec_penalty
+
+        # --- Trade-frequency bonus ---
+        if getattr(self.config, 'scoring_use_trade_frequency_bonus', False):
+            tc = int(metrics.get('total_trades', 0))
+            if tc > 30:
+                # Log-scaled bonus: 30 trades → 0%, 100 → ~3.5%, 300 → ~6.5%
+                freq_bonus = min(0.08, 0.03 * math.log(tc / 30.0))
+                score *= (1.0 + freq_bonus)
 
         return float(score)
 
     def calculate_fx_opt_score(self, metrics: Dict[str, Any]) -> float:
         """Backtester-aligned optimization score (train only).
 
-        Mirrors fx_pipeline_main._calc_score().
+        Mirrors fx_pipeline_main._calc_score() with calibration extensions:
+        - Continuous DD penalty (replaces 3-tier discrete)
+        - Profit factor and win rate components
+        - Sortino blend for downside awareness
+        All extensions gated by PipelineConfig feature flags.
         """
         sharpe = max(-2.0, min(5.0, float(metrics.get('sharpe_ratio', 0.0))))
         ret = float(metrics.get('total_return_pct', 0.0))
         dd = float(metrics.get('max_drawdown_pct', 100.0))
+        pf = min(max(float(metrics.get('profit_factor', 0.0)), 0.0), 10.0)
+        wr = float(metrics.get('win_rate', 0.0)) / 100.0
 
-        dd_penalty = 1.0 if dd < 15.0 else 0.8 if dd < 25.0 else 0.5
-        return float((sharpe * 30.0 + min(ret, 500.0) * 0.1) * dd_penalty)
+        # --- Sortino blend ---
+        risk_adj = sharpe
+        if getattr(self.config, 'scoring_use_sortino_blend', False):
+            sortino = max(-2.0, min(5.0, float(metrics.get('sortino_ratio', sharpe))))
+            risk_adj = 0.6 * sharpe + 0.4 * sortino
+
+        # Base score: risk-adjusted return + return magnitude + PF + win rate
+        base = (
+            risk_adj * 30.0 +
+            min(ret, 500.0) * 0.1 +
+            min(pf, 5.0) * 2.0 +
+            wr * 5.0
+        )
+
+        # --- DD penalty ---
+        if getattr(self.config, 'scoring_use_continuous_dd', False):
+            dd_penalty = math.exp(-0.03 * dd)
+        else:
+            dd_penalty = 1.0 if dd < 15.0 else 0.8 if dd < 25.0 else 0.5
+
+        return float(base * dd_penalty)
     def calculate_return_robustness_ratio(self,
                                           train_metrics: Dict[str, Any],
                                           val_metrics: Dict[str, Any]) -> float:
@@ -3758,6 +3911,7 @@ __all__ = [
     'InstrumentSpec',
     'INSTRUMENT_SPECS',
     'get_instrument_spec',
+    'sync_instrument_spec_from_mt5',
     'load_broker_specs',
     'set_broker_specs_path',
     'set_instrument_specs',

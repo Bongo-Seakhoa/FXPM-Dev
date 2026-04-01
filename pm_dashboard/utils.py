@@ -86,6 +86,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "display_allow_if_actions": [
         "SKIPPED_RISK_CAP",
         "BLOCKED_RISK_CAP",
+        "SKIPPED_POSITION_EXISTS",
+    ],
+    "display_allow_if_action_prefixes": [
+        "SKIPPED_",
+        "BLOCKED_",
+        "FAILED_",
+        "PAPER",
     ],
     "alert": {
         "enabled": True,

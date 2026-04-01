@@ -1756,20 +1756,20 @@
   "NZDUSD": {
     "symbol": "NZDUSD",
     "broker_symbol": "NZDUSD",
-    "decision_key": "f6d99dcd3599b2c1",
-    "bar_time": "2026-04-01 00:00:00",
+    "decision_key": "d843163cacb8df45",
+    "bar_time": "2026-04-01 08:00:00",
     "timeframe": "H4",
     "regime": "TREND",
     "strategy_name": "DonchianBreakoutStrategy",
     "direction": "BUY",
-    "action": "BLOCKED_SPREAD_FILTER",
-    "action_time": "2026-04-01T03:01:10.532470",
-    "entry_price": 0.57512,
-    "stop_loss_price": null,
-    "take_profit_price": null,
-    "volume": null,
-    "target_risk_pct": null,
-    "actual_risk_pct": null,
+    "action": "EXECUTED",
+    "action_time": "2026-04-01T11:00:05.557530",
+    "entry_price": 0.0,
+    "stop_loss_price": 0.5692235714285714,
+    "take_profit_price": 0.5800782142857143,
+    "volume": 0.01,
+    "target_risk_pct": 0.12217389226869564,
+    "actual_risk_pct": 0.14232636772887222,
     "secondary_trade": false,
     "secondary_reason": "",
     "position_context": {
@@ -1785,9 +1785,9 @@
       },
       "open_positions": []
     },
-    "score": 0.14178839654232825,
+    "score": 0.12771082221940655,
     "quality": 0.36674177079682024,
     "freshness": 1.0,
-    "regime_strength": 0.386616436503168
+    "regime_strength": 0.3482309144713162
   }
 }

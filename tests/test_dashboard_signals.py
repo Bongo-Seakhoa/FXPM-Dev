@@ -42,16 +42,57 @@ class TestDashboardSignalDesk(unittest.TestCase):
         self.assertTrue(entry.secondary_trade)
         self.assertEqual(entry.secondary_reason, "log_tag")
 
+    def test_parse_pm_execution_log_secondary_and_skips(self) -> None:
+        log_text = (
+            "2026-02-10 00:22:06 [INFO] __main__: [USDSEK] [SECONDARY] Selected: "
+            "MomentumBurstStrategy @ D1/TREND (strength=0.32, quality=0.44, freshness=1.00, score=0.141)\n"
+            "2026-02-10 00:22:06 [INFO] __main__: [USDSEK] Skipping trade; position already exists for magic 123456 "
+            "(ticket=789101, tf=D1)\n"
+            "2026-02-10 00:21:40 [INFO] __main__: [XAGUSD] Selected: "
+            "KeltnerBreakoutStrategy @ M30/TREND (strength=0.42, quality=0.44, freshness=1.00, score=0.183)\n"
+            "2026-02-10 00:21:40 [WARNING] __main__: [XAGUSD] Skipping trade; risk 8.97% exceeds cap 5.00% "
+            "(vol=0.0100, sl=79.32350)\n"
+        )
+        config = deepcopy(DEFAULT_CONFIG)
+        entries = parse_pm_execution_log(log_text, "pm.log", config, {})
+        self.assertEqual(len(entries), 2)
+
+        by_key = {(e.symbol, e.reason): e for e in entries}
+        self.assertIn(("USDSEK", "SKIPPED_POSITION_EXISTS"), by_key)
+        self.assertIn(("XAGUSD", "SKIPPED_RISK_CAP"), by_key)
+        self.assertEqual(by_key[("USDSEK", "SKIPPED_POSITION_EXISTS")].timeframe, "D1")
+        self.assertEqual(by_key[("XAGUSD", "SKIPPED_RISK_CAP")].timeframe, "M30")
+        self.assertAlmostEqual(by_key[("XAGUSD", "SKIPPED_RISK_CAP")].stop_loss_price, 79.3235, places=4)
+
+    def test_parse_pm_execution_log_failed_order(self) -> None:
+        log_text = (
+            "2026-02-10 00:21:47 [INFO] __main__: [EU50] [SECONDARY] Selected: "
+            "MomentumBurstStrategy @ D1/CHOP (strength=0.32, quality=0.39, freshness=1.00, score=0.126)\n"
+            "2026-02-10 00:21:47 [INFO] __main__: [EU50] BUY | basis=1412.46 (balance) | "
+            "target_risk=1.00% ($14.12) | actual_risk=1.56% ($22.08) | vol_raw=0.0100 | "
+            "vol=0.0100 | entry=6066.95000 | sl=5881.52143 | tp=6345.09286\n"
+            "2026-02-10 00:21:47 [WARNING] __main__: [FAIL] [EU50] Order failed: 10018 - Market closed\n"
+        )
+        config = deepcopy(DEFAULT_CONFIG)
+        entries = parse_pm_execution_log(log_text, "pm.log", config, {})
+        self.assertEqual(len(entries), 1)
+
+        entry = entries[0]
+        self.assertEqual(entry.symbol, "EU50")
+        self.assertEqual(entry.reason, "FAILED_10018")
+        self.assertEqual(entry.signal_direction, "buy")
+        self.assertTrue(entry.secondary_trade)
+
     def test_display_filters_respect_actions_and_fields(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)
-        config["display_actions"] = ["EXECUTED", "SKIPPED_RISK_CAP"]
+        config["display_actions"] = ["EXECUTED", "SKIPPED_RISK_CAP", "SKIPPED_POSITION_EXISTS"]
         config["display_require_fields"] = [
             "signal_direction",
             "entry_price",
             "stop_loss_price",
             "take_profit_price",
         ]
-        config["display_allow_if_actions"] = ["SKIPPED_RISK_CAP"]
+        config["display_allow_if_actions"] = ["SKIPPED_RISK_CAP", "SKIPPED_POSITION_EXISTS"]
 
         executed_missing = SignalEntry(
             symbol="EURGBP",
@@ -74,6 +115,41 @@ class TestDashboardSignalDesk(unittest.TestCase):
             raw={"action": "SKIPPED_RISK_CAP"},
         )
         self.assertTrue(should_display_entry(risk_cap_missing, config))
+
+        skip_exists_missing = SignalEntry(
+            symbol="USDSEK",
+            signal_direction="sell",
+            entry_price=None,
+            stop_loss_price=None,
+            take_profit_price=None,
+            reason="SKIPPED_POSITION_EXISTS",
+            raw={"action": "SKIPPED_POSITION_EXISTS"},
+        )
+        self.assertTrue(should_display_entry(skip_exists_missing, config))
+
+    def test_display_filters_support_action_prefixes(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["display_actions"] = []
+        config["display_action_prefixes"] = ["FAILED_"]
+        config["display_require_fields"] = [
+            "signal_direction",
+            "entry_price",
+            "stop_loss_price",
+            "take_profit_price",
+        ]
+        config["display_allow_if_actions"] = []
+        config["display_allow_if_action_prefixes"] = ["FAILED_"]
+
+        failed_missing = SignalEntry(
+            symbol="EU50",
+            signal_direction="buy",
+            entry_price=None,
+            stop_loss_price=None,
+            take_profit_price=None,
+            reason="FAILED_10018",
+            raw={"action": "FAILED_10018"},
+        )
+        self.assertTrue(should_display_entry(failed_missing, config))
 
     def test_validity_respects_age(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)

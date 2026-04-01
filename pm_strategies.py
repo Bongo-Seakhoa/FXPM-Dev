@@ -44,6 +44,13 @@ _STRATEGY_HELPER_FINALIZERS: Dict[int, weakref.finalize] = {}
 # FEATURE LOOKUP HELPERS (efficiency optimization)
 # =============================================================================
 
+def _memoize_series(features: pd.DataFrame, col: str, result: pd.Series) -> None:
+    """Memoize computed helper series unless ``features`` is a slice/view."""
+    if getattr(features, "_is_copy", None) is not None:
+        return
+    features.loc[:, col] = result
+
+
 def _get_ema(features: pd.DataFrame, period: int) -> pd.Series:
     """Get EMA from precomputed features or compute if missing (C3: memoize)."""
     col = f'EMA_{period}'
@@ -987,7 +994,7 @@ class ADXDIStrengthStrategy(BaseStrategy):
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = int(self.params.get('adx_period', 14))
-        adx_th = float(self.params.get('adx_threshold', 20))
+        adx_th = float(self.params.get('adx_threshold', 22))
         spread_min = float(self.params.get('di_spread_min', 5.0))
         adx_rising = bool(self.params.get('require_adx_rising', True))
 
@@ -3473,9 +3480,12 @@ class StrategyRegistry:
     @classmethod
     def get(cls, name: str, **params) -> BaseStrategy:
         """Get strategy instance by name."""
-        if name not in cls._strategies:
+        resolved_name = name
+        if resolved_name not in cls._strategies:
+            resolved_name = _STRATEGY_MIGRATION.get(resolved_name, resolved_name)
+        if resolved_name not in cls._strategies:
             raise ValueError(f"Unknown strategy: {name}")
-        return cls._strategies[name](**params)
+        return cls._strategies[resolved_name](**params)
     
     @classmethod
     def list_all(cls) -> List[str]:

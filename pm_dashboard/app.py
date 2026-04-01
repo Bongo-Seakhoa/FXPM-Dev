@@ -242,6 +242,46 @@ def create_app(
             return _json_error("Internal server error", 500)
         return "Internal server error", 500
 
+    # Initialize MT5 connector and data jobs (optional)
+    mt5_connector = None
+    data_downloader = None
+    data_scheduler = None
+
+    if JOBS_AVAILABLE:
+        scheduler_enabled = bool(config.get("enable_data_maintenance_scheduler", True))
+        scheduler_time = str(config.get("data_maintenance_time", "00:00") or "00:00")
+
+        if MT5_AVAILABLE:
+            try:
+                mt5_connector = MT5Connector()
+                if mt5_connector.connect():
+                    logger.info("MT5 connector initialized for root data maintenance")
+                else:
+                    logger.warning("MT5 initial connect failed; local-data simulation remains available")
+            except Exception as e:
+                logger.error(f"Failed to initialize MT5 connector: {e}")
+                mt5_connector = None
+
+        try:
+            data_downloader, data_scheduler = initialize_data_jobs(
+                pm_root,
+                mt5_connector=mt5_connector,
+                enable_scheduler=scheduler_enabled,
+                run_time=scheduler_time,
+            )
+            app.config["data_downloader"] = data_downloader
+            app.config["data_scheduler"] = data_scheduler
+            logger.info(
+                "Dashboard data jobs initialized (scheduler=%s @ %s)",
+                "enabled" if scheduler_enabled else "disabled",
+                scheduler_time,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize data jobs: {e}")
+    else:
+        logger.info("Dashboard jobs module unavailable - simulation features will be limited")
+    app.config["mt5_connector"] = mt5_connector
+
     @app.route("/")
     def index() -> str:
         return render_template("index.html")
@@ -594,6 +634,34 @@ def apply_config_updates(config: Dict[str, Any], payload: Dict[str, Any]) -> Dic
             alert_cfg["min_strength"] = _coerce_float(alert_payload.get("min_strength"), "alert.min_strength", 0.0)
         updated["alert"] = alert_cfg
     return updated
+
+
+def _reinitialize_data_jobs(app: Flask, config: Dict[str, Any]) -> None:
+    """Recreate data jobs when configuration changes (especially pm_root)."""
+    if not JOBS_AVAILABLE:
+        return
+    try:
+        scheduler = app.config.get("data_scheduler")
+        if scheduler:
+            scheduler.stop()
+    except Exception:
+        pass
+
+    try:
+        pm_root = config.get("pm_root") or ""
+        mt5_connector = app.config.get("mt5_connector")
+        scheduler_enabled = bool(config.get("enable_data_maintenance_scheduler", True))
+        scheduler_time = str(config.get("data_maintenance_time", "00:00") or "00:00")
+        data_downloader, data_scheduler = initialize_data_jobs(
+            pm_root,
+            mt5_connector=mt5_connector,
+            enable_scheduler=scheduler_enabled,
+            run_time=scheduler_time,
+        )
+        app.config["data_downloader"] = data_downloader
+        app.config["data_scheduler"] = data_scheduler
+    except Exception as exc:
+        logger.error(f"Failed to reinitialize data jobs: {exc}")
 
 
 def build_strategy_payload(pm_configs: Dict[str, Any], include_invalid: bool) -> Dict[str, Any]:

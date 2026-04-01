@@ -16,6 +16,7 @@ Version: 3.1 (Portfolio Manager with Optuna TPE Optimization)
 import json
 import hashlib
 import logging
+import math
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -42,6 +43,7 @@ from pm_core import (
 from pm_enhancement_seams import EnhancementSeams, create_default_enhancement_seams
 from pm_strategies import StrategyRegistry, BaseStrategy, _STRATEGY_MIGRATION
 from pm_position import PositionConfig, PositionManager
+from pm_regime import load_regime_params
 
 # Import Optuna TPE optimizer
 try:
@@ -384,8 +386,8 @@ class ConfigLedger:
                 if stored and stored != current_regime_version:
                     return True, "regime detection params changed"
             return False, reason  # Skip - config is valid
-        else:
-            return True, reason  # Optimize - config is missing/expired/invalid
+
+        return True, reason  # Optimize - config is missing/expired/invalid
     
     def get_symbols_to_optimize(self,
                                 symbols: List[str],
@@ -513,7 +515,13 @@ class RegimeConfig:
         """Check if this config is a NO_TRADE marker (no valid strategy found)."""
         return self.strategy_name == "NO_TRADE" or self.strategy_name == ""
     
-    def is_valid_for_live(self, min_pf: float = 1.0, min_return: float = 0.0, max_dd: float = 35.0) -> bool:
+    def is_valid_for_live(
+        self,
+        min_pf: float = 1.0,
+        min_return: float = 5.0,
+        max_dd: float = 35.0,
+        min_return_dd_ratio: float = 1.0,
+    ) -> bool:
         """
         Check if this config passes the live quality gate.
         
@@ -522,11 +530,13 @@ class RegimeConfig:
         - Validation profit_factor >= min_pf
         - Validation return >= min_return
         - Validation drawdown <= max_dd
+        - Validation return/DD ratio >= min_return_dd_ratio
         
         Args:
             min_pf: Minimum validation profit factor (default 1.0)
-            min_return: Minimum validation return % (default 0.0)
+            min_return: Minimum validation return % (default 5.0)
             max_dd: Maximum validation drawdown % (default 35.0)
+            min_return_dd_ratio: Minimum validation return/DD ratio (default 1.0)
             
         Returns:
             True if this config is valid for live trading
@@ -537,8 +547,14 @@ class RegimeConfig:
         val_pf = self.val_metrics.get('profit_factor', 0.0)
         val_return = self.val_metrics.get('total_return_pct', -100.0)
         val_dd = self.val_metrics.get('max_drawdown_pct', 100.0)
-        
-        return val_pf >= min_pf and val_return >= min_return and val_dd <= max_dd
+
+        ratio = val_return / max(val_dd, 0.5)
+        return (
+            val_pf >= min_pf and
+            val_return >= min_return and
+            val_dd <= max_dd and
+            ratio >= min_return_dd_ratio
+        )
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -620,6 +636,9 @@ class SymbolConfig:
     # Validation status
     is_validated: bool = False
     validation_reason: str = ""
+
+    # Regime detection version stamp for invalidation when params change.
+    regime_detection_version: Optional[Dict[str, Any]] = None
     
     # Regime detection version stamp (for invalidation when params change)
     regime_detection_version: Optional[Dict[str, Any]] = None
@@ -679,6 +698,9 @@ class SymbolConfig:
                                 if k not in ['equity_curve', 'trades']},
             'artifact_meta': self.artifact_meta,
         }
+
+        if self.regime_detection_version:
+            result['regime_detection_version'] = self.regime_detection_version
         
         # Regime detection version stamp
         if self.regime_detection_version:
@@ -1472,12 +1494,19 @@ class RegimeOptimizer:
         self.val_min_sharpe_override = getattr(config, 'fx_val_sharpe_override', 0.3)
         self.min_robustness_ratio = getattr(config, 'fx_min_robustness_ratio', 0.85)
         
+        # Max candidates to attempt validation on (descent through scored list)
+        self.regime_validation_top_k = getattr(config, 'regime_validation_top_k', 5)
+
         # ===== PROFITABILITY GATES (FIX #1) =====
         # These prevent storing losing strategies as "regime winners"
         self.min_val_profit_factor = getattr(config, 'regime_min_val_profit_factor', 1.0)
-        self.min_val_return_pct = getattr(config, 'regime_min_val_return_pct', 0.0)
+        self.min_val_return_pct = getattr(config, 'regime_min_val_return_pct', 5.0)
         self.allow_losing_winners = getattr(config, 'regime_allow_losing_winners', False)
         self.no_winner_marker = getattr(config, 'regime_no_winner_marker', 'NO_TRADE')
+
+        # Return-to-DD efficiency gate (unconditional hard gate)
+        _raw_ratio = float(getattr(config, 'regime_min_val_return_dd_ratio', 1.0))
+        self.min_val_return_dd_ratio = _raw_ratio if math.isfinite(_raw_ratio) and _raw_ratio > 0 else 1.0
         
         # Use fx_backtester scoring mode
         self.use_fx_scoring = getattr(config, 'scoring_mode', 'pm_weighted') == 'fx_backtester'
@@ -1496,6 +1525,11 @@ class RegimeOptimizer:
             if self.enable_hyperparam_tuning:
                 logger.debug("RegimeOptimizer using: Grid Search (Optuna not available)")
     
+    @staticmethod
+    def _compute_return_dd_ratio(val_return: float, val_dd: float, eps: float = 0.5) -> float:
+        """Return-to-drawdown efficiency ratio with epsilon floor."""
+        return val_return / max(val_dd, eps)
+
     def optimize_symbol(self,
                         symbol: str,
                         train_features_by_tf: Dict[str, pd.DataFrame],
@@ -1599,6 +1633,15 @@ class RegimeOptimizer:
                         f"NO TRADE for this regime (no fallback to best train)."
                     )
         
+        # --- Reason-coded summary telemetry ---
+        total_slots = sum(len(self.REGIMES) for _ in train_features_by_tf)
+        logger.info(
+            f"[{symbol}] Regime optimization summary: "
+            f"{validated_winners}/{total_slots} validated, "
+            f"{unvalidated_winners} unvalidated/no-winner, "
+            f"{total_slots - validated_winners - unvalidated_winners} skipped (data)"
+        )
+
         return regime_configs, best_overall_config, validated_winners, unvalidated_winners
 
     def _apply_training_eligibility_gates(self,
@@ -2151,40 +2194,49 @@ class RegimeOptimizer:
         Returns:
             Tuple of (RegimeConfig or None, is_validated, validation_reason)
         """
-        best_score = -float('inf')
-        best_candidate = None
-        rejection_reasons = []  # Track why candidates were rejected
-        
+        scored_candidates = []  # List of (score, candidate) tuples
+        rejection_reasons = []  # Track why candidates were rejected at gate level
+
         for cand in candidates:
             train_metrics = cand['train_regime_metrics'].get(regime, {})
             val_metrics = cand['val_regime_metrics'].get(regime, {})
-            
+
             train_trades = train_metrics.get('total_trades', 0)
             val_trades = val_metrics.get('total_trades', 0)
-            
+
             # Check minimum trades
             if train_trades < self.min_train_trades:
                 continue
             if val_trades < self.min_val_trades:
                 continue
-            
-            # ===== EARLY REJECTION: Check drawdown before scoring (saves compute) =====
+
+            # ===== EARLY REJECTION: Check drawdown before scoring =====
             train_dd = train_metrics.get('max_drawdown_pct', 100.0)
             val_dd = val_metrics.get('max_drawdown_pct', 100.0)
-            
+
             # Reject if validation drawdown exceeds threshold
             if val_dd > self.val_max_drawdown:
                 continue
-            
+
             # Reject if training drawdown is excessively high (1.25x threshold)
             if train_dd > self.val_max_drawdown * 1.25:
                 continue
-            
+
+            # Return-to-DD efficiency gate (unconditional, same category as DD caps)
+            val_return_early = val_metrics.get('total_return_pct', -100.0)
+            val_return_dd_ratio = self._compute_return_dd_ratio(val_return_early, val_dd)
+            if val_return_dd_ratio < self.min_val_return_dd_ratio:
+                rejection_reasons.append(
+                    f"{cand['strategy_name']}: return/DD={val_return_dd_ratio:.2f} < "
+                    f"{self.min_val_return_dd_ratio:.2f} (ret={val_return_early:.1f}%, dd={val_dd:.1f}%)"
+                )
+                continue
+
             # ===== FIX #1: EARLY REJECTION - Profitability gates =====
             # Reject candidates that are clearly losing BEFORE scoring
             val_pf = val_metrics.get('profit_factor', 0.0)
             val_return = val_metrics.get('total_return_pct', -100.0)
-            
+
             if not self.allow_losing_winners:
                 if val_pf < self.min_val_profit_factor:
                     rejection_reasons.append(f"{cand['strategy_name']}: PF={val_pf:.2f} < {self.min_val_profit_factor}")
@@ -2219,10 +2271,69 @@ class RegimeOptimizer:
         if best_candidate is None:
             reason = "No candidates met minimum trade/drawdown/profitability thresholds"
             if rejection_reasons:
-                reason += f" (rejected: {len(rejection_reasons)} candidates for profitability)"
+                reason += f" (rejected: {len(rejection_reasons)} candidates by gate checks)"
             return None, False, reason
-        
-        # Build RegimeConfig
+
+        # Sort descending by score
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # Cap the number of validation attempts
+        top_k = min(self.regime_validation_top_k, len(scored_candidates))
+
+        logger.debug(
+            f"[{symbol}] [{timeframe}] [{regime}] Candidate descent: "
+            f"{len(scored_candidates)} gate-passed, validating top-{top_k}"
+        )
+
+        # Iterate top-K candidates, return first that passes validation
+        validation_failures = []
+        for rank, (score, cand) in enumerate(scored_candidates[:top_k], start=1):
+            train_metrics = cand['train_regime_metrics'].get(regime, {})
+            val_metrics = cand['val_regime_metrics'].get(regime, {})
+            strategy_name = cand.get('strategy_name', 'Unknown')
+
+            is_validated, validation_reason = self._validate_regime_winner(
+                train_metrics, val_metrics, regime, strategy_name
+            )
+
+            if is_validated:
+                if rank > 1:
+                    logger.info(
+                        f"[{symbol}] [{timeframe}] [{regime}] Descent: "
+                        f"rank #{rank} {strategy_name} passed validation "
+                        f"(top {rank - 1} failed)"
+                    )
+                else:
+                    logger.debug(
+                        f"[{symbol}] [{timeframe}] [{regime}] Descent: "
+                        f"rank #1 {strategy_name} passed validation"
+                    )
+
+                quality_score = self._normalize_score(score)
+                now = datetime.now()
+
+                config = RegimeConfig(
+                    strategy_name=strategy_name,
+                    parameters=cand['params'],
+                    quality_score=quality_score,
+                    train_metrics=train_metrics,
+                    val_metrics=val_metrics,
+                    regime_train_trades=train_metrics.get('total_trades', 0),
+                    regime_val_trades=val_metrics.get('total_trades', 0),
+                    trained_at=now,
+                    valid_until=now + timedelta(days=60),
+                )
+
+                return config, True, validation_reason
+            else:
+                validation_failures.append(f"#{rank} {strategy_name}: {validation_reason}")
+                logger.debug(
+                    f"[{symbol}] [{timeframe}] [{regime}] Descent: "
+                    f"rank #{rank} {strategy_name} FAILED: {validation_reason}"
+                )
+
+        # All top-K candidates failed validation - return the best one as unvalidated
+        best_score, best_candidate = scored_candidates[0]
         train_metrics = best_candidate['train_regime_metrics'].get(regime, {})
         val_metrics = best_candidate['val_regime_metrics'].get(regime, {})
         
@@ -2233,9 +2344,8 @@ class RegimeOptimizer:
         
         # Normalize quality score to 0-1 using sigmoid mapping
         quality_score = self._normalize_score(best_score)
-        
         now = datetime.now()
-        
+
         config = RegimeConfig(
             strategy_name=best_candidate['strategy_name'],
             parameters=best_candidate['params'],
@@ -2247,8 +2357,18 @@ class RegimeOptimizer:
             trained_at=now,
             valid_until=_scheduled_valid_until(self.config, now),
         )
-        
-        return config, is_validated, validation_reason
+
+        descent_summary = "; ".join(validation_failures)
+        final_reason = (
+            f"All {len(validation_failures)} descent candidates failed validation "
+            f"[{descent_summary}]"
+        )
+        logger.info(
+            f"[{symbol}] [{timeframe}] [{regime}] Descent exhausted: "
+            f"{len(validation_failures)}/{top_k} candidates failed validation"
+        )
+
+        return config, False, final_reason
     
     def _validate_regime_winner(self,
                                  train_metrics: Dict[str, Any],
@@ -2348,7 +2468,17 @@ class RegimeOptimizer:
             # Check return >= threshold (default 0.0 = must be non-negative)
             if val_return < self.min_val_return_pct:
                 return False, f"Negative return: val return {val_return:.2f}% < {self.min_val_return_pct:.1f}%"
-        
+
+        # Return-to-DD efficiency gate (unconditional risk-efficiency rule, same category as DD cap)
+        val_return_dd_ratio = self._compute_return_dd_ratio(val_return, val_drawdown)
+        min_return_dd = self.min_val_return_dd_ratio
+        if val_return_dd_ratio < min_return_dd:
+            return False, (
+                f"Poor return/DD efficiency: {val_return_dd_ratio:.2f} "
+                f"(return {val_return:.1f}% / DD {val_drawdown:.1f}%) "
+                f"< {min_return_dd:.2f}"
+            )
+
         # Compute robustness ratio
         train_full = self._bucket_to_full_metrics(train_metrics)
         val_full = self._bucket_to_full_metrics(val_metrics)
@@ -2470,24 +2600,32 @@ class RegimeOptimizer:
             'gross_profit': bucket_metrics.get('gross_profit', 0),
             'gross_loss': bucket_metrics.get('gross_loss', 0),
             'total_pnl': bucket_metrics.get('total_pnl', 0),
-            'expectancy_pips': bucket_metrics.get('avg_win', 0) * bucket_metrics.get('win_rate', 0) / 100 
+            'expectancy_pips': bucket_metrics.get('avg_win', 0) * bucket_metrics.get('win_rate', 0) / 100
                              - bucket_metrics.get('avg_loss', 0) * (1 - bucket_metrics.get('win_rate', 0) / 100),
+            'sortino_ratio': bucket_metrics.get('sortino_approx', 0),
+            'calmar_ratio': bucket_metrics.get('calmar_ratio', 0),
+            'mean_r': bucket_metrics.get('mean_r', 0),
+            'worst_5pct_r': bucket_metrics.get('worst_5pct_r', 0),
+            'max_consecutive_losses': bucket_metrics.get('max_consecutive_losses', 0),
         }
     
     def _normalize_score(self, score: float) -> float:
         """
         Normalize score to 0-1 range using sigmoid mapping.
-        
+
         This prevents saturation at extreme scores.
+        Calibrated for the continuous-DD scoring distribution where
+        typical scores land in the 25-55 range.
         """
-        # Sigmoid centered at 80 with scale 40
-        # score=0 -> ~0.12, score=80 -> 0.5, score=160 -> ~0.88
+        # Sigmoid centered at 45 with scale 30
+        # score=15 -> ~0.27, score=30 -> ~0.38, score=45 -> 0.5,
+        # score=60 -> ~0.62, score=80 -> ~0.76
         import math
         try:
-            normalized = 1.0 / (1.0 + math.exp(-(score - 80) / 40))
+            normalized = 1.0 / (1.0 + math.exp(-(score - 45) / 30))
         except OverflowError:
             normalized = 0.0 if score < 0 else 1.0
-        
+
         return max(0.0, min(1.0, normalized))
 
 
@@ -3189,3 +3327,4 @@ if __name__ == "__main__":
     
     pm.print_status()
     print("\npm_pipeline.py loaded successfully!")
+

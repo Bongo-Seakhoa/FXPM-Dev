@@ -2,6 +2,8 @@
   "pipeline": {
     "data_dir": "./data",
     "output_dir": "./pm_outputs",
+    "initial_capital": 10000.0,
+    "risk_per_trade_pct": 1.0,
     "train_pct": 80.0,
     "val_pct": 30.0,
     "overlap_pct": 10.0,
@@ -457,6 +459,86 @@
       "swap_long": 2.0,
       "swap_short": -10.0
     },
+    "EURZAR": {
+      "pip_position": 4,
+      "pip_value": 0.55,
+      "spread_avg": 70.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 15.0,
+      "swap_long": 10.0,
+      "swap_short": -30.0
+    },
+    "GBPZAR": {
+      "pip_position": 4,
+      "pip_value": 0.55,
+      "spread_avg": 80.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 15.0,
+      "swap_long": 12.0,
+      "swap_short": -35.0
+    },
+    "USDCNH": {
+      "pip_position": 4,
+      "pip_value": 1.4,
+      "spread_avg": 20.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 10.0,
+      "swap_long": 2.0,
+      "swap_short": -10.0
+    },
+    "EURPLN": {
+      "pip_position": 4,
+      "pip_value": 2.5,
+      "spread_avg": 25.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 10.0,
+      "swap_long": 3.0,
+      "swap_short": -12.0
+    },
+    "EURNOK": {
+      "inherit": "USDNOK"
+    },
+    "EURSEK": {
+      "inherit": "USDSEK"
+    },
+    "EURCNH": {
+      "pip_position": 4,
+      "pip_value": 1.4,
+      "spread_avg": 10.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 10.0,
+      "swap_long": 2.0,
+      "swap_short": -10.0
+    },
+    "GBPNOK": {
+      "pip_position": 4,
+      "pip_value": 0.95,
+      "spread_avg": 35.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 10.0,
+      "swap_long": 2.0,
+      "swap_short": -12.0
+    },
+    "GBPSEK": {
+      "pip_position": 4,
+      "pip_value": 0.95,
+      "spread_avg": 35.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 10.0,
+      "swap_long": 2.0,
+      "swap_short": -12.0
+    },
+    "EURTRY": {
+      "inherit": "USDTRY",
+      "spread_avg": 120.0
+    },
     "XAUUSD": {
       "pip_position": 2,
       "pip_value": 1.0,
@@ -476,6 +558,58 @@
       "commission_per_lot": 5.0,
       "swap_long": -3.0,
       "swap_short": -2.0
+    },
+    "XAUEUR": {
+      "inherit": "XAUUSD"
+    },
+    "XAUGBP": {
+      "inherit": "XAUUSD"
+    },
+    "XAUAUD": {
+      "inherit": "XAUUSD"
+    },
+    "XAGEUR": {
+      "inherit": "XAGUSD"
+    },
+    "XRX": {
+      "pip_position": 3,
+      "pip_value": 1.0,
+      "spread_avg": 5.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 5.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "XTIUSD": {
+      "pip_position": 2,
+      "pip_value": 1.0,
+      "spread_avg": 3.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 5.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "XBRUSD": {
+      "pip_position": 2,
+      "pip_value": 1.0,
+      "spread_avg": 3.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 5.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "XNGUSD": {
+      "pip_position": 3,
+      "pip_value": 1.0,
+      "spread_avg": 4.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 5.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
     },
     "US100": {
       "pip_position": 0,
@@ -537,10 +671,120 @@
       "swap_long": 0.0,
       "swap_short": 0.0
     },
+    "US500": {
+      "pip_position": 0,
+      "pip_value": 1.0,
+      "spread_avg": 2.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "FR40": {
+      "pip_position": 0,
+      "pip_value": 1.0,
+      "spread_avg": 2.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "ES35": {
+      "pip_position": 0,
+      "pip_value": 1.0,
+      "spread_avg": 2.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "HK50": {
+      "pip_position": 0,
+      "pip_value": 1.0,
+      "spread_avg": 8.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "AU200": {
+      "pip_position": 0,
+      "pip_value": 1.0,
+      "spread_avg": 2.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "BTCUSD": {
+      "pip_position": 2,
+      "pip_value": 1.0,
+      "spread_avg": 20.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
     "ETHUSD": {
       "pip_position": 2,
       "pip_value": 1.0,
       "spread_avg": 8.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "LTCUSD": {
+      "pip_position": 2,
+      "pip_value": 1.0,
+      "spread_avg": 15.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "SOLUSD": {
+      "pip_position": 2,
+      "pip_value": 1.0,
+      "spread_avg": 15.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "BCHUSD": {
+      "pip_position": 2,
+      "pip_value": 1.0,
+      "spread_avg": 20.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "DOGUSD": {
+      "pip_position": 4,
+      "pip_value": 1.0,
+      "spread_avg": 20.0,
+      "min_lot": 0.01,
+      "max_lot": 100.0,
+      "commission_per_lot": 0.0,
+      "swap_long": 0.0,
+      "swap_short": 0.0
+    },
+    "TRXUSD": {
+      "pip_position": 4,
+      "pip_value": 1.0,
+      "spread_avg": 15.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
       "commission_per_lot": 0.0,

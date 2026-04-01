@@ -149,6 +149,21 @@ _RE_EXECUTED = re.compile(
     rf"\[OK\]\s+\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?P<side>LONG|SHORT)\s+executed.*?@\s+(?P<price>{_NUM_TOKEN})",
     re.IGNORECASE,
 )
+_RE_FAILED_ORDER = re.compile(
+    r"\[FAIL\]\s+\[(?P<symbol>[A-Z0-9_]+)\]\s+Order failed:\s+(?P<retcode>\d+)\s*-\s*(?P<description>.+)"
+)
+_RE_SKIPPED_RISK_CAP = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Skipping trade;\s+risk\s+(?P<actual_risk>[0-9.]+)%\s+exceeds cap\s+(?P<cap_risk>[0-9.]+)%\s+\(vol=(?P<volume>[0-9.]+),\s*sl=(?P<sl>[0-9.]+)\)"
+)
+_RE_BLOCKED_RISK_CAP = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Secondary trade blocked:\s+combined risk cap reached\s+\((?P<existing_risk>[0-9.]+)%\s*>=\s*(?P<cap_risk>[0-9.]+)%\)"
+)
+_RE_BLOCKED_SYMBOL_RISK_CAP = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Symbol risk cap exceeded for (?P<canonical>[A-Z0-9_]+):.*?new (?P<new_risk>[0-9.]+)%\s*=\s*(?P<total_risk>[0-9.]+)%\s*>\s*max (?P<cap_risk>[0-9.]+)%"
+)
+_RE_SKIPPED_POSITION_EXISTS = re.compile(
+    r"\[(?P<symbol>[A-Z0-9_]+)\]\s+Skipping trade;\s+position already exists for magic\s+(?P<magic>\d+)(?:\s+\(ticket=(?P<ticket>\d+),\s*tf=(?P<timeframe>[A-Z0-9_]+)\))?"
+)
 
 
 def parse_pm_execution_log(
@@ -175,6 +190,7 @@ def parse_pm_execution_log(
             ctx["strategy_name"] = sel.group("strategy").strip()
             ctx["timeframe"] = sel.group("tf").strip().upper()
             ctx["regime"] = sel.group("regime").strip().upper()
+            ctx["secondary_trade"] = bool(sel.group("trade_type"))
             ctx["timestamp"] = ts_val
             if sel.group("secondary"):
                 ctx["secondary_trade"] = True

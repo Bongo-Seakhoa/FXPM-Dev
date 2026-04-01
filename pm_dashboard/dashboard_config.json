@@ -1,8 +1,8 @@
 {
   "alert": {
-    "enabled": true,
+    "enabled": false,
     "min_strength": 0,
-    "sound": true
+    "sound": false
   },
   "data_maintenance_time": "00:00",
   "enable_data_maintenance_scheduler": true,

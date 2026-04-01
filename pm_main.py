@@ -84,7 +84,9 @@ def log_resolved_config_summary(logger: logging.Logger,
             f"bars={getattr(p, 'max_bars', None)} | "
             f"tfs={tf_str} | "
             f"live={getattr(p, 'live_bars_count', None)}/{getattr(p, 'live_min_bars', None)} | "
-            f"risk={getattr(p, 'risk_per_trade_pct', None)}% | "
+            f"risk(base*mult/cap)={getattr(p, 'risk_per_trade_pct', None)}%*"
+            f"{getattr(p, 'live_risk_multiplier', None)}/"
+            f"{getattr(p, 'live_max_risk_pct', None)}% | "
             f"d1+lower={getattr(p, 'allow_d1_plus_lower_tf', None)} | "
             f"max_sym_risk={getattr(p, 'max_combined_risk_pct', None)}% | "
             f"opt_workers={getattr(p, 'optimization_max_workers', None)}"
@@ -96,6 +98,7 @@ def log_resolved_config_summary(logger: logging.Logger,
             f"val_dd<={getattr(p, 'fx_val_max_drawdown', None)} | "
             f"pf>={getattr(p, 'regime_min_val_profit_factor', None)} | "
             f"ret>={getattr(p, 'regime_min_val_return_pct', None)} | "
+            f"ret/dd>={getattr(p, 'regime_min_val_return_dd_ratio', None)} | "
             f"optuna_val_obj={bool(getattr(p, 'optuna_use_val_in_objective', False))}"
         )
         logger.info(
@@ -121,7 +124,7 @@ def log_resolved_config_summary(logger: logging.Logger,
             "  position: "
             f"risk={getattr(pos_cfg, 'risk_per_trade_pct', None)}% | "
             f"basis={getattr(pos_cfg, 'risk_basis', None)} | "
-            f"max_risk={getattr(pos_cfg, 'max_risk_pct', None)}% | "
+            f"max_risk={getattr(pos_cfg, 'max_risk_pct', None)}% (non-live fallback) | "
             f"size={getattr(pos_cfg, 'min_position_size', None)}-{getattr(pos_cfg, 'max_position_size', None)} | "
             f"auto_widen_sl={getattr(pos_cfg, 'auto_widen_sl', None)}"
         )
@@ -157,6 +160,7 @@ from pm_core import (
     FeatureComputer,
     Timer,
     get_instrument_spec,
+    sync_instrument_spec_from_mt5,
     set_broker_specs_path,
     set_instrument_specs,
     load_broker_specs
@@ -235,15 +239,20 @@ DEFAULT_SYMBOLS = [
     # Added Crosses / Minors
     "AUDCAD", "AUDCHF", "CADCHF", "CHFJPY", "NZDCAD", "NZDCHF", "GBPNZD",
     # Exotics (and USD minors)
-    "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN",
+    "USDNOK", "USDMXN", "USDSGD", "USDZAR", "USDPLN", "USDSEK",
     # Added Exotic / Minor
-    "USDSEK",
-    # Commodities
-    "XAUUSD", "XAGUSD",
+    "EURZAR", "GBPZAR", "USDCNH", "EURPLN",
+    # Added Nordic + selected replacements
+    "EURNOK", "EURSEK", "EURCNH", "GBPNOK", "GBPSEK", "EURTRY",
+    "Platinum", "Palladium", "EURMXN", "NOKJPY",
+    # Commodities (Metals + Energy)
+    "XAUUSD", "XAGUSD", "XAUEUR", "XAUGBP", "XAUAUD", "XAGEUR", "XRX", "XTIUSD", "XBRUSD", "XNGUSD",
     # Indices
     "US100", "US30", "DE30", "EU50", "UK100", "JP225",
+    "US500", "FR40", "ES35", "HK50", "AU200",
     # Crypto (CFDs)
-    "ETHUSD", "XRPUSD", "TONUSD", "BTCETH",
+    "BTCUSD", "ETHUSD", "LTCUSD", "SOLUSD", "BCHUSD",
+    "DOGUSD", "TRXUSD", "XRPUSD", "TONUSD", "BTCETH", "BTCXAU",
 ]
 
 
@@ -464,13 +473,13 @@ class DecisionThrottle:
 
 
 # =============================================================================
-# ACTIONABLE DECISION LOG (EXECUTED + RISK CAP ONLY)
+# ACTIONABLE DECISION LOG (DASHBOARD FEED)
 # =============================================================================
 
 class ActionableDecisionLog:
     """
-    Persist only actionable outcomes (EXECUTED / risk-cap skips) so the
-    dashboard can always show the most recent actionable decision per symbol.
+    Persist dashboard-relevant trade outcomes so the dashboard can always show
+    the most recent decision per symbol.
 
     This log is *not* used for throttling. It is purely a read-only feed for
     the dashboard and is never overwritten by NO_ACTIONABLE_SIGNAL events.
@@ -646,6 +655,7 @@ class LiveTrader:
         self._shutdown_event = threading.Event()
         self._last_bar_times: Dict[str, datetime] = {}
         self._last_order_times: Dict[str, datetime] = {}  # For rate limiting
+        self._unknown_tf_position_warnings: Set[int] = set()
         
         # Decision throttle – prevents re-evaluation / re-logging of the
         # same decision on the same bar (e.g. risk-cap skips for XAUUSD).
@@ -1127,7 +1137,7 @@ class LiveTrader:
             if pos_tf == 'D1':
                 has_d1_position = True
                 d1_position_direction = "LONG" if pos.type == 0 else "SHORT"  # 0=BUY, 1=SELL
-            elif pos_tf is not None:
+            elif pos_tf:
                 has_non_d1_position = True
             else:
                 # Unknown trade tag - assume it's a non-D1 trade for safety
@@ -1166,7 +1176,12 @@ class LiveTrader:
             block_reason = "2 positions already open"
             
         elif num_positions == 1:
-            if allow_d1_plus_lower and has_d1_position:
+            if allow_d1_plus_lower and has_unknown_position_timeframe:
+                # Avoid inconsistent state where a trade is selected but then blocked
+                # later by magic-level duplicate checks.
+                can_open_trade = False
+                block_reason = "Position timeframe unknown; blocking secondary trade"
+            elif allow_d1_plus_lower and has_d1_position:
                 # D1 position open - allow one additional non-D1 trade
                 can_open_trade = True
                 allowed_timeframes = ['M5', 'M15', 'M30', 'H1', 'H4']  # Exclude D1
@@ -1433,8 +1448,12 @@ class LiveTrader:
         
         # Get live quality gate thresholds from config
         min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
-        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 0.0) if self.pipeline_config else 0.0
+        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 5.0) if self.pipeline_config else 5.0
         max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
+        min_return_dd_ratio = (
+            getattr(self.pipeline_config, 'regime_min_val_return_dd_ratio', 1.0)
+            if self.pipeline_config else 1.0
+        )
         
         for tf in available_timeframes:
             # Get bars for this timeframe (need at least the latest bar time)
@@ -1452,8 +1471,7 @@ class LiveTrader:
             # Determine if this is a new bar
             is_new_bar = (last_bar_time is None or current_bar_time > last_bar_time)
             freshness = 1.0 if is_new_bar else freshness_decay
-            
-            # ── Feature/Signal Cache Logic ───────────────────────────────────
+            # Feature/signal cache logic
             # Build cache key including bar_time to ensure we invalidate on new bar
             feature_cache_key = f"{symbol}_{tf}_{current_bar_time}"
             cached = self._candidate_cache.get(feature_cache_key)
@@ -1518,13 +1536,17 @@ class LiveTrader:
                     }
                     self._prune_cache()
                     continue
-                if not regime_config.is_valid_for_live(min_pf, min_return, max_dd):
+                if not regime_config.is_valid_for_live(min_pf, min_return, max_dd, min_return_dd_ratio):
+                    val_ret = regime_config.val_metrics.get('total_return_pct', -100)
+                    val_dd = regime_config.val_metrics.get('max_drawdown_pct', 100)
+                    val_ratio = val_ret / max(val_dd, 0.5)
                     stats["winner_failed_gate"] += 1
                     self.logger.debug(
                         f"[{symbol}] [{tf}] [{current_regime}] Winner failed live gate "
                         f"(PF={regime_config.val_metrics.get('profit_factor', 0):.2f}, "
-                        f"ret={regime_config.val_metrics.get('total_return_pct', -100):.1f}%, "
-                        f"dd={regime_config.val_metrics.get('max_drawdown_pct', 100):.1f}%)"
+                        f"ret={val_ret:.1f}%, "
+                        f"dd={val_dd:.1f}%, "
+                        f"ret/dd={val_ratio:.2f})"
                     )
                     self._candidate_cache[feature_cache_key] = {
                         'features': features,
@@ -1595,15 +1617,27 @@ class LiveTrader:
         
         # Winners-only live gate for legacy configs
         min_pf = getattr(self.pipeline_config, 'regime_min_val_profit_factor', 1.0) if self.pipeline_config else 1.0
-        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 0.0) if self.pipeline_config else 0.0
+        min_return = getattr(self.pipeline_config, 'regime_min_val_return_pct', 5.0) if self.pipeline_config else 5.0
         max_dd = getattr(self.pipeline_config, 'fx_val_max_drawdown', 35.0) if self.pipeline_config else 35.0
+        min_return_dd_ratio = (
+            getattr(self.pipeline_config, 'regime_min_val_return_dd_ratio', 1.0)
+            if self.pipeline_config else 1.0
+        )
         val_pf = config.val_metrics.get('profit_factor', 0.0)
         val_return = config.val_metrics.get('total_return_pct', -100.0)
         val_dd = config.val_metrics.get('max_drawdown_pct', 100.0)
-        if not config.is_validated or val_pf < min_pf or val_return < min_return or val_dd > max_dd:
+        val_return_dd_ratio = val_return / max(val_dd, 0.5)
+        if (
+            not config.is_validated or
+            val_pf < min_pf or
+            val_return < min_return or
+            val_dd > max_dd or
+            val_return_dd_ratio < min_return_dd_ratio
+        ):
             self.logger.debug(
                 f"[{symbol}] Legacy config failed live gate "
-                f"(validated={config.is_validated}, PF={val_pf:.2f}, ret={val_return:.1f}%, dd={val_dd:.1f}%)"
+                f"(validated={config.is_validated}, PF={val_pf:.2f}, ret={val_return:.1f}%, "
+                f"dd={val_dd:.1f}%, ret/dd={val_return_dd_ratio:.2f})"
             )
             return []
         
@@ -1730,6 +1764,13 @@ class LiveTrader:
         quality_score = _safe_float(best_candidate.get('quality_score')) if best_candidate else None
         freshness_score = _safe_float(best_candidate.get('freshness')) if best_candidate else None
         regime_strength_score = _safe_float(best_candidate.get('regime_strength')) if best_candidate else None
+        decision_context: Dict[str, Any] = {
+            "secondary_trade": bool(is_secondary_trade),
+            "selection_score": selection_score,
+            "quality_score": quality_score,
+            "freshness": freshness_score,
+            "regime_strength": regime_strength_score,
+        }
 
         def _record_actionable(action: str,
                                entry_price_value: Optional[float] = None,
@@ -1778,7 +1819,10 @@ class LiveTrader:
         if last_order_time:
             time_since_last = (datetime.now() - last_order_time).total_seconds()
             if time_since_last < self.ORDER_RATE_LIMIT_SECONDS:
-                self.logger.debug(f"[{symbol}] Rate limited, {self.ORDER_RATE_LIMIT_SECONDS - time_since_last:.1f}s remaining")
+                remaining = max(0.0, self.ORDER_RATE_LIMIT_SECONDS - time_since_last)
+                self.logger.info(f"[{symbol}] Skipping trade; rate limited ({remaining:.1f}s remaining)")
+                _record_throttle("SKIPPED_RATE_LIMIT", cooldown=int(max(1.0, remaining)))
+                _record_actionable(action="SKIPPED_RATE_LIMIT")
                 return
         
         # Re-verify no position exists right before execution (race condition prevention)
@@ -1796,6 +1840,7 @@ class LiveTrader:
                 f"(tf={_tf}, regime={_regime})"
             )
             _record_throttle("SKIPPED_POSITION_EXISTS")
+            _record_actionable(action="SKIPPED_POSITION_EXISTS")
             return
 
         # Calculate stops (use MT5-derived spec for live parity)
@@ -1811,6 +1856,9 @@ class LiveTrader:
         # Get symbol info for sizing and broker constraints
         symbol_info = self.mt5.get_symbol_info(broker_symbol)
         if symbol_info is None:
+            self.logger.warning(f"[{symbol}] Skipping trade; symbol info unavailable")
+            _record_throttle("SKIPPED_NO_SYMBOL_INFO")
+            _record_actionable(action="SKIPPED_NO_SYMBOL_INFO")
             return
 
         # D4: Symbol-level tradability gate — reject untradable symbols early
@@ -1824,17 +1872,39 @@ class LiveTrader:
         # Risk basis (balance/equity)
         account = account_info or self.mt5.get_account_info()
         if account is None:
+            self.logger.warning(f"[{symbol}] Skipping trade; account info unavailable")
+            _record_throttle("SKIPPED_NO_ACCOUNT_INFO")
+            _record_actionable(action="SKIPPED_NO_ACCOUNT_INFO")
             return
+
+        # --- Margin protection entry gate (black-swan guard) ---
+        margin_level = float(getattr(account, 'margin_level', 0.0) or 0.0)
+        margin_block = float(getattr(
+            self.pipeline_config, 'margin_entry_block_level', 100.0))
+        # margin_level == 0 means no positions open (undefined, not stressed).
+        if margin_level > 0 and margin_level < margin_block:
+            self.logger.info(
+                f"[{symbol}] MARGIN BLOCKED: margin_level={margin_level:.1f}% "
+                f"< {margin_block:.0f}% — entry blocked"
+            )
+            _record_throttle("SKIPPED_MARGIN_BLOCKED")
+            _record_actionable(action="SKIPPED_MARGIN_BLOCKED")
+            return
+
         basis_pref = getattr(self.position_config, "risk_basis", "balance")
         basis_value = account.balance if basis_pref == "balance" else account.equity
         if basis_value <= 0:
             self.logger.warning(f"[{symbol}] Invalid risk basis value ({basis_value}); skipping trade")
             _record_throttle("SKIPPED_INVALID_BASIS")
+            _record_actionable(action="SKIPPED_INVALID_BASIS")
             return
 
         # Get current price (same basis used for execution)
         tick = self.mt5.get_symbol_tick(broker_symbol)
         if tick is None:
+            self.logger.warning(f"[{symbol}] Skipping trade; tick data unavailable")
+            _record_throttle("SKIPPED_NO_TICK")
+            _record_actionable(action="SKIPPED_NO_TICK")
             return
         entry_price = tick.ask if is_long else tick.bid
 
@@ -2026,11 +2096,8 @@ class LiveTrader:
         # Ensure non-zero (and not absurdly tiny) risk if we proceed
         if target_risk_pct < min_trade_risk:
             self.logger.info(f"[{symbol}] Trade blocked: computed risk {target_risk_pct:.3f}% below min_trade_risk_pct={min_trade_risk:.3f}%")
-            self._decision_throttle.record_decision(
-                symbol=symbol, decision_key=decision_key,
-                bar_time_iso=bar_time_iso,
-                timeframe=best_candidate.get('timeframe'), regime=best_candidate.get('regime'),
-                strategy_name=best_candidate.get('strategy_name'), direction=int(best_candidate.get('signal', 0)),
+            _record_throttle("BLOCKED_TOO_LOW_RISK")
+            _record_actionable(
                 action="BLOCKED_TOO_LOW_RISK",
                 context=decision_context,
             )
@@ -2068,6 +2135,15 @@ class LiveTrader:
         if loss_per_lot <= 0:
             self.logger.warning(f"[{symbol}] Could not compute loss_per_lot; skipping trade")
             _record_throttle("SKIPPED_NO_LOSS_CALC")
+            _record_actionable(
+                action="SKIPPED_NO_LOSS_CALC",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=None,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=None,
+            )
             return
 
         # Raw volume for target risk
@@ -2115,7 +2191,7 @@ class LiveTrader:
                 actual_risk_amount = abs(float(sl_pips)) * float(spec.pip_value) * float(volume)
 
         actual_risk_pct = (actual_risk_amount / basis_value) * 100.0 if basis_value > 0 else float('inf')
-        max_risk_pct = float(getattr(self.position_config, "max_risk_pct", 5.0))
+        max_risk_pct = float(getattr(self.pipeline_config, "live_max_risk_pct", target_risk_pct))
         if actual_risk_pct > max_risk_pct + 1e-9:
             self.logger.warning(
                 f"[{symbol}] Skipping trade; risk {actual_risk_pct:.2f}% exceeds cap {max_risk_pct:.2f}% "
@@ -2178,6 +2254,15 @@ class LiveTrader:
             self._log_trade(symbol, direction, volume, entry_price,
                             sl_price, tp_price, magic, "PAPER")
             _record_throttle("PAPER")
+            _record_actionable(
+                action="PAPER",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+            )
             return
 
         # ===== FIX #2: Encode trade comment with full metadata =====
@@ -2235,6 +2320,15 @@ class LiveTrader:
             self._log_trade(symbol, direction, volume, entry_price,
                            sl_price, tp_price, magic, f"FAILED: {result.retcode_description}")
             _record_throttle(f"FAILED_{result.retcode}")
+            _record_actionable(
+                action=f"FAILED_{result.retcode}",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+            )
     
     def _close_position_on_signal(self, position: MT5Position, features: pd.DataFrame, spec):
         """Close position on opposite signal."""
