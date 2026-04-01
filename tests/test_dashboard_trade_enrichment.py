@@ -8,7 +8,12 @@ import uuid
 
 import pandas as pd
 
-from pm_dashboard.analytics import build_analytics_payload, load_trade_history, reconstruct_trade_outcomes
+from pm_dashboard.analytics import (
+    build_analytics_payload,
+    compute_performance_metrics,
+    load_trade_history,
+    reconstruct_trade_outcomes,
+)
 
 
 def _encode_magic(symbol: str, timeframe: str, regime: str) -> int:
@@ -32,6 +37,11 @@ class DashboardTradeEnrichmentTests(unittest.TestCase):
 
     def _write_pm_configs(self, cfg) -> None:
         path = os.path.join(self.pm_root, "pm_configs.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(cfg, handle)
+
+    def _write_root_config(self, cfg) -> None:
+        path = os.path.join(self.pm_root, "config.json")
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(cfg, handle)
 
@@ -257,6 +267,95 @@ class DashboardTradeEnrichmentTests(unittest.TestCase):
         self.assertEqual(metrics["drawdown_duration"], 0)
         self.assertEqual(metrics["recovery_time"], 0)
         self.assertEqual(metrics["ulcer_index"], 0.0)
+
+    def test_compute_metrics_expectancy_matches_avg_trade_pnl(self) -> None:
+        trades = [
+            {"timestamp": "2026-02-09T03:00:00", "status": "CLOSED", "pnl": 15.0},
+            {"timestamp": "2026-02-09T04:00:00", "status": "CLOSED", "pnl": -5.0},
+            {"timestamp": "2026-02-09T05:00:00", "status": "CLOSED", "pnl": 10.0},
+        ]
+
+        metrics = compute_performance_metrics(trades, initial_capital=10000.0)
+        self.assertAlmostEqual(metrics["expectancy"], metrics["avg_trade_pnl"], places=2)
+
+    def test_reconstruct_trade_outcomes_uses_root_instrument_specs_for_pip_value(self) -> None:
+        self._write_root_config(
+            {
+                "instrument_specs": {
+                    "USDJPY": {
+                        "pip_position": 2,
+                        "pip_value": 9.0,
+                    }
+                }
+            }
+        )
+        entry_time = datetime(2026, 2, 9, 2, 0, 0)
+        bars = pd.DataFrame(
+            {
+                "Open": [150.00],
+                "High": [150.12],
+                "Low": [149.95],
+                "Close": [150.10],
+            },
+            index=[entry_time + pd.Timedelta(minutes=5)],
+        )
+
+        reconstructed = reconstruct_trade_outcomes(
+            [
+                {
+                    "timestamp": entry_time.isoformat(),
+                    "symbol": "USDJPY",
+                    "timeframe": "M5",
+                    "direction": "LONG",
+                    "volume": 0.5,
+                    "price": 150.00,
+                    "sl": 149.90,
+                    "tp": 150.10,
+                }
+            ],
+            lambda symbol, timeframe, start, end: bars,
+            max_trades=10,
+            instrument_specs={
+                "USDJPY": {"pip_position": 2, "pip_value": 9.0},
+            },
+        )
+
+        self.assertEqual(len(reconstructed), 1)
+        self.assertAlmostEqual(reconstructed[0]["pnl_pips"], 10.0, places=4)
+        self.assertAlmostEqual(reconstructed[0]["pnl"], 45.0, places=2)
+
+    def test_build_analytics_payload_sorts_recent_trades_by_close_timestamp(self) -> None:
+        self._write_trades(
+            [
+                {
+                    "timestamp": "2026-02-09T01:00:00",
+                    "exit_timestamp": "2026-02-09T05:00:00",
+                    "symbol": "EURUSD",
+                    "direction": "LONG",
+                    "price": 1.1,
+                    "sl": 1.09,
+                    "tp": 1.12,
+                    "status": "CLOSED",
+                    "pnl": 10.0,
+                },
+                {
+                    "timestamp": "2026-02-09T04:00:00",
+                    "exit_timestamp": "2026-02-09T04:30:00",
+                    "symbol": "GBPUSD",
+                    "direction": "SHORT",
+                    "price": 1.25,
+                    "sl": 1.26,
+                    "tp": 1.24,
+                    "status": "CLOSED",
+                    "pnl": 8.0,
+                },
+            ]
+        )
+
+        payload = build_analytics_payload(self.pm_root, initial_capital=10000.0)
+        self.assertTrue(payload["recent_trades"])
+        self.assertEqual(payload["recent_trades"][0]["symbol"], "EURUSD")
+        self.assertEqual(payload["recent_trades"][0]["timestamp"], "2026-02-09T05:00:00")
 
 
 if __name__ == "__main__":

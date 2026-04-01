@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PM Dashboard - Trade History</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260208a') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v=asset_version) }}" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -40,6 +40,8 @@
           </div>
         </div>
       </header>
+
+      <section class="loading-indicator" id="trades-loading" aria-live="polite">Loading trade history...</section>
 
       <section class="card controls fade-in">
         <div class="filters filters-wide">
@@ -152,7 +154,7 @@
       </div>
     </aside>
 
-    <script src="{{ url_for('static', filename='common.js', v='20260208a') }}"></script>
-    <script src="{{ url_for('static', filename='trades.js', v='20260208a') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v=asset_version) }}"></script>
+    <script src="{{ url_for('static', filename='trades.js', v=asset_version) }}"></script>
   </body>
 </html>

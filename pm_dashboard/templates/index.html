@@ -5,9 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PM Dashboard - Signal Desk</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260208a') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v=asset_version) }}" />
   </head>
   <body>
+    <noscript><div style="padding:2em;text-align:center;color:#b83333;">JavaScript is required to use the PM Dashboard.</div></noscript>
     <div class="bg-grid"></div>
     <div class="app">
       <header class="top">
@@ -48,6 +49,7 @@
       </header>
 
       <section class="status-banner hidden" id="status-banner" aria-live="polite"></section>
+      <section class="loading-indicator" id="entries-loading" aria-live="polite">Loading signal desk...</section>
 
       <section class="card controls fade-in">
         <div class="filters filters-wide">
@@ -305,7 +307,7 @@
       </div>
     </aside>
 
-    <script src="{{ url_for('static', filename='common.js', v='20260208a') }}"></script>
-    <script src="{{ url_for('static', filename='app.js', v='20260208a') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v=asset_version) }}"></script>
+    <script src="{{ url_for('static', filename='app.js', v=asset_version) }}"></script>
   </body>
 </html>

@@ -19,7 +19,8 @@
       "Bash(ls:*)",
       "Bash(pytest:*)",
       "Bash(set:*)",
-      "Bash(git status:*)"
+      "Bash(git status:*)",
+      "WebFetch(domain:www.mql5.com)"
     ]
   }
 }

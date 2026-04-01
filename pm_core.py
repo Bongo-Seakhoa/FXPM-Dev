@@ -567,6 +567,10 @@ class PipelineConfig:
     # Live trading data window
     live_bars_count: int = 1500      # bars loaded per timeframe during live trading
     live_min_bars: int = 300         # minimum bars required to evaluate a timeframe in live trading
+    execution_spread_filter_enabled: bool = True
+    execution_spread_min_edge_mult: float = 1.5
+    execution_spread_spike_mult: float = 2.0
+    execution_spread_penalty_start_mult: float = 0.5
 
     # Retrain periods to evaluate (research-only; production uses the fixed calendar schedule below)
     retrain_periods: List[int] = field(default_factory=lambda: [7, 14, 30, 60, 90])
@@ -693,6 +697,19 @@ class PipelineConfig:
             self.production_retrain_poll_seconds = max(1, int(self.production_retrain_poll_seconds))
         except Exception:
             self.production_retrain_poll_seconds = 60
+        self.execution_spread_filter_enabled = bool(self.execution_spread_filter_enabled)
+        try:
+            self.execution_spread_min_edge_mult = max(0.0, float(self.execution_spread_min_edge_mult))
+        except Exception:
+            self.execution_spread_min_edge_mult = 1.5
+        try:
+            self.execution_spread_spike_mult = max(1.0, float(self.execution_spread_spike_mult))
+        except Exception:
+            self.execution_spread_spike_mult = 2.0
+        try:
+            self.execution_spread_penalty_start_mult = max(0.0, float(self.execution_spread_penalty_start_mult))
+        except Exception:
+            self.execution_spread_penalty_start_mult = 0.5
         try:
             self.fixed_retrain_days = max(
                 1,

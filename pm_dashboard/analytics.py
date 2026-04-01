@@ -16,16 +16,19 @@ import pandas as pd
 import numpy as np
 
 from .utils import (
-    parse_timestamp,
+    load_instrument_specs,
     normalize_symbol,
     normalize_timeframe,
     normalize_regime,
     load_pm_configs,
+    parse_timestamp,
+    pip_size_from_spec,
 )
 
 logger = logging.getLogger(__name__)
 
 _TRADE_HISTORY_CACHE: Dict[Tuple[str, int, Tuple[Tuple[str, int, int], ...], Tuple[str, int, int]], List[Dict[str, Any]]] = {}
+_TRADE_HISTORY_CACHE_VERSION = "v2"
 
 _REALIZED_STATUSES = {
     "CLOSED",
@@ -225,6 +228,47 @@ def _pm_config_signature(pm_root: str) -> Tuple[str, int, int]:
         return (path, 0, 0)
 
 
+def _root_config_signature(pm_root: str) -> Tuple[str, int, int]:
+    path = os.path.join(pm_root, "config.json")
+    if not os.path.isfile(path):
+        return (path, 0, 0)
+    try:
+        return _path_signature(path)
+    except OSError:
+        return (path, 0, 0)
+
+
+def _normalize_cache_root(pm_root: str) -> str:
+    return os.path.normcase(os.path.abspath(pm_root))
+
+
+def _trade_entry_timestamp(trade: Dict[str, Any]) -> Optional[datetime]:
+    cached = trade.get("_parsed_timestamp")
+    if isinstance(cached, datetime):
+        return cached
+    return parse_timestamp(trade.get("timestamp"))
+
+
+def _trade_sort_timestamp(trade: Dict[str, Any]) -> Optional[datetime]:
+    cached = trade.get("_sort_timestamp")
+    if isinstance(cached, datetime):
+        return cached
+
+    for key in (
+        "exit_timestamp",
+        "close_timestamp",
+        "closed_at",
+        "close_time",
+        "exit_time",
+        "updated_at",
+        "filled_at",
+    ):
+        ts = parse_timestamp(trade.get(key))
+        if ts is not None:
+            return ts
+    return _trade_entry_timestamp(trade)
+
+
 def _trade_pnl_value(trade: Dict[str, Any]) -> float:
     for key in ("pnl", "profit", "net_profit", "realized_pnl"):
         value = trade.get(key)
@@ -293,7 +337,15 @@ def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any
 
     trade_signature = _trade_file_signature(pm_root, max_files)
     config_signature = _pm_config_signature(pm_root)
-    cache_key = (pm_root, max_files, trade_signature, config_signature)
+    root_config_signature = _root_config_signature(pm_root)
+    cache_key = (
+        _TRADE_HISTORY_CACHE_VERSION,
+        _normalize_cache_root(pm_root),
+        max_files,
+        trade_signature,
+        config_signature,
+        root_config_signature,
+    )
 
     cached = _TRADE_HISTORY_CACHE.get(cache_key)
     if cached is not None:
@@ -320,12 +372,17 @@ def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any
             trade["symbol"] = normalize_symbol(trade["symbol"])
         trade["realized"] = _is_realized_trade(trade)
         trade["pnl"] = _trade_pnl_value(trade) if trade["realized"] else 0.0
-        if "timestamp" in trade:
-            ts = parse_timestamp(trade["timestamp"])
-            if ts:
-                trade["_parsed_timestamp"] = ts
+        entry_ts = _trade_entry_timestamp(trade)
+        if entry_ts:
+            trade["_parsed_timestamp"] = entry_ts
+        sort_ts = _trade_sort_timestamp(trade)
+        if sort_ts:
+            trade["_sort_timestamp"] = sort_ts
 
-    all_trades.sort(key=lambda t: t.get("_parsed_timestamp") or datetime.min, reverse=True)
+    all_trades.sort(
+        key=lambda t: (t.get("_sort_timestamp") or t.get("_parsed_timestamp") or datetime.min, t.get("symbol", ""), t.get("entry_id", "")),
+        reverse=True,
+    )
     _TRADE_HISTORY_CACHE[cache_key] = copy.deepcopy(all_trades)
     return all_trades
 
@@ -339,7 +396,10 @@ def compute_equity_curve(trades: List[Dict[str, Any]], initial_capital: float = 
         return []
 
     realized_trades = _realized_trades(trades)
-    sorted_trades = sorted([t for t in realized_trades if t.get("_parsed_timestamp")], key=lambda t: t["_parsed_timestamp"])
+    sorted_trades = sorted(
+        [t for t in realized_trades if _trade_sort_timestamp(t)],
+        key=lambda t: _trade_sort_timestamp(t) or datetime.min,
+    )
 
     if not sorted_trades:
         return []
@@ -349,7 +409,7 @@ def compute_equity_curve(trades: List[Dict[str, Any]], initial_capital: float = 
     curve: List[Dict[str, Any]] = []
 
     curve.append({
-        "timestamp": sorted_trades[0]["_parsed_timestamp"].isoformat() if sorted_trades else datetime.now().isoformat(),
+        "timestamp": (_trade_sort_timestamp(sorted_trades[0]) or datetime.now()).isoformat() if sorted_trades else datetime.now().isoformat(),
         "equity": equity,
         "pnl": 0.0,
         "cumulative_pnl": 0.0
@@ -359,9 +419,10 @@ def compute_equity_curve(trades: List[Dict[str, Any]], initial_capital: float = 
         pnl = _trade_pnl_value(trade)
         equity += pnl
         cumulative_pnl += pnl
+        trade_ts = _trade_sort_timestamp(trade) or datetime.now()
 
         curve.append({
-            "timestamp": trade["_parsed_timestamp"].isoformat(),
+            "timestamp": trade_ts.isoformat(),
             "equity": equity,
             "pnl": pnl,
             "cumulative_pnl": cumulative_pnl
@@ -401,7 +462,7 @@ def compute_drawdown_curve(equity_curve: List[Dict[str, Any]]) -> List[Dict[str,
 
 
 # ---------------------------------------------------------------------------
-# Extended risk metrics (Package E7)
+# Extended risk metrics: drawdown duration, recovery time, ulcer index
 # ---------------------------------------------------------------------------
 
 def _compute_drawdown_duration(equity_curve: List[float]) -> int:
@@ -556,9 +617,9 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
     # Recovery factor (net profit / max drawdown $)
     recovery_factor = (total_pnl / max_dd_abs) if max_dd_abs > 0 else 0.0
 
-    # Expectancy (avg_win * win_rate - avg_loss * loss_rate)
+    # Expectancy (avg_win * win_rate - |avg_loss| * loss_rate)
     loss_rate = (losing_trades / total_trades) if total_trades > 0 else 0.0
-    expectancy = avg_win * (win_rate / 100.0) + avg_loss * loss_rate
+    expectancy = avg_trade_pnl
 
     # Consecutive wins/losses
     max_consec_wins = 0
@@ -626,7 +687,7 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
         "worst_trade": round(min(pnls, default=0.0), 2),
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
-        # --- Extended risk metrics (Package E7) ---
+        # Extended risk metrics
         "drawdown_duration": _compute_drawdown_duration(_equity_floats),
         "recovery_time": _compute_recovery_time(_equity_floats),
         "ulcer_index": round(_compute_ulcer_index(_equity_floats), 4),
@@ -667,7 +728,7 @@ def compute_monthly_performance(
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     for trade in _realized_trades(trades):
-        ts = trade.get("_parsed_timestamp")
+        ts = _trade_sort_timestamp(trade)
         if ts:
             month_key = ts.strftime("%Y-%m")
             grouped[month_key].append(trade)
@@ -690,7 +751,7 @@ def compute_daily_pnl(trades: List[Dict[str, Any]], days: int = 30) -> List[Dict
     daily: Dict[str, List[float]] = defaultdict(list)
 
     for trade in _realized_trades(trades):
-        ts = trade.get("_parsed_timestamp")
+        ts = _trade_sort_timestamp(trade)
         if ts:
             date_key = ts.strftime("%Y-%m-%d")
             pnl = _trade_pnl_value(trade)
@@ -718,7 +779,7 @@ def compute_hour_day_heatmap(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str
     heatmap: Dict[str, Dict[str, float]] = {d: {} for d in days}
 
     for trade in _realized_trades(trades):
-        ts = trade.get("_parsed_timestamp")
+        ts = _trade_sort_timestamp(trade)
         if not ts:
             continue
         pnl = _trade_pnl_value(trade)
@@ -755,9 +816,11 @@ def compute_strategy_ranking(trades: List[Dict[str, Any]], top_n: int = 10) -> L
     return ranking[:top_n]
 
 
-def get_pip_size(symbol: str) -> float:
+def get_pip_size(symbol: str, instrument_specs: Optional[Dict[str, Dict[str, Any]]] = None) -> float:
     """
     Get pip size for a symbol.
+
+    Tries pm_core.get_instrument_spec first, then falls back to heuristic.
 
     Args:
         symbol: Symbol name
@@ -765,22 +828,80 @@ def get_pip_size(symbol: str) -> float:
     Returns:
         Pip size (default: 0.0001 for most FX pairs)
     """
-    # JPY pairs use 0.01
-    if 'JPY' in symbol.upper():
+    symbol_norm = normalize_symbol(symbol)
+    if instrument_specs:
+        spec = instrument_specs.get(symbol_norm)
+        pip_size = pip_size_from_spec(spec)
+        if pip_size and pip_size > 0:
+            return float(pip_size)
+
+    try:
+        from pm_core import get_instrument_spec
+        spec = get_instrument_spec(symbol_norm)
+        if spec and spec.pip_size > 0:
+            return spec.pip_size
+    except Exception:
+        pass
+
+    # Heuristic fallback
+    sym = symbol_norm.upper()
+    if 'JPY' in sym:
         return 0.01
-    # Metals and indices
-    if symbol.upper() in ['XAUUSD', 'XAGUSD', 'US30', 'US100', 'EU50', 'UK100', 'DE30', 'JP225']:
+    if sym in ('XAUUSD',):
+        return 0.01  # Gold: 2-digit pip
+    if sym in ('XAGUSD',):
+        return 0.001
+    if sym in ('US30', 'US100', 'US500', 'EU50', 'UK100', 'DE30', 'JP225',
+               'FR40', 'ES35', 'AU200', 'HK50'):
         return 0.1
-    # Crypto
-    if symbol.upper() in ['BTCUSD', 'ETHUSD', 'XRPUSD', 'TONUSD', 'BTCETH']:
+    if sym in ('BTCUSD', 'ETHUSD', 'XRPUSD', 'TONUSD', 'BTCETH', 'BCHUSD',
+               'LTCUSD', 'SOLUSD', 'DOGUSD', 'TRXUSD'):
         return 1.0
-    # Default FX
+    if sym in ('XBRUSD', 'XTIUSD', 'XNGUSD'):
+        return 0.01
     return 0.0001
 
 
-def reconstruct_trade_outcome(trade_entry: Dict[str, Any],
-                              historical_bars: pd.DataFrame,
-                              timeout_bars: int = 1000) -> Dict[str, Any]:
+def _get_pip_value_per_lot(symbol: str, instrument_specs: Optional[Dict[str, Dict[str, Any]]] = None) -> float:
+    """Get pip value per standard lot from instrument specs, with fallback."""
+    symbol_norm = normalize_symbol(symbol)
+    if instrument_specs:
+        spec = instrument_specs.get(symbol_norm)
+        if isinstance(spec, dict):
+            try:
+                pip_value = float(spec.get("pip_value", 0.0) or 0.0)
+                if pip_value > 0:
+                    return pip_value
+            except (TypeError, ValueError):
+                pass
+    try:
+        from pm_core import get_instrument_spec
+        spec = get_instrument_spec(symbol_norm)
+        if spec and spec.pip_value > 0:
+            return spec.pip_value
+    except Exception:
+        pass
+    # Heuristic fallback
+    sym = symbol_norm.upper()
+    if sym in ('XAUUSD', 'XAGUSD'):
+        return 1.0
+    if sym in ('BTCUSD', 'ETHUSD', 'XRPUSD', 'TONUSD', 'BTCETH', 'BCHUSD',
+               'LTCUSD', 'SOLUSD', 'DOGUSD', 'TRXUSD'):
+        return 1.0
+    if sym in ('US30', 'US100', 'US500', 'EU50', 'UK100', 'DE30', 'JP225',
+               'FR40', 'ES35', 'AU200', 'HK50'):
+        return 1.0
+    if sym in ('XBRUSD', 'XTIUSD', 'XNGUSD'):
+        return 1.0
+    return 10.0  # Standard FX pip value per lot
+
+
+def reconstruct_trade_outcome(
+    trade_entry: Dict[str, Any],
+    historical_bars: pd.DataFrame,
+    timeout_bars: int = 1000,
+    instrument_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """
     Simulate trade execution using historical bars.
 
@@ -837,7 +958,7 @@ def reconstruct_trade_outcome(trade_entry: Dict[str, Any],
                 'duration_minutes': None
             }
 
-        pip_size = get_pip_size(symbol)
+        pip_size = get_pip_size(symbol, instrument_specs=instrument_specs)
 
         # Filter bars after entry
         bars_after_entry = historical_bars[historical_bars.index > entry_time].head(timeout_bars)
@@ -852,53 +973,86 @@ def reconstruct_trade_outcome(trade_entry: Dict[str, Any],
             }
 
         # Walk through bars to find SL/TP hit
+        # Mirrors pm_core A2 gap-through-stop semantics:
+        # check Open first (gap-through), then intra-bar Low/High.
         for idx, bar in bars_after_entry.iterrows():
+            bar_open = bar['Open']
+            duration = (idx - entry_time).total_seconds() / 60
+
             if direction == 'LONG':
-                # Check SL first (conservative)
+                # Gap-through SL at open
+                if bar_open <= sl:
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': bar_open,
+                        'close_reason': 'SL_HIT',
+                        'pnl_pips': (bar_open - entry_price) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration,
+                    }
+                # Intra-bar SL
                 if bar['Low'] <= sl:
-                    pnl_pips = (sl - entry_price) / pip_size if pip_size > 0 else 0
-                    duration = (idx - entry_time).total_seconds() / 60
                     return {
                         'exit_timestamp': idx.isoformat(),
                         'exit_price': sl,
                         'close_reason': 'SL_HIT',
-                        'pnl_pips': pnl_pips,
-                        'duration_minutes': duration
+                        'pnl_pips': (sl - entry_price) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration,
                     }
-                # Check TP
-                elif bar['High'] >= tp:
-                    pnl_pips = (tp - entry_price) / pip_size if pip_size > 0 else 0
-                    duration = (idx - entry_time).total_seconds() / 60
+                # Gap-through TP at open
+                if bar_open >= tp:
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': bar_open,
+                        'close_reason': 'TP_HIT',
+                        'pnl_pips': (bar_open - entry_price) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration,
+                    }
+                # Intra-bar TP
+                if bar['High'] >= tp:
                     return {
                         'exit_timestamp': idx.isoformat(),
                         'exit_price': tp,
                         'close_reason': 'TP_HIT',
-                        'pnl_pips': pnl_pips,
-                        'duration_minutes': duration
+                        'pnl_pips': (tp - entry_price) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration,
                     }
 
             else:  # SHORT
-                # Check SL first (conservative)
+                # Gap-through SL at open
+                if bar_open >= sl:
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': bar_open,
+                        'close_reason': 'SL_HIT',
+                        'pnl_pips': (entry_price - bar_open) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration,
+                    }
+                # Intra-bar SL
                 if bar['High'] >= sl:
-                    pnl_pips = (entry_price - sl) / pip_size if pip_size > 0 else 0
-                    duration = (idx - entry_time).total_seconds() / 60
                     return {
                         'exit_timestamp': idx.isoformat(),
                         'exit_price': sl,
                         'close_reason': 'SL_HIT',
                         'pnl_pips': (entry_price - sl) / pip_size if pip_size > 0 else 0,
-                        'duration_minutes': duration
+                        'duration_minutes': duration,
                     }
-                # Check TP
-                elif bar['Low'] <= tp:
-                    pnl_pips = (entry_price - tp) / pip_size if pip_size > 0 else 0
-                    duration = (idx - entry_time).total_seconds() / 60
+                # Gap-through TP at open
+                if bar_open <= tp:
+                    return {
+                        'exit_timestamp': idx.isoformat(),
+                        'exit_price': bar_open,
+                        'close_reason': 'TP_HIT',
+                        'pnl_pips': (entry_price - bar_open) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration,
+                    }
+                # Intra-bar TP
+                if bar['Low'] <= tp:
                     return {
                         'exit_timestamp': idx.isoformat(),
                         'exit_price': tp,
                         'close_reason': 'TP_HIT',
-                        'pnl_pips': pnl_pips,
-                        'duration_minutes': duration
+                        'pnl_pips': (entry_price - tp) / pip_size if pip_size > 0 else 0,
+                        'duration_minutes': duration,
                     }
 
         # Timeout: no SL/TP hit within available data
@@ -921,9 +1075,12 @@ def reconstruct_trade_outcome(trade_entry: Dict[str, Any],
         }
 
 
-def reconstruct_trade_outcomes(trades: List[Dict[str, Any]],
-                               data_loader_func,
-                               max_trades: int = 1000) -> List[Dict[str, Any]]:
+def reconstruct_trade_outcomes(
+    trades: List[Dict[str, Any]],
+    data_loader_func,
+    max_trades: int = 1000,
+    instrument_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """
     Reconstruct outcomes for multiple trades.
 
@@ -961,20 +1118,18 @@ def reconstruct_trade_outcomes(trades: List[Dict[str, Any]],
 
         for idx, trade, _ in batch:
             try:
-                outcome = reconstruct_trade_outcome(trade, historical_bars)
+                outcome = reconstruct_trade_outcome(
+                    trade,
+                    historical_bars,
+                    instrument_specs=instrument_specs,
+                )
                 trade_with_outcome = dict(trade)
                 trade_with_outcome.update(outcome)
 
                 if outcome['pnl_pips'] != 0:
                     volume = float(trade.get('volume', 0.0) or 1.0)
                     trade_symbol = normalize_symbol(trade.get('symbol') or '')
-                    pip_value_per_lot = 10.0
-                    if trade_symbol in ('XAUUSD',):
-                        pip_value_per_lot = 1.0
-                    elif trade_symbol in ('BTCUSD', 'ETHUSD', 'XRPUSD', 'TONUSD', 'BTCETH'):
-                        pip_value_per_lot = 1.0
-                    elif trade_symbol in ('US30', 'US100', 'DE30', 'EU50', 'UK100', 'JP225'):
-                        pip_value_per_lot = 1.0
+                    pip_value_per_lot = _get_pip_value_per_lot(trade_symbol, instrument_specs=instrument_specs)
                     trade_with_outcome['pnl'] = outcome['pnl_pips'] * pip_value_per_lot * volume
                 else:
                     trade_with_outcome['pnl'] = 0.0
@@ -1020,10 +1175,16 @@ def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> D
     heatmap = compute_hour_day_heatmap(realized_trades)
     strategy_ranking = compute_strategy_ranking(realized_trades, top_n=10)
 
+    sorted_recent_trades = sorted(
+        realized_trades,
+        key=lambda trade: _trade_sort_timestamp(trade) or datetime.min,
+        reverse=True,
+    )
     recent_trades = []
-    for trade in realized_trades[:50]:
+    for trade in sorted_recent_trades[:50]:
+        event_ts = _trade_sort_timestamp(trade) or _trade_entry_timestamp(trade)
         recent_trades.append({
-            "timestamp": trade.get("timestamp"),
+            "timestamp": event_ts.isoformat() if event_ts else trade.get("timestamp"),
             "symbol": trade.get("symbol"),
             "direction": trade.get("direction"),
             "volume": trade.get("volume"),

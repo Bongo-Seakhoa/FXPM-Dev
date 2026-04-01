@@ -23,6 +23,7 @@ Version: 4.1 (Portfolio Manager — efficiency optimizations)
 
 import numpy as np
 import pandas as pd
+import weakref
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Tuple, Optional, Set
 
@@ -35,6 +36,8 @@ from pm_core import StrategyCategory, get_instrument_spec, InstrumentSpec, Featu
 
 _GLOBAL_SL_GRID: List[float] = list(np.arange(1.5, 3.5, 0.5))   # [1.5, 2.0, 2.5, 3.0]
 _GLOBAL_TP_GRID: List[float] = list(np.arange(1.0, 6.5, 0.5))   # [1.0 .. 6.0]
+_STRATEGY_HELPER_CACHE: Dict[int, Dict[Tuple[Any, ...], Any]] = {}
+_STRATEGY_HELPER_FINALIZERS: Dict[int, weakref.finalize] = {}
 
 
 # =============================================================================
@@ -46,8 +49,12 @@ def _get_ema(features: pd.DataFrame, period: int) -> pd.Series:
     col = f'EMA_{period}'
     if col in features.columns:
         return features[col]
+    cache = _strategy_cache(features)
+    key = ('EMA', period)
+    if key in cache:
+        return cache[key]
     result = features['Close'].ewm(span=period, adjust=False).mean()
-    features.loc[:, col] = result
+    cache[key] = result
     return result
 
 
@@ -56,8 +63,12 @@ def _get_sma(features: pd.DataFrame, period: int) -> pd.Series:
     col = f'SMA_{period}'
     if col in features.columns:
         return features[col]
+    cache = _strategy_cache(features)
+    key = ('SMA', period)
+    if key in cache:
+        return cache[key]
     result = features['Close'].rolling(period).mean()
-    features.loc[:, col] = result
+    cache[key] = result
     return result
 
 
@@ -66,11 +77,15 @@ def _get_tr(features: pd.DataFrame) -> pd.Series:
     col = '_TR'
     if col in features.columns:
         return features[col]
+    cache = _strategy_cache(features)
+    key = ('TR',)
+    if key in cache:
+        return cache[key]
     high_low = features['High'] - features['Low']
     high_close = (features['High'] - features['Close'].shift(1)).abs()
     low_close = (features['Low'] - features['Close'].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    features.loc[:, col] = tr
+    cache[key] = tr
     return tr
 
 
@@ -79,9 +94,13 @@ def _get_atr(features: pd.DataFrame, period: int) -> pd.Series:
     col = f'ATR_{period}'
     if col in features.columns:
         return features[col]
+    cache = _strategy_cache(features)
+    key = ('ATR', period)
+    if key in cache:
+        return cache[key]
     tr = _get_tr(features)
     result = tr.rolling(period).mean()
-    features.loc[:, col] = result
+    cache[key] = result
     return result
 
 
@@ -97,13 +116,34 @@ def _cache_tag(*parts: Any) -> str:
     return "_".join(_tag(part) for part in parts)
 
 
+def _strategy_cache(features: pd.DataFrame) -> Dict[Tuple[Any, ...], Any]:
+    """Transient helper cache that avoids mutating the feature frame layout."""
+    frame_id = id(features)
+    cache = _STRATEGY_HELPER_CACHE.get(frame_id)
+    if cache is None:
+        cache = {}
+        _STRATEGY_HELPER_CACHE[frame_id] = cache
+        _STRATEGY_HELPER_FINALIZERS[frame_id] = weakref.finalize(
+            features,
+            lambda fid=frame_id: (
+                _STRATEGY_HELPER_CACHE.pop(fid, None),
+                _STRATEGY_HELPER_FINALIZERS.pop(fid, None),
+            ),
+        )
+    return cache
+
+
 def _get_rsi(features: pd.DataFrame, period: int) -> pd.Series:
     """Get RSI from precomputed features or compute if missing (C3: memoize)."""
     col = f'RSI_{period}'
     if col in features.columns:
         return features[col]
+    cache = _strategy_cache(features)
+    key = ('RSI', period)
+    if key in cache:
+        return cache[key]
     result = FeatureComputer.rsi(features['Close'], period)
-    features.loc[:, col] = result
+    cache[key] = result
     return result
 
 
@@ -114,30 +154,18 @@ def _get_keltner(features: pd.DataFrame, ema_period: int = 20,
     if ema_period == 20 and atr_period == 20 and float(mult) == 2.0:
         if {'KC_MID', 'KC_UPPER', 'KC_LOWER'}.issubset(features.columns):
             return features['KC_MID'], features['KC_UPPER'], features['KC_LOWER']
-        mid = _get_ema(features, ema_period)
-        atr = _get_atr(features, atr_period)
-        upper = mid + mult * atr
-        lower = mid - mult * atr
-        features.loc[:, 'KC_MID'] = mid
-        features.loc[:, 'KC_UPPER'] = upper
-        features.loc[:, 'KC_LOWER'] = lower
-        return mid, upper, lower
-
-    cache_tag = _cache_tag(ema_period, atr_period, mult)
-    mid_col = f'_KC_MID_{cache_tag}'
-    upper_col = f'_KC_UPPER_{cache_tag}'
-    lower_col = f'_KC_LOWER_{cache_tag}'
-    if {mid_col, upper_col, lower_col}.issubset(features.columns):
-        return features[mid_col], features[upper_col], features[lower_col]
+    cache = _strategy_cache(features)
+    cache_key = ('KC', ema_period, atr_period, float(mult))
+    if cache_key in cache:
+        return cache[cache_key]
 
     mid = _get_ema(features, ema_period)
     atr = _get_atr(features, atr_period)
     upper = mid + mult * atr
     lower = mid - mult * atr
-    features.loc[:, mid_col] = mid
-    features.loc[:, upper_col] = upper
-    features.loc[:, lower_col] = lower
-    return mid, upper, lower
+    result = (mid, upper, lower)
+    cache[cache_key] = result
+    return result
 
 
 def _detect_swing_points(series: pd.Series, order: int = 5
@@ -197,6 +225,10 @@ def _get_adx_di(features: pd.DataFrame, period: int = 14
     # Return cached if available
     if {adx_col, pdi_col, mdi_col}.issubset(features.columns):
         return features[adx_col], features[pdi_col], features[mdi_col]
+    cache = _strategy_cache(features)
+    cache_key = ('ADX_DI', period)
+    if cache_key in cache:
+        return cache[cache_key]
 
     high = features['High']
     low = features['Low']
@@ -215,10 +247,9 @@ def _get_adx_di(features: pd.DataFrame, period: int = 14
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
     adx = dx.rolling(period).mean()
 
-    features.loc[:, adx_col] = adx
-    features.loc[:, pdi_col] = plus_di
-    features.loc[:, mdi_col] = minus_di
-    return adx, plus_di, minus_di
+    result = (adx, plus_di, minus_di)
+    cache[cache_key] = result
+    return result
 
 
 def _get_hull_ma(features: pd.DataFrame, period: int) -> pd.Series:
@@ -226,8 +257,12 @@ def _get_hull_ma(features: pd.DataFrame, period: int) -> pd.Series:
     col = f'HULL_MA_{period}' if period != 20 else 'HULL_MA'
     if col in features.columns:
         return features[col]
+    cache = _strategy_cache(features)
+    key = ('HULL_MA', period)
+    if key in cache:
+        return cache[key]
     result = FeatureComputer.hull_ma(features['Close'], period)
-    features.loc[:, col] = result
+    cache[key] = result
     return result
 
 
@@ -235,35 +270,25 @@ def _get_bb(features: pd.DataFrame, period: int, std: float = 2.0) -> Tuple[pd.S
     """Get Bollinger Bands from precomputed features or compute if missing."""
     if period == 20 and float(std) == 2.0 and {'BB_MID_20', 'BB_UPPER_20', 'BB_LOWER_20'}.issubset(features.columns):
         return features['BB_MID_20'], features['BB_UPPER_20'], features['BB_LOWER_20']
-
-    cache_tag = _cache_tag(period, std)
-    mid_col = f'_BB_MID_{cache_tag}'
-    upper_col = f'_BB_UPPER_{cache_tag}'
-    lower_col = f'_BB_LOWER_{cache_tag}'
-    if {mid_col, upper_col, lower_col}.issubset(features.columns):
-        return features[mid_col], features[upper_col], features[lower_col]
+    cache = _strategy_cache(features)
+    cache_key = ('BB', period, float(std))
+    if cache_key in cache:
+        return cache[cache_key]
 
     mid, upper, lower = FeatureComputer.bollinger_bands(features['Close'], period, std)
-    if period == 20 and float(std) == 2.0:
-        features.loc[:, 'BB_MID_20'] = mid
-        features.loc[:, 'BB_UPPER_20'] = upper
-        features.loc[:, 'BB_LOWER_20'] = lower
-    else:
-        features.loc[:, mid_col] = mid
-        features.loc[:, upper_col] = upper
-        features.loc[:, lower_col] = lower
-    return mid, upper, lower
+    result = (mid, upper, lower)
+    cache[cache_key] = result
+    return result
 
 
 def _get_stochastic(features: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
     """Get Stochastic from precomputed features or compute if missing."""
     if 'STOCH_K' in features.columns and 'STOCH_D' in features.columns and k_period == 14 and d_period == 3:
         return features['STOCH_K'], features['STOCH_D']
-    cache_tag = _cache_tag(k_period, d_period)
-    k_col = f'_STOCH_K_{cache_tag}'
-    d_col = f'_STOCH_D_{cache_tag}'
-    if {k_col, d_col}.issubset(features.columns):
-        return features[k_col], features[d_col]
+    cache = _strategy_cache(features)
+    cache_key = ('STOCH', k_period, d_period)
+    if cache_key in cache:
+        return cache[cache_key]
     low_min = features['Low'].rolling(window=k_period).min()
     high_max = features['High'].rolling(window=k_period).max()
     denom = high_max - low_min
@@ -271,13 +296,9 @@ def _get_stochastic(features: pd.DataFrame, k_period: int = 14, d_period: int = 
     valid = denom > 1e-10
     k[valid] = 100.0 * (features['Close'][valid] - low_min[valid]) / denom[valid]
     d = k.rolling(window=d_period).mean()
-    if k_period == 14 and d_period == 3:
-        features.loc[:, 'STOCH_K'] = k
-        features.loc[:, 'STOCH_D'] = d
-    else:
-        features.loc[:, k_col] = k
-        features.loc[:, d_col] = d
-    return k, d
+    result = (k, d)
+    cache[cache_key] = result
+    return result
 
 
 def _get_macd(features: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
@@ -3335,8 +3356,16 @@ class ChoppinessCompressionBreakoutStrategy(BaseStrategy):
         lowest = features['Low'].rolling(ci_p).min()
         hl_range = highest - lowest
 
-        # Choppiness Index
-        ci = 100.0 * np.log10(atr_sum / (hl_range + 1e-10)) / np.log10(ci_p)
+        # Choppiness Index. Fully flat windows can make both ATR sum and range
+        # collapse to zero, which makes the formula undefined; keep those as NaN
+        # rather than emitting log10(0) warnings during optimization.
+        ci = pd.Series(np.nan, index=features.index, dtype=float)
+        log_period = np.log10(ci_p) if ci_p > 1 else np.nan
+        if np.isfinite(log_period) and log_period > 0:
+            valid = (atr_sum > 0) & (hl_range > 0)
+            if valid.any():
+                ratio = (atr_sum[valid] / hl_range[valid]).clip(lower=1.0)
+                ci.loc[valid] = 100.0 * np.log10(ratio) / log_period
 
         # Was recently choppy (compression phase)
         was_choppy = ci.rolling(lookback).max() > chop_thresh

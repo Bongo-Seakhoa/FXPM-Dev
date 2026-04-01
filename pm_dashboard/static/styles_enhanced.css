@@ -222,6 +222,21 @@ body.drawer-open {
   color: var(--muted);
 }
 
+.loading-indicator {
+  margin-bottom: 18px;
+  padding: 12px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(42, 77, 153, 0.08);
+  color: var(--accent-3);
+  font-weight: 600;
+  box-shadow: var(--shadow);
+}
+
+.loading-indicator.hidden {
+  display: none;
+}
+
 .card {
   background: var(--card);
   border-radius: var(--radius);
@@ -234,6 +249,18 @@ body.drawer-open {
   margin: 0 0 14px;
   font-size: 18px;
   font-family: var(--font-serif);
+}
+
+.chart-fallback-card {
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+  padding: 16px;
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-soft);
 }
 
 .controls {

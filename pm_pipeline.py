@@ -2511,7 +2511,7 @@ class OptimizationPipeline:
         self.config = config
         self.data_loader = DataLoader(config.data_dir)
         self.splitter = DataSplitter(config)
-        self.enhancement_seams: EnhancementSeams = create_default_enhancement_seams()
+        self.enhancement_seams: EnhancementSeams = create_default_enhancement_seams(config)
         
         # Legacy pipeline surfaces removed from production path (F1).
         # Classes StrategySelector, HyperparameterOptimizer, Validator, and

@@ -465,8 +465,12 @@ class EnhancementSeams:
     strategy_extension_registry: StrategyExtensionRegistry
 
 
-def create_default_enhancement_seams() -> EnhancementSeams:
+def create_default_enhancement_seams(config: Optional[Any] = None) -> EnhancementSeams:
     """Build the default seam bundle with sensible production defaults."""
+    spread_enabled = bool(getattr(config, "execution_spread_filter_enabled", True))
+    spread_min_edge_mult = float(getattr(config, "execution_spread_min_edge_mult", 1.5))
+    spread_spike_mult = float(getattr(config, "execution_spread_spike_mult", 2.0))
+    spread_penalty_start_mult = float(getattr(config, "execution_spread_penalty_start_mult", 0.5))
     return EnhancementSeams(
         risk_scalar_stack=RiskScalarStack([
             VolatilityTargetScalar(target_annual_vol=0.10),
@@ -477,7 +481,12 @@ def create_default_enhancement_seams() -> EnhancementSeams:
         exit_pack=MarketDrivenExitPack(enabled=False),  # Opt-in after validation
         portfolio_allocator=PortfolioAllocator(),
         regime_model_adapter=RegimeModelAdapter(),
-        execution_quality_overlay=SpreadAwareExecutionOverlay(enabled=True),
+        execution_quality_overlay=SpreadAwareExecutionOverlay(
+            min_edge_mult=spread_min_edge_mult,
+            spike_mult=spread_spike_mult,
+            penalty_start_mult=spread_penalty_start_mult,
+            enabled=spread_enabled,
+        ),
         options_model_adapter=OptionsModelAdapter(),
         strategy_extension_registry=StrategyExtensionRegistry(),
     )

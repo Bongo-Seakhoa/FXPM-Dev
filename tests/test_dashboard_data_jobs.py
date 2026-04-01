@@ -102,6 +102,24 @@ class DashboardDataJobsTests(unittest.TestCase):
         self.assertEqual(result["updated"], 0)
         self.assertEqual(result["failed"], 2)
 
+    def test_load_historical_data_resolves_requested_symbol_to_broker_suffixed_local_file(self) -> None:
+        self._write_m5("EURUSD.A", bars=288)
+        jobs = HistoricalDataDownloader(self.pm_root, mt5_connector=None)
+
+        start = datetime(2026, 2, 1, 0, 0, 0)
+        end = datetime(2026, 2, 1, 23, 59, 59)
+        frame = jobs.load_historical_data("EURUSD", "M5", start, end)
+
+        self.assertIsNotNone(frame)
+        self.assertGreater(len(frame), 0)
+
+    def test_load_historical_data_rejects_unsupported_timeframe(self) -> None:
+        self._write_m5("EURUSD", bars=288)
+        jobs = HistoricalDataDownloader(self.pm_root, mt5_connector=None)
+
+        with self.assertRaises(ValueError):
+            jobs.load_historical_data("EURUSD", "M2", datetime(2026, 2, 1), datetime(2026, 2, 2))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ var elements = {
   staleness: document.getElementById("staleness"),
   sourceFiles: document.getElementById("source-files"),
   statusBanner: document.getElementById("status-banner"),
+  loading: document.getElementById("entries-loading"),
   tableBody: document.getElementById("entries-body"),
   drawer: document.getElementById("drawer"),
   drawerTitle: document.getElementById("drawer-title"),
@@ -595,6 +596,7 @@ function applyViewToDom() {
 }
 
 function fetchEntries() {
+  PMCommon.setLoadingState(elements.loading, true, "Loading signal desk...");
   return PMCommon.fetchWithRetry("/api/entries")
     .then(function (response) { return response.json(); })
     .then(function (data) {
@@ -633,6 +635,9 @@ function fetchEntries() {
     })
     .catch(function (err) {
       showJsError(err ? String(err) : "Failed to fetch entries");
+    })
+    .finally(function () {
+      PMCommon.setLoadingState(elements.loading, false);
     });
 }
 
@@ -688,8 +693,12 @@ function saveConfig(event) {
     body: JSON.stringify(payload)
   })
     .then(function (response) {
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      return response.json();
+      return response.json().then(function (body) {
+        if (!response.ok) {
+          throw new Error(body && body.error ? body.error : "HTTP " + response.status);
+        }
+        return body;
+      });
     })
     .then(function (config) {
       state.config = config || {};

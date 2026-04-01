@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from pm_enhancement_seams import (
     ExecutionQualityContext,
@@ -94,6 +95,22 @@ class EnhancementSeamsTests(unittest.TestCase):
 
         self.assertFalse(decision.allow_trade)
         self.assertEqual(decision.score_multiplier, 0.0)
+
+    def test_default_seams_respect_configured_spread_thresholds(self):
+        config = SimpleNamespace(
+            execution_spread_filter_enabled=True,
+            execution_spread_min_edge_mult=1.25,
+            execution_spread_spike_mult=5.0,
+            execution_spread_penalty_start_mult=0.4,
+        )
+        seams = create_default_enhancement_seams(config)
+        overlay = seams.execution_quality_overlay
+
+        self.assertIsInstance(overlay, SpreadAwareExecutionOverlay)
+        self.assertTrue(overlay.enabled)
+        self.assertEqual(overlay.min_edge_mult, 1.25)
+        self.assertEqual(overlay.spike_mult, 5.0)
+        self.assertEqual(overlay.penalty_start_mult, 0.4)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,11 @@ from pm_dashboard.models import SignalEntry
 from pm_dashboard.parsers import parse_pm_execution_log
 from pm_dashboard.utils import DEFAULT_CONFIG
 from pm_dashboard.watcher import (
+    entry_alert_key,
     enrich_entries,
     merge_actionable_with_log_executions,
     normalize_action_flags,
+    select_trade_candidate,
     should_display_entry,
 )
 
@@ -209,6 +211,59 @@ class TestDashboardSignalDesk(unittest.TestCase):
             ),
             1,
         )
+
+    def test_select_trade_candidate_does_not_fallback_to_mismatched_direction(self) -> None:
+        entry = SignalEntry(
+            symbol="EURUSD",
+            timeframe="M5",
+            regime="TREND",
+            strategy_name="MomentumBurstStrategy",
+            signal_direction="sell",
+            timestamp="2026-02-09T00:00:00",
+            raw={"action": "EXECUTED"},
+        )
+        candidate = {
+            "symbol": "EURUSD",
+            "timeframe": "M5",
+            "regime": "TREND",
+            "strategy": "MomentumBurstStrategy",
+            "direction": "BUY",
+            "timestamp": "2026-02-09T00:00:05",
+            "_ts": datetime.fromisoformat("2026-02-09T00:00:05").timestamp(),
+        }
+
+        selected = select_trade_candidate(entry, [candidate], deepcopy(DEFAULT_CONFIG))
+        self.assertIsNone(selected)
+
+    def test_entry_alert_key_distinguishes_different_actions(self) -> None:
+        base = SignalEntry(
+            symbol="EURUSD",
+            timeframe="M5",
+            regime="TREND",
+            strategy_name="MomentumBurstStrategy",
+            signal_direction="buy",
+            entry_price=1.1,
+            stop_loss_price=1.09,
+            take_profit_price=1.12,
+            timestamp="2026-02-09T00:00:00",
+            reason="EXECUTED",
+            raw={"action": "EXECUTED"},
+        )
+        blocked = SignalEntry(
+            symbol=base.symbol,
+            timeframe=base.timeframe,
+            regime=base.regime,
+            strategy_name=base.strategy_name,
+            signal_direction=base.signal_direction,
+            entry_price=base.entry_price,
+            stop_loss_price=base.stop_loss_price,
+            take_profit_price=base.take_profit_price,
+            timestamp=base.timestamp,
+            reason="BLOCKED_RISK_CAP",
+            raw={"action": "BLOCKED_RISK_CAP"},
+        )
+
+        self.assertNotEqual(entry_alert_key(base), entry_alert_key(blocked))
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -50,6 +50,7 @@ class HistoricalDataDownloader:
         "AUDUSD", "NZDUSD", "AUDNZD", "EURGBP", "EURJPY",
         "GBPJPY", "AUDJPY", "XAUUSD", "XAGUSD", "US30", "US100",
     ]
+    SUPPORTED_TIMEFRAMES = {"M5", "M15", "M30", "H1", "H4", "D1"}
 
     def __init__(self, pm_root: str, mt5_connector: Optional[MT5Connector] = None):
         self.pm_root = pm_root
@@ -57,7 +58,7 @@ class HistoricalDataDownloader:
         self.mt5 = mt5_connector
         self._data_loader: Optional[DataLoader] = None
         self._config_cache_signature: Optional[Tuple[str, int, int]] = None
-        self._config_cache: Dict[str, object] = {}
+        self._config_cache: Dict[str, Any] = {}
         self._ensure_data_dir()
 
     def _ensure_data_dir(self) -> None:
@@ -84,34 +85,83 @@ class HistoricalDataDownloader:
             return []
         return sorted(set(symbols))
 
-    def _resolve_symbol_name(self, symbol: str) -> str:
+    def _resolve_symbol_candidates(self, symbol: str) -> List[str]:
         requested = str(symbol or "").strip().upper()
         if not requested:
-            return requested
+            return []
 
-        available = set(self._available_data_symbols())
-        if requested in available:
-            return requested
+        available = self._available_data_symbols()
+        available_set = set(available)
+        seed_candidates: List[str] = []
+        resolved_candidates: List[str] = []
+
+        def _add(value: str) -> None:
+            normalized = str(value or "").strip().upper()
+            if normalized and normalized not in seed_candidates:
+                seed_candidates.append(normalized)
+
+        def _add_resolved(value: str) -> None:
+            normalized = str(value or "").strip().upper()
+            if normalized and normalized not in resolved_candidates:
+                resolved_candidates.append(normalized)
+
+        _add(requested)
 
         if "." in requested:
             left = requested.split(".", 1)[0].strip()
-            if left in available:
-                return left
+            _add(left)
 
         if len(requested) >= 6:
             prefix6 = requested[:6]
-            if prefix6 in available:
-                return prefix6
+            _add(prefix6)
+
+        for candidate in seed_candidates:
+            if candidate in available_set:
+                _add_resolved(candidate)
 
         startswith_matches = [sym for sym in available if requested.startswith(sym)]
-        if len(startswith_matches) == 1:
-            return startswith_matches[0]
-
         prefix_matches = [sym for sym in available if sym.startswith(requested)]
-        if len(prefix_matches) == 1:
-            return prefix_matches[0]
+        for match in startswith_matches + prefix_matches:
+            _add_resolved(match)
 
-        return requested
+        for candidate in seed_candidates:
+            _add_resolved(candidate)
+
+        return resolved_candidates
+
+    def _resolve_symbol_name(self, symbol: str) -> str:
+        candidates = self._resolve_symbol_candidates(symbol)
+        return candidates[0] if candidates else str(symbol or "").strip().upper()
+
+    def _normalize_symbols_list(self, symbols: Optional[List[str]]) -> List[str]:
+        if symbols is None:
+            return self.get_symbols_from_config()
+        if not isinstance(symbols, list):
+            raise ValueError("symbols must be a list")
+        normalized = []
+        seen = set()
+        for item in symbols:
+            text = str(item or "").strip().upper()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
+    def _normalize_max_bars(self, value: Optional[Any]) -> int:
+        if value is None:
+            return self.get_max_bars_from_config()
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("max_bars must be an integer")
+        return max(1000, numeric)
+
+    def _normalize_timeframe(self, timeframe: str) -> str:
+        tf = str(timeframe or self.MAINTENANCE_TIMEFRAME).strip().upper()
+        if tf not in self.SUPPORTED_TIMEFRAMES:
+            raise ValueError(f"Unsupported timeframe '{timeframe}'")
+        return tf
 
     def _clear_data_loader_cache(self) -> None:
         if self._data_loader is not None:
@@ -210,7 +260,7 @@ class HistoricalDataDownloader:
             return False
 
         bars = self.mt5.get_bars(broker_symbol, self.MAINTENANCE_TIMEFRAME, count=max_bars)
-        if bars is None or len(bars) == 0:
+        if bars is None or not isinstance(bars, pd.DataFrame) or len(bars) == 0:
             logger.warning("No M5 data returned for %s (%s)", symbol, broker_symbol)
             return False
 
@@ -229,8 +279,8 @@ class HistoricalDataDownloader:
         """
         Refresh root M5 data files for configured symbols.
         """
-        symbols_to_refresh = symbols or self.get_symbols_from_config()
-        bars = max_bars if max_bars is not None else self.get_max_bars_from_config()
+        symbols_to_refresh = self._normalize_symbols_list(symbols)
+        bars = self._normalize_max_bars(max_bars)
 
         logger.info(
             "Starting root data maintenance: symbols=%d, timeframe=%s, bars=%d",
@@ -294,13 +344,21 @@ class HistoricalDataDownloader:
             logger.error("pm_core.DataLoader unavailable; cannot load historical data")
             return None
 
-        symbol = self._resolve_symbol_name(symbol)
-        tf = str(timeframe or "M5").strip().upper()
-        if not symbol:
+        symbol_candidates = self._resolve_symbol_candidates(symbol)
+        tf = self._normalize_timeframe(timeframe)
+        if not symbol_candidates:
             return None
 
-        base = loader.load_symbol(symbol, "M5")
+        base = None
+        resolved_symbol = ""
+        for candidate in symbol_candidates:
+            candidate_frame = loader.load_symbol(candidate, "M5")
+            if candidate_frame is not None and len(candidate_frame) > 0:
+                base = candidate_frame
+                resolved_symbol = candidate
+                break
         if base is None or len(base) == 0:
+            logger.warning("No local M5 data found for %s (candidates=%s)", symbol, symbol_candidates)
             return None
 
         if tf == "M5":
@@ -309,7 +367,7 @@ class HistoricalDataDownloader:
             try:
                 frame = loader.resample(base, tf)
             except Exception as exc:
-                logger.warning("Failed resample %s %s from M5: %s", symbol, tf, exc)
+                logger.warning("Failed resample %s %s from M5: %s", resolved_symbol or symbol, tf, exc)
                 return None
 
         sliced = frame[(frame.index >= start_date) & (frame.index <= end_date)]
@@ -348,10 +406,12 @@ class DataDownloadScheduler:
         self._thread.start()
         logger.info("Data maintenance scheduler started (daily at %s)", self.run_time)
 
-    def stop(self):
+    def stop(self, timeout_sec: float = 10.0):
         self._running = False
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=max(0.1, float(timeout_sec)))
+            if self._thread.is_alive():
+                logger.warning("Data maintenance scheduler thread did not stop within %.1fs", timeout_sec)
         logger.info("Data maintenance scheduler stopped")
 
     def _should_run_now(self, now: datetime, target_hour: int, target_minute: int) -> bool:

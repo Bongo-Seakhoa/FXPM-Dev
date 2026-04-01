@@ -426,3 +426,893 @@
 2026-02-08 11:51:58 [WARNING] __main__: DecisionThrottle: failed to save cache: [WinError 5] Access is denied: 'last_trade_log.json.tmp' -> 'last_trade_log.json'
 2026-02-08 13:59:07 [INFO] pm_pipeline: SAVED EURUSD to pm_configs.json (atomic)
 2026-02-08 14:09:18 [INFO] pm_pipeline: SAVED GBPUSD to pm_configs.json (atomic)
+2026-02-08 18:15:43 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 18:15:43 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 18:15:43 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 18:15:43 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.2 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 18:15:43 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 18:15:43 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 18:15:43 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 18:15:43 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 18:15:43 [INFO] __main__: ============================================================
+2026-02-08 18:15:43 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 18:15:43 [INFO] __main__: ============================================================
+2026-02-08 18:15:43 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 18:15:50 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 18:15:50 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 18:15:50 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 18:15:50 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 18:15:50 [INFO] __main__:   Symbols: 46
+2026-02-08 18:15:50 [INFO] __main__:   Strategies: 42
+2026-02-08 18:15:50 [INFO] __main__:   Existing configs: 46
+2026-02-08 18:15:50 [INFO] __main__: 
+============================================================
+2026-02-08 18:15:50 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-08 18:15:50 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-08 18:15:50 [INFO] __main__: ============================================================
+2026-02-08 18:15:50 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-08 18:15:53 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-08 18:15:55 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-08 18:15:58 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-08 18:16:01 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-08 18:16:04 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-08 18:16:06 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-08 18:16:09 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-08 18:16:12 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-08 18:16:15 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-08 18:16:17 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-08 18:16:20 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-08 18:16:22 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-08 18:16:25 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-08 18:16:28 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-08 18:16:31 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-08 18:16:33 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-08 18:16:36 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-08 18:16:39 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-08 18:16:42 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-08 18:16:45 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-08 18:16:47 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-08 18:16:50 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-08 18:16:53 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-08 18:16:55 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-08 18:16:58 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-08 18:17:01 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-08 18:17:03 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-08 18:17:06 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-08 18:17:09 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-08 18:17:12 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-08 18:17:15 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-08 18:17:17 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-08 18:17:20 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-08 18:17:23 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-08 18:17:26 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-08 18:17:28 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-08 18:17:30 [INFO] __main__:   US100: 367015 bars saved
+2026-02-08 18:17:33 [INFO] __main__:   US30: 368650 bars saved
+2026-02-08 18:17:35 [INFO] __main__:   DE30: 353181 bars saved
+2026-02-08 18:17:36 [INFO] __main__:   EU50: 228553 bars saved
+2026-02-08 18:17:39 [INFO] __main__:   UK100: 357667 bars saved
+2026-02-08 18:17:41 [INFO] __main__:   JP225: 363624 bars saved
+2026-02-08 18:17:44 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-08 18:17:48 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-08 18:17:49 [INFO] __main__:   TONUSD: 158018 bars saved
+2026-02-08 18:17:52 [INFO] __main__:   BTCETH: 474557 bars saved
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-08 18:17:52 [INFO] pm_pipeline: 
+############################################################
+2026-02-08 18:17:52 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-08 18:17:52 [INFO] pm_pipeline: Total symbols: 46
+2026-02-08 18:17:52 [INFO] pm_pipeline: To optimize: 46
+2026-02-08 18:17:52 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-08 18:17:52 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-08 18:17:52 [INFO] pm_pipeline: Strategies: 42
+2026-02-08 18:17:52 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-08 18:17:52 [INFO] pm_pipeline: ############################################################
+2026-02-08 18:17:52 [INFO] pm_pipeline: Parallel optimization enabled: workers=4
+2026-02-08 18:42:44 [INFO] __main__: Shutting down...
+2026-02-08 18:42:44 [INFO] pm_mt5: Disconnected from MT5
+2026-02-08 18:42:44 [INFO] __main__: Shutdown complete
+2026-02-08 18:45:25 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 18:45:25 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 18:45:25 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 18:45:25 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 18:45:25 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 18:45:25 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 18:45:25 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 18:45:25 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 18:45:25 [INFO] __main__: ============================================================
+2026-02-08 18:45:25 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 18:45:25 [INFO] __main__: ============================================================
+2026-02-08 18:45:25 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 18:45:25 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 18:45:25 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 18:45:25 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 18:45:25 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 18:45:25 [INFO] __main__:   Symbols: 46
+2026-02-08 18:45:25 [INFO] __main__:   Strategies: 42
+2026-02-08 18:45:25 [INFO] __main__:   Existing configs: 46
+2026-02-08 18:45:25 [INFO] __main__: 
+============================================================
+2026-02-08 18:45:25 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-08 18:45:25 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-08 18:45:25 [INFO] __main__: ============================================================
+2026-02-08 18:45:25 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-08 18:45:28 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-08 18:45:31 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-08 18:45:34 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-08 18:45:37 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-08 18:45:40 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-08 18:45:43 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-08 18:45:46 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-08 18:45:49 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-08 18:45:52 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-08 18:45:55 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-08 18:45:58 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-08 18:46:01 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-08 18:46:04 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-08 18:46:07 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-08 18:46:10 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-08 18:46:13 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-08 18:46:17 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-08 18:46:20 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-08 18:46:23 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-08 18:46:26 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-08 18:46:29 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-08 18:46:32 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-08 18:46:34 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-08 18:46:37 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-08 18:46:40 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-08 18:46:43 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-08 18:46:46 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-08 18:46:50 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-08 18:46:53 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-08 18:46:56 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-08 18:46:59 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-08 18:47:02 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-08 18:47:05 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-08 18:47:08 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-08 18:47:11 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-08 18:47:14 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-08 18:47:16 [INFO] __main__:   US100: 367015 bars saved
+2026-02-08 18:47:18 [INFO] __main__:   US30: 368650 bars saved
+2026-02-08 18:47:20 [INFO] __main__:   DE30: 353181 bars saved
+2026-02-08 18:47:21 [INFO] __main__:   EU50: 228553 bars saved
+2026-02-08 18:47:23 [INFO] __main__:   UK100: 357667 bars saved
+2026-02-08 18:47:26 [INFO] __main__:   JP225: 363624 bars saved
+2026-02-08 18:47:28 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-08 18:47:31 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-08 18:47:32 [INFO] __main__:   TONUSD: 158024 bars saved
+2026-02-08 18:47:35 [INFO] __main__:   BTCETH: 474563 bars saved
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-08 18:47:35 [INFO] pm_pipeline: 
+############################################################
+2026-02-08 18:47:35 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-08 18:47:35 [INFO] pm_pipeline: Total symbols: 46
+2026-02-08 18:47:35 [INFO] pm_pipeline: To optimize: 46
+2026-02-08 18:47:35 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-08 18:47:35 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-08 18:47:35 [INFO] pm_pipeline: Strategies: 42
+2026-02-08 18:47:35 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-08 18:47:35 [INFO] pm_pipeline: ############################################################
+2026-02-08 18:47:35 [INFO] pm_pipeline: Parallel optimization enabled: workers=4
+2026-02-08 19:21:00 [INFO] pm_pipeline: SAVED USDCHF to pm_configs.json (atomic)
+2026-02-08 19:22:30 [INFO] pm_pipeline: SAVED EURUSD to pm_configs.json (atomic)
+2026-02-08 19:23:00 [INFO] pm_pipeline: SAVED GBPUSD to pm_configs.json (atomic)
+2026-02-08 19:31:01 [INFO] pm_pipeline: SAVED USDJPY to pm_configs.json (atomic)
+2026-02-08 19:32:57 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 19:32:57 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 19:32:57 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 19:32:57 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.0 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 19:32:57 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 19:32:57 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 19:32:57 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 19:32:57 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 19:32:57 [INFO] __main__: ============================================================
+2026-02-08 19:32:57 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 19:32:57 [INFO] __main__: ============================================================
+2026-02-08 19:32:57 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 19:32:57 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 19:32:57 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 19:32:57 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 19:32:57 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 19:32:57 [INFO] __main__:   Symbols: 46
+2026-02-08 19:32:57 [INFO] __main__:   Strategies: 42
+2026-02-08 19:32:57 [INFO] __main__:   Existing configs: 46
+2026-02-08 19:32:57 [INFO] __main__: 
+============================================================
+2026-02-08 19:32:57 [INFO] __main__: STARTING LIVE TRADING
+2026-02-08 19:32:57 [INFO] __main__: Trading enabled: True
+2026-02-08 19:32:57 [INFO] __main__: Auto-retrain: False
+2026-02-08 19:32:57 [INFO] __main__: Close on opposite signal: False
+2026-02-08 19:32:57 [INFO] __main__: ============================================================
+2026-02-08 19:32:57 [INFO] __main__: Synchronizing instrument specs from MT5...
+2026-02-08 19:32:57 [ERROR] __main__: Application error: 'PortfolioManager' object has no attribute 'get_instrument_spec'
+Traceback (most recent call last):
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_main.py", line 2410, in main
+    _app_instance.run_trading(
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_main.py", line 2105, in run_trading
+    self.trader = LiveTrader(
+                  ^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM 1.4 - Obtimized\pm_main.py", line 657, in __init__
+    spec = self.pm.get_instrument_spec(symbol)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'PortfolioManager' object has no attribute 'get_instrument_spec'
+2026-02-08 19:32:57 [INFO] __main__: Shutting down...
+2026-02-08 19:32:57 [INFO] pm_mt5: Disconnected from MT5
+2026-02-08 19:32:57 [INFO] __main__: Shutdown complete
+2026-02-08 19:42:37 [INFO] pm_pipeline: SAVED AUDUSD to pm_configs.json (atomic)
+2026-02-08 19:48:43 [INFO] pm_pipeline: SAVED USDCAD to pm_configs.json (atomic)
+2026-02-08 19:52:26 [INFO] pm_pipeline: SAVED NZDUSD to pm_configs.json (atomic)
+2026-02-08 19:53:05 [INFO] pm_pipeline: SAVED AUDNZD to pm_configs.json (atomic)
+2026-02-08 20:03:29 [INFO] pm_pipeline: SAVED EURGBP to pm_configs.json (atomic)
+2026-02-08 20:26:17 [INFO] pm_pipeline: SAVED AUDJPY to pm_configs.json (atomic)
+2026-02-08 20:33:01 [INFO] __main__: Shutting down...
+2026-02-08 20:33:01 [INFO] pm_mt5: Disconnected from MT5
+2026-02-08 20:33:01 [INFO] __main__: Shutdown complete
+2026-02-08 20:53:31 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 20:53:31 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 20:53:31 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 20:53:31 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.05 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 20:53:31 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 20:53:31 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 20:53:31 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 20:53:31 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 20:53:31 [INFO] __main__: ============================================================
+2026-02-08 20:53:31 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 20:53:31 [INFO] __main__: ============================================================
+2026-02-08 20:53:31 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 20:53:31 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 20:53:31 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 20:53:31 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 20:53:31 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 20:53:31 [INFO] __main__:   Symbols: 46
+2026-02-08 20:53:31 [INFO] __main__:   Strategies: 42
+2026-02-08 20:53:31 [INFO] __main__:   Existing configs: 46
+2026-02-08 20:53:31 [INFO] __main__: 
+============================================================
+2026-02-08 20:53:31 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-08 20:53:31 [INFO] __main__: MODE: INCREMENTAL (skipping valid configs)
+2026-02-08 20:53:31 [INFO] __main__: ============================================================
+2026-02-08 20:53:31 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-08 20:53:35 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-08 20:53:38 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-08 20:53:42 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-08 20:53:47 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-08 20:53:54 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-08 20:53:59 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-08 20:54:04 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-08 20:54:09 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-08 20:54:14 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-08 20:54:19 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-08 20:54:25 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-08 20:54:29 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-08 20:54:35 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-08 20:54:40 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-08 20:54:44 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-08 20:54:49 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-08 20:54:55 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-08 20:55:01 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-08 20:55:05 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-08 20:55:09 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-08 20:55:14 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-08 20:55:19 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-08 20:55:24 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-08 20:55:29 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-08 20:55:34 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-08 20:55:39 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-08 20:55:44 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-08 20:55:49 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-08 20:55:56 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-08 20:56:03 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-08 20:56:08 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-08 20:56:14 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-08 20:56:19 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-08 20:56:24 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-08 20:56:29 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-08 20:56:36 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-08 20:56:40 [INFO] __main__:   US100: 367015 bars saved
+2026-02-08 20:56:44 [INFO] __main__:   US30: 368650 bars saved
+2026-02-08 20:56:48 [INFO] __main__:   DE30: 353181 bars saved
+2026-02-08 20:56:52 [INFO] __main__:   EU50: 228553 bars saved
+2026-02-08 20:56:57 [INFO] __main__:   UK100: 357667 bars saved
+2026-02-08 20:57:00 [INFO] __main__:   JP225: 363624 bars saved
+2026-02-08 20:57:06 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-08 20:57:11 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-08 20:57:13 [INFO] __main__:   TONUSD: 158050 bars saved
+2026-02-08 20:57:18 [INFO] __main__:   BTCETH: 474589 bars saved
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP EURUSD: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP GBPUSD: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP USDJPY: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP USDCHF: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP USDCAD: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP AUDUSD: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP NZDUSD: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP AUDNZD: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP EURGBP: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP EURJPY: valid until 2026-06-04 (115 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP GBPJPY: valid until 2026-06-04 (115 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP AUDJPY: valid until 2026-03-10 (29 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP EURAUD: valid until 2026-03-06 (25 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP EURCHF: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP EURCAD: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP EURNZD: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:18 [INFO] pm_pipeline: SKIP GBPAUD: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP GBPCAD: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP GBPCHF: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP CADJPY: valid until 2026-06-05 (116 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP NZDJPY: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP AUDCAD: valid until 2026-06-05 (116 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP AUDCHF: valid until 2026-03-07 (27 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP CADCHF: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP CHFJPY: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP NZDCAD: valid until 2026-03-07 (27 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP NZDCHF: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP GBPNZD: valid until 2026-02-20 (11 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP USDNOK: valid until 2026-05-06 (87 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP USDMXN: valid until 2026-03-06 (25 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP USDSGD: valid until 2026-06-06 (117 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP USDZAR: valid until 2026-03-06 (25 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP USDPLN: valid until 2026-03-08 (27 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP USDSEK: valid until 2026-02-20 (11 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP XAUUSD: valid until 2026-06-04 (115 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP XAGUSD: valid until 2026-03-06 (25 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP US100: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP US30: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP DE30: valid until 2026-04-06 (56 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP EU50: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP UK100: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP JP225: valid until 2026-05-06 (86 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP ETHUSD: valid until 2026-04-06 (56 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP XRPUSD: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP TONUSD: valid until 2026-03-01 (20 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: SKIP BTCETH: valid until 2026-03-07 (26 days remaining)
+2026-02-08 20:57:19 [INFO] pm_pipeline: 
+############################################################
+2026-02-08 20:57:19 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-08 20:57:19 [INFO] pm_pipeline: Total symbols: 46
+2026-02-08 20:57:19 [INFO] pm_pipeline: To optimize: 0
+2026-02-08 20:57:19 [INFO] pm_pipeline: Skipping: 46 (valid configs)
+2026-02-08 20:57:19 [INFO] pm_pipeline: Strategies: 42
+2026-02-08 20:57:19 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-08 20:57:19 [INFO] pm_pipeline: ############################################################
+2026-02-08 20:57:19 [INFO] pm_pipeline: All symbols have valid configs. Nothing to optimize.
+2026-02-08 20:57:19 [INFO] __main__: Saved optimization summary to pm_outputs\optimization_summary.csv
+2026-02-08 20:57:19 [INFO] __main__: Shutting down...
+2026-02-08 20:57:19 [INFO] pm_mt5: Disconnected from MT5
+2026-02-08 20:57:19 [INFO] __main__: Shutdown complete
+2026-02-08 21:00:54 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 21:00:54 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 21:00:54 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 21:00:54 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.05 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 21:00:54 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 21:00:54 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 21:00:54 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 21:00:54 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 21:00:54 [INFO] __main__: ============================================================
+2026-02-08 21:00:54 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 21:00:54 [INFO] __main__: ============================================================
+2026-02-08 21:00:54 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 21:00:54 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 21:00:54 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 21:00:54 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 21:00:54 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 21:00:54 [INFO] __main__:   Symbols: 46
+2026-02-08 21:00:54 [INFO] __main__:   Strategies: 42
+2026-02-08 21:00:54 [INFO] __main__:   Existing configs: 46
+2026-02-08 21:00:54 [INFO] __main__: 
+============================================================
+2026-02-08 21:00:54 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-08 21:00:54 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-08 21:00:54 [INFO] __main__: ============================================================
+2026-02-08 21:00:54 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-08 21:00:59 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-08 21:01:03 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-08 21:01:07 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-08 21:01:11 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-08 21:01:12 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 21:01:12 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 21:01:12 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 21:01:12 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.05 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 21:01:12 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 21:01:12 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 21:01:12 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 21:01:12 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 21:01:12 [INFO] __main__: ============================================================
+2026-02-08 21:01:12 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 21:01:12 [INFO] __main__: ============================================================
+2026-02-08 21:01:12 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 21:01:12 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 21:01:12 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 21:01:12 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 21:01:12 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 21:01:12 [INFO] __main__:   Symbols: 46
+2026-02-08 21:01:12 [INFO] __main__:   Strategies: 42
+2026-02-08 21:01:12 [INFO] __main__:   Existing configs: 46
+2026-02-08 21:01:12 [INFO] __main__: 
+============================================================
+2026-02-08 21:01:12 [INFO] __main__: STARTING LIVE TRADING
+2026-02-08 21:01:12 [INFO] __main__: Trading enabled: True
+2026-02-08 21:01:12 [INFO] __main__: Auto-retrain: False
+2026-02-08 21:01:12 [INFO] __main__: Close on opposite signal: False
+2026-02-08 21:01:12 [INFO] __main__: ============================================================
+2026-02-08 21:01:12 [INFO] __main__: Synchronizing instrument specs from MT5...
+2026-02-08 21:01:12 [INFO] __main__: [EURUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=2.6pips (was 1.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [GBPUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=4.6pips (was 1.2pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [USDJPY] Synced from MT5: tick_value=0.6359 (was 0.0090), volume_step=0.01 (was 0.01), spread=4.0pips (was 1.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [USDCHF] Synced from MT5: tick_value=1.2885 (was 1.1000), volume_step=0.01 (was 0.01), spread=5.2pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [USDCAD] Synced from MT5: tick_value=0.7312 (was 0.7500), volume_step=0.01 (was 0.01), spread=5.3pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [AUDUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=5.5pips (was 1.2pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [NZDUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=4.5pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [AUDNZD] Synced from MT5: tick_value=0.6015 (was 0.6000), volume_step=0.01 (was 0.01), spread=7.5pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [EURGBP] Synced from MT5: tick_value=1.3608 (was 1.2500), volume_step=0.01 (was 0.01), spread=5.0pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [EURJPY] Synced from MT5: tick_value=0.6359 (was 0.0090), volume_step=0.01 (was 0.01), spread=5.9pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [GBPJPY] Synced from MT5: tick_value=0.6359 (was 0.0090), volume_step=0.01 (was 0.01), spread=7.9pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [AUDJPY] Synced from MT5: tick_value=0.6359 (was 0.0090), volume_step=0.01 (was 0.01), spread=5.8pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [EURAUD] Synced from MT5: tick_value=0.7013 (was 0.7000), volume_step=0.01 (was 0.01), spread=6.1pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [EURCHF] Synced from MT5: tick_value=1.2885 (was 1.1000), volume_step=0.01 (was 0.01), spread=6.0pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [EURCAD] Synced from MT5: tick_value=0.7312 (was 0.7500), volume_step=0.01 (was 0.01), spread=7.1pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [EURNZD] Synced from MT5: tick_value=0.6015 (was 0.6000), volume_step=0.01 (was 0.01), spread=8.4pips (was 3.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [GBPAUD] Synced from MT5: tick_value=0.7013 (was 0.7000), volume_step=0.01 (was 0.01), spread=7.9pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [GBPCAD] Synced from MT5: tick_value=0.7312 (was 0.7500), volume_step=0.01 (was 0.01), spread=7.0pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [GBPCHF] Synced from MT5: tick_value=1.2885 (was 1.1000), volume_step=0.01 (was 0.01), spread=8.0pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [CADJPY] Synced from MT5: tick_value=0.6359 (was 0.0090), volume_step=0.01 (was 0.01), spread=6.5pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [NZDJPY] Synced from MT5: tick_value=0.6359 (was 0.0090), volume_step=0.01 (was 0.01), spread=8.5pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [AUDCAD] Synced from MT5: tick_value=0.7312 (was 0.7500), volume_step=0.01 (was 0.01), spread=6.5pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [AUDCHF] Synced from MT5: tick_value=1.2885 (was 1.1000), volume_step=0.01 (was 0.01), spread=6.1pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [CADCHF] Synced from MT5: tick_value=1.2885 (was 1.1000), volume_step=0.01 (was 0.01), spread=8.0pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [CHFJPY] Synced from MT5: tick_value=0.6359 (was 0.0090), volume_step=0.01 (was 0.01), spread=9.3pips (was 1.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [NZDCAD] Synced from MT5: tick_value=0.7312 (was 0.7500), volume_step=0.01 (was 0.01), spread=6.3pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [NZDCHF] Synced from MT5: tick_value=1.2885 (was 1.1000), volume_step=0.01 (was 0.01), spread=7.0pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [GBPNZD] Synced from MT5: tick_value=0.6015 (was 0.6000), volume_step=0.01 (was 0.01), spread=8.5pips (was 3.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [USDNOK] Synced from MT5: tick_value=0.1033 (was 0.0950), volume_step=0.01 (was 0.01), spread=81.8pips (was 30.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [USDMXN] Synced from MT5: tick_value=0.5790 (was 0.0550), volume_step=0.01 (was 0.01), spread=59.0pips (was 30.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [USDSGD] Synced from MT5: tick_value=0.7860 (was 0.7500), volume_step=0.01 (was 0.01), spread=15.3pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [USDZAR] Synced from MT5: tick_value=0.6229 (was 0.0550), volume_step=0.01 (was 0.01), spread=140.0pips (was 50.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [USDPLN] Synced from MT5: tick_value=0.2799 (was 0.2500), volume_step=0.01 (was 0.01), spread=29.4pips (was 25.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [USDSEK] Synced from MT5: tick_value=0.1107 (was 0.0950), volume_step=0.01 (was 0.01), spread=106.0pips (was 30.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [XAUUSD] Synced from MT5: tick_value=1.0000 (was 0.0010), volume_step=0.01 (was 0.01), spread=50.0pips (was 3.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [XAGUSD] Synced from MT5: tick_value=5.0000 (was 0.0500), volume_step=0.01 (was 0.01), spread=134.0pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 21:01:12 [INFO] __main__: [US100] Synced from MT5: tick_value=0.1000 (was 0.0000), volume_step=0.01 (was 0.01), spread=3.1pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [US30] Synced from MT5: tick_value=0.1000 (was 0.0000), volume_step=0.01 (was 0.01), spread=6.2pips (was 3.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [DE30] Synced from MT5: tick_value=0.1181 (was 0.0000), volume_step=0.01 (was 0.01), spread=10.2pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [EU50] Synced from MT5: tick_value=0.1181 (was 0.0000), volume_step=0.01 (was 0.01), spread=4.1pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [UK100] Synced from MT5: tick_value=0.1361 (was 0.0000), volume_step=0.01 (was 0.01), spread=4.3pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [JP225] Synced from MT5: tick_value=0.0636 (was 0.0000), volume_step=0.01 (was 0.01), spread=19.0pips (was 8.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [ETHUSD] Synced from MT5: tick_value=0.1000 (was 0.0010), volume_step=0.01 (was 0.01), spread=199.0pips (was 8.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [XRPUSD] Synced from MT5: tick_value=0.0500 (was 0.1000), volume_step=0.01 (was 0.01), spread=30.1pips (was 12.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [TONUSD] Synced from MT5: tick_value=0.0100 (was 0.0100), volume_step=0.01 (was 0.01), spread=6.3pips (was 12.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: [BTCETH] Synced from MT5: tick_value=0.0010 (was 0.0010), volume_step=0.01 (was 0.01), spread=3.4pips (was 8.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 21:01:12 [INFO] __main__: MT5 spec sync complete: 46 synced, 0 failed/unavailable
+2026-02-08 21:01:15 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-08 21:01:20 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-08 21:01:25 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-08 21:01:30 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-08 21:01:35 [INFO] __main__: [NZDUSD] [SECONDARY] Selected: MomentumBurstStrategy @ D1/TREND (strength=0.36, quality=0.41, freshness=1.00, score=0.148)
+2026-02-08 21:01:35 [INFO] __main__: [NZDUSD] Secondary trade: risk 1.00% -> 1.00% (existing=1.00%, cap=3.00%)
+2026-02-08 21:01:35 [INFO] __main__: [NZDUSD] Symbol risk OK for NZDUSD: 1.17% / 3.00% (0 open positions, adding 1 new)
+2026-02-08 21:01:35 [INFO] __main__: [NZDUSD] SELL | basis=1437.93 (balance) | target_risk=1.00% ($14.38) | actual_risk=1.17% ($16.77) | vol_raw=0.0100 | vol=0.0100 | entry=0.60148 | sl=0.61825 | tp=0.59142
+2026-02-08 21:01:35 [WARNING] __main__: [FAIL] [NZDUSD] Order failed: 10018 - Market closed
+2026-02-08 21:01:36 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-08 21:01:40 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-08 21:01:46 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-08 21:01:50 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-08 21:01:55 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-08 21:01:59 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-08 21:02:04 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-08 21:02:08 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-08 21:02:13 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-08 21:02:17 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-08 21:02:21 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-08 21:02:25 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-08 21:02:26 [INFO] __main__: [US100] Selected: MomentumBurstStrategy @ D1/TREND (strength=0.31, quality=0.42, freshness=1.00, score=0.132)
+2026-02-08 21:02:26 [WARNING] __main__: [US100] Skipping trade; risk 11.82% exceeds cap 5.00% (vol=0.0100, sl=26719.74357)
+2026-02-08 21:02:29 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-08 21:02:33 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-08 21:02:37 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-08 21:02:41 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-08 21:02:45 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-08 21:02:49 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-08 21:02:53 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-08 21:02:58 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-08 21:03:04 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-08 21:03:08 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-08 21:03:13 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-08 21:03:18 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-08 21:03:24 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-08 21:03:30 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-08 21:03:35 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-08 21:03:40 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-08 21:03:45 [INFO] __main__:   US100: 367015 bars saved
+2026-02-08 21:03:50 [INFO] __main__:   US30: 368650 bars saved
+2026-02-08 21:03:54 [INFO] __main__:   DE30: 353181 bars saved
+2026-02-08 21:03:56 [INFO] __main__:   EU50: 228553 bars saved
+2026-02-08 21:04:00 [INFO] __main__:   UK100: 357667 bars saved
+2026-02-08 21:04:03 [INFO] __main__:   JP225: 363624 bars saved
+2026-02-08 21:04:08 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-08 21:04:13 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-08 21:04:14 [INFO] __main__:   TONUSD: 158051 bars saved
+2026-02-08 21:04:19 [INFO] __main__:   BTCETH: 474590 bars saved
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-08 21:04:19 [INFO] pm_pipeline: 
+############################################################
+2026-02-08 21:04:19 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-08 21:04:19 [INFO] pm_pipeline: Total symbols: 46
+2026-02-08 21:04:19 [INFO] pm_pipeline: To optimize: 46
+2026-02-08 21:04:19 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-08 21:04:19 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-08 21:04:19 [INFO] pm_pipeline: Strategies: 42
+2026-02-08 21:04:19 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-08 21:04:19 [INFO] pm_pipeline: ############################################################
+2026-02-08 21:04:19 [INFO] pm_pipeline: Parallel optimization enabled: workers=4
+2026-02-08 21:31:02 [INFO] __main__: Shutting down...
+2026-02-08 21:31:02 [INFO] pm_mt5: Disconnected from MT5
+2026-02-08 21:31:02 [INFO] __main__: Shutdown complete
+2026-02-08 21:32:39 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 21:32:39 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 21:32:39 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 21:32:39 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.05 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 21:32:39 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 21:32:39 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 21:32:39 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 21:32:39 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 21:32:39 [INFO] __main__: ============================================================
+2026-02-08 21:32:39 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 21:32:39 [INFO] __main__: ============================================================
+2026-02-08 21:32:39 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 21:32:39 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 21:32:39 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 21:32:39 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 21:32:39 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 21:32:39 [INFO] __main__:   Symbols: 46
+2026-02-08 21:32:39 [INFO] __main__:   Strategies: 42
+2026-02-08 21:32:39 [INFO] __main__:   Existing configs: 46
+2026-02-08 21:32:39 [INFO] __main__: 
+============================================================
+2026-02-08 21:32:39 [INFO] __main__: RUNNING OPTIMIZATION
+2026-02-08 21:32:39 [INFO] __main__: MODE: OVERWRITE (re-optimizing all symbols)
+2026-02-08 21:32:39 [INFO] __main__: ============================================================
+2026-02-08 21:32:39 [INFO] __main__: Fetching historical data for 46 symbols...
+2026-02-08 21:32:43 [INFO] __main__:   EURUSD: 500000 bars saved
+2026-02-08 21:32:48 [INFO] __main__:   GBPUSD: 500000 bars saved
+2026-02-08 21:32:52 [INFO] __main__:   USDJPY: 500000 bars saved
+2026-02-08 21:32:56 [INFO] __main__:   USDCHF: 500000 bars saved
+2026-02-08 21:33:00 [INFO] __main__:   USDCAD: 500000 bars saved
+2026-02-08 21:33:03 [INFO] __main__:   AUDUSD: 500000 bars saved
+2026-02-08 21:33:07 [INFO] __main__:   NZDUSD: 500000 bars saved
+2026-02-08 21:33:11 [INFO] __main__:   AUDNZD: 500000 bars saved
+2026-02-08 21:33:15 [INFO] __main__:   EURGBP: 500000 bars saved
+2026-02-08 21:33:19 [INFO] __main__:   EURJPY: 500000 bars saved
+2026-02-08 21:33:23 [INFO] __main__:   GBPJPY: 500000 bars saved
+2026-02-08 21:33:27 [INFO] __main__:   AUDJPY: 500000 bars saved
+2026-02-08 21:33:31 [INFO] __main__:   EURAUD: 500000 bars saved
+2026-02-08 21:33:35 [INFO] __main__:   EURCHF: 500000 bars saved
+2026-02-08 21:33:39 [INFO] __main__:   EURCAD: 500000 bars saved
+2026-02-08 21:33:44 [INFO] __main__:   EURNZD: 500000 bars saved
+2026-02-08 21:33:48 [INFO] __main__:   GBPAUD: 500000 bars saved
+2026-02-08 21:33:52 [INFO] __main__:   GBPCAD: 500000 bars saved
+2026-02-08 21:33:56 [INFO] __main__:   GBPCHF: 500000 bars saved
+2026-02-08 21:34:00 [INFO] __main__:   CADJPY: 500000 bars saved
+2026-02-08 21:34:04 [INFO] __main__:   NZDJPY: 500000 bars saved
+2026-02-08 21:34:08 [INFO] __main__:   AUDCAD: 500000 bars saved
+2026-02-08 21:34:12 [INFO] __main__:   AUDCHF: 500000 bars saved
+2026-02-08 21:34:16 [INFO] __main__:   CADCHF: 500000 bars saved
+2026-02-08 21:34:20 [INFO] __main__:   CHFJPY: 500000 bars saved
+2026-02-08 21:34:23 [INFO] __main__:   NZDCAD: 500000 bars saved
+2026-02-08 21:34:27 [INFO] __main__:   NZDCHF: 500000 bars saved
+2026-02-08 21:34:31 [INFO] __main__:   GBPNZD: 500000 bars saved
+2026-02-08 21:34:35 [INFO] __main__:   USDNOK: 500000 bars saved
+2026-02-08 21:34:40 [INFO] __main__:   USDMXN: 500000 bars saved
+2026-02-08 21:34:44 [INFO] __main__:   USDSGD: 500000 bars saved
+2026-02-08 21:34:50 [INFO] __main__:   USDZAR: 500000 bars saved
+2026-02-08 21:34:55 [INFO] __main__:   USDPLN: 500000 bars saved
+2026-02-08 21:34:59 [INFO] __main__:   USDSEK: 500000 bars saved
+2026-02-08 21:35:03 [INFO] __main__:   XAUUSD: 500000 bars saved
+2026-02-08 21:35:07 [INFO] __main__:   XAGUSD: 500000 bars saved
+2026-02-08 21:35:10 [INFO] __main__:   US100: 367015 bars saved
+2026-02-08 21:35:13 [INFO] __main__:   US30: 368650 bars saved
+2026-02-08 21:35:16 [INFO] __main__:   DE30: 353181 bars saved
+2026-02-08 21:35:17 [INFO] __main__:   EU50: 228553 bars saved
+2026-02-08 21:35:20 [INFO] __main__:   UK100: 357667 bars saved
+2026-02-08 21:35:23 [INFO] __main__:   JP225: 363624 bars saved
+2026-02-08 21:35:27 [INFO] __main__:   ETHUSD: 500000 bars saved
+2026-02-08 21:35:31 [INFO] __main__:   XRPUSD: 500000 bars saved
+2026-02-08 21:35:32 [INFO] __main__:   TONUSD: 158058 bars saved
+2026-02-08 21:35:36 [INFO] __main__:   BTCETH: 474597 bars saved
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EURUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE GBPUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDJPY: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDCHF: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDCAD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE AUDUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE NZDUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE AUDNZD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EURGBP: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EURJPY: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE GBPJPY: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE AUDJPY: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EURAUD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EURCHF: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EURCAD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EURNZD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE GBPAUD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE GBPCAD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE GBPCHF: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE CADJPY: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE NZDJPY: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE AUDCAD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE AUDCHF: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE CADCHF: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE CHFJPY: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE NZDCAD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE NZDCHF: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE GBPNZD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDNOK: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDMXN: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDSGD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDZAR: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDPLN: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE USDSEK: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE XAUUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE XAGUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE US100: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE US30: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE DE30: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE EU50: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE UK100: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE JP225: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE ETHUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE XRPUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE TONUSD: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: OPTIMIZE BTCETH: overwrite enabled
+2026-02-08 21:35:36 [INFO] pm_pipeline: 
+############################################################
+2026-02-08 21:35:36 [INFO] pm_pipeline: PORTFOLIO MANAGER - STATEFUL OPTIMIZATION
+2026-02-08 21:35:36 [INFO] pm_pipeline: Total symbols: 46
+2026-02-08 21:35:36 [INFO] pm_pipeline: To optimize: 46
+2026-02-08 21:35:36 [INFO] pm_pipeline: Skipping: 0 (valid configs)
+2026-02-08 21:35:36 [INFO] pm_pipeline: OVERWRITE MODE: ignoring validity checks
+2026-02-08 21:35:36 [INFO] pm_pipeline: Strategies: 42
+2026-02-08 21:35:36 [INFO] pm_pipeline: Timeframes: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']
+2026-02-08 21:35:36 [INFO] pm_pipeline: ############################################################
+2026-02-08 21:35:36 [INFO] pm_pipeline: Parallel optimization enabled: workers=4
+2026-02-08 22:18:07 [INFO] pm_pipeline: SAVED EURUSD to pm_configs.json (atomic)
+2026-02-08 22:18:52 [INFO] pm_pipeline: SAVED USDCHF to pm_configs.json (atomic)
+2026-02-08 22:22:24 [INFO] pm_pipeline: SAVED USDJPY to pm_configs.json (atomic)
+2026-02-08 22:46:40 [INFO] pm_pipeline: SAVED USDCAD to pm_configs.json (atomic)
+2026-02-08 22:55:57 [INFO] pm_pipeline: SAVED NZDUSD to pm_configs.json (atomic)
+2026-02-08 23:00:28 [INFO] __main__: [BTCETH] [SECONDARY] Selected: MomentumBurstStrategy @ D1/TREND (strength=0.34, quality=0.50, freshness=1.00, score=0.168)
+2026-02-08 23:05:46 [INFO] pm_pipeline: SAVED AUDUSD to pm_configs.json (atomic)
+2026-02-08 23:06:09 [INFO] __main__: [USDJPY] Selected: EMAPullbackContinuationStrategy @ H1/TREND (strength=0.31, quality=0.43, freshness=1.00, score=0.135)
+2026-02-08 23:06:09 [INFO] __main__: [USDJPY] Symbol risk OK for USDJPY: 0.93% / 3.00% (0 open positions, adding 1 new)
+2026-02-08 23:06:09 [INFO] __main__: [USDJPY] BUY | basis=1398.76 (balance) | target_risk=1.00% ($13.99) | actual_risk=0.93% ($13.06) | vol_raw=0.0429 | vol=0.0400 | entry=157.45900 | sl=156.94686 | tp=157.80043
+2026-02-08 23:06:09 [INFO] __main__: [OK] [USDJPY] LONG executed: 0.04 lots @ 157.45900
+2026-02-08 23:06:27 [INFO] __main__: [GBPJPY] [SECONDARY] Selected: KeltnerPullbackStrategy @ D1/CHOP (strength=0.35, quality=0.36, freshness=1.00, score=0.126)
+2026-02-08 23:06:36 [INFO] __main__: [EURNZD] [SECONDARY] Selected: MomentumBurstStrategy @ D1/TREND (strength=0.35, quality=0.40, freshness=1.00, score=0.140)
+2026-02-08 23:08:49 [INFO] pm_pipeline: SAVED GBPUSD to pm_configs.json (atomic)
+2026-02-08 23:09:24 [INFO] pm_pipeline: SAVED AUDNZD to pm_configs.json (atomic)
+2026-02-08 23:45:52 [INFO] __main__: Resolved config summary (source=config.json)
+2026-02-08 23:45:52 [INFO] __main__:   sections: broker_specs_path, instrument_spec_defaults, instrument_specs, mt5, pipeline, position, symbols
+2026-02-08 23:45:52 [INFO] __main__:   pipeline: scoring=fx_backtester | bars=500000 | tfs=M5,M15,M30,H1,H4,D1 | live=1500/300 | risk=1.0% | d1+lower=True | max_sym_risk=3.0% | opt_workers=4
+2026-02-08 23:45:52 [INFO] __main__:             validation: opt_min=15 | val_min=15 | val_dd<=15 | pf>=1.05 | ret>=0.0 | optuna_val_obj=False
+2026-02-08 23:45:52 [INFO] __main__:   position: risk=1.0% | basis=balance | max_risk=5.0% | size=0.01-0.0 | auto_widen_sl=True
+2026-02-08 23:45:52 [INFO] __main__:   mt5: server=n/a | path=n/a | timeout=60000 | portable=False
+2026-02-08 23:45:52 [INFO] __main__:   instruments: overrides=46 | defaults=commission_per_lot | broker_specs=broker_specs.json
+2026-02-08 23:45:52 [INFO] __main__: ------------------------------------------------------------
+2026-02-08 23:45:52 [INFO] __main__: ============================================================
+2026-02-08 23:45:52 [INFO] __main__: FX PORTFOLIO MANAGER v3.0
+2026-02-08 23:45:52 [INFO] __main__: ============================================================
+2026-02-08 23:45:52 [INFO] __main__: Connecting to MetaTrader 5...
+2026-02-08 23:45:52 [INFO] pm_mt5: Connected to MT5 (using existing session)
+2026-02-08 23:45:52 [INFO] __main__: [OK] Connected to MT5
+2026-02-08 23:45:52 [INFO] pm_pipeline: Loaded 46 existing configs from pm_configs.json
+2026-02-08 23:45:52 [INFO] __main__: [OK] Portfolio Manager initialized
+2026-02-08 23:45:52 [INFO] __main__:   Symbols: 46
+2026-02-08 23:45:52 [INFO] __main__:   Strategies: 42
+2026-02-08 23:45:52 [INFO] __main__:   Existing configs: 46
+2026-02-08 23:45:52 [INFO] __main__: 
+============================================================
+2026-02-08 23:45:52 [INFO] __main__: STARTING LIVE TRADING
+2026-02-08 23:45:52 [INFO] __main__: Trading enabled: True
+2026-02-08 23:45:52 [INFO] __main__: Auto-retrain: False
+2026-02-08 23:45:52 [INFO] __main__: Close on opposite signal: False
+2026-02-08 23:45:52 [INFO] __main__: ============================================================
+2026-02-08 23:45:52 [INFO] __main__: Synchronizing instrument specs from MT5...
+2026-02-08 23:45:52 [INFO] __main__: [EURUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=4.4pips (was 1.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [GBPUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=9.0pips (was 1.2pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [USDJPY] Synced from MT5: tick_value=0.6350 (was 0.0090), volume_step=0.01 (was 0.01), spread=7.4pips (was 1.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [USDCHF] Synced from MT5: tick_value=1.2870 (was 1.1000), volume_step=0.01 (was 0.01), spread=10.0pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [USDCAD] Synced from MT5: tick_value=0.7316 (was 0.7500), volume_step=0.01 (was 0.01), spread=9.1pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [AUDUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=9.1pips (was 1.2pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [NZDUSD] Synced from MT5: tick_value=1.0000 (was 1.0000), volume_step=0.01 (was 0.01), spread=10.5pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [AUDNZD] Synced from MT5: tick_value=0.6010 (was 0.6000), volume_step=0.01 (was 0.01), spread=15.2pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [EURGBP] Synced from MT5: tick_value=1.3599 (was 1.2500), volume_step=0.01 (was 0.01), spread=5.5pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [EURJPY] Synced from MT5: tick_value=0.6350 (was 0.0090), volume_step=0.01 (was 0.01), spread=10.3pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [GBPJPY] Synced from MT5: tick_value=0.6350 (was 0.0090), volume_step=0.01 (was 0.01), spread=17.9pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [AUDJPY] Synced from MT5: tick_value=0.6350 (was 0.0090), volume_step=0.01 (was 0.01), spread=12.7pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [EURAUD] Synced from MT5: tick_value=0.7013 (was 0.7000), volume_step=0.01 (was 0.01), spread=17.3pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [EURCHF] Synced from MT5: tick_value=1.2870 (was 1.1000), volume_step=0.01 (was 0.01), spread=9.4pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [EURCAD] Synced from MT5: tick_value=0.7316 (was 0.7500), volume_step=0.01 (was 0.01), spread=18.8pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [EURNZD] Synced from MT5: tick_value=0.6010 (was 0.6000), volume_step=0.01 (was 0.01), spread=31.0pips (was 3.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [GBPAUD] Synced from MT5: tick_value=0.7013 (was 0.7000), volume_step=0.01 (was 0.01), spread=24.4pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [GBPCAD] Synced from MT5: tick_value=0.7316 (was 0.7500), volume_step=0.01 (was 0.01), spread=27.2pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [GBPCHF] Synced from MT5: tick_value=1.2870 (was 1.1000), volume_step=0.01 (was 0.01), spread=18.8pips (was 2.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [CADJPY] Synced from MT5: tick_value=0.6350 (was 0.0090), volume_step=0.01 (was 0.01), spread=16.9pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [NZDJPY] Synced from MT5: tick_value=0.6350 (was 0.0090), volume_step=0.01 (was 0.01), spread=22.6pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [AUDCAD] Synced from MT5: tick_value=0.7316 (was 0.7500), volume_step=0.01 (was 0.01), spread=15.5pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [AUDCHF] Synced from MT5: tick_value=1.2870 (was 1.1000), volume_step=0.01 (was 0.01), spread=12.8pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [CADCHF] Synced from MT5: tick_value=1.2870 (was 1.1000), volume_step=0.01 (was 0.01), spread=9.8pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [CHFJPY] Synced from MT5: tick_value=0.6350 (was 0.0090), volume_step=0.01 (was 0.01), spread=20.0pips (was 1.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [NZDCAD] Synced from MT5: tick_value=0.7316 (was 0.7500), volume_step=0.01 (was 0.01), spread=13.1pips (was 1.5pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [NZDCHF] Synced from MT5: tick_value=1.2870 (was 1.1000), volume_step=0.01 (was 0.01), spread=14.2pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [GBPNZD] Synced from MT5: tick_value=0.6010 (was 0.6000), volume_step=0.01 (was 0.01), spread=22.6pips (was 3.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [USDNOK] Synced from MT5: tick_value=0.1033 (was 0.0950), volume_step=0.01 (was 0.01), spread=81.8pips (was 30.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [USDMXN] Synced from MT5: tick_value=0.5790 (was 0.0550), volume_step=0.01 (was 0.01), spread=59.0pips (was 30.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [USDSGD] Synced from MT5: tick_value=0.7860 (was 0.7500), volume_step=0.01 (was 0.01), spread=15.3pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [USDZAR] Synced from MT5: tick_value=0.6225 (was 0.0550), volume_step=0.01 (was 0.01), spread=283.0pips (was 50.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [USDPLN] Synced from MT5: tick_value=0.2799 (was 0.2500), volume_step=0.01 (was 0.01), spread=29.4pips (was 25.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [USDSEK] Synced from MT5: tick_value=0.1107 (was 0.0950), volume_step=0.01 (was 0.01), spread=106.0pips (was 30.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [XAUUSD] Synced from MT5: tick_value=1.0000 (was 0.0010), volume_step=0.01 (was 0.01), spread=50.0pips (was 3.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [XAGUSD] Synced from MT5: tick_value=5.0000 (was 0.0500), volume_step=0.01 (was 0.01), spread=134.0pips (was 2.0pips), min_lot=0.01, max_lot=1000.0
+2026-02-08 23:45:52 [INFO] __main__: [US100] Synced from MT5: tick_value=0.1000 (was 0.0000), volume_step=0.01 (was 0.01), spread=3.1pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [US30] Synced from MT5: tick_value=0.1000 (was 0.0000), volume_step=0.01 (was 0.01), spread=6.2pips (was 3.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [DE30] Synced from MT5: tick_value=0.1181 (was 0.0000), volume_step=0.01 (was 0.01), spread=10.2pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [EU50] Synced from MT5: tick_value=0.1181 (was 0.0000), volume_step=0.01 (was 0.01), spread=4.1pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [UK100] Synced from MT5: tick_value=0.1360 (was 0.0000), volume_step=0.01 (was 0.01), spread=4.3pips (was 2.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [JP225] Synced from MT5: tick_value=0.0635 (was 0.0000), volume_step=0.01 (was 0.01), spread=19.0pips (was 8.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [ETHUSD] Synced from MT5: tick_value=0.1000 (was 0.0010), volume_step=0.01 (was 0.01), spread=193.0pips (was 8.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [XRPUSD] Synced from MT5: tick_value=0.0500 (was 0.1000), volume_step=0.01 (was 0.01), spread=30.1pips (was 12.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [TONUSD] Synced from MT5: tick_value=0.0100 (was 0.0100), volume_step=0.01 (was 0.01), spread=6.5pips (was 12.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: [BTCETH] Synced from MT5: tick_value=0.0010 (was 0.0010), volume_step=0.01 (was 0.01), spread=3.4pips (was 8.0pips), min_lot=0.01, max_lot=500.0
+2026-02-08 23:45:52 [INFO] __main__: MT5 spec sync complete: 46 synced, 0 failed/unavailable
+2026-02-08 23:59:43 [INFO] __main__: [USDMXN] Selected: MomentumBurstStrategy @ D1/TREND (strength=0.32, quality=0.47, freshness=1.00, score=0.149)
+2026-02-08 23:59:43 [INFO] __main__: [USDMXN] Symbol risk OK for USDMXN: 1.52% / 3.00% (0 open positions, adding 1 new)
+2026-02-08 23:59:43 [INFO] __main__: [USDMXN] SELL | basis=1383.83 (balance) | target_risk=1.00% ($13.84) | actual_risk=1.52% ($21.10) | vol_raw=0.0100 | vol=0.0100 | entry=17.23490 | sl=17.60647 | tp=16.58465
+2026-02-08 23:59:43 [INFO] __main__: [OK] [USDMXN] SHORT executed: 0.01 lots @ 17.23490
+2026-02-09 00:00:00 [INFO] __main__: [US100] Selected: MomentumBurstStrategy @ M30/RANGE (strength=0.45, quality=0.38, freshness=1.00, score=0.171)
+2026-02-09 00:00:00 [INFO] __main__: [US100] Symbol risk OK for US100: 1.66% / 3.00% (0 open positions, adding 1 new)
+2026-02-09 00:00:00 [INFO] __main__: [US100] BUY | basis=1383.83 (balance) | target_risk=1.00% ($13.84) | actual_risk=1.66% ($22.95) | vol_raw=0.0100 | vol=0.0100 | entry=25122.82000 | sl=24893.35643 | tp=25237.55179
+2026-02-09 00:00:00 [INFO] __main__: [OK] [US100] LONG executed: 0.01 lots @ 25122.82000
+2026-02-09 00:01:37 [INFO] __main__: [US100] [SECONDARY] Selected: MomentumBurstStrategy @ D1/TREND (strength=0.31, quality=0.42, freshness=0.85, score=0.111)
+2026-02-09 00:01:37 [INFO] __main__: [US100] Secondary trade: risk 1.00% -> 1.00% (existing=1.00%, cap=3.00%)
+2026-02-09 00:01:37 [WARNING] __main__: [US100] Skipping trade; risk 11.70% exceeds cap 5.00% (vol=0.0100, sl=26774.96786)
+2026-02-09 00:06:11 [INFO] __main__: [XAUUSD] Selected: MomentumBurstStrategy @ H1/TREND (strength=0.38, quality=0.45, freshness=1.00, score=0.172)
+2026-02-09 00:06:11 [WARNING] __main__: [XAUUSD] Skipping trade; risk 6.40% exceeds cap 5.00% (vol=0.0100, sl=4897.79000)
+2026-02-09 00:06:14 [INFO] __main__: [XAGUSD] Selected: KeltnerBreakoutStrategy @ M30/TREND (strength=0.40, quality=0.44, freshness=1.00, score=0.175)
+2026-02-09 00:06:14 [WARNING] __main__: [XAGUSD] Skipping trade; risk 10.24% exceeds cap 5.00% (vol=0.0100, sl=76.63536)
+2026-02-09 00:29:52 [INFO] __main__: [XAGUSD] Selected: KeltnerBreakoutStrategy @ M30/TREND (strength=0.40, quality=0.44, freshness=1.00, score=0.174)
+2026-02-09 00:29:52 [WARNING] __main__: [XAGUSD] Skipping trade; risk 9.18% exceeds cap 5.00% (vol=0.0100, sl=77.24936)

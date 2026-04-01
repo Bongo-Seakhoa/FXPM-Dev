@@ -107,6 +107,13 @@ def log_resolved_config_summary(logger: logging.Logger,
             f"data_dir={getattr(p, 'data_dir', None)} | "
             f"output_dir={getattr(p, 'output_dir', None)}"
         )
+        logger.info(
+            "            "
+            f"spread_filter: enabled={bool(getattr(p, 'execution_spread_filter_enabled', True))} | "
+            f"min_edge={getattr(p, 'execution_spread_min_edge_mult', None)}x | "
+            f"spike={getattr(p, 'execution_spread_spike_mult', None)}x | "
+            f"penalty_start={getattr(p, 'execution_spread_penalty_start_mult', None)}"
+        )
 
         # Position config (risk + execution safety)
         pos_cfg = position_config
@@ -664,7 +671,7 @@ class LiveTrader:
         self.logger = logging.getLogger(__name__)
 
         # Enhancement seams (risk scalars, spread filter, exit pack)
-        self._enhancement_seams = create_default_enhancement_seams()
+        self._enhancement_seams = create_default_enhancement_seams(self.pipeline_config)
 
         # === MT5 SPEC SYNCHRONIZATION ===
         # Update InstrumentSpec with live MT5 values for accurate position sizing

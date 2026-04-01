@@ -1,8 +1,10 @@
 """Regression tests for strategy-layer fixes and helper parity."""
 import unittest
+import warnings
 
 import numpy as np
 import pandas as pd
+from pandas.errors import PerformanceWarning
 
 from pm_core import FeatureComputer
 from pm_strategies import (
@@ -11,6 +13,7 @@ from pm_strategies import (
     StrategyRegistry,
     _get_adx_di,
     _get_bb,
+    _get_keltner,
 )
 
 
@@ -170,6 +173,45 @@ class StrategyRegressionTests(unittest.TestCase):
         sig_wide = strat_wide.generate_signals(df.copy(), "TEST")
         self.assertEqual(int(sig_tight.abs().sum()), 1)
         self.assertEqual(int(sig_wide.abs().sum()), 0)
+
+    def test_choppiness_breakout_handles_flat_windows_without_log_warnings(self):
+        n = 40
+        flat = np.full(n, 100.0)
+        df = pd.DataFrame({
+            "Open": flat,
+            "High": flat,
+            "Low": flat,
+            "Close": flat,
+            "Volume": np.full(n, 100),
+        })
+        strat = StrategyRegistry.get(
+            "ChoppinessCompressionBreakoutStrategy",
+            ci_period=14,
+            lookback=5,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            signals = strat.generate_signals(df.copy(), "TEST")
+        self.assertFalse(any("log10" in str(w.message) for w in caught))
+        self.assertEqual(int(signals.abs().sum()), 0)
+
+    def test_bb_cache_assignment_does_not_emit_fragmentation_warning(self):
+        df = self._make_market(n=220)
+        features = df.copy()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", PerformanceWarning)
+            for std in [1.5, 2.0, 2.5, 3.0, 1.8, 2.2, 2.8]:
+                _get_bb(features, 20, std)
+        self.assertFalse(any(isinstance(w.message, PerformanceWarning) for w in caught))
+
+    def test_keltner_cache_assignment_does_not_emit_fragmentation_warning(self):
+        df = self._make_market(n=220)
+        features = df.copy()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", PerformanceWarning)
+            for mult in [1.0, 1.5, 2.0, 2.5, 3.0, 1.2, 2.2]:
+                _get_keltner(features, ema_period=20, atr_period=14, mult=mult)
+        self.assertFalse(any(isinstance(w.message, PerformanceWarning) for w in caught))
 
 
 if __name__ == "__main__":

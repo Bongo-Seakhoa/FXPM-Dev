@@ -5,8 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PM Dashboard - Analytics</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260208a') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v=asset_version) }}" />
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script>
+      if (typeof Chart === "undefined") {
+        document.write('<script src="https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>');
+      }
+    </script>
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -46,6 +51,8 @@
         </div>
       </header>
 
+      <section class="loading-indicator" id="analytics-loading" aria-live="polite">Loading analytics...</section>
+
       <section class="grid four-col mb-3 fade-in">
         <div class="card metric-card"><span>Total Trades</span><strong id="kpi-total-trades">0</strong></div>
         <div class="card metric-card"><span>Win Rate</span><strong id="kpi-win-rate">0.00%</strong></div>
@@ -60,6 +67,15 @@
         <div class="card metric-card"><span>Expectancy</span><strong id="kpi-expectancy">$0.00</strong></div>
         <div class="card metric-card"><span>Max Consec Wins</span><strong id="kpi-max-consec-wins">0</strong></div>
         <div class="card metric-card"><span>Max Consec Losses</span><strong id="kpi-max-consec-losses">0</strong></div>
+      </section>
+
+      <section class="grid six-col mb-3 fade-in">
+        <div class="card metric-card"><span>DD Duration</span><strong id="kpi-dd-duration">0</strong></div>
+        <div class="card metric-card"><span>Recovery Time</span><strong id="kpi-recovery-time">0</strong></div>
+        <div class="card metric-card"><span>Ulcer Index</span><strong id="kpi-ulcer-index">0.00</strong></div>
+        <div class="card metric-card"><span>Long PF</span><strong id="kpi-long-pf">0.00</strong></div>
+        <div class="card metric-card"><span>Short PF</span><strong id="kpi-short-pf">0.00</strong></div>
+        <div class="card metric-card"><span>Avg Trade</span><strong id="kpi-avg-trade">$0.00</strong></div>
       </section>
 
       <main class="grid mb-3">
@@ -184,7 +200,7 @@
 
     <div class="scroll-top" id="scroll-top">TOP</div>
 
-    <script src="{{ url_for('static', filename='common.js', v='20260209a') }}"></script>
-    <script src="{{ url_for('static', filename='analytics.js', v='20260209a') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v=asset_version) }}"></script>
+    <script src="{{ url_for('static', filename='analytics.js', v=asset_version) }}"></script>
   </body>
 </html>

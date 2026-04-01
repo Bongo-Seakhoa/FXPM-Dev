@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PM Dashboard - Strategies</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v='20260208a') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles_enhanced.css', v=asset_version) }}" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -117,7 +117,7 @@
       </main>
     </div>
 
-    <script src="{{ url_for('static', filename='common.js', v='20260208a') }}"></script>
-    <script src="{{ url_for('static', filename='strategies.js', v='20260208a') }}"></script>
+    <script src="{{ url_for('static', filename='common.js', v=asset_version) }}"></script>
+    <script src="{{ url_for('static', filename='strategies.js', v=asset_version) }}"></script>
   </body>
 </html>

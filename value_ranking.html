@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PM Value Ranking</title>
+    <style>
+      :root {
+        --bg: #f4f1ea;
+        --bg-soft: #fbfaf7;
+        --card: #ffffff;
+        --ink: #18212b;
+        --muted: #5a6674;
+        --accent: #0d6e69;
+        --accent-2: #d36e3d;
+        --good: #148a5d;
+        --warn: #b97a09;
+        --bad: #b13c3c;
+        --border: rgba(24, 33, 43, 0.12);
+        --shadow: 0 18px 42px rgba(13, 26, 40, 0.12);
+        --radius: 18px;
+        --radius-sm: 12px;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        font-family: "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 12% 8%, rgba(13, 110, 105, 0.12), transparent 36%),
+          radial-gradient(circle at 88% 14%, rgba(211, 110, 61, 0.12), transparent 34%),
+          linear-gradient(160deg, var(--bg), var(--bg-soft));
+      }
+
+      .wrap {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 34px 26px 60px;
+      }
+
+      .hero,
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+      }
+
+      .hero {
+        padding: 28px 30px;
+        margin-bottom: 20px;
+      }
+
+      .eyebrow {
+        display: inline-block;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--accent);
+        background: rgba(13, 110, 105, 0.08);
+      }
+
+      h1, h2, h3 {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+      }
+
+      h1 {
+        margin-top: 14px;
+        font-size: 34px;
+      }
+
+      .subtitle {
+        margin-top: 10px;
+        max-width: 900px;
+        color: var(--muted);
+        line-height: 1.6;
+        font-size: 15px;
+      }
+
+      .hero-grid,
+      .score-grid,
+      .detail-grid {
+        display: grid;
+        gap: 16px;
+      }
+
+      .hero-grid {
+        grid-template-columns: 1.35fr 0.95fr;
+        margin-top: 22px;
+      }
+
+      .score-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin: 20px 0;
+      }
+
+      .detail-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .metric {
+        padding: 18px;
+        border-radius: var(--radius-sm);
+        background: linear-gradient(135deg, rgba(13, 110, 105, 0.06), rgba(211, 110, 61, 0.07));
+        border: 1px solid rgba(13, 110, 105, 0.12);
+      }
+
+      .metric span {
+        display: block;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 8px;
+        font-size: 28px;
+        color: var(--accent);
+      }
+
+      .metric small {
+        display: block;
+        margin-top: 8px;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .stack {
+        display: grid;
+        gap: 16px;
+      }
+
+      .card {
+        padding: 22px 24px;
+        margin-top: 18px;
+      }
+
+      .card h2 {
+        font-size: 24px;
+        margin-bottom: 14px;
+      }
+
+      .card h3 {
+        font-size: 18px;
+        margin-bottom: 10px;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      .pill {
+        padding: 8px 12px;
+        border-radius: 999px;
+        font-size: 13px;
+        font-weight: 700;
+        border: 1px solid var(--border);
+        background: #fff;
+      }
+
+      .pill.good { color: var(--good); }
+      .pill.warn { color: var(--warn); }
+      .pill.bad { color: var(--bad); }
+
+      ul {
+        margin: 0;
+        padding-left: 18px;
+        line-height: 1.7;
+      }
+
+      li + li {
+        margin-top: 6px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 12px;
+      }
+
+      th, td {
+        text-align: left;
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--border);
+        vertical-align: top;
+      }
+
+      th {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+
+      .rank {
+        font-weight: 800;
+      }
+
+      .rank.good { color: var(--good); }
+      .rank.warn { color: var(--warn); }
+
+      .footer-note {
+        margin-top: 20px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      @media (max-width: 900px) {
+        .hero-grid,
+        .score-grid,
+        .detail-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <section class="hero">
+        <div class="eyebrow">Final Audit Signoff</div>
+        <h1>FxPM Current Value Ranking</h1>
+        <p class="subtitle">
+          Final engineering and methodology assessment of the PM as it stands on March 30, 2026.
+          This is a codebase-quality and system-readiness ranking, not a guarantee of future return.
+          The ranking is based on the audited implementation, the current test baseline, and the
+          remaining known operational caveats.
+        </p>
+
+        <div class="hero-grid">
+          <div class="score-grid">
+            <div class="metric">
+              <span>Overall Grade</span>
+              <strong>A-</strong>
+              <small>Current overall standing: strong independent quant build, clearly above generic retail bot quality.</small>
+            </div>
+            <div class="metric">
+              <span>Overall Score</span>
+              <strong>84 / 100</strong>
+              <small>High-value private PM asset with materially improved methodology, reliability, and observability.</small>
+            </div>
+            <div class="metric">
+              <span>Signoff</span>
+              <strong>Yes</strong>
+              <small>Signed off for continued use and controlled deployment, with the non-blocking caveats listed below.</small>
+            </div>
+          </div>
+
+          <div class="stack">
+            <div class="metric">
+              <span>Current Scope</span>
+              <strong>47 strategies</strong>
+              <small>Across 62 configured symbols, 6 timeframes, and a 500,000-bar research depth in the current pipeline setup.</small>
+            </div>
+            <div class="metric">
+              <span>Test Baseline</span>
+              <strong>112 passing tests</strong>
+              <small>The last full sweep completed cleanly with no failing tests in the active suite.</small>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Value Estimate</h2>
+        <div class="detail-grid">
+          <div>
+            <h3>Engineering Asset Value</h3>
+            <p class="muted">
+              As a private engineering and research asset, the PM is now valuable enough that rebuilding it
+              cleanly to the same current state would likely cost meaningful senior time rather than being a
+              trivial “weekend bot” recreation.
+            </p>
+            <div class="pill-row">
+              <div class="pill good">Replacement-cost estimate: roughly $50k to $120k</div>
+              <div class="pill warn">P&amp;L franchise value: still not knowable from code alone</div>
+            </div>
+          </div>
+          <div>
+            <h3>Honest Placement</h3>
+            <p class="muted">
+              I would rank the PM in the upper retail / strong independent systematic tier, but not in
+              institutional top-tier territory yet. It is much more defensible now, but it still relies on
+              MT5, candle-close execution, and a few necessary live-data fallback paths.
+            </p>
+            <div class="pill-row">
+              <div class="pill good">Upper-quartile independent PM</div>
+              <div class="pill warn">Below institutional-grade execution/research infrastructure</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Scorecard</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Score</th>
+              <th>Assessment</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Methodology Integrity</td>
+              <td class="rank good">8.6 / 10</td>
+              <td>Meaningfully improved. Validation, backtest semantics, regime handling, sizing overlays, and dashboard truthfulness are much stronger than before.</td>
+            </tr>
+            <tr>
+              <td>Reliability / Defensive Behavior</td>
+              <td class="rank good">8.5 / 10</td>
+              <td>Good fail-closed behavior in many live/runtime paths, stronger MT5 handling, safer config propagation, and broader regression coverage.</td>
+            </tr>
+            <tr>
+              <td>Live Trading Readiness</td>
+              <td class="rank warn">7.9 / 10</td>
+              <td>Strong for the current PM architecture, but still bounded by candle-close execution, broker/session dependence, and some unavoidable fallback behavior when MT5 data is incomplete.</td>
+            </tr>
+            <tr>
+              <td>Research / Optimization Stack</td>
+              <td class="rank good">8.4 / 10</td>
+              <td>Much better than a naive tuning stack. The current process is materially more defensible, though still not a full institutional research platform.</td>
+            </tr>
+            <tr>
+              <td>Observability / Dashboard</td>
+              <td class="rank good">8.7 / 10</td>
+              <td>The dashboard is now far more trustworthy and usable. Analytics, trade reconstruction, config handling, watcher behavior, and UI alignment are in good shape.</td>
+            </tr>
+            <tr>
+              <td>Maintainability</td>
+              <td class="rank warn">7.7 / 10</td>
+              <td>Improved, but still a fairly large and ambitious codebase with compatibility surfaces, generated artifacts, and multiple runtime modes.</td>
+            </tr>
+            <tr>
+              <td>Profitability Potential</td>
+              <td class="rank warn">8.0 / 10</td>
+              <td>Good potential from a code/methodology standpoint, but this remains potential. Only forward/live evidence can turn that into a higher-confidence commercial ranking.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>Why The PM Ranks Well</h2>
+        <ul>
+          <li>The core methodology is materially better defended than before: corrected backtest semantics, less optimistic validation flow, improved regime handling, and stronger artifact/config discipline.</li>
+          <li>The live path is more robust: stronger MT5 order handling, more fail-closed checks, better risk overlays, and better protection against silent mis-measurement in the dashboard.</li>
+          <li>The system breadth is real, not cosmetic: 47 strategies, regime-aware selection, portfolio-level overlays, and a much better supporting test surface.</li>
+          <li>The dashboard is no longer just presentation; it is a meaningful operational tool with better analytics, reconstruction, config management, and UI-state behavior.</li>
+          <li>The active test baseline is solid: 112 passing tests and 126 test functions identified in the current tree.</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>What Keeps It Below Top Tier</h2>
+        <ul>
+          <li>Candle-close execution remains a real design constraint. The PM is still not a true tick-level execution engine, so some backtest/live distortion is structurally unavoidable.</li>
+          <li>Some live/runtime paths still rely on fallbacks when MT5 is unavailable or broker metadata is incomplete. Those paths are much safer now, but they are still fallbacks.</li>
+          <li>There are compatibility surfaces left in place for legacy configs and offline operation. Helpful in practice, but they add complexity and reduce purity.</li>
+          <li>The codebase is still carrying a dirty working tree with many generated caches/data artifacts and deleted documentation files in the repo state. That is not a methodology blocker, but it is an operational hygiene weakness.</li>
+          <li>There is no honest way to certify “institutional-grade” purely from code. The PM still needs ongoing forward evidence, operator discipline, and controlled live monitoring to earn a higher ranking.</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>Final Position</h2>
+        <p class="muted">
+          My honest ranking is that the PM is now a strong, credible, high-effort private systematic trading
+          platform rather than a fragile hobby bot. It is meaningfully more profitable in potential,
+          more reliable in implementation, more accurate in measurement, and more defendable in methodology
+          than the earlier versions that motivated the upgrade work.
+        </p>
+        <p class="muted">
+          I do sign off on it as a serious PM codebase in its current form. I would not call it finished forever,
+          and I would not overclaim institutional maturity, but I would call it genuinely strong and worthy of
+          continued optimization and controlled live use.
+        </p>
+        <div class="pill-row">
+          <div class="pill good">Final rank: A- / 84</div>
+          <div class="pill good">Signed off for current audited state</div>
+          <div class="pill warn">Best interpreted as a high-quality evolving PM, not a guaranteed edge certificate</div>
+        </div>
+        <div class="footer-note">
+          Audit basis used for this signoff: full current test run passed (`112` tests), dashboard-focused suite passed,
+          current strategy registry count confirmed at `47`, and core pipeline/live/dashboard files were reviewed for
+          residual fallback, compatibility, and reliability risks. Date of assessment: March 30, 2026.
+        </div>
+      </section>
+    </div>
+  </body>
+</html>

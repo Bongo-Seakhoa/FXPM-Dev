@@ -4,6 +4,7 @@ import fnmatch
 import glob
 import json
 import os
+import re
 from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -52,21 +53,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "EXECUTED",
         "SKIPPED_RISK_CAP",
         "BLOCKED_RISK_CAP",
+        "BLOCKED_SPREAD_FILTER",
+        "BLOCKED_SYMBOL_RISK_CAP",
     ],
     "valid_action_prefixes": [
         "EXECUTED",
         "SKIPPED_RISK_CAP",
         "BLOCKED_RISK_CAP",
+        "BLOCKED_SPREAD",
+        "BLOCKED_SYMBOL",
     ],
     "display_actions": [
         "EXECUTED",
         "SKIPPED_RISK_CAP",
         "BLOCKED_RISK_CAP",
+        "BLOCKED_SPREAD_FILTER",
+        "BLOCKED_SYMBOL_RISK_CAP",
     ],
     "exclude_actions": [
         "NO_ACTIONABLE_SIGNAL",
         "NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN",
         "SKIPPED_NO_SIGNAL",
+        "SKIPPED_POSITION_EXISTS",
         "FAILED",
     ],
     "display_require_fields": [
@@ -296,12 +304,35 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
         raw = value.strip()
         if not raw:
             return None
-        raw = raw.replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            pass
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", raw):
+            try:
+                epoch = float(raw)
+                if epoch > 1e12:
+                    epoch = epoch / 1000.0
+                return datetime.fromtimestamp(epoch)
+            except (ValueError, OSError):
+                pass
+        raw = raw.replace("Z", "+00:00").replace("z", "+00:00")
+        raw = re.sub(r"\s+UTC$", "+00:00", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s+([+-]\d{2}:\d{2})$", r"\1", raw)
+        iso_candidates = [raw]
+        if " " in raw and "T" not in raw:
+            iso_candidates.append(raw.replace(" ", "T", 1))
+        for candidate in iso_candidates:
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                continue
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y/%m/%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y/%m/%d %H:%M",
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+        ):
             try:
                 return datetime.strptime(raw, fmt)
             except ValueError:
@@ -352,8 +383,8 @@ def load_instrument_specs(pm_root: str) -> Dict[str, Dict[str, Any]]:
         for symbol, spec in specs.items():
             if not isinstance(spec, dict):
                 continue
-            merged_spec = dict(defaults) if isinstance(defaults, dict) else {}
-            merged_spec.update(spec)
+            merged_spec = deepcopy(defaults) if isinstance(defaults, dict) else {}
+            merged_spec.update(deepcopy(spec))
             merged[normalize_symbol(symbol)] = merged_spec
     return merged
 
@@ -368,7 +399,8 @@ def load_pm_configs(pm_root: str, path_override: Optional[str] = None) -> Dict[s
         return {}
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+            loaded = json.load(handle)
+        return deepcopy(loaded) if isinstance(loaded, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 

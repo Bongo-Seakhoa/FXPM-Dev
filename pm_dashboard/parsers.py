@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import os
 from datetime import datetime
@@ -135,15 +136,18 @@ def parse_entries_from_log(
 
 _RE_TS = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
 _SYMBOL_TOKEN = r"[A-Z0-9_.#-]+"
+_NUM_TOKEN = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
 _RE_SELECTED = re.compile(
     rf"\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?:\[(?P<secondary>SECONDARY)\]\s+)?Selected:\s+"
     r"(?P<strategy>[^@]+)\s+@\s+(?P<tf>[^/]+)/(?P<regime>[A-Z0-9_]+)"
 )
 _RE_ORDER = re.compile(
-    rf"\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?P<side>BUY|SELL)\s+\|.*?entry=(?P<entry>[0-9.]+)\s+\|\s+sl=(?P<sl>[0-9.]+)\s+\|\s+tp=(?P<tp>[0-9.]+)"
+    rf"\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?P<side>BUY|SELL)\s+\|.*?entry=(?P<entry>{_NUM_TOKEN})\s+\|\s+sl=(?P<sl>{_NUM_TOKEN})\s+\|\s+tp=(?P<tp>{_NUM_TOKEN})",
+    re.IGNORECASE,
 )
 _RE_EXECUTED = re.compile(
-    rf"\[OK\]\s+\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?P<side>LONG|SHORT)\s+executed.*?@\s+(?P<price>[0-9.]+)"
+    rf"\[OK\]\s+\[(?P<symbol>{_SYMBOL_TOKEN})\]\s+(?P<side>LONG|SHORT)\s+executed.*?@\s+(?P<price>{_NUM_TOKEN})",
+    re.IGNORECASE,
 )
 
 
@@ -298,6 +302,8 @@ def normalize_record(
     position_context = record.get("position_context")
     if not isinstance(position_context, dict):
         position_context = {}
+    else:
+        position_context = copy.deepcopy(position_context)
 
     if entry_price is None:
         entry_price = coerce_float(record.get("entry"))
@@ -334,7 +340,7 @@ def normalize_record(
         secondary_reason=str(secondary_reason).strip(),
         position_context=position_context,
         source=source,
-        raw=record,
+        raw=copy.deepcopy(record),
     )
     entry.entry_id = build_entry_id(
         (

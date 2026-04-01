@@ -91,6 +91,16 @@ class DashboardAppRouteTests(unittest.TestCase):
         self.assertEqual(len(payload["trades"]), 1)
         self.assertAlmostEqual(payload["metrics"]["total_pnl"], 12.5, places=2)
 
+    def test_api_config_rejects_non_object_payload(self) -> None:
+        app = create_app(self.config_path, start_background_workers=False)
+        client = app.test_client()
+
+        response = client.post("/api/config", json=["not", "an", "object"])
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertFalse(payload["success"])
+        self.assertIn("payload", payload["error"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 
-from .utils import load_dashboard_config, save_dashboard_config
+from .utils import DEFAULT_CONFIG, deep_merge, load_dashboard_config, save_dashboard_config
 from .watcher import DashboardState, DashboardWatcher
 from .utils import parse_timestamp
 from .utils import load_instrument_specs
@@ -119,6 +122,68 @@ def _setup_runtime_services(
     app.config["data_scheduler"] = data_scheduler
 
 
+def _build_asset_version(static_root: str) -> str:
+    digest = hashlib.sha1()
+    if static_root and os.path.isdir(static_root):
+        for name in sorted(os.listdir(static_root)):
+            path = os.path.join(static_root, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                stat = os.stat(path)
+                digest.update(f"{name}:{int(stat.st_mtime_ns)}:{int(stat.st_size)}".encode("utf-8"))
+            except OSError:
+                continue
+    return digest.hexdigest()[:12] or "0"
+
+
+def _json_error(message: str, status_code: int = 400) -> Any:
+    return jsonify({"success": False, "error": message}), status_code
+
+
+def _coerce_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+def _coerce_float(value: Any, field_name: str, minimum: Optional[float] = None) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be numeric")
+    if minimum is not None and numeric < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return numeric
+
+
+def _coerce_int(value: Any, field_name: str, minimum: Optional[int] = None) -> int:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be an integer")
+    if minimum is not None and numeric < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return numeric
+
+
+def _coerce_string_list(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    normalized = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
 def create_app(
     config_path: str,
     pm_root_override: Optional[str] = None,
@@ -143,6 +208,7 @@ def create_app(
         watcher.start()
 
     app = Flask(__name__, static_folder="static", template_folder="templates")
+    app.config["asset_version"] = _build_asset_version(app.static_folder or "")
     app.config["dashboard_state"] = state
     app.config["dashboard_watcher"] = watcher
     app.config["dashboard_config"] = config
@@ -158,6 +224,23 @@ def create_app(
 
     if not JOBS_AVAILABLE:
         logger.info("Dashboard jobs module unavailable - simulation features will be limited")
+
+    @app.context_processor
+    def inject_asset_version() -> Dict[str, Any]:
+        return {"asset_version": app.config.get("asset_version", "0")}
+
+    @app.errorhandler(HTTPException)
+    def handle_http_exception(exc: HTTPException) -> Any:
+        if request.path.startswith("/api/"):
+            return _json_error(exc.description or exc.name, exc.code or 500)
+        return exc
+
+    @app.errorhandler(Exception)
+    def handle_unexpected_exception(exc: Exception) -> Any:
+        logger.exception("Unhandled dashboard error")
+        if request.path.startswith("/api/"):
+            return _json_error("Internal server error", 500)
+        return "Internal server error", 500
 
     @app.route("/")
     def index() -> str:
@@ -193,22 +276,32 @@ def create_app(
 
         payload = request.get_json(silent=True)
         if payload is None and request.data:
-            return jsonify({"success": False, "error": "Invalid JSON payload"}), 400
+            return _json_error("Invalid JSON payload", 400)
         payload = payload or {}
-        updated = apply_config_updates(current_config, payload)
+        if not isinstance(payload, dict):
+            return _json_error("Config payload must be a JSON object", 400)
+        original_config = copy.deepcopy(current_config)
+        try:
+            updated = apply_config_updates(original_config, payload)
+        except ValueError as exc:
+            return _json_error(str(exc), 400)
         updated["pm_root"] = resolve_pm_root(updated.get("pm_root"), base_dir)
+        runtime_keys = ("pm_root", "enable_data_maintenance_scheduler", "data_maintenance_time")
+        runtime_changed = any(updated.get(key) != original_config.get(key) for key in runtime_keys)
         try:
             save_dashboard_config(config_path, updated)
         except Exception as exc:
             logger.error("Failed to persist dashboard config: %s", exc)
-            return jsonify({"success": False, "error": "Failed to persist dashboard config"}), 500
+            return _json_error("Failed to persist dashboard config", 500)
 
-        app.config["dashboard_config"] = updated
+        app.config["dashboard_config"] = copy.deepcopy(updated)
+        if runtime_changed:
+            new_pm_root = resolve_pm_root(updated.get("pm_root"), base_dir)
+            updated["pm_root"] = new_pm_root
+            state.set_instrument_specs(load_instrument_specs(new_pm_root))
+            if JOBS_AVAILABLE and app.config.get("start_background_workers", True):
+                _setup_runtime_services(app, updated, base_dir, True)
         app.config["dashboard_watcher"].update_config(updated)
-        runtime_keys = ("pm_root", "enable_data_maintenance_scheduler", "data_maintenance_time")
-        runtime_changed = any(updated.get(key) != current_config.get(key) for key in runtime_keys)
-        if JOBS_AVAILABLE and app.config.get("start_background_workers", True) and runtime_changed:
-            _setup_runtime_services(app, updated, base_dir, True)
         return jsonify(serialize_config(updated))
 
     @app.route("/api/strategies", methods=["GET"])
@@ -241,8 +334,13 @@ def create_app(
 
         filtered_trades = []
         for trade in trades[:limit]:
+            sort_ts = trade.get("_sort_timestamp")
+            if hasattr(sort_ts, "isoformat"):
+                trade_timestamp = sort_ts.isoformat()
+            else:
+                trade_timestamp = trade.get("timestamp")
             filtered_trades.append({
-                "timestamp": trade.get("timestamp"),
+                "timestamp": trade_timestamp,
                 "symbol": trade.get("symbol"),
                 "direction": trade.get("direction"),
                 "volume": trade.get("volume"),
@@ -361,12 +459,15 @@ def create_app(
         def load_historical_data(symbol, timeframe, start, end):
             return data_downloader.load_historical_data(symbol, timeframe, start, end)
 
+        instrument_specs = load_instrument_specs(pm_root)
+
         # Reconstruct trade outcomes
-        logger.info(f"Reconstructing {len(filtered_trades)} trade outcomes...")
+        logger.info("Reconstructing %d trade outcomes...", len(filtered_trades))
         reconstructed_trades = reconstruct_trade_outcomes(
             filtered_trades,
             load_historical_data,
-            max_trades=max_trades
+            max_trades=max_trades,
+            instrument_specs=instrument_specs,
         )
 
         if not reconstructed_trades:
@@ -436,7 +537,7 @@ def create_app(
                 "message": "Root M5 data maintenance started"
             })
         except Exception as e:
-            logger.error(f"Failed to start data maintenance: {e}")
+            logger.error("Failed to start data maintenance: %s", e)
             return jsonify({
                 "success": False,
                 "error": str(e)
@@ -446,33 +547,51 @@ def create_app(
 
 
 def serialize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    merged = deep_merge(DEFAULT_CONFIG, config if isinstance(config, dict) else {})
     return {
-        "pm_root": config.get("pm_root", ""),
-        "refresh_interval_sec": config.get("refresh_interval_sec", 5),
-        "file_patterns": config.get("file_patterns", []),
-        "explicit_files": config.get("explicit_files", []),
-        "min_strength": config.get("min_strength", 0.0),
-        "max_signal_age_minutes": config.get("max_signal_age_minutes", 1440),
-        "alert": config.get("alert", {}),
+        "pm_root": merged.get("pm_root", ""),
+        "refresh_interval_sec": merged.get("refresh_interval_sec"),
+        "file_patterns": list(merged.get("file_patterns", [])),
+        "explicit_files": list(merged.get("explicit_files", [])),
+        "min_strength": merged.get("min_strength"),
+        "max_signal_age_minutes": merged.get("max_signal_age_minutes"),
+        "alert": copy.deepcopy(merged.get("alert", {})),
     }
 
 
 def apply_config_updates(config: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    updated = dict(config)
-    for key in ("pm_root", "refresh_interval_sec", "min_strength", "max_signal_age_minutes"):
-        if key in payload:
-            updated[key] = payload[key]
+    if not isinstance(payload, dict):
+        raise ValueError("Config payload must be a JSON object")
 
-    if "file_patterns" in payload and isinstance(payload["file_patterns"], list):
-        updated["file_patterns"] = payload["file_patterns"]
-    if "explicit_files" in payload and isinstance(payload["explicit_files"], list):
-        updated["explicit_files"] = payload["explicit_files"]
+    updated = deep_merge(DEFAULT_CONFIG, copy.deepcopy(config if isinstance(config, dict) else {}))
+    if "pm_root" in payload:
+        updated["pm_root"] = str(payload.get("pm_root") or "").strip()
+    if "refresh_interval_sec" in payload:
+        updated["refresh_interval_sec"] = _coerce_int(payload.get("refresh_interval_sec"), "refresh_interval_sec", 1)
+    if "min_strength" in payload:
+        updated["min_strength"] = _coerce_float(payload.get("min_strength"), "min_strength", 0.0)
+    if "max_signal_age_minutes" in payload:
+        updated["max_signal_age_minutes"] = _coerce_int(
+            payload.get("max_signal_age_minutes"),
+            "max_signal_age_minutes",
+            1,
+        )
+    if "file_patterns" in payload:
+        updated["file_patterns"] = _coerce_string_list(payload.get("file_patterns"), "file_patterns")
+    if "explicit_files" in payload:
+        updated["explicit_files"] = _coerce_string_list(payload.get("explicit_files"), "explicit_files")
 
-    if "alert" in payload and isinstance(payload["alert"], dict):
-        alert_cfg = dict(updated.get("alert", {}))
-        for key in ("enabled", "sound", "min_strength"):
-            if key in payload["alert"]:
-                alert_cfg[key] = payload["alert"][key]
+    if "alert" in payload:
+        alert_payload = payload.get("alert")
+        if not isinstance(alert_payload, dict):
+            raise ValueError("alert must be an object")
+        alert_cfg = copy.deepcopy(updated.get("alert", {}))
+        if "enabled" in alert_payload:
+            alert_cfg["enabled"] = _coerce_bool(alert_payload.get("enabled"), "alert.enabled")
+        if "sound" in alert_payload:
+            alert_cfg["sound"] = _coerce_bool(alert_payload.get("sound"), "alert.sound")
+        if "min_strength" in alert_payload:
+            alert_cfg["min_strength"] = _coerce_float(alert_payload.get("min_strength"), "alert.min_strength", 0.0)
         updated["alert"] = alert_cfg
     return updated
 

@@ -35,7 +35,49 @@ function getChartColors() {
   return PMCommon.isDark() ? chartColorsDark : chartColors;
 }
 
+function getChartTextColor() {
+  return PMCommon.isDark() ? '#e8eef6' : '#1c222b';
+}
+
+function getChartMutedColor() {
+  return PMCommon.isDark() ? '#a4afbc' : '#5f6774';
+}
+
+function applyChartThemeDefaults() {
+  if (!canUseCharts()) return;
+  var colors = getChartColors();
+  Chart.defaults.color = getChartMutedColor();
+  Chart.defaults.borderColor = colors.grid;
+  Chart.defaults.plugins.legend.labels.color = getChartTextColor();
+  Chart.defaults.plugins.tooltip.backgroundColor = PMCommon.isDark() ? 'rgba(17, 23, 31, 0.94)' : 'rgba(255, 255, 255, 0.97)';
+  Chart.defaults.plugins.tooltip.titleColor = getChartTextColor();
+  Chart.defaults.plugins.tooltip.bodyColor = getChartTextColor();
+  Chart.defaults.plugins.tooltip.borderColor = colors.grid;
+  Chart.defaults.plugins.tooltip.borderWidth = 1;
+}
+
+function setAnalyticsLoading(isLoading, message) {
+  PMCommon.setLoadingState(document.getElementById('analytics-loading'), isLoading, message || 'Loading analytics...');
+}
+
+function showChartUnavailableState() {
+  var containers = document.querySelectorAll('.chart-container');
+  for (var i = 0; i < containers.length; i += 1) {
+    var container = containers[i];
+    if (!container) continue;
+    var canvas = container.querySelector('canvas');
+    if (canvas) canvas.style.display = 'none';
+    if (!container.querySelector('.chart-fallback-card')) {
+      var fallback = document.createElement('div');
+      fallback.className = 'chart-fallback-card';
+      fallback.textContent = 'Charts are temporarily unavailable. KPI cards and tables remain live.';
+      container.appendChild(fallback);
+    }
+  }
+}
+
 function fetchAnalytics() {
+  setAnalyticsLoading(true, 'Loading analytics...');
   return PMCommon.fetchWithRetry('/api/analytics')
     .then(function(response) { return response.json(); })
     .then(function(data) {
@@ -61,6 +103,9 @@ function fetchAnalytics() {
     .catch(function(err) {
       console.error('Failed to fetch analytics:', err);
       PMCommon.showToast('Failed to load analytics');
+    })
+    .finally(function() {
+      setAnalyticsLoading(false);
     });
 }
 
@@ -95,6 +140,20 @@ function renderKPIs(metrics) {
   if (el) el.textContent = metrics.max_consecutive_wins || 0;
   el = document.getElementById('kpi-max-consec-losses');
   if (el) el.textContent = metrics.max_consecutive_losses || 0;
+
+  // Extended risk metrics
+  el = document.getElementById('kpi-dd-duration');
+  if (el) el.textContent = (metrics.drawdown_duration || 0) + ' trades';
+  el = document.getElementById('kpi-recovery-time');
+  if (el) el.textContent = (metrics.recovery_time || 0) + ' trades';
+  el = document.getElementById('kpi-ulcer-index');
+  if (el) el.textContent = PMCommon.formatNumber(metrics.ulcer_index, 4);
+  el = document.getElementById('kpi-long-pf');
+  if (el) el.textContent = PMCommon.formatNumber(metrics.long_profit_factor, 2);
+  el = document.getElementById('kpi-short-pf');
+  if (el) el.textContent = PMCommon.formatNumber(metrics.short_profit_factor, 2);
+  el = document.getElementById('kpi-avg-trade');
+  if (el) el.textContent = PMCommon.formatCurrency(metrics.avg_trade_pnl);
 }
 
 function renderEquityChart(equityCurve) {
@@ -849,9 +908,14 @@ function setDefaultDates() {
 
 function init() {
   PMCommon.initTheme();
-  PMCommon.onThemeChange(function() { updateAllCharts(); });
+  applyChartThemeDefaults();
+  PMCommon.onThemeChange(function() {
+    applyChartThemeDefaults();
+    updateAllCharts();
+  });
   PMCommon.initScrollToTop();
   if (!canUseCharts()) {
+    showChartUnavailableState();
     PMCommon.showToast('Chart library unavailable - showing metrics/tables only');
   }
   fetchAnalytics();

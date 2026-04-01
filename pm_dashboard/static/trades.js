@@ -18,6 +18,7 @@ var elements = {
   showingCount: document.getElementById('showing-count'),
   pageInfo: document.getElementById('page-info'),
   rowCount: document.getElementById('row-count'),
+  loading: document.getElementById('trades-loading'),
   pageSize: document.getElementById('page-size'),
   pagePrev: document.getElementById('page-prev'),
   pageNext: document.getElementById('page-next'),
@@ -49,6 +50,7 @@ function formatTimestamp(ts) {
 }
 
 function fetchTrades() {
+  PMCommon.setLoadingState(elements.loading, true, 'Loading trade history...');
   return PMCommon.fetchWithRetry('/api/trades?limit=500')
     .then(function(response) { return response.json(); })
     .then(function(data) {
@@ -63,6 +65,9 @@ function fetchTrades() {
     .catch(function(err) {
       console.error('Failed to fetch trades:', err);
       PMCommon.showToast('Failed to load trades');
+    })
+    .finally(function() {
+      PMCommon.setLoadingState(elements.loading, false);
     });
 }
 

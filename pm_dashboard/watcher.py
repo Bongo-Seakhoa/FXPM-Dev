@@ -51,12 +51,12 @@ class DashboardState:
         with self._lock:
             self.entries = entries
             self.valid_entries = valid_entries
-            self.source_files = source_files
+            self.source_files = list(source_files)
             self.last_updated = last_updated
             if instrument_specs is not None:
-                self.instrument_specs = instrument_specs
+                self.instrument_specs = copy.deepcopy(instrument_specs)
             if pm_configs is not None:
-                self.pm_configs = pm_configs
+                self.pm_configs = copy.deepcopy(pm_configs)
             self.last_error = last_error
 
     def snapshot(self) -> Dict[str, Any]:
@@ -67,8 +67,8 @@ class DashboardState:
                 "entries": entries,
                 "valid_entries": valid_entries,
                 "last_updated": self.last_updated,
-                "source_files": self.source_files,
-                "instrument_specs": self.instrument_specs,
+                "source_files": list(self.source_files),
+                "instrument_specs": copy.deepcopy(self.instrument_specs),
                 "stats": {
                     "total": len(entries),
                     "valid": len(valid_entries),
@@ -76,9 +76,17 @@ class DashboardState:
                 "last_error": self.last_error,
             }
 
+    def set_instrument_specs(self, specs: Dict[str, Dict[str, Any]]) -> None:
+        with self._lock:
+            self.instrument_specs = copy.deepcopy(specs or {})
+
     def get_pm_configs(self) -> Dict[str, Any]:
         with self._lock:
-            return self.pm_configs
+            return copy.deepcopy(self.pm_configs)
+
+    def get_instrument_specs(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return copy.deepcopy(self.instrument_specs)
 
 
 def entry_to_dict(entry: SignalEntry) -> Dict[str, Any]:
@@ -98,7 +106,7 @@ def entry_to_dict(entry: SignalEntry) -> Dict[str, Any]:
         "reason": entry.reason,
         "secondary_trade": entry.secondary_trade,
         "secondary_reason": entry.secondary_reason,
-        "position_context": entry.position_context,
+        "position_context": copy.deepcopy(entry.position_context),
         "source": entry.source,
     }
 
@@ -107,9 +115,10 @@ class DashboardWatcher(threading.Thread):
     def __init__(self, pm_root: str, config: Dict[str, Any], state: DashboardState) -> None:
         super().__init__(daemon=True)
         self.pm_root = pm_root
-        self.config = config
+        self.config = copy.deepcopy(config)
         self.state = state
         self._stop_event = threading.Event()
+        self._config_lock = threading.RLock()
         self._last_alert_set: str = ""
         self._last_alert_strongest: str = ""
         self._pm_configs_mtime: Optional[float] = None
@@ -121,7 +130,7 @@ class DashboardWatcher(threading.Thread):
     def run(self) -> None:
         while not self._stop_event.is_set():
             self.poll_once()
-            interval = self.config.get("refresh_interval_sec", 5)
+            interval = self._get_config().get("refresh_interval_sec", 5)
             try:
                 interval = max(1.0, float(interval))
             except (TypeError, ValueError):
@@ -132,12 +141,18 @@ class DashboardWatcher(threading.Thread):
         self._stop_event.set()
 
     def update_config(self, config: Dict[str, Any]) -> None:
-        self.config = config
-        self._parsed_file_cache.clear()
-        self._trade_map_cache_signature = None
-        self._trade_map_cache = {}
-        if self.pm_root != config.get("pm_root"):
-            self.pm_root = config.get("pm_root") or self.pm_root
+        with self._config_lock:
+            self.config = copy.deepcopy(config)
+            self._parsed_file_cache.clear()
+            self._trade_map_cache_signature = None
+            self._trade_map_cache = {}
+            self._last_alert_set = ""
+            self._last_alert_strongest = ""
+            new_pm_root = str(config.get("pm_root") or "").strip() or self.pm_root
+            pm_root_changed = self.pm_root != new_pm_root
+            if pm_root_changed:
+                self.pm_root = new_pm_root
+        if pm_root_changed:
             self.state.update(
                 self.state.entries,
                 self.state.valid_entries,
@@ -147,25 +162,30 @@ class DashboardWatcher(threading.Thread):
                 pm_configs=self._load_pm_configs(),
             )
 
+    def _get_config(self) -> Dict[str, Any]:
+        with self._config_lock:
+            return copy.deepcopy(self.config)
+
     def poll_once(self) -> None:
         if not self.pm_root:
             return
 
+        config = self._get_config()
         pm_configs = self._load_pm_configs()
-        patterns = self.config.get("file_patterns", [])
-        explicit_files = self.config.get("explicit_files", [])
-        exclude_patterns = self.config.get("exclude_patterns", [])
+        patterns = config.get("file_patterns", [])
+        explicit_files = config.get("explicit_files", [])
+        exclude_patterns = config.get("exclude_patterns", [])
         source_files = sorted(iter_candidate_files(self.pm_root, patterns, explicit_files, exclude_patterns))
 
         entries: List[SignalEntry] = []
         last_error = ""
         try:
-            entries = self._load_primary_entries(source_files, pm_configs)
+            entries = self._load_primary_entries(source_files, pm_configs, config)
         except Exception as exc:
             last_error = str(exc)
 
         deduped = dedupe_entries(entries)
-        display_entries = [entry for entry in deduped if should_display_entry(entry, self.config)]
+        display_entries = [entry for entry in deduped if should_display_entry(entry, config)]
         valid_entries = [entry for entry in display_entries if entry.valid_now]
         valid_entries = sorted(valid_entries, key=entry_sort_key, reverse=True)
         last_updated = datetime.now().isoformat()
@@ -178,23 +198,28 @@ class DashboardWatcher(threading.Thread):
             pm_configs=pm_configs,
             last_error=last_error,
         )
-        self.maybe_alert(valid_entries)
+        self.maybe_alert(valid_entries, config)
 
-    def _load_primary_entries(self, source_files: List[str], pm_configs: Dict[str, Any]) -> List[SignalEntry]:
-        primary_patterns = self.config.get("primary_sources") or ["last_trade_log.json"]
+    def _load_primary_entries(
+        self,
+        source_files: List[str],
+        pm_configs: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> List[SignalEntry]:
+        primary_patterns = config.get("primary_sources") or ["last_trade_log.json"]
         primary_file = find_primary_file(self.pm_root, primary_patterns)
-        trade_map = self._load_trade_map()
+        trade_map = self._load_trade_map(config)
         if primary_file:
             text = safe_read_text(primary_file)
             if text:
                 entries = self._parse_entries_cached(primary_file, text)
-                log_entries = self._load_log_entries()
+                log_entries = self._load_log_entries(config)
                 if is_actionable_primary(primary_file):
                     entries = merge_actionable_with_log_executions(entries, log_entries)
                 else:
                     entries.extend(log_entries)
-                entries = enrich_entries(entries, pm_configs, trade_map, self.config)
-                entries = normalize_action_flags(entries, self.config)
+                entries = enrich_entries(entries, pm_configs, trade_map, config)
+                entries = normalize_action_flags(entries, config)
                 return entries
 
         entries: List[SignalEntry] = []
@@ -206,9 +231,9 @@ class DashboardWatcher(threading.Thread):
                 entries.extend(self._parse_entries_cached(path, text))
             except Exception:
                 continue
-        entries.extend(self._load_log_entries())
-        entries = enrich_entries(entries, pm_configs, trade_map, self.config)
-        entries = normalize_action_flags(entries, self.config)
+        entries.extend(self._load_log_entries(config))
+        entries = enrich_entries(entries, pm_configs, trade_map, config)
+        entries = normalize_action_flags(entries, config)
         return entries
 
     def _file_signature(self, path: str) -> Optional[tuple]:
@@ -225,13 +250,13 @@ class DashboardWatcher(threading.Thread):
             if cached and cached[0] == signature:
                 return [copy.deepcopy(item) for item in cached[1]]
         mtime = os.path.getmtime(path) if os.path.exists(path) else None
-        entries = parse_entries_from_file(path, text, self.config, self.state.instrument_specs, mtime)
+        entries = parse_entries_from_file(path, text, self._get_config(), self.state.get_instrument_specs(), mtime)
         if signature is not None:
             self._parsed_file_cache[path] = (signature, [copy.deepcopy(item) for item in entries])
         return entries
 
     def _load_pm_configs(self) -> Dict[str, Any]:
-        path = self.config.get("pm_configs_path", "pm_configs.json")
+        path = self._get_config().get("pm_configs_path", "pm_configs.json")
         if not self.pm_root:
             return {}
         if not os.path.isabs(path):
@@ -249,8 +274,8 @@ class DashboardWatcher(threading.Thread):
             self._pm_configs_mtime = mtime
         return self._pm_configs_cache
 
-    def _load_trade_map(self) -> Dict[str, List[Dict[str, Any]]]:
-        pattern = self.config.get("trade_files_pattern", "**/trades_*.json")
+    def _load_trade_map(self, config: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+        pattern = config.get("trade_files_pattern", "**/trades_*.json")
         trade_files = []
         if self.pm_root:
             trade_files = [path for path in glob_paths(self.pm_root, pattern)]
@@ -316,9 +341,9 @@ class DashboardWatcher(threading.Thread):
         self._trade_map_cache = trade_map
         return trade_map
 
-    def _load_log_entries(self) -> List[SignalEntry]:
-        log_patterns = self.config.get("log_sources") or ["logs/*.log", "**/pm_*.log"]
-        max_files = int(self.config.get("log_max_files", 2) or 2)
+    def _load_log_entries(self, config: Dict[str, Any]) -> List[SignalEntry]:
+        log_patterns = config.get("log_sources") or ["logs/*.log", "**/pm_*.log"]
+        max_files = int(config.get("log_max_files", 2) or 2)
         files: List[str] = []
         for pattern in log_patterns:
             files.extend(glob_paths(self.pm_root, pattern))
@@ -334,8 +359,8 @@ class DashboardWatcher(threading.Thread):
             entries.extend(self._parse_entries_cached(path, text))
         return entries
 
-    def maybe_alert(self, valid_entries: List[SignalEntry]) -> None:
-        alert_cfg = self.config.get("alert", {})
+    def maybe_alert(self, valid_entries: List[SignalEntry], config: Dict[str, Any]) -> None:
+        alert_cfg = config.get("alert", {})
         if not alert_cfg.get("enabled", True):
             return
         min_strength = alert_cfg.get("min_strength", 0.0)
@@ -408,7 +433,11 @@ def entry_alert_key(entry: SignalEntry) -> str:
             entry.entry_price,
             entry.stop_loss_price,
             entry.take_profit_price,
+            entry.timestamp,
+            entry_action_value(entry),
             entry.reason,
+            bool(entry.secondary_trade),
+            entry.secondary_reason,
         )
     )
 
@@ -514,16 +543,23 @@ def should_display_entry(entry: SignalEntry, config: Dict[str, Any]) -> bool:
     return action_value in allow_actions
 
 
+_NOTIFY_LOCK = threading.Lock()
+
+
 def send_desktop_alert(title: str, message: str, play_sound: bool) -> None:
-    try:
-        from plyer import notification
+    def _dispatch() -> None:
+        with _NOTIFY_LOCK:
+            try:
+                from plyer import notification
 
-        notification.notify(title=title, message=message, app_name="PM Dashboard", timeout=5)
-    except Exception:
-        print(f"[PM Dashboard] {title}: {message}")
+                notification.notify(title=title, message=message, app_name="PM Dashboard", timeout=5)
+            except Exception:
+                print(f"[PM Dashboard] {title}: {message}")
 
-    if play_sound:
-        play_alert_sound()
+            if play_sound:
+                play_alert_sound()
+
+    threading.Thread(target=_dispatch, daemon=True).start()
 
 
 def play_alert_sound() -> None:
@@ -590,7 +626,7 @@ def enrich_entries(
         trade = select_trade_candidate(entry, trade_map.get(symbol, []), config)
         if action_value == "EXECUTED" and trade:
             trade_dir = direction_from_value(trade.get("direction"))
-            if entry.signal_direction and trade_dir and trade_dir != entry.signal_direction:
+            if entry.signal_direction is not None and entry.signal_direction != "" and trade_dir and trade_dir != entry.signal_direction:
                 trade = None
             if trade and not trade_map_is_fresh(entry, trade, config):
                 trade = None
@@ -669,7 +705,7 @@ def select_trade_candidate(
         if trade_map_is_fresh(entry, candidate, config):
             return candidate
 
-    return ranked[0]
+    return None
 
 
 def trade_map_is_fresh(

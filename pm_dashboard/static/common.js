@@ -318,6 +318,20 @@ var PMCommon = (function () {
     return attempt(retries);
   }
 
+  function setLoadingState(element, isLoading, message) {
+    if (!element) return;
+    if (message !== undefined && message !== null) {
+      element.textContent = String(message);
+    }
+    if (isLoading) {
+      element.classList.remove("hidden");
+      element.setAttribute("aria-busy", "true");
+      return;
+    }
+    element.classList.add("hidden");
+    element.setAttribute("aria-busy", "false");
+  }
+
   function initScrollToTop() {
     var button = document.getElementById("scroll-top");
     if (!button) return;
@@ -383,6 +397,7 @@ var PMCommon = (function () {
     initEscapeClose: initEscapeClose,
     debounce: debounce,
     fetchWithRetry: fetchWithRetry,
+    setLoadingState: setLoadingState,
     initScrollToTop: initScrollToTop,
     saveJSON: saveJSON,
     loadJSON: loadJSON,
