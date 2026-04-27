@@ -113,6 +113,17 @@ function metricValue(metrics, key) {
   return value.toFixed(3);
 }
 
+function scoreValue(value) {
+  return PMCommon.formatNumber(value, 3);
+}
+
+function countValue(value) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  var numberValue = Number(value);
+  if (Number.isFinite(numberValue)) return String(Math.trunc(numberValue));
+  return PMCommon.escapeHtml(String(value));
+}
+
 function renderMetrics(metrics) {
   var keys = Object.keys(metrics || {}).sort();
   if (!keys.length) return '<div class="metric-pill">N/A</div>';
@@ -201,9 +212,9 @@ function renderTable() {
       "<td>" + PMCommon.escapeHtml(row.timeframe) + "</td>" +
       "<td>" + PMCommon.escapeHtml(row.regime) + "</td>" +
       "<td>" + PMCommon.escapeHtml(row.strategy_name) + "</td>" +
-      "<td>" + (row.quality_score !== null && row.quality_score !== undefined ? row.quality_score.toFixed(3) : "N/A") + "</td>" +
-      "<td>" + (row.regime_train_trades || "N/A") + "</td>" +
-      "<td>" + (row.regime_val_trades || "N/A") + "</td>" +
+      "<td>" + scoreValue(row.quality_score) + "</td>" +
+      "<td>" + countValue(row.regime_train_trades) + "</td>" +
+      "<td>" + countValue(row.regime_val_trades) + "</td>" +
       "<td>" + metricValue(row.val_metrics, "win_rate") + "</td>" +
       "<td>" + metricValue(row.val_metrics, "profit_factor") + "</td>" +
       "<td>" + metricValue(row.val_metrics, "total_return_pct") + "</td>" +

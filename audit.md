@@ -1,243 +1,353 @@
-# Data-In vs Strategy-Expectations Audit
+# FXPM Final Comprehensive Audit
 
-**Date:** 2026-02-15
-**Scope:** Backtester and live trading data alignment, volume handling, feature expectations
-
----
-
-## 1. Data Ingestion Summary
-
-### 1a. Backtest Path (CSV via `DataLoader`)
-
-| Step | File | What Happens |
-|------|------|-------------|
-| Load CSV | `pm_core.py:1482` | `pd.read_csv(data_file)` |
-| Standardize cols | `pm_core.py:1662-1679` | Lowercases all columns, then renames via map |
-| Column map | `pm_core.py:1664-1675` | `open->Open, high->High, low->Low, close->Close, volume->Volume, tick_volume->Volume, tickvolume->Volume, spread->Spread, real_volume->RealVolume` |
-| Validate | `pm_core.py:1698-1741` | Checks OHLC present, coerces numeric, drops NaN rows. If `Volume` missing, fills with 0 |
-| Resample | `pm_core.py:1538-1544` | Aggregates `Volume` via `sum`, `Spread` via `mean` |
-
-**CSV header example** (EURUSD_M5.csv):
-```
-time,Open,High,Low,Close,Volume,Spread,RealVolume
-2019-05-29 15:30:00,1.11515,1.11536,1.115,1.11536,332,9,0
-```
-
-**Result:** After loading, the DataFrame has columns: `Open, High, Low, Close, Volume, Spread, RealVolume`.
-`Volume` = tick_volume from MT5 (confirmed: `RealVolume` is 0 for most symbols).
-
-### 1b. Live Path (MT5 via `MT5Connector.get_bars`)
-
-| Step | File | What Happens |
-|------|------|-------------|
-| Fetch bars | `pm_mt5.py:575` | `mt5.copy_rates_from_pos(...)` returns structured array with `open, high, low, close, tick_volume, spread, real_volume` |
-| Rename | `pm_mt5.py:587-595` | `open->Open, high->High, low->Low, close->Close, tick_volume->Volume, spread->Spread, real_volume->RealVolume` |
-
-**Result:** Columns: `Open, High, Low, Close, Volume (=tick_volume), Spread, RealVolume`
-
-### 1c. Live Path (`get_bars_range`)
-
-| Step | File | What Happens |
-|------|------|-------------|
-| Rename | `pm_mt5.py:635-641` | `open->Open, high->High, low->Low, close->Close, tick_volume->Volume` |
-
-**FINDING-1 (Minor):** `get_bars_range` does NOT rename `spread` or `real_volume`. This means if any code path uses `get_bars_range` and then checks for `Spread`, it will fail silently. Currently this method is not used in live trading (only `get_bars` is used), so this is low-risk but worth noting.
+Date: 2026-04-25
+Scope: current FXPM codebase, active high-risk configuration, optimizer/backtester/live propagation, generated artifacts, storage/cache behavior, dashboard visibility, documentation state, and intent alignment.
+Constraint honored: full-universe `python pm_main.py --optimize` was not run.
 
 ---
 
-## 2. Volume Handling
+## Executive Summary
 
-### 2a. What Volume Is
+The FXPM codebase is materially stronger than the older audit trail. The current architecture now has a coherent active-recent M5 workflow, regime-aware winner selection, Stage 3 risk/governance selection, shared strategy trade-intent exits, storage governance, and a much better live safety envelope than the previous versions.
 
-| Source | Column Used as `Volume` | Origin |
-|--------|------------------------|--------|
-| CSV files | `Volume` column | tick_volume from MT5 export (confirmed: `RealVolume` = 0 for most forex/CFD symbols) |
-| MT5 `get_bars` | `tick_volume` -> renamed to `Volume` | MT5 tick_volume field |
-| MT5 `get_bars_range` | `tick_volume` -> renamed to `Volume` | MT5 tick_volume field |
+The core methodology is broadly aligned with the stated PM intent: maximize quality, profitability, accuracy, actionability, and only then efficiency. The audit does not treat known low-balance broker rejections as PM failures. A $25 high-risk live account will naturally reject otherwise valid symbols when minimum lot, margin, spread, stop-distance, or broker feasibility makes the trade impossible. That is an expected execution constraint, not a strategy-selection defect.
 
-**VERDICT: ALIGNED.** Both backtest and live paths use `tick_volume` as `Volume`. This is correct.
+Post-audit implementation update: the code-level findings F1, F4, F5, F6, and F7 have now been patched. F2 remains intentionally dependent on the operator's full `python pm_main.py --optimize --overwrite` regeneration run. F3 remains a source-control/deployment boundary decision because staging or committing files is outside a code patch.
 
-### 2b. RealVolume
+At the time of the audit snapshot, the strongest remaining issues were propagation and live-readiness issues:
 
-- CSV files have `RealVolume` column, value is `0` for most forex/CFD symbols
-- `get_bars` renames `real_volume -> RealVolume` (present but unused)
-- `get_bars_range` does NOT rename `real_volume` (so it stays as lowercase `real_volume`)
-- **No strategy, feature, or regime code uses RealVolume** -- it is inert data. No issue.
+1. Live config eligibility used `is_validated` only, while retrain/status logic used expiry and artifact fingerprints. This has been corrected with a separate live eligibility surface.
+2. The active high-risk ledger is partial and mixed-version: 14 of 62 symbols are configured, 59 symbols are due for optimization, and most persisted artifacts predate the latest contract.
+3. Several core runtime files are untracked by git, so a git-based deploy would not reproduce the working local system.
+4. Two live safety edges remained: non-finite margin values and stale same-symbol combined-risk input. Both have been patched.
+5. Dashboard defaults hid several margin/low-balance skip actions. The dashboard defaults now surface those actions.
 
-### 2c. Strategies That Use Volume
-
-Three strategies directly consume the `Volume` column:
-
-| Strategy | File:Line | How Volume Is Used | Graceful on Zero? |
-|----------|-----------|-------------------|-------------------|
-| `ZScoreVWAPReversionStrategy` | `pm_strategies.py:1504` | Rolling VWAP: `tp * vol`. Falls back to `1.0` if missing | YES (fillna=1.0) |
-| `VolumeSpikeMomentumStrategy` | `pm_strategies.py:2462` | Volume spike detection: `vol > mult * avg_vol` | YES (fillna=0, but spike detection will never trigger if vol=0) |
-| `OBVDivergenceStrategy` | `pm_strategies.py:2602` | OBV = cumsum(vol * direction) | YES (fillna=0, but OBV will be flat/uninformative if vol=0) |
-
-**FINDING-2 (Informational):** All three volume-consuming strategies are defensive (`fillna`, `pd.to_numeric` with `errors='coerce'`). However, if a symbol truly has no tick volume (all zeros), `VolumeSpikeMomentumStrategy` will never generate signals, and `OBVDivergenceStrategy` will produce flat OBV and no divergence signals. This is acceptable behavior (no crash, just no signals).
-
-### 2d. Backtest vs Live Volume Parity
-
-| Scenario | Volume Source | Value |
-|----------|-------------|-------|
-| Backtest (CSV) | `Volume` column from exported CSV | tick_volume |
-| Live (MT5 `get_bars`) | `tick_volume` from MT5 API | tick_volume |
-| Historical data fetch (`_fetch_historical_data`) | `get_bars` output saved to CSV via `bars.to_csv()` | tick_volume as `Volume` |
-
-**VERDICT: ALIGNED.** The CSV files are generated by `_fetch_historical_data` which calls `get_bars` (tick_volume -> Volume), and the backtester reads those same CSVs. The data cycle is consistent.
+No evidence was found that the active data split philosophy itself is broken. The active recent-M5 workflow, the `historical_stress_audit` naming, and the rejection of walk-forward as a mandatory intermediary promotion layer remain appropriate for the PM's stated live-trading objective.
 
 ---
 
-## 3. Feature Computation Alignment
+## Verification Performed
 
-### 3a. Backtest Path
-
-`FeatureComputer.compute_all()` (`pm_core.py:1970`) adds all standard indicators on top of OHLCV data:
-
-**Computed features:** ATR_{7,10,14,20}, SMA_{5,8,10,13,20,21,30,50,100,200}, EMA_{5,8,10,13,20,21,30,50,100,200}, RSI_{7,14,21}, BB_MID_20, BB_UPPER_20, BB_LOWER_20, MACD, MACD_SIGNAL, MACD_HIST, STOCH_K, STOCH_D, ADX, PLUS_DI, MINUS_DI, CCI, WILLR, DONCHIAN_HIGH_{20,50}, DONCHIAN_LOW_{20,50}, KC_MID, KC_UPPER, KC_LOWER, HULL_MA, CHANGE, CHANGE_PCT, VOLATILITY, plus regime columns (TREND_SCORE, RANGE_SCORE, BREAKOUT_SCORE, CHOP_SCORE, REGIME_RAW, REGIME, REGIME_STRENGTH, REGIME_GAP, REGIME_LIVE, REGIME_STRENGTH_LIVE).
-
-### 3b. Live Path
-
-`_evaluate_regime_candidates` (`pm_main.py:1232`) calls:
-```python
-features = FeatureComputer.compute_all(bars, symbol=symbol, timeframe=tf, regime_params_file=regime_params_file)
-```
-
-**VERDICT: ALIGNED.** The exact same `FeatureComputer.compute_all()` is used in both paths. No feature mismatch.
+- Ran `python -m pytest -q`.
+  - Result: `541 passed, 1 skipped, 350 subtests passed`.
+- Ran `python pm_main.py --status`.
+  - Result: active ledger `pm_configs_high_risk.json`, 62 managed symbols, 14 configured, 14 valid, 0 expired, 0 invalid, 59 needing optimization.
+- Inspected `config.json`, `pm_configs_high_risk.json`, `pm_outputs/storage_state.json`, core runtime modules, optimizer/backtester modules, storage manager, dashboard config/parsers, docs, and tests.
+- Inspected active storage state.
+  - Storage pressure: `normal`.
+  - `data/.cache`: approximately 667 MB in the latest storage state.
+  - `data` directory: approximately 1.93 GB in the latest storage state.
+  - Cache quota: 4 GB, 14-day retention in active config.
+- Did not run full optimization.
 
 ---
 
-## 4. Regime Detection Alignment
+## Current System State
 
-### 4a. Data Requirements
+### Active Configuration
 
-`MarketRegimeDetector.compute_regime_scores()` (`pm_regime.py:443`) requires:
-- Minimum: `Open, High, Low, Close` columns
-- Optionally reuses precomputed `ADX`, `ATR_14` if available
-- Internally computes: BB width, directional efficiency, slope consistency, band containment, BB squeeze, ATR percentile, structure break, whipsaw, direction flips
-- **Does NOT use Volume**
+The active runtime profile is `config.json` with:
 
-### 4b. Regime Shift (REGIME_LIVE)
+- `pipeline.winner_ledger_path = "pm_configs_high_risk.json"`
+- `pipeline.data_workflow_mode = "active_recent_m5"`
+- `pipeline.max_bars = 300000`
+- `pipeline.historical_stress_audit_bars = 50000`
+- `pipeline.active_universe_bars = 250000`
+- `pipeline.risk_management_optimization_enabled = true`
+- `pipeline.risk_management_selection_stage = "stage3"`
+- `pipeline.production_retrain_mode = "notify"`
+- `storage_resample_cache_max_gb = 4.0`
+- `storage_resample_cache_max_age_days = 14`
+- `position.risk_per_trade_pct = 2.0`
+- `position.max_risk_pct = 3.0`
 
-- `REGIME_LIVE = REGIME.shift(1)` - provides look-back-safe regime label for decision-making
-- Backtest: strategies use `features` which includes `REGIME_LIVE`, and signals are shifted by 1 bar (`sig_arr[i-1]`)
-- Live: regime is read at `features['REGIME'].iloc[-2]` (second-to-last = last closed bar)
+This is an aggressive high-risk proof profile. It is not intended to simulate a conservative institutional account.
 
-**VERDICT: ALIGNED.** Both paths read regime from the last completed bar, not the forming bar.
+### Active High-Risk Ledger
 
----
+`pm_configs_high_risk.json` currently contains:
 
-## 5. Backtester vs Live Trading Execution
+- 14 configured symbols out of 62.
+- 108 regime/timeframe slots.
+- 69 tradeable slots.
+- 39 explicit no-trade slots.
+- 11 symbols on artifact contract `2026-03-29b / 2026-03-29a`.
+- 3 symbols on artifact contract `2026-04-25-active-recent-risk-mgmt / 2026-04-25-active-recent-m5`.
+- 0 symbols with compact `validation_evidence`.
+- 0 symbols with `ledger_status`.
+- 0 symbols with `data_window_fingerprint`.
+- 0 symbols with non-zero top-level `robustness_ratio`.
+- Current `valid_until` values are `2026-04-26T00:01:00`.
 
-### 5a. Signal Timing
+This ledger should be treated as an in-progress operational artifact, not the final optimized high-risk universe.
 
-| Aspect | Backtest | Live |
-|--------|----------|------|
-| Signal source bar | `sig_arr[i-1]` (previous bar's signal) | `signals.iloc[-2]` (second-to-last bar = last closed) |
-| Entry bar | Bar `i` (next bar open) | Next bar after signal detection |
-| Entry price | `open_arr[i] +/- half_spread` | MT5 market order at ask/bid |
+### Code/Test State
 
-**VERDICT: ALIGNED.** Both use "signal on closed bar, enter on next bar open."
+The unit test suite is healthy. The current tests cover a wide surface, including strategy execution, pipeline artifacts, storage governance, dashboard behavior, live loop behavior, and config source-of-truth rules.
 
-### 5b. Stop Loss / Take Profit
+The main test gaps are targeted rather than broad:
 
-| Aspect | Backtest | Live |
-|--------|----------|------|
-| SL/TP source | `strategy.calculate_stops(features, direction, symbol, spec, bar_index)` | Same call: `strategy.calculate_stops(features, direction, symbol, spec, bar_index)` |
-| SL check order | SL checked before TP (same-bar hit) | MT5 server handles (broker priority) |
-| Spread application | Bid/Ask simulated from OHLC +/- half_spread | MT5 native bid/ask |
-
-**VERDICT: ALIGNED.** The SL/TP calculation logic is identical.
-
-### 5c. Position Sizing
-
-| Aspect | Backtest | Live |
-|--------|----------|------|
-| Risk amount | `equity * (position_size_pct / 100)` using live equity | `PositionManager` using balance/equity from MT5 |
-| Loss-per-lot calc | tick_size/tick_value math -> `risk_amount / loss_per_lot` | Same tick math via `PositionCalculator` |
-| Volume rounding | `spec.round_volume()` or `_round_volume_numba()` (floor to step) | `MT5Connector._normalize_volume()` (floor to step) |
-| Volume step source | `InstrumentSpec.volume_step` (from config or broker_specs.json) | `MT5SymbolInfo.volume_step` (live from broker) |
-
-**FINDING-3 (Low Risk):** The backtest uses `InstrumentSpec` which may come from `config.json` fallback defaults (e.g., `volume_step=0.01`). In live trading, the actual MT5 value is used. If `broker_specs.json` is populated via `save_broker_specs_to_json()`, these align. If not, backtest may use generic defaults while live uses broker-specific values.
-
-**Recommendation:** Ensure `broker_specs.json` is generated before optimization runs. The system already supports this via `set_broker_specs_path()` in config.
-
-### 5d. P&L Calculation
-
-| Aspect | Backtest | Live |
-|--------|----------|------|
-| Method | tick-based: `ticks * tick_value * volume` | MT5 native (same formula internally) |
-| Fallback | pip-based: `pips * pip_value * volume` | N/A (MT5 always uses tick math) |
-| Commission | `commission_per_lot * volume` deducted | Broker deducts (not in our code) |
-
-**VERDICT: ALIGNED** when `tick_size` and `tick_value` are properly populated.
+- Live eligibility should be tested against expired configs and artifact-due configs.
+- Margin gates should be tested with `NaN`, `inf`, and broker-null values.
+- Same-symbol combined risk should be tested against a fresh broker read that differs from the sweep snapshot.
+- Dashboard defaults should be tested for new margin and low-balance skip actions.
 
 ---
 
-## 6. Spread Handling
+## Methodology Alignment
 
-### 6a. Backtest
+### Data Workflow
 
-- `Spread` column is present in CSV (integer, in points)
-- However, the backtester does NOT use the per-bar `Spread` column
-- Instead uses `InstrumentSpec.spread_avg` (a fixed average) for all bars
-- `half_spread = spec.get_half_spread_price()` is constant across the backtest
+The active data workflow is aligned with the PM intent:
 
-### 6b. Live
+- The latest 300,000 M5 bars define the workflow window.
+- The oldest 50,000 M5 bars inside that window are `historical_stress_audit`.
+- The newest 250,000 M5 bars form the active universe.
+- Stage 2 selection works on the active recent universe.
+- Stage 3 risk/governance selection uses the freshest Stage 2 selection surface.
 
-- MT5 provides live bid/ask prices (real spread)
-- Entry at `tick.ask` (long) or `tick.bid` (short)
-- The `Spread` column from `get_bars` is available in features but NOT used by strategies
+The older 50,000 M5 bars are correctly not a forward-looking holdout. They are older out-of-selection context for catastrophic fragility checks.
 
-**FINDING-4 (Informational):** The backtester uses a fixed average spread, while live trading uses real-time variable spreads. This is standard practice for backtesting and is acceptable, but means backtest results slightly differ from live results during high-spread periods (news events, low liquidity). No action required.
+### Walk-Forward Position
 
----
+Walk-forward evaluation should remain an offline audit report, not a mandatory promotion gate between Stage 2/Stage 3 and live implementation. Adding it as an intermediary selection layer would reduce freshness and conflict with the current live-relevance objective.
 
-## 7. Data Freshness in Live Trading
+### Backtest Balance Versus Live Balance
 
-| Aspect | Implementation | Status |
-|--------|---------------|--------|
-| Bar count | `live_bars_count = 1500` from config | Sufficient for all indicator warmup periods |
-| Min bars | `live_min_bars = 500` | Covers max warmup (BB squeeze lookback = 200) |
-| Cache invalidation | By `bar_time` comparison | Correct - recomputes on new bar only |
-| Regime warmup | `max(bb_squeeze_lookback, atr_lookback, 50) = 200` | Covered by 500+ bars |
+Using a larger backtest balance for strategy discovery is acceptable. The backtest is primarily selecting strategies, parameters, risk-management behavior, symbol/timeframe/regime winners, and order-management behavior. Live feasibility is handled by sizing, margin, broker constraints, minimum lot rules, and signal-ledger visibility.
 
-**VERDICT: ALIGNED.** Live bars are sufficient for all feature warmup requirements.
+Low-balance rejections are expected. They only become deeper PM failures if symbols continue failing after the account is large enough for the required minimum lot, margin, and broker constraints.
 
----
+### Regime Methodology
 
-## 8. Column Completeness Matrix
+The live/optimization regime alignment is now conceptually coherent:
 
-Required by | Open | High | Low | Close | Volume | Spread | ATR | ADX | RSI | BB | MACD | STOCH | Regime
----|---|---|---|---|---|---|---|---|---|---|---|---|---
-DataLoader validation | REQ | REQ | REQ | REQ | opt(fill 0) | opt | - | - | - | - | - | - | -
-FeatureComputer | REQ | REQ | REQ | REQ | passthrough | passthrough | computed | computed | computed | computed | computed | computed | computed
-Regime detector | REQ | REQ | REQ | REQ | NOT USED | NOT USED | reused | reused | - | computed | - | - | output
-Backtester loop | REQ | REQ | REQ | REQ | NOT USED | NOT USED | - | - | - | - | - | - | -
-Strategies (most) | REQ | REQ | REQ | REQ | NOT USED | NOT USED | via features | via features | via features | via features | via features | via features | via features
-3 volume strategies | REQ | REQ | REQ | REQ | USED | NOT USED | via features | via features | - | - | - | - | -
+- Optimization buckets trades by `REGIME_LIVE` at the signal bar.
+- Live winner lookup prefers `REGIME_LIVE` / `REGIME_STRENGTH_LIVE` on the last closed bar.
+- `REGIME` is a fallback, not the primary live decision surface.
 
-**VERDICT: All required columns are always available in both backtest and live paths.**
+This is the right compromise between backtest parity and live feasibility. Parallel regime code paths are not automatically wrong; the important condition is that they share the same decision-time contract, and they now largely do.
+
+### Exit Surface And TP Behavior
+
+Backtester and live execution now share the strategy `build_trade_intent()` surface. The backtester computes stops and take-profits at the signal bar and installs configured regime TP multipliers before strategy evaluation. The artifact contract also records the exit-surface contract and regime TP multipliers.
+
+No current evidence suggests that optimization is selecting on one TP surface while live trades another materially different one.
 
 ---
 
-## 9. Summary of Findings
+## Findings
 
-| ID | Severity | Finding | Impact |
-|----|----------|---------|--------|
-| FINDING-1 | LOW | `get_bars_range()` does not rename `spread`/`real_volume` to capitalized form | No impact currently - this method is not used in active code paths |
-| FINDING-2 | INFO | 3 strategies use Volume (tick_volume) - all have graceful fallbacks | Strategies degrade to "no signals" if volume=0, never crash |
-| FINDING-3 | LOW | Backtest InstrumentSpec may use config.json defaults vs live MT5 values | Mitigated when `broker_specs.json` is populated. Verify it exists before optimizing. |
-| FINDING-4 | INFO | Backtest uses fixed average spread; live uses real-time variable spread | Standard practice; minor P&L deviation expected during volatile spreads |
+### F1 - Live Eligibility Does Not Enforce Expiry Or Artifact Due Status
 
-### Overall Assessment
+Severity: High
+Status: Resolved in code after this audit.
+Impact: Profitability, safety, selection freshness, live/live-status consistency
+Files: `pm_pipeline.py`, `pm_main.py`
 
-**The data pipeline is well-aligned between backtesting and live trading.** The system correctly:
-- Uses `tick_volume` as `Volume` in both paths (confirmed: `real_volume`/`RealVolume` is unused and typically 0)
-- Applies the same `FeatureComputer.compute_all()` in both paths
-- Uses the same regime detection with proper bar-shifting for look-ahead prevention
-- Uses the same signal timing (signal on closed bar, enter on next open)
-- Uses the same SL/TP calculation via `strategy.calculate_stops()`
-- Uses the same tick-based P&L math
+`ConfigLedger.has_valid_config()` correctly rejects missing, invalid, no-expiry, and expired configs. `ConfigLedger.should_optimize()` also detects artifact fingerprint drift. But `PortfolioManager.get_validated_configs()` currently returns every config with `is_validated = true`.
 
-No critical misalignments found. The two low-severity findings are edge cases that do not affect normal operation.
+A direct probe confirmed the mismatch:
+
+- `ledger.has_valid_config("EURUSD")` returned expired.
+- `portfolio_manager.get_validated_configs()` still returned `EURUSD`.
+
+Live trading uses `get_validated_configs()`, so an expired config can remain live-tradeable. Artifact-due configs are also still tradeable even though `--status` marks them `DU`.
+
+Implementation:
+
+- `get_live_eligible_configs()` now separates live trading eligibility from raw validated-ledger reads.
+- Live trading uses the live-eligible surface.
+- Expired, no-expiry, no-winner, and artifact-drifted configs are blocked under `live_artifact_drift_policy = "block"`.
+- `--status` now reports live eligibility and marks blocked configs with `BL`.
+- Artifact invalidation now compares only semantic contract keys so volatile ledger metadata does not make fresh optimized configs immediately stale.
+- Focused regression tests cover expiry and artifact-drift behavior.
+
+This is the most important code-level finding in the audit.
+
+### F2 - Active High-Risk Ledger Is Not Final Or Fully Propagated
+
+Severity: High
+Impact: Production readiness, ranking truthfulness, operator interpretation
+Files: `pm_configs_high_risk.json`, `pm_pipeline.py`, `config.json`
+
+The active high-risk ledger is incomplete:
+
+- 14 configured symbols out of 62.
+- 59 symbols currently need optimization according to `python pm_main.py --status`.
+- 11 of the 14 configured symbols are due because the artifact fingerprint changed.
+- The current ledger lacks the newer validation evidence, ledger status, data-window fingerprint, and non-zero robustness evidence fields.
+
+This does not prove that the optimizer is wrong. It means the generated ledger is not yet the final optimized production artifact.
+
+Recommendation:
+
+- Do not evaluate the final PM quality from the current high-risk ledger.
+- After the next deliberate optimization, verify that the new ledger includes:
+  - expected symbol coverage
+  - artifact contract consistency
+  - validation evidence
+  - data-window fingerprint
+  - ledger completion status
+  - non-zero robustness evidence where applicable
+- Keep `--status` as the first operational readiness check before live deployment.
+
+### F3 - Git/Deployment Boundary Is Not Clean
+
+Severity: High
+Impact: Reproducibility, deployment safety, handoff reliability
+Files: workspace/git state
+
+Several core files that the local system now depends on are untracked by git, including:
+
+- `pm_storage.py`
+- `pm_order_governance.py`
+- `pm_dashboard/ledger.py`
+- `pm_configs_high_risk.json`
+- `audit.html`
+- several tests, including storage/config-source tests
+
+There are also tracked deletions such as:
+
+- `Analysis.md`
+- `Normal config (Full Equity).json`
+
+The local workspace can run because those files exist on disk. A git-based deployment or backup from tracked files only would not reproduce the working PM.
+
+Recommendation:
+
+- Before any live deployment or remote handoff, decide which generated artifacts should remain untracked and which source/runtime modules must be tracked.
+- At minimum, source modules and tests should be tracked.
+- If `pm_configs_high_risk.json` is the active production ledger, either track it deliberately or document the deployment process that provisions it.
+
+### F4 - Margin Guards Do Not Normalize Non-Finite Values
+
+Severity: Medium-High
+Status: Resolved in code after this audit.
+Impact: Live safety, broker edge-case handling
+File: `pm_main.py`
+
+`_safe_account_margin_level()` converts values with `float(raw_level)` but does not reject `NaN` or `inf`. `float("nan")` succeeds. In the entry path, this can avoid both the missing-margin fail-closed branch and the normal margin-level comparisons.
+
+The margin protection cycle is mostly conservative when classification sees `NaN`, but the entry gate should not depend on that downstream behavior.
+
+Implementation:
+
+- Non-finite margin level, free margin, and required margin are treated as unavailable.
+- Entries fail closed with `SKIPPED_MARGIN_UNAVAILABLE` where broker/account margin data is unsafe.
+- Regression tests cover `NaN`/`inf` margin cases.
+
+### F5 - Same-Symbol Combined Risk Still Uses Stale Sweep Snapshot
+
+Severity: Medium-High
+Status: Resolved in code after this audit.
+Impact: Live risk accuracy, duplicate/exposure protection
+File: `pm_main.py`
+
+The exact duplicate-position guard now performs a fresh broker-side read immediately before sending an order. That is a meaningful improvement.
+
+However, the same-symbol combined-risk check later still receives the original `positions_snapshot`, not the fresh symbol-level positions already fetched during the duplicate check. If another same-symbol/different-magic position appears after the sweep snapshot, the exact duplicate guard can pass while the combined symbol-risk cap evaluates stale exposure.
+
+Implementation:
+
+- The fresh symbol-level broker positions read during the final duplicate guard are now passed into `_check_symbol_combined_risk_cap()`.
+- A regression test verifies the combined-risk cap receives the fresh broker-side symbol snapshot.
+
+### F6 - Dashboard Defaults Hide New Margin/Low-Balance Skip Actions
+
+Severity: Medium
+Status: Resolved in code after this audit.
+Impact: Actionability, low-balance proof observability
+Files: `pm_dashboard/utils.py`, `pm_dashboard/dashboard_config.json`, `pm_dashboard/watcher.py`
+
+The live system records useful skip actions such as:
+
+- `SKIPPED_MARGIN_UNAVAILABLE`
+- `SKIPPED_MARGIN_BLOCKED`
+- `SKIPPED_MARGIN_REOPEN_WAIT`
+- `SKIPPED_MARGIN_COOLDOWN`
+- `SKIPPED_MARGIN_REQUIRED`
+- `BLOCKED_MIN_LOT_EXCEEDS_CAP`
+
+Before the patch, the dashboard display filter had a non-empty `display_actions` list and no `display_action_prefixes`, so important small-account feasibility telemetry could be written to ledgers/logs but hidden from the operator dashboard.
+
+Implementation:
+
+- Dashboard defaults now include margin and minimum-lot feasibility actions and prefixes.
+- Regression tests verify those entries display and validate correctly.
+- Noisy `NO_ACTIONABLE_*` entries remain excluded.
+
+### F7 - Storage/Cache Implementation Is Healthy, But State Semantics Need Tightening
+
+Severity: Medium-Low
+Status: Resolved in code after this audit.
+Impact: Long-run operations, interpretation clarity
+Files: `pm_storage.py`, `pm_core.py`, `pm_outputs/storage_state.json`
+
+The cache/storage design is in a good zone:
+
+- Active cache quota is 4 GB, not overly conservative.
+- Current cache use is well below quota.
+- Housekeeping is observe-only by default.
+- PM-owned cleanup candidates are zero in the latest state.
+- Resample-cache telemetry exists for memory hits, disk hits, misses, invalidations, bytes, and timing.
+- Tests cover cache invalidation, pruning, and storage cleanup.
+
+The main issue is interpretability. `storage_state.json` has a current housekeeping timestamp, but `last_sweep` and several `next_*` timestamps can remain stale from an older live session. That can mislead an operator if the state file is read as one current snapshot.
+
+Implementation:
+
+- Storage state now includes `state_updated_at` and a `freshness` block with last-sweep and housekeeping ages/freshness flags.
+- The 4 GB cache cap remains unchanged.
+- MetaQuotes/external cleanup remains observe-only unless deliberately configured otherwise.
+
+### F8 - Production Retrain Mode Is Notify, Not Auto
+
+Severity: Medium-Low
+Impact: Operational freshness
+File: `config.json`
+
+The active config uses `production_retrain_mode = "notify"`. This is valid if the operator wants manual control, but it means due symbols are announced rather than automatically refreshed.
+
+Given that the current status reports 59 symbols needing optimization, this setting should be treated as an operational decision, not a background automation guarantee.
+
+Recommendation:
+
+- Keep `notify` if manual retrain control is desired.
+- Use `auto` only when the machine, broker connection, storage, and time budget are ready for unattended retraining.
+- Do not assume `notify` will keep the ledger fresh by itself.
+
+---
+
+## Non-Issues Confirmed
+
+These areas were reviewed and should not be treated as defects without new evidence:
+
+- The active-recent M5 workflow is not broken by not being a traditional academic train/validation/holdout design.
+- `historical_stress_audit` is the correct name for the oldest 50,000 M5 bars.
+- Walk-forward should remain an offline audit, not a mandatory live-promotion gate.
+- Larger backtest notional balance is acceptable for strategy discovery.
+- Low-balance live rejections are expected and should not be over-interpreted.
+- Regime live/optimization logic is now aligned around `REGIME_LIVE` at decision time.
+- Backtester and live execution now share the strategy trade-intent exit surface.
+- The 4 GB cache setting is reasonable; there is no evidence that shrinking cache would improve PM quality.
+
+---
+
+## Patch Order
+
+1. Completed: live eligibility semantics now prevent live use of expired/no-winner/artifact-drifted configs under the active strict policy.
+2. Remaining operator/deployment task: clean the git/deployment boundary so source modules, tests, and active runtime expectations are reproducible.
+3. Completed: non-finite margin handling and tests.
+4. Completed: fresh symbol positions now feed the same-symbol combined-risk cap.
+5. Completed: dashboard action filters now surface margin and low-balance feasibility events.
+6. Remaining F2 task: regenerate the high-risk ledger deliberately, then verify contract coverage and evidence propagation.
+7. Completed: storage-state freshness labels were added without reducing useful cache capacity.
+
+---
+
+## Final Assessment
+
+FXPM is directionally in a much better state than it was before the recent patches. The methodology is sound enough to continue with the active recent-M5, Stage 3 risk-management workflow. The code-level safety and actionability issues from this audit have now been handled.
+
+The codebase should not be considered production-clean until the high-risk ledger is regenerated and the git/deployment boundary is cleaned up, but the remaining work is now narrower and operational rather than architectural.

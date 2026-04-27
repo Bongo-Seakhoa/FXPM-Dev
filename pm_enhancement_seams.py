@@ -9,11 +9,15 @@ exit packs, portfolio allocators, regime model upgrades, execution-quality
 overlays, option-model adaptations, and strategy extensions.
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+
+
+logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
@@ -165,16 +169,35 @@ class DrawdownPositionScalar(RiskScalarOverlay):
 
 
 class RiskScalarStack:
-    """Composable risk-scalar stack."""
+    """Composable risk-scalar stack.
 
-    def __init__(self, overlays: Optional[List[RiskScalarOverlay]] = None):
+    Supports an explicit ``shadow_mode`` (E1) where overlays are computed for
+    observability but the original ``risk_pct`` is returned unchanged. This
+    allows operators to measure how the stack *would* behave on live trades
+    before flipping it to authoritative sizing.
+    """
+
+    def __init__(
+        self,
+        overlays: Optional[List[RiskScalarOverlay]] = None,
+        shadow_mode: bool = False,
+    ):
         self.overlays = overlays or []
+        self.shadow_mode = bool(shadow_mode)
 
-    def apply(self, risk_pct: float, context: RiskScalarContext) -> float:
+    def compute(self, risk_pct: float, context: RiskScalarContext) -> float:
+        """Run every overlay and return the composed result, regardless of mode."""
         current = risk_pct
         for overlay in self.overlays:
             current = float(overlay.apply(current, context))
         return current
+
+    def apply(self, risk_pct: float, context: RiskScalarContext) -> float:
+        if not self.overlays:
+            return risk_pct
+        if self.shadow_mode:
+            return risk_pct
+        return self.compute(risk_pct, context)
 
 
 # ===========================================================================
@@ -207,7 +230,15 @@ class ExitPackDecision:
 
 
 class MarketDrivenExitPack:
-    """Configurable exit pack with ATR trailing, breakeven, and partial profit."""
+    """Configurable exit pack with ATR trailing, breakeven, and partial profit.
+
+    E7 — supports paper-mode: `compute_decision()` always runs the full logic
+    when `paper_mode=True` (so operators can measure what the pack *would* do
+    on live trades) while `evaluate()` returns an empty decision so the
+    position is not actually mutated. `evaluate()` in paper-mode emits a
+    single INFO line per non-empty decision so the would-be action is
+    observable.
+    """
 
     def __init__(self,
                  atr_trail_mult: float = 2.5,
@@ -216,7 +247,8 @@ class MarketDrivenExitPack:
                  partial_tp1_close_pct: float = 50.0,
                  breakeven_trigger_mult: float = 1.0,
                  breakeven_offset_pips: float = 1.0,
-                 enabled: bool = False):
+                 enabled: bool = False,
+                 paper_mode: bool = False):
         self.atr_trail_mult = atr_trail_mult
         self.atr_trail_activation_mult = atr_trail_activation_mult
         self.partial_tp1_mult = partial_tp1_mult
@@ -224,9 +256,16 @@ class MarketDrivenExitPack:
         self.breakeven_trigger_mult = breakeven_trigger_mult
         self.breakeven_offset_pips = breakeven_offset_pips
         self.enabled = enabled
+        self.paper_mode = bool(paper_mode)
 
-    def evaluate(self, context: ExitPackContext) -> ExitPackDecision:
-        if not self.enabled or context.current_atr <= 0:
+    def compute_decision(self, context: ExitPackContext) -> ExitPackDecision:
+        """Pure compute — returns the decision the pack *would* dispatch.
+
+        Always runs the full logic regardless of `enabled`/`paper_mode`; the
+        only short-circuit is `current_atr <= 0` because the math is undefined
+        without an ATR (same guard the original `evaluate()` had).
+        """
+        if context.current_atr <= 0:
             return ExitPackDecision()
 
         is_long = context.direction.upper() in ("LONG", "BUY", "1")
@@ -276,6 +315,34 @@ class MarketDrivenExitPack:
 
         return ExitPackDecision()
 
+    def evaluate(self, context: ExitPackContext) -> ExitPackDecision:
+        """Authoritative entry point used by the live loop.
+
+        - `enabled=False, paper_mode=False` → no-op (empty decision).
+        - `paper_mode=True` → compute the decision, emit one INFO line per
+          non-empty decision, and return an empty decision so the position
+          is not mutated. Runs regardless of `enabled`.
+        - `enabled=True, paper_mode=False` → compute and return the decision
+          for the caller to dispatch.
+        """
+        if not self.enabled and not self.paper_mode:
+            return ExitPackDecision()
+
+        decision = self.compute_decision(context)
+
+        if self.paper_mode:
+            if decision.exit_now or decision.stop_loss is not None or decision.take_profit is not None:
+                logger.info(
+                    "Exit pack PAPER: would %s volume=%.1f%% sl=%s tp=%s (live action unchanged)",
+                    decision.exit_reason or "adjust",
+                    decision.exit_volume_pct,
+                    f"{decision.stop_loss:.5f}" if decision.stop_loss is not None else "—",
+                    f"{decision.take_profit:.5f}" if decision.take_profit is not None else "—",
+                )
+            return ExitPackDecision()
+
+        return decision
+
 
 # ===========================================================================
 # G3: Portfolio Construction
@@ -287,6 +354,68 @@ class PortfolioConstructionContext:
     candidate_scores: Dict[str, float]
     exposures: Dict[str, float] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PortfolioObservationContext:
+    positions: List[Any]
+    estimated_risk_by_symbol: Dict[str, float] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class PortfolioObservatory:
+    """Report-only portfolio exposure snapshot used during weekly review."""
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = bool(enabled)
+
+    @staticmethod
+    def _extract_legs(symbol: str) -> List[str]:
+        cleaned = "".join(ch for ch in str(symbol or "").upper() if ch.isalpha())
+        if len(cleaned) == 6:
+            return [cleaned[:3], cleaned[3:6]]
+        if len(cleaned) >= 3:
+            return [cleaned[:3]]
+        return [cleaned or "UNKNOWN"]
+
+    def snapshot(self, context: PortfolioObservationContext) -> Dict[str, Any]:
+        positions = list(context.positions or [])
+        clusters: Dict[str, Dict[str, Any]] = {}
+        symbol_exposure: Dict[str, int] = {}
+        for position in positions:
+            symbol = str(getattr(position, "symbol", "") or "")
+            symbol_exposure[symbol] = symbol_exposure.get(symbol, 0) + 1
+            for leg in self._extract_legs(symbol):
+                bucket = clusters.setdefault(
+                    leg,
+                    {"cluster": leg, "symbols": set(), "open_positions": 0, "estimated_risk_pct": 0.0},
+                )
+                bucket["symbols"].add(symbol)
+                bucket["open_positions"] += 1
+                bucket["estimated_risk_pct"] += float(context.estimated_risk_by_symbol.get(symbol, 0.0) or 0.0)
+        ordered_clusters = []
+        for cluster in sorted(
+            clusters.values(),
+            key=lambda item: (-int(item["open_positions"]), str(item["cluster"])),
+        ):
+            ordered_clusters.append(
+                {
+                    "cluster": cluster["cluster"],
+                    "symbols": sorted(cluster["symbols"]),
+                    "open_positions": int(cluster["open_positions"]),
+                    "estimated_risk_pct": round(float(cluster["estimated_risk_pct"]), 3),
+                }
+            )
+        return {
+            "enabled": self.enabled,
+            "open_positions": len(positions),
+            "symbols_with_positions": len(symbol_exposure),
+            "estimated_risk_by_symbol": {
+                symbol: round(float(value), 3)
+                for symbol, value in sorted((context.estimated_risk_by_symbol or {}).items())
+            },
+            "clusters": ordered_clusters,
+        }
 
 
 class PortfolioAllocator:
@@ -385,10 +514,14 @@ class SpreadAwareExecutionOverlay:
                     notes=[f"ATR {context.atr_pips:.1f} < {self.min_edge_mult}x spread {context.spread_pips:.1f}"],
                 )
 
-            # Soft penalty when spread is significant relative to ATR
+            # Soft penalty when spread is significant relative to ATR.
+            # Slope 0.4 with floor 0.25 keeps the penalty *non-saturating* across
+            # realistic spread/ATR ratios — earlier `max(0.5, 1 - delta)` floored
+            # at 0.5 once delta exceeded 0.5, so further deterioration was free.
+            # See findings.html §9 (execution-quality overlay quick wins).
             spread_ratio = context.spread_pips / context.atr_pips
             if spread_ratio > self.penalty_start_mult:
-                penalty = max(0.5, 1.0 - (spread_ratio - self.penalty_start_mult))
+                penalty = max(0.25, 1.0 - 0.4 * (spread_ratio - self.penalty_start_mult))
                 notes.append(f"Spread penalty: ratio={spread_ratio:.2f}, multiplier={penalty:.2f}")
                 return ExecutionQualityDecision(
                     allow_trade=True,
@@ -458,6 +591,7 @@ class StrategyExtensionRegistry:
 class EnhancementSeams:
     risk_scalar_stack: RiskScalarStack
     exit_pack: MarketDrivenExitPack
+    portfolio_observatory: PortfolioObservatory
     portfolio_allocator: PortfolioAllocator
     regime_model_adapter: RegimeModelAdapter
     execution_quality_overlay: ExecutionQualityOverlay
@@ -467,18 +601,86 @@ class EnhancementSeams:
 
 def create_default_enhancement_seams(config: Optional[Any] = None) -> EnhancementSeams:
     """Build the default seam bundle with sensible production defaults."""
-    spread_enabled = bool(getattr(config, "execution_spread_filter_enabled", True))
-    spread_min_edge_mult = float(getattr(config, "execution_spread_min_edge_mult", 1.5))
-    spread_spike_mult = float(getattr(config, "execution_spread_spike_mult", 2.0))
-    spread_penalty_start_mult = float(getattr(config, "execution_spread_penalty_start_mult", 0.5))
+    def _coerce_bool(attr: str, default: bool) -> bool:
+        value = getattr(config, attr, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    def _coerce_float(attr: str, default: float) -> float:
+        value = getattr(config, attr, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _coerce_risk_scalars_mode(cfg: Optional[Any], *, legacy_enabled: bool) -> str:
+        """Resolve `live_risk_scalars_mode` ∈ {off, shadow, on}.
+
+        Backward-compat: if the explicit mode is missing/empty/invalid, fall
+        back to the legacy `live_risk_scalars_enabled` boolean (True → "on").
+        """
+        raw = getattr(cfg, "live_risk_scalars_mode", None) if cfg is not None else None
+        if raw is None:
+            return "on" if legacy_enabled else "off"
+        if not isinstance(raw, str):
+            return "on" if legacy_enabled else "off"
+        normalized = raw.strip().lower()
+        if normalized in {"off", "shadow", "on"}:
+            return normalized
+        return "on" if legacy_enabled else "off"
+
+    def _coerce_exit_pack_mode(cfg: Optional[Any]) -> str:
+        """E7 — resolve `market_driven_exit_pack_mode` ∈ {off, paper, on}.
+
+        No legacy boolean exists for this seam (it was always `enabled=False`
+        by construction), so invalid / missing values degrade to `"off"`.
+        """
+        raw = getattr(cfg, "market_driven_exit_pack_mode", None) if cfg is not None else None
+        if not isinstance(raw, str):
+            return "off"
+        normalized = raw.strip().lower()
+        if normalized in {"off", "paper", "on"}:
+            return normalized
+        return "off"
+
+    spread_enabled = _coerce_bool("execution_spread_filter_enabled", True)
+    risk_scalars_enabled = _coerce_bool("live_risk_scalars_enabled", False)
+    risk_scalars_mode = _coerce_risk_scalars_mode(config, legacy_enabled=risk_scalars_enabled)
+    exit_pack_mode = _coerce_exit_pack_mode(config)
+    spread_min_edge_mult = _coerce_float("execution_spread_min_edge_mult", 1.5)
+    spread_spike_mult = _coerce_float("execution_spread_spike_mult", 2.0)
+    spread_penalty_start_mult = _coerce_float("execution_spread_penalty_start_mult", 0.5)
+    target_annual_vol = _coerce_float("target_annual_vol", 0.10)
+    if risk_scalars_mode == "off":
+        risk_scalar_stack = RiskScalarStack([], shadow_mode=False)
+    else:
+        risk_scalar_stack = RiskScalarStack(
+            [
+                VolatilityTargetScalar(target_annual_vol=target_annual_vol),
+                ExposureCorrelationScalar(max_positions=10),
+                FractionalKellyCap(kelly_fraction=0.25),
+                DrawdownPositionScalar(max_dd_pct=20.0),
+            ],
+            shadow_mode=(risk_scalars_mode == "shadow"),
+        )
     return EnhancementSeams(
-        risk_scalar_stack=RiskScalarStack([
-            VolatilityTargetScalar(target_annual_vol=0.10),
-            ExposureCorrelationScalar(max_positions=10),
-            FractionalKellyCap(kelly_fraction=0.25),
-            DrawdownPositionScalar(max_dd_pct=20.0),
-        ]),
-        exit_pack=MarketDrivenExitPack(enabled=False),  # Opt-in after validation
+        risk_scalar_stack=risk_scalar_stack,
+        exit_pack=MarketDrivenExitPack(
+            enabled=(exit_pack_mode == "on"),
+            paper_mode=(exit_pack_mode == "paper"),
+        ),
+        portfolio_observatory=PortfolioObservatory(
+            enabled=_coerce_bool("portfolio_observatory_enabled", False),
+        ),
         portfolio_allocator=PortfolioAllocator(),
         regime_model_adapter=RegimeModelAdapter(),
         execution_quality_overlay=SpreadAwareExecutionOverlay(

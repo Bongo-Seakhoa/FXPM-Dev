@@ -64,7 +64,10 @@ class ResampleCacheTests(unittest.TestCase):
             shutil.rmtree(data_dir, ignore_errors=True)
 
     def test_cached_frames_are_returned_as_copies(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_resample_cache_copies")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
             csv_path = os.path.join(tmp, "EURUSD_M5.csv")
             start = datetime(2024, 1, 1, 0, 0, 0)
             self._write_csv(csv_path, start, 180)
@@ -91,6 +94,36 @@ class ResampleCacheTests(unittest.TestCase):
 
             self.assertNotIn("TMP_COL", m5_b.columns)
             self.assertNotIn("TMP_COL", h1_b.columns)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_resample_cache_stats_track_disk_hit_and_write(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_resample_cache_stats")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            csv_path = os.path.join(tmp, "EURUSD_M5.csv")
+            start = datetime(2024, 1, 1, 0, 0, 0)
+            self._write_csv(csv_path, start, 180)
+
+            original_h1_min = DataLoader.MIN_BARS.get("H1", 5000)
+            DataLoader.MIN_BARS["H1"] = 1
+            try:
+                loader = DataLoader(tmp)
+                self.assertIsNotNone(loader.get_data("EURUSD", "H1"))
+                first_stats = loader.get_resample_cache_stats()
+                self.assertEqual(first_stats["writes"], 1)
+                self.assertEqual(first_stats["misses"], 1)
+
+                loader2 = DataLoader(tmp)
+                self.assertIsNotNone(loader2.get_data("EURUSD", "H1"))
+                second_stats = loader2.get_resample_cache_stats()
+                self.assertEqual(second_stats["disk_hits"], 1)
+                self.assertGreater(second_stats["bytes_read"], 0)
+            finally:
+                DataLoader.MIN_BARS["H1"] = original_h1_min
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

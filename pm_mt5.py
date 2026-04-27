@@ -132,9 +132,24 @@ class MT5SymbolInfo:
         else:
             self.pip_value = float(self.trade_tick_value or 0.0)
     
-    def to_instrument_spec(self) -> InstrumentSpec:
+    def to_instrument_spec(self,
+                           base_spec: Optional[InstrumentSpec] = None,
+                           commission_per_lot: Optional[float] = None) -> InstrumentSpec:
         """Convert to InstrumentSpec for backtesting compatibility."""
         pip_position = self.digits - 1 if self.digits in [3, 5] else self.digits
+
+        resolved_commission = commission_per_lot
+        if resolved_commission is None and base_spec is not None:
+            resolved_commission = getattr(base_spec, "commission_per_lot", None)
+        if resolved_commission is None:
+            try:
+                resolved_commission = get_instrument_spec(self.symbol).commission_per_lot
+            except Exception:
+                resolved_commission = None
+        try:
+            resolved_commission = float(resolved_commission)
+        except (TypeError, ValueError):
+            resolved_commission = 7.0
         
         return InstrumentSpec(
             symbol=self.symbol,
@@ -143,7 +158,7 @@ class MT5SymbolInfo:
             spread_avg=(self.spread * self.point / self.pip_size) if self.pip_size > 0 else float(self.spread),
             min_lot=self.volume_min,
             max_lot=self.volume_max,
-            commission_per_lot=7.0,  # Default, broker-specific
+            commission_per_lot=resolved_commission,
             swap_long=self.swap_long,
             swap_short=self.swap_short,
             tick_size=self.trade_tick_size,
@@ -200,6 +215,9 @@ class MT5Position:
     magic: int
     comment: str
     time: datetime
+    identifier: int = 0        # POSITION_IDENTIFIER (stable ID for history lookups)
+    reason: int = 0            # POSITION_REASON (0=CLIENT, 1=MOBILE, 2=WEB, 3=EXPERT, 4=SL, 5=TP, 6=SO)
+    time_update: Optional[datetime] = None  # Last modification time
 
 
 @dataclass
@@ -693,7 +711,9 @@ class MT5Connector:
                           tp: float = 0.0,
                           deviation: int = 30,
                           magic: int = 0,
-                          comment: str = "") -> MT5OrderResult:
+                          comment: str = "",
+                          price: Optional[float] = None,
+                          symbol_info: Optional[MT5SymbolInfo] = None) -> MT5OrderResult:
         """
         Send a market order.
         
@@ -718,21 +738,30 @@ class MT5Connector:
             return MT5OrderResult(False, -1, f"Symbol not available: {symbol}")
 
         # Get symbol info
-        symbol_info = self.get_symbol_info(broker_symbol)
+        symbol_info = symbol_info or self.get_symbol_info(broker_symbol)
         if symbol_info is None:
             return MT5OrderResult(False, -1, f"Symbol info not available: {broker_symbol}")
-        
-        # Get current price
-        tick = self.get_tick(broker_symbol)
-        if tick is None:
-            return MT5OrderResult(False, -1, "No tick data")
-        
-        # Determine price
+
+        mt5_type = mt5.ORDER_TYPE_BUY if order_type == OrderType.BUY else mt5.ORDER_TYPE_SELL
+        if price is None:
+            # Get current price
+            tick = self.get_tick(broker_symbol)
+            if tick is None:
+                return MT5OrderResult(False, -1, "No tick data")
+
+            # Determine price
+            price = tick.ask if order_type == OrderType.BUY else tick.bid
+        else:
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                return MT5OrderResult(False, 10015, f"Invalid price override: {price!r}")
+            if price <= 0.0:
+                return MT5OrderResult(False, 10015, f"Invalid price override: {price!r}")
+
         if order_type == OrderType.BUY:
-            price = tick.ask
             mt5_type = mt5.ORDER_TYPE_BUY
         else:
-            price = tick.bid
             mt5_type = mt5.ORDER_TYPE_SELL
         
         # Normalize volume
@@ -807,6 +836,10 @@ class MT5Connector:
         
         retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
         
+        result_price = float(getattr(result, "price", 0.0) or 0.0)
+        if result_price <= 0.0:
+            result_price = float(request["price"])
+
         return MT5OrderResult(
             success=(result.retcode in [10008, 10009, 10010]),
             retcode=result.retcode,
@@ -814,7 +847,7 @@ class MT5Connector:
             deal=result.deal,
             order=result.order,
             volume=result.volume,
-            price=result.price
+            price=result_price
         )
     
     def close_position(self,
@@ -878,6 +911,10 @@ class MT5Connector:
         
         retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
         
+        result_price = float(getattr(result, "price", 0.0) or 0.0)
+        if result_price <= 0.0:
+            result_price = float(price)
+
         return MT5OrderResult(
             success=(result.retcode in [10008, 10009, 10010]),
             retcode=result.retcode,
@@ -885,7 +922,7 @@ class MT5Connector:
             deal=result.deal,
             order=result.order,
             volume=result.volume,
-            price=result.price
+            price=result_price
         )
     
     def modify_position(self,
@@ -993,6 +1030,7 @@ class MT5Connector:
             if magic is not None and pos.magic != magic:
                 continue
             
+            time_update_raw = getattr(pos, 'time_update', None)
             result.append(MT5Position(
                 ticket=pos.ticket,
                 symbol=pos.symbol,
@@ -1006,7 +1044,10 @@ class MT5Connector:
                 profit=pos.profit,
                 magic=pos.magic,
                 comment=pos.comment,
-                time=datetime.fromtimestamp(pos.time)
+                time=datetime.fromtimestamp(pos.time),
+                identifier=int(getattr(pos, 'identifier', 0) or 0),
+                reason=int(getattr(pos, 'reason', 0) or 0),
+                time_update=datetime.fromtimestamp(time_update_raw) if time_update_raw else None,
             ))
         
         return result
@@ -1032,6 +1073,56 @@ class MT5Connector:
         """Count open positions."""
         positions = self.get_positions(symbol=symbol, magic=magic)
         return len(positions) if positions is not None else 0
+
+    def get_position_opening_metadata(self, position_identifier: int) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve the opening order/deal metadata for a position by its identifier.
+
+        Uses MT5 history_orders_get(position=...) and history_deals_get(position=...)
+        to find the original comment and magic from the entry order/deal. This is the
+        robust recovery path for positions whose live comment was truncated or cleared.
+
+        Returns dict with keys: comment, magic, reason  (or None on failure).
+        """
+        if not position_identifier or not self._check_connection():
+            return None
+
+        try:
+            # Try deals first — deals carry the final executed metadata
+            deals = mt5.history_deals_get(position=position_identifier)
+            if deals:
+                entry_type = getattr(mt5, 'DEAL_ENTRY_IN', 0)
+                for deal in deals:
+                    if getattr(deal, 'entry', None) == entry_type:
+                        return {
+                            'comment': getattr(deal, 'comment', '') or '',
+                            'magic': int(getattr(deal, 'magic', 0) or 0),
+                            'reason': int(getattr(deal, 'reason', 0) or 0),
+                        }
+                # Fallback: first deal if no explicit ENTRY_IN found
+                deal = deals[0]
+                return {
+                    'comment': getattr(deal, 'comment', '') or '',
+                    'magic': int(getattr(deal, 'magic', 0) or 0),
+                    'reason': int(getattr(deal, 'reason', 0) or 0),
+                }
+        except Exception:
+            pass
+
+        try:
+            # Fallback to orders — opening order may have the original comment
+            orders = mt5.history_orders_get(position=position_identifier)
+            if orders:
+                order = orders[0]
+                return {
+                    'comment': getattr(order, 'comment', '') or '',
+                    'magic': int(getattr(order, 'magic', 0) or 0),
+                    'reason': int(getattr(order, 'reason', 0) or 0),
+                }
+        except Exception:
+            pass
+
+        return None
 
     def get_recent_closing_deals(self, lookback_hours: int = 48) -> List[Dict[str, Any]]:
         """Fetch recent closing deals for drift-monitor integration."""
@@ -1095,10 +1186,21 @@ class MT5Connector:
         step = symbol_info.volume_step
         if step <= 0:
             step = 0.01
-        volume = math.floor(volume / step) * step  # floor-to-step (risk-safe)
-        volume = math.floor(volume * 100) / 100.0  # avoid rounding up
+        volume = math.floor((volume / step) + 1e-12) * step  # floor-to-step (risk-safe)
+        volume = max(symbol_info.volume_min, min(symbol_info.volume_max, volume))
 
-        return volume
+        precision = max(
+            self._volume_decimal_places(step),
+            self._volume_decimal_places(symbol_info.volume_min),
+        )
+        return round(volume, precision)
+
+    @staticmethod
+    def _volume_decimal_places(value: float) -> int:
+        text = f"{float(value):.10f}".rstrip("0").rstrip(".")
+        if "." not in text:
+            return 0
+        return min(8, len(text.rsplit(".", 1)[1]))
     
     
     def normalize_volume(self, volume: float, symbol_info: MT5SymbolInfo) -> float:
@@ -1124,6 +1226,28 @@ class MT5Connector:
         if profit is None:
             return None
         return abs(float(profit))
+
+    def calc_margin_required(self, order_type: int, symbol: str, volume: float,
+                             price: float) -> Optional[float]:
+        """Estimate required margin for a proposed market order."""
+        if not MT5_AVAILABLE or not hasattr(mt5, "order_calc_margin"):
+            return None
+        try:
+            resolved_symbol = self._resolve_symbol(symbol) or symbol
+            if int(order_type) == int(getattr(OrderType, "BUY").value):
+                mt5_type = mt5.ORDER_TYPE_BUY
+            else:
+                mt5_type = mt5.ORDER_TYPE_SELL
+            margin = mt5.order_calc_margin(mt5_type, resolved_symbol, float(volume), float(price))
+        except Exception as e:
+            logger.debug(f"order_calc_margin failed for {symbol}: {e}")
+            return None
+        if margin is None:
+            return None
+        try:
+            return abs(float(margin))
+        except (TypeError, ValueError):
+            return None
 
     def _preflight_order_request(self, request: Dict[str, Any]) -> Optional[MT5OrderResult]:
         """Validate an MT5 trade request with order_check when available."""

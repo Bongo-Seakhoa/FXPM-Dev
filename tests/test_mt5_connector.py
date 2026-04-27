@@ -21,6 +21,7 @@ class _FakeMT5:
     def __init__(self):
         self.order_check_request = None
         self.order_send_request = None
+        self.tick_calls = 0
 
     def symbol_select(self, symbol, enable):
         return symbol == "EURUSD.a"
@@ -54,6 +55,7 @@ class _FakeMT5:
         )
 
     def symbol_info_tick(self, symbol):
+        self.tick_calls += 1
         if symbol != "EURUSD.a":
             return None
         return SimpleNamespace(
@@ -115,6 +117,35 @@ class MT5ConnectorTests(unittest.TestCase):
             self.fake_mt5.order_send_request["type_filling"],
             self.fake_mt5.ORDER_FILLING_FOK,
         )
+
+    def test_send_market_order_uses_prechecked_price_without_refetching_tick(self):
+        connector = MT5Connector(MT5Config())
+        connector._connected = True
+
+        result = connector.send_market_order(
+            symbol="EURUSD",
+            order_type=OrderType.BUY,
+            volume=0.17,
+            sl=1.09800,
+            tp=1.10300,
+            price=1.10123,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(self.fake_mt5.tick_calls, 0)
+        self.assertEqual(self.fake_mt5.order_send_request["price"], 1.10123)
+
+    def test_normalize_volume_preserves_broker_step_precision(self):
+        connector = MT5Connector(MT5Config())
+        symbol_info = SimpleNamespace(
+            volume_min=0.001,
+            volume_max=100.0,
+            volume_step=0.001,
+        )
+
+        volume = connector.normalize_volume(0.1239, symbol_info)
+
+        self.assertEqual(volume, 0.123)
 
     def test_return_fill_is_rejected_for_market_execution(self):
         connector = MT5Connector(MT5Config(preferred_filling_type="return"))

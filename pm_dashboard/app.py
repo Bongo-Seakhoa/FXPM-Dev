@@ -3,15 +3,26 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import hmac
+import ipaddress
+import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
-from .utils import DEFAULT_CONFIG, deep_merge, load_dashboard_config, save_dashboard_config
+from .utils import (
+    DEFAULT_CONFIG,
+    coerce_float,
+    deep_merge,
+    load_dashboard_config,
+    resolve_pm_configs_path,
+    save_dashboard_config,
+)
 from .watcher import DashboardState, DashboardWatcher
 from .utils import parse_timestamp
 from .utils import load_instrument_specs
@@ -141,6 +152,69 @@ def _json_error(message: str, status_code: int = 400) -> Any:
     return jsonify({"success": False, "error": message}), status_code
 
 
+def _configured_write_token(config: Dict[str, Any]) -> str:
+    env_name = str(config.get("write_api_token_env") or "PM_DASHBOARD_WRITE_TOKEN").strip()
+    if not env_name:
+        return ""
+    return os.environ.get(env_name, "")
+
+
+def _request_write_token() -> str:
+    token = str(request.headers.get("X-PM-Dashboard-Token") or "").strip()
+    if token:
+        return token
+    auth = str(request.headers.get("Authorization") or "").strip()
+    prefix = "bearer "
+    if auth.lower().startswith(prefix):
+        return auth[len(prefix):].strip()
+    return ""
+
+
+def _is_loopback_request() -> bool:
+    remote_addr = request.remote_addr or ""
+    try:
+        return ipaddress.ip_address(remote_addr).is_loopback
+    except ValueError:
+        return remote_addr.lower() in {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_same_origin_request() -> bool:
+    origin = str(request.headers.get("Origin") or "").strip()
+    referer = str(request.headers.get("Referer") or "").strip()
+    source = origin or referer
+    if not source:
+        return True
+    try:
+        source_url = urlparse(source)
+        host_url = urlparse(request.host_url)
+    except Exception:
+        return False
+    return (
+        source_url.scheme == host_url.scheme
+        and source_url.netloc.lower() == host_url.netloc.lower()
+    )
+
+
+def _authorize_write_api(config: Dict[str, Any]) -> Optional[Any]:
+    expected_token = _configured_write_token(config)
+    if expected_token:
+        supplied_token = _request_write_token()
+        if supplied_token and hmac.compare_digest(supplied_token, expected_token):
+            return None
+        return _json_error("Dashboard write token required", 401)
+
+    if _is_loopback_request() and _is_same_origin_request():
+        return None
+    if _is_loopback_request():
+        return _json_error("Cross-origin dashboard writes are disabled", 403)
+
+    return _json_error(
+        "Remote dashboard writes are disabled. Set PM_DASHBOARD_WRITE_TOKEN and send it as "
+        "X-PM-Dashboard-Token or Authorization: Bearer <token>.",
+        403,
+    )
+
+
 def _coerce_bool(value: Any, field_name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -182,6 +256,332 @@ def _coerce_string_list(value: Any, field_name: str) -> list[str]:
         if text:
             normalized.append(text)
     return normalized
+
+
+def _load_root_config(pm_root: str) -> Dict[str, Any]:
+    if not pm_root:
+        return {}
+    config_path = os.path.join(pm_root, "config.json")
+    if not os.path.isfile(config_path):
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _configured_symbols(root_config: Dict[str, Any], pm_configs: Dict[str, Any]) -> List[str]:
+    raw_symbols = root_config.get("symbols")
+    if isinstance(raw_symbols, list) and raw_symbols:
+        return sorted({str(symbol).strip().upper() for symbol in raw_symbols if str(symbol).strip()})
+
+    specs = root_config.get("instrument_specs")
+    if isinstance(specs, dict) and specs:
+        return sorted({str(symbol).strip().upper() for symbol in specs.keys() if str(symbol).strip()})
+
+    return sorted({str(symbol).strip().upper() for symbol in pm_configs.keys() if str(symbol).strip()})
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    return parse_timestamp(value)
+
+
+def _max_timestamp(values: List[Any]) -> Optional[str]:
+    parsed = [_parse_dt(value) for value in values if value]
+    parsed = [value for value in parsed if value is not None]
+    if not parsed:
+        return None
+
+    def _rank(value: datetime) -> float:
+        try:
+            return value.timestamp()
+        except Exception:
+            return 0.0
+
+    return max(parsed, key=_rank).isoformat()
+
+
+def _entry_action(entry: Dict[str, Any]) -> str:
+    return str(entry.get("action") or entry.get("status") or entry.get("reason") or "").strip().upper()
+
+
+def _entry_timestamp(entry: Dict[str, Any]) -> Optional[datetime]:
+    return _parse_dt(entry.get("timestamp"))
+
+
+def _risk_action_group(action: str) -> str:
+    action = str(action or "").upper()
+    if action.startswith("SKIPPED_MARGIN_"):
+        return "margin"
+    if "RISK_CAP" in action or action.startswith("BLOCKED_MIN_LOT"):
+        return "risk"
+    if action.startswith("BLOCKED_SPREAD"):
+        return "spread"
+    if action.startswith("BLOCKED_POSITION"):
+        return "position"
+    if action.startswith("FAILED"):
+        return "failed"
+    if action == "EXECUTED":
+        return "executed"
+    return "other"
+
+
+def _ledger_status_from_pm_configs(
+    root_config: Dict[str, Any],
+    pm_configs: Dict[str, Any],
+) -> Dict[str, Any]:
+    configured = _configured_symbols(root_config, pm_configs)
+    configured_set = set(configured)
+    optimized = sorted({str(symbol).strip().upper() for symbol in pm_configs.keys() if str(symbol).strip()})
+    optimized_set = set(optimized)
+
+    now = datetime.now()
+    symbols_validated = 0
+    symbols_expired = 0
+    symbols_invalid = 0
+    regime_slots = 0
+    tradeable_winners = 0
+    no_trade_slots = 0
+    validation_status_counts: Dict[str, int] = {}
+    artifact_contract_counts: Dict[str, int] = {}
+    optimized_at_values: List[Any] = []
+    valid_until_values: List[Any] = []
+
+    for cfg in pm_configs.values():
+        if not isinstance(cfg, dict):
+            continue
+        if cfg.get("is_validated", True):
+            symbols_validated += 1
+        else:
+            symbols_invalid += 1
+
+        valid_until = cfg.get("valid_until")
+        if valid_until:
+            valid_until_values.append(valid_until)
+            valid_until_dt = _parse_dt(valid_until)
+            if valid_until_dt is not None:
+                probe_now = datetime.now(valid_until_dt.tzinfo) if valid_until_dt.tzinfo else now
+                if valid_until_dt < probe_now:
+                    symbols_expired += 1
+
+        if cfg.get("optimized_at"):
+            optimized_at_values.append(cfg.get("optimized_at"))
+
+        artifact = cfg.get("artifact_meta", {}) if isinstance(cfg.get("artifact_meta"), dict) else {}
+        contract_key = "|".join([
+            str(artifact.get("artifact_version", "missing")),
+            str(artifact.get("split_contract_version", "missing")),
+        ])
+        artifact_contract_counts[contract_key] = artifact_contract_counts.get(contract_key, 0) + 1
+
+        regime_configs = cfg.get("regime_configs", {})
+        if isinstance(regime_configs, dict) and regime_configs:
+            for regimes in regime_configs.values():
+                if not isinstance(regimes, dict):
+                    continue
+                for reg_cfg in regimes.values():
+                    if not isinstance(reg_cfg, dict):
+                        continue
+                    regime_slots += 1
+                    status = str(reg_cfg.get("validation_status") or "validated").strip().lower()
+                    validation_status_counts[status] = validation_status_counts.get(status, 0) + 1
+                    strategy_name = str(reg_cfg.get("strategy_name") or "").strip().upper()
+                    if strategy_name == "NO_TRADE" or bool((reg_cfg.get("artifact_meta") or {}).get("no_trade")):
+                        no_trade_slots += 1
+                    elif status != "invalid":
+                        tradeable_winners += 1
+        else:
+            default_cfg = cfg.get("default_config", {}) if isinstance(cfg.get("default_config"), dict) else {}
+            if default_cfg:
+                regime_slots += 1
+                strategy_name = str(default_cfg.get("strategy_name") or cfg.get("strategy_name") or "").strip().upper()
+                if strategy_name == "NO_TRADE":
+                    no_trade_slots += 1
+                else:
+                    tradeable_winners += 1
+
+    missing = sorted(configured_set - optimized_set)
+    extra = sorted(optimized_set - configured_set) if configured_set else []
+    configured_count = len(configured)
+    optimized_count = len(optimized)
+    coverage_pct = (optimized_count / configured_count * 100.0) if configured_count else 0.0
+
+    return {
+        "configured_symbol_count": configured_count,
+        "optimized_symbol_count": optimized_count,
+        "missing_symbol_count": len(missing),
+        "missing_symbols": missing[:20],
+        "extra_symbols": extra[:20],
+        "complete_universe": bool(configured_set) and configured_set.issubset(optimized_set),
+        "coverage_pct": round(coverage_pct, 2),
+        "symbols_validated": symbols_validated,
+        "symbols_invalid": symbols_invalid,
+        "symbols_expired": symbols_expired,
+        "regime_slots": regime_slots,
+        "tradeable_winners": tradeable_winners,
+        "no_trade_slots": no_trade_slots,
+        "validation_status_counts": validation_status_counts,
+        "artifact_contract_counts": artifact_contract_counts,
+        "latest_optimized_at": _max_timestamp(optimized_at_values),
+        "latest_valid_until": _max_timestamp(valid_until_values),
+    }
+
+
+def _signal_status_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    entries = snapshot.get("entries") or []
+    valid_entries = snapshot.get("valid_entries") or []
+    action_counts: Dict[str, int] = {}
+    action_groups: Dict[str, int] = {}
+    direction_counts = {"buy": 0, "sell": 0, "other": 0}
+    newest_ts: Optional[datetime] = None
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        action = _entry_action(entry) or "UNKNOWN"
+        action_counts[action] = action_counts.get(action, 0) + 1
+        group = _risk_action_group(action)
+        action_groups[group] = action_groups.get(group, 0) + 1
+        ts = _entry_timestamp(entry)
+        if ts is not None and (newest_ts is None or ts > newest_ts):
+            newest_ts = ts
+
+    for entry in valid_entries:
+        direction = str(entry.get("signal_direction") or "").lower()
+        if direction in direction_counts:
+            direction_counts[direction] += 1
+        else:
+            direction_counts["other"] += 1
+
+    age_minutes = None
+    if newest_ts is not None:
+        try:
+            probe = datetime.now(newest_ts.tzinfo) if newest_ts.tzinfo else datetime.now()
+            age_minutes = max((probe - newest_ts).total_seconds() / 60.0, 0.0)
+        except Exception:
+            age_minutes = None
+
+    top_actions = sorted(action_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+    return {
+        "total_entries": len(entries),
+        "valid_entries": len(valid_entries),
+        "source_file_count": len(snapshot.get("source_files") or []),
+        "last_updated": snapshot.get("last_updated"),
+        "newest_signal_at": newest_ts.isoformat() if newest_ts else None,
+        "newest_signal_age_minutes": None if age_minutes is None else round(age_minutes, 2),
+        "direction_counts": direction_counts,
+        "action_counts": dict(top_actions),
+        "action_groups": action_groups,
+        "last_error": snapshot.get("last_error") or "",
+    }
+
+
+def _trade_status(pm_root: str, pm_configs_path: str, initial_capital: float) -> Dict[str, Any]:
+    trades = load_trade_history(pm_root, max_files=100, pm_configs_path=pm_configs_path)
+    realized = [trade for trade in trades if bool(trade.get("realized"))]
+    open_events = [trade for trade in trades if not bool(trade.get("realized"))]
+    realized_pnl = 0.0
+    latest_event_at = None
+    latest_realized_at = None
+    for trade in trades:
+        ts = trade.get("_sort_timestamp") or trade.get("_parsed_timestamp") or _parse_dt(trade.get("timestamp"))
+        if ts is not None and (latest_event_at is None or ts > latest_event_at):
+            latest_event_at = ts
+    for trade in realized:
+        try:
+            realized_pnl += float(trade.get("pnl", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        ts = trade.get("_sort_timestamp") or trade.get("_parsed_timestamp") or _parse_dt(trade.get("timestamp"))
+        if ts is not None and (latest_realized_at is None or ts > latest_realized_at):
+            latest_realized_at = ts
+    return {
+        "total_events": len(trades),
+        "realized_events": len(realized),
+        "open_or_entry_events": len(open_events),
+        "realized_pnl": round(realized_pnl, 2),
+        "equity_estimate": round(initial_capital + realized_pnl, 2),
+        "latest_event_at": latest_event_at.isoformat() if latest_event_at else None,
+        "latest_realized_at": latest_realized_at.isoformat() if latest_realized_at else None,
+        "analytics_backed_by_realized_trades": len(realized) > 0,
+    }
+
+
+def build_live_command_payload(
+    pm_root: str,
+    dashboard_config: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    pm_configs: Dict[str, Any],
+) -> Dict[str, Any]:
+    root_config = _load_root_config(pm_root)
+    pipeline = root_config.get("pipeline", {}) if isinstance(root_config.get("pipeline"), dict) else {}
+    pm_configs_path = resolve_pm_configs_path(pm_root, dashboard_config)
+    initial_capital = 10000.0
+    try:
+        initial_capital = float(pipeline.get("initial_capital", initial_capital))
+    except (TypeError, ValueError):
+        initial_capital = 10000.0
+
+    ledger = _ledger_status_from_pm_configs(root_config, pm_configs)
+    signals = _signal_status_from_snapshot(snapshot)
+    trades = _trade_status(pm_root, pm_configs_path, initial_capital)
+
+    blockers: List[str] = []
+    warnings: List[str] = []
+    score = 100
+    if ledger["configured_symbol_count"] and not ledger["complete_universe"]:
+        score -= 22
+        warnings.append(f"{ledger['missing_symbol_count']} configured symbols are not yet in the active ledger")
+    if ledger["tradeable_winners"] <= 0:
+        score -= 35
+        blockers.append("No tradeable winners found in the active ledger")
+    if ledger["symbols_expired"] > 0:
+        score -= 20
+        blockers.append(f"{ledger['symbols_expired']} symbol configs are expired")
+    if signals["last_error"]:
+        score -= 15
+        warnings.append("Watcher reported a parsing/loading warning")
+    if signals["total_entries"] <= 0:
+        score -= 10
+        warnings.append("No signal/action entries are currently visible")
+    if not trades["analytics_backed_by_realized_trades"] and trades["total_events"] > 0:
+        warnings.append("Trade analytics are currently entry-event based; no realized close outcomes found")
+
+    score = max(0, min(100, score))
+    if blockers:
+        score = min(score, 55)
+        tone = "danger"
+        label = "Blocked"
+    elif score < 75:
+        tone = "warning"
+        label = "Needs Review"
+    else:
+        tone = "good"
+        label = "Operational"
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "pm_root": pm_root,
+        "active_pm_configs_path": pm_configs_path,
+        "readiness": {
+            "score": score,
+            "tone": tone,
+            "label": label,
+            "blockers": blockers,
+            "warnings": warnings,
+        },
+        "ledger": ledger,
+        "signals": signals,
+        "trades": trades,
+        "telegram": {
+            "enabled": bool((dashboard_config.get("telegram") or {}).get("enabled", False)),
+            "chat_id_configured": bool(str((dashboard_config.get("telegram") or {}).get("chat_id") or "").strip()),
+            "token_env": str((dashboard_config.get("telegram") or {}).get("bot_token_env") or "PM_DASHBOARD_TELEGRAM_BOT_TOKEN"),
+            "token_configured": bool(os.environ.get(str((dashboard_config.get("telegram") or {}).get("bot_token_env") or "PM_DASHBOARD_TELEGRAM_BOT_TOKEN"))),
+        },
+    }
 
 
 def create_app(
@@ -242,45 +642,8 @@ def create_app(
             return _json_error("Internal server error", 500)
         return "Internal server error", 500
 
-    # Initialize MT5 connector and data jobs (optional)
-    mt5_connector = None
-    data_downloader = None
-    data_scheduler = None
-
-    if JOBS_AVAILABLE:
-        scheduler_enabled = bool(config.get("enable_data_maintenance_scheduler", True))
-        scheduler_time = str(config.get("data_maintenance_time", "00:00") or "00:00")
-
-        if MT5_AVAILABLE:
-            try:
-                mt5_connector = MT5Connector()
-                if mt5_connector.connect():
-                    logger.info("MT5 connector initialized for root data maintenance")
-                else:
-                    logger.warning("MT5 initial connect failed; local-data simulation remains available")
-            except Exception as e:
-                logger.error(f"Failed to initialize MT5 connector: {e}")
-                mt5_connector = None
-
-        try:
-            data_downloader, data_scheduler = initialize_data_jobs(
-                pm_root,
-                mt5_connector=mt5_connector,
-                enable_scheduler=scheduler_enabled,
-                run_time=scheduler_time,
-            )
-            app.config["data_downloader"] = data_downloader
-            app.config["data_scheduler"] = data_scheduler
-            logger.info(
-                "Dashboard data jobs initialized (scheduler=%s @ %s)",
-                "enabled" if scheduler_enabled else "disabled",
-                scheduler_time,
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize data jobs: {e}")
-    else:
+    if not JOBS_AVAILABLE:
         logger.info("Dashboard jobs module unavailable - simulation features will be limited")
-    app.config["mt5_connector"] = mt5_connector
 
     @app.route("/")
     def index() -> str:
@@ -308,11 +671,24 @@ def create_app(
         }
         return jsonify(snapshot)
 
+    @app.route("/api/live-command", methods=["GET"])
+    def api_live_command() -> Any:
+        current_config = app.config["dashboard_config"]
+        snapshot = state.snapshot()
+        pm_configs = state.get_pm_configs()
+        pm_root = current_config.get("pm_root") or ""
+        payload = build_live_command_payload(pm_root, current_config, snapshot, pm_configs)
+        return jsonify(payload)
+
     @app.route("/api/config", methods=["GET", "POST"])
     def api_config() -> Any:
         current_config = app.config["dashboard_config"]
         if request.method == "GET":
             return jsonify(serialize_config(current_config))
+
+        auth_error = _authorize_write_api(current_config)
+        if auth_error is not None:
+            return auth_error
 
         payload = request.get_json(silent=True)
         if payload is None and request.data:
@@ -355,22 +731,24 @@ def create_app(
     def api_analytics() -> Any:
         current_config = app.config["dashboard_config"]
         pm_root = current_config.get("pm_root") or ""
+        pm_configs_path = resolve_pm_configs_path(pm_root, current_config)
         try:
             initial_capital = float(request.args.get("initial_capital", 10000.0))
         except (ValueError, TypeError):
             initial_capital = 10000.0
-        payload = build_analytics_payload(pm_root, initial_capital=initial_capital)
+        payload = build_analytics_payload(pm_root, initial_capital=initial_capital, pm_configs_path=pm_configs_path)
         return jsonify(payload)
 
     @app.route("/api/trades", methods=["GET"])
     def api_trades() -> Any:
         current_config = app.config["dashboard_config"]
         pm_root = current_config.get("pm_root") or ""
+        pm_configs_path = resolve_pm_configs_path(pm_root, current_config)
         try:
             limit = int(request.args.get("limit", 200))
         except (ValueError, TypeError):
             limit = 200
-        trades = load_trade_history(pm_root, max_files=100)
+        trades = load_trade_history(pm_root, max_files=100, pm_configs_path=pm_configs_path)
 
         filtered_trades = []
         for trade in trades[:limit]:
@@ -412,6 +790,7 @@ def create_app(
         """
         current_config = app.config["dashboard_config"]
         pm_root = current_config.get("pm_root") or ""
+        pm_configs_path = resolve_pm_configs_path(pm_root, current_config)
         data_downloader = app.config.get("data_downloader")
 
         payload = request.get_json(silent=True)
@@ -452,7 +831,7 @@ def create_app(
             }), 400
 
         # Load trades
-        all_trades = load_trade_history(pm_root, max_files=100)
+        all_trades = load_trade_history(pm_root, max_files=100, pm_configs_path=pm_configs_path)
 
         if not all_trades:
             return jsonify({
@@ -551,6 +930,11 @@ def create_app(
     @app.route("/api/download_historical_data", methods=["POST"])
     def api_download_historical_data() -> Any:
         """Trigger manual root-data M5 refresh."""
+        current_config = app.config["dashboard_config"]
+        auth_error = _authorize_write_api(current_config)
+        if auth_error is not None:
+            return auth_error
+
         data_downloader = app.config.get("data_downloader")
         data_scheduler = app.config.get("data_scheduler")
 
@@ -588,14 +972,21 @@ def create_app(
 
 def serialize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     merged = deep_merge(DEFAULT_CONFIG, config if isinstance(config, dict) else {})
+    pm_root = str(merged.get("pm_root") or "")
+    telegram_cfg = copy.deepcopy(merged.get("telegram", {}) or {})
+    token_env = str(telegram_cfg.get("bot_token_env") or "PM_DASHBOARD_TELEGRAM_BOT_TOKEN")
+    telegram_cfg["bot_token_configured"] = bool(os.environ.get(token_env))
     return {
-        "pm_root": merged.get("pm_root", ""),
+        "pm_root": pm_root,
         "refresh_interval_sec": merged.get("refresh_interval_sec"),
         "file_patterns": list(merged.get("file_patterns", [])),
         "explicit_files": list(merged.get("explicit_files", [])),
+        "pm_configs_path": merged.get("pm_configs_path", "auto"),
+        "active_pm_configs_path": resolve_pm_configs_path(pm_root, merged),
         "min_strength": merged.get("min_strength"),
         "max_signal_age_minutes": merged.get("max_signal_age_minutes"),
         "alert": copy.deepcopy(merged.get("alert", {})),
+        "telegram": telegram_cfg,
     }
 
 
@@ -620,6 +1011,8 @@ def apply_config_updates(config: Dict[str, Any], payload: Dict[str, Any]) -> Dic
         updated["file_patterns"] = _coerce_string_list(payload.get("file_patterns"), "file_patterns")
     if "explicit_files" in payload:
         updated["explicit_files"] = _coerce_string_list(payload.get("explicit_files"), "explicit_files")
+    if "pm_configs_path" in payload:
+        updated["pm_configs_path"] = str(payload.get("pm_configs_path") or "auto").strip() or "auto"
 
     if "alert" in payload:
         alert_payload = payload.get("alert")
@@ -633,35 +1026,55 @@ def apply_config_updates(config: Dict[str, Any], payload: Dict[str, Any]) -> Dic
         if "min_strength" in alert_payload:
             alert_cfg["min_strength"] = _coerce_float(alert_payload.get("min_strength"), "alert.min_strength", 0.0)
         updated["alert"] = alert_cfg
+    if "telegram" in payload:
+        telegram_payload = payload.get("telegram")
+        if not isinstance(telegram_payload, dict):
+            raise ValueError("telegram must be an object")
+        telegram_cfg = copy.deepcopy(updated.get("telegram", {}))
+        if "enabled" in telegram_payload:
+            telegram_cfg["enabled"] = _coerce_bool(telegram_payload.get("enabled"), "telegram.enabled")
+        if "chat_id" in telegram_payload:
+            telegram_cfg["chat_id"] = str(telegram_payload.get("chat_id") or "").strip()
+        if "bot_token_env" in telegram_payload:
+            telegram_cfg["bot_token_env"] = str(
+                telegram_payload.get("bot_token_env") or "PM_DASHBOARD_TELEGRAM_BOT_TOKEN"
+            ).strip() or "PM_DASHBOARD_TELEGRAM_BOT_TOKEN"
+        if "min_strength" in telegram_payload:
+            telegram_cfg["min_strength"] = _coerce_float(
+                telegram_payload.get("min_strength"),
+                "telegram.min_strength",
+                0.0,
+            )
+        if "max_signal_age_minutes" in telegram_payload:
+            telegram_cfg["max_signal_age_minutes"] = _coerce_int(
+                telegram_payload.get("max_signal_age_minutes"),
+                "telegram.max_signal_age_minutes",
+                1,
+            )
+        if "include_strategy" in telegram_payload:
+            telegram_cfg["include_strategy"] = _coerce_bool(
+                telegram_payload.get("include_strategy"),
+                "telegram.include_strategy",
+            )
+        if "include_regime" in telegram_payload:
+            telegram_cfg["include_regime"] = _coerce_bool(
+                telegram_payload.get("include_regime"),
+                "telegram.include_regime",
+            )
+        if "send_on_startup" in telegram_payload:
+            telegram_cfg["send_on_startup"] = _coerce_bool(
+                telegram_payload.get("send_on_startup"),
+                "telegram.send_on_startup",
+            )
+        if "actions" in telegram_payload:
+            telegram_cfg["actions"] = _coerce_string_list(telegram_payload.get("actions"), "telegram.actions")
+        if "action_prefixes" in telegram_payload:
+            telegram_cfg["action_prefixes"] = _coerce_string_list(
+                telegram_payload.get("action_prefixes"),
+                "telegram.action_prefixes",
+            )
+        updated["telegram"] = telegram_cfg
     return updated
-
-
-def _reinitialize_data_jobs(app: Flask, config: Dict[str, Any]) -> None:
-    """Recreate data jobs when configuration changes (especially pm_root)."""
-    if not JOBS_AVAILABLE:
-        return
-    try:
-        scheduler = app.config.get("data_scheduler")
-        if scheduler:
-            scheduler.stop()
-    except Exception:
-        pass
-
-    try:
-        pm_root = config.get("pm_root") or ""
-        mt5_connector = app.config.get("mt5_connector")
-        scheduler_enabled = bool(config.get("enable_data_maintenance_scheduler", True))
-        scheduler_time = str(config.get("data_maintenance_time", "00:00") or "00:00")
-        data_downloader, data_scheduler = initialize_data_jobs(
-            pm_root,
-            mt5_connector=mt5_connector,
-            enable_scheduler=scheduler_enabled,
-            run_time=scheduler_time,
-        )
-        app.config["data_downloader"] = data_downloader
-        app.config["data_scheduler"] = data_scheduler
-    except Exception as exc:
-        logger.error(f"Failed to reinitialize data jobs: {exc}")
 
 
 def build_strategy_payload(pm_configs: Dict[str, Any], include_invalid: bool) -> Dict[str, Any]:
@@ -733,6 +1146,13 @@ def build_strategy_payload(pm_configs: Dict[str, Any], include_invalid: bool) ->
     return {"rows": rows, "summary": summary}
 
 
+def _optional_count(value: Any) -> Optional[int]:
+    numeric = coerce_float(value)
+    if numeric is None:
+        return None
+    return int(numeric)
+
+
 def strategy_row_from_config(
     symbol: str,
     timeframe: str,
@@ -744,7 +1164,7 @@ def strategy_row_from_config(
     symbol_valid_until: Optional[str],
 ) -> Dict[str, Any]:
     strategy_name = reg_cfg.get("strategy_name") or ""
-    quality_score = reg_cfg.get("quality_score")
+    quality_score = coerce_float(reg_cfg.get("quality_score"))
     train_metrics = reg_cfg.get("train_metrics", {}) or {}
     val_metrics = reg_cfg.get("val_metrics", {}) or {}
     trained_at = reg_cfg.get("trained_at")
@@ -765,8 +1185,8 @@ def strategy_row_from_config(
         "regime": regime,
         "strategy_name": strategy_name,
         "quality_score": quality_score,
-        "regime_train_trades": reg_cfg.get("regime_train_trades"),
-        "regime_val_trades": reg_cfg.get("regime_val_trades"),
+        "regime_train_trades": _optional_count(reg_cfg.get("regime_train_trades")),
+        "regime_val_trades": _optional_count(reg_cfg.get("regime_val_trades")),
         "validation_status": status,
         "validation_reason": validation_reason,
         "optimized_at": optimized_at,
@@ -779,7 +1199,7 @@ def strategy_row_from_config(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PM Dashboard (read-only)")
+    parser = argparse.ArgumentParser(description="PM Dashboard (read-mostly)")
     parser.add_argument("--pm-root", dest="pm_root", default=None, help="Path to the PM project directory")
     parser.add_argument("--config", dest="config_path", default=None, help="Path to dashboard_config.json")
     parser.add_argument("--host", dest="host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")

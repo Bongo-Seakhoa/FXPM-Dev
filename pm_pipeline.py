@@ -18,7 +18,7 @@ import hashlib
 import logging
 import math
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -41,9 +41,16 @@ from pm_core import (
     InstrumentSpec
 )
 from pm_enhancement_seams import EnhancementSeams, create_default_enhancement_seams
-from pm_strategies import StrategyRegistry, BaseStrategy, _STRATEGY_MIGRATION
+from pm_strategies import (
+    StrategyRegistry,
+    BaseStrategy,
+    _STRATEGY_MIGRATION,
+    get_regime_tp_multipliers,
+    set_regime_tp_multipliers,
+)
 from pm_position import PositionConfig, PositionManager
 from pm_regime import load_regime_params
+from pm_order_governance import candidate_policy_names, make_policy, policy_name_from_artifact
 
 # Import Optuna TPE optimizer
 try:
@@ -78,7 +85,7 @@ except ImportError:
 
 # Configure module logger
 logger = logging.getLogger(__name__)
-PIPELINE_ARTIFACT_VERSION = "2026-03-29b"
+PIPELINE_ARTIFACT_VERSION = "2026-04-25-active-recent-risk-mgmt"
 
 
 def _stable_seed(*parts: Any) -> int:
@@ -135,20 +142,112 @@ def build_artifact_meta(config: PipelineConfig,
         "artifact_version": PIPELINE_ARTIFACT_VERSION,
         "feature_cache_version": FeatureComputer.FEATURE_CACHE_VERSION,
         "split_contract_version": DataSplitter.SPLIT_CONTRACT_VERSION,
+        "data_workflow_mode": str(getattr(config, "data_workflow_mode", "active_recent_m5")),
+        "max_bars": int(getattr(config, "max_bars", 300000)),
+        "historical_stress_audit_bars": int(getattr(config, "historical_stress_audit_bars", 50000)),
+        "active_universe_bars": int(getattr(config, "active_universe_bars", 250000)),
+        "active_stage2_pct": float(getattr(config, "active_stage2_pct", 50.0)),
         "train_pct": float(config.train_pct),
+        "val_pct": float(config.val_pct),
         "overlap_pct": float(config.overlap_pct),
         "holdout_pct": None if config.holdout_pct is None else float(config.holdout_pct),
         "scoring_mode": str(config.scoring_mode),
-        "optuna_use_val_in_objective": bool(getattr(config, "optuna_use_val_in_objective", False)),
         "fixed_retrain_days": int(getattr(config, "fixed_retrain_days", getattr(config, "optimization_valid_days", 14))),
         "production_retrain_mode": str(getattr(config, "production_retrain_mode", "auto")),
         "production_retrain_interval_weeks": int(getattr(config, "production_retrain_interval_weeks", 2)),
         "production_retrain_weekday": str(getattr(config, "production_retrain_weekday", "sunday")),
         "production_retrain_time": str(getattr(config, "production_retrain_time", "00:01")),
         "production_retrain_anchor_date": str(getattr(config, "production_retrain_anchor_date", "2026-03-29")),
+        "walk_forward_audit_enabled": bool(getattr(config, "walk_forward_audit_enabled", False)),
+        "walk_forward_audit_windows": int(getattr(config, "walk_forward_audit_windows", 3)),
+        "local_governance_tournament_enabled": bool(getattr(config, "local_governance_tournament_enabled", False)),
+        "local_governance_candidate_policies": candidate_policy_names(
+            getattr(config, "local_governance_candidate_policies", None)
+        ),
+        "local_governance_require_baseline_improvement": bool(
+            getattr(config, "local_governance_require_baseline_improvement", True)
+        ),
+        "local_governance_min_score_improvement": float(
+            getattr(config, "local_governance_min_score_improvement", 0.0) or 0.0
+        ),
+        "risk_management_optimization_enabled": bool(
+            getattr(config, "risk_management_optimization_enabled", True)
+        ),
+        "risk_management_selection_stage": str(
+            getattr(config, "risk_management_selection_stage", "stage3")
+        ),
+        "exit_surface_contract": "trade_intent_regime_tp_v1",
+        "regime_tp_multipliers": dict(
+            getattr(config, "regime_tp_multipliers", None) or get_regime_tp_multipliers()
+        ),
         "regime_params": _regime_params_fingerprint(getattr(config, "regime_params_file", "regime_params.json")),
         "strategy_surface_hash": _strategy_surface_fingerprint(strategies),
         "metric_contract": "net_dollar_mtm_equity_v1",
+    }
+
+
+def _artifact_contract_view(stored_artifact: Dict[str, Any],
+                            current_artifact_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return only the semantic artifact keys that participate in invalidation.
+
+    Persisted artifacts may carry operational metadata such as ledger completion
+    state or no-trade explanations. Those fields are useful audit evidence but
+    must not make a freshly saved config look stale on the next status check.
+    """
+    stored = stored_artifact or {}
+    current = current_artifact_meta or {}
+    return {key: stored.get(key) for key in current.keys()}
+
+
+def artifact_contract_matches(stored_artifact: Dict[str, Any],
+                              current_artifact_meta: Dict[str, Any]) -> bool:
+    """Return True when the persisted artifact matches the current contract."""
+    if not current_artifact_meta:
+        return True
+    return _artifact_contract_view(stored_artifact, current_artifact_meta) == current_artifact_meta
+
+
+def _default_live_observability() -> Dict[str, Any]:
+    return {
+        "last_seen_drift": {},
+        "recent_consecutive_losses": 0,
+        "last_review_ts": None,
+        "operator_note": "",
+        "operator_state": "ACTIVE",
+    }
+
+
+def _default_governance_policy() -> Dict[str, Any]:
+    return {
+        "selected_policy": "control_fixed",
+        "selection_basis": "baseline",
+        "optimization_stage": None,
+        "selection_surface": None,
+        "selected_at": None,
+        "candidate_results": {},
+    }
+
+
+def _default_walk_forward_audit() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "window_count": 0,
+        "summary": {},
+        "windows": [],
+        "audited_at": None,
+    }
+
+
+def _default_historical_audit() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "window": "historical_stress_audit",
+        "total_trades": 0,
+        "severe_failure": False,
+        "failure_reasons": [],
+        "metrics": {},
+        "audited_at": None,
     }
 
 
@@ -160,6 +259,8 @@ def _pipeline_config_to_dict(config: PipelineConfig) -> Dict[str, Any]:
         cfg["data_dir"] = str(cfg["data_dir"])
     if isinstance(cfg.get("output_dir"), Path):
         cfg["output_dir"] = str(cfg["output_dir"])
+    if isinstance(cfg.get("log_dir"), Path):
+        cfg["log_dir"] = str(cfg["log_dir"])
     return cfg
 
 
@@ -378,7 +479,7 @@ class ConfigLedger:
         if is_valid:
             if current_artifact_meta and symbol in self.configs:
                 stored_artifact = getattr(self.configs[symbol], "artifact_meta", {}) or {}
-                if stored_artifact != current_artifact_meta:
+                if not artifact_contract_matches(stored_artifact, current_artifact_meta):
                     return True, "artifact fingerprint changed"
             # Extra check: regime detection params changed since optimization
             if current_regime_version and symbol in self.configs:
@@ -464,9 +565,18 @@ class ConfigLedger:
         valid = 0
         expired = 0
         invalid = 0
+        artifact_contract_counts: Dict[str, int] = {}
         
         for config in self.configs.values():
+            artifact = getattr(config, "artifact_meta", {}) or {}
+            artifact_key = "|".join([
+                str(artifact.get("artifact_version", "missing")),
+                str(artifact.get("split_contract_version", "missing")),
+            ])
+            artifact_contract_counts[artifact_key] = artifact_contract_counts.get(artifact_key, 0) + 1
             if not config.is_validated:
+                invalid += 1
+            elif not config.valid_until:
                 invalid += 1
             elif config.valid_until and now >= config.valid_until:
                 expired += 1
@@ -478,6 +588,7 @@ class ConfigLedger:
             'valid': valid,
             'expired': expired,
             'invalid': invalid,
+            'artifact_contract_counts': artifact_contract_counts,
             'filepath': str(self.filepath)
         }
 
@@ -501,6 +612,7 @@ class RegimeConfig:
     train_metrics: Dict[str, Any] = field(default_factory=dict)
     val_metrics: Dict[str, Any] = field(default_factory=dict)
     holdout_metrics: Dict[str, Any] = field(default_factory=dict)
+    historical_audit_metrics: Dict[str, Any] = field(default_factory=_default_historical_audit)
     
     # Regime-specific stats
     regime_train_trades: int = 0
@@ -510,10 +622,18 @@ class RegimeConfig:
     trained_at: Optional[datetime] = None
     valid_until: Optional[datetime] = None
     artifact_meta: Dict[str, Any] = field(default_factory=dict)
+    validation_evidence: Dict[str, Any] = field(default_factory=dict)
+    live_observability: Dict[str, Any] = field(default_factory=_default_live_observability)
+    governance_policy: Dict[str, Any] = field(default_factory=_default_governance_policy)
+    walk_forward_audit: Dict[str, Any] = field(default_factory=_default_walk_forward_audit)
     
     def is_no_trade_marker(self) -> bool:
         """Check if this config is a NO_TRADE marker (no valid strategy found)."""
-        return self.strategy_name == "NO_TRADE" or self.strategy_name == ""
+        return (
+            self.strategy_name == "NO_TRADE" or
+            self.strategy_name == "" or
+            bool((self.artifact_meta or {}).get("no_trade"))
+        )
     
     def is_valid_for_live(
         self,
@@ -572,7 +692,15 @@ class RegimeConfig:
                           if k not in ['equity_curve', 'trades']},
             'holdout_metrics': {k: v for k, v in self.holdout_metrics.items()
                                 if k not in ['equity_curve', 'trades']},
+            'historical_audit_metrics': {
+                k: v for k, v in (self.historical_audit_metrics or _default_historical_audit()).items()
+                if k not in ['equity_curve', 'trades']
+            },
             'artifact_meta': self.artifact_meta,
+            'validation_evidence': dict(self.validation_evidence or {}),
+            'live_observability': dict(self.live_observability or _default_live_observability()),
+            'governance_policy': dict(self.governance_policy or _default_governance_policy()),
+            'walk_forward_audit': dict(self.walk_forward_audit or _default_walk_forward_audit()),
         }
     
     @classmethod
@@ -589,9 +717,14 @@ class RegimeConfig:
             train_metrics=data.get('train_metrics', {}),
             val_metrics=data.get('val_metrics', {}),
             holdout_metrics=data.get('holdout_metrics', {}),
+            historical_audit_metrics=data.get('historical_audit_metrics') or _default_historical_audit(),
             regime_train_trades=data.get('regime_train_trades', 0),
             regime_val_trades=data.get('regime_val_trades', 0),
             artifact_meta=data.get('artifact_meta', {}),
+            validation_evidence=data.get('validation_evidence', {}),
+            live_observability=data.get('live_observability') or _default_live_observability(),
+            governance_policy=data.get('governance_policy') or _default_governance_policy(),
+            walk_forward_audit=data.get('walk_forward_audit') or _default_walk_forward_audit(),
         )
         
         if data.get('trained_at'):
@@ -630,19 +763,21 @@ class SymbolConfig:
     train_metrics: Dict[str, Any] = field(default_factory=dict)
     val_metrics: Dict[str, Any] = field(default_factory=dict)
     holdout_metrics: Dict[str, Any] = field(default_factory=dict)
+    historical_audit_metrics: Dict[str, Any] = field(default_factory=_default_historical_audit)
+    data_window_meta: Dict[str, Any] = field(default_factory=dict)
     composite_score: float = 0.0
     robustness_ratio: float = 0.0
     
     # Validation status
     is_validated: bool = False
     validation_reason: str = ""
+    validation_evidence: Dict[str, Any] = field(default_factory=dict)
 
     # Regime detection version stamp for invalidation when params change.
     regime_detection_version: Optional[Dict[str, Any]] = None
-    
-    # Regime detection version stamp (for invalidation when params change)
-    regime_detection_version: Optional[Dict[str, Any]] = None
     artifact_meta: Dict[str, Any] = field(default_factory=dict)
+    live_observability: Dict[str, Any] = field(default_factory=_default_live_observability)
+    walk_forward_audit: Dict[str, Any] = field(default_factory=_default_walk_forward_audit)
 
     # Timestamps
     optimized_at: Optional[datetime] = None
@@ -669,8 +804,13 @@ class SymbolConfig:
         return []
     
     def count_regime_winners(self) -> int:
-        """Count total number of regime winners across all timeframes."""
-        return sum(len(regimes) for regimes in self.regime_configs.values())
+        """Count validated tradeable regime winners across all timeframes."""
+        return sum(
+            1
+            for regimes in self.regime_configs.values()
+            for cfg in regimes.values()
+            if cfg is not None and not cfg.is_no_trade_marker()
+        )
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -684,6 +824,7 @@ class SymbolConfig:
             'robustness_ratio': self.robustness_ratio,
             'is_validated': self.is_validated,
             'validation_reason': self.validation_reason,
+            'validation_evidence': dict(self.validation_evidence or {}),
             'train_return': float(self.train_metrics.get('total_return_pct', 0.0)) if self.train_metrics else 0.0,
             'train_sharpe': float(self.train_metrics.get('sharpe_ratio', 0.0)) if self.train_metrics else 0.0,
             'val_return': float(self.val_metrics.get('total_return_pct', 0.0)) if self.val_metrics else 0.0,
@@ -696,13 +837,16 @@ class SymbolConfig:
                           if k not in ['equity_curve', 'trades']},
             'holdout_metrics': {k: v for k, v in self.holdout_metrics.items()
                                 if k not in ['equity_curve', 'trades']},
+            'historical_audit_metrics': {
+                k: v for k, v in (self.historical_audit_metrics or _default_historical_audit()).items()
+                if k not in ['equity_curve', 'trades']
+            },
+            'data_window_meta': dict(self.data_window_meta or {}),
             'artifact_meta': self.artifact_meta,
+            'live_observability': dict(self.live_observability or _default_live_observability()),
+            'walk_forward_audit': dict(self.walk_forward_audit or _default_walk_forward_audit()),
         }
 
-        if self.regime_detection_version:
-            result['regime_detection_version'] = self.regime_detection_version
-        
-        # Regime detection version stamp
         if self.regime_detection_version:
             result['regime_detection_version'] = self.regime_detection_version
 
@@ -735,10 +879,15 @@ class SymbolConfig:
             robustness_ratio=data.get('robustness_ratio', 0.0),
             is_validated=data.get('is_validated', False),
             validation_reason=data.get('validation_reason', ''),
+            validation_evidence=data.get('validation_evidence', {}),
             train_metrics=data.get('train_metrics', {}),
             val_metrics=data.get('val_metrics', {}),
             holdout_metrics=data.get('holdout_metrics', {}),
+            historical_audit_metrics=data.get('historical_audit_metrics') or _default_historical_audit(),
+            data_window_meta=data.get('data_window_meta', {}),
             artifact_meta=data.get('artifact_meta', {}),
+            live_observability=data.get('live_observability') or _default_live_observability(),
+            walk_forward_audit=data.get('walk_forward_audit') or _default_walk_forward_audit(),
         )
         
         if data.get('optimized_at'):
@@ -1469,7 +1618,7 @@ class RegimeOptimizer:
     3. Final selection: pick best tuned config per regime
     4. Validation: apply fx_backtester validation rules to each winner
     
-    Trade bucketing uses REGIME_LIVE at entry bar for backtest/live parity.
+    Trade bucketing uses REGIME_LIVE at the signal bar for backtest/live parity.
     """
     
     # Regime types
@@ -1497,8 +1646,7 @@ class RegimeOptimizer:
         # Max candidates to attempt validation on (descent through scored list)
         self.regime_validation_top_k = getattr(config, 'regime_validation_top_k', 5)
 
-        # ===== PROFITABILITY GATES (FIX #1) =====
-        # These prevent storing losing strategies as "regime winners"
+        # Validation profitability gates for stored regime winners.
         self.min_val_profit_factor = getattr(config, 'regime_min_val_profit_factor', 1.0)
         self.min_val_return_pct = getattr(config, 'regime_min_val_return_pct', 5.0)
         self.allow_losing_winners = getattr(config, 'regime_allow_losing_winners', False)
@@ -1510,6 +1658,7 @@ class RegimeOptimizer:
         
         # Use fx_backtester scoring mode
         self.use_fx_scoring = getattr(config, 'scoring_mode', 'pm_weighted') == 'fx_backtester'
+        self.training_gate_telemetry: Dict[str, Any] = {}
         
         # Initialize Optuna optimizer for regime tuning
         if OPTUNA_AVAILABLE and self.enable_hyperparam_tuning:
@@ -1524,6 +1673,27 @@ class RegimeOptimizer:
             self.optuna_optimizer = None
             if self.enable_hyperparam_tuning:
                 logger.debug("RegimeOptimizer using: Grid Search (Optuna not available)")
+
+    def _make_no_trade_marker(self, reason: str, now: Optional[datetime] = None) -> RegimeConfig:
+        """Create an explicit non-tradeable marker for a regime slot with no validated winner."""
+        marker_time = now or datetime.now()
+        return RegimeConfig(
+            strategy_name=self.no_winner_marker or "NO_TRADE",
+            parameters={},
+            quality_score=0.0,
+            train_metrics={"total_trades": 0},
+            val_metrics={"total_trades": 0, "validation_status": "no_trade", "reason": reason},
+            regime_train_trades=0,
+            regime_val_trades=0,
+            trained_at=marker_time,
+            valid_until=_scheduled_valid_until(self.config, marker_time),
+            artifact_meta={"no_trade": True, "reason": reason},
+            validation_evidence={
+                "validation_reason": reason,
+                "tradeable": False,
+                "no_trade": True,
+            },
+        )
     
     @staticmethod
     def _compute_return_dd_ratio(val_return: float, val_dd: float, eps: float = 0.5) -> float:
@@ -1588,6 +1758,11 @@ class RegimeOptimizer:
             
             if not tf_candidates:
                 logger.debug(f"[{symbol}] [{tf}] No valid candidates")
+                now = datetime.now()
+                for regime in self.REGIMES:
+                    reason = "No strategies passed training eligibility or produced trades"
+                    regime_configs[tf][regime] = self._make_no_trade_marker(reason, now=now)
+                    unvalidated_winners += 1
                 continue
             
             # Select best per regime (with validation)
@@ -1623,11 +1798,13 @@ class RegimeOptimizer:
                                    f"[VALIDATED: {val_reason}]")
                     else:
                         unvalidated_winners += 1
+                        regime_configs[tf][regime] = self._make_no_trade_marker(val_reason)
                         logger.debug(f"[{symbol}] [{tf}] [{regime}] Candidate {best_config.strategy_name} "
                                     f"FAILED validation: {val_reason}")
                 else:
                     # NO WINNER - No fallback to best train
                     unvalidated_winners += 1
+                    regime_configs[tf][regime] = self._make_no_trade_marker(val_reason)
                     logger.warning(
                         f"[{symbol}] [{tf}] [{regime}] No validated winner - {val_reason}. "
                         f"NO TRADE for this regime (no fallback to best train)."
@@ -1643,6 +1820,12 @@ class RegimeOptimizer:
         )
 
         return regime_configs, best_overall_config, validated_winners, unvalidated_winners
+
+    def consume_training_gate_telemetry(self) -> Dict[str, Any]:
+        """Return and clear compact pre-tuning gate telemetry for the latest symbol run."""
+        telemetry = dict(self.training_gate_telemetry or {})
+        self.training_gate_telemetry = {}
+        return telemetry
 
     def _apply_training_eligibility_gates(self,
                                           candidates: List[Dict[str, Any]],
@@ -1670,6 +1853,8 @@ class RegimeOptimizer:
         """
         eligible = []
         rejected_reasons = []
+        rejected_by_reason: Dict[str, int] = {}
+        rescued_count = 0
 
         # Get configurable thresholds (defined in PipelineConfig dataclass)
         train_pf_floor = float(self.config.train_min_profit_factor)
@@ -1719,15 +1904,25 @@ class RegimeOptimizer:
                         rescued = True
                         break
                 if rescued:
+                    rescued_count += 1
                     eligible.append(cand)
                 else:
                     rejected_reasons.append(f"{cand['strategy_name']}: {reason}")
+                    rejected_by_reason[str(reason or "unknown")] = rejected_by_reason.get(str(reason or "unknown"), 0) + 1
 
         if rejected_reasons:
             logger.info(
                 f"[{symbol}] [{timeframe}] Training eligibility rejected {len(rejected_reasons)}/{len(candidates)}: "
                 f"{rejected_reasons[:3]}{'...' if len(rejected_reasons) > 3 else ''}"
             )
+
+        self.training_gate_telemetry[f"{symbol}:{timeframe}"] = {
+            "candidates": len(candidates),
+            "eligible": len(eligible),
+            "rejected": len(rejected_reasons),
+            "rescued": rescued_count,
+            "rejected_by_reason": rejected_by_reason,
+        }
 
         return eligible
 
@@ -1764,7 +1959,7 @@ class RegimeOptimizer:
                 # Bucket trades by regime
                 train_trades = train_result.get('trades', [])
                 train_regime_metrics = self._bucket_trades_by_regime(
-                    train_trades, train_features
+                    train_trades, train_features, timeframe=timeframe
                 )
                 
                 # Run validation if available
@@ -1776,7 +1971,7 @@ class RegimeOptimizer:
                     )
                     val_trades = val_result.get('trades', [])
                     val_regime_metrics = self._bucket_trades_by_regime(
-                        val_trades, val_features
+                        val_trades, val_features, timeframe=timeframe
                     )
                 
                 screening_candidates.append({
@@ -2000,7 +2195,9 @@ class RegimeOptimizer:
                 
                 # Bucket by regime
                 train_trades = train_result.get('trades', [])
-                train_regime_metrics = self._bucket_trades_by_regime(train_trades, train_features)
+                train_regime_metrics = self._bucket_trades_by_regime(
+                    train_trades, train_features, timeframe=timeframe
+                )
                 
                 # Validation
                 val_regime_metrics = {}
@@ -2010,7 +2207,9 @@ class RegimeOptimizer:
                         val_features, val_signals, symbol, test_strategy, warmup_bars=val_warmup_bars
                     )
                     val_trades = val_result.get('trades', [])
-                    val_regime_metrics = self._bucket_trades_by_regime(val_trades, val_features)
+                    val_regime_metrics = self._bucket_trades_by_regime(
+                        val_trades, val_features, timeframe=timeframe
+                    )
                 
                 # Score per regime and track best
                 for regime in self.REGIMES:
@@ -2060,22 +2259,29 @@ class RegimeOptimizer:
     
     def _bucket_trades_by_regime(self,
                                   trades: List[Dict],
-                                  features: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+                                  features: pd.DataFrame,
+                                  timeframe: str = "") -> Dict[str, Dict[str, Any]]:
         """
-        Bucket trades by REGIME_LIVE at entry bar.
+        Bucket trades by REGIME_LIVE at the signal bar.
         
-        Uses REGIME_LIVE which is the shifted regime (what the system knows at decision time).
+        Uses REGIME_LIVE which is the shifted regime (what the system knows at
+        decision time). The signal bar is the correct attribution point because
+        live PM chooses the regime winner before the next-bar execution fill.
         
         Returns dict mapping regime -> metrics for trades in that regime.
         """
         regime_buckets = {regime: [] for regime in self.REGIMES}
         
         for trade in trades:
-            entry_bar = trade.get('entry_bar', trade.get('signal_bar', 0))
+            signal_bar = trade.get('signal_bar', trade.get('entry_bar', 0))
+            try:
+                signal_bar = int(signal_bar)
+            except (TypeError, ValueError):
+                continue
             
-            # Get regime at entry using REGIME_LIVE (shifted version for decision-time parity)
-            if entry_bar < len(features) and 'REGIME_LIVE' in features.columns:
-                regime = features['REGIME_LIVE'].iloc[entry_bar]
+            # Get regime at signal time using REGIME_LIVE (decision-time parity).
+            if 0 <= signal_bar < len(features) and 'REGIME_LIVE' in features.columns:
+                regime = features['REGIME_LIVE'].iloc[signal_bar]
                 
                 if pd.notna(regime) and regime in regime_buckets:
                     regime_buckets[regime].append(trade)
@@ -2084,13 +2290,21 @@ class RegimeOptimizer:
         regime_metrics = {}
         for regime, bucket_trades in regime_buckets.items():
             if bucket_trades:
-                regime_metrics[regime] = self._compute_bucket_metrics(bucket_trades)
+                regime_metrics[regime] = self._compute_bucket_metrics(
+                    bucket_trades,
+                    features=features,
+                    timeframe=timeframe,
+                )
             else:
                 regime_metrics[regime] = {'total_trades': 0}
         
         return regime_metrics
     
-    def _compute_bucket_metrics(self, trades: List[Dict], initial_capital: float = None) -> Dict[str, Any]:
+    def _compute_bucket_metrics(self,
+                                trades: List[Dict],
+                                initial_capital: float = None,
+                                features: Optional[pd.DataFrame] = None,
+                                timeframe: str = "") -> Dict[str, Any]:
         """
         Compute metrics for a bucket of trades including proper drawdown.
         
@@ -2126,6 +2340,8 @@ class RegimeOptimizer:
             equity,
             equity_curve,
             max_drawdown_pct,
+            features=features,
+            timeframe=timeframe,
         )
         return {
             'total_trades': metrics.get('total_trades', 0),
@@ -2196,6 +2412,8 @@ class RegimeOptimizer:
         """
         scored_candidates = []  # List of (score, candidate) tuples
         rejection_reasons = []  # Track why candidates were rejected at gate level
+        best_score = -float('inf')
+        best_candidate = None
 
         for cand in candidates:
             train_metrics = cand['train_regime_metrics'].get(regime, {})
@@ -2232,8 +2450,7 @@ class RegimeOptimizer:
                 )
                 continue
 
-            # ===== FIX #1: EARLY REJECTION - Profitability gates =====
-            # Reject candidates that are clearly losing BEFORE scoring
+            # Reject clearly losing validation candidates before scoring.
             val_pf = val_metrics.get('profit_factor', 0.0)
             val_return = val_metrics.get('total_return_pct', -100.0)
 
@@ -2263,12 +2480,13 @@ class RegimeOptimizer:
                 adjusted_val_metrics['sharpe_approx'] = val_sharpe * dsr
                 adjusted_val_metrics['sharpe_ratio'] = adjusted_val_metrics['sharpe_approx']
             score = self._compute_regime_score(train_metrics, adjusted_val_metrics)
+            scored_candidates.append((score, cand))
 
             if score > best_score:
                 best_score = score
                 best_candidate = cand
 
-        if best_candidate is None:
+        if not scored_candidates or best_candidate is None:
             reason = "No candidates met minimum trade/drawdown/profitability thresholds"
             if rejection_reasons:
                 reason += f" (rejected: {len(rejection_reasons)} candidates by gate checks)"
@@ -2321,7 +2539,13 @@ class RegimeOptimizer:
                     regime_train_trades=train_metrics.get('total_trades', 0),
                     regime_val_trades=val_metrics.get('total_trades', 0),
                     trained_at=now,
-                    valid_until=now + timedelta(days=60),
+                    valid_until=_scheduled_valid_until(self.config, now),
+                    validation_evidence=self._build_validation_evidence(
+                        train_metrics,
+                        val_metrics,
+                        score=score,
+                        validation_reason=validation_reason,
+                    ),
                 )
 
                 return config, True, validation_reason
@@ -2356,6 +2580,12 @@ class RegimeOptimizer:
             regime_val_trades=val_metrics.get('total_trades', 0),
             trained_at=now,
             valid_until=_scheduled_valid_until(self.config, now),
+            validation_evidence=self._build_validation_evidence(
+                train_metrics,
+                val_metrics,
+                score=best_score,
+                validation_reason=validation_reason,
+            ),
         )
 
         descent_summary = "; ".join(validation_failures)
@@ -2416,7 +2646,7 @@ class RegimeOptimizer:
         if val_trades < self.min_val_trades:
             return False, f"Insufficient val trades: {val_trades} < {self.min_val_trades}"
 
-        # ===== FIX #1: Check validation drawdown =====
+        # Enforce drawdown limits before winner validation.
         if val_drawdown > self.val_max_drawdown:
             return False, f"Excessive val drawdown: {val_drawdown:.1f}% > {self.val_max_drawdown}%"
 
@@ -2432,34 +2662,45 @@ class RegimeOptimizer:
         weak_train = train_pf < 1.0 or train_return < 0
 
         if weak_train:
-            # Require EXCEPTIONAL validation to allow weak train
+            # Require EXCEPTIONAL validation to allow weak train (findings.html §5).
+            # In addition to the original PF/return/trades gates we now demand:
+            #   * val_sharpe ≥ 0.5  — risk-adjusted return must be real, not noise
+            #   * val_trades ≥ max(2·min_val_trades, 50)  — sample size large enough
+            #   * val_win_rate > 50% — edge must come from hit-rate, not lucky tail
             exceptional_val_pf = float(self.config.exceptional_val_profit_factor)
             exceptional_val_return = float(self.config.exceptional_val_return_pct)
-            exceptional_val_min_trades = self.min_val_trades * 2
+            exceptional_val_min_trades = max(self.min_val_trades * 2, 50)
+            exceptional_val_min_sharpe = 0.5
+            exceptional_val_min_win_rate = 50.0
+            val_win_rate = float(val_metrics.get('win_rate', 0.0) or 0.0)
 
             if (val_pf >= exceptional_val_pf and
                 val_return >= exceptional_val_return and
-                val_trades >= exceptional_val_min_trades):
+                val_trades >= exceptional_val_min_trades and
+                val_sharpe >= exceptional_val_min_sharpe and
+                val_win_rate > exceptional_val_min_win_rate):
 
                 logger.info(
                     f"[{regime}] {candidate_name}: Allowing weak train "
                     f"(train PF {train_pf:.2f}, train return {train_return:.1f}%) "
                     f"due to exceptional validation "
                     f"(val PF {val_pf:.2f}, val return {val_return:.1f}%, "
-                    f"val trades {val_trades})"
+                    f"val trades {val_trades}, val sharpe {val_sharpe:.2f}, "
+                    f"val WR {val_win_rate:.1f}%)"
                 )
                 # Continue to other validation checks below
             else:
                 return False, (
                     f"Weak train rejected: train PF {train_pf:.2f}, "
-                    f"train return {train_return:.1f}% "
-                    f"(validation not exceptional: val PF {val_pf:.2f} < {exceptional_val_pf}, "
-                    f"val return {val_return:.1f}% < {exceptional_val_return}%, "
-                    f"or val trades {val_trades} < {exceptional_val_min_trades})"
+                    f"train return {train_return:.1f}% — validation not exceptional "
+                    f"(val PF {val_pf:.2f}/{exceptional_val_pf}, "
+                    f"val return {val_return:.1f}%/{exceptional_val_return}%, "
+                    f"val trades {val_trades}/{exceptional_val_min_trades}, "
+                    f"val sharpe {val_sharpe:.2f}/{exceptional_val_min_sharpe}, "
+                    f"val WR {val_win_rate:.1f}%/{exceptional_val_min_win_rate}%)"
                 )
 
-        # ===== FIX #1: PROFITABILITY GATES (Critical new checks) =====
-        # These prevent storing losing strategies as "regime winners"
+        # Final profitability gates for validated winners.
         if not self.allow_losing_winners:
             # Check profit factor >= threshold (default 1.0 = must be profitable)
             if val_pf < self.min_val_profit_factor:
@@ -2473,8 +2714,9 @@ class RegimeOptimizer:
         val_return_dd_ratio = self._compute_return_dd_ratio(val_return, val_drawdown)
         min_return_dd = self.min_val_return_dd_ratio
         if val_return_dd_ratio < min_return_dd:
+            prefix = "Weak train rejected: " if weak_train else ""
             return False, (
-                f"Poor return/DD efficiency: {val_return_dd_ratio:.2f} "
+                f"{prefix}Poor return/DD efficiency: {val_return_dd_ratio:.2f} "
                 f"(return {val_return:.1f}% / DD {val_drawdown:.1f}%) "
                 f"< {min_return_dd:.2f}"
             )
@@ -2496,6 +2738,39 @@ class RegimeOptimizer:
             return False, f"Low robustness {robustness:.2f} < {self.min_robustness_ratio} and Sharpe {val_sharpe:.2f} <= {self.val_min_sharpe_override}"
         
         return True, f"Validated (PF={val_pf:.2f}, ret={val_return:.1f}%, robustness={robustness:.2f}, dd={val_drawdown:.1f}%)"
+
+    def _build_validation_evidence(self,
+                                   train_metrics: Dict[str, Any],
+                                   val_metrics: Dict[str, Any],
+                                   *,
+                                   score: Optional[float] = None,
+                                   validation_reason: str = "") -> Dict[str, Any]:
+        """Build compact, persisted validation evidence for dashboards and review."""
+        train_full = self._bucket_to_full_metrics(train_metrics or {})
+        val_full = self._bucket_to_full_metrics(val_metrics or {})
+        if self.use_fx_scoring:
+            robustness = self.scorer.calculate_fx_score_robustness_ratio(
+                train_full, val_full, purpose="selection"
+            )
+        else:
+            train_pf = float(train_metrics.get("profit_factor", 0.0) or 0.0)
+            val_pf = float(val_metrics.get("profit_factor", 0.0) or 0.0)
+            robustness = val_pf / (train_pf + 0.1) if train_pf > 0 else 0.5
+        val_return = float(val_metrics.get("total_return_pct", 0.0) or 0.0)
+        val_dd = float(val_metrics.get("max_drawdown_pct", 0.0) or 0.0)
+        evidence = {
+            "robustness_ratio": round(float(robustness), 6),
+            "return_dd_ratio": round(self._compute_return_dd_ratio(val_return, val_dd), 6),
+            "train_trades": int(train_metrics.get("total_trades", 0) or 0),
+            "val_trades": int(val_metrics.get("total_trades", 0) or 0),
+            "val_profit_factor": float(val_metrics.get("profit_factor", 0.0) or 0.0),
+            "val_return_pct": val_return,
+            "val_max_drawdown_pct": val_dd,
+            "validation_reason": validation_reason,
+        }
+        if score is not None:
+            evidence["selection_score_raw"] = float(score)
+        return evidence
     
     def _compute_regime_score(self,
                                train_metrics: Dict[str, Any],
@@ -2604,6 +2879,7 @@ class RegimeOptimizer:
                              - bucket_metrics.get('avg_loss', 0) * (1 - bucket_metrics.get('win_rate', 0) / 100),
             'sortino_ratio': bucket_metrics.get('sortino_approx', 0),
             'calmar_ratio': bucket_metrics.get('calmar_ratio', 0),
+            'std_weekly_return': bucket_metrics.get('std_weekly_return', 0.0),
             'mean_r': bucket_metrics.get('mean_r', 0),
             'worst_5pct_r': bucket_metrics.get('worst_5pct_r', 0),
             'max_consecutive_losses': bucket_metrics.get('max_consecutive_losses', 0),
@@ -2647,6 +2923,7 @@ class OptimizationPipeline:
     
     def __init__(self, config: PipelineConfig):
         self.config = config
+        set_regime_tp_multipliers(getattr(config, "regime_tp_multipliers", None))
         self.data_loader = DataLoader(config.data_dir)
         self.splitter = DataSplitter(config)
         self.enhancement_seams: EnhancementSeams = create_default_enhancement_seams(config)
@@ -2675,6 +2952,103 @@ class OptimizationPipeline:
                     return tf, regime
         return None, None
 
+    @staticmethod
+    def _index_at(df: pd.DataFrame, idx: int) -> Optional[pd.Timestamp]:
+        """Return the timestamp at an integer boundary, or None for open-ended slices."""
+        if df is None or len(df) == 0:
+            return None
+        if idx <= 0:
+            return pd.Timestamp(df.index[0])
+        if idx >= len(df):
+            return None
+        return pd.Timestamp(df.index[int(idx)])
+
+    @staticmethod
+    def _slice_time_window(df: pd.DataFrame,
+                           start_ts: Optional[pd.Timestamp],
+                           end_ts: Optional[pd.Timestamp]) -> pd.DataFrame:
+        """Slice by half-open timestamp window [start_ts, end_ts)."""
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        mask = pd.Series(True, index=df.index)
+        if start_ts is not None:
+            mask &= df.index >= start_ts
+        if end_ts is not None:
+            mask &= df.index < end_ts
+        return df.loc[mask].copy()
+
+    def _build_m5_workflow_meta(self, base_m5: pd.DataFrame) -> Dict[str, Any]:
+        """Build per-symbol workflow metadata from the base M5 data window."""
+        indices = self.splitter.get_workflow_indices(len(base_m5))
+
+        def _meta(name: str) -> Dict[str, Any]:
+            start, end = indices[name]
+            frame = base_m5.iloc[start:end]
+            return {
+                "start_index": int(start),
+                "end_index": int(end),
+                "rows": int(max(0, end - start)),
+                "start_ts": frame.index[0].isoformat() if len(frame) else None,
+                "end_ts": frame.index[-1].isoformat() if len(frame) else None,
+            }
+
+        return {
+            "mode": str(getattr(self.config, "data_workflow_mode", "active_recent_m5")),
+            "base_timeframe": "M5",
+            "max_bars": int(getattr(self.config, "max_bars", 300000)),
+            "historical_stress_audit_bars": int(getattr(self.config, "historical_stress_audit_bars", 50000)),
+            "active_universe_bars": int(getattr(self.config, "active_universe_bars", 250000)),
+            "active_stage2_pct": float(getattr(self.config, "active_stage2_pct", 50.0)),
+            "windows": {
+                "workflow_window": _meta("workflow_window"),
+                "historical_stress_audit": _meta("historical_stress_audit"),
+                "active_universe": _meta("active_universe"),
+                "stage2_selection": _meta("stage2_selection"),
+                "stage2_selection_with_warmup": _meta("stage2_selection_with_warmup"),
+            },
+        }
+
+    def _load_symbol_timeframe_data(self, symbol: str) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+        """
+        Load the latest base-M5 workflow window and derive higher timeframes
+        from the same timestamp-bounded source.
+        """
+        base_m5 = self.data_loader.get_data(symbol, "M5")
+        if base_m5 is None or len(base_m5) < 200:
+            return {}, {}
+        base_m5 = base_m5.sort_index()
+        max_bars = int(getattr(self.config, "max_bars", 300000) or 300000)
+        if max_bars > 0 and len(base_m5) > max_bars:
+            base_m5 = base_m5.tail(max_bars).copy()
+
+        workflow_meta = self._build_m5_workflow_meta(base_m5)
+        source_meta = dict(getattr(self.data_loader, "_source_meta", {}).get(f"{symbol}_M5", {}) or {})
+        workflow_window = (workflow_meta.get("windows", {}) or {}).get("workflow_window", {})
+        workflow_meta["source"] = {
+            "path": source_meta.get("path"),
+            "mtime": source_meta.get("mtime"),
+            "rows": source_meta.get("rows"),
+            "last_index": source_meta.get("last_index"),
+        }
+        workflow_meta["data_window_fingerprint"] = _stable_hash({
+            "symbol": symbol,
+            "source": workflow_meta["source"],
+            "workflow_window": workflow_window,
+        })
+        data_by_tf: Dict[str, pd.DataFrame] = {}
+        for tf in self.config.timeframes:
+            tf_name = str(tf).upper()
+            try:
+                if tf_name == "M5":
+                    data = base_m5.copy()
+                else:
+                    data = self.data_loader.resample(base_m5, tf_name)
+                if data is not None and len(data) >= 200:
+                    data_by_tf[tf_name] = data.copy()
+            except Exception as exc:
+                logger.warning(f"[{symbol}] [{tf_name}] Data preparation failed: {exc}")
+        return data_by_tf, workflow_meta
+
     def _attach_holdout_metrics(self,
                                 symbol: str,
                                 regime_configs: Dict[str, Dict[str, RegimeConfig]],
@@ -2689,6 +3063,8 @@ class OptimizationPipeline:
             if 'REGIME_LIVE' not in holdout_features.columns:
                 continue
             for regime, cfg in regimes.items():
+                if cfg.is_no_trade_marker():
+                    continue
                 try:
                     strategy = StrategyRegistry.get(cfg.strategy_name, **cfg.parameters)
                     signals = strategy.generate_signals(holdout_features, symbol)
@@ -2701,11 +3077,357 @@ class OptimizationPipeline:
                     )
                     holdout_bucket = self.regime_optimizer._bucket_trades_by_regime(
                         holdout_result.get('trades', []),
-                        holdout_features
+                        holdout_features,
+                        timeframe=tf,
                     )
                     cfg.holdout_metrics = holdout_bucket.get(regime, {'total_trades': 0})
                 except Exception as exc:
                     logger.warning(f"[{symbol}] [{tf}] [{regime}] Holdout evaluation failed: {exc}")
+
+    def _attach_historical_stress_audit(self,
+                                        symbol: str,
+                                        regime_configs: Dict[str, Dict[str, RegimeConfig]],
+                                        historical_features_by_tf: Dict[str, pd.DataFrame]) -> None:
+        """Evaluate selected winners on the older historical audit window."""
+        min_trades = int(getattr(self.config, "historical_audit_min_trades", 5) or 0)
+        max_dd = float(getattr(self.config, "historical_audit_max_drawdown", 35.0) or 35.0)
+        min_pf = float(getattr(self.config, "historical_audit_min_profit_factor", 0.60) or 0.0)
+        for tf, regimes in regime_configs.items():
+            audit_features = historical_features_by_tf.get(tf)
+            if audit_features is None or len(audit_features) < 50:
+                continue
+            if 'REGIME_LIVE' not in audit_features.columns:
+                continue
+            for regime, cfg in regimes.items():
+                if cfg.is_no_trade_marker():
+                    continue
+                payload = _default_historical_audit()
+                payload["enabled"] = True
+                payload["audited_at"] = datetime.now().isoformat()
+                try:
+                    strategy = StrategyRegistry.get(cfg.strategy_name, **cfg.parameters)
+                    signals = strategy.generate_signals(audit_features, symbol)
+                    audit_result = self.regime_optimizer.backtester.run(
+                        audit_features,
+                        signals,
+                        symbol,
+                        strategy,
+                        timeframe=tf,
+                    )
+                    bucket = self.regime_optimizer._bucket_trades_by_regime(
+                        audit_result.get("trades", []),
+                        audit_features,
+                        timeframe=tf,
+                    )
+                    metrics = bucket.get(regime, {"total_trades": 0})
+                    total_trades = int(metrics.get("total_trades", 0) or 0)
+                    pf = float(metrics.get("profit_factor", 0.0) or 0.0)
+                    dd = float(metrics.get("max_drawdown_pct", 0.0) or 0.0)
+                    reasons: List[str] = []
+                    if total_trades < min_trades:
+                        reasons.append(f"trades {total_trades} < {min_trades}")
+                    if dd > max_dd:
+                        reasons.append(f"drawdown {dd:.1f}% > {max_dd:.1f}%")
+                    if total_trades > 0 and pf < min_pf:
+                        reasons.append(f"profit_factor {pf:.2f} < {min_pf:.2f}")
+                    payload.update(
+                        {
+                            "total_trades": total_trades,
+                            "severe_failure": bool(reasons),
+                            "failure_reasons": reasons,
+                            "metrics": {
+                                k: v for k, v in metrics.items()
+                                if k not in {"equity_curve", "trades"}
+                            },
+                        }
+                    )
+                except Exception as exc:
+                    payload.update(
+                        {
+                            "severe_failure": True,
+                            "failure_reasons": [f"audit_failed:{exc}"],
+                        }
+                    )
+                    logger.warning(f"[{symbol}] [{tf}] [{regime}] Historical audit failed: {exc}")
+                cfg.historical_audit_metrics = payload
+
+    def _build_walk_forward_audit(self,
+                                  symbol: str,
+                                  timeframe: str,
+                                  regime: str,
+                                  cfg: RegimeConfig,
+                                  validation_features: Optional[pd.DataFrame],
+                                  validation_warmup: int) -> Dict[str, Any]:
+        audit = _default_walk_forward_audit()
+        audit["enabled"] = bool(getattr(self.config, "walk_forward_audit_enabled", False))
+        if not audit["enabled"]:
+            return audit
+        if validation_features is None or len(validation_features) <= max(1, validation_warmup):
+            audit["summary"] = {"reason": "insufficient_validation_window"}
+            return audit
+        try:
+            window_count = max(1, int(getattr(self.config, "walk_forward_audit_windows", 3)))
+        except Exception:
+            window_count = 3
+        scored_start = max(0, int(validation_warmup))
+        scored_len = len(validation_features) - scored_start
+        if scored_len <= 1:
+            audit["summary"] = {"reason": "no_scored_window"}
+            return audit
+        try:
+            strategy = StrategyRegistry.get(cfg.strategy_name, **cfg.parameters)
+        except Exception as exc:
+            audit["summary"] = {"reason": f"strategy_load_failed:{exc}"}
+            return audit
+        cut_points = np.linspace(scored_start, len(validation_features), num=window_count + 1, dtype=int)
+        windows: List[Dict[str, Any]] = []
+        for idx in range(window_count):
+            scored_window_start = int(cut_points[idx])
+            scored_window_end = int(cut_points[idx + 1])
+            if scored_window_end - scored_window_start <= 1:
+                continue
+            window_start = max(0, scored_window_start - scored_start)
+            window_features = validation_features.iloc[window_start:scored_window_end].copy()
+            window_warmup = max(0, scored_window_start - window_start)
+            if len(window_features) <= window_warmup:
+                continue
+            try:
+                signals = strategy.generate_signals(window_features, symbol)
+                result = self.regime_optimizer.backtester.run(
+                    window_features,
+                    signals,
+                    symbol,
+                    strategy,
+                    timeframe=timeframe,
+                    warmup_bars=window_warmup,
+                )
+                bucket = self.regime_optimizer._bucket_trades_by_regime(
+                    result.get("trades", []),
+                    window_features,
+                    timeframe=timeframe,
+                )
+                metrics = bucket.get(regime, {"total_trades": 0})
+            except Exception as exc:
+                metrics = {"total_trades": 0, "error": str(exc)}
+            windows.append(
+                {
+                    "window_index": idx,
+                    "scored_start_bar": scored_window_start,
+                    "scored_end_bar": scored_window_end,
+                    "total_trades": int(metrics.get("total_trades", 0) or 0),
+                    "profit_factor": float(metrics.get("profit_factor", 0.0) or 0.0),
+                    "total_return_pct": float(metrics.get("total_return_pct", 0.0) or 0.0),
+                    "max_drawdown_pct": float(metrics.get("max_drawdown_pct", 0.0) or 0.0),
+                    "score": float(self.regime_optimizer.scorer.score(metrics, purpose="selection"))
+                    if metrics.get("total_trades", 0) else 0.0,
+                }
+            )
+        audited_windows = [window for window in windows if window.get("total_trades", 0) > 0]
+        if audited_windows:
+            pf_values = [float(window["profit_factor"]) for window in audited_windows]
+            return_values = [float(window["total_return_pct"]) for window in audited_windows]
+            score_values = [float(window["score"]) for window in audited_windows]
+            audit["summary"] = {
+                "audited_windows": len(audited_windows),
+                "avg_profit_factor": round(float(np.mean(pf_values)), 4),
+                "avg_total_return_pct": round(float(np.mean(return_values)), 4),
+                "min_score": round(float(np.min(score_values)), 4),
+                "max_score": round(float(np.max(score_values)), 4),
+                "positive_windows": int(sum(1 for value in return_values if value > 0)),
+            }
+        else:
+            audit["summary"] = {"reason": "no_regime_trades"}
+        audit["window_count"] = len(windows)
+        audit["windows"] = windows
+        audit["audited_at"] = datetime.now().isoformat()
+        return audit
+
+    def _attach_walk_forward_audit(self,
+                                   symbol: str,
+                                   regime_configs: Dict[str, Dict[str, RegimeConfig]],
+                                   validation_features_by_tf: Dict[str, pd.DataFrame],
+                                   validation_warmup_by_tf: Dict[str, int]) -> None:
+        if not bool(getattr(self.config, "walk_forward_audit_enabled", False)):
+            return
+        for timeframe, regimes in regime_configs.items():
+            validation_features = validation_features_by_tf.get(timeframe)
+            validation_warmup = int(validation_warmup_by_tf.get(timeframe, 0) or 0)
+            for regime, cfg in regimes.items():
+                if cfg.is_no_trade_marker():
+                    continue
+                cfg.walk_forward_audit = self._build_walk_forward_audit(
+                    symbol,
+                    timeframe,
+                    regime,
+                    cfg,
+                    validation_features,
+                    validation_warmup,
+                )
+
+    def _select_governance_policy(self,
+                                  symbol: str,
+                                  timeframe: str,
+                                  regime: str,
+                                  cfg: RegimeConfig,
+                                  evaluation_features: Optional[pd.DataFrame],
+                                  evaluation_warmup: int,
+                                  *,
+                                  selection_surface: str = "stage3_selection") -> Dict[str, Any]:
+        risk_opt_enabled = bool(getattr(self.config, "risk_management_optimization_enabled", True))
+        tournament_enabled = bool(getattr(self.config, "local_governance_tournament_enabled", False))
+        if cfg.is_no_trade_marker():
+            payload = _default_governance_policy()
+            payload["selection_basis"] = "no_trade_marker"
+            return payload
+        if not risk_opt_enabled and not tournament_enabled:
+            payload = _default_governance_policy()
+            payload["selection_basis"] = "disabled"
+            return payload
+        if evaluation_features is None or len(evaluation_features) <= max(1, evaluation_warmup):
+            payload = _default_governance_policy()
+            payload["selection_basis"] = f"{selection_surface}_unavailable"
+            return payload
+        try:
+            strategy = StrategyRegistry.get(cfg.strategy_name, **cfg.parameters)
+            signals = strategy.generate_signals(evaluation_features, symbol)
+        except Exception as exc:
+            payload = _default_governance_policy()
+            payload["selection_basis"] = f"strategy_load_failed:{exc}"
+            return payload
+
+        candidate_results: Dict[str, Dict[str, Any]] = {}
+        best_name = "control_fixed"
+        best_metrics: Dict[str, Any] = {"total_trades": 0}
+        best_rank: Tuple[float, float, float] = (-float("inf"), -float("inf"), -float("inf"))
+        baseline_metrics: Optional[Dict[str, Any]] = None
+        baseline_rank: Tuple[float, float, float] = (-float("inf"), -float("inf"), -float("inf"))
+        for name in candidate_policy_names(getattr(self.config, "local_governance_candidate_policies", None)):
+            try:
+                policy = make_policy(name)
+                result = self.regime_optimizer.backtester.run(
+                    evaluation_features,
+                    signals,
+                    symbol,
+                    strategy,
+                    timeframe=timeframe,
+                    warmup_bars=evaluation_warmup,
+                    governance_policy=policy,
+                )
+                bucket = self.regime_optimizer._bucket_trades_by_regime(
+                    result.get("trades", []),
+                    evaluation_features,
+                    timeframe=timeframe,
+                )
+                metrics = bucket.get(regime, {"total_trades": 0})
+            except Exception as exc:
+                metrics = {"total_trades": 0, "error": str(exc)}
+            if name == "control_fixed":
+                baseline_metrics = dict(metrics)
+            score = (
+                float(self.regime_optimizer.scorer.score(metrics, purpose="selection"))
+                if int(metrics.get("total_trades", 0) or 0) > 0 else -float("inf")
+            )
+            rank = (
+                score,
+                float(metrics.get("total_return_pct", 0.0) or 0.0),
+                -float(metrics.get("max_drawdown_pct", 0.0) or 0.0),
+            )
+            candidate_results[name] = {
+                "score": None if not math.isfinite(score) else round(score, 6),
+                "total_trades": int(metrics.get("total_trades", 0) or 0),
+                "profit_factor": float(metrics.get("profit_factor", 0.0) or 0.0),
+                "total_return_pct": float(metrics.get("total_return_pct", 0.0) or 0.0),
+                "max_drawdown_pct": float(metrics.get("max_drawdown_pct", 0.0) or 0.0),
+                "win_rate": float(metrics.get("win_rate", 0.0) or 0.0),
+            }
+            if name == "control_fixed":
+                baseline_rank = rank
+            if rank > best_rank:
+                best_name = name
+                best_metrics = metrics
+                best_rank = rank
+        baseline_metrics = baseline_metrics or {"total_trades": 0}
+        stage = str(getattr(self.config, "risk_management_selection_stage", "stage3"))
+        selection_basis = f"{selection_surface}_risk_management_tournament"
+        if (
+            best_name != "control_fixed"
+            and bool(getattr(self.config, "local_governance_require_baseline_improvement", True))
+        ):
+            min_improvement = float(getattr(self.config, "local_governance_min_score_improvement", 0.0) or 0.0)
+            baseline_score = baseline_rank[0]
+            best_score = best_rank[0]
+            selected_return = float(best_metrics.get("total_return_pct", 0.0) or 0.0)
+            baseline_return = float(baseline_metrics.get("total_return_pct", 0.0) or 0.0)
+            selected_pf = float(best_metrics.get("profit_factor", 0.0) or 0.0)
+            baseline_pf = float(baseline_metrics.get("profit_factor", 0.0) or 0.0)
+            baseline_trades = int(baseline_metrics.get("total_trades", 0) or 0)
+            score_improved = (
+                math.isfinite(best_score)
+                and (
+                    not math.isfinite(baseline_score)
+                    or best_score >= baseline_score + min_improvement
+                )
+            )
+            profitability_preserved = (
+                baseline_trades <= 0
+                or (
+                    selected_return >= baseline_return
+                    and selected_pf >= baseline_pf
+                )
+            )
+            if not score_improved or not profitability_preserved:
+                best_name = "control_fixed"
+                best_metrics = baseline_metrics
+                selection_basis = "baseline_not_improved"
+            else:
+                selection_basis = f"{selection_surface}_baseline_improved"
+        payload = _default_governance_policy()
+        payload.update(
+            {
+                "selected_policy": best_name,
+                "selection_basis": selection_basis,
+                "optimization_stage": stage,
+                "selection_surface": selection_surface,
+                "selected_at": datetime.now().isoformat(),
+                "candidate_results": candidate_results,
+                "selected_metrics": {
+                    "total_trades": int(best_metrics.get("total_trades", 0) or 0),
+                    "profit_factor": float(best_metrics.get("profit_factor", 0.0) or 0.0),
+                    "total_return_pct": float(best_metrics.get("total_return_pct", 0.0) or 0.0),
+                    "max_drawdown_pct": float(best_metrics.get("max_drawdown_pct", 0.0) or 0.0),
+                    "win_rate": float(best_metrics.get("win_rate", 0.0) or 0.0),
+                },
+                "baseline_metrics": {
+                    "total_trades": int(baseline_metrics.get("total_trades", 0) or 0),
+                    "profit_factor": float(baseline_metrics.get("profit_factor", 0.0) or 0.0),
+                    "total_return_pct": float(baseline_metrics.get("total_return_pct", 0.0) or 0.0),
+                    "max_drawdown_pct": float(baseline_metrics.get("max_drawdown_pct", 0.0) or 0.0),
+                    "win_rate": float(baseline_metrics.get("win_rate", 0.0) or 0.0),
+                },
+            }
+        )
+        return payload
+
+    def _attach_governance_policies(self,
+                                    symbol: str,
+                                    regime_configs: Dict[str, Dict[str, RegimeConfig]],
+                                    evaluation_features_by_tf: Dict[str, pd.DataFrame],
+                                    evaluation_warmup_by_tf: Dict[str, int],
+                                    *,
+                                    selection_surface: str = "stage3_selection") -> None:
+        for timeframe, regimes in regime_configs.items():
+            evaluation_features = evaluation_features_by_tf.get(timeframe)
+            evaluation_warmup = int(evaluation_warmup_by_tf.get(timeframe, 0) or 0)
+            for regime, cfg in regimes.items():
+                cfg.governance_policy = self._select_governance_policy(
+                    symbol,
+                    timeframe,
+                    regime,
+                    cfg,
+                    evaluation_features,
+                    evaluation_warmup,
+                    selection_surface=selection_surface,
+                )
     
     def run_for_symbol(self, symbol: str) -> PipelineResult:
         """
@@ -2727,12 +3449,9 @@ class OptimizationPipeline:
         logger.info(f"{'='*60}")
         
         try:
-            # Load data for all timeframes
-            data_by_tf = {}
-            for tf in self.config.timeframes:
-                data = self.data_loader.get_data(symbol, tf)
-                if data is not None and len(data) >= 200:
-                    data_by_tf[tf] = data
+            # Load one base-M5 workflow window and derive all higher timeframes
+            # from it so every timeframe shares the same calendar boundary.
+            data_by_tf, data_window_meta = self._load_symbol_timeframe_data(symbol)
             
             if not data_by_tf:
                 result.error_message = "No valid data available"
@@ -2751,24 +3470,59 @@ class OptimizationPipeline:
             val_warmup_by_tf = {}
             holdout_features_by_tf = {}
             holdout_warmup_by_tf = {}
+            historical_features_by_tf = {}
+            stage3_features_by_tf = {}
+            stage3_warmup_by_tf = {}
             
             regime_params_file = getattr(self.config, 'regime_params_file', 'regime_params.json')
+            active_mode = self.splitter.workflow_enabled()
             
             for tf, data in data_by_tf.items():
-                split_idx = self.splitter.get_split_indices(len(data))
-                train_start, train_end = split_idx['train']
-                val_start, val_end = split_idx['validation_with_warmup']
-                holdout_start, holdout_end = split_idx['holdout_with_warmup']
-
                 full_features = FeatureComputer.compute_all(
                     data, symbol=symbol, timeframe=tf,
                     regime_params_file=regime_params_file
                 )
-                train_features_by_tf[tf] = full_features.iloc[train_start:train_end].copy()
-                val_features_by_tf[tf] = full_features.iloc[val_start:val_end].copy()
-                val_warmup_by_tf[tf] = max(0, split_idx['validation'][0] - val_start)
-                holdout_features_by_tf[tf] = full_features.iloc[holdout_start:holdout_end].copy()
-                holdout_warmup_by_tf[tf] = max(0, split_idx['holdout'][0] - holdout_start)
+                if active_mode and data_window_meta:
+                    windows = data_window_meta.get("windows", {})
+                    hist_meta = windows.get("historical_stress_audit", {})
+                    active_meta = windows.get("active_universe", {})
+                    stage2_meta = windows.get("stage2_selection", {})
+                    stage2_warm_meta = windows.get("stage2_selection_with_warmup", {})
+
+                    hist_start = pd.Timestamp(hist_meta["start_ts"]) if hist_meta.get("start_ts") else None
+                    hist_end = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
+                    active_start = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
+                    stage2_start = pd.Timestamp(stage2_meta["start_ts"]) if stage2_meta.get("start_ts") else active_start
+                    stage2_warm_start = (
+                        pd.Timestamp(stage2_warm_meta["start_ts"])
+                        if stage2_warm_meta.get("start_ts") else stage2_start
+                    )
+
+                    active_features = self._slice_time_window(full_features, active_start, None)
+                    stage2_features = self._slice_time_window(full_features, stage2_warm_start, None)
+                    historical_features = self._slice_time_window(full_features, hist_start, hist_end)
+                    if len(active_features) >= 200:
+                        train_features_by_tf[tf] = active_features
+                    if len(stage2_features) >= 50:
+                        val_features_by_tf[tf] = stage2_features
+                        stage3_features_by_tf[tf] = stage2_features.copy()
+                        val_warmup_by_tf[tf] = int((stage2_features.index < stage2_start).sum()) if stage2_start is not None else 0
+                        stage3_warmup_by_tf[tf] = val_warmup_by_tf[tf]
+                    if len(historical_features) >= 50:
+                        historical_features_by_tf[tf] = historical_features
+                else:
+                    split_idx = self.splitter.get_split_indices(len(data))
+                    train_start, train_end = split_idx['train']
+                    val_start, val_end = split_idx['validation_with_warmup']
+                    holdout_start, holdout_end = split_idx['holdout_with_warmup']
+
+                    train_features_by_tf[tf] = full_features.iloc[train_start:train_end].copy()
+                    val_features_by_tf[tf] = full_features.iloc[val_start:val_end].copy()
+                    val_warmup_by_tf[tf] = max(0, split_idx['validation'][0] - val_start)
+                    holdout_features_by_tf[tf] = full_features.iloc[holdout_start:holdout_end].copy()
+                    holdout_warmup_by_tf[tf] = max(0, split_idx['holdout'][0] - holdout_start)
+                    stage3_features_by_tf[tf] = holdout_features_by_tf[tf].copy()
+                    stage3_warmup_by_tf[tf] = holdout_warmup_by_tf[tf]
             
             # Run regime-aware optimization
             with Timer(f"[{symbol}] Regime Optimization"):
@@ -2777,8 +3531,13 @@ class OptimizationPipeline:
                     val_warmup_by_tf=val_warmup_by_tf,
                 )
             
-            # Count total validated winners
-            total_winners = sum(len(regimes) for regimes in regime_configs.values())
+            # Count only tradeable validated winners; explicit NO_TRADE markers are slots, not winners.
+            total_winners = sum(
+                1
+                for regimes in regime_configs.values()
+                for cfg in regimes.values()
+                if cfg is not None and not cfg.is_no_trade_marker()
+            )
             result.regime_winners = total_winners
             
             if total_winners == 0 and default_config is None:
@@ -2788,17 +3547,53 @@ class OptimizationPipeline:
                     result.error_message = "No valid regime winners found"
                 return result
             
-            self._attach_holdout_metrics(symbol, regime_configs, holdout_features_by_tf, holdout_warmup_by_tf)
+            if holdout_features_by_tf:
+                self._attach_holdout_metrics(symbol, regime_configs, holdout_features_by_tf, holdout_warmup_by_tf)
+            self._attach_historical_stress_audit(symbol, regime_configs, historical_features_by_tf)
+            self._attach_walk_forward_audit(symbol, regime_configs, val_features_by_tf, val_warmup_by_tf)
+            risk_selection_stage = str(
+                getattr(self.config, "risk_management_selection_stage", "stage3") or "stage3"
+            ).lower()
+            if risk_selection_stage == "stage2":
+                governance_features_by_tf = train_features_by_tf
+                governance_warmup_by_tf = {tf: 0 for tf in train_features_by_tf}
+                governance_surface = "stage2_active_universe"
+            else:
+                governance_features_by_tf = stage3_features_by_tf
+                governance_warmup_by_tf = stage3_warmup_by_tf
+                governance_surface = "stage3_selection" if active_mode else "freshest_tail_holdout"
+            self._attach_governance_policies(
+                symbol,
+                regime_configs,
+                governance_features_by_tf,
+                governance_warmup_by_tf,
+                selection_surface=governance_surface,
+            )
             best_overall_tf, best_overall_regime = self._locate_default_origin(default_config, regime_configs)
             if best_overall_tf and best_overall_regime and default_config is not None:
                 matched_cfg = regime_configs[best_overall_tf][best_overall_regime]
                 default_config.holdout_metrics = matched_cfg.holdout_metrics
+                default_config.historical_audit_metrics = dict(matched_cfg.historical_audit_metrics)
+                default_config.live_observability = dict(matched_cfg.live_observability)
+                default_config.walk_forward_audit = dict(matched_cfg.walk_forward_audit)
+                default_config.governance_policy = dict(matched_cfg.governance_policy)
 
             for regimes in regime_configs.values():
                 for cfg in regimes.values():
-                    cfg.artifact_meta = artifact_meta
+                    cfg.artifact_meta = {**artifact_meta, **dict(cfg.artifact_meta or {})}
             if default_config is not None:
-                default_config.artifact_meta = artifact_meta
+                default_config.artifact_meta = {**artifact_meta, **dict(default_config.artifact_meta or {})}
+
+            default_validation_evidence = (
+                dict(getattr(default_config, "validation_evidence", {}) or {})
+                if default_config is not None else {}
+            )
+            optimizer_telemetry = {
+                "training_gates": self.regime_optimizer.consume_training_gate_telemetry(),
+                "resample_cache": self.data_loader.get_resample_cache_stats(reset=False),
+            }
+            default_validation_evidence["optimizer_telemetry"] = optimizer_telemetry
+            selected_robustness = float(default_validation_evidence.get("robustness_ratio", 0.0) or 0.0)
 
             retrain_days = int(getattr(self.config, 'fixed_retrain_days', getattr(self.config, 'optimization_valid_days', 14)))
             now = datetime.now()
@@ -2815,12 +3610,17 @@ class OptimizationPipeline:
                 train_metrics=default_config.train_metrics if default_config else {},
                 val_metrics=default_config.val_metrics if default_config else {},
                 holdout_metrics=default_config.holdout_metrics if default_config else {},
+                historical_audit_metrics=default_config.historical_audit_metrics if default_config else _default_historical_audit(),
+                data_window_meta=data_window_meta,
                 composite_score=default_config.quality_score * 100 if default_config else 0.0,
-                robustness_ratio=0.0,
+                robustness_ratio=selected_robustness,
                 is_validated=total_winners > 0,
                 validation_reason=f"{total_winners} validated winners ({unvalidated_count} rejected) across {len(regime_configs)} timeframes",
+                validation_evidence=default_validation_evidence,
                 regime_detection_version=artifact_meta.get('regime_params'),
                 artifact_meta=artifact_meta,
+                live_observability=dict(default_config.live_observability) if default_config else _default_live_observability(),
+                walk_forward_audit=dict(default_config.walk_forward_audit) if default_config else _default_walk_forward_audit(),
                 optimized_at=now,
                 valid_until=valid_until,
             )
@@ -2846,14 +3646,53 @@ class OptimizationPipeline:
                 if regimes:
                     regime_summary = ", ".join(f"{r}:{cfg.strategy_name[:12]}" for r, cfg in regimes.items())
                     logger.info(f"  [{tf}] {regime_summary}")
+
+            # findings.html §C6: regime coverage report — one line per (symbol, tf)
+            # showing the realized regime distribution across train+val features.
+            self._log_regime_coverage(symbol, train_features_by_tf, val_features_by_tf)
             
         except Exception as e:
             logger.exception(f"[{symbol}] Pipeline error: {e}")
             result.error_message = str(e)
             result.duration_seconds = time.time() - start_time
-        
+
         return result
-    
+
+    @staticmethod
+    def _log_regime_coverage(symbol: str,
+                             train_features_by_tf: Dict[str, "pd.DataFrame"],
+                             val_features_by_tf: Dict[str, "pd.DataFrame"]) -> None:
+        """findings.html §C6: per-(symbol, tf) regime distribution one-liner.
+
+        Combines train+val features (the population the optimizer actually saw)
+        and emits TREND % | RANGE % | BREAKOUT % | CHOP %. Silent if the regime
+        column is absent.
+        """
+        regime_order = ['TREND', 'RANGE', 'BREAKOUT', 'CHOP']
+        for tf in sorted(set(train_features_by_tf.keys()) | set(val_features_by_tf.keys())):
+            try:
+                frames = []
+                tr = train_features_by_tf.get(tf)
+                vl = val_features_by_tf.get(tf)
+                if tr is not None and 'REGIME' in tr.columns:
+                    frames.append(tr['REGIME'])
+                if vl is not None and 'REGIME' in vl.columns:
+                    frames.append(vl['REGIME'])
+                if not frames:
+                    continue
+                combined = pd.concat(frames).dropna()
+                total = int(combined.shape[0])
+                if total == 0:
+                    continue
+                counts = combined.value_counts()
+                parts = []
+                for r in regime_order:
+                    pct = float(counts.get(r, 0)) / total * 100.0
+                    parts.append(f"{r} {pct:.1f}%")
+                logger.info(f"  [{tf}] regime coverage: {' | '.join(parts)}")
+            except Exception as exc:
+                logger.debug(f"[{symbol}/{tf}] regime coverage report skipped: {exc}")
+
     def run_for_all(self, symbols: List[str]) -> Dict[str, PipelineResult]:
         """
         Run optimization for all symbols.
@@ -2984,6 +3823,29 @@ class PortfolioManager:
         except Exception as e:
             logger.warning(f"Could not load configs: {e}")
             self.symbol_configs = {}
+
+    def _build_ledger_status(self) -> Dict[str, Any]:
+        """Build operator-facing completion metadata for the active winner ledger."""
+        configured_symbols = [str(symbol) for symbol in (self.symbols or [])]
+        optimized_symbols = sorted(str(symbol) for symbol in self.symbol_configs.keys())
+        artifact_contract_counts: Dict[str, int] = {}
+        for cfg in self.symbol_configs.values():
+            artifact = getattr(cfg, "artifact_meta", {}) or {}
+            key = "|".join([
+                str(artifact.get("artifact_version", "missing")),
+                str(artifact.get("split_contract_version", "missing")),
+            ])
+            artifact_contract_counts[key] = artifact_contract_counts.get(key, 0) + 1
+        configured_set = {symbol.upper() for symbol in configured_symbols}
+        optimized_set = {symbol.upper() for symbol in optimized_symbols}
+        return {
+            "configured_symbol_count": len(configured_symbols),
+            "optimized_symbol_count": len(optimized_symbols),
+            "complete_universe": bool(configured_set) and configured_set.issubset(optimized_set),
+            "missing_symbols": sorted(configured_set - optimized_set),
+            "artifact_contract_counts": artifact_contract_counts,
+            "updated_at": datetime.now().isoformat(),
+        }
     
     def _save_symbol_config(self, symbol: str, config: SymbolConfig):
         """
@@ -2992,6 +3854,11 @@ class PortfolioManager:
         This is the incremental persistence method.
         """
         self.symbol_configs[symbol] = config
+        ledger_status = self._build_ledger_status()
+        config.artifact_meta = {
+            **dict(config.artifact_meta or {}),
+            "ledger_status": ledger_status,
+        }
         if not self.ledger.update_symbol(symbol, config):
             logger.warning(f"Failed to persist config for {symbol}")
     
@@ -3181,6 +4048,7 @@ class PortfolioManager:
         
         # Include skipped symbols in final counts
         total_validated = len(self.get_validated_configs())
+        total_live_eligible = len(self.get_live_eligible_configs())
         
         logger.info(f"\n{'#'*60}")
         logger.info(f"OPTIMIZATION COMPLETE")
@@ -3188,6 +4056,7 @@ class PortfolioManager:
         logger.info(f"Optimized: {successful}/{len(to_optimize)}")
         logger.info(f"Skipped: {len(to_skip)} (already valid)")
         logger.info(f"Total validated: {total_validated}/{len(self.symbols)}")
+        logger.info(f"Live eligible: {total_live_eligible}/{len(self.symbols)}")
         logger.info(f"{'#'*60}")
         
         return results
@@ -3197,6 +4066,94 @@ class PortfolioManager:
         # Refresh from ledger to ensure consistency
         self.symbol_configs = self.ledger.get_all_configs()
         return {s: c for s, c in self.symbol_configs.items() if c.is_validated}
+
+    def _live_eligibility_reason(self,
+                                 symbol: str,
+                                 config: SymbolConfig,
+                                 *,
+                                 now: datetime,
+                                 current_artifact_meta: Dict[str, Any],
+                                 artifact_policy: str,
+                                 expiry_grace_minutes: int) -> Tuple[bool, str]:
+        """Evaluate the live-trading eligibility contract for one config."""
+        if not config.is_validated:
+            return False, f"invalid ({config.validation_reason or 'not validated'})"
+        if config.valid_until is None:
+            return False, "no expiry date"
+        grace = max(0, int(expiry_grace_minutes or 0))
+        valid_deadline = config.valid_until + pd.Timedelta(minutes=grace).to_pytimedelta()
+        if now >= valid_deadline:
+            return False, f"expired at {config.valid_until.strftime('%Y-%m-%d %H:%M')}"
+        if config.has_regime_configs() and config.count_regime_winners() <= 0:
+            return False, "no tradeable regime winners"
+        if not config.has_regime_configs():
+            default_cfg = config.default_config
+            if default_cfg is not None and default_cfg.is_no_trade_marker():
+                return False, "default config is NO_TRADE"
+            if str(config.strategy_name or "").upper() == "NO_TRADE" or bool((config.artifact_meta or {}).get("no_trade")):
+                return False, "symbol config is NO_TRADE"
+            if not config.strategy_name and default_cfg is None:
+                return False, "no strategy"
+
+        if current_artifact_meta and artifact_policy == "block":
+            stored_artifact = getattr(config, "artifact_meta", {}) or {}
+            if not artifact_contract_matches(stored_artifact, current_artifact_meta):
+                return False, "artifact fingerprint changed"
+
+        return True, "live eligible"
+
+    def get_live_eligible_configs(self,
+                                  *,
+                                  current_artifact_meta: Optional[Dict[str, Any]] = None,
+                                  log_rejections: bool = False,
+                                  now: Optional[datetime] = None) -> Dict[str, SymbolConfig]:
+        """
+        Get configurations eligible for live trading.
+
+        This is intentionally stricter than `get_validated_configs()`: live
+        trading must honor expiry/no-winner state and the configured artifact
+        drift policy, while raw validation remains useful for optimization and
+        ledger reporting.
+        """
+        self.symbol_configs = self.ledger.get_all_configs()
+        artifact_meta = current_artifact_meta if current_artifact_meta is not None else build_artifact_meta(self.config)
+        artifact_policy = str(getattr(self.config, "live_artifact_drift_policy", "block") or "block").strip().lower()
+        if artifact_policy not in {"block", "warn", "ignore"}:
+            artifact_policy = "block"
+        expiry_grace = int(getattr(self.config, "live_config_expiry_grace_minutes", 0) or 0)
+        probe = now or datetime.now()
+
+        eligible: Dict[str, SymbolConfig] = {}
+        rejections: Dict[str, str] = {}
+        drift_warnings: Dict[str, str] = {}
+        for symbol, config in self.symbol_configs.items():
+            ok, reason = self._live_eligibility_reason(
+                symbol,
+                config,
+                now=probe,
+                current_artifact_meta=artifact_meta,
+                artifact_policy=artifact_policy,
+                expiry_grace_minutes=expiry_grace,
+            )
+            if ok:
+                if artifact_policy == "warn" and artifact_meta:
+                    stored_artifact = getattr(config, "artifact_meta", {}) or {}
+                    if not artifact_contract_matches(stored_artifact, artifact_meta):
+                        drift_warnings[symbol] = "artifact fingerprint changed"
+                eligible[symbol] = config
+            else:
+                rejections[symbol] = reason
+
+        self._last_live_eligibility_rejections = dict(rejections)
+        self._last_live_eligibility_warnings = dict(drift_warnings)
+
+        if log_rejections:
+            for symbol, reason in sorted(rejections.items()):
+                logger.warning(f"LIVE BLOCK {symbol}: {reason}")
+            for symbol, reason in sorted(drift_warnings.items()):
+                logger.warning(f"LIVE WARN {symbol}: {reason}; trading allowed by policy")
+
+        return eligible
     
     def get_active_strategy(self, symbol: str) -> Optional[BaseStrategy]:
         """
@@ -3217,6 +4174,107 @@ class PortfolioManager:
             return None
         
         return StrategyRegistry.get(config.strategy_name, **config.parameters)
+
+    def _resolve_regime_config(self,
+                               symbol: str,
+                               timeframe: Optional[str] = None,
+                               regime: Optional[str] = None) -> Optional[RegimeConfig]:
+        symbol_cfg = self.symbol_configs.get(symbol)
+        if symbol_cfg is None:
+            return None
+        tf = str(timeframe or "").upper()
+        rg = str(regime or "").upper()
+        if tf and rg and symbol_cfg.has_regime_configs():
+            return symbol_cfg.get_regime_config(tf, rg)
+        return symbol_cfg.default_config
+
+    def get_governance_policy(self,
+                              symbol: str,
+                              timeframe: Optional[str] = None,
+                              regime: Optional[str] = None) -> Dict[str, Any]:
+        cfg = self._resolve_regime_config(symbol, timeframe, regime)
+        if cfg is None:
+            return _default_governance_policy()
+        return dict(cfg.governance_policy or _default_governance_policy())
+
+    def live_eligibility_report(self,
+                                symbol: str,
+                                timeframe: Optional[str] = None,
+                                regime: Optional[str] = None,
+                                at_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        probe = at_dt or datetime.now()
+        report = {
+            "symbol": symbol,
+            "timeframe": str(timeframe or "").upper(),
+            "regime": str(regime or "").upper(),
+            "config_present": False,
+            "config_age_days": None,
+            "cycle_position": None,
+            "last_retrain_ts": None,
+            "next_retrain_due": None,
+            "freshness_band": "missing",
+        }
+        symbol_cfg = self.symbol_configs.get(symbol)
+        if symbol_cfg is None:
+            return report
+        tf = str(timeframe or "").upper()
+        rg = str(regime or "").upper()
+        if tf and rg and symbol_cfg.has_regime_configs():
+            cfg = symbol_cfg.get_regime_config(tf, rg)
+        else:
+            cfg = self._resolve_regime_config(symbol, timeframe, regime)
+        if cfg is None:
+            return report
+        last_retrain_ts = cfg.trained_at or symbol_cfg.optimized_at
+        next_retrain_due = symbol_cfg.valid_until or self.config.get_next_retrain_at(probe)
+        last_slot = self.config.get_last_retrain_slot(probe)
+        cycle_span_seconds = max((next_retrain_due - last_slot).total_seconds(), 1.0)
+        cycle_position = min(max((probe - last_slot).total_seconds() / cycle_span_seconds, 0.0), 1.0)
+        if cycle_position < (1.0 / 3.0):
+            freshness_band = "fresh"
+        elif cycle_position < (2.0 / 3.0):
+            freshness_band = "mid_cycle"
+        else:
+            freshness_band = "end_of_cycle"
+        report.update(
+            {
+                "config_present": True,
+                "config_age_days": None if last_retrain_ts is None else round(
+                    max((probe - last_retrain_ts).total_seconds(), 0.0) / 86400.0, 3
+                ),
+                "cycle_position": round(cycle_position, 4),
+                "last_retrain_ts": last_retrain_ts.isoformat() if last_retrain_ts else None,
+                "next_retrain_due": next_retrain_due.isoformat() if next_retrain_due else None,
+                "freshness_band": freshness_band,
+            }
+        )
+        return report
+
+    def update_live_observability(self,
+                                  symbol: str,
+                                  timeframe: Optional[str],
+                                  regime: Optional[str],
+                                  updates: Dict[str, Any],
+                                  *,
+                                  save: bool = False) -> Dict[str, Any]:
+        symbol_cfg = self.symbol_configs.get(symbol)
+        tf = str(timeframe or "").upper()
+        rg = str(regime or "").upper()
+        if symbol_cfg is not None and tf and rg and symbol_cfg.has_regime_configs():
+            cfg = symbol_cfg.get_regime_config(tf, rg)
+        else:
+            cfg = self._resolve_regime_config(symbol, timeframe, regime)
+        if symbol_cfg is None or cfg is None or not isinstance(updates, dict):
+            return {}
+        merged = _default_live_observability()
+        merged.update(dict(cfg.live_observability or {}))
+        merged.update(dict(updates))
+        cfg.live_observability = merged
+        if symbol_cfg.default_config is cfg:
+            symbol_cfg.live_observability = dict(merged)
+        if save:
+            self._save_symbol_config(symbol, symbol_cfg)
+        return dict(merged)
     
     def get_ledger_stats(self) -> Dict[str, Any]:
         """Get ledger statistics for monitoring."""
@@ -3226,6 +4284,8 @@ class PortfolioManager:
         """Print current portfolio status."""
         stats = self.ledger.get_stats()
         artifact_meta = build_artifact_meta(self.config)
+        live_eligible = self.get_live_eligible_configs(current_artifact_meta=artifact_meta)
+        live_rejections = getattr(self, "_last_live_eligibility_rejections", {}) or {}
         
         print("\n" + "=" * 70)
         print("PORTFOLIO MANAGER STATUS")
@@ -3234,9 +4294,11 @@ class PortfolioManager:
         print(f"Symbols managed: {len(self.symbols)}")
         print(f"Configured: {stats['total']}")
         print(f"Valid: {stats['valid']}")
+        print(f"Live eligible: {len(live_eligible)}")
         print(f"Expired: {stats['expired']}")
         print(f"Invalid: {stats['invalid']}")
         print(f"Need optimization: {len(self.get_symbols_needing_retrain())}")
+        print(f"Live artifact policy: {getattr(self.config, 'live_artifact_drift_policy', 'block')}")
         print()
         
         now = datetime.now()
@@ -3251,15 +4313,19 @@ class PortfolioManager:
                 # Determine status indicator
                 if not c.is_validated:
                     status = "NO"
-                elif should_optimize:
-                    status = "DU"
                 elif c.valid_until and now >= c.valid_until:
                     status = "EX"  # Expired
+                elif symbol not in live_eligible:
+                    status = "BL"
+                elif should_optimize:
+                    status = "DU"
                 else:
                     status = "OK"
                 
                 # Calculate days remaining/expired
-                if should_optimize and optimize_reason:
+                if symbol in live_rejections:
+                    expire_str = f"LIVE BLOCK: {live_rejections[symbol]}"
+                elif should_optimize and optimize_reason:
                     expire_str = f"DUE: {optimize_reason}"
                 elif c.valid_until:
                     days = (c.valid_until - now).days

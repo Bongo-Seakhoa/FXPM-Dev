@@ -16,19 +16,24 @@ import pandas as pd
 import numpy as np
 
 from .utils import (
+    build_entry_id,
     load_instrument_specs,
+    load_winner_ledger_path,
     normalize_symbol,
     normalize_timeframe,
     normalize_regime,
     load_pm_configs,
     parse_timestamp,
     pip_size_from_spec,
+    safe_read_text,
 )
+from .ledger import iter_matching_files, load_records_from_text
 
 logger = logging.getLogger(__name__)
 
 _TRADE_HISTORY_CACHE: Dict[Tuple[str, int, Tuple[Tuple[str, int, int], ...], Tuple[str, int, int]], List[Dict[str, Any]]] = {}
-_TRADE_HISTORY_CACHE_VERSION = "v2"
+_TRADE_HISTORY_CACHE_VERSION = "v4"
+_TRADE_HISTORY_PATTERNS = ("**/signal_ledger*.jsonl", "**/trades_*.json")
 
 _REALIZED_STATUSES = {
     "CLOSED",
@@ -192,22 +197,19 @@ def _path_signature(path: str) -> Tuple[str, int, int]:
 
 
 def _trade_file_signature(pm_root: str, max_files: int) -> Tuple[Tuple[str, int, int], ...]:
-    trades_dir = os.path.join(pm_root, "pm_outputs")
-    if not os.path.isdir(trades_dir):
+    trade_files = iter_matching_files(pm_root, _TRADE_HISTORY_PATTERNS)
+    if not trade_files:
         return tuple()
 
-    trade_files: List[Tuple[str, float]] = []
-    for filename in os.listdir(trades_dir):
-        if filename.startswith("trades_") and filename.endswith(".json"):
-            filepath = os.path.join(trades_dir, filename)
-            if os.path.isfile(filepath):
-                try:
-                    trade_files.append((filepath, os.path.getmtime(filepath)))
-                except OSError:
-                    continue
+    trade_files_with_mtime: List[Tuple[str, float]] = []
+    for filepath in trade_files:
+        try:
+            trade_files_with_mtime.append((filepath, os.path.getmtime(filepath)))
+        except OSError:
+            continue
 
-    trade_files.sort(key=lambda item: item[1], reverse=True)
-    selected = [path for path, _ in trade_files[:max_files]]
+    trade_files_with_mtime.sort(key=lambda item: item[1], reverse=True)
+    selected = [path for path, _ in trade_files_with_mtime[:max_files]]
 
     signature: List[Tuple[str, int, int]] = []
     for path in selected:
@@ -218,8 +220,11 @@ def _trade_file_signature(pm_root: str, max_files: int) -> Tuple[Tuple[str, int,
     return tuple(signature)
 
 
-def _pm_config_signature(pm_root: str) -> Tuple[str, int, int]:
-    path = os.path.join(pm_root, "pm_configs.json")
+def _pm_config_signature(pm_root: str, pm_configs_path: Optional[str] = None) -> Tuple[str, int, int]:
+    path = pm_configs_path or "pm_configs.json"
+    if not os.path.isabs(path):
+        path = os.path.join(pm_root, path)
+    path = os.path.abspath(path)
     if not os.path.isfile(path):
         return (path, 0, 0)
     try:
@@ -281,6 +286,21 @@ def _trade_pnl_value(trade: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _trade_identity_key(trade: Dict[str, Any]) -> Tuple[Any, ...]:
+    entry_id = str(trade.get("entry_id") or "").strip()
+    if entry_id:
+        return ("entry_id", entry_id)
+    return (
+        normalize_symbol(trade.get("symbol")),
+        normalize_timeframe(trade.get("timeframe")),
+        normalize_regime(trade.get("regime")),
+        str(trade.get("strategy") or trade.get("strategy_name") or "").strip(),
+        str(trade.get("direction") or trade.get("signal_direction") or "").strip().lower(),
+        str(trade.get("timestamp") or trade.get("action_time") or trade.get("close_timestamp") or trade.get("exit_timestamp") or ""),
+        str(trade.get("action") or trade.get("status") or trade.get("reason") or "").strip().upper(),
+    )
+
+
 def _is_realized_trade(trade: Dict[str, Any]) -> bool:
     if not isinstance(trade, dict):
         return False
@@ -326,17 +346,18 @@ def _realized_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [trade for trade in trades if _is_realized_trade(trade)]
 
 
-def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any]]:
-    """Load trade history from pm_outputs/trades_*.json files."""
+def load_trade_history(
+    pm_root: str,
+    max_files: int = 100,
+    pm_configs_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Load trade history from canonical signal ledger and legacy trade snapshots."""
     if not pm_root:
         return []
 
-    trades_dir = os.path.join(pm_root, "pm_outputs")
-    if not os.path.isdir(trades_dir):
-        return []
-
+    active_pm_configs_path = pm_configs_path or load_winner_ledger_path(pm_root)
     trade_signature = _trade_file_signature(pm_root, max_files)
-    config_signature = _pm_config_signature(pm_root)
+    config_signature = _pm_config_signature(pm_root, active_pm_configs_path)
     root_config_signature = _root_config_signature(pm_root)
     cache_key = (
         _TRADE_HISTORY_CACHE_VERSION,
@@ -353,23 +374,35 @@ def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any
 
     all_trades: List[Dict[str, Any]] = []
     for filepath, _, _ in trade_signature:
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                all_trades.extend(data)
-        except Exception:
+        text = safe_read_text(filepath)
+        if not text:
             continue
+        all_trades.extend(load_records_from_text(filepath, text))
 
-    pm_configs = load_pm_configs(pm_root)
+    pm_configs = load_pm_configs(pm_root, active_pm_configs_path)
     magic_lookup = _build_magic_lookup(pm_configs)
 
+    deduped: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     for trade in all_trades:
         if not isinstance(trade, dict):
             continue
         _enrich_trade_metadata(trade, pm_configs, magic_lookup)
         if "symbol" in trade:
             trade["symbol"] = normalize_symbol(trade["symbol"])
+        if not str(trade.get("entry_id") or "").strip():
+            trade["entry_id"] = build_entry_id(
+                (
+                    trade.get("symbol", ""),
+                    trade.get("timeframe", ""),
+                    trade.get("regime", ""),
+                    trade.get("strategy", trade.get("strategy_name", "")),
+                    trade.get("direction", trade.get("signal_direction", "")),
+                    trade.get("entry_price", trade.get("price", "")),
+                    trade.get("stop_loss_price", trade.get("sl", "")),
+                    trade.get("take_profit_price", trade.get("tp", "")),
+                    trade.get("timestamp", trade.get("action_time", "")),
+                )
+            )
         trade["realized"] = _is_realized_trade(trade)
         trade["pnl"] = _trade_pnl_value(trade) if trade["realized"] else 0.0
         entry_ts = _trade_entry_timestamp(trade)
@@ -378,7 +411,17 @@ def load_trade_history(pm_root: str, max_files: int = 100) -> List[Dict[str, Any
         sort_ts = _trade_sort_timestamp(trade)
         if sort_ts:
             trade["_sort_timestamp"] = sort_ts
+        key = _trade_identity_key(trade)
+        incumbent = deduped.get(key)
+        if incumbent is None:
+            deduped[key] = trade
+            continue
+        incumbent_rank = incumbent.get("_sort_timestamp") or incumbent.get("_parsed_timestamp") or datetime.min
+        trade_rank = trade.get("_sort_timestamp") or trade.get("_parsed_timestamp") or datetime.min
+        if trade_rank >= incumbent_rank:
+            deduped[key] = trade
 
+    all_trades = list(deduped.values())
     all_trades.sort(
         key=lambda t: (t.get("_sort_timestamp") or t.get("_parsed_timestamp") or datetime.min, t.get("symbol", ""), t.get("entry_id", "")),
         reverse=True,
@@ -1141,9 +1184,13 @@ def reconstruct_trade_outcomes(
     return [reconstructed_by_index[idx] for idx in sorted(reconstructed_by_index)]
 
 
-def build_analytics_payload(pm_root: str, initial_capital: float = 10000.0) -> Dict[str, Any]:
+def build_analytics_payload(
+    pm_root: str,
+    initial_capital: float = 10000.0,
+    pm_configs_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """Build complete analytics payload for the frontend."""
-    trades = load_trade_history(pm_root, max_files=100)
+    trades = load_trade_history(pm_root, max_files=100, pm_configs_path=pm_configs_path)
     realized_trades = _realized_trades(trades)
 
     if not trades:

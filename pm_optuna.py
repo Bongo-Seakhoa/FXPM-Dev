@@ -89,17 +89,6 @@ class OptunaConfig:
     # Timeout (optional)
     timeout_seconds: Optional[float] = None
 
-    # Objective definition
-    # If True, Optuna maximizes a score that includes validation metrics. This can overfit
-    # to the holdout split because the same validation set is later used for selection.
-    # Default is False to avoid train/val leakage: tune on train, validate on val.
-    use_validation_in_objective: bool = False
-
-    # Blended objective weights (train-first with bounded val influence)
-    objective_blend_enabled: bool = True
-    objective_train_weight: float = 0.80
-    objective_val_weight: float = 0.20
-
     # Early rejection thresholds (configurable)
     train_dd_multiplier: float = 1.25
     val_dd_multiplier: float = 1.0
@@ -122,7 +111,13 @@ class OptunaConfig:
 
     # Logging
     log_interval: int = 25  # Log progress every N trials
-    
+
+    # Phase D3 — family-size-aware search budget (opt-in)
+    family_size_aware_budget: bool = False
+    min_trials_per_strategy: int = 50
+    max_trials_per_strategy: int = 500
+    target_coverage_pct: float = 0.10  # 10% of cartesian space
+
     @classmethod
     def from_pipeline_config(cls, config) -> 'OptunaConfig':
         """Create OptunaConfig from PipelineConfig."""
@@ -131,11 +126,27 @@ class OptunaConfig:
             n_startup_trials=min(10, getattr(config, 'regime_hyperparam_max_combos', 100) // 10),
             seed=int(getattr(config, 'optimization_seed', 0) or 0),
             multivariate=True,
-            use_validation_in_objective=bool(getattr(config, 'optuna_use_val_in_objective', False)),
-            objective_blend_enabled=bool(getattr(config, 'optuna_objective_blend_enabled', True)),
-            objective_train_weight=float(getattr(config, 'optuna_objective_train_weight', 0.80)),
-            objective_val_weight=float(getattr(config, 'optuna_objective_val_weight', 0.20)),
+            family_size_aware_budget=bool(getattr(config, 'optuna_family_size_aware_budget', False)),
+            min_trials_per_strategy=int(getattr(config, 'optuna_min_trials_per_strategy', 50)),
+            max_trials_per_strategy=int(getattr(config, 'optuna_max_trials_per_strategy', 500)),
+            target_coverage_pct=float(getattr(config, 'optuna_target_coverage_pct', 0.10)),
         )
+
+    def resolve_trial_budget(self, search_space_size: int) -> Tuple[int, str]:
+        """Resolve effective trial budget for a given cartesian search-space size.
+
+        Returns (n_trials, mode) where mode is one of:
+        - "flat":             flat n_trials (legacy behavior); capped at search_space_size
+        - "family_aware":     coverage-based; clamp(min, max, ceil(coverage * size))
+        """
+        if not self.family_size_aware_budget:
+            return min(self.n_trials, search_space_size), "flat"
+        target = max(
+            self.min_trials_per_strategy,
+            int(round(self.target_coverage_pct * search_space_size)),
+        )
+        capped = min(self.max_trials_per_strategy, target, search_space_size)
+        return capped, "family_aware"
 
 
 # =============================================================================
@@ -435,12 +446,27 @@ class OptunaTPEOptimizer:
         # Create parameter space
         param_space = ParameterSpace(param_grid, default_params)
         search_space_size = param_space.get_search_space_size()
-        
-        # Adjust n_trials based on search space
-        n_trials = min(self.config.n_trials, search_space_size)
-        
-        logger.info(f"[{symbol}] Optuna TPE optimization for {strategy_name}: "
-                   f"search_space={search_space_size}, trials={n_trials}")
+
+        # D4 — emit one-time WARN if cartesian > threshold (observability only)
+        try:
+            base_strategy.warn_if_param_grid_large()
+        except Exception:
+            pass
+
+        # Resolve effective trial budget — flat by default, family-size-aware when enabled (D3)
+        n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
+
+        if budget_mode == "family_aware":
+            coverage = (n_trials / search_space_size) if search_space_size else 1.0
+            logger.info(
+                f"[{symbol}] Optuna TPE optimization for {strategy_name}: "
+                f"search_space={search_space_size}, trials={n_trials} "
+                f"(family-aware budget: {coverage:.1%} coverage, "
+                f"min={self.config.min_trials_per_strategy}, max={self.config.max_trials_per_strategy})"
+            )
+        else:
+            logger.info(f"[{symbol}] Optuna TPE optimization for {strategy_name}: "
+                       f"search_space={search_space_size}, trials={n_trials}")
         
         # Track best results
         best_result = {
@@ -635,8 +661,24 @@ class OptunaTPEOptimizer:
         # Create parameter space
         param_space = ParameterSpace(param_grid, default_params)
         search_space_size = param_space.get_search_space_size()
-        n_trials = min(self.config.n_trials, search_space_size)
-        
+
+        # D4 — emit one-time WARN if cartesian > threshold (observability only)
+        try:
+            base_strategy.warn_if_param_grid_large()
+        except Exception:
+            pass
+
+        # Resolve effective trial budget — flat by default, family-size-aware when enabled (D3)
+        n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
+        if budget_mode == "family_aware":
+            coverage = (n_trials / search_space_size) if search_space_size else 1.0
+            logger.info(
+                f"[{symbol}] Optuna multi-regime optimization for {strategy_name}: "
+                f"search_space={search_space_size}, trials={n_trials} "
+                f"(family-aware budget: {coverage:.1%} coverage, "
+                f"min={self.config.min_trials_per_strategy}, max={self.config.max_trials_per_strategy})"
+            )
+
         # Track best per regime
         best_by_regime: Dict[str, Tuple[float, Dict[str, Any]]] = {
             r: (float('-inf'), None) for r in regimes
@@ -686,7 +728,12 @@ class OptunaTPEOptimizer:
 
                 # Bucket trades by regime
                 train_trades = train_result.get('trades', [])
-                train_regime_metrics = bucket_trades_fn(train_trades, train_features)
+                try:
+                    train_regime_metrics = bucket_trades_fn(
+                        train_trades, train_features, timeframe=timeframe
+                    )
+                except TypeError:
+                    train_regime_metrics = bucket_trades_fn(train_trades, train_features)
 
                 # ===== CONDITIONAL VALIDATION: Only if training passed DD check =====
                 val_regime_metrics = {}
@@ -703,7 +750,12 @@ class OptunaTPEOptimizer:
                         return self.config.penalty_dd_rejection
 
                     val_trades = val_result.get('trades', [])
-                    val_regime_metrics = bucket_trades_fn(val_trades, val_features)
+                    try:
+                        val_regime_metrics = bucket_trades_fn(
+                            val_trades, val_features, timeframe=timeframe
+                        )
+                    except TypeError:
+                        val_regime_metrics = bucket_trades_fn(val_trades, val_features)
 
                 # Score each regime and track best
                 regime_scores = []
@@ -726,7 +778,7 @@ class OptunaTPEOptimizer:
                     if regime_train_dd > max_drawdown_pct * dd_train_mult:
                         continue
                     
-                    score = compute_score_fn(train_m, {})
+                    score = compute_score_fn(train_m, val_m)
                     regime_scores.append(score)
                     
                     # Update best for this regime (only if passes DD check)
@@ -1036,7 +1088,12 @@ class OptunaTPEOptimizer:
                     continue
 
                 train_trades = train_result.get('trades', [])
-                train_regime_metrics = bucket_trades_fn(train_trades, train_features)
+                try:
+                    train_regime_metrics = bucket_trades_fn(
+                        train_trades, train_features, timeframe=timeframe
+                    )
+                except TypeError:
+                    train_regime_metrics = bucket_trades_fn(train_trades, train_features)
 
                 # CONDITIONAL VALIDATION: Only if training passed DD check
                 val_regime_metrics = {}
@@ -1053,7 +1110,12 @@ class OptunaTPEOptimizer:
                         continue
 
                     val_trades = val_result.get('trades', [])
-                    val_regime_metrics = bucket_trades_fn(val_trades, val_features)
+                    try:
+                        val_regime_metrics = bucket_trades_fn(
+                            val_trades, val_features, timeframe=timeframe
+                        )
+                    except TypeError:
+                        val_regime_metrics = bucket_trades_fn(val_trades, val_features)
 
                 clean_params = self._clean_params(params)
 
@@ -1074,7 +1136,7 @@ class OptunaTPEOptimizer:
                     if regime_train_dd > max_drawdown_pct * dd_train_mult:
                         continue
                     
-                    score = compute_score_fn(train_m, {})
+                    score = compute_score_fn(train_m, val_m)
                     
                     if score > best_by_regime[regime][0]:
                         best_by_regime[regime] = (score, {

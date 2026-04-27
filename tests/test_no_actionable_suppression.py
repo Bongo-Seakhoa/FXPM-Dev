@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 from pm_main import DecisionThrottle
 
 
-def test_no_actionable_signal_suppression_same_bar():
+def test_no_actionable_signal_suppression_same_bar(tmp_path):
     """
     Test that duplicate no-actionable signals within the same bar are suppressed.
 
@@ -18,7 +18,7 @@ def test_no_actionable_signal_suppression_same_bar():
     - Second call with same bar_time: should be suppressed (no log, no record)
     - Third call with different bar_time: should log and record again
     """
-    throttle = DecisionThrottle()
+    throttle = DecisionThrottle(log_path=str(tmp_path / "last_trade_log.json"))
 
     symbol = "EURUSD"
     strategy = "RSI_TREND"
@@ -61,13 +61,13 @@ def test_no_actionable_signal_suppression_same_bar():
     assert should_suppress_3 is False, "Call with new bar_time should not be suppressed"
 
 
-def test_no_actionable_signal_different_strategies_not_suppressed():
+def test_no_actionable_signal_different_strategies_not_suppressed(tmp_path):
     """
     Test that different strategies within same bar are NOT suppressed.
 
     This ensures we only suppress identical decisions, not different ones.
     """
-    throttle = DecisionThrottle()
+    throttle = DecisionThrottle(log_path=str(tmp_path / "last_trade_log.json"))
 
     symbol = "GBPUSD"
     timeframe = "M15"
@@ -98,11 +98,11 @@ def test_no_actionable_signal_different_strategies_not_suppressed():
     assert should_suppress is False, "Different strategy should not be suppressed"
 
 
-def test_no_actionable_signal_different_symbols_not_suppressed():
+def test_no_actionable_signal_different_symbols_not_suppressed(tmp_path):
     """
     Test that different symbols are tracked independently.
     """
-    throttle = DecisionThrottle()
+    throttle = DecisionThrottle(log_path=str(tmp_path / "last_trade_log.json"))
 
     strategy = "RSI_TREND"
     timeframe = "H4"
@@ -133,12 +133,12 @@ def test_no_actionable_signal_different_symbols_not_suppressed():
     assert should_suppress is False, "Different symbol should not be suppressed"
 
 
-def test_actionable_signals_not_affected():
+def test_actionable_signals_not_affected(tmp_path):
     """
     Test that actionable signals (direction != 0) are not affected by
     no-actionable signal suppression.
     """
-    throttle = DecisionThrottle()
+    throttle = DecisionThrottle(log_path=str(tmp_path / "last_trade_log.json"))
 
     symbol = "USDJPY"
     strategy = "MACD_CROSS"
@@ -169,19 +169,14 @@ def test_actionable_signals_not_affected():
     assert should_suppress is False, "Actionable signal should not be suppressed by no-actionable"
 
 
-def test_log_reduction_scenario():
+def test_log_reduction_scenario(tmp_path):
     """
     Simulate a high-frequency scenario where multiple ticks arrive within
     the same bar with no actionable signals.
 
     Expected: Only the first tick should log, subsequent ticks suppressed.
     """
-    import os
-    # Use a temporary file to avoid state contamination
-    tmp_dir = os.path.join(os.getcwd(), "_test_tmp", "no_actionable_suppression")
-    os.makedirs(tmp_dir, exist_ok=True)
-    tmp_file = os.path.join(tmp_dir, "last_trade_log.json")
-    throttle = DecisionThrottle(log_path=tmp_file)
+    throttle = DecisionThrottle(log_path=str(tmp_path / "last_trade_log.json"))
 
     symbol = "EURJPY"
     strategy = "RSI_TREND"
@@ -213,14 +208,97 @@ def test_log_reduction_scenario():
                 action="NO_ACTIONABLE_WINNER_SIGNAL"
             )
 
-    # Clean up
-    try:
-        os.unlink(tmp_file)
-    except:
-        pass
-
     # Should only log once (first tick)
     assert log_count == 1, f"Expected 1 log, got {log_count} (90% reduction achieved)"
+
+
+def _make_min_trader(log_path):
+    """Construct a LiveTrader skeleton via __new__ for gate-level tests."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from pm_main import LiveTrader, DecisionThrottle
+
+    trader = LiveTrader.__new__(LiveTrader)
+    trader.mt5 = MagicMock()
+    trader.mt5.find_broker_symbol.return_value = "EURUSD"
+    trader.mt5.get_positions.return_value = []
+    trader.portfolio_manager = MagicMock()
+    trader.position_config = SimpleNamespace(allow_d1_plus_lower=False)
+    trader.pipeline_config = SimpleNamespace(actionable_score_margin=0.92)
+    trader.logger = MagicMock()
+    trader._decision_throttle = DecisionThrottle(log_path=str(log_path))
+    trader._actionable_log = MagicMock()
+    trader._last_order_times = {}
+    trader.enable_trading = False
+    trader._log_no_actionable_signal = MagicMock()
+    trader._candidate_rank_key = lambda c: float(c.get('selection_score', 0.0))
+    trader._evaluate_regime_candidates = MagicMock()
+    return trader
+
+
+def test_best_overall_score_nonpositive_triggers_gate(tmp_path):
+    """findings.html §C8: if best_overall_score ≤ 0, the actionable-margin gate
+    must fire NO_ACTIONABLE_BEST_SCORE_NONPOSITIVE and not proceed to selection."""
+    from unittest.mock import MagicMock
+    from pm_pipeline import SymbolConfig
+
+    trader = _make_min_trader(tmp_path / "last_trade_log.json")
+    candidates = [
+        {'selection_score': -0.5, 'signal': 1, 'timeframe': 'H1', 'regime': 'TREND',
+         'strategy_name': 'X', 'bar_time': '2026-04-21T10:00:00'},
+        {'selection_score': -0.8, 'signal': -1, 'timeframe': 'H4', 'regime': 'CHOP',
+         'strategy_name': 'Y', 'bar_time': '2026-04-21T10:00:00'},
+    ]
+    trader._evaluate_regime_candidates.return_value = (candidates, {'timeframes_evaluated': 2, 'timeframes_total': 2})
+    cfg = MagicMock(spec=SymbolConfig)
+
+    trader._process_symbol("EURUSD", cfg)
+
+    trader._log_no_actionable_signal.assert_called_once()
+    call = trader._log_no_actionable_signal.call_args
+    assert call.kwargs.get("action_type") == "NO_ACTIONABLE_BEST_SCORE_NONPOSITIVE", (
+        f"expected NONPOSITIVE gate action_type, got {call.kwargs}"
+    )
+
+
+def test_best_overall_score_zero_triggers_gate(tmp_path):
+    """A leader scoring exactly zero must also trip the gate (margin would collapse)."""
+    from unittest.mock import MagicMock
+    from pm_pipeline import SymbolConfig
+
+    trader = _make_min_trader(tmp_path / "last_trade_log.json")
+    candidates = [
+        {'selection_score': 0.0, 'signal': 1, 'timeframe': 'H1', 'regime': 'TREND',
+         'strategy_name': 'X', 'bar_time': '2026-04-21T10:00:00'},
+    ]
+    trader._evaluate_regime_candidates.return_value = (candidates, {'timeframes_evaluated': 1, 'timeframes_total': 1})
+    cfg = MagicMock(spec=SymbolConfig)
+
+    trader._process_symbol("EURUSD", cfg)
+
+    trader._log_no_actionable_signal.assert_called_once()
+    assert trader._log_no_actionable_signal.call_args.kwargs.get("action_type") == "NO_ACTIONABLE_BEST_SCORE_NONPOSITIVE"
+
+
+def test_positive_score_does_not_trigger_nonpositive_gate(tmp_path):
+    """When best_overall_score > 0, the §C8 gate stays silent (other gates may still fire)."""
+    from unittest.mock import MagicMock
+    from pm_pipeline import SymbolConfig
+
+    trader = _make_min_trader(tmp_path / "last_trade_log.json")
+    # Single positive-score candidate with no actionable signal — falls through to NO_ACTIONABLE_WINNER_SIGNAL,
+    # NOT the new NONPOSITIVE gate.
+    candidates = [
+        {'selection_score': 5.0, 'signal': 0, 'timeframe': 'H1', 'regime': 'TREND',
+         'strategy_name': 'X', 'bar_time': '2026-04-21T10:00:00'},
+    ]
+    trader._evaluate_regime_candidates.return_value = (candidates, {'timeframes_evaluated': 1, 'timeframes_total': 1})
+    cfg = MagicMock(spec=SymbolConfig)
+
+    trader._process_symbol("EURUSD", cfg)
+
+    if trader._log_no_actionable_signal.called:
+        assert trader._log_no_actionable_signal.call_args.kwargs.get("action_type") != "NO_ACTIONABLE_BEST_SCORE_NONPOSITIVE"
 
 
 if __name__ == "__main__":

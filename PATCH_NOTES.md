@@ -2,6 +2,139 @@
 Scope: Comprehensive change history for this repository.
 Status: Canonical patch note file (single source of truth).
 
+## 2026-04-25 - Live Eligibility and Optimize-Readiness Hardening
+- Added `PortfolioManager.get_live_eligible_configs()` and moved live trading surfaces to it instead of raw `get_validated_configs()`.
+- Added `live_artifact_drift_policy` (`block`, `warn`, `ignore`) and `live_config_expiry_grace_minutes`; the active profile blocks drifted artifacts and has no expiry grace.
+- Fixed artifact-contract comparison so operational metadata such as `ledger_status` does not make a freshly optimized config immediately due.
+- Updated `--status` to report `Live eligible` and show live-blocked configs as `BL`.
+- Treated non-finite margin values (`NaN`/`inf`) as unavailable and blocked unsafe entries with `SKIPPED_MARGIN_UNAVAILABLE`.
+- Passed the final fresh symbol-position read into the same-symbol combined-risk cap.
+- Added a fresh same-symbol D1/lower-timeframe pairing check inside `_execute_entry()` so a candidate selected from an older sweep snapshot is blocked if the broker position state changes before sizing.
+- Refreshed the executable quote immediately before submit and rechecked shifted SL/TP geometry, actual risk, same-symbol risk, and margin against that final quote.
+- Updated dashboard defaults so margin and minimum-lot feasibility skips are visible and valid in the dashboard feed.
+- Added storage-state freshness metadata so stale sweep values are not confused with current housekeeping.
+- Added MT5 bar-timestamp live gating via `live_loop_trigger_mode = "bar"` and `live_bar_poll_seconds`; changed broker bars now wake signal checks for the affected symbol/timeframe branches, while the older due-time loop remains available as `scheduled`.
+- Preserved runtime-only management cycles between changed signal bars so margin protection and open-position governance continue running while signal discovery remains bar-gated.
+- Added focused regression tests for live eligibility, artifact-contract volatility, margin finite checks, fresh symbol risk snapshots, dashboard visibility, and storage freshness.
+- Full optimizer was not run.
+
+## 2026-04-25 - Intent Audit Implementation Sweep
+### Live/optimizer alignment
+- Live regime winner lookup now prefers the same decision-time surface used by optimization and backtesting: `REGIME_LIVE` / `REGIME_STRENGTH_LIVE`, with legacy fallback to `REGIME` only when shifted columns are unavailable.
+- Added regression coverage where `REGIME` and `REGIME_LIVE` intentionally differ so live selection must use the intended surface.
+
+### Live safety and account protection
+- Implemented stateful margin reopen hysteresis:
+  - margin stress or a forced close sets a reopen-required latch
+  - new entries resume only after `margin_reopen_level` and the configured cooldown are satisfied
+  - missing/unparseable `margin_level` blocks new entries only when margin exposure exists
+- Hardened the final duplicate-position guard so `_execute_entry()` uses the sweep snapshot first, then refreshes exact/symbol broker positions immediately before order send.
+
+### Artifact and optimizer truthfulness
+- Preserved `NO_TRADE` marker reasons during artifact metadata propagation.
+- Added compact `validation_evidence` to regime and symbol artifacts.
+- Populated selected top-level robustness evidence where available.
+- Added per-symbol/timeframe data-window fingerprints and ledger-completion status.
+- Added pre-tuning eligibility gate telemetry for rejection/rescue visibility.
+
+### Cache/storage observability
+- Added resample-cache telemetry for memory hits, disk hits, misses, invalidations, bytes, and read/write seconds.
+- Kept the active high-risk profile's 4 GB resample-cache quota. Future 5-10 GB cache sizing is acceptable when telemetry proves a quality-preserving efficiency benefit and storage remains manageable.
+
+### Documentation and verification
+- Updated `README.md`, `SETTINGS_REFERENCE.md`, `CHANGELOG.md`, `audit.md`, `audit.html`, and `trading_implementation.html`.
+- Full optimizer was not run.
+- Verification: `python -m pytest -q` -> `559 passed, 1 skipped, 350 subtests passed`.
+- Hygiene: `git diff --check` passed for the touched tracked files.
+
+## 2026-04-25 - Active Workflow Documentation and Preset Propagation
+### Stage 1 / Stage 2 preset posture
+- Reviewed the checked-in backtester and optimizer presets against the active `config.json`.
+- Kept the current Stage 1/Stage 2 values unchanged as the recommended baseline:
+  - `max_param_combos = 200`
+  - `optimization_max_workers = 4`
+  - `regime_hyperparam_top_k = 5`
+  - `regime_hyperparam_max_combos = 200`
+  - `optuna_family_size_aware_budget = true`
+- Documented that these presets are a strong current baseline, not a guaranteed global optimum; proof still comes from regenerated ledgers, paper/live outcomes, and targeted one-symbol experiments.
+
+### Workflow documentation
+- Updated operator docs to describe the active recent M5 workflow:
+  - latest `300000` M5 bars per symbol
+  - oldest `50000` as `historical_stress_audit`
+  - newest `250000` as the active universe
+  - Stage 1 baseline eligibility over the full active universe
+  - newest `50%` of the active universe as the fresh Stage 2 optimization/risk-management surface with warmup context
+- Clarified that the older audit window detects severe fragility and does not act as a forward-looking holdout.
+- Hardened the workflow splitter so raising `max_bars` cannot silently expand the configured 50k M5 historical audit window.
+- Propagated timeframe-aware regime-bucket metrics.
+- Propagated the high-risk low-balance profile into README/setup/settings docs, including `pm_configs_high_risk.json`, live sizing, spread profile, risk scalars in shadow mode, and governance in shadow mode.
+
+### Verification
+- Documentation-only sync; no full optimization run was performed.
+- Current implementation verification: `python -m pytest -q`: `559 passed, 1 skipped, 350 subtests passed`.
+- Ran targeted stale-reference checks and `git diff --check` after the documentation patch.
+
+### Documentation cleanup
+- Archived completed audit, analysis, and implementation-planning artifacts under `documentation_archive/2026-04-25-active-workflow-audit/`.
+- Moved stale root-level files such as `audit.md`, `audit.html`, `analysis.md`, `analysis.html`, `IMPLEMENTATION_TRACKING.md`, `findings.html`, and the active-workflow proposal/implementation documents out of the main operator doc surface.
+- Added an archive index and updated the root README/documentation archive README so the active docs remain `README.md`, `SETUP_AND_RUN.md`, `SETTINGS_REFERENCE.md`, `CHANGELOG.md`, and `PATCH_NOTES.md`.
+
+## 2026-04-02 - Restart Recovery Completion and Regression Cleanup
+### Live restart hardening
+- Fixed the live-loop crash caused by referencing `has_unknown_position_timeframe` instead of the actual `has_unknown_position` state.
+- Finished the unified open-position timeframe inference path in `pm_main.py`:
+  - `position_timeframe_overrides`
+  - live comment decode
+  - legacy `PM_<tag>` strategy-tag match
+  - magic lookup
+  - MT5 opening order/deal metadata recovery
+- Kept fail-closed behavior intact: if timeframe still cannot be resolved, secondary trades remain blocked.
+- Added per-position warning throttling so unknown-timeframe leftovers after an ungraceful shutdown emit one warning per session instead of spamming every cycle.
+
+### MT5 metadata recovery
+- Added session-cached timeframe recovery keyed by `POSITION_IDENTIFIER`.
+- Preserved best-effort fallback behavior: history lookups never override a confident live comment or magic decode.
+- Continued using truncated `PM2`/`PM3` comment decode so broker-shortened comments still recover symbol and timeframe when possible.
+
+### Regression fixes
+- Restored `PipelineConfig.actionable_score_margin` default to `0.92` to match the repo test contract and prior baseline notes.
+- Restored the missing `PipelineConfig` scoring and validation fields expected by the active scoring path:
+  - `regime_validation_top_k`
+  - `regime_min_val_return_dd_ratio`
+  - `scoring_use_continuous_dd`
+  - `scoring_use_sortino_blend`
+  - `scoring_use_tail_risk`
+  - `scoring_use_consistency`
+  - `scoring_use_trade_frequency_bonus`
+- Restored the stricter weak-train exceptional defaults:
+  - `exceptional_val_profit_factor = 1.5`
+  - `exceptional_val_return_pct = 10.0`
+- Fixed regime-candidate descent bookkeeping and weak-train rejection messaging so the live code matches the scoring-audit expectations already encoded in tests.
+- Hardened `create_default_enhancement_seams(...)` against partial or mocked config objects by safely coercing bool/float fields.
+- Fixed dashboard execution-log parsing for `[SECONDARY] Selected:` lines by using the current regex group name.
+- Fixed dashboard app startup and refresh-job writes for temp-data tests:
+  - `create_app(..., start_background_workers=False)` now stays read-mostly as intended
+  - refresh jobs create missing `data/` directories before writing CSVs
+- Completed the current live margin-protection helper path in `pm_main.py`:
+  - margin-state classification
+  - RECOVERY / PANIC close-cycle handling
+  - post-close re-checks and transition logging
+- Refreshed stale tests to the current repo surface:
+  - repaired missing imports in feature-cache and instrument-spec tests
+  - moved the resample-cache temp path into the repo runtime artifact area
+  - replaced the stale 42/50 strategy expansion test with a baseline aligned to the shipped `47`-strategy roster
+
+### Documentation updates
+- Updated `CHANGELOG.md` for repository version `1.4.6`.
+- Updated `SETTINGS_REFERENCE.md` with `position_timeframe_overrides`, restored validation/scoring defaults, and corrected live defaults.
+- Updated `SETUP_AND_RUN.md` and `README.md` troubleshooting notes for restart/orphan-position recovery.
+
+### Verification
+- Broad baseline verification now passes:
+  - `python -m unittest discover -s tests -p "test*.py"`
+  - Result: `Ran 208 tests ... OK`
+
 ## 2026-02-15 - Audit Pass Hardening and Quality Cleanup
 ### Configuration integrity
 - Restored `pipeline.regime_min_val_return_pct` in `config.json` to `5.0` (from `4.0`) to preserve the validated-winner floor policy.

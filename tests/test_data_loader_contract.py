@@ -59,6 +59,35 @@ class DataLoaderContractTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_duplicate_alias_columns_are_coalesced_before_validation(self):
+        tmp = self._make_local_tmpdir()
+        try:
+            path = os.path.join(tmp, "EURUSD_M5.csv")
+            df = pd.DataFrame({
+                "time": [datetime(2024, 1, 1), datetime(2024, 1, 1, 0, 5)],
+                "Open": [1.0, 1.1],
+                "High": [1.2, 1.3],
+                "Low": [0.9, 1.0],
+                "Close": [1.1, 1.2],
+                "Volume": [100, 110],
+                "Spread": [8.0, 9.0],
+                "RealVolume": [1.0, 2.0],
+                "spread": [None, None],
+                "real_volume": [None, None],
+            })
+            df.to_csv(path, index=False)
+
+            loader = DataLoader(tmp)
+            loaded = loader.load_symbol("EURUSD", "M5")
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(list(loaded.columns).count("Spread"), 1)
+            self.assertEqual(list(loaded.columns).count("RealVolume"), 1)
+            self.assertEqual(float(loaded["Spread"].iloc[0]), 8.0)
+            self.assertEqual(float(loaded["RealVolume"].iloc[1]), 2.0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

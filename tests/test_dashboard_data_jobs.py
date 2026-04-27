@@ -4,10 +4,11 @@ import shutil
 import unittest
 from datetime import datetime
 import uuid
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-from pm_dashboard.jobs import HistoricalDataDownloader
+from pm_dashboard.jobs import DataDownloadScheduler, HistoricalDataDownloader
 
 
 class DashboardDataJobsTests(unittest.TestCase):
@@ -102,6 +103,39 @@ class DashboardDataJobsTests(unittest.TestCase):
         self.assertEqual(result["updated"], 0)
         self.assertEqual(result["failed"], 2)
 
+    def test_refresh_symbol_merges_and_atomically_replaces_csv(self) -> None:
+        self._write_m5("EURUSD", bars=3)
+        idx = pd.date_range("2026-02-01 00:10:00", periods=3, freq="5min")
+        fresh = pd.DataFrame(
+            {
+                "Open": [1.2000, 1.2001, 1.2002],
+                "High": [1.2003, 1.2004, 1.2005],
+                "Low": [1.1997, 1.1998, 1.1999],
+                "Close": [1.2001, 1.2002, 1.2003],
+                "Volume": [2000, 2000, 2000],
+            },
+            index=idx,
+        )
+        fresh.index.name = "time"
+
+        mt5 = MagicMock()
+        mt5.is_connected.return_value = True
+        mt5.find_broker_symbol.return_value = "EURUSD"
+        mt5.get_bars.return_value = fresh
+
+        with patch("pm_dashboard.jobs.MT5_AVAILABLE", True):
+            jobs = HistoricalDataDownloader(self.pm_root, mt5_connector=mt5)
+            ok = jobs.refresh_symbol_m5("EURUSD", max_bars=4)
+
+        self.assertTrue(ok)
+        path = os.path.join(self.data_dir, "EURUSD_M5.csv")
+        merged = pd.read_csv(path, index_col=0, parse_dates=True)
+        self.assertEqual(len(merged), 4)
+        self.assertTrue(merged.index.is_unique)
+        self.assertAlmostEqual(float(merged.iloc[-1]["Close"]), 1.2003, places=6)
+        leftovers = [name for name in os.listdir(self.data_dir) if ".tmp." in name]
+        self.assertEqual(leftovers, [])
+
     def test_load_historical_data_resolves_requested_symbol_to_broker_suffixed_local_file(self) -> None:
         self._write_m5("EURUSD.A", bars=288)
         jobs = HistoricalDataDownloader(self.pm_root, mt5_connector=None)
@@ -119,6 +153,21 @@ class DashboardDataJobsTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             jobs.load_historical_data("EURUSD", "M2", datetime(2026, 2, 1), datetime(2026, 2, 2))
+
+    def test_scheduler_next_due_rolls_to_next_day_after_run(self) -> None:
+        scheduler = DataDownloadScheduler(MagicMock(), run_time="00:30")
+        scheduler._last_run_date = datetime(2026, 4, 2).date()
+
+        due_at = scheduler._next_due_at(datetime(2026, 4, 2, 1, 0, 0))
+
+        self.assertEqual(due_at, datetime(2026, 4, 3, 0, 30, 0))
+
+    def test_scheduler_next_due_uses_same_day_target_before_run(self) -> None:
+        scheduler = DataDownloadScheduler(MagicMock(), run_time="06:15")
+
+        due_at = scheduler._next_due_at(datetime(2026, 4, 2, 5, 0, 0))
+
+        self.assertEqual(due_at, datetime(2026, 4, 2, 6, 15, 0))
 
 
 if __name__ == "__main__":

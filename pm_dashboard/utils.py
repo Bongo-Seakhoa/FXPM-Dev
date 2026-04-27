@@ -19,6 +19,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "**/*recommendation*.json",
         "**/*recommendations*.json",
         "**/*signal*.json",
+        "**/*signal*.jsonl",
+        "**/*signal_ledger*.jsonl",
         "**/*signals*.json",
         "**/*signal*.csv",
         "**/*signals*.csv",
@@ -30,6 +32,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "**/*.log",
     ],
     "primary_sources": [
+        "**/signal_ledger*.jsonl",
         "last_actionable_log.json",
         "last_trade_log.json",
     ],
@@ -38,9 +41,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "**/pm_*.log",
     ],
     "log_max_files": 2,
+    "ledger_files_pattern": "**/signal_ledger*.jsonl",
     "trade_files_pattern": "**/trades_*.json",
     "trade_map_max_age_minutes": 30,
-    "pm_configs_path": "pm_configs.json",
+    "pm_configs_path": "auto",
+    "write_api_token_env": "PM_DASHBOARD_WRITE_TOKEN",
     "explicit_files": [],
     "exclude_patterns": [
         "**/pm_dashboard/**",
@@ -55,13 +60,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "BLOCKED_RISK_CAP",
         "BLOCKED_SPREAD_FILTER",
         "BLOCKED_SYMBOL_RISK_CAP",
+        "BLOCKED_MIN_LOT_EXCEEDS_CAP",
+        "SKIPPED_MARGIN_UNAVAILABLE",
+        "SKIPPED_MARGIN_BLOCKED",
+        "SKIPPED_MARGIN_REOPEN_WAIT",
+        "SKIPPED_MARGIN_COOLDOWN",
+        "SKIPPED_MARGIN_REQUIRED",
     ],
     "valid_action_prefixes": [
         "EXECUTED",
         "SKIPPED_RISK_CAP",
+        "SKIPPED_MARGIN_",
         "BLOCKED_RISK_CAP",
+        "BLOCKED_MIN_LOT",
         "BLOCKED_SPREAD",
         "BLOCKED_SYMBOL",
+        "BLOCKED_POSITION_SNAPSHOT",
     ],
     "display_actions": [
         "EXECUTED",
@@ -69,6 +83,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "BLOCKED_RISK_CAP",
         "BLOCKED_SPREAD_FILTER",
         "BLOCKED_SYMBOL_RISK_CAP",
+        "BLOCKED_MIN_LOT_EXCEEDS_CAP",
+        "SKIPPED_MARGIN_UNAVAILABLE",
+        "SKIPPED_MARGIN_BLOCKED",
+        "SKIPPED_MARGIN_REOPEN_WAIT",
+        "SKIPPED_MARGIN_COOLDOWN",
+        "SKIPPED_MARGIN_REQUIRED",
+    ],
+    "display_action_prefixes": [
+        "SKIPPED_MARGIN_",
+        "BLOCKED_MIN_LOT",
+        "BLOCKED_POSITION_SNAPSHOT",
     ],
     "exclude_actions": [
         "NO_ACTIONABLE_SIGNAL",
@@ -99,12 +124,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sound": True,
         "min_strength": 0.0,
     },
+    "telegram": {
+        "enabled": False,
+        "bot_token_env": "PM_DASHBOARD_TELEGRAM_BOT_TOKEN",
+        "chat_id": "",
+        "min_strength": 0.0,
+        "max_signal_age_minutes": 30,
+        "include_strategy": False,
+        "include_regime": True,
+        "send_on_startup": False,
+        "actions": ["EXECUTED"],
+        "action_prefixes": [],
+    },
     "field_aliases": {
         "symbol": ["symbol", "pair", "instrument", "ticker"],
         "timeframe": ["timeframe", "tf", "interval", "frame"],
         "regime": ["regime", "market_regime"],
         "strategy_name": ["strategy", "strategy_name", "signal_source", "model", "algo"],
-        "signal_direction": ["direction", "side", "signal", "action", "trade_direction"],
+        "signal_direction": ["signal_direction", "direction", "side", "signal", "action", "trade_direction"],
         "secondary_trade": ["secondary_trade", "is_secondary", "secondary"],
         "secondary_reason": ["secondary_reason", "secondary_trade_reason"],
         "entry_price": ["entry", "entry_price", "price", "entryPrice", "open_price", "signal_price"],
@@ -162,6 +199,42 @@ def save_dashboard_config(path: str, config: Dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_path, path)
+
+
+def load_winner_ledger_path(pm_root: str) -> str:
+    """Return the active PM winner ledger from root config.json."""
+    if not pm_root:
+        return "pm_configs.json"
+    config_path = os.path.join(pm_root, "config.json")
+    if not os.path.isfile(config_path):
+        return "pm_configs.json"
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return "pm_configs.json"
+    if not isinstance(loaded, dict):
+        return "pm_configs.json"
+    pipeline = loaded.get("pipeline", {})
+    if not isinstance(pipeline, dict):
+        return "pm_configs.json"
+    ledger_path = str(pipeline.get("winner_ledger_path") or "").strip()
+    return ledger_path or "pm_configs.json"
+
+
+def resolve_pm_configs_path(pm_root: str, dashboard_config: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Resolve the dashboard strategy ledger.
+
+    `pm_configs_path` may be set to a concrete dashboard override. The default
+    `auto` follows the PM root config's `pipeline.winner_ledger_path`, which is
+    the active ledger used by the live/optimization app.
+    """
+    config = dashboard_config if isinstance(dashboard_config, dict) else {}
+    configured = str(config.get("pm_configs_path") or "auto").strip()
+    if configured and configured.lower() not in {"auto", "default"}:
+        return configured
+    return load_winner_ledger_path(pm_root)
 
 
 def safe_read_text(path: str) -> Optional[str]:

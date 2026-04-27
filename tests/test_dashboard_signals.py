@@ -1,13 +1,21 @@
+import json
+import os
+import shutil
 import unittest
+import uuid
 from copy import deepcopy
 from datetime import datetime
 
 from pm_dashboard.models import SignalEntry
-from pm_dashboard.parsers import parse_pm_execution_log
+from pm_dashboard.analytics import load_trade_history
+from pm_dashboard.parsers import parse_entries_from_file, parse_pm_execution_log
 from pm_dashboard.utils import DEFAULT_CONFIG
 from pm_dashboard.watcher import (
+    build_telegram_message,
     entry_alert_key,
     enrich_entries,
+    filter_telegram_entries,
+    find_primary_file,
     merge_actionable_with_log_executions,
     normalize_action_flags,
     select_trade_candidate,
@@ -16,6 +24,27 @@ from pm_dashboard.watcher import (
 
 
 class TestDashboardSignalDesk(unittest.TestCase):
+    def _make_temp_dir(self, prefix: str) -> str:
+        root = os.path.join(os.getcwd(), ".tmp_dashboard_tests", f"{prefix}_{uuid.uuid4().hex}")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def test_parse_signal_ledger_jsonl(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        text = (
+            '{"symbol":"XAUUSD","action":"EXECUTED","direction":"buy","timeframe":"M15","regime":"CHOP",'
+            '"strategy_name":"MomentumBurstStrategy","entry_price":3021.5,"stop_loss_price":3018.0,'
+            '"take_profit_price":3028.0,"action_time":"2026-04-02T15:00:00"}\n'
+        )
+        entries = parse_entries_from_file("signal_ledger_202604.jsonl", text, config, {})
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry.symbol, "XAUUSD")
+        self.assertEqual(entry.reason, "EXECUTED")
+        self.assertEqual(entry.timeframe, "M15")
+        self.assertEqual(entry.regime, "CHOP")
+        self.assertEqual(entry.signal_direction, "buy")
+
     def test_parse_pm_execution_log(self) -> None:
         log_text = (
             "2026-02-04 11:52:15 [INFO] __main__: [EURGBP.A] [SECONDARY] Selected: "
@@ -41,6 +70,95 @@ class TestDashboardSignalDesk(unittest.TestCase):
         self.assertEqual(entry.reason, "EXECUTED")
         self.assertTrue(entry.secondary_trade)
         self.assertEqual(entry.secondary_reason, "log_tag")
+
+    def test_parse_signal_ledger_jsonl(self) -> None:
+        tmp = self._make_temp_dir("ledger_jsonl")
+        try:
+            path = os.path.join(tmp, "signal_ledger.jsonl")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "symbol": "EURUSD",
+                            "timeframe": "H1",
+                            "regime": "TREND",
+                            "strategy_name": "MomentumBurstStrategy",
+                            "signal_direction": "buy",
+                            "entry_price": 1.0834,
+                            "stop_loss_price": 1.0801,
+                            "take_profit_price": 1.0902,
+                            "signal_strength": 0.72,
+                            "timestamp": "2026-04-02T12:00:00",
+                            "action": "EXECUTED",
+                        }
+                    )
+                    + "\n"
+                )
+
+            from pm_dashboard.parsers import parse_entries_from_file
+
+            with open(path, "r", encoding="utf-8") as handle:
+                parsed = parse_entries_from_file(path, handle.read(), deepcopy(DEFAULT_CONFIG), {}, None)
+
+            self.assertEqual(len(parsed), 1)
+            entry = parsed[0]
+            self.assertEqual(entry.symbol, "EURUSD")
+            self.assertEqual(entry.timeframe, "H1")
+            self.assertEqual(entry.signal_direction, "buy")
+            self.assertEqual(entry.reason, "EXECUTED")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_find_primary_file_prefers_signal_ledger(self) -> None:
+        tmp = self._make_temp_dir("primary_file")
+        try:
+            outputs = os.path.join(tmp, "pm_outputs")
+            os.makedirs(outputs, exist_ok=True)
+            ledger = os.path.join(outputs, "signal_ledger.jsonl")
+            actionable = os.path.join(tmp, "last_actionable_log.json")
+            with open(ledger, "w", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            with open(actionable, "w", encoding="utf-8") as handle:
+                handle.write("{}\n")
+
+            primary = find_primary_file(tmp, ["**/signal_ledger*.jsonl", "last_actionable_log.json", "last_trade_log.json"])
+            self.assertEqual(os.path.normpath(primary), os.path.normpath(ledger))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_load_trade_history_reads_ledger_and_dedupes_legacy_snapshots(self) -> None:
+        tmp = self._make_temp_dir("trade_history")
+        try:
+            outputs = os.path.join(tmp, "pm_outputs")
+            os.makedirs(outputs, exist_ok=True)
+            ledger_path = os.path.join(outputs, "signal_ledger.jsonl")
+            legacy_path = os.path.join(outputs, "trades_20260402_120000.json")
+
+            record = {
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "regime": "TREND",
+                "strategy_name": "MomentumBurstStrategy",
+                "direction": "buy",
+                "entry_price": 1.0834,
+                "stop_loss_price": 1.0801,
+                "take_profit_price": 1.0902,
+                "timestamp": "2026-04-02T12:00:00",
+                "action": "EXECUTED",
+            }
+
+            with open(ledger_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+            with open(legacy_path, "w", encoding="utf-8") as handle:
+                json.dump([record], handle)
+
+            trades = load_trade_history(tmp, max_files=10)
+            self.assertEqual(len(trades), 1)
+            self.assertEqual(trades[0]["symbol"], "EURUSD")
+            self.assertEqual(trades[0]["timeframe"], "H1")
+            self.assertEqual(trades[0]["action"], "EXECUTED")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_parse_pm_execution_log_secondary_and_skips(self) -> None:
         log_text = (
@@ -150,6 +268,100 @@ class TestDashboardSignalDesk(unittest.TestCase):
             raw={"action": "FAILED_10018"},
         )
         self.assertTrue(should_display_entry(failed_missing, config))
+
+    def test_default_display_filters_surface_margin_and_min_lot_actions(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        margin_entry = SignalEntry(
+            symbol="XAUUSD",
+            signal_direction="buy",
+            entry_price=None,
+            stop_loss_price=None,
+            take_profit_price=None,
+            reason="SKIPPED_MARGIN_REQUIRED",
+            raw={"action": "SKIPPED_MARGIN_REQUIRED"},
+        )
+        min_lot_entry = SignalEntry(
+            symbol="XAGUSD",
+            signal_direction="buy",
+            entry_price=None,
+            stop_loss_price=None,
+            take_profit_price=None,
+            reason="BLOCKED_MIN_LOT_EXCEEDS_CAP",
+            raw={"action": "BLOCKED_MIN_LOT_EXCEEDS_CAP"},
+        )
+
+        self.assertTrue(should_display_entry(margin_entry, config))
+        self.assertTrue(should_display_entry(min_lot_entry, config))
+
+        margin_entry.timestamp = datetime.now().isoformat()
+        min_lot_entry.timestamp = datetime.now().isoformat()
+        normalize_action_flags([margin_entry, min_lot_entry], config)
+        self.assertTrue(margin_entry.valid_now)
+        self.assertTrue(min_lot_entry.valid_now)
+
+    def test_telegram_filter_only_allows_recent_configured_valid_signals(self) -> None:
+        cfg = {
+            "actions": ["EXECUTED"],
+            "action_prefixes": [],
+            "min_strength": 0.50,
+            "max_signal_age_minutes": 60,
+        }
+        valid = SignalEntry(
+            symbol="EURUSD",
+            timeframe="H1",
+            regime="TREND",
+            strategy_name="HiddenStrategy",
+            signal_direction="buy",
+            entry_price=1.1,
+            stop_loss_price=1.09,
+            take_profit_price=1.12,
+            signal_strength=0.72,
+            timestamp=datetime.now().isoformat(),
+            valid_now=True,
+            reason="EXECUTED",
+            raw={"action": "EXECUTED"},
+        )
+        blocked = SignalEntry(
+            symbol="XAUUSD",
+            signal_direction="sell",
+            entry_price=3000,
+            stop_loss_price=3010,
+            take_profit_price=2980,
+            signal_strength=0.90,
+            timestamp=datetime.now().isoformat(),
+            valid_now=True,
+            reason="SKIPPED_MARGIN_REQUIRED",
+            raw={"action": "SKIPPED_MARGIN_REQUIRED"},
+        )
+
+        selected = filter_telegram_entries([blocked, valid], cfg)
+
+        self.assertEqual(selected, [valid])
+
+    def test_telegram_message_hides_strategy_by_default_but_keeps_trade_layout(self) -> None:
+        entry = SignalEntry(
+            symbol="EURUSD",
+            timeframe="H1",
+            regime="TREND",
+            strategy_name="DoNotExpose",
+            signal_direction="buy",
+            entry_price=1.10001,
+            stop_loss_price=1.09501,
+            take_profit_price=1.11001,
+            signal_strength=0.72,
+            timestamp="2026-04-02T12:00:00",
+            valid_now=True,
+            reason="EXECUTED",
+            raw={"action": "EXECUTED"},
+        )
+
+        message = build_telegram_message(entry, {"include_strategy": False, "include_regime": True})
+
+        self.assertIn("<b>FXPM Signal</b>", message)
+        self.assertIn("EURUSD BUY", message)
+        self.assertIn("Entry: <code>1.10001</code>", message)
+        self.assertIn("Context: H1 / TREND", message)
+        self.assertNotIn("DoNotExpose", message)
 
     def test_validity_respects_age(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)

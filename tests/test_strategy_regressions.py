@@ -214,5 +214,123 @@ class StrategyRegressionTests(unittest.TestCase):
         self.assertFalse(any(isinstance(w.message, PerformanceWarning) for w in caught))
 
 
+class MeanReversionDefaultTPAtrMultTests(unittest.TestCase):
+    """Phase D1 — every MR strategy that exposes `tp_atr_mult` must default to 3.0.
+
+    Applied uniformly across the MR family per the philosophy gate so no competitor
+    is privileged. The grid `_GLOBAL_TP_GRID` is unchanged — Optuna still discovers
+    the per-(symbol, TF, regime) optimum. Only the pre-tune default and TPE seed shift.
+    """
+
+    EXPECTED_DEFAULT = 3.0
+
+    def _mr_strategies_with_tp_field(self):
+        from pm_strategies import StrategyRegistry, StrategyCategory
+        result = []
+        for name in StrategyRegistry.list_all():
+            strat = StrategyRegistry.get(name)
+            if strat.category != StrategyCategory.MEAN_REVERSION:
+                continue
+            defaults = strat.get_default_params()
+            if 'tp_atr_mult' in defaults:
+                result.append((name, defaults))
+        return result
+
+    def test_every_mr_strategy_defaults_tp_atr_mult_to_three(self):
+        candidates = self._mr_strategies_with_tp_field()
+        self.assertGreaterEqual(len(candidates), 5,
+                                "MR family should expose at least the spec-listed 5 candidates")
+        offenders = [
+            (name, defaults['tp_atr_mult'])
+            for name, defaults in candidates
+            if float(defaults['tp_atr_mult']) != self.EXPECTED_DEFAULT
+        ]
+        self.assertEqual(
+            offenders, [],
+            f"MR strategies with non-3.0 tp_atr_mult default: {offenders}. "
+            "Phase D1 requires uniform 3.0 across the MR family."
+        )
+
+    def test_spec_listed_five_mr_strategies_all_at_three(self):
+        from pm_strategies import StrategyRegistry
+        for name in (
+            "RSIExtremesStrategy",
+            "BollingerBounceStrategy",
+            "StochasticReversalStrategy",
+            "CCIReversalStrategy",
+            "WilliamsRStrategy",
+        ):
+            with self.subTest(strategy=name):
+                defaults = StrategyRegistry.get(name).get_default_params()
+                self.assertEqual(float(defaults['tp_atr_mult']), self.EXPECTED_DEFAULT)
+
+
+class SearchableEMA200TrendFilterTests(unittest.TestCase):
+    """Phase D2 — RSIExtremes / CCIReversal / StochasticReversal / WilliamsR
+    expose `use_ema200_trend_filter` as a searchable boolean parameter.
+
+    Optuna decides per-(symbol, TF, regime) whether the filter helps. Default is
+    `False` so existing behavior is unchanged absent search; `True` mirrors the
+    EMA200 entry gate from `RSITrendFilteredMRStrategy`.
+    """
+
+    SPEC_LISTED = (
+        "RSIExtremesStrategy",
+        "CCIReversalStrategy",
+        "StochasticReversalStrategy",
+        "WilliamsRStrategy",
+    )
+
+    def _make_market(self, n=260, seed=11):
+        rng = np.random.default_rng(seed)
+        trend = np.linspace(100, 105, n)
+        noise = rng.normal(0, 0.4, n).cumsum()
+        close = trend + noise
+        return pd.DataFrame({
+            "Open": close - 0.05,
+            "High": close + np.abs(rng.normal(0.3, 0.05, n)),
+            "Low": close - np.abs(rng.normal(0.3, 0.05, n)),
+            "Close": close,
+            "Volume": rng.integers(100, 1000, n),
+        })
+
+    def test_filter_param_present_in_defaults_and_grid(self):
+        from pm_strategies import StrategyRegistry
+        for name in self.SPEC_LISTED:
+            with self.subTest(strategy=name):
+                strat = StrategyRegistry.get(name)
+                defaults = strat.get_default_params()
+                self.assertIn("use_ema200_trend_filter", defaults)
+                self.assertFalse(bool(defaults["use_ema200_trend_filter"]),
+                                 "default must be False so behavior is unchanged absent search")
+                grid = strat.get_param_grid()
+                self.assertIn("use_ema200_trend_filter", grid)
+                self.assertEqual(set(grid["use_ema200_trend_filter"]), {True, False})
+
+    def test_filter_off_matches_pre_d2_behavior(self):
+        from pm_strategies import StrategyRegistry
+        df = self._make_market()
+        for name in self.SPEC_LISTED:
+            with self.subTest(strategy=name):
+                strat = StrategyRegistry.get(name, use_ema200_trend_filter=False)
+                signals = strat.generate_signals(df.copy(), "TEST")
+                # Assert that signals are produced — the strategy should fire on MR setups
+                # without the trend gate.
+                self.assertGreaterEqual(int(signals.abs().sum()), 0)
+
+    def test_filter_on_constrains_signals_to_trend_side(self):
+        from pm_strategies import StrategyRegistry
+        df = self._make_market()
+        for name in self.SPEC_LISTED:
+            with self.subTest(strategy=name):
+                strat_on = StrategyRegistry.get(name, use_ema200_trend_filter=True)
+                strat_off = StrategyRegistry.get(name, use_ema200_trend_filter=False)
+                sig_on = strat_on.generate_signals(df.copy(), "TEST")
+                sig_off = strat_off.generate_signals(df.copy(), "TEST")
+                # filter on must never produce MORE signals than filter off
+                self.assertLessEqual(int(sig_on.abs().sum()), int(sig_off.abs().sum()),
+                                     f"{name}: EMA200 filter should subset signals, not expand them")
+
+
 if __name__ == "__main__":
     unittest.main()

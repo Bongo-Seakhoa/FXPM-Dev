@@ -12,7 +12,7 @@ import sys
 import os
 import json
 import datetime
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -326,6 +326,134 @@ class LiveLoopIntegrationTests(unittest.TestCase):
         trader._close_position_on_signal.assert_called_once()
         trader._execute_entry.assert_not_called()
 
+    def test_unknown_position_timeframe_logs_once_and_blocks_secondary_trade(self):
+        """Unknown open-position timeframe should fail closed without repeated warning spam."""
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+
+        mock_mt5 = Mock()
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.find_broker_symbol.return_value = "EURUSD"
+        mock_mt5.get_positions.return_value = [
+            Mock(symbol="EURUSD", type=0, magic=987654321, comment="", ticket=4242, identifier=4242)
+        ]
+        mock_mt5.get_account_info.return_value = Mock(trade_allowed=True, trade_expert=True)
+
+        mock_pm = Mock()
+        mock_pm.symbols = ["EURUSD"]
+        mock_pm.get_validated_configs.return_value = {
+            "EURUSD": Mock(
+                has_regime_configs=Mock(return_value=False),
+                timeframe="H1",
+            )
+        }
+
+        mock_pipeline = Mock()
+        mock_pipeline.actionable_score_margin = 1.0
+        mock_pipeline.allow_d1_plus_lower_tf = True
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            enable_trading=False,
+            pipeline_config=mock_pipeline,
+        )
+        trader.logger = MagicMock()
+        trader._evaluate_regime_candidates = MagicMock()
+
+        trader.process_all_symbols()
+        trader.process_all_symbols()
+
+        trader._evaluate_regime_candidates.assert_not_called()
+        warning_messages = [
+            args[0]
+            for args, _kwargs in trader.logger.warning.call_args_list
+            if args and "timeframe unknown; blocking secondary trade" in args[0]
+        ]
+        self.assertEqual(len(warning_messages), 1)
+
+    def test_no_actionable_signal_is_visible_at_info_level(self):
+        """No-actionable winners should be visible in the normal INFO log stream."""
+        from pm_main import LiveTrader, DecisionThrottle
+        from pm_position import PositionConfig
+
+        mock_mt5 = Mock()
+        mock_mt5.is_connected.return_value = False
+
+        mock_pm = Mock()
+        mock_pm.symbols = ["EURUSD"]
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            enable_trading=False,
+            pipeline_config=Mock(),
+        )
+        trader.logger = MagicMock()
+        trader._decision_throttle = DecisionThrottle(
+            log_path=os.path.join(self.tmp_dir, "last_trade_log.json")
+        )
+
+        candidate = {
+            "strategy_name": "SupertrendStrategy",
+            "timeframe": "H1",
+            "regime": "TREND",
+        }
+
+        trader._log_no_actionable_signal(
+            symbol="EURUSD",
+            message="NO_ACTIONABLE_WINNER_SIGNAL (no actionable winners)",
+            best_candidate=candidate,
+            bar_time_iso="2026-04-02 18:00:00",
+            action_type="NO_ACTIONABLE_WINNER_SIGNAL",
+        )
+
+        trader.logger.info.assert_any_call(
+            "[EURUSD] NO_ACTIONABLE_WINNER_SIGNAL (no actionable winners)"
+        )
+
+    def test_process_all_symbols_logs_sweep_completion_heartbeat(self):
+        """Each live sweep should emit a completion heartbeat at INFO level."""
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+
+        mock_mt5 = Mock()
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.get_positions.return_value = []
+        mock_mt5.get_account_info.return_value = Mock(
+            equity=5100.0,
+            trade_allowed=True,
+            trade_expert=True,
+        )
+
+        mock_pm = Mock()
+        mock_pm.symbols = ["EURUSD"]
+        mock_pm.get_validated_configs.return_value = {
+            "EURUSD": Mock(),
+        }
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            enable_trading=False,
+            pipeline_config=Mock(),
+        )
+        trader.logger = MagicMock()
+        trader._process_symbol = MagicMock()
+        trader._sync_drift_monitor = MagicMock()
+
+        trader.process_all_symbols()
+
+        heartbeat_messages = [
+            args[0]
+            for args, _kwargs in trader.logger.info.call_args_list
+            if args and str(args[0]).startswith("Live sweep complete:")
+        ]
+        self.assertEqual(len(heartbeat_messages), 1)
+
     def test_regime_detection_on_synthetic_bars(self):
         """MarketRegimeDetector should produce valid regime labels."""
         from pm_regime import MarketRegimeDetector
@@ -421,6 +549,82 @@ class LiveLoopIntegrationTests(unittest.TestCase):
         self.assertEqual(decoded["timeframe"], "H1")
         self.assertEqual(decoded["strategy_name"], "SupertrendStrategy")
         self.assertEqual(decoded["direction"], "LONG")
+
+    def test_regime_candidate_selection_uses_regime_live_surface(self):
+        """Live winner lookup should follow the same decision-time regime surface as optimization."""
+        from types import SimpleNamespace
+        from pm_main import LiveTrader
+        from pm_pipeline import RegimeConfig, SymbolConfig
+
+        class _FakeStrategy:
+            name = "FakeLiveStrategy"
+
+            def generate_signals(self, features, symbol):
+                return pd.Series([0, 1, 0], index=features.index)
+
+        trader = LiveTrader.__new__(LiveTrader)
+        trader.pipeline_config = SimpleNamespace(
+            regime_params_file="regime_params.json",
+            live_bars_count=10,
+            live_min_bars=2,
+            regime_min_val_profit_factor=1.0,
+            regime_min_val_return_pct=0.0,
+            fx_val_max_drawdown=35.0,
+            regime_min_val_return_dd_ratio=0.0,
+        )
+        trader._candidate_cache = {}
+        trader._cache_hits = 0
+        trader._cache_misses = 0
+        trader._last_bar_times = {}
+        trader._is_symbol_timeframe_due = Mock(return_value=True)
+        trader._prune_cache = Mock()
+        trader.logger = Mock()
+        trader.pm = None
+        bars = _make_ohlcv(3)
+        trader._get_live_bars = Mock(return_value=bars)
+
+        features = bars.copy()
+        features["REGIME"] = ["TREND", "RANGE", "RANGE"]
+        features["REGIME_LIVE"] = ["CHOP", "TREND", "RANGE"]
+        features["REGIME_STRENGTH"] = [0.1, 0.2, 0.3]
+        features["REGIME_STRENGTH_LIVE"] = [0.4, 0.9, 0.2]
+
+        config = SymbolConfig(
+            symbol="EURUSD",
+            regime_configs={
+                "M5": {
+                    "TREND": RegimeConfig(
+                        strategy_name="FakeLiveStrategy",
+                        parameters={},
+                        quality_score=0.8,
+                        val_metrics={
+                            "profit_factor": 1.5,
+                            "total_return_pct": 5.0,
+                            "max_drawdown_pct": 2.0,
+                        },
+                    ),
+                    "RANGE": RegimeConfig(
+                        strategy_name="ShouldNotUse",
+                        parameters={},
+                        quality_score=0.8,
+                        val_metrics={
+                            "profit_factor": 1.5,
+                            "total_return_pct": 5.0,
+                            "max_drawdown_pct": 2.0,
+                        },
+                    ),
+                }
+            },
+        )
+
+        with patch("pm_main.FeatureComputer.compute_all", return_value=features), \
+             patch("pm_main.StrategyRegistry.get", return_value=_FakeStrategy()):
+            candidates, stats = trader._evaluate_regime_candidates("EURUSD", "EURUSD", config)
+
+        self.assertEqual(stats["winner_candidates"], 1)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["regime"], "TREND")
+        self.assertAlmostEqual(candidates[0]["regime_strength"], 0.9)
 
 
 if __name__ == "__main__":

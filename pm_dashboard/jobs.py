@@ -16,8 +16,7 @@ import json
 import logging
 import os
 import threading
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +55,7 @@ class HistoricalDataDownloader:
         self.pm_root = pm_root
         self.data_dir = os.path.join(pm_root, "data")
         self.mt5 = mt5_connector
+        self._refresh_lock = threading.RLock()
         self._data_loader: Optional[DataLoader] = None
         self._config_cache_signature: Optional[Tuple[str, int, int]] = None
         self._config_cache: Dict[str, Any] = {}
@@ -246,6 +246,39 @@ class HistoricalDataDownloader:
     def can_refresh_from_mt5(self) -> bool:
         return self._ensure_mt5_connection()
 
+    def _merge_existing_bars(self, filepath: str, bars: pd.DataFrame, max_bars: int) -> pd.DataFrame:
+        merged = bars.copy()
+        if os.path.isfile(filepath):
+            try:
+                existing = pd.read_csv(filepath, index_col=0, parse_dates=True)
+                if isinstance(existing, pd.DataFrame) and not existing.empty:
+                    merged = pd.concat([existing, merged], axis=0, sort=False)
+                    if not merged.index.is_unique:
+                        merged = merged[~merged.index.duplicated(keep="last")]
+                    merged = merged.sort_index()
+            except Exception as exc:
+                logger.warning("Could not merge existing %s; replacing with fresh MT5 data: %s", filepath, exc)
+
+        if max_bars and len(merged) > max_bars:
+            merged = merged.tail(max_bars)
+        return merged
+
+    def _write_csv_atomic(self, filepath: str, frame: pd.DataFrame) -> None:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        tmp_path = f"{filepath}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8", newline="") as handle:
+                frame.to_csv(handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, filepath)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
     def refresh_symbol_m5(self, symbol: str, max_bars: int) -> bool:
         """
         Refresh one symbol's root M5 file using the same MT5 path as PM main app.
@@ -266,8 +299,10 @@ class HistoricalDataDownloader:
 
         filepath = os.path.join(self.data_dir, f"{symbol}_M5.csv")
         try:
-            bars.to_csv(filepath)
-            logger.info("Updated %s with %d bars", filepath, len(bars))
+            with self._refresh_lock:
+                merged = self._merge_existing_bars(filepath, bars, max_bars)
+                self._write_csv_atomic(filepath, merged)
+            logger.info("Updated %s with %d bars (%d fresh)", filepath, len(merged), len(bars))
             return True
         except Exception as exc:
             logger.error("Failed writing %s: %s", filepath, exc)
@@ -296,7 +331,6 @@ class HistoricalDataDownloader:
                 success += 1
             else:
                 failed += 1
-            time.sleep(0.05)
 
         self._clear_data_loader_cache()
 
@@ -387,6 +421,7 @@ class DataDownloadScheduler:
         self._running = False
         self._thread = None
         self._last_run_date = None
+        self._stop_event = threading.Event()
 
     def _parse_run_time(self) -> Tuple[int, int]:
         try:
@@ -402,12 +437,14 @@ class DataDownloadScheduler:
             logger.warning("Data maintenance scheduler already running")
             return
         self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         logger.info("Data maintenance scheduler started (daily at %s)", self.run_time)
 
     def stop(self, timeout_sec: float = 10.0):
         self._running = False
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=max(0.1, float(timeout_sec)))
             if self._thread.is_alive():
@@ -423,18 +460,34 @@ class DataDownloadScheduler:
             return True
         return False
 
+    def _next_due_at(self, now: Optional[datetime] = None) -> datetime:
+        probe = now or datetime.now()
+        target_hour, target_minute = self._parse_run_time()
+        due_at = probe.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+        if self._last_run_date == probe.date():
+            return due_at + timedelta(days=1)
+        if probe > due_at:
+            return probe
+        return due_at
+
+    def _wait_until_due(self, due_at: datetime, *, now: Optional[datetime] = None) -> None:
+        probe = now or datetime.now()
+        timeout = max(0.0, (due_at - probe).total_seconds())
+        self._stop_event.wait(timeout=min(timeout, 1.0))
+
     def _run_loop(self):
         target_hour, target_minute = self._parse_run_time()
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             try:
                 now = datetime.now()
                 if self._should_run_now(now, target_hour, target_minute):
                     self.run_now()
                     self._last_run_date = now.date()
-                time.sleep(30)
+                    continue
+                self._wait_until_due(self._next_due_at(now), now=now)
             except Exception as exc:
                 logger.error("Error in data maintenance scheduler: %s", exc, exc_info=True)
-                time.sleep(60)
+                self._wait_until_due(datetime.now() + timedelta(seconds=60))
 
     def run_now(self):
         logger.info("Manual/root data maintenance triggered")

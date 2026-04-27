@@ -17,6 +17,7 @@ This is the foundation module that provides:
 Version: 3.1 (Portfolio Manager - Numba backtester optimization)
 """
 
+import io
 import os
 import time
 import math
@@ -30,6 +31,7 @@ from typing import Dict, List, Any, Optional, Tuple, Union, Set
 
 import numpy as np
 import pandas as pd
+from pm_order_governance import candidate_policy_names, evaluate_policy, make_policy, GovernanceContext
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -489,13 +491,23 @@ class PipelineConfig:
     # Data directories
     data_dir: Path = field(default_factory=lambda: Path("./data"))
     output_dir: Path = field(default_factory=lambda: Path("./pm_outputs"))
+    log_dir: Path = field(default_factory=lambda: Path("./logs"))
     
-    # Data split ratios
-    # - Training remains the freshest large in-sample window.
-    # - overlap_pct is now warmup-only overlap, never scored.
-    # - holdout_pct reserves the freshest scored tail for final checks.
+    # Data workflow:
+    # - active_recent_m5 uses the latest max_bars M5 rows, reserves the oldest
+    #   historical_stress_audit_bars as audit-only context, and lets the newest
+    #   active_universe_bars drive production strategy selection.
+    # - legacy_percentage keeps the old train/validation/freshest-holdout split.
+    data_workflow_mode: str = "active_recent_m5"
+    historical_stress_audit_bars: int = 50000
+    active_universe_bars: int = 250000
+    active_stage2_pct: float = 50.0
+
+    # Legacy percentage split ratios. In active_recent_m5 mode these are still
+    # used for warmup sizing and compatibility, but the production window comes
+    # from the explicit M5 workflow above.
     train_pct: float = 80.0
-    val_pct: float = 30.0
+    val_pct: float = 10.0
     overlap_pct: float = 10.0
     holdout_pct: Optional[float] = None
     
@@ -524,6 +536,18 @@ class PipelineConfig:
     min_trades: int = 25
     min_robustness: float = 0.20
     optimization_max_workers: int = 1  # 1 = sequential
+
+    # Optional family-size-aware search budget.
+    # When enabled, the per-strategy Optuna trial budget scales with the cartesian
+    # size of `get_param_grid()` instead of a flat `max_param_combos`. This prevents
+    # large families (e.g., EMARibbonADX, 46k+ combos) from receiving a coarser
+    # search than a 48-combo family. Disabled by default so existing behavior is
+    # preserved; opt-in per operator policy. Effective trials per strategy:
+    #     n = clamp(min, max, max(min, round(coverage * cartesian_size)))
+    optuna_family_size_aware_budget: bool = False
+    optuna_min_trials_per_strategy: int = 50
+    optuna_max_trials_per_strategy: int = 500
+    optuna_target_coverage_pct: float = 0.10  # 10% of cartesian; capped by max
     
     # Evaluation thresholds
     min_win_rate: float = 40.0
@@ -541,7 +565,7 @@ class PipelineConfig:
     # FX backtester-aligned optimization/validation thresholds
     fx_opt_min_trades: int = 15          # used during param search (train only)
     fx_val_min_trades: int = 15          # minimum validation trades required
-    fx_val_max_drawdown: float = 18.0    # maximum validation drawdown (%)
+    fx_val_max_drawdown: float = 12.0    # maximum validation drawdown (%)
     fx_val_sharpe_override: float = 0.3  # validation Sharpe can override robustness threshold
     # Generalization controls (fx_backtester)
     fx_selection_top_k: int = 5          # validate only top-K strategy/timeframe candidates
@@ -549,22 +573,22 @@ class PipelineConfig:
     fx_gap_penalty_lambda: float = 0.70  # penalty strength for train->val score gaps
     fx_robustness_boost: float = 0.15    # robustness multiplier weight (0..0.5 recommended)
     fx_min_robustness_ratio: float = 0.80  # minimum val_score/train_score ratio for validation
+    # Multiplicative variance / stability penalty in fx_generalization_score: exp(-k * std_weekly_return)
+    # Set 0.0 to disable the validation-side stability penalty.
+    fx_stability_penalty_k: float = 2.0
 
-    # Optuna objective behavior
-    # If True, Optuna's trial objective includes validation metrics (may overfit to holdout split).
-    # Default False: tune on train-only, validate on val during selection.
-    optuna_use_val_in_objective: bool = False
-    # Blended objective: train_weight * train_score + val_weight * val_score
-    # Active only when optuna_use_val_in_objective is False and val data exists.
-    # This provides bounded val influence without full val optimization.
-    optuna_objective_blend_enabled: bool = True
-    optuna_objective_train_weight: float = 0.80
-    optuna_objective_val_weight: float = 0.20
+    regime_validation_top_k: int = 5
+    regime_min_val_return_dd_ratio: float = 1.0
+    scoring_use_continuous_dd: bool = True
+    scoring_use_sortino_blend: bool = True
+    scoring_use_tail_risk: bool = True
+    scoring_use_consistency: bool = True
+    scoring_use_trade_frequency_bonus: bool = True
 
     # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
     # to be considered actionable in live trading. Signals below this are logged but
     # not executed. Default 0.95 is strict; lower values (e.g. 0.9) allow more trades.
-    actionable_score_margin: float = 0.95
+    actionable_score_margin: float = 0.92
 
     # Timeframes to evaluate
     timeframes: List[str] = field(default_factory=lambda: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'])
@@ -573,10 +597,77 @@ class PipelineConfig:
     # Live trading data window
     live_bars_count: int = 1500      # bars loaded per timeframe during live trading
     live_min_bars: int = 300         # minimum bars required to evaluate a timeframe in live trading
+    live_loop_trigger_mode: str = "bar"  # bar|scheduled
+    live_bar_poll_seconds: float = 0.25  # CPU-idle polling interval; decisions are gated by MT5 bar changes
+    live_tick_poll_seconds: float = 0.25  # backward-compatible alias for older configs
+    live_bar_settle_seconds: int = 5
+    live_stale_retry_seconds: int = 15
+    live_artifact_drift_policy: str = "block"  # block|warn|ignore
+    live_config_expiry_grace_minutes: int = 0
+    reconnect_max_attempts: int = 5
+    reconnect_attempt_interval_seconds: int = 5
+    reconnect_failure_retry_seconds: int = 30
+    live_risk_scalars_enabled: bool = False
+    # Tri-state mode for the risk-scalar stack: off = disabled,
+    # shadow = log-only, on = authoritative. The legacy boolean still
+    # maps True -> "on" when the mode is left at "off".
+    live_risk_scalars_mode: str = "off"
+    # Tri-state mode for the MarketDrivenExitPack: off = disabled,
+    # paper = log-only, on = authoritative.
+    market_driven_exit_pack_mode: str = "off"
+    portfolio_observatory_enabled: bool = False
+    walk_forward_audit_enabled: bool = False
+    walk_forward_audit_windows: int = 3
+    local_governance_tournament_enabled: bool = False
+    local_governance_live_mode: str = "off"
+    local_governance_candidate_policies: List[str] = field(
+        default_factory=lambda: ["control_fixed", "breakeven_1r", "atr_trail_capped", "pure_atr"]
+    )
+    local_governance_require_baseline_improvement: bool = True
+    local_governance_min_score_improvement: float = 0.0
+    risk_management_optimization_enabled: bool = True
+    risk_management_selection_stage: str = "stage3"
+    historical_audit_min_trades: int = 5
+    historical_audit_max_drawdown: float = 35.0
+    historical_audit_min_profit_factor: float = 0.60
+    winner_ledger_path: str = "pm_configs.json"
+    daily_loss_advisory_pct: float = 0.0
+    session_loss_advisory_pct: float = 0.0
+    target_annual_vol: float = 0.10
     execution_spread_filter_enabled: bool = True
     execution_spread_min_edge_mult: float = 1.5
     execution_spread_spike_mult: float = 2.0
     execution_spread_penalty_start_mult: float = 0.5
+
+    # Storage governance
+    storage_enabled: bool = True
+    storage_observe_only: bool = True
+    storage_signal_ledger_enabled: bool = True
+    storage_warn_free_gb: float = 15.0
+    storage_critical_free_gb: float = 10.0
+    storage_pause_entries_below_free_gb: Optional[float] = None
+    storage_measure_interval_seconds: int = 300
+    storage_housekeeping_interval_seconds: int = 900
+    storage_metaquotes_review_interval_seconds: int = 21600
+    storage_write_protect_minutes: int = 5
+    storage_local_data_first_enabled: bool = True
+    storage_live_sync_bars: int = 3000
+    storage_live_sync_overlap_bars: int = 100
+    storage_live_cache_max_age_days: int = 7
+    storage_delta_sync_overlap_minutes: int = 1440
+    storage_resample_cache_max_gb: float = 1.0
+    storage_resample_cache_max_age_days: int = 7
+    storage_logs_keep_days: int = 14
+    storage_pm_outputs_keep_days: int = 14
+    storage_pm_outputs_keep_count: int = 30
+    storage_metaquotes_cleanup_enabled: bool = False
+    storage_metaquotes_root: str = ""
+    storage_metaquotes_active_root_allowlist: List[str] = field(default_factory=list)
+    storage_metaquotes_demo_servers: List[str] = field(default_factory=lambda: ["FBS-Demo", "MetaQuotes-Demo"])
+    storage_metaquotes_stale_tester_days: int = 14
+    state_filename: str = "storage_state.json"
+    manifest_filename: str = "storage_manifest.jsonl"
+    ledger_filename: str = "signal_ledger.jsonl"
 
     # Retrain periods to evaluate (research-only; production uses the fixed calendar schedule below)
     retrain_periods: List[int] = field(default_factory=lambda: [7, 14, 30, 60, 90])
@@ -588,8 +679,8 @@ class PipelineConfig:
     production_retrain_anchor_date: str = "2026-03-29"
     production_retrain_poll_seconds: int = 60
     
-    # Maximum bars to load per symbol (5 years of M5 data = ~500k bars)
-    max_bars: int = 500000
+    # Maximum base M5 bars to load per symbol for optimization.
+    max_bars: int = 300000
     
     # Regime-aware optimization settings
     use_regime_optimization: bool = True
@@ -598,14 +689,21 @@ class PipelineConfig:
     regime_freshness_decay: float = 0.85  # Freshness decay for stale timeframe signals
     regime_chop_no_trade: bool = False  # Hard no-trade when in CHOP with no winner
     regime_params_file: str = "regime_params.json"  # Path to tuned regime params
+    # Mirrored from PositionConfig at app startup so optimization workers evaluate
+    # the same trade-intent TP surface that live trading sends to the executor.
+    regime_tp_multipliers: Dict[str, float] = field(default_factory=lambda: {
+        "TREND": 1.25,
+        "BREAKOUT": 1.15,
+        "RANGE": 0.85,
+        "CHOP": 0.75,
+    })
     
     # Hyperparameter tuning settings for regime optimization
     regime_enable_hyperparam_tuning: bool = True  # Enable hyperparameter tuning in regime optimization
     regime_hyperparam_top_k: int = 3  # Top K strategies to tune per regime (screening phase)
     regime_hyperparam_max_combos: int = 150  # Max param combinations to test per strategy
     
-    # ===== REGIME WINNER PROFITABILITY GATES (FIX #1) =====
-    # These thresholds ensure regime winners are actually profitable, not just "best loser"
+    # Validation profitability gates for stored regime winners.
     regime_min_val_profit_factor: float = 1.05   # Minimum validation PF to be stored as winner
     regime_min_val_return_pct: float = 5.0       # Minimum validation return % floor for validated winners
     regime_allow_losing_winners: bool = False    # If True, allows PF < 1 (not recommended)
@@ -614,7 +712,7 @@ class PipelineConfig:
     # ===== PRE-TUNING ELIGIBILITY GATES =====
     # Applied BEFORE hyperparameter tuning on DEFAULT-param training results.
     # Purpose: skip truly catastrophic strategies to save compute.
-    # Must be LENIENT — default params are not optimized yet.
+    # Must stay lenient because default params are not optimized yet.
     train_min_profit_factor: float = 0.5     # Reject only extremely bad PF
     train_min_return_pct: float = -30.0      # Allow moderate losses (tuning may fix)
     train_max_drawdown: float = 60.0         # Reject only catastrophic blowups
@@ -622,8 +720,8 @@ class PipelineConfig:
     # ===== WEAK-TRAIN EXCEPTIONAL VALIDATION =====
     # When training PF < 1.0 or negative return, require exceptional validation
     # to still allow the strategy as a winner.
-    exceptional_val_profit_factor: float = 1.3  # Min val PF to override weak train
-    exceptional_val_return_pct: float = 2.0     # Min val return % to override weak train
+    exceptional_val_profit_factor: float = 1.5  # Min val PF to override weak train
+    exceptional_val_return_pct: float = 10.0    # Min val return % to override weak train
 
     # ===== LIVE RISK POLICY (WINNERS-ONLY) =====
     # Risk per trade comes from PositionConfig.risk_per_trade_pct.
@@ -639,10 +737,16 @@ class PipelineConfig:
     margin_reopen_level: float = 100.0            # resume entries above this %
     margin_recovery_closes_per_cycle: int = 1     # max forced closes per cycle in RECOVERY
     margin_panic_closes_per_cycle: int = 3        # max forced closes per cycle in PANIC
+    margin_reopen_cooldown_minutes: float = 15.0  # block all new entries for N minutes after any forced close (flash-crash guard)
 
     
-    # ===== DUAL-TRADE D1 + LOWER-TF SETTINGS (FIX #2) =====
-    # Allow up to 2 concurrent trades: one D1 + one lower-TF
+    # ===== POSITION TIMEFRAME OVERRIDES =====
+    # Manual overrides for position timeframe inference when comment/magic
+    # decoding fails.  Keys: "magic:<number>" or "ticket:<number>".
+    # Values: timeframe string (e.g. "D1", "H4").
+    position_timeframe_overrides: Dict[str, str] = field(default_factory=dict)
+
+    # Allow up to two concurrent trades per symbol: one D1 + one lower-TF.
     allow_d1_plus_lower_tf: bool = True          # Enable D1 + lower-TF concurrent trades
     d1_secondary_risk_multiplier: float = 1.0   # Risk for second trade when D1 is open
     max_combined_risk_pct: float = 3.0          # Max combined risk per symbol (D1 + lower)
@@ -666,8 +770,10 @@ class PipelineConfig:
         """Ensure directories exist and sync aliases."""
         self.data_dir = Path(self.data_dir)
         self.output_dir = Path(self.output_dir)
+        self.log_dir = Path(self.log_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         # Clamp workers to sane minimum
         try:
             self.optimization_max_workers = max(1, int(self.optimization_max_workers))
@@ -690,21 +796,27 @@ class PipelineConfig:
             self.regime_min_val_return_dd_ratio = ratio if math.isfinite(ratio) and ratio > 0 else 1.0
         except Exception:
             self.regime_min_val_return_dd_ratio = 1.0
-
-        # Normalize Optuna objective blend weights for robustness against config typos.
         try:
-            tw = float(self.optuna_objective_train_weight)
-            vw = float(self.optuna_objective_val_weight)
-            total = tw + vw
-            if total > 0:
-                self.optuna_objective_train_weight = tw / total
-                self.optuna_objective_val_weight = vw / total
-            else:
-                self.optuna_objective_train_weight = 0.80
-                self.optuna_objective_val_weight = 0.20
+            normalized_regime_tp: Dict[str, float] = {}
+            for key, value in (self.regime_tp_multipliers or {}).items():
+                regime_key = str(key).strip().upper()
+                multiplier = float(value)
+                if regime_key and math.isfinite(multiplier) and multiplier > 0:
+                    normalized_regime_tp[regime_key] = multiplier
+            self.regime_tp_multipliers = normalized_regime_tp or {
+                "TREND": 1.25,
+                "BREAKOUT": 1.15,
+                "RANGE": 0.85,
+                "CHOP": 0.75,
+            }
         except Exception:
-            self.optuna_objective_train_weight = 0.80
-            self.optuna_objective_val_weight = 0.20
+            self.regime_tp_multipliers = {
+                "TREND": 1.25,
+                "BREAKOUT": 1.15,
+                "RANGE": 0.85,
+                "CHOP": 0.75,
+            }
+
         self.position_size_pct = self.risk_per_trade_pct
         self.production_retrain_mode = str(self.production_retrain_mode or "auto").strip().lower()
         if self.production_retrain_mode not in {"auto", "notify", "off"}:
@@ -742,6 +854,178 @@ class PipelineConfig:
         except Exception:
             self.production_retrain_poll_seconds = 60
         self.execution_spread_filter_enabled = bool(self.execution_spread_filter_enabled)
+        self.live_risk_scalars_enabled = bool(self.live_risk_scalars_enabled)
+        raw_loop_mode = getattr(self, "live_loop_trigger_mode", "bar")
+        if isinstance(raw_loop_mode, str):
+            loop_mode = raw_loop_mode.strip().lower()
+        else:
+            loop_mode = "bar"
+        loop_mode_aliases = {
+            "tick": "bar",
+            "quote": "bar",
+            "quotes": "bar",
+            "per_quote": "bar",
+            "per-tick": "bar",
+            "bars": "bar",
+            "candle": "bar",
+            "candles": "bar",
+            "data": "bar",
+            "timer": "scheduled",
+            "time": "scheduled",
+        }
+        loop_mode = loop_mode_aliases.get(loop_mode, loop_mode)
+        if loop_mode not in {"bar", "scheduled"}:
+            logger.warning(
+                "Invalid live_loop_trigger_mode=%r; falling back to 'bar'. "
+                "Allowed values: bar | scheduled.",
+                raw_loop_mode,
+            )
+            loop_mode = "bar"
+        self.live_loop_trigger_mode = loop_mode
+        try:
+            self.live_bar_poll_seconds = max(0.05, float(self.live_bar_poll_seconds))
+        except Exception:
+            try:
+                self.live_bar_poll_seconds = max(0.05, float(self.live_tick_poll_seconds))
+            except Exception:
+                self.live_bar_poll_seconds = 0.25
+        self.live_tick_poll_seconds = self.live_bar_poll_seconds
+        raw_artifact_policy = getattr(self, "live_artifact_drift_policy", "block")
+        if isinstance(raw_artifact_policy, str):
+            artifact_policy = raw_artifact_policy.strip().lower()
+        else:
+            artifact_policy = "block"
+        policy_aliases = {"strict": "block", "allow": "ignore", "log": "warn"}
+        artifact_policy = policy_aliases.get(artifact_policy, artifact_policy)
+        if artifact_policy not in {"block", "warn", "ignore"}:
+            logger.warning(
+                "Invalid live_artifact_drift_policy=%r; falling back to 'block'. "
+                "Allowed values: block | warn | ignore.",
+                raw_artifact_policy,
+            )
+            artifact_policy = "block"
+        self.live_artifact_drift_policy = artifact_policy
+        try:
+            self.live_config_expiry_grace_minutes = max(0, int(self.live_config_expiry_grace_minutes))
+        except Exception:
+            self.live_config_expiry_grace_minutes = 0
+        # Normalize the tri-state risk-scalar mode once at startup.
+        _raw_mode = getattr(self, "live_risk_scalars_mode", "off")
+        if isinstance(_raw_mode, str):
+            _norm_mode = _raw_mode.strip().lower()
+        else:
+            _norm_mode = "off"
+        if _norm_mode not in {"off", "shadow", "on"}:
+            logger.warning(
+                "Invalid live_risk_scalars_mode=%r; falling back to 'off'. "
+                "Allowed values: off | shadow | on.",
+                _raw_mode,
+            )
+            _norm_mode = "off"
+        self.live_risk_scalars_mode = _norm_mode
+        # Normalize the tri-state market-driven exit-pack mode once at startup.
+        _raw_exit_mode = getattr(self, "market_driven_exit_pack_mode", "off")
+        if isinstance(_raw_exit_mode, str):
+            _norm_exit_mode = _raw_exit_mode.strip().lower()
+        else:
+            _norm_exit_mode = "off"
+        if _norm_exit_mode not in {"off", "paper", "on"}:
+            logger.warning(
+                "Invalid market_driven_exit_pack_mode=%r; falling back to 'off'. "
+                "Allowed values: off | paper | on.",
+                _raw_exit_mode,
+            )
+            _norm_exit_mode = "off"
+        self.market_driven_exit_pack_mode = _norm_exit_mode
+        self.portfolio_observatory_enabled = bool(self.portfolio_observatory_enabled)
+        self.walk_forward_audit_enabled = bool(self.walk_forward_audit_enabled)
+        self.local_governance_tournament_enabled = bool(self.local_governance_tournament_enabled)
+        self.risk_management_optimization_enabled = bool(self.risk_management_optimization_enabled)
+        self.data_workflow_mode = str(getattr(self, "data_workflow_mode", "active_recent_m5") or "").strip().lower()
+        if self.data_workflow_mode not in {"active_recent_m5", "legacy_percentage"}:
+            logger.warning(
+                "Invalid data_workflow_mode=%r; falling back to active_recent_m5.",
+                getattr(self, "data_workflow_mode", None),
+            )
+            self.data_workflow_mode = "active_recent_m5"
+        self.risk_management_selection_stage = str(
+            getattr(self, "risk_management_selection_stage", "stage3") or ""
+        ).strip().lower()
+        if self.risk_management_selection_stage not in {"stage2", "stage3"}:
+            logger.warning(
+                "Invalid risk_management_selection_stage=%r; falling back to stage3.",
+                getattr(self, "risk_management_selection_stage", None),
+            )
+            self.risk_management_selection_stage = "stage3"
+        try:
+            self.max_bars = max(1000, int(self.max_bars))
+        except Exception:
+            self.max_bars = 300000
+        try:
+            self.historical_stress_audit_bars = max(0, int(self.historical_stress_audit_bars))
+        except Exception:
+            self.historical_stress_audit_bars = 50000
+        try:
+            self.active_universe_bars = max(1000, int(self.active_universe_bars))
+        except Exception:
+            self.active_universe_bars = 250000
+        try:
+            self.active_stage2_pct = max(1.0, min(100.0, float(self.active_stage2_pct)))
+        except Exception:
+            self.active_stage2_pct = 50.0
+        try:
+            self.historical_audit_min_trades = max(0, int(self.historical_audit_min_trades))
+        except Exception:
+            self.historical_audit_min_trades = 5
+        try:
+            self.historical_audit_max_drawdown = max(0.0, float(self.historical_audit_max_drawdown))
+        except Exception:
+            self.historical_audit_max_drawdown = 35.0
+        try:
+            self.historical_audit_min_profit_factor = max(0.0, float(self.historical_audit_min_profit_factor))
+        except Exception:
+            self.historical_audit_min_profit_factor = 0.60
+        try:
+            self.walk_forward_audit_windows = max(1, int(self.walk_forward_audit_windows))
+        except Exception:
+            self.walk_forward_audit_windows = 3
+        raw_governance_mode = getattr(self, "local_governance_live_mode", "off")
+        if isinstance(raw_governance_mode, str):
+            governance_mode = raw_governance_mode.strip().lower()
+        else:
+            governance_mode = "off"
+        if governance_mode not in {"off", "shadow", "on"}:
+            logger.warning(
+                "Invalid local_governance_live_mode=%r; falling back to 'off'. "
+                "Allowed values: off | shadow | on.",
+                raw_governance_mode,
+            )
+            governance_mode = "off"
+        self.local_governance_live_mode = governance_mode
+        self.local_governance_candidate_policies = candidate_policy_names(
+            getattr(self, "local_governance_candidate_policies", None)
+        )
+        self.local_governance_require_baseline_improvement = bool(
+            self.local_governance_require_baseline_improvement
+        )
+        try:
+            self.local_governance_min_score_improvement = max(
+                0.0,
+                float(self.local_governance_min_score_improvement),
+            )
+        except Exception:
+            self.local_governance_min_score_improvement = 0.0
+        winner_ledger_path = str(getattr(self, "winner_ledger_path", "pm_configs.json") or "").strip()
+        self.winner_ledger_path = winner_ledger_path or "pm_configs.json"
+        self.storage_enabled = bool(self.storage_enabled)
+        self.storage_observe_only = bool(self.storage_observe_only)
+        self.storage_signal_ledger_enabled = bool(self.storage_signal_ledger_enabled)
+        self.storage_metaquotes_cleanup_enabled = bool(self.storage_metaquotes_cleanup_enabled)
+        self.storage_local_data_first_enabled = bool(self.storage_local_data_first_enabled)
+        try:
+            self.target_annual_vol = max(0.0, float(self.target_annual_vol))
+        except Exception:
+            self.target_annual_vol = 0.10
         try:
             self.execution_spread_min_edge_mult = max(0.0, float(self.execution_spread_min_edge_mult))
         except Exception:
@@ -754,6 +1038,117 @@ class PipelineConfig:
             self.execution_spread_penalty_start_mult = max(0.0, float(self.execution_spread_penalty_start_mult))
         except Exception:
             self.execution_spread_penalty_start_mult = 0.5
+        try:
+            self.daily_loss_advisory_pct = max(0.0, float(self.daily_loss_advisory_pct))
+        except Exception:
+            self.daily_loss_advisory_pct = 0.0
+        try:
+            self.session_loss_advisory_pct = max(0.0, float(self.session_loss_advisory_pct))
+        except Exception:
+            self.session_loss_advisory_pct = 0.0
+        try:
+            self.storage_warn_free_gb = max(0.0, float(self.storage_warn_free_gb))
+        except Exception:
+            self.storage_warn_free_gb = 15.0
+        try:
+            self.storage_critical_free_gb = max(0.0, float(self.storage_critical_free_gb))
+        except Exception:
+            self.storage_critical_free_gb = 10.0
+        if self.storage_warn_free_gb and self.storage_critical_free_gb and self.storage_warn_free_gb < self.storage_critical_free_gb:
+            self.storage_warn_free_gb = self.storage_critical_free_gb
+        try:
+            if self.storage_pause_entries_below_free_gb in ("", None):
+                self.storage_pause_entries_below_free_gb = None
+            else:
+                self.storage_pause_entries_below_free_gb = max(0.0, float(self.storage_pause_entries_below_free_gb))
+        except Exception:
+            self.storage_pause_entries_below_free_gb = None
+        try:
+            self.storage_measure_interval_seconds = max(1, int(self.storage_measure_interval_seconds))
+        except Exception:
+            self.storage_measure_interval_seconds = 300
+        try:
+            self.storage_housekeeping_interval_seconds = max(1, int(self.storage_housekeeping_interval_seconds))
+        except Exception:
+            self.storage_housekeeping_interval_seconds = 900
+        try:
+            self.storage_metaquotes_review_interval_seconds = max(1, int(self.storage_metaquotes_review_interval_seconds))
+        except Exception:
+            self.storage_metaquotes_review_interval_seconds = 21600
+        try:
+            self.storage_write_protect_minutes = max(1, int(self.storage_write_protect_minutes))
+        except Exception:
+            self.storage_write_protect_minutes = 5
+        try:
+            self.storage_live_sync_bars = max(100, int(self.storage_live_sync_bars))
+        except Exception:
+            self.storage_live_sync_bars = 3000
+        try:
+            self.storage_live_sync_overlap_bars = max(0, int(self.storage_live_sync_overlap_bars))
+        except Exception:
+            self.storage_live_sync_overlap_bars = 100
+        try:
+            self.storage_live_cache_max_age_days = max(0, int(self.storage_live_cache_max_age_days))
+        except Exception:
+            self.storage_live_cache_max_age_days = 7
+        try:
+            self.storage_delta_sync_overlap_minutes = max(1, int(self.storage_delta_sync_overlap_minutes))
+        except Exception:
+            self.storage_delta_sync_overlap_minutes = 1440
+        try:
+            self.storage_resample_cache_max_gb = max(0.0, float(self.storage_resample_cache_max_gb))
+        except Exception:
+            self.storage_resample_cache_max_gb = 1.0
+        try:
+            self.storage_resample_cache_max_age_days = max(0, int(self.storage_resample_cache_max_age_days))
+        except Exception:
+            self.storage_resample_cache_max_age_days = 7
+        try:
+            self.storage_logs_keep_days = max(0, int(self.storage_logs_keep_days))
+        except Exception:
+            self.storage_logs_keep_days = 14
+        try:
+            self.storage_pm_outputs_keep_days = max(0, int(self.storage_pm_outputs_keep_days))
+        except Exception:
+            self.storage_pm_outputs_keep_days = 14
+        try:
+            self.storage_pm_outputs_keep_count = max(0, int(self.storage_pm_outputs_keep_count))
+        except Exception:
+            self.storage_pm_outputs_keep_count = 30
+        try:
+            self.storage_metaquotes_stale_tester_days = max(1, int(self.storage_metaquotes_stale_tester_days))
+        except Exception:
+            self.storage_metaquotes_stale_tester_days = 14
+        self.storage_metaquotes_root = str(self.storage_metaquotes_root or "").strip()
+        self.storage_metaquotes_active_root_allowlist = [
+            str(item).strip() for item in (self.storage_metaquotes_active_root_allowlist or []) if str(item).strip()
+        ]
+        self.storage_metaquotes_demo_servers = [
+            str(item).strip() for item in (self.storage_metaquotes_demo_servers or []) if str(item).strip()
+        ]
+        self.state_filename = str(self.state_filename or "storage_state.json").strip() or "storage_state.json"
+        self.manifest_filename = str(self.manifest_filename or "storage_manifest.jsonl").strip() or "storage_manifest.jsonl"
+        self.ledger_filename = str(self.ledger_filename or "signal_ledger.jsonl").strip() or "signal_ledger.jsonl"
+        try:
+            self.live_bar_settle_seconds = max(0, int(self.live_bar_settle_seconds))
+        except Exception:
+            self.live_bar_settle_seconds = 5
+        try:
+            self.live_stale_retry_seconds = max(1, int(self.live_stale_retry_seconds))
+        except Exception:
+            self.live_stale_retry_seconds = 15
+        try:
+            self.reconnect_max_attempts = max(1, int(self.reconnect_max_attempts))
+        except Exception:
+            self.reconnect_max_attempts = 5
+        try:
+            self.reconnect_attempt_interval_seconds = max(1, int(self.reconnect_attempt_interval_seconds))
+        except Exception:
+            self.reconnect_attempt_interval_seconds = 5
+        try:
+            self.reconnect_failure_retry_seconds = max(1, int(self.reconnect_failure_retry_seconds))
+        except Exception:
+            self.reconnect_failure_retry_seconds = 30
         try:
             self.fixed_retrain_days = max(
                 1,
@@ -881,6 +1276,125 @@ class Timer:
 # =============================================================================
 # INSTRUMENT SPECIFICATIONS
 # =============================================================================
+
+
+@dataclass
+class StorageConfig:
+    """
+    Storage governance configuration.
+
+    This config is intentionally conservative by default. The live PM can wire
+    it in later without changing behavior until storage management is explicitly
+    enabled and scheduled.
+    """
+    enabled: bool = True
+    observe_only: bool = True
+    warn_free_gb: float = 15.0
+    critical_free_gb: float = 10.0
+    pause_new_entries_below_free_gb: Optional[float] = None
+    write_protection_seconds: int = 300
+
+    signal_ledger_enabled: bool = True
+    data_cache_max_age_days: int = 7
+    data_cache_max_bytes: int = 1_000_000_000
+    live_cache_max_age_days: int = 7
+    live_sync_overlap_bars: int = 100
+    log_keep_days: int = 14
+    output_keep_days: int = 14
+    output_keep_count: int = 30
+
+    maintenance_interval_seconds: int = 120
+    post_optimization_interval_seconds: int = 0
+
+    metaquotes_cleanup_enabled: bool = False
+    metaquotes_active_root_allowlist: List[str] = field(default_factory=list)
+
+    state_filename: str = "storage_state.json"
+    manifest_filename: str = "storage_manifest.jsonl"
+    ledger_filename: str = "signal_ledger.jsonl"
+
+    def __post_init__(self):
+        try:
+            self.warn_free_gb = max(0.0, float(self.warn_free_gb))
+        except Exception:
+            self.warn_free_gb = 15.0
+        try:
+            self.critical_free_gb = max(0.0, float(self.critical_free_gb))
+        except Exception:
+            self.critical_free_gb = 10.0
+        if self.pause_new_entries_below_free_gb is not None:
+            try:
+                self.pause_new_entries_below_free_gb = max(0.0, float(self.pause_new_entries_below_free_gb))
+            except Exception:
+                self.pause_new_entries_below_free_gb = None
+        try:
+            self.write_protection_seconds = max(0, int(self.write_protection_seconds))
+        except Exception:
+            self.write_protection_seconds = 300
+        self.signal_ledger_enabled = bool(self.signal_ledger_enabled)
+        try:
+            self.data_cache_max_age_days = max(0, int(self.data_cache_max_age_days))
+        except Exception:
+            self.data_cache_max_age_days = 7
+        try:
+            self.data_cache_max_bytes = max(0, int(self.data_cache_max_bytes))
+        except Exception:
+            self.data_cache_max_bytes = 1_000_000_000
+        try:
+            self.live_cache_max_age_days = max(0, int(self.live_cache_max_age_days))
+        except Exception:
+            self.live_cache_max_age_days = 7
+        try:
+            self.live_sync_overlap_bars = max(0, int(self.live_sync_overlap_bars))
+        except Exception:
+            self.live_sync_overlap_bars = 100
+        try:
+            self.log_keep_days = max(0, int(self.log_keep_days))
+        except Exception:
+            self.log_keep_days = 14
+        try:
+            self.output_keep_days = max(0, int(self.output_keep_days))
+        except Exception:
+            self.output_keep_days = 14
+        try:
+            self.output_keep_count = max(0, int(self.output_keep_count))
+        except Exception:
+            self.output_keep_count = 30
+        try:
+            self.maintenance_interval_seconds = max(1, int(self.maintenance_interval_seconds))
+        except Exception:
+            self.maintenance_interval_seconds = 120
+        try:
+            self.post_optimization_interval_seconds = max(0, int(self.post_optimization_interval_seconds))
+        except Exception:
+            self.post_optimization_interval_seconds = 0
+        self.enabled = bool(self.enabled)
+        self.observe_only = bool(self.observe_only)
+        self.metaquotes_cleanup_enabled = bool(self.metaquotes_cleanup_enabled)
+        self.metaquotes_active_root_allowlist = [
+            str(item).strip() for item in (self.metaquotes_active_root_allowlist or []) if str(item).strip()
+        ]
+        self.state_filename = str(self.state_filename or "storage_state.json").strip() or "storage_state.json"
+        self.manifest_filename = str(self.manifest_filename or "storage_manifest.jsonl").strip() or "storage_manifest.jsonl"
+        self.ledger_filename = str(self.ledger_filename or "signal_ledger.jsonl").strip() or "signal_ledger.jsonl"
+        # Compatibility aliases for the existing storage manager and later PM wiring.
+        self.storage_enabled = bool(self.enabled)
+        self.storage_observe_only = bool(self.observe_only)
+        self.storage_signal_ledger_enabled = bool(self.signal_ledger_enabled)
+        self.storage_warn_free_gb = float(self.warn_free_gb)
+        self.storage_critical_free_gb = float(self.critical_free_gb)
+        self.storage_pause_entries_below_free_gb = self.pause_new_entries_below_free_gb
+        self.storage_write_protect_minutes = max(1, int(round(self.write_protection_seconds / 60.0)) or 5)
+        self.storage_measure_interval_seconds = 300
+        self.storage_housekeeping_interval_seconds = 900
+        self.storage_metaquotes_review_interval_seconds = 21600
+        self.storage_live_cache_max_age_days = int(self.live_cache_max_age_days)
+        self.storage_live_sync_overlap_bars = int(self.live_sync_overlap_bars)
+        self.storage_metaquotes_cleanup_enabled = bool(self.metaquotes_cleanup_enabled)
+        self.storage_metaquotes_stale_tester_days = 14
+        self.storage_metaquotes_demo_servers = ["FBS-Demo", "MetaQuotes-Demo"]
+        self.storage_metaquotes_active_root_allowlist = list(self.metaquotes_active_root_allowlist)
+
 
 @dataclass
 class InstrumentSpec:
@@ -1271,16 +1785,20 @@ def load_broker_specs(filepath: Optional[str] = None) -> Dict[str, Dict[str, Any
         import json
         with open(filepath, 'r') as f:
             specs = json.load(f)
+        if not isinstance(specs, dict):
+            raise ValueError("broker specs JSON must be an object keyed by symbol")
         _BROKER_SPECS_CACHE = specs
         _BROKER_SPECS_LOADED = True
         _BROKER_SPECS_LOADED_PATH = filepath
         logger.info(f"Loaded broker specs for {len(specs)} symbols from {filepath}")
     except FileNotFoundError:
         logger.debug(f"No broker specs file found at {filepath}, using defaults")
+        _BROKER_SPECS_CACHE = {}
         _BROKER_SPECS_LOADED = True
         _BROKER_SPECS_LOADED_PATH = filepath
     except Exception as e:
         logger.warning(f"Failed to load broker_specs.json: {e}")
+        _BROKER_SPECS_CACHE = {}
         _BROKER_SPECS_LOADED = True
         _BROKER_SPECS_LOADED_PATH = filepath
     
@@ -1560,6 +2078,12 @@ def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> I
     else:
         spread_avg = 2.0
 
+    commission_raw = broker_data.get('commission_per_lot', 7.0)
+    try:
+        commission_per_lot = float(commission_raw if commission_raw is not None else 7.0)
+    except (TypeError, ValueError):
+        commission_per_lot = 7.0
+
     try:
         return InstrumentSpec(
             symbol=symbol,
@@ -1569,7 +2093,7 @@ def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> I
             min_lot=float(broker_data.get('volume_min', 0.01) or 0.01),
             max_lot=float(broker_data.get('volume_max', 100.0) or 100.0),
             volume_step=float(broker_data.get('volume_step', 0.01) or 0.01),
-            commission_per_lot=float(broker_data.get('commission_per_lot', 7.0) or 7.0),
+            commission_per_lot=commission_per_lot,
             swap_long=float(broker_data.get('swap_long', 0.0) or 0.0),
             swap_short=float(broker_data.get('swap_short', 0.0) or 0.0),
             # Broker-real fields (used for MT5-parity sizing/P&L)
@@ -1662,6 +2186,17 @@ class DataLoader:
         'D1': '1D',
         'W1': '1W',
     }
+
+    TIMEFRAME_MINUTES = {
+        'M1': 1,
+        'M5': 5,
+        'M15': 15,
+        'M30': 30,
+        'H1': 60,
+        'H4': 240,
+        'D1': 1440,
+        'W1': 10080,
+    }
     
     # Minimum bars required for each timeframe (increased for 5-year data)
     MIN_BARS = {
@@ -1685,6 +2220,19 @@ class DataLoader:
         self._resample_cache: Dict[str, pd.DataFrame] = {}
         self._resample_meta: Dict[str, Dict[str, Any]] = {}
         self._source_meta: Dict[str, Dict[str, Any]] = {}
+        self._resample_cache_stats: Dict[str, Any] = {
+            "memory_hits": 0,
+            "disk_hits": 0,
+            "misses": 0,
+            "invalidations": 0,
+            "writes": 0,
+            "read_failures": 0,
+            "write_failures": 0,
+            "bytes_read": 0,
+            "bytes_written": 0,
+            "read_seconds": 0.0,
+            "write_seconds": 0.0,
+        }
 
         self.cache_resampled = bool(cache_resampled)
         self.cache_dir = Path(cache_dir) if cache_dir else (self.data_dir / ".cache")
@@ -1784,6 +2332,100 @@ class DataLoader:
         except Exception as e:
             logger.error(f"Error loading {symbol}: {e}")
             return None
+
+    def estimate_source_rows(self,
+                             timeframe: str,
+                             target_bars: int,
+                             *,
+                             base_timeframe: str = 'M5',
+                             padding_bars: int = 2) -> int:
+        """
+        Estimate how many base-timeframe rows are needed to produce a recent
+        tail of `target_bars` for the requested timeframe.
+
+        This is used by the live loop to bound local file reads without
+        degrading higher-timeframe signal quality.
+        """
+        try:
+            target_bars = max(1, int(target_bars))
+        except Exception:
+            target_bars = 1
+        try:
+            padding_bars = max(0, int(padding_bars))
+        except Exception:
+            padding_bars = 2
+
+        tf = str(timeframe or base_timeframe).upper()
+        base_tf = str(base_timeframe or 'M5').upper()
+        target_minutes = int(self.TIMEFRAME_MINUTES.get(tf, self.TIMEFRAME_MINUTES.get(base_tf, 5)))
+        base_minutes = int(self.TIMEFRAME_MINUTES.get(base_tf, 5))
+        if base_minutes <= 0:
+            base_minutes = 5
+        compression = max(1, int(math.ceil(target_minutes / base_minutes)))
+        return max(target_bars, (target_bars + padding_bars) * compression)
+
+    def _read_recent_csv_rows(self, data_file: Path, row_count: int) -> pd.DataFrame:
+        """
+        Read only the trailing `row_count` data rows from a CSV.
+
+        The PM's canonical/live M5 files are append-oriented and line based, so
+        reading from the end keeps live sweeps bounded even when the full
+        canonical history is much larger.
+        """
+        try:
+            row_count = max(0, int(row_count))
+        except Exception:
+            row_count = 0
+        if row_count <= 0:
+            return pd.read_csv(data_file)
+
+        with data_file.open("rb") as handle:
+            header = handle.readline()
+            if not header:
+                return pd.DataFrame()
+            header_line = header.rstrip(b"\r\n")
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            buffer = b""
+            newline_target = row_count + 1
+            while position > 0 and buffer.count(b"\n") <= newline_target:
+                read_size = min(65536, position)
+                position -= read_size
+                handle.seek(position)
+                buffer = handle.read(read_size) + buffer
+
+        lines = buffer.splitlines()
+        if lines and lines[0] == header_line:
+            lines = lines[1:]
+        tail_lines = lines[-row_count:] if row_count > 0 else lines
+        payload = header if header.endswith((b"\n", b"\r")) else header + b"\n"
+        if tail_lines:
+            payload += b"\n".join(tail_lines) + b"\n"
+        return pd.read_csv(io.BytesIO(payload))
+
+    def _load_recent_source(self,
+                            symbol: str,
+                            *,
+                            base_timeframe: str = 'M5',
+                            row_count: int,
+                            source_path: Optional[Path] = None) -> Optional[pd.DataFrame]:
+        """Load a bounded recent source window from canonical or live-local CSV."""
+        data_file = Path(source_path) if source_path else self._resolve_data_file(symbol, base_timeframe)
+        if not data_file or not data_file.exists():
+            return None
+
+        try:
+            df = self._read_recent_csv_rows(data_file, row_count)
+            df = self._standardize_columns(df)
+            df = self._parse_datetime_index(df)
+            if not self._validate_data(df, symbol):
+                return None
+            return df.copy()
+        except Exception as exc:
+            logger.debug(
+                f"{symbol} {base_timeframe}: recent load failed from {getattr(data_file, 'name', data_file)}: {exc}"
+            )
+            return None
     
     def resample(self, df: pd.DataFrame, target_timeframe: str) -> pd.DataFrame:
         """
@@ -1839,31 +2481,45 @@ class DataLoader:
         # In-memory cache
         meta = self._resample_meta.get(cache_key)
         if cache_key in self._resample_cache and self._is_resample_cache_valid(meta, source_meta):
+            self._resample_cache_stats["memory_hits"] += 1
             return self._resample_cache[cache_key].copy()
+        if cache_key in self._resample_cache:
+            self._resample_cache_stats["invalidations"] += 1
 
         if not self.cache_resampled:
+            self._resample_cache_stats["misses"] += 1
             return None
 
         # Disk cache
         path = self._resample_cache_path(symbol, timeframe)
         if not path.exists():
+            self._resample_cache_stats["misses"] += 1
             return None
 
+        start = time.perf_counter()
         try:
+            size_bytes = path.stat().st_size
             payload = pd.read_pickle(path)
+            self._resample_cache_stats["read_seconds"] += max(0.0, time.perf_counter() - start)
+            self._resample_cache_stats["bytes_read"] += int(size_bytes)
             if not isinstance(payload, dict):
+                self._resample_cache_stats["invalidations"] += 1
                 return None
             meta = payload.get("meta", {})
             if not self._is_resample_cache_valid(meta, source_meta):
+                self._resample_cache_stats["invalidations"] += 1
                 return None
             df = payload.get("data")
             if isinstance(df, pd.DataFrame):
                 self._resample_cache[cache_key] = df.copy()
                 self._resample_meta[cache_key] = meta
+                self._resample_cache_stats["disk_hits"] += 1
                 return df.copy()
         except Exception:
+            self._resample_cache_stats["read_failures"] += 1
             return None
 
+        self._resample_cache_stats["misses"] += 1
         return None
 
     def _save_resample_cache(self, symbol: str, timeframe: str, source_meta: Dict[str, Any],
@@ -1883,8 +2539,16 @@ class DataLoader:
         try:
             path = self._resample_cache_path(symbol, timeframe)
             payload = {"meta": meta, "data": df_copy}
+            start = time.perf_counter()
             pd.to_pickle(payload, path)
+            self._resample_cache_stats["write_seconds"] += max(0.0, time.perf_counter() - start)
+            self._resample_cache_stats["writes"] += 1
+            try:
+                self._resample_cache_stats["bytes_written"] += int(path.stat().st_size)
+            except OSError:
+                pass
         except Exception:
+            self._resample_cache_stats["write_failures"] += 1
             pass
     
     def get_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
@@ -1925,6 +2589,47 @@ class DataLoader:
             return None
         
         return resampled.copy()
+
+    def get_recent_data(self,
+                        symbol: str,
+                        timeframe: str,
+                        *,
+                        count: int,
+                        min_required: int = 0,
+                        base_timeframe: str = 'M5',
+                        source_path: Optional[Path] = None) -> Optional[pd.DataFrame]:
+        """
+        Get only the recent tail needed for live evaluation.
+
+        Unlike `get_data`, this method does not load the full canonical M5 file
+        or enforce research/backtest minimum-bar thresholds. It is intended for
+        the live loop, where `count`/`min_required` are the authoritative bounds.
+        """
+        target_bars = max(int(count or 0), int(min_required or 0), 1)
+        source_rows = self.estimate_source_rows(
+            timeframe,
+            target_bars,
+            base_timeframe=base_timeframe,
+        )
+        base_df = self._load_recent_source(
+            symbol,
+            base_timeframe=base_timeframe,
+            row_count=source_rows,
+            source_path=source_path,
+        )
+        if base_df is None or len(base_df) == 0:
+            return None
+
+        tf = str(timeframe or base_timeframe).upper()
+        base_tf = str(base_timeframe or 'M5').upper()
+        result = base_df.copy() if tf == base_tf else self.resample(base_df, tf)
+        if result is None or len(result) == 0:
+            return None
+        if count > 0 and len(result) > count:
+            result = result.tail(int(count))
+        if min_required > 0 and len(result) < int(min_required):
+            return None
+        return result.copy()
     
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Standardize column names to Open, High, Low, Close, Volume."""
@@ -1938,25 +2643,59 @@ class DataLoader:
             'tickvolume': 'Volume',
             'spread': 'Spread',
             'real_volume': 'RealVolume',
+            'realvolume': 'RealVolume',
         }
-        
-        df.columns = df.columns.str.lower()
-        df = df.rename(columns=column_map)
-        
-        return df
+
+        normalized_names = [
+            column_map.get(str(col).strip().lower(), str(col).strip())
+            for col in df.columns
+        ]
+        df = df.copy()
+        df.columns = normalized_names
+
+        if df.columns.is_unique:
+            return df
+
+        merged_columns: Dict[str, pd.Series] = {}
+        ordered_names: List[str] = []
+        for column_name in df.columns:
+            if column_name in merged_columns:
+                continue
+            ordered_names.append(column_name)
+            column_frame = df.loc[:, df.columns == column_name]
+            merged = column_frame.iloc[:, 0].copy()
+            for idx in range(1, column_frame.shape[1]):
+                merged = merged.combine_first(column_frame.iloc[:, idx])
+            merged_columns[column_name] = merged
+
+        return pd.DataFrame({name: merged_columns[name] for name in ordered_names}, index=df.index)
     
     def _parse_datetime_index(self, df: pd.DataFrame) -> pd.DataFrame:
         """Parse datetime and set as index."""
+        df.columns = [str(col) for col in df.columns]
         time_col = None
         for col in ['time', 'datetime', 'date', 'timestamp']:
             if col in df.columns.str.lower():
                 time_col = [c for c in df.columns if c.lower() == col][0]
                 break
-        
+
+        if time_col is None:
+            unnamed_cols = [c for c in df.columns if c.lower().startswith("unnamed:")]
+            fallback_candidates = unnamed_cols or ([df.columns[0]] if len(df.columns) > 0 else [])
+            for candidate in fallback_candidates:
+                parsed_candidate = pd.to_datetime(df[candidate], errors='coerce')
+                if parsed_candidate.notna().sum() >= max(1, len(parsed_candidate) // 2):
+                    time_col = candidate
+                    df[candidate] = parsed_candidate
+                    break
+
         if time_col is None:
             raise ValueError("No datetime column found")
-        
-        df[time_col] = pd.to_datetime(df[time_col])
+
+        if not pd.api.types.is_datetime64_any_dtype(df[time_col]):
+            df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
+        if df[time_col].isna().all():
+            raise ValueError("Datetime column could not be parsed")
         df = df.set_index(time_col)
         df = df.sort_index()
         
@@ -2008,13 +2747,175 @@ class DataLoader:
             logger.warning(f"{symbol}: No volume data, using 0")
         
         return True
-    
+
+    @staticmethod
+    def _parse_resample_cache_identity(path: Path) -> Tuple[str, str]:
+        """Best-effort parse of ``<symbol>_<timeframe>.pkl`` cache filenames."""
+        stem = path.stem
+        if "_" not in stem:
+            return "", ""
+        symbol, timeframe = stem.rsplit("_", 1)
+        return symbol.upper(), timeframe.upper()
+
+    def prune_resample_cache(self,
+                             max_age_days: Optional[int] = None,
+                             max_total_bytes: Optional[int] = None,
+                             active_symbols: Optional[List[str]] = None,
+                             active_timeframes: Optional[List[str]] = None,
+                             dry_run: bool = True,
+                             recent_window_seconds: int = 300) -> Dict[str, Any]:
+        """
+        Prune disk-backed resample cache entries.
+
+        This is a storage helper only. It never affects live data loading unless
+        explicitly called by a storage manager.
+        """
+        stats = {
+            "files_scanned": 0,
+            "files_removed": 0,
+            "bytes_reclaimed": 0,
+            "files_kept": 0,
+            "skipped_recent": 0,
+            "skipped_unclassified": 0,
+            "dry_run": bool(dry_run),
+        }
+        if not self.cache_dir.exists():
+            return stats
+
+        now_ts = time.time()
+        max_age_seconds = None
+        if max_age_days is not None:
+            try:
+                max_age_seconds = max(0, int(max_age_days)) * 86400
+            except Exception:
+                max_age_seconds = None
+        try:
+            recent_window_seconds = max(0, int(recent_window_seconds))
+        except Exception:
+            recent_window_seconds = 300
+
+        active_symbol_set = {str(sym).strip().upper() for sym in (active_symbols or []) if str(sym).strip()}
+        active_tf_set = {str(tf).strip().upper() for tf in (active_timeframes or []) if str(tf).strip()}
+
+        entries: List[Dict[str, Any]] = []
+        for path in sorted(self.cache_dir.glob("*.pkl")):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            stats["files_scanned"] += 1
+            symbol, timeframe = self._parse_resample_cache_identity(path)
+            age_seconds = max(0.0, now_ts - float(stat.st_mtime))
+            recent = age_seconds < recent_window_seconds
+            classified = bool(symbol and timeframe)
+            active_match = True
+            if active_symbol_set and symbol:
+                active_match = active_match and symbol in active_symbol_set
+            if active_tf_set and timeframe:
+                active_match = active_match and timeframe in active_tf_set
+            elif active_tf_set and not timeframe:
+                active_match = False
+
+            entries.append({
+                "path": path,
+                "size": int(stat.st_size),
+                "mtime": float(stat.st_mtime),
+                "age_seconds": age_seconds,
+                "recent": recent,
+                "classified": classified,
+                "active_match": active_match,
+                "remove": False,
+            })
+
+        if not entries:
+            return stats
+
+        for item in entries:
+            if item["recent"]:
+                stats["skipped_recent"] += 1
+                continue
+            remove = False
+            if max_age_seconds is not None and item["age_seconds"] > max_age_seconds:
+                remove = True
+            if item["classified"] and not item["active_match"]:
+                remove = True
+            if not item["classified"] and max_age_seconds is None:
+                stats["skipped_unclassified"] += 1
+            item["remove"] = remove
+
+        def _delete_item(item: Dict[str, Any]) -> None:
+            path = item["path"]
+            try:
+                if not dry_run:
+                    path.unlink(missing_ok=True)
+                stats["files_removed"] += 1
+                stats["bytes_reclaimed"] += int(item["size"])
+            except Exception:
+                return
+
+        for item in entries:
+            if item["remove"]:
+                _delete_item(item)
+
+        remaining = [item for item in entries if not item["remove"]]
+        if max_total_bytes is not None:
+            try:
+                max_total_bytes = max(0, int(max_total_bytes))
+            except Exception:
+                max_total_bytes = None
+        if max_total_bytes is not None:
+            remaining_bytes = sum(int(item["size"]) for item in remaining)
+            if remaining_bytes > max_total_bytes:
+                quota_candidates = sorted(
+                    [item for item in remaining if not item["recent"]],
+                    key=lambda item: (item["mtime"], item["size"]),
+                )
+                for item in quota_candidates:
+                    if remaining_bytes <= max_total_bytes:
+                        break
+                    _delete_item(item)
+                    remaining_bytes -= int(item["size"])
+
+        stats["files_kept"] = max(0, stats["files_scanned"] - stats["files_removed"])
+        return stats
+
     def clear_cache(self):
         """Clear the data cache."""
+        stats = self.get_resample_cache_stats(reset=True)
+        total_lookups = int(stats.get("memory_hits", 0)) + int(stats.get("disk_hits", 0)) + int(stats.get("misses", 0))
+        if total_lookups or int(stats.get("writes", 0)):
+            hits = int(stats.get("memory_hits", 0)) + int(stats.get("disk_hits", 0))
+            hit_rate = (hits / total_lookups * 100.0) if total_lookups else 0.0
+            logger.info(
+                "ResampleCache stats: "
+                f"hits={hits} (mem={stats.get('memory_hits', 0)}, disk={stats.get('disk_hits', 0)}) "
+                f"misses={stats.get('misses', 0)} invalidations={stats.get('invalidations', 0)} "
+                f"writes={stats.get('writes', 0)} hit_rate={hit_rate:.1f}% "
+                f"read_mb={float(stats.get('bytes_read', 0)) / (1024 ** 2):.1f} "
+                f"write_mb={float(stats.get('bytes_written', 0)) / (1024 ** 2):.1f} "
+                f"read_s={float(stats.get('read_seconds', 0.0)):.3f} "
+                f"write_s={float(stats.get('write_seconds', 0.0)):.3f}"
+            )
         self._cache.clear()
         self._resample_cache.clear()
         self._resample_meta.clear()
         self._source_meta.clear()
+
+    def get_resample_cache_stats(self, reset: bool = False) -> Dict[str, Any]:
+        """Return disk/memory resample-cache telemetry for optimization visibility."""
+        stats = dict(self._resample_cache_stats)
+        stats["enabled"] = bool(self.cache_resampled)
+        stats["cache_dir"] = str(self.cache_dir)
+        stats["memory_entries"] = len(self._resample_cache)
+        if reset:
+            for key in list(self._resample_cache_stats.keys()):
+                if isinstance(self._resample_cache_stats[key], float):
+                    self._resample_cache_stats[key] = 0.0
+                else:
+                    self._resample_cache_stats[key] = 0
+        return stats
 
 
 # =============================================================================
@@ -2038,17 +2939,45 @@ class FeatureComputer:
     features are needed.
     """
 
-    # In-memory feature cache (bounded to avoid memory bloat)
+    # In-memory feature cache (bounded to avoid memory bloat).
+    # Capacity 24 covers the common per-symbol retrain footprint without thrashing.
     _FEATURE_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
     _FEATURE_CACHE_ORDER: List[Tuple[Any, ...]] = []
-    _FEATURE_CACHE_MAX = 6
+    _FEATURE_CACHE_MAX = 24
+    _FEATURE_CACHE_HITS = 0
+    _FEATURE_CACHE_MISSES = 0
     FEATURE_CACHE_VERSION = "2026-03-29a"
 
     @classmethod
     def clear_cache(cls) -> None:
-        """Clear in-memory feature cache (memory hygiene between symbols)."""
+        """Clear the in-memory feature cache and log hit-rate telemetry."""
+        hits = cls._FEATURE_CACHE_HITS
+        misses = cls._FEATURE_CACHE_MISSES
+        total = hits + misses
+        if total > 0:
+            rate = (hits / total) * 100.0
+            logger.info(
+                f"FeatureCache stats: hits={hits} misses={misses} "
+                f"hit_rate={rate:.1f}% (cap={cls._FEATURE_CACHE_MAX}, "
+                f"size={len(cls._FEATURE_CACHE)})"
+            )
         cls._FEATURE_CACHE.clear()
         cls._FEATURE_CACHE_ORDER.clear()
+        cls._FEATURE_CACHE_HITS = 0
+        cls._FEATURE_CACHE_MISSES = 0
+
+    # Per-DataFrame attribute key recording which precomputed columns use which
+    # parameter tuples. Kept here as a string constant to avoid a circular import.
+    _PRECOMPUTED_ATTR = '_fxpm_precomputed_params'
+
+    @staticmethod
+    def _stamp_precomputed(features: pd.DataFrame, **params_by_key: Tuple[Any, ...]) -> None:
+        """Record which precomputed columns on *features* use which parameter tuples."""
+        tags = features.attrs.get(FeatureComputer._PRECOMPUTED_ATTR)
+        if tags is None:
+            tags = {}
+            features.attrs[FeatureComputer._PRECOMPUTED_ATTR] = tags
+        tags.update(params_by_key)
 
     @staticmethod
     def _regime_params_fingerprint(regime_params_file: str) -> Tuple[Any, ...]:
@@ -2101,7 +3030,9 @@ class FeatureComputer:
     @classmethod
     def _cache_get(cls, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
         if key in cls._FEATURE_CACHE:
+            cls._FEATURE_CACHE_HITS += 1
             return cls._FEATURE_CACHE[key].copy()
+        cls._FEATURE_CACHE_MISSES += 1
         return None
 
     @classmethod
@@ -2217,6 +3148,8 @@ class FeatureComputer:
             if 'BB_LOWER_20' in to_compute:
                 features.loc[:, 'BB_LOWER_20'] = bb_lower
             computed.update(bb_cols)
+            if bb_cols.issubset(computed):
+                FeatureComputer._stamp_precomputed(features, BB_20=(20, 2.0))
 
         # MACD
         macd_cols = {'MACD', 'MACD_SIGNAL', 'MACD_HIST'}
@@ -2226,6 +3159,7 @@ class FeatureComputer:
             features.loc[:, 'MACD_SIGNAL'] = signal
             features.loc[:, 'MACD_HIST'] = hist
             computed.update(macd_cols)
+            FeatureComputer._stamp_precomputed(features, MACD=(12, 26, 9))
 
         # Stochastic
         stoch_cols = {'STOCH_K', 'STOCH_D'}
@@ -2234,6 +3168,7 @@ class FeatureComputer:
             features.loc[:, 'STOCH_K'] = stoch_k
             features.loc[:, 'STOCH_D'] = stoch_d
             computed.update(stoch_cols)
+            FeatureComputer._stamp_precomputed(features, STOCH=(14, 3))
 
         # ADX family (uses cached ATR)
         adx_cols = {'ADX', 'PLUS_DI', 'MINUS_DI'}
@@ -2246,6 +3181,8 @@ class FeatureComputer:
             if 'MINUS_DI' in to_compute:
                 features.loc[:, 'MINUS_DI'] = FeatureComputer.minus_di(features, 14, atr_cache=atr_14)
             computed.update(adx_cols)
+            if adx_cols.issubset(computed):
+                FeatureComputer._stamp_precomputed(features, ADX=(14,))
 
         # CCI
         if 'CCI' in to_compute and 'CCI' not in computed:
@@ -2282,6 +3219,8 @@ class FeatureComputer:
             if 'KC_LOWER' in to_compute:
                 features.loc[:, 'KC_LOWER'] = kc_lower
             computed.update(kc_cols)
+            if kc_cols.issubset(computed):
+                FeatureComputer._stamp_precomputed(features, KC=(20, 20, 2.0))
 
         # Hull MA
         if 'HULL_MA' in to_compute and 'HULL_MA' not in computed:
@@ -2423,7 +3362,18 @@ class FeatureComputer:
 
         # Volatility
         features.loc[:, 'VOLATILITY'] = features['Close'].rolling(20).std()
-        
+
+        # Stamp precomputed parameter tuples so strategy helpers can trust
+        # these columns without re-checking raw column names alone.
+        FeatureComputer._stamp_precomputed(
+            features,
+            BB_20=(20, 2.0),
+            MACD=(12, 26, 9),
+            STOCH=(14, 3),
+            ADX=(14,),
+            KC=(20, 20, 2.0),
+        )
+
         # =====================================================================
         # REGIME DETECTION
         # Compute regime features using symbol/timeframe-specific parameters
@@ -2653,7 +3603,7 @@ class DataSplitter:
 
     The overlap window is warmup-only and is never scored.
     """
-    SPLIT_CONTRACT_VERSION = "2026-03-29a"
+    SPLIT_CONTRACT_VERSION = "2026-04-25-active-recent-m5"
     
     def __init__(self, config: PipelineConfig):
         """
@@ -2669,6 +3619,12 @@ class DataSplitter:
             return 0
         if self.config.holdout_pct is not None:
             return min(scored_oos_bars - 1, int(n * (float(self.config.holdout_pct) / 100.0)))
+        try:
+            validation_bars = int(n * (float(self.config.val_pct) / 100.0))
+        except Exception:
+            validation_bars = 0
+        if 0 < validation_bars < scored_oos_bars:
+            return scored_oos_bars - validation_bars
         return max(1, scored_oos_bars // 2)
 
     def split(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -2683,6 +3639,65 @@ class DataSplitter:
         """
         indices = self.get_split_indices(len(df))
         return {name: df.iloc[start:end].copy() for name, (start, end) in indices.items()}
+
+    def workflow_enabled(self) -> bool:
+        """Return True when the production active-recent M5 workflow is enabled."""
+        return str(getattr(self.config, "data_workflow_mode", "active_recent_m5")).lower() == "active_recent_m5"
+
+    def get_workflow_indices(self, n: int) -> Dict[str, Tuple[int, int]]:
+        """
+        Get explicit base-M5 workflow indices.
+
+        The active workflow uses the newest active/audit slice inside the
+        configured `max_bars` load cap. The oldest configured audit rows in
+        that slice are audit-only and the newest `active_universe_bars` rows
+        form the live-relevant active universe. Stage 2/risk-management
+        selection uses the newest `active_stage2_pct` percent of the active
+        universe with warmup context.
+        """
+        n = max(0, int(n))
+        if n <= 0:
+            return {
+                "workflow_window": (0, 0),
+                "historical_stress_audit": (0, 0),
+                "active_universe": (0, 0),
+                "stage2_selection": (0, 0),
+                "stage2_selection_with_warmup": (0, 0),
+            }
+
+        max_bars = max(1, int(getattr(self.config, "max_bars", 300000)))
+        active_bars = max(1, int(getattr(self.config, "active_universe_bars", 250000)))
+        audit_bars = max(0, int(getattr(self.config, "historical_stress_audit_bars", 50000)))
+        stage2_pct = max(1.0, min(100.0, float(getattr(self.config, "active_stage2_pct", 50.0))))
+
+        target_workflow_size = active_bars + audit_bars
+        if target_workflow_size <= 0:
+            target_workflow_size = active_bars
+        workflow_size = min(n, max_bars, max(1, target_workflow_size))
+        workflow_start = n - workflow_size
+        workflow_end = n
+
+        active_size = min(active_bars, workflow_size)
+        active_start = workflow_end - active_size
+        active_end = workflow_end
+
+        audit_start = workflow_start
+        audit_end = active_start
+
+        stage2_size = max(1, int(math.ceil(active_size * (stage2_pct / 100.0))))
+        stage2_start = active_end - min(active_size, stage2_size)
+        stage2_end = active_end
+
+        warmup_bars = int(active_size * (float(getattr(self.config, "overlap_pct", 0.0)) / 100.0))
+        stage2_warmup_start = max(active_start, stage2_start - max(0, warmup_bars))
+
+        return {
+            "workflow_window": (workflow_start, workflow_end),
+            "historical_stress_audit": (audit_start, audit_end),
+            "active_universe": (active_start, active_end),
+            "stage2_selection": (stage2_start, stage2_end),
+            "stage2_selection_with_warmup": (stage2_warmup_start, stage2_end),
+        }
     
     def get_split_indices(self, n: int) -> Dict[str, Tuple[int, int]]:
         """
@@ -2735,7 +3750,7 @@ class Backtester:
     Optimizations:
     - Pre-extracts OHLC to NumPy arrays
     - Caches spread price
-    - Passes bar index to strategy.calculate_stops()
+    - Passes bar index through strategy.build_trade_intent()
     - Numba JIT-compiled main loop (3-10x speedup when available)
     
     The Numba optimization preserves EXACT trade semantics:
@@ -2752,6 +3767,11 @@ class Backtester:
             config: Pipeline configuration
         """
         self.config = config
+        try:
+            from pm_strategies import set_regime_tp_multipliers
+            set_regime_tp_multipliers(getattr(config, "regime_tp_multipliers", None))
+        except Exception:
+            pass
     
     def run(self,
             features: pd.DataFrame,
@@ -2760,7 +3780,8 @@ class Backtester:
             strategy: Any,
             spec: Optional[InstrumentSpec] = None,
             timeframe: str = "",
-            warmup_bars: int = 0) -> Dict[str, Any]:
+            warmup_bars: int = 0,
+            governance_policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Run backtest on a dataset with signals.
         
@@ -2824,6 +3845,11 @@ class Backtester:
         slippage_price = spec.pips_to_price(self.config.slippage_pips) if self.config.use_slippage else 0.0
         
         n_bars = len(features)
+        if 'ATR_14' in features.columns:
+            atr_arr = pd.to_numeric(features['ATR_14'], errors='coerce').to_numpy().astype(np.float64)
+        else:
+            atr_arr = np.full(n_bars, np.nan, dtype=np.float64)
+        normalized_governance = make_policy(governance_policy) if governance_policy else None
         
         # ----------------------------------------------------------------
         # PRE-COMPUTE ENTRY/STOP PRICES ONLY (NOT position sizes)
@@ -2841,13 +3867,40 @@ class Backtester:
                 is_long = direction == 1
                 signal_bar_index = i - 1
                 
-                # Calculate stops using the SIGNAL bar index (i-1)
+                # Build the same execution intent live trading uses, evaluated at
+                # the SIGNAL bar (i-1). This keeps optimization, governance policy
+                # selection, and live execution on one exit surface.
                 try:
-                    sl_pips, tp_pips = strategy.calculate_stops(
-                        features, direction, symbol, spec=spec, bar_index=signal_bar_index
-                    )
+                    if callable(getattr(strategy, "build_trade_intent", None)):
+                        regime_label = ""
+                        regime_col = (
+                            "REGIME_LIVE" if "REGIME_LIVE" in features.columns
+                            else "REGIME" if "REGIME" in features.columns
+                            else None
+                        )
+                        if regime_col is not None:
+                            try:
+                                regime_label = str(features[regime_col].iat[signal_bar_index])
+                            except Exception:
+                                regime_label = ""
+                        intent = strategy.build_trade_intent(
+                            features,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime_label,
+                            signal=direction,
+                            spec=spec,
+                            bar_index=signal_bar_index,
+                        )
+                        sl_pips = float(intent.stop_loss_pips)
+                        tp_pips = float(intent.take_profit_pips)
+                    else:
+                        sl_pips, tp_pips = strategy.calculate_stops(
+                            features, direction, symbol, spec=spec, bar_index=signal_bar_index
+                        )
                 except TypeError:
-                    # Fallback for strategies without bar_index support
+                    # Fallback for legacy strategies/test doubles without the
+                    # trade-intent or bar_index-aware stop signature.
                     try:
                         sl_pips, tp_pips = strategy.calculate_stops(
                             features.iloc[:signal_bar_index + 1].copy(), direction, symbol
@@ -2890,7 +3943,7 @@ class Backtester:
         # ----------------------------------------------------------------
         # RUN BACKTEST LOOP (Numba JIT or Pure Python)
         # ----------------------------------------------------------------
-        if NUMBA_AVAILABLE:
+        if NUMBA_AVAILABLE and normalized_governance is None:
             # Use Numba JIT-compiled kernel with live-equity sizing
             (
                 trade_signal_bars, trade_entry_bars, trade_exit_bars,
@@ -2949,7 +4002,9 @@ class Backtester:
             trades, final_equity, max_drawdown, equity_curve = self._run_python_loop(
                 features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
-                half_spread, slippage_price, spec, warmup_bars
+                half_spread, slippage_price, spec, warmup_bars,
+                atr_arr=atr_arr,
+                governance_policy=normalized_governance,
             )
         
         return self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
@@ -2957,7 +4012,9 @@ class Backtester:
     def _run_python_loop(self, features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                          sl_prices, tp_prices, entry_prices,
                          half_spread, slippage_price, spec,
-                         warmup_bars: int = 0) -> Tuple[List[Dict], float, float, List[float]]:
+                         warmup_bars: int = 0,
+                         atr_arr: Optional[np.ndarray] = None,
+                         governance_policy: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict], float, float, List[float]]:
         """
         Pure Python backtest loop (fallback when Numba not available).
         
@@ -2980,7 +4037,16 @@ class Backtester:
         take_profit = 0.0
         position_size = 0.0
         risk_amount_at_entry = 0.0
-        
+        initial_stop_loss = 0.0
+        initial_take_profit = 0.0
+        highest_since_entry = 0.0
+        lowest_since_entry = 0.0
+        governance_tp_released = False
+        active_governance_name = (
+            governance_policy.get("name", "control_fixed")
+            if isinstance(governance_policy, dict) else "control_fixed"
+        )
+
         n_bars = len(features)
         
         for i in range(1, n_bars):
@@ -3010,6 +4076,41 @@ class Backtester:
             
             # CHECK EXITS FOR OPEN POSITIONS
             if in_position:
+                if governance_policy:
+                    prev_bar = i - 1
+                    if prev_bar >= entry_bar:
+                        highest_since_entry = max(highest_since_entry, float(high_arr[prev_bar]))
+                        lowest_since_entry = min(lowest_since_entry, float(low_arr[prev_bar]))
+                        prev_close = float(close_arr[prev_bar])
+                        prev_price = prev_close - half_spread if position_direction == 1 and self.config.use_spread else (
+                            prev_close + half_spread if position_direction == -1 and self.config.use_spread else prev_close
+                        )
+                        prev_atr = float(atr_arr[prev_bar]) if atr_arr is not None and prev_bar < len(atr_arr) else float("nan")
+                        context = GovernanceContext(
+                            symbol="",
+                            timeframe="",
+                            regime="",
+                            direction=position_direction,
+                            entry_price=entry_price,
+                            current_stop_loss=stop_loss,
+                            current_take_profit=take_profit,
+                            initial_stop_loss=initial_stop_loss,
+                            initial_take_profit=initial_take_profit,
+                            current_price=prev_price,
+                            current_atr=0.0 if np.isnan(prev_atr) else prev_atr,
+                            highest_since_entry=highest_since_entry,
+                            lowest_since_entry=lowest_since_entry,
+                            pip_size=float(getattr(spec, "pip_size", 0.0) or 0.0),
+                            price_step=float(getattr(spec, "point", 0.0) or getattr(spec, "pip_size", 0.0) or 0.0),
+                            min_stop_distance=float(getattr(spec, "stops_level", 0) or 0) * float(getattr(spec, "point", 0.0) or 0.0),
+                            tp_released=governance_tp_released,
+                        )
+                        decision = evaluate_policy(governance_policy, context)
+                        if decision.stop_loss is not None:
+                            stop_loss = float(decision.stop_loss)
+                        if decision.take_profit is not None:
+                            take_profit = float(decision.take_profit)
+                        governance_tp_released = governance_tp_released or bool(decision.tp_released)
                 exit_price = None
                 exit_reason = None
                 
@@ -3075,6 +4176,8 @@ class Backtester:
                         'exit_reason': exit_reason,
                         'risk_amount': round(risk_amount_at_entry, 2),
                         'r_multiple': round(r_multiple, 3),
+                        'governance_policy': active_governance_name,
+                        'tp_released': governance_tp_released,
                     })
                     
                     in_position = False
@@ -3114,6 +4217,11 @@ class Backtester:
                             entry_price = entry_price_candidate
                             stop_loss = stop_loss_candidate
                             take_profit = take_profit_candidate
+                            initial_stop_loss = stop_loss_candidate
+                            initial_take_profit = take_profit_candidate
+                            highest_since_entry = float(high_price)
+                            lowest_since_entry = float(low_price)
+                            governance_tp_released = False
                             
                             in_position = True
                             position_direction = direction
@@ -3174,6 +4282,8 @@ class Backtester:
                                     'exit_reason': exit_reason,
                                     'risk_amount': round(risk_amount_at_entry, 2),
                                     'r_multiple': round(r_multiple, 3),
+                                    'governance_policy': active_governance_name,
+                                    'tp_released': governance_tp_released,
                                 })
                                 in_position = False
             
@@ -3234,6 +4344,8 @@ class Backtester:
                 'exit_reason': TradeStatus.CLOSED_EOD.value,
                 'risk_amount': round(risk_amount_at_entry, 2),
                 'r_multiple': round(r_multiple, 3),
+                'governance_policy': active_governance_name,
+                'tp_released': governance_tp_released,
             })
             
             equity_curve[-1] = equity
@@ -3318,7 +4430,8 @@ class Backtester:
         # ================================================================
         sharpe = 0.0
         sortino = 0.0
-        
+        std_weekly_return = 0.0  # findings.html §C4: variance/stability penalty input
+
         # Need at least 3 equity points to get 2 returns for meaningful std calculation
         if len(equity_curve) > 2:
             # Convert equity curve to returns
@@ -3367,7 +4480,20 @@ class Backtester:
                 else:
                     if np.mean(bar_returns) > 0:
                         sortino = float('inf')
-        
+
+            # Weekly-return std for stability penalty (findings.html §C4).
+            # Sample equity at ~weekly intervals; need ≥3 weekly samples for ddof=1 std.
+            bars_per_week = max(1, int(round(bars_per_year / 52.0)))
+            if len(equity_arr) >= 3 * bars_per_week:
+                weekly_idxs = np.arange(0, len(equity_arr), bars_per_week)
+                weekly_equity = equity_arr[weekly_idxs]
+                if len(weekly_equity) >= 3:
+                    weekly_returns = np.diff(weekly_equity) / np.where(
+                        weekly_equity[:-1] != 0, weekly_equity[:-1], 1.0
+                    )
+                    if len(weekly_returns) >= 2:
+                        std_weekly_return = float(np.std(weekly_returns, ddof=1))
+
         # ================================================================
         # R-Multiple Statistics (risk-normalized performance)
         # ================================================================
@@ -3440,6 +4566,7 @@ class Backtester:
             'sharpe_ratio': round(sharpe, 2),
             'sortino_ratio': round(sortino, 2) if math.isfinite(sortino) else sortino,
             'calmar_ratio': round(calmar, 2),
+            'std_weekly_return': round(std_weekly_return, 6),
             
             # R-Multiple metrics (risk-normalized)
             'mean_r': round(mean_r, 3),
@@ -3577,6 +4704,7 @@ class Backtester:
             'sharpe_ratio': 0,
             'sortino_ratio': 0,
             'calmar_ratio': 0,
+            'std_weekly_return': 0.0,
             'mean_r': 0,
             'median_r': 0,
             'pct_positive_r': 0,
@@ -3705,8 +4833,10 @@ class StrategyScorer:
 
         # --- Drawdown penalty ---
         if getattr(self.config, 'scoring_use_continuous_dd', False):
-            # Smooth exponential: dd=0 → 1.0, dd=15 → 0.64, dd=25 → 0.47, dd=35 → 0.35
-            dd_mult = math.exp(-0.03 * dd)
+            # findings.html §4: tightened from -0.03·dd to -0.05·dd so the
+            # selector pays a real cost for high-DD candidates.
+            # dd=0 → 1.0, dd=15 → 0.47, dd=25 → 0.29, dd=35 → 0.17
+            dd_mult = math.exp(-0.05 * dd)
             score *= dd_mult
         else:
             # Legacy discrete buckets
@@ -3773,8 +4903,10 @@ class StrategyScorer:
         )
 
         # --- DD penalty ---
+        # Matches the selection scorer's slope (findings.html §4) so TPE doesn't
+        # surface candidates that the downstream selector will then discount.
         if getattr(self.config, 'scoring_use_continuous_dd', False):
-            dd_penalty = math.exp(-0.03 * dd)
+            dd_penalty = math.exp(-0.05 * dd)
         else:
             dd_penalty = 1.0 if dd < 15.0 else 0.8 if dd < 25.0 else 0.5
 
@@ -3829,6 +4961,15 @@ class StrategyScorer:
         rr_clipped = float(np.clip(rr, 0.0, 1.25))
         robust_mult = (1.0 - boost_w) + boost_w * rr_clipped
         final_score *= robust_mult
+
+        # Variance / stability penalty (findings.html §C4): exp(-k * std_weekly_return) on val side.
+        # std_weekly_return is a fraction (e.g. 0.05 = 5%); k=2.0 default → 5% std → ~0.90 mult.
+        k_var = float(getattr(self.config, "fx_stability_penalty_k", 2.0))
+        if k_var > 0.0:
+            std_wkly = float(val_metrics.get("std_weekly_return", 0.0) or 0.0)
+            if std_wkly > 0.0:
+                stability_mult = math.exp(-k_var * std_wkly)
+                final_score *= stability_mult
 
         return float(final_score), float(train_score), float(val_score), float(rr)
 

@@ -8,8 +8,12 @@ from pm_core import (
     _create_spec_from_broker_data,
     get_instrument_spec,
     InstrumentSpec,
+    load_broker_specs,
+    set_broker_specs_path,
+    set_instrument_specs,
     sync_instrument_spec_from_mt5,
 )
+from pm_mt5 import MT5SymbolInfo
 
 
 class InstrumentSpecTests(unittest.TestCase):
@@ -56,6 +60,69 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(spec.pip_value, 10.0)
         self.assertEqual(spec.spread_avg, 1.2)
         self.assertEqual(spec.symbol, "EURUSD.a")
+
+    def test_mt5_symbol_info_to_spec_uses_configured_commission(self):
+        specs = {
+            "EURUSD": {
+                "pip_position": 4,
+                "pip_value": 10.0,
+                "spread_avg": 1.2,
+                "min_lot": 0.01,
+                "max_lot": 100.0,
+                "commission_per_lot": 0.0,
+            },
+        }
+        set_instrument_specs(specs=specs, defaults={})
+        symbol_info = MT5SymbolInfo(
+            symbol="EURUSD.a",
+            digits=5,
+            point=0.00001,
+            trade_tick_value=1.0,
+            trade_tick_size=0.00001,
+            trade_contract_size=100000.0,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            spread=12,
+            spread_float=True,
+            swap_long=-1.0,
+            swap_short=0.5,
+            trade_stops_level=10,
+        )
+
+        spec = symbol_info.to_instrument_spec()
+
+        self.assertEqual(spec.commission_per_lot, 0.0)
+
+    def test_broker_spec_preserves_explicit_zero_commission(self):
+        spec = _create_spec_from_broker_data(
+            "US100",
+            {
+                "digits": 2,
+                "point": 0.01,
+                "tick_size": 0.01,
+                "tick_value": 1.0,
+                "contract_size": 1.0,
+                "pip_value": 1.0,
+                "spread": 150,
+                "volume_min": 0.1,
+                "volume_max": 100.0,
+                "volume_step": 0.1,
+                "commission_per_lot": 0.0,
+            },
+        )
+
+        self.assertEqual(spec.commission_per_lot, 0.0)
+
+    def test_missing_broker_specs_path_clears_previous_cache(self):
+        valid_path = self._tmpdir / "broker_specs.json"
+        valid_path.write_text('{"EURUSD": {"digits": 5, "point": 0.00001}}', encoding="utf-8")
+
+        set_broker_specs_path(str(valid_path))
+        self.assertIn("EURUSD", load_broker_specs())
+
+        set_broker_specs_path(str(self._tmpdir / "missing_broker_specs.json"))
+        self.assertEqual(load_broker_specs(), {})
 
     def test_sync_from_mt5_updates_spec(self):
         """Test that sync_instrument_spec_from_mt5 updates InstrumentSpec with MT5 values."""

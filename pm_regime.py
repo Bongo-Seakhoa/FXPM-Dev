@@ -20,7 +20,7 @@ Version: 3.1 (Portfolio Manager - Numba optimizations)
 import json
 import logging
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -309,7 +309,10 @@ class RegimeParams:
     chop_adx_weight: float = 0.30
     chop_efficiency_weight: float = 0.30
     chop_whipsaw_weight: float = 0.40
-    
+
+    # Asset-class defaults can override this unless regime_params.json pins it.
+    adx_trend_threshold: float = 25.0
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return asdict(self)
@@ -322,20 +325,74 @@ class RegimeParams:
         return cls(**filtered)
 
 
-# Default parameters by timeframe
+# Default parameters by timeframe.
 DEFAULT_PARAMS_BY_TIMEFRAME: Dict[str, RegimeParams] = {
-    'M5': RegimeParams(k_confirm=3, gap_min=0.10, k_hold=5),
-    'M15': RegimeParams(k_confirm=3, gap_min=0.10, k_hold=4),
+    'M5':  RegimeParams(k_confirm=3, gap_min=0.10, k_hold=5, bb_squeeze_lookback=50),
+    'M15': RegimeParams(k_confirm=3, gap_min=0.10, k_hold=4, bb_squeeze_lookback=80),
     'M30': RegimeParams(k_confirm=2, gap_min=0.10, k_hold=4),
-    'H1': RegimeParams(k_confirm=2, gap_min=0.10, k_hold=3),
-    'H4': RegimeParams(k_confirm=2, gap_min=0.08, k_hold=2),
-    'D1': RegimeParams(k_confirm=1, gap_min=0.08, k_hold=2),
+    'H1':  RegimeParams(k_confirm=2, gap_min=0.10, k_hold=3, bb_squeeze_lookback=50),
+    'H4':  RegimeParams(k_confirm=2, gap_min=0.08, k_hold=2, bb_squeeze_lookback=50),
+    # D1 uses slightly stronger hysteresis to avoid one-bar regime flips.
+    'D1':  RegimeParams(k_confirm=1, gap_min=0.08, k_hold=3, bb_squeeze_lookback=60),
 }
+
+
+# Asset-class defaults for the ADX trend anchor. JSON-pinned values win.
+DEFAULT_ADX_TREND_THRESHOLD_BY_ASSET_CLASS: Dict[str, float] = {
+    'fx':     25.0,
+    'metal':  22.0,
+    'crypto': 30.0,
+    'index':  25.0,
+}
+
+
+def _infer_asset_class(symbol: str) -> str:
+    """Infer asset class from symbol name (pure string-match; no I/O).
+
+    Returns one of ``{'fx', 'metal', 'crypto', 'index'}``. Unknown symbols
+    default to ``'fx'`` so the classic `25.0` threshold still applies — safest
+    fallback for a broad-discovery engine that shouldn't silently shift a
+    symbol's trend anchor on a name collision.
+    """
+    up = (symbol or "").upper().strip()
+    if not up:
+        return 'fx'
+    # Metals — XAU/XAG/XPT/XPD plus legacy GOLD/SILVER spellings.
+    if up.startswith(('XAU', 'XAG', 'XPT', 'XPD')) or up in {'GOLD', 'SILVER'}:
+        return 'metal'
+    # Crypto — prefix match covers majors (BTC, ETH, LTC, XRP, SOL, ADA, DOT,
+    # DOGE, BCH) plus any pair that crosses two crypto tickers (BTCETH, BTCXAU
+    # is treated as crypto because its volatility profile is crypto-driven).
+    crypto_prefixes = ('BTC', 'ETH', 'LTC', 'XRP', 'SOL', 'ADA', 'DOT', 'DOGE', 'BCH')
+    if up.startswith(crypto_prefixes):
+        return 'crypto'
+    # Indices — common ticker shorthand used by MT5 brokers.
+    index_tickers = {
+        'SP500', 'SPX500', 'US500', 'US30', 'US100', 'NAS100', 'USTEC',
+        'DAX', 'DE30', 'DE40', 'GER30', 'GER40', 'FTSE', 'UK100',
+        'NIKKEI', 'JP225', 'AUS200', 'HK50', 'CHINA50',
+    }
+    if up in index_tickers or 'INDEX' in up:
+        return 'index'
+    return 'fx'
+
+
+def _resolve_adx_trend_threshold(symbol: str) -> float:
+    """Asset-class-derived default for `RegimeParams.adx_trend_threshold`."""
+    return DEFAULT_ADX_TREND_THRESHOLD_BY_ASSET_CLASS.get(
+        _infer_asset_class(symbol),
+        DEFAULT_ADX_TREND_THRESHOLD_BY_ASSET_CLASS['fx'],
+    )
 
 
 # Global cache for loaded regime params
 _REGIME_PARAMS_CACHE: Dict[str, Dict[str, RegimeParams]] = {}
 _REGIME_PARAMS_LOADED: bool = False
+# Track fallback use so the startup summary can surface tuning gaps once.
+_REGIME_FALLBACK_LOGGED: Set[Tuple[str, str]] = set()
+_REGIME_FALLBACK_RECORD: Dict[Tuple[str, str], str] = {}
+# Pairs whose JSON explicitly pinned adx_trend_threshold.
+_REGIME_ADX_THRESHOLD_EXPLICIT: Set[Tuple[str, str]] = set()
 
 
 def load_regime_params(symbol: str, timeframe: str, 
@@ -357,37 +414,82 @@ def load_regime_params(symbol: str, timeframe: str,
         RegimeParams for the symbol/timeframe
     """
     global _REGIME_PARAMS_CACHE, _REGIME_PARAMS_LOADED
-    
+
     # Load cache if not loaded
     if not _REGIME_PARAMS_LOADED:
         try:
             with open(filepath, 'r') as f:
                 raw_data = json.load(f)
-            
+
             for sym, tf_dict in raw_data.items():
                 _REGIME_PARAMS_CACHE[sym] = {}
                 for tf, params_dict in tf_dict.items():
                     _REGIME_PARAMS_CACHE[sym][tf] = RegimeParams.from_dict(params_dict)
-            
+                    # Preserve JSON-pinned ADX anchors for this pair.
+                    if isinstance(params_dict, dict) and 'adx_trend_threshold' in params_dict:
+                        _REGIME_ADX_THRESHOLD_EXPLICIT.add((sym, tf))
+
             logger.info(f"Loaded regime params for {len(_REGIME_PARAMS_CACHE)} symbols from {filepath}")
         except FileNotFoundError:
             logger.debug(f"No regime_params.json found at {filepath}, using defaults")
         except Exception as e:
             logger.warning(f"Failed to load regime params from {filepath}: {e}")
-        
+
         _REGIME_PARAMS_LOADED = True
-    
+
     # Try symbol + timeframe specific
     if symbol in _REGIME_PARAMS_CACHE:
         if timeframe in _REGIME_PARAMS_CACHE[symbol]:
-            return _REGIME_PARAMS_CACHE[symbol][timeframe]
-    
-    # Fall back to timeframe defaults
+            cached = _REGIME_PARAMS_CACHE[symbol][timeframe]
+            # Respect explicit JSON thresholds; otherwise apply the asset-class default.
+            if (symbol, timeframe) in _REGIME_ADX_THRESHOLD_EXPLICIT:
+                return cached
+            return _with_asset_class_adx_threshold(cached, symbol)
+
+    # Record fallback sources for the startup summary.
+    fallback_key = (symbol, timeframe)
     if timeframe in DEFAULT_PARAMS_BY_TIMEFRAME:
-        return DEFAULT_PARAMS_BY_TIMEFRAME[timeframe]
-    
-    # Ultimate fallback
-    return RegimeParams()
+        _record_regime_fallback(fallback_key, source="timeframe_default")
+        return _with_asset_class_adx_threshold(
+            DEFAULT_PARAMS_BY_TIMEFRAME[timeframe], symbol
+        )
+
+    _record_regime_fallback(fallback_key, source="hardcoded_default")
+    return _with_asset_class_adx_threshold(RegimeParams(), symbol)
+
+
+def _with_asset_class_adx_threshold(base: RegimeParams, symbol: str) -> RegimeParams:
+    """Return a copy of `base` with the asset-class ADX threshold applied."""
+    target = _resolve_adx_trend_threshold(symbol)
+    if float(base.adx_trend_threshold) == float(target):
+        return base
+    # RegimeParams is a plain dataclass — copy via replace().
+    from dataclasses import replace
+    return replace(base, adx_trend_threshold=target)
+
+
+def _record_regime_fallback(key: Tuple[str, str], source: str) -> None:
+    """Log INFO once per (symbol, timeframe) fallback and stash for the startup summary."""
+    if key in _REGIME_FALLBACK_LOGGED:
+        return
+    _REGIME_FALLBACK_LOGGED.add(key)
+    _REGIME_FALLBACK_RECORD[key] = source
+    symbol, timeframe = key
+    logger.info(
+        "regime_params fallback for %s/%s -> %s (no tuned entry; using defaults)",
+        symbol, timeframe, source,
+    )
+
+
+def get_regime_fallback_record() -> Dict[Tuple[str, str], str]:
+    """Snapshot of (symbol, timeframe) → fallback source for the startup summary."""
+    return dict(_REGIME_FALLBACK_RECORD)
+
+
+def clear_regime_fallback_log() -> None:
+    """Reset the fallback log (used by tests)."""
+    _REGIME_FALLBACK_LOGGED.clear()
+    _REGIME_FALLBACK_RECORD.clear()
 
 
 def save_regime_params(params_dict: Dict[str, Dict[str, RegimeParams]], 
@@ -410,6 +512,8 @@ def clear_regime_params_cache():
     global _REGIME_PARAMS_CACHE, _REGIME_PARAMS_LOADED
     _REGIME_PARAMS_CACHE = {}
     _REGIME_PARAMS_LOADED = False
+    _REGIME_ADX_THRESHOLD_EXPLICIT.clear()
+    clear_regime_fallback_log()
 
 
 # =============================================================================
@@ -478,10 +582,11 @@ class MarketRegimeDetector:
         # COMPUTE RAW INDICATOR VALUES
         # =====================================================================
         
-        # ADX (use precomputed if available)
+        # Seed ADX warmup NaNs at the local trend anchor.
+        adx_threshold = float(getattr(p, 'adx_trend_threshold', 25.0))
         if 'ADX' in df.columns:
             adx = df['ADX'].values.copy()
-            adx = np.nan_to_num(adx, nan=25.0)
+            adx = np.nan_to_num(adx, nan=adx_threshold)
         else:
             adx = self._compute_adx(df, p.adx_period)
         
@@ -529,9 +634,9 @@ class MarketRegimeDetector:
         
         warmup = max(p.bb_squeeze_lookback, p.atr_lookback, 50)
         
-        # Pre-compute vectorized normalizations for entire arrays
-        adx_norm = self._normalize_adx_vectorized(adx)
-        adx_mid = self._normalize_adx_mid_vectorized(adx)
+        # Anchor both curves at the local ADX threshold.
+        adx_norm = self._normalize_adx_vectorized(adx, adx_threshold)
+        adx_mid = self._normalize_adx_mid_vectorized(adx, adx_threshold)
         squeeze_release = self._compute_squeeze_release_vectorized(bb_squeeze)
         
         # Vectorized score computation (warmup region stays zero)
@@ -1036,68 +1141,90 @@ class MarketRegimeDetector:
     # NORMALIZATION HELPERS
     # =========================================================================
     
-    def _normalize_adx(self, adx_value: float) -> float:
+    def _normalize_adx(self, adx_value: float, threshold: float = 25.0) -> float:
         """
-        Normalize ADX to 0-1 range.
-        
-        ADX < 20: weak trend (low score)
-        ADX 20-40: moderate trend
-        ADX > 40: strong trend (high score)
+        Normalize ADX to 0-1 range, anchored at `threshold`.
+
+        Knees are defined in terms of the trend anchor so the curve re-scales
+        for asset classes whose natural trend floor differs from the classic
+        Wilder 25. At threshold=25 the knees collapse to the original 20/40
+        bands, preserving legacy behavior for FX / indices.
+
+        Knees (as multiples of threshold):
+            adx < 0.8·T  → weak (0.0 → 0.5)
+            adx < 1.6·T  → moderate (0.5 → 1.0)
+            adx ≥ 1.6·T  → strong (0.75 → 1.0, saturates at 2.4·T)
         """
-        if adx_value < 20:
-            return adx_value / 40  # 0 to 0.5
-        elif adx_value < 40:
-            return 0.5 + (adx_value - 20) / 40  # 0.5 to 1.0
+        low = 0.8 * threshold
+        high = 1.6 * threshold
+        tail = 3.2 * threshold
+        if adx_value < low:
+            return adx_value / high
+        elif adx_value < high:
+            return 0.5 + (adx_value - low) / high
         else:
-            return min(1.0, 0.75 + (adx_value - 40) / 80)
-    
-    def _normalize_adx_vectorized(self, adx: np.ndarray) -> np.ndarray:
-        """Vectorized ADX normalization for 5-10x speedup on large arrays."""
-        result = np.zeros_like(adx)
-        
-        # ADX < 20
-        mask1 = adx < 20
-        result[mask1] = adx[mask1] / 40
-        
-        # 20 <= ADX < 40
-        mask2 = (adx >= 20) & (adx < 40)
-        result[mask2] = 0.5 + (adx[mask2] - 20) / 40
-        
-        # ADX >= 40
-        mask3 = adx >= 40
-        result[mask3] = np.minimum(1.0, 0.75 + (adx[mask3] - 40) / 80)
-        
+            return min(1.0, 0.75 + (adx_value - high) / tail)
+
+    def _normalize_adx_vectorized(self, adx: np.ndarray, threshold: float = 25.0) -> np.ndarray:
+        """Vectorized ADX normalization anchored at `threshold`."""
+        low = 0.8 * threshold
+        high = 1.6 * threshold
+        tail = 3.2 * threshold
+        result = np.zeros_like(adx, dtype=float)
+
+        # adx < 0.8·T
+        mask1 = adx < low
+        result[mask1] = adx[mask1] / high
+
+        # 0.8·T <= adx < 1.6·T
+        mask2 = (adx >= low) & (adx < high)
+        result[mask2] = 0.5 + (adx[mask2] - low) / high
+
+        # adx >= 1.6·T
+        mask3 = adx >= high
+        result[mask3] = np.minimum(1.0, 0.75 + (adx[mask3] - high) / tail)
+
         return result
-    
-    def _normalize_adx_mid(self, adx_value: float) -> float:
+
+    def _normalize_adx_mid(self, adx_value: float, threshold: float = 25.0) -> float:
         """
-        Normalize ADX for CHOP detection (peaks at mid-range ADX).
-        
-        CHOP has movement (ADX > 15) but no clear direction (ADX < 30).
+        Normalize ADX for CHOP detection, anchored at `threshold`.
+
+        Peaks at `0.9·T` (mid of the 0.6·T — 1.2·T band) — the regime where
+        ADX shows meaningful movement but no clear direction. At threshold=25
+        this collapses to the original 15 / 22.5 / 30 knees.
         """
-        if adx_value < 15:
-            return adx_value / 30
-        elif adx_value < 30:
-            return 0.5 + (30 - abs(adx_value - 22.5)) / 30
+        low_mid = 0.6 * threshold
+        peak = 0.9 * threshold
+        high_mid = 1.2 * threshold
+        tail_mid = 1.6 * threshold
+        if adx_value < low_mid:
+            return adx_value / high_mid
+        elif adx_value < high_mid:
+            return 0.5 + (high_mid - abs(adx_value - peak)) / high_mid
         else:
-            return max(0.0, 1.0 - (adx_value - 30) / 40)
-    
-    def _normalize_adx_mid_vectorized(self, adx: np.ndarray) -> np.ndarray:
-        """Vectorized ADX mid-range normalization for CHOP detection."""
-        result = np.zeros_like(adx)
-        
-        # ADX < 15
-        mask1 = adx < 15
-        result[mask1] = adx[mask1] / 30
-        
-        # 15 <= ADX < 30
-        mask2 = (adx >= 15) & (adx < 30)
-        result[mask2] = 0.5 + (30 - np.abs(adx[mask2] - 22.5)) / 30
-        
-        # ADX >= 30
-        mask3 = adx >= 30
-        result[mask3] = np.maximum(0.0, 1.0 - (adx[mask3] - 30) / 40)
-        
+            return max(0.0, 1.0 - (adx_value - high_mid) / tail_mid)
+
+    def _normalize_adx_mid_vectorized(self, adx: np.ndarray, threshold: float = 25.0) -> np.ndarray:
+        """Vectorized ADX mid-range normalization anchored at `threshold`."""
+        low_mid = 0.6 * threshold
+        peak = 0.9 * threshold
+        high_mid = 1.2 * threshold
+        tail_mid = 1.6 * threshold
+        result = np.zeros_like(adx, dtype=float)
+
+        # adx < 0.6·T
+        mask1 = adx < low_mid
+        result[mask1] = adx[mask1] / high_mid
+
+        # 0.6·T <= adx < 1.2·T
+        mask2 = (adx >= low_mid) & (adx < high_mid)
+        result[mask2] = 0.5 + (high_mid - np.abs(adx[mask2] - peak)) / high_mid
+
+        # adx >= 1.2·T
+        mask3 = adx >= high_mid
+        result[mask3] = np.maximum(0.0, 1.0 - (adx[mask3] - high_mid) / tail_mid)
+
         return result
     
     def _compute_squeeze_release_vectorized(self, squeeze: np.ndarray) -> np.ndarray:

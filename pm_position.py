@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# TRADE TAG UTILITIES (FIX #2: D1 + Lower-TF Support)
+# TRADE TAG UTILITIES
 # =============================================================================
 
 class TradeTagEncoder:
@@ -127,11 +127,6 @@ class TradeTagEncoder:
             risk_tenths = int(round(float(risk_pct) * 10.0))
             return f"{TradeTagEncoder.COMMENT_PREFIX_V3}{symbol}:{timeframe}:{scode}:{dir_short}:{risk_tenths}"
 
-        if risk_pct is not None:
-            scode = TradeTagEncoder._strategy_code(strategy_name, max_len=5)
-            risk_tenths = int(round(float(risk_pct) * 10.0))
-            return f"{TradeTagEncoder.COMMENT_PREFIX_V3}{symbol}:{timeframe}:{scode}:{dir_short}:{risk_tenths}"
-
         # Legacy v1
         return f"{TradeTagEncoder.COMMENT_PREFIX_V1}{symbol}:{timeframe}:{strategy_name}:{str(direction).upper()}"
 
@@ -174,6 +169,14 @@ class TradeTagEncoder:
                         "direction": direction,
                         "risk_pct": risk_pct,
                     }
+                # PM3 short (truncated by broker): PM3:symbol:tf:scode
+                if len(parts) >= 3:
+                    result = {"symbol": parts[0], "timeframe": parts[1], "strategy_code": parts[2]}
+                    if len(parts) >= 4:
+                        direction = TradeTagEncoder._normalize_direction(parts[3])
+                        if direction:
+                            result["direction"] = direction
+                    return result
 
             # v2 (backward compat): PM2:symbol:tf:scode:dir:tier:risk_tenths
             if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V2):
@@ -189,6 +192,14 @@ class TradeTagEncoder:
                         "direction": direction,
                         "risk_pct": risk_pct,
                     }
+                # PM2 short (truncated by broker): PM2:symbol:tf:scode
+                if len(parts) >= 3:
+                    result = {"symbol": parts[0], "timeframe": parts[1], "strategy_code": parts[2]}
+                    if len(parts) >= 4:
+                        direction = TradeTagEncoder._normalize_direction(parts[3])
+                        if direction:
+                            result["direction"] = direction
+                    return result
 
             # v1 (legacy): PM:symbol:tf:strategy:direction
             if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V1):
@@ -251,6 +262,7 @@ class PositionConfig:
     max_risk_pct: float = 2.0  # hard safety cap (skip if exceeded)
     risk_tolerance_pct: float = 2.0  # allowed deviation vs target before logging/adjustment
     auto_widen_sl: bool = True  # widen SL only to satisfy broker min stop distance / constraints
+    allow_min_lot_risk_clamp: bool = False  # only clamp up to min_lot when the hard cap still permits it
 
     # Stop management
     use_trailing_stop: bool = False
@@ -273,6 +285,14 @@ class PositionConfig:
     use_spread: bool = True
     use_slippage: bool = True
     slippage_pips: float = 0.5
+
+    # Optional regime-specific TP scaling applied when building live trade intents.
+    regime_tp_multipliers: Dict[str, float] = field(default_factory=lambda: {
+        "TREND": 1.25,
+        "BREAKOUT": 1.15,
+        "RANGE": 0.85,
+        "CHOP": 0.75,
+    })
 
 
 @dataclass
@@ -394,7 +414,8 @@ class PositionCalculator:
         
         # Get pip value
         pip_value = spec.pip_value
-        
+        loss_per_lot = 0.0
+
         # Calculate lot size using tick-based math if available, else pip-based
         if spec.tick_value > 0 and spec.tick_size > 0 and sl_pips > 0:
             # Tick-based sizing: more accurate for CFDs/indices
@@ -411,41 +432,54 @@ class PositionCalculator:
         else:
             volume = self.config.min_position_size
 
-        # If risk-based volume is below min_lot, the trade is not viable.
-        # Clamping up to min_lot could take materially more risk than intended.
+        allow_min_lot_clamp = bool(getattr(self.config, "allow_min_lot_risk_clamp", False))
+        min_lot_volume = max(spec.min_lot, self.config.min_position_size)
+
         if volume < spec.min_lot:
-            logger.warning(
-                f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot} "
-                f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
-            )
-            return PositionSizeResult(
-                volume=0.0,
-                risk_amount=risk_amount,
-                sl_pips=sl_pips,
-                pip_value=pip_value,
-                equity=equity,
-                details=(
-                    f"Equity: {equity:.2f}, Risk: {risk_amount:.2f}, "
-                    f"SL: {sl_pips:.1f} pips - volume below min_lot, skipped"
-                ),
-            )
-        
-        # If risk-based volume is below min_lot, the trade is not viable
-        # (clamping up to min_lot would take far more risk than intended)
-        if volume < spec.min_lot:
-            logger.warning(
-                f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot} "
-                f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
-            )
-            return PositionSizeResult(
-                volume=0.0,
-                risk_amount=risk_amount,
-                sl_pips=sl_pips,
-                pip_value=pip_value,
-                equity=equity,
-                details=(f"Equity: {equity:.2f}, Risk: {risk_amount:.2f}, "
-                         f"SL: {sl_pips:.1f} pips — volume below min_lot, skipped"),
-            )
+            if allow_min_lot_clamp and loss_per_lot > 0 and equity > 0:
+                actual_risk_amount = loss_per_lot * min_lot_volume
+                actual_risk_pct = (actual_risk_amount / equity) * 100.0
+                hard_cap = float(getattr(self.config, "max_risk_pct", 0.0) or 0.0)
+                if hard_cap <= 0.0 or actual_risk_pct <= hard_cap + 1e-9:
+                    logger.info(
+                        f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot}; "
+                        f"clamping to min_lot {min_lot_volume:.4f} within hard cap "
+                        f"{hard_cap:.2f}% (actual_risk={actual_risk_pct:.2f}%)"
+                    )
+                    volume = min_lot_volume
+                else:
+                    logger.warning(
+                        f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot} "
+                        f"and min_lot risk {actual_risk_pct:.2f}% exceeds hard cap {hard_cap:.2f}% "
+                        f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
+                    )
+                    return PositionSizeResult(
+                        volume=0.0,
+                        risk_amount=risk_amount,
+                        sl_pips=sl_pips,
+                        pip_value=pip_value,
+                        equity=equity,
+                        details=(
+                            f"Equity: {equity:.2f}, Risk: {risk_amount:.2f}, "
+                            f"SL: {sl_pips:.1f} pips - min_lot exceeds hard cap, skipped"
+                        ),
+                    )
+            else:
+                logger.warning(
+                    f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot} "
+                    f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
+                )
+                return PositionSizeResult(
+                    volume=0.0,
+                    risk_amount=risk_amount,
+                    sl_pips=sl_pips,
+                    pip_value=pip_value,
+                    equity=equity,
+                    details=(
+                        f"Equity: {equity:.2f}, Risk: {risk_amount:.2f}, "
+                        f"SL: {sl_pips:.1f} pips - volume below min_lot, skipped"
+                    ),
+                )
 
         # Apply limits
         volume = max(spec.min_lot, volume)
@@ -462,13 +496,32 @@ class PositionCalculator:
         volume = math.floor(volume / volume_step) * volume_step
         volume = round(volume, 8)
 
-        # If rounding pushed volume below min_lot, the trade is not viable
+        # If rounding pushed volume below min_lot, either clamp back up within the
+        # hard cap or reject the trade.
         if volume < spec.min_lot:
-            logger.warning(
-                f"Volume {volume:.8f} below min_lot {spec.min_lot} after rounding "
-                f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
-            )
-            volume = 0.0
+            if allow_min_lot_clamp and loss_per_lot > 0 and equity > 0:
+                actual_risk_amount = loss_per_lot * min_lot_volume
+                actual_risk_pct = (actual_risk_amount / equity) * 100.0
+                hard_cap = float(getattr(self.config, "max_risk_pct", 0.0) or 0.0)
+                if hard_cap <= 0.0 or actual_risk_pct <= hard_cap + 1e-9:
+                    logger.info(
+                        f"Rounded volume fell below min_lot; clamping to {min_lot_volume:.4f} "
+                        f"within hard cap {hard_cap:.2f}% (actual_risk={actual_risk_pct:.2f}%)"
+                    )
+                    volume = round(min_lot_volume, 8)
+                else:
+                    logger.warning(
+                        f"Volume {volume:.8f} below min_lot {spec.min_lot} after rounding "
+                        f"and min_lot risk {actual_risk_pct:.2f}% exceeds hard cap {hard_cap:.2f}% "
+                        f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
+                    )
+                    volume = 0.0
+            else:
+                logger.warning(
+                    f"Volume {volume:.8f} below min_lot {spec.min_lot} after rounding "
+                    f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
+                )
+                volume = 0.0
         
         details = (f"Equity: {equity:.2f}, Risk: {risk_amount:.2f} "
                   f"({self.config.risk_per_trade_pct}%), SL: {sl_pips:.1f} pips, "

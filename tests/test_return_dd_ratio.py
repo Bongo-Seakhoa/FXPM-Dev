@@ -87,7 +87,9 @@ class TestReturnDDRatioGate(unittest.TestCase):
         """Test 4: ratio gate applies even when allow_losing_winners=True."""
         opt = _make_optimizer(regime_allow_losing_winners=True)
         train = _make_train_metrics()
-        val = _make_val_metrics(total_return_pct=6.0, max_drawdown_pct=15.0)  # ratio=0.4
+        # DD kept under fx_val_max_drawdown (12.0) so the DD gate doesn't fire first;
+        # ratio = 6.0 / 10.0 = 0.6 still under the 1.0 ratio gate.
+        val = _make_val_metrics(total_return_pct=6.0, max_drawdown_pct=10.0)  # ratio=0.6
         is_valid, reason = opt._validate_regime_winner(train, val, "TREND", "TestStrat")
         self.assertFalse(is_valid)
         self.assertIn("return/DD", reason)
@@ -126,6 +128,84 @@ class TestReturnDDRatioGate(unittest.TestCase):
             profit_factor=1.5,
             total_trades=60,
             win_rate=55.0,
+        )
+        is_valid, reason = opt._validate_regime_winner(train, val, "TREND", "TestStrat")
+        self.assertTrue(is_valid)
+
+    def test_weak_train_rejected_when_val_sharpe_below_05(self):
+        """findings.html §5: weak-train rescue must require val_sharpe ≥ 0.5."""
+        opt = _make_optimizer(
+            exceptional_val_profit_factor=1.15,
+            exceptional_val_return_pct=8.0,
+        )
+        train = _make_train_metrics(profit_factor=0.8, total_return_pct=-5.0)
+        val = _make_val_metrics(
+            total_return_pct=14.0,
+            max_drawdown_pct=10.0,
+            profit_factor=1.5,
+            total_trades=60,
+            win_rate=55.0,
+            sharpe_approx=0.3,  # below the 0.5 floor
+        )
+        is_valid, reason = opt._validate_regime_winner(train, val, "TREND", "TestStrat")
+        self.assertFalse(is_valid)
+        self.assertIn("Weak train rejected", reason)
+        self.assertIn("sharpe", reason.lower())
+
+    def test_weak_train_rejected_when_val_win_rate_at_or_below_50(self):
+        """findings.html §5: weak-train rescue must require val_win_rate > 50%."""
+        opt = _make_optimizer(
+            exceptional_val_profit_factor=1.15,
+            exceptional_val_return_pct=8.0,
+        )
+        train = _make_train_metrics(profit_factor=0.8, total_return_pct=-5.0)
+        val = _make_val_metrics(
+            total_return_pct=14.0,
+            max_drawdown_pct=10.0,
+            profit_factor=1.5,
+            total_trades=60,
+            win_rate=50.0,  # exactly at boundary — must reject (strict >)
+            sharpe_approx=1.2,
+        )
+        is_valid, reason = opt._validate_regime_winner(train, val, "TREND", "TestStrat")
+        self.assertFalse(is_valid)
+        self.assertIn("Weak train rejected", reason)
+        self.assertIn("WR", reason)
+
+    def test_weak_train_rejected_when_val_trades_below_50(self):
+        """findings.html §5: weak-train rescue must require val_trades ≥ 50."""
+        opt = _make_optimizer(
+            exceptional_val_profit_factor=1.15,
+            exceptional_val_return_pct=8.0,
+        )
+        train = _make_train_metrics(profit_factor=0.8, total_return_pct=-5.0)
+        val = _make_val_metrics(
+            total_return_pct=14.0,
+            max_drawdown_pct=10.0,
+            profit_factor=1.5,
+            total_trades=40,  # below the 50 floor
+            win_rate=55.0,
+            sharpe_approx=1.2,
+        )
+        is_valid, reason = opt._validate_regime_winner(train, val, "TREND", "TestStrat")
+        self.assertFalse(is_valid)
+        self.assertIn("Weak train rejected", reason)
+        self.assertIn("trades", reason.lower())
+
+    def test_weak_train_passes_when_all_new_gates_satisfied(self):
+        """All three new gates pass: rescue still works for genuinely strong val."""
+        opt = _make_optimizer(
+            exceptional_val_profit_factor=1.15,
+            exceptional_val_return_pct=8.0,
+        )
+        train = _make_train_metrics(profit_factor=0.8, total_return_pct=-5.0)
+        val = _make_val_metrics(
+            total_return_pct=14.0,
+            max_drawdown_pct=10.0,
+            profit_factor=1.5,
+            total_trades=55,         # ≥ 50
+            win_rate=55.0,           # > 50
+            sharpe_approx=0.7,       # ≥ 0.5
         )
         is_valid, reason = opt._validate_regime_winner(train, val, "TREND", "TestStrat")
         self.assertTrue(is_valid)

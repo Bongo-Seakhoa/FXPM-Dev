@@ -1,7 +1,7 @@
 import logging
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -31,6 +31,7 @@ def make_trader():
         regime_min_val_profit_factor=1.0,
         regime_min_val_return_pct=0.0,
         fx_val_max_drawdown=35.0,
+        live_loop_trigger_mode="scheduled",
     )
     trader._candidate_cache = {}
     trader._last_bar_times = {}
@@ -116,6 +117,62 @@ class WinnersOnlyTests(unittest.TestCase):
         self.assertEqual(len(candidates), 0)
         self.assertGreaterEqual(stats.get("winner_failed_gate", 0), 1)
         mock_get.assert_not_called()
+
+    @patch("pm_main.FeatureComputer.compute_all")
+    @patch("pm_strategies.StrategyRegistry.get")
+    def test_winners_only_skips_stale_timeframe_before_bar_load(self, mock_get, mock_compute):
+        valid_cfg = RegimeConfig(
+            strategy_name="TrendStrategy",
+            parameters={},
+            quality_score=0.8,
+            train_metrics={},
+            val_metrics={"profit_factor": 2.0, "total_return_pct": 10.0, "max_drawdown_pct": 5.0},
+        )
+
+        symbol_cfg = SymbolConfig(
+            symbol="TONUSD",
+            regime_configs={"H1": {"TREND": valid_cfg}},
+            default_config=valid_cfg,
+        )
+
+        trader = make_trader()
+        trader.mt5 = MagicMock()
+        trader.mt5.get_bars.side_effect = AssertionError("stale timeframe should not load bars")
+        trader._last_bar_times["TONUSD_H1"] = pd.Timestamp.now()
+
+        candidates, stats = trader._evaluate_regime_candidates("TONUSD", "TONUSD", symbol_cfg)
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(stats.get("timeframes_skipped_stale", 0), 1)
+        mock_compute.assert_not_called()
+        mock_get.assert_not_called()
+
+    @patch("pm_main.FeatureComputer.compute_all")
+    @patch("pm_strategies.StrategyRegistry.get")
+    def test_zero_quality_score_is_preserved_in_live_selection(self, mock_get, mock_compute):
+        mock_get.return_value = DummyStrategy()
+        mock_compute.return_value = make_features()
+
+        valid_cfg = RegimeConfig(
+            strategy_name="TrendStrategy",
+            parameters={},
+            quality_score=0.0,
+            train_metrics={},
+            val_metrics={"profit_factor": 2.0, "total_return_pct": 10.0, "max_drawdown_pct": 5.0},
+        )
+
+        symbol_cfg = SymbolConfig(
+            symbol="TONUSD",
+            regime_configs={"H1": {"TREND": valid_cfg}},
+            default_config=valid_cfg,
+        )
+
+        trader = make_trader()
+        candidates, _stats = trader._evaluate_regime_candidates("TONUSD", "TONUSD", symbol_cfg)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["quality_score"], 0.0)
+        self.assertEqual(candidates[0]["selection_score"], 0.0)
 
 
 if __name__ == "__main__":

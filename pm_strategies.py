@@ -21,13 +21,63 @@ _GLOBAL_SL_GRID and _GLOBAL_TP_GRID.
 Version: 4.1 (Portfolio Manager — efficiency optimizations)
 """
 
+import logging
 import numpy as np
 import pandas as pd
 import weakref
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Dict, List, Any, Tuple, Optional, Set
 
 from pm_core import StrategyCategory, get_instrument_spec, InstrumentSpec, FeatureComputer
+
+
+logger = logging.getLogger(__name__)
+
+# Warn once when a strategy's cartesian grid gets very large.
+_LARGE_PARAM_GRID_WARN_THRESHOLD: int = 1000
+_LARGE_GRID_WARN_EMITTED: Set[Tuple[str, int]] = set()
+
+# Optional structural-stop helper for trend and breakout families.
+_STRUCTURAL_SL_DEFAULT_LOOKBACK: int = 20
+_STRUCTURAL_SL_ATR_MAX_MULT: float = 1.5
+
+# Regime-aware TP multipliers applied after winner discovery.
+_DEFAULT_REGIME_TP_MULTIPLIERS: Dict[str, float] = {
+    "TREND": 1.25,
+    "BREAKOUT": 1.15,
+    "RANGE": 0.85,
+    "CHOP": 0.75,
+}
+_REGIME_TP_MULTIPLIERS: Dict[str, float] = dict(_DEFAULT_REGIME_TP_MULTIPLIERS)
+
+
+def set_regime_tp_multipliers(multipliers: Optional[Dict[str, float]]) -> None:
+    """Replace the active regime -> TP-multiplier table.
+
+    Empty / None resets to the module default. Keys are upper-cased so live and
+    backtest paths agree on `'trend'` vs `'TREND'` even with mixed-case configs.
+    Non-positive or non-numeric values are dropped (treated as no-op).
+    """
+    global _REGIME_TP_MULTIPLIERS
+    if not multipliers:
+        _REGIME_TP_MULTIPLIERS = dict(_DEFAULT_REGIME_TP_MULTIPLIERS)
+        return
+    cleaned: Dict[str, float] = {}
+    for k, v in dict(multipliers).items():
+        try:
+            mv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if mv <= 0:
+            continue
+        cleaned[str(k).strip().upper()] = mv
+    _REGIME_TP_MULTIPLIERS = cleaned or dict(_DEFAULT_REGIME_TP_MULTIPLIERS)
+
+
+def get_regime_tp_multipliers() -> Dict[str, float]:
+    """Return a copy of the active regime → TP-multiplier table."""
+    return dict(_REGIME_TP_MULTIPLIERS)
 
 
 # =============================================================================
@@ -43,6 +93,33 @@ _STRATEGY_HELPER_FINALIZERS: Dict[int, weakref.finalize] = {}
 # =============================================================================
 # FEATURE LOOKUP HELPERS (efficiency optimization)
 # =============================================================================
+
+# Per-DataFrame registry so helpers only trust precomputed indicator columns
+# when they were built with the expected parameters.
+_PRECOMPUTED_ATTR = '_fxpm_precomputed_params'
+
+
+def mark_precomputed(features: pd.DataFrame, **params_by_key: Tuple[Any, ...]) -> None:
+    """Record which precomputed columns on *features* use which parameter tuples.
+
+    Called by the feature-layer (pm_core) after writing precomputed indicators.
+    Helper short-circuits on this tag rather than column presence, so a leftover
+    column from a previous strategy run can never be returned as if it matched
+    the current caller's parameters.
+    """
+    tags = features.attrs.get(_PRECOMPUTED_ATTR)
+    if tags is None:
+        tags = {}
+        features.attrs[_PRECOMPUTED_ATTR] = tags
+    tags.update(params_by_key)
+
+
+def _precomputed_matches(features: pd.DataFrame, key: str, expected: Tuple[Any, ...]) -> bool:
+    tags = features.attrs.get(_PRECOMPUTED_ATTR)
+    if not tags:
+        return False
+    return tags.get(key) == expected
+
 
 def _memoize_series(features: pd.DataFrame, col: str, result: pd.Series) -> None:
     """Memoize computed helper series unless ``features`` is a slice/view."""
@@ -80,7 +157,7 @@ def _get_sma(features: pd.DataFrame, period: int) -> pd.Series:
 
 
 def _get_tr(features: pd.DataFrame) -> pd.Series:
-    """Get True Range (C2: consolidated helper). Memoized into features."""
+    """Get True Range. Memoized into features."""
     col = '_TR'
     if col in features.columns:
         return features[col]
@@ -158,9 +235,11 @@ def _get_keltner(features: pd.DataFrame, ema_period: int = 20,
                  atr_period: int = 14, mult: float = 2.0
                  ) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """Get Keltner Channel (mid, upper, lower) with parameter-aware caching."""
-    if ema_period == 20 and atr_period == 20 and float(mult) == 2.0:
-        if {'KC_MID', 'KC_UPPER', 'KC_LOWER'}.issubset(features.columns):
-            return features['KC_MID'], features['KC_UPPER'], features['KC_LOWER']
+    requested = (int(ema_period), int(atr_period), float(mult))
+    if (requested == (20, 20, 2.0)
+            and _precomputed_matches(features, 'KC', requested)
+            and {'KC_MID', 'KC_UPPER', 'KC_LOWER'}.issubset(features.columns)):
+        return features['KC_MID'], features['KC_UPPER'], features['KC_LOWER']
     cache = _strategy_cache(features)
     cache_key = ('KC', ema_period, atr_period, float(mult))
     if cache_key in cache:
@@ -177,7 +256,7 @@ def _get_keltner(features: pd.DataFrame, ema_period: int = 20,
 
 def _detect_swing_points(series: pd.Series, order: int = 5
                          ) -> Tuple[pd.Series, pd.Series]:
-    """Detect swing highs and lows using rolling window comparison (D0 helper).
+    """Detect swing highs and lows using rolling-window comparison.
 
     Returns boolean Series pair (swing_highs, swing_lows).
     A swing high at bar i means series[i] >= all values in [i-order, i+order].
@@ -206,7 +285,7 @@ def _detect_swing_points(series: pd.Series, order: int = 5
 
 
 def _rolling_percentile_rank(series: pd.Series, window: int) -> pd.Series:
-    """Rolling percentile rank (0-100) of current value within its window (D0 helper)."""
+    """Rolling percentile rank (0-100) of the current value within its window."""
     def _pct_rank(arr):
         if len(arr) < 2:
             return 50.0
@@ -221,7 +300,10 @@ def _get_adx_di(features: pd.DataFrame, period: int = 14
     Uses the same rolling-mean / ATR basis as the core feature layer so
     helper and precomputed values stay on one mathematical surface.
     """
-    if period == 14 and {'ADX', 'PLUS_DI', 'MINUS_DI'}.issubset(features.columns):
+    requested = (int(period),)
+    if (requested == (14,)
+            and _precomputed_matches(features, 'ADX', requested)
+            and {'ADX', 'PLUS_DI', 'MINUS_DI'}.issubset(features.columns)):
         return features['ADX'], features['PLUS_DI'], features['MINUS_DI']
 
     cache_tag = _cache_tag(period)
@@ -275,7 +357,10 @@ def _get_hull_ma(features: pd.DataFrame, period: int) -> pd.Series:
 
 def _get_bb(features: pd.DataFrame, period: int, std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """Get Bollinger Bands from precomputed features or compute if missing."""
-    if period == 20 and float(std) == 2.0 and {'BB_MID_20', 'BB_UPPER_20', 'BB_LOWER_20'}.issubset(features.columns):
+    requested = (int(period), float(std))
+    if (requested == (20, 2.0)
+            and _precomputed_matches(features, 'BB_20', requested)
+            and {'BB_MID_20', 'BB_UPPER_20', 'BB_LOWER_20'}.issubset(features.columns)):
         return features['BB_MID_20'], features['BB_UPPER_20'], features['BB_LOWER_20']
     cache = _strategy_cache(features)
     cache_key = ('BB', period, float(std))
@@ -290,7 +375,10 @@ def _get_bb(features: pd.DataFrame, period: int, std: float = 2.0) -> Tuple[pd.S
 
 def _get_stochastic(features: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
     """Get Stochastic from precomputed features or compute if missing."""
-    if 'STOCH_K' in features.columns and 'STOCH_D' in features.columns and k_period == 14 and d_period == 3:
+    requested = (int(k_period), int(d_period))
+    if (requested == (14, 3)
+            and _precomputed_matches(features, 'STOCH', requested)
+            and {'STOCH_K', 'STOCH_D'}.issubset(features.columns)):
         return features['STOCH_K'], features['STOCH_D']
     cache = _strategy_cache(features)
     cache_key = ('STOCH', k_period, d_period)
@@ -310,7 +398,10 @@ def _get_stochastic(features: pd.DataFrame, k_period: int = 14, d_period: int = 
 
 def _get_macd(features: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """Get MACD from precomputed features or compute if missing."""
-    if 'MACD' in features.columns and fast == 12 and slow == 26 and signal == 9:
+    requested = (int(fast), int(slow), int(signal))
+    if (requested == (12, 26, 9)
+            and _precomputed_matches(features, 'MACD', requested)
+            and {'MACD', 'MACD_SIGNAL', 'MACD_HIST'}.issubset(features.columns)):
         return features['MACD'], features['MACD_SIGNAL'], features['MACD_HIST']
     return FeatureComputer.macd(features['Close'], fast, slow, signal)
 
@@ -318,6 +409,25 @@ def _get_macd(features: pd.DataFrame, fast: int = 12, slow: int = 26, signal: in
 # =============================================================================
 # BASE STRATEGY CLASS
 # =============================================================================
+
+
+@dataclass
+class TradeIntent:
+    """Typed handoff from a local winner to the live executor."""
+
+    symbol: str
+    timeframe: str
+    regime: str
+    strategy_name: str
+    direction: int
+    entry_bar_time: Optional[str] = None
+    signal_strength: float = 0.0
+    selection_score: float = 0.0
+    quality_score: float = 0.0
+    stop_loss_pips: float = 0.0
+    take_profit_pips: float = 0.0
+    governance_hint: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class BaseStrategy(ABC):
     """
@@ -423,9 +533,9 @@ class BaseStrategy(ABC):
                         bar_index: Optional[int] = None) -> Tuple[float, float]:
         """
         Calculate stop loss and take profit in pips.
-        
+
         Default implementation uses ATR-based stops.
-        
+
         Args:
             features: DataFrame with OHLCV and indicators (full or sliced)
             signal: Direction (1 for long, -1 for short)
@@ -433,7 +543,7 @@ class BaseStrategy(ABC):
             spec: Optional InstrumentSpec
             bar_index: Optional bar index (if provided, features is the full DataFrame
                        and we read values at bar_index using .iat for O(1) access)
-        
+
         Returns:
             Tuple of (stop_loss_pips, take_profit_pips)
         """
@@ -461,16 +571,217 @@ class BaseStrategy(ABC):
         atr_pips = spec.price_to_pips(atr)
         sl_mult = self.params.get('sl_atr_mult', 2.0)
         tp_mult = self.params.get('tp_atr_mult', 3.0)
-        
+
         sl_pips = max(5.0, atr_pips * sl_mult)
         tp_pips = max(10.0, atr_pips * tp_mult)
-        
+
+        if self.params.get('use_structural_sl', False):
+            structural_sl = self._compute_structural_sl_pips(
+                features=features, signal=signal, spec=spec,
+                bar_index=bar_index, atr_sl_pips=sl_pips,
+            )
+            if structural_sl is not None:
+                # max(ATR, swing) widens to the structural level when it sits
+                # beyond the ATR stop; clip at 1.5× ATR so a chaotic swing
+                # cannot blow up risk per trade.
+                cap = sl_pips * _STRUCTURAL_SL_ATR_MAX_MULT
+                sl_pips = float(min(cap, max(sl_pips, structural_sl)))
+
         return sl_pips, tp_pips
+
+    def build_trade_intent(
+        self,
+        features: pd.DataFrame,
+        *,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        signal: int,
+        spec: Optional[InstrumentSpec] = None,
+        bar_index: Optional[int] = None,
+        signal_strength: float = 0.0,
+        selection_score: float = 0.0,
+        quality_score: float = 0.0,
+        governance_hint: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> TradeIntent:
+        """Build a typed executor payload without adding strategy-level policy."""
+        sl_pips, tp_pips = self.calculate_stops(
+            features,
+            signal,
+            symbol,
+            spec=spec,
+            bar_index=bar_index,
+        )
+        tp_pips = self._apply_regime_tp_multiplier(tp_pips, features, bar_index)
+        entry_bar_time: Optional[str] = None
+        if bar_index is not None and 0 <= int(bar_index) < len(features.index):
+            entry_bar_time = str(features.index[int(bar_index)])
+        elif len(features.index) > 0:
+            entry_bar_time = str(features.index[-1])
+        return TradeIntent(
+            symbol=symbol,
+            timeframe=str(timeframe or "").upper(),
+            regime=str(regime or "").upper(),
+            strategy_name=self.name,
+            direction=int(signal),
+            entry_bar_time=entry_bar_time,
+            signal_strength=float(signal_strength or 0.0),
+            selection_score=float(selection_score or 0.0),
+            quality_score=float(quality_score or 0.0),
+            stop_loss_pips=float(sl_pips),
+            take_profit_pips=float(tp_pips),
+            governance_hint=dict(governance_hint or {}),
+            metadata=dict(metadata or {}),
+        )
+
+    @staticmethod
+    def _apply_regime_tp_multiplier(
+        tp_pips: float,
+        features: pd.DataFrame,
+        bar_index: Optional[int],
+    ) -> float:
+        """Scale the base TP by the active regime's multiplier.
+
+        Reads the look-ahead-safe ``REGIME_LIVE`` label (falls back to ``REGIME``
+        when the live column is absent, e.g. in legacy fixtures). Silent no-op if
+        the column is missing, the value is non-finite, the regime label is not
+        in the active multipliers table, or the multiplier is non-positive. The
+        10-pip TP floor from ``calculate_stops`` is preserved.
+        """
+        if not _REGIME_TP_MULTIPLIERS:
+            return tp_pips
+        col = 'REGIME_LIVE' if 'REGIME_LIVE' in features.columns else (
+            'REGIME' if 'REGIME' in features.columns else None
+        )
+        if col is None:
+            return tp_pips
+        try:
+            if bar_index is not None:
+                label = features[col].iat[int(bar_index)]
+            else:
+                label = features[col].iloc[-1]
+        except (IndexError, KeyError, ValueError):
+            return tp_pips
+        if label is None:
+            return tp_pips
+        try:
+            if isinstance(label, float) and not np.isfinite(label):
+                return tp_pips
+        except TypeError:
+            pass
+        key = str(label).strip().upper()
+        if not key or key == 'NAN':
+            return tp_pips
+        mult = _REGIME_TP_MULTIPLIERS.get(key)
+        if mult is None or mult <= 0:
+            return tp_pips
+        return max(10.0, float(tp_pips) * float(mult))
+
+    def _compute_structural_sl_pips(
+        self,
+        features: pd.DataFrame,
+        signal: int,
+        spec: InstrumentSpec,
+        bar_index: Optional[int],
+        atr_sl_pips: float,
+    ) -> Optional[float]:
+        """Distance in pips from current Close to nearest structural swing.
+
+        For longs we take the lowest Low in the lookback window (a structural
+        support that has actually held). For shorts the highest High. Returns
+        None when the lookback window is shorter than the available history
+        or when prices are non-finite — the caller falls back to the pure
+        ATR stop in that case.
+
+        Pure read-from-past — never references bars at or after `bar_index`.
+        """
+        try:
+            lookback = int(self.params.get('structural_sl_lookback',
+                                           _STRUCTURAL_SL_DEFAULT_LOOKBACK))
+        except (TypeError, ValueError):
+            lookback = _STRUCTURAL_SL_DEFAULT_LOOKBACK
+        if lookback < 2:
+            return None
+
+        if bar_index is None:
+            end = len(features)
+        else:
+            end = int(bar_index) + 1
+        start = max(0, end - lookback)
+        if end - start < 2:
+            return None
+
+        close_arr = features['Close'].to_numpy()
+        if end - 1 < 0 or end - 1 >= len(close_arr):
+            return None
+        current_close = float(close_arr[end - 1])
+        if not np.isfinite(current_close):
+            return None
+
+        if signal > 0:
+            window = features['Low'].to_numpy()[start:end]
+            if window.size == 0:
+                return None
+            ref = float(np.nanmin(window))
+            if not np.isfinite(ref) or ref >= current_close:
+                return None
+            distance = current_close - ref
+        elif signal < 0:
+            window = features['High'].to_numpy()[start:end]
+            if window.size == 0:
+                return None
+            ref = float(np.nanmax(window))
+            if not np.isfinite(ref) or ref <= current_close:
+                return None
+            distance = ref - current_close
+        else:
+            return None
+
+        return float(spec.price_to_pips(distance))
     
     def get_param_grid(self) -> Dict[str, List]:
         """Get parameter grid for optimization."""
         return {}
-    
+
+    def cartesian_grid_size(self) -> int:
+        """Compute cartesian-product size of `get_param_grid()`.
+
+        Returns 0 for an empty grid. Pure observability — used by the optimizer
+        log surface and the large-grid WARN. Does not influence search.
+        """
+        grid = self.get_param_grid()
+        if not grid:
+            return 0
+        size = 1
+        for values in grid.values():
+            n = len(values) if values else 0
+            if n == 0:
+                return 0
+            size *= n
+        return size
+
+    def warn_if_param_grid_large(self) -> int:
+        """Emit one-time WARN per (strategy, size) when cartesian > threshold.
+
+        Returns the cartesian size for caller logging. Idempotent across calls
+        with identical (name, size); reset by clearing `_LARGE_GRID_WARN_EMITTED`.
+        """
+        size = self.cartesian_grid_size()
+        if size > _LARGE_PARAM_GRID_WARN_THRESHOLD:
+            key = (self.name, size)
+            if key not in _LARGE_GRID_WARN_EMITTED:
+                _LARGE_GRID_WARN_EMITTED.add(key)
+                logger.warning(
+                    "Large parameter grid: %s cartesian=%d > threshold=%d. "
+                    "Under flat trial budget this family will receive sparser "
+                    "coverage than smaller families. Consider enabling "
+                    "`optuna_family_size_aware_budget` or raising "
+                    "`optuna_max_trials_per_strategy`.",
+                    self.name, size, _LARGE_PARAM_GRID_WARN_THRESHOLD,
+                )
+        return size
+
     @staticmethod
     def _base_sl_tp_grid() -> Dict[str, List[float]]:
         """Return the global SL/TP grid entries for use in get_param_grid()."""
@@ -478,6 +789,19 @@ class BaseStrategy(ABC):
             'sl_atr_mult': _GLOBAL_SL_GRID,
             'tp_atr_mult': _GLOBAL_TP_GRID,
         }
+
+    @staticmethod
+    def _structural_sl_defaults() -> Dict[str, Any]:
+        """Opt-in structural-SL defaults for families that support it."""
+        return {
+            'use_structural_sl': False,
+            'structural_sl_lookback': _STRUCTURAL_SL_DEFAULT_LOOKBACK,
+        }
+
+    @staticmethod
+    def _structural_sl_grid() -> Dict[str, List]:
+        """Opt-in structural-SL search axis."""
+        return {'use_structural_sl': [True, False]}
     
     def set_params(self, **params):
         """Update strategy parameters."""
@@ -512,9 +836,10 @@ class EMACrossoverStrategy(BaseStrategy):
             'fast_period': 10,
             'slow_period': 20,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
-    
+
     def get_required_features(self) -> Set[str]:
         """EMA crossover needs EMA columns for fast and slow periods."""
         fast = self.params.get('fast_period', 10)
@@ -543,6 +868,7 @@ class EMACrossoverStrategy(BaseStrategy):
             'fast_period': [5, 8, 10, 13, 15],
             'slow_period': [20, 26, 30, 40, 50],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -566,7 +892,8 @@ class SupertrendStrategy(BaseStrategy):
             'atr_period': 10,
             'multiplier': 3.0,
             'sl_atr_mult': 1.5,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -652,6 +979,7 @@ class SupertrendStrategy(BaseStrategy):
             'atr_period': [7, 10, 14, 20, 25],
             'multiplier': [1.5, 2.0, 2.5, 3.0, 4.0],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -672,7 +1000,8 @@ class MACDTrendStrategy(BaseStrategy):
             'slow_period': 26,
             'signal_period': 9,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
     
     def get_required_features(self) -> Set[str]:
@@ -707,6 +1036,7 @@ class MACDTrendStrategy(BaseStrategy):
             'slow_period': [21, 26, 30, 34],
             'signal_period': [7, 9, 12],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -730,7 +1060,8 @@ class ADXTrendStrategy(BaseStrategy):
             'adx_period': 14,
             'adx_threshold': 25,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -762,6 +1093,7 @@ class ADXTrendStrategy(BaseStrategy):
             'adx_period': [7, 10, 14, 20, 25],
             'adx_threshold': [15, 20, 25, 30, 35],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -782,7 +1114,8 @@ class IchimokuStrategy(BaseStrategy):
             'kijun_period': 26,
             'senkou_b_period': 52,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -817,6 +1150,7 @@ class IchimokuStrategy(BaseStrategy):
             'tenkan_period': [7, 9, 12, 15, 18],
             'kijun_period': [18, 22, 26, 30, 34],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -838,9 +1172,10 @@ class HullMATrendStrategy(BaseStrategy):
         return {
             'period': 20,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
-    
+
     def get_required_features(self) -> Set[str]:
         """Hull MA strategy uses precomputed HULL_MA for period 20."""
         period = self.params.get('period', 20)
@@ -868,6 +1203,7 @@ class HullMATrendStrategy(BaseStrategy):
         return {
             'period': [9, 14, 20, 30, 50],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -897,6 +1233,7 @@ class AroonTrendStrategy(BaseStrategy):
             'strength_level': 70,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     @staticmethod
@@ -957,6 +1294,7 @@ class AroonTrendStrategy(BaseStrategy):
             'period': [14, 20, 25, 30, 50],
             'strength_level': [50, 60, 70, 80, 90],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -990,6 +1328,7 @@ class ADXDIStrengthStrategy(BaseStrategy):
             'require_adx_rising': True,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1025,6 +1364,7 @@ class ADXDIStrengthStrategy(BaseStrategy):
             'di_spread_min': [0.0, 5.0, 10.0, 15.0],
             'require_adx_rising': [True, False],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1058,6 +1398,7 @@ class KeltnerPullbackStrategy(BaseStrategy):
             'ema_slope_bars': 5,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -1100,6 +1441,7 @@ class KeltnerPullbackStrategy(BaseStrategy):
             'kc_mult': [1.0, 1.5, 2.0, 2.5],
             'ema_slope_bars': [3, 5, 8, 10],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1123,31 +1465,40 @@ class RSIExtremesStrategy(BaseStrategy):
             'rsi_period': 14,
             'oversold': 30,
             'overbought': 70,
+            'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0
+            'tp_atr_mult': 3.0
         }
-    
+
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = self.params.get('rsi_period', 14)
         oversold = self.params.get('oversold', 30)
         overbought = self.params.get('overbought', 70)
+        use_filter = bool(self.params.get('use_ema200_trend_filter', False))
 
         rsi = _get_rsi(features, period)
-        
+
         signals = pd.Series(0, index=features.index)
         buy_signal = (rsi > oversold) & (rsi.shift(1) <= oversold)
         sell_signal = (rsi < overbought) & (rsi.shift(1) >= overbought)
-        
+
+        if use_filter:
+            ema200 = _get_ema(features, 200)
+            close = features['Close']
+            buy_signal = buy_signal & (close > ema200)
+            sell_signal = sell_signal & (close < ema200)
+
         signals[buy_signal] = 1
         signals[sell_signal] = -1
-        
+
         return signals
-    
+
     def get_param_grid(self) -> Dict[str, List]:
         return {
             'rsi_period': [5, 7, 10, 14, 21],
             'oversold': [15, 20, 25, 30],
             'overbought': [70, 75, 80, 85],
+            'use_ema200_trend_filter': [True, False],
             **self._base_sl_tp_grid(),
         }
 
@@ -1168,7 +1519,7 @@ class BollingerBounceStrategy(BaseStrategy):
             'period': 20,
             'std_dev': 2.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0
+            'tp_atr_mult': 3.0
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1211,7 +1562,7 @@ class ZScoreMRStrategy(BaseStrategy):
             'period': 20,
             'entry_z': 2.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0
+            'tp_atr_mult': 3.0
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1256,16 +1607,18 @@ class StochasticReversalStrategy(BaseStrategy):
             'd_period': 3,
             'oversold': 20,
             'overbought': 80,
+            'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0
+            'tp_atr_mult': 3.0
         }
-    
+
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         k_period = self.params.get('k_period', 14)
         d_period = self.params.get('d_period', 3)
         oversold = self.params.get('oversold', 20)
         overbought = self.params.get('overbought', 80)
-        
+        use_filter = bool(self.params.get('use_ema200_trend_filter', False))
+
         low_min = features['Low'].rolling(k_period).min()
         high_max = features['High'].rolling(k_period).max()
         denom = high_max - low_min
@@ -1273,24 +1626,29 @@ class StochasticReversalStrategy(BaseStrategy):
         valid = denom > 1e-8
         stoch_k[valid] = 100 * (features['Close'][valid] - low_min[valid]) / denom[valid]
         stoch_d = stoch_k.rolling(d_period).mean()
-        
+
         signals = pd.Series(0, index=features.index)
-        # %K crosses above %D in oversold zone
         buy_signal = (stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1)) & (stoch_k < oversold + 10)
-        # %K crosses below %D in overbought zone
         sell_signal = (stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1)) & (stoch_k > overbought - 10)
-        
+
+        if use_filter:
+            ema200 = _get_ema(features, 200)
+            close = features['Close']
+            buy_signal = buy_signal & (close > ema200)
+            sell_signal = sell_signal & (close < ema200)
+
         signals[buy_signal] = 1
         signals[sell_signal] = -1
-        
+
         return signals
-    
+
     def get_param_grid(self) -> Dict[str, List]:
         return {
             'k_period': [5, 9, 14, 21],
             'd_period': [3, 5, 7],
             'oversold': [10, 15, 20, 25],
             'overbought': [75, 80, 85, 90],
+            'use_ema200_trend_filter': [True, False],
             **self._base_sl_tp_grid(),
         }
 
@@ -1311,34 +1669,43 @@ class CCIReversalStrategy(BaseStrategy):
             'cci_period': 20,
             'oversold': -100,
             'overbought': 100,
+            'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0
+            'tp_atr_mult': 3.0
         }
-    
+
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = self.params.get('cci_period', 20)
         oversold = self.params.get('oversold', -100)
         overbought = self.params.get('overbought', 100)
-        
+        use_filter = bool(self.params.get('use_ema200_trend_filter', False))
+
         tp = (features['High'] + features['Low'] + features['Close']) / 3
         sma = tp.rolling(period).mean()
         mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean())
         cci = (tp - sma) / (0.015 * mad + 1e-10)
-        
+
         signals = pd.Series(0, index=features.index)
         buy_signal = (cci > oversold) & (cci.shift(1) <= oversold)
         sell_signal = (cci < overbought) & (cci.shift(1) >= overbought)
-        
+
+        if use_filter:
+            ema200 = _get_ema(features, 200)
+            close = features['Close']
+            buy_signal = buy_signal & (close > ema200)
+            sell_signal = sell_signal & (close < ema200)
+
         signals[buy_signal] = 1
         signals[sell_signal] = -1
-        
+
         return signals
-    
+
     def get_param_grid(self) -> Dict[str, List]:
         return {
             'cci_period': [10, 14, 20, 30],
             'oversold': [-150, -125, -100, -80],
             'overbought': [80, 100, 125, 150],
+            'use_ema200_trend_filter': [True, False],
             **self._base_sl_tp_grid(),
         }
 
@@ -1359,36 +1726,45 @@ class WilliamsRStrategy(BaseStrategy):
             'period': 14,
             'oversold': -80,
             'overbought': -20,
+            'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0
+            'tp_atr_mult': 3.0
         }
-    
+
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = self.params.get('period', 14)
         oversold = self.params.get('oversold', -80)
         overbought = self.params.get('overbought', -20)
-        
+        use_filter = bool(self.params.get('use_ema200_trend_filter', False))
+
         high_max = features['High'].rolling(period).max()
         low_min = features['Low'].rolling(period).min()
         denom = high_max - low_min
         willr = pd.Series(-50.0, index=features.index)
         valid = denom > 1e-8
         willr[valid] = -100 * (high_max[valid] - features['Close'][valid]) / denom[valid]
-        
+
         signals = pd.Series(0, index=features.index)
         buy_signal = (willr > oversold) & (willr.shift(1) <= oversold)
         sell_signal = (willr < overbought) & (willr.shift(1) >= overbought)
-        
+
+        if use_filter:
+            ema200 = _get_ema(features, 200)
+            close = features['Close']
+            buy_signal = buy_signal & (close > ema200)
+            sell_signal = sell_signal & (close < ema200)
+
         signals[buy_signal] = 1
         signals[sell_signal] = -1
-        
+
         return signals
-    
+
     def get_param_grid(self) -> Dict[str, List]:
         return {
             'period': [7, 10, 14, 21, 28],
             'oversold': [-95, -90, -85, -80],
             'overbought': [-20, -15, -10, -5],
+            'use_ema200_trend_filter': [True, False],
             **self._base_sl_tp_grid(),
         }
 
@@ -1422,7 +1798,7 @@ class FisherTransformMRStrategy(BaseStrategy):
             'period': 10,
             'threshold': 1.5,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0,
+            'tp_atr_mult': 3.0,
         }
 
     def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1524,7 +1900,7 @@ class ZScoreVWAPReversionStrategy(BaseStrategy):
             'entry_z': 2.0,
             'adx_threshold': 25,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 2.0,
+            'tp_atr_mult': 3.0,
         }
 
     def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1610,30 +1986,32 @@ class DonchianBreakoutStrategy(BaseStrategy):
         return {
             'period': 20,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
-    
+
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = self.params.get('period', 20)
-        
+
         high_max = features['High'].rolling(period).max()
         low_min = features['Low'].rolling(period).min()
-        
+
         signals = pd.Series(0, index=features.index)
         # Breakout above channel (shift(1) avoids lookahead)
         breakout_up = features['Close'] > high_max.shift(1)
         # Breakout below channel
         breakout_down = features['Close'] < low_min.shift(1)
-        
+
         signals[breakout_up] = 1
         signals[breakout_down] = -1
-        
+
         return signals
-    
+
     def get_param_grid(self) -> Dict[str, List]:
         return {
             'period': [10, 15, 20, 30, 50],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1653,7 +2031,8 @@ class VolatilityBreakoutStrategy(BaseStrategy):
             'atr_period': 20,
             'breakout_mult': 1.0,
             'sl_atr_mult': 1.5,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1684,6 +2063,7 @@ class VolatilityBreakoutStrategy(BaseStrategy):
             'atr_period': [10, 14, 20, 30],
             'breakout_mult': [0.5, 0.75, 1.0, 1.25, 1.5],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1703,7 +2083,8 @@ class MomentumBurstStrategy(BaseStrategy):
             'momentum_period': 10,
             'threshold_pct': 1.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1723,6 +2104,7 @@ class MomentumBurstStrategy(BaseStrategy):
             'momentum_period': [3, 5, 10, 15, 20],
             'threshold_pct': [0.3, 0.5, 1.0, 1.5, 2.0],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1749,7 +2131,8 @@ class SqueezeBreakoutStrategy(BaseStrategy):
             'kc_period': 20,
             'kc_mult': 1.5,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1787,6 +2170,7 @@ class SqueezeBreakoutStrategy(BaseStrategy):
             'bb_std': [1.5, 2.0, 2.5, 3.0],
             'kc_mult': [1.0, 1.25, 1.5, 2.0],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1806,9 +2190,10 @@ class KeltnerBreakoutStrategy(BaseStrategy):
             'period': 20,
             'atr_mult': 2.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
-    
+
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         period = self.params.get('period', 20)
         mult = self.params.get('atr_mult', 2.0)
@@ -1826,6 +2211,7 @@ class KeltnerBreakoutStrategy(BaseStrategy):
             'period': [10, 15, 20, 25, 30],
             'atr_mult': [1.25, 1.5, 1.75, 2.0, 2.5],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1859,6 +2245,7 @@ class PivotBreakoutStrategy(BaseStrategy):
             'retest_tolerance': 0.5,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1955,6 +2342,7 @@ class PivotBreakoutStrategy(BaseStrategy):
             'confirm_window': [3, 5, 7, 10],
             'retest_tolerance': [0.25, 0.5, 0.75, 1.0],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -1996,6 +2384,7 @@ class EMARibbonADXStrategy(BaseStrategy):
             "use_di_confirmation": True,
             "sl_atr_mult": 2.0,
             "tp_atr_mult": 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -2058,6 +2447,7 @@ class EMARibbonADXStrategy(BaseStrategy):
             "adx_period": [10, 14, 20],
             "use_di_confirmation": [True, False],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -2088,7 +2478,7 @@ class RSITrendFilteredMRStrategy(BaseStrategy):
             "overbought": 70,
             "ema_trend_period": 200,
             "sl_atr_mult": 2.0,
-            "tp_atr_mult": 2.0,
+            "tp_atr_mult": 3.0,
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -2147,6 +2537,7 @@ class MACDHistogramMomentumStrategy(BaseStrategy):
             "adx_threshold": 0,
             "sl_atr_mult": 2.0,
             "tp_atr_mult": 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -2196,6 +2587,7 @@ class MACDHistogramMomentumStrategy(BaseStrategy):
             "ema_filter_period": [0, 20, 50, 100],
             "adx_threshold": [0, 15, 20, 25, 30],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -2229,7 +2621,7 @@ class StochRSITrendGateStrategy(BaseStrategy):
             "upper_band": 80,
             "ema_trend_period": 200,
             "sl_atr_mult": 2.0,
-            "tp_atr_mult": 2.0,
+            "tp_atr_mult": 3.0,
         }
 
     @staticmethod
@@ -2282,12 +2674,12 @@ class StochRSITrendGateStrategy(BaseStrategy):
         }
 
 
-# VWAPDeviationReversionStrategy retired — near-duplicate of ZScoreVWAPReversionStrategy.
-# Existing configs are migrated to ZScoreVWAPReversionStrategy on load.
+# Existing configs migrate VWAPDeviationReversionStrategy to the
+# retained ZScoreVWAPReversionStrategy on load.
 
 
 # =============================================================================
-# NEW STRATEGIES (D1-D15)
+# Additional strategies
 # =============================================================================
 
 
@@ -2303,7 +2695,8 @@ class InsideBarBreakoutStrategy(BaseStrategy):
         return StrategyCategory.BREAKOUT_MOMENTUM
 
     def get_default_params(self) -> Dict[str, Any]:
-        return {'min_inside_bars': 1, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+        return {'min_inside_bars': 1, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2351,7 +2744,8 @@ class InsideBarBreakoutStrategy(BaseStrategy):
         return signals
 
     def get_param_grid(self) -> Dict[str, List]:
-        return {'min_inside_bars': [1, 2, 3], **self._base_sl_tp_grid()}
+        return {'min_inside_bars': [1, 2, 3], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 class NarrowRangeBreakoutStrategy(BaseStrategy):
@@ -2366,7 +2760,8 @@ class NarrowRangeBreakoutStrategy(BaseStrategy):
         return StrategyCategory.BREAKOUT_MOMENTUM
 
     def get_default_params(self) -> Dict[str, Any]:
-        return {'nr_lookback': 7, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+        return {'nr_lookback': 7, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2386,7 +2781,8 @@ class NarrowRangeBreakoutStrategy(BaseStrategy):
         return signals
 
     def get_param_grid(self) -> Dict[str, List]:
-        return {'nr_lookback': [4, 7, 10], **self._base_sl_tp_grid()}
+        return {'nr_lookback': [4, 7, 10], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 class TurtleSoupReversalStrategy(BaseStrategy):
@@ -2402,7 +2798,7 @@ class TurtleSoupReversalStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'channel_period': 20, 'reclaim_window': 2,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2465,7 +2861,7 @@ class PinBarReversalStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'wick_ratio': 2.5, 'proximity_atr': 1.0,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14', 'BB_LOWER_20', 'BB_UPPER_20'}
@@ -2507,7 +2903,7 @@ class EngulfingPatternStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'lookback_level': 20, 'use_adx_filter': True,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14', 'BB_LOWER_20', 'BB_UPPER_20', 'ADX'}
@@ -2556,7 +2952,8 @@ class VolumeSpikeMomentumStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'vol_mult': 2.0, 'vol_lookback': 20,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2578,7 +2975,8 @@ class VolumeSpikeMomentumStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'vol_mult': [1.5, 2.0, 2.5, 3.0],
-                'vol_lookback': [10, 20, 30], **self._base_sl_tp_grid()}
+                'vol_lookback': [10, 20, 30], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 class RSIDivergenceStrategy(BaseStrategy):
@@ -2594,7 +2992,7 @@ class RSIDivergenceStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'rsi_period': 14, 'swing_order': 5,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2644,7 +3042,7 @@ class MACDDivergenceStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'swing_order': 5, 'macd_fast': 12, 'macd_slow': 26,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14', 'MACD_HIST'}
@@ -2693,7 +3091,8 @@ class OBVDivergenceStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'swing_order': 5, 'obv_smooth': 5,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2730,7 +3129,8 @@ class OBVDivergenceStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'swing_order': [3, 5, 7], 'obv_smooth': [0, 5, 10],
-                **self._base_sl_tp_grid()}
+                **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 class KeltnerFadeStrategy(BaseStrategy):
@@ -2746,7 +3146,7 @@ class KeltnerFadeStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'kc_ema': 20, 'kc_mult': 2.0, 'adx_threshold': 25,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
 
     def get_required_features(self) -> Set[str]:
         ema_period = int(self.params.get('kc_ema', 20))
@@ -2787,7 +3187,7 @@ class ROCExhaustionReversalStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'roc_period': 10, 'pct_lookback': 100, 'extreme_pct': 10,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2826,7 +3226,8 @@ class EMAPullbackContinuationStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'fast_period': 10, 'slow_period': 30, 'touch_atr': 0.5,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {
@@ -2854,7 +3255,8 @@ class EMAPullbackContinuationStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'fast_period': [8, 10, 13], 'slow_period': [20, 30, 50],
-                'touch_atr': [0.3, 0.5, 0.7], **self._base_sl_tp_grid()}
+                'touch_atr': [0.3, 0.5, 0.7], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 class ParabolicSARTrendStrategy(BaseStrategy):
@@ -2870,7 +3272,8 @@ class ParabolicSARTrendStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'af_start': 0.02, 'af_max': 0.20, 'adx_threshold': 20,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14', 'ADX'}
@@ -2934,7 +3337,8 @@ class ParabolicSARTrendStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'af_start': [0.01, 0.02, 0.03], 'af_max': [0.15, 0.20, 0.25],
-                'adx_threshold': [15, 20, 25], **self._base_sl_tp_grid()}
+                'adx_threshold': [15, 20, 25], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 class ATRPercentileBreakoutStrategy(BaseStrategy):
@@ -2950,7 +3354,8 @@ class ATRPercentileBreakoutStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'pct_lookback': 100, 'compress_pct': 20, 'expand_pct': 70,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2974,7 +3379,8 @@ class ATRPercentileBreakoutStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'pct_lookback': [50, 100, 200], 'compress_pct': [10, 20, 30],
-                'expand_pct': [60, 70, 80], **self._base_sl_tp_grid()}
+                'expand_pct': [60, 70, 80], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 class KaufmanAMATrendStrategy(BaseStrategy):
@@ -2990,7 +3396,8 @@ class KaufmanAMATrendStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'er_period': 10, 'fast_period': 2, 'slow_period': 30,
-                'signal_mode': 'direction', 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'signal_mode': 'direction', 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -3042,7 +3449,8 @@ class KaufmanAMATrendStrategy(BaseStrategy):
         return {'er_period': [5, 10, 20], 'fast_period': [2, 3],
                 'slow_period': [20, 30, 50],
                 'signal_mode': ['direction', 'crossover'],
-                **self._base_sl_tp_grid()}
+                **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
 
 
 # =============================================================================
@@ -3073,6 +3481,7 @@ class VortexTrendStrategy(BaseStrategy):
             'period': 14,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -3110,6 +3519,7 @@ class VortexTrendStrategy(BaseStrategy):
         return {
             'period': [7, 10, 14, 20, 25],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -3136,6 +3546,7 @@ class TRIXSignalStrategy(BaseStrategy):
             'signal_period': 9,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -3171,6 +3582,7 @@ class TRIXSignalStrategy(BaseStrategy):
             'trix_period': [9, 12, 15, 20],
             'signal_period': [5, 7, 9],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -3196,6 +3608,7 @@ class RelativeVigorIndexStrategy(BaseStrategy):
             'period': 10,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -3224,6 +3637,7 @@ class RelativeVigorIndexStrategy(BaseStrategy):
         return {
             'period': [5, 7, 10, 14, 20],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -3253,6 +3667,7 @@ class VIDYABandTrendStrategy(BaseStrategy):
             'atr_period': 14,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -3317,6 +3732,7 @@ class VIDYABandTrendStrategy(BaseStrategy):
             'band_mult': [1.0, 1.5, 2.0],
             'atr_period': [10, 14],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -3346,6 +3762,7 @@ class ChoppinessCompressionBreakoutStrategy(BaseStrategy):
             'lookback': 5,
             'sl_atr_mult': 2.0,
             'tp_atr_mult': 3.0,
+            **self._structural_sl_defaults(),
         }
 
     def get_required_features(self) -> Set[str]:
@@ -3397,6 +3814,7 @@ class ChoppinessCompressionBreakoutStrategy(BaseStrategy):
             'trend_threshold': [35.0, 38.2, 42.0],
             'lookback': [3, 5, 7],
             **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
         }
 
 
@@ -3449,7 +3867,7 @@ class StrategyRegistry:
         'PivotBreakoutStrategy': PivotBreakoutStrategy,
         'MACDHistogramMomentumStrategy': MACDHistogramMomentumStrategy,
 
-        # New strategies (D1-D15)
+        # Additional strategies
         # Breakout
         'InsideBarBreakoutStrategy': InsideBarBreakoutStrategy,
         'NarrowRangeBreakoutStrategy': NarrowRangeBreakoutStrategy,
@@ -3560,7 +3978,7 @@ __all__ = [
     'KeltnerBreakoutStrategy',
     'PivotBreakoutStrategy',
     'MACDHistogramMomentumStrategy',
-    # New strategies (D1-D15)
+    # Additional strategies
     'InsideBarBreakoutStrategy',
     'NarrowRangeBreakoutStrategy',
     'TurtleSoupReversalStrategy',
@@ -3587,6 +4005,7 @@ __all__ = [
 # Migration map for retired strategy names → current names
 _STRATEGY_MIGRATION = {
     'VWAPDeviationReversionStrategy': 'ZScoreVWAPReversionStrategy',
+    'VWAPDeviationReversalStrategy': 'ZScoreVWAPReversionStrategy',
 }
 
 

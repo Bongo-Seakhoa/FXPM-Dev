@@ -51,6 +51,52 @@
       <section class="status-banner hidden" id="status-banner" aria-live="polite"></section>
       <section class="loading-indicator" id="entries-loading" aria-live="polite">Loading signal desk...</section>
 
+      <section class="command-center fade-in" aria-label="Live command status">
+        <div class="command-hero">
+          <div>
+            <span class="eyebrow">Live Command</span>
+            <h2 id="command-label">Loading readiness...</h2>
+            <p id="command-subtitle">Checking ledger, signal surface, trade events, and delivery channels.</p>
+          </div>
+          <div class="readiness-dial" id="readiness-dial">
+            <strong id="readiness-score">--</strong>
+            <span>score</span>
+          </div>
+        </div>
+        <div class="command-grid">
+          <div class="command-panel">
+            <span>Active Ledger</span>
+            <strong id="ledger-path">--</strong>
+            <div class="bar-meter" aria-hidden="true"><div id="ledger-coverage-bar"></div></div>
+            <small id="ledger-coverage">--</small>
+          </div>
+          <div class="command-panel">
+            <span>Tradeable Winners</span>
+            <strong id="tradeable-winners">--</strong>
+            <small id="ledger-slots">--</small>
+          </div>
+          <div class="command-panel">
+            <span>Signal Surface</span>
+            <strong id="command-valid-signals">--</strong>
+            <small id="command-signal-detail">--</small>
+          </div>
+          <div class="command-panel">
+            <span>Trade Events</span>
+            <strong id="command-trade-events">--</strong>
+            <small id="command-trade-detail">--</small>
+          </div>
+          <div class="command-panel">
+            <span>Telegram</span>
+            <strong id="telegram-status">Off</strong>
+            <small id="telegram-detail">Disabled</small>
+          </div>
+        </div>
+        <div class="command-foot">
+          <div class="command-actions" id="action-groups"></div>
+          <div class="command-warnings" id="command-warnings"></div>
+        </div>
+      </section>
+
       <section class="card controls fade-in">
         <div class="filters filters-wide">
           <div>
@@ -107,6 +153,7 @@
                 <th>TF</th>
                 <th>Regime</th>
                 <th>Dir</th>
+                <th>Action</th>
                 <th>Entry</th>
                 <th>SL</th>
                 <th>TP</th>
@@ -255,6 +302,40 @@
               <label class="toggle">
                 <input id="cfg-sound" type="checkbox" />
                 <span>Sound Alerts</span>
+              </label>
+            </div>
+            <div class="toggle-control">
+              <label class="toggle">
+                <input id="cfg-telegram-enabled" type="checkbox" />
+                <span>Telegram Signals</span>
+              </label>
+            </div>
+            <div>
+              <label for="cfg-telegram-chat">Telegram Chat ID</label>
+              <input id="cfg-telegram-chat" type="text" placeholder="-100..." />
+            </div>
+            <div>
+              <label for="cfg-telegram-token-env">Telegram Token Env</label>
+              <input id="cfg-telegram-token-env" type="text" placeholder="PM_DASHBOARD_TELEGRAM_BOT_TOKEN" />
+            </div>
+            <div>
+              <label for="cfg-telegram-min-strength">Telegram Min Strength</label>
+              <input id="cfg-telegram-min-strength" type="number" step="0.01" />
+            </div>
+            <div>
+              <label for="cfg-telegram-max-age">Telegram Max Age (min)</label>
+              <input id="cfg-telegram-max-age" type="number" step="1" />
+            </div>
+            <div class="toggle-control">
+              <label class="toggle">
+                <input id="cfg-telegram-regime" type="checkbox" />
+                <span>Share Regime</span>
+              </label>
+            </div>
+            <div class="toggle-control">
+              <label class="toggle">
+                <input id="cfg-telegram-strategy" type="checkbox" />
+                <span>Share Strategy</span>
               </label>
             </div>
           </div>

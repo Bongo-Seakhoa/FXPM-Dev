@@ -865,7 +865,7 @@ function downloadHistoricalData() {
   if (statusEl) statusEl.textContent = 'Starting root M5 data refresh...';
   if (downloadBtn) downloadBtn.disabled = true;
 
-  fetch('/api/download_historical_data', {
+  PMCommon.fetchWrite('/api/download_historical_data', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' }
   })

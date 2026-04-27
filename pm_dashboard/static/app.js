@@ -6,11 +6,13 @@
   selectedEntryId: "",
   instrumentSpecs: {},
   config: {},
+  command: null,
   pageSize: 20,
   currentPage: 1,
   totalPages: 1,
   latestOnly: true,
-  sortBy: "recent"
+  sortBy: "recent",
+  entriesSignature: ""
 };
 
 var VIEW_PREFS_KEY = "pm-signaldesk-view";
@@ -25,6 +27,23 @@ var elements = {
   sourceFiles: document.getElementById("source-files"),
   statusBanner: document.getElementById("status-banner"),
   loading: document.getElementById("entries-loading"),
+  commandLabel: document.getElementById("command-label"),
+  commandSubtitle: document.getElementById("command-subtitle"),
+  readinessDial: document.getElementById("readiness-dial"),
+  readinessScore: document.getElementById("readiness-score"),
+  ledgerPath: document.getElementById("ledger-path"),
+  ledgerCoverageBar: document.getElementById("ledger-coverage-bar"),
+  ledgerCoverage: document.getElementById("ledger-coverage"),
+  tradeableWinners: document.getElementById("tradeable-winners"),
+  ledgerSlots: document.getElementById("ledger-slots"),
+  commandValidSignals: document.getElementById("command-valid-signals"),
+  commandSignalDetail: document.getElementById("command-signal-detail"),
+  commandTradeEvents: document.getElementById("command-trade-events"),
+  commandTradeDetail: document.getElementById("command-trade-detail"),
+  telegramStatus: document.getElementById("telegram-status"),
+  telegramDetail: document.getElementById("telegram-detail"),
+  actionGroups: document.getElementById("action-groups"),
+  commandWarnings: document.getElementById("command-warnings"),
   tableBody: document.getElementById("entries-body"),
   drawer: document.getElementById("drawer"),
   drawerTitle: document.getElementById("drawer-title"),
@@ -156,8 +175,9 @@ function updateFilterOptions() {
       var value = options[key][index];
       html += '<option value="' + PMCommon.escapeHtml(value) + '">' + PMCommon.escapeHtml(value) + "</option>";
     }
-    select.innerHTML = html;
-    if (options[key].indexOf(current) !== -1) select.value = current;
+    if (select.innerHTML !== html) select.innerHTML = html;
+    var nextValue = options[key].indexOf(current) !== -1 ? current : "";
+    if (select.value !== nextValue) select.value = nextValue;
   }
 }
 
@@ -179,7 +199,7 @@ function reduceEntries(entries) {
   });
 }
 
-function applyFilters() {
+function applyFilters(resetPage) {
   var searchTerm = (elements.searchInput && elements.searchInput.value ? elements.searchInput.value : "").trim().toLowerCase();
 
   state.filtered = state.entries.filter(function (entry) {
@@ -205,7 +225,7 @@ function applyFilters() {
   });
 
   state.displayed = reduceEntries(state.filtered);
-  state.currentPage = 1;
+  if (resetPage !== false) state.currentPage = 1;
 }
 
 function updateCounts() {
@@ -246,6 +266,123 @@ function strategyCell(entry) {
   var href = "/strategies" + (params.length ? "?" + params.join("&") : "");
   return '<a class="strategy-link" href="' + href + '">' + PMCommon.escapeHtml(entry.strategy_name) + "</a>";
 }
+
+function actionValue(entry) {
+  return String((entry && (entry.action || entry.status || entry.reason)) || "SIGNAL").toUpperCase();
+}
+
+function actionClass(action) {
+  var value = String(action || "").toUpperCase();
+  if (value === "EXECUTED") return "pill-valid";
+  if (value.indexOf("MARGIN") !== -1 || value.indexOf("RISK") !== -1 || value.indexOf("SPREAD") !== -1) return "pill-expired";
+  if (value.indexOf("FAILED") === 0 || value.indexOf("BLOCKED") === 0) return "pill-invalid";
+  return "pill-neutral";
+}
+
+function compactPath(path) {
+  if (!path) return "--";
+  var text = String(path);
+  var parts = text.split(/[\\/]/);
+  return parts.length > 1 ? parts.slice(-2).join("/") : text;
+}
+
+function renderActionGroups(groups) {
+  if (!elements.actionGroups) return;
+  groups = groups || {};
+  var keys = Object.keys(groups).filter(function (key) {
+    return Number(groups[key] || 0) > 0;
+  }).sort();
+  if (!keys.length) {
+    elements.actionGroups.innerHTML = '<span class="quiet-chip">No recent action groups</span>';
+    return;
+  }
+  elements.actionGroups.innerHTML = keys.map(function (key) {
+    return '<span class="action-chip action-chip-' + PMCommon.escapeHtml(key) + '">' +
+      PMCommon.escapeHtml(key) + " " + PMCommon.escapeHtml(groups[key]) + "</span>";
+  }).join("");
+}
+
+function renderCommandWarnings(readiness) {
+  if (!elements.commandWarnings) return;
+  var warnings = [];
+  if (readiness && readiness.blockers) warnings = warnings.concat(readiness.blockers);
+  if (readiness && readiness.warnings) warnings = warnings.concat(readiness.warnings);
+  if (!warnings.length) {
+    elements.commandWarnings.innerHTML = '<span class="quiet-chip">No dashboard readiness warnings</span>';
+    return;
+  }
+  elements.commandWarnings.innerHTML = warnings.slice(0, 3).map(function (warning) {
+    return '<span class="warning-chip">' + PMCommon.escapeHtml(warning) + "</span>";
+  }).join("");
+}
+
+function renderLiveCommand(data) {
+  if (!data) return;
+  state.command = data;
+  var readiness = data.readiness || {};
+  var ledger = data.ledger || {};
+  var signals = data.signals || {};
+  var trades = data.trades || {};
+  var telegram = data.telegram || {};
+  var tone = readiness.tone || "warning";
+  var score = Number(readiness.score);
+  var scoreLabel = Number.isFinite(score) ? String(Math.round(score)) : "--";
+
+  if (elements.commandLabel) elements.commandLabel.textContent = readiness.label || "Operational";
+  if (elements.commandSubtitle) {
+    elements.commandSubtitle.textContent = "Ledger " + (ledger.coverage_pct || 0) + "% complete | " +
+      (signals.valid_entries || 0) + " valid signals | " +
+      (trades.total_events || 0) + " trade events";
+  }
+  if (elements.readinessDial) {
+    elements.readinessDial.className = "readiness-dial readiness-" + tone;
+    elements.readinessDial.style.setProperty("--readiness-deg", (Number.isFinite(score) ? Math.max(0, Math.min(100, score)) * 3.6 : 0) + "deg");
+  }
+  if (elements.readinessScore) elements.readinessScore.textContent = scoreLabel;
+  if (elements.ledgerPath) elements.ledgerPath.textContent = compactPath(data.active_pm_configs_path);
+  if (elements.ledgerCoverageBar) elements.ledgerCoverageBar.style.width = Math.max(0, Math.min(100, Number(ledger.coverage_pct || 0))) + "%";
+  if (elements.ledgerCoverage) {
+    elements.ledgerCoverage.textContent = (ledger.optimized_symbol_count || 0) + "/" +
+      (ledger.configured_symbol_count || 0) + " symbols optimized";
+  }
+  if (elements.tradeableWinners) elements.tradeableWinners.textContent = String(ledger.tradeable_winners || 0);
+  if (elements.ledgerSlots) {
+    elements.ledgerSlots.textContent = (ledger.regime_slots || 0) + " slots | " +
+      (ledger.no_trade_slots || 0) + " no-trade";
+  }
+  if (elements.commandValidSignals) elements.commandValidSignals.textContent = String(signals.valid_entries || 0);
+  if (elements.commandSignalDetail) {
+    elements.commandSignalDetail.textContent = "Total " + (signals.total_entries || 0) +
+      " | newest " + (signals.newest_signal_at ? PMCommon.formatRelativeTime(signals.newest_signal_at) : "N/A");
+  }
+  if (elements.commandTradeEvents) elements.commandTradeEvents.textContent = String(trades.total_events || 0);
+  if (elements.commandTradeDetail) {
+    elements.commandTradeDetail.textContent = (trades.realized_events || 0) + " realized | " +
+      (trades.open_or_entry_events || 0) + " open/entry";
+  }
+  if (elements.telegramStatus) {
+    elements.telegramStatus.textContent = telegram.enabled ? (telegram.chat_id_configured && telegram.token_configured ? "Ready" : "Needs Setup") : "Off";
+    elements.telegramStatus.className = telegram.enabled && telegram.chat_id_configured && telegram.token_configured ? "text-success" : (telegram.enabled ? "text-warning" : "");
+  }
+  if (elements.telegramDetail) {
+    var detail = telegram.enabled
+      ? ((telegram.chat_id_configured ? "Chat set" : "No chat") + " | " + (telegram.token_configured ? "token set" : "token missing"))
+      : "Disabled";
+    elements.telegramDetail.textContent = detail;
+  }
+  renderActionGroups(signals.action_groups);
+  renderCommandWarnings(readiness);
+}
+
+function fetchLiveCommand() {
+  return PMCommon.fetchWithRetry("/api/live-command")
+    .then(function (response) { return response.json(); })
+    .then(renderLiveCommand)
+    .catch(function (err) {
+      showStatus("Live command panel failed to refresh: " + (err ? String(err) : "unknown error"), "warning");
+    });
+}
+
 function renderTable() {
   if (!elements.tableBody) return;
 
@@ -256,7 +393,7 @@ function renderTable() {
   var rows = pageEntries();
   if (!rows.length) {
     var emptyRow = document.createElement("tr");
-    emptyRow.innerHTML = '<td colspan="11" class="table-empty">No entries match the current filters.</td>';
+    emptyRow.innerHTML = '<td colspan="12" class="table-empty">No entries match the current filters.</td>';
     elements.tableBody.appendChild(emptyRow);
     return;
   }
@@ -278,6 +415,7 @@ function renderTable() {
       "<td>" + PMCommon.escapeHtml(entry.timeframe || "N/A") + "</td>" +
       "<td>" + PMCommon.escapeHtml(entry.regime || "N/A") + "</td>" +
       '<td class="' + dirClass + '">' + PMCommon.escapeHtml((entry.signal_direction || "N/A").toUpperCase()) + "</td>" +
+      '<td><span class="pill ' + actionClass(actionValue(entry)) + '">' + PMCommon.escapeHtml(actionValue(entry)) + "</span></td>" +
       "<td>" + PMCommon.formatNumber(entry.entry_price) + "</td>" +
       "<td>" + PMCommon.formatNumber(entry.stop_loss_price) + "</td>" +
       "<td>" + PMCommon.formatNumber(entry.take_profit_price) + "</td>" +
@@ -595,56 +733,108 @@ function applyViewToDom() {
   if (elements.latestOnly) elements.latestOnly.checked = state.latestOnly;
 }
 
-function fetchEntries() {
-  PMCommon.setLoadingState(elements.loading, true, "Loading signal desk...");
+function stableSignature(value) {
+  try {
+    return JSON.stringify(value || null);
+  } catch (err) {
+    return "";
+  }
+}
+
+function entriesSignature(data) {
+  return stableSignature({
+    entries: data.entries || [],
+    instrument_specs: data.instrument_specs || {},
+    last_error: data.last_error || "",
+    source_files: data.source_files || []
+  });
+}
+
+function updateEntryHeader(data) {
+  if (elements.lastUpdated) elements.lastUpdated.textContent = data.last_updated ? PMCommon.formatDateTime(data.last_updated) : "N/A";
+  if (elements.staleness) elements.staleness.textContent = data.last_updated ? PMCommon.formatRelativeTime(data.last_updated) : "N/A";
+  if (elements.sourceFiles) elements.sourceFiles.textContent = data.source_files ? String(data.source_files.length) : "0";
+}
+
+function updateSelectionFromEntries() {
+  if (!state.selectedEntryId) return;
+  var selected = findById(state.entries, state.selectedEntryId);
+  if (selected) {
+    state.selected = selected;
+    updateSummary(selected);
+    syncSizing(selected);
+    updateSizingOutputs(selected);
+    updateTicket(selected);
+    return;
+  }
+  setSelection(null);
+}
+
+function updateEntryStatus(data) {
+  if (data.last_error) {
+    showStatus("Watcher warning: " + data.last_error, "warning");
+  } else if (!state.entries.length) {
+    showStatus("No entries found in current PM outputs.", "info");
+  } else {
+    showStatus("");
+  }
+}
+
+function fetchEntries(options) {
+  options = options || {};
+  var silent = Boolean(options.silent);
+  var force = Boolean(options.force);
+  if (!silent) PMCommon.setLoadingState(elements.loading, true, "Loading signal desk...");
   return PMCommon.fetchWithRetry("/api/entries")
     .then(function (response) { return response.json(); })
     .then(function (data) {
-      state.entries = data.entries || [];
-      state.instrumentSpecs = data.instrument_specs || {};
+      var signature = entriesSignature(data);
+      var changed = force || signature !== state.entriesSignature;
 
-      if (elements.lastUpdated) elements.lastUpdated.textContent = data.last_updated ? PMCommon.formatDateTime(data.last_updated) : "N/A";
-      if (elements.staleness) elements.staleness.textContent = data.last_updated ? PMCommon.formatRelativeTime(data.last_updated) : "N/A";
-      if (elements.sourceFiles) elements.sourceFiles.textContent = data.source_files ? String(data.source_files.length) : "0";
+      updateEntryHeader(data);
 
-      updateFilterOptions();
-      applyFilters();
+      if (changed) {
+        state.entriesSignature = signature;
+        state.entries = data.entries || [];
+        state.instrumentSpecs = data.instrument_specs || {};
 
-      if (state.selectedEntryId) {
-        var selected = findById(state.entries, state.selectedEntryId);
-        if (selected) {
-          state.selected = selected;
-          updateSummary(selected);
-          syncSizing(selected);
-          updateSizingOutputs(selected);
-          updateTicket(selected);
-        } else {
-          setSelection(null);
-        }
-      }
-
-      renderTable();
-
-      if (data.last_error) {
-        showStatus("Watcher warning: " + data.last_error, "warning");
-      } else if (!state.entries.length) {
-        showStatus("No entries found in current PM outputs.", "info");
+        updateFilterOptions();
+        applyFilters(!silent);
+        updateSelectionFromEntries();
+        renderTable();
       } else {
-        showStatus("");
+        updateCounts();
+        updatePagination();
       }
+
+      updateEntryStatus(data);
     })
     .catch(function (err) {
       showJsError(err ? String(err) : "Failed to fetch entries");
     })
     .finally(function () {
-      PMCommon.setLoadingState(elements.loading, false);
+      if (!silent) PMCommon.setLoadingState(elements.loading, false);
     });
+}
+
+var dashboardRefreshPromise = null;
+
+function fetchDashboard(options) {
+  options = options || {};
+  if (dashboardRefreshPromise) return dashboardRefreshPromise;
+  dashboardRefreshPromise = fetchEntries(options)
+    .then(function () { return fetchLiveCommand(options); })
+    .finally(function () {
+      dashboardRefreshPromise = null;
+    });
+  return dashboardRefreshPromise;
 }
 
 function fetchConfig() {
   return PMCommon.fetchWithRetry("/api/config")
     .then(function (response) { return response.json(); })
     .then(function (data) {
+      var telegram = data.telegram || {};
       state.config = data;
       document.getElementById("cfg-pm-root").value = data.pm_root || "";
       document.getElementById("cfg-refresh").value = data.refresh_interval_sec !== undefined ? data.refresh_interval_sec : 5;
@@ -653,6 +843,13 @@ function fetchConfig() {
       document.getElementById("cfg-alert-enabled").checked = data.alert && data.alert.enabled !== undefined ? data.alert.enabled : true;
       document.getElementById("cfg-sound").checked = data.alert && data.alert.sound !== undefined ? data.alert.sound : true;
       document.getElementById("cfg-alert-min").value = data.alert && data.alert.min_strength !== undefined ? data.alert.min_strength : 0;
+      document.getElementById("cfg-telegram-enabled").checked = Boolean(telegram.enabled);
+      document.getElementById("cfg-telegram-chat").value = telegram.chat_id || "";
+      document.getElementById("cfg-telegram-token-env").value = telegram.bot_token_env || "PM_DASHBOARD_TELEGRAM_BOT_TOKEN";
+      document.getElementById("cfg-telegram-min-strength").value = telegram.min_strength !== undefined ? telegram.min_strength : 0;
+      document.getElementById("cfg-telegram-max-age").value = telegram.max_signal_age_minutes !== undefined ? telegram.max_signal_age_minutes : 30;
+      document.getElementById("cfg-telegram-regime").checked = telegram.include_regime !== undefined ? Boolean(telegram.include_regime) : true;
+      document.getElementById("cfg-telegram-strategy").checked = Boolean(telegram.include_strategy);
       document.getElementById("cfg-patterns").value = (data.file_patterns || []).join("\n");
     })
     .catch(function (err) {
@@ -665,7 +862,9 @@ var refreshTimer = null;
 function startAutoRefresh(intervalSec) {
   if (refreshTimer) clearInterval(refreshTimer);
   var seconds = Math.max(2, Number(intervalSec || 5));
-  refreshTimer = setInterval(fetchEntries, seconds * 1000);
+  refreshTimer = setInterval(function () {
+    fetchDashboard({ silent: true });
+  }, seconds * 1000);
 }
 
 function saveConfig(event) {
@@ -684,10 +883,19 @@ function saveConfig(event) {
       enabled: document.getElementById("cfg-alert-enabled").checked,
       sound: document.getElementById("cfg-sound").checked,
       min_strength: Number(document.getElementById("cfg-alert-min").value || 0)
+    },
+    telegram: {
+      enabled: document.getElementById("cfg-telegram-enabled").checked,
+      chat_id: document.getElementById("cfg-telegram-chat").value.trim(),
+      bot_token_env: document.getElementById("cfg-telegram-token-env").value.trim() || "PM_DASHBOARD_TELEGRAM_BOT_TOKEN",
+      min_strength: Number(document.getElementById("cfg-telegram-min-strength").value || 0),
+      max_signal_age_minutes: Number(document.getElementById("cfg-telegram-max-age").value || 30),
+      include_regime: document.getElementById("cfg-telegram-regime").checked,
+      include_strategy: document.getElementById("cfg-telegram-strategy").checked
     }
   };
 
-  return fetch("/api/config", {
+  return PMCommon.fetchWrite("/api/config", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -704,7 +912,7 @@ function saveConfig(event) {
       state.config = config || {};
       PMCommon.showToast("Settings saved");
       startAutoRefresh(state.config.refresh_interval_sec || 5);
-      return fetchEntries();
+      return fetchDashboard({ force: true });
     })
     .catch(function (err) {
       showJsError(err ? String(err) : "Failed to save config");
@@ -759,7 +967,11 @@ function bindEvents() {
   if (closeBtn) closeBtn.addEventListener("click", function () { PMCommon.closeDrawer(elements.drawer); });
 
   var refreshBtn = document.getElementById("refresh-btn");
-  if (refreshBtn) refreshBtn.addEventListener("click", fetchEntries);
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", function () {
+      fetchDashboard({ force: true });
+    });
+  }
 
   var clearFiltersBtn = document.getElementById("clear-filters-btn");
   if (clearFiltersBtn) clearFiltersBtn.addEventListener("click", resetFilters);
@@ -861,7 +1073,7 @@ function init() {
   }
 
   fetchConfig()
-    .then(fetchEntries)
+    .then(function () { return fetchDashboard({ force: true }); })
     .then(function () { startAutoRefresh(state.config.refresh_interval_sec || 5); })
     .catch(function (err) { showJsError(err ? String(err) : "Initialization failed"); });
 }

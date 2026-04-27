@@ -5,6 +5,7 @@ var PMCommon = (function () {
   var _isDark = false;
   var _themeChangeCallbacks = [];
   var _toastContainer = null;
+  var WRITE_TOKEN_STORAGE_KEY = "pm-dashboard-write-token";
 
   function initTheme() {
     var savedTheme = null;
@@ -16,8 +17,8 @@ var PMCommon = (function () {
 
     if (savedTheme === "dark" || savedTheme === "light") {
       _isDark = savedTheme === "dark";
-    } else if (typeof window !== "undefined" && window.matchMedia) {
-      _isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    } else {
+      _isDark = true;
     }
 
     _applyTheme();
@@ -318,6 +319,47 @@ var PMCommon = (function () {
     return attempt(retries);
   }
 
+  function _getWriteToken() {
+    try {
+      return sessionStorage.getItem(WRITE_TOKEN_STORAGE_KEY) || "";
+    } catch (err) {
+      return "";
+    }
+  }
+
+  function _setWriteToken(token) {
+    try {
+      if (token) {
+        sessionStorage.setItem(WRITE_TOKEN_STORAGE_KEY, token);
+      } else {
+        sessionStorage.removeItem(WRITE_TOKEN_STORAGE_KEY);
+      }
+    } catch (err) {
+      // Ignore storage failures.
+    }
+  }
+
+  function _withWriteToken(options, token) {
+    var requestOptions = Object.assign({}, options || {});
+    var headers = Object.assign({}, requestOptions.headers || {});
+    if (token) headers["X-PM-Dashboard-Token"] = token;
+    requestOptions.headers = headers;
+    return requestOptions;
+  }
+
+  function fetchWrite(url, options) {
+    return fetch(url, _withWriteToken(options, _getWriteToken()))
+      .then(function (response) {
+        if (response.status !== 401 || typeof window.prompt !== "function") {
+          return response;
+        }
+        var token = window.prompt("Dashboard write token");
+        if (!token) return response;
+        _setWriteToken(token);
+        return fetch(url, _withWriteToken(options, token));
+      });
+  }
+
   function setLoadingState(element, isLoading, message) {
     if (!element) return;
     if (message !== undefined && message !== null) {
@@ -397,6 +439,7 @@ var PMCommon = (function () {
     initEscapeClose: initEscapeClose,
     debounce: debounce,
     fetchWithRetry: fetchWithRetry,
+    fetchWrite: fetchWrite,
     setLoadingState: setLoadingState,
     initScrollToTop: initScrollToTop,
     saveJSON: saveJSON,

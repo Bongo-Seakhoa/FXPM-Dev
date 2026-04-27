@@ -44,8 +44,33 @@ class TestScoringFeatureFlags(unittest.TestCase):
     def test_continuous_dd_flag_on(self):
         scorer = self._make_scorer(scoring_use_continuous_dd=True)
         score = scorer.calculate_fx_selection_score(self._base_metrics())
-        # With continuous DD at 12%, multiplier = exp(-0.03*12) ≈ 0.70
+        # findings.html §4: continuous DD slope tightened to -0.05.
+        # At 12% DD, multiplier = exp(-0.05*12) ≈ 0.55.
         self.assertGreater(score, 0)
+
+    def test_continuous_dd_uses_005_slope(self):
+        """findings.html §4: penalty slope tightened from -0.03 to -0.05.
+
+        We can't isolate the dd_mult cleanly (the score also includes a
+        return/dd term which moves with dd), so we sanity-check that the
+        full-score ratio at DD=15 is well below what the old -0.03 slope
+        could have produced even with the return/dd shift baked in.
+        """
+        scorer = self._make_scorer(
+            scoring_use_continuous_dd=True,
+            scoring_use_sortino_blend=False,
+            scoring_use_tail_risk=False,
+            scoring_use_consistency=False,
+            scoring_use_trade_frequency_bonus=False,
+        )
+        # Hold all other inputs constant, vary only DD.
+        score_dd0 = scorer.calculate_fx_selection_score(self._base_metrics(max_drawdown_pct=0.0001))
+        score_dd15 = scorer.calculate_fx_selection_score(self._base_metrics(max_drawdown_pct=15.0))
+        ratio = score_dd15 / score_dd0 if score_dd0 > 0 else 0
+        # Old slope at DD=15: math.exp(-0.03*15) ≈ 0.64. With the return/dd
+        # term shift the empirical ratio under the old slope was around 0.45.
+        # New slope brings it well below 0.40.
+        self.assertLess(ratio, 0.40)
 
     def test_continuous_dd_flag_off_uses_buckets(self):
         scorer = self._make_scorer(scoring_use_continuous_dd=False)
@@ -214,31 +239,29 @@ class TestDDHardGateInvariants(unittest.TestCase):
         self.assertTrue(cfg.scoring_use_trade_frequency_bonus)
 
 
-class TestOptunaBlendConfig(unittest.TestCase):
-    """Verify Optuna objective blend config propagates correctly."""
+class TestOptunaBlendKnobsRemoved(unittest.TestCase):
+    """findings §C7 / §8.3: the blend knobs never propagated past OptunaConfig —
+    the actual train/val gap lever is fx_gap_penalty_lambda on PipelineConfig.
+    This test guards against silent reintroduction."""
 
-    def test_blend_defaults(self):
+    def test_blend_knobs_absent_from_pipeline_config(self):
         cfg = PipelineConfig()
-        self.assertTrue(getattr(cfg, 'optuna_objective_blend_enabled', False))
-        self.assertAlmostEqual(getattr(cfg, 'optuna_objective_train_weight', 0), 0.80)
-        self.assertAlmostEqual(getattr(cfg, 'optuna_objective_val_weight', 0), 0.20)
+        for dead_knob in (
+            "optuna_objective_blend_enabled",
+            "optuna_objective_train_weight",
+            "optuna_objective_val_weight",
+            "optuna_use_val_in_objective",
+        ):
+            self.assertFalse(
+                hasattr(cfg, dead_knob),
+                f"{dead_knob} should have been removed (findings §C7); "
+                "fx_gap_penalty_lambda is the real train/val lever.",
+            )
 
-    def test_weights_sum_to_one(self):
+    def test_actual_train_val_lever_still_present(self):
         cfg = PipelineConfig()
-        total = cfg.optuna_objective_train_weight + cfg.optuna_objective_val_weight
-        self.assertAlmostEqual(total, 1.0, places=5)
-
-    def test_weights_normalize_when_misconfigured(self):
-        cfg = PipelineConfig(
-            optuna_objective_train_weight=2.0,
-            optuna_objective_val_weight=1.0,
-        )
-        self.assertAlmostEqual(cfg.optuna_objective_train_weight, 2.0 / 3.0, places=6)
-        self.assertAlmostEqual(cfg.optuna_objective_val_weight, 1.0 / 3.0, places=6)
-
-    def test_val_in_objective_default_false(self):
-        cfg = PipelineConfig()
-        self.assertFalse(cfg.optuna_use_val_in_objective)
+        self.assertTrue(hasattr(cfg, "fx_gap_penalty_lambda"))
+        self.assertGreater(float(cfg.fx_gap_penalty_lambda), 0.0)
 
 
 class TestSigmoidRecalibration(unittest.TestCase):
@@ -362,6 +385,88 @@ class TestCandidateDescentSelection(unittest.TestCase):
         self.assertIsNotNone(cfg_out)
         self.assertEqual(cfg_out.strategy_name, "S1")
         self.assertIn("failed validation", reason)
+
+
+class TestStabilityPenalty(unittest.TestCase):
+    """findings.html §C4: multiplicative exp(-k * std_weekly_return) on val side
+    in fx_generalization_score. Default k=2.0; setting 0 disables the penalty."""
+
+    def _make_scorer(self, **overrides):
+        cfg = PipelineConfig(scoring_mode="fx_backtester", **overrides)
+        return StrategyScorer(cfg)
+
+    def _metrics(self, std_weekly_return=0.0, **overrides):
+        m = {
+            'sharpe_ratio': 1.5,
+            'profit_factor': 2.0,
+            'win_rate': 55.0,
+            'total_return_pct': 30.0,
+            'max_drawdown_pct': 8.0,
+            'expectancy_pips': 5.0,
+            'sortino_ratio': 2.0,
+            'worst_5pct_r': -1.0,
+            'max_consecutive_losses': 4,
+            'total_trades': 80,
+            'std_weekly_return': std_weekly_return,
+        }
+        m.update(overrides)
+        return m
+
+    def test_zero_std_means_no_penalty(self):
+        """std_weekly_return=0 → multiplier exp(0)=1.0 → penalty inert."""
+        scorer = self._make_scorer(fx_stability_penalty_k=2.0)
+        train = self._metrics(std_weekly_return=0.0)
+        val = self._metrics(std_weekly_return=0.0)
+        score_no_var, _, _, _ = scorer.fx_generalization_score(train, val)
+        # Reference: same path with k=0 disables the term entirely.
+        scorer_off = self._make_scorer(fx_stability_penalty_k=0.0)
+        score_off, _, _, _ = scorer_off.fx_generalization_score(train, val)
+        self.assertAlmostEqual(score_no_var, score_off, places=6)
+
+    def test_high_std_lowers_score(self):
+        """A jagged val curve must score below a smooth one (all else equal)."""
+        scorer = self._make_scorer(fx_stability_penalty_k=2.0)
+        train = self._metrics()
+        smooth_val = self._metrics(std_weekly_return=0.01)  # 1% weekly std
+        jagged_val = self._metrics(std_weekly_return=0.20)  # 20% weekly std
+        s_smooth, _, _, _ = scorer.fx_generalization_score(train, smooth_val)
+        s_jagged, _, _, _ = scorer.fx_generalization_score(train, jagged_val)
+        self.assertGreater(s_smooth, s_jagged)
+
+    def test_disable_with_k_zero(self):
+        """fx_stability_penalty_k=0 short-circuits: result identical regardless of std."""
+        scorer = self._make_scorer(fx_stability_penalty_k=0.0)
+        train = self._metrics()
+        v1 = self._metrics(std_weekly_return=0.01)
+        v2 = self._metrics(std_weekly_return=0.50)
+        s1, _, _, _ = scorer.fx_generalization_score(train, v1)
+        s2, _, _, _ = scorer.fx_generalization_score(train, v2)
+        self.assertAlmostEqual(s1, s2, places=6)
+
+    def test_safe_when_field_missing(self):
+        """val_metrics without std_weekly_return must not crash."""
+        scorer = self._make_scorer(fx_stability_penalty_k=2.0)
+        train = self._metrics()
+        val = self._metrics()
+        val.pop('std_weekly_return', None)
+        score, _, _, _ = scorer.fx_generalization_score(train, val)
+        self.assertIsInstance(score, float)
+
+    def test_penalty_magnitude_matches_formula(self):
+        """At k=2.0 and std=0.05, multiplier should equal exp(-0.10) ≈ 0.9048."""
+        scorer = self._make_scorer(fx_stability_penalty_k=2.0)
+        train = self._metrics()
+        val_zero = self._metrics(std_weekly_return=0.0)
+        val_5pct = self._metrics(std_weekly_return=0.05)
+        s_zero, _, _, _ = scorer.fx_generalization_score(train, val_zero)
+        s_5pct, _, _, _ = scorer.fx_generalization_score(train, val_5pct)
+        if abs(s_zero) > 1e-9:
+            ratio = s_5pct / s_zero
+            self.assertAlmostEqual(ratio, math.exp(-2.0 * 0.05), places=5)
+
+    def test_config_default_is_2(self):
+        cfg = PipelineConfig()
+        self.assertAlmostEqual(cfg.fx_stability_penalty_k, 2.0)
 
 
 if __name__ == "__main__":

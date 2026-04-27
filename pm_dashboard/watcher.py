@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import copy
 import glob
+import html
 import json
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .models import SignalEntry
+from .ledger import iter_matching_files, load_records_from_text
 from .parsers import parse_entries_from_file
 from .utils import (
     build_entry_id,
@@ -23,6 +27,7 @@ from .utils import (
     normalize_timeframe,
     parse_timestamp,
     pick_action_value,
+    resolve_pm_configs_path,
     safe_read_text,
 )
 
@@ -122,10 +127,13 @@ class DashboardWatcher(threading.Thread):
         self._last_alert_set: str = ""
         self._last_alert_strongest: str = ""
         self._pm_configs_mtime: Optional[float] = None
+        self._pm_configs_path: Optional[str] = None
         self._pm_configs_cache: Dict[str, Any] = {}
         self._parsed_file_cache: Dict[str, tuple] = {}
         self._trade_map_cache_signature: Optional[tuple] = None
         self._trade_map_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._telegram_seen_keys: set[str] = set()
+        self._telegram_initialized = False
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -199,6 +207,7 @@ class DashboardWatcher(threading.Thread):
             last_error=last_error,
         )
         self.maybe_alert(valid_entries, config)
+        self.maybe_send_telegram(valid_entries, config)
 
     def _load_primary_entries(
         self,
@@ -206,7 +215,7 @@ class DashboardWatcher(threading.Thread):
         pm_configs: Dict[str, Any],
         config: Dict[str, Any],
     ) -> List[SignalEntry]:
-        primary_patterns = config.get("primary_sources") or ["last_trade_log.json"]
+        primary_patterns = config.get("primary_sources") or ["**/signal_ledger*.jsonl", "last_actionable_log.json", "last_trade_log.json"]
         primary_file = find_primary_file(self.pm_root, primary_patterns)
         trade_map = self._load_trade_map(config)
         if primary_file:
@@ -256,30 +265,33 @@ class DashboardWatcher(threading.Thread):
         return entries
 
     def _load_pm_configs(self) -> Dict[str, Any]:
-        path = self._get_config().get("pm_configs_path", "pm_configs.json")
+        path = resolve_pm_configs_path(self.pm_root, self._get_config())
         if not self.pm_root:
             return {}
         if not os.path.isabs(path):
             path = os.path.join(self.pm_root, path)
+        path = os.path.abspath(path)
         if not os.path.isfile(path):
             self._pm_configs_cache = {}
             self._pm_configs_mtime = None
+            self._pm_configs_path = path
             return {}
         try:
             mtime = os.path.getmtime(path)
         except OSError:
             return self._pm_configs_cache
-        if self._pm_configs_mtime != mtime:
+        if self._pm_configs_mtime != mtime or self._pm_configs_path != path:
             self._pm_configs_cache = load_pm_configs(self.pm_root, path)
             self._pm_configs_mtime = mtime
+            self._pm_configs_path = path
         return self._pm_configs_cache
 
     def _load_trade_map(self, config: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-        pattern = config.get("trade_files_pattern", "**/trades_*.json")
-        trade_files = []
-        if self.pm_root:
-            trade_files = [path for path in glob_paths(self.pm_root, pattern)]
-        trade_files = sorted(set(trade_files))
+        trade_patterns = [
+            config.get("ledger_files_pattern", "**/signal_ledger*.jsonl"),
+            config.get("trade_files_pattern", "**/trades_*.json"),
+        ]
+        trade_files = iter_matching_files(self.pm_root, trade_patterns)
         signature_parts: List[tuple] = []
         for path in trade_files:
             file_signature = self._file_signature(path)
@@ -295,13 +307,7 @@ class DashboardWatcher(threading.Thread):
             text = safe_read_text(path)
             if not text:
                 continue
-            try:
-                data = json.loads(text)
-            except Exception:
-                continue
-            if not isinstance(data, list):
-                continue
-            for record in data:
+            for record in load_records_from_text(path, text):
                 if not isinstance(record, dict):
                     continue
                 symbol = normalize_symbol(record.get("symbol"))
@@ -388,6 +394,164 @@ class DashboardWatcher(threading.Thread):
             message = f"{strongest.symbol} {direction} ({strongest.timeframe or 'TF?'})"
             send_desktop_alert(title, message, alert_cfg.get("sound", True))
             self._last_alert_strongest = strongest_id
+
+    def maybe_send_telegram(self, valid_entries: List[SignalEntry], config: Dict[str, Any]) -> None:
+        telegram_cfg = config.get("telegram", {})
+        if not isinstance(telegram_cfg, dict) or not telegram_cfg.get("enabled", False):
+            return
+
+        token_env = str(telegram_cfg.get("bot_token_env") or "PM_DASHBOARD_TELEGRAM_BOT_TOKEN").strip()
+        token = os.environ.get(token_env, "").strip()
+        chat_id = str(telegram_cfg.get("chat_id") or "").strip()
+        if not token or not chat_id:
+            return
+
+        candidates = filter_telegram_entries(valid_entries, telegram_cfg)
+        candidate_keys = {entry_alert_key(entry) for entry in candidates}
+        send_on_startup = bool(telegram_cfg.get("send_on_startup", False))
+        if not self._telegram_initialized:
+            self._telegram_initialized = True
+            if not send_on_startup:
+                self._telegram_seen_keys.update(candidate_keys)
+                return
+
+        for entry in candidates:
+            key = entry_alert_key(entry)
+            if key in self._telegram_seen_keys:
+                continue
+            message = build_telegram_message(entry, telegram_cfg)
+            ok = send_telegram_message(token, chat_id, message)
+            if ok:
+                self._telegram_seen_keys.add(key)
+
+
+def _telegram_action_allowed(entry: SignalEntry, telegram_cfg: Dict[str, Any]) -> bool:
+    action_value = entry_action_value(entry)
+    allowed_actions = {str(item).strip().upper() for item in telegram_cfg.get("actions", ["EXECUTED"]) if str(item).strip()}
+    allowed_prefixes = [str(item).strip().upper() for item in telegram_cfg.get("action_prefixes", []) if str(item).strip()]
+    if allowed_actions or allowed_prefixes:
+        if action_value in allowed_actions:
+            return True
+        return any(action_value.startswith(prefix) for prefix in allowed_prefixes)
+    return action_value == "EXECUTED"
+
+
+def filter_telegram_entries(entries: List[SignalEntry], telegram_cfg: Dict[str, Any]) -> List[SignalEntry]:
+    try:
+        min_strength = float(telegram_cfg.get("min_strength", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        min_strength = 0.0
+    try:
+        max_age_minutes = float(telegram_cfg.get("max_signal_age_minutes", 30) or 30)
+    except (TypeError, ValueError):
+        max_age_minutes = 30.0
+
+    filtered: List[SignalEntry] = []
+    for entry in entries:
+        if not entry.valid_now:
+            continue
+        if not _telegram_action_allowed(entry, telegram_cfg):
+            continue
+        if entry.signal_strength is not None:
+            try:
+                if float(entry.signal_strength) < min_strength:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        ts = parse_timestamp(entry.timestamp)
+        if not is_recent(ts, max_age_minutes):
+            continue
+        if not entry.symbol or not entry.signal_direction:
+            continue
+        if entry.entry_price is None or entry.stop_loss_price is None or entry.take_profit_price is None:
+            continue
+        filtered.append(entry)
+    return sorted(filtered, key=entry_sort_key, reverse=True)
+
+
+def _html_text(value: Any) -> str:
+    return html.escape(str(value if value is not None else "N/A"), quote=False)
+
+
+def _format_price(value: Any) -> str:
+    try:
+        return f"{float(value):.5f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _entry_rr(entry: SignalEntry) -> Optional[float]:
+    try:
+        entry_price = float(entry.entry_price)
+        sl = float(entry.stop_loss_price)
+        tp = float(entry.take_profit_price)
+    except (TypeError, ValueError):
+        return None
+    risk = abs(entry_price - sl)
+    if risk <= 0:
+        return None
+    return abs(tp - entry_price) / risk
+
+
+def build_telegram_message(entry: SignalEntry, telegram_cfg: Dict[str, Any]) -> str:
+    direction = str(entry.signal_direction or "").upper()
+    action = entry_action_value(entry) or "SIGNAL"
+    rr = _entry_rr(entry)
+    lines = [
+        "<b>FXPM Signal</b>",
+        f"<b>{_html_text(entry.symbol)} {html.escape(direction, quote=False)}</b>",
+        f"Action: <b>{html.escape(action, quote=False)}</b>",
+    ]
+
+    context_parts = []
+    if entry.timeframe:
+        context_parts.append(_html_text(entry.timeframe))
+    if bool(telegram_cfg.get("include_regime", True)) and entry.regime:
+        context_parts.append(_html_text(entry.regime))
+    if context_parts:
+        lines.append("Context: " + " / ".join(context_parts))
+
+    lines.extend([
+        f"Entry: <code>{_format_price(entry.entry_price)}</code>",
+        f"SL: <code>{_format_price(entry.stop_loss_price)}</code>",
+        f"TP: <code>{_format_price(entry.take_profit_price)}</code>",
+    ])
+
+    if rr is not None:
+        lines.append(f"R:R: <b>{rr:.2f}</b>")
+    if entry.signal_strength is not None:
+        try:
+            lines.append(f"Strength: <b>{float(entry.signal_strength):.2f}</b>")
+        except (TypeError, ValueError):
+            pass
+    if bool(telegram_cfg.get("include_strategy", False)) and entry.strategy_name:
+        lines.append(f"Strategy: {_html_text(entry.strategy_name)}")
+    if entry.timestamp:
+        lines.append(f"Time: {_html_text(entry.timestamp)}")
+    return "\n".join(lines)
+
+
+def send_telegram_message(token: str, chat_id: str, message: str) -> bool:
+    if not token or not chat_id or not message:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = json.dumps({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            return 200 <= int(getattr(response, "status", 200)) < 300
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError):
+        return False
 
 
 def dedupe_entries(entries: List[SignalEntry]) -> List[SignalEntry]:

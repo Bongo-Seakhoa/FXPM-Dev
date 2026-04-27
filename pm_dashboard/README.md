@@ -17,14 +17,16 @@ The dashboard measures PM signal and trade behavior. It is not a broker-account 
 ### Signal Desk (`/`)
 
 - live signal list with filtering and sorting
+- live command panel for ledger coverage, readiness, signal/action health, and delivery status
 - entry, stop, target, regime, strategy, and strength visibility
 - notification and alert support
+- optional Telegram publishing for valid signals when explicitly enabled
 - staleness and watcher-state feedback
 - quick sizing tools using PM instrument specs
 
 ### Strategies (`/strategies`)
 
-- browse current PM strategies from `pm_configs.json`
+- browse current PM strategies from the active winner ledger
 - filter by symbol, timeframe, regime, and strategy
 - inspect assigned winners and tuned parameters
 
@@ -48,12 +50,13 @@ The dashboard measures PM signal and trade behavior. It is not a broker-account 
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/api/entries` | Current signal snapshot and metadata |
-| `GET/POST` | `/api/config` | Read or update dashboard configuration |
+| `GET` | `/api/live-command` | Operator readiness summary for active ledger, signals, trade events, and Telegram status |
+| `GET/POST` | `/api/config` | Read or update dashboard configuration. Writes require loopback access or a write token. |
 | `GET` | `/api/strategies` | Current PM strategies and winners |
 | `GET` | `/api/analytics` | Analytics summary and metrics |
 | `GET` | `/api/trades` | Trade history |
 | `POST` | `/api/simulate` | Historical trade reconstruction |
-| `POST` | `/api/download_historical_data` | Trigger root `data/` maintenance via MT5 |
+| `POST` | `/api/download_historical_data` | Trigger root `data/` maintenance via MT5. Writes require loopback access or a write token. |
 
 ---
 
@@ -64,6 +67,7 @@ The dashboard measures PM signal and trade behavior. It is not a broker-account 
 - Dashboard config lives in `pm_dashboard/dashboard_config.json`
 - PM root can be set via `--pm-root` or dashboard config
 - The dashboard reloads current config at request time for key routes
+- By default, `pm_configs_path = "auto"` follows `pipeline.winner_ledger_path` from the PM root `config.json`
 - Asset version hashes are generated dynamically from the static directory
 
 ### Watcher behavior
@@ -72,6 +76,7 @@ The dashboard measures PM signal and trade behavior. It is not a broker-account 
 - alert keys are stabilized to reduce duplicate notifications
 - notification helpers run asynchronously
 - recent `EXECUTED` events can be retained even when later decisions overwrite the latest actionable state
+- Telegram delivery is disabled by default, uses a bot token from environment, and dedupes signal keys in memory during the active dashboard session
 
 ### Analytics behavior
 
@@ -125,6 +130,16 @@ Custom host/port:
 python -m pm_dashboard.app --pm-root "." --host 0.0.0.0 --port 9000
 ```
 
+When binding beyond loopback, set a write token before exposing the dashboard:
+
+```bash
+$env:PM_DASHBOARD_WRITE_TOKEN = "choose-a-long-random-token"
+python -m pm_dashboard.app --pm-root "." --host 0.0.0.0 --port 9000
+```
+
+Write APIs accept the token in `X-PM-Dashboard-Token` or `Authorization: Bearer <token>`.
+Without a token, remote requests can read dashboard pages/API data but cannot update dashboard config or start root data refreshes. Local loopback writes remain available for the default single-user workflow, with cross-origin browser writes rejected.
+
 ---
 
 ## Configuration
@@ -144,16 +159,31 @@ Important keys include:
 - `log_max_files`
 - `trade_files_pattern`
 - `trade_map_max_age_minutes`
-- `pm_configs_path`
+- `pm_configs_path` (`"auto"` follows `pipeline.winner_ledger_path`; set a file path only for an explicit dashboard override)
+- `write_api_token_env`
 - `explicit_files`
 - `min_strength`
 - `max_signal_age_minutes`
 - `valid_actions`
 - `valid_action_prefixes`
 - `alert`
+- `telegram`
 - `field_aliases`
 
 The Settings UI updates common dashboard values and persists them back to `dashboard_config.json`.
+
+### Telegram Signal Publishing
+
+Telegram publishing is opt-in. The dashboard never stores a bot token in `dashboard_config.json`; it stores the environment variable name and reads the token at runtime.
+
+Recommended setup:
+
+```powershell
+$env:PM_DASHBOARD_TELEGRAM_BOT_TOKEN = "123456:bot-token"
+python -m pm_dashboard.app --pm-root "."
+```
+
+Then set the Telegram chat/group ID in the dashboard settings and enable Telegram Signals. By default, the Telegram message includes symbol, direction, action, timeframe/regime, entry, SL, TP, R:R, strength, and timestamp. Strategy names are hidden unless `telegram.include_strategy` is enabled.
 
 ---
 
@@ -166,6 +196,10 @@ This can:
 - run scheduled refreshes
 - trigger manual refreshes through `/api/download_historical_data`
 - refresh root `data/<SYMBOL>_M5.csv` files via MT5
+
+Refresh writes are protected by an in-process lock, merge returned MT5 bars with existing local bars, and publish the CSV with an atomic replace so readers do not observe partial files.
+
+The scheduler now uses the same due-time comparator style as the PM runtime instead of a fixed sleep loop, so it stays responsive without carrying an extra polling cadence of its own.
 
 This is why the dashboard is not documented as fully read-only.
 

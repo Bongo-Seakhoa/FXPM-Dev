@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FXPM Final Comprehensive Audit</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b10;
+      --surface: #0f141b;
+      --surface-2: #131a23;
+      --surface-3: #17212c;
+      --text: #edf4ff;
+      --muted: #9aa8bb;
+      --line: #253244;
+      --cyan: #4fd1c5;
+      --blue: #6aa7ff;
+      --green: #7ddc91;
+      --amber: #f3c15d;
+      --red: #ff7180;
+      --violet: #b69bff;
+      --shadow: 0 18px 50px rgba(0, 0, 0, 0.34);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #080b10 0%, #0b1017 48%, #080b10 100%);
+      color: var(--text);
+      font-family: "Segoe UI", Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      line-height: 1.58;
+    }
+
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr);
+      gap: 26px;
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    aside {
+      position: sticky;
+      top: 24px;
+      height: calc(100vh - 48px);
+      overflow: auto;
+      padding: 22px;
+      background: rgba(15, 20, 27, 0.92);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      box-shadow: var(--shadow);
+      border-radius: 8px;
+    }
+
+    .brand {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 22px;
+    }
+
+    .brand .eyebrow {
+      color: var(--cyan);
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 1.24rem;
+      line-height: 1.2;
+    }
+
+    .brand p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    nav {
+      display: grid;
+      gap: 7px;
+      margin-top: 18px;
+    }
+
+    nav a {
+      display: block;
+      padding: 9px 10px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      color: #dbe7f7;
+      font-size: 0.92rem;
+    }
+
+    nav a:hover {
+      background: #121b27;
+      border-color: #26364a;
+      text-decoration: none;
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    .hero {
+      min-height: 330px;
+      display: grid;
+      align-content: end;
+      padding: 34px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, rgba(79, 209, 197, 0.14) 0%, rgba(106, 167, 255, 0.08) 42%, rgba(182, 155, 255, 0.10) 100%),
+        repeating-linear-gradient(90deg, rgba(255,255,255,0.035) 0 1px, transparent 1px 42px),
+        #0f141b;
+      box-shadow: var(--shadow);
+    }
+
+    .hero h2 {
+      max-width: 980px;
+      margin: 0 0 14px;
+      font-size: clamp(2.0rem, 4.8vw, 4.6rem);
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    .hero p {
+      max-width: 920px;
+      margin: 0;
+      color: #c8d6e8;
+      font-size: 1.04rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-bottom: 22px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 10px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 999px;
+      background: rgba(8, 11, 16, 0.42);
+      color: #dce8f7;
+      font-size: 0.82rem;
+      font-weight: 650;
+    }
+
+    section {
+      margin-top: 24px;
+      padding: 28px;
+      background: rgba(15, 20, 27, 0.86);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 8px;
+    }
+
+    section h2 {
+      margin: 0 0 16px;
+      font-size: 1.45rem;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 1.08rem;
+    }
+
+    p {
+      margin: 0 0 13px;
+      color: #d8e2ef;
+    }
+
+    ul, ol {
+      margin: 0 0 14px 20px;
+      padding: 0;
+      color: #d8e2ef;
+    }
+
+    li { margin: 6px 0; }
+
+    code {
+      color: #e8f3ff;
+      background: #17212c;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      padding: 1px 5px;
+      border-radius: 5px;
+      font-size: 0.92em;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }
+
+    .stat {
+      padding: 15px;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 8px;
+      background: #111821;
+    }
+
+    .stat strong {
+      display: block;
+      font-size: 1.6rem;
+      line-height: 1.1;
+      color: var(--text);
+    }
+
+    .stat span {
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .finding {
+      margin-top: 16px;
+      padding: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 8px;
+      background: #111821;
+    }
+
+    .finding h3 {
+      margin-top: 0;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 9px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .tag.high { color: #fff2f4; background: rgba(255, 113, 128, 0.20); border: 1px solid rgba(255, 113, 128, 0.36); }
+    .tag.medhigh { color: #fff6e2; background: rgba(243, 193, 93, 0.18); border: 1px solid rgba(243, 193, 93, 0.35); }
+    .tag.medium { color: #eaf3ff; background: rgba(106, 167, 255, 0.16); border: 1px solid rgba(106, 167, 255, 0.32); }
+    .tag.low { color: #e8fff7; background: rgba(125, 220, 145, 0.14); border: 1px solid rgba(125, 220, 145, 0.30); }
+
+    .callout {
+      border-left: 3px solid var(--cyan);
+      background: #101923;
+      padding: 13px 15px;
+      margin: 15px 0;
+      border-radius: 0 8px 8px 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      overflow: hidden;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+    }
+
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #151f2a;
+      color: #eef6ff;
+      font-size: 0.86rem;
+    }
+
+    td {
+      color: #d8e2ef;
+      background: #101720;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .two {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+    }
+
+    .panel {
+      padding: 17px;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      background: #111821;
+    }
+
+    .panel h3 { margin-top: 0; }
+
+    @media (max-width: 1020px) {
+      .layout { grid-template-columns: 1fr; padding: 18px; }
+      aside { position: relative; top: 0; height: auto; }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .two { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 620px) {
+      .hero { padding: 24px; min-height: 300px; }
+      section { padding: 20px; }
+      .grid { grid-template-columns: 1fr; }
+      table { font-size: 0.9rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside>
+      <div class="brand">
+        <div class="eyebrow">FXPM Audit</div>
+        <h1>Final Comprehensive Audit</h1>
+        <p>Current-state review of code, artifacts, live propagation, storage, dashboard visibility, and methodology alignment.</p>
+      </div>
+      <nav>
+        <a href="#summary">Executive Summary</a>
+        <a href="#verification">Verification</a>
+        <a href="#state">Current State</a>
+        <a href="#methodology">Methodology</a>
+        <a href="#findings">Findings</a>
+        <a href="#nonissues">Non-Issues</a>
+        <a href="#patch-order">Patch Order</a>
+        <a href="#assessment">Final Assessment</a>
+      </nav>
+    </aside>
+
+    <main>
+      <header class="hero">
+        <div class="meta">
+          <span class="pill">2026-04-25</span>
+          <span class="pill">No full optimize run</span>
+          <span class="pill">541 tests passing</span>
+          <span class="pill">High-risk ledger audited</span>
+        </div>
+        <h2>FXPM Final Comprehensive Audit</h2>
+        <p>The PM is architecturally stronger, but not production-clean yet. The remaining work is targeted: live eligibility, reproducible source state, final safety edges, dashboard actionability, and a deliberately regenerated high-risk ledger.</p>
+      </header>
+
+      <section id="summary">
+        <h2>Executive Summary</h2>
+        <p>The current FXPM architecture is broadly aligned with the stated objective: quality, profitability, accuracy, actionability, and then efficiency. The active recent-M5 workflow, regime-aware selection, Stage 3 risk/governance surface, shared trade-intent exits, and storage governance are all moving in the right direction.</p>
+        <p>The audit does not treat known low-balance broker rejections as system failures. Those rejections are expected while the account is small. They become a deeper problem only if they continue after balance, margin, minimum lot, and broker constraints are no longer the limiting cause.</p>
+        <div class="callout">
+          Post-audit implementation update: F1, F4, F5, F6, and F7 have been patched in code. F2 remains tied to the operator's full high-risk ledger regeneration run. F3 remains a source-control/deployment boundary decision.
+        </div>
+        <ol>
+          <li>Live config eligibility previously used <code>is_validated</code> only; live trading now uses a stricter live-eligible surface.</li>
+          <li>The active high-risk ledger is partial and mixed-version.</li>
+          <li>Several core runtime files are untracked by git.</li>
+          <li>The non-finite margin and stale same-symbol risk-input safety edges have been patched.</li>
+          <li>Dashboard defaults now surface important margin/low-balance skip actions.</li>
+        </ol>
+      </section>
+
+      <section id="verification">
+        <h2>Verification</h2>
+        <div class="grid">
+          <div class="stat"><strong>541</strong><span>pytest cases passed</span></div>
+          <div class="stat"><strong>350</strong><span>subtests passed</span></div>
+          <div class="stat"><strong>14/62</strong><span>symbols configured</span></div>
+          <div class="stat"><strong>59</strong><span>symbols need optimization</span></div>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Check</th><th>Result</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>python -m pytest -q</code></td><td><code>541 passed, 1 skipped, 350 subtests passed</code></td></tr>
+            <tr><td><code>python pm_main.py --status</code></td><td>Ledger <code>pm_configs_high_risk.json</code>, 62 managed, 14 configured, 14 valid, 59 need optimization.</td></tr>
+            <tr><td>Storage state</td><td>Pressure normal. Cache approximately 667 MB against a 4 GB active quota.</td></tr>
+            <tr><td>Full optimization</td><td>Not run, per instruction.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="state">
+        <h2>Current System State</h2>
+        <div class="two">
+          <div class="panel">
+            <h3>Active Config</h3>
+            <ul>
+              <li><code>winner_ledger_path = pm_configs_high_risk.json</code></li>
+              <li><code>data_workflow_mode = active_recent_m5</code></li>
+              <li><code>max_bars = 300000</code> M5 bars</li>
+              <li><code>historical_stress_audit_bars = 50000</code> M5 bars</li>
+              <li><code>active_universe_bars = 250000</code> M5 bars</li>
+              <li><code>risk_management_selection_stage = stage3</code></li>
+              <li><code>production_retrain_mode = notify</code></li>
+              <li><code>storage_resample_cache_max_gb = 4.0</code></li>
+            </ul>
+          </div>
+          <div class="panel">
+            <h3>Active Ledger</h3>
+            <ul>
+              <li>14 configured symbols out of 62.</li>
+              <li>108 regime/timeframe slots.</li>
+              <li>69 tradeable slots and 39 no-trade slots.</li>
+              <li>11 symbols on old artifact contract.</li>
+              <li>3 symbols on latest artifact contract.</li>
+              <li>0 symbols with compact validation evidence.</li>
+              <li>0 symbols with data-window fingerprints.</li>
+            </ul>
+          </div>
+        </div>
+        <p>This ledger is an in-progress operational artifact. It should not be treated as the final optimized high-risk production universe.</p>
+      </section>
+
+      <section id="methodology">
+        <h2>Methodology Alignment</h2>
+        <h3>Data Workflow</h3>
+        <p>The active workflow is coherent: latest 300,000 M5 bars, oldest 50,000 M5 bars as <code>historical_stress_audit</code>, newest 250,000 M5 bars as the active universe, and Stage 3 risk/governance selection on the freshest Stage 2 surface.</p>
+        <h3>Walk-Forward</h3>
+        <p>Walk-forward should remain an offline audit report, not a mandatory promotion layer. Adding it between Stage 2/Stage 3 and live implementation would reduce freshness and conflict with the live-relevance goal.</p>
+        <h3>Backtest Balance</h3>
+        <p>A larger notional backtest balance is acceptable for strategy discovery. The live layer is responsible for broker feasibility, minimum lot, margin, and sizing constraints.</p>
+        <h3>Regime And Exit Surface</h3>
+        <p>Optimization and live selection now align around <code>REGIME_LIVE</code> at decision time. Backtester and live execution also share the strategy <code>build_trade_intent()</code> exit surface, including regime TP multipliers.</p>
+      </section>
+
+      <section id="findings">
+        <h2>Findings</h2>
+
+        <article class="finding">
+          <h3>F1 - Live Eligibility Does Not Enforce Expiry Or Artifact Due Status <span class="tag high">Resolved</span></h3>
+          <p><code>ConfigLedger.has_valid_config()</code> rejects expired configs, and <code>should_optimize()</code> detects artifact fingerprint drift. But <code>PortfolioManager.get_validated_configs()</code> returns configs based on <code>is_validated</code> only.</p>
+          <p>A direct probe confirmed that an expired config is rejected by the ledger but still returned by <code>get_validated_configs()</code>. Since live trading uses that surface, expired configs can remain live-tradeable.</p>
+          <p><strong>Implemented:</strong> live trading now uses <code>get_live_eligible_configs()</code>, blocks expired/no-winner/artifact-drifted configs under <code>live_artifact_drift_policy = "block"</code>, and status now reports live eligibility with <code>BL</code> markers. Artifact invalidation ignores volatile ledger metadata.</p>
+        </article>
+
+        <article class="finding">
+          <h3>F2 - Active High-Risk Ledger Is Not Final Or Fully Propagated <span class="tag high">High</span></h3>
+          <p>The active ledger contains only 14 of 62 symbols, and <code>--status</code> reports 59 symbols needing optimization. Most configured symbols are marked due because the artifact fingerprint changed.</p>
+          <p><strong>Recommendation:</strong> do not judge final PM quality from the current ledger. After deliberate optimization, verify symbol coverage, artifact contract consistency, validation evidence, data-window fingerprinting, ledger status, and robustness evidence.</p>
+        </article>
+
+        <article class="finding">
+          <h3>F3 - Git/Deployment Boundary Is Not Clean <span class="tag high">High</span></h3>
+          <p>Core local files are untracked by git, including <code>pm_storage.py</code>, <code>pm_order_governance.py</code>, <code>pm_dashboard/ledger.py</code>, <code>pm_configs_high_risk.json</code>, and several tests.</p>
+          <p><strong>Recommendation:</strong> before live deployment or handoff, decide what is generated and what is source. Track source modules and tests, and deliberately provision or track the active production ledger.</p>
+        </article>
+
+        <article class="finding">
+          <h3>F4 - Margin Guards Do Not Normalize Non-Finite Values <span class="tag medhigh">Resolved</span></h3>
+          <p><code>_safe_account_margin_level()</code> converts values with <code>float()</code> but does not reject <code>NaN</code> or <code>inf</code>. Those values can avoid both missing-margin and normal threshold branches.</p>
+          <p><strong>Implemented:</strong> non-finite margin level, free margin, and required margin now fail closed with <code>SKIPPED_MARGIN_UNAVAILABLE</code> where trading would be unsafe.</p>
+        </article>
+
+        <article class="finding">
+          <h3>F5 - Same-Symbol Combined Risk Still Uses Stale Sweep Snapshot <span class="tag medhigh">Resolved</span></h3>
+          <p>The exact duplicate-position guard now performs a fresh broker read, but the later same-symbol combined-risk check still receives the original sweep snapshot. A same-symbol/different-magic position opened after the sweep could be missed.</p>
+          <p><strong>Implemented:</strong> the fresh symbol-level broker positions are now passed into <code>_check_symbol_combined_risk_cap()</code>, with regression coverage.</p>
+        </article>
+
+        <article class="finding">
+          <h3>F6 - Dashboard Defaults Hide Margin And Low-Balance Skip Actions <span class="tag medium">Resolved</span></h3>
+          <p>Important actions such as <code>SKIPPED_MARGIN_REQUIRED</code>, <code>SKIPPED_MARGIN_BLOCKED</code>, and <code>BLOCKED_MIN_LOT_EXCEEDS_CAP</code> may be recorded but hidden by dashboard display filters.</p>
+          <p><strong>Implemented:</strong> dashboard defaults now include margin and minimum-lot feasibility actions/prefixes while keeping noisy <code>NO_ACTIONABLE_*</code> entries excluded.</p>
+        </article>
+
+        <article class="finding">
+          <h3>F7 - Storage/Cache Is Healthy, But State Semantics Need Tightening <span class="tag low">Resolved</span></h3>
+          <p>The cache/storage design is in a good zone: 4 GB quota, current use well below quota, observe-only cleanup, resample-cache telemetry, and storage tests. The state file can still mix current housekeeping with stale live-sweep fields.</p>
+          <p><strong>Implemented:</strong> storage state now carries <code>state_updated_at</code> and freshness labels for sweep/housekeeping fields. The 4 GB cache cap remains unchanged.</p>
+        </article>
+
+        <article class="finding">
+          <h3>F8 - Production Retrain Mode Is Notify, Not Auto <span class="tag low">Medium-Low</span></h3>
+          <p><code>production_retrain_mode = notify</code> is valid for manual control, but it means due symbols are announced rather than automatically refreshed.</p>
+          <p><strong>Recommendation:</strong> keep <code>notify</code> only if manual retrain control is intended. Use <code>auto</code> only when the machine, broker connection, storage, and time budget are ready.</p>
+        </article>
+      </section>
+
+      <section id="nonissues">
+        <h2>Non-Issues Confirmed</h2>
+        <ul>
+          <li>The active-recent M5 workflow is not broken by not being a traditional academic train/validation/holdout design.</li>
+          <li><code>historical_stress_audit</code> is the correct name for the oldest 50,000 M5 bars.</li>
+          <li>Walk-forward should remain an offline audit, not a mandatory live-promotion gate.</li>
+          <li>Larger backtest notional balance is acceptable for strategy discovery.</li>
+          <li>Low-balance live rejections are expected and should not be over-interpreted.</li>
+          <li>Regime live/optimization logic is now aligned around <code>REGIME_LIVE</code> at decision time.</li>
+          <li>Backtester and live execution now share the strategy trade-intent exit surface.</li>
+          <li>The 4 GB cache setting is reasonable; shrinking cache is not currently indicated.</li>
+        </ul>
+      </section>
+
+      <section id="patch-order">
+        <h2>Patch Order</h2>
+        <ol>
+          <li>Completed: live eligibility now blocks expired/no-winner/artifact-drifted configs under the active strict policy.</li>
+          <li>Remaining operator/deployment task: clean the git/deployment boundary so source modules, tests, and active runtime expectations are reproducible.</li>
+          <li>Completed: non-finite margin handling and tests.</li>
+          <li>Completed: fresh symbol positions now feed the same-symbol combined-risk cap.</li>
+          <li>Completed: dashboard action filters now surface margin and low-balance feasibility events.</li>
+          <li>Remaining F2 task: regenerate the high-risk ledger deliberately, then verify contract coverage and evidence propagation.</li>
+          <li>Completed: storage-state freshness labels were added without reducing useful cache capacity.</li>
+        </ol>
+      </section>
+
+      <section id="assessment">
+        <h2>Final Assessment</h2>
+        <p>FXPM is directionally in a much better state than it was before the recent patches. The methodology is sound enough to continue with the active recent-M5, Stage 3 risk-management workflow. The code-level safety and actionability issues from this audit have now been handled.</p>
+        <p>The codebase should not be considered production-clean until the high-risk ledger is regenerated and the git/deployment boundary is cleaned up, but the remaining work is now narrower and operational rather than architectural.</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
