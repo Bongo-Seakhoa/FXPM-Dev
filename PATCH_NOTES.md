@@ -2,6 +2,14 @@
 Scope: Comprehensive change history for this repository.
 Status: Canonical patch note file (single source of truth).
 
+## 2026-04-29 - Neutral Discovery Exit Surface
+- Reset Stage 1 strategy defaults to a neutral `2.0` ATR stop / `2.0` ATR take-profit across all registered strategies.
+- Made the fallback stop/target floor symmetric at `5.0` pips so the neutral baseline remains neutral even on tiny-ATR bars.
+- Kept the Stage 2 SL/TP search grid broad so optimization can still discover asymmetric exits per symbol/timeframe/regime.
+- Removed regime TP multipliers from backtest/discovery scoring; `Backtester.run()` now disables that live-only overlay when building trade intents.
+- Changed default `regime_tp_multipliers` to neutral `1.0` values. Non-neutral values remain available only as an explicit downstream live operator overlay.
+- Updated artifact metadata to `2026-04-29-neutral-discovery-exit-surface` / `neutral_discovery_sl_tp_v1`.
+
 ## 2026-04-25 - Live Eligibility and Optimize-Readiness Hardening
 - Added `PortfolioManager.get_live_eligible_configs()` and moved live trading surfaces to it instead of raw `get_validated_configs()`.
 - Added `live_artifact_drift_policy` (`block`, `warn`, `ignore`) and `live_config_expiry_grace_minutes`; the active profile blocks drifted artifacts and has no expiry grace.

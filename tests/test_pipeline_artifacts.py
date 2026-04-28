@@ -65,6 +65,13 @@ class PipelineArtifactTests(unittest.TestCase):
         changed["artifact_version"] = "changed"
         self.assertFalse(artifact_contract_matches(stored, changed))
 
+    def test_artifact_meta_keeps_live_tp_overlay_out_of_discovery_contract(self):
+        cfg = PipelineConfig(regime_tp_multipliers={"TREND": 1.25})
+        current = build_artifact_meta(cfg)
+
+        self.assertEqual(current["exit_surface_contract"], "neutral_discovery_sl_tp_v1")
+        self.assertNotIn("regime_tp_multipliers", current)
+
     def test_live_eligible_configs_exclude_expired_and_artifact_drift_when_blocking(self):
         tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_live_eligibility")
         shutil.rmtree(tmp, ignore_errors=True)

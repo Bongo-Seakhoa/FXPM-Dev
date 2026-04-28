@@ -390,7 +390,7 @@ These settings live under `"position"` and primarily affect live trading.
 | `use_spread` | bool | `true` | Mirrors spread modeling preference into live helper code paths. |
 | `use_slippage` | bool | `true` | Mirrors slippage modeling preference into live helper code paths. |
 | `slippage_pips` | float | `0.5` | Mirrored slippage setting. |
-| `regime_tp_multipliers` | dict[str,float] | `{"TREND":1.25,"BREAKOUT":1.15,"RANGE":0.85,"CHOP":0.75}` | Regime-aware TP multipliers applied when `BaseStrategy.build_trade_intent()` prepares a live trade after winner selection. Empty dict resets to the module default; unknown labels / non-positive values are silently dropped. The base strategy tournament remains unchanged, and the 10-pip TP floor is preserved. |
+| `regime_tp_multipliers` | dict[str,float] | `{"TREND":1.0,"BREAKOUT":1.0,"RANGE":1.0,"CHOP":1.0}` | Optional live-only TP multipliers applied when `BaseStrategy.build_trade_intent()` prepares a live trade. Defaults are neutral, and backtest/discovery scoring explicitly disables this overlay so Stage 1 and Stage 2 trade the discovered SL/TP surface. Empty dict resets to the neutral module default; unknown labels / non-positive values are silently dropped. |
 
 Important:
 

@@ -1,4 +1,5 @@
 import unittest
+import logging
 from types import SimpleNamespace
 
 import pm_mt5
@@ -169,6 +170,32 @@ class MT5ConnectorTests(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertTrue(info.visible)
         self.assertEqual(info.trade_mode, 2)
+
+    def test_missing_symbol_get_bars_is_not_terminal_noise(self):
+        connector = MT5Connector(MT5Config())
+        connector._connected = True
+        records = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _ListHandler()
+        handler.setLevel(logging.DEBUG)
+        previous_level = pm_mt5.logger.level
+        pm_mt5.logger.setLevel(logging.DEBUG)
+        pm_mt5.logger.addHandler(handler)
+        try:
+            bars = connector.get_bars("BCHUSD", "M5", count=3)
+        finally:
+            pm_mt5.logger.removeHandler(handler)
+            pm_mt5.logger.setLevel(previous_level)
+
+        self.assertIsNone(bars)
+        self.assertFalse(
+            [record for record in records if record.levelno >= logging.WARNING],
+            "Missing broker-universe symbols should stay below terminal log levels.",
+        )
 
 
 if __name__ == "__main__":

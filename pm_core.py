@@ -689,13 +689,13 @@ class PipelineConfig:
     regime_freshness_decay: float = 0.85  # Freshness decay for stale timeframe signals
     regime_chop_no_trade: bool = False  # Hard no-trade when in CHOP with no winner
     regime_params_file: str = "regime_params.json"  # Path to tuned regime params
-    # Mirrored from PositionConfig at app startup so optimization workers evaluate
-    # the same trade-intent TP surface that live trading sends to the executor.
+    # Live-only optional TP overlay. Discovery/backtesting keeps this neutral so
+    # the tournament trades the SL/TP surface that actually won.
     regime_tp_multipliers: Dict[str, float] = field(default_factory=lambda: {
-        "TREND": 1.25,
-        "BREAKOUT": 1.15,
-        "RANGE": 0.85,
-        "CHOP": 0.75,
+        "TREND": 1.0,
+        "BREAKOUT": 1.0,
+        "RANGE": 1.0,
+        "CHOP": 1.0,
     })
     
     # Hyperparameter tuning settings for regime optimization
@@ -804,17 +804,17 @@ class PipelineConfig:
                 if regime_key and math.isfinite(multiplier) and multiplier > 0:
                     normalized_regime_tp[regime_key] = multiplier
             self.regime_tp_multipliers = normalized_regime_tp or {
-                "TREND": 1.25,
-                "BREAKOUT": 1.15,
-                "RANGE": 0.85,
-                "CHOP": 0.75,
+                "TREND": 1.0,
+                "BREAKOUT": 1.0,
+                "RANGE": 1.0,
+                "CHOP": 1.0,
             }
         except Exception:
             self.regime_tp_multipliers = {
-                "TREND": 1.25,
-                "BREAKOUT": 1.15,
-                "RANGE": 0.85,
-                "CHOP": 0.75,
+                "TREND": 1.0,
+                "BREAKOUT": 1.0,
+                "RANGE": 1.0,
+                "CHOP": 1.0,
             }
 
         self.position_size_pct = self.risk_per_trade_pct
@@ -3767,11 +3767,8 @@ class Backtester:
             config: Pipeline configuration
         """
         self.config = config
-        try:
-            from pm_strategies import set_regime_tp_multipliers
-            set_regime_tp_multipliers(getattr(config, "regime_tp_multipliers", None))
-        except Exception:
-            pass
+        # Discovery/backtest scoring must not use live-only regime TP overlays.
+        # Stage 2 can still search `tp_atr_mult` normally via strategy grids.
     
     def run(self,
             features: pd.DataFrame,
@@ -3891,6 +3888,7 @@ class Backtester:
                             signal=direction,
                             spec=spec,
                             bar_index=signal_bar_index,
+                            apply_regime_tp_multiplier=False,
                         )
                         sl_pips = float(intent.stop_loss_pips)
                         tp_pips = float(intent.take_profit_pips)
