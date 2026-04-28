@@ -1,16 +1,16 @@
 {
   "freshness": {
-    "as_of": "2026-04-27T22:16:34.847723",
+    "as_of": "2026-04-29T00:55:32.726630",
     "last_housekeeping_age_seconds": 0,
-    "last_housekeeping_at": "2026-04-27T22:16:34.729591",
+    "last_housekeeping_at": "2026-04-29T00:55:32.665061",
     "last_housekeeping_is_fresh": true,
-    "last_sweep_age_seconds": 0,
-    "last_sweep_at": "2026-04-27T22:16:34.729591",
+    "last_sweep_age_seconds": 7,
+    "last_sweep_at": "2026-04-29T00:55:24.814509",
     "last_sweep_is_fresh": true
   },
-  "last_free_gb": 3.8,
+  "last_free_gb": 3.15,
   "last_housekeeping": {
-    "free_gb": 3.8,
+    "free_gb": 3.15,
     "metaquotes": {},
     "observe_only": true,
     "pm_owned_cleanup": {
@@ -21,48 +21,27 @@
     },
     "pm_sizes": {
       "cache_dir_bytes": 667208587,
-      "data_dir_bytes": 2008454258,
-      "live_dir_bytes": 21375145,
-      "log_dir_bytes": 12899335,
-      "output_dir_bytes": 790229
+      "data_dir_bytes": 2051910645,
+      "live_dir_bytes": 26278199,
+      "log_dir_bytes": 89278,
+      "output_dir_bytes": 816793
     },
-    "ran_at": "2026-04-27T22:16:34.729591",
-    "trigger": "sweep"
+    "ran_at": "2026-04-29T00:55:32.665061",
+    "trigger": "shutdown"
   },
   "last_optimization_at": "2026-04-27T15:42:26.146746",
   "last_sweep": {
-    "at": "2026-04-27T22:16:34.729591",
-    "free_gb": 3.8,
-    "live_equity": 4960.66,
-    "open_positions": 10,
-    "sweep_duration_seconds": 81.502,
+    "at": "2026-04-29T00:55:24.814509",
+    "free_gb": 3.15,
+    "live_equity": 4832.39,
+    "open_positions": 4,
+    "sweep_duration_seconds": 0.546,
     "symbol_count": 62
   },
-  "next_housekeep_at": "2026-04-27T22:31:34.729591",
-  "next_measure_at": "2026-04-27T22:17:14.778715",
-  "next_metaquotes_review_at": "2026-04-27T22:54:12.494902",
-  "order_governance": {
-    "171970570": {
-      "initial_stop_loss": 0.78727,
-      "initial_take_profit": 0.78248,
-      "last_bar_time": "2026-04-27T23:00:00",
-      "last_policy_name": "breakeven_1r",
-      "shadow_stop_loss": 0.78727,
-      "shadow_take_profit": 0.78248,
-      "shadow_tp_released": false,
-      "tp_released": false
-    },
-    "171975841": {
-      "initial_stop_loss": 76.128,
-      "initial_take_profit": 74.574,
-      "last_bar_time": "2026-04-27T23:15:00",
-      "last_policy_name": "breakeven_1r",
-      "shadow_stop_loss": 76.128,
-      "shadow_take_profit": 74.574,
-      "shadow_tp_released": false,
-      "tp_released": false
-    }
-  },
+  "next_housekeep_at": "2026-04-29T00:55:31.418169",
+  "next_measure_at": "2026-04-29T01:00:09.573190",
+  "next_metaquotes_review_at": "2026-04-29T05:00:15.339540",
+  "order_governance": {},
   "pressure_level": "critical",
-  "state_updated_at": "2026-04-27T22:16:34.847723"
+  "state_updated_at": "2026-04-29T00:55:32.726630"
 }

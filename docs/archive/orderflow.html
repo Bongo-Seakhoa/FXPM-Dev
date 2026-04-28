@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FxPM Order Flow Audit</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --panel: #fffdf8;
+      --text: #1f1b16;
+      --muted: #6b6257;
+      --border: #d8ccbc;
+      --high: #8f1d14;
+      --medium: #9a5a00;
+      --low: #2c5f77;
+      --good: #1d5c3a;
+      --code: #f3eadc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      background: linear-gradient(180deg, #efe5d7 0%, var(--bg) 100%);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .wrap {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 12px 40px rgba(48, 35, 23, 0.08);
+    }
+    .hero {
+      padding: 28px;
+      margin-bottom: 20px;
+    }
+    .panel {
+      padding: 24px;
+      margin-bottom: 18px;
+    }
+    h1, h2, h3 {
+      margin: 0 0 12px;
+      line-height: 1.2;
+    }
+    h1 { font-size: 2rem; }
+    h2 { font-size: 1.35rem; margin-top: 4px; }
+    h3 { font-size: 1.05rem; }
+    p { margin: 0 0 12px; }
+    ul, ol { margin: 0 0 12px 20px; }
+    li { margin-bottom: 8px; }
+    .meta {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .verdict {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 16px;
+      align-items: start;
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+    }
+    .rating {
+      background: #fbf3e6;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      text-align: center;
+    }
+    .rating strong {
+      display: block;
+      font-size: 1.4rem;
+      margin-bottom: 6px;
+    }
+    .finding {
+      border: 1px solid var(--border);
+      border-left-width: 6px;
+      border-radius: 12px;
+      padding: 16px 16px 14px;
+      margin-bottom: 14px;
+      background: #fffdf9;
+    }
+    .finding.high { border-left-color: var(--high); }
+    .finding.medium { border-left-color: var(--medium); }
+    .finding.low { border-left-color: var(--low); }
+    .sev {
+      font-size: 0.82rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+    .high .sev { color: var(--high); }
+    .medium .sev { color: var(--medium); }
+    .low .sev { color: var(--low); }
+    .good {
+      color: var(--good);
+      font-weight: bold;
+    }
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      background: var(--code);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th {
+      font-size: 0.9rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>FxPM Order Flow Audit</h1>
+      <p class="meta">Generated: 2026-04-02 | Scope: live order flow, scaling, sizing, broker execution, active order management, same-symbol risk handling, and config authority.</p>
+      <p>This audit intentionally did not re-litigate accepted strategy-specific or PM-specific design choices that are already part of your operating doctrine. It focused on whether the current implementation is faithful to your intent, operationally trustworthy, and internally consistent.</p>
+      <div class="verdict">
+        <div class="rating">
+          <strong>Amber</strong>
+          Trust with caveats
+        </div>
+        <div>
+          <p><span class="good">Primary entry flow is materially strong.</span> Config-first propagation, MT5 preflight, broker-aware stop validation, contract-math risk sizing, hard per-trade caps, same-symbol risk checks, margin protection, and restart-safe position recovery are all present and covered by tests.</p>
+          <p><strong>The two biggest trust blockers are active-path accounting gaps, not philosophy gaps:</strong> open-position risk metadata currently stores target risk instead of actual post-sizing risk, and one fail-closed secondary-trade branch can reference variables before assignment. Also, scaling and the richer order-management toggles are not active in the live MT5 loop, so they should not be relied on operationally today.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Findings First</h2>
+
+      <article class="finding high">
+        <div class="sev">High</div>
+        <h3>Open-position risk metadata records target risk, not actual post-sizing risk</h3>
+        <p><strong>Why it matters:</strong> same-symbol risk accounting later reads risk back from position comments. If min-lot flooring, volume-step normalization, SL widening, or fill drift pushes actual risk above the target, the open position can be undercounted in future combined-risk checks.</p>
+        <p><strong>Evidence:</strong> <code>pm_main.py:2512-2517</code> writes <code>risk_pct=target_risk_pct</code> into the trade comment, while later risk reads use <code>TradeTagEncoder.get_risk_pct_from_comment(...)</code> in <code>pm_main.py:2217</code> and <code>pm_main.py:2289</code>.</p>
+        <p><strong>Impact:</strong> the active same-symbol exposure model is directionally correct, but it is not fully faithful whenever actual risk exceeds target. This is most relevant on symbols where <code>0.01</code> lots often over-risks relative to the requested target.</p>
+        <p><strong>Recommendation:</strong> persist actual post-normalization risk in the comment or reconstruct it from durable metadata after execution. Do not continue using target risk as the stored exposure proxy for live risk aggregation.</p>
+      </article>
+
+      <article class="finding high">
+        <div class="sev">High</div>
+        <h3>Secondary-trade fail-closed path can reference variables before assignment</h3>
+        <p><strong>Why it matters:</strong> in the branch that blocks a secondary trade because the position snapshot is unavailable, the actionable log path references <code>volume</code> and <code>actual_risk_pct</code> before those variables are defined.</p>
+        <p><strong>Evidence:</strong> <code>pm_main.py:2273-2282</code>.</p>
+        <p><strong>Impact:</strong> the intended fail-closed branch can itself throw an exception instead of logging and returning cleanly. This is a latent reliability bug in an error-handling path.</p>
+        <p><strong>Recommendation:</strong> write <code>None</code> for values not yet computed, or move the block after sizing. This should be fixed before claiming the secondary-trade path is fully hardened.</p>
+      </article>
+
+      <article class="finding medium">
+        <div class="sev">Medium</div>
+        <h3>Scaling flags exist, but scaling is not implemented in the live order engine</h3>
+        <p><strong>Why it matters:</strong> enabling scaling in config currently does not produce scale-ins, additional entry logic, or live position additions through the MT5 loop.</p>
+        <p><strong>Evidence:</strong> <code>pm_position.py:281-283</code> defines <code>allow_scaling</code>, <code>max_scale_ins</code>, and <code>scale_in_pct</code>, and <code>pm_position.py:339</code> tracks <code>scale_count</code>, but there is no live execution usage outside those definitions.</p>
+        <p><strong>Impact:</strong> turning scaling on today gives a false sense of live capability. Operationally, nothing happens.</p>
+        <p><strong>Recommendation:</strong> either wire scale-ins explicitly into the MT5 live loop or document these settings as dormant/non-live.</p>
+      </article>
+
+      <article class="finding medium">
+        <div class="sev">Medium</div>
+        <h3>Trailing stop, breakeven, and time-based exit helpers are not wired into the live MT5 loop</h3>
+        <p><strong>Why it matters:</strong> the standalone <code>PositionManager</code> has working helper methods for trailing, breakeven, and max-duration exits, but the live trader does not call them or mirror them into <code>modify_position()</code> requests.</p>
+        <p><strong>Evidence:</strong> helpers exist at <code>pm_position.py:827-908</code>; live order flow in <code>pm_main.py</code> uses initial SL/TP, opposite-signal close, and margin-protection close, but no active <code>modify_position()</code> path.</p>
+        <p><strong>Impact:</strong> these config toggles should not be treated as live protections today. They are helper seams, not active broker-side order management.</p>
+        <p><strong>Recommendation:</strong> same as scaling: either wire them into the live MT5 loop or mark them clearly as non-live helper fields.</p>
+      </article>
+
+      <article class="finding medium">
+        <div class="sev">Medium</div>
+        <h3>Broker symbol resolution failures degrade or skip live trading for affected instruments</h3>
+        <p><strong>Why it matters:</strong> startup spec sync logs a warning and falls back to config values when broker aliases are unresolved, but live symbol processing later returns immediately if the symbol still cannot be resolved.</p>
+        <p><strong>Evidence:</strong> sync warnings at <code>pm_main.py:697-700</code>; live per-symbol processing returns on unresolved broker symbols at <code>pm_main.py:1289-1290</code>.</p>
+        <p><strong>Impact:</strong> unresolved CFDs/crypto pairs are not just less precise; they are often effectively non-tradable in the live loop unless the broker alias is recognized.</p>
+        <p><strong>Recommendation:</strong> add broker alias mapping for your unresolved symbols or expose a config-backed symbol alias table as an authoritative extension point.</p>
+      </article>
+
+      <article class="finding low">
+        <div class="sev">Low</div>
+        <h3><code>config.json</code> contains duplicate <code>pipeline.risk_per_trade_pct</code> keys</h3>
+        <p><strong>Evidence:</strong> <code>config.json:6</code>, <code>config.json:11</code>, and the operative live field at <code>config.json:88</code> under <code>position</code>.</p>
+        <p><strong>Impact:</strong> the runtime currently behaves correctly because live entry uses <code>position.risk_per_trade_pct</code> when present, but the duplicated pipeline keys create avoidable ambiguity during reviews and incident response.</p>
+        <p><strong>Recommendation:</strong> remove the duplicate pipeline entries so config remains unambiguous as the single source of truth.</p>
+      </article>
+    </section>
+
+    <section class="panel">
+      <h2>Verified Strengths</h2>
+      <ul>
+        <li><strong>Config-first risk basis is now correct.</strong> The live entry path starts from <code>position.risk_per_trade_pct</code>, uses <code>position.max_risk_pct</code> as the hard cap, and respects <code>pipeline.min_trade_risk_pct</code> as a viability threshold rather than a forced floor.</li>
+        <li><strong>Risk scalars are no longer silently default-on.</strong> <code>live_risk_scalars_enabled</code> is default-off in <code>pm_core.py:583</code> and only activates overlays when explicitly enabled in <code>pm_enhancement_seams.py:492-500</code>.</li>
+        <li><strong>Spread overlay remains explicitly config-gated.</strong> It can block or soften the effective target only when <code>execution_spread_filter_enabled</code> is on, which matches the current config-first model.</li>
+        <li><strong>Execution uses broker-aware pricing and contract math.</strong> The live path sizes from MT5 <code>order_calc_profit</code> first, then falls back to tick math, and only lastly to pip-value math.</li>
+        <li><strong>Broker-side protection is strong.</strong> Market orders validate side-correct SL/TP placement, stop-distance rules, filling mode, and <code>order_check()</code> preflight before submission in <code>pm_mt5.py:691-824</code>.</li>
+        <li><strong>Stop widening preserves the validated reward:risk relationship.</strong> The live path widens only when required by broker stop-distance constraints and recalculates TP to preserve the original R multiple.</li>
+        <li><strong>Entry duplication is throttled.</strong> Decision throttling prevents the same decision on the same bar from being retried or re-logged repeatedly.</li>
+        <li><strong>Live fail-closed behavior is generally good.</strong> Missing symbol info, missing ticks, missing account info, margin stress, and unresolved position timeframe metadata all block trading rather than trading blind.</li>
+        <li><strong>Margin protection is real and tested.</strong> The current margin cycle closes losers first in recovery/panic states and is covered by dedicated tests.</li>
+        <li><strong>MT5 fill-price logging is improved.</strong> The connector no longer prints <code>0.00000</code> when MT5 omits the returned fill price; it falls back to the requested execution price for logging continuity.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Scaling And Order-Management Reality Check</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Capability</th>
+            <th>Configured Field Exists</th>
+            <th>Live MT5 Loop Active</th>
+            <th>Audit View</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Initial SL/TP on entry</td>
+            <td>Yes</td>
+            <td>Yes</td>
+            <td>Trusted</td>
+          </tr>
+          <tr>
+            <td>Opposite-signal close</td>
+            <td>CLI toggle</td>
+            <td>Yes</td>
+            <td>Trusted, conservative because it closes and returns without same-cycle reversal</td>
+          </tr>
+          <tr>
+            <td>Margin-protection forced close</td>
+            <td>Yes</td>
+            <td>Yes</td>
+            <td>Trusted</td>
+          </tr>
+          <tr>
+            <td>Trailing stop</td>
+            <td>Yes</td>
+            <td>No</td>
+            <td>Dormant helper, do not rely on live</td>
+          </tr>
+          <tr>
+            <td>Breakeven stop</td>
+            <td>Yes</td>
+            <td>No</td>
+            <td>Dormant helper, do not rely on live</td>
+          </tr>
+          <tr>
+            <td>Max trade duration</td>
+            <td>Yes</td>
+            <td>No</td>
+            <td>Dormant helper, do not rely on live</td>
+          </tr>
+          <tr>
+            <td>Scale-ins / scaling</td>
+            <td>Yes</td>
+            <td>No</td>
+            <td>Not implemented in live order flow</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Trust Verdict</h2>
+      <p><strong>Can you trust the live order flow today?</strong> Yes for the primary entry path, with caveats.</p>
+      <ul>
+        <li>You can trust the config-first sizing basis, broker-aware pricing, hard risk cap enforcement, stop validation, preflight, same-bar decision throttling, and margin protection.</li>
+        <li>You should <strong>not</strong> treat scaling, trailing stop, breakeven, or max-duration fields as active live behavior.</li>
+        <li>You should treat same-symbol exposure accounting as <strong>directionally correct but not fully faithful</strong> until comments store actual risk rather than target risk.</li>
+        <li>You should treat unresolved broker-symbol warnings as operationally significant because they can prevent live trading on those instruments.</li>
+      </ul>
+      <p><strong>Operational confidence level:</strong> strong enough for disciplined live use on well-mapped symbols, but not yet "fully trust without caveats" until the two high-severity findings are resolved.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Evidence And Validation</h2>
+      <p>Relevant regression coverage was executed during this audit:</p>
+      <ul>
+        <li><code>python -m unittest tests.test_mt5_connector tests.test_portfolio_risk_cap tests.test_live_loop_integration tests.test_margin_protection tests.test_secondary_position_inference tests.test_enhancement_seams tests.test_config_source_of_truth</code></li>
+        <li>Result: <strong>68 tests, OK</strong></li>
+        <li><code>python -m unittest discover -s tests -p "test*.py"</code></li>
+        <li>Result: <strong>213 tests, OK</strong></li>
+      </ul>
+    </section>
+  </div>
+</body>
+</html>

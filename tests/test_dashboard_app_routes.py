@@ -37,6 +37,12 @@ class DashboardAppRouteTests(unittest.TestCase):
         with open(os.path.join(self.pm_root, filename), "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
 
+    def _load_strict_json(self, response):
+        def reject_constant(value):
+            raise ValueError(f"Non-standard JSON constant emitted: {value}")
+
+        return json.loads(response.get_data(as_text=True), parse_constant=reject_constant)
+
     def test_api_config_rejects_invalid_json_and_persists_atomically(self) -> None:
         app = create_app(self.config_path, start_background_workers=False)
         client = app.test_client()
@@ -223,6 +229,80 @@ class DashboardAppRouteTests(unittest.TestCase):
         self.assertEqual(row["quality_score"], 0.0)
         self.assertEqual(row["regime_train_trades"], 0)
         self.assertEqual(row["regime_val_trades"], 0)
+
+    def test_strategies_emit_strict_json_when_metrics_are_non_finite(self) -> None:
+        self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})
+        self._write_pm_configs(
+            "pm_configs_high_risk.json",
+            {
+                "EURUSD": {
+                    "symbol": "EURUSD",
+                    "is_validated": True,
+                    "regime_configs": {
+                        "M5": {
+                            "RANGE": {
+                                "strategy_name": "NonFiniteWinner",
+                                "quality_score": 1.2,
+                                "regime_train_trades": float("inf"),
+                                "val_metrics": {
+                                    "win_rate": 100.0,
+                                    "profit_factor": float("inf"),
+                                },
+                                "train_metrics": {
+                                    "profit_factor": float("nan"),
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        )
+
+        app = create_app(self.config_path, start_background_workers=False)
+        client = app.test_client()
+        response = client.get("/api/strategies")
+
+        self.assertEqual(response.status_code, 200)
+        payload = self._load_strict_json(response)
+        row = payload["rows"][0]
+        self.assertIsNone(row["regime_train_trades"])
+        self.assertIsNone(row["val_metrics"]["profit_factor"])
+        self.assertIsNone(row["train_metrics"]["profit_factor"])
+
+    def test_strategies_handle_regime_invalid_status_and_timezone_valid_until(self) -> None:
+        self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})
+        self._write_pm_configs(
+            "pm_configs_high_risk.json",
+            {
+                "GBPUSD": {
+                    "symbol": "GBPUSD",
+                    "is_validated": True,
+                    "valid_until": "2099-01-01T00:00:00+00:00",
+                    "regime_configs": {
+                        "H1": {
+                            "TREND": {
+                                "strategy_name": "RejectedWinner",
+                                "validation_status": "invalid",
+                                "validation_reason": "Out-of-sample regression",
+                            }
+                        }
+                    },
+                }
+            },
+        )
+
+        app = create_app(self.config_path, start_background_workers=False)
+        client = app.test_client()
+
+        hidden = client.get("/api/strategies")
+        self.assertEqual(hidden.status_code, 200)
+        self.assertEqual(self._load_strict_json(hidden)["rows"], [])
+
+        shown = client.get("/api/strategies?include_invalid=1")
+        self.assertEqual(shown.status_code, 200)
+        payload = self._load_strict_json(shown)
+        self.assertEqual(payload["rows"][0]["validation_status"], "invalid")
+        self.assertEqual(payload["summary"]["invalid"], 1)
 
     def test_trade_history_uses_pipeline_winner_ledger_for_enrichment(self) -> None:
         self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})

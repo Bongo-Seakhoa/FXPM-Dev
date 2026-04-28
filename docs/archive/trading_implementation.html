@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FXPM Trading Implementation Audit - Ultra-Small-Account Live Mode</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f1ea;
+      --paper: #fffdf8;
+      --ink: #1f1b16;
+      --muted: #6c6256;
+      --line: #d8ccbd;
+      --accent: #8f4d18;
+      --good: #165a3d;
+      --warn: #8f5b00;
+      --bad: #9d1f1f;
+      --chip: #efe4d4;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #efe7db 0%, var(--bg) 100%);
+      color: var(--ink);
+      font: 16px/1.55 Georgia, "Times New Roman", serif;
+    }
+
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+
+    .hero,
+    section,
+    .note {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 10px 30px rgba(48, 32, 14, 0.06);
+    }
+
+    .hero {
+      padding: 28px 28px 22px;
+      margin-bottom: 20px;
+    }
+
+    section {
+      padding: 24px 26px;
+      margin-top: 18px;
+    }
+
+    .note {
+      padding: 18px 20px;
+      margin-top: 18px;
+    }
+
+    h1, h2, h3 {
+      font-family: Cambria, Georgia, serif;
+      line-height: 1.2;
+      margin: 0 0 14px;
+    }
+
+    h1 { font-size: 2rem; }
+    h2 { font-size: 1.35rem; }
+    h3 { font-size: 1.05rem; margin-top: 18px; }
+
+    p { margin: 0 0 12px; }
+    ul { margin: 0 0 12px 20px; }
+    li { margin: 0 0 8px; }
+
+    .meta {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .card {
+      background: #faf4ea;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px 14px 12px;
+    }
+
+    .card strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .chip {
+      display: inline-block;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: var(--chip);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      font-size: 0.88rem;
+      margin-right: 6px;
+      margin-bottom: 6px;
+    }
+
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 0.96rem;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f7efe2;
+    }
+
+    code {
+      background: #f4eadb;
+      border: 1px solid #e2d4bf;
+      border-radius: 6px;
+      padding: 1px 5px;
+      font-size: 0.92em;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="hero">
+      <h1>FXPM Trading Implementation Audit</h1>
+      <p class="meta">Date: 2026-04-25 | Scope: preparing FXPM for live proof-of-ability trading on a <code>$25</code> account | Method: codebase audit plus targeted runtime and config implementation</p>
+      <p>This document focuses on what the PM needs in order to function meaningfully on an ultra-small balance during a temporary, deliberately high-risk proof phase. The core question is not whether the PM should become conservative; it is whether the live stack can express valid winners cleanly at broker-minimum size while still preserving real execution discipline.</p>
+      <div class="summary">
+        <div class="card">
+          <strong class="warn">Main conclusion</strong>
+          FXPM does not need a redesign for this temporary mode. The core issue was never the discovery engine; it was the live expression of winners at <code>0.01</code> lot on a tiny balance. This pass keeps the tournament broad and fixes the highest-value downstream execution gaps.
+        </div>
+        <div class="card">
+          <strong class="bad">Primary blockers</strong>
+          The hard constraints are still broker min-lot granularity, spread and commission drag, broker stop-distance rules, and real margin feasibility. Commission-aware risk math, projected margin checks, winner-ledger isolation, decision-time regime lookup, margin reopen hysteresis, and fresh duplicate-position guards are now implemented.
+        </div>
+        <div class="card">
+          <strong class="good">Best first move</strong>
+          Run the shipped high-risk profile in <code>config.json</code>, keep the full live symbol set active, and let real feasibility determine what opens now versus later as the account grows.
+        </div>
+        <div class="card">
+          <strong class="good">Philosophy alignment</strong>
+          The recommended changes stay downstream of winner discovery. They change live expression and live account handling on a tiny balance, not the upstream strategy tournament.
+        </div>
+      </div>
+    </div>
+
+    <section>
+      <h2>1. Scope and Method</h2>
+      <p>The findings below are split into two buckets:</p>
+      <p><span class="chip">Config-first</span> the PM can already behave differently through settings and profile choice.</p>
+      <p><span class="chip">Code-path</span> the runtime logic that previously distorted tiny-account live trading has now been tightened where the fixes were high value and low regression risk.</p>
+      <p>This audit is grounded in the current code and docs, especially <code>config.json</code>, <code>pm_main.py</code>, <code>pm_core.py</code>, <code>pm_mt5.py</code>, <code>pm_position.py</code>, <code>pm_enhancement_seams.py</code>, <code>README.md</code>, and <code>SETUP_AND_RUN.md</code>.</p>
+    </section>
+
+    <section>
+      <h2>2. Highest-Impact Findings</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Severity</th>
+            <th>Type</th>
+            <th>Finding</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="bad"><strong>Critical</strong></td>
+            <td>Config-first</td>
+            <td>The checked-in live profile is now explicitly small-account and high-risk: <code>position.risk_per_trade_pct = 2.0</code>, <code>position.max_risk_pct = 3.0</code>, <code>risk_basis = "balance"</code>, looser spread and same-symbol constraints, explicit micro-account margin thresholds, and a dedicated high-risk winner ledger.</td>
+            <td><code>config.json</code>, <code>pm_core.py</code></td>
+          </tr>
+          <tr>
+            <td class="bad"><strong>Critical</strong></td>
+            <td>Code-path</td>
+            <td>The live path sizes to target risk, clamps volume up to broker minimum size, then recomputes actual risk and blocks only if the hard cap is breached. On a micro account, many trades fail because <code>0.01</code> lot is already too large for the intended stop.</td>
+            <td><code>pm_main.py:3567-3690</code></td>
+          </tr>
+          <tr>
+            <td class="bad"><strong>Critical</strong></td>
+            <td>Code-path</td>
+            <td>Live hard-cap math now includes commission through a shared cost-aware stop-loss helper, bringing the live sizing path into line with the backtester's one-way commission model.</td>
+            <td><code>pm_main.py</code>, <code>pm_mt5.py</code>, <code>pm_core.py</code></td>
+          </tr>
+          <tr>
+            <td class="bad"><strong>High</strong></td>
+            <td>Code-path</td>
+            <td>The PM now performs a projected free-margin feasibility check before order submission, converting a large class of late broker rejects into clean PM-side decisions.</td>
+            <td><code>pm_mt5.py</code>, <code>pm_main.py</code></td>
+          </tr>
+          <tr>
+            <td class="bad"><strong>High</strong></td>
+            <td>Code-path</td>
+            <td>Broker stop-distance and freeze rules can widen or reject stops, and that widening can destroy tiny-account viability at the minimum lot floor.</td>
+            <td><code>pm_main.py:3392-3404</code>, <code>pm_mt5.py:747-778</code>, <code>pm_mt5.py:929-949</code></td>
+          </tr>
+          <tr>
+            <td class="warn"><strong>High</strong></td>
+            <td>Config-first</td>
+            <td>The spread-quality overlay is active and meaningful. It can fully block trades or shrink risk before sizing, which matters much more on a micro account than on a funded-challenge-sized account.</td>
+            <td><code>config.json:112-115</code>, <code>pm_enhancement_seams.py:473-530</code>, <code>pm_main.py:3344-3380</code></td>
+          </tr>
+          <tr>
+            <td class="warn"><strong>High</strong></td>
+            <td>Config-first</td>
+            <td>The live-authoritative risk knobs are in <code>position</code>, not <code>pipeline</code>. Raising only <code>pipeline.risk_per_trade_pct</code> would not actually re-profile live trading if the <code>position</code> section stays explicit.</td>
+            <td><code>config.json:7</code>, <code>config.json:136</code>, <code>pm_main.py:4500-4502</code></td>
+          </tr>
+          <tr>
+            <td class="warn"><strong>Medium</strong></td>
+            <td>Code-path</td>
+            <td>The winner ledger is now configurable through the pipeline surface, and the shipped high-risk profile isolates its validated winners in <code>pm_configs_high_risk.json</code> instead of defaulting to the shared <code>pm_configs.json</code>.</td>
+            <td><code>pm_core.py</code>, <code>pm_main.py</code>, <code>config.json</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. Why the Original Profile Failed on a $25 Account</h2>
+      <p>Before this pass, the PM was trying to trade around <code>$0.125</code> target risk with a <code>$0.25</code> hard cap. The table below preserves that original constraint picture because it explains why the micro-account profile had to be loosened.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Risk per pip / point at 0.01 lot</th>
+            <th>Commission at 0.01 lot</th>
+            <th>Spread cost at entry from the pre-change config</th>
+            <th>Max stop width that still fit the old 1.0% hard cap after commission</th>
+            <th>Max stop width that still fit the old 0.5% target after commission</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>EURUSD</td>
+            <td><code>$0.10</code> per pip</td>
+            <td><code>$0.07</code></td>
+            <td><code>$0.10</code></td>
+            <td><code>1.8</code> pips</td>
+            <td><code>0.55</code> pips</td>
+          </tr>
+          <tr>
+            <td>GBPUSD</td>
+            <td><code>$0.10</code> per pip</td>
+            <td><code>$0.07</code></td>
+            <td><code>$0.12</code></td>
+            <td><code>1.8</code> pips</td>
+            <td><code>0.55</code> pips</td>
+          </tr>
+          <tr>
+            <td>USDJPY</td>
+            <td><code>$0.09</code> per pip</td>
+            <td><code>$0.07</code></td>
+            <td><code>$0.09</code></td>
+            <td><code>2.0</code> pips</td>
+            <td><code>0.61</code> pips</td>
+          </tr>
+          <tr>
+            <td>XAUUSD</td>
+            <td><code>$0.01</code> per pip</td>
+            <td><code>$0.05</code></td>
+            <td><code>$0.03</code></td>
+            <td><code>20</code> pips</td>
+            <td><code>7.5</code> pips</td>
+          </tr>
+          <tr>
+            <td>US500</td>
+            <td><code>$0.01</code> per point</td>
+            <td><code>$0.00</code></td>
+            <td><code>$0.015</code></td>
+            <td><code>25</code> points</td>
+            <td><code>12.5</code> points</td>
+          </tr>
+          <tr>
+            <td>US100</td>
+            <td><code>$0.01</code> per point</td>
+            <td><code>$0.00</code></td>
+            <td><code>$0.02</code></td>
+            <td><code>25</code> points</td>
+            <td><code>12.5</code> points</td>
+          </tr>
+          <tr>
+            <td>BTCUSD</td>
+            <td><code>$0.01</code> per pip</td>
+            <td><code>$0.00</code></td>
+            <td><code>$0.15</code></td>
+            <td><code>25</code> pips</td>
+            <td><code>12.5</code> pips</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="small">These figures are derived from the current <code>instrument_specs</code> in <code>config.json</code>. They are indicative rather than guaranteed because live MT5 metadata can overwrite <code>min_lot</code>, <code>volume_step</code>, <code>spread_avg</code>, and stop-distance fields at runtime.</p>
+      <p><strong>Interpretation:</strong> for major FX pairs, the current micro-account target is effectively incompatible with normal stop widths at <code>0.01</code> lot. The PM is not refusing trades philosophically; many trades simply cannot be expressed inside the current dollar cap once broker reality is applied.</p>
+    </section>
+
+    <section>
+      <h2>4. Config-First State Now Shipped in the Repo</h2>
+      <h3>4.1 Live risk profile is now explicitly micro-account and high-risk</h3>
+      <ul>
+        <li><code>position.risk_per_trade_pct = 2.0</code>, <code>position.max_risk_pct = 3.0</code>, and <code>allow_min_lot_risk_clamp = true</code> now give the live path room to express valid micro-account trades while still honoring a real hard cap.</li>
+        <li><code>pipeline.risk_per_trade_pct = 1.0</code> stays at a standard baseline so the temporary live account expression does not quietly push the upstream tournament itself into a tiny-account risk posture.</li>
+      </ul>
+
+      <h3>4.2 Risk basis is now set for temporary proof-mode deployment</h3>
+      <ul>
+        <li>The active profile now uses <code>risk_basis = "balance"</code>. On a tiny account this prevents open PnL from hollowing out the next trade too aggressively during the proof phase.</li>
+      </ul>
+
+      <h3>4.3 Spread and same-symbol controls are still real, but now looser</h3>
+      <ul>
+        <li>The spread overlay remains on, but the shipped proof profile now uses <code>min_edge_mult = 1.25</code>, <code>spike_mult = 3.0</code>, and <code>penalty_start_mult = 0.75</code> so it is less hair-trigger on a tiny account.</li>
+        <li><code>secondary_trade_max_risk_pct = 1.0</code> and <code>max_combined_risk_pct = 4.0</code> remain same-symbol controls, not umbrella portfolio lockouts, but they now leave more room for local winners to stay active.</li>
+      </ul>
+
+      <h3>4.4 Margin thresholds are now explicit rather than hidden in dataclass defaults</h3>
+      <ul>
+        <li>The proof profile now exposes the full margin ladder directly in config as <code>80 / 65 / 50 / 90</code> for entry block, recovery, panic, and reopen, with a shorter <code>5</code>-minute reopen cooldown.</li>
+        <li>The runtime now treats <code>margin_reopen_level</code> as a true recovery threshold after margin stress or a forced close. Missing <code>margin_level</code> is neutral only when no margin is in use; with open exposure it blocks new entries until account data is trustworthy.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>5. Code-Path Constraints and What Was Implemented</h2>
+      <h3>5.1 The broker min-lot floor is the main executable bottleneck</h3>
+      <p>The live path in <code>pm_main.py</code> does not behave like the standalone sizing helper in <code>pm_position.py</code>. Live trading clamps to broker minimum size, then lets the hard cap decide whether the trade survives.</p>
+      <ul>
+        <li>Target risk amount is computed from account balance or equity: <code>pm_main.py:3414-3420</code>, <code>pm_main.py:3567</code>.</li>
+        <li>Broker minimum volume is enforced by <code>min_vol = max(config.min_position_size, symbol_info.volume_min)</code>: <code>pm_main.py:3570</code>.</li>
+        <li>Actual post-normalization risk is then checked against the hard cap: <code>pm_main.py:3645-3690</code>.</li>
+      </ul>
+
+      <h3>5.2 Live pre-entry risk now includes commission</h3>
+      <p>The live path now uses a shared cost-aware stop-loss helper. It still estimates stop risk from MT5 contract math first and deterministic fallbacks second, but it no longer omits commission on a tiny account.</p>
+      <ul>
+        <li>Live stop-risk and post-fill telemetry now use the same helper path in <code>pm_main.py</code>.</li>
+        <li>Backtest commission deduction remains in <code>pm_core.py</code>, so live and research now agree on the one-way commission model.</li>
+      </ul>
+
+      <h3>5.3 Broker metadata overwrites config assumptions at runtime</h3>
+      <ul>
+        <li><code>tick_value</code>, <code>tick_size</code>, <code>volume_step</code>, <code>min_lot</code>, <code>max_lot</code>, <code>spread_avg</code>, and point/digit metadata are refreshed from MT5 symbol info. Evidence: <code>pm_core.py:1430-1450</code>.</li>
+        <li>That means a permissive tiny-account config is not sufficient on its own; the live broker can still make a symbol economically or operationally impossible.</li>
+      </ul>
+
+      <h3>5.4 Projected margin sizing is now implemented</h3>
+      <ul>
+        <li>The PM now estimates required margin before submission using an <code>order_calc_margin</code>-style wrapper in <code>pm_mt5.py</code> and blocks locally when free margin is not sufficient.</li>
+        <li><code>order_check</code> still matters as the broker's final authority, but many impossible micro-account orders now fail cleanly inside the PM first.</li>
+      </ul>
+
+      <h3>5.5 Min-lot handling is now configurable instead of silently divergent</h3>
+      <ul>
+        <li><code>pm_main.py</code> still uses live-authoritative clamp-and-cap behavior.</li>
+        <li><code>pm_position.py</code> now has an explicit <code>allow_min_lot_risk_clamp</code> seam so the same philosophy can be opted into without forcing it globally.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>6. Instrument Economics Under a Full-Symbol High-Risk Mode</h2>
+      <p>The broad universe is not economically neutral on <code>$25</code>, but that does not mean the PM must be narrowed. In the intended high-risk proof mode, the full symbol set can remain active while real feasibility checks decide what can actually open at the current account size.</p>
+      <p><strong>Direct answer to the central question:</strong> proactive symbol limitation is not necessary for this mode. The existing live path already applies natural executable filters through min-lot sizing, hard-cap checks, broker stop rules, margin gating, and MT5 preflight. If those filters reject a trade, that is an acceptable outcome of the high-risk proof phase rather than evidence that the symbol should be removed from the PM universe.</p>
+      <ul>
+        <li>Major FX pairs are the harshest micro-account case in the current config because <code>0.01</code> lot is already around <code>$0.09-$0.10</code> per pip and commission is non-trivial.</li>
+        <li><code>XAUUSD</code> and the low-friction index complex are structurally friendlier on pip-value grounds, though live margin and stop-distance must still be confirmed.</li>
+        <li>Crypto is mixed: some symbols have low nominal pip risk but meaningfully higher spread drag.</li>
+        <li>Low pip value alone is not enough. Exotics like <code>EURZAR</code>, <code>GBPZAR</code>, and <code>USDZAR</code> look cheap per pip but are still expensive once spread and commission are included.</li>
+      </ul>
+      <p><strong>Correct implementation stance for this mode:</strong> keep the full symbol set active and accept that some symbols will simply surface non-actionable or rejected trades until the account grows enough for them to become executable. The economics above should be read as explanatory context, not as a requirement to pre-limit the PM universe.</p>
+      <p><strong>Optional operator use only:</strong> if you ever want a cleaner diagnostic run, the low-friction index complex and selected metals are the friendliest starting points, but that is now an optional convenience rather than part of the recommended high-risk live profile.</p>
+    </section>
+
+    <section>
+      <h2>7. Recommended Operating Model: Two Explicit Live Profiles</h2>
+      <p>The cleanest reversible path is to run two explicit profiles through the startup surface that already exists.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Profile</th>
+            <th>Purpose</th>
+            <th>Startup surface</th>
+            <th>Important note</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Small-account high-risk proof mode</strong></td>
+            <td>Temporary proof-of-ability on a micro balance where the PM must stay active and accept higher local risk.</td>
+            <td><code>python pm_main.py --trade --config config.json</code></td>
+            <td>Keep the full symbol universe active and let live feasibility determine what actually opens.</td>
+          </tr>
+          <tr>
+            <td><strong>Standard larger-account live mode</strong></td>
+            <td>Normal live deployment once capital is large enough to support more reasonable risk and broader symbol breadth.</td>
+            <td><code>python pm_main.py --trade --config &lt;standard-profile.json&gt;</code></td>
+            <td>Restores safer settings and a broader symbol set.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>Good news:</strong> the code already supports separate configs through <code>--config</code>, can isolate most runtime artifacts through <code>pipeline.data_dir</code>, <code>pipeline.output_dir</code>, and <code>pipeline.log_dir</code>, and now also supports a configurable validated-winner ledger path.</p>
+      <p><strong>Current shipped state:</strong> the small-account profile isolates its winners in <code>pm_configs_high_risk.json</code> through <code>pipeline.winner_ledger_path</code>.</p>
+      <p><strong>Why this remains aligned with PM philosophy:</strong> this split happens after winner discovery. It does not curate or narrow the tournament itself; it only changes the live account expression of winners once they already exist. In the small-account high-risk mode, even symbols that are not yet executable remain part of the live opportunity surface and can naturally become tradable later as capital grows.</p>
+    </section>
+
+    <section>
+      <h2>8. Config-First Profile Recommendation</h2>
+      <p>The first wave should be configuration work, not a heavy rewrite. The table below gives a practical starting point.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Setting</th>
+            <th>Current live profile</th>
+            <th>Small-account high-risk</th>
+            <th>Standard larger-account</th>
+            <th>Rationale</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>pipeline.risk_per_trade_pct</code></td>
+            <td><code>1.0</code></td>
+            <td><code>1.0</code></td>
+            <td><code>1.0</code></td>
+            <td>Keep the tournament on a standard baseline while letting the live proof mode be more aggressive downstream in <code>position</code>.</td>
+          </tr>
+          <tr>
+            <td><code>position.risk_per_trade_pct</code></td>
+            <td><code>2.0</code></td>
+            <td><code>2.0</code></td>
+            <td><code>1.0</code></td>
+            <td>This is the live-authoritative knob. On <code>$25</code>, <code>2.0%</code> means a target of <code>$0.50</code>, which matches the intended stop scale far better than the earlier challenge profile.</td>
+          </tr>
+          <tr>
+            <td><code>position.risk_basis</code></td>
+            <td><code>balance</code></td>
+            <td><code>balance</code></td>
+            <td><code>equity</code></td>
+            <td>Use <code>balance</code> in the proof phase so open PnL does not throttle the next live trade too aggressively on a tiny account. Return to <code>equity</code> when the account is larger and more stability-focused.</td>
+          </tr>
+          <tr>
+            <td><code>position.max_risk_pct</code></td>
+            <td><code>3.0</code></td>
+            <td><code>3.0</code></td>
+            <td><code>2.0</code></td>
+            <td>The tiny-account mode needs room for min-lot and volume-step drift. The hard cap still remains real, but it cannot be as tight as the challenge profile.</td>
+          </tr>
+          <tr>
+            <td><code>pipeline.min_trade_risk_pct</code></td>
+            <td><code>0.05</code></td>
+            <td><code>0.05</code></td>
+            <td><code>0.10</code></td>
+            <td>Prevents spread penalties or same-symbol scaling from canceling otherwise meaningful micro-account opportunities too early.</td>
+          </tr>
+          <tr>
+            <td><code>execution_spread_filter_enabled</code></td>
+            <td><code>true</code></td>
+            <td><code>true</code></td>
+            <td><code>true</code></td>
+            <td>Keep execution discipline, but soften thresholds rather than stripping the filter away immediately.</td>
+          </tr>
+          <tr>
+            <td><code>execution_spread_min_edge_mult</code></td>
+            <td><code>1.25</code></td>
+            <td><code>1.25</code></td>
+            <td><code>1.5</code></td>
+            <td>Reduces overblocking when ATR is modest but the trade is still worth taking in the proof phase.</td>
+          </tr>
+          <tr>
+            <td><code>execution_spread_spike_mult</code></td>
+            <td><code>3.0</code></td>
+            <td><code>3.0</code></td>
+            <td><code>2.0</code></td>
+            <td>Keeps the spike blocker, but makes it less hair-trigger in the temporary high-risk mode.</td>
+          </tr>
+          <tr>
+            <td><code>execution_spread_penalty_start_mult</code></td>
+            <td><code>0.75</code></td>
+            <td><code>0.75</code></td>
+            <td><code>0.5</code></td>
+            <td>Delays soft risk shrinkage so the overlay does not hollow out the already small effective risk budget.</td>
+          </tr>
+          <tr>
+            <td><code>secondary_trade_max_risk_pct</code></td>
+            <td><code>1.0</code></td>
+            <td><code>1.0</code></td>
+            <td><code>0.90</code></td>
+            <td>The proof phase should not be blocked too easily by a second local winner on the same symbol if the operator accepts the extra risk.</td>
+          </tr>
+          <tr>
+            <td><code>max_combined_risk_pct</code></td>
+            <td><code>4.0</code></td>
+            <td><code>4.0</code></td>
+            <td><code>3.0</code></td>
+            <td>This is same-symbol only, not portfolio-wide. The temporary mode can afford a looser same-symbol ceiling.</td>
+          </tr>
+          <tr>
+            <td><code>margin_entry_block_level</code></td>
+            <td><code>80.0</code></td>
+            <td><code>80.0</code></td>
+            <td><code>100.0</code></td>
+            <td>The proof phase should tolerate lower margin before blocking new entries, while still keeping a real safety boundary.</td>
+          </tr>
+          <tr>
+            <td><code>margin_recovery_start_level</code></td>
+            <td><code>65.0</code></td>
+            <td><code>65.0</code></td>
+            <td><code>80.0</code></td>
+            <td>Pushes forced-closure logic lower in the temporary high-risk mode.</td>
+          </tr>
+          <tr>
+            <td><code>margin_panic_level</code></td>
+            <td><code>50.0</code></td>
+            <td><code>50.0</code></td>
+            <td><code>65.0</code></td>
+            <td>Keeps a true emergency floor without treating ordinary micro-account strain as an immediate panic event.</td>
+          </tr>
+          <tr>
+            <td><code>margin_reopen_level</code></td>
+            <td><code>90.0</code></td>
+            <td><code>90.0</code></td>
+            <td><code>100.0</code></td>
+            <td>Lets the temporary mode resume activity sooner after a forced close.</td>
+          </tr>
+          <tr>
+            <td><code>margin_reopen_cooldown_minutes</code></td>
+            <td><code>5.0</code></td>
+            <td><code>5.0</code></td>
+            <td><code>15.0</code></td>
+            <td>Shortens the post-event freeze without removing it.</td>
+          </tr>
+          <tr>
+            <td><code>symbols</code> or <code>--symbols</code></td>
+            <td>Broad default universe</td>
+            <td>Full intended live universe</td>
+            <td>Full intended live universe</td>
+            <td>In the intended proof phase, the PM keeps the full symbol set active and lets real execution feasibility determine which winners can open now versus later as the account grows.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>Important implementation note:</strong> the shipped profile now uses an intentional split: <code>pipeline.risk_per_trade_pct</code> stays at a standard tournament-facing baseline while <code>position.risk_per_trade_pct</code> carries the temporary high-risk live expression.</p>
+      <p><strong>Auxiliary feature posture now shipped:</strong> <code>local_governance_tournament_enabled = true</code>, <code>local_governance_live_mode = "shadow"</code>, <code>portfolio_observatory_enabled = true</code>, <code>live_risk_scalars_mode = "shadow"</code>, <code>daily_loss_advisory_pct = 8.0</code>, <code>session_loss_advisory_pct = 15.0</code>, <code>storage_observe_only = true</code>, and <code>storage_metaquotes_cleanup_enabled = false</code>.</p>
+      <p><strong>Why these auxiliary choices fit the philosophy:</strong> the local governance layer is the strongest dormant downstream improvement seam, while the observatory and loss advisories add visibility without imposing portfolio-level lockouts. Risk scalars stay in <code>shadow</code> mode so they inform but do not mute the aggressive proof profile, and the global exit pack remains <code>off</code> because it is not the right place to impose one umbrella policy across many local winners.</p>
+      <p><strong>Full-symbol interpretation:</strong> the high-risk small-account profile should not proactively narrow the live universe. If a symbol cannot currently open because of margin, min-lot, stop-distance, spread, or broker feasibility, that is acceptable; the PM can continue surfacing those opportunities until the account is large enough for them to become executable.</p>
+      <p><strong>Confidence adjustment:</strong> the correct mindset for this temporary mode is more exploratory and less defensive than the earlier framing. The PM should be allowed as much breadth and freedom as possible, while real execution feasibility remains the final gate. In practice that means loosening non-feasibility restrictions and accepting repeated skips, rejections, and delayed activation on deeper symbols as normal behavior rather than something that must be designed away.</p>
+      <p><strong>What not to do first:</strong> I do not recommend an internal "virtual 5000 notional" model as the initial fix. It adds abstraction but does not solve the broker's actual <code>min_lot</code>, spread, stop-distance, or margin constraints.</p>
+    </section>
+
+    <section>
+      <h2>9. Code Changes Implemented in This Pass</h2>
+      <p>The PM did not need a full overhaul for this use case. The highest-value changes were narrow runtime fixes that improved tiny-account live behavior, artifact truthfulness, and optimizer/live alignment without narrowing the tournament.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Priority</th>
+            <th>Change</th>
+            <th>Implementation outcome</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>1</strong></td>
+            <td>Commission-aware live risk and hard-cap math.</td>
+            <td>Implemented through a shared stop-loss helper so sizing, open-position risk estimation, and post-fill telemetry all include commission when enabled.</td>
+          </tr>
+          <tr>
+            <td><strong>2</strong></td>
+            <td>Projected margin feasibility before request submission.</td>
+            <td>Implemented through an MT5 margin wrapper plus a PM-side free-margin gate before <code>send_market_order</code>.</td>
+          </tr>
+          <tr>
+            <td><strong>3</strong></td>
+            <td>Configurable validated-winner ledger path.</td>
+            <td>Implemented through <code>pipeline.winner_ledger_path</code> plus CLI threading so the temporary proof profile can keep its own winner chain.</td>
+          </tr>
+          <tr>
+            <td><strong>4</strong></td>
+            <td>Configurable min-lot clamp philosophy.</td>
+            <td>Implemented as an opt-in seam in <code>pm_position.py</code> so the live clamp-and-cap behavior can be reused where wanted without forcing it globally.</td>
+          </tr>
+          <tr>
+            <td><strong>5</strong></td>
+            <td>Dashboard active-ledger and write-surface hardening.</td>
+            <td>Implemented so the dashboard follows <code>pipeline.winner_ledger_path</code> by default, gates remote write APIs behind <code>PM_DASHBOARD_WRITE_TOKEN</code>, and refreshes root CSV data through a locked merge plus atomic replace.</td>
+          </tr>
+          <tr>
+            <td><strong>6</strong></td>
+            <td>Decision-time regime alignment.</td>
+            <td>Implemented so live winner lookup now prefers <code>REGIME_LIVE</code> / <code>REGIME_STRENGTH_LIVE</code>, matching the optimizer and backtester decision surface.</td>
+          </tr>
+          <tr>
+            <td><strong>7</strong></td>
+            <td>Margin reopen and account-snapshot safety.</td>
+            <td>Implemented stateful reopen hysteresis using <code>margin_reopen_level</code>, with fail-closed handling for missing margin level when margin exposure exists.</td>
+          </tr>
+          <tr>
+            <td><strong>8</strong></td>
+            <td>Fresh final duplicate-position check.</td>
+            <td>Implemented so final order submission refreshes exact/symbol broker positions after the sweep snapshot and fails closed if the fresh snapshot is unavailable.</td>
+          </tr>
+          <tr>
+            <td><strong>9</strong></td>
+            <td>Artifact and cache telemetry truthfulness.</td>
+            <td>Implemented validation evidence, no-trade reason preservation, data-window fingerprints, ledger completion status, and resample-cache hit/miss/read/write telemetry.</td>
+          </tr>
+          <tr>
+            <td><strong>10</strong></td>
+            <td>Symbol viability report.</td>
+            <td>Still optional future observability work. It would be useful, but it was not required to put the high-risk mode into a materially better live state.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p><strong>What does not need changing:</strong> the discovery engine, the regime framework, the broad strategy tournament, and the main execution-orchestration architecture. The issue is executable trade expression on a tiny account, not the PM's core research identity.</p>
+    </section>
+
+    <section>
+      <h2>10. Transition and Reversal Logic</h2>
+      <p>The move back toward a normal live profile should be explicit, manual, and review-based. The repo already supports restart-based profile switching through <code>--config</code>; it does not support automatic account-balance-triggered switching, and that is acceptable for now.</p>
+      <h3>10.1 Recommended transition ladder</h3>
+      <ul>
+        <li><strong>Stage A: under <code>$100</code></strong> - stay in the small-account high-risk profile, keep the full symbol universe live, and review every weekly check plus every two-week retrain boundary.</li>
+        <li><strong>Stage B: <code>$100-$500</code></strong> - step down toward <code>1.5%</code> target risk and <code>2.5%</code> hard cap, start re-tightening the spread overlay, and keep reviewing which parts of the broad universe have become genuinely executable rather than merely visible.</li>
+        <li><strong>Stage C: <code>$500-$1000+</code></strong> - move toward the standard larger-account profile at the next structured review if order-check failures, margin events, and min-lot blocks are no longer dominant.</li>
+        <li><strong>Stage D: around <code>$5000</code></strong> - operate fully on the standard profile and retire the micro-account proof mode rather than letting it become permanent by accident.</li>
+      </ul>
+      <h3>10.2 Review gates before stepping down from the proof profile</h3>
+      <ul>
+        <li>MT5 insufficient-funds or invalid-volume failures are no longer common.</li>
+        <li>The account spends most of its time in <code>NORMAL</code> rather than <code>BLOCKED</code>, <code>RECOVERY</code>, or <code>PANIC</code> margin state.</li>
+        <li>Min-lot normalization is not constantly forcing actual risk to the hard cap.</li>
+        <li>The proof profile is producing real executable trades rather than mostly near-misses and broker rejections.</li>
+      </ul>
+      <p><strong>Practical note:</strong> because the PM already uses a fixed two-week retrain cycle as its freshness mechanism, the cleanest moment to change profiles is a structured weekly review or a retrain boundary, not a silent mid-cycle auto-switch.</p>
+    </section>
+
+    <div class="note">
+      <h2>11. Final Audit Judgment</h2>
+      <p><strong>Bottom line:</strong> the FXPM live stack is now materially better prepared for a temporary micro-account proof phase. The remaining hard realities are min-lot granularity, spread and friction drag, broker stop rules, and genuine margin constraints, not missing core implementation seams.</p>
+      <p><strong>Final answer on symbol scope:</strong> proactive symbol limitation is not required. In this temporary high-risk mode, the PM should keep the full symbol universe live and let real feasibility decide what opens now versus later as the account grows.</p>
+      <p><strong>Best first action set:</strong> build a dedicated small-account high-risk config, run it with the full live symbol universe active, isolate outputs as much as possible, and then promote only the small set of code changes that improve live correctness without unnecessarily constraining the PM.</p>
+      <p class="small">Audit produced from direct code inspection. Dashboard/runtime hardening has since been patched where the audit identified actionable drift.</p>
+    </div>
+  </main>
+</body>
+</html>

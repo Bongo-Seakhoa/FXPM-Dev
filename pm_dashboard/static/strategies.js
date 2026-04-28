@@ -6,12 +6,16 @@
   totalPages: 1,
   preselect: null,
   preselectApplied: false,
-  selectedRowId: ""
+  selectedRowId: "",
+  sortColumn: "quality_score",
+  sortDirection: "desc"
 };
 
 var strategyElements = {
   count: document.getElementById("strategy-count"),
-  validCount: document.getElementById("strategy-valid-count"),
+  tradeableCount: document.getElementById("strategy-tradeable-count"),
+  noTradeCount: document.getElementById("strategy-no-trade-count"),
+  expiredCount: document.getElementById("strategy-expired-count"),
   invalidCount: document.getElementById("strategy-invalid-count"),
   body: document.getElementById("strategy-body"),
   details: document.getElementById("strategy-details"),
@@ -19,6 +23,7 @@ var strategyElements = {
   train: document.getElementById("strategy-train"),
   val: document.getElementById("strategy-val"),
   includeInvalid: document.getElementById("strategy-include-invalid"),
+  hideNoTrade: document.getElementById("strategy-hide-no-trade"),
   searchInput: document.getElementById("strategy-search"),
   pageInfo: document.getElementById("strategy-page-info"),
   prevBtn: document.getElementById("strategy-prev"),
@@ -27,7 +32,8 @@ var strategyElements = {
     symbol: document.getElementById("strategy-filter-symbol"),
     timeframe: document.getElementById("strategy-filter-timeframe"),
     regime: document.getElementById("strategy-filter-regime"),
-    strategy: document.getElementById("strategy-filter-name")
+    strategy: document.getElementById("strategy-filter-name"),
+    status: document.getElementById("strategy-filter-status")
   }
 };
 
@@ -71,6 +77,7 @@ function updateFilterOptions() {
 
   for (var key in strategyElements.filters) {
     if (!Object.prototype.hasOwnProperty.call(strategyElements.filters, key)) continue;
+    if (!options[key]) continue; // Skip filters that aren't dynamically populated (e.g., status with static options).
     var select = strategyElements.filters[key];
     if (!select) continue;
     var current = select.value;
@@ -85,12 +92,15 @@ function applyFilters() {
   var searchTerm = strategyElements.searchInput && strategyElements.searchInput.value
     ? strategyElements.searchInput.value.trim().toLowerCase()
     : "";
+  var hideNoTrade = strategyElements.hideNoTrade && strategyElements.hideNoTrade.checked;
 
   strategyState.filtered = strategyState.rows.filter(function (row) {
     if (strategyElements.filters.symbol && strategyElements.filters.symbol.value && row.symbol !== strategyElements.filters.symbol.value) return false;
     if (strategyElements.filters.timeframe && strategyElements.filters.timeframe.value && row.timeframe !== strategyElements.filters.timeframe.value) return false;
     if (strategyElements.filters.regime && strategyElements.filters.regime.value && row.regime !== strategyElements.filters.regime.value) return false;
     if (strategyElements.filters.strategy && strategyElements.filters.strategy.value && row.strategy_name !== strategyElements.filters.strategy.value) return false;
+    if (strategyElements.filters.status && strategyElements.filters.status.value && row.validation_status !== strategyElements.filters.status.value) return false;
+    if (hideNoTrade && String(row.strategy_name || "").toUpperCase() === "NO_TRADE") return false;
 
     if (searchTerm) {
       var text = [row.symbol, row.timeframe, row.regime, row.strategy_name].join(" ").toLowerCase();
@@ -100,7 +110,67 @@ function applyFilters() {
     return true;
   });
 
+  sortFiltered();
   strategyState.currentPage = 1;
+}
+
+function sortKeyValue(row, column) {
+  if (column === "val_win_rate") return (row.val_metrics || {}).win_rate;
+  if (column === "val_profit_factor") return (row.val_metrics || {}).profit_factor;
+  if (column === "val_total_return_pct") return (row.val_metrics || {}).total_return_pct;
+  if (column === "val_max_drawdown_pct") return (row.val_metrics || {}).max_drawdown_pct;
+  return row[column];
+}
+
+function sortFiltered() {
+  var column = strategyState.sortColumn;
+  var direction = strategyState.sortDirection === "asc" ? 1 : -1;
+  if (!column) return;
+
+  strategyState.filtered.sort(function (a, b) {
+    var va = sortKeyValue(a, column);
+    var vb = sortKeyValue(b, column);
+    var aMissing = va === null || va === undefined || va === "";
+    var bMissing = vb === null || vb === undefined || vb === "";
+    if (aMissing && bMissing) return 0;
+    if (aMissing) return 1;
+    if (bMissing) return -1;
+    var na = Number(va);
+    var nb = Number(vb);
+    if (Number.isFinite(na) && Number.isFinite(nb)) {
+      return (na - nb) * direction;
+    }
+    var sa = String(va).toLowerCase();
+    var sb = String(vb).toLowerCase();
+    if (sa < sb) return -1 * direction;
+    if (sa > sb) return 1 * direction;
+    return 0;
+  });
+}
+
+function updateSortHeaders() {
+  var headers = document.querySelectorAll("th.sortable");
+  for (var i = 0; i < headers.length; i += 1) {
+    var th = headers[i];
+    th.classList.remove("sorted-asc", "sorted-desc");
+    if (th.getAttribute("data-sort") === strategyState.sortColumn) {
+      th.classList.add(strategyState.sortDirection === "asc" ? "sorted-asc" : "sorted-desc");
+    }
+  }
+}
+
+function handleSort(event) {
+  var th = event.target.closest("th.sortable");
+  if (!th) return;
+  var column = th.getAttribute("data-sort");
+  if (!column) return;
+  if (strategyState.sortColumn === column) {
+    strategyState.sortDirection = strategyState.sortDirection === "asc" ? "desc" : "asc";
+  } else {
+    strategyState.sortColumn = column;
+    strategyState.sortDirection = "desc";
+  }
+  applyFiltersAndRender(false);
 }
 
 function metricValue(metrics, key) {
@@ -124,19 +194,33 @@ function countValue(value) {
   return PMCommon.escapeHtml(String(value));
 }
 
+function detailMetricValue(value) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  var numberValue = Number(value);
+  if (Number.isFinite(numberValue)) return PMCommon.formatNumber(numberValue, 3);
+  return String(value);
+}
+
 function renderMetrics(metrics) {
   var keys = Object.keys(metrics || {}).sort();
   if (!keys.length) return '<div class="metric-pill">N/A</div>';
   var html = "";
   for (var i = 0; i < keys.length; i += 1) {
     var key = keys[i];
-    html += '<div class="metric-pill"><span>' + PMCommon.escapeHtml(key.replace(/_/g, " ")) + '</span><strong>' + PMCommon.escapeHtml(String(metrics[key])) + '</strong></div>';
+    html += '<div class="metric-pill"><span>' + PMCommon.escapeHtml(key.replace(/_/g, " ")) + '</span><strong>' + PMCommon.escapeHtml(detailMetricValue(metrics[key])) + '</strong></div>';
   }
   return html;
 }
 
 function showDetails(row) {
-  if (!row || !strategyElements.details) return;
+  if (!strategyElements.details) return;
+  if (!row) {
+    strategyElements.details.innerHTML = '<div class="detail-item"><span>Selection</span><strong>None</strong></div>';
+    if (strategyElements.params) strategyElements.params.textContent = "Select a row to view parameters.";
+    if (strategyElements.train) strategyElements.train.innerHTML = '<div class="metric-pill">N/A</div>';
+    if (strategyElements.val) strategyElements.val.innerHTML = '<div class="metric-pill">N/A</div>';
+    return;
+  }
 
   var details = [
     ["Symbol", row.symbol],
@@ -192,7 +276,14 @@ function renderTable() {
     var emptyRow = document.createElement("tr");
     emptyRow.innerHTML = '<td colspan="12" class="table-empty">No strategies found.</td>';
     body.appendChild(emptyRow);
+    strategyState.selectedRowId = "";
+    showDetails(null);
+    updateSortHeaders();
     return;
+  }
+
+  if (!strategyState.selectedRowId || !findRowById(pageRows, strategyState.selectedRowId)) {
+    strategyState.selectedRowId = pageRows[0].id;
   }
 
   for (var i = 0; i < pageRows.length; i += 1) {
@@ -225,9 +316,7 @@ function renderTable() {
     body.appendChild(tr);
   }
 
-  if (!strategyState.selectedRowId || !findRowById(pageRows, strategyState.selectedRowId)) {
-    strategyState.selectedRowId = pageRows[0].id;
-  }
+  updateSortHeaders();
 
   var selected = findRowById(pageRows, strategyState.selectedRowId) || pageRows[0];
   showDetails(selected);
@@ -260,10 +349,12 @@ function fetchStrategies() {
     .then(function (response) { return response.json(); })
     .then(function (data) {
       strategyState.rows = data.rows || [];
-
-      if (strategyElements.count) strategyElements.count.textContent = data.summary ? data.summary.total : strategyState.rows.length;
-      if (strategyElements.validCount) strategyElements.validCount.textContent = data.summary ? data.summary.validated : 0;
-      if (strategyElements.invalidCount) strategyElements.invalidCount.textContent = data.summary ? data.summary.invalid : 0;
+      var summary = data.summary || {};
+      if (strategyElements.count) strategyElements.count.textContent = summary.total !== undefined ? summary.total : strategyState.rows.length;
+      if (strategyElements.tradeableCount) strategyElements.tradeableCount.textContent = summary.tradeable || 0;
+      if (strategyElements.noTradeCount) strategyElements.noTradeCount.textContent = summary.no_trade || 0;
+      if (strategyElements.expiredCount) strategyElements.expiredCount.textContent = summary.expired || 0;
+      if (strategyElements.invalidCount) strategyElements.invalidCount.textContent = summary.invalid || 0;
 
       updateFilterOptions();
       applyPreselectIfAny();
@@ -307,6 +398,17 @@ function bindEvents() {
         PMCommon.showToast("Failed to load strategies");
       });
     });
+  }
+
+  if (strategyElements.hideNoTrade) {
+    strategyElements.hideNoTrade.addEventListener("change", function () {
+      applyFiltersAndRender(true);
+    });
+  }
+
+  var thead = document.querySelector(".strategy-layout thead");
+  if (thead) {
+    thead.addEventListener("click", handleSort);
   }
 
   if (strategyElements.prevBtn) {
