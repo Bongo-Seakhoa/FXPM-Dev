@@ -286,12 +286,13 @@ class PositionConfig:
     use_slippage: bool = True
     slippage_pips: float = 0.5
 
-    # Optional regime-specific TP scaling applied when building live trade intents.
+    # Optional live-only regime-specific TP scaling. Defaults are neutral so live
+    # trades use the discovered winner's TP unless the operator opts in.
     regime_tp_multipliers: Dict[str, float] = field(default_factory=lambda: {
-        "TREND": 1.25,
-        "BREAKOUT": 1.15,
-        "RANGE": 0.85,
-        "CHOP": 0.75,
+        "TREND": 1.0,
+        "BREAKOUT": 1.0,
+        "RANGE": 1.0,
+        "CHOP": 1.0,
     })
 
 

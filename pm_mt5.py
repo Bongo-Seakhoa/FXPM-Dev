@@ -622,7 +622,7 @@ class MT5Connector:
         # Ensure symbol is selected
         broker_symbol = self.find_broker_symbol(symbol)
         if broker_symbol is None:
-            logger.error(f"Symbol not found: {symbol}")
+            logger.debug(f"Broker universe miss while fetching bars: {symbol}")
             return None
         
         # Fetch bars

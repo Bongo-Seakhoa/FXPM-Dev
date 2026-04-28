@@ -42,12 +42,16 @@ _LARGE_GRID_WARN_EMITTED: Set[Tuple[str, int]] = set()
 _STRUCTURAL_SL_DEFAULT_LOOKBACK: int = 20
 _STRUCTURAL_SL_ATR_MAX_MULT: float = 1.5
 
-# Regime-aware TP multipliers applied after winner discovery.
+# Optional live-only regime-aware TP multipliers.
+#
+# Defaults are neutral so the optimizer trades exactly the SL/TP surface that won
+# discovery. Operators may still opt into a downstream live overlay by setting
+# non-1.0 values in PositionConfig/config.json.
 _DEFAULT_REGIME_TP_MULTIPLIERS: Dict[str, float] = {
-    "TREND": 1.25,
-    "BREAKOUT": 1.15,
-    "RANGE": 0.85,
-    "CHOP": 0.75,
+    "TREND": 1.0,
+    "BREAKOUT": 1.0,
+    "RANGE": 1.0,
+    "CHOP": 1.0,
 }
 _REGIME_TP_MULTIPLIERS: Dict[str, float] = dict(_DEFAULT_REGIME_TP_MULTIPLIERS)
 
@@ -55,8 +59,8 @@ _REGIME_TP_MULTIPLIERS: Dict[str, float] = dict(_DEFAULT_REGIME_TP_MULTIPLIERS)
 def set_regime_tp_multipliers(multipliers: Optional[Dict[str, float]]) -> None:
     """Replace the active regime -> TP-multiplier table.
 
-    Empty / None resets to the module default. Keys are upper-cased so live and
-    backtest paths agree on `'trend'` vs `'TREND'` even with mixed-case configs.
+    Empty / None resets to the neutral module default. Keys are upper-cased so
+    live trade intents agree on `'trend'` vs `'TREND'` with mixed-case configs.
     Non-positive or non-numeric values are dropped (treated as no-op).
     """
     global _REGIME_TP_MULTIPLIERS
@@ -570,10 +574,11 @@ class BaseStrategy(ABC):
             spec = get_instrument_spec(symbol)
         atr_pips = spec.price_to_pips(atr)
         sl_mult = self.params.get('sl_atr_mult', 2.0)
-        tp_mult = self.params.get('tp_atr_mult', 3.0)
+        tp_mult = self.params.get('tp_atr_mult', 2.0)
 
-        sl_pips = max(5.0, atr_pips * sl_mult)
-        tp_pips = max(10.0, atr_pips * tp_mult)
+        min_exit_pips = 5.0
+        sl_pips = max(min_exit_pips, atr_pips * sl_mult)
+        tp_pips = max(min_exit_pips, atr_pips * tp_mult)
 
         if self.params.get('use_structural_sl', False):
             structural_sl = self._compute_structural_sl_pips(
@@ -604,6 +609,7 @@ class BaseStrategy(ABC):
         quality_score: float = 0.0,
         governance_hint: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        apply_regime_tp_multiplier: bool = True,
     ) -> TradeIntent:
         """Build a typed executor payload without adding strategy-level policy."""
         sl_pips, tp_pips = self.calculate_stops(
@@ -613,7 +619,8 @@ class BaseStrategy(ABC):
             spec=spec,
             bar_index=bar_index,
         )
-        tp_pips = self._apply_regime_tp_multiplier(tp_pips, features, bar_index)
+        if apply_regime_tp_multiplier:
+            tp_pips = self._apply_regime_tp_multiplier(tp_pips, features, bar_index)
         entry_bar_time: Optional[str] = None
         if bar_index is not None and 0 <= int(bar_index) < len(features.index):
             entry_bar_time = str(features.index[int(bar_index)])
@@ -647,7 +654,7 @@ class BaseStrategy(ABC):
         when the live column is absent, e.g. in legacy fixtures). Silent no-op if
         the column is missing, the value is non-finite, the regime label is not
         in the active multipliers table, or the multiplier is non-positive. The
-        10-pip TP floor from ``calculate_stops`` is preserved.
+        neutral minimum-exit floor from ``calculate_stops`` is preserved.
         """
         if not _REGIME_TP_MULTIPLIERS:
             return tp_pips
@@ -676,7 +683,7 @@ class BaseStrategy(ABC):
         mult = _REGIME_TP_MULTIPLIERS.get(key)
         if mult is None or mult <= 0:
             return tp_pips
-        return max(10.0, float(tp_pips) * float(mult))
+        return max(5.0, float(tp_pips) * float(mult))
 
     def _compute_structural_sl_pips(
         self,
@@ -836,7 +843,7 @@ class EMACrossoverStrategy(BaseStrategy):
             'fast_period': 10,
             'slow_period': 20,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -891,8 +898,8 @@ class SupertrendStrategy(BaseStrategy):
         return {
             'atr_period': 10,
             'multiplier': 3.0,
-            'sl_atr_mult': 1.5,
-            'tp_atr_mult': 3.0,
+            'sl_atr_mult': 2.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -1000,7 +1007,7 @@ class MACDTrendStrategy(BaseStrategy):
             'slow_period': 26,
             'signal_period': 9,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
     
@@ -1060,7 +1067,7 @@ class ADXTrendStrategy(BaseStrategy):
             'adx_period': 14,
             'adx_threshold': 25,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -1114,7 +1121,7 @@ class IchimokuStrategy(BaseStrategy):
             'kijun_period': 26,
             'senkou_b_period': 52,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
     
@@ -1172,7 +1179,7 @@ class HullMATrendStrategy(BaseStrategy):
         return {
             'period': 20,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -1232,7 +1239,7 @@ class AroonTrendStrategy(BaseStrategy):
             'period': 25,
             'strength_level': 70,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -1327,7 +1334,7 @@ class ADXDIStrengthStrategy(BaseStrategy):
             'di_spread_min': 5.0,
             'require_adx_rising': True,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -1397,7 +1404,7 @@ class KeltnerPullbackStrategy(BaseStrategy):
             'kc_mult': 2.0,
             'ema_slope_bars': 5,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -1467,7 +1474,7 @@ class RSIExtremesStrategy(BaseStrategy):
             'overbought': 70,
             'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 2.0
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1519,7 +1526,7 @@ class BollingerBounceStrategy(BaseStrategy):
             'period': 20,
             'std_dev': 2.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 2.0
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1562,7 +1569,7 @@ class ZScoreMRStrategy(BaseStrategy):
             'period': 20,
             'entry_z': 2.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 2.0
         }
     
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1609,7 +1616,7 @@ class StochasticReversalStrategy(BaseStrategy):
             'overbought': 80,
             'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 2.0
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1671,7 +1678,7 @@ class CCIReversalStrategy(BaseStrategy):
             'overbought': 100,
             'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 2.0
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1728,7 +1735,7 @@ class WilliamsRStrategy(BaseStrategy):
             'overbought': -20,
             'use_ema200_trend_filter': False,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0
+            'tp_atr_mult': 2.0
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -1798,7 +1805,7 @@ class FisherTransformMRStrategy(BaseStrategy):
             'period': 10,
             'threshold': 1.5,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
         }
 
     def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1900,7 +1907,7 @@ class ZScoreVWAPReversionStrategy(BaseStrategy):
             'entry_z': 2.0,
             'adx_threshold': 25,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
         }
 
     def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1986,7 +1993,7 @@ class DonchianBreakoutStrategy(BaseStrategy):
         return {
             'period': 20,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -2030,8 +2037,8 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         return {
             'atr_period': 20,
             'breakout_mult': 1.0,
-            'sl_atr_mult': 1.5,
-            'tp_atr_mult': 3.0,
+            'sl_atr_mult': 2.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
     
@@ -2083,7 +2090,7 @@ class MomentumBurstStrategy(BaseStrategy):
             'momentum_period': 10,
             'threshold_pct': 1.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
     
@@ -2131,7 +2138,7 @@ class SqueezeBreakoutStrategy(BaseStrategy):
             'kc_period': 20,
             'kc_mult': 1.5,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
     
@@ -2190,7 +2197,7 @@ class KeltnerBreakoutStrategy(BaseStrategy):
             'period': 20,
             'atr_mult': 2.0,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -2244,7 +2251,7 @@ class PivotBreakoutStrategy(BaseStrategy):
             'confirm_window': 5,
             'retest_tolerance': 0.5,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -2383,7 +2390,7 @@ class EMARibbonADXStrategy(BaseStrategy):
             "adx_threshold": 20,
             "use_di_confirmation": True,
             "sl_atr_mult": 2.0,
-            "tp_atr_mult": 3.0,
+            "tp_atr_mult": 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -2478,7 +2485,7 @@ class RSITrendFilteredMRStrategy(BaseStrategy):
             "overbought": 70,
             "ema_trend_period": 200,
             "sl_atr_mult": 2.0,
-            "tp_atr_mult": 3.0,
+            "tp_atr_mult": 2.0,
         }
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
@@ -2536,7 +2543,7 @@ class MACDHistogramMomentumStrategy(BaseStrategy):
             "ema_filter_period": 50,
             "adx_threshold": 0,
             "sl_atr_mult": 2.0,
-            "tp_atr_mult": 3.0,
+            "tp_atr_mult": 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -2621,7 +2628,7 @@ class StochRSITrendGateStrategy(BaseStrategy):
             "upper_band": 80,
             "ema_trend_period": 200,
             "sl_atr_mult": 2.0,
-            "tp_atr_mult": 3.0,
+            "tp_atr_mult": 2.0,
         }
 
     @staticmethod
@@ -2695,7 +2702,7 @@ class InsideBarBreakoutStrategy(BaseStrategy):
         return StrategyCategory.BREAKOUT_MOMENTUM
 
     def get_default_params(self) -> Dict[str, Any]:
-        return {'min_inside_bars': 1, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+        return {'min_inside_bars': 1, 'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -2760,7 +2767,7 @@ class NarrowRangeBreakoutStrategy(BaseStrategy):
         return StrategyCategory.BREAKOUT_MOMENTUM
 
     def get_default_params(self) -> Dict[str, Any]:
-        return {'nr_lookback': 7, 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+        return {'nr_lookback': 7, 'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -2798,7 +2805,7 @@ class TurtleSoupReversalStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'channel_period': 20, 'reclaim_window': 2,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -2861,7 +2868,7 @@ class PinBarReversalStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'wick_ratio': 2.5, 'proximity_atr': 1.0,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14', 'BB_LOWER_20', 'BB_UPPER_20'}
@@ -2903,7 +2910,7 @@ class EngulfingPatternStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'lookback_level': 20, 'use_adx_filter': True,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14', 'BB_LOWER_20', 'BB_UPPER_20', 'ADX'}
@@ -2952,7 +2959,7 @@ class VolumeSpikeMomentumStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'vol_mult': 2.0, 'vol_lookback': 20,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -2992,7 +2999,7 @@ class RSIDivergenceStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'rsi_period': 14, 'swing_order': 5,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -3042,7 +3049,7 @@ class MACDDivergenceStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'swing_order': 5, 'macd_fast': 12, 'macd_slow': 26,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14', 'MACD_HIST'}
@@ -3091,7 +3098,7 @@ class OBVDivergenceStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'swing_order': 5, 'obv_smooth': 5,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.5,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -3146,7 +3153,7 @@ class KeltnerFadeStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'kc_ema': 20, 'kc_mult': 2.0, 'adx_threshold': 25,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
     def get_required_features(self) -> Set[str]:
         ema_period = int(self.params.get('kc_ema', 20))
@@ -3187,7 +3194,7 @@ class ROCExhaustionReversalStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'roc_period': 10, 'pct_lookback': 100, 'extreme_pct': 10,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0}
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {'ATR_14'}
@@ -3226,7 +3233,7 @@ class EMAPullbackContinuationStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'fast_period': 10, 'slow_period': 30, 'touch_atr': 0.5,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -3272,7 +3279,7 @@ class ParabolicSARTrendStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'af_start': 0.02, 'af_max': 0.20, 'adx_threshold': 20,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -3354,7 +3361,7 @@ class ATRPercentileBreakoutStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'pct_lookback': 100, 'compress_pct': 20, 'expand_pct': 70,
-                'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -3396,7 +3403,7 @@ class KaufmanAMATrendStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {'er_period': 10, 'fast_period': 2, 'slow_period': 30,
-                'signal_mode': 'direction', 'sl_atr_mult': 2.0, 'tp_atr_mult': 3.0,
+                'signal_mode': 'direction', 'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -3480,7 +3487,7 @@ class VortexTrendStrategy(BaseStrategy):
         return {
             'period': 14,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -3545,7 +3552,7 @@ class TRIXSignalStrategy(BaseStrategy):
             'trix_period': 15,
             'signal_period': 9,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -3607,7 +3614,7 @@ class RelativeVigorIndexStrategy(BaseStrategy):
         return {
             'period': 10,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -3666,7 +3673,7 @@ class VIDYABandTrendStrategy(BaseStrategy):
             'band_mult': 1.5,
             'atr_period': 14,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 
@@ -3761,7 +3768,7 @@ class ChoppinessCompressionBreakoutStrategy(BaseStrategy):
             'trend_threshold': 38.2,
             'lookback': 5,
             'sl_atr_mult': 2.0,
-            'tp_atr_mult': 3.0,
+            'tp_atr_mult': 2.0,
             **self._structural_sl_defaults(),
         }
 

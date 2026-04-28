@@ -214,55 +214,33 @@ class StrategyRegressionTests(unittest.TestCase):
         self.assertFalse(any(isinstance(w.message, PerformanceWarning) for w in caught))
 
 
-class MeanReversionDefaultTPAtrMultTests(unittest.TestCase):
-    """Phase D1 — every MR strategy that exposes `tp_atr_mult` must default to 3.0.
+class StageOneNeutralStopDefaultsTests(unittest.TestCase):
+    """Stage 1 screens signal quality on a neutral 2 ATR / 2 ATR baseline."""
 
-    Applied uniformly across the MR family per the philosophy gate so no competitor
-    is privileged. The grid `_GLOBAL_TP_GRID` is unchanged — Optuna still discovers
-    the per-(symbol, TF, regime) optimum. Only the pre-tune default and TPE seed shift.
-    """
-
-    EXPECTED_DEFAULT = 3.0
-
-    def _mr_strategies_with_tp_field(self):
-        from pm_strategies import StrategyRegistry, StrategyCategory
-        result = []
+    def test_every_strategy_with_sl_tp_defaults_is_neutral(self):
+        offenders = []
         for name in StrategyRegistry.list_all():
-            strat = StrategyRegistry.get(name)
-            if strat.category != StrategyCategory.MEAN_REVERSION:
+            defaults = StrategyRegistry.get(name).get_default_params()
+            if "sl_atr_mult" not in defaults and "tp_atr_mult" not in defaults:
                 continue
-            defaults = strat.get_default_params()
-            if 'tp_atr_mult' in defaults:
-                result.append((name, defaults))
-        return result
+            sl = float(defaults.get("sl_atr_mult", 2.0))
+            tp = float(defaults.get("tp_atr_mult", 2.0))
+            if (sl, tp) != (2.0, 2.0):
+                offenders.append((name, sl, tp))
 
-    def test_every_mr_strategy_defaults_tp_atr_mult_to_three(self):
-        candidates = self._mr_strategies_with_tp_field()
-        self.assertGreaterEqual(len(candidates), 5,
-                                "MR family should expose at least the spec-listed 5 candidates")
-        offenders = [
-            (name, defaults['tp_atr_mult'])
-            for name, defaults in candidates
-            if float(defaults['tp_atr_mult']) != self.EXPECTED_DEFAULT
-        ]
         self.assertEqual(
-            offenders, [],
-            f"MR strategies with non-3.0 tp_atr_mult default: {offenders}. "
-            "Phase D1 requires uniform 3.0 across the MR family."
+            offenders,
+            [],
+            f"Stage 1 neutral SL/TP offenders: {offenders}",
         )
 
-    def test_spec_listed_five_mr_strategies_all_at_three(self):
-        from pm_strategies import StrategyRegistry
-        for name in (
-            "RSIExtremesStrategy",
-            "BollingerBounceStrategy",
-            "StochasticReversalStrategy",
-            "CCIReversalStrategy",
-            "WilliamsRStrategy",
-        ):
-            with self.subTest(strategy=name):
-                defaults = StrategyRegistry.get(name).get_default_params()
-                self.assertEqual(float(defaults['tp_atr_mult']), self.EXPECTED_DEFAULT)
+    def test_stage_two_sl_tp_grid_still_searches_broad_surface(self):
+        from pm_strategies import _GLOBAL_SL_GRID, _GLOBAL_TP_GRID
+
+        self.assertIn(2.0, _GLOBAL_SL_GRID)
+        self.assertIn(2.0, _GLOBAL_TP_GRID)
+        self.assertGreater(max(_GLOBAL_TP_GRID), 2.0)
+        self.assertLess(min(_GLOBAL_TP_GRID), 2.0)
 
 
 class SearchableEMA200TrendFilterTests(unittest.TestCase):

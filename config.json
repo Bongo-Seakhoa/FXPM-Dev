@@ -170,10 +170,10 @@
     "scale_in_pct": 50.0,
     "max_trade_duration_bars": 0,
     "regime_tp_multipliers": {
-      "TREND": 1.25,
-      "BREAKOUT": 1.15,
-      "RANGE": 0.85,
-      "CHOP": 0.75
+      "TREND": 1.0,
+      "BREAKOUT": 1.0,
+      "RANGE": 1.0,
+      "CHOP": 1.0
     },
     "use_spread": true,
     "use_slippage": true,

@@ -45,8 +45,6 @@ from pm_strategies import (
     StrategyRegistry,
     BaseStrategy,
     _STRATEGY_MIGRATION,
-    get_regime_tp_multipliers,
-    set_regime_tp_multipliers,
 )
 from pm_position import PositionConfig, PositionManager
 from pm_regime import load_regime_params
@@ -85,7 +83,7 @@ except ImportError:
 
 # Configure module logger
 logger = logging.getLogger(__name__)
-PIPELINE_ARTIFACT_VERSION = "2026-04-25-active-recent-risk-mgmt"
+PIPELINE_ARTIFACT_VERSION = "2026-04-29-neutral-discovery-exit-surface"
 
 
 def _stable_seed(*parts: Any) -> int:
@@ -176,10 +174,7 @@ def build_artifact_meta(config: PipelineConfig,
         "risk_management_selection_stage": str(
             getattr(config, "risk_management_selection_stage", "stage3")
         ),
-        "exit_surface_contract": "trade_intent_regime_tp_v1",
-        "regime_tp_multipliers": dict(
-            getattr(config, "regime_tp_multipliers", None) or get_regime_tp_multipliers()
-        ),
+        "exit_surface_contract": "neutral_discovery_sl_tp_v1",
         "regime_params": _regime_params_fingerprint(getattr(config, "regime_params_file", "regime_params.json")),
         "strategy_surface_hash": _strategy_surface_fingerprint(strategies),
         "metric_contract": "net_dollar_mtm_equity_v1",
@@ -2923,7 +2918,6 @@ class OptimizationPipeline:
     
     def __init__(self, config: PipelineConfig):
         self.config = config
-        set_regime_tp_multipliers(getattr(config, "regime_tp_multipliers", None))
         self.data_loader = DataLoader(config.data_dir)
         self.splitter = DataSplitter(config)
         self.enhancement_seams: EnhancementSeams = create_default_enhancement_seams(config)
