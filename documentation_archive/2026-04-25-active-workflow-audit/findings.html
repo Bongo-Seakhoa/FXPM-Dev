@@ -1,0 +1,822 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>FxPM 1.4 — Comprehensive End-to-End Review</title>
+<style>
+  :root{--fg:#1c2431;--muted:#5a6676;--bg:#fafbfc;--card:#ffffff;--bd:#e6ebf0;--ac:#1e6feb;
+        --sev-crit:#b91c1c;--sev-high:#c2410c;--sev-med:#b45309;--sev-low:#0f766e;--sev-pass:#166534;
+        --sev-crit-bg:#fef2f2;--sev-high-bg:#fff7ed;--sev-med-bg:#fffbeb;--sev-low-bg:#ecfdf5;--sev-pass-bg:#f0fdf4;}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;color:var(--fg);background:var(--bg);margin:0;line-height:1.55;font-size:15px;}
+  .wrap{max-width:1100px;margin:0 auto;padding:32px 28px 64px}
+  h1{font-size:26px;margin:0 0 4px}
+  h2{font-size:20px;margin:36px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--bd);}
+  h3{font-size:16px;margin:20px 0 8px}
+  h4{font-size:14px;margin:16px 0 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  p,ul,ol{margin:8px 0 12px}
+  code{font-family:"SFMono-Regular",Consolas,Menlo,monospace;font-size:13px;background:#eef2f6;padding:1px 5px;border-radius:3px;white-space:nowrap}
+  pre{background:#0d1117;color:#d1d5db;padding:12px 14px;border-radius:6px;overflow-x:auto;font-size:12.5px;line-height:1.45}
+  pre code{background:transparent;color:inherit;padding:0;white-space:pre}
+  .meta{color:var(--muted);font-size:13px;margin-bottom:22px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px 18px;margin:14px 0;}
+  .finding{background:var(--card);border:1px solid var(--bd);border-left-width:4px;border-radius:6px;padding:14px 16px;margin:10px 0;}
+  .finding h4{margin:0 0 6px;color:var(--fg);text-transform:none;letter-spacing:0;font-size:15px;font-weight:600}
+  .finding .loc{color:var(--muted);font-size:12px;margin-bottom:8px}
+  .sev{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.05em;padding:2px 7px;border-radius:3px;text-transform:uppercase;margin-right:8px;vertical-align:1px}
+  .sev-crit{background:var(--sev-crit-bg);color:var(--sev-crit);border:1px solid var(--sev-crit)}
+  .sev-high{background:var(--sev-high-bg);color:var(--sev-high);border:1px solid var(--sev-high)}
+  .sev-med{background:var(--sev-med-bg);color:var(--sev-med);border:1px solid var(--sev-med)}
+  .sev-low{background:var(--sev-low-bg);color:var(--sev-low);border:1px solid var(--sev-low)}
+  .sev-pass{background:var(--sev-pass-bg);color:var(--sev-pass);border:1px solid var(--sev-pass)}
+  .f-crit{border-left-color:var(--sev-crit)}
+  .f-high{border-left-color:var(--sev-high)}
+  .f-med{border-left-color:var(--sev-med)}
+  .f-low{border-left-color:var(--sev-low)}
+  .f-pass{border-left-color:var(--sev-pass)}
+  .grid{display:grid;gap:10px}
+  .kv{display:grid;grid-template-columns:180px 1fr;gap:8px;font-size:13.5px;margin:2px 0}
+  .kv b{color:var(--muted);font-weight:500}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0}
+  th,td{border:1px solid var(--bd);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#f1f4f8;font-weight:600}
+  tbody tr:nth-child(even){background:#fafbfc}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:3px;background:#eef2f6;color:var(--muted);margin-right:4px}
+  details{background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:10px 14px;margin:10px 0}
+  details[open]{background:#fcfcfd}
+  summary{cursor:pointer;font-weight:600;color:var(--fg)}
+  .toc{columns:2;column-gap:24px;font-size:13.5px}
+  .toc a{color:var(--ac);text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  .callout{background:#fff7ed;border:1px solid #fdba74;border-left:4px solid #c2410c;padding:10px 14px;border-radius:6px;margin:10px 0;font-size:13.5px}
+  .callout.good{background:#ecfdf5;border-color:#86efac;border-left-color:#166534}
+  .small{font-size:12.5px;color:var(--muted)}
+  hr{border:none;border-top:1px solid var(--bd);margin:24px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>FxPM 1.4 — Comprehensive End-to-End Review</h1>
+<div class="meta">
+  Scope: full source + config + docs review for live-trading robustness and PnL quality &nbsp;|&nbsp;
+  Target: <code>pm_core.py</code>, <code>pm_pipeline.py</code>, <code>pm_main.py</code>, <code>pm_strategies.py</code>, <code>pm_mt5.py</code>, <code>pm_position.py</code>, <code>pm_regime.py</code>, <code>pm_optuna.py</code>, <code>pm_enhancement_seams.py</code>, <code>pm_storage.py</code>, <code>config.json</code>, documentation &nbsp;|&nbsp;
+  Codebase: ~21,300 LOC across 10 modules, 47-strategy pool, 4-regime detector, Numba backtest, MT5 execution &nbsp;|&nbsp;
+  Review date: 2026-04-21
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Executive summary</h3>
+  <p>The FxPM 1.4 codebase is <b>structurally mature</b>: the regime-aware selection model, the Numba backtest with same-bar gap-through-stop parity, the calendar-anchored retrain schedule, the winners-only live policy, the MT5 contract-aware sizing, and the broker/spread-quality overlay together form a disciplined, correctness-first trading stack. Backtest-to-live data parity is tight (see <code>audit.md</code>) and restart recovery is robust.</p>
+  <p>The <b>PnL risk is not in execution</b> — it is concentrated in <b>validation gate tightness, scoring-weight design, and the committed challenge-profile <code>config.json</code></b>, which is materially looser than the in-code defaults in several quality-critical places. The review also surfaces a handful of execution edge cases (spread-median windowing, lot-normalization drift, decision-throttle persistence, dead-code in the position layer) that will bite asymmetrically in live vs. paper.</p>
+  <p>The single highest-leverage intervention is to <b>realign the committed config with the code-default validation gates</b> (regime PF, regime return floor, exceptional-val thresholds, robustness ratio, actionable margin) before live deployment. The second is to tighten selection-time discipline at the active <code>fx_backtester</code> scorer (PF emphasis, continuous DD penalty, weak-train rescue gate). The third is the <b>strategic gap surfaced by the holistic review pass</b> — the system today is a strong per-symbol research/execution engine but still needs clearer downstream review discipline, better cost realism, and a first-class post-entry order-governance subsystem built around exact local winners rather than one global umbrella policy. See <a href="#strategic">Section 13</a>.</p>
+  <p class="small"><b>Note on this revision (2026-04-21).</b> A second-pass review verified each finding against the current source. Several earlier claims have been demoted, withdrawn, or reframed where the code evidence did not support the original severity. A <a href="#corrections">corrections log</a> below identifies every reclassified item; the unchanged findings are those that were independently re-verified. The strategic recommendations in <a href="#strategic">§13</a> were further refined against direct measurements in <code>fxpm_order_management_poc.ipynb</code> (control-arm parity verified against <code>Backtester.run</code>).</p>
+</div>
+
+<h2>Contents</h2>
+<div class="toc">
+  <p><a href="#philosophy">1. Governing philosophy &amp; review lens</a><br/>
+  <a href="#summary-table">2. Prioritized findings at a glance</a><br/>
+  <a href="#corrections">2a. Corrections log (second-pass reviewer)</a><br/>
+  <a href="#foundation-correction">2b. Foundational correction in research governance</a><br/>
+  <a href="#config-drift">3. Config-vs-code-default drift (critical)</a><br/>
+  <a href="#scoring">4. Scoring, validation, and backtester</a><br/>
+  <a href="#strategies">5. Strategy pool</a><br/>
+  <a href="#live">6. Live loop, MT5 &amp; storage</a><br/>
+  <a href="#regime">7. Regime detection</a><br/>
+  <a href="#position">8. Position sizing &amp; Optuna</a><br/>
+  <a href="#exec-spread">9. Execution-quality overlay</a><br/>
+  <a href="#new-strategies">10. Candidate new strategies</a><br/>
+  <a href="#roadmap">11. Recommended rollout roadmap</a><br/>
+  <a href="#technical-direction">12. Technical direction &amp; guiding principles</a><br/>
+  <a href="#strategic">13. Strategic &amp; holistic recommendations (second-pass review)</a></p>
+</div>
+
+<h2 id="philosophy">1. Governing philosophy &amp; review lens</h2>
+<p>The review is conducted strictly within the design values already encoded in <code>README.md</code>, <code>SETTINGS_REFERENCE.md</code>, <code>PATCH_NOTES.md</code>, and the archived audits. Those values are:</p>
+<ul>
+  <li><b>Winners-only, no fallback</b> — validation failure is a no-trade, not a "best available" trade.</li>
+  <li><b>Correctness before performance</b> — Numba speed is opt-in; the Python path is authoritative when they conflict.</li>
+  <li><b>Config is the source of truth</b> — defensive code defaults are a safety net, not operating values.</li>
+  <li><b>Candle-close decision timing</b> — signals are computed on closed bars; next-bar execution has a defined, modeled gap.</li>
+  <li><b>MT5 contract-aware sizing</b> — risk-at-stop uses broker math, not pip shortcuts.</li>
+  <li><b>Regime-aware, per-(symbol, TF, regime) winners</b> — strategies must prove themselves locally, not globally.</li>
+  <li><b>Calendar-anchored retrain</b> — fixed schedule beats rolling expiry in production.</li>
+  <li><b>Quality gates stack</b> — pre-tuning eligibility → tuning → validation gates → regime descent → live scoring margin → live winners-only → live spread overlay → broker preflight.</li>
+</ul>
+<p>Every recommendation below is required to <b>respect and strengthen</b> these values; no recommendation intentionally relaxes the winners-only policy, candle-close semantics, or the config-first model.</p>
+<div class="callout good">
+<b>Foundational correction in intent.</b> FXPM is a <b>broad competitive discovery system</b>, not a curated shortlist of preferred strategies. Winners exist only at exact <code>(symbol, TF, regime)</code> resolution. Breadth, parameter freedom, and strategy diversity are discovery assets unless they create scientific invalidity. Efficiency improvements are acceptable only when they do <b>not</b> bias the tournament before discovery. Downstream governance such as holdout gates, live allocation, and post-fill order management remains compatible because it acts <b>after</b> winner discovery rather than contaminating it.
+</div>
+
+<h2 id="summary-table">2. Prioritized findings at a glance</h2>
+<table>
+  <thead><tr><th style="width:42px">#</th><th style="width:80px">Severity</th><th>Finding</th><th style="width:200px">Subsystem</th><th style="width:120px">PnL lever</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td><span class="sev sev-crit">Crit</span></td><td>Committed <code>config.json</code> is materially looser than code defaults on 7+ quality gates (regime return floor, exceptional-val rescue, actionable margin, robustness ratio, spread-spike multiplier, min trade risk, weak-train thresholds). Challenge profile weakens winner quality.</td><td>config.json vs pm_core.py</td><td>winner quality, expectancy</td></tr>
+    <tr><td class="num">2</td><td><span class="sev sev-high">High</span></td><td><b>Softened</b>: <code>regime_min_val_return_pct = 0.0</code> permits non-negative-return winners, but the unconditional return-to-DD efficiency gate at <code>pm_pipeline.py:2475-2484</code> still rejects winners with poor return/DD ratio. The remaining concern: very thin positive expectancies do pass the floor, leaving little buffer against live cost drag.</td><td>pm_pipeline.py:2464–2484</td><td>winner quality</td></tr>
+    <tr><td class="num">3</td><td><span class="sev sev-med">Med</span></td><td><b>Corrected</b>: secondary-trade risk geometry-first path was added in 1.4.6 (live entry/SL/volume estimated first, comments only as fallback) and a same-symbol combined cap is enforced again before order send. Residual exposure is bounded; recommendation reduces to "log a WARN when geometry returns 0 and comment decode also fails."</td><td>pm_main.py same-symbol enforcement</td><td>observability</td></tr>
+    <tr><td class="num">4</td><td><span class="sev sev-pass">Pass</span></td><td><b>Corrected</b>: auto-widen path at <code>pm_main.py:2765-2782</code> captures <code>original_r_multiple</code> and recalculates TP after widening SL, preserving the validated reward:risk. Earlier "ratio not pip risk" claim was wrong.</td><td>pm_main.py:2765–2782</td><td>—</td></tr>
+    <tr><td class="num">5</td><td><span class="sev sev-high">High</span></td><td>Mean-reversion default SL/TP is 2.0×/2.0× ATR (1:1 R:R). After spread + slippage + commission, expectancy is negative even at 60% WR.</td><td>pm_strategies.py:1127,1171,1260,1315</td><td>expectancy, WR</td></tr>
+    <tr><td class="num">6</td><td><span class="sev sev-low">Low</span></td><td><b>Corrected</b>: committed config uses <code>scoring_mode="fx_backtester"</code>, so the legacy <code>score_weights</code> block is inert at runtime. The PF-weight recommendation should target the active <code>calculate_fx_selection_score</code> / <code>calculate_fx_opt_score</code> in <code>pm_core.py</code> instead — see Section 4 for the rewritten recommendation.</td><td>pm_core.py: fx_backtester scorer</td><td>selection quality</td></tr>
+    <tr><td class="num">7</td><td><span class="sev sev-high">High</span></td><td>Continuous DD penalty <code>exp(-0.03·dd)</code> is too gentle — DD=18% only cuts score 42%. Tighten to <code>exp(-0.05·dd)</code>.</td><td>pm_core.py:4286–4289</td><td>DD avoidance</td></tr>
+    <tr><td class="num">8</td><td><span class="sev sev-high">High</span></td><td>Oscillator-reversal strategies (RSIExtremes, CCI, Stochastic, Williams%R) have no higher-TF trend filter — roughly half of all "reversal" signals fire into trends.</td><td>pm_strategies.py (multiple)</td><td>WR</td></tr>
+    <tr><td class="num">9</td><td><span class="sev sev-high">High</span></td><td>Spread-spike median may use stale window relative to the live tick spread; spike blocker mis-calibrated during volatility opens.</td><td>pm_main.py:2739–2742</td><td>entry quality</td></tr>
+    <tr><td class="num">10</td><td><span class="sev sev-low">Low</span></td><td><b>Corrected</b>: <code>load_regime_params()</code> is wired into <code>FeatureComputer._append_regime_features</code> (<code>pm_core.py:3172</code>) and called from both <code>pm_pipeline.py:2769</code> and <code>pm_main.py:2297</code>. The residual concern is that <code>regime_params.json</code> may be absent in this snapshot, in which case the loader falls back to <code>DEFAULT_PARAMS_BY_TIMEFRAME</code> silently — adding an INFO log on fallback would surface untuned regime params.</td><td>pm_core.py:3172, pm_pipeline.py:2769, pm_main.py:2297</td><td>observability</td></tr>
+    <tr><td class="num">11</td><td><span class="sev sev-med">Med</span></td><td>EMARibbonADX parameter grid is <b>84,480 combinations</b> (corrected from earlier 100,800). Grid breadth is not itself the defect; the defect is that a flat <code>max_param_combos</code> budget can under-search this family relative to smaller families. Prefer staged search, family-level budget controls, or higher justified compute over hard preconditioning of axes.</td><td>pm_strategies.py:2052–2061</td><td>tournament fairness, trial efficiency</td></tr>
+    <tr><td class="num">12</td><td><span class="sev sev-med">Med</span></td><td>ADX-based regime thresholds are hardcoded at 20/30/40 and not asset-class aware; JPY pairs systematically under-score TREND.</td><td>pm_regime.py:1047–1052</td><td>signal frequency</td></tr>
+    <tr><td class="num">13</td><td><span class="sev sev-med">Med</span></td><td>Bollinger squeeze lookback fixed at 200 bars across all timeframes — too stale for intraday, too fresh for D1.</td><td>pm_regime.py:290–291</td><td>breakout timing</td></tr>
+    <tr><td class="num">14</td><td><span class="sev sev-med">Med</span></td><td>Live cache resync has a narrow race window if cache rewrite exceeds <code>live_bar_settle_seconds=5</code>; risk of evaluating on stale cache.</td><td>pm_main.py:1002–1098</td><td>duplicate trades</td></tr>
+    <tr><td class="num">15</td><td><span class="sev sev-med">Med</span></td><td>Decision-throttle cache has no expiry; restarting mid-day and re-evaluating the same bar after a transient skip condition silently permanently suppresses that signal.</td><td>pm_main.py:319–508</td><td>missed signals</td></tr>
+    <tr><td class="num">16</td><td><span class="sev sev-med">Med</span></td><td>Margin-protection RECOVERY→entry has no cooldown; one bar after forced closes it will accept new entries even if margin is still stressed.</td><td>pm_main.py:1733–1812</td><td>cascade risk</td></tr>
+    <tr><td class="num">17</td><td><span class="sev sev-med">Med</span></td><td>Feature cache size of 6 evicts constantly on 10+ symbol runs; optimization wall-clock 15–20% slower than necessary.</td><td>pm_core.py:2621–2693</td><td>retrain latency</td></tr>
+    <tr><td class="num">18</td><td><span class="sev sev-pass">Pass</span></td><td><b>Corrected</b>: <code>DataSplitter</code> docstring explicitly states "the overlap window is warmup-only and is never scored" (<code>pm_core.py:3233</code>). Earlier soft-look-ahead claim is unsupported by the splitter contract.</td><td>pm_core.py:3229–3234</td><td>—</td></tr>
+    <tr><td class="num">19</td><td><span class="sev sev-low">Low</span></td><td>Structural similarity exists across EMA, oscillator, and band families, but similarity alone is not grounds for consolidation. Merge or prune only if matched-budget backfill shows exact local winners are preserved under fair search.</td><td>pm_strategies.py</td><td>tournament fairness</td></tr>
+    <tr><td class="num">20</td><td><span class="sev sev-low">Low</span></td><td><code>ATRPercentileBreakout</code> and <code>KaufmanAMATrendStrategy</code> routinely produce 0 trades on short/quiet data (already noted in project memory).</td><td>pm_strategies.py</td><td>pool utilization</td></tr>
+    <tr><td class="num">21</td><td><span class="sev sev-low">Low</span></td><td>Backtest uses <code>spec.spread_avg</code> (fixed) while live uses real-time spread — standard but means news-time results diverge; document and trust the live overlay.</td><td>pm_core.py, pm_main.py</td><td>backtest realism</td></tr>
+    <tr><td class="num">22</td><td><span class="sev sev-pass">Pass</span></td><td>Backtest-live data parity (OHLCV, features, regime shift, signal timing) is tight. Numba/Python parity preserved. See <code>audit.md</code>.</td><td>system-wide</td><td>—</td></tr>
+    <tr><td class="num">23</td><td><span class="sev sev-pass">Pass</span></td><td>Regime freshness-decay drift has been closed (per CHANGELOG 1.4.6) — stale higher-TF winners are no longer carried between bars.</td><td>pm_main.py, pm_pipeline.py</td><td>—</td></tr>
+    <tr><td class="num">24</td><td><span class="sev sev-pass">Pass</span></td><td><b>Withdrawn</b>: previous claim that auto-widen scales SL but not TP was wrong. Actual code (<code>pm_main.py:2778-2781</code>) preserves R-multiple by recomputing TP from the widened SL.</td><td>pm_main.py:2765–2782</td><td>—</td></tr>
+    <tr><td class="num">25</td><td><span class="sev sev-med">Med</span></td><td><b>Reframed</b>: the documented Optuna 80/20 blend weights (<code>optuna_objective_train_weight</code>, <code>_val_weight</code>) are dead config — neither the strategy-Optuna path (<code>pm_pipeline.py:1034-1055</code>) nor the regime-tuning path (<code>pm_pipeline.py:2539-2555</code>) consumes them. Both paths use <code>fx_generalization_score(train, val)</code> which IS validation-anchored (val − λ·gap), so trials are not "train-only." Fix: either remove the dead knobs or wire them to control <code>fx_gap_penalty_lambda</code>.</td><td>pm_optuna.py:100,134; pm_pipeline.py:1043,2547</td><td>config hygiene</td></tr>
+    <tr><td class="num">26</td><td><span class="sev sev-high">High</span></td><td>No daily/session loss circuit-breaker at the portfolio layer. Per-trade + same-symbol caps exist; aggregate drawdown-of-day has no gate.</td><td>pm_main.py, pm_core.py PortfolioManager</td><td>challenge-day survival</td></tr>
+    <tr><td class="num">27</td><td><span class="sev sev-high">High</span></td><td>Risk-scalar stack (vol-target, fractional Kelly, DD-scalar) is well-built but disabled by default (<code>live_risk_scalars_enabled=false</code>). Committed <code>target_annual_vol=0.10</code> is inert.</td><td>pm_enhancement_seams.py:117–242, config.json</td><td>vol normalization, DD scaling</td></tr>
+    <tr><td class="num">28</td><td><span class="sev sev-high">High</span></td><td>Generalization score has no variance/stability penalty — two strategies with same Sharpe but different weekly-return dispersion score identically. Second strategy bleeds on live costs.</td><td>pm_core.py:_compute_fx_generalization_score</code></td><td>winner stability</td></tr>
+    <tr><td class="num">29</td><td><span class="sev sev-med">Med</span></td><td>No regime-conditional TP multiplier. Same R-target for TREND and RANGE forces one into a suboptimal exit plan.</td><td>pm_position.py:_compute_tp_pips</td><td>expectancy per regime</td></tr>
+    <tr><td class="num">30</td><td><span class="sev sev-low">Low</span></td><td>Duplicate min-lot viability block in <code>PositionCalculator.size_position</code> (<code>pm_position.py:432-447</code> and <code>449-464</code>). The first block returns unconditionally, so the second is dead code — no behavioral impact, but worth removing for clarity.</td><td>pm_position.py:432–464</td><td>code clarity</td></tr>
+    <tr><td class="num">31</td><td><span class="sev sev-med">Med</span></td><td><b>New (holistic review)</b>: the two-week retraining cycle is the intended edge-freshness mechanism. The remaining gap is better structured in-cycle and end-of-cycle review visibility, not an intrusive mid-cycle fail-closed shutdown layer.</td><td>pm_main.py + pipeline review cadence</td><td>edge freshness discipline</td></tr>
+    <tr><td class="num">32</td><td><span class="sev sev-med">Med</span></td><td><b>New (holistic review)</b>: holdout metrics are stored but not surfaced cleanly into structured review, retrain prioritization, or downstream context metadata. They should inform the next cycle without becoming a hidden mid-cycle kill switch.</td><td>pipeline + review metadata</td><td>generalization durability</td></tr>
+    <tr><td class="num">33</td><td><span class="sev sev-high">High</span></td><td><b>New (holistic review)</b>: no first-class post-entry order-governance subsystem. Trades enter with broker SL/TP and are then unmanaged. Trailing/breakeven/time-exit logic exists in code but is not bound into a live supervisor loop.</td><td>pm_main.py, pm_position.py, pm_enhancement_seams.py</td><td>realized R, profit factor, capital efficiency</td></tr>
+    <tr><td class="num">34</td><td><span class="sev sev-low">Low</span></td><td><b>New (holistic review)</b>: portfolio-level orchestration is thin. If expanded, it should stay light-touch and supportive — sequencing or visibility when many local winners fire — rather than a heavy umbrella lockout that suppresses productive capital.</td><td>pm_main.py live loop</td><td>capital orchestration</td></tr>
+    <tr><td class="num">35</td><td><span class="sev sev-med">Med</span></td><td><b>New (holistic review)</b>: backtest cost realism is simplified — fixed slippage, average spread, no swap/carry. Strategies that look tradable in validation may be marginal after real friction.</td><td>pm_core.py backtester</td><td>research-to-live alignment</td></tr>
+  </tbody>
+</table>
+
+<h2 id="corrections">2a. Corrections log (2026-04-21 review pass)</h2>
+<p>This subsection records every finding that was reclassified after a second-pass code verification, with the evidence.</p>
+<table>
+  <thead><tr><th>Row</th><th>Original severity</th><th>New severity</th><th>Reason</th></tr></thead>
+  <tbody>
+    <tr><td class="num">3</td><td><span class="sev sev-crit">Crit</span></td><td><span class="sev sev-med">Med</span></td><td>Geometry-first secondary-trade risk path was added in 1.4.6 (<code>CHANGELOG</code> entry: "same-symbol exposure checks now estimate open-position risk from live entry/SL/volume geometry first and use comment metadata only as a fallback"). Residual concern is observability only.</td></tr>
+    <tr><td class="num">4 / 24</td><td><span class="sev sev-high">High</span> / <span class="sev sev-crit">Crit</span></td><td><span class="sev sev-pass">Pass</span></td><td>Auto-widen at <code>pm_main.py:2765-2782</code> captures <code>original_r_multiple</code> and recalculates TP after widening SL. The path I cited in <code>pm_position.py:260-275</code> is the <code>PositionConfig</code> dataclass declaration, not execution logic.</td></tr>
+    <tr><td class="num">2</td><td><span class="sev sev-crit">Crit</span></td><td><span class="sev sev-high">High</span></td><td>The return-to-DD efficiency gate at <code>pm_pipeline.py:2475-2484</code> still acts as an unconditional backstop when <code>regime_min_val_return_pct = 0.0</code>. Concern softened from "break-even allowed" to "thin-positive expectancy survives."</td></tr>
+    <tr><td class="num">6</td><td><span class="sev sev-high">High</span></td><td><span class="sev sev-low">Low</span></td><td><code>scoring_mode = "fx_backtester"</code> in committed config bypasses <code>score_weights</code> entirely. Recommendation rewritten in Section 4 to target the active scorer.</td></tr>
+    <tr><td class="num">10</td><td><span class="sev sev-high">High</span></td><td><span class="sev sev-low">Low</span></td><td><code>load_regime_params()</code> is wired through <code>FeatureComputer._append_regime_features</code> and consumed by both pipeline and live paths. Residual concern: silent fallback to <code>DEFAULT_PARAMS_BY_TIMEFRAME</code> when <code>regime_params.json</code> is absent.</td></tr>
+    <tr><td class="num">11</td><td><span class="sev sev-high">High</span></td><td><span class="sev sev-med">Med</span></td><td>Grid is 84,480 (5×4×4×4×3×2 × the shared 4-SL × 11-TP grid), not the 100,800 originally cited. Optuna sampling cap reduces actual exploration.</td></tr>
+    <tr><td class="num">18</td><td><span class="sev sev-med">Med</span></td><td><span class="sev sev-pass">Pass</span></td><td><code>DataSplitter</code> docstring at <code>pm_core.py:3233</code> explicitly says "the overlap window is warmup-only and is never scored." Earlier soft-look-ahead claim withdrawn.</td></tr>
+    <tr><td class="num">25</td><td><span class="sev sev-crit">Crit</span></td><td><span class="sev sev-med">Med</span></td><td>The active <code>fx_backtester</code> Optuna scoring path uses <code>fx_generalization_score(train, val) = val − λ·gap</code>, which IS validation-anchored. The 80/20 weights named in the dataclass are dead config (no consumer reads them). Reframed from "trials are train-only" to "config knob hygiene."</td></tr>
+    <tr><td class="num">30</td><td><span class="sev sev-high">High</span></td><td><span class="sev sev-low">Low</span></td><td>The duplicate min-lot block exists, but the first block returns unconditionally, so the second is unreachable dead code. Severity reduced from "doubled broker round-trip" to "code clarity."</td></tr>
+    <tr><td>—</td><td>—</td><td>—</td><td>The <code>target_annual_vol</code> value was corrected from 0.18 to 0.10 (actual config). The risk-scalar finding stands; only the cited number changed.</td></tr>
+  </tbody>
+</table>
+
+<h3 id="foundation-correction">2b. Foundational correction in research governance</h3>
+<p>The second-pass review surfaced a deeper drift than ordinary wording: parts of the earlier write-up quietly treated pool compression, regime-balancing admission rules, and family merging as if they were obviously good. That is not the governing philosophy of FXPM. The corrections below are now adopted across this document and the companion technical-direction document.</p>
+<table>
+  <thead><tr><th>Prior drift</th><th>Corrected position</th></tr></thead>
+  <tbody>
+    <tr><td><b>A.</b> "From 47 strategies toward 35 high-quality strategies."</td><td>FXPM is not trying to converge toward a smaller curated catalogue by default. Broad competition remains the default. Pruning is acceptable only after evidence shows exact local winners are materially unchanged.</td></tr>
+    <tr><td><b>B.</b> "New strategies must fill a regime-coverage hole."</td><td>Coverage improvement can be useful, but it is not an admission requirement. A narrow or specialized strategy is legitimate if it can win exact local tournaments.</td></tr>
+    <tr><td><b>C.</b> "Must win on at least 3 symbols across at least 2 regimes."</td><td>That rule unfairly rejects local specialists. One durable local edge can justify a strategy's existence.</td></tr>
+    <tr><td><b>D.</b> Correlation-based redundancy pruning and family-merging tone.</td><td>Structural similarity is an audit target, not a default reason to merge or evict. Similar-looking competitors may still produce different exact local winners.</td></tr>
+    <tr><td><b>E.</b> Hard-fixing large parameter spaces such as EMARibbonADX.</td><td>The problem is not breadth itself. The correct fix is fairness-preserving search governance: staged search, family-level budget controls, matched-budget experiments, or larger justified compute. Hard preconditioning requires proof it does not distort winner discovery.</td></tr>
+    <tr><td><b>F.</b> Treating lower strategy count as an obvious good.</td><td>Efficiency is subordinate to truthful discovery. Fewer, tidier strategies are not automatically better. Any narrowing must prove fairness preservation, not just elegance or maintainability.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+<b>Disagreement noted but not actioned.</b> The reviewer also flagged "encoding corruption" (<code>â€"</code>, <code>â†'</code>, <code>Ã—</code> artifacts) in both deliverables. The files are stored as valid UTF-8 (<code>file</code> reports <code>UTF-8 text</code>; <code>findings.html</code> declares <code>&lt;meta charset="utf-8"/&gt;</code> at line 4). Those artifacts are the bytes interpreted by a CP-1252 / Windows-1252 viewer. The bytes are correct; the viewer's decoding is not. This will render correctly in any browser, GitHub renderer, or UTF-8-aware editor.
+</div>
+
+<h2 id="config-drift">3. Config-vs-code-default drift (the most important finding)</h2>
+<p>The committed <code>config.json</code> is a "challenge profile" (per <code>README.md</code> line 54). In the drift below, positive deltas indicate the config is <b>looser</b> than the code default — i.e., the challenge profile allows weaker winners into the pool, precisely where the code defaults were recently tightened (<code>PATCH_NOTES.md</code> 2026-02-15 scoring audit). The net effect is that the safety work in the code is partially undone by operating config.</p>
+
+<table>
+<thead><tr><th>Key</th><th>Code default</th><th>config.json</th><th>Direction</th><th>Net effect on live PnL</th></tr></thead>
+<tbody>
+<tr><td><code>regime_min_val_return_pct</code></td><td class="num">5.0</td><td class="num">0.0</td><td><span class="sev sev-crit">Looser</span></td><td>Break-even regime winners allowed. Live DD shock when a marginal winner regresses.</td></tr>
+<tr><td><code>exceptional_val_profit_factor</code></td><td class="num">1.5</td><td class="num">1.15</td><td><span class="sev sev-high">Looser</span></td><td>Weak-train strategies rescued on modest val PF. Curve-fit risk.</td></tr>
+<tr><td><code>exceptional_val_return_pct</code></td><td class="num">10.0</td><td class="num">5.0</td><td><span class="sev sev-high">Looser</span></td><td>Weak-train rescue on low validation return.</td></tr>
+<tr><td><code>fx_min_robustness_ratio</code></td><td class="num">0.80</td><td class="num">0.75</td><td><span class="sev sev-med">Looser</span></td><td>Allows 25% score degradation train→val. Live regression tolerance too wide.</td></tr>
+<tr><td><code>actionable_score_margin</code></td><td class="num">0.92</td><td class="num">0.90</td><td><span class="sev sev-med">Looser</span></td><td>Candidates within 10% of best are actionable (was 8%). Marginal selections slip in.</td></tr>
+<tr><td><code>execution_spread_spike_mult</code></td><td class="num">2.0</td><td class="num">3.0</td><td><span class="sev sev-med">Looser</span></td><td>Spike blocker fires only at 3× rolling median — wide events pass.</td></tr>
+<tr><td><code>min_trade_risk_pct</code></td><td class="num">0.10</td><td class="num">0.05</td><td><span class="sev sev-low">Looser</span></td><td>Low-risk micro-trades allowed. Noise relative to commission floor.</td></tr>
+<tr><td><code>min_profit_factor</code> (legacy)</td><td class="num">1.10</td><td class="num">1.05</td><td><span class="sev sev-low">Looser</span></td><td>Only active in legacy scoring mode; still worth aligning.</td></tr>
+<tr><td><code>train_min_profit_factor</code></td><td class="num">0.5</td><td class="num">0.80</td><td><span class="sev sev-pass">Stricter</span></td><td>Good — pre-tune gate rejects obvious losers before compute spend.</td></tr>
+<tr><td><code>train_min_return_pct</code></td><td class="num">-30.0</td><td class="num">-15.0</td><td><span class="sev sev-pass">Stricter</span></td><td>Good.</td></tr>
+<tr><td><code>train_max_drawdown</code></td><td class="num">60.0</td><td class="num">20.0</td><td><span class="sev sev-pass">Stricter</span></td><td>Good — bounds the pre-tune search space.</td></tr>
+<tr><td><code>max_combined_risk_pct</code></td><td class="num">3.0</td><td class="num">2.0</td><td><span class="sev sev-pass">Stricter</span></td><td>Good — same-symbol D1+lower-TF cap.</td></tr>
+<tr><td><code>secondary_trade_max_risk_pct</code></td><td class="num">0.9</td><td class="num">0.5</td><td><span class="sev sev-pass">Stricter</span></td><td>Good — secondary trades are capped at 0.5% of equity.</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<b>Why this is the critical finding.</b> The challenge profile's <i>risk caps</i> are correctly tightened, but the <i>selection gates</i> are loosened. That inversion is exactly wrong for challenge conditions: a challenge-risk account cannot afford marginal winners because every drawdown consumes limited loss buffer. The right trade-off is <b>stricter gates, tighter caps</b> — not looser gates, tighter caps.
+</div>
+
+<h4>Proposed config.json changes (minimum set)</h4>
+<pre><code>// pipeline section
+"regime_min_val_return_pct":       5.0,    // was 0.0  — no break-even winners
+"exceptional_val_profit_factor":   1.50,   // was 1.15 — align with restored code default
+"exceptional_val_return_pct":      10.0,   // was 5.0  — align
+"fx_min_robustness_ratio":         0.80,   // was 0.75 — align
+"actionable_score_margin":         0.92,   // was 0.90 — align with code+tests
+"execution_spread_spike_mult":     2.0,    // was 3.0  — align with seam default
+"min_trade_risk_pct":              0.10    // was 0.05 — align</code></pre>
+<p>Every one of these is a single-number change that re-arms a guard already validated by tests; none weakens the winners-only policy; all are conservative for a challenge account.</p>
+
+<h2 id="scoring">4. Scoring, validation, and backtester</h2>
+
+<div class="finding f-crit">
+<span class="sev sev-crit">Critical</span>
+<h4>Weak-train exceptional-validation rescue path is too permissive</h4>
+<div class="loc">pm_pipeline.py:2437–2462 · pm_core.py:670–672</div>
+<p>A strategy that loses money in-sample (train PF &lt; 1 or negative return) can still be selected as a regime winner on ~20 lucky validation trades. With code-default thresholds (val PF ≥ 1.5, val return ≥ 10%) this is already marginal; with the challenge config (1.15 / 5.0) it is a curve-fit magnet.</p>
+<p><b>Proposed</b>: (a) align config with code defaults, (b) also require <code>val_sharpe ≥ 0.5</code> and <code>val_trades ≥ 50</code> for the rescue path, (c) require <code>val_win_rate &gt; 50%</code>. Together these stop "one lucky validation run" from overruling a losing training set.</p>
+</div>
+
+<div class="finding f-low">
+<span class="sev sev-low">Low</span>
+<h4>Score weights only matter in the legacy <code>pm_weighted</code> scoring mode</h4>
+<div class="loc">pm_core.py:708–714 (legacy weights), pm_core.py:4421–4426 (mode dispatcher), config.json:23 (active mode)</div>
+<p>The committed config sets <code>scoring_mode = "fx_backtester"</code>, which routes all selection scoring through <code>calculate_fx_selection_score</code> / <code>calculate_fx_opt_score</code> and bypasses the <code>score_weights</code> block entirely. So the original "PF→0.30, Sharpe→0.20" recommendation against the legacy block has no live effect.</p>
+<p><b>Where to actually express PF emphasis in the active path</b>: the <code>fx_backtester</code> scorer combines validation PF, return, DD, and trade-count stability in <code>fx_generalization_score</code> with a fixed gap penalty (<code>fx_gap_penalty_lambda</code>) and a robustness boost (<code>fx_robustness_boost</code>). PF emphasis already comes from how PF enters the <i>component scores</i>, not from a separate weight. The realistic levers are:</p>
+<ul>
+  <li>Raise <code>fx_min_robustness_ratio</code> (committed 0.75 → recommend 0.85). This thins train→val degradation tolerance directly; Section 3 already lists this.</li>
+  <li>Tighten <code>fx_val_max_drawdown</code> from 15.0 → 12.0 in the active path; this is the real DD penalty input.</li>
+  <li>If the legacy <code>pm_weighted</code> mode is no longer intended for live, either remove it or guard it behind a clear "legacy" comment so operators know the <code>score_weights</code> block in <code>config.json</code> is informational only.</li>
+</ul>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>Continuous drawdown penalty too soft</h4>
+<div class="loc">pm_core.py:4286–4289 (<code>calculate_fx_selection_score</code>)</div>
+<p>At the <code>fx_val_max_drawdown = 15</code> threshold, <code>exp(-0.03·15) = 0.64</code> — a 36% penalty. A candidate at 25% DD with strong Sharpe can still win. Tighten to <code>exp(-0.05·dd)</code> so the penalty at 15% DD is 0.47 and at 25% is 0.29.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>Robustness ratio default permits 20% out-of-sample degradation</h4>
+<div class="loc">pm_core.py:553</div>
+<p><code>fx_min_robustness_ratio = 0.80</code> means a strategy can score 100 in training and 80 in validation and still be considered robust. For FX, 20% out-of-sample regression is a predictable end to live profitability. Raise to 0.90 in both code and config; expect ~10–15% pool thinning, which is the point.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4><code>actionable_score_margin</code> semantics are relative, not absolute</h4>
+<div class="loc">pm_main.py:2047–2062; docstring pm_core.py:573–576</div>
+<p>In live code, margin is applied as <code>min_score = best_overall_score * margin</code> (pm_main.py:2090). The SETTINGS_REFERENCE wording ("minimum score threshold") is misleading — this is a <i>margin around the leader</i>, not a floor. Code-default 0.92 means "candidates within 8% of leader are eligible"; config 0.90 means "within 10%". For multi-winner symbols this widens the tie-break, letting slightly weaker candidates win.</p>
+<p><b>Proposed</b>: (a) align config to 0.92; (b) rewrite the SETTINGS_REFERENCE description to "minimum fraction of the leader's selection score required to be eligible"; (c) in code, also guarantee <code>best_overall_score &gt; 0</code> before the margin is applied (so a zero-score leader doesn't silently let zero-score candidates through).</p>
+</div>
+
+<div class="finding f-pass">
+<span class="sev sev-pass">Pass</span>
+<h4>Train/val overlap is warmup-only and never scored (corrected)</h4>
+<div class="loc">pm_core.py:3229–3234 (<code>DataSplitter</code> docstring + contract version)</div>
+<p>Re-read of <code>DataSplitter</code> shows it explicitly states "the overlap window is warmup-only and is never scored" and pins this behavior with <code>SPLIT_CONTRACT_VERSION = "2026-03-29a"</code>. Earlier soft-look-ahead claim is unsupported by the splitter contract. <b>Finding withdrawn.</b></p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>Feature cache thrashes on multi-symbol runs</h4>
+<div class="loc">pm_core.py:2621–2693 (<code>_FEATURE_CACHE_MAX = 6</code>)</div>
+<p>Current cap fits 6 symbols × 1 TF concurrent. With 10+ symbols across 6 timeframes, evictions every iteration lose tens of seconds each. Raise to 24 and add a hit-rate log line once per retrain.</p>
+</div>
+
+<div class="finding f-pass">
+<span class="sev sev-pass">Pass</span>
+<h4>Backtester correctness — sound</h4>
+<div class="loc">pm_core.py:248–422 + Numba kernel</div>
+<p>Same-bar gap-through-stop, bid/ask spread application at entry and exit, SL-before-TP same-bar check, next-bar-open execution, and Python/Numba parity all verified. The only note is that EOD force-close exits at <code>close ± half_spread</code> are slightly optimistic (~0.5 pip on M5 EOD); acceptable for the timeframes you trade.</p>
+</div>
+
+<h2 id="strategies">5. Strategy pool</h2>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>Mean-reversion strategies default to 1:1 R:R</h4>
+<div class="loc">pm_strategies.py — RSIExtremes, BollingerBounce, StochasticReversal, CCIReversal, WilliamsR</div>
+<p>Defaults to <code>sl_mult = 2.0, tp_mult = 2.0</code>. After commission + spread + slippage, breakeven requires ~53–55% WR even on majors. Proposed default <code>sl_mult = 2.0, tp_mult = 3.0</code>. Grid remains free to tune, but defaults shouldn't seed a negative-expectancy candidate.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>Oscillator reversals lack higher-TF trend filter</h4>
+<div class="loc">pm_strategies.py — RSIExtremes:1130–1144, CCIReversal, Stochastic, Williams%R; template at RSITrendFilteredMRStrategy:2104–2109</div>
+<p>Roughly half of "oversold" fires happen in established downtrends — a known failure mode. Apply the existing <code>RSITrendFilteredMRStrategy</code> pattern (EMA200 gate) to all four. Estimated +10–15% win rate on the affected candidates; keeps the entry logic otherwise unchanged.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>EMARibbonADX search budget is imbalanced under a flat trial cap</h4>
+<div class="loc">pm_strategies.py:2052–2061</div>
+<p><code>84,480</code> combinations is large, but large is not automatically wrong in FXPM. The real issue is fairness: with <code>max_param_combos = 200</code>, this family receives a materially coarser search than smaller families, so the tournament can become compute-biased rather than merit-biased. <b>Proposed</b>: replace hard axis-fixing with staged search (coarse template pass then focused refinement), family-level budget controls, or larger justified trial budgets for large families. Only hard-remove axes such as <code>adx_period</code> or <code>use_di_confirmation</code> if a matched-budget invariance audit shows exact local winners are preserved. Add an explicit warning in <code>BaseStrategy.get_param_grid()</code> when the cartesian product exceeds a threshold so operators can choose budget intentionally.</p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>Cached helper short-circuits on hardcoded defaults may return wrong precomputed column</h4>
+<div class="loc">pm_strategies.py _get_keltner / _get_bb / _get_adx_di</div>
+<p>Example: <code>_get_keltner</code> short-circuits to the precomputed <code>KC_*</code> columns if params equal <code>(20, 20, 2.0)</code>. If a grid tests <code>(20, 20, 1.5)</code> right after <code>(20, 20, 2.0)</code>, the helper correctly misses the short-circuit — but the precomputed columns from the prior run may still be in the DataFrame with the wrong multiplier. Make the short-circuit explicit on a per-DataFrame tag rather than column presence.</p>
+</div>
+
+<div class="finding f-low">
+<span class="sev sev-low">Low</span>
+<h4>Structural similarity is not automatic redundancy</h4>
+<div class="loc">pm_strategies.py (pool-wide)</div>
+<p>4 EMA-crossover-family variants, 4 oscillator-reversal variants, and 3 BB/Keltner-band variants may look similar structurally, but similar-looking competitors can still produce different exact local winners. Treat similarity as an audit target, not an eviction rule. Merge or prune only after matched-budget backfill shows the exact local winner set is materially unchanged. The zero-trade-tail issue is separate: keep <code>ATRPercentileBreakoutStrategy</code> and <code>KaufmanAMATrendStrategy</code> visible in optimizer summaries so operators can see empty buckets without pre-judging them out of the tournament.</p>
+</div>
+
+<h2 id="live">6. Live loop, MT5 &amp; storage</h2>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>Secondary-trade risk path is geometry-first, but fallback observability should be louder (corrected)</h4>
+<div class="loc">pm_main.py same-symbol enforcement path</div>
+<p>Earlier draft treated comment-tag decoding as the primary exposure estimate. Re-verification showed the live path now estimates existing-symbol risk from live geometry first and re-enforces the same-symbol combined cap before order send. The residual concern is observability: when geometry is unavailable and comment decode also fails, operators should see a loud, structured fallback reason rather than infer behavior indirectly.</p>
+<p><b>Proposed</b>: keep the geometry-first contract, wrap decode failure in explicit WARNING logging, and emit a structured fallback reason whenever <code>default_risk_pct</code> is used.</p>
+</div>
+
+<div class="finding f-pass">
+<span class="sev sev-pass">Pass</span>
+<h4>Auto-widen preserves validated R-multiple (corrected)</h4>
+<div class="loc">pm_main.py:2770–2798</div>
+<p>Re-reading the live path showed the code captures <code>original_r_multiple</code> and recomputes TP after widening SL, preserving the validated reward:risk contract. The earlier recommendation to preserve absolute pip risk instead would have changed the trade geometry away from the validated strategy. The remaining requirement is observability: log widen amount and resulting geometry clearly whenever broker minimum stop distance changes the authored trade.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>Spread-spike median is timing-sensitive</h4>
+<div class="loc">pm_main.py:2739–2742 · pm_enhancement_seams.py:363–399</div>
+<p>The rolling 50-bar median uses closed-bar spread values, then compares to the <i>current tick</i> spread. In pre-news compression, rolling median can be very low, so a routine widening is flagged as a spike; in post-news persistence, a high baseline median can hide actual spikes. <b>Proposed</b>: use a slightly longer window (e.g., 100 bars) and also compare against <code>spec.spread_avg</code> (whichever is higher) for the spike threshold; keep the current behavior when median is the higher anchor.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>Lot-normalization can silently elevate risk</h4>
+<div class="loc">pm_main.py:3000–3056</div>
+<p>When computed volume &lt; broker <code>min_lot</code>, the code floors up to <code>min_lot</code>, which pushes risk above target. The logger reports the drift, but the trade still places. For a challenge profile this is the wrong default: if the only way to satisfy broker minimum is to exceed target risk, the correct behavior is to skip unless the post-round risk still fits inside <code>max_risk_pct</code>. Add an explicit check: <code>if actual_risk_pct &gt; target_risk_pct * (1 + tolerance) and actual_risk_pct &lt;= max_risk_pct</code> → log loud warning; <code>if actual_risk_pct &gt; max_risk_pct</code> → block.</p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>Margin-recovery has no cooldown before new entries</h4>
+<div class="loc">pm_main.py:1733–1812</div>
+<p>After a PANIC close cycle lifts the account back above <code>margin_recovery_start_level</code>, the very next sweep accepts new trades. In flash-crash conditions this allows immediate re-entry into the same exposure that caused the panic. <b>Proposed</b>: add a <code>margin_reopen_cooldown_minutes</code> setting (default 15 min) and block all new entries for that window after any forced close cycle, regardless of current margin level.</p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>Decision-throttle has no expiry — cross-restart hazard</h4>
+<div class="loc">pm_main.py:319–508</div>
+<p>The throttle persists last-decision state per symbol to <code>last_trade_log.json</code> and is keyed by bar time. On restart after a transient skip (e.g., spread spike), if the same bar is replayed and conditions have normalized, the stale suppression sticks. <b>Proposed</b>: add a 24-hour max-age purge on load; alternatively, key the throttle by bar <i>close</i> time rather than start time so a new bar inherently invalidates.</p>
+</div>
+
+<div class="finding f-pass">
+<span class="sev sev-pass">Pass</span>
+<h4>Winners-only selection and regime-shift semantics</h4>
+<div class="loc">pm_main.py (winners loop), pm_pipeline.py (ledger)</div>
+<p>Strict per-(symbol, TF, regime) lookup. No fallback path remains active. <code>REGIME_LIVE.iloc[-2]</code> correctly reads the previous closed bar. Open-position TF inference chain is complete and fail-closed.</p>
+</div>
+
+<h2 id="regime">7. Regime detection</h2>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>Tuned <code>regime_params.json</code> falls back silently when absent (corrected)</h4>
+<div class="loc">pm_core.py:3172 (<code>_append_regime_features</code>); pm_pipeline.py:2769; pm_main.py:2297</div>
+<p>Earlier draft claimed the tuner output was orphaned. Re-verification shows <code>load_regime_params()</code> is in fact wired:</p>
+<ul>
+  <li><code>FeatureComputer._append_regime_features</code> calls <code>load_regime_params(symbol, timeframe, regime_params_file)</code> (<code>pm_core.py:3180</code>).</li>
+  <li><code>pm_pipeline.py:2769</code> passes <code>regime_params_file</code> into <code>FeatureComputer.compute_all</code> during optimization.</li>
+  <li><code>pm_main.py:2297</code> passes <code>regime_params_file</code> into <code>FeatureComputer.compute_all</code> during live evaluation.</li>
+  <li>A pipeline-config fingerprint of the file is captured at <code>pm_pipeline.py:149</code>.</li>
+</ul>
+<p><b>Real residual concern</b>: when <code>regime_params.json</code> is <i>absent</i> in the working directory, <code>load_regime_params()</code> silently falls back to <code>DEFAULT_PARAMS_BY_TIMEFRAME</code>. Operators running without the tuned file may not realize they're on defaults.</p>
+<p><b>Fix</b>: log INFO once per session per (symbol, TF) when the loader falls back to defaults, and surface "regime params: tuned vs default" in the startup config summary.</p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>ADX normalization hardcoded to majors</h4>
+<div class="loc">pm_regime.py:1047–1052</div>
+<p>20/40 thresholds under-weight TREND for JPY pairs (baseline ADX 15–18) and over-weight it for exotics (USDMXN, USDZAR baseline ADX 25+). <b>Proposed</b>: add <code>adx_trend_threshold</code> to <code>RegimeParams</code> and compute normalization relative to it; set per-asset-class defaults in the tuner and in static fallbacks.</p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>Bollinger-squeeze lookback is not timeframe-aware</h4>
+<div class="loc">pm_regime.py:290–291</div>
+<p>200 bars on M5 = ~16 hours (dense), 200 bars on D1 = 9 months (stale). Use TF-specific defaults: M5=50, M15=80, H1=50, H4=50, D1=60. This sharpens BREAKOUT score timing without destabilizing the state machine.</p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>D1 hysteresis <code>k_hold=2</code> allows fast flips</h4>
+<div class="loc">pm_regime.py:327–333</div>
+<p>Raise D1 <code>k_hold</code> to 3. For an overnight-holding account this prevents one-bar spikes from flipping the held regime before the next evaluation. Low impact on intraday TFs; meaningful on D1 winners.</p>
+</div>
+
+<div class="finding f-low">
+<span class="sev sev-low">Low</span>
+<h4>Regime coverage is not reported</h4>
+<p>Add a one-line coverage summary per (symbol, TF) to optimizer output: <code>TREND 22% | RANGE 31% | BREAKOUT 9% | CHOP 38%</code>. Operators will immediately notice under-populated buckets (BREAKOUT &lt; 5%, CHOP &gt; 60%) that distort winner selection.</p>
+</div>
+
+<div class="finding f-pass">
+<span class="sev sev-pass">Pass</span>
+<h4>Causal labeling and warmup masking</h4>
+<p>Regime labels at bar t use only bars ≤ t; warmup is correctly masked; <code>REGIME_LIVE = REGIME.shift(1)</code> gives look-ahead-safe decision labels. Freshness-decay leak is closed per 1.4.6.</p>
+</div>
+
+<h2 id="position">8. Position sizing &amp; Optuna</h2>
+<p>The position layer is MT5-aware and deterministic, and the Optuna layer is reproducible on seed, but both carry material correctness and expressiveness gaps that quietly cost PnL on live bars. Findings below are file-line precise and ordered by impact.</p>
+
+<div class="finding f-pass">
+<span class="sev sev-pass">Pass</span>
+<h4>8.1 — Auto-widen SL preserves R-multiple (corrected)</h4>
+<div class="loc"><code>pm_main.py:2765–2782</code></div>
+<p>Earlier draft claimed auto-widen scales SL but not TP. Re-reading the live path showed the opposite is true: the code captures <code>original_r_multiple</code> at line 2768, and after widening SL to satisfy broker minimum stop distance (lines 2772-2776), it explicitly recomputes TP at lines 2778-2781:</p>
+<pre><code>if original_r_multiple &gt; 0:
+    new_sl_dist = abs(entry_price - sl_price)
+    new_tp_dist = original_r_multiple * new_sl_dist
+    tp_price = (entry_price + new_tp_dist) if is_long else (entry_price - new_tp_dist)</code></pre>
+<p>The validated reward:risk is preserved across the widening. The cited <code>pm_position.py:260-275</code> path I originally referenced is the <code>PositionConfig</code> dataclass declaration, not execution logic. <b>Finding withdrawn.</b></p>
+</div>
+
+<div class="finding f-low">
+<span class="sev sev-low">Low</span>
+<h4>8.2 — Duplicate min-lot viability block is dead code (corrected)</h4>
+<div class="loc"><code>pm_position.py:432–464</code></div>
+<p>Two structurally identical blocks exist in <code>PositionCalculator.size_position</code>. The first block (lines 432-447) returns unconditionally on <code>volume &lt; spec.min_lot</code>, so the second block (lines 449-464) is never reached. There is no behavioral or PnL impact — only code-clarity cost. Severity reduced from "doubled broker round-trip" (which was wrong; nothing is doubled) to "remove dead code."</p>
+<p><b>Fix</b>: delete lines 449-464.</p>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>8.3 — Optuna 80/20 blend weights are dead config (reframed)</h4>
+<div class="loc"><code>pm_optuna.py:100, 134</code> · <code>pm_pipeline.py:1034-1055, 2539-2555</code></div>
+<p>The original framing claimed trials are selected on train-only score because <code>optuna_use_val_in_objective=false</code>. Re-reading the active scoring path showed this is wrong:</p>
+<ul>
+  <li><b>Strategy-Optuna path</b> (<code>pm_pipeline.py:1034-1055</code>): in <code>fx_backtester</code> mode (the committed setting), the per-trial scoring function calls <code>fx_generalization_score(train, val)</code>, which returns <code>val_score - λ·gap</code>. This is validation-anchored — not train-only.</li>
+  <li><b>Regime-tuning path</b> (<code>pm_pipeline.py:2539-2555</code>): same call into <code>fx_generalization_score</code> when val has enough trades. Falls back to <code>train_score * 0.7</code> only when val trade count is insufficient.</li>
+  <li><b>Dead knobs</b>: <code>optuna_objective_train_weight=0.80</code> and <code>optuna_objective_val_weight=0.20</code> in <code>OptunaConfig</code> have no consumer in either path. They are also documented in <code>SETTINGS_REFERENCE.md</code> as if active.</li>
+</ul>
+<p><b>Reframed concern</b>: the dead weights cause documentation drift and operator confusion (operator believes they can tune the blend; the knobs do nothing). The actual blend lever is <code>fx_gap_penalty_lambda</code> on <code>PipelineConfig</code> (default 0.50).</p>
+<p><b>Fix</b>: either (a) remove the dead <code>optuna_objective_*_weight</code> knobs and the <code>optuna_use_val_in_objective</code> flag from <code>OptunaConfig</code> + <code>SETTINGS_REFERENCE.md</code>, or (b) wire them so the operator can actually adjust the train-vs-val emphasis. Option (a) is lower-risk and preserves the existing val-anchored behavior.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>8.4 — Objective has no variance / stability penalty</h4>
+<div class="loc"><code>pm_core.py:_compute_fx_generalization_score</code></div>
+<p>The pipeline's generalization score penalizes drawdown and rewards PF/Sharpe/WR/ret/trades but carries no explicit term for <i>dispersion of equity-curve returns</i>. Two strategies with identical Sharpe can have very different bar-return variance; the second will bleed more on live spreads and slippage.</p>
+<p><b>Fix</b>: add a multiplicative penalty <code>exp(-k · std_weekly_return)</code> with <code>k ≈ 2.0</code>. Small but consistent impact on winner stability; pairs naturally with the tighter DD penalty in §6.</p>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>8.5 — Risk scalars disabled by default, leaving volatility targeting off</h4>
+<div class="loc"><code>config.json</code> (<code>live_risk_scalars_enabled: false</code>), <code>pm_enhancement_seams.py:117–242</code></div>
+<p>The <code>RiskScalarStack</code> (VolatilityTargetScalar → FractionalKellyCap → DrawdownPositionScalar) is well-constructed and correctly ordered (vol-target first, Kelly-cap second, DD-scalar last), but the master switch is off. This means:</p>
+<ul>
+  <li>A trade sized at <code>risk_per_trade_pct</code> on a mid-volatility USDJPY bar carries the same equity-risk as the same config on a hyper-volatile XAUUSD bar.</li>
+  <li>Drawdown-based de-risking is not applied — a 10 % drawdown triggers nothing at the sizing layer.</li>
+  <li>The committed <code>target_annual_vol=0.10</code> has no effect at all.</li>
+</ul>
+<p><b>Fix</b>: enable the stack behind a two-stage rollout —</p>
+<ol>
+  <li>Shadow mode: compute scalars, log them, do not apply. One full week of logs to verify the stack's realized sizes are not degenerate.</li>
+  <li>Full enable with a conservative floor (<code>min_scalar=0.5</code>) and a cap (<code>max_scalar=1.0</code>) so the stack can only <i>reduce</i> risk, never amplify it.</li>
+</ol>
+</div>
+
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<h4>8.6 — No daily / session loss cap at the portfolio layer</h4>
+<div class="loc"><code>pm_main.py</code> live loop, <code>pm_core.py</code> <code>PortfolioManager</code></div>
+<p>There is a per-trade cap (<code>position.max_risk_pct</code>), a same-symbol combined cap (<code>max_combined_risk_pct</code>), and a margin-recovery state machine, but no explicit <b>daily-loss circuit-breaker</b>. A prop-firm or challenge profile without one is effectively gambling on the drawdown-of-the-day distribution.</p>
+<p><b>Fix</b>: add <code>position.daily_loss_halt_pct</code> (default 3.0 %) and <code>position.session_loss_halt_pct</code> (default 5.0 %). When breached:</p>
+<ul>
+  <li>No new entries allowed until the next trading day (daily) or next session rollover.</li>
+  <li>Existing open trades are <i>not</i> force-closed — they continue to their SL/TP so we do not panic-realize. This matches the winners-only philosophy: the decision we revoke is "start a new trade," not "abandon a plan we already committed to."</li>
+</ul>
+</div>
+
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<h4>8.7 — No regime-conditional R-multiple</h4>
+<div class="loc"><code>pm_position.py:_compute_tp_pips</code></div>
+<p>The same R-target is used whether the active regime is TREND or RANGE. TREND regime supports and rewards wider TPs (trend-continuation expectancy is asymmetric); RANGE regime is better served by tighter targets (mean-reversion mean is close). A single multiplier forces one of the two regimes into a suboptimal exit plan.</p>
+<p><b>Fix</b>: add <code>position.regime_tp_multipliers</code> as a dict — e.g. <code>{"TREND":1.25, "BREAKOUT":1.15, "RANGE":0.85, "CHOP":0.75}</code> — and apply it multiplicatively to the base TP during live entry. This composes cleanly with the existing regime-aware strategy selection; no winners-set change required.</p>
+</div>
+
+<div class="finding f-low">
+<span class="sev sev-low">Low</span>
+<h4>8.8 — Pip-value fallback when MT5 <code>order_calc_profit</code> unavailable</h4>
+<div class="loc"><code>pm_position.py:_estimate_risk_usd</code></div>
+<p>The fallback path uses static pip-value tables. For JPY crosses and metals, the static table underestimates true pip-value when the account is funded in a non-USD currency. Not a common scenario on the current account config, but worth noting: if the MT5 primitive returns <code>None</code>, the system will silently under-size. An explicit WARN log (not just DEBUG) on fallback would surface this before it becomes a live PnL issue.</p>
+</div>
+
+<div class="finding f-pass">
+<span class="sev sev-pass">Pass</span>
+<h4>Lot-normalization floor, seed determinism, pm_configs.json atomic write</h4>
+<p>Broker lot step floor, min/max clipping, and tick rounding are handled correctly in <code>_normalize_lot</code>. Optuna's <code>TPESampler(seed=…)</code> is passed through with the configured seed; repeated optimizer runs with the same seed are reproducible to the trade. <code>pm_configs.json</code> uses atomic replace-writes; interrupted runs do not corrupt the ledger.</p>
+</div>
+
+<h2 id="exec-spread">9. Execution-quality overlay — issues &amp; quick wins</h2>
+<p>The spread overlay (<code>pm_enhancement_seams.py:344–399</code>) is conceptually correct (spike block, min-edge reject, soft penalty). Two fixes materially improve its behavior:</p>
+<ol>
+  <li><b>Penalty curve saturates at 0.5.</b> Current: <code>penalty = max(0.5, 1 - (ratio - start))</code>. Once <code>spread/ATR</code> exceeds <code>start + 0.5</code>, further deterioration is free. <b>Fix</b>: <code>penalty = max(0.25, 1 - 0.4·(ratio - start))</code> — softer floor, slower decay, non-saturating at realistic ratios.</li>
+  <li><b>Spread-spike compare base.</b> Use <code>max(rolling_median_50, spec.spread_avg)</code> as anchor; prevents collapsed rolling medians from arming the blocker unfairly, and prevents inflated rolling medians from hiding real spikes.</li>
+</ol>
+
+<h2 id="new-strategies">10. Candidate new strategies (examples, not privileged admissions)</h2>
+<p>The proposals below are candidate entrants or wrappers that could be allowed to compete in the same tournament. They are <b>not</b> privileged because they "balance the pool"; they still must earn exact local wins under the same symbol x timeframe x regime contract as every incumbent.</p>
+<ul>
+  <li><b>Session-Momentum Continuation</b> (LondonOpen, NY-Overlap): only fires during high-liquidity windows and gates on spread-quality overlay. Plausible specialist for exact local trend pockets where session structure matters.</li>
+  <li><b>Range Mean-Reversion with Volatility Filter</b>: BB ±1.5σ fade, gated by <code>ADX &lt; 20</code> and ATR non-expanding. Plausible specialist for low-ADX local range pockets.</li>
+  <li><b>Daily-Breakout Retest</b>: D1 breakout that closes back inside the range triggers an H4 entry in the reverse direction with a structural SL beyond the daily swing. Low-trade-count candidate for exact breakout-failure pockets.</li>
+  <li><b>Hybrid Structural SL wrapper</b>: not a strategy, but a wrapper the base class can apply to any breakout/trend strategy — combine ATR-based SL with the nearest past swing; pick the wider of the two, clip at 1.5× ATR. Materially reduces whipsaw losses without over-tightening TP.</li>
+</ul>
+
+<h2 id="roadmap">11. Recommended rollout roadmap</h2>
+
+<h3>Phase A — Config realignment (hours, not days)</h3>
+<ul>
+  <li>Apply the seven single-line config changes in §3 and rerun <code>--optimize --overwrite</code>.</li>
+  <li>Verify full test suite still passes (it should — code defaults already agree with the proposed config values).</li>
+  <li>Paper-run for at least one full trading week; capture the new winners set in <code>pm_configs.json</code>.</li>
+</ul>
+
+<h3>Phase B — Critical live-loop patches (1–2 days)</h3>
+<ul>
+  <li>Raise observability on fallback paths in the secondary-trade risk check (geometry-first path stays intact; decode/default fallbacks become explicit WARN events).</li>
+  <li>Keep auto-widen's R-multiple-preservation behavior; add clearer geometry logging when broker minimum stop distance rewrites the authored trade.</li>
+  <li>Harden spread-spike window (longer lookback, <code>max(median, spread_avg)</code> anchor, non-saturating penalty).</li>
+  <li>Add margin-reopen cooldown (15 min default).</li>
+  <li>Add 24h purge to decision-throttle persistence on load.</li>
+</ul>
+
+<h3>Phase C — Selection quality (2–3 days)</h3>
+<ul>
+  <li>Tighten the active <code>fx_backtester</code> path rather than the inert legacy weight block: stronger DD penalty, stronger robustness ratio, and clearer documentation around dead legacy knobs.</li>
+  <li>Tighten continuous DD penalty to <code>exp(-0.05·dd)</code>.</li>
+  <li>Tighten weak-train rescue: add <code>val_sharpe ≥ 0.5</code> and <code>val_trades ≥ 50</code>.</li>
+  <li>Add tuned-vs-default regime-params observability and a coverage report; the loader is already wired into both live and backtest compute paths.</li>
+</ul>
+
+<h3>Phase D — Strategy-level uplift (1 week)</h3>
+<ul>
+  <li>Raise mean-reversion default TP to 3.0× ATR.</li>
+  <li>Add EMA200 direction filter to RSIExtremes, CCI, Stochastic, Williams%R.</li>
+  <li>Replace hard EMARibbonADX preconditioning with staged search, family-level budget control, or larger justified compute so large families can compete fairly.</li>
+  <li>Add structural-SL wrapper optional param to breakout strategies.</li>
+  <li>Retune 2–3 strategies per regime using the tightened Optuna objective.</li>
+</ul>
+
+<h3>Phase E — Optional uplift (behind flags, rolled in carefully)</h3>
+<ul>
+  <li>Turn on <code>live_risk_scalars_enabled</code> with <code>VolatilityTargetScalar</code> only; measure drift.</li>
+  <li>Add per-asset-class <code>adx_trend_threshold</code> defaults and timeframe-aware BB lookback.</li>
+  <li>Introduce candidate new strategies and let them compete under the same tournament contract; do not require portfolio-balancing justification for admission.</li>
+  <li>Enable <code>MarketDrivenExitPack</code> in paper only; compare to SL/TP-only control group for a month.</li>
+</ul>
+
+<h2 id="technical-direction">12. Technical direction &amp; guiding philosophy</h2>
+<p>For a stable long-term direction, a separate <code>TECHNICAL_DIRECTION.md</code> document accompanies this review. The core principles encoded there (and mirrored briefly below) are intentionally framed as <b>decision rules</b>, not aspirations:</p>
+
+<div class="card">
+<h3 style="margin-top:0">The FxPM 1.4 decision rules</h3>
+<ol>
+  <li><b>Correctness is a precondition, not a feature.</b> Any code path that privileges speed over deterministic, causal behavior is rejected even if faster.</li>
+  <li><b>Config is a contract between operator and strategy.</b> If code defaults tighten, committed config must catch up before live. Drift is a defect.</li>
+  <li><b>Winners-only means no fallback, ever.</b> "No trade" is a first-class outcome with dedicated logging, metrics, and throttle behavior.</li>
+  <li><b>Regime is a hard filter, not a hint.</b> A winner in TREND does not trade in CHOP even if its signal happens to fire. Transitions are explicit.</li>
+  <li><b>Risk is budgeted forward, not reconciled backward.</b> Risk caps are checked at decision time against geometry-derived exposure; tags are informational, not authoritative.</li>
+  <li><b>Backtest and live must be indistinguishable to the strategy.</b> Any divergence (spread, slippage, gap handling, entry timing) is a debt; debts are paid off, not rationalized.</li>
+  <li><b>Signals fire on closed bars.</b> Anything else is look-ahead. Settle-time is a feature, not a delay.</li>
+  <li><b>Generalization beats optimization.</b> The robustness ratio gate, the train/val gap penalty, and the weak-train rescue thresholds all answer the same question: does this survive the next regime?</li>
+  <li><b>Selection is a fair tournament at exact local granularity.</b> Winners are decided per-(symbol, TF, regime), stored, and retrained on a calendar. There is no global symbol winner, and no strategy family is entitled to pre-discovery preference.</li>
+  <li><b>Observability is execution's insurance.</b> Every blocked entry has a reason; every margin transition has a log line; every deviation from modeled behavior is surfaced.</li>
+</ol>
+</div>
+
+<h2 id="strategic">13. Strategic &amp; holistic recommendations (from second-pass review)</h2>
+<p>The first twelve sections cover correctness and tactical PnL leverage. The points below are at the architectural / business level — incorporated from a holistic second-pass review and (for §13.6) re-grounded in direct measurements from <code>fxpm_order_management_poc.ipynb</code>. They are accepted into this document because they identify <b>real gaps not captured by the line-level findings</b> and they materially shape the next stage of the project.</p>
+
+<div class="callout good">
+<b>Headline verdict from the holistic review:</b> the project does <b>not</b> need a ground-up overhaul. The execution stack, persistence, MT5 safeguards, and core selection pipeline are real strengths and worth preserving. The next gains are not from collapsing the PM into one umbrella policy engine, but from improving <b>downstream review discipline, research realism, and post-entry governance</b> while preserving the autonomy of exact local winners.
+</div>
+
+<div class="callout good">
+<b>Three-layer model (corrected).</b> FXPM should be understood as three linked but distinct layers:
+<ol>
+  <li><b>Discovery tournament</b>: find the winning strategy and parameterization for the exact local context <code>(symbol, TF, regime)</code>.</li>
+  <li><b>Local governance tournament</b>: once that winner exists, test order-management variants for that same exact local context.</li>
+  <li><b>PM backbone</b>: provide broker calls, order flow, persistence, telemetry, and execution infrastructure so these specialized local winners can operate reliably.</li>
+</ol>
+<p class="small">That means freshness review, holdout review, and order governance should support exact local winners after discovery. They should not be framed as a universal umbrella policy that flattens local autonomy.</p>
+</div>
+
+<h3>13.1 - Edge freshness via fixed retraining cadence and structured review (Priority 0)</h3>
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<p><b>Gap</b>: the earlier framing leaned too hard toward fail-closed freshness shutdown. That is not the intended operating model. FXPM already has a defined edge-freshness mechanism: the fixed two-week retraining cycle.</p>
+<p><b>Corrected recommendation</b>: keep the two-week live window as the primary freshness anchor and improve the review discipline around it rather than overriding it mid-cycle. The practical additions should be:</p>
+<ul>
+  <li><b>Pre-cycle hygiene</b>: confirm the new winner set is loaded cleanly before the live window begins.</li>
+  <li><b>In-cycle weekly review</b>: generate a structured review report covering realized behavior, spread conditions, missed fills, holdout context, and live-vs-research drift signals.</li>
+  <li><b>End-of-cycle refresh</b>: treat the scheduled retrain as the normal point for intervention, replacement, and re-qualification.</li>
+</ul>
+<p>Mid-cycle intervention should be reserved for <b>hard integrity failures</b> such as corrupt artifacts, broken execution plumbing, or clearly invalid runtime state. It should not be the default response to presumed edge decay inside the active two-week window.</p>
+</div>
+
+<h3>13.2 - Promote holdout into structured review and next-cycle context (Priority 1)</h3>
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<div class="loc">snapshot evidence: median val PF 2.06 vs median holdout PF 0.95 · 31/62 default winners have negative holdout return · 133/265 regime winners have negative holdout return</div>
+<p><b>Gap</b>: holdout metrics are informative, but the earlier framing turned them into a quasi-live gating layer. That is too intrusive for the intended operating model. Holdout should inform review discipline and next-cycle prioritization without silently shutting down local winners mid-cycle.</p>
+<p><b>Corrected recommendation</b>: extend each winner artifact with a structured review context block rather than a hidden quarantine engine:</p>
+<pre><code>{
+  "holdout_context": {
+    "pf": &lt;float&gt;,
+    "return_pct": &lt;float&gt;,
+    "max_dd_pct": &lt;float&gt;,
+    "trade_count": &lt;int&gt;
+  },
+  "review_flag": "NORMAL" | "WATCH" | "REVIEW",
+  "retrain_priority": &lt;score&gt;,
+  "last_review": &lt;timestamp&gt;
+}</code></pre>
+<p>This keeps the information visible and operationally useful without introducing an automatic intra-cycle deactivation layer. Holdout remains a downstream review input and next-cycle context signal, not a stealth live kill switch.</p>
+</div>
+
+<h3>13.3 - Portfolio awareness without heavy umbrella lockout (Priority 2)</h3>
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<p><b>Gap</b>: the earlier framing leaned too hard toward a central allocator with hard account budgets and cluster caps. That is philosophically misaligned if it routinely suppresses productive capital that exact local winners are ready to deploy.</p>
+<p><b>Corrected recommendation</b>: keep any portfolio layer light-touch and supportive. The order should be:</p>
+<ol>
+  <li><b>Visibility first</b>: aggregate exposure, symbol concentration, and cluster awareness in logs and dashboards.</li>
+  <li><b>Soft sequencing second</b>: if many local winners fire at once, allow the PM to sequence or stage submissions where it improves execution quality.</li>
+  <li><b>Hard restrictions only for extreme states</b>: reserve true account-level lockouts for clearly exceptional conditions rather than making them the normal umbrella policy.</li>
+</ol>
+<p>The PM should default to keeping capital active and productive. A portfolio orchestration seam can still be useful, but it should act as an execution aid, not as a low-ceiling rationing engine.</p>
+</div>
+
+<h3>13.4 - Walk-forward as audit, not a blocking promotion ladder (Priority 3)</h3>
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<p><b>Gap</b>: the earlier recommendation treated an extra walk-forward promotion stage between validation and live deployment as inherently beneficial. That is not supported by the operating philosophy or by prior experience when freshness decays between tuning and live execution.</p>
+<p><b>Corrected recommendation</b>: if walk-forward remains in the framework, use it as a <b>parallel audit tool</b>, a post-cycle confidence study, or a research cross-check. Do <b>not</b> make it a blocking rung that delays movement from validation into the active live window unless it can be inserted without weakening freshness.</p>
+<p>This preserves the value of additional robustness analysis while respecting the practical reality that late deployment can be worse than theoretically cleaner deployment.</p>
+</div>
+
+<h3>13.5 — Cost realism upgrades (Priority 4)</h3>
+<div class="finding f-med">
+<span class="sev sev-med">Medium</span>
+<p><b>Gap</b>: backtest currently uses fixed <code>spec.spread_avg</code>, fixed slippage, and no swap/carry. The 1.07-pip-vs-0.95-PF gap between validation and holdout (snapshot above) is partly research-realism, not just generalization.</p>
+<p><b>Recommendation</b>:</p>
+<ul>
+  <li>Use recorded per-bar spread when available; for symbols where it isn't, model spread as a session/volatility function.</li>
+  <li>Replace fixed slippage with session/symbol-conditioned slippage tables.</li>
+  <li>Apply swap/carry in backtest PnL for any position carried across rollover.</li>
+  <li>Add "edge after friction" as a first-class metric and require it &gt; 0 for promotion.</li>
+</ul>
+</div>
+
+<h3>13.6 - Local OrderGovernanceEngine: governance as a second tournament after winner discovery (most material strategic addition)</h3>
+<div class="finding f-high">
+<span class="sev sev-high">High</span>
+<p><b>The single largest gap in the current architecture.</b> FXPM today enters trades with broker-side SL/TP and then leaves them mostly unmanaged. Trailing, breakeven, and time-exit logic exist in <code>pm_position.py</code>; <code>MarketDrivenExitPack</code> exists in <code>pm_enhancement_seams.py</code>. What is missing is a first-class live supervisor that owns an open trade through its lifecycle.</p>
+<p>This is why the current system is still an incomplete live-trading model even though the selection skeleton is strong. Fixed exits are a useful scientific control, but they are not the full economic answer once a trade is live.</p>
+<p><b>Corrected design boundary</b>: strategy selection stays untouched. Governance begins <i>only after</i> a trade is filled, and it must be selected <b>locally</b> for the exact winner context rather than imposed as one global PM policy.</p>
+
+<h4>What the PM is doing here</h4>
+<ul>
+  <li><b>Discovery tournament</b>: choose the winning strategy and parameter set for the exact local context <code>(symbol, TF, regime)</code>.</li>
+  <li><b>Local governance tournament</b>: given that winner, compare post-entry governance variants for the same exact local context.</li>
+  <li><b>Technical backbone</b>: run broker calls, persistence, telemetry, throttles, and execution plumbing so those local winners and local governance policies can operate safely.</li>
+</ul>
+
+<h4>Subsystem shape</h4>
+<ul>
+  <li><code>OrderGovernanceEngine</code> owned by <code>LiveTrader</code></li>
+  <li><code>OrderGovernanceContext</code> + <code>OrderGovernanceState</code> + <code>OrderGovernanceDecision</code></li>
+  <li>Decision types: <code>NOOP</code>, <code>MODIFY_SLTP</code>, <code>CLOSE_FULL</code>, <code>CLOSE_PARTIAL</code>, <code>SHADOW_ONLY</code></li>
+  <li>Reuse <code>MarketDrivenExitPack</code> as the policy seam, <code>PositionManager</code> for trail/BE/time-exit semantics, MT5 <code>modify_position()</code> for broker updates, and <code>StorageManager</code> for durable per-position state</li>
+</ul>
+
+<h4>Governance arm library (candidate policies, not universal defaults)</h4>
+<table>
+  <thead><tr><th>Arm</th><th>Policy</th><th>Broker-ready now</th><th>Hypothesis</th></tr></thead>
+  <tbody>
+    <tr><td><code>G0_CONTROL</code></td><td>Current fixed SL/TP</td><td>Yes</td><td>Scientific baseline</td></tr>
+    <tr><td><code>G1_BREAKEVEN</code></td><td>Move SL to BE after profit threshold</td><td>Yes</td><td>Reduce winner-to-loser reversals</td></tr>
+    <tr><td><code>G2_ATR_TRAIL</code></td><td>ATR-trail after activation</td><td>Yes</td><td>Capture extended directional moves</td></tr>
+    <tr><td><code>G3_TIME_STOP</code></td><td>Exit stalled trades after max bars</td><td>Yes</td><td>Improve capital efficiency</td></tr>
+    <tr><td><code>G4_SIGNAL_GOV</code></td><td>Formalize thesis-invalidation exits</td><td>Yes</td><td>Exit when the trade logic is contradicted</td></tr>
+    <tr><td><code>G5_COMPOSITE</code></td><td>BE + ATR trail + time stop</td><td>Yes</td><td>Combined win-quality uplift</td></tr>
+    <tr><td><code>G6_PARTIAL_PLUS_TRAIL</code></td><td>Partial at TP1, trail remainder</td><td>No (phase 2)</td><td>Keep upside while raising realized win quality</td></tr>
+  </tbody>
+</table>
+<p>There is no philosophical reason two exact local contexts must share the same governance winner. Similar entry winners may still justify different governance winners.</p>
+
+<h4>Validation ladder (local-context competition, no contamination of selection science)</h4>
+<ol>
+  <li><b>Stage 1 - Offline local governance replay</b>: replay each selected winner's bars under each governance arm and emit comparable trade metrics keyed by <code>(winner_fingerprint, governance_variant_id)</code>.</li>
+  <li><b>Stage 2 - Shadow live on the same local context</b>: log hypothetical governance decisions to the ledger without modifying live orders.</li>
+  <li><b>Stage 3 - Controlled local A/B</b>: deterministic per-fill arm assignment, persisted; throttle identity includes the arm; control arm always stays active for measured uplift.</li>
+  <li><b>Stage 4 - Select the governance winner for that exact local context</b>: promote the winning governance arm locally, not across the PM globally.</li>
+</ol>
+
+<h4>Persisted governance state</h4>
+<p>Key by MT5 ticket and link it to the exact winner fingerprint. Required fields: symbol, TF, regime, strategy fingerprint, parameter fingerprint, entry/SL/TP, initial risk pips/USD, governance policy + version + arm id, MFE/MAE, bars held, last stop level, flags (<code>breakeven_applied</code>, <code>partial_tp1_taken</code>, <code>trailing_active</code>), and last governance action timestamp. This belongs in a dedicated durable store, not <code>last_actionable_log.json</code>.</p>
+
+<h4>Promotion criteria (must satisfy both)</h4>
+<ul>
+  <li><b>Local economic uplift</b>: PF lift vs control, win-quality improvement, R-multiple change, DD impact, and net return after friction for that exact local context.</li>
+  <li><b>Operational stability</b>: MFE capture rate, giveback before exit, stop-out rate after adjustment, modify/freeze/requote failure rate, and emergency-close frequency.</li>
+</ul>
+
+<h4>Empirical evidence: <code>fxpm_order_management_poc.ipynb</code> (audited 2026-04-21)</h4>
+<div class="callout good">
+<b>Audit verification</b>: I read the notebook directly. The <code>control_fixed</code> arm is asserted byte-for-byte against <code>Backtester.run</code> in the parity cell; for both <code>EURUSD</code> and <code>NZDJPY</code> on H4 (KaufmanAMATrendStrategy), <code>pf_delta = 0</code>, <code>return_delta = 0</code>, and <code>dd_delta = 0</code>. Every per-arm number quoted below was re-read from the notebook results table, not copied from an intermediate proposal.
+</div>
+
+<p>The notebook does <b>not</b> establish a universal governance winner for all FXPM. What it does show is that several governance arms are promising on sampled exact local contexts. That is the right use of the evidence: local narrowing, not global flattening.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Arm</th>
+      <th>EURUSD PF / Ret % / DD %</th>
+      <th>NZDJPY PF / Ret % / DD %</th>
+      <th>Verdict</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>control_fixed</code> (G0)</td><td>1.74 / 15.64 / 6.43</td><td>1.16 / 4.01 / 4.96</td><td>Baseline; matches FXPM backtester exactly</td></tr>
+    <tr style="background:#ecfdf5"><td><code>atr_trail_capped</code> (G2)</td><td><b>2.22 / 20.51 / 3.58</b></td><td><b>1.65 / 15.99 / 5.02</b></td><td><b>Strongest on both sampled local contexts - first local test cohort</b></td></tr>
+    <tr style="background:#f0fdf4"><td><code>breakeven_1r</code> (G1)</td><td>1.99 / 18.86 / 3.50</td><td>1.31 / 7.34 / 5.67</td><td>Credible local second on the sampled contexts</td></tr>
+    <tr><td><code>r_ladder_lock</code></td><td>1.99 / 18.86 / 3.50</td><td>1.31 / 7.34 / 5.67</td><td>Numerically identical to <code>breakeven_1r</code> on this sample; do not promote as a separate arm</td></tr>
+    <tr><td><code>donchian_trail</code></td><td>1.86 / 17.22 / 4.77</td><td>1.55 / 12.88 / 4.52</td><td>Tier-2 local replay candidate</td></tr>
+    <tr><td><code>hard_time_exit</code> (24-bar)</td><td>1.80 / 16.77 / 5.34</td><td>1.43 / 11.21 / 4.61</td><td>Tier-2 local replay candidate</td></tr>
+    <tr><td><code>profit_giveback_exit</code> (35%)</td><td>1.88 / 17.96 / 3.51</td><td>1.24 / 5.81 / 5.33</td><td>Tier-2 local replay candidate</td></tr>
+    <tr><td><code>two_leg_scaleout_runner</code></td><td>1.46 / 8.43 / 2.75</td><td>1.34 / 7.76 / 5.17</td><td>Tier-2 local replay candidate with changed trade-count semantics</td></tr>
+    <tr><td><code>chandelier_exit</code></td><td>1.53 / 12.39 / 4.54</td><td>1.33 / 8.42 / 3.89</td><td>Mixed; exploratory only on this sample</td></tr>
+    <tr><td><code>stagnation_time_stop</code> (8-bar)</td><td>1.38 / 10.04 / 6.43</td><td>1.22 / 5.60 / 4.64</td><td>Exploratory only on this sample</td></tr>
+    <tr><td><code>trend_decay_runner</code></td><td>1.40 / 8.43 / 4.39</td><td>1.45 / 11.19 / 5.68</td><td>Phase-2 model-aware candidate with localized NZDJPY promise</td></tr>
+    <tr><td><code>signal_invalidation_exit</code></td><td>1.17 / 4.72 / 5.76</td><td>1.08 / 2.36 / 7.10</td><td>Phase-2 only; weak on this sample</td></tr>
+    <tr><td><code>be_plus_atr_runner</code></td><td>1.35 / 7.20 / 3.68</td><td>1.40 / 9.68 / 5.71</td><td>Underperformed pure ATR trail on EURUSD</td></tr>
+    <tr><td><code>volatility_shock_exit</code></td><td>1.74 / 15.64 / 6.43</td><td>1.16 / 4.01 / 4.96</td><td><b>Numerically identical to control</b>; treat as exploratory only</td></tr>
+  </tbody>
+</table>
+
+<h4>Notebook-backed local testing ladder (for the sampled contexts only)</h4>
+<ol>
+  <li><code>control_fixed</code> remains the benchmark in every offline replay and live A/B.</li>
+  <li><b>First local production-test cohort:</b> <code>atr_trail_capped</code> first, <code>breakeven_1r</code> second.</li>
+  <li><b>Second local replay cohort:</b> <code>donchian_trail</code>, <code>hard_time_exit</code>, <code>profit_giveback_exit</code>, <code>two_leg_scaleout_runner</code>.</li>
+  <li><b>Phase-2 model-aware cohort:</b> <code>trend_decay_runner</code> first, <code>signal_invalidation_exit</code> second.</li>
+  <li><b>Exploratory only:</b> <code>stagnation_time_stop</code>, <code>volatility_shock_exit</code>, <code>chandelier_exit</code>.</li>
+  <li><b>Deferred:</b> live partial-profit / scale-out enforcement until the broker connector supports production-grade partial close.</li>
+</ol>
+
+<h4>Constraints the notebook adds</h4>
+<ul>
+  <li><b>The correct unit of promotion is the local winner fingerprint.</b> The governance winner belongs to the exact local context that produced the evidence.</li>
+  <li><b>Two-symbol evidence is not portfolio evidence.</b> The notebook exercised one strategy (KaufmanAMATrendStrategy, H4) on two symbols. That is enough for local narrowing, not for a PM-wide governance decree.</li>
+  <li><b>Random-entry sanity controls remain required.</b> Price-path overlays must still prove they are improving the selected strategy beyond what they add to random-entry paths.</li>
+  <li><b>Arms with identical numbers are one arm.</b> <code>r_ladder_lock</code> matched <code>breakeven_1r</code> exactly on this sample and should not count as an independent winner.</li>
+</ul>
+</div>
+
+<h3>13.7 - PM backbone role and optional TradeIntent seam (Priority 6, longer horizon)</h3>
+<div class="finding f-low">
+<span class="sev sev-low">Low</span>
+<p><b>Gap</b>: the PM already acts mainly as a technical backbone - broker calls, order flow, persistence, telemetry, and execution mechanics for many specialized local winners - but the contract between local winners, local governance, and the backbone is still narrow.</p>
+<p><b>Recommendation</b>: if the separation needs to become cleaner, introduce a <code>TradeIntent</code> typed structure carrying side, expected edge after cost, expected holding horizon, stop/target geometry, sizing bounds, and governance hints. The goal is not to centralize policy; it is to make local autonomy easier for the backbone to carry reliably.</p>
+</div>
+
+<h3>13.8 - Recommended sequencing</h3>
+<ol>
+  <li>Keep the two-week retraining cycle as the freshness anchor and add structured weekly review inside the active window (13.1).</li>
+  <li>Promote holdout into review, retrain prioritization, and downstream context metadata without turning it into a mid-cycle kill switch (13.2).</li>
+  <li>Improve research realism without inserting blocking deployment delay (13.5 and the non-blocking interpretation of 13.4).</li>
+  <li>Stand up <code>OrderGovernanceEngine</code> as a local governance tournament per exact winner context (13.6) - start with <b>price-path-only arms (<code>atr_trail_capped</code>, then <code>breakeven_1r</code>)</b> on the sampled contexts, and let broader contexts prove themselves locally.</li>
+  <li>Add light-touch portfolio awareness only if it helps orchestration, not to impose routine umbrella lockouts on productive capital (13.3).</li>
+  <li>Only then expand the orchestration contract if useful (<code>TradeIntent</code>, 13.7).</li>
+</ol>
+<p class="small"><b>Why this order</b>: the PM already has a freshness mechanism - the fixed retrain cadence. The next gains come from better review discipline, better cost realism, and local governance uplift. Heavy mid-cycle shutdown logic, blocking walk-forward ladders, or low-ceiling umbrella allocators would fight the operating philosophy instead of serving it.</p>
+<p class="small"><b>Why the narrowed first cohort</b>: the order-management notebook is the only empirical promotion evidence currently available, and its strongest signal is for two price-path arms on sampled local contexts. That is a good basis for the next local tests, not a license to impose one global governance winner across the PM.</p>
+
+<hr/>
+<p class="small">End of findings document. Accompanying artifacts: <a href="TECHNICAL_DIRECTION.md">TECHNICAL_DIRECTION.md</a> (long-horizon guiding philosophy) and <a href="fxpm_order_management_poc.ipynb">fxpm_order_management_poc.ipynb</a> (the order-management notebook whose results back §13.6). All second-pass reviewer corrections and holistic recommendations have been integrated directly into §2a and §13 above; the source proposal documents are intentionally not retained.</p>
+
+</div>
+</body>
+</html>
+

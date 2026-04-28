@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FxPM Final Storage Control Plan</title>
+  <style>
+    :root {
+      --bg: #edf2ec;
+      --panel: #fbfcfa;
+      --text: #1e241f;
+      --muted: #5d6a60;
+      --border: #cfd8cf;
+      --accent: #274c3b;
+      --good: #215a2f;
+      --warn: #8a5a13;
+      --danger: #7d2222;
+      --code: #eef3ef;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #e7eee5 0%, var(--bg) 100%);
+      color: var(--text);
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1.58;
+    }
+    .wrap {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 28px 18px 56px;
+    }
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 12px 34px rgba(28, 40, 29, 0.08);
+    }
+    .hero {
+      padding: 28px;
+      margin-bottom: 18px;
+    }
+    .panel {
+      padding: 24px;
+      margin-bottom: 18px;
+    }
+    h1, h2, h3 {
+      margin: 0 0 12px;
+      line-height: 1.2;
+    }
+    h1 { font-size: 2rem; }
+    h2 { font-size: 1.32rem; }
+    h3 { font-size: 1.05rem; }
+    p { margin: 0 0 12px; }
+    ul, ol { margin: 0 0 12px 22px; }
+    li { margin-bottom: 8px; }
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      background: var(--code);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--muted);
+      font-size: 0.92rem;
+      letter-spacing: 0.02em;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      background: #fffefb;
+    }
+    .callout {
+      border-left: 6px solid var(--accent);
+      background: #f5faf6;
+      border-radius: 12px;
+      padding: 15px 16px;
+      margin-bottom: 14px;
+    }
+    .good { border-left-color: var(--good); background: #f3fbf4; }
+    .warn { border-left-color: var(--warn); background: #fff9ef; }
+    .danger { border-left-color: var(--danger); background: #fff4f4; }
+    .pill {
+      display: inline-block;
+      padding: 4px 8px;
+      margin: 0 6px 6px 0;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: #f3f7f2;
+      font-size: 0.82rem;
+    }
+    .status-good { color: var(--good); font-weight: bold; }
+    .status-warn { color: var(--warn); font-weight: bold; }
+    .status-danger { color: var(--danger); font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>FxPM Final Storage Control Plan</h1>
+      <p class="meta">Finalized on 2026-04-02 after reviewing the existing storage plan, the later suggestions, and the verified PM code paths. This document is a decision-ready plan only. No deletions were performed while preparing it.</p>
+      <div class="callout good">
+        <strong>Final verdict:</strong>
+        The right storage strategy for FxPM is a PM-native, config-driven storage manager that keeps PM-owned data canonical and bounded, reduces MT5 history pressure structurally, and treats MetaQuotes cleanup as a guarded maintenance layer rather than the center of the design.
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3>Current Disk Pressure</h3>
+          <p>The latest check still shows <strong>critically low free space</strong> on <code>C:</code>, with about <strong>5.14 GB free</strong> out of <code>475.92 GB</code>.</p>
+        </div>
+        <div class="card">
+          <h3>Main Growth Driver</h3>
+          <p>The largest uncontrolled growth remains <strong>MetaQuotes terminal and tester caches</strong>, not PM local CSV duplication.</p>
+        </div>
+        <div class="card">
+          <h3>PM Baseline</h3>
+          <p>PM local market data is already mostly aligned with intent: one canonical <code>symbol_M5.csv</code> per symbol, overwritten in place.</p>
+        </div>
+        <div class="card">
+          <h3>Operational Priority</h3>
+          <p>We need longevity without regression: no accidental loss of live trading continuity, restart recovery, optimization capability, or dashboard visibility.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Verified Baseline</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Area</th>
+            <th>Observed State</th>
+            <th>Why It Matters</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>MetaQuotes\Terminal</code></td>
+            <td>About 26.98 GB</td>
+            <td>Main live/history cache growth area outside the PM.</td>
+          </tr>
+          <tr>
+            <td><code>MetaQuotes\Tester</code></td>
+            <td>About 5.17 GB</td>
+            <td>Tester tick and agent storage, also outside the PM.</td>
+          </tr>
+          <tr>
+            <td><code>MetaQuotes demo roots</code></td>
+            <td>About 5.44 GB combined</td>
+            <td><code>FBS-Demo</code> and <code>MetaQuotes-Demo</code> are confirmed as not needed for active testing and are approved reclaim candidates once MT5 is stopped.</td>
+          </tr>
+          <tr>
+            <td><code>data</code></td>
+            <td>About 2.64 GB</td>
+            <td>PM-owned canonical M5 storage. Reasonable, but needs cap and hygiene.</td>
+          </tr>
+          <tr>
+            <td><code>data\.cache</code></td>
+            <td>About 0.94 GB</td>
+            <td>Useful acceleration layer with no retention policy yet.</td>
+          </tr>
+          <tr>
+            <td><code>pm_outputs\trades_*.json</code></td>
+            <td>Small today</td>
+            <td>Structurally append-only and still scanned by the dashboard.</td>
+          </tr>
+          <tr>
+            <td>Live sweep data path</td>
+            <td>Still requests bars directly from MT5 in live evaluation</td>
+            <td>Increases pressure on MT5 terminal history stores over time.</td>
+          </tr>
+          <tr>
+            <td>Workspace location</td>
+            <td>Under <code>OneDrive\Desktop</code></td>
+            <td>Adds sync churn and file-lock risk, but is separate from the core PM storage design.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="meta">Code facts reflected in this plan: <code>pm_main.py</code> still uses <code>self.mt5.get_bars(...)</code> in live evaluation, <code>pm_main.py</code> writes canonical M5 CSVs in place during historical refresh, <code>DataLoader</code> persists resample cache under <code>data/.cache</code>, and the dashboard still reads <code>pm_outputs/trades_*.json</code>.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Core Objectives To Preserve</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Config Is Authoritative</h3>
+          <p>Storage behavior must be governed by config. Code defaults exist only as safe backstops.</p>
+        </div>
+        <div class="card">
+          <h3>No Regression Of Function</h3>
+          <p>Cleanup must never compromise live entry, protective exits, restart recovery, retraining, or dashboard continuity.</p>
+        </div>
+        <div class="card">
+          <h3>One Canonical Data Copy</h3>
+          <p>PM should keep a single authoritative local market-data copy per symbol and update it by delta.</p>
+        </div>
+        <div class="card">
+          <h3>One True Growing Ledger</h3>
+          <p>The only intentionally long-lived growth path should be the actionable signal and trade ledger. No-actionable noise and sweep heartbeats stay out.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Suggestion Audit</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Suggestion</th>
+            <th>Decision</th>
+            <th>Final Treatment</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Use a PM-native Python storage manager as the primary solution</td>
+            <td class="status-good">ACCEPT</td>
+            <td>Core recommendation</td>
+            <td>Best fit for config authority, testing, manifests, guarded deletion, and integration with live sweep cadence.</td>
+          </tr>
+          <tr>
+            <td>Use shell or PowerShell cleanup commands as the main implementation</td>
+            <td class="status-danger">REJECT</td>
+            <td>Moved out of the core plan</td>
+            <td>Too operational and brittle for the primary design. Shell remains a fallback or runbook tool, not the architecture.</td>
+          </tr>
+          <tr>
+            <td>Add an emergency storage tier with thresholds</td>
+            <td class="status-good">ACCEPT</td>
+            <td>Kept with config-gated actions</td>
+            <td>Appropriate given how full the machine is, but actions must be tiered and safe.</td>
+          </tr>
+          <tr>
+            <td>Pause new trade execution below a very low free-space floor</td>
+            <td class="status-warn">REVISE</td>
+            <td>Allowed only as opt-in, after safe cleanup, and never allowed to block protective exits or close logic</td>
+            <td>Directionally sensible, but too risky as an unconditional default because it changes trading behavior.</td>
+          </tr>
+          <tr>
+            <td>JSONL or SQLite canonical ledger</td>
+            <td class="status-good">ACCEPT</td>
+            <td>JSONL first, SQLite optional later</td>
+            <td>JSONL fits the current framework and dashboard migration path with less disruption than a database-first change.</td>
+          </tr>
+          <tr>
+            <td>Do not delete files modified within the last 60 seconds</td>
+            <td class="status-good">ACCEPT</td>
+            <td>Accepted in principle, revised to 5 minutes</td>
+            <td>The guardrail is correct, but 60 seconds is too short for the real live sweep cadence. The final plan uses a 5-minute write-protection window.</td>
+          </tr>
+          <tr>
+            <td>Do not delete history files for symbols in <code>config.json symbol_configs</code></td>
+            <td class="status-danger">REJECT</td>
+            <td>Replaced with active-root and PM-canonical-data protections</td>
+            <td><code>symbol_configs</code> is not the right runtime safety model. Protection must be based on active MT5 roots, current broker/server allowlists, and PM-owned canonical sufficiency.</td>
+          </tr>
+          <tr>
+            <td>Add disk plateau verification after rollout</td>
+            <td class="status-good">ACCEPT</td>
+            <td>Kept as a rollout gate</td>
+            <td>We need proof that storage actually stabilizes, not just one-time relief.</td>
+          </tr>
+          <tr>
+            <td>Add an explicit OneDrive risk section</td>
+            <td class="status-good">ACCEPT</td>
+            <td>Kept as an operator recommendation, not core PM storage logic</td>
+            <td>Relevant because the repo lives under OneDrive, but not something the PM itself should attempt to control automatically.</td>
+          </tr>
+          <tr>
+            <td>Keep exact destructive shell commands inside the final plan</td>
+            <td class="status-danger">REJECT</td>
+            <td>Remove from the final document</td>
+            <td>Those belong in a separate execution runbook after approval and path verification, not in the architecture plan.</td>
+          </tr>
+          <tr>
+            <td>Keep the risk-scalar and spread-overlay audit inside this storage plan</td>
+            <td class="status-danger">REJECT</td>
+            <td>Removed as out of scope</td>
+            <td>Important elsewhere, but it dilutes the storage plan and is not needed for storage decisions.</td>
+          </tr>
+          <tr>
+            <td>Claim live MT5 history growth is the only thing that can refill the disk soon</td>
+            <td class="status-warn">REVISE</td>
+            <td>Softened in the final plan</td>
+            <td>MT5 history is a major driver, but OneDrive, Claude VM, Chrome, Docker, and operator behavior can also materially move disk usage.</td>
+          </tr>
+          <tr>
+            <td>Highlight duplicate config keys</td>
+            <td class="status-warn">REVISE</td>
+            <td>Keep as adjacent config hygiene, not a storage-plan pillar</td>
+            <td>True and worth fixing, but not a central storage-control mechanism.</td>
+          </tr>
+          <tr>
+            <td>Add Phase 0.5 immediate safe reclamation</td>
+            <td class="status-good">ACCEPT</td>
+            <td>Kept as an operator-side stabilization phase</td>
+            <td>Disk pressure is too high to wait for code changes alone.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Final Architecture</h2>
+      <div class="callout good">
+        <strong>Target state:</strong>
+        FxPM should own and bound what it creates, reduce how often it forces MT5 to expand its own caches, and treat external cleanup as governed maintenance rather than ad hoc deletion.
+      </div>
+
+      <h3>1. PM-Owned Storage Must Become Fully Bounded</h3>
+      <ul>
+        <li>Keep one canonical <code>data/&lt;symbol&gt;_M5.csv</code> per symbol.</li>
+        <li>On refresh, append only missing delta bars, then deduplicate, sort, compact, and cap to configured bar budgets.</li>
+        <li>Prune <code>data/.cache</code> by age, orphan state, source mismatch, and total size quota.</li>
+        <li>Replace unbounded or compatibility-only PM snapshots with bounded retention.</li>
+        <li>Keep <code>last_trade_log.json</code> and <code>last_actionable_log.json</code> as bounded latest-state files.</li>
+      </ul>
+
+      <h3>2. Replace Scattershot Trade Snapshots With One Canonical Actionable Ledger</h3>
+      <ul>
+        <li>Create a canonical ledger, preferably <code>pm_outputs/signal_ledger.jsonl</code>.</li>
+        <li>Write only actionable events to the ledger.</li>
+        <li>Explicitly exclude:
+          <span class="pill">NO_ACTIONABLE_WINNER_SIGNAL</span>
+          <span class="pill">NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN</span>
+          <span class="pill">live sweep heartbeat</span>
+        </li>
+        <li>Allow the ledger to be long-lived, but segment it by month or size for safe rotation and dashboard loading.</li>
+        <li>Migrate the dashboard from wide scans of <code>trades_*.json</code> to the canonical ledger plus the latest-state snapshots.</li>
+      </ul>
+
+      <h3>3. Make Live Data Access Local-Data-First</h3>
+      <ul>
+        <li>Use PM local M5 data as the primary live-analysis source.</li>
+        <li>Refresh only missing delta bars from MT5 when needed.</li>
+        <li>Resample higher timeframes locally via <code>DataLoader</code>.</li>
+        <li>Use MT5 directly only for things that truly must be live:
+          <span class="pill">account info</span>
+          <span class="pill">ticks</span>
+          <span class="pill">positions</span>
+          <span class="pill">order send</span>
+          <span class="pill">modify</span>
+          <span class="pill">close</span>
+          <span class="pill">small delta refreshes</span>
+        </li>
+      </ul>
+
+      <h3>4. Add A Safe MetaQuotes Maintenance Layer</h3>
+      <ul>
+        <li>Implement it in Python first, with dry-run, manifests, path verification, protected roots, and post-clean validation.</li>
+        <li>Start with low-risk targets only: stale tester agent logs, old terminal logs, temp directories, installer leftovers, and clearly inactive tester bases.</li>
+        <li>Do not auto-prune active-server history until the local-data-first path is proven.</li>
+        <li>Any shell usage should be an implementation detail behind the same verified plan, not an operator improvisation.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Final Rollout Plan</h2>
+
+      <h3>Phase 0.5: Immediate Safe Reclamation</h3>
+      <p>Because free space is critically low, there should be a short operator-side stabilization pass before or in parallel with code work. This phase is deliberately narrow: only clearly safe, noncritical reclaim targets should be touched, and only through a dry-run-first process. Exact commands belong in a separate runbook, not in this plan.</p>
+      <ul>
+        <li>Confirmed low-risk reclaim target: once MT5 is fully stopped, remove or archive the inactive demo roots <code>FBS-Demo</code> and <code>MetaQuotes-Demo</code>.</li>
+        <li>Expected benefit: about <strong>5.44 GB</strong> recovered, which is enough to more than double current free space.</li>
+        <li>Required safeguards: manifest the exact paths first, verify MT5 is not running, record pre-clean free space, perform post-clean verification, and confirm active real-server roots remain untouched.</li>
+        <li>This is part of the MetaQuotes maintenance scope, not the later active-root quota work.</li>
+      </ul>
+
+      <h3>Phase 1: Observe-Only Storage Governance</h3>
+      <ul>
+        <li>Add a storage section to config and the dataclass model.</li>
+        <li>Introduce a storage housekeeper invoked at the end of each live sweep.</li>
+        <li>In the first release, it measures only: sizes, growth rate, reclaim candidates, and threshold crossings.</li>
+        <li>Persist a compact state file such as <code>pm_outputs/storage_state.json</code>.</li>
+        <li>Use due-time comparison such as <code>now &gt;= next_due_at</code> for cadence control rather than <code>sleep</code>-based waiting loops.</li>
+      </ul>
+
+      <h3>Phase 2: Bound PM-Owned Storage</h3>
+      <ul>
+        <li>Cap and compact canonical M5 files.</li>
+        <li>Add cache retention and orphan pruning for <code>data/.cache</code>.</li>
+        <li>Add retention-aware log rotation.</li>
+        <li>Put compatibility snapshots under bounded age or count retention.</li>
+      </ul>
+
+      <h3>Phase 3: Introduce The Canonical Actionable Ledger</h3>
+      <ul>
+        <li>Add <code>signal_ledger.jsonl</code> as the primary long-term history store.</li>
+        <li>Update the dashboard to consume it incrementally.</li>
+        <li>Keep legacy <code>trades_*.json</code> compatibility only until the dashboard migration is complete, then retain them minimally.</li>
+      </ul>
+
+      <h3>Phase 4: Local-Data-First Live Analysis</h3>
+      <ul>
+        <li>Change live sweeps to analyze from canonical local M5 data plus delta syncs.</li>
+        <li>Use MT5 direct bar pulls only when local data is missing or stale beyond configured tolerance.</li>
+        <li>This is the structural fix most likely to reduce future MetaQuotes history expansion pressure.</li>
+      </ul>
+
+      <h3>Phase 5: MetaQuotes Janitor</h3>
+      <ul>
+        <li>Enable automated cleanup for clearly safe MetaQuotes targets.</li>
+        <li>Treat confirmed-unused demo roots as early approved janitor candidates once the stop-MT5 precondition is met.</li>
+        <li>Keep active roots protected by default.</li>
+        <li>Require dry-run success and manifest verification before destructive mode.</li>
+      </ul>
+
+      <h3>Phase 6: Optional Active-Root Quotas</h3>
+      <ul>
+        <li>Only after Phase 4 has proven reliable in production.</li>
+        <li>Explicit opt-in only.</li>
+        <li>Idle-window only.</li>
+        <li>Protected minimum history must remain around the current live universe and recent optimization universe.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Housekeeper Cadence</h2>
+      <div class="callout good">
+        <strong>Scheduling rule:</strong>
+        The storage subsystem should not run as a separate sleep-based timer thread. It should piggyback on the existing PM runtime and decide whether maintenance is due by comparing <code>datetime.now()</code> with persisted desired run times such as <code>next_due_at</code>.
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Cadence</th>
+            <th>Allowed Work</th>
+            <th>Why</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Every live sweep</td>
+            <td>Cheap checks only: free space, quota breaches, state update, threshold alerts</td>
+            <td>Keeps overhead tiny and avoids interference with live trading.</td>
+          </tr>
+          <tr>
+            <td>Periodic maintenance window</td>
+            <td>PM-owned cleanup such as cache pruning, log rotation, snapshot retention</td>
+            <td>Bounded and safe work that does not need to run every sweep.</td>
+          </tr>
+          <tr>
+            <td>Explicit janitor cycle</td>
+            <td>MetaQuotes cleanup after dry-run and path verification</td>
+            <td>External-store cleanup is more delicate and should be isolated.</td>
+          </tr>
+          <tr>
+            <td>Post-optimization</td>
+            <td>Targeted cache trimming plus explicit review of MetaQuotes <code>Tester/*/bases/*</code> artifacts</td>
+            <td>Optimization is one of the times growth can spike suddenly, especially through tester-base downloads and caches.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Required Guardrails</h2>
+      <div class="callout danger">
+        <strong>These are mandatory for any automated cleanup path.</strong>
+      </div>
+      <ul>
+        <li>Resolve and verify absolute paths before any deletion.</li>
+        <li>Keep explicit protected roots for the active workspace, current PM outputs, and active MT5 roots.</li>
+        <li>Do not delete any file modified in the last 5 minutes.</li>
+        <li>Never let storage cleanup block protective trading actions such as close, modify, stop management, or restart recovery state writes.</li>
+        <li>If a storage emergency mode exists, it may only pause new entries when explicitly enabled in config and only after safe cleanup has already been attempted.</li>
+        <li>Maintain manifest logging for every cleanup action with path, reason, size before, timestamp, and result.</li>
+        <li>Run post-clean verification for PM health, critical file presence, and MT5 connectivity where applicable.</li>
+        <li>Keep dry-run as the default mode for new cleanup scopes until they have passed verification and tests.</li>
+        <li>Avoid dedicated <code>sleep</code>-driven janitor processes. Use comparator-based scheduling inside the existing live loop or maintenance entry points.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Proposed Config Surface</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Purpose</th>
+            <th>Recommended Starting Default</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>storage_enabled</code></td>
+            <td>Master switch for the storage subsystem</td>
+            <td><code>true</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_observe_only</code></td>
+            <td>Measure and report without deleting</td>
+            <td><code>true</code> for initial rollout</td>
+          </tr>
+          <tr>
+            <td><code>storage_warn_free_gb</code></td>
+            <td>Warning threshold</td>
+            <td><code>15</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_critical_free_gb</code></td>
+            <td>Critical threshold that triggers immediate safe PM-owned cleanup</td>
+            <td><code>10</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_pause_entries_below_free_gb</code></td>
+            <td>Optional emergency entry-pause floor</td>
+            <td><code>null</code> or disabled initially</td>
+          </tr>
+          <tr>
+            <td><code>storage_resample_cache_max_gb</code></td>
+            <td>Quota for <code>data/.cache</code></td>
+            <td><code>0.75</code> to <code>1.0</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_resample_cache_max_age_days</code></td>
+            <td>Age-based pruning for cache entries</td>
+            <td><code>7</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_logs_keep_days</code></td>
+            <td>Log retention</td>
+            <td><code>14</code> or <code>30</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_pm_outputs_keep_days</code></td>
+            <td>Retention for legacy compatibility snapshots</td>
+            <td><code>14</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_pm_outputs_keep_count</code></td>
+            <td>Count-based guardrail for legacy snapshots</td>
+            <td><code>30</code></td>
+          </tr>
+          <tr>
+            <td><code>storage_metaquotes_cleanup_enabled</code></td>
+            <td>Allow automated MetaQuotes maintenance</td>
+            <td><code>false</code> initially</td>
+          </tr>
+          <tr>
+            <td><code>storage_metaquotes_active_root_allowlist</code></td>
+            <td>Protected MT5 roots and server names</td>
+            <td>Explicitly configured</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Operator Recommendations Outside The PM</h2>
+      <div class="callout warn">
+        <strong>These are good recommendations, but they are not the PM's job to enforce automatically.</strong>
+      </div>
+      <ul>
+        <li>Review whether the PM workspace should remain under OneDrive. This is operationally useful, but it adds sync churn and possible file-lock contention.</li>
+        <li>If the workspace stays in OneDrive, consider excluding or freeing up space for large regenerable folders such as local data and cache, subject to your backup policy.</li>
+        <li>Clean up the duplicate keys in <code>config.json</code>, especially the repeated <code>pipeline.risk_per_trade_pct</code>, so storage settings and all future config-driven behavior remain unambiguous.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Verification Gates</h2>
+      <ul>
+        <li>Functional parity: live sweeps, entries, closes, restart recovery, dashboard updates, and optimization must still work.</li>
+        <li>Safety parity: no accidental cleanup of active PM files or active MT5 roots.</li>
+        <li>Storage plateau: free-space trend must improve or stabilize after rollout, not just bounce once.</li>
+        <li>Observability: storage warnings must be visible without flooding the logs.</li>
+        <li>Rollback readiness: every destructive cleanup scope must be disableable by config.</li>
+      </ul>
+      <div class="callout good">
+        <strong>Success condition:</strong>
+        After rollout, the PM should be able to run indefinitely without PM-owned storage growing without bound, while MetaQuotes growth is reduced structurally and cleaned only through guarded maintenance.
+      </div>
+    </section>
+  </div>
+</body>
+</html>

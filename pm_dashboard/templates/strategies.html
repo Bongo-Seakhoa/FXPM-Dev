@@ -34,8 +34,16 @@
               <strong class="stat-value-inline" id="strategy-count">0</strong>
             </div>
             <div>
-              <span class="stat-label">Validated</span>
-              <strong class="stat-value-inline" id="strategy-valid-count">0</strong>
+              <span class="stat-label">Tradeable</span>
+              <strong class="stat-value-inline" id="strategy-tradeable-count">0</strong>
+            </div>
+            <div>
+              <span class="stat-label">No-Trade</span>
+              <strong class="stat-value-inline" id="strategy-no-trade-count">0</strong>
+            </div>
+            <div>
+              <span class="stat-label">Expired</span>
+              <strong class="stat-value-inline" id="strategy-expired-count">0</strong>
             </div>
             <div>
               <span class="stat-label">Invalid</span>
@@ -64,8 +72,23 @@
             <select id="strategy-filter-name" aria-label="Filter by strategy"></select>
           </div>
           <div>
+            <label for="strategy-filter-status">Status</label>
+            <select id="strategy-filter-status" aria-label="Filter by status">
+              <option value="">All</option>
+              <option value="validated">Validated</option>
+              <option value="expired">Expired</option>
+              <option value="invalid">Invalid</option>
+            </select>
+          </div>
+          <div>
             <label for="strategy-search">Search</label>
             <input id="strategy-search" type="text" placeholder="Name, symbol, regime" />
+          </div>
+          <div class="toggle-control">
+            <label class="toggle">
+              <input type="checkbox" id="strategy-hide-no-trade" checked />
+              <span>Hide No-Trade</span>
+            </label>
           </div>
           <div class="toggle-control">
             <label class="toggle">
@@ -81,18 +104,18 @@
           <table>
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>TF</th>
-                <th>Regime</th>
-                <th>Strategy</th>
-                <th>Quality</th>
-                <th>Train Trades</th>
-                <th>Val Trades</th>
-                <th>Val Win%</th>
-                <th>Val PF</th>
-                <th>Val Return%</th>
-                <th>Max DD%</th>
-                <th>Status</th>
+                <th class="sortable" data-sort="symbol">Symbol</th>
+                <th class="sortable" data-sort="timeframe">TF</th>
+                <th class="sortable" data-sort="regime">Regime</th>
+                <th class="sortable" data-sort="strategy_name">Strategy</th>
+                <th class="sortable" data-sort="quality_score">Quality</th>
+                <th class="sortable" data-sort="regime_train_trades">Train Trades</th>
+                <th class="sortable" data-sort="regime_val_trades">Val Trades</th>
+                <th class="sortable" data-sort="val_win_rate">Val Win%</th>
+                <th class="sortable" data-sort="val_profit_factor">Val PF</th>
+                <th class="sortable" data-sort="val_total_return_pct">Val Return%</th>
+                <th class="sortable" data-sort="val_max_drawdown_pct">Max DD%</th>
+                <th class="sortable" data-sort="validation_status">Status</th>
               </tr>
             </thead>
             <tbody id="strategy-body"></tbody>

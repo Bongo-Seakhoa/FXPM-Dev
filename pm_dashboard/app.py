@@ -7,6 +7,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -148,8 +149,29 @@ def _build_asset_version(static_root: str) -> str:
     return digest.hexdigest()[:12] or "0"
 
 
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return value
+
+
+def _json_response(payload: Any, status_code: int = 200) -> Any:
+    response = jsonify(_json_safe_value(payload))
+    if status_code != 200:
+        return response, status_code
+    return response
+
+
 def _json_error(message: str, status_code: int = 400) -> Any:
-    return jsonify({"success": False, "error": message}), status_code
+    return _json_response({"success": False, "error": message}, status_code)
+
+
+def _now_for_timestamp(timestamp: datetime) -> datetime:
+    return datetime.now(timestamp.tzinfo) if timestamp.tzinfo else datetime.now()
 
 
 def _configured_write_token(config: Dict[str, Any]) -> str:
@@ -669,7 +691,7 @@ def create_app(
             "pm_root": current_config.get("pm_root"),
             "refresh_interval_sec": current_config.get("refresh_interval_sec"),
         }
-        return jsonify(snapshot)
+        return _json_response(snapshot)
 
     @app.route("/api/live-command", methods=["GET"])
     def api_live_command() -> Any:
@@ -678,13 +700,13 @@ def create_app(
         pm_configs = state.get_pm_configs()
         pm_root = current_config.get("pm_root") or ""
         payload = build_live_command_payload(pm_root, current_config, snapshot, pm_configs)
-        return jsonify(payload)
+        return _json_response(payload)
 
     @app.route("/api/config", methods=["GET", "POST"])
     def api_config() -> Any:
         current_config = app.config["dashboard_config"]
         if request.method == "GET":
-            return jsonify(serialize_config(current_config))
+            return _json_response(serialize_config(current_config))
 
         auth_error = _authorize_write_api(current_config)
         if auth_error is not None:
@@ -718,14 +740,14 @@ def create_app(
             if JOBS_AVAILABLE and app.config.get("start_background_workers", True):
                 _setup_runtime_services(app, updated, base_dir, True)
         app.config["dashboard_watcher"].update_config(updated)
-        return jsonify(serialize_config(updated))
+        return _json_response(serialize_config(updated))
 
     @app.route("/api/strategies", methods=["GET"])
     def api_strategies() -> Any:
         include_invalid = request.args.get("include_invalid", "false").lower() in ("1", "true", "yes", "y")
         pm_configs = state.get_pm_configs()
         payload = build_strategy_payload(pm_configs, include_invalid)
-        return jsonify(payload)
+        return _json_response(payload)
 
     @app.route("/api/analytics", methods=["GET"])
     def api_analytics() -> Any:
@@ -737,7 +759,7 @@ def create_app(
         except (ValueError, TypeError):
             initial_capital = 10000.0
         payload = build_analytics_payload(pm_root, initial_capital=initial_capital, pm_configs_path=pm_configs_path)
-        return jsonify(payload)
+        return _json_response(payload)
 
     @app.route("/api/trades", methods=["GET"])
     def api_trades() -> Any:
@@ -774,7 +796,7 @@ def create_app(
                 "realized": bool(trade.get("realized")),
             })
 
-        return jsonify({"trades": filtered_trades, "total": len(trades)})
+        return _json_response({"trades": filtered_trades, "total": len(trades)})
 
     @app.route("/api/simulate", methods=["POST"])
     def api_simulate() -> Any:
@@ -795,14 +817,14 @@ def create_app(
 
         payload = request.get_json(silent=True)
         if payload is None and request.data:
-            return jsonify({
+            return _json_response({
                 "success": False,
                 "error": "Invalid JSON payload",
                 "trades": [],
                 "metrics": {},
                 "equity_curve": [],
                 "drawdown_curve": [],
-            }), 400
+            }, 400)
         payload = payload or {}
 
         try:
@@ -821,20 +843,20 @@ def create_app(
         start_date = parse_timestamp(start_date_str) if start_date_str else None
         end_date = parse_timestamp(end_date_str) if end_date_str else None
         if start_date and end_date and start_date > end_date:
-            return jsonify({
+            return _json_response({
                 "success": False,
                 "error": "start_date must be earlier than end_date",
                 "trades": [],
                 "metrics": {},
                 "equity_curve": [],
                 "drawdown_curve": [],
-            }), 400
+            }, 400)
 
         # Load trades
         all_trades = load_trade_history(pm_root, max_files=100, pm_configs_path=pm_configs_path)
 
         if not all_trades:
-            return jsonify({
+            return _json_response({
                 "success": False,
                 "error": "No trade data available",
                 "trades": [],
@@ -863,7 +885,7 @@ def create_app(
             equity_curve = compute_equity_curve(filtered_trades[:max_trades], initial_capital)
             drawdown_curve = compute_drawdown_curve(equity_curve)
 
-            return jsonify({
+            return _json_response({
                 "success": True,
                 "simulated": False,
                 "message": "Using existing trade data (historical-data loader unavailable)",
@@ -890,7 +912,7 @@ def create_app(
         )
 
         if not reconstructed_trades:
-            return jsonify({
+            return _json_response({
                 "success": False,
                 "error": "Failed to reconstruct any trades (missing historical data)",
                 "trades": [],
@@ -915,7 +937,7 @@ def create_app(
         equity_curve = compute_equity_curve(reconstructed_trades, initial_capital)
         drawdown_curve = compute_drawdown_curve(equity_curve)
 
-        return jsonify({
+        return _json_response({
             "success": True,
             "simulated": True,
             "message": f"Reconstructed {len(reconstructed_trades)} trades",
@@ -939,12 +961,12 @@ def create_app(
         data_scheduler = app.config.get("data_scheduler")
 
         if not data_downloader:
-            return jsonify({
+            return _json_response({
                 "success": False,
                 "error": "Data maintenance service not available"
             })
         if not data_downloader.can_refresh_from_mt5():
-            return jsonify({
+            return _json_response({
                 "success": False,
                 "error": "MT5 is not connected; cannot refresh root M5 data"
             })
@@ -956,13 +978,13 @@ def create_app(
             thread = threading.Thread(target=run_target, daemon=True)
             thread.start()
 
-            return jsonify({
+            return _json_response({
                 "success": True,
                 "message": "Root M5 data maintenance started"
             })
         except Exception as e:
             logger.error("Failed to start data maintenance: %s", e)
-            return jsonify({
+            return _json_response({
                 "success": False,
                 "error": str(e)
             })
@@ -1078,9 +1100,32 @@ def apply_config_updates(config: Dict[str, Any], payload: Dict[str, Any]) -> Dic
 
 
 def build_strategy_payload(pm_configs: Dict[str, Any], include_invalid: bool) -> Dict[str, Any]:
-    rows = []
-    summary = {"total": 0, "validated": 0, "invalid": 0, "expired": 0}
-    now = None
+    rows: List[Dict[str, Any]] = []
+    summary = {
+        "total": 0,
+        "validated": 0,
+        "invalid": 0,
+        "expired": 0,
+        "no_trade": 0,
+        "tradeable": 0,
+    }
+
+    def _accumulate(row: Dict[str, Any]) -> None:
+        status = row.get("validation_status", "validated")
+        if not include_invalid and status == "invalid":
+            return
+        summary["total"] += 1
+        if status == "validated":
+            summary["validated"] += 1
+        elif status == "invalid":
+            summary["invalid"] += 1
+        elif status == "expired":
+            summary["expired"] += 1
+        if str(row.get("strategy_name") or "").strip().upper() == "NO_TRADE":
+            summary["no_trade"] += 1
+        elif status != "invalid":
+            summary["tradeable"] += 1
+        rows.append(row)
 
     for symbol, cfg in pm_configs.items():
         if not isinstance(cfg, dict):
@@ -1102,45 +1147,18 @@ def build_strategy_payload(pm_configs: Dict[str, Any], include_invalid: bool) ->
                 if not isinstance(reg_cfg, dict):
                     continue
                 has_regimes = True
-                row = strategy_row_from_config(
-                    symbol,
-                    timeframe,
-                    regime,
-                    reg_cfg,
-                    is_validated,
-                    validation_reason,
-                    optimized_at,
-                    valid_until,
-                )
-                status = row.get("validation_status", "validated")
-                if not include_invalid and status == "invalid":
-                    continue
-                summary["total"] += 1
-                summary["validated"] += 1 if status == "validated" else 0
-                summary["invalid"] += 1 if status == "invalid" else 0
-                summary["expired"] += 1 if status == "expired" else 0
-                rows.append(row)
+                _accumulate(strategy_row_from_config(
+                    symbol, timeframe, regime, reg_cfg,
+                    is_validated, validation_reason, optimized_at, valid_until,
+                ))
 
         if not has_regimes:
             default_cfg = cfg.get("default_config", {}) if isinstance(cfg.get("default_config"), dict) else {}
             if default_cfg:
-                row = strategy_row_from_config(
-                    symbol,
-                    symbol_timeframe or "DEFAULT",
-                    "DEFAULT",
-                    default_cfg,
-                    is_validated,
-                    validation_reason,
-                    optimized_at,
-                    valid_until,
-                )
-                status = row.get("validation_status", "validated")
-                if include_invalid or status != "invalid":
-                    summary["total"] += 1
-                    summary["validated"] += 1 if status == "validated" else 0
-                    summary["invalid"] += 1 if status == "invalid" else 0
-                    summary["expired"] += 1 if status == "expired" else 0
-                    rows.append(row)
+                _accumulate(strategy_row_from_config(
+                    symbol, symbol_timeframe or "DEFAULT", "DEFAULT", default_cfg,
+                    is_validated, validation_reason, optimized_at, valid_until,
+                ))
 
     rows.sort(key=lambda item: (item.get("symbol", ""), item.get("timeframe", ""), item.get("regime", "")))
     return {"rows": rows, "summary": summary}
@@ -1149,6 +1167,8 @@ def build_strategy_payload(pm_configs: Dict[str, Any], include_invalid: bool) ->
 def _optional_count(value: Any) -> Optional[int]:
     numeric = coerce_float(value)
     if numeric is None:
+        return None
+    if not math.isfinite(numeric):
         return None
     return int(numeric)
 
@@ -1170,11 +1190,14 @@ def strategy_row_from_config(
     trained_at = reg_cfg.get("trained_at")
     valid_until = reg_cfg.get("valid_until") or symbol_valid_until
 
-    status = "validated" if is_validated else "invalid"
+    raw_status = str(reg_cfg.get("validation_status") or "").strip().lower()
+    status = raw_status if raw_status in {"validated", "invalid", "expired"} else "validated"
+    if not is_validated:
+        status = "invalid"
     if valid_until:
         ts = parse_timestamp(valid_until)
         if ts is not None:
-            if ts < datetime.now():
+            if ts < _now_for_timestamp(ts) and status != "invalid":
                 status = "expired"
 
     row_id = "|".join([str(symbol), str(timeframe), str(regime), str(strategy_name)])

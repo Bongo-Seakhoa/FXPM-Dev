@@ -1,0 +1,1179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FXPM FundedNext 5K Challenge Preparation</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070a0f;
+      --bg-2: #0b1119;
+      --panel: #101823;
+      --panel-2: #121d29;
+      --ink: #eef5ff;
+      --muted: #a8b4c6;
+      --dim: #748196;
+      --line: #243244;
+      --line-2: #31445d;
+      --cyan: #61d6ff;
+      --green: #56e39f;
+      --amber: #ffd166;
+      --red: #ff6b7a;
+      --blue: #8bb8ff;
+      --violet: #c7a4ff;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+      --radius: 8px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font: 15px/1.58 Inter, "Segoe UI", Roboto, Arial, sans-serif;
+      background:
+        linear-gradient(180deg, rgba(11, 17, 25, 0.96), rgba(7, 10, 15, 1)),
+        repeating-linear-gradient(90deg, rgba(97, 214, 255, 0.05) 0 1px, transparent 1px 72px),
+        repeating-linear-gradient(0deg, rgba(97, 214, 255, 0.04) 0 1px, transparent 1px 72px);
+      color: var(--ink);
+    }
+
+    a {
+      color: var(--cyan);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .shell {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      backdrop-filter: blur(14px);
+      background: rgba(7, 10, 15, 0.82);
+      border-bottom: 1px solid rgba(36, 50, 68, 0.75);
+    }
+
+    .topbar .shell {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 64px;
+      gap: 18px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .mark {
+      width: 34px;
+      height: 34px;
+      border: 1px solid rgba(97, 214, 255, 0.55);
+      border-radius: var(--radius);
+      display: grid;
+      place-items: center;
+      color: var(--cyan);
+      font-weight: 800;
+      letter-spacing: 0;
+      background: linear-gradient(135deg, rgba(97, 214, 255, 0.18), rgba(86, 227, 159, 0.08));
+      flex: 0 0 auto;
+    }
+
+    .brand strong {
+      display: block;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+    }
+
+    .brand span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .nav a {
+      color: var(--muted);
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      padding: 7px 9px;
+      font-size: 12px;
+    }
+
+    .nav a:hover {
+      color: var(--ink);
+      border-color: var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      text-decoration: none;
+    }
+
+    header {
+      padding: 56px 0 28px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+      gap: 28px;
+      align-items: stretch;
+    }
+
+    h1, h2, h3, h4 {
+      margin: 0;
+      line-height: 1.18;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      max-width: 850px;
+      font-size: clamp(34px, 5vw, 64px);
+      font-weight: 800;
+    }
+
+    h2 {
+      font-size: 26px;
+      margin-bottom: 12px;
+    }
+
+    h3 {
+      font-size: 18px;
+      margin-bottom: 10px;
+    }
+
+    h4 {
+      font-size: 14px;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      margin-bottom: 8px;
+    }
+
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+
+    .lead {
+      max-width: 860px;
+      font-size: 18px;
+      color: #dbe7f7;
+      margin-top: 18px;
+    }
+
+    .tagline {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(97, 214, 255, 0.35);
+      color: var(--cyan);
+      background: rgba(97, 214, 255, 0.08);
+      padding: 7px 10px;
+      border-radius: var(--radius);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 18px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .hero-panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(16, 24, 35, 0.95), rgba(12, 18, 26, 0.95));
+      box-shadow: var(--shadow);
+      padding: 22px;
+      min-height: 100%;
+    }
+
+    .mission {
+      border-left: 3px solid var(--green);
+      padding-left: 14px;
+      margin-top: 18px;
+    }
+
+    .mission strong {
+      color: var(--green);
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.025);
+      padding: 12px;
+      min-height: 86px;
+    }
+
+    .stat b {
+      display: block;
+      font-size: 22px;
+      color: var(--ink);
+      margin-bottom: 4px;
+    }
+
+    .stat span {
+      display: block;
+      font-size: 12px;
+      color: var(--dim);
+    }
+
+    main {
+      padding-bottom: 56px;
+    }
+
+    section {
+      margin: 20px 0;
+      border: 1px solid rgba(36, 50, 68, 0.85);
+      border-radius: var(--radius);
+      background: rgba(16, 24, 35, 0.76);
+      box-shadow: 0 14px 46px rgba(0, 0, 0, 0.2);
+      overflow: hidden;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 22px 22px 16px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(90deg, rgba(97, 214, 255, 0.07), rgba(86, 227, 159, 0.025));
+    }
+
+    .section-head p {
+      margin-bottom: 0;
+      max-width: 760px;
+    }
+
+    .section-body {
+      padding: 20px 22px 22px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .span-12 { grid-column: span 12; }
+    .span-8 { grid-column: span 8; }
+    .span-7 { grid-column: span 7; }
+    .span-6 { grid-column: span 6; }
+    .span-5 { grid-column: span 5; }
+    .span-4 { grid-column: span 4; }
+    .span-3 { grid-column: span 3; }
+
+    .box {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.025);
+      padding: 16px;
+      min-height: 100%;
+    }
+
+    .box.good { border-color: rgba(86, 227, 159, 0.42); }
+    .box.warn { border-color: rgba(255, 209, 102, 0.46); }
+    .box.bad { border-color: rgba(255, 107, 122, 0.46); }
+    .box.info { border-color: rgba(97, 214, 255, 0.42); }
+
+    .label {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 4px 8px;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 10px;
+    }
+
+    .label.good { color: var(--green); border-color: rgba(86, 227, 159, 0.45); }
+    .label.warn { color: var(--amber); border-color: rgba(255, 209, 102, 0.45); }
+    .label.bad { color: var(--red); border-color: rgba(255, 107, 122, 0.45); }
+    .label.info { color: var(--cyan); border-color: rgba(97, 214, 255, 0.45); }
+
+    ul, ol {
+      margin: 10px 0 0;
+      padding-left: 20px;
+      color: var(--muted);
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    strong {
+      color: var(--ink);
+    }
+
+    code {
+      background: rgba(6, 10, 16, 0.76);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 2px 6px;
+      color: #dcecff;
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      font-size: 14px;
+    }
+
+    th, td {
+      padding: 11px 12px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+    }
+
+    th {
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.055);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    td {
+      color: var(--muted);
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .number {
+      color: var(--ink);
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .good-text { color: var(--green); }
+    .warn-text { color: var(--amber); }
+    .bad-text { color: var(--red); }
+    .info-text { color: var(--cyan); }
+    .blue-text { color: var(--blue); }
+
+    .callout {
+      border: 1px solid var(--line-2);
+      border-left: 4px solid var(--cyan);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      background: rgba(97, 214, 255, 0.06);
+      margin: 14px 0;
+    }
+
+    .callout.good { border-left-color: var(--green); background: rgba(86, 227, 159, 0.055); }
+    .callout.warn { border-left-color: var(--amber); background: rgba(255, 209, 102, 0.055); }
+    .callout.bad { border-left-color: var(--red); background: rgba(255, 107, 122, 0.055); }
+
+    .callout p:last-child {
+      margin-bottom: 0;
+    }
+
+    .timeline {
+      display: grid;
+      gap: 10px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+
+    .step-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: rgba(97, 214, 255, 0.1);
+      border: 1px solid rgba(97, 214, 255, 0.45);
+      color: var(--cyan);
+      font-weight: 800;
+      font-size: 12px;
+    }
+
+    .step-body {
+      border-bottom: 1px solid rgba(36, 50, 68, 0.72);
+      padding-bottom: 12px;
+    }
+
+    .step:last-child .step-body {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .kpi-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .kpi {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.024);
+    }
+
+    .kpi b {
+      display: block;
+      font-size: 25px;
+      line-height: 1.1;
+      color: var(--ink);
+    }
+
+    .kpi span {
+      display: block;
+      color: var(--dim);
+      font-size: 12px;
+      margin-top: 5px;
+    }
+
+    .footer {
+      color: var(--dim);
+      padding: 24px 0 40px;
+      font-size: 13px;
+    }
+
+    .source-list {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
+    .source-list a {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 7px 9px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .source-list a:hover {
+      color: var(--cyan);
+      text-decoration: none;
+    }
+
+    @media (max-width: 920px) {
+      .hero {
+        grid-template-columns: 1fr;
+      }
+
+      .nav {
+        display: none;
+      }
+
+      .span-8, .span-7, .span-6, .span-5, .span-4, .span-3 {
+        grid-column: span 12;
+      }
+
+      .kpi-strip, .status-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 620px) {
+      .shell {
+        width: min(100% - 20px, 1240px);
+      }
+
+      header {
+        padding-top: 34px;
+      }
+
+      h1 {
+        font-size: 36px;
+      }
+
+      .section-head {
+        display: block;
+      }
+
+      .kpi-strip, .status-grid {
+        grid-template-columns: 1fr;
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="shell">
+      <div class="brand">
+        <div class="mark">FX</div>
+        <div>
+          <strong>FXPM Challenge Desk</strong>
+          <span>FundedNext 5K config prepared, high-risk ledger with challenge-safe execution</span>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Page navigation">
+        <a href="#decision">Decision</a>
+        <a href="#rules">Rules</a>
+        <a href="#state">Current State</a>
+        <a href="#wrapper">Risk Wrapper</a>
+        <a href="#implementation-audit">Audit</a>
+        <a href="#launch">Launch Gates</a>
+      </nav>
+    </div>
+  </div>
+
+  <header class="shell">
+    <div class="hero">
+      <div>
+        <div class="tagline">Prepared April 27, 2026 | Config Applied</div>
+        <h1>FXPM FundedNext 5K Challenge Preparation</h1>
+        <p class="lead">
+          This document records the PM's 5K FundedNext challenge profile using
+          <code>pm_configs_high_risk.json</code> as the strategy winner ledger once the current optimization is complete.
+          The strategy selection surface should remain the optimized FXPM surface; the funded account must receive a funded-challenge execution profile that preserves PM freedom while reducing only the risk settings that no longer fit a 5K account.
+        </p>
+        <div class="mission">
+          <p><strong>Operating principle:</strong> preserve strategy quality and profitability intent first, then adapt live sizing, same-symbol exposure, governance activation, and broker feasibility to the 5K account without turning the PM into a timid or over-filtered system.</p>
+        </div>
+      </div>
+
+      <aside class="hero-panel">
+        <h3>Challenge Posture</h3>
+        <p>
+          The high-risk ledger is acceptable as a selection source. The change for FundedNext should be the account expression layer:
+          smaller primary risk, a 1% hard trade cap, equity-aware sizing, active local governance, and no artificial conservative launch mode.
+        </p>
+        <div class="status-grid">
+          <div class="stat">
+            <b>$5,000</b>
+            <span>Target account size</span>
+          </div>
+          <div class="stat">
+            <b>0.50%</b>
+            <span>Recommended starting risk per trade</span>
+          </div>
+          <div class="stat">
+            <b>1.25-1.50%</b>
+            <span>Recommended same-symbol combined cap</span>
+          </div>
+          <div class="stat">
+            <b>10%</b>
+            <span>Telemetry-only loss advisory, not a hard stop</span>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section id="decision">
+      <div class="section-head">
+        <div>
+          <h2>Locked Direction</h2>
+          <p>Use the optimized FXPM winner set, but trade it through a FundedNext-specific risk envelope.</p>
+        </div>
+        <span class="label info">Config Prepared, No Code Change</span>
+      </div>
+      <div class="section-body">
+        <div class="grid">
+          <div class="span-7 box good">
+            <span class="label good">Decision</span>
+            <h3>Use <code>pm_configs_high_risk.json</code> after completion</h3>
+            <p>
+              The challenge plan is to use the PM's current optimized high-risk ledger once it has finished the full symbol run and passes final pre-live checks.
+              That means strategy, timeframe, regime, and risk-management winner selection should come from the existing optimization workflow, not from a separate funded-challenge strategy search.
+            </p>
+            <p>
+              This is the right philosophical split: optimization should find the best actionable PM winners; the live challenge layer should decide how much of that edge is allowed to reach broker execution.
+            </p>
+          </div>
+
+          <div class="span-5 box warn">
+            <span class="label warn">Boundary</span>
+            <h3>Do not copy the current live risk profile as-is</h3>
+            <p>
+              The previous PM settings were shaped for aggressive low-balance growth. The 5K funded challenge keeps the same winner-selection philosophy, with the live account profile now re-anchored around 0.50% target risk, a 1.00% hard trade cap, equity basis, and tighter same-symbol exposure.
+            </p>
+            <p>
+              This page is the preparation document only. No code, JSON config, or ledger changes are made by this file.
+            </p>
+          </div>
+        </div>
+
+        <div class="callout good">
+          <p>
+            <strong>Best interpretation:</strong> the word "high-risk" in the ledger name should describe the growth-oriented winner set and full-market opportunity surface, not a requirement to keep the temporary $25-account live sizing profile on a 5K funded account.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="rules">
+      <div class="section-head">
+        <div>
+          <h2>FundedNext Rule Envelope</h2>
+          <p>Working assumptions for a Stellar 2-Step style 5K challenge. Confirm the exact dashboard product before live trading.</p>
+        </div>
+        <span class="label warn">Verify In Dashboard</span>
+      </div>
+      <div class="section-body">
+        <table>
+          <thead>
+            <tr>
+              <th>Rule</th>
+              <th>Working Assumption</th>
+              <th>5K Dollar Value</th>
+              <th>FXPM Implication</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Daily loss limit</td>
+              <td><span class="number">5%</span> of initial balance for Stellar 2-Step</td>
+              <td><span class="number">$250</span></td>
+              <td>This is the official breach line. Current intent is telemetry-only, not an internal PM stop; floating losses, commissions, swaps, and fees still matter.</td>
+            </tr>
+            <tr>
+              <td>Maximum loss limit</td>
+              <td><span class="number">10%</span> of initial balance for Stellar 2-Step</td>
+              <td><span class="number">$500</span></td>
+              <td>There is no PM-wide hard portfolio cap today; use per-trade sizing, same-symbol caps, margin feasibility, and operator review to control exposure.</td>
+            </tr>
+            <tr>
+              <td>Phase 1 target</td>
+              <td><span class="number">8%</span></td>
+              <td><span class="number">$400</span></td>
+              <td>The PM can pursue the target, but not by accepting breach-level drawdown volatility.</td>
+            </tr>
+            <tr>
+              <td>Phase 2 target</td>
+              <td><span class="number">5%</span></td>
+              <td><span class="number">$250</span></td>
+              <td>Keep the same funded profile unless live evidence justifies a deliberate risk change.</td>
+            </tr>
+            <tr>
+              <td>Minimum trading days</td>
+              <td><span class="number">5</span> days per challenge phase</td>
+              <td>At least one valid trade day per phase day</td>
+              <td>Avoid overtrading just to satisfy the day count. Use natural PM signals where possible.</td>
+            </tr>
+            <tr>
+              <td>Server day reset</td>
+              <td>Daily loss resets at <span class="number">00:00 server time</span></td>
+              <td>Depends on platform time</td>
+              <td>Daily hard-stop logic must align to broker/platform server time, not local machine time.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout warn">
+          <p>
+            If the purchased account is Stellar Lite, Stellar 1-Step, Stellar Instant, or a platform-specific variant, these limits may differ.
+            The challenge wrapper should be recalculated from the actual account dashboard before the first live trade.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="state">
+      <div class="section-head">
+        <div>
+          <h2>Current FXPM State</h2>
+          <p>Read-only snapshot from the local workspace while the optimization is still in progress.</p>
+        </div>
+        <span class="label info">Snapshot</span>
+      </div>
+      <div class="section-body">
+        <div class="grid">
+          <div class="span-6 box">
+            <span class="label info">Routing</span>
+            <h3>Winner ledger routing is already pointed at the high-risk file</h3>
+            <table>
+              <tbody>
+                <tr>
+                  <td><code>pipeline.winner_ledger_path</code></td>
+                  <td><code>pm_configs_high_risk.json</code></td>
+                </tr>
+                <tr>
+                  <td><code>position.risk_per_trade_pct</code></td>
+                  <td><span class="good-text">0.50%</span> funded live sizing target</td>
+                </tr>
+                <tr>
+                  <td><code>position.max_risk_pct</code></td>
+                  <td><span class="good-text">1.00%</span> funded trade cap</td>
+                </tr>
+                <tr>
+                  <td><code>pipeline.max_combined_risk_pct</code></td>
+                  <td><span class="good-text">1.50%</span> funded same-symbol combined cap</td>
+                </tr>
+                <tr>
+                  <td><code>pipeline.secondary_trade_max_risk_pct</code></td>
+                  <td><span class="good-text">0.50%</span> funded secondary cap</td>
+                </tr>
+                <tr>
+                  <td><code>pipeline.allow_d1_plus_lower_tf</code></td>
+                  <td><span class="warn-text">true</span></td>
+                </tr>
+                <tr>
+                  <td><code>position.risk_basis</code></td>
+                  <td><code>equity</code></td>
+                </tr>
+                <tr>
+                  <td><code>position.risk_tolerance_pct</code></td>
+                  <td><code>10.0</code> advisory drift logging threshold</td>
+                </tr>
+                <tr>
+                  <td><code>local_governance_live_mode</code></td>
+                  <td><code>on</code> funded live posture</td>
+                </tr>
+                <tr>
+                  <td><code>live_risk_scalars_mode</code></td>
+                  <td><code>shadow</code> current sizing-scalar posture</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="span-6 box">
+            <span class="label info">Ledger Snapshot</span>
+            <h3><code>pm_configs_high_risk.json</code></h3>
+            <div class="kpi-strip">
+              <div class="kpi">
+                <b>60</b>
+                <span>Top-level symbols saved</span>
+              </div>
+              <div class="kpi">
+                <b>60</b>
+                <span>Validated top-level winners</span>
+              </div>
+              <div class="kpi">
+                <b>563</b>
+                <span>Tradeable regime slots</span>
+              </div>
+              <div class="kpi">
+                <b>877</b>
+                <span>No-trade regime slots</span>
+              </div>
+            </div>
+            <p style="margin-top: 14px;">
+              Last observed file write: <strong>2026-04-27 01:21:48</strong>. There were still <strong>17 stale or pre-boundary valid-until entries</strong> in this interim snapshot, so the file should not be treated as final until the full run completes and stale entries roll forward.
+            </p>
+          </div>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <div class="span-4 box">
+            <span class="label">Top Default Timeframes</span>
+            <p><strong>H4:</strong> 27 symbols</p>
+            <p><strong>D1:</strong> 22 symbols</p>
+            <p><strong>H1:</strong> 9 symbols</p>
+            <p><strong>M5/M30:</strong> 1 each</p>
+          </div>
+          <div class="span-4 box">
+            <span class="label">Regime Slot Distribution</span>
+            <p><strong>H4:</strong> 155 tradeable slots</p>
+            <p><strong>H1:</strong> 141 tradeable slots</p>
+            <p><strong>M30:</strong> 108 tradeable slots</p>
+            <p><strong>D1:</strong> 93 tradeable slots</p>
+          </div>
+          <div class="span-4 box">
+            <span class="label">Dominant Families</span>
+            <p><strong>EMA pullback:</strong> 51 regime slots</p>
+            <p><strong>Momentum burst:</strong> 50 regime slots</p>
+            <p><strong>Z-score VWAP:</strong> 45 regime slots</p>
+            <p><strong>Compression breakout:</strong> 31 regime slots</p>
+          </div>
+        </div>
+
+        <div class="callout bad">
+          <p>
+            <strong>Challenge risk warning:</strong> the previous low-balance live exposure settings could consume too much of a FundedNext daily loss allowance in one trade or one same-symbol stack.
+            On a 5K challenge, 2% per trade would be about $100 and 4% same-symbol combined risk would be about $200 before spread, slippage, commissions, swaps, floating loss, and gap behavior.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="wrapper">
+      <div class="section-head">
+        <div>
+          <h2>Funded Challenge Risk Wrapper</h2>
+          <p>The funded live deployment settings now applied in <code>config.json</code>, with remaining broker and ledger verification still required before execution.</p>
+        </div>
+        <span class="label good">Applied</span>
+      </div>
+      <div class="section-body">
+        <table>
+          <thead>
+            <tr>
+              <th>Control</th>
+              <th>Active Setting</th>
+              <th>Status</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Primary risk per trade</td>
+              <td><code>position.risk_per_trade_pct = 0.5</code></td>
+              <td><span class="number good-text">Applied</span></td>
+              <td>Enough to let edge compound while avoiding breach-level loss concentration.</td>
+            </tr>
+            <tr>
+              <td>Hard trade risk cap</td>
+              <td><code>position.max_risk_pct = 1.0</code></td>
+              <td><span class="number good-text">Applied</span></td>
+              <td>Allows enough wiggle room for broker volume steps and min-lot mechanics while keeping the real per-trade blocker tight for a 5K account.</td>
+            </tr>
+            <tr>
+              <td>Risk basis</td>
+              <td><code>equity</code></td>
+              <td><span class="number good-text">Applied</span></td>
+              <td>FundedNext limits can be affected by floating loss, so equity is the cleaner sizing basis for the funded account.</td>
+            </tr>
+            <tr>
+              <td>Risk tolerance</td>
+              <td><code>10.0%</code></td>
+              <td><span class="number good-text">Keep 10.0%</span></td>
+              <td>This is an advisory drift threshold for over-target-but-in-cap sizing logs. It does not supersede <code>position.max_risk_pct</code>; the hard cap still blocks.</td>
+            </tr>
+            <tr>
+              <td>Same-symbol combined risk</td>
+              <td><code>1.5%</code></td>
+              <td><span class="number good-text">Applied at upper bound</span></td>
+              <td>This is not a PM-wide portfolio lockout. It caps added exposure on the same symbol, especially D1 plus lower-timeframe stacks.</td>
+            </tr>
+            <tr>
+              <td>Secondary trade cap</td>
+              <td><code>0.5%</code></td>
+              <td><span class="number good-text">Applied at lower bound</span></td>
+              <td>Preserves valid second trades while letting the same-symbol combined cap control total local exposure.</td>
+            </tr>
+            <tr>
+              <td>D1 plus lower timeframe</td>
+              <td><code>true</code></td>
+              <td><span class="number good-text">Keep true</span></td>
+              <td>Do not handicap the PM's intended workflow. Keep the current D1 plus lower-timeframe behavior and manage the exposure with the same-symbol caps.</td>
+            </tr>
+            <tr>
+              <td>Daily loss behavior</td>
+              <td><code>daily_loss_advisory_pct = 10.0</code>, advisory only</td>
+              <td><span class="number warn-text">Applied as telemetry only</span></td>
+              <td>This intentionally accepts that the PM may fail the challenge if loss limits are breached. Do not label this as pass-protection; it is only visibility.</td>
+            </tr>
+            <tr>
+              <td>Local governance</td>
+              <td><code>local_governance_live_mode = "on"</code></td>
+              <td><span class="number good-text">Applied</span></td>
+              <td>The artifact-selected governance policy should actively manage matching open trades per symbol/timeframe/regime when the account goes live.</td>
+            </tr>
+            <tr>
+              <td>Risk scalars</td>
+              <td><code>live_risk_scalars_mode = "shadow"</code></td>
+              <td><span class="number warn-text">Keep shadow unless deliberately promoted</span></td>
+              <td>Risk scalars are not the same as governance. They can reduce live sizing dynamically, so leave them observational unless the operator wants that throttle.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="grid" style="margin-top: 14px;">
+          <div class="span-6 box good">
+            <span class="label good">What Should Stay</span>
+            <ul>
+              <li>The active-recent data workflow: 300,000 M5 bars, 50,000 historical stress audit bars, 250,000 active universe bars.</li>
+              <li>Stage 1 broad winner eligibility over the active universe.</li>
+              <li>Stage 2 and stage 3 risk-management selection for winning symbol, timeframe, and regime candidates.</li>
+              <li>The high-risk ledger as the source of optimized strategy choice once complete and clean.</li>
+            </ul>
+          </div>
+
+          <div class="span-6 box warn">
+            <span class="label warn">Prepared And Still Open</span>
+            <ul>
+              <li>Prepared: live risk percentage, per-trade hard cap, same-symbol combined cap, secondary cap, equity basis, and active local governance.</li>
+              <li>Prepared: daily and session loss settings remain advisory telemetry only at <code>10.0%</code>; they are not hard stops.</li>
+              <li>Actual broker symbol specifications from the FundedNext MT5 account.</li>
+              <li>Final stale-entry review after the optimizer finishes all expected symbols.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <p>
+            <strong>Clarification on daily loss:</strong> the PM's current daily/session loss logic is advisory only and logs that entries continue.
+            The funded-challenge intent recorded here is not to add a daily hard stop now. That is an intentional risk choice, not a code limitation or a hidden safety feature.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="implementation-audit">
+      <div class="section-head">
+        <div>
+          <h2>Implementation Re-Evaluation</h2>
+          <p>Read-only audit notes on what was actually built for the small-account high-risk profile and how it carries into a 5K funded challenge.</p>
+        </div>
+        <span class="label info">Audit-Level</span>
+      </div>
+      <div class="section-body">
+        <div class="grid">
+          <div class="span-6 box good">
+            <span class="label good">Safe To Keep</span>
+            <h3>Low-balance code-path changes that improve the PM generally</h3>
+            <ul>
+              <li>Commission-aware stop-loss risk math before entry, during open-position exposure estimation, and after quote refresh.</li>
+              <li>Projected margin feasibility before broker submission, which converts late broker rejects into clearer PM-side decisions.</li>
+              <li>Reason-coded min-lot and hard-cap outcomes such as <code>BLOCKED_MIN_LOT_EXCEEDS_CAP</code>.</li>
+              <li><code>allow_min_lot_risk_clamp</code>, because it still respects <code>position.max_risk_pct</code>; on a 5K account with a 1% cap it should remain a safety valve, not a bypass.</li>
+              <li><code>winner_ledger_path</code> routing and dashboard alignment to the configured ledger.</li>
+              <li>Same-symbol exposure estimation from live trade geometry before falling back to comment metadata.</li>
+            </ul>
+          </div>
+
+          <div class="span-6 box warn">
+            <span class="label warn">Profile Items Re-Anchored</span>
+            <h3>Settings changed for the 5K funded profile</h3>
+            <ul>
+              <li><code>position.risk_per_trade_pct</code> is now <code>0.50</code> for the 5K funded challenge.</li>
+              <li><code>position.max_risk_pct</code> is now <code>1.00</code>.</li>
+              <li><code>position.risk_basis</code> is now <code>"equity"</code>.</li>
+              <li><code>pipeline.max_combined_risk_pct</code> is now <code>1.50</code> as a same-symbol cap, not a PM-wide cap.</li>
+              <li><code>pipeline.secondary_trade_max_risk_pct</code> is now <code>0.50</code>.</li>
+              <li><code>execution_spread_spike_mult = 3.0</code> and <code>min_trade_risk_pct = 0.05</code> are low-balance-friendly settings to review against FundedNext spreads, not automatic defects.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <div class="span-6 box info">
+            <span class="label info">Governance Reality</span>
+            <h3>Implemented, selected per context, currently shadowed live</h3>
+            <p>
+              The optimization pipeline does select a governance policy per exact winner context and persists it onto the artifact.
+              The live runtime dispatches that artifact policy per open trade after resolving symbol, timeframe, regime, and ticket state.
+            </p>
+            <p>
+              In the current interim ledger snapshot, tradeable regime slots show <strong>488</strong> <code>control_fixed</code>,
+              <strong>30</strong> <code>atr_trail_capped</code>, <strong>26</strong> <code>breakeven_1r</code>, and
+              <strong>19</strong> <code>pure_atr</code>. That means governance is real, but most contexts are still selecting the baseline fixed-control policy.
+            </p>
+          </div>
+
+          <div class="span-6 box info">
+            <span class="label info">Live Activation Meaning</span>
+            <h3><code>local_governance_live_mode = "on"</code></h3>
+            <p>
+              In <code>shadow</code>, governance computes would-be SL/TP changes and stores shadow state, but it does not call broker modification.
+              In <code>on</code>, non-control policies can call <code>modify_position</code> to tighten stops or release TP according to the selected local policy.
+            </p>
+            <p>
+              For the funded challenge intent, governance is now promoted to <code>on</code>, while risk scalars remain in <code>shadow</code> unless there is a deliberate decision to let them reduce live sizing.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="launch">
+      <div class="section-head">
+        <div>
+          <h2>Launch Gates</h2>
+          <p>Use these gates before the PM is connected to the funded account in the intended high-freedom funded-challenge posture.</p>
+        </div>
+        <span class="label warn">Execution Gates</span>
+      </div>
+      <div class="section-body">
+        <div class="grid">
+          <div class="span-6 box good">
+            <span class="label good">Go Conditions</span>
+            <ul>
+              <li><code>pm_configs_high_risk.json</code> has completed the expected symbol universe and no stale pre-boundary winners remain.</li>
+              <li>The exact FundedNext account model, platform, server time, EA permission, and loss rules are verified from the dashboard.</li>
+              <li>The PM risk wrapper is applied to the funded profile: 0.50% primary risk, 1.00% hard cap, 10.0% risk tolerance, and 1.25-1.50% same-symbol combined risk.</li>
+              <li><code>local_governance_live_mode</code> is intentionally set for the funded objective, preferably <code>on</code> if governance is meant to actively manage open trades.</li>
+              <li>Daily/session loss settings are understood as telemetry only; no one is relying on them to protect the challenge from failure.</li>
+              <li>FundedNext broker specs, min lots, volume steps, symbol suffixes, spreads, commissions, swaps, and stop levels have been refreshed locally.</li>
+              <li>At least one dry-run or disabled-trading session confirms signals, order requests, stop-loss placement, and rejection logging on the funded terminal.</li>
+            </ul>
+          </div>
+
+          <div class="span-6 box bad">
+            <span class="label bad">No-Go Conditions</span>
+            <ul>
+              <li>The challenge is not actually Stellar 2-Step and the rule envelope has not been recalculated.</li>
+              <li>The optimizer file is still partial, stale, or contains expired/pre-boundary configs intended to be replaced by the current run.</li>
+              <li>The PM still has 2% per-trade live risk, 3% max trade risk, or 4% same-symbol combined risk when the funded account is meant to run the 5K profile.</li>
+              <li>Governance is expected to be active, but <code>local_governance_live_mode</code> is still left in <code>shadow</code>.</li>
+              <li>Broker symbol mapping or instrument specs are assumed from the old environment instead of pulled from FundedNext MT5.</li>
+              <li>The operator believes there is a PM-wide portfolio cap where the code only implements same-symbol caps and report-only observability.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout info">
+          <p>
+            <strong>First-week stance:</strong> let the PM trade naturally under the funded profile rather than a special conservative mode.
+            The aim is to let the optimized ledger express edge while keeping the per-trade and same-symbol sizing settings matched to the 5K account.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="sequence">
+      <div class="section-head">
+        <div>
+          <h2>Execution Sequence</h2>
+          <p>The practical order of operations for moving from the current optimization run into a funded challenge deployment.</p>
+        </div>
+        <span class="label info">Plan</span>
+      </div>
+      <div class="section-body">
+        <div class="timeline">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <h3>Let the optimization finish</h3>
+              <p>Do not trade the interim ledger as final. Wait for the full expected symbol universe and then regenerate the performance summary from the completed file.</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <h3>Run final ledger hygiene checks</h3>
+              <p>Confirm valid-until dates, artifact contract, data-window identity, historical stress audit status, and any symbols that intentionally produce no-trade regimes.</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <h3>Create the funded challenge live profile</h3>
+              <p>Apply the funded profile in config after review. Strategy choices should remain from the optimized ledger; the funded profile should control 0.50% target risk, 1.00% hard cap, equity basis, same-symbol exposure, and governance activation.</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">4</div>
+            <div class="step-body">
+              <h3>Connect and refresh broker conditions</h3>
+              <p>Use the actual FundedNext terminal account to refresh symbol names, volume constraints, margin data, spread behavior, commission, swaps, stop levels, and market-session restrictions.</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">5</div>
+            <div class="step-body">
+              <h3>Dry run with live data and no execution</h3>
+              <p>Confirm bar-driven signal evaluation, order request formation, trade-management behavior, and rejection telemetry before the PM is permitted to place funded orders.</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">6</div>
+            <div class="step-body">
+              <h3>Start challenge mode</h3>
+              <p>Begin with the funded profile, not a conservative launch mode. Review every rejection, fill, stop placement, governance modification, and daily loss calculation until the funded account behavior is understood.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="open-items">
+      <div class="section-head">
+        <div>
+          <h2>Open Items Before First Trade</h2>
+          <p>The remaining items are operational and risk-control related, not reasons to rework the optimizer.</p>
+        </div>
+        <span class="label warn">Outstanding</span>
+      </div>
+      <div class="section-body">
+        <div class="grid">
+          <div class="span-4 box">
+            <span class="label">Rule Confirmation</span>
+            <p>Confirm whether the account is Stellar 2-Step or another FundedNext model. Recalculate daily loss, max loss, targets, and minimum-day requirements from the actual dashboard.</p>
+          </div>
+          <div class="span-4 box">
+            <span class="label">Risk Profile Applied</span>
+            <p>The config now uses 0.50% risk, 1.00% hard cap, equity basis, 10.0% risk tolerance, 1.50% same-symbol combined cap, and 0.50% secondary cap.</p>
+          </div>
+          <div class="span-4 box">
+            <span class="label">Broker Feasibility</span>
+            <p>Refresh FundedNext MT5 broker specs. Validate min lot, volume step, stop distance, margin, commission, swap, and symbol suffix behavior against the live account.</p>
+          </div>
+          <div class="span-4 box">
+            <span class="label">Ledger Finality</span>
+            <p>Resolve partial-run status. Interim snapshot shows 60 saved symbols and stale valid-until entries, so the final file still needs completion and hygiene review.</p>
+          </div>
+          <div class="span-4 box">
+            <span class="label">Governance Mode</span>
+            <p><code>local_governance_live_mode = "on"</code> is now set. Confirm broker-side modification behavior during dry-run or disabled-trading review before funded execution.</p>
+          </div>
+          <div class="span-4 box">
+            <span class="label">Launch Report</span>
+            <p>Generate a final challenge launch report from the completed ledger and funded broker specs so the first live session has a clean baseline.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="shell footer">
+    <p>
+      This document records the funded challenge preparation state. PM code, account credentials, broker settings, and strategy ledgers were not modified; the operational JSON config has been prepared for the 5K challenge profile.
+    </p>
+    <p>
+      Official rule references checked on April 27, 2026:
+    </p>
+    <div class="source-list">
+      <a href="https://help.fundednext.com/en/articles/8021076-what-rules-do-i-need-to-follow-in-the-stellar-2-step-challenge">Stellar 2-Step Rules</a>
+      <a href="https://help.fundednext.com/en/articles/9941519-daily-loss-limit-vs-maximum-loss-limit">Daily vs Maximum Loss</a>
+      <a href="https://help.fundednext.com/en/articles/8019811-how-can-i-calculate-the-daily-loss-limit/">Daily Loss Calculation</a>
+      <a href="https://fundednext.com/cfd-challenge-terms">CFD Challenge Terms</a>
+    </div>
+  </footer>
+</body>
+</html>

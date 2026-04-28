@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FXPM Codebase Audit</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070b10;
+      --surface: #0d141d;
+      --surface-2: #121c28;
+      --line: #253647;
+      --soft: #8fa1b5;
+      --text: #eef5ff;
+      --muted: #b7c3d1;
+      --cyan: #42d9f5;
+      --green: #39d98a;
+      --amber: #ffbf4d;
+      --red: #ff5d6c;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, rgba(66, 217, 245, 0.08), transparent 360px),
+        linear-gradient(90deg, rgba(255, 191, 77, 0.05), transparent 520px),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+      letter-spacing: 0;
+    }
+    .page { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 72px; }
+    .hero {
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(18, 28, 40, 0.98), rgba(8, 12, 18, 0.98));
+      border-radius: var(--radius);
+      padding: 36px;
+      box-shadow: 0 24px 80px rgba(0,0,0,.42);
+      position: relative;
+      overflow: hidden;
+    }
+    .hero:before { content: ""; position: absolute; inset: 0 0 auto; height: 3px; background: linear-gradient(90deg, var(--cyan), var(--green), var(--amber)); }
+    .eyebrow { color: var(--cyan); text-transform: uppercase; font-size: 12px; font-weight: 800; letter-spacing: .14em; margin: 0 0 12px; }
+    h1, h2, h3 { line-height: 1.12; letter-spacing: 0; }
+    h1 { font-size: clamp(34px, 5vw, 66px); margin: 0; max-width: 900px; }
+    .hero p { max-width: 860px; color: var(--muted); font-size: 18px; margin: 18px 0 0; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 28px; }
+    .stat, .panel, .finding {
+      border: 1px solid var(--line);
+      background: rgba(13, 20, 29, .88);
+      border-radius: var(--radius);
+    }
+    .stat { padding: 16px; min-height: 96px; }
+    .stat span { display: block; color: var(--soft); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; }
+    .stat strong { display: block; margin-top: 8px; font-size: 22px; }
+    section { margin-top: 28px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .panel, .finding { padding: 22px; }
+    h2 { font-size: 28px; margin: 0 0 14px; }
+    h3 { margin: 0 0 10px; font-size: 18px; }
+    p { color: var(--muted); margin: 0 0 12px; }
+    ul { margin: 0; padding-left: 20px; color: var(--muted); }
+    li { margin: 6px 0; }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: var(--radius); }
+    th, td { border-bottom: 1px solid var(--line); padding: 12px 14px; text-align: left; vertical-align: top; }
+    th { color: var(--text); background: rgba(18, 28, 40, .9); }
+    td { color: var(--muted); }
+    code { color: var(--cyan); background: rgba(66,217,245,.08); padding: 1px 5px; border-radius: 4px; }
+    .ok { color: var(--green); }
+    .warn { color: var(--amber); }
+    .risk { color: var(--red); }
+    @media (max-width: 820px) {
+      .stats, .grid { grid-template-columns: 1fr; }
+      .hero { padding: 26px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">FXPM audit - 2026-04-25</p>
+      <h1>Codebase stronger, live alignment improved, artifact regeneration still required.</h1>
+      <p>The active workflow, optimizer alignment, risk-management propagation, and live margin safety patches are implemented and covered by the full local test suite. No full optimization run was executed.</p>
+      <div class="stats">
+        <div class="stat"><span>Validation</span><strong class="ok">531 passed</strong></div>
+        <div class="stat"><span>Workflow</span><strong>300k M5</strong></div>
+        <div class="stat"><span>Audit Window</span><strong>50k M5</strong></div>
+        <div class="stat"><span>Active Universe</span><strong>250k M5</strong></div>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2>Executive Verdict</h2>
+      <p>The PM is in a materially better position. Recent data now drives the active selection universe, older data is separated into a historical stress audit, risk-management policy evidence is attached to winners, and live execution no longer trades a different exit surface than the optimizer evaluates.</p>
+      <p>The remaining high-priority work is operational: capture broker specs, regenerate the high-risk ledger under the new contract, and clean runtime artifacts from the worktree.</p>
+    </section>
+
+    <section>
+      <h2>Current Snapshot</h2>
+      <table>
+        <tr><th>Area</th><th>State</th></tr>
+        <tr><td>Production optimizer</td><td>Regime-aware <code>OptimizationPipeline</code></td></tr>
+        <tr><td>Data mode</td><td><code>active_recent_m5</code></td></tr>
+        <tr><td>Risk-management selection</td><td>Mandatory, default <code>stage3</code></td></tr>
+        <tr><td>Active ledger path</td><td><code>pm_configs_high_risk.json</code></td></tr>
+        <tr><td>Governance live mode</td><td><code>shadow</code></td></tr>
+        <tr><td>Walk-forward gating</td><td>Disabled; future stale-winner report should be non-gating</td></tr>
+        <tr><td>Test result</td><td><code>531 passed, 1 skipped, 350 subtests passed</code></td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Implemented Corrections</h2>
+      <div class="grid">
+        <article class="finding"><h3>Active M5 Workflow</h3><p>Latest 300,000 M5 bars are used, with 50,000 older bars reserved for historical stress audit and 250,000 newer bars used as the active production universe.</p></article>
+        <article class="finding"><h3>Historical Stress Audit</h3><p>Regime and symbol artifacts now carry historical audit metrics and severe-failure reasons without letting the older window dominate live-relevant selection.</p></article>
+        <article class="finding"><h3>Risk Policy Propagation</h3><p>Winner artifacts now include selected governance policy, candidate metrics, baseline metrics, stage, and selection surface.</p></article>
+        <article class="finding"><h3>Optimizer Alignment</h3><p>Regime Optuna scoring now uses validation bucket metrics when available, and regime buckets are attributed by signal bar.</p></article>
+        <article class="finding"><h3>No-Trade Markers</h3><p>Evaluated no-winner slots are explicit <code>NO_TRADE</code> markers, skipped by audits and not counted as tradeable winners.</p></article>
+        <article class="finding"><h3>Live Margin Safety</h3><p>Margin protection is wired into the live sweep, handles missing margin values, and preserves the single-snapshot contract unless a forced close changes positions.</p></article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Remaining Risks</h2>
+      <div class="grid">
+        <article class="finding"><h3 class="warn">Regenerate Ledger</h3><p>The current high-risk JSON is transitional until regenerated by the latest code. Treat old winners as inspection material, not authoritative output.</p></article>
+        <article class="finding"><h3 class="warn">Capture Broker Specs</h3><p><code>broker_specs.json</code> is configured but absent. Capture terminal specs before authoritative optimization.</p></article>
+        <article class="finding"><h3 class="warn">Clean Worktree</h3><p>Runtime artifacts, caches, ledgers, logs, and source changes remain mixed. This is a reproducibility risk.</p></article>
+        <article class="finding"><h3>Dashboard Status</h3><p>Manual historical refresh still needs a job-status endpoint so operators can see completion and errors.</p></article>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Recommended Next Steps</h2>
+      <ul>
+        <li>Capture broker specs from the target MT5 terminal.</li>
+        <li>Run a controlled one-symbol optimization first.</li>
+        <li>Inspect the generated artifact metadata, historical audit, governance policy, and no-trade markers.</li>
+        <li>Regenerate <code>pm_configs_high_risk.json</code> when ready.</li>
+        <li>Re-audit the regenerated ledger before expanding live authority.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
