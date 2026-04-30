@@ -1,0 +1,2740 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FXPM Profitability-Readiness Blueprint v2</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  --bg: #f7f8fb;
+  --panel: #ffffff;
+  --text: #17202a;
+  --muted: #5f6b7a;
+  --border: #d9dee8;
+  --accent: #1f5eff;
+  --accent-soft: #e9efff;
+  --code-bg: #101828;
+  --code-text: #eef4ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  line-height: 1.62;
+  background: var(--bg);
+  color: var(--text);
+}
+.wrapper {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 36px 24px 80px;
+}
+.header {
+  background: linear-gradient(135deg, #101828, #1f5eff);
+  color: white;
+  border-radius: 18px;
+  padding: 34px 38px;
+  margin-bottom: 28px;
+  box-shadow: 0 16px 45px rgba(16, 24, 40, 0.18);
+}
+.header h1 {
+  margin: 0 0 8px;
+  font-size: 2.0rem;
+}
+.header p {
+  margin: 0;
+  color: #dbe7ff;
+}
+.content {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 34px 40px;
+  box-shadow: 0 8px 30px rgba(16, 24, 40, 0.06);
+}
+h1, h2, h3, h4 {
+  line-height: 1.25;
+  margin-top: 1.6em;
+  margin-bottom: 0.55em;
+}
+h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: .35em; }
+h2 { font-size: 1.55rem; color: #102a56; border-bottom: 1px solid var(--border); padding-bottom: .25em; }
+h3 { font-size: 1.25rem; color: #183b75; }
+h4 { font-size: 1.08rem; color: #243b5a; }
+p { margin: 0.75em 0; }
+code {
+  background: var(--accent-soft);
+  color: #16306b;
+  padding: 0.1em 0.35em;
+  border-radius: 5px;
+  font-size: 0.92em;
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-text);
+  padding: 18px 20px;
+  border-radius: 12px;
+  overflow-x: auto;
+  font-size: 0.91rem;
+  line-height: 1.48;
+  border: 1px solid #22304a;
+}
+pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+ul, ol { padding-left: 1.45em; }
+li { margin: .25em 0; }
+.table-wrap { overflow-x: auto; margin: 1em 0 1.4em; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+th, td {
+  border: 1px solid var(--border);
+  padding: 10px 12px;
+  vertical-align: top;
+}
+th {
+  background: #eef3ff;
+  color: #0f2b61;
+  text-align: left;
+}
+tr:nth-child(even) td { background: #fafbff; }
+strong { color: #0f2b61; }
+@media print {
+  body { background: white; }
+  .wrapper { max-width: none; padding: 0; }
+  .header { border-radius: 0; box-shadow: none; }
+  .content { border: none; box-shadow: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrapper">
+  <div class="header">
+    <h1>FXPM Profitability-Readiness Blueprint v2</h1>
+    <p>Revised around the autonomous specialist-manager architecture, hard institutional breakpoints, expanded order management, regime profitability audit, and fresh-edge preservation.</p>
+  </div>
+  <main class="content">
+<h1 id='fxpm-profitability-readiness-blueprint-v2'>FXPM Profitability-Readiness Blueprint v2</h1>
+
+<p><strong>Document purpose:</strong> This is a revised implementation blueprint after incorporating the FXPM philosophy that each <code>(symbol, timeframe, regime)</code> winner acts as an autonomous specialist trader. The revised architecture avoids unnecessary top-down interference while adding the minimum institutional controls needed to protect profitability, sustainability, and live funding confidence.</p>
+
+<p><strong>Core position:</strong> I do <strong>not</strong> vehemently disagree with your specialist-manager model. I think it is the correct philosophical center for FXPM. My earlier portfolio-risk recommendation should be refined: the portfolio layer should <strong>not</strong> become a constant correlation veto or top-down allocator that suppresses the best local opportunities. Instead, it should become a <strong>circuit-breaker and institutional supervisor layer</strong> that intervenes only when aggregate system behavior becomes dangerous, clearly degraded, or operationally untrustworthy.</p>
+
+<p>The highest-profitability version of FXPM should therefore be:</p>
+
+<pre><code>Autonomous specialist managers
+    +
+Local order-management tournaments
+    +
+Causal profitability-aligned regime selection
+    +
+Fast two-week reselection cycle
+    +
+Lightweight institutional safety breakpoints
+    +
+Fail-closed deployment readiness</code></pre>
+
+<p>not:</p>
+
+<pre><code>Autonomous specialists
+    +
+Heavy portfolio optimizer that second-guesses every signal</code></pre>
+
+<p>and not:</p>
+
+<pre><code>Research winners
+    +
+No institutional protection once many specialists are active simultaneously</code></pre>
+
+<p>---</p>
+
+<h2 id='1-revised-verdict-after-your-clarification'>1. Revised verdict after your clarification</h2>
+
+<p>Your clarification materially changes how the blueprint should be framed.</p>
+
+<h3 id='where-i-agree-with-you'>Where I agree with you</h3>
+
+<p>I agree that FXPM should not be turned into a conventional top-down portfolio allocation engine. The core value proposition is that each local context can identify its best specialist:</p>
+
+<pre><code>symbol × timeframe × regime → best strategy + best params + best order policy</code></pre>
+
+<p>If that local specialist is valid, current, and live-eligible, suppressing it merely because another signal looks correlated can easily harm profitability. In a system designed to discover independent local edges, excessive portfolio-level filters can remove the very opportunity breadth that makes FXPM powerful.</p>
+
+<p>I also agree that the two-week retrain cadence is not incidental. It is part of the edge. The system is trying to capture a fresh market-surface advantage before it decays. Adding a long extra validation layer between optimization and live trading can reduce the expected edge.</p>
+
+<p>I further agree that the live order-management pool is underdeveloped relative to the strategy pool. With 47 entry strategies but only around four governance/order-management policies, the system may be leaving a large portion of profitability on the table after entry. This is now elevated to a top-priority profitability upgrade.</p>
+
+<h3 id='where-i-partially-disagree'>Where I partially disagree</h3>
+
+<p>I do not think a two-week retrain cadence eliminates the need for live drift controls. It reduces the need for a heavy model-lifecycle apparatus, but it does not protect against:</p>
+
+<pre><code>broker spread regime changing inside the two-week cycle
+data-feed discontinuity
+wrong active regime selection
+execution slippage expanding
+MT5 symbol metadata changing
+a local winner suffering immediate live mismatch
+margin stress from multiple active specialists
+platform restart / stale artifact / stale ledger issues</code></pre>
+
+<p>So the right compromise is not “heavy drift monitor.” It is a <strong>lightweight cycle guard</strong>. It should not constantly derate or second-guess local winners. It should only detect severe within-cycle failure modes and pause, derate, or require review when the evidence is strong.</p>
+
+<h3 id='where-i-strongly-disagree'>Where I strongly disagree</h3>
+
+<p>I strongly disagree with having no real aggregate fail-safe. Even if every specialist is locally valid, the combined book can still become unsustainable. This is not a contradiction of the specialist model. It is the same reason a trading house allows specialists to trade independently but still has firm-level drawdown, margin, and catastrophic-loss rules.</p>
+
+<p>The key is that the institutional layer should not say:</p>
+
+<pre><code>“Do not take EURUSD because GBPUSD is already long.”</code></pre>
+
+<p>It should say:</p>
+
+<pre><code>“New entries are paused because aggregate open risk, margin stress, daily loss, or execution degradation has crossed a hard breakpoint.”</code></pre>
+
+<p>That is a very different architecture. The first suppresses local edge. The second protects survival.</p>
+
+<p>---</p>
+
+<h2 id='2-revised-target-architecture'>2. Revised target architecture</h2>
+
+<h3 id='2-1-architecture-in-one-sentence'>2.1 Architecture in one sentence</h3>
+
+<p>FXPM should be structured as a federation of autonomous specialist managers supervised by a lightweight institutional safety layer.</p>
+
+<h3 id='2-2-specialist-manager-model'>2.2 Specialist manager model</h3>
+
+<p>Each local manager is defined by:</p>
+
+<pre><code>SpecialistManagerKey:
+    symbol
+    timeframe
+    regime
+
+SpecialistManagerArtifact:
+    strategy_name
+    parameters
+    validation evidence
+    regime evidence
+    cost evidence
+    order_management_policy
+    artifact fingerprint
+    valid_until
+    promotion_status</code></pre>
+
+<p>A specialist is allowed to trade only when:</p>
+
+<pre><code>1. Its artifact is current.
+2. Its validation evidence meets gates.
+3. Its regime label is live-causal and valid.
+4. Its order-management policy is known.
+5. Broker and execution preflight pass.
+6. The institutional supervisor has not triggered a hard breakpoint.</code></pre>
+
+<p>The institutional supervisor should not normally rank, reallocate, or filter the specialists. It should only stop new risk when the system is unsafe.</p>
+
+<h3 id='2-3-institutional-supervisor-model'>2.3 Institutional supervisor model</h3>
+
+<p>The supervisor is not a portfolio optimizer. It is a capital-preservation shell.</p>
+
+<p>It directly evaluates:</p>
+
+<pre><code>daily realized loss
+session realized loss
+weekly realized loss
+open drawdown
+margin level
+total open risk</code></pre>
+
+<p>Companion live gates and sentinels monitor the remaining operational evidence:</p>
+
+<pre><code>broker execution degradation
+artifact validity
+ledger completeness
+severe live-cycle drift
+data continuity</code></pre>
+
+<p>It normally returns:</p>
+
+<pre><code>SupervisorDecision(allow_new_entries=True, risk_multiplier=1.0, reason=&quot;normal&quot;)</code></pre>
+
+<p>It intervenes only under hard breakpoints:</p>
+
+<pre><code>SupervisorDecision(allow_new_entries=False, risk_multiplier=0.0, reason=&quot;daily_loss_hard_block&quot;)</code></pre>
+
+<p>or, optionally, under a narrow derating mode:</p>
+
+<pre><code>SupervisorDecision(allow_new_entries=True, risk_multiplier=0.5, reason=&quot;execution_degradation&quot;)</code></pre>
+
+<h3 id='2-4-revised-architecture-diagram'>2.4 Revised architecture diagram</h3>
+
+<pre><code>                       ┌──────────────────────────┐
+                       │       config.json         │
+                       │ risk, validation, modes   │
+                       └─────────────┬────────────┘
+                                     │
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                         OPTIMIZATION FACTORY                         │
+│                                                                      │
+│  M5 data window → features → causal regimes → strategy tournament     │
+│      → per-regime winners → governance tournament → artifacts         │
+│                                                                      │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        WINNER LEDGER / ARTIFACTS                     │
+│                                                                      │
+│  symbol → timeframe → regime → strategy + params + policy + evidence │
+│                                                                      │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                            LIVE TRADING LOOP                         │
+│                                                                      │
+│  New bar → features → REGIME_LIVE → exact local winner lookup         │
+│      → signal → local order policy → broker preflight                 │
+│                                                                      │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                    INSTITUTIONAL SUPERVISOR                          │
+│                                                                      │
+│  Fail-closed deployment checks                                        │
+│  Hard system drawdown/loss breakpoints                                │
+│  Margin and execution safety                                          │
+│  Lightweight two-week-cycle drift sentinel                            │
+│                                                                      │
+│  Normal behavior: allow specialists to act                            │
+│  Emergency behavior: pause/derate/block new entries                   │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                         MT5 EXECUTION                                │
+│                                                                      │
+│  symbol resolution, tick, broker metadata, order_check, order_send    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<p>---</p>
+
+<h2 id='3-updated-recommendation-map'>3. Updated recommendation map</h2>
+
+<div class='table-wrap'><table>
+<thead><tr><th>Topic</th><th>Revised stance</th></tr></thead>
+<tbody>
+<tr><td>Portfolio/correlation control</td><td>Do <strong>not</strong> add constant correlation vetoes. Add institutional hard breakpoints only.</td></tr>
+<tr><td>Same-symbol controls</td><td>Keep existing same-symbol geometry controls; they are local safety, not top-down suppression.</td></tr>
+<tr><td>Portfolio-wide risk</td><td>Add high-threshold system risk circuit breakers, not per-signal allocation interference.</td></tr>
+<tr><td>Live drift</td><td>Add lightweight cycle drift sentinel only. Do not build a heavy drift platform.</td></tr>
+<tr><td>Walk-forward validation</td><td>Do not add a stale intermediary layer. Add same-cycle fragility audit and severe-failure blocker.</td></tr>
+<tr><td>Order management</td><td>Elevate to top priority. Expand governance pool and validate per specialist.</td></tr>
+<tr><td>Strategy pool</td><td>Expand from 47 to 50-52 only with genuinely distinct edge archetypes.</td></tr>
+<tr><td>Regime accuracy</td><td>Treat as central. Add regime profitability audit, regime confidence metrics, and boundary diagnostics.</td></tr>
+<tr><td>Carry/news/currency strength</td><td>Implement as optional strategy/archetype or cost modeling, not broad portfolio suppression.</td></tr>
+<tr><td>Fair comparison</td><td>Preserve common assumptions; add fairness telemetry and family-size-aware validation metrics.</td></tr>
+</tbody></table></div>
+
+<p>---</p>
+
+<h1 id='part-a-required-config-edits'>Part A — Required config edits</h1>
+
+<h2 id='a1-immediate-config-edits'>A1. Immediate config edits</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>config.json</code></pre>
+
+<h3 id='current-issues-to-address'>Current issues to address</h3>
+
+<p>The current active config contains:</p>
+
+<pre><code>&quot;live_artifact_drift_policy&quot;: &quot;warn&quot;,
+&quot;walk_forward_audit_enabled&quot;: false,
+&quot;local_governance_live_mode&quot;: &quot;on&quot;,
+&quot;daily_loss_advisory_pct&quot;: 10.0,
+&quot;session_loss_advisory_pct&quot;: 10.0,
+&quot;market_driven_exit_pack_mode&quot;: &quot;off&quot;</code></pre>
+
+<p>The revised version should distinguish between:</p>
+
+<pre><code>1. autonomous specialist freedom
+2. local order-management expansion
+3. institutional hard breakpoints
+4. lightweight cycle monitoring</code></pre>
+
+<h3 id='recommended-patch'>Recommended patch</h3>
+
+<pre><code>{
+  &quot;pipeline&quot;: {
+    &quot;live_artifact_drift_policy&quot;: &quot;block&quot;,
+
+    &quot;institutional_supervisor_enabled&quot;: true,
+    &quot;institutional_supervisor_mode&quot;: &quot;circuit_breaker&quot;,
+    &quot;portfolio_control_policy&quot;: &quot;hard_breakpoints_only&quot;,
+
+    &quot;max_total_open_risk_pct&quot;: 8.0,
+    &quot;max_new_entries_when_total_open_risk_above_pct&quot;: 6.0,
+    &quot;open_risk_action&quot;: &quot;pause_new_entries&quot;,
+
+    &quot;daily_loss_hard_block_pct&quot;: 3.0,
+    &quot;session_loss_hard_block_pct&quot;: 2.0,
+    &quot;weekly_loss_hard_block_pct&quot;: 6.0,
+    &quot;open_drawdown_hard_block_pct&quot;: 8.0,
+    &quot;hard_block_reopen_mode&quot;: &quot;manual_or_next_cycle&quot;,
+
+    &quot;cycle_drift_monitor_enabled&quot;: true,
+    &quot;cycle_drift_mode&quot;: &quot;lightweight&quot;,
+    &quot;cycle_drift_min_trades&quot;: 6,
+    &quot;cycle_drift_consecutive_losses&quot;: 5,
+    &quot;cycle_drift_execution_slippage_mult&quot;: 2.5,
+    &quot;cycle_drift_spread_degradation_mult&quot;: 2.0,
+    &quot;cycle_drift_action&quot;: &quot;pause_context&quot;,
+
+    &quot;walk_forward_audit_enabled&quot;: true,
+    &quot;walk_forward_audit_mode&quot;: &quot;severe_fragility_only&quot;,
+    &quot;walk_forward_promotion_policy&quot;: &quot;block_severe_only&quot;,
+    &quot;walk_forward_do_not_displace_latest_surface&quot;: true,
+
+    &quot;local_governance_tournament_enabled&quot;: true,
+    &quot;local_governance_live_mode&quot;: &quot;shadow&quot;,
+    &quot;local_governance_candidate_policies&quot;: [
+      &quot;control_fixed&quot;,
+      &quot;breakeven_1r&quot;,
+      &quot;stepped_breakeven&quot;,
+      &quot;atr_trail_capped&quot;,
+      &quot;chandelier_atr&quot;,
+      &quot;structure_trail&quot;,
+      &quot;partial_tp_runner&quot;,
+      &quot;time_decay_exit&quot;,
+      &quot;volatility_contraction_exit&quot;,
+      &quot;regime_flip_reduce&quot;
+    ],
+
+    &quot;market_driven_exit_pack_mode&quot;: &quot;paper&quot;,
+
+    &quot;swap_model_enabled&quot;: true,
+    &quot;swap_model_triple_rollover_day&quot;: &quot;wednesday&quot;,
+    &quot;swap_model_min_holding_hours&quot;: 20,
+
+    &quot;regime_profitability_audit_enabled&quot;: true,
+    &quot;regime_boundary_audit_enabled&quot;: true,
+    &quot;regime_ambiguity_policy&quot;: &quot;observe_only&quot;,
+    &quot;regime_min_live_gap_warn&quot;: 0.05
+  }
+}</code></pre>
+
+<h3 id='why-these-settings-fit-fxpm-philosophy'>Why these settings fit FXPM philosophy</h3>
+
+<p><code>portfolio_control_policy = &amp;quot;hard_breakpoints_only&amp;quot;</code> explicitly prevents the institutional layer from acting as a constant signal suppressor.</p>
+
+<p><code>max_total_open_risk_pct</code> and hard loss gates protect the account when the aggregate system is clearly misaligned. They do not block a valid specialist merely because it is correlated with another signal.</p>
+
+<p><code>local_governance_live_mode = &amp;quot;shadow&amp;quot;</code> is recommended initially because the governance pool is about to expand. Once the expanded policies have artifact evidence, it can be set to <code>&amp;quot;on&amp;quot;</code>.</p>
+
+<p><code>market_driven_exit_pack_mode = &amp;quot;paper&amp;quot;</code> lets the system measure possible exit improvements without changing live orders prematurely.</p>
+
+<p><code>walk_forward_promotion_policy = &amp;quot;block_severe_only&amp;quot;</code> avoids destroying the fresh two-week edge while still blocking obviously fragile winners.</p>
+
+<p>---</p>
+
+<h1 id='part-b-pipelineconfig-additions'>Part B — PipelineConfig additions</h1>
+
+<h2 id='b1-add-new-config-fields'>B1. Add new config fields</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_core.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Inside:</p>
+
+<pre><code>@dataclass
+class PipelineConfig:</code></pre>
+
+<p>after existing live/advisory risk fields, near:</p>
+
+<pre><code>daily_loss_advisory_pct: float = 0.0
+session_loss_advisory_pct: float = 0.0</code></pre>
+
+<h3 id='add'>Add</h3>
+
+<pre><code>    # ===== INSTITUTIONAL SUPERVISOR (HARD BREAKPOINTS ONLY) =====
+    # This is not a top-down portfolio optimizer. It is a safety shell.
+    institutional_supervisor_enabled: bool = True
+    institutional_supervisor_mode: str = &quot;circuit_breaker&quot;  # off|observe|circuit_breaker
+    portfolio_control_policy: str = &quot;hard_breakpoints_only&quot;
+
+    # Aggregate open-risk safety. High threshold by design: protects survival
+    # without suppressing normal specialist-manager opportunity capture.
+    max_total_open_risk_pct: float = 8.0
+    max_new_entries_when_total_open_risk_above_pct: float = 6.0
+    open_risk_action: str = &quot;pause_new_entries&quot;  # observe|pause_new_entries|derate
+
+    # Hard system-level loss gates. These are firm-level breakpoints.
+    daily_loss_hard_block_pct: float = 0.0
+    session_loss_hard_block_pct: float = 0.0
+    weekly_loss_hard_block_pct: float = 0.0
+    open_drawdown_hard_block_pct: float = 0.0
+    hard_block_reopen_mode: str = &quot;manual_or_next_cycle&quot;
+
+    # ===== LIGHTWEIGHT CYCLE DRIFT SENTINEL =====
+    # Two-week retraining reduces model-age drift, but does not eliminate
+    # severe within-cycle execution/data/regime failures.
+    cycle_drift_monitor_enabled: bool = True
+    cycle_drift_mode: str = &quot;lightweight&quot;  # off|observe|lightweight
+    cycle_drift_min_trades: int = 6
+    cycle_drift_consecutive_losses: int = 5
+    cycle_drift_execution_slippage_mult: float = 2.5
+    cycle_drift_spread_degradation_mult: float = 2.0
+    cycle_drift_action: str = &quot;pause_context&quot;  # observe|pause_context|derate_context
+
+    # ===== WALK-FORWARD / FRAGILITY AUDIT =====
+    # Must not displace the latest live selection surface unless severe
+    # fragility is detected.
+    walk_forward_audit_mode: str = &quot;severe_fragility_only&quot;
+    walk_forward_promotion_policy: str = &quot;block_severe_only&quot;
+    walk_forward_do_not_displace_latest_surface: bool = True
+
+    # ===== COST REALISM =====
+    swap_model_enabled: bool = True
+    swap_model_triple_rollover_day: str = &quot;wednesday&quot;
+    swap_model_min_holding_hours: float = 20.0
+
+    # ===== REGIME PROFITABILITY AUDIT =====
+    regime_profitability_audit_enabled: bool = True
+    regime_boundary_audit_enabled: bool = True
+    regime_ambiguity_policy: str = &quot;observe_only&quot;  # observe_only|derate|no_trade_when_extreme
+    regime_min_live_gap_warn: float = 0.05</code></pre>
+
+<h3 id='normalization-rules-to-add-in-pipelineconfig-post-init'>Normalization rules to add in <code>PipelineConfig.__post_init__</code></h3>
+
+<p>Find or create the normalization block in <code>PipelineConfig.__post_init__</code>.</p>
+
+<p>Add:</p>
+
+<pre><code>        valid_supervisor_modes = {&quot;off&quot;, &quot;observe&quot;, &quot;circuit_breaker&quot;}
+        self.institutional_supervisor_mode = str(
+            getattr(self, &quot;institutional_supervisor_mode&quot;, &quot;circuit_breaker&quot;)
+        ).strip().lower()
+        if self.institutional_supervisor_mode not in valid_supervisor_modes:
+            logger.warning(
+                &quot;Invalid institutional_supervisor_mode=%r; using circuit_breaker&quot;,
+                self.institutional_supervisor_mode,
+            )
+            self.institutional_supervisor_mode = &quot;circuit_breaker&quot;
+
+        valid_portfolio_policies = {&quot;hard_breakpoints_only&quot;}
+        self.portfolio_control_policy = str(
+            getattr(self, &quot;portfolio_control_policy&quot;, &quot;hard_breakpoints_only&quot;)
+        ).strip().lower()
+        if self.portfolio_control_policy not in valid_portfolio_policies:
+            logger.warning(
+                &quot;Unsupported portfolio_control_policy=%r; using hard_breakpoints_only&quot;,
+                self.portfolio_control_policy,
+            )
+            self.portfolio_control_policy = &quot;hard_breakpoints_only&quot;
+
+        valid_drift_modes = {&quot;off&quot;, &quot;observe&quot;, &quot;lightweight&quot;}
+        self.cycle_drift_mode = str(
+            getattr(self, &quot;cycle_drift_mode&quot;, &quot;lightweight&quot;)
+        ).strip().lower()
+        if self.cycle_drift_mode not in valid_drift_modes:
+            logger.warning(&quot;Invalid cycle_drift_mode=%r; using lightweight&quot;, self.cycle_drift_mode)
+            self.cycle_drift_mode = &quot;lightweight&quot;
+
+        valid_wf_modes = {&quot;off&quot;, &quot;observe&quot;, &quot;severe_fragility_only&quot;}
+        self.walk_forward_audit_mode = str(
+            getattr(self, &quot;walk_forward_audit_mode&quot;, &quot;severe_fragility_only&quot;)
+        ).strip().lower()
+        if self.walk_forward_audit_mode not in valid_wf_modes:
+            logger.warning(&quot;Invalid walk_forward_audit_mode=%r; using severe_fragility_only&quot;,
+                           self.walk_forward_audit_mode)
+            self.walk_forward_audit_mode = &quot;severe_fragility_only&quot;
+
+        valid_wf_policies = {&quot;observe&quot;, &quot;block_severe_only&quot;, &quot;block_any_failure&quot;}
+        self.walk_forward_promotion_policy = str(
+            getattr(self, &quot;walk_forward_promotion_policy&quot;, &quot;block_severe_only&quot;)
+        ).strip().lower()
+        if self.walk_forward_promotion_policy not in valid_wf_policies:
+            logger.warning(&quot;Invalid walk_forward_promotion_policy=%r; using block_severe_only&quot;,
+                           self.walk_forward_promotion_policy)
+            self.walk_forward_promotion_policy = &quot;block_severe_only&quot;</code></pre>
+
+<p>---</p>
+
+<h1 id='part-c-live-readiness-gate'>Part C — Live readiness gate</h1>
+
+<h2 id='c1-add-a-fail-closed-deployment-readiness-module'>C1. Add a fail-closed deployment readiness module</h2>
+
+<h3 id='new-file'>New file</h3>
+
+<pre><code>pm_live_readiness.py</code></pre>
+
+<h3 id='purpose'>Purpose</h3>
+
+<p>This is the missing bridge between research and live deployment. It does not optimize or suppress strategy signals. It answers one question before live trading starts:</p>
+
+<pre><code>Are artifact drift policy and the active winner ledger safe enough to allow funded live startup?</code></pre>
+
+<h3 id='code-skeleton'>Code skeleton</h3>
+
+<pre><code># pm_live_readiness.py
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReadinessFinding:
+    severity: str          # pass|warn|block
+    code: str
+    message: str
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ReadinessReport:
+    allow_live: bool
+    findings: List[ReadinessFinding] = field(default_factory=list)
+
+    def add(self, severity: str, code: str, message: str, **context: Any) -&gt; None:
+        self.findings.append(ReadinessFinding(severity, code, message, context))
+
+    @property
+    def blockers(self) -&gt; List[ReadinessFinding]:
+        return [f for f in self.findings if f.severity == &quot;block&quot;]
+
+
+def _load_json_file(path: Path) -&gt; Optional[Any]:
+    try:
+        if not path.exists():
+            return None
+        raw = path.read_text(encoding=&quot;utf-8&quot;).strip()
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception as exc:
+        logger.warning(&quot;Failed reading %s: %s&quot;, path, exc)
+        return None
+
+
+def validate_live_readiness(
+    *,
+    pipeline_config: Any,
+    config_data: Dict[str, Any],
+    repo_root: Path = Path(&quot;.&quot;),
+    require_regime_params: bool = False,
+) -&gt; ReadinessReport:
+    report = ReadinessReport(allow_live=False)
+
+    ledger_path = Path(getattr(pipeline_config, &quot;winner_ledger_path&quot;, &quot;pm_configs.json&quot;))
+    if not ledger_path.is_absolute():
+        ledger_path = repo_root / ledger_path
+
+    ledger = _load_json_file(ledger_path)
+    if not isinstance(ledger, dict) or not ledger:
+        report.add(
+            &quot;block&quot;,
+            &quot;winner_ledger_empty&quot;,
+            &quot;Active winner ledger is missing or empty. Live trading must not start.&quot;,
+            path=str(ledger_path),
+        )
+
+    drift_policy = str(getattr(pipeline_config, &quot;live_artifact_drift_policy&quot;, &quot;block&quot;)).lower()
+    if drift_policy != &quot;block&quot;:
+        report.add(
+            &quot;block&quot;,
+            &quot;artifact_drift_not_blocking&quot;,
+            &quot;live_artifact_drift_policy must be &#x27;block&#x27; before funded live trading.&quot;,
+            current=drift_policy,
+        )
+
+    if require_regime_params:
+        regime_path = Path(getattr(pipeline_config, &quot;regime_params_file&quot;, &quot;regime_params.json&quot;))
+        if not regime_path.is_absolute():
+            regime_path = repo_root / regime_path
+        regime_params = _load_json_file(regime_path)
+        if not isinstance(regime_params, dict) or not regime_params:
+            report.add(
+                &quot;block&quot;,
+                &quot;regime_params_missing&quot;,
+                &quot;Regime params are required by deployment policy but missing/empty.&quot;,
+                path=str(regime_path),
+            )
+    else:
+        report.add(
+            &quot;warn&quot;,
+            &quot;regime_params_optional&quot;,
+            &quot;Regime params not required by policy. Defaults may be used if explicitly accepted.&quot;,
+        )
+
+    if bool(getattr(pipeline_config, &quot;walk_forward_audit_enabled&quot;, False)):
+        wf_policy = str(getattr(pipeline_config, &quot;walk_forward_promotion_policy&quot;, &quot;observe&quot;)).lower()
+        if wf_policy == &quot;observe&quot;:
+            report.add(
+                &quot;warn&quot;,
+                &quot;walk_forward_observe_only&quot;,
+                &quot;Walk-forward audit is observe-only. This preserves edge but does not block severe fragility.&quot;,
+            )
+    else:
+        report.add(
+            &quot;warn&quot;,
+            &quot;walk_forward_disabled&quot;,
+            &quot;Walk-forward fragility audit is disabled.&quot;,
+        )
+
+    supervisor_enabled = bool(getattr(pipeline_config, &quot;institutional_supervisor_enabled&quot;, False))
+    if not supervisor_enabled:
+        report.add(
+            &quot;warn&quot;,
+            &quot;institutional_supervisor_disabled&quot;,
+            &quot;Institutional supervisor is disabled. Local specialists may trade without aggregate breakpoints.&quot;,
+        )
+
+    symbols = config_data.get(&quot;symbols&quot;) or []
+    if not symbols:
+        report.add(
+            &quot;warn&quot;,
+            &quot;symbols_missing&quot;,
+            &quot;No explicit symbols list in config. Runtime may fall back to defaults.&quot;,
+        )
+
+    report.allow_live = len(report.blockers) == 0
+    return report
+
+
+def log_readiness_report(report: ReadinessReport) -&gt; None:
+    for finding in report.findings:
+        log_fn = logger.info
+        if finding.severity == &quot;warn&quot;:
+            log_fn = logger.warning
+        elif finding.severity == &quot;block&quot;:
+            log_fn = logger.error
+        log_fn(&quot;[%s] %s: %s %s&quot;, finding.severity.upper(), finding.code, finding.message, finding.context)</code></pre>
+
+<h2 id='c2-call-readiness-gate-before-live-trading'>C2. Call readiness gate before live trading</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_main.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Before constructing or starting the live trading loop in the CLI branch for <code>--trade</code>.</p>
+
+<h3 id='add-import'>Add import</h3>
+
+<pre><code>from pm_live_readiness import validate_live_readiness, log_readiness_report</code></pre>
+
+<h3 id='add-call'>Add call</h3>
+
+<pre><code>        readiness = validate_live_readiness(
+            pipeline_config=pipeline_config,
+            config_data=config_data,
+            repo_root=Path(&quot;.&quot;),
+            require_regime_params=False,
+        )
+        log_readiness_report(readiness)
+
+        if not readiness.allow_live and not args.paper:
+            logger.error(&quot;Live readiness gate failed; refusing funded live trading.&quot;)
+            return 2</code></pre>
+
+<h3 id='why-this-fits-fxpm'>Why this fits FXPM</h3>
+
+<p>This is not a top-down trading constraint. It does not second-guess valid specialists. It only ensures the deployment surface is complete and trustworthy before money is at risk.</p>
+
+<p>---</p>
+
+<h1 id='part-d-institutional-supervisor-hard-breakpoints-only'>Part D — Institutional supervisor, hard breakpoints only</h1>
+
+<h2 id='d1-add-pm-institutional-supervisor-py'>D1. Add <code>pm_institutional_supervisor.py</code></h2>
+
+<h3 id='new-file'>New file</h3>
+
+<pre><code>pm_institutional_supervisor.py</code></pre>
+
+<h3 id='purpose'>Purpose</h3>
+
+<p>Protect the whole FXPM system when aggregate behavior becomes unacceptable. It does not block ordinary specialist opportunities due to correlation or overlap.</p>
+
+<h3 id='code-skeleton'>Code skeleton</h3>
+
+<pre><code># pm_institutional_supervisor.py
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SupervisorContext:
+    account_balance: float
+    account_equity: float
+    account_margin_level: float
+    open_positions: List[Any] = field(default_factory=list)
+    estimated_total_open_risk_pct: float = 0.0
+    realized_daily_loss_pct: float = 0.0
+    realized_session_loss_pct: float = 0.0
+    realized_weekly_loss_pct: float = 0.0
+    open_drawdown_pct: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SupervisorDecision:
+    allow_new_entries: bool = True
+    risk_multiplier: float = 1.0
+    reason: str = &quot;normal&quot;
+    severity: str = &quot;pass&quot;  # pass|warn|block
+    notes: List[str] = field(default_factory=list)
+
+
+class InstitutionalSupervisor:
+    # Firm-level guardrail for FXPM.
+    #
+    # This class intentionally does NOT:
+    # - rank strategies,
+    # - veto ordinary correlation,
+    # - allocate capital top-down,
+    # - choose between specialists.
+    #
+    # It only blocks/derates when hard breakpoints are reached.
+
+    def __init__(self, config: Any, state_path: str = &quot;pm_outputs/institutional_supervisor_state.json&quot;):
+        self.config = config
+        self.state_path = Path(state_path)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state = self._load_state()
+
+    def _load_state(self) -&gt; Dict[str, Any]:
+        try:
+            if self.state_path.exists():
+                return json.loads(self.state_path.read_text(encoding=&quot;utf-8&quot;))
+        except Exception as exc:
+            logger.warning(&quot;Failed to load supervisor state: %s&quot;, exc)
+        return {
+            &quot;blocked&quot;: False,
+            &quot;block_reason&quot;: &quot;&quot;,
+            &quot;blocked_at&quot;: None,
+            &quot;block_cycle_id&quot;: None,
+        }
+
+    def _save_state(self) -&gt; None:
+        tmp = self.state_path.with_suffix(&quot;.json.tmp&quot;)
+        tmp.write_text(json.dumps(self.state, indent=2, default=str), encoding=&quot;utf-8&quot;)
+        tmp.replace(self.state_path)
+
+    def evaluate(self, context: SupervisorContext) -&gt; SupervisorDecision:
+        if not bool(getattr(self.config, &quot;institutional_supervisor_enabled&quot;, True)):
+            return SupervisorDecision(True, 1.0, &quot;supervisor_disabled&quot;, &quot;warn&quot;)
+
+        mode = str(getattr(self.config, &quot;institutional_supervisor_mode&quot;, &quot;circuit_breaker&quot;)).lower()
+        if mode == &quot;off&quot;:
+            return SupervisorDecision(True, 1.0, &quot;supervisor_off&quot;, &quot;warn&quot;)
+
+        if self.state.get(&quot;blocked&quot;) and str(getattr(self.config, &quot;hard_block_reopen_mode&quot;, &quot;&quot;)).lower() == &quot;manual_or_next_cycle&quot;:
+            return SupervisorDecision(
+                allow_new_entries=False,
+                risk_multiplier=0.0,
+                reason=self.state.get(&quot;block_reason&quot;, &quot;persistent_hard_block&quot;),
+                severity=&quot;block&quot;,
+                notes=[&quot;Supervisor remains blocked until manual reset or next approved retrain cycle.&quot;],
+            )
+
+        checks = [
+            (&quot;daily_loss_hard_block&quot;, context.realized_daily_loss_pct, getattr(self.config, &quot;daily_loss_hard_block_pct&quot;, 0.0)),
+            (&quot;session_loss_hard_block&quot;, context.realized_session_loss_pct, getattr(self.config, &quot;session_loss_hard_block_pct&quot;, 0.0)),
+            (&quot;weekly_loss_hard_block&quot;, context.realized_weekly_loss_pct, getattr(self.config, &quot;weekly_loss_hard_block_pct&quot;, 0.0)),
+            (&quot;open_drawdown_hard_block&quot;, context.open_drawdown_pct, getattr(self.config, &quot;open_drawdown_hard_block_pct&quot;, 0.0)),
+        ]
+
+        for code, observed, threshold in checks:
+            try:
+                threshold = float(threshold or 0.0)
+                observed = float(observed or 0.0)
+            except Exception:
+                continue
+            if threshold &gt; 0 and observed &gt;= threshold:
+                return self._block(code, observed=observed, threshold=threshold)
+
+        max_total_open = float(getattr(self.config, &quot;max_total_open_risk_pct&quot;, 0.0) or 0.0)
+        if max_total_open &gt; 0 and context.estimated_total_open_risk_pct &gt;= max_total_open:
+            return self._block(
+                &quot;max_total_open_risk&quot;,
+                observed=context.estimated_total_open_risk_pct,
+                threshold=max_total_open,
+            )
+
+        pause_above = float(getattr(self.config, &quot;max_new_entries_when_total_open_risk_above_pct&quot;, 0.0) or 0.0)
+        if pause_above &gt; 0 and context.estimated_total_open_risk_pct &gt;= pause_above:
+            return SupervisorDecision(
+                allow_new_entries=False,
+                risk_multiplier=0.0,
+                reason=&quot;open_risk_pause_new_entries&quot;,
+                severity=&quot;warn&quot;,
+                notes=[
+                    f&quot;Total open risk {context.estimated_total_open_risk_pct:.2f}% &quot;
+                    f&quot;&gt;= pause threshold {pause_above:.2f}%.&quot;
+                ],
+            )
+
+        return SupervisorDecision(True, 1.0, &quot;normal&quot;, &quot;pass&quot;)
+
+    def _block(self, reason: str, **payload: Any) -&gt; SupervisorDecision:
+        self.state.update({
+            &quot;blocked&quot;: True,
+            &quot;block_reason&quot;: reason,
+            &quot;blocked_at&quot;: datetime.now().isoformat(),
+            &quot;payload&quot;: payload,
+        })
+        self._save_state()
+        return SupervisorDecision(
+            allow_new_entries=False,
+            risk_multiplier=0.0,
+            reason=reason,
+            severity=&quot;block&quot;,
+            notes=[f&quot;Hard breakpoint triggered: {reason} {payload}&quot;],
+        )
+
+    def manual_reset(self, note: str = &quot;&quot;) -&gt; None:
+        self.state = {
+            &quot;blocked&quot;: False,
+            &quot;block_reason&quot;: &quot;&quot;,
+            &quot;blocked_at&quot;: None,
+            &quot;manual_reset_at&quot;: datetime.now().isoformat(),
+            &quot;manual_reset_note&quot;: note,
+        }
+        self._save_state()</code></pre>
+
+<h2 id='d2-integrate-in-livetrader'>D2. Integrate in <code>LiveTrader</code></h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_main.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Inside <code>LiveTrader.__init__</code>, after enhancement seams and storage manager initialization.</p>
+
+<h3 id='add-import'>Add import</h3>
+
+<pre><code>from pm_institutional_supervisor import InstitutionalSupervisor, SupervisorContext</code></pre>
+
+<h3 id='add-field'>Add field</h3>
+
+<pre><code>        self._institutional_supervisor = InstitutionalSupervisor(
+            pipeline_config,
+            state_path=str(Path(getattr(pipeline_config, &quot;output_dir&quot;, &quot;./pm_outputs&quot;)) / &quot;institutional_supervisor_state.json&quot;),
+        )</code></pre>
+
+<h3 id='add-evaluation-before-placing-any-new-entry'>Add evaluation before placing any new entry</h3>
+
+<p>Find the live decision point immediately before final order send.</p>
+
+<p>Add:</p>
+
+<pre><code>        supervisor_ctx = self._build_supervisor_context(open_positions_snapshot)
+        supervisor_decision = self._institutional_supervisor.evaluate(supervisor_ctx)
+
+        if not supervisor_decision.allow_new_entries:
+            self.logger.warning(
+                &quot;[%s] Institutional supervisor blocked new entry: %s (%s)&quot;,
+                symbol,
+                supervisor_decision.reason,
+                supervisor_decision.notes,
+            )
+            self._decision_throttle.record_decision(
+                symbol=symbol,
+                decision_key=decision_key,
+                bar_time_iso=bar_time_iso,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_name=strategy.name,
+                direction=signal,
+                action=&quot;SKIPPED_INSTITUTIONAL_SUPERVISOR&quot;,
+                context={
+                    &quot;reason&quot;: supervisor_decision.reason,
+                    &quot;severity&quot;: supervisor_decision.severity,
+                    &quot;notes&quot;: supervisor_decision.notes,
+                },
+            )
+            return</code></pre>
+
+<h3 id='add-helper'>Add helper</h3>
+
+<pre><code>    def _build_supervisor_context(self, open_positions_snapshot) -&gt; SupervisorContext:
+        account = self.mt5.get_account_info()
+        balance = float(getattr(account, &quot;balance&quot;, 0.0) or 0.0)
+        equity = float(getattr(account, &quot;equity&quot;, 0.0) or 0.0)
+        margin_level = float(getattr(account, &quot;margin_level&quot;, 0.0) or 0.0)
+
+        estimated_total_open_risk_pct = self._estimate_total_open_risk_pct(open_positions_snapshot, equity)
+
+        return SupervisorContext(
+            account_balance=balance,
+            account_equity=equity,
+            account_margin_level=margin_level,
+            open_positions=list(open_positions_snapshot or []),
+            estimated_total_open_risk_pct=estimated_total_open_risk_pct,
+            realized_daily_loss_pct=self._estimate_realized_loss_pct(&quot;daily&quot;, balance),
+            realized_session_loss_pct=self._estimate_realized_loss_pct(&quot;session&quot;, balance),
+            realized_weekly_loss_pct=self._estimate_realized_loss_pct(&quot;weekly&quot;, balance),
+            open_drawdown_pct=self._estimate_open_drawdown_pct(balance, equity),
+            metadata={&quot;mode&quot;: &quot;hard_breakpoints_only&quot;},
+        )</code></pre>
+
+<h3 id='note'>Note</h3>
+
+<p>The helper functions can start conservative and improve over time. The first release can use available position geometry and account data. The key is to create the institutional shell without turning it into a constant signal suppressor.</p>
+
+<p>---</p>
+
+<h1 id='part-e-live-order-management-expansion'>Part E — Live order-management expansion</h1>
+
+<p>This is now the highest-probability direct profitability upgrade.</p>
+
+<h2 id='e1-current-issue'>E1. Current issue</h2>
+
+<p>The current governance policy list is too small for the size and ambition of FXPM. Entry strategies compete across 47 strategies, multiple symbols, multiple timeframes, and multiple regimes. But after entry, the current policy surface is approximately:</p>
+
+<pre><code>control_fixed
+breakeven_1r
+atr_trail_capped
+pure_atr</code></pre>
+
+<p>The downstream management surface is probably too narrow. Many strategies lose profitability not because entries are bad, but because exits and trade management are mismatched to the regime.</p>
+
+<h2 id='e2-expand-the-governance-candidate-set'>E2. Expand the governance candidate set</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_order_governance.py</code></pre>
+
+<h3 id='current-constant'>Current constant</h3>
+
+<pre><code>DEFAULT_GOVERNANCE_CANDIDATES: Sequence[str] = (
+    &quot;control_fixed&quot;,
+    &quot;breakeven_1r&quot;,
+    &quot;atr_trail_capped&quot;,
+    &quot;pure_atr&quot;,
+)</code></pre>
+
+<h3 id='replace-with'>Replace with</h3>
+
+<pre><code>DEFAULT_GOVERNANCE_CANDIDATES: Sequence[str] = (
+    &quot;control_fixed&quot;,
+    &quot;breakeven_1r&quot;,
+    &quot;stepped_breakeven&quot;,
+    &quot;atr_trail_capped&quot;,
+    &quot;chandelier_atr&quot;,
+    &quot;structure_trail&quot;,
+    &quot;partial_tp_runner&quot;,
+    &quot;time_decay_exit&quot;,
+    &quot;volatility_contraction_exit&quot;,
+    &quot;regime_flip_reduce&quot;,
+    &quot;pure_atr&quot;,
+)</code></pre>
+
+<h2 id='e3-update-policy-allowlist'>E3. Update policy allowlist</h2>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>In <code>candidate_policy_names</code>, update the allowlist:</p>
+
+<pre><code>        if name not in {
+            &quot;control_fixed&quot;,
+            &quot;breakeven_1r&quot;,
+            &quot;stepped_breakeven&quot;,
+            &quot;atr_trail_capped&quot;,
+            &quot;chandelier_atr&quot;,
+            &quot;structure_trail&quot;,
+            &quot;partial_tp_runner&quot;,
+            &quot;time_decay_exit&quot;,
+            &quot;volatility_contraction_exit&quot;,
+            &quot;regime_flip_reduce&quot;,
+            &quot;pure_atr&quot;,
+        }:
+            continue</code></pre>
+
+<h2 id='e4-add-aliases'>E4. Add aliases</h2>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Inside <code>normalize_policy_name</code>.</p>
+
+<p>Add:</p>
+
+<pre><code>        &quot;step_be&quot;: &quot;stepped_breakeven&quot;,
+        &quot;stepped_be&quot;: &quot;stepped_breakeven&quot;,
+        &quot;chandelier&quot;: &quot;chandelier_atr&quot;,
+        &quot;structure&quot;: &quot;structure_trail&quot;,
+        &quot;swing_trail&quot;: &quot;structure_trail&quot;,
+        &quot;partial_runner&quot;: &quot;partial_tp_runner&quot;,
+        &quot;time_decay&quot;: &quot;time_decay_exit&quot;,
+        &quot;vol_contraction&quot;: &quot;volatility_contraction_exit&quot;,
+        &quot;regime_flip&quot;: &quot;regime_flip_reduce&quot;,</code></pre>
+
+<h2 id='e5-expand-make-policy-defaults'>E5. Expand <code>make_policy</code> defaults</h2>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Inside <code>make_policy</code>.</p>
+
+<p>Replace the default params with:</p>
+
+<pre><code>    params: Dict[str, Any] = {
+        &quot;name&quot;: name,
+
+        # Existing policies
+        &quot;trail_activation_atr_mult&quot;: 1.5,
+        &quot;trail_atr_mult&quot;: 2.5,
+        &quot;breakeven_r&quot;: 1.0,
+        &quot;breakeven_offset_pips&quot;: 0.0,
+        &quot;release_tp_after_r&quot;: None,
+
+        # Stepped breakeven
+        &quot;step1_r&quot;: 1.0,
+        &quot;step1_lock_r&quot;: 0.0,
+        &quot;step2_r&quot;: 1.5,
+        &quot;step2_lock_r&quot;: 0.5,
+        &quot;step3_r&quot;: 2.0,
+        &quot;step3_lock_r&quot;: 1.0,
+
+        # Chandelier ATR
+        &quot;chandelier_atr_mult&quot;: 3.0,
+        &quot;chandelier_activation_r&quot;: 1.0,
+
+        # Structure trail
+        &quot;structure_lookback&quot;: 20,
+        &quot;structure_buffer_atr_mult&quot;: 0.25,
+        &quot;structure_activation_r&quot;: 0.8,
+
+        # Partial TP runner
+        &quot;partial_tp_r&quot;: 1.0,
+        &quot;partial_close_pct&quot;: 50.0,
+        &quot;runner_trail_atr_mult&quot;: 2.5,
+
+        # Time decay exit
+        &quot;time_decay_bars&quot;: 48,
+        &quot;time_decay_min_r&quot;: 0.0,
+        &quot;time_decay_action&quot;: &quot;tighten&quot;,  # tighten|exit
+
+        # Volatility contraction exit
+        &quot;vol_contract_lookback&quot;: 20,
+        &quot;vol_contract_threshold&quot;: 0.65,
+        &quot;vol_contract_action&quot;: &quot;tighten&quot;,
+
+        # Regime flip reduce
+        &quot;regime_flip_action&quot;: &quot;tighten&quot;,  # tighten|exit|release_tp
+        &quot;regime_flip_tighten_to_r&quot;: 0.0,
+    }</code></pre>
+
+<h2 id='e6-extend-governancecontext'>E6. Extend <code>GovernanceContext</code></h2>
+
+<h3 id='current-context'>Current context</h3>
+
+<pre><code>@dataclass
+class GovernanceContext:
+    symbol: str
+    timeframe: str
+    regime: str
+    ...</code></pre>
+
+<h3 id='add-fields'>Add fields</h3>
+
+<pre><code>    bars_held: int = 0
+    entry_regime: str = &quot;&quot;
+    current_regime: str = &quot;&quot;
+    current_regime_gap: float = 0.0
+    recent_high: float = 0.0
+    recent_low: float = 0.0
+    atr_percentile: float = 0.0
+    realized_vol_ratio: float = 1.0
+    partial_taken: bool = False</code></pre>
+
+<h2 id='e7-add-policy-evaluation-branches'>E7. Add policy evaluation branches</h2>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Inside <code>evaluate_policy</code>.</p>
+
+<h3 id='add-helper'>Add helper</h3>
+
+<pre><code>def _stop_from_r(context: GovernanceContext, lock_r: float) -&gt; float:
+    initial_r = context.initial_r
+    if initial_r &lt;= 0:
+        return context.current_stop_loss
+    if context.is_long:
+        return context.entry_price + lock_r * initial_r
+    return context.entry_price - lock_r * initial_r</code></pre>
+
+<h3 id='add-branch-stepped-breakeven'>Add branch: stepped breakeven</h3>
+
+<pre><code>    if name == &quot;stepped_breakeven&quot;:
+        lock_r = None
+        if context.favorable_r &gt;= float(normalized[&quot;step3_r&quot;]):
+            lock_r = float(normalized[&quot;step3_lock_r&quot;])
+        elif context.favorable_r &gt;= float(normalized[&quot;step2_r&quot;]):
+            lock_r = float(normalized[&quot;step2_lock_r&quot;])
+        elif context.favorable_r &gt;= float(normalized[&quot;step1_r&quot;]):
+            lock_r = float(normalized[&quot;step1_lock_r&quot;])
+
+        if lock_r is not None:
+            candidate = _stop_from_r(context, lock_r)
+            tightened = _tighten_stop(
+                context.current_stop_loss,
+                _sanitize_stop_candidate(candidate, context),
+                context.direction,
+            )
+            if tightened is not None:
+                decision.stop_loss = tightened
+                decision.notes.append(f&quot;stepped_breakeven_lock_{lock_r:.2f}r&quot;)
+        return decision</code></pre>
+
+<h3 id='add-branch-chandelier-atr'>Add branch: chandelier ATR</h3>
+
+<pre><code>    if name == &quot;chandelier_atr&quot;:
+        if context.current_atr &gt; 0 and context.favorable_r &gt;= float(normalized[&quot;chandelier_activation_r&quot;]):
+            mult = float(normalized[&quot;chandelier_atr_mult&quot;])
+            if context.is_long:
+                anchor = context.highest_since_entry or context.recent_high or context.current_price
+                candidate = float(anchor) - mult * float(context.current_atr)
+            else:
+                anchor = context.lowest_since_entry or context.recent_low or context.current_price
+                candidate = float(anchor) + mult * float(context.current_atr)
+
+            tightened = _tighten_stop(
+                context.current_stop_loss,
+                _sanitize_stop_candidate(candidate, context),
+                context.direction,
+            )
+            if tightened is not None:
+                decision.stop_loss = tightened
+                decision.notes.append(&quot;chandelier_atr&quot;)
+        return decision</code></pre>
+
+<h3 id='add-branch-structure-trail'>Add branch: structure trail</h3>
+
+<pre><code>    if name == &quot;structure_trail&quot;:
+        if context.current_atr &gt; 0 and context.favorable_r &gt;= float(normalized[&quot;structure_activation_r&quot;]):
+            buffer_price = float(normalized[&quot;structure_buffer_atr_mult&quot;]) * float(context.current_atr)
+            if context.is_long and context.recent_low &gt; 0:
+                candidate = float(context.recent_low) - buffer_price
+            elif (not context.is_long) and context.recent_high &gt; 0:
+                candidate = float(context.recent_high) + buffer_price
+            else:
+                return decision
+
+            tightened = _tighten_stop(
+                context.current_stop_loss,
+                _sanitize_stop_candidate(candidate, context),
+                context.direction,
+            )
+            if tightened is not None:
+                decision.stop_loss = tightened
+                decision.notes.append(&quot;structure_trail&quot;)
+        return decision</code></pre>
+
+<h3 id='add-branch-partial-tp-runner'>Add branch: partial TP runner</h3>
+
+<pre><code>    if name == &quot;partial_tp_runner&quot;:
+        if (not context.partial_taken) and context.favorable_r &gt;= float(normalized[&quot;partial_tp_r&quot;]):
+            decision.partial_close_pct = float(normalized[&quot;partial_close_pct&quot;])
+            decision.notes.append(f&quot;partial_tp_runner_signal_{decision.partial_close_pct:.1f}%&quot;)
+            if context.current_atr &gt; 0:
+                if context.is_long:
+                    candidate = context.highest_since_entry - float(normalized[&quot;runner_trail_atr_mult&quot;]) * context.current_atr
+                else:
+                    candidate = context.lowest_since_entry + float(normalized[&quot;runner_trail_atr_mult&quot;]) * context.current_atr
+                tightened = _tighten_stop(
+                    context.current_stop_loss,
+                    _sanitize_stop_candidate(candidate, context),
+                    context.direction,
+                )
+                if tightened is not None:
+                    decision.stop_loss = tightened
+                    decision.notes.append(&quot;runner_trail_after_partial&quot;)
+        return decision</code></pre>
+
+<h3 id='add-branch-time-decay-exit'>Add branch: time decay exit</h3>
+
+<pre><code>    if name == &quot;time_decay_exit&quot;:
+        bars_held = int(context.bars_held or 0)
+        if bars_held &gt;= int(normalized[&quot;time_decay_bars&quot;]) and context.favorable_r &lt;= float(normalized[&quot;time_decay_min_r&quot;]):
+            action = str(normalized[&quot;time_decay_action&quot;]).lower()
+            if action == &quot;exit&quot;:
+                decision.take_profit = context.current_price
+                decision.exit_now = True
+                decision.notes.append(&quot;time_decay_exit_now&quot;)
+            else:
+                candidate = _stop_from_r(context, 0.0)
+                tightened = _tighten_stop(
+                    context.current_stop_loss,
+                    _sanitize_stop_candidate(candidate, context),
+                    context.direction,
+                )
+                if tightened is not None:
+                    decision.stop_loss = tightened
+                    decision.notes.append(&quot;time_decay_tighten&quot;)
+        return decision</code></pre>
+
+<h3 id='add-branch-volatility-contraction-exit'>Add branch: volatility contraction exit</h3>
+
+<pre><code>    if name == &quot;volatility_contraction_exit&quot;:
+        ratio = float(context.realized_vol_ratio or 1.0)
+        if ratio &lt;= float(normalized[&quot;vol_contract_threshold&quot;]):
+            action = str(normalized[&quot;vol_contract_action&quot;]).lower()
+            if action == &quot;exit&quot;:
+                decision.take_profit = context.current_price
+                decision.exit_now = True
+                decision.notes.append(&quot;volatility_contraction_exit&quot;)
+            else:
+                candidate = _stop_from_r(context, 0.0)
+                tightened = _tighten_stop(
+                    context.current_stop_loss,
+                    _sanitize_stop_candidate(candidate, context),
+                    context.direction,
+                )
+                if tightened is not None:
+                    decision.stop_loss = tightened
+                    decision.notes.append(&quot;volatility_contraction_tighten&quot;)
+        return decision</code></pre>
+
+<h3 id='add-branch-regime-flip-reduce'>Add branch: regime flip reduce</h3>
+
+<pre><code>    if name == &quot;regime_flip_reduce&quot;:
+        entry_regime = str(context.entry_regime or context.regime or &quot;&quot;).upper()
+        current_regime = str(context.current_regime or context.regime or &quot;&quot;).upper()
+        if entry_regime and current_regime and entry_regime != current_regime:
+            action = str(normalized[&quot;regime_flip_action&quot;]).lower()
+            if action == &quot;exit&quot;:
+                decision.take_profit = context.current_price
+                decision.exit_now = True
+                decision.notes.append(f&quot;regime_flip_exit_{entry_regime}_to_{current_regime}&quot;)
+            elif action == &quot;release_tp&quot;:
+                decision.take_profit = math.inf if context.is_long else -math.inf
+                decision.tp_released = True
+                decision.notes.append(f&quot;regime_flip_tp_release_{entry_regime}_to_{current_regime}&quot;)
+            else:
+                lock_r = float(normalized[&quot;regime_flip_tighten_to_r&quot;])
+                candidate = _stop_from_r(context, lock_r)
+                tightened = _tighten_stop(
+                    context.current_stop_loss,
+                    _sanitize_stop_candidate(candidate, context),
+                    context.direction,
+                )
+                if tightened is not None:
+                    decision.stop_loss = tightened
+                    decision.notes.append(f&quot;regime_flip_tighten_{entry_regime}_to_{current_regime}&quot;)
+        return decision</code></pre>
+
+<h2 id='e8-extend-governancedecision-for-partial-closes'>E8. Extend <code>GovernanceDecision</code> for partial closes</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_order_governance.py</code></pre>
+
+<h3 id='current'>Current</h3>
+
+<pre><code>@dataclass
+class GovernanceDecision:
+    policy_name: str
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    tp_released: bool = False
+    notes: List[str] = field(default_factory=list)</code></pre>
+
+<h3 id='replace-with'>Replace with</h3>
+
+<pre><code>@dataclass
+class GovernanceDecision:
+    policy_name: str
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    tp_released: bool = False
+    partial_close_pct: float = 0.0
+    exit_now: bool = False
+    notes: List[str] = field(default_factory=list)</code></pre>
+
+<h3 id='live-executor-insertion'>Live executor insertion</h3>
+
+<p>In <code>pm_main.py</code>, wherever governance decisions are applied to open positions, add:</p>
+
+<pre><code>if decision.partial_close_pct &gt; 0:
+    self.logger.info(
+        &quot;[%s] Governance policy %s requests partial close %.1f%%&quot;,
+        position.symbol,
+        decision.policy_name,
+        decision.partial_close_pct,
+    )</code></pre>
+
+<h3 id='add-partial-close-helper-to-pm-mt5-py'>Add partial close helper to <code>pm_mt5.py</code></h3>
+
+<pre><code>    def close_position_partial(
+        self,
+        position: MT5Position,
+        close_volume: float,
+        deviation: int = 30,
+        magic: int = 0,
+        comment: str = &quot;&quot;,
+    ) -&gt; MT5OrderResult:
+        if close_volume &lt;= 0:
+            return MT5OrderResult(False, 10014, &quot;Invalid partial close volume&quot;)
+
+        symbol_info = self.get_symbol_info(position.symbol)
+        if symbol_info is None:
+            return MT5OrderResult(False, -1, &quot;Symbol info unavailable&quot;)
+
+        close_volume = self._normalize_volume(close_volume, symbol_info)
+        if close_volume &lt;= 0 or close_volume &gt; position.volume:
+            return MT5OrderResult(False, 10014, &quot;Invalid normalized partial close volume&quot;)
+
+        clone = MT5Position(**{**position.__dict__, &quot;volume&quot;: close_volume})
+        return self.close_position(clone, deviation=deviation, magic=magic, comment=comment or &quot;Partial close&quot;)</code></pre>
+
+<p>---</p>
+
+<h1 id='part-f-strategy-pool-expansion-to-50-52'>Part F — Strategy pool expansion to 50-52</h1>
+
+<p>The target of 50-52 strategies is reasonable if additions are genuinely distinct and improve coverage. Do not add more simple indicator variants unless they fill a missing behavioral niche.</p>
+
+<h2 id='f1-recommended-additions'>F1. Recommended additions</h2>
+
+<h3 id='1-session-vwap-reversion-strategy'>1. Session VWAP Reversion Strategy</h3>
+
+<p><strong>Purpose:</strong> Capture session-specific mean reversion around a rolling/session VWAP proxy.</p>
+
+<p><strong>Why it fits:</strong> Adds time/session behavior without top-down portfolio suppression.</p>
+
+<p><strong>Category:</strong> Mean reversion.</p>
+
+<p><strong>Name:</strong> <code>SessionVWAPReversionStrategy</code></p>
+
+<p><strong>Core logic:</strong></p>
+
+<pre><code>If price deviates far from session VWAP proxy and regime is RANGE/CHOP, fade back to VWAP.</code></pre>
+
+<h3 id='2-liquidity-sweep-reversal-strategy'>2. Liquidity Sweep Reversal Strategy</h3>
+
+<p><strong>Purpose:</strong> Trade false breaks / stop-runs around prior highs/lows.</p>
+
+<p><strong>Why it fits:</strong> Adds price-action microstructure not already covered by standard oscillators.</p>
+
+<p><strong>Category:</strong> Mean reversion / reversal.</p>
+
+<p><strong>Name:</strong> <code>LiquiditySweepReversalStrategy</code></p>
+
+<p><strong>Core logic:</strong></p>
+
+<pre><code>If current high sweeps prior N-bar high but closes back below it, short.
+If current low sweeps prior N-bar low but closes back above it, long.</code></pre>
+
+<h3 id='3-regime-transition-breakout-strategy'>3. Regime Transition Breakout Strategy</h3>
+
+<p><strong>Purpose:</strong> Trade CHOP/RANGE → BREAKOUT transition.</p>
+
+<p><strong>Why it fits:</strong> Directly addresses regime transition as edge, not just static regime lookup.</p>
+
+<p><strong>Category:</strong> Breakout.</p>
+
+<p><strong>Name:</strong> <code>RegimeTransitionBreakoutStrategy</code></p>
+
+<p><strong>Core logic:</strong></p>
+
+<pre><code>If previous live regime was CHOP/RANGE and current live regime becomes BREAKOUT with sufficient gap,
+trade breakout direction.</code></pre>
+
+<h3 id='4-carry-filtered-trend-continuation-strategy'>4. Carry-Filtered Trend Continuation Strategy</h3>
+
+<p><strong>Purpose:</strong> Trend following that can optionally require favorable carry or avoid strongly negative carry.</p>
+
+<p><strong>Why it fits:</strong> Converts carry from a portfolio restriction into a local strategy archetype.</p>
+
+<p><strong>Category:</strong> Trend.</p>
+
+<p><strong>Name:</strong> <code>CarryFilteredTrendContinuationStrategy</code></p>
+
+<p><strong>Core logic:</strong></p>
+
+<pre><code>Trend signal must pass EMA/ADX trend condition.
+Optional carry gate adjusts or filters direction based on swap_long/swap_short.</code></pre>
+
+<h3 id='5-multi-pair-currency-strength-momentum-strategy'>5. Multi-Pair Currency Strength Momentum Strategy</h3>
+
+<p><strong>Purpose:</strong> Trade pair direction based on relative strength of base vs quote currency.</p>
+
+<p><strong>Why it fits:</strong> This should be added as a strategy candidate, not as a portfolio-level veto.</p>
+
+<p><strong>Category:</strong> Trend / momentum.</p>
+
+<p><strong>Name:</strong> <code>CurrencyStrengthMomentumStrategy</code></p>
+
+<p><strong>Core logic:</strong></p>
+
+<pre><code>If base currency strength &gt; quote currency strength by threshold, long.
+If quote currency strength &gt; base currency strength by threshold, short.</code></pre>
+
+<h3 id='recommended-target'>Recommended target</h3>
+
+<p>Add <strong>three first</strong>, not all five at once:</p>
+
+<pre><code>1. LiquiditySweepReversalStrategy
+2. RegimeTransitionBreakoutStrategy
+3. SessionVWAPReversionStrategy</code></pre>
+
+<p>Then add carry and currency-strength only after the core live readiness work is stable.</p>
+
+<h2 id='f2-strategy-registry-insertion'>F2. Strategy registry insertion</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_strategies.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Add classes near related strategy families, then update the registry map where <code>StrategyRegistry</code> registers all strategy classes.</p>
+
+<h3 id='example-class-skeleton-liquidity-sweep-reversal'>Example class skeleton: Liquidity Sweep Reversal</h3>
+
+<pre><code>class LiquiditySweepReversalStrategy(BaseStrategy):
+    @property
+    def name(self) -&gt; str:
+        return &quot;LiquiditySweepReversalStrategy&quot;
+
+    @property
+    def category(self) -&gt; StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -&gt; Dict[str, Any]:
+        return {
+            &quot;lookback&quot;: 20,
+            &quot;close_back_pct&quot;: 0.25,
+            &quot;atr_filter_mult&quot;: 0.5,
+            &quot;sl_atr_mult&quot;: 2.0,
+            &quot;tp_atr_mult&quot;: 2.5,
+            &quot;use_structural_sl&quot;: True,
+            &quot;structural_sl_lookback&quot;: 20,
+        }
+
+    def get_param_grid(self) -&gt; Dict[str, List]:
+        return {
+            &quot;lookback&quot;: [10, 20, 30, 50],
+            &quot;close_back_pct&quot;: [0.15, 0.25, 0.35],
+            &quot;atr_filter_mult&quot;: [0.0, 0.5, 1.0],
+            &quot;sl_atr_mult&quot;: _GLOBAL_SL_GRID,
+            &quot;tp_atr_mult&quot;: _GLOBAL_TP_GRID,
+            &quot;use_structural_sl&quot;: [False, True],
+        }
+
+    def get_required_features(self) -&gt; Set[str]:
+        return {&quot;ATR_14&quot;}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -&gt; pd.Series:
+        p = self.params
+        lookback = int(p[&quot;lookback&quot;])
+        close_back_pct = float(p[&quot;close_back_pct&quot;])
+        atr_mult = float(p[&quot;atr_filter_mult&quot;])
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        prior_high = features[&quot;High&quot;].shift(1).rolling(lookback).max()
+        prior_low = features[&quot;Low&quot;].shift(1).rolling(lookback).min()
+        atr = features.get(&quot;ATR_14&quot;, (features[&quot;High&quot;] - features[&quot;Low&quot;]).rolling(14).mean())
+
+        bar_range = (features[&quot;High&quot;] - features[&quot;Low&quot;]).replace(0, np.nan)
+
+        swept_high = features[&quot;High&quot;] &gt; prior_high
+        closed_back_below = features[&quot;Close&quot;] &lt; prior_high - close_back_pct * atr
+        enough_range = bar_range &gt;= atr_mult * atr
+
+        swept_low = features[&quot;Low&quot;] &lt; prior_low
+        closed_back_above = features[&quot;Close&quot;] &gt; prior_low + close_back_pct * atr
+
+        signals[swept_high &amp; closed_back_below &amp; enough_range] = -1
+        signals[swept_low &amp; closed_back_above &amp; enough_range] = 1
+
+        return self._zero_warmup(signals, max(lookback, 50))</code></pre>
+
+<h3 id='example-class-skeleton-regime-transition-breakout'>Example class skeleton: Regime Transition Breakout</h3>
+
+<pre><code>class RegimeTransitionBreakoutStrategy(BaseStrategy):
+    @property
+    def name(self) -&gt; str:
+        return &quot;RegimeTransitionBreakoutStrategy&quot;
+
+    @property
+    def category(self) -&gt; StrategyCategory:
+        return StrategyCategory.BREAKOUT
+
+    def get_default_params(self) -&gt; Dict[str, Any]:
+        return {
+            &quot;lookback&quot;: 20,
+            &quot;min_regime_gap&quot;: 0.05,
+            &quot;atr_buffer_mult&quot;: 0.10,
+            &quot;sl_atr_mult&quot;: 2.0,
+            &quot;tp_atr_mult&quot;: 3.0,
+        }
+
+    def get_param_grid(self) -&gt; Dict[str, List]:
+        return {
+            &quot;lookback&quot;: [10, 20, 30, 50],
+            &quot;min_regime_gap&quot;: [0.03, 0.05, 0.08, 0.10],
+            &quot;atr_buffer_mult&quot;: [0.0, 0.10, 0.20],
+            &quot;sl_atr_mult&quot;: _GLOBAL_SL_GRID,
+            &quot;tp_atr_mult&quot;: _GLOBAL_TP_GRID,
+        }
+
+    def get_required_features(self) -&gt; Set[str]:
+        return {&quot;ATR_14&quot;, &quot;REGIME_LIVE&quot;, &quot;REGIME_GAP&quot;}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -&gt; pd.Series:
+        p = self.params
+        lookback = int(p[&quot;lookback&quot;])
+        min_gap = float(p[&quot;min_regime_gap&quot;])
+        atr_buffer = float(p[&quot;atr_buffer_mult&quot;])
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        regime = features[&quot;REGIME_LIVE&quot;] if &quot;REGIME_LIVE&quot; in features else features.get(&quot;REGIME&quot;)
+        gap = features.get(&quot;REGIME_GAP&quot;, pd.Series(0.0, index=features.index))
+        atr = features.get(&quot;ATR_14&quot;, (features[&quot;High&quot;] - features[&quot;Low&quot;]).rolling(14).mean())
+
+        prev_regime = regime.shift(1)
+        transition = prev_regime.isin([&quot;CHOP&quot;, &quot;RANGE&quot;]) &amp; (regime == &quot;BREAKOUT&quot;) &amp; (gap &gt;= min_gap)
+
+        prior_high = features[&quot;High&quot;].shift(1).rolling(lookback).max()
+        prior_low = features[&quot;Low&quot;].shift(1).rolling(lookback).min()
+
+        long_break = features[&quot;Close&quot;] &gt; prior_high + atr_buffer * atr
+        short_break = features[&quot;Close&quot;] &lt; prior_low - atr_buffer * atr
+
+        signals[transition &amp; long_break] = 1
+        signals[transition &amp; short_break] = -1
+
+        return self._zero_warmup(signals, max(lookback, 50))</code></pre>
+
+<p>---</p>
+
+<h1 id='part-g-regime-accuracy-and-profitability-alignment'>Part G — Regime accuracy and profitability alignment</h1>
+
+<p>Regime accuracy is central to FXPM. The issue is not whether regimes are conceptually valid. The issue is whether the live system selects the correct specialist often enough to preserve profitability.</p>
+
+<h2 id='g1-add-a-regime-profitability-audit'>G1. Add a regime profitability audit</h2>
+
+<h3 id='new-file'>New file</h3>
+
+<pre><code>pm_regime_audit.py</code></pre>
+
+<h3 id='purpose'>Purpose</h3>
+
+<p>Measure whether regime labels are helping the strategy-selection process.</p>
+
+<h3 id='metrics'>Metrics</h3>
+
+<pre><code>1. Regime distribution per symbol/timeframe.
+2. Regime transition counts.
+3. Average REGIME_GAP per label.
+4. PnL by detected regime.
+5. PnL by previous regime → current regime transition.
+6. Winner coverage by regime.
+7. No-trade marker frequency by regime.
+8. Near-boundary trade outcomes where REGIME_GAP is low.</code></pre>
+
+<h3 id='code-skeleton'>Code skeleton</h3>
+
+<pre><code># pm_regime_audit.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+import pandas as pd
+import numpy as np
+
+
+@dataclass
+class RegimeAuditReport:
+    symbol: str
+    timeframe: str
+    summary: Dict[str, Any] = field(default_factory=dict)
+    regime_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    transition_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    boundary_metrics: Dict[str, Any] = field(default_factory=dict)
+
+
+def _trade_regime(trade: Dict[str, Any], features: pd.DataFrame) -&gt; str:
+    signal_bar = trade.get(&quot;signal_bar&quot;, trade.get(&quot;signal_bar_index&quot;, None))
+    if signal_bar is None:
+        return &quot;UNKNOWN&quot;
+    try:
+        i = int(signal_bar)
+        col = &quot;REGIME_LIVE&quot; if &quot;REGIME_LIVE&quot; in features.columns else &quot;REGIME&quot;
+        return str(features[col].iat[i])
+    except Exception:
+        return &quot;UNKNOWN&quot;
+
+
+def audit_regime_profitability(
+    *,
+    symbol: str,
+    timeframe: str,
+    features: pd.DataFrame,
+    trades: List[Dict[str, Any]],
+    low_gap_threshold: float = 0.05,
+) -&gt; RegimeAuditReport:
+    report = RegimeAuditReport(symbol=symbol, timeframe=timeframe)
+
+    regime_col = &quot;REGIME_LIVE&quot; if &quot;REGIME_LIVE&quot; in features.columns else &quot;REGIME&quot;
+    gap_col = &quot;REGIME_GAP&quot; if &quot;REGIME_GAP&quot; in features.columns else None
+
+    regime_counts = features[regime_col].value_counts(dropna=False).to_dict()
+    report.summary[&quot;regime_counts&quot;] = {str(k): int(v) for k, v in regime_counts.items()}
+
+    by_regime: Dict[str, List[float]] = {}
+    low_gap_pnls: List[float] = []
+    normal_gap_pnls: List[float] = []
+
+    for trade in trades or []:
+        regime = _trade_regime(trade, features)
+        pnl = float(trade.get(&quot;pnl_dollars&quot;, trade.get(&quot;pnl&quot;, 0.0)) or 0.0)
+        by_regime.setdefault(regime, []).append(pnl)
+
+        signal_bar = trade.get(&quot;signal_bar&quot;, trade.get(&quot;signal_bar_index&quot;, None))
+        if gap_col and signal_bar is not None:
+            try:
+                gap = float(features[gap_col].iat[int(signal_bar)] or 0.0)
+                if gap &lt; low_gap_threshold:
+                    low_gap_pnls.append(pnl)
+                else:
+                    normal_gap_pnls.append(pnl)
+            except Exception:
+                pass
+
+    for regime, pnls in by_regime.items():
+        arr = np.array(pnls, dtype=float)
+        report.regime_metrics[regime] = {
+            &quot;trades&quot;: int(len(arr)),
+            &quot;total_pnl&quot;: float(arr.sum()) if len(arr) else 0.0,
+            &quot;mean_pnl&quot;: float(arr.mean()) if len(arr) else 0.0,
+            &quot;win_rate&quot;: float((arr &gt; 0).mean() * 100.0) if len(arr) else 0.0,
+        }
+
+    report.boundary_metrics = {
+        &quot;low_gap_threshold&quot;: low_gap_threshold,
+        &quot;low_gap_trades&quot;: len(low_gap_pnls),
+        &quot;low_gap_total_pnl&quot;: float(np.sum(low_gap_pnls)) if low_gap_pnls else 0.0,
+        &quot;normal_gap_trades&quot;: len(normal_gap_pnls),
+        &quot;normal_gap_total_pnl&quot;: float(np.sum(normal_gap_pnls)) if normal_gap_pnls else 0.0,
+    }
+
+    return report</code></pre>
+
+<h2 id='g2-add-regime-audit-to-winner-artifacts'>G2. Add regime audit to winner artifacts</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_pipeline.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>After a candidate winner is selected and before <code>RegimeConfig</code> is finalized.</p>
+
+<h3 id='add'>Add</h3>
+
+<pre><code>from pm_regime_audit import audit_regime_profitability</code></pre>
+
+<p>Then:</p>
+
+<pre><code>regime_audit = audit_regime_profitability(
+    symbol=symbol,
+    timeframe=timeframe,
+    features=selection_features,
+    trades=selection_result.get(&quot;trades&quot;, []),
+    low_gap_threshold=float(getattr(self.config, &quot;regime_min_live_gap_warn&quot;, 0.05)),
+)
+
+regime_config.validation_evidence[&quot;regime_audit&quot;] = {
+    &quot;summary&quot;: regime_audit.summary,
+    &quot;regime_metrics&quot;: regime_audit.regime_metrics,
+    &quot;boundary_metrics&quot;: regime_audit.boundary_metrics,
+}</code></pre>
+
+<h2 id='g3-live-regime-boundary-handling'>G3. Live regime boundary handling</h2>
+
+<p>Do not immediately block low-gap regime decisions. That would risk suppressing too much edge. Start with observe-only:</p>
+
+<pre><code>regime_ambiguity_policy = observe_only</code></pre>
+
+<p>The system should record:</p>
+
+<pre><code>symbol
+timeframe
+detected regime
+top score
+gap
+selected winner
+signal
+trade result</code></pre>
+
+<p>After enough evidence, you can decide whether low-gap cases should:</p>
+
+<pre><code>1. remain fully tradable
+2. use lower risk
+3. defer if both top regimes have conflicting winners
+4. use a transition strategy</code></pre>
+
+<p>---</p>
+
+<h1 id='part-h-walk-forward-without-killing-live-edge'>Part H — Walk-forward without killing live edge</h1>
+
+<p>Your concern is valid: an extra validation layer that forces the live system to trade older parameters can harm the fresh two-week edge.</p>
+
+<h2 id='h1-revised-walk-forward-principle'>H1. Revised walk-forward principle</h2>
+
+<p>Walk-forward should be used as a <strong>fragility audit</strong>, not as a replacement for the latest selection surface.</p>
+
+<p>Use the newest surface for live selection.</p>
+
+<p>Use walk-forward only to detect severe instability:</p>
+
+<pre><code>If the latest winner is strong but collapses catastrophically across recent rolling windows,
+block or demote it.
+Otherwise, allow it to trade.</code></pre>
+
+<h2 id='h2-implementation-rule'>H2. Implementation rule</h2>
+
+<p>Do not add:</p>
+
+<pre><code>optimize on old window → validate on newer window → then trade still older params</code></pre>
+
+<p>Instead add:</p>
+
+<pre><code>latest optimization remains the champion
+rolling audit checks whether champion behavior is catastrophically unstable
+severe fail = no live promotion
+non-severe fail = warning / paper tag
+pass = live eligible</code></pre>
+
+<h2 id='h3-artifact-fields'>H3. Artifact fields</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_pipeline.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p><code>RegimeConfig.validation_evidence</code></p>
+
+<p>Add:</p>
+
+<pre><code>&quot;fresh_edge_policy&quot;: {
+    &quot;live_surface&quot;: &quot;latest_stage2_or_stage3&quot;,
+    &quot;walk_forward_role&quot;: &quot;severe_fragility_audit&quot;,
+    &quot;do_not_displace_latest_surface&quot;: True
+}</code></pre>
+
+<h2 id='h4-promotion-labels'>H4. Promotion labels</h2>
+
+<p>Add to each <code>RegimeConfig</code>:</p>
+
+<pre><code>promotion_status: str = &quot;PROMOTED&quot;  # PROMOTED|PROMOTE_SMALL|PAPER_ONLY|NO_TRADE|BLOCKED
+promotion_reasons: List[str] = field(default_factory=list)</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p><code>pm_pipeline.py</code>, inside <code>RegimeConfig</code>.</p>
+
+<pre><code>    promotion_status: str = &quot;PROMOTED&quot;
+    promotion_reasons: List[str] = field(default_factory=list)</code></pre>
+
+<p>Update <code>to_dict</code> and <code>from_dict</code> accordingly.</p>
+
+<h3 id='promotion-logic'>Promotion logic</h3>
+
+<pre><code>def classify_promotion_status(regime_config: RegimeConfig, config: PipelineConfig) -&gt; str:
+    wf = regime_config.walk_forward_audit or {}
+    summary = wf.get(&quot;summary&quot;, {}) if isinstance(wf, dict) else {}
+
+    if regime_config.is_no_trade_marker():
+        return &quot;NO_TRADE&quot;
+
+    if summary.get(&quot;severe_failure&quot;) and getattr(config, &quot;walk_forward_promotion_policy&quot;, &quot;&quot;) == &quot;block_severe_only&quot;:
+        return &quot;BLOCKED&quot;
+
+    hist = regime_config.historical_audit_metrics or {}
+    if hist.get(&quot;severe_failure&quot;):
+        return &quot;PROMOTE_SMALL&quot;
+
+    return &quot;PROMOTED&quot;</code></pre>
+
+<h3 id='live-lookup-rule'>Live lookup rule</h3>
+
+<p>In live trading, only allow:</p>
+
+<pre><code>PROMOTED
+PROMOTE_SMALL</code></pre>
+
+<p>For <code>PROMOTE_SMALL</code>, apply a risk multiplier such as 0.5 if enabled. Otherwise, start with observe-only.</p>
+
+<p>---</p>
+
+<h1 id='part-i-lightweight-live-cycle-drift-sentinel'>Part I — Lightweight live-cycle drift sentinel</h1>
+
+<h2 id='i1-why-it-still-matters-despite-two-week-retraining'>I1. Why it still matters despite two-week retraining</h2>
+
+<p>Two-week retraining solves model-age decay. It does not solve within-cycle operational degradation.</p>
+
+<p>Examples:</p>
+
+<pre><code>A broker widens spreads for two days.
+A symbol’s execution becomes poor after a server issue.
+The regime detector starts selecting CHOP while price is breaking out.
+A data cache discontinuity creates bad features.
+A local winner has five immediate live losses.</code></pre>
+
+<p>A lightweight sentinel catches these without becoming a heavy drift system.</p>
+
+<h2 id='i2-new-file'>I2. New file</h2>
+
+<pre><code>pm_cycle_drift.py</code></pre>
+
+<h3 id='code-skeleton'>Code skeleton</h3>
+
+<pre><code># pm_cycle_drift.py
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict
+
+
+@dataclass
+class CycleDriftDecision:
+    action: str = &quot;allow&quot;  # allow|pause_context|derate_context|observe
+    risk_multiplier: float = 1.0
+    reason: str = &quot;normal&quot;
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+
+class CycleDriftMonitor:
+    # Lightweight two-week-cycle sentinel.
+    #
+    # This is not a full model lifecycle system. It only catches severe live mismatch
+    # during the current retrain cycle.
+
+    def __init__(self, config: Any, state_path: str = &quot;pm_outputs/cycle_drift_state.json&quot;):
+        self.config = config
+        self.state_path = Path(state_path)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state = self._load()
+
+    def _load(self) -&gt; Dict[str, Any]:
+        try:
+            if self.state_path.exists():
+                return json.loads(self.state_path.read_text(encoding=&quot;utf-8&quot;))
+        except Exception:
+            pass
+        return {&quot;contexts&quot;: {}}
+
+    def _save(self) -&gt; None:
+        tmp = self.state_path.with_suffix(&quot;.json.tmp&quot;)
+        tmp.write_text(json.dumps(self.state, indent=2, default=str), encoding=&quot;utf-8&quot;)
+        tmp.replace(self.state_path)
+
+    @staticmethod
+    def context_key(symbol: str, timeframe: str, regime: str, strategy_name: str) -&gt; str:
+        return f&quot;{symbol}|{timeframe}|{regime}|{strategy_name}&quot;
+
+    def record_trade_result(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        strategy_name: str,
+        pnl_dollars: float,
+        r_multiple: float = 0.0,
+        slippage_pips: float = 0.0,
+        spread_pips: float = 0.0,
+        expected_spread_pips: float = 0.0,
+    ) -&gt; None:
+        key = self.context_key(symbol, timeframe, regime, strategy_name)
+        ctx = self.state[&quot;contexts&quot;].setdefault(key, {
+            &quot;trades&quot;: 0,
+            &quot;wins&quot;: 0,
+            &quot;losses&quot;: 0,
+            &quot;consecutive_losses&quot;: 0,
+            &quot;total_pnl&quot;: 0.0,
+            &quot;max_slippage_pips&quot;: 0.0,
+            &quot;max_spread_ratio&quot;: 0.0,
+            &quot;paused&quot;: False,
+            &quot;pause_reason&quot;: &quot;&quot;,
+        })
+
+        pnl = float(pnl_dollars or 0.0)
+        ctx[&quot;trades&quot;] += 1
+        ctx[&quot;total_pnl&quot;] += pnl
+        if pnl &gt; 0:
+            ctx[&quot;wins&quot;] += 1
+            ctx[&quot;consecutive_losses&quot;] = 0
+        else:
+            ctx[&quot;losses&quot;] += 1
+            ctx[&quot;consecutive_losses&quot;] += 1
+
+        ctx[&quot;max_slippage_pips&quot;] = max(float(ctx.get(&quot;max_slippage_pips&quot;, 0.0)), float(slippage_pips or 0.0))
+
+        if expected_spread_pips and expected_spread_pips &gt; 0:
+            ratio = float(spread_pips or 0.0) / float(expected_spread_pips)
+            ctx[&quot;max_spread_ratio&quot;] = max(float(ctx.get(&quot;max_spread_ratio&quot;, 0.0)), ratio)
+
+        ctx[&quot;last_update&quot;] = datetime.now().isoformat()
+        self._save()
+
+    def evaluate_context(self, *, symbol: str, timeframe: str, regime: str, strategy_name: str) -&gt; CycleDriftDecision:
+        if not bool(getattr(self.config, &quot;cycle_drift_monitor_enabled&quot;, True)):
+            return CycleDriftDecision(&quot;allow&quot;, 1.0, &quot;cycle_drift_disabled&quot;)
+
+        mode = str(getattr(self.config, &quot;cycle_drift_mode&quot;, &quot;lightweight&quot;)).lower()
+        if mode == &quot;off&quot;:
+            return CycleDriftDecision(&quot;allow&quot;, 1.0, &quot;cycle_drift_off&quot;)
+
+        key = self.context_key(symbol, timeframe, regime, strategy_name)
+        ctx = self.state.get(&quot;contexts&quot;, {}).get(key, {})
+        if ctx.get(&quot;paused&quot;):
+            return CycleDriftDecision(&quot;pause_context&quot;, 0.0, ctx.get(&quot;pause_reason&quot;, &quot;context_paused&quot;), ctx)
+
+        min_trades = int(getattr(self.config, &quot;cycle_drift_min_trades&quot;, 6) or 6)
+        max_consec = int(getattr(self.config, &quot;cycle_drift_consecutive_losses&quot;, 5) or 5)
+
+        if int(ctx.get(&quot;trades&quot;, 0)) &gt;= min_trades and int(ctx.get(&quot;consecutive_losses&quot;, 0)) &gt;= max_consec:
+            return self._action(key, &quot;consecutive_losses&quot;, ctx)
+
+        spread_mult = float(getattr(self.config, &quot;cycle_drift_spread_degradation_mult&quot;, 2.0) or 2.0)
+        if float(ctx.get(&quot;max_spread_ratio&quot;, 0.0)) &gt;= spread_mult:
+            return self._action(key, &quot;spread_degradation&quot;, ctx)
+
+        return CycleDriftDecision(&quot;allow&quot;, 1.0, &quot;normal&quot;, ctx)
+
+    def _action(self, key: str, reason: str, ctx: Dict[str, Any]) -&gt; CycleDriftDecision:
+        mode = str(getattr(self.config, &quot;cycle_drift_mode&quot;, &quot;lightweight&quot;)).lower()
+        configured_action = str(getattr(self.config, &quot;cycle_drift_action&quot;, &quot;pause_context&quot;)).lower()
+
+        if mode == &quot;observe&quot;:
+            return CycleDriftDecision(&quot;observe&quot;, 1.0, reason, ctx)
+
+        if configured_action == &quot;derate_context&quot;:
+            return CycleDriftDecision(&quot;derate_context&quot;, 0.5, reason, ctx)
+
+        ctx[&quot;paused&quot;] = True
+        ctx[&quot;pause_reason&quot;] = reason
+        self.state[&quot;contexts&quot;][key] = ctx
+        self._save()
+        return CycleDriftDecision(&quot;pause_context&quot;, 0.0, reason, ctx)</code></pre>
+
+<h2 id='i3-integration-in-livetrader'>I3. Integration in <code>LiveTrader</code></h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_main.py</code></pre>
+
+<h3 id='add-import'>Add import</h3>
+
+<pre><code>from pm_cycle_drift import CycleDriftMonitor</code></pre>
+
+<h3 id='in-livetrader-init'>In <code>LiveTrader.__init__</code></h3>
+
+<pre><code>        self._cycle_drift = CycleDriftMonitor(
+            pipeline_config,
+            state_path=str(Path(getattr(pipeline_config, &quot;output_dir&quot;, &quot;./pm_outputs&quot;)) / &quot;cycle_drift_state.json&quot;),
+        )</code></pre>
+
+<h3 id='before-placing-a-new-trade'>Before placing a new trade</h3>
+
+<pre><code>        drift_decision = self._cycle_drift.evaluate_context(
+            symbol=symbol,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_name=strategy.name,
+        )
+
+        if drift_decision.action == &quot;pause_context&quot;:
+            self.logger.warning(
+                &quot;[%s] Cycle drift paused context %s/%s/%s: %s&quot;,
+                symbol, timeframe, regime, strategy.name, drift_decision.reason,
+            )
+            return
+
+        if drift_decision.action == &quot;derate_context&quot;:
+            risk_pct *= float(drift_decision.risk_multiplier)</code></pre>
+
+<h3 id='after-trade-close'>After trade close</h3>
+
+<p>Where closed trade results are recorded, call:</p>
+
+<pre><code>self._cycle_drift.record_trade_result(
+    symbol=symbol,
+    timeframe=timeframe,
+    regime=regime,
+    strategy_name=strategy_name,
+    pnl_dollars=pnl_dollars,
+    r_multiple=r_multiple,
+    slippage_pips=observed_slippage_pips,
+    spread_pips=observed_spread_pips,
+    expected_spread_pips=expected_spread_pips,
+)</code></pre>
+
+<p>---</p>
+
+<h1 id='part-j-swap-carry-modeling-without-over-filtering'>Part J — Swap/carry modeling without over-filtering</h1>
+
+<h2 id='j1-revised-recommendation'>J1. Revised recommendation</h2>
+
+<p>Do not add broad carry restrictions unless evidence proves they improve profitability. But do add swap/carry modeling to the backtest and artifacts. This is not optional for D1/exotics sustainability.</p>
+
+<p>Carry should enter FXPM in two ways:</p>
+
+<pre><code>1. Cost realism: all strategies pay or receive swap when holding through rollover.
+2. Strategy archetype: selected carry-aware strategies may use carry as a local signal/filter.</code></pre>
+
+<p>It should not become:</p>
+
+<pre><code>&quot;Never trade against carry.&quot;</code></pre>
+
+<p>That would be too blunt.</p>
+
+<h2 id='j2-add-post-trade-swap-adjustment'>J2. Add post-trade swap adjustment</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_core.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>Inside <code>Backtester.run</code>, after trades are reconstructed from <code>_backtest_loop_numba</code> and before performance metrics are calculated.</p>
+
+<p>Because the Numba loop does not receive timestamps, do swap adjustment in Python after trade reconstruction.</p>
+
+<h3 id='code-skeleton'>Code skeleton</h3>
+
+<pre><code>def _apply_swap_costs_to_trades(
+    self,
+    trades: List[Dict[str, Any]],
+    features: pd.DataFrame,
+    symbol: str,
+    spec: InstrumentSpec,
+) -&gt; List[Dict[str, Any]]:
+    if not bool(getattr(self.config, &quot;swap_model_enabled&quot;, False)):
+        return trades
+
+    triple_day = str(getattr(self.config, &quot;swap_model_triple_rollover_day&quot;, &quot;wednesday&quot;)).lower()
+    triple_weekday = {
+        &quot;monday&quot;: 0, &quot;tuesday&quot;: 1, &quot;wednesday&quot;: 2, &quot;thursday&quot;: 3,
+        &quot;friday&quot;: 4, &quot;saturday&quot;: 5, &quot;sunday&quot;: 6,
+    }.get(triple_day, 2)
+
+    min_hours = float(getattr(self.config, &quot;swap_model_min_holding_hours&quot;, 20.0) or 20.0)
+
+    for trade in trades:
+        try:
+            entry_i = int(trade.get(&quot;entry_bar&quot;, trade.get(&quot;entry_bar_index&quot;)))
+            exit_i = int(trade.get(&quot;exit_bar&quot;, trade.get(&quot;exit_bar_index&quot;)))
+            entry_ts = features.index[entry_i]
+            exit_ts = features.index[exit_i]
+        except Exception:
+            continue
+
+        holding_hours = (exit_ts - entry_ts).total_seconds() / 3600.0
+        if holding_hours &lt; min_hours:
+            trade[&quot;swap_cost&quot;] = 0.0
+            continue
+
+        direction = int(trade.get(&quot;direction&quot;, 0))
+        volume = float(trade.get(&quot;size&quot;, trade.get(&quot;volume&quot;, 0.0)) or 0.0)
+        swap_per_lot = float(spec.swap_long if direction == 1 else spec.swap_short)
+
+        rollover_days = 0
+        cur = entry_ts.normalize()
+        end = exit_ts.normalize()
+        while cur &lt; end:
+            mult = 3 if cur.weekday() == triple_weekday else 1
+            rollover_days += mult
+            cur += pd.Timedelta(days=1)
+
+        swap_cost = swap_per_lot * volume * rollover_days
+        trade[&quot;swap_cost&quot;] = float(swap_cost)
+        trade[&quot;pnl_dollars&quot;] = float(trade.get(&quot;pnl_dollars&quot;, 0.0)) + float(swap_cost)
+
+    return trades</code></pre>
+
+<p>Then call:</p>
+
+<pre><code>trades = self._apply_swap_costs_to_trades(trades, features, symbol, spec)</code></pre>
+
+<p>---</p>
+
+<h1 id='part-k-news-event-logic-without-over-restricting-specialists'>Part K — News/event logic without over-restricting specialists</h1>
+
+<h2 id='k1-revised-recommendation'>K1. Revised recommendation</h2>
+
+<p>Do not add a broad news-event veto by default. That could suppress the system’s best opportunities.</p>
+
+<p>Instead implement news/event handling as:</p>
+
+<pre><code>1. execution-quality context
+2. optional imported event calendar
+3. local strategy feature if a strategy wants it
+4. hard block only for extreme spread/rollover conditions</code></pre>
+
+<h2 id='k2-add-optional-event-calendar-loader'>K2. Add optional event calendar loader</h2>
+
+<h3 id='new-file'>New file</h3>
+
+<pre><code>pm_event_context.py</code></pre>
+
+<h3 id='code-skeleton'>Code skeleton</h3>
+
+<pre><code># pm_event_context.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import pandas as pd
+
+
+@dataclass
+class EventRisk:
+    active: bool = False
+    severity: str = &quot;none&quot;  # none|low|medium|high
+    event_name: str = &quot;&quot;
+    minutes_to_event: float = 999999.0
+
+
+class EventCalendar:
+    def __init__(self, path: str = &quot;data/events.csv&quot;):
+        self.path = Path(path)
+        self.events = self._load()
+
+    def _load(self) -&gt; pd.DataFrame:
+        if not self.path.exists():
+            return pd.DataFrame(columns=[&quot;time&quot;, &quot;currency&quot;, &quot;severity&quot;, &quot;name&quot;])
+        df = pd.read_csv(self.path)
+        df[&quot;time&quot;] = pd.to_datetime(df[&quot;time&quot;])
+        return df.sort_values(&quot;time&quot;)
+
+    def risk_for_symbol(self, symbol: str, timestamp, window_minutes: int = 30) -&gt; EventRisk:
+        if self.events.empty:
+            return EventRisk(False, &quot;none&quot;)
+
+        currencies = _symbol_currencies(symbol)
+        ts = pd.Timestamp(timestamp)
+        start = ts - pd.Timedelta(minutes=window_minutes)
+        end = ts + pd.Timedelta(minutes=window_minutes)
+
+        subset = self.events[
+            (self.events[&quot;time&quot;] &gt;= start)
+            &amp; (self.events[&quot;time&quot;] &lt;= end)
+            &amp; (self.events[&quot;currency&quot;].isin(currencies))
+        ]
+
+        if subset.empty:
+            return EventRisk(False, &quot;none&quot;)
+
+        row = subset.iloc[0]
+        minutes = abs((row[&quot;time&quot;] - ts).total_seconds()) / 60.0
+        return EventRisk(True, str(row.get(&quot;severity&quot;, &quot;medium&quot;)), str(row.get(&quot;name&quot;, &quot;&quot;)), minutes)
+
+
+def _symbol_currencies(symbol: str):
+    s = &quot;&quot;.join(ch for ch in str(symbol).upper() if ch.isalpha())
+    if len(s) &gt;= 6:
+        return [s[:3], s[3:6]]
+    return []</code></pre>
+
+<h2 id='k3-policy'>K3. Policy</h2>
+
+<p>Start as observe-only:</p>
+
+<pre><code>&quot;event_calendar_enabled&quot;: false,
+&quot;event_calendar_mode&quot;: &quot;observe&quot;,
+&quot;event_calendar_high_impact_action&quot;: &quot;observe&quot;</code></pre>
+
+<p>Only move to hard blocks if live/paper evidence shows news windows damage expectancy.</p>
+
+<p>---</p>
+
+<h1 id='part-l-fairness-in-strategy-comparison'>Part L — Fairness in strategy comparison</h1>
+
+<p>Your fairness concern is important. A strategy tournament can unintentionally favor certain strategy types if:</p>
+
+<pre><code>one strategy has a much larger parameter grid
+one strategy has higher trade frequency and therefore more stable metrics
+one strategy has easier-to-optimize defaults
+one strategy benefits from the shared ATR stop surface more than another
+one strategy is penalized by signal sparsity despite strong expectancy</code></pre>
+
+<p>FXPM already helps by using a common SL/TP grid and family-size-aware Optuna budgets. Keep that. Add telemetry rather than heavy interference.</p>
+
+<h2 id='l1-add-fairness-metadata-to-optimization-artifacts'>L1. Add fairness metadata to optimization artifacts</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_pipeline.py</code></pre>
+
+<h3 id='insertion-point'>Insertion point</h3>
+
+<p>When storing <code>validation_evidence</code>.</p>
+
+<p>Add:</p>
+
+<pre><code>&quot;fairness_evidence&quot;: {
+    &quot;strategy_category&quot;: strategy.category.value if hasattr(strategy.category, &quot;value&quot;) else str(strategy.category),
+    &quot;param_grid_size&quot;: strategy.cartesian_grid_size() if hasattr(strategy, &quot;cartesian_grid_size&quot;) else None,
+    &quot;search_trials&quot;: int(search_trials or 0),
+    &quot;search_coverage_pct&quot;: float(search_trials / max(strategy.cartesian_grid_size(), 1)) if hasattr(strategy, &quot;cartesian_grid_size&quot;) else None,
+    &quot;signal_count_train&quot;: int(train_signals.abs().sum()) if train_signals is not None else None,
+    &quot;signal_count_val&quot;: int(val_signals.abs().sum()) if val_signals is not None else None,
+    &quot;trade_count_train&quot;: int(train_metrics.get(&quot;total_trades&quot;, 0)),
+    &quot;trade_count_val&quot;: int(val_metrics.get(&quot;total_trades&quot;, 0)),
+}</code></pre>
+
+<h2 id='l2-add-fairness-report'>L2. Add fairness report</h2>
+
+<h3 id='new-file'>New file</h3>
+
+<pre><code>pm_fairness_audit.py</code></pre>
+
+<h3 id='purpose'>Purpose</h3>
+
+<p>This report should not change selection at first. It should reveal whether the tournament is skewing toward a particular class.</p>
+
+<h3 id='metrics'>Metrics</h3>
+
+<pre><code>Strategy category winner rate
+Average param-grid coverage by category
+Average validation trade count by category
+No-trade rate by regime
+Winner concentration by family</code></pre>
+
+<p>---</p>
+
+<h1 id='part-m-revised-validation-design'>Part M — Revised validation design</h1>
+
+<h2 id='m1-keep-the-fresh-edge'>M1. Keep the fresh edge</h2>
+
+<p>Do not add a validation layer that forces the model to trade older stale parameters.</p>
+
+<h2 id='m2-add-severe-fragility-blocker'>M2. Add severe-fragility blocker</h2>
+
+<p>Add:</p>
+
+<pre><code>latest winner remains live candidate
+audit checks severe fragility only
+severe failure blocks
+moderate concerns become PROMOTE_SMALL or observe</code></pre>
+
+<h2 id='m3-add-promotion-status-to-live-selection'>M3. Add promotion status to live selection</h2>
+
+<h3 id='file'>File</h3>
+
+<pre><code>pm_pipeline.py / pm_main.py</code></pre>
+
+<h3 id='live-selection-rule'>Live selection rule</h3>
+
+<p>When a live winner is found:</p>
+
+<pre><code>promotion_status = getattr(regime_config, &quot;promotion_status&quot;, &quot;PROMOTED&quot;)
+if promotion_status in {&quot;BLOCKED&quot;, &quot;PAPER_ONLY&quot;, &quot;NO_TRADE&quot;}:
+    skip live entry
+elif promotion_status == &quot;PROMOTE_SMALL&quot;:
+    optional risk multiplier = 0.5
+else:
+    normal trade</code></pre>
+
+<p>This gives you robustness without creating a stale intermediate window.</p>
+
+<p>---</p>
+
+<h1 id='part-n-specific-disagreement-acceptance-register'>Part N — Specific disagreement/acceptance register</h1>
+
+<h2 id='n1-portfolio-risk'>N1. Portfolio risk</h2>
+
+<h3 id='your-position'>Your position</h3>
+
+<p>Let each specialist act independently. Avoid top-down interference.</p>
+
+<h3 id='revised-blueprint-position'>Revised blueprint position</h3>
+
+<p>Accepted with modification.</p>
+
+<h3 id='implementation'>Implementation</h3>
+
+<p>Add institutional breakpoints only.</p>
+
+<p>Do not implement default correlation veto.</p>
+
+<p>Do not implement default currency-leg veto.</p>
+
+<p>Do add high-threshold hard system risk gates.</p>
+
+<h2 id='n2-live-order-management'>N2. Live order management</h2>
+
+<h3 id='your-position'>Your position</h3>
+
+<p>Current pool is likely too small.</p>
+
+<h3 id='revised-blueprint-position'>Revised blueprint position</h3>
+
+<p>Strongly accepted.</p>
+
+<h3 id='implementation'>Implementation</h3>
+
+<p>Expand governance pool from 4 to 10+ policies and validate per local winner.</p>
+
+<h2 id='n3-live-drift'>N3. Live drift</h2>
+
+<h3 id='your-position'>Your position</h3>
+
+<p>Two-week retrain reduces need for heavy drift.</p>
+
+<h3 id='revised-blueprint-position'>Revised blueprint position</h3>
+
+<p>Accepted with modification.</p>
+
+<h3 id='implementation'>Implementation</h3>
+
+<p>Add lightweight cycle sentinel only. No heavy drift platform.</p>
+
+<h2 id='n4-carry-news-currency-strength'>N4. Carry/news/currency strength</h2>
+
+<h3 id='your-position'>Your position</h3>
+
+<p>Need specificity; avoid broad restrictions.</p>
+
+<h3 id='revised-blueprint-position'>Revised blueprint position</h3>
+
+<p>Accepted.</p>
+
+<h3 id='implementation'>Implementation</h3>
+
+<p>Carry becomes cost modeling and optional strategy. News becomes optional event context / execution observation. Currency strength becomes a strategy candidate, not a portfolio veto.</p>
+
+<h2 id='n5-strategy-pool'>N5. Strategy pool</h2>
+
+<h3 id='your-position'>Your position</h3>
+
+<p>47 is broad but not complete; target 50-52.</p>
+
+<h3 id='revised-blueprint-position'>Revised blueprint position</h3>
+
+<p>Accepted.</p>
+
+<h3 id='implementation'>Implementation</h3>
+
+<p>Add 3 first, then 2 later, all distinct.</p>
+
+<h2 id='n6-regime-accuracy'>N6. Regime accuracy</h2>
+
+<h3 id='your-position'>Your position</h3>
+
+<p>Central to the entire system.</p>
+
+<h3 id='revised-blueprint-position'>Revised blueprint position</h3>
+
+<p>Strongly accepted.</p>
+
+<h3 id='implementation'>Implementation</h3>
+
+<p>Add profitability-aligned regime audits, boundary diagnostics, and transition strategy archetype.</p>
+
+<h2 id='n7-walk-forward-validation'>N7. Walk-forward validation</h2>
+
+<h3 id='your-position'>Your position</h3>
+
+<p>Avoid adding a stale layer that decays live edge.</p>
+
+<h3 id='revised-blueprint-position'>Revised blueprint position</h3>
+
+<p>Strongly accepted.</p>
+
+<h3 id='implementation'>Implementation</h3>
+
+<p>Use severe-fragility audit only. Latest optimization remains live surface.</p>
+
+<p>---</p>
+
+<h1 id='part-o-priority-implementation-plan'>Part O — Priority implementation plan</h1>
+
+<h2 id='phase-1-deployment-safety-without-suppressing-edge'>Phase 1: Deployment safety without suppressing edge</h2>
+
+<ol>
+<li>Add <code>pm_live_readiness.py</code>.</li>
+<li>Set <code>live_artifact_drift_policy = &amp;quot;block&amp;quot;</code>.</li>
+<li>Add institutional supervisor in hard-breakpoints-only mode.</li>
+<li>Add hard daily/session/weekly/open-drawdown gates.</li>
+<li>Keep correlation and currency-leg controls observe-only.</li>
+</ol>
+
+<h2 id='phase-2-order-management-profitability-expansion'>Phase 2: Order-management profitability expansion</h2>
+
+<ol>
+<li>Expand governance candidate pool.</li>
+<li>Add policy fields and evaluation branches.</li>
+<li>Add partial close support.</li>
+<li>Run governance in shadow first.</li>
+<li>Promote policies to live only when artifact evidence supports them.</li>
+</ol>
+
+<h2 id='phase-3-regime-accuracy'>Phase 3: Regime accuracy</h2>
+
+<ol>
+<li>Add <code>pm_regime_audit.py</code>.</li>
+<li>Persist regime audit evidence per winner.</li>
+<li>Add boundary diagnostics.</li>
+<li>Add <code>RegimeTransitionBreakoutStrategy</code>.</li>
+</ol>
+
+<h2 id='phase-4-cost-realism'>Phase 4: Cost realism</h2>
+
+<ol>
+<li>Add swap modeling.</li>
+<li>Add cost evidence to artifacts.</li>
+<li>Re-run D1/exotic winners.</li>
+<li>Consider disabling D1/exotics until swap-adjusted evidence is acceptable.</li>
+</ol>
+
+<h2 id='phase-5-lightweight-cycle-drift'>Phase 5: Lightweight cycle drift</h2>
+
+<ol>
+<li>Add <code>pm_cycle_drift.py</code>.</li>
+<li>Record context-level outcomes.</li>
+<li>Pause only severe underperformance or execution degradation.</li>
+<li>Reset by retrain cycle or manual operator approval.</li>
+</ol>
+
+<h2 id='phase-6-strategy-pool-expansion'>Phase 6: Strategy pool expansion</h2>
+
+<ol>
+<li>Add <code>LiquiditySweepReversalStrategy</code>.</li>
+<li>Add <code>RegimeTransitionBreakoutStrategy</code>.</li>
+<li>Add <code>SessionVWAPReversionStrategy</code>.</li>
+<li>Evaluate fairness and winner contribution.</li>
+<li>Add carry/currency-strength only if they pass proof-of-value.</li>
+</ol>
+
+<p>---</p>
+
+<h1 id='part-p-tests-to-add'>Part P — Tests to add</h1>
+
+<h2 id='p1-unit-tests'>P1. Unit tests</h2>
+
+<pre><code>tests/test_profitability_readiness_blueprint.py
+tests/test_new_strategies_42_50.py
+tests/test_strategy_param_grid_consistency.py
+tests/test_live_loop_integration.py
+tests/test_mt5_connector.py
+tests/test_instrument_specs.py</code></pre>
+
+<h2 id='p2-key-test-cases'>P2. Key test cases</h2>
+
+<h3 id='live-readiness'>Live readiness</h3>
+
+<pre><code>empty active ledger blocks funded live
+warn drift policy blocks funded live
+missing regime params warns or blocks depending policy
+paper mode can bypass funded-live block</code></pre>
+
+<h3 id='institutional-supervisor'>Institutional supervisor</h3>
+
+<pre><code>normal context allows entries
+daily loss threshold blocks entries
+open risk pause threshold pauses new entries
+manual reset clears persistent block
+supervisor never blocks due only to correlation</code></pre>
+
+<h3 id='order-governance'>Order governance</h3>
+
+<pre><code>stepped breakeven only tightens stops
+chandelier never loosens stops
+structure trail respects executable side of market
+partial runner emits partial-close instruction
+regime flip reduce reacts only after actual regime change</code></pre>
+
+<h3 id='swap-modeling'>Swap modeling</h3>
+
+<pre><code>intraday trade no swap
+overnight long applies long swap
+overnight short applies short swap
+Wednesday rollover applies triple swap
+D1 multi-day trade includes cumulative swap</code></pre>
+
+<h3 id='regime-audit'>Regime audit</h3>
+
+<pre><code>low-gap trades are counted
+PnL is attributed to REGIME_LIVE
+regime distribution persisted
+boundary metrics persisted</code></pre>
+
+<p>---</p>
+
+<h1 id='part-q-final-live-deployment-checklist'>Part Q — Final live deployment checklist</h1>
+
+<p>Before funded live trading:</p>
+
+<pre><code>[ ] Active winner ledger is non-empty.
+[ ] Artifact drift policy is block.
+[ ] Live readiness gate passes.
+[ ] Institutional supervisor is enabled in hard_breakpoints_only mode.
+[ ] Hard daily/session/weekly/open-drawdown breakpoints exist.
+[ ] Walk-forward audit is severe_fragility_only, not stale validation displacement.
+[ ] Governance policies have been shadow-tested or are artifact-approved.
+[ ] Swap modeling has been applied or D1/exotics are excluded.
+[ ] Regime audit evidence exists for winners.
+[ ] Cycle drift sentinel is enabled in lightweight mode.
+[ ] No constant correlation veto is active by default.
+[ ] Event/news logic is observe-only unless evidence supports blocking.
+[ ] Paper deployment has run on the same broker/account setup.
+[ ] MT5 broker metadata is synced and verified.</code></pre>
+
+<p>---</p>
+
+<h1 id='part-r-context-questions-for-a-future-refinement-pass'>Part R — Context questions for a future refinement pass</h1>
+
+<p>These questions are not blockers for the current blueprint, but they would help tune thresholds and code details.</p>
+
+<ol>
+<li>What is the intended starting live account size?</li>
+<li>Is the broker account netting or hedging?</li>
+<li>Which symbols are actually intended for live deployment, versus only research?</li>
+<li>Are D1 and exotics intended to trade live immediately?</li>
+<li>Do your local winner artifacts already contain governance policy evidence for each local winner?</li>
+<li>Do you have recent paper-mode logs with skipped trades, spread rejections, and order-check failures?</li>
+<li>Do you want partial close support in live MT5 immediately, or should partial policies remain shadow-only first?</li>
+<li>Should <code>PROMOTE_SMALL</code> apply a fixed 0.5 risk multiplier, or should it only tag the dashboard initially?</li>
+<li>Is the two-week retrain schedule manually supervised, or should expiry force all new entries off until retraining completes?</li>
+<li>Do you want regime ambiguity to remain observe-only initially, or derate risk when <code>REGIME_GAP</code> is below threshold?</li>
+</ol>
+
+<p>---</p>
+
+<h1 id='appendix-s-current-repository-grounding'>Appendix S — Current-repository grounding</h1>
+
+<p>This blueprint was grounded in the following current-repository facts observed during the pre-implementation review. The implementation status is recorded in Appendix T.</p>
+
+<ol>
+<li><code>config.json</code> previously set <code>live_artifact_drift_policy</code> to <code>&amp;quot;warn&amp;quot;</code> while the code default in <code>PipelineConfig</code> was <code>&amp;quot;block&amp;quot;</code>. For funded live trading, the active config needed to be changed to <code>&amp;quot;block&amp;quot;</code>.</li>
+<li><code>config.json</code> sets <code>winner_ledger_path</code> to <code>pm_configs_high_risk.json</code>.</li>
+<li>Winner ledger presence/content must be checked by the live readiness gate before funded trading.</li>
+<li><code>regime_params.json</code> was not present in the repository snapshot reviewed.</li>
+<li><code>pm_core.py</code> previously documented that swap was configured but not applied in backtest, and that D1 multi-week holds may see material impact.</li>
+<li><code>pm_order_governance.py</code> previously exposed a small governance policy surface: <code>control_fixed</code>, <code>breakeven_1r</code>, <code>atr_trail_capped</code>, and <code>pure_atr</code>.</li>
+<li><code>pm_main.py</code> contained a live pipeline crash path where <code>active_mode</code> was referenced without being defined.</li>
+<li><code>pm_enhancement_seams.py</code> already has risk-scalar, exit-pack, portfolio-observatory, and execution-quality seam concepts, so the recommended additions fit the existing design direction.</li>
+<li><code>pm_regime.py</code> uses causal regime detection and provides shifted <code>REGIME_LIVE</code> for decision-time parity.</li>
+<li><code>pm_regime_tuner.py</code> tunes regime parameters using stability/gap/trend-ratio style metrics; this should be supplemented with profitability-aligned regime audit evidence.</li>
+</ol>
+
+<p>---</p>
+
+<h1 id='appendix-t-implementation-and-qa-status'>Appendix T — Implementation and QA status</h1>
+
+<p>Implementation date: 2026-04-30.</p>
+
+<p>The blueprint has been implemented with the following codebase changes:</p>
+
+<ol>
+<li><code>config.json</code> now sets <code>live_artifact_drift_policy</code> to <code>&amp;quot;block&amp;quot;</code>, enables the institutional supervisor in <code>circuit_breaker</code> mode, enables <code>walk_forward_audit_enabled</code>, enables swap modeling, expands <code>local_governance_candidate_policies</code>, and keeps live governance in <code>&amp;quot;shadow&amp;quot;</code> mode until the expanded policies have live broker evidence.</li>
+<li><code>PipelineConfig</code> now exposes and normalizes the institutional supervisor, hard breakpoint, cycle drift, walk-forward promotion, swap model, regime audit, and event observe-only configuration fields.</li>
+<li><code>pm_live_readiness.py</code> adds a fail-closed live readiness gate for funded startup: artifact drift must be blocking, the winner ledger must be readable/non-empty, and the ledger must contain at least one live-tradeable winner. <code>PAPER_ONLY</code>, <code>NO_TRADE</code>, and <code>BLOCKED</code> winners are not counted as live-tradeable. <code>pm_main.py</code> calls the gate before real live trading and returns exit code <code>2</code> if readiness fails.</li>
+<li><code>pm_institutional_supervisor.py</code> adds hard-breakpoint-only portfolio supervision with persisted latch state and next-cycle/manual reopening. It does not implement a constant correlation veto or top-down allocator.</li>
+<li><code>pm_cycle_drift.py</code> adds a persisted lightweight cycle drift sentinel. <code>pm_main.py</code> records closed strategy outcomes into it by position closure, so partial exits do not inflate cycle trade counts, and the sentinel persists live spread degradation/final quote-adjustment slippage evidence for operator review or reset.</li>
+<li><code>pm_order_governance.py</code> now includes <code>stepped_breakeven</code>, <code>chandelier_atr</code>, <code>structure_trail</code>, <code>partial_tp_runner</code>, <code>time_decay_exit</code>, <code>volatility_contraction_exit</code>, and <code>regime_flip_reduce</code>, with live-cycle propagation in <code>pm_main.py</code>.</li>
+<li><code>pm_mt5.py</code> now supports partial position closes for governance policies that require runner management, and live governance persists successful partial-close state immediately before any follow-up SL/TP modification.</li>
+<li><code>pm_core.Backtester</code> now applies signed overnight swap/carry costs to trade P&amp;L and the equity curve, including configured triple rollover, avoids charging same-day holds that never cross a rollover boundary, preserves broker swap mode metadata, and models governance partial/forced-exit decisions in the Python governance backtest path.</li>
+<li><code>pm_strategies.py</code> now registers <code>SessionVWAPReversionStrategy</code>, <code>LiquiditySweepReversalStrategy</code>, and <code>RegimeTransitionBreakoutStrategy</code>; the transition strategy requires source-regime to target-regime movement with <code>REGIME_GAP</code> support.</li>
+<li><code>pm_pipeline.py</code> now persists promotion status/reasons, records fresh-edge/no-best-train-fallback evidence, records search-budget fairness telemetry and category-level fairness reporting, attaches regime profitability/boundary audit evidence into <code>validation_evidence[&quot;regime_audit&quot;]</code>, and fixes the undefined <code>active_mode</code> pipeline crash by using the explicit <code>stage3_selection</code> surface.</li>
+<li><code>pm_event_context.py</code> provides an observe-only CSV event calendar with symbol/currency matching, severity filtering, and <code>minutes_to_event</code> annotations. <code>pm_main.py</code> now propagates nearby event context into actionable live decisions. It is intentionally non-blocking until there is broker/calendar evidence to justify execution impact.</li>
+<li><code>pm_main.py</code> now refreshes full portfolio positions immediately before institutional-supervisor checks in real trading, preventing same-sweep portfolio-risk undercounting after an earlier symbol opens a trade.</li>
+</ol>
+
+<p>QA verification completed:</p>
+
+<pre><code>python -m pytest -q -p no:cacheprovider
+588 passed, 1 skipped, 356 subtests passed</code></pre>
+
+<p>Quality status:</p>
+
+<pre><code>[x] Active code no longer references undefined active_mode.
+[x] Live artifact drift is configured to block.
+[x] Readiness gate is fail-closed for funded live artifact drift and live-tradeable winner ledger requirements.
+[x] Institutional supervision is hard-breakpoint-only.
+[x] Institutional hard blocks persist and respect manual/next-cycle reopening.
+[x] Daily/session/weekly realized-loss hard breakpoints are estimated from broker closing deals with weekly lookback coverage.
+[x] Expanded local governance is propagated to backtest and live management surfaces.
+[x] Expanded governance is shadow-mode by default for live execution safety.
+[x] Successful live partial closes are persisted before any follow-up modify can fail.
+[x] Swap/carry costs are applied in backtest metrics without same-day non-rollover charges.
+[x] Promotion status, fairness evidence, and regime audit evidence are persisted.
+[x] Event calendar support is observe-only and wired into live actionable context.
+[x] New strategies are registered, parameter-grid checked, and signal-contract tested.
+[x] Full deterministic regression suite passed.</code></pre>
+
+<p>Known intentional limits after implementation:</p>
+
+<ol>
+<li>Event/news handling remains observe-only as the blueprint recommended.</li>
+<li>Realized loss breakpoints use the broker recent-closing-deal feed available to the live loop; a persistent broker-ledger warehouse would improve long-horizon auditability but is not required for the configured daily/session/weekly circuit breaker.</li>
+<li><code>PROMOTE_SMALL</code> applies a fixed <code>0.5</code> live risk multiplier, matching the blueprint question’s suggested default until operator policy is refined.</li>
+</ol>
+
+<p>---</p>
+
+<h1 id='final-summary'>Final summary</h1>
+
+<p>The revised blueprint accepts the central FXPM philosophy: autonomous specialists should be allowed to exploit their local edge. The system should not be burdened with a heavy top-down portfolio optimizer or stale validation layer.</p>
+
+<p>The correct profitability-focused next step is to strengthen the <strong>promotion and supervision shell</strong>, not to suppress the specialist model.</p>
+
+<p>The most important changes are:</p>
+
+<pre><code>1. Fail-closed live readiness.
+2. Hard institutional breakpoints only, not constant correlation vetoes.
+3. Expanded local order-management tournament.
+4. Profitability-aligned regime audit.
+5. Severe-fragility walk-forward audit that does not displace the latest edge.
+6. Swap/carry cost realism.
+7. Lightweight two-week-cycle drift sentinel.
+8. Three high-quality new strategy archetypes before expanding further.</code></pre>
+
+<p>This keeps FXPM aligned with its intended purpose: a profitability-first system where each local best manager can act, while the whole system remains sustainable enough to fund with real money.</p>
+  </main>
+</div>
+</body>
+</html>

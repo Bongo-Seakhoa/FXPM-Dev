@@ -518,13 +518,16 @@ class PipelineConfig:
     #   spread-only accounts where commission is embedded in the spread.
     # - Slippage: applied only to SL exits (market orders). TP exits are
     #   limit fills and do not incur slippage (correct by design).
-    # - Swap: defined in config.json (swap_long/swap_short) but NOT applied
-    #   in backtest. This is a known simplification; impact is <5% for H4 and
-    #   below. D1 strategies with multi-week holds may see up to 20% impact.
+    # - Swap: modeled from InstrumentSpec.swap_long/swap_short when
+    #   swap_model_enabled=True. Triple rollover is applied on the configured
+    #   broker rollover weekday.
     use_spread: bool = True
     use_commission: bool = True
     use_slippage: bool = True
     slippage_pips: float = 0.5
+    swap_model_enabled: bool = True
+    swap_model_triple_rollover_day: str = "wednesday"
+    swap_model_min_holding_hours: float = 20.0
     
     # Optimization settings
     max_param_combos: int = 150
@@ -597,12 +600,45 @@ class PipelineConfig:
     # paper = log-only, on = authoritative.
     market_driven_exit_pack_mode: str = "off"
     portfolio_observatory_enabled: bool = False
+    institutional_supervisor_enabled: bool = True
+    institutional_supervisor_mode: str = "circuit_breaker"  # off|observe|circuit_breaker
+    portfolio_control_policy: str = "hard_breakpoints_only"
+    max_total_open_risk_pct: float = 8.0
+    max_new_entries_when_total_open_risk_above_pct: float = 6.0
+    open_risk_action: str = "pause_new_entries"  # observe|pause_new_entries|derate
+    daily_loss_hard_block_pct: float = 0.0
+    session_loss_hard_block_pct: float = 0.0
+    weekly_loss_hard_block_pct: float = 0.0
+    open_drawdown_hard_block_pct: float = 0.0
+    hard_block_reopen_mode: str = "manual_or_next_cycle"
+    cycle_drift_monitor_enabled: bool = True
+    cycle_drift_mode: str = "lightweight"  # off|observe|lightweight
+    cycle_drift_min_trades: int = 6
+    cycle_drift_consecutive_losses: int = 5
+    cycle_drift_execution_slippage_mult: float = 2.5
+    cycle_drift_spread_degradation_mult: float = 2.0
+    cycle_drift_action: str = "pause_context"  # observe|pause_context|derate_context
     walk_forward_audit_enabled: bool = False
     walk_forward_audit_windows: int = 3
+    walk_forward_audit_mode: str = "severe_fragility_only"
+    walk_forward_promotion_policy: str = "block_severe_only"
+    walk_forward_do_not_displace_latest_surface: bool = True
     local_governance_tournament_enabled: bool = False
     local_governance_live_mode: str = "off"
     local_governance_candidate_policies: List[str] = field(
-        default_factory=lambda: ["control_fixed", "breakeven_1r", "atr_trail_capped", "pure_atr"]
+        default_factory=lambda: [
+            "control_fixed",
+            "breakeven_1r",
+            "stepped_breakeven",
+            "atr_trail_capped",
+            "chandelier_atr",
+            "structure_trail",
+            "partial_tp_runner",
+            "time_decay_exit",
+            "volatility_contraction_exit",
+            "regime_flip_reduce",
+            "pure_atr",
+        ]
     )
     local_governance_require_baseline_improvement: bool = True
     local_governance_min_score_improvement: float = 0.0
@@ -619,6 +655,15 @@ class PipelineConfig:
     execution_spread_min_edge_mult: float = 1.5
     execution_spread_spike_mult: float = 2.0
     execution_spread_penalty_start_mult: float = 0.5
+    regime_profitability_audit_enabled: bool = True
+    regime_boundary_audit_enabled: bool = True
+    regime_ambiguity_policy: str = "observe_only"
+    regime_min_live_gap_warn: float = 0.05
+    event_calendar_enabled: bool = False
+    event_calendar_mode: str = "observe"
+    event_calendar_action: str = "annotate"
+    event_calendar_path: str = ""
+    event_calendar_high_impact_action: str = "observe"
 
     # Storage governance
     storage_enabled: bool = True
@@ -907,8 +952,142 @@ class PipelineConfig:
             )
             _norm_exit_mode = "off"
         self.market_driven_exit_pack_mode = _norm_exit_mode
+        self.institutional_supervisor_enabled = bool(self.institutional_supervisor_enabled)
+        _raw_supervisor_mode = getattr(self, "institutional_supervisor_mode", "circuit_breaker")
+        _norm_supervisor_mode = (
+            _raw_supervisor_mode.strip().lower()
+            if isinstance(_raw_supervisor_mode, str) else "circuit_breaker"
+        )
+        _norm_supervisor_mode = {
+            "disabled": "off",
+            "false": "off",
+            "log": "observe",
+            "shadow": "observe",
+            "enabled": "circuit_breaker",
+            "on": "circuit_breaker",
+            "block": "circuit_breaker",
+        }.get(_norm_supervisor_mode, _norm_supervisor_mode)
+        if _norm_supervisor_mode not in {"off", "observe", "circuit_breaker"}:
+            logger.warning(
+                "Invalid institutional_supervisor_mode=%r; falling back to 'circuit_breaker'. "
+                "Allowed values: off | observe | circuit_breaker.",
+                _raw_supervisor_mode,
+            )
+            _norm_supervisor_mode = "circuit_breaker"
+        self.institutional_supervisor_mode = _norm_supervisor_mode
+        _raw_portfolio_policy = getattr(self, "portfolio_control_policy", "hard_breakpoints_only")
+        _portfolio_policy = (
+            _raw_portfolio_policy.strip().lower()
+            if isinstance(_raw_portfolio_policy, str) else "hard_breakpoints_only"
+        )
+        _portfolio_policy = {
+            "hard_breakpoints": "hard_breakpoints_only",
+            "breakpoints": "hard_breakpoints_only",
+            "circuit_breaker": "hard_breakpoints_only",
+            "disabled": "off",
+        }.get(_portfolio_policy, _portfolio_policy)
+        if _portfolio_policy not in {"off", "hard_breakpoints_only"}:
+            logger.warning(
+                "Invalid portfolio_control_policy=%r; falling back to 'hard_breakpoints_only'.",
+                _raw_portfolio_policy,
+            )
+            _portfolio_policy = "hard_breakpoints_only"
+        self.portfolio_control_policy = _portfolio_policy
+
+        def _clamp_float_attr(name: str, default: float, low: float = 0.0, high: Optional[float] = None) -> None:
+            try:
+                value = float(getattr(self, name, default))
+                if not math.isfinite(value):
+                    raise ValueError
+                value = max(low, value)
+                if high is not None:
+                    value = min(high, value)
+                setattr(self, name, value)
+            except Exception:
+                setattr(self, name, default)
+
+        def _clamp_int_attr(name: str, default: int, low: int = 0) -> None:
+            try:
+                setattr(self, name, max(low, int(getattr(self, name, default))))
+            except Exception:
+                setattr(self, name, default)
+
+        for _name, _default in {
+            "max_total_open_risk_pct": 8.0,
+            "max_new_entries_when_total_open_risk_above_pct": 6.0,
+            "daily_loss_hard_block_pct": 0.0,
+            "session_loss_hard_block_pct": 0.0,
+            "weekly_loss_hard_block_pct": 0.0,
+            "open_drawdown_hard_block_pct": 0.0,
+            "cycle_drift_execution_slippage_mult": 2.5,
+            "cycle_drift_spread_degradation_mult": 2.0,
+            "swap_model_min_holding_hours": 20.0,
+            "regime_min_live_gap_warn": 0.05,
+        }.items():
+            _clamp_float_attr(_name, _default)
+        _clamp_int_attr("cycle_drift_min_trades", 6, low=1)
+        _clamp_int_attr("cycle_drift_consecutive_losses", 5, low=1)
+
+        _open_risk_action = str(getattr(self, "open_risk_action", "pause_new_entries") or "").strip().lower()
+        if _open_risk_action not in {"observe", "pause_new_entries", "derate"}:
+            _open_risk_action = "pause_new_entries"
+        self.open_risk_action = _open_risk_action
+        _reopen_mode = str(getattr(self, "hard_block_reopen_mode", "manual_or_next_cycle") or "").strip().lower()
+        if _reopen_mode not in {"manual_or_next_cycle", "manual", "next_cycle"}:
+            _reopen_mode = "manual_or_next_cycle"
+        self.hard_block_reopen_mode = _reopen_mode
+        self.cycle_drift_monitor_enabled = bool(self.cycle_drift_monitor_enabled)
+        _drift_mode = str(getattr(self, "cycle_drift_mode", "lightweight") or "").strip().lower()
+        _drift_mode = {"log": "observe", "shadow": "observe", "on": "lightweight"}.get(_drift_mode, _drift_mode)
+        if _drift_mode not in {"off", "observe", "lightweight"}:
+            _drift_mode = "lightweight"
+        self.cycle_drift_mode = _drift_mode
+        _drift_action = str(getattr(self, "cycle_drift_action", "pause_context") or "").strip().lower()
+        if _drift_action not in {"observe", "pause_context", "derate_context"}:
+            _drift_action = "pause_context"
+        self.cycle_drift_action = _drift_action
         self.portfolio_observatory_enabled = bool(self.portfolio_observatory_enabled)
         self.walk_forward_audit_enabled = bool(self.walk_forward_audit_enabled)
+        self.walk_forward_do_not_displace_latest_surface = bool(self.walk_forward_do_not_displace_latest_surface)
+        self.walk_forward_audit_mode = str(
+            getattr(self, "walk_forward_audit_mode", "severe_fragility_only") or "severe_fragility_only"
+        ).strip().lower()
+        if self.walk_forward_audit_mode not in {"off", "observe", "severe_fragility_only"}:
+            self.walk_forward_audit_mode = "severe_fragility_only"
+        self.walk_forward_promotion_policy = str(
+            getattr(self, "walk_forward_promotion_policy", "block_severe_only") or "block_severe_only"
+        ).strip().lower()
+        if self.walk_forward_promotion_policy not in {"observe_only", "block_severe_only"}:
+            self.walk_forward_promotion_policy = "block_severe_only"
+        self.swap_model_enabled = bool(self.swap_model_enabled)
+        _rollover_day = str(getattr(self, "swap_model_triple_rollover_day", "wednesday") or "").strip().lower()
+        if _rollover_day not in _WEEKDAY_NAME_TO_INDEX:
+            logger.warning(
+                "Invalid swap_model_triple_rollover_day=%r; falling back to 'wednesday'.",
+                getattr(self, "swap_model_triple_rollover_day", None),
+            )
+            _rollover_day = "wednesday"
+        self.swap_model_triple_rollover_day = _rollover_day
+        self.regime_profitability_audit_enabled = bool(self.regime_profitability_audit_enabled)
+        self.regime_boundary_audit_enabled = bool(self.regime_boundary_audit_enabled)
+        self.regime_ambiguity_policy = str(
+            getattr(self, "regime_ambiguity_policy", "observe_only") or "observe_only"
+        ).strip().lower()
+        if self.regime_ambiguity_policy not in {"observe_only", "block"}:
+            self.regime_ambiguity_policy = "observe_only"
+        self.event_calendar_enabled = bool(self.event_calendar_enabled)
+        self.event_calendar_mode = str(getattr(self, "event_calendar_mode", "observe") or "observe").strip().lower()
+        if self.event_calendar_mode == "observe_only":
+            self.event_calendar_mode = "observe"
+        if self.event_calendar_mode not in {"off", "observe"}:
+            self.event_calendar_mode = "observe"
+        self.event_calendar_action = str(getattr(self, "event_calendar_action", "annotate") or "annotate").strip().lower()
+        self.event_calendar_path = str(getattr(self, "event_calendar_path", "") or "").strip()
+        self.event_calendar_high_impact_action = str(
+            getattr(self, "event_calendar_high_impact_action", "observe") or "observe"
+        ).strip().lower()
+        if self.event_calendar_high_impact_action not in {"observe", "annotate"}:
+            self.event_calendar_high_impact_action = "observe"
         self.local_governance_tournament_enabled = bool(self.local_governance_tournament_enabled)
         self.risk_management_optimization_enabled = bool(self.risk_management_optimization_enabled)
         self.risk_management_selection_stage = str(
@@ -1384,6 +1563,8 @@ class InstrumentSpec:
     commission_per_lot: float = 7.0  # Commission in USD per round trip per lot
     swap_long: float = 0.0  # Daily swap for long positions
     swap_short: float = 0.0  # Daily swap for short positions
+    swap_mode: int = -1  # -1=config/account-currency-per-lot; MT5 mode otherwise
+    swap_rollover3days: int = 3  # MT5 weekday index used for triple rollover when available
     
     # Broker-real fields (populated from MT5 snapshot or broker_specs.json)
     tick_size: float = 0.0  # trade_tick_size from MT5
@@ -1571,6 +1752,10 @@ def sync_instrument_spec_from_mt5(spec: InstrumentSpec, mt5_symbol_info) -> Inst
     # Update swap rates
     spec.swap_long = mt5_symbol_info.swap_long
     spec.swap_short = mt5_symbol_info.swap_short
+    raw_swap_mode = getattr(mt5_symbol_info, "swap_mode", -1)
+    spec.swap_mode = int(raw_swap_mode if raw_swap_mode is not None else -1)
+    raw_triple_rollover = getattr(mt5_symbol_info, "swap_rollover3days", 3)
+    spec.swap_rollover3days = int(raw_triple_rollover if raw_triple_rollover is not None else 3)
 
     return spec
 
@@ -1881,7 +2066,7 @@ def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
         "swap_long", "swap_short", "tick_size", "tick_value", "contract_size",
         "volume_step", "point"
     }
-    int_fields = {"pip_position", "stops_level", "digits"}
+    int_fields = {"pip_position", "stops_level", "digits", "swap_mode", "swap_rollover3days"}
     for k in float_fields:
         if k in filtered and filtered[k] is not None:
             try:
@@ -2053,6 +2238,11 @@ def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> I
             commission_per_lot=commission_per_lot,
             swap_long=float(broker_data.get('swap_long', 0.0) or 0.0),
             swap_short=float(broker_data.get('swap_short', 0.0) or 0.0),
+            swap_mode=int(broker_data.get('swap_mode', -1) if broker_data.get('swap_mode') is not None else -1),
+            swap_rollover3days=int(
+                broker_data.get('swap_rollover3days', 3)
+                if broker_data.get('swap_rollover3days') is not None else 3
+            ),
             # Broker-real fields (used for MT5-parity sizing/P&L)
             digits=digits,
             point=point,
@@ -3911,7 +4101,184 @@ class Backtester:
                 discovery_risk_per_trade_pct=discovery_risk_per_trade_pct,
             )
         
+        trades, final_equity, max_drawdown, equity_curve = self._apply_swap_model(
+            trades,
+            final_equity,
+            equity_curve,
+            max_drawdown,
+            features,
+            spec,
+            timeframe=timeframe,
+        )
+
         return self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
+
+    @staticmethod
+    def _max_drawdown_from_equity_curve(equity_curve: List[float]) -> float:
+        peak = None
+        max_dd = 0.0
+        for raw_value in equity_curve or []:
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            if peak is None or value > peak:
+                peak = value
+            if peak and peak > 0.0:
+                max_dd = max(max_dd, (peak - value) / peak * 100.0)
+        return max_dd
+
+    @staticmethod
+    def _trade_is_long(trade: Dict[str, Any]) -> bool:
+        direction = trade.get("direction", "")
+        if isinstance(direction, str):
+            return direction.strip().upper() in {"LONG", "BUY", "1"}
+        try:
+            return int(direction) == 1
+        except (TypeError, ValueError):
+            return True
+
+    def _swap_rollover_units(self,
+                             trade: Dict[str, Any],
+                             features: Optional[pd.DataFrame],
+                             timeframe: str = "") -> int:
+        """Count broker rollover units for one closed trade."""
+        try:
+            entry_time = pd.Timestamp(trade.get("entry_time"))
+            exit_time = pd.Timestamp(trade.get("exit_time"))
+            if pd.notna(entry_time) and pd.notna(exit_time) and exit_time > entry_time:
+                holding_hours = (exit_time - entry_time).total_seconds() / 3600.0
+                min_hours = float(getattr(self.config, "swap_model_min_holding_hours", 20.0) or 0.0)
+                if holding_hours < min_hours:
+                    return 0
+                rollover_day = _WEEKDAY_NAME_TO_INDEX.get(
+                    str(getattr(self.config, "swap_model_triple_rollover_day", "wednesday")).lower(),
+                    2,
+                )
+                units = 0
+                cursor = (entry_time.normalize() + pd.Timedelta(days=1))
+                end_day = exit_time.normalize()
+                while cursor <= end_day:
+                    units += 3 if int(cursor.weekday()) == rollover_day else 1
+                    cursor += pd.Timedelta(days=1)
+                return max(0, units)
+        except Exception:
+            pass
+
+        try:
+            entry_bar = int(trade.get("entry_bar", 0) or 0)
+            exit_bar = int(trade.get("exit_bar", entry_bar) or entry_bar)
+            bars_held = max(0, exit_bar - entry_bar)
+        except Exception:
+            bars_held = 0
+        if bars_held <= 0:
+            return 0
+
+        bars_per_day = {
+            "M1": 1440,
+            "M5": 288,
+            "M15": 96,
+            "M30": 48,
+            "H1": 24,
+            "H4": 6,
+            "D1": 1,
+        }.get(str(timeframe or "").upper(), 24)
+        min_hours = float(getattr(self.config, "swap_model_min_holding_hours", 20.0) or 0.0)
+        holding_hours = bars_held * (24.0 / max(1, bars_per_day))
+        if holding_hours < min_hours:
+            return 0
+        return max(0, int(math.floor(bars_held / max(1, bars_per_day))))
+
+    @staticmethod
+    def _swap_value_per_lot_dollars(spec: InstrumentSpec, raw_swap: float) -> float:
+        """Convert configured/MT5 swap value to account-currency dollars per lot."""
+        try:
+            swap_value = float(raw_swap or 0.0)
+        except Exception:
+            return 0.0
+        try:
+            mode = int(getattr(spec, "swap_mode", -1))
+        except Exception:
+            mode = -1
+        if mode == 0:
+            return 0.0
+        if mode in {-1, 4}:
+            return swap_value
+        if mode == 1:
+            tick_size = float(getattr(spec, "tick_size", 0.0) or 0.0)
+            tick_value = float(getattr(spec, "tick_value", 0.0) or 0.0)
+            point = float(getattr(spec, "point", 0.0) or 0.0)
+            if tick_size > 0.0 and tick_value > 0.0 and point > 0.0:
+                return swap_value * (point / tick_size) * tick_value
+            return 0.0
+        return 0.0
+
+    def _apply_swap_model(self,
+                          trades: List[Dict[str, Any]],
+                          final_equity: float,
+                          equity_curve: List[float],
+                          max_drawdown: float,
+                          features: Optional[pd.DataFrame],
+                          spec: InstrumentSpec,
+                          *,
+                          timeframe: str = "") -> Tuple[List[Dict[str, Any]], float, float, List[float]]:
+        """Apply signed overnight swap to closed trades and the equity curve."""
+        if not bool(getattr(self.config, "swap_model_enabled", True)):
+            return trades, final_equity, max_drawdown, equity_curve
+        if not trades:
+            return trades, final_equity, max_drawdown, equity_curve
+
+        adjustments_by_exit_bar: Dict[int, float] = {}
+        total_swap = 0.0
+        for trade in trades:
+            units = self._swap_rollover_units(trade, features, timeframe=timeframe)
+            if units <= 0:
+                trade["swap_rollover_units"] = 0
+                trade["swap_dollars"] = 0.0
+                continue
+            volume = float(trade.get("position_size", trade.get("size", 0.0)) or 0.0)
+            raw_daily_swap = float(spec.swap_long if self._trade_is_long(trade) else spec.swap_short)
+            daily_swap = self._swap_value_per_lot_dollars(spec, raw_daily_swap)
+            swap_dollars = daily_swap * volume * units
+            if not math.isfinite(swap_dollars):
+                swap_dollars = 0.0
+            gross_pnl = float(trade.get("pnl_dollars", 0.0) or 0.0)
+            trade.setdefault("gross_pnl_dollars", round(gross_pnl, 2))
+            trade["swap_rollover_units"] = int(units)
+            trade["swap_dollars"] = round(float(swap_dollars), 2)
+            trade["pnl_dollars"] = round(gross_pnl + swap_dollars, 2)
+            risk_amount = float(trade.get("risk_amount", 0.0) or 0.0)
+            if risk_amount > 0.0:
+                trade["r_multiple"] = round(float(trade["pnl_dollars"]) / risk_amount, 3)
+            total_swap += swap_dollars
+            try:
+                exit_bar = int(trade.get("exit_bar", 0) or 0)
+                adjustments_by_exit_bar[exit_bar] = adjustments_by_exit_bar.get(exit_bar, 0.0) + swap_dollars
+            except Exception:
+                pass
+
+        if not adjustments_by_exit_bar and abs(total_swap) <= 1e-12:
+            return trades, final_equity, max_drawdown, equity_curve
+
+        adjusted_curve = list(equity_curve or [])
+        if adjusted_curve:
+            cumulative = 0.0
+            for idx in range(len(adjusted_curve)):
+                cumulative += adjustments_by_exit_bar.get(idx, 0.0)
+                if cumulative:
+                    adjusted_curve[idx] = float(adjusted_curve[idx]) + cumulative
+            last_adjusted_idx = len(adjusted_curve) - 1
+            trailing = sum(
+                amount for exit_bar, amount in adjustments_by_exit_bar.items()
+                if int(exit_bar) > last_adjusted_idx
+            )
+            if trailing:
+                adjusted_curve[-1] = float(adjusted_curve[-1]) + trailing
+        adjusted_final_equity = float(final_equity) + float(total_swap)
+        adjusted_max_dd = self._max_drawdown_from_equity_curve(adjusted_curve) if adjusted_curve else max_drawdown
+        return trades, adjusted_final_equity, adjusted_max_dd, adjusted_curve
     
     def _run_python_loop(self, features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                          sl_prices, tp_prices, entry_prices,
@@ -3947,6 +4314,8 @@ class Backtester:
         highest_since_entry = 0.0
         lowest_since_entry = 0.0
         governance_tp_released = False
+        governance_partial_taken = False
+        entry_regime_label = ""
         active_governance_name = (
             governance_policy.get("name", "control_fixed")
             if isinstance(governance_policy, dict) else "control_fixed"
@@ -3981,6 +4350,8 @@ class Backtester:
             
             # CHECK EXITS FOR OPEN POSITIONS
             if in_position:
+                governance_exit_price = None
+                governance_exit_reason = None
                 if governance_policy:
                     prev_bar = i - 1
                     if prev_bar >= entry_bar:
@@ -3991,10 +4362,40 @@ class Backtester:
                             prev_close + half_spread if position_direction == -1 and self.config.use_spread else prev_close
                         )
                         prev_atr = float(atr_arr[prev_bar]) if atr_arr is not None and prev_bar < len(atr_arr) else float("nan")
+                        regime_col = (
+                            "REGIME_LIVE" if "REGIME_LIVE" in features.columns
+                            else "REGIME" if "REGIME" in features.columns
+                            else None
+                        )
+                        current_regime_label = ""
+                        if regime_col is not None:
+                            try:
+                                current_regime_label = str(features[regime_col].iat[prev_bar])
+                            except Exception:
+                                current_regime_label = ""
+                        current_regime_gap = 0.0
+                        if "REGIME_GAP" in features.columns:
+                            try:
+                                current_regime_gap = float(features["REGIME_GAP"].iat[prev_bar])
+                                if not math.isfinite(current_regime_gap):
+                                    current_regime_gap = 0.0
+                            except Exception:
+                                current_regime_gap = 0.0
+                        realized_vol_ratio = None
+                        if atr_arr is not None and prev_bar < len(atr_arr):
+                            try:
+                                atr_window = atr_arr[max(entry_bar, prev_bar - 49):prev_bar + 1]
+                                atr_window = atr_window[np.isfinite(atr_window)]
+                                if len(atr_window) > 0:
+                                    atr_mean = float(np.mean(atr_window))
+                                    if atr_mean > 0 and not np.isnan(prev_atr):
+                                        realized_vol_ratio = float(prev_atr) / atr_mean
+                            except Exception:
+                                realized_vol_ratio = None
                         context = GovernanceContext(
                             symbol="",
                             timeframe="",
-                            regime="",
+                            regime=current_regime_label,
                             direction=position_direction,
                             entry_price=entry_price,
                             current_stop_loss=stop_loss,
@@ -4009,17 +4410,68 @@ class Backtester:
                             price_step=float(getattr(spec, "point", 0.0) or getattr(spec, "pip_size", 0.0) or 0.0),
                             min_stop_distance=float(getattr(spec, "stops_level", 0) or 0) * float(getattr(spec, "point", 0.0) or 0.0),
                             tp_released=governance_tp_released,
+                            bars_held=max(0, prev_bar - entry_bar + 1),
+                            entry_regime=entry_regime_label,
+                            current_regime=current_regime_label,
+                            current_regime_gap=current_regime_gap,
+                            recent_high=float(np.nanmax(high_arr[max(entry_bar, prev_bar - 19):prev_bar + 1])),
+                            recent_low=float(np.nanmin(low_arr[max(entry_bar, prev_bar - 19):prev_bar + 1])),
+                            realized_vol_ratio=realized_vol_ratio,
+                            partial_taken=governance_partial_taken,
                         )
                         decision = evaluate_policy(governance_policy, context)
+                        if decision.partial_close_pct > 0 and not governance_partial_taken and position_size > 0:
+                            partial_fraction = max(0.0, min(1.0, float(decision.partial_close_pct) / 100.0))
+                            partial_size = position_size * partial_fraction
+                            if partial_size > 0 and partial_fraction < 1.0:
+                                partial_pnl = spec.calculate_tick_profit(
+                                    entry_price, prev_price, partial_size, position_direction
+                                )
+                                if self.config.use_commission:
+                                    partial_pnl -= spec.commission_per_lot * partial_size
+                                partial_risk = risk_amount_at_entry * partial_fraction
+                                equity += partial_pnl
+                                trades.append({
+                                    'signal_bar': signal_bar,
+                                    'entry_bar': entry_bar,
+                                    'exit_bar': prev_bar,
+                                    'signal_time': features.index[signal_bar],
+                                    'entry_time': features.index[entry_bar],
+                                    'exit_time': features.index[prev_bar],
+                                    'direction': 'LONG' if position_direction == 1 else 'SHORT',
+                                    'entry_price': entry_price,
+                                    'exit_price': prev_price,
+                                    'stop_loss': stop_loss,
+                                    'take_profit': take_profit,
+                                    'position_size': partial_size,
+                                    'pnl_pips': round(
+                                        spec.price_to_pips(prev_price - entry_price)
+                                        if position_direction == 1
+                                        else spec.price_to_pips(entry_price - prev_price),
+                                        2,
+                                    ),
+                                    'pnl_dollars': round(partial_pnl, 2),
+                                    'exit_reason': 'governance_partial',
+                                    'risk_amount': round(partial_risk, 2),
+                                    'r_multiple': round(partial_pnl / partial_risk, 3) if partial_risk > 0 else 0.0,
+                                    'governance_policy': active_governance_name,
+                                    'tp_released': governance_tp_released,
+                                })
+                                position_size = max(0.0, position_size - partial_size)
+                                risk_amount_at_entry = max(0.0, risk_amount_at_entry - partial_risk)
+                                governance_partial_taken = True
                         if decision.stop_loss is not None:
                             stop_loss = float(decision.stop_loss)
                         if decision.take_profit is not None:
                             take_profit = float(decision.take_profit)
                         governance_tp_released = governance_tp_released or bool(decision.tp_released)
-                exit_price = None
-                exit_reason = None
+                        if decision.exit_now:
+                            governance_exit_price = prev_price
+                            governance_exit_reason = 'governance_exit'
+                exit_price = governance_exit_price
+                exit_reason = governance_exit_reason
                 
-                if position_direction == 1:  # Long position
+                if exit_price is None and position_direction == 1:  # Long position
                     if bid_open <= stop_loss:
                         exit_price = bid_open
                         exit_reason = TradeStatus.CLOSED_SL.value
@@ -4030,7 +4482,7 @@ class Backtester:
                         exit_price = take_profit
                         exit_reason = TradeStatus.CLOSED_TP.value
                         
-                else:  # Short position
+                elif exit_price is None:  # Short position
                     if ask_open >= stop_loss:
                         exit_price = ask_open
                         exit_reason = TradeStatus.CLOSED_SL.value
@@ -4127,11 +4579,23 @@ class Backtester:
                             highest_since_entry = float(high_price)
                             lowest_since_entry = float(low_price)
                             governance_tp_released = False
+                            governance_partial_taken = False
+                            entry_regime_label = ""
                             
                             in_position = True
                             position_direction = direction
                             entry_bar = i
                             signal_bar = i - 1
+                            regime_col = (
+                                "REGIME_LIVE" if "REGIME_LIVE" in features.columns
+                                else "REGIME" if "REGIME" in features.columns
+                                else None
+                            )
+                            if regime_col is not None:
+                                try:
+                                    entry_regime_label = str(features[regime_col].iat[signal_bar])
+                                except Exception:
+                                    entry_regime_label = ""
 
                             # Same-bar exit: check gap-through at open FIRST, then intra-bar
                             exit_price = None

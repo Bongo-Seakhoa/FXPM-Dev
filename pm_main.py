@@ -210,6 +210,10 @@ from pm_enhancement_seams import (
     PortfolioObservationContext,
 )
 from pm_order_governance import GovernanceContext, evaluate_policy, make_policy, policy_name_from_artifact
+from pm_institutional_supervisor import InstitutionalSupervisor, SupervisorContext
+from pm_cycle_drift import CycleDriftContext, CycleDriftMonitor
+from pm_event_context import EventCalendar, observe_event_context
+from pm_live_readiness import log_readiness_report, validate_live_readiness
 from pm_storage import StorageManager
 from pm_mt5 import (
     MT5_AVAILABLE,
@@ -777,6 +781,10 @@ class LiveTrader:
         self.trade_log: List[Dict] = []
         self.drift_monitor = DriftMonitor(logging.getLogger(__name__))
         self._seen_closing_deals: Set[int] = set()
+        self._seen_cycle_closure_keys: Set[str] = set()
+        self._recent_closing_deals: List[Dict[str, Any]] = []
+        self._recent_closing_deals_lookback_hours: int = 0
+        self._live_session_started_at = datetime.now()
         
         # Cache statistics for monitoring
         self._cache_hits = 0
@@ -798,6 +806,16 @@ class LiveTrader:
 
         # Enhancement seams (risk scalars, spread filter, exit pack)
         self._enhancement_seams = create_default_enhancement_seams(self.pipeline_config)
+        self._institutional_supervisor = InstitutionalSupervisor(self.pipeline_config)
+        self._cycle_drift_monitor = CycleDriftMonitor(self.pipeline_config)
+        self._event_calendar: Optional[EventCalendar] = None
+        if bool(getattr(self.pipeline_config, "event_calendar_enabled", False)):
+            try:
+                event_path = str(getattr(self.pipeline_config, "event_calendar_path", "") or "")
+                self._event_calendar = EventCalendar.from_csv(event_path) if event_path else EventCalendar()
+            except Exception as exc:
+                self.logger.warning(f"Event calendar initialization failed: {exc}")
+                self._event_calendar = EventCalendar()
 
         # === MT5 SPEC SYNCHRONIZATION ===
         # Update InstrumentSpec with live MT5 values for accurate position sizing
@@ -1528,9 +1546,14 @@ class LiveTrader:
         recent_deals: List[Dict[str, Any]] = []
         if not runtime_only:
             try:
-                recent_deals = list(self.mt5.get_recent_closing_deals() or [])
+                recent_lookback_hours = 24 * 8
+                recent_deals = list(
+                    self.mt5.get_recent_closing_deals(lookback_hours=recent_lookback_hours) or []
+                )
+                self._recent_closing_deals_lookback_hours = recent_lookback_hours
             except Exception as exc:
                 self.logger.debug(f"Recent closing deals unavailable: {exc}")
+            self._recent_closing_deals = list(recent_deals or [])
 
         self._run_order_governance_cycle(active_configs, positions_snapshot)
 
@@ -1607,6 +1630,24 @@ class LiveTrader:
 
         from pm_position import TradeTagEncoder
 
+        open_position_ids: Set[int] = set()
+        if hasattr(self.mt5, "get_positions"):
+            try:
+                open_positions = self.mt5.get_positions()
+                if isinstance(open_positions, (list, tuple)):
+                    for position in open_positions:
+                        identifier = int(
+                            getattr(position, "identifier", 0)
+                            or getattr(position, "ticket", 0)
+                            or 0
+                        )
+                        if identifier > 0:
+                            open_position_ids.add(identifier)
+            except Exception as exc:
+                self.logger.debug(f"Cycle drift open-position snapshot unavailable: {exc}")
+
+        cycle_groups: Dict[str, Dict[str, Any]] = {}
+
         for deal in deals:
             ticket = int(deal.get('ticket', 0) or 0)
             if ticket <= 0 or ticket in self._seen_closing_deals:
@@ -1646,6 +1687,22 @@ class LiveTrader:
                 pnl_dollars=float(deal.get('profit', 0.0) or 0.0),
                 r_multiple=None,
             )
+            position_id = int(deal.get("position_id", 0) or 0)
+            closure_key = f"position:{position_id}" if position_id > 0 else f"deal:{ticket}"
+            grouped = cycle_groups.setdefault(
+                closure_key,
+                {
+                    "position_id": position_id,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "regime": regime,
+                    "strategy_name": str(getattr(regime_cfg, "strategy_name", "") or ""),
+                    "pnl_dollars": 0.0,
+                    "tickets": [],
+                },
+            )
+            grouped["pnl_dollars"] = float(grouped.get("pnl_dollars", 0.0) or 0.0) + float(deal.get("profit", 0.0) or 0.0)
+            grouped.setdefault("tickets", []).append(ticket)
             drift_summary = dict(self.drift_monitor.get_summary(symbol))
             drift_summary["updated_at"] = datetime.now().isoformat()
             if regime_cfg is not None:
@@ -1669,6 +1726,28 @@ class LiveTrader:
                 symbol,
                 getattr(regime_cfg, "val_metrics", None) or validated[symbol].val_metrics,
             )
+
+        seen_cycle_closure_keys = getattr(self, "_seen_cycle_closure_keys", set())
+        for closure_key, grouped in cycle_groups.items():
+            if closure_key in seen_cycle_closure_keys:
+                continue
+            position_id = int(grouped.get("position_id", 0) or 0)
+            if position_id > 0 and position_id in open_position_ids:
+                continue
+            try:
+                self._cycle_drift_monitor.record_trade(
+                    symbol=str(grouped.get("symbol", "") or ""),
+                    timeframe=str(grouped.get("timeframe", "") or ""),
+                    regime=str(grouped.get("regime", "") or ""),
+                    strategy_name=str(grouped.get("strategy_name", "") or ""),
+                    pnl_dollars=float(grouped.get("pnl_dollars", 0.0) or 0.0),
+                )
+                seen_cycle_closure_keys.add(closure_key)
+                self._seen_cycle_closure_keys = seen_cycle_closure_keys
+            except Exception as exc:
+                self.logger.debug(
+                    f"[{grouped.get('symbol', '')}] Cycle drift trade sync failed: {exc}"
+                )
 
     def _resolve_symbol_from_broker(self,
                                     broker_symbol: str,
@@ -1845,6 +1924,8 @@ class LiveTrader:
                     "shadow_stop_loss": float(getattr(position, "sl", 0.0) or 0.0),
                     "shadow_take_profit": float(getattr(position, "tp", 0.0) or 0.0),
                     "shadow_tp_released": False,
+                    "partial_taken": False,
+                    "shadow_partial_taken": False,
                 }
             shadow_mode = mode == "shadow"
             current_stop_loss = (
@@ -1859,6 +1940,34 @@ class LiveTrader:
                 state.get("shadow_tp_released", False)
                 if shadow_mode else state.get("tp_released", False)
             )
+            structure_lookback = int(policy_payload.get("structure_lookback", 20) or 20)
+            recent_window = since_entry.tail(max(1, structure_lookback))
+            current_regime = str(pos_regime or "")
+            if "REGIME_LIVE" in closed_features.columns:
+                current_regime = str(closed_features["REGIME_LIVE"].iloc[-1])
+            elif "REGIME" in closed_features.columns:
+                current_regime = str(closed_features["REGIME"].iloc[-1])
+            current_regime_gap = 0.0
+            if "REGIME_GAP" in closed_features.columns:
+                try:
+                    current_regime_gap = float(pd.to_numeric(closed_features["REGIME_GAP"].iloc[-1], errors="coerce"))
+                except Exception:
+                    current_regime_gap = 0.0
+            current_atr = 0.0
+            try:
+                current_atr = float(pd.to_numeric(closed_features["ATR_14"].iloc[-1], errors="coerce"))
+                if not math.isfinite(current_atr):
+                    current_atr = 0.0
+            except Exception:
+                current_atr = 0.0
+            realized_vol_ratio = None
+            try:
+                atr_window = pd.to_numeric(closed_features["ATR_14"], errors="coerce").dropna().tail(50)
+                atr_mean = float(atr_window.mean()) if not atr_window.empty else 0.0
+                if atr_mean > 0.0:
+                    realized_vol_ratio = current_atr / atr_mean
+            except Exception:
+                realized_vol_ratio = None
             context = GovernanceContext(
                 symbol=symbol,
                 timeframe=pos_timeframe,
@@ -1870,13 +1979,24 @@ class LiveTrader:
                 initial_stop_loss=float(state.get("initial_stop_loss", getattr(position, "sl", 0.0)) or 0.0),
                 initial_take_profit=float(state.get("initial_take_profit", getattr(position, "tp", 0.0)) or 0.0),
                 current_price=current_price,
-                current_atr=float(pd.to_numeric(closed_features["ATR_14"].iloc[-1], errors="coerce") or 0.0),
+                current_atr=current_atr,
                 highest_since_entry=float(pd.to_numeric(since_entry["High"], errors="coerce").max()),
                 lowest_since_entry=float(pd.to_numeric(since_entry["Low"], errors="coerce").min()),
                 pip_size=float(getattr(spec, "pip_size", 0.0) or 0.0),
                 price_step=float(getattr(symbol_info, "point", 0.0) or getattr(spec, "point", 0.0) or getattr(spec, "pip_size", 0.0) or 0.0),
                 min_stop_distance=min_stop_distance,
                 tp_released=tp_released,
+                bars_held=len(since_entry),
+                entry_regime=pos_regime,
+                current_regime=current_regime,
+                current_regime_gap=current_regime_gap,
+                recent_high=float(pd.to_numeric(recent_window["High"], errors="coerce").max()),
+                recent_low=float(pd.to_numeric(recent_window["Low"], errors="coerce").min()),
+                realized_vol_ratio=realized_vol_ratio,
+                partial_taken=bool(
+                    state.get("shadow_partial_taken", False)
+                    if shadow_mode else state.get("partial_taken", False)
+                ),
             )
             decision = evaluate_policy(policy_payload, context)
             self._last_governance_bar_times[cache_key] = current_bar_time
@@ -1885,22 +2005,84 @@ class LiveTrader:
             if decision.take_profit is not None:
                 new_tp = 0.0 if math.isinf(float(decision.take_profit)) else float(decision.take_profit)
             if mode == "shadow":
-                if new_sl is not None or new_tp is not None or decision.tp_released:
+                if new_sl is not None or new_tp is not None or decision.tp_released or decision.partial_close_pct > 0:
                     self.logger.info(
                         f"[{symbol}] Governance SHADOW {policy_name} @ {pos_timeframe}/{pos_regime}: "
                         f"sl={f'{new_sl:.5f}' if new_sl is not None else 'keep'} "
-                        f"tp={'release' if new_tp == 0.0 else (f'{new_tp:.5f}' if new_tp is not None else 'keep')}"
+                        f"tp={'release' if new_tp == 0.0 else (f'{new_tp:.5f}' if new_tp is not None else 'keep')} "
+                        f"partial={decision.partial_close_pct:.1f}%"
                     )
                 if new_sl is not None:
                     state["shadow_stop_loss"] = float(new_sl)
                 if new_tp is not None:
                     state["shadow_take_profit"] = float(new_tp)
                 state["shadow_tp_released"] = bool(state.get("shadow_tp_released", False) or decision.tp_released)
+                if decision.partial_close_pct > 0:
+                    state["shadow_partial_taken"] = True
                 state["last_policy_name"] = policy_name
                 state["last_bar_time"] = current_bar_time.isoformat()
                 self._set_order_governance_state(ticket_id, state)
                 continue
-            if new_sl is None and new_tp is None and not decision.tp_released:
+            if decision.partial_close_pct > 0 and not state.get("partial_taken", False):
+                if self.enable_trading and hasattr(self.mt5, "close_position_partial"):
+                    partial_result = self.mt5.close_position_partial(
+                        position,
+                        percent=decision.partial_close_pct,
+                        comment=f"Governance partial {policy_name}",
+                    )
+                    if getattr(partial_result, "success", False):
+                        state["partial_taken"] = True
+                        state["last_policy_name"] = policy_name
+                        state["last_bar_time"] = current_bar_time.isoformat()
+                        state["last_partial_close_at"] = datetime.now().isoformat()
+                        self._set_order_governance_state(ticket_id, state)
+                        self.logger.info(
+                            f"[{symbol}] Governance {policy_name} partial close "
+                            f"{decision.partial_close_pct:.1f}% applied @ {pos_timeframe}/{pos_regime}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"[{symbol}] Governance {policy_name} partial close failed: "
+                            f"{getattr(partial_result, 'retcode_description', 'unknown error')}"
+                        )
+                else:
+                    self.logger.info(
+                        f"[{symbol}] Governance {policy_name} partial close signal "
+                        f"{decision.partial_close_pct:.1f}% (paper/no connector support)"
+                    )
+                    state["partial_taken"] = True
+                    state["last_policy_name"] = policy_name
+                    state["last_bar_time"] = current_bar_time.isoformat()
+                    state["last_partial_close_at"] = datetime.now().isoformat()
+                    self._set_order_governance_state(ticket_id, state)
+            if decision.exit_now:
+                if self.enable_trading and hasattr(self.mt5, "close_position"):
+                    close_result = self.mt5.close_position(
+                        position,
+                        comment=f"Governance exit {policy_name}",
+                    )
+                    if getattr(close_result, "success", False):
+                        self.logger.info(
+                            f"[{symbol}] Governance {policy_name} exited position @ {pos_timeframe}/{pos_regime}"
+                        )
+                        state["last_policy_name"] = policy_name
+                        state["last_bar_time"] = current_bar_time.isoformat()
+                        state["last_applied_at"] = datetime.now().isoformat()
+                        self._set_order_governance_state(ticket_id, state)
+                        continue
+                    self.logger.warning(
+                        f"[{symbol}] Governance {policy_name} exit failed: "
+                        f"{getattr(close_result, 'retcode_description', 'unknown error')}"
+                    )
+                else:
+                    self.logger.info(
+                        f"[{symbol}] Governance {policy_name} exit signal (paper/no connector support)"
+                    )
+                    state["last_policy_name"] = policy_name
+                    state["last_bar_time"] = current_bar_time.isoformat()
+                    self._set_order_governance_state(ticket_id, state)
+                    continue
+            if new_sl is None and new_tp is None and not decision.tp_released and not decision.exit_now:
                 state["last_policy_name"] = policy_name
                 state["last_bar_time"] = current_bar_time.isoformat()
                 self._set_order_governance_state(ticket_id, state)
@@ -2571,6 +2753,85 @@ class LiveTrader:
             positions_snapshot=positions_snapshot,
             account_info=account_info,
         )
+
+    def _estimate_total_open_risk_pct(self,
+                                      positions_snapshot: Optional[List[Any]],
+                                      account_info: Optional[Any],
+                                      *,
+                                      default_risk_pct: Optional[float] = None) -> float:
+        total = 0.0
+        if not positions_snapshot:
+            return total
+        for pos in positions_snapshot:
+            broker_symbol = str(getattr(pos, "symbol", "") or "")
+            risk_pct = self._estimate_position_risk_pct(
+                pos,
+                account_info=account_info,
+                broker_symbol=broker_symbol,
+                default_risk_pct=default_risk_pct,
+            )
+            if risk_pct is not None and math.isfinite(float(risk_pct)):
+                total += max(0.0, float(risk_pct))
+        return total
+
+    @staticmethod
+    def _estimate_open_drawdown_pct(account_info: Optional[Any]) -> float:
+        if account_info is None:
+            return 0.0
+        balance = LiveTrader._safe_finite_float(getattr(account_info, "balance", 0.0), default=0.0) or 0.0
+        equity = LiveTrader._safe_finite_float(getattr(account_info, "equity", balance), default=balance) or balance
+        if balance <= 0.0 or equity >= balance:
+            return 0.0
+        return (balance - equity) / balance * 100.0
+
+    def _estimate_realized_loss_pct(self, period: str, account_info: Optional[Any]) -> float:
+        """Estimate realized loss percent from recent broker closing deals."""
+        if account_info is None:
+            return 0.0
+        balance = self._safe_finite_float(getattr(account_info, "balance", 0.0), default=0.0) or 0.0
+        if balance <= 0.0:
+            return 0.0
+
+        normalized_period = str(period or "daily").strip().lower()
+        now = datetime.now()
+        if normalized_period == "weekly":
+            boundary = datetime(now.year, now.month, now.day) - timedelta(days=now.weekday())
+            lookback_hours = 24 * 8
+        elif normalized_period == "session":
+            boundary = getattr(self, "_live_session_started_at", None) or now
+            lookback_hours = max(1, int(math.ceil((now - boundary).total_seconds() / 3600.0)) + 1)
+        else:
+            boundary = datetime(now.year, now.month, now.day)
+            lookback_hours = 48
+
+        deals = list(getattr(self, "_recent_closing_deals", []) or [])
+        cached_lookback_hours = int(getattr(self, "_recent_closing_deals_lookback_hours", 0) or 0)
+        cache_too_short = cached_lookback_hours <= 0 or cached_lookback_hours < lookback_hours
+        if self.mt5 is not None and hasattr(self.mt5, "get_recent_closing_deals") and (
+            not deals or cache_too_short
+        ):
+            try:
+                deals = list(self.mt5.get_recent_closing_deals(lookback_hours=lookback_hours) or [])
+                self._recent_closing_deals = list(deals)
+                self._recent_closing_deals_lookback_hours = lookback_hours
+            except Exception as exc:
+                self.logger.debug(f"Realized loss snapshot unavailable for {normalized_period}: {exc}")
+                return 0.0
+        if not deals:
+            return 0.0
+
+        realized = 0.0
+        for deal in deals:
+            deal_time = deal.get("time")
+            if deal_time is None:
+                continue
+            try:
+                timestamp = pd.Timestamp(deal_time).to_pydatetime()
+            except Exception:
+                continue
+            if timestamp >= boundary:
+                realized += float(deal.get("profit", 0.0) or 0.0)
+        return max(0.0, (-realized / balance) * 100.0)
 
     @staticmethod
     def _safe_finite_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -3309,6 +3570,32 @@ class LiveTrader:
                         f"[{symbol}] [{tf}] REGIME_LIVE is empty on the decision bar, refusing to trade"
                     )
                     continue
+                if bool(getattr(self.pipeline_config, "regime_boundary_audit_enabled", True)):
+                    ambiguity_policy = str(
+                        getattr(self.pipeline_config, "regime_ambiguity_policy", "observe_only") or "observe_only"
+                    ).lower()
+                    if ambiguity_policy == "block" and "REGIME_GAP" in features.columns:
+                        try:
+                            current_gap = abs(float(pd.to_numeric(features["REGIME_GAP"].iloc[-2], errors="coerce")))
+                        except Exception:
+                            current_gap = 0.0
+                        min_gap = float(getattr(self.pipeline_config, "regime_min_live_gap_warn", 0.05) or 0.05)
+                        if current_gap < min_gap:
+                            stats["winner_failed_gate"] += 1
+                            self.logger.info(
+                                f"[{symbol}] [{tf}] [{current_regime}] Regime ambiguity block: "
+                                f"gap {current_gap:.4f} < {min_gap:.4f}"
+                            )
+                            self._candidate_cache[feature_cache_key] = {
+                                'features': features,
+                                'regime': current_regime,
+                                'regime_strength': float(regime_strength),
+                                'signal': 0,
+                                'strategy': None,
+                                'regime_config': None,
+                            }
+                            self._prune_cache()
+                            continue
                 
                 # ===== WINNERS-ONLY LADDER =====
                 # Only use the validated winner for this exact (tf, regime).
@@ -3337,6 +3624,24 @@ class LiveTrader:
                     self.logger.debug(
                         f"[{symbol}] [{tf}] [{current_regime}] Explicit NO_TRADE marker; skipping "
                         f"({marker_reason})"
+                    )
+                    self._candidate_cache[feature_cache_key] = {
+                        'features': features,
+                        'regime': current_regime,
+                        'regime_strength': float(regime_strength),
+                        'signal': 0,
+                        'strategy': None,
+                        'regime_config': None,
+                    }
+                    self._prune_cache()
+                    continue
+                promotion_status = str(getattr(regime_config, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+                if promotion_status in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+                    stats["winner_failed_gate"] += 1
+                    reasons = "; ".join(getattr(regime_config, "promotion_reasons", []) or [])
+                    self.logger.debug(
+                        f"[{symbol}] [{tf}] [{current_regime}] Winner promotion status "
+                        f"{promotion_status}; skipping live entry ({reasons})"
                     )
                     self._candidate_cache[feature_cache_key] = {
                         'features': features,
@@ -3396,6 +3701,11 @@ class LiveTrader:
                 self._prune_cache()  # Prevent unbounded growth
             # ─────────────────────────────────────────────────────────────────
             
+            promotion_status = str(getattr(regime_config, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+            if promotion_status in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+                stats["winner_failed_gate"] += 1
+                continue
+
             # Compute selection score = strength * quality_score * freshness
             quality_score = (
                 float(regime_config.quality_score)
@@ -3421,6 +3731,10 @@ class LiveTrader:
                 'features': features,
                 'regime_config': regime_config,
                 'eligibility_report': eligibility_report,
+                'promotion_status': str(getattr(regime_config, "promotion_status", "PROMOTED") or "PROMOTED"),
+                'promotion_risk_multiplier': 0.5
+                if str(getattr(regime_config, "promotion_status", "") or "").upper() == "PROMOTE_SMALL"
+                else 1.0,
                 'bar_time': str(features.index[-2]) if len(features) > 1 else '',
             })
             stats["winner_candidates"] += 1
@@ -3591,6 +3905,21 @@ class LiveTrader:
             "secondary_reason": secondary_reason,
             "position_context": position_context,
         }
+        try:
+            event_observation = observe_event_context(
+                symbol,
+                self.pipeline_config,
+                observed_at=datetime.now(),
+                calendar=getattr(self, "_event_calendar", None),
+            )
+            if event_observation.nearby_events:
+                decision_context["event_calendar"] = {
+                    "action": event_observation.action,
+                    "observed_at": event_observation.observed_at.isoformat(),
+                    "nearby_events": list(event_observation.nearby_events),
+                }
+        except Exception as exc:
+            self.logger.debug(f"[{symbol}] Event calendar observation failed: {exc}")
 
         def _record_throttle(action: str, cooldown: int = 0) -> None:
             """Record this decision outcome into the throttle."""
@@ -3670,8 +3999,13 @@ class LiveTrader:
                     "freshness": freshness_score,
                     "regime_strength": regime_strength_score,
                 }
+                payload_context: Dict[str, Any] = {}
+                if isinstance(decision_context.get("event_calendar"), dict):
+                    payload_context["event_calendar"] = dict(decision_context["event_calendar"])
                 if isinstance(context, dict) and context:
-                    payload["context"] = dict(context)
+                    payload_context.update(dict(context))
+                if payload_context:
+                    payload["context"] = payload_context
                 self._actionable_log.record(symbol, payload)
                 storage_manager = getattr(self, "storage_manager", None)
                 if storage_manager is not None:
@@ -3951,6 +4285,7 @@ class LiveTrader:
         # Spread-aware execution overlay
         _spread_overlay = self._enhancement_seams.execution_quality_overlay
         _execution_risk_mult = 1.0
+        _cycle_spread_degradation_mult = 0.0
         if hasattr(_spread_overlay, 'enabled') and _spread_overlay.enabled:
             _pip_size = spec.pip_size if spec.pip_size > 0 else 1e-5
             _spread_pips = (tick.ask - tick.bid) / _pip_size
@@ -3975,6 +4310,8 @@ class LiveTrader:
                 atr_pips=_atr_val,
                 rolling_spread_median=_rolling_spread_median,
             )
+            if _rolling_spread_median > 0:
+                _cycle_spread_degradation_mult = float(_spread_pips) / float(_rolling_spread_median)
             _eq_decision = _spread_overlay.evaluate(_eq_ctx)
             if not _eq_decision.allow_trade:
                 self.logger.info(f"[{symbol}] Trade blocked by spread filter: {'; '.join(_eq_decision.notes)}")
@@ -4021,6 +4358,16 @@ class LiveTrader:
         configured_risk_pct = float(getattr(self.position_config, 'risk_per_trade_pct', 1.0))
         min_trade_risk = float(getattr(self.pipeline_config, 'min_trade_risk_pct', 0.1))
         target_risk_pct = configured_risk_pct
+        promotion_risk_multiplier = 1.0
+        if best_candidate:
+            promotion_risk_multiplier = float(best_candidate.get("promotion_risk_multiplier", 1.0) or 1.0)
+        if promotion_risk_multiplier < 1.0:
+            prior_risk = target_risk_pct
+            target_risk_pct *= max(0.0, min(1.0, promotion_risk_multiplier))
+            self.logger.info(
+                f"[{symbol}] Promotion risk derate: {prior_risk:.3f}% -> {target_risk_pct:.3f}% "
+                f"(status={best_candidate.get('promotion_status') if best_candidate else 'unknown'})"
+            )
 
         # Enforce PositionConfig max_risk_pct (hard safety cap)
         max_risk_cap = float(getattr(self.position_config, 'max_risk_pct', 2.0))
@@ -4160,6 +4507,114 @@ class LiveTrader:
 
             target_risk_pct = min(target_risk_pct, available)
             self.logger.info(f"[{symbol}] Secondary trade: risk {original_risk:.2f}% -> {target_risk_pct:.2f}% (existing={existing_risk:.2f}%, cap={max_combined_risk:.2f}%)")
+
+        cycle_drift_monitor = getattr(self, "_cycle_drift_monitor", CycleDriftMonitor(self.pipeline_config))
+        drift_decision = cycle_drift_monitor.evaluate(
+            CycleDriftContext(
+                symbol=symbol,
+                timeframe=_tf,
+                regime=_regime,
+                strategy_name=_strat_name,
+                spread_degradation_mult=_cycle_spread_degradation_mult,
+            )
+        )
+        if drift_decision.reasons:
+            decision_context["cycle_drift"] = {
+                "action": drift_decision.action,
+                "reasons": list(drift_decision.reasons),
+                "observed_only": bool(drift_decision.observed_only),
+            }
+        if not drift_decision.allow_trade:
+            self.logger.warning(
+                f"[{symbol}] Trade blocked by cycle drift sentinel: {'; '.join(drift_decision.reasons)}"
+            )
+            _record_throttle("BLOCKED_CYCLE_DRIFT")
+            _record_actionable(action="BLOCKED_CYCLE_DRIFT", context={"cycle_drift": decision_context.get("cycle_drift")})
+            return
+        if drift_decision.risk_multiplier < 1.0 and target_risk_pct > 0.0:
+            prior_risk = target_risk_pct
+            target_risk_pct *= max(0.0, min(1.0, float(drift_decision.risk_multiplier)))
+            self.logger.warning(
+                f"[{symbol}] Cycle drift risk derate: {prior_risk:.3f}% -> {target_risk_pct:.3f}% "
+                f"({'; '.join(drift_decision.reasons)})"
+            )
+
+        open_positions_for_supervisor = positions_snapshot
+        if self.enable_trading and hasattr(self.mt5, "get_positions"):
+            try:
+                refreshed_portfolio_positions = self.mt5.get_positions()
+            except Exception:
+                refreshed_portfolio_positions = None
+            if refreshed_portfolio_positions is None:
+                self.logger.warning(
+                    f"[{symbol}] Trade skipped: fresh portfolio position snapshot unavailable"
+                )
+                _record_throttle("BLOCKED_PORTFOLIO_SNAPSHOT_UNAVAILABLE")
+                _record_actionable(
+                    action="BLOCKED_PORTFOLIO_SNAPSHOT_UNAVAILABLE",
+                    target_risk_pct_value=target_risk_pct,
+                    context={"institutional_supervisor": {"stage": "pre_size_snapshot"}},
+                )
+                return
+            open_positions_for_supervisor = list(refreshed_portfolio_positions or [])
+        elif open_positions_for_supervisor is None and hasattr(self.mt5, "get_positions"):
+            open_positions_for_supervisor = self.mt5.get_positions()
+        try:
+            supervisor_cycle_id = self.pipeline_config.get_last_retrain_slot(datetime.now()).isoformat()
+        except Exception:
+            supervisor_cycle_id = datetime.now().date().isoformat()
+        total_open_risk_pct = self._estimate_total_open_risk_pct(
+            open_positions_for_supervisor,
+            account,
+            default_risk_pct=configured_risk_pct,
+        )
+        institutional_supervisor = getattr(self, "_institutional_supervisor", InstitutionalSupervisor(self.pipeline_config))
+        supervisor_decision = institutional_supervisor.evaluate(
+            SupervisorContext(
+                symbol=symbol,
+                timeframe=_tf,
+                regime=_regime,
+                strategy_name=_strat_name,
+                total_open_risk_pct=total_open_risk_pct,
+                new_trade_risk_pct=target_risk_pct,
+                daily_loss_pct=self._estimate_realized_loss_pct("daily", account),
+                session_loss_pct=self._estimate_realized_loss_pct("session", account),
+                weekly_loss_pct=self._estimate_realized_loss_pct("weekly", account),
+                open_drawdown_pct=self._estimate_open_drawdown_pct(account),
+                margin_level=margin_level or 0.0,
+                metadata={"cycle_id": supervisor_cycle_id},
+            )
+        )
+        if supervisor_decision.reasons:
+            decision_context["institutional_supervisor"] = {
+                "action": supervisor_decision.action,
+                "reasons": list(supervisor_decision.reasons),
+                "observed_only": bool(supervisor_decision.observed_only),
+                "total_open_risk_pct": total_open_risk_pct,
+            }
+        if not supervisor_decision.allow_trade:
+            self.logger.warning(
+                f"[{symbol}] Trade blocked by institutional supervisor: "
+                f"{'; '.join(supervisor_decision.reasons)}"
+            )
+            _record_throttle("BLOCKED_INSTITUTIONAL_SUPERVISOR")
+            _record_actionable(
+                action="BLOCKED_INSTITUTIONAL_SUPERVISOR",
+                target_risk_pct_value=target_risk_pct,
+                context={"institutional_supervisor": decision_context.get("institutional_supervisor")},
+            )
+            return
+        if supervisor_decision.risk_multiplier < 1.0 and target_risk_pct > 0.0:
+            prior_risk = target_risk_pct
+            target_risk_pct *= max(0.0, min(1.0, float(supervisor_decision.risk_multiplier)))
+            self.logger.warning(
+                f"[{symbol}] Institutional supervisor risk derate: "
+                f"{prior_risk:.3f}% -> {target_risk_pct:.3f}%"
+            )
+        elif supervisor_decision.observed_only and supervisor_decision.reasons:
+            self.logger.warning(
+                f"[{symbol}] Institutional supervisor OBSERVE: {'; '.join(supervisor_decision.reasons)}"
+            )
 
         # Ensure non-zero (and not absurdly tiny) risk if we proceed
         if target_risk_pct < min_trade_risk:
@@ -4535,6 +4990,118 @@ class LiveTrader:
                 target_risk_pct_value=target_risk_pct,
                 actual_risk_pct_value=actual_risk_pct,
                 context={"stage": "final_quote_refresh"},
+            )
+            return
+
+        _pip_size_exec = float(getattr(spec, "pip_size", 0.0) or 0.0) or 1e-5
+        _entry_adjustment_pips = abs(float(entry_price) - float(previous_entry_price)) / _pip_size_exec
+        _slippage_baseline = max(float(getattr(spec, "spread_avg", 0.0) or 0.0), 1e-9)
+        final_drift_decision = cycle_drift_monitor.evaluate(
+            CycleDriftContext(
+                symbol=symbol,
+                timeframe=_tf,
+                regime=_regime,
+                strategy_name=_strat_name,
+                execution_slippage_mult=_entry_adjustment_pips / _slippage_baseline,
+                spread_degradation_mult=_cycle_spread_degradation_mult,
+                metadata={"stage": "final_quote_refresh"},
+            )
+        )
+        if final_drift_decision.reasons:
+            decision_context["cycle_drift_final"] = {
+                "action": final_drift_decision.action,
+                "reasons": list(final_drift_decision.reasons),
+                "observed_only": bool(final_drift_decision.observed_only),
+            }
+        if not final_drift_decision.allow_trade or (
+            final_drift_decision.risk_multiplier < 1.0 and not final_drift_decision.observed_only
+        ):
+            self.logger.warning(
+                f"[{symbol}] Trade blocked by final cycle drift check: "
+                f"{'; '.join(final_drift_decision.reasons)}"
+            )
+            _record_throttle("BLOCKED_CYCLE_DRIFT")
+            _record_actionable(
+                action="BLOCKED_CYCLE_DRIFT",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+                context={"cycle_drift": decision_context.get("cycle_drift_final")},
+            )
+            return
+
+        final_open_positions_for_supervisor = open_positions_for_supervisor
+        if self.enable_trading and hasattr(self.mt5, "get_positions"):
+            try:
+                refreshed_final_positions = self.mt5.get_positions()
+            except Exception:
+                refreshed_final_positions = None
+            if refreshed_final_positions is None:
+                self.logger.warning(
+                    f"[{symbol}] Trade skipped: final portfolio position snapshot unavailable"
+                )
+                _record_throttle("BLOCKED_PORTFOLIO_SNAPSHOT_UNAVAILABLE")
+                _record_actionable(
+                    action="BLOCKED_PORTFOLIO_SNAPSHOT_UNAVAILABLE",
+                    entry_price_value=entry_price,
+                    sl_value=sl_price,
+                    tp_value=tp_price,
+                    volume_value=volume,
+                    target_risk_pct_value=target_risk_pct,
+                    actual_risk_pct_value=actual_risk_pct,
+                    context={"institutional_supervisor": {"stage": "final_quote_refresh"}},
+                )
+                return
+            final_open_positions_for_supervisor = list(refreshed_final_positions or [])
+        final_total_open_risk_pct = self._estimate_total_open_risk_pct(
+            final_open_positions_for_supervisor,
+            account,
+            default_risk_pct=configured_risk_pct,
+        )
+        final_supervisor = getattr(self, "_institutional_supervisor", InstitutionalSupervisor(self.pipeline_config))
+        final_supervisor_decision = final_supervisor.evaluate(
+            SupervisorContext(
+                symbol=symbol,
+                timeframe=_tf,
+                regime=_regime,
+                strategy_name=_strat_name,
+                total_open_risk_pct=final_total_open_risk_pct,
+                new_trade_risk_pct=actual_risk_pct,
+                daily_loss_pct=self._estimate_realized_loss_pct("daily", account),
+                session_loss_pct=self._estimate_realized_loss_pct("session", account),
+                weekly_loss_pct=self._estimate_realized_loss_pct("weekly", account),
+                open_drawdown_pct=self._estimate_open_drawdown_pct(account),
+                margin_level=margin_level or 0.0,
+                metadata={"stage": "final_quote_refresh", "cycle_id": supervisor_cycle_id},
+            )
+        )
+        if final_supervisor_decision.reasons:
+            decision_context["institutional_supervisor_final"] = {
+                "action": final_supervisor_decision.action,
+                "reasons": list(final_supervisor_decision.reasons),
+                "observed_only": bool(final_supervisor_decision.observed_only),
+                "total_open_risk_pct": final_total_open_risk_pct,
+            }
+        if not final_supervisor_decision.allow_trade or (
+            final_supervisor_decision.risk_multiplier < 1.0 and not final_supervisor_decision.observed_only
+        ):
+            self.logger.warning(
+                f"[{symbol}] Trade blocked by final institutional supervisor check: "
+                f"{'; '.join(final_supervisor_decision.reasons)}"
+            )
+            _record_throttle("BLOCKED_INSTITUTIONAL_SUPERVISOR")
+            _record_actionable(
+                action="BLOCKED_INSTITUTIONAL_SUPERVISOR",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+                context={"institutional_supervisor": decision_context.get("institutional_supervisor_final")},
             )
             return
 
@@ -5556,6 +6123,17 @@ def main():
         
         # Run trading
         if args.trade:
+            if not args.paper:
+                readiness = validate_live_readiness(
+                    pipeline_config,
+                    symbols=symbols,
+                    config_path=args.config,
+                    winner_ledger_path=getattr(pipeline_config, "winner_ledger_path", None),
+                )
+                log_readiness_report(logger, readiness)
+                if not readiness.ok:
+                    logger.error("Live readiness failed; refusing to start live trading.")
+                    return 2
             _app_instance.run_trading(
                 enable_trading=not args.paper,
                 close_on_opposite_signal=args.close_on_opposite_signal

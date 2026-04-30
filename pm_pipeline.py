@@ -49,6 +49,8 @@ from pm_strategies import (
 from pm_position import PositionConfig, PositionManager
 from pm_regime import load_regime_params
 from pm_order_governance import candidate_policy_names, make_policy, policy_name_from_artifact
+from pm_fairness_audit import build_fairness_evidence, build_fairness_report
+from pm_regime_audit import audit_regime_profitability
 
 # Import Optuna TPE optimizer
 try:
@@ -240,6 +242,41 @@ def _default_historical_audit() -> Dict[str, Any]:
         "metrics": {},
         "audited_at": None,
     }
+
+
+def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineConfig) -> Tuple[str, List[str]]:
+    """Classify whether a local winner can trade live, paper only, or is blocked."""
+    reasons: List[str] = []
+    if regime_config is None or regime_config.is_no_trade_marker():
+        return "NO_TRADE", ["no trade marker"]
+
+    historical = dict(getattr(regime_config, "historical_audit_metrics", {}) or {})
+    if bool(historical.get("severe_failure", False)):
+        reasons.extend(str(reason) for reason in historical.get("failure_reasons", []) or [])
+
+    walk_forward = dict(getattr(regime_config, "walk_forward_audit", {}) or {})
+    wf_policy = str(getattr(config, "walk_forward_promotion_policy", "block_severe_only") or "").lower()
+    if wf_policy == "block_severe_only":
+        summary = walk_forward.get("summary") if isinstance(walk_forward.get("summary"), dict) else {}
+        windows = walk_forward.get("windows") if isinstance(walk_forward.get("windows"), list) else []
+        audited = [window for window in windows if int(window.get("total_trades", 0) or 0) > 0]
+        if audited:
+            negative = [window for window in audited if float(window.get("total_return_pct", 0.0) or 0.0) < 0.0]
+            if len(negative) == len(audited):
+                reasons.append("walk_forward all audited windows negative")
+            min_score = float(summary.get("min_score", 0.0) or 0.0)
+            if min_score < 0.0:
+                reasons.append(f"walk_forward min_score {min_score:.2f} < 0")
+
+    if reasons:
+        return "BLOCKED", reasons
+
+    holdout = dict(getattr(regime_config, "holdout_metrics", {}) or {})
+    holdout_trades = int(holdout.get("total_trades", 0) or 0)
+    holdout_return = float(holdout.get("total_return_pct", 0.0) or 0.0)
+    if holdout_trades > 0 and holdout_return <= 0.0:
+        return "PROMOTE_SMALL", ["freshest holdout non-positive; risk derated"]
+    return "PROMOTED", []
 
 
 def _pipeline_config_to_dict(config: PipelineConfig) -> Dict[str, Any]:
@@ -617,6 +654,8 @@ class RegimeConfig:
     live_observability: Dict[str, Any] = field(default_factory=_default_live_observability)
     governance_policy: Dict[str, Any] = field(default_factory=_default_governance_policy)
     walk_forward_audit: Dict[str, Any] = field(default_factory=_default_walk_forward_audit)
+    promotion_status: str = "PROMOTED"
+    promotion_reasons: List[str] = field(default_factory=list)
     
     def is_no_trade_marker(self) -> bool:
         """Check if this config is a NO_TRADE marker (no valid strategy found)."""
@@ -692,6 +731,8 @@ class RegimeConfig:
             'live_observability': dict(self.live_observability or _default_live_observability()),
             'governance_policy': dict(self.governance_policy or _default_governance_policy()),
             'walk_forward_audit': dict(self.walk_forward_audit or _default_walk_forward_audit()),
+            'promotion_status': str(self.promotion_status or "PROMOTED"),
+            'promotion_reasons': list(self.promotion_reasons or []),
         }
     
     @classmethod
@@ -716,6 +757,8 @@ class RegimeConfig:
             live_observability=data.get('live_observability') or _default_live_observability(),
             governance_policy=data.get('governance_policy') or _default_governance_policy(),
             walk_forward_audit=data.get('walk_forward_audit') or _default_walk_forward_audit(),
+            promotion_status=data.get('promotion_status', 'PROMOTED'),
+            promotion_reasons=list(data.get('promotion_reasons', []) or []),
         )
         
         if data.get('trained_at'):
@@ -1596,6 +1639,8 @@ class RegimeOptimizer:
                 "tradeable": False,
                 "no_trade": True,
             },
+            promotion_status="NO_TRADE",
+            promotion_reasons=[reason],
         )
     
     @staticmethod
@@ -2454,6 +2499,7 @@ class RegimeOptimizer:
                         val_metrics,
                         score=score,
                         validation_reason=validation_reason,
+                        candidate=cand,
                     ),
                 )
 
@@ -2494,6 +2540,7 @@ class RegimeOptimizer:
                 val_metrics,
                 score=best_score,
                 validation_reason=validation_reason,
+                candidate=best_candidate,
             ),
         )
 
@@ -2648,7 +2695,8 @@ class RegimeOptimizer:
                                    val_metrics: Dict[str, Any],
                                    *,
                                    score: Optional[float] = None,
-                                   validation_reason: str = "") -> Dict[str, Any]:
+                                   validation_reason: str = "",
+                                   candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build compact, persisted validation evidence for dashboards and review."""
         train_full = self._bucket_to_full_metrics(train_metrics or {})
         val_full = self._bucket_to_full_metrics(val_metrics or {})
@@ -2666,9 +2714,22 @@ class RegimeOptimizer:
             "val_return_pct": val_return,
             "val_max_drawdown_pct": val_dd,
             "validation_reason": validation_reason,
+            "fresh_edge_policy": {
+                "winner_source": "active_recent_stage3",
+                "no_fallback_to_best_train": True,
+                "holdout_does_not_displace_latest_surface": bool(
+                    getattr(self.config, "walk_forward_do_not_displace_latest_surface", True)
+                ),
+            },
         }
         if score is not None:
             evidence["selection_score_raw"] = float(score)
+        if isinstance(candidate, dict):
+            try:
+                strategy = StrategyRegistry.get(candidate.get("strategy_name", ""), **(candidate.get("params", {}) or {}))
+            except Exception:
+                strategy = None
+            evidence["fairness_evidence"] = build_fairness_evidence(candidate, strategy=strategy)
         return evidence
     
     def _compute_regime_score(self,
@@ -2982,6 +3043,23 @@ class OptimizationPipeline:
                         timeframe=tf,
                     )
                     metrics = bucket.get(regime, {"total_trades": 0})
+                    if bool(getattr(self.config, "regime_profitability_audit_enabled", True)):
+                        regime_audit = audit_regime_profitability(
+                            {regime: metrics},
+                            features=audit_features,
+                            trades=audit_result.get("trades", []),
+                            min_trades=min_trades,
+                            min_profit_factor=min_pf,
+                            min_return_pct=0.0,
+                            low_gap_warn=float(getattr(self.config, "regime_min_live_gap_warn", 0.05) or 0.05),
+                            include_boundary_audit=bool(
+                                getattr(self.config, "regime_boundary_audit_enabled", True)
+                            ),
+                        ).to_dict()
+                        payload["regime_profitability_audit"] = regime_audit
+                        validation_evidence = dict(getattr(cfg, "validation_evidence", {}) or {})
+                        validation_evidence["regime_audit"] = regime_audit
+                        cfg.validation_evidence = validation_evidence
                     total_trades = int(metrics.get("total_trades", 0) or 0)
                     pf = float(metrics.get("profit_factor", 0.0) or 0.0)
                     dd = float(metrics.get("max_drawdown_pct", 0.0) or 0.0)
@@ -3290,6 +3368,19 @@ class OptimizationPipeline:
                     evaluation_warmup,
                     selection_surface=selection_surface,
                 )
+
+    def _apply_promotion_statuses(self,
+                                  regime_configs: Dict[str, Dict[str, RegimeConfig]],
+                                  default_config: Optional[RegimeConfig]) -> None:
+        for regimes in regime_configs.values():
+            for cfg in regimes.values():
+                status, reasons = classify_promotion_status(cfg, self.config)
+                cfg.promotion_status = status
+                cfg.promotion_reasons = reasons
+        if default_config is not None:
+            status, reasons = classify_promotion_status(default_config, self.config)
+            default_config.promotion_status = status
+            default_config.promotion_reasons = reasons
     
     def run_for_symbol(self, symbol: str) -> PipelineResult:
         """
@@ -3415,7 +3506,7 @@ class OptimizationPipeline:
             else:
                 governance_features_by_tf = stage3_features_by_tf
                 governance_warmup_by_tf = stage3_warmup_by_tf
-                governance_surface = "stage3_selection" if active_mode else "freshest_tail_holdout"
+                governance_surface = "stage3_selection"
             self._attach_governance_policies(
                 symbol,
                 regime_configs,
@@ -3431,6 +3522,10 @@ class OptimizationPipeline:
                 default_config.live_observability = dict(matched_cfg.live_observability)
                 default_config.walk_forward_audit = dict(matched_cfg.walk_forward_audit)
                 default_config.governance_policy = dict(matched_cfg.governance_policy)
+                default_config.promotion_status = str(matched_cfg.promotion_status or "PROMOTED")
+                default_config.promotion_reasons = list(matched_cfg.promotion_reasons or [])
+
+            self._apply_promotion_statuses(regime_configs, default_config)
 
             for regimes in regime_configs.values():
                 for cfg in regimes.values():
@@ -3447,6 +3542,7 @@ class OptimizationPipeline:
                 "resample_cache": self.data_loader.get_resample_cache_stats(reset=False),
             }
             default_validation_evidence["optimizer_telemetry"] = optimizer_telemetry
+            default_validation_evidence["fairness_report"] = build_fairness_report(regime_configs)
             selected_robustness = float(default_validation_evidence.get("robustness_ratio", 0.0) or 0.0)
 
             retrain_days = int(getattr(self.config, 'fixed_retrain_days', getattr(self.config, 'optimization_valid_days', 14)))
