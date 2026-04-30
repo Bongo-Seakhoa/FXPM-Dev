@@ -96,6 +96,8 @@ class MT5SymbolInfo:
     trade_stops_level: int
     visible: bool = True
     trade_mode: int = 2
+    swap_mode: int = -1
+    swap_rollover3days: int = 3
     filling_mode: int = 0
     trade_exemode: int = 0
     trade_freeze_level: int = 0
@@ -161,6 +163,8 @@ class MT5SymbolInfo:
             commission_per_lot=resolved_commission,
             swap_long=self.swap_long,
             swap_short=self.swap_short,
+            swap_mode=self.swap_mode,
+            swap_rollover3days=self.swap_rollover3days,
             tick_size=self.trade_tick_size,
             tick_value=self.trade_tick_value,
             contract_size=self.trade_contract_size,
@@ -510,6 +514,11 @@ class MT5Connector:
             trade_stops_level=info.trade_stops_level,
             visible=bool(getattr(info, "visible", True)),
             trade_mode=int(getattr(info, "trade_mode", 2) or 0),
+            swap_mode=int(getattr(info, "swap_mode", -1) if getattr(info, "swap_mode", None) is not None else -1),
+            swap_rollover3days=int(
+                getattr(info, "swap_rollover3days", 3)
+                if getattr(info, "swap_rollover3days", None) is not None else 3
+            ),
             filling_mode=int(getattr(info, "filling_mode", 0) or 0),
             trade_exemode=int(getattr(info, "trade_exemode", 0) or 0),
             trade_freeze_level=int(getattr(info, "trade_freeze_level", 0) or 0),
@@ -923,6 +932,100 @@ class MT5Connector:
             order=result.order,
             volume=result.volume,
             price=result_price
+        )
+
+    def close_position_partial(self,
+                               position: MT5Position,
+                               percent: float = 50.0,
+                               deviation: int = 30,
+                               magic: int = 0,
+                               comment: str = "") -> MT5OrderResult:
+        """Close a percentage of an open position volume."""
+        if not self._check_connection():
+            return MT5OrderResult(False, -1, "Not connected")
+
+        try:
+            pct = max(0.0, min(100.0, float(percent)))
+            current_volume = float(position.volume)
+        except (TypeError, ValueError):
+            return MT5OrderResult(False, -1, "Invalid partial close volume")
+        if pct <= 0.0 or current_volume <= 0.0:
+            return MT5OrderResult(False, -1, "Partial close percent/volume must be positive")
+
+        symbol_info = self.get_symbol_info(position.symbol)
+        if symbol_info is None:
+            return MT5OrderResult(False, -1, f"Symbol info not available: {position.symbol}")
+
+        if pct >= 99.999:
+            return self.close_position(position, deviation=deviation, magic=magic, comment=comment or "Partial close full")
+
+        raw_target_volume = current_volume * pct / 100.0
+        step = float(symbol_info.volume_step or 0.01)
+        if step <= 0:
+            step = 0.01
+        target_volume = math.floor((raw_target_volume / step) + 1e-12) * step
+        precision = max(
+            self._volume_decimal_places(step),
+            self._volume_decimal_places(symbol_info.volume_min),
+        )
+        target_volume = round(target_volume, precision)
+        min_volume = float(symbol_info.volume_min)
+        if target_volume < min_volume:
+            return MT5OrderResult(False, -1, "Partial close below broker minimum volume")
+        remaining = current_volume - target_volume
+        if remaining < min_volume:
+            return MT5OrderResult(False, -1, "Partial close would leave remainder below broker minimum volume")
+        if target_volume <= 0.0:
+            return MT5OrderResult(False, -1, "Partial close normalized to zero")
+
+        tick = self.get_tick(position.symbol)
+        if tick is None:
+            return MT5OrderResult(False, -1, "No tick data")
+
+        if position.type == 0:
+            close_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+
+        filling_type = self._get_filling_type(position.symbol, symbol_info=symbol_info)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": target_volume,
+            "type": close_type,
+            "position": position.ticket,
+            "price": price,
+            "deviation": deviation,
+            "magic": magic or position.magic,
+            "comment": comment or "Partial close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_type,
+        }
+
+        preflight = self._preflight_order_request(request)
+        if preflight is not None:
+            return preflight
+
+        result = mt5.order_send(request)
+        if result is None:
+            error = mt5.last_error()
+            return MT5OrderResult(False, error[0], str(error[1]))
+
+        retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
+        result_price = float(getattr(result, "price", 0.0) or 0.0)
+        if result_price <= 0.0:
+            result_price = float(price)
+
+        return MT5OrderResult(
+            success=(result.retcode in [10008, 10009, 10010]),
+            retcode=result.retcode,
+            retcode_description=retcode_desc,
+            deal=result.deal,
+            order=result.order,
+            volume=target_volume,
+            price=result_price,
         )
     
     def modify_position(self,
@@ -1363,6 +1466,8 @@ class MT5Connector:
                 'spread_float': info.spread_float,
                 'swap_long': info.swap_long,
                 'swap_short': info.swap_short,
+                'swap_mode': info.swap_mode,
+                'swap_rollover3days': info.swap_rollover3days,
                 'stops_level': info.trade_stops_level,
                 'pip_size': info.pip_size,
                 'pip_value': info.pip_value,

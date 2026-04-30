@@ -2690,6 +2690,276 @@ class StochRSITrendGateStrategy(BaseStrategy):
 # =============================================================================
 
 
+class SessionVWAPReversionStrategy(BaseStrategy):
+    """Session VWAP reversion using intraday fair value and ATR bands."""
+
+    @property
+    def name(self) -> str:
+        return "SessionVWAPReversionStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "session_start_hour": 7,
+            "session_end_hour": 20,
+            "deviation_atr_mult": 1.25,
+            "atr_period": 14,
+            "trend_ema_period": 0,
+            "adx_max": 30,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+        }
+
+    @staticmethod
+    def _session_vwap(features: pd.DataFrame) -> pd.Series:
+        volume = pd.to_numeric(features.get("Volume", pd.Series(1.0, index=features.index)), errors="coerce").fillna(1.0)
+        typical = (features["High"] + features["Low"] + features["Close"]) / 3.0
+        if isinstance(features.index, pd.DatetimeIndex):
+            session_key = pd.Series(features.index.date, index=features.index)
+        else:
+            session_key = pd.Series(0, index=features.index)
+        pv = typical * volume
+        cum_pv = pv.groupby(session_key).cumsum()
+        cum_vol = volume.groupby(session_key).cumsum()
+        return cum_pv / (cum_vol + 1e-10)
+
+    def get_required_features(self) -> Set[str]:
+        required = {f'ATR_{int(self.params.get("atr_period", 14))}'}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        if float(self.params.get("adx_max", 0)) > 0:
+            required.add("ADX")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        start_hour = int(self.params.get("session_start_hour", 7))
+        end_hour = int(self.params.get("session_end_hour", 20))
+        deviation_mult = float(self.params.get("deviation_atr_mult", 1.25))
+        atr_period = int(self.params.get("atr_period", 14))
+
+        close = features["Close"]
+        atr = _get_atr(features, atr_period)
+        vwap = self._session_vwap(features)
+        lower = vwap - deviation_mult * atr
+        upper = vwap + deviation_mult * atr
+
+        if isinstance(features.index, pd.DatetimeIndex):
+            hours = pd.Series(features.index.hour, index=features.index)
+            if start_hour <= end_hour:
+                session = (hours >= start_hour) & (hours <= end_hour)
+            else:
+                session = (hours >= start_hour) | (hours <= end_hour)
+        else:
+            session = pd.Series(True, index=features.index)
+
+        long_entry = session & (close > lower) & (close.shift(1) <= lower.shift(1))
+        short_entry = session & (close < upper) & (close.shift(1) >= upper.shift(1))
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            long_entry = long_entry & (close >= ema)
+            short_entry = short_entry & (close <= ema)
+
+        adx_max = float(self.params.get("adx_max", 30))
+        if adx_max > 0 and "ADX" in features.columns:
+            allow = features["ADX"] <= adx_max
+            long_entry = long_entry & allow
+            short_entry = short_entry & allow
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, max(atr_period, ema_period, 2))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "session_start_hour": [0, 7, 8],
+            "session_end_hour": [16, 20, 23],
+            "deviation_atr_mult": [0.75, 1.0, 1.25, 1.5, 2.0],
+            "atr_period": [10, 14, 20],
+            "trend_ema_period": [0, 50, 100, 200],
+            "adx_max": [0, 20, 25, 30],
+            **self._base_sl_tp_grid(),
+        }
+
+
+class LiquiditySweepReversalStrategy(BaseStrategy):
+    """Reversal after a stop sweep through recent structure."""
+
+    @property
+    def name(self) -> str:
+        return "LiquiditySweepReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "lookback": 20,
+            "min_sweep_atr": 0.10,
+            "atr_period": 14,
+            "require_close_inside": True,
+            "ema_filter_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+        }
+
+    def get_required_features(self) -> Set[str]:
+        required = {f'ATR_{int(self.params.get("atr_period", 14))}'}
+        ema_period = int(self.params.get("ema_filter_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        lookback = int(self.params.get("lookback", 20))
+        atr_period = int(self.params.get("atr_period", 14))
+        min_sweep_atr = float(self.params.get("min_sweep_atr", 0.10))
+        require_inside = bool(self.params.get("require_close_inside", True))
+
+        high = features["High"]
+        low = features["Low"]
+        close = features["Close"]
+        atr = _get_atr(features, atr_period)
+        prior_high = high.shift(1).rolling(lookback).max()
+        prior_low = low.shift(1).rolling(lookback).min()
+        min_sweep = min_sweep_atr * atr
+
+        long_entry = low < (prior_low - min_sweep)
+        short_entry = high > (prior_high + min_sweep)
+        if require_inside:
+            long_entry = long_entry & (close > prior_low)
+            short_entry = short_entry & (close < prior_high)
+
+        ema_period = int(self.params.get("ema_filter_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            long_entry = long_entry & (close >= ema)
+            short_entry = short_entry & (close <= ema)
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, max(lookback + 1, atr_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "lookback": [10, 20, 30, 50],
+            "min_sweep_atr": [0.0, 0.1, 0.2, 0.35],
+            "atr_period": [10, 14, 20],
+            "require_close_inside": [True, False],
+            "ema_filter_period": [0, 50, 100, 200],
+            **self._base_sl_tp_grid(),
+        }
+
+
+class RegimeTransitionBreakoutStrategy(BaseStrategy):
+    """Breakout entry on fresh transition into trend/breakout regimes."""
+
+    @property
+    def name(self) -> str:
+        return "RegimeTransitionBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "lookback": 20,
+            "transition_window": 5,
+            "source_regimes": ("CHOP", "RANGE"),
+            "target_regimes": ("BREAKOUT",),
+            "min_regime_gap": 0.05,
+            "adx_threshold": 18,
+            "ema_filter_period": 50,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+            **self._structural_sl_defaults(),
+        }
+
+    def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(params)
+        if "allowed_regimes" in normalized and "target_regimes" not in normalized:
+            normalized["target_regimes"] = normalized.pop("allowed_regimes")
+        for key, default in {"source_regimes": ("CHOP", "RANGE"), "target_regimes": ("BREAKOUT",)}.items():
+            values = normalized.get(key, default)
+            if isinstance(values, str):
+                values = tuple(item.strip().upper() for item in values.split(",") if item.strip())
+            normalized[key] = tuple(str(item).upper() for item in values)
+        return normalized
+
+    def get_required_features(self) -> Set[str]:
+        required = {"REGIME_LIVE", "REGIME_GAP", "ADX"}
+        ema_period = int(self.params.get("ema_filter_period", 50))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        lookback = int(self.params.get("lookback", 20))
+        transition_window = int(self.params.get("transition_window", 5))
+        source_regimes = set(self.params.get("source_regimes", ("CHOP", "RANGE")))
+        target_regimes = set(self.params.get("target_regimes", ("BREAKOUT",)))
+        min_regime_gap = float(self.params.get("min_regime_gap", 0.05))
+        adx_threshold = float(self.params.get("adx_threshold", 18))
+
+        regime_col = "REGIME_LIVE" if "REGIME_LIVE" in features.columns else "REGIME" if "REGIME" in features.columns else None
+        if regime_col is None:
+            return pd.Series(0, index=features.index, dtype=int)
+        regimes = features[regime_col].astype(str).str.upper()
+        prior_regimes = regimes.shift(1)
+        transition_now = prior_regimes.isin(source_regimes) & regimes.isin(target_regimes)
+        fresh_transition = transition_now.rolling(transition_window, min_periods=1).max().astype(bool)
+        if "REGIME_GAP" in features.columns and min_regime_gap > 0:
+            gap_ok = pd.to_numeric(features["REGIME_GAP"], errors="coerce").abs() >= min_regime_gap
+        else:
+            gap_ok = pd.Series(True, index=features.index)
+
+        high = features["High"]
+        low = features["Low"]
+        close = features["Close"]
+        prior_high = high.shift(1).rolling(lookback).max()
+        prior_low = low.shift(1).rolling(lookback).min()
+        long_entry = regimes.isin(target_regimes) & fresh_transition & gap_ok & (close > prior_high)
+        short_entry = regimes.isin(target_regimes) & fresh_transition & gap_ok & (close < prior_low)
+
+        if adx_threshold > 0 and "ADX" in features.columns:
+            strong = features["ADX"] >= adx_threshold
+            long_entry = long_entry & strong
+            short_entry = short_entry & strong
+
+        ema_period = int(self.params.get("ema_filter_period", 50))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            long_entry = long_entry & (close >= ema)
+            short_entry = short_entry & (close <= ema)
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, max(lookback + 1, ema_period, transition_window))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "lookback": [10, 20, 30, 50],
+            "transition_window": [2, 3, 5, 8],
+            "source_regimes": [("CHOP",), ("RANGE",), ("CHOP", "RANGE")],
+            "target_regimes": [("BREAKOUT",), ("TREND",), ("BREAKOUT", "TREND")],
+            "min_regime_gap": [0.0, 0.03, 0.05, 0.08],
+            "adx_threshold": [0, 15, 18, 22, 25],
+            "ema_filter_period": [0, 20, 50, 100],
+            **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
+        }
+
+
 class InsideBarBreakoutStrategy(BaseStrategy):
     """Inside bar breakout: mother bar engulfs child bar(s), breakout of mother range."""
 
@@ -3864,6 +4134,8 @@ class StrategyRegistry:
         'StochRSITrendGateStrategy': StochRSITrendGateStrategy,
         'FisherTransformMRStrategy': FisherTransformMRStrategy,
         'ZScoreVWAPReversionStrategy': ZScoreVWAPReversionStrategy,
+        'SessionVWAPReversionStrategy': SessionVWAPReversionStrategy,
+        'LiquiditySweepReversalStrategy': LiquiditySweepReversalStrategy,
         
         # Breakout/Momentum
         'DonchianBreakoutStrategy': DonchianBreakoutStrategy,
@@ -3873,6 +4145,7 @@ class StrategyRegistry:
         'KeltnerBreakoutStrategy': KeltnerBreakoutStrategy,
         'PivotBreakoutStrategy': PivotBreakoutStrategy,
         'MACDHistogramMomentumStrategy': MACDHistogramMomentumStrategy,
+        'RegimeTransitionBreakoutStrategy': RegimeTransitionBreakoutStrategy,
 
         # Additional strategies
         # Breakout
@@ -3977,6 +4250,8 @@ __all__ = [
     'StochRSITrendGateStrategy',
     'FisherTransformMRStrategy',
     'ZScoreVWAPReversionStrategy',
+    'SessionVWAPReversionStrategy',
+    'LiquiditySweepReversalStrategy',
     # Breakout/Momentum
     'DonchianBreakoutStrategy',
     'VolatilityBreakoutStrategy',
@@ -3985,6 +4260,7 @@ __all__ = [
     'KeltnerBreakoutStrategy',
     'PivotBreakoutStrategy',
     'MACDHistogramMomentumStrategy',
+    'RegimeTransitionBreakoutStrategy',
     # Additional strategies
     'InsideBarBreakoutStrategy',
     'NarrowRangeBreakoutStrategy',
