@@ -623,6 +623,8 @@ class PipelineConfig:
     walk_forward_audit_mode: str = "severe_fragility_only"
     walk_forward_promotion_policy: str = "block_severe_only"
     walk_forward_do_not_displace_latest_surface: bool = True
+    # PROMOTE_SMALL winners trade live with a derated risk multiplier (0..1).
+    promote_small_risk_multiplier: float = 0.5
     local_governance_tournament_enabled: bool = False
     local_governance_live_mode: str = "off"
     local_governance_candidate_policies: List[str] = field(
@@ -1059,6 +1061,11 @@ class PipelineConfig:
         ).strip().lower()
         if self.walk_forward_promotion_policy not in {"observe_only", "block_severe_only"}:
             self.walk_forward_promotion_policy = "block_severe_only"
+        try:
+            mult = float(getattr(self, "promote_small_risk_multiplier", 0.5) or 0.0)
+        except Exception:
+            mult = 0.5
+        self.promote_small_risk_multiplier = max(0.0, min(1.0, mult))
         self.swap_model_enabled = bool(self.swap_model_enabled)
         _rollover_day = str(getattr(self, "swap_model_triple_rollover_day", "wednesday") or "").strip().lower()
         if _rollover_day not in _WEEKDAY_NAME_TO_INDEX:

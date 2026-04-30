@@ -1,6 +1,6 @@
-# FxPM 1.4 Settings Reference
+# FXPM-Dev Settings Reference
 
-This file documents the current `config.json` schema and the way the PM uses those settings today.
+This file documents the current `config.json` schema and the way FXPM-Dev uses those settings today. The repository name is `FXPM-Dev`; the internal runtime banner currently remains `FX PORTFOLIO MANAGER v3.1`.
 
 Use this as the reference for the live codebase. The `Default` column documents code defaults unless a row says otherwise. The checked-in `config.json` is the active repo profile and may intentionally override those defaults.
 
@@ -102,6 +102,9 @@ The active-recent M5 workflow drives all selection windows from the bar counts i
 | `use_commission` | bool | `true` | Apply commission per lot in backtests. |
 | `use_slippage` | bool | `true` | Apply slippage modeling for stop-based exits. |
 | `slippage_pips` | float | `0.5` | Slippage in pips for modeled stop exits. |
+| `swap_model_enabled` | bool | `true` | Applies signed overnight swap/carry costs to closed-trade P&L and the backtest equity curve. |
+| `swap_model_triple_rollover_day` | enum | `"wednesday"` | Weekday that receives triple rollover in the swap model. Invalid values normalize to `"wednesday"`. |
+| `swap_model_min_holding_hours` | float | `20.0` | Minimum holding time before swap rollover is considered. |
 
 ### 2.5 Optimization controls
 
@@ -161,6 +164,10 @@ The pipeline uses the FX backtester scoring path exclusively (no `scoring_mode` 
 | `regime_enable_hyperparam_tuning` | bool | `true` | Enable regime-aware hyperparameter tuning. |
 | `regime_hyperparam_top_k` | int | `3` | Code default Top-K strategies to tune per regime. The active profile uses `5`. |
 | `regime_hyperparam_max_combos` | int | `150` | Code default max parameter combinations per regime-tuned strategy. The active profile uses `200`. |
+| `regime_profitability_audit_enabled` | bool | `true` | Attaches per-regime profitability evidence to validation artifacts. |
+| `regime_boundary_audit_enabled` | bool | `true` | Attaches transition and boundary metrics to validation evidence for regime-change review. |
+| `regime_ambiguity_policy` | enum | `"observe_only"` | Live policy for ambiguous regime gaps. `"observe_only"` annotates; `"block"` can block when configured. |
+| `regime_min_live_gap_warn` | float | `0.05` | Gap threshold used by regime ambiguity warnings. |
 
 Optimization, backtest trade intent, regime TP multipliers, and live winner lookup all prefer the decision-time `REGIME_LIVE` / `REGIME_STRENGTH_LIVE` surface. `REGIME` / `REGIME_STRENGTH` are legacy fallbacks when shifted live-decision columns are unavailable.
 
@@ -202,7 +209,7 @@ These gates act before tuning and should remain materially looser than the final
 | `live_bar_poll_seconds` | float | `0.25` | CPU-idle poll interval used only to avoid a busy loop while checking MT5 bar availability. It does not decide whether a signal is due. |
 | `live_bar_settle_seconds` | int | `5` | Scheduled-mode post-close settle buffer before a bar is treated as due. In bar mode, freshness is determined from live data timestamps instead of this wall-clock gate. |
 | `live_stale_retry_seconds` | int | `15` | Scheduled-mode retry fallback when the PM cannot yet compute a trustworthy next due-time or a broker feed has not advanced after the expected close. |
-| `live_artifact_drift_policy` | enum | `"block"` | Live eligibility policy when a validated config's semantic artifact contract no longer matches the current optimizer/backtester contract. `"block"` prevents live trading on stale contracts, `"warn"` allows trading but records warnings, and `"ignore"` suppresses the artifact-drift live gate. |
+| `live_artifact_drift_policy` | enum | `"block"` | Live eligibility policy when a validated config's semantic artifact contract no longer matches the current optimizer/backtester contract. `"block"` prevents live trading on stale contracts, `"warn"` allows trading but records warnings, and `"ignore"` suppresses the artifact-drift live gate. The funded-live readiness gate requires `"block"` and returns exit code `2` before real trading if the policy is weaker. |
 | `live_config_expiry_grace_minutes` | int | `0` | Optional grace period after `valid_until` before live trading blocks an otherwise validated config. The active profile uses `0` so expiry is strict. |
 | `actionable_score_margin` | float | `0.92` | Relative margin used when comparing actionable signal quality. |
 | `min_trade_risk_pct` | float | `0.1` | Minimum non-zero risk required for a trade to be placed. The active high-risk low-balance profile uses `0.05`. |
@@ -220,6 +227,16 @@ These gates act before tuning and should remain materially looser than the final
 | Key | Type | Default | Description |
 |---|---|---:|---|
 | `market_driven_exit_pack_mode` | enum | `"off"` | Exit-pack runtime mode. `"off"` disables the pack, `"paper"` records would-be actions without modifying live trades, and `"on"` allows the pack to act. This is separate from the local governance tournament and should be treated as a downstream execution layer. |
+
+### 2.13c Optional event calendar context
+
+| Key | Type | Default | Description |
+|---|---|---:|---|
+| `event_calendar_enabled` | bool | `false` | Enables observe-only event-calendar annotations in live actionable context. |
+| `event_calendar_mode` | enum | `"observe"` | `"off"` disables calendar use; `"observe"` annotates nearby events without blocking. |
+| `event_calendar_action` | enum | `"annotate"` | Default action for matched events. The current implementation is intentionally non-blocking. |
+| `event_calendar_path` | string | `""` | Optional CSV path for event data. Empty initializes an empty calendar. |
+| `event_calendar_high_impact_action` | enum | `"observe"` | Action for high-impact events. Invalid values normalize to `"observe"`. |
 
 ### 2.14 Live spread-quality overlay
 
@@ -271,7 +288,32 @@ Related artifact surfaces:
 - `live_eligibility_report(symbol, timeframe, regime)` reports `config_present`, artifact age, cycle position, retrain timestamps, and a freshness band for weekly review.
 - Winner artifacts persist a `live_observability` block (`last_seen_drift`, `recent_consecutive_losses`, `last_review_ts`, `operator_note`, `operator_state`) for operator review without auto-derating live sizing.
 
-### 2.15b Walk-forward audit and local governance tournament
+### 2.15b Institutional supervisor and cycle drift
+
+These keys form the live protection shell around local winners. They are deliberately hard-breakpoint and context-drift controls, not a top-down allocator.
+
+| Key | Type | Default | Description |
+|---|---|---:|---|
+| `institutional_supervisor_enabled` | bool | `true` | Enables hard portfolio/account breakpoint checks before live order submission. |
+| `institutional_supervisor_mode` | enum | `"circuit_breaker"` | `"off"` disables, `"observe"` logs would-be hard blocks without blocking, and `"circuit_breaker"` blocks new entries when a hard breakpoint is breached. |
+| `portfolio_control_policy` | enum | `"hard_breakpoints_only"` | Supervisor policy. The current implementation intentionally supports hard breakpoints only; it does not rank symbols or allocate top-down risk. |
+| `max_total_open_risk_pct` | float | `8.0` | Maximum prospective total open risk percentage after adding the new trade. |
+| `max_new_entries_when_total_open_risk_above_pct` | float | `6.0` | Existing open-risk level where the supervisor starts applying `open_risk_action`. |
+| `open_risk_action` | enum | `"pause_new_entries"` | Action when existing open risk is elevated: `"observe"`, `"pause_new_entries"`, or `"derate"`. |
+| `daily_loss_hard_block_pct` | float | `0.0` | Daily realized-loss hard block. `0.0` disables the breakpoint. |
+| `session_loss_hard_block_pct` | float | `0.0` | Session realized-loss hard block. `0.0` disables the breakpoint. |
+| `weekly_loss_hard_block_pct` | float | `0.0` | Weekly realized-loss hard block. `0.0` disables the breakpoint. |
+| `open_drawdown_hard_block_pct` | float | `0.0` | Open drawdown hard block. `0.0` disables the breakpoint. |
+| `hard_block_reopen_mode` | enum | `"manual_or_next_cycle"` | Latch recovery mode after a hard block: manual reset, next cycle, or either. The latch is persisted in `logs/institutional_supervisor_state.json`; funded-live readiness refuses to start while it remains active. |
+| `cycle_drift_monitor_enabled` | bool | `true` | Enables the lightweight local cycle-drift monitor. |
+| `cycle_drift_mode` | enum | `"lightweight"` | `"off"` disables, `"observe"` records without blocking, and `"lightweight"` applies the configured action when severe drift is detected. |
+| `cycle_drift_min_trades` | int | `6` | Minimum closed trades before consecutive-loss drift can pause a context. |
+| `cycle_drift_consecutive_losses` | int | `5` | Consecutive local losses required for loss-cluster drift. |
+| `cycle_drift_execution_slippage_mult` | float | `2.5` | Execution-slippage multiple threshold. The monitor records observations from live pre-trade/final checks, and `record_trade()` can also accept post-close execution-quality values when the caller provides them. |
+| `cycle_drift_spread_degradation_mult` | float | `2.0` | Spread-degradation multiple threshold versus the live rolling median. |
+| `cycle_drift_action` | enum | `"pause_context"` | Drift response: `"observe"`, `"pause_context"`, or `"derate_context"`. |
+
+### 2.15c Walk-forward audit and local governance tournament
 
 These keys are post-selection research and execution-governance controls. They do not narrow the strategy tournament before winner discovery.
 
@@ -279,12 +321,16 @@ These keys are post-selection research and execution-governance controls. They d
 |---|---|---:|---|
 | `walk_forward_audit_enabled` | bool | `false` | Runs walk-forward analysis as an offline audit inside the normal retraining window. It records telemetry on winner artifacts but does not delay validation-to-live promotion. |
 | `walk_forward_audit_windows` | int | `3` | Number of audit windows used when `walk_forward_audit_enabled` is on. `PipelineConfig` normalizes this to at least `1`. |
+| `walk_forward_audit_mode` | enum | `"severe_fragility_only"` | Audit posture for walk-forward evidence. Current live promotion classification is driven by the severe-fragility/block policy. |
+| `walk_forward_promotion_policy` | enum | `"block_severe_only"` | Promotion classifier policy. `"block_severe_only"` turns severe walk-forward failure into `BLOCKED`; non-positive freshest holdout can become `PROMOTE_SMALL`. |
+| `walk_forward_do_not_displace_latest_surface` | bool | `true` | Keeps the newest selection surface authoritative while attaching walk-forward evidence as audit/promotion telemetry. |
+| `promote_small_risk_multiplier` | float | `0.5` | Live risk multiplier for `PROMOTE_SMALL` winners. `PipelineConfig` clamps this to `[0.0, 1.0]`. |
 | `local_governance_tournament_enabled` | bool | `false` | Enables the per-context governance sweep that compares candidate order-management policies after a `(symbol, timeframe, regime, strategy)` winner already exists. The active profile enables it. |
 | `local_governance_live_mode` | enum | `"off"` | Live runtime mode for the selected governance policy: `"off"` disables the layer, `"shadow"` logs would-be stop updates without modifying broker orders, `"on"` applies the chosen policy to open trades in that exact local context. Invalid values fall back to `"off"` with a WARN. The active profile uses `"shadow"`. |
-| `local_governance_candidate_policies` | list[string] | `["control_fixed","breakeven_1r","atr_trail_capped","pure_atr"]` | Candidate governance policies normalized by `PipelineConfig`. Aliases such as `"control"` and `"pure_atr_runner"` are mapped to canonical names. Unknown values are dropped. |
+| `local_governance_candidate_policies` | list[string] | `["control_fixed","breakeven_1r","stepped_breakeven","atr_trail_capped","chandelier_atr","structure_trail","partial_tp_runner","time_decay_exit","volatility_contraction_exit","regime_flip_reduce","pure_atr"]` | Candidate governance policies normalized by `PipelineConfig`. Aliases such as `"control"`, `"swing_trail"`, and `"pure_atr_runner"` are mapped to canonical names. Unknown values are dropped. |
 | `winner_ledger_path` | string | `"pm_configs.json"` | Path to the validated-winner ledger used by `PortfolioManager`. The active high-risk profile uses `pm_configs_high_risk.json`. |
 
-### 2.15c Risk-management optimization and historical audit
+### 2.15d Risk-management optimization and historical audit
 
 These settings make risk-management selection explicit after a strategy/timeframe/regime winner exists. They do not replace strategy discovery.
 

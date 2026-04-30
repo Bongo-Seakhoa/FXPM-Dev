@@ -1,8 +1,8 @@
-# FxPM Practical Workflow Operating Model
+# FXPM-Dev Practical Workflow Operating Model
 
-Snapshot date: 2026-04-29
+Snapshot date: 2026-04-29; refreshed for the profitability-readiness integration sweep.
 
-This document explains how the current FxPM system functions as an operating workflow. It is not a full audit and it is not a setup guide. Its purpose is to make the practical machine visible:
+This document explains how the current FXPM-Dev system functions as an operating workflow. It is not a full audit and it is not a setup guide. Its purpose is to make the practical machine visible:
 
 - what enters the system
 - what transforms those inputs
@@ -10,13 +10,13 @@ This document explains how the current FxPM system functions as an operating wor
 - what outcomes the system is meant to create
 - where the actual live/research behavior can deviate from the expected narrative
 
-Use this as a working reference when asking: "Is FxPM doing what I think it is doing?"
+Use this as a working reference when asking: "Is FXPM-Dev doing what I think it is doing?"
 
 ---
 
 ## 1. Operating Thesis
 
-FxPM is a regime-aware strategy discovery and live execution system. It does not train one fixed model. It runs a structured competition between many strategy candidates, selects validated winners per market context, stores those winners in a stateful ledger, and then trades only the winner that matches the current live symbol, timeframe, and regime.
+FXPM-Dev is a regime-aware strategy discovery and live execution system. It does not train one fixed model. It runs a structured competition between many strategy candidates, selects validated winners per market context, stores those winners in a stateful ledger, and then trades only the winner that matches the current live symbol, timeframe, and regime.
 
 The practical goal is:
 
@@ -76,17 +76,17 @@ These values are read from the local `config.json` at the time this document was
 | Winner ledger | `pm_configs_high_risk.json` | Active validated-winner ledger. |
 | Retrain mode | `notify` | Due retrain logs a warning but does not auto-run optimization. |
 | Retrain schedule | every 2 weeks Sunday `00:01` | Calendar-anchored production cycle. |
-| Live artifact drift | `warn` | Drift warns in live eligibility but does not block live trading under current local profile. |
+| Live artifact drift | `block` | Stale artifact contracts fail live eligibility and funded-live readiness. |
 | Live loop trigger | `bar` | MT5 bar timestamp changes trigger live checks. |
-| Governance live mode | `on` | Selected local governance can actively modify open-trade SL/TP. |
+| Governance live mode | `shadow` | Selected local governance is observable before broker-side SL/TP changes are made authoritative. |
 | Risk-management selection stage | `stage3` | Governance/risk policy selected after strategy winner discovery. |
-| Walk-forward audit | `false` | Walk-forward audit is not an active promotion gate. |
+| Walk-forward audit | `true` | Severe walk-forward fragility affects promotion status without displacing the newest selection surface. |
+| Institutional supervisor | `circuit_breaker` | Hard breakpoints can latch and block funded live startup until reset or next cycle. |
+| Cycle drift | `lightweight` | Severe local execution/spread/loss drift can pause a specific live context. |
 | Regime TP multipliers | all `1.0` | Live overlay defaults neutral; discovery disables the overlay. |
 | Live risk target | `position.risk_per_trade_pct = 0.5` | Position config is the authoritative live risk source. |
 | Live hard risk cap | `position.max_risk_pct = 0.8` | Entries above cap block. |
 | Risk tolerance warning | `position.risk_tolerance_pct = 8.0` | Lot-normalization drift tolerance before warning/block classification. |
-
-Deviation note: some root docs still describe `live_artifact_drift_policy = block` and `local_governance_live_mode = shadow` as the active profile. The local config currently says `warn` and `on` (`config.json:79`, `config.json:114`). Treat this as a real narrative-vs-runtime checkpoint.
 
 ---
 
@@ -104,7 +104,7 @@ These are physically measurable:
 | Drawdown control | `max_drawdown_pct`, `return_dd_ratio`, `calmar_ratio` | validation evidence and backtest metrics |
 | Risk-adjusted quality | `sharpe_ratio`, `sortino_ratio`, `mean_r`, `worst_5pct_r` | backtest metrics and scorer |
 | Robustness | `robustness_ratio`, train/validation gap, stability penalty | `validation_evidence`, `pm_core.py:4934` |
-| Live tradability | `Live eligible`, exact regime/timeframe winner, not expired, not `NO_TRADE` | `python pm_main.py --status`, `pm_pipeline.py:4099` |
+| Live tradability | `Live eligible`, exact regime/timeframe winner, not expired, not `NO_TRADE`/`PAPER_ONLY`/`BLOCKED` | `python pm_main.py --status`, `pm_pipeline.py:4099` |
 | Broker feasibility | symbol visible/tradeable, valid tick, valid stops, margin, min lot, order check | live logs and actionable ledger |
 | Execution action | order placed, paper action, skipped, blocked, no actionable setup | `last_actionable_log.json`, `pm_outputs/signal_ledger_YYYYMM.jsonl` |
 
@@ -119,7 +119,7 @@ These are not just financial, but they decide whether the system is trustworthy:
 | Explainable no-trade | No action should have a reason: no winner, no signal, spread, margin, risk, symbol, stale bar, expiry, etc. |
 | Statefulness | Optimization can resume without losing prior symbols; configs are saved atomically. |
 | Fail-closed safety | Missing account/position/tick/margin information blocks or skips entries rather than trading blind. |
-| Operator control | Retrain mode, artifact drift policy, governance mode, storage policy, and risk posture are config-driven. |
+| Operator control | Retrain mode, artifact drift policy, promotion risk derate, supervisor/drift modes, governance mode, storage policy, and risk posture are config-driven. |
 | Live/research alignment | The live strategy, timeframe, regime, stops, and risk surfaces should trace back to the selected artifact. |
 
 ---
@@ -143,6 +143,7 @@ Discovery Transform
   Stage 1 baseline screening
   Stage 2 parameter optimization
   Stage 3 governance/risk policy selection
+  walk-forward promotion + regime audit
   validation and artifact fingerprinting
 
 Discovery Output
@@ -151,6 +152,7 @@ Discovery Output
   historical audit evidence
   NO_TRADE markers
   governance policy evidence
+  promotion status and reasons
   artifact metadata and expiry
 
 Live Transform
@@ -317,7 +319,7 @@ The output is not a trade. The output is a validated winner artifact.
 
 - resolved `PipelineConfig`
 - latest M5-derived timeframe data
-- 47-strategy registry
+- 50-strategy registry
 - neutral Stage 1 defaults
 - global parameter grids and optional Optuna
 - regime labels
@@ -339,6 +341,7 @@ PortfolioManager.initial_optimization()
           -> final validation
           -> NO_TRADE markers where no candidate survives
       -> attach historical stress audit
+      -> attach walk-forward promotion and regime audit evidence
       -> attach governance/risk policy evidence
       -> build SymbolConfig
   -> save each symbol atomically to winner ledger
@@ -396,7 +399,7 @@ Stage 2 answers:
 
 ### Stage 3: Governance / Risk-Management Selection
 
-After a strategy winner exists, the pipeline can select a local order-governance/risk-management policy. With `risk_management_selection_stage = "stage3"`, the current active workflow uses the freshest tail surface copied into `stage3_features_by_tf`.
+After a strategy winner exists, the pipeline can select a local order-governance/risk-management policy from the expanded 11-policy pool. With `risk_management_selection_stage = "stage3"`, the current active workflow uses the freshest tail surface copied into `stage3_features_by_tf`.
 
 This is a deviation checkpoint: Stage 3 is a post-winner governance selection step, but in active mode it is not a fully independent third holdout universe.
 
@@ -413,6 +416,7 @@ Backtester behavior:
 - previous closed-bar signal
 - next-bar open entry
 - spread/slippage/commission modeling
+- signed swap/carry modeling with configured triple rollover
 - broker-aware tick/pip sizing
 - Numba-compatible semantics
 - live-only regime TP overlay disabled during discovery
@@ -468,8 +472,10 @@ Each saved winner artifact can include:
 - regime configs per timeframe
 - default winner
 - explicit `NO_TRADE` markers
+- promotion status and reasons
 - metrics
 - validation evidence
+- regime audit evidence
 - data window metadata
 - historical stress audit
 - governance policy
@@ -590,7 +596,7 @@ Live eligibility is stricter than raw validation. It blocks or excludes configs 
 - missing expiry
 - expired
 - no tradeable regime winners
-- default/symbol config is `NO_TRADE`
+- default/symbol config is `NO_TRADE`, `PAPER_ONLY`, or `BLOCKED`
 - artifact drift exists and policy is `block`
 
 Code anchors:
@@ -606,18 +612,24 @@ Policy behavior:
 | `warn` | Artifact drift logs a live warning but allows trading. |
 | `ignore` | Artifact drift live gate is suppressed. |
 
-Current local profile is `warn`, so artifact drift is advisory for live eligibility, but it still makes symbols due for optimization.
+Current local profile is `block`, so artifact drift blocks live eligibility and funded-live readiness.
+
+Before real live trading starts, `pm_live_readiness.py` also checks that:
+
+- `live_artifact_drift_policy` is `block`
+- the configured winner ledger is readable and non-empty
+- the ledger contains at least one live-tradeable winner
+- `logs/institutional_supervisor_state.json` is not actively latched from a previous hard block
 
 ### Advisory Versus Blocking
 
 Advisory examples:
 
 - retrain due when `production_retrain_mode = notify`
-- artifact drift when `live_artifact_drift_policy = warn`
 - storage pressure unless `storage_pause_entries_below_free_gb` is set
 - storage cleanup when `storage_observe_only = true`
 - daily/session loss advisory logs
-- live drift monitor warnings
+- cycle drift in observe mode
 - lot-normalization drift that stays under hard cap
 
 Blocking examples:
@@ -625,6 +637,9 @@ Blocking examples:
 - expired or invalid config
 - no live-eligible configs and no open positions
 - artifact drift when policy is `block`
+- funded-live readiness failure
+- latched institutional-supervisor hard block
+- cycle drift pause in lightweight mode
 - missing account/position snapshot
 - margin block/reopen cooldown
 - spread filter
@@ -641,6 +656,8 @@ Blocking examples:
 - `last_trade_log.json`
 - `last_actionable_log.json`
 - `pm_outputs/signal_ledger_YYYYMM.jsonl`
+- `logs/institutional_supervisor_state.json`
+- `logs/cycle_drift_state.json`
 
 ### Deviation Checkpoints
 
@@ -648,8 +665,8 @@ Blocking examples:
 |---|---|
 | "Retrain due blocks PM." | In `notify` mode it logs only; expired configs/live eligibility can still block new entries separately. |
 | "Raw validated configs are live configs." | Live eligibility is stricter than raw validation. |
-| "Artifact drift always blocks." | It depends on `live_artifact_drift_policy`; current local profile is `warn`. |
-| "Ledger complete means all symbols trade." | Ledger can contain `NO_TRADE`, expired, drifted, or no-winner configs. |
+| "Artifact drift always blocks." | It depends on `live_artifact_drift_policy`; current local profile is `block`. |
+| "Ledger complete means all symbols trade." | Ledger can contain `NO_TRADE`, `PAPER_ONLY`, `BLOCKED`, expired, drifted, or no-winner configs. |
 | "Status only reports optimization." | Status separates valid, live eligible, expired, invalid, and due. |
 
 ---
@@ -724,9 +741,10 @@ For each symbol:
 5. Use the last closed bar.
 6. Read `REGIME_LIVE` and `REGIME_STRENGTH_LIVE`.
 7. Require exact validated winner for `(timeframe, regime)`.
-8. Apply live quality gates.
-9. Generate signal from the selected strategy.
-10. Rank candidates by live context quality.
+8. Skip `BLOCKED`, `PAPER_ONLY`, and `NO_TRADE`; derate `PROMOTE_SMALL`.
+9. Apply live quality gates.
+10. Generate signal from the selected strategy.
+11. Rank candidates by live context quality.
 
 Code anchors:
 
@@ -774,8 +792,11 @@ Before an order is sent, `_execute_entry()` checks:
 - margin reopen/cooldown
 - tick availability
 - spread filter
+- cycle-drift pre-trade check
+- institutional-supervisor pre-size check
 - stop distances
 - risk scalar mode
+- promotion risk derate
 - secondary risk adjustments
 - minimum risk
 - broker volume min/max/step
@@ -784,6 +805,7 @@ Before an order is sent, `_execute_entry()` checks:
 - same-symbol combined risk
 - required margin versus free margin
 - final quote refresh
+- final cycle-drift and institutional-supervisor checks
 - final risk and margin recheck
 - MT5 `order_check`
 
@@ -809,7 +831,7 @@ Live runtime also manages open positions:
 - forced loser closes during margin stress
 - margin reopen cooldown
 - local governance policies such as breakeven and ATR trails
-- shadow or active governance depending on config
+- shadow or active governance depending on config; current active profile is `shadow`
 
 Code anchors:
 
@@ -838,7 +860,7 @@ Code anchors:
 | "Broker universe misses are fatal." | Missing broker symbols fail that symbol path but do not remove it from config. Recent log noise is debug-only for bar fetch misses. |
 | "Paper/live use same decision path." | Paper skips broker order send but still goes through most selection and risk logic. |
 | "Final price is the same as signal price." | Final quote refresh re-anchors price, stops, risk, and margin before submit. |
-| "Governance is shadow." | Current local config says governance live mode is `on`. |
+| "Governance always modifies broker orders." | Current local config says governance live mode is `shadow`, so decisions are observable before being made authoritative. |
 | "Daily/session loss advisory stops entries." | It is advisory unless implemented as a blocking policy. |
 
 ---
@@ -903,7 +925,7 @@ Code anchors:
 | Fair baseline competition | neutral strategy defaults | Stage 1 baseline screen | no strategy advantaged by default SL/TP asymmetry | non-neutral defaults, hidden floors, live overlay in discovery |
 | Robust strategy selection | enough active data and regimes | Stage 2 tuning and validation | validated winner per tradeable regime | low trades, high DD, weak PF, poor robustness |
 | Broker-executable live trading | MT5 symbols, specs, account, ticks | live gates and preflight | order accepted or clear block reason | symbol missing, invalid stops, min-lot risk drift, margin failure |
-| Risk containment | position config and broker account | sizing, hard cap, margin checks | risk within target/cap | `SKIPPED_RISK_CAP`, `BLOCKED_MIN_LOT_EXCEEDS_CAP`, margin blocks |
+| Risk containment | position config, broker account, supervisor/drift state | sizing, hard cap, margin, supervisor, and cycle-drift checks | risk within target/cap or clear block | `SKIPPED_RISK_CAP`, `BLOCKED_MIN_LOT_EXCEEDS_CAP`, margin blocks, supervisor/cycle-drift blocks |
 | Explainable no-trade | decision and logging surfaces | throttled action records | clear reason for no action | silence, missing actionable record, repeated vague logs |
 | Operational continuity | winner ledger and retrain schedule | validity/drift checks | live-eligible configs or retrain instruction | expired configs, artifact drift, incomplete ledger |
 | Human confidence | status, dashboard, logs, evidence | observability loop | operator can explain PM state | docs/config mismatch, hidden mode changes, stale dashboards |
@@ -916,14 +938,14 @@ This section is the practical bridge between planned narrative and live reality.
 
 | Deviation | Why it matters | How to detect | Current posture |
 |---|---|---|---|
-| Docs say drift blocking, local config says drift warning | Stale artifacts may still trade if policy is `warn` | check `config.json:79`, live logs for `LIVE WARN` | local `warn` |
-| Docs say governance shadow, local config says on | Broker SL/TP may be actively modified | check `config.json:114`, governance logs | local `on` |
+| Funded-live readiness can block before the live loop starts | A stale ledger, non-blocking artifact policy, or latched supervisor prevents real orders | `pm_live_readiness.py`, startup logs, exit code `2` | expected safety behavior |
+| Governance is selected but live mode is shadow | Broker SL/TP is not modified until the mode is intentionally changed to `on` | check `config.json`, governance logs | local `shadow` |
 | Stage 3 is named like a separate stage but uses fresh-tail surface copy | May be mistaken for independent holdout validation | inspect `pm_pipeline.py:3501`, `pm_pipeline.py:3548` | active workflow behavior |
 | `use_regime_optimization` exists but production always uses `RegimeOptimizer` | Config knob can create false expectation | inspect `pm_pipeline.py:2925`, `pm_pipeline.py:2930` | regime path active |
 | Legacy selector/validator classes still exist | Readers can confuse dead/offline paths with production | production pipeline comments and instantiation | production bypasses legacy |
-| `NO_TRADE` artifacts can be present in a valid ledger | Configured does not mean tradeable | status live-eligible count, no-trade metadata | expected behavior |
+| `NO_TRADE`/`PAPER_ONLY`/`BLOCKED` artifacts can be present in a valid ledger | Configured does not mean tradeable | status live-eligible count, promotion metadata | expected behavior |
 | Retrain warning does not block in `notify` mode | Operator may assume PM stopped | check logs and mode | advisory only |
-| Artifact drift can still trigger optimization even if live warns only | Optimize due and live eligibility are related but not identical | `should_optimize()` vs `get_live_eligible_configs()` | due can exist while live trades |
+| Artifact drift can trigger both optimization due-state and live blocking | Optimize due and live eligibility are related but not identical surfaces | `should_optimize()` vs `get_live_eligible_configs()` | current policy blocks live |
 | Live bar gate evaluates changed bars only | No signal checks on unchanged bars | bar trigger logs, changed bar probes | expected behavior |
 | Broker symbol universe mismatch | Symbols may remain in config but not trade at current broker | MT5 spec sync failures, debug bar misses | expected if broker lacks symbols |
 | Position risk config overrides pipeline risk | Risk may not match research value | resolved config summary, `position` section | position authoritative |
@@ -1064,4 +1086,3 @@ Observability:
 - `pm_storage.py:528` - storage freshness
 - `pm_pipeline.py:4280` - status report
 - `pm_dashboard/app.py:536` - dashboard readiness
-

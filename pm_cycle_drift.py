@@ -139,7 +139,13 @@ class CycleDriftMonitor:
                      timeframe: str,
                      regime: str,
                      strategy_name: str,
-                     pnl_dollars: float) -> None:
+                     pnl_dollars: float,
+                     *,
+                     execution_slippage_mult: float = 0.0,
+                     spread_degradation_mult: float = 0.0) -> None:
+        """Record a closed trade. Optional execution-quality observations widen
+        the running max so the sentinel can pause a context whose live execution
+        has degraded materially against expectations."""
         key = self._key(symbol, timeframe, regime, strategy_name)
         state = self._state.setdefault(key, _ContextState())
         state.trades += 1
@@ -148,6 +154,15 @@ class CycleDriftMonitor:
             state.consecutive_losses += 1
         else:
             state.consecutive_losses = 0
+        if execution_slippage_mult:
+            value = float(execution_slippage_mult)
+            state.last_execution_slippage_mult = value
+            state.max_execution_slippage_mult = max(state.max_execution_slippage_mult, value)
+        if spread_degradation_mult:
+            value = float(spread_degradation_mult)
+            state.last_spread_degradation_mult = value
+            state.max_spread_degradation_mult = max(state.max_spread_degradation_mult, value)
+        state.last_evaluated_at = datetime.now().isoformat()
         self._save_state()
 
     def reset_context(self,

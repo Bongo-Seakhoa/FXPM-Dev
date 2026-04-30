@@ -1,0 +1,794 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FXPM-Dev - GPT Best Config Recommendations</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #5c667a;
+      --line: #d8deea;
+      --soft: #f5f7fb;
+      --soft-2: #eef4f1;
+      --accent: #256b5f;
+      --accent-2: #8a5b12;
+      --danger: #9f2f25;
+      --good: #1e6f43;
+      --paper: #ffffff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #f2f4f8;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      line-height: 1.55;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 34px 22px 56px;
+    }
+
+    header {
+      padding: 28px 0 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(2rem, 4vw, 3.25rem);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 38px 0 12px;
+      font-size: 1.55rem;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 26px 0 8px;
+      font-size: 1.1rem;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    code {
+      background: #edf1f7;
+      padding: 0.08rem 0.28rem;
+      border-radius: 4px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.95em;
+    }
+
+    .lede {
+      max-width: 900px;
+      color: var(--muted);
+      font-size: 1.04rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--paper);
+      color: var(--muted);
+      font-size: 0.88rem;
+      white-space: nowrap;
+    }
+
+    section {
+      margin: 24px 0;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      padding: 18px;
+      margin: 14px 0;
+    }
+
+    .callout {
+      border-left: 5px solid var(--accent);
+      background: var(--soft-2);
+    }
+
+    .warning {
+      border-left-color: var(--accent-2);
+      background: #fff7e8;
+    }
+
+    .danger {
+      border-left-color: var(--danger);
+      background: #fff0ed;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      padding: 14px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 1.05rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 26px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      font-size: 0.94rem;
+    }
+
+    th,
+    td {
+      padding: 10px 11px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #e9eef7;
+      color: #24324a;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .setting {
+      font-family: Consolas, "Courier New", monospace;
+      color: #24324a;
+      white-space: nowrap;
+    }
+
+    .keep {
+      color: var(--good);
+      font-weight: 700;
+    }
+
+    .review {
+      color: var(--accent-2);
+      font-weight: 700;
+    }
+
+    .change {
+      color: var(--danger);
+      font-weight: 700;
+    }
+
+    .symbol-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .symbol-grid code {
+      display: block;
+      text-align: center;
+      padding: 5px 6px;
+      background: #edf1f7;
+    }
+
+    @media (max-width: 820px) {
+      table,
+      thead,
+      tbody,
+      tr,
+      th,
+      td {
+        display: block;
+      }
+
+      thead {
+        display: none;
+      }
+
+      tr {
+        border-bottom: 1px solid var(--line);
+      }
+
+      td {
+        border-bottom: 0;
+        padding: 8px 10px;
+      }
+
+      td::before {
+        content: attr(data-label);
+        display: block;
+        color: var(--muted);
+        font-weight: 700;
+        margin-bottom: 2px;
+      }
+
+      .setting {
+        white-space: normal;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>FXPM-Dev GPT Best Config Recommendations</h1>
+    <p class="lede">
+      This is my independent review of the current <code>config.json</code> settings after the v2 profitability-readiness work was implemented.
+      The target is a survival-first, profit-seeking profile where discovery, validation, promotion, live readiness, governance, and broker execution all help each other rather than fighting each other.
+    </p>
+    <div class="meta">
+      <span class="pill">Generated: 2026-05-01</span>
+      <span class="pill">Repository: FXPM-Dev</span>
+      <span class="pill">Source reviewed: config.json</span>
+      <span class="pill">Strategy registry: 50</span>
+      <span class="pill">Governance pool: 11 policies</span>
+      <span class="pill">No profit guarantee</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>Bottom Line</h2>
+    <div class="panel callout">
+      <p>
+        The current profile is largely coherent and better integrated than the pre-v2 stack. I would keep the active-recent workflow, real-cost discovery, strict artifact drift blocking, institutional supervisor, cycle drift monitor, walk-forward promotion gating, swap model, and governance tournament exactly as the backbone.
+      </p>
+      <p>
+        The main settings I would review before funded live are not discovery settings. They are operational settings: generate the missing <code>regime_params.json</code>, lower advisory loss thresholds so warnings arrive before hard blocks, set a storage entry-pause floor, and only graduate shadow-mode overlays after paper evidence proves they add value.
+      </p>
+    </div>
+
+    <div class="grid">
+      <div class="metric">
+        <strong>Best immediate posture</strong>
+        Paper or first-funded live with risk controls strict, governance/risk overlays in shadow, and live readiness fail-closed.
+      </div>
+      <div class="metric">
+        <strong>Best growth posture</strong>
+        Raise trade risk only after at least one full retrain cycle plus a clean paper/live observation window.
+      </div>
+      <div class="metric">
+        <strong>Most important blocker</strong>
+        A missing <code>regime_params.json</code> or an active supervisor latch should stop funded live until resolved.
+      </div>
+      <div class="metric">
+        <strong>Configuration principle</strong>
+        Optimize edge with realistic costs; scale risk only after live behavior validates the artifact assumptions.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Settings I Would Change Or Review First</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Current</th>
+          <th>Recommended target</th>
+          <th>Action</th>
+          <th>Why</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.regime_params_file</td>
+          <td data-label="Current"><code>regime_params.json</code></td>
+          <td data-label="Recommended target"><code>regime_params.json</code> present and fresh</td>
+          <td data-label="Action" class="review">Review</td>
+          <td data-label="Why">The path is right, but live readiness warned that the file was missing. Generate or restore it before funded live so regime optimization and live regime evidence are aligned.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.daily_loss_advisory_pct</td>
+          <td data-label="Current"><code>10.0</code></td>
+          <td data-label="Recommended target"><code>2.0</code></td>
+          <td data-label="Action" class="change">Change</td>
+          <td data-label="Why">Advisory warnings should arrive before the <code>3.0</code> percent daily hard block. At <code>10.0</code>, this signal is too late to be useful.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.session_loss_advisory_pct</td>
+          <td data-label="Current"><code>10.0</code></td>
+          <td data-label="Recommended target"><code>1.0</code></td>
+          <td data-label="Action" class="change">Change</td>
+          <td data-label="Why">This should warn before the <code>2.0</code> percent session hard block. It complements the supervisor instead of duplicating it after the fact.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.storage_pause_entries_below_free_gb</td>
+          <td data-label="Current"><code>null</code></td>
+          <td data-label="Recommended target"><code>8.0</code></td>
+          <td data-label="Action" class="review">Review</td>
+          <td data-label="Why">A disk-space entry pause gives the live trader a clean fail-safe before logging, cache, or ledger writes become unreliable.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.margin_*_level</td>
+          <td data-label="Current"><code>80 / 65 / 50 / 90</code></td>
+          <td data-label="Recommended target"><code>100 / 80 / 65 / 120</code> for funded accounts; keep current for aggressive small-balance testing</td>
+          <td data-label="Action" class="review">Review</td>
+          <td data-label="Why">The current levels maximize trading room. Funded accounts usually deserve wider margin hysteresis so the supervisor and margin layer act before broker stress is severe.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">position.risk_per_trade_pct</td>
+          <td data-label="Current"><code>0.5</code></td>
+          <td data-label="Recommended target"><code>0.5</code> first live; <code>0.75</code> only after paper/live evidence</td>
+          <td data-label="Action" class="keep">Keep now</td>
+          <td data-label="Why">The portfolio can stack symbols, timeframes, and D1/lower-TF pairings. Keeping first-live unit risk at <code>0.5</code> lets the new supervisor and drift layers prove themselves.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.local_governance_live_mode</td>
+          <td data-label="Current"><code>shadow</code></td>
+          <td data-label="Recommended target"><code>shadow</code> now; promote only after winner-ledger evidence</td>
+          <td data-label="Action" class="keep">Keep now</td>
+          <td data-label="Why">The 11-policy tournament is valuable, but live management policy should earn promotion from observed behavior, not just backtest appeal.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.live_risk_scalars_mode</td>
+          <td data-label="Current"><code>shadow</code></td>
+          <td data-label="Recommended target"><code>shadow</code> now; <code>on</code> only after clean attribution</td>
+          <td data-label="Action" class="keep">Keep now</td>
+          <td data-label="Why">Risk-scalar behavior can improve capital allocation, but it should not silently change live sizing before its effect is measured.</td>
+        </tr>
+        <tr>
+          <td data-label="Setting" class="setting">pipeline.event_calendar_enabled</td>
+          <td data-label="Current"><code>false</code></td>
+          <td data-label="Recommended target"><code>false</code> until a trusted calendar file exists; then <code>true</code> in <code>observe</code></td>
+          <td data-label="Action" class="keep">Keep now</td>
+          <td data-label="Why">A blank or unreliable event calendar is worse than none. Turn it on only with a curated high-impact event source.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Complementary Feature Fit</h2>
+    <div class="panel">
+      <p>
+        The settings now form a useful chain: discovery uses realistic spread, commission, slippage, and swap assumptions; validation and walk-forward audits classify fragility; live readiness refuses stale or blocked artifacts; promotion status controls whether winners are skipped, paper-only, derated, or fully tradable; supervisor and margin rules contain account-level damage; cycle drift watches whether live execution quality is decaying; governance experiments with exits in shadow before it changes real trade handling.
+      </p>
+      <p>
+        The one friction point I still see is operational, not architectural: advisory loss thresholds are set too high to be meaningful next to the hard block thresholds. Lowering those makes the warning layer complement the supervisor instead of arriving after the supervisor has already done the important work.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Pipeline Settings</h2>
+    <h3>Paths, Capital, Costs, And Discovery Fairness</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">pipeline.data_dir</td><td data-label="Recommended target"><code>./data</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps historical and live data under the repo data surface used by the workflow.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.output_dir</td><td data-label="Recommended target"><code>./pm_outputs</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Separates generated artifacts from source code and raw data.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.log_dir</td><td data-label="Recommended target"><code>./logs</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches live readiness, supervisor, cycle drift, and runtime observability paths.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.initial_capital</td><td data-label="Recommended target"><code>10000.0</code>, or the funded account baseline for account-specific research</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">A stable research baseline makes discovery comparable. Change only when deliberately modeling a different account size.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.risk_per_trade_pct</td><td data-label="Recommended target"><code>1.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good for normalized discovery comparisons. Live sizing is controlled separately by <code>position.risk_per_trade_pct</code>.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.discovery_risk_per_trade_pct</td><td data-label="Recommended target"><code>1.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps discovery winners comparable across profiles and avoids risk-shape drift in the optimizer.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.overlap_pct</td><td data-label="Recommended target"><code>10.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Enough continuity for window boundaries without letting overlap dominate the active sample.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.use_spread</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Realistic spread costs are required for fair strategy ranking.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.use_commission</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Commission-sensitive strategies should not look artificially profitable.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.use_slippage</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Slippage modeling complements cycle drift and execution-quality monitoring.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.slippage_pips</td><td data-label="Recommended target"><code>0.5</code>, then broker-tune from live observations</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">A conservative default for FX majors; execution telemetry can refine it later.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Optimization And Validation Gates</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">pipeline.max_param_combos</td><td data-label="Recommended target"><code>200</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good balance of breadth and runtime before Optuna family-size scaling takes over.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.optimization_max_workers</td><td data-label="Recommended target"><code>4</code>, or CPU cores minus one when memory allows</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps optimization parallel without overloading the workstation.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.min_trades</td><td data-label="Recommended target"><code>25</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Prevents fragile low-sample strategies from becoming primary candidates.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_opt_min_trades</td><td data-label="Recommended target"><code>15</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Allows optimization candidates through while validation and promotion still police fragility.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_val_min_trades</td><td data-label="Recommended target"><code>15</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Minimum validation sample before a winner is considered reliable enough to promote.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_val_max_drawdown</td><td data-label="Recommended target"><code>12</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps validation drawdown controlled without over-filtering aggressive symbols.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_val_sharpe_override</td><td data-label="Recommended target"><code>0.3</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Low enough to rescue useful return profiles, high enough to reject noisy flat winners.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_selection_top_k</td><td data-label="Recommended target"><code>5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Maintains diversity without flooding downstream validation.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_opt_top_k</td><td data-label="Recommended target"><code>5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Consistent with selection breadth and Optuna budget.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_gap_penalty_lambda</td><td data-label="Recommended target"><code>0.7</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Penalizes train-to-validation overfit without forcing the older stress window to select winners.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_robustness_boost</td><td data-label="Recommended target"><code>0.15</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Rewards robust winners while still letting actual performance lead.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_min_robustness_ratio</td><td data-label="Recommended target"><code>0.80</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Rejects brittle winner surfaces without being so strict that it kills all edges.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.fx_stability_penalty_k</td><td data-label="Recommended target"><code>2.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Reasonable penalty curve for unstable validation profiles.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Timeframes, Retraining, And Data Windows</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">pipeline.timeframes</td><td data-label="Recommended target"><code>["M5","M15","M30","H1","H4","D1"]</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Broad enough for intraday plus swing context; D1 pairing is controlled separately by risk caps.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.production_retrain_mode</td><td data-label="Recommended target"><code>notify</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Operator review is still valuable while the v2 safety stack is new.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.production_retrain_interval_weeks</td><td data-label="Recommended target"><code>2</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Frequent enough to adapt; not so frequent that the system churns winners constantly.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.production_retrain_weekday</td><td data-label="Recommended target"><code>sunday</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good maintenance window for FX/CFD markets.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.production_retrain_time</td><td data-label="Recommended target"><code>00:01</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids active trading hours and lines up with weekly regime refresh.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.production_retrain_anchor_date</td><td data-label="Recommended target"><code>2026-03-29</code>, then update only when intentionally resetting the cycle schedule</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Cycle IDs feed supervisor reopen behavior, so do not churn this casually.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.production_retrain_poll_seconds</td><td data-label="Recommended target"><code>60</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Low overhead while still responsive to scheduled retrain windows.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.max_bars</td><td data-label="Recommended target"><code>300000</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches the active-recent M5 design.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.historical_stress_audit_bars</td><td data-label="Recommended target"><code>50000</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Older-window fragility check without displacing the active selection surface.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.active_universe_bars</td><td data-label="Recommended target"><code>250000</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">The live-relevant universe drives winner selection.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.active_stage2_pct</td><td data-label="Recommended target"><code>50.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Lets Stage 2 optimize on the freshest half of the active universe while Stage 1 still sees the broader base.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Risk Management Selection And Regime Optimization</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">pipeline.risk_management_optimization_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Lets governance/risk policy evidence attach to winners rather than using static exits only.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.risk_management_selection_stage</td><td data-label="Recommended target"><code>stage3</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Correct: entry discovery first, management selection after the candidate has survived validation.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.historical_audit_min_trades</td><td data-label="Recommended target"><code>5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Enough to record a stress signal without falsely making the older window the selector.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.historical_audit_max_drawdown</td><td data-label="Recommended target"><code>35.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Severe older-window drawdown deserves a flag but not automatic displacement of current winners.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.historical_audit_min_profit_factor</td><td data-label="Recommended target"><code>0.60</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Captures catastrophic older-window weakness.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.use_regime_optimization</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Regime-specific winners are central to the current architecture.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_min_train_trades</td><td data-label="Recommended target"><code>25</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps regime training evidence meaningful.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_min_val_trades</td><td data-label="Recommended target"><code>15</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches validation minimums and avoids fragile regime winners.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_params_file</td><td data-label="Recommended target"><code>regime_params.json</code> present and generated from current data</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">The name is correct; the file must exist before live readiness should pass.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_enable_hyperparam_tuning</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Lets regime boundary behavior adapt instead of relying on fixed defaults.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_hyperparam_top_k</td><td data-label="Recommended target"><code>5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches the rest of the top-k optimization profile.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_hyperparam_max_combos</td><td data-label="Recommended target"><code>200</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Reasonable search breadth for regime hyperparameters.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Live Data, Artifact Readiness, And Storage</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">pipeline.live_bars_count</td><td data-label="Recommended target"><code>1500</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Enough live context for indicators without overloading broker reads.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.live_min_bars</td><td data-label="Recommended target"><code>300</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Prevents signals from running on underfilled live history.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.live_loop_trigger_mode</td><td data-label="Recommended target"><code>bar</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Broker bar timestamps are the right trigger for signal work.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.live_bar_poll_seconds</td><td data-label="Recommended target"><code>0.25</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Responsive enough for bar detection while runtime-only management still runs between signal bars.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.live_artifact_drift_policy</td><td data-label="Recommended target"><code>block</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">This is one of the most important survival settings. Stale or drifted artifacts should not trade funded live.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.live_config_expiry_grace_minutes</td><td data-label="Recommended target"><code>0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Strict expiry is correct while promotion/readiness logic is the source of truth.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Storage telemetry protects data and artifact continuity.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_observe_only</td><td data-label="Recommended target"><code>true</code> until cleanup behavior is trusted</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Safe observation first; automatic cleanup can be enabled later with confidence.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_signal_ledger_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Signal-ledger evidence helps explain live decisions and rejected trades.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_warn_free_gb</td><td data-label="Recommended target"><code>15.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Early warning before critical storage pressure.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_critical_free_gb</td><td data-label="Recommended target"><code>10.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good fail-closed threshold for live systems writing logs and ledgers.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_pause_entries_below_free_gb</td><td data-label="Recommended target"><code>8.0</code></td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">I prefer an entry pause before disk pressure can corrupt observability.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_measure_interval_seconds</td><td data-label="Recommended target"><code>300</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Sensible cadence for disk telemetry.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_housekeeping_interval_seconds</td><td data-label="Recommended target"><code>900</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Housekeeping stays current without creating noise.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_metaquotes_review_interval_seconds</td><td data-label="Recommended target"><code>21600</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Six-hour review cadence is enough for MetaQuotes folder growth.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_write_protect_minutes</td><td data-label="Recommended target"><code>5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Protects files that may still be actively written.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_local_data_first_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids unnecessary broker pulls when local data is fresh enough.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_live_sync_bars</td><td data-label="Recommended target"><code>3000</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">More than live signal context, useful for refresh overlap.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_live_sync_overlap_bars</td><td data-label="Recommended target"><code>100</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Protects against small broker/local boundary mismatches.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_live_cache_max_age_days</td><td data-label="Recommended target"><code>7</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Reasonable live-cache freshness window.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_delta_sync_overlap_minutes</td><td data-label="Recommended target"><code>1440</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">One-day overlap protects late broker corrections.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_resample_cache_max_gb</td><td data-label="Recommended target"><code>4.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Enough cache for current optimization without letting cache dominate disk.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_resample_cache_max_age_days</td><td data-label="Recommended target"><code>14</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps optimization efficient while allowing cache churn.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_logs_keep_days</td><td data-label="Recommended target"><code>14</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good operational log retention.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_pm_outputs_keep_days</td><td data-label="Recommended target"><code>14</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Prevents old outputs from accumulating indefinitely.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_pm_outputs_keep_count</td><td data-label="Recommended target"><code>30</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps enough recent artifacts for rollback/review.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_metaquotes_cleanup_enabled</td><td data-label="Recommended target"><code>false</code> until manually verified</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">MetaQuotes cleanup is operationally sensitive. Review first, automate later.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_metaquotes_active_root_allowlist</td><td data-label="Recommended target"><code>[]</code>, then explicit roots only when cleanup is enabled</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Empty is safe while cleanup is disabled.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_metaquotes_demo_servers</td><td data-label="Recommended target"><code>["FBS-Demo","MetaQuotes-Demo"]</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Useful defaults for separating demo/test storage.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.storage_metaquotes_stale_tester_days</td><td data-label="Recommended target"><code>14</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">A fair age threshold for tester artifacts.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Supervisor, Drift, Promotion, Governance, And Execution Filters</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">pipeline.live_risk_scalars_enabled</td><td data-label="Recommended target"><code>false</code> while mode is shadow</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids hidden live sizing changes while attribution is still being collected.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.live_risk_scalars_mode</td><td data-label="Recommended target"><code>shadow</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Correct first posture for a newly integrated risk-scalar layer.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.portfolio_observatory_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Supports operator visibility without directly changing risk.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.institutional_supervisor_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Core account-level survival layer.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.institutional_supervisor_mode</td><td data-label="Recommended target"><code>circuit_breaker</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Hard-breakpoint behavior is appropriate for funded/live capital.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.portfolio_control_policy</td><td data-label="Recommended target"><code>hard_breakpoints_only</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids soft discretionary throttling inside the supervisor while other layers handle observation.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.max_total_open_risk_pct</td><td data-label="Recommended target"><code>8.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Portfolio cap is coherent with <code>position.risk_tolerance_pct</code>.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.max_new_entries_when_total_open_risk_above_pct</td><td data-label="Recommended target"><code>6.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Lets existing positions manage while pausing new risk when portfolio load is high.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.open_risk_action</td><td data-label="Recommended target"><code>pause_new_entries</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Pauses expansion without forcing unnecessary closes.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.daily_loss_hard_block_pct</td><td data-label="Recommended target"><code>3.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Appropriate daily circuit breaker for a profit-seeking but survival-first system.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.session_loss_hard_block_pct</td><td data-label="Recommended target"><code>2.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Stops bad intraday behavior before daily damage compounds.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.weekly_loss_hard_block_pct</td><td data-label="Recommended target"><code>6.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Gives weekly room while preventing compounding loss cycles.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.open_drawdown_hard_block_pct</td><td data-label="Recommended target"><code>8.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches portfolio risk tolerance and open risk cap.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.hard_block_reopen_mode</td><td data-label="Recommended target"><code>manual_or_next_cycle</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good balance: manual reset for same-cycle damage, automatic forgiveness after a retrain cycle.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.cycle_drift_monitor_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Detects when a live context is no longer behaving like its artifact.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.cycle_drift_mode</td><td data-label="Recommended target"><code>lightweight</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Low-overhead first pass while the feature matures.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.cycle_drift_min_trades</td><td data-label="Recommended target"><code>6</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids reacting to one or two noisy outcomes.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.cycle_drift_consecutive_losses</td><td data-label="Recommended target"><code>5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Clear loss cluster threshold.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.cycle_drift_execution_slippage_mult</td><td data-label="Recommended target"><code>2.5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Flags serious execution degradation without overreacting to normal noise.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.cycle_drift_spread_degradation_mult</td><td data-label="Recommended target"><code>2.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good threshold for spread regime deterioration.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.cycle_drift_action</td><td data-label="Recommended target"><code>pause_context</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Right action: pause the degraded context instead of globally disabling the trader.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.walk_forward_audit_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Critical fragility evidence for promotion status.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.walk_forward_audit_windows</td><td data-label="Recommended target"><code>3</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Enough windows for a fragility signal without overburdening every cycle.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.walk_forward_audit_mode</td><td data-label="Recommended target"><code>severe_fragility_only</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches current classifier behavior and avoids premature complexity.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.walk_forward_promotion_policy</td><td data-label="Recommended target"><code>block_severe_only</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Blocks severe fragility while allowing derated promotion where appropriate.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.walk_forward_do_not_displace_latest_surface</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Preserves live relevance; walk-forward evidence classifies promotion rather than choosing stale winners.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.promote_small_risk_multiplier</td><td data-label="Recommended target"><code>0.5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good derating for negative holdout or cautionary promotion states.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.local_governance_tournament_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">The governance tournament can improve exits without changing the entry edge.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.local_governance_live_mode</td><td data-label="Recommended target"><code>shadow</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Correct until live/paper evidence proves a policy beats control.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.local_governance_candidate_policies</td><td data-label="Recommended target">All 11 current policies, including <code>structure_trail</code>, <code>partial_tp_runner</code>, <code>regime_flip_reduce</code>, and <code>pure_atr</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Diverse exit management lets the system learn which management style fits each winner.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.winner_ledger_path</td><td data-label="Recommended target"><code>pm_configs_high_risk.json</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches the current high-risk optimized ledger profile. Use a different file only when deliberately changing profiles.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.market_driven_exit_pack_mode</td><td data-label="Recommended target"><code>paper</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good observation posture for optional market-driven exits.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.swap_model_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps longer holds, D1, exotics, metals, and CFDs honest.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.swap_model_triple_rollover_day</td><td data-label="Recommended target"><code>wednesday</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Standard FX triple-rollover assumption; override only if broker differs.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.swap_model_min_holding_hours</td><td data-label="Recommended target"><code>20</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids charging swap on truly intraday trades while capturing overnight cost.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_profitability_audit_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Adds context-specific evidence to validation artifacts.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_boundary_audit_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Boundary evidence helps explain regime-transition performance.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_ambiguity_policy</td><td data-label="Recommended target"><code>observe_only</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Correct first step for ambiguity telemetry without blocking too aggressively.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_min_live_gap_warn</td><td data-label="Recommended target"><code>0.05</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good warning boundary for weak live regime separation.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.event_calendar_enabled</td><td data-label="Recommended target"><code>false</code> until a trusted file exists</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Calendar logic should not depend on an empty path.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.event_calendar_mode</td><td data-label="Recommended target"><code>observe</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Best first posture when enabled.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.event_calendar_action</td><td data-label="Recommended target"><code>annotate</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Annotate first, block later only with evidence.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.event_calendar_path</td><td data-label="Recommended target">Blank while disabled; set to a curated local calendar file before enabling</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids false confidence from a missing feed.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.event_calendar_high_impact_action</td><td data-label="Recommended target"><code>observe</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Observation is right until the calendar source is proven reliable.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.target_annual_vol</td><td data-label="Recommended target"><code>0.10</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Sensible institutional target if/when volatility targeting is activated.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.execution_spread_filter_enabled</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Live edge should not be consumed by bad spread conditions.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.execution_spread_min_edge_mult</td><td data-label="Recommended target"><code>1.25</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps edge-to-cost ratio above a usable threshold.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.execution_spread_spike_mult</td><td data-label="Recommended target"><code>3.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good spike definition for refusing poor liquidity.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.execution_spread_penalty_start_mult</td><td data-label="Recommended target"><code>0.75</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Starts penalizing before spread becomes extreme.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.min_trade_risk_pct</td><td data-label="Recommended target"><code>0.05</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids meaningless micro-risk signals while allowing low-balance lot clamps.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Margin, Secondary Positions, Winner Gates, And Optuna Budget</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">pipeline.margin_entry_block_level</td><td data-label="Recommended target"><code>80.0</code> aggressive; <code>100.0</code> funded-safety</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Use the higher target when margin policy matters more than trade count.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.margin_recovery_start_level</td><td data-label="Recommended target"><code>65.0</code> aggressive; <code>80.0</code> funded-safety</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Recovery should begin before broker panic levels.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.margin_panic_level</td><td data-label="Recommended target"><code>50.0</code> aggressive; <code>65.0</code> funded-safety</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Funded accounts benefit from a wider emergency buffer.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.margin_reopen_level</td><td data-label="Recommended target"><code>90.0</code> aggressive; <code>120.0</code> funded-safety</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Reopen hysteresis should require genuinely recovered margin.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.margin_reopen_cooldown_minutes</td><td data-label="Recommended target"><code>5.0</code> aggressive; <code>10.0</code> funded-safety</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">A slightly longer cooldown reduces immediate re-entry after margin stress.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.allow_d1_plus_lower_tf</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Allows complementary slow/fast exposure while risk caps police concentration.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.d1_secondary_risk_multiplier</td><td data-label="Recommended target"><code>1.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">No hidden derating unless evidence says D1 pairings are too correlated.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.secondary_trade_max_risk_pct</td><td data-label="Recommended target"><code>0.5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Caps the added risk from secondary same-symbol exposure.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.max_combined_risk_pct</td><td data-label="Recommended target"><code>1.5</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Prevents D1 plus lower-TF pairings from becoming an oversized single-symbol bet.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_min_val_profit_factor</td><td data-label="Recommended target"><code>1.05</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Modest but positive regime winner gate.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.regime_min_val_return_pct</td><td data-label="Recommended target"><code>5.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Prevents flat winners from displacing useful candidates.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.train_min_profit_factor</td><td data-label="Recommended target"><code>0.80</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Permissive enough for train/validation divergence while not accepting severe train weakness.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.train_min_return_pct</td><td data-label="Recommended target"><code>-15.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Allows validation-rescued candidates but blocks catastrophic training profiles.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.train_max_drawdown</td><td data-label="Recommended target"><code>20.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Reasonable train-side drawdown ceiling.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.exceptional_val_profit_factor</td><td data-label="Recommended target"><code>1.50</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Clear exceptional-validation threshold.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.exceptional_val_return_pct</td><td data-label="Recommended target"><code>10.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Pairs with exceptional profit factor to rescue strong validators.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.actionable_score_margin</td><td data-label="Recommended target"><code>0.92</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Allows near-best candidates to remain actionable when trade count or robustness supports them.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.optuna_family_size_aware_budget</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Important for fair coverage across larger strategy families.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.optuna_min_trials_per_strategy</td><td data-label="Recommended target"><code>200</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Minimum useful search floor.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.optuna_max_trials_per_strategy</td><td data-label="Recommended target"><code>5000</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Gives large families a real chance without making the budget unbounded.</td></tr>
+        <tr><td data-label="Setting" class="setting">pipeline.optuna_target_coverage_pct</td><td data-label="Recommended target"><code>0.15</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Good current trade-off between coverage and compute time.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Position Settings</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">position.risk_per_trade_pct</td><td data-label="Recommended target"><code>0.5</code> first live; <code>0.75</code> after evidence</td><td data-label="Status" class="keep">Keep now</td><td data-label="Reasoning">Controls actual live unit risk. Let the safety stack prove itself before increasing.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.max_position_size</td><td data-label="Recommended target"><code>0.0</code> unless your broker/funded account needs a hard lot cap</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Risk and margin gates are the primary caps. A hard lot cap is account-specific.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.min_position_size</td><td data-label="Recommended target"><code>0.01</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches common minimum lot sizing.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.risk_basis</td><td data-label="Recommended target"><code>equity</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Equity-based risk responds to open PnL and drawdown better than balance-only sizing.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.max_risk_pct</td><td data-label="Recommended target"><code>0.8</code> first live; <code>1.0</code> only after evidence</td><td data-label="Status" class="keep">Keep now</td><td data-label="Reasoning">Useful guard above the normal <code>0.5</code> unit risk.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.risk_tolerance_pct</td><td data-label="Recommended target"><code>8.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches total open-risk supervisor threshold.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.auto_widen_sl</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Helps broker geometry without blindly increasing risk because sizing caps still apply.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.allow_min_lot_risk_clamp</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Needed for low-balance accounts where minimum lot would otherwise block too much. Watch actual-risk logs.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.use_trailing_stop</td><td data-label="Recommended target"><code>false</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Governance policies should own live trailing behavior, not the generic position layer.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.trailing_stop_pips</td><td data-label="Recommended target"><code>0.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Inactive because generic trailing is disabled.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.trailing_activation_pips</td><td data-label="Recommended target"><code>0.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Inactive because generic trailing is disabled.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.use_breakeven_stop</td><td data-label="Recommended target"><code>false</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Governance policies already test breakeven variants more intelligently.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.breakeven_trigger_pips</td><td data-label="Recommended target"><code>0.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Inactive with generic breakeven disabled.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.breakeven_offset_pips</td><td data-label="Recommended target"><code>1.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Harmless default if manually enabled later, but governance should remain preferred.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.allow_scaling</td><td data-label="Recommended target"><code>false</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Avoids compounding exposure while D1/lower-TF secondary rules already permit controlled pairings.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.max_scale_ins</td><td data-label="Recommended target"><code>3</code> but inactive</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">No effect while scaling is disabled.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.scale_in_pct</td><td data-label="Recommended target"><code>50.0</code> but inactive</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">No effect while scaling is disabled.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.max_trade_duration_bars</td><td data-label="Recommended target"><code>0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Time exits are better handled by the governance pool.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.regime_tp_multipliers</td><td data-label="Recommended target">All regimes at <code>1.0</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Keeps discovery neutral and avoids hidden live-only TP distortion.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.use_spread</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Live position sizing should stay cost-aware.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.use_slippage</td><td data-label="Recommended target"><code>true</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Pairs with cycle drift and broker execution monitoring.</td></tr>
+        <tr><td data-label="Setting" class="setting">position.slippage_pips</td><td data-label="Recommended target"><code>0.5</code>, broker-tuned after observation</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Consistent with discovery cost assumptions.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>MT5 And Broker Settings</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Setting</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Setting" class="setting">mt5.login</td><td data-label="Recommended target"><code>0</code> in committed template; real login only in local/private config</td><td data-label="Status" class="keep">Keep template</td><td data-label="Reasoning">Avoids committing credentials or account identifiers.</td></tr>
+        <tr><td data-label="Setting" class="setting">mt5.password</td><td data-label="Recommended target">Blank in committed template</td><td data-label="Status" class="keep">Keep template</td><td data-label="Reasoning">Secrets should not be in repository docs or source control.</td></tr>
+        <tr><td data-label="Setting" class="setting">mt5.server</td><td data-label="Recommended target">Blank in committed template; exact broker server in local/private config</td><td data-label="Status" class="keep">Keep template</td><td data-label="Reasoning">Keeps the repo broker-neutral.</td></tr>
+        <tr><td data-label="Setting" class="setting">mt5.path</td><td data-label="Recommended target">Blank unless a specific terminal path is required</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Default MT5 discovery is cleaner when one terminal is installed.</td></tr>
+        <tr><td data-label="Setting" class="setting">mt5.timeout</td><td data-label="Recommended target"><code>60000</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Sensible request timeout for broker/API variability.</td></tr>
+        <tr><td data-label="Setting" class="setting">mt5.portable</td><td data-label="Recommended target"><code>false</code>, unless using a portable MT5 installation</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Matches normal installed-terminal use.</td></tr>
+        <tr><td data-label="Setting" class="setting">broker_specs_path</td><td data-label="Recommended target"><code>broker_specs.json</code></td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Broker-specific truth should live outside strategy code.</td></tr>
+        <tr><td data-label="Setting" class="setting">instrument_spec_defaults.commission_per_lot</td><td data-label="Recommended target"><code>7.0</code>, broker-verified</td><td data-label="Status" class="keep">Keep</td><td data-label="Reasoning">Reasonable FX commission default. Override per symbol when broker schedule differs.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="panel warning">
+      <p>
+        Instrument specs are not performance knobs. Best working state means broker-accurate <code>pip_position</code>, <code>pip_value</code>, <code>spread_avg</code>, <code>min_lot</code>, <code>max_lot</code>, <code>commission_per_lot</code>, <code>swap_long</code>, and <code>swap_short</code>. If the broker changes contract size, commission, spread, or swap, update the spec rather than tuning strategy risk to hide the mismatch.
+      </p>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Instrument spec area</th>
+          <th>Recommended target</th>
+          <th>Status</th>
+          <th>Reasoning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td data-label="Instrument spec area" class="setting">Major FX specs</td><td data-label="Recommended target">Keep current values only if broker-verified</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Majors are sensitive to small commission/spread errors because many strategies trade frequently.</td></tr>
+        <tr><td data-label="Instrument spec area" class="setting">Cross FX specs</td><td data-label="Recommended target">Broker-verify pip value and swap</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Crosses often have larger pip-value differences and swap asymmetry.</td></tr>
+        <tr><td data-label="Instrument spec area" class="setting">Exotic FX specs</td><td data-label="Recommended target">Use conservative spread and swap values</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Exotics can look attractive in backtests if spread and rollover are understated.</td></tr>
+        <tr><td data-label="Instrument spec area" class="setting">Metals and commodities</td><td data-label="Recommended target">Broker-verify tick/pip value before live</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Contract conventions vary and affect risk sizing directly.</td></tr>
+        <tr><td data-label="Instrument spec area" class="setting">Indices</td><td data-label="Recommended target">Verify tick value, trading hours, and min lot</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Index CFDs differ widely by broker.</td></tr>
+        <tr><td data-label="Instrument spec area" class="setting">Crypto CFDs</td><td data-label="Recommended target">Treat spread and weekend behavior conservatively</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning">Crypto spread regimes can change sharply and can make old assumptions stale.</td></tr>
+        <tr><td data-label="Instrument spec area" class="setting">Inherited specs</td><td data-label="Recommended target">Use inheritance only where contract economics truly match</td><td data-label="Status" class="review">Review</td><td data-label="Reasoning"><code>EURNOK</code>, <code>EURSEK</code>, <code>EURTRY</code>, and metal crosses inherit from related symbols. This is clean only if broker contracts align.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Symbol Universe</h2>
+    <div class="panel">
+      <p>
+        The enabled symbol universe is broad. That is fine for discovery because no-trade markers, promotion status, artifact drift blocking, spread filters, and readiness checks now police weak contexts. For first funded live, I would still review the live-eligible ledger and consider trading only symbols with fresh winners, clean regime evidence, and broker-verified specs.
+      </p>
+      <div class="symbol-grid">
+        <code>EURUSD</code><code>GBPUSD</code><code>USDJPY</code><code>USDCHF</code><code>USDCAD</code><code>AUDUSD</code><code>NZDUSD</code><code>AUDNZD</code>
+        <code>EURGBP</code><code>EURJPY</code><code>GBPJPY</code><code>AUDJPY</code><code>EURAUD</code><code>EURCHF</code><code>EURCAD</code><code>EURNZD</code>
+        <code>GBPAUD</code><code>GBPCAD</code><code>GBPCHF</code><code>CADJPY</code><code>NZDJPY</code><code>AUDCAD</code><code>AUDCHF</code><code>CADCHF</code>
+        <code>CHFJPY</code><code>NZDCAD</code><code>NZDCHF</code><code>GBPNZD</code><code>USDNOK</code><code>USDMXN</code><code>USDSGD</code><code>USDZAR</code>
+        <code>USDPLN</code><code>USDSEK</code><code>EURZAR</code><code>GBPZAR</code><code>XAUUSD</code><code>XAGUSD</code><code>XTIUSD</code><code>XBRUSD</code>
+        <code>XNGUSD</code><code>US100</code><code>US30</code><code>US500</code><code>DE30</code><code>EU50</code><code>UK100</code><code>JP225</code>
+        <code>FR40</code><code>ES35</code><code>HK50</code><code>AU200</code><code>BTCUSD</code><code>ETHUSD</code><code>XRPUSD</code><code>TONUSD</code>
+        <code>BTCETH</code><code>LTCUSD</code><code>SOLUSD</code><code>BCHUSD</code><code>DOGUSD</code><code>TRXUSD</code>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Recommended Operating Profiles</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Profile</th>
+          <th>Use when</th>
+          <th>Key values</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td data-label="Profile"><strong>Paper validation</strong></td>
+          <td data-label="Use when">Running the first full v2-integrated observation cycle</td>
+          <td data-label="Key values"><code>position.risk_per_trade_pct=0.5</code>, governance <code>shadow</code>, risk scalars <code>shadow</code>, readiness <code>block</code></td>
+          <td data-label="Notes">Best immediate profile. It exercises the whole stack with minimum capital consequence.</td>
+        </tr>
+        <tr>
+          <td data-label="Profile"><strong>First funded live</strong></td>
+          <td data-label="Use when">Paper cycle is clean, latches are clear, specs are broker-verified</td>
+          <td data-label="Key values"><code>position.risk_per_trade_pct=0.5</code>, advisories <code>2.0/1.0</code>, storage pause <code>8.0</code>, margin safety reviewed</td>
+          <td data-label="Notes">My preferred first funded posture. It gives the edge room but does not bet the account on a new integration layer immediately.</td>
+        </tr>
+        <tr>
+          <td data-label="Profile"><strong>Evidence-based growth</strong></td>
+          <td data-label="Use when">At least one full retrain cycle plus live/paper execution evidence is clean</td>
+          <td data-label="Key values"><code>position.risk_per_trade_pct=0.75</code>, <code>position.max_risk_pct=1.0</code>, promote proven governance/risk overlays only</td>
+          <td data-label="Notes">This is the profit-push profile, but it should be earned by the ledger rather than assumed.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Signoff View</h2>
+    <div class="panel callout">
+      <p>
+        I sign off on the current configuration architecture as internally complementary: the features now mostly reinforce one another instead of competing for control. The best immediate working state is close to the current <code>config.json</code>, with the operational adjustments called out above.
+      </p>
+      <p>
+        I do not sign off on funded live until runtime state is clean: no active supervisor latch, fresh eligible winner ledger, broker-verified specs, and the missing regime params file resolved. After that, paper-first or low-risk first-live is the right way to let the improved stack prove itself.
+      </p>
+    </div>
+  </section>
+</main>
+</body>
+</html>

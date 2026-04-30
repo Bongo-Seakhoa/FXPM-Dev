@@ -40,6 +40,7 @@ def normalize_policy_name(name: Any) -> str:
         "atr_trail": "atr_trail_capped",
         "chandelier": "chandelier_atr",
         "structure": "structure_trail",
+        "swing_trail": "structure_trail",
         "partial_runner": "partial_tp_runner",
         "runner": "partial_tp_runner",
         "time_decay": "time_decay_exit",

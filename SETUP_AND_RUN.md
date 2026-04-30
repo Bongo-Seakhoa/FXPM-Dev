@@ -1,6 +1,6 @@
-# FX Portfolio Manager v3.1 - Setup and Run Guide
+# FXPM-Dev - Setup and Run Guide
 
-This guide covers installation, configuration, optimization, paper trading, live trading, monitoring, and maintenance for the current PM.
+This guide covers installation, configuration, optimization, paper trading, live trading, monitoring, and maintenance for FXPM-Dev. The repository/folder name is `FXPM-Dev`; the internal runtime banner currently remains `FX PORTFOLIO MANAGER v3.1`.
 
 ---
 
@@ -78,7 +78,7 @@ python -c "from pm_main import FXPortfolioManagerApp; print('PM import OK')"
 ### Expected root layout
 
 ```text
-FxPM 1.4 - Obtimized/
+FXPM-Dev/
 |-- pm_core.py
 |-- pm_strategies.py
 |-- pm_pipeline.py
@@ -142,8 +142,17 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "live_bar_poll_seconds": 0.25,
     "live_bar_settle_seconds": 5,
     "live_stale_retry_seconds": 15,
+    "live_artifact_drift_policy": "block",
     "live_risk_scalars_enabled": false,
     "live_risk_scalars_mode": "shadow",
+    "institutional_supervisor_enabled": true,
+    "institutional_supervisor_mode": "circuit_breaker",
+    "hard_block_reopen_mode": "manual_or_next_cycle",
+    "cycle_drift_monitor_enabled": true,
+    "cycle_drift_mode": "lightweight",
+    "walk_forward_audit_enabled": true,
+    "walk_forward_promotion_policy": "block_severe_only",
+    "promote_small_risk_multiplier": 0.5,
     "local_governance_tournament_enabled": true,
     "local_governance_live_mode": "shadow",
     "winner_ledger_path": "pm_configs_high_risk.json",
@@ -187,6 +196,10 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
 - `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.discovery_risk_per_trade_pct` is the fixed discovery/backtest sizing value, while `pipeline.risk_per_trade_pct` only remains as a compatibility backfill if the `position` value is absent.
 - `live_risk_scalars_mode = "shadow"` records the would-be risk-scalar effect without changing live position sizing.
 - `local_governance_live_mode = "shadow"` keeps governance policy selection observable before broker-side stop management is made authoritative.
+- `live_artifact_drift_policy = "block"` is required by the funded-live readiness gate.
+- `institutional_supervisor_mode = "circuit_breaker"` blocks new live entries at configured hard breakpoints and persists a latch in `logs/institutional_supervisor_state.json`.
+- `cycle_drift_mode = "lightweight"` lets severe context degradation pause a local `(symbol, timeframe, regime, strategy)` entry path.
+- `PROMOTE_SMALL` winners are still live-eligible, but their risk is multiplied by `promote_small_risk_multiplier`; `BLOCKED`, `PAPER_ONLY`, and `NO_TRADE` winners are skipped.
 - storage governance is now config-backed through `pipeline.storage_*`.
   - `storage_observe_only = true` is the recommended first rollout mode because it records state, manifests, and cleanup candidates without deleting PM-owned files yet.
   - `storage_local_data_first_enabled = true` keeps live analysis local-first, but live sweeps now use bounded timeframe-specific `.live/<symbol>_<TF>.csv` caches instead of rereading the full canonical `*_M5.csv` files every cycle.
@@ -251,7 +264,7 @@ FX PORTFOLIO MANAGER v3.1
 Connected to MT5
 Portfolio Manager initialized
   Symbols: 62
-  Strategies: 47
+  Strategies: 50
 ```
 
 Example optimization flow:
@@ -259,7 +272,7 @@ Example optimization flow:
 ```text
 RUNNING OPTIMIZATION
 MODE: OVERWRITE
-[EURUSD] Regime Optimization: 47 strategies x 6 timeframes x 4 regimes
+[EURUSD] Regime Optimization: 50 strategies x 6 timeframes x 4 regimes
 [EURUSD] [H1] [TREND] Winner: SupertrendStrategy
 SAVED EURUSD to <configured winner ledger>
 ```
@@ -336,6 +349,8 @@ python pm_main.py --trade
 ### Pre-live checklist
 
 - the configured winner ledger has been regenerated or confirmed current
+- `python pm_main.py --trade` can pass the funded-live readiness gate; failure exits with code `2`
+- `logs/institutional_supervisor_state.json` is clear, manually reset, or belongs to a prior cycle that has intentionally reopened
 - MT5 is open and logged in
 - AutoTrading is enabled
 - broker symbol naming matches the configured symbol list
@@ -356,6 +371,7 @@ Use `Ctrl+C` in the terminal. The PM is designed to stop cleanly and preserve th
 2. Review `logs/pm_YYYYMMDD.log`
 3. Check MT5 positions against recent PM decisions
 4. Inspect `last_actionable_log.json` if you need the latest actionable state quickly
+5. Inspect `logs/institutional_supervisor_state.json` and `logs/cycle_drift_state.json` after any hard block or drift pause
 
 ### Weekly checks
 
@@ -400,11 +416,15 @@ python pm_main.py --optimize --overwrite
 - compare live results against the recent optimization profile
 - review symbols that repeatedly fail validation or tradability checks
 - review spread filter behavior if too many otherwise-valid entries are blocked
+- review `PROMOTE_SMALL`, `BLOCKED`, and `NO_TRADE` promotion statuses in the active winner ledger
+- review cycle-drift pauses before manually resetting a context
 - refresh regime parameters if the detector behavior appears stale
 
 ### Useful files during maintenance
 
 - `logs/pm_YYYYMMDD.log`
+- `logs/institutional_supervisor_state.json`
+- `logs/cycle_drift_state.json`
 - the active winner ledger from `pipeline.winner_ledger_path`
 - `pm_outputs/optimization_summary.csv`
 - `last_actionable_log.json`
