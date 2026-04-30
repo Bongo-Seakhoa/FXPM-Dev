@@ -115,7 +115,7 @@ class OptunaConfig:
     # Phase D3 — family-size-aware search budget (opt-in)
     family_size_aware_budget: bool = False
     min_trials_per_strategy: int = 50
-    max_trials_per_strategy: int = 500
+    max_trials_per_strategy: int = 5000
     target_coverage_pct: float = 0.10  # 10% of cartesian space
 
     @classmethod
@@ -128,7 +128,7 @@ class OptunaConfig:
             multivariate=True,
             family_size_aware_budget=bool(getattr(config, 'optuna_family_size_aware_budget', False)),
             min_trials_per_strategy=int(getattr(config, 'optuna_min_trials_per_strategy', 50)),
-            max_trials_per_strategy=int(getattr(config, 'optuna_max_trials_per_strategy', 500)),
+            max_trials_per_strategy=int(getattr(config, 'optuna_max_trials_per_strategy', 5000)),
             target_coverage_pct=float(getattr(config, 'optuna_target_coverage_pct', 0.10)),
         )
 

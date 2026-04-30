@@ -80,6 +80,30 @@ class BacktesterTests(unittest.TestCase):
         self.assertEqual(trade["entry_bar"], 1)
         self.assertEqual(trade["exit_bar"], 1)
 
+    def test_discovery_risk_is_independent_from_pipeline_risk(self):
+        cfg = PipelineConfig(
+            use_spread=False,
+            use_slippage=False,
+            use_commission=False,
+            risk_per_trade_pct=5.0,
+            discovery_risk_per_trade_pct=1.0,
+        )
+        bt = Backtester(cfg)
+        df = pd.DataFrame({
+            "Open": [100.0, 100.0, 100.0],
+            "High": [100.0, 100.2, 100.0],
+            "Low": [100.0, 99.95, 100.0],
+            "Close": [100.0, 100.1, 100.0],
+            "Volume": [100, 100, 100],
+        })
+        strat = DummyStrategy()
+        signals = strat.generate_signals(df, "EURUSD")
+        spec = InstrumentSpec(symbol="EURUSD", pip_position=2, pip_value=10.0, spread_avg=0.0)
+
+        res = bt.run(df, signals, "EURUSD", strat, spec=spec)
+
+        self.assertAlmostEqual(res["trades"][0]["risk_amount"], 100.0)
+
     def test_signal_index_mismatch_raises(self):
         cfg = PipelineConfig(use_spread=False, use_slippage=False, use_commission=False)
         bt = Backtester(cfg)

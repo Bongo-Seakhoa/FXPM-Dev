@@ -140,16 +140,12 @@ def build_artifact_meta(config: PipelineConfig,
         "artifact_version": PIPELINE_ARTIFACT_VERSION,
         "feature_cache_version": FeatureComputer.FEATURE_CACHE_VERSION,
         "split_contract_version": DataSplitter.SPLIT_CONTRACT_VERSION,
-        "data_workflow_mode": str(getattr(config, "data_workflow_mode", "active_recent_m5")),
         "max_bars": int(getattr(config, "max_bars", 300000)),
         "historical_stress_audit_bars": int(getattr(config, "historical_stress_audit_bars", 50000)),
         "active_universe_bars": int(getattr(config, "active_universe_bars", 250000)),
         "active_stage2_pct": float(getattr(config, "active_stage2_pct", 50.0)),
-        "train_pct": float(config.train_pct),
-        "val_pct": float(config.val_pct),
         "overlap_pct": float(config.overlap_pct),
-        "holdout_pct": None if config.holdout_pct is None else float(config.holdout_pct),
-        "scoring_mode": str(config.scoring_mode),
+        "discovery_risk_per_trade_pct": float(getattr(config, "discovery_risk_per_trade_pct", 1.0)),
         "fixed_retrain_days": int(getattr(config, "fixed_retrain_days", getattr(config, "optimization_valid_days", 14))),
         "production_retrain_mode": str(getattr(config, "production_retrain_mode", "auto")),
         "production_retrain_interval_weeks": int(getattr(config, "production_retrain_interval_weeks", 2)),
@@ -997,28 +993,15 @@ class StrategySelector:
                             strategy=strategy
                         )
 
-                        if self.config.scoring_mode == "fx_backtester":
-                            if metrics.get('total_trades', 0) < self.config.min_trades:
-                                continue
-                            train_score = float(self.scorer.score(metrics, purpose="selection"))
-                            candidates.append({
-                                "strategy_name": strategy.name,
-                                "timeframe": timeframe,
-                                "train_metrics": metrics,
-                                "train_score": train_score
-                            })
-                        else:
-                            # Original behavior: strict minimum criteria + composite
-                            passes, _ = self.scorer.passes_minimum_criteria(metrics)
-                            if not passes:
-                                continue
-                            train_score = float(self.scorer.calculate_composite_score(metrics))
-                            candidates.append({
-                                "strategy_name": strategy.name,
-                                "timeframe": timeframe,
-                                "train_metrics": metrics,
-                                "train_score": train_score
-                            })
+                        if metrics.get('total_trades', 0) < self.config.min_trades:
+                            continue
+                        train_score = float(self.scorer.score(metrics, purpose="selection"))
+                        candidates.append({
+                            "strategy_name": strategy.name,
+                            "timeframe": timeframe,
+                            "train_metrics": metrics,
+                            "train_score": train_score
+                        })
                     except Exception as e:
                         logger.warning(f"  [{symbol}] Error testing {strategy.name} {timeframe}: {e}")
                         continue
@@ -1028,9 +1011,9 @@ class StrategySelector:
                 return None, None, {}
 
             # ------------------------------------------------------------
-            # Pass 2: validation-aware selection (fx_backtester)
+            # Pass 2: validation-aware selection
             # ------------------------------------------------------------
-            if self.config.scoring_mode == "fx_backtester" and val_data_by_tf is not None:
+            if val_data_by_tf is not None:
                 top_k = int(getattr(self.config, "fx_selection_top_k", 5))
                 top_k = max(1, top_k)
 
@@ -1083,7 +1066,7 @@ class StrategySelector:
                 return None, None, {}
 
             # ------------------------------------------------------------
-            # Non-fx_backtester: choose best train score (original)
+            # No validation data: fall back to best train score
             # ------------------------------------------------------------
             best_train = max(candidates, key=lambda d: d["train_score"])
             logger.info(f"[{symbol}] Selected: {best_train['strategy_name']} @ {best_train['timeframe']} "
@@ -1174,29 +1157,18 @@ class HyperparameterOptimizer:
                               val_features: pd.DataFrame) -> Tuple[Dict[str, Any], Dict, Dict]:
         """Optimize using Optuna TPE."""
         
-        # Define scoring function based on config mode
+        # FX backtester scoring: validation-aware when enough val trades, otherwise train-with-discount
         def scoring_fn(train_metrics: Dict, val_metrics: Dict) -> float:
-            if self.config.scoring_mode == "fx_backtester":
-                # Use fx_generalization_score for validation-aware scoring
-                if val_metrics.get('total_trades', 0) >= self.config.fx_val_min_trades:
-                    # Check validation guardrails
-                    val_dd = float(val_metrics.get('max_drawdown_pct', 100.0))
-                    if val_dd >= self.config.fx_val_max_drawdown:
-                        return -500.0  # Penalty for excessive drawdown
-                    
-                    final_score, _, _, _ = self.scorer.fx_generalization_score(
-                        train_metrics, val_metrics, purpose="opt"
-                    )
-                    return final_score
-                else:
-                    # Not enough validation trades - use train with discount
-                    train_score = self.scorer.score(train_metrics, purpose="opt")
-                    return train_score * 0.7
-            else:
-                # Legacy pm_weighted mode
-                train_score = self.scorer.calculate_composite_score(train_metrics)
-                val_score = self.scorer.calculate_composite_score(val_metrics)
-                return 0.4 * train_score + 0.6 * val_score
+            if val_metrics.get('total_trades', 0) >= self.config.fx_val_min_trades:
+                val_dd = float(val_metrics.get('max_drawdown_pct', 100.0))
+                if val_dd >= self.config.fx_val_max_drawdown:
+                    return -500.0  # Penalty for excessive drawdown
+                final_score, _, _, _ = self.scorer.fx_generalization_score(
+                    train_metrics, val_metrics, purpose="opt"
+                )
+                return final_score
+            # Not enough validation trades - use train with discount
+            return self.scorer.score(train_metrics, purpose="opt") * 0.7
         
         # Get n_trials from config
         n_trials = getattr(self.config, 'max_param_combos', 100)
@@ -1213,8 +1185,7 @@ class HyperparameterOptimizer:
             train_features=train_features,
             val_features=val_features,
             scoring_fn=scoring_fn,
-            min_trades=self.config.fx_opt_min_trades if self.config.scoring_mode == "fx_backtester" 
-                       else self.config.min_trades
+            min_trades=self.config.fx_opt_min_trades
         )
         
         logger.info(f"[{symbol}] Optuna optimization for {strategy_name}: "
@@ -1254,146 +1225,101 @@ class HyperparameterOptimizer:
             combinations = [combinations[i] for i in indices]
         
         logger.info(f"[{symbol}] Grid search {strategy_name}: {len(combinations)} combinations")
-        
-        # fx_backtester mode with validation
-        if self.config.scoring_mode == "fx_backtester":
-            candidates: List[Dict[str, Any]] = []
-            
-            for combo in combinations:
-                params = dict(zip(param_names, combo))
-                test_params = {**default_params, **params}
-                test_strategy = StrategyRegistry.get(strategy_name, **test_params)
-                
-                try:
-                    signals = test_strategy.generate_signals(train_features, symbol)
-                    train_metrics = self.backtester.run(train_features, signals, symbol, test_strategy)
-                    
-                    if train_metrics.get('total_trades', 0) < self.config.fx_opt_min_trades:
-                        continue
-                    
-                    train_score = float(self.scorer.score(train_metrics, purpose="opt"))
-                    candidates.append({
-                        "params": dict(test_params),
-                        "train_metrics": train_metrics,
-                        "train_score": train_score
-                    })
-                except Exception as e:
-                    logger.debug(f"[{symbol}] Grid opt {strategy_name} combo failed: {e}")
-                    continue
 
-            if not candidates:
-                candidates.append({
-                    "params": dict(default_params),
-                    "train_metrics": {},
-                    "train_score": -float("inf")
-                })
-            
-            candidates.sort(key=lambda d: d["train_score"], reverse=True)
-            top_k = max(1, int(getattr(self.config, "fx_opt_top_k", 5)))
-            shortlist = candidates[:top_k]
-            
-            best_final = -float("inf")
-            best_params = dict(default_params)
-            best_train_metrics: Dict[str, Any] = {}
-            best_val_metrics: Dict[str, Any] = {}
-            
-            for cand in shortlist:
-                test_params = cand["params"]
-                test_strategy = StrategyRegistry.get(strategy_name, **test_params)
-                train_metrics = cand.get("train_metrics") or {}
-                
-                if not train_metrics:
-                    try:
-                        signals = test_strategy.generate_signals(train_features, symbol)
-                        train_metrics = self.backtester.run(train_features, signals, symbol, test_strategy)
-                    except Exception as e:
-                        logger.debug(f"[{symbol}] Val-shortlist train {strategy_name} failed: {e}")
-                        continue
+        # FX backtester selection: train-score shortlist, then validation-aware tiebreak.
+        candidates: List[Dict[str, Any]] = []
 
-                if val_features is None or len(val_features) < 50:
-                    val_metrics = {'total_return_pct': 0.0, 'sharpe_ratio': 0.0,
-                                   'max_drawdown_pct': 0.0, 'total_trades': 0}
-                else:
-                    try:
-                        signals = test_strategy.generate_signals(val_features, symbol)
-                        val_metrics = self.backtester.run(val_features, signals, symbol, test_strategy)
-                    except Exception as e:
-                        logger.debug(f"[{symbol}] Val-shortlist val {strategy_name} failed: {e}")
-                        continue
-                
-                val_trades = int(val_metrics.get("total_trades", 0))
-                val_dd = float(val_metrics.get("max_drawdown_pct", 100.0))
-                if val_trades < self.config.fx_val_min_trades:
-                    continue
-                if val_dd >= self.config.fx_val_max_drawdown:
-                    continue
-                
-                final_score, _, _, _ = self.scorer.fx_generalization_score(
-                    train_metrics, val_metrics, purpose="opt"
-                )
-                
-                if final_score > best_final:
-                    best_final = final_score
-                    best_params = dict(test_params)
-                    best_train_metrics = train_metrics
-                    best_val_metrics = val_metrics
-            
-            if not best_train_metrics:
-                best_params = dict(shortlist[0]["params"])
-                best_strategy = StrategyRegistry.get(strategy_name, **best_params)
-                signals = best_strategy.generate_signals(train_features, symbol)
-                best_train_metrics = self.backtester.run(train_features, signals, symbol, best_strategy)
-                if val_features is not None and len(val_features) >= 50:
-                    signals = best_strategy.generate_signals(val_features, symbol)
-                    best_val_metrics = self.backtester.run(val_features, signals, symbol, best_strategy)
-                else:
-                    best_val_metrics = {'total_return_pct': 0.0, 'sharpe_ratio': 0.0,
-                                        'max_drawdown_pct': 0.0, 'total_trades': 0}
-            
-            return self._clean_params(best_params), best_train_metrics, best_val_metrics
-        
-        # Legacy pm_weighted mode
-        best_score = -float('inf')
-        best_params = default_params
-        best_train_metrics = {}
-        best_val_metrics = {}
-        
         for combo in combinations:
             params = dict(zip(param_names, combo))
-            test_strategy = StrategyRegistry.get(strategy_name, **params)
-            
+            test_params = {**default_params, **params}
+            test_strategy = StrategyRegistry.get(strategy_name, **test_params)
+
             try:
                 signals = test_strategy.generate_signals(train_features, symbol)
                 train_metrics = self.backtester.run(train_features, signals, symbol, test_strategy)
-                
-                passes, _ = self.scorer.passes_minimum_criteria(train_metrics)
-                if not passes:
+
+                if train_metrics.get('total_trades', 0) < self.config.fx_opt_min_trades:
                     continue
-                
-                signals = test_strategy.generate_signals(val_features, symbol)
-                val_metrics = self.backtester.run(val_features, signals, symbol, test_strategy)
-                
-                train_score = self.scorer.calculate_composite_score(train_metrics)
-                val_score = self.scorer.calculate_composite_score(val_metrics)
-                combined_score = 0.4 * train_score + 0.6 * val_score
-                
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_params = test_strategy.get_params()
-                    best_train_metrics = train_metrics
-                    best_val_metrics = val_metrics
-                    
+
+                train_score = float(self.scorer.score(train_metrics, purpose="opt"))
+                candidates.append({
+                    "params": dict(test_params),
+                    "train_metrics": train_metrics,
+                    "train_score": train_score
+                })
             except Exception as e:
-                logger.debug(f"[{symbol}] Param combo failed: {params} - {e}")
+                logger.debug(f"[{symbol}] Grid opt {strategy_name} combo failed: {e}")
                 continue
-        
+
+        if not candidates:
+            candidates.append({
+                "params": dict(default_params),
+                "train_metrics": {},
+                "train_score": -float("inf")
+            })
+
+        candidates.sort(key=lambda d: d["train_score"], reverse=True)
+        top_k = max(1, int(getattr(self.config, "fx_opt_top_k", 5)))
+        shortlist = candidates[:top_k]
+
+        best_final = -float("inf")
+        best_params = dict(default_params)
+        best_train_metrics: Dict[str, Any] = {}
+        best_val_metrics: Dict[str, Any] = {}
+
+        for cand in shortlist:
+            test_params = cand["params"]
+            test_strategy = StrategyRegistry.get(strategy_name, **test_params)
+            train_metrics = cand.get("train_metrics") or {}
+
+            if not train_metrics:
+                try:
+                    signals = test_strategy.generate_signals(train_features, symbol)
+                    train_metrics = self.backtester.run(train_features, signals, symbol, test_strategy)
+                except Exception as e:
+                    logger.debug(f"[{symbol}] Val-shortlist train {strategy_name} failed: {e}")
+                    continue
+
+            if val_features is None or len(val_features) < 50:
+                val_metrics = {'total_return_pct': 0.0, 'sharpe_ratio': 0.0,
+                               'max_drawdown_pct': 0.0, 'total_trades': 0}
+            else:
+                try:
+                    signals = test_strategy.generate_signals(val_features, symbol)
+                    val_metrics = self.backtester.run(val_features, signals, symbol, test_strategy)
+                except Exception as e:
+                    logger.debug(f"[{symbol}] Val-shortlist val {strategy_name} failed: {e}")
+                    continue
+
+            val_trades = int(val_metrics.get("total_trades", 0))
+            val_dd = float(val_metrics.get("max_drawdown_pct", 100.0))
+            if val_trades < self.config.fx_val_min_trades:
+                continue
+            if val_dd >= self.config.fx_val_max_drawdown:
+                continue
+
+            final_score, _, _, _ = self.scorer.fx_generalization_score(
+                train_metrics, val_metrics, purpose="opt"
+            )
+
+            if final_score > best_final:
+                best_final = final_score
+                best_params = dict(test_params)
+                best_train_metrics = train_metrics
+                best_val_metrics = val_metrics
+
         if not best_train_metrics:
-            logger.warning(f"[{symbol}] No valid params found, using defaults")
-            signals = strategy.generate_signals(train_features, symbol)
-            best_train_metrics = self.backtester.run(train_features, signals, symbol, strategy)
-            signals = strategy.generate_signals(val_features, symbol)
-            best_val_metrics = self.backtester.run(val_features, signals, symbol, strategy)
-        
+            best_params = dict(shortlist[0]["params"])
+            best_strategy = StrategyRegistry.get(strategy_name, **best_params)
+            signals = best_strategy.generate_signals(train_features, symbol)
+            best_train_metrics = self.backtester.run(train_features, signals, symbol, best_strategy)
+            if val_features is not None and len(val_features) >= 50:
+                signals = best_strategy.generate_signals(val_features, symbol)
+                best_val_metrics = self.backtester.run(val_features, signals, symbol, best_strategy)
+            else:
+                best_val_metrics = {'total_return_pct': 0.0, 'sharpe_ratio': 0.0,
+                                    'max_drawdown_pct': 0.0, 'total_trades': 0}
+
         return self._clean_params(best_params), best_train_metrics, best_val_metrics
     
     def _clean_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1549,51 +1475,35 @@ class Validator:
                  train_metrics: Dict[str, Any],
                  val_metrics: Dict[str, Any]) -> Tuple[bool, str, float]:
         """
-        Validate strategy configuration.
-        
+        Validate strategy configuration with FX backtester-aligned rules.
+
         Args:
             train_metrics: Training period metrics
             val_metrics: Validation period metrics
-            
+
         Returns:
             Tuple of (is_valid, reason, robustness_ratio)
         """
-        # Backtester-aligned validation rules
-        if self.config.scoring_mode == "fx_backtester":
-            robustness = self.scorer.calculate_fx_score_robustness_ratio(train_metrics, val_metrics, purpose="selection")
+        robustness = self.scorer.calculate_fx_score_robustness_ratio(train_metrics, val_metrics, purpose="selection")
 
-            val_sharpe = float(val_metrics.get('sharpe_ratio', 0.0))
-            val_dd = float(val_metrics.get('max_drawdown_pct', 100.0))
-            val_trades = int(val_metrics.get('total_trades', 0))
+        val_sharpe = float(val_metrics.get('sharpe_ratio', 0.0))
+        val_dd = float(val_metrics.get('max_drawdown_pct', 100.0))
+        val_trades = int(val_metrics.get('total_trades', 0))
 
-            is_valid = (
-                (robustness >= getattr(self.config, "fx_min_robustness_ratio", 0.85) or val_sharpe > self.config.fx_val_sharpe_override)
-                and val_dd < self.config.fx_val_max_drawdown
-                and val_trades >= self.config.fx_val_min_trades
-            )
+        is_valid = (
+            (robustness >= getattr(self.config, "fx_min_robustness_ratio", 0.85) or val_sharpe > self.config.fx_val_sharpe_override)
+            and val_dd < self.config.fx_val_max_drawdown
+            and val_trades >= self.config.fx_val_min_trades
+        )
 
-            if not is_valid:
-                if val_trades < self.config.fx_val_min_trades:
-                    return False, f"Validation failed: Insufficient trades: {val_trades} < {self.config.fx_val_min_trades}", robustness
-                if val_dd >= self.config.fx_val_max_drawdown:
-                    return False, f"Validation failed: High drawdown: {val_dd:.2f}% >= {self.config.fx_val_max_drawdown}%", robustness
-                return False, f"Validation failed: Robustness {robustness:.2f} < {getattr(self.config, 'fx_min_robustness_ratio', 0.85)} and Sharpe {val_sharpe:.2f} <= {self.config.fx_val_sharpe_override}", robustness
-
+        if is_valid:
             return True, "Validated successfully", robustness
 
-        # Check validation metrics pass minimum criteria
-        passes, reason = self.scorer.passes_minimum_criteria(val_metrics)
-        if not passes:
-            return False, f"Validation failed: {reason}", 0.0
-        
-        # Calculate robustness ratio
-        robustness = self.scorer.calculate_robustness_ratio(train_metrics, val_metrics)
-        
-        # Check robustness
-        if robustness < self.config.min_robustness:
-            return False, f"Low robustness: {robustness:.2f} < {self.config.min_robustness}", robustness
-        
-        return True, "Validated successfully", robustness
+        if val_trades < self.config.fx_val_min_trades:
+            return False, f"Validation failed: Insufficient trades: {val_trades} < {self.config.fx_val_min_trades}", robustness
+        if val_dd >= self.config.fx_val_max_drawdown:
+            return False, f"Validation failed: High drawdown: {val_dd:.2f}% >= {self.config.fx_val_max_drawdown}%", robustness
+        return False, f"Validation failed: Robustness {robustness:.2f} < {getattr(self.config, 'fx_min_robustness_ratio', 0.85)} and Sharpe {val_sharpe:.2f} <= {self.config.fx_val_sharpe_override}", robustness
 
 
 # =============================================================================
@@ -1651,8 +1561,6 @@ class RegimeOptimizer:
         _raw_ratio = float(getattr(config, 'regime_min_val_return_dd_ratio', 1.0))
         self.min_val_return_dd_ratio = _raw_ratio if math.isfinite(_raw_ratio) and _raw_ratio > 0 else 1.0
         
-        # Use fx_backtester scoring mode
-        self.use_fx_scoring = getattr(config, 'scoring_mode', 'pm_weighted') == 'fx_backtester'
         self.training_gate_telemetry: Dict[str, Any] = {}
         
         # Initialize Optuna optimizer for regime tuning
@@ -2487,8 +2395,14 @@ class RegimeOptimizer:
                 reason += f" (rejected: {len(rejection_reasons)} candidates by gate checks)"
             return None, False, reason
 
-        # Sort descending by score
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        scored_candidates.sort(
+            key=lambda item: (
+                -float(item[0]),
+                -int(item[1]['train_regime_metrics'].get(regime, {}).get('total_trades', 0) or 0),
+                int(item[1].get('search_trials', 1) or 1),
+                str(item[1].get('strategy_name', '')),
+            )
+        )
 
         # Cap the number of validation attempts
         top_k = min(self.regime_validation_top_k, len(scored_candidates))
@@ -2719,15 +2633,10 @@ class RegimeOptimizer:
         # Compute robustness ratio
         train_full = self._bucket_to_full_metrics(train_metrics)
         val_full = self._bucket_to_full_metrics(val_metrics)
-        
-        if self.use_fx_scoring:
-            robustness = self.scorer.calculate_fx_score_robustness_ratio(
-                train_full, val_full, purpose="selection"
-            )
-        else:
-            # Simple profit factor ratio (train_pf already declared above)
-            robustness = val_pf / (train_pf + 0.1) if train_pf > 0 else 0.5
-        
+        robustness = self.scorer.calculate_fx_score_robustness_ratio(
+            train_full, val_full, purpose="selection"
+        )
+
         # Check robustness OR Sharpe override
         if robustness < self.min_robustness_ratio and val_sharpe <= self.val_min_sharpe_override:
             return False, f"Low robustness {robustness:.2f} < {self.min_robustness_ratio} and Sharpe {val_sharpe:.2f} <= {self.val_min_sharpe_override}"
@@ -2743,14 +2652,9 @@ class RegimeOptimizer:
         """Build compact, persisted validation evidence for dashboards and review."""
         train_full = self._bucket_to_full_metrics(train_metrics or {})
         val_full = self._bucket_to_full_metrics(val_metrics or {})
-        if self.use_fx_scoring:
-            robustness = self.scorer.calculate_fx_score_robustness_ratio(
-                train_full, val_full, purpose="selection"
-            )
-        else:
-            train_pf = float(train_metrics.get("profit_factor", 0.0) or 0.0)
-            val_pf = float(val_metrics.get("profit_factor", 0.0) or 0.0)
-            robustness = val_pf / (train_pf + 0.1) if train_pf > 0 else 0.5
+        robustness = self.scorer.calculate_fx_score_robustness_ratio(
+            train_full, val_full, purpose="selection"
+        )
         val_return = float(val_metrics.get("total_return_pct", 0.0) or 0.0)
         val_dd = float(val_metrics.get("max_drawdown_pct", 0.0) or 0.0)
         evidence = {
@@ -2772,82 +2676,47 @@ class RegimeOptimizer:
                                val_metrics: Dict[str, Any]) -> float:
         """
         Compute score for a regime bucket using fx_backtester generalization scoring.
-        
-        When scoring_mode='fx_backtester', uses:
+
+        Uses:
         - Gap penalty for train->val degradation
         - Robustness ratio boost
         - Validation-first scoring
         - Trade count stability factor (Gap C fix)
-        
-        Falls back to simple composite for pm_weighted mode.
         """
         # ===== FIX Gap C: Trade count stability factor =====
         # Prefer candidates with more trades (more statistical confidence)
         # Uses log scaling: log1p(trades) / log1p(target) capped at 1.0
         train_trades = train_metrics.get('total_trades', 0)
         val_trades = val_metrics.get('total_trades', 0)
-        
+
         # Target trade counts for full stability bonus
         # (2x minimum is considered "healthy")
         target_train = self.min_train_trades * 2
         target_val = self.min_val_trades * 2
-        
+
         # Calculate stability factors using log scaling
-        import math
         train_stability = min(1.0, math.log1p(train_trades) / math.log1p(target_train)) if target_train > 0 else 0.5
         val_stability = min(1.0, math.log1p(val_trades) / math.log1p(target_val)) if target_val > 0 else 0.5
-        
+
         # Combined stability factor (weighted average favoring validation)
         stability_factor = 0.3 * train_stability + 0.7 * val_stability
         # Clamp to reasonable range [0.7, 1.0] - don't over-penalize low counts
         stability_factor = 0.7 + 0.3 * stability_factor
-        
-        if self.use_fx_scoring:
-            # Build pseudo-metrics dicts for the scorer (regime bucket metrics -> full metrics format)
-            train_full = self._bucket_to_full_metrics(train_metrics)
-            val_full = self._bucket_to_full_metrics(val_metrics)
-            
-            # Use validation metrics if sufficient trades
-            if val_trades >= self.min_val_trades:
-                # Use fx_generalization_score for proper gap penalty + robustness boost
-                final_score, train_score, val_score, rr = self.scorer.fx_generalization_score(
-                    train_full, val_full, purpose="selection"
-                )
-                # Apply stability factor (Gap C fix)
-                return final_score * stability_factor
-            else:
-                # Not enough validation trades - use train score with discount
-                train_score = self.scorer.score(train_full, purpose="selection")
-                return train_score * 0.7 * stability_factor  # Discount for no validation
-        
-        # Legacy pm_weighted scoring (original behavior)
+
+        # Build pseudo-metrics dicts for the scorer (regime bucket metrics -> full metrics format)
+        train_full = self._bucket_to_full_metrics(train_metrics)
+        val_full = self._bucket_to_full_metrics(val_metrics)
+
+        # Use validation metrics if sufficient trades
         if val_trades >= self.min_val_trades:
-            metrics = val_metrics
-            train_pf = train_metrics.get('profit_factor', 1.0)
-            val_pf = metrics.get('profit_factor', 1.0)
-            robustness = min(1.0, val_pf / (train_pf + 0.1)) if train_pf > 0 else 0.5
-        else:
-            metrics = train_metrics
-            robustness = 0.7
-        
-        if metrics.get('total_trades', 0) == 0:
-            return -float('inf')
-        
-        pf = metrics.get('profit_factor', 0)
-        wr = metrics.get('win_rate', 0) / 100
-        sharpe = metrics.get('sharpe_approx', 0)
-        total_pnl = metrics.get('total_pnl', 0)
-        
-        score = (
-            min(pf, 5.0) * 20 +
-            wr * 30 +
-            min(max(sharpe, -2), 3) * 15 +
-            min(total_pnl / 50, 20) +
-            robustness * 20
-        )
-        
-        # Apply stability factor (Gap C fix)
-        return score * stability_factor
+            # Use fx_generalization_score for proper gap penalty + robustness boost
+            final_score, _, _, _ = self.scorer.fx_generalization_score(
+                train_full, val_full, purpose="selection"
+            )
+            return final_score * stability_factor
+
+        # Not enough validation trades - use train score with discount
+        return self.scorer.score(train_full, purpose="selection") * 0.7 * stability_factor
     
     def _bucket_to_full_metrics(self, bucket_metrics: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -2987,7 +2856,6 @@ class OptimizationPipeline:
             }
 
         return {
-            "mode": str(getattr(self.config, "data_workflow_mode", "active_recent_m5")),
             "base_timeframe": "M5",
             "max_bars": int(getattr(self.config, "max_bars", 300000)),
             "historical_stress_audit_bars": int(getattr(self.config, "historical_stress_audit_bars", 50000)),
@@ -3469,54 +3337,46 @@ class OptimizationPipeline:
             stage3_warmup_by_tf = {}
             
             regime_params_file = getattr(self.config, 'regime_params_file', 'regime_params.json')
-            active_mode = self.splitter.workflow_enabled()
-            
+
+            # The active-recent M5 workflow always emits data_window_meta; bail if it
+            # didn't (means _load_symbol_timeframe_data returned an empty window).
+            if not data_window_meta:
+                logger.warning(f"[{symbol}] Empty workflow window; skipping symbol")
+                result.error_message = "Empty workflow window"
+                return result
+
+            windows = data_window_meta.get("windows", {})
+            hist_meta = windows.get("historical_stress_audit", {})
+            active_meta = windows.get("active_universe", {})
+            stage2_meta = windows.get("stage2_selection", {})
+            stage2_warm_meta = windows.get("stage2_selection_with_warmup", {})
+
+            hist_start = pd.Timestamp(hist_meta["start_ts"]) if hist_meta.get("start_ts") else None
+            hist_end = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
+            active_start = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
+            stage2_start = pd.Timestamp(stage2_meta["start_ts"]) if stage2_meta.get("start_ts") else active_start
+            stage2_warm_start = (
+                pd.Timestamp(stage2_warm_meta["start_ts"])
+                if stage2_warm_meta.get("start_ts") else stage2_start
+            )
+
             for tf, data in data_by_tf.items():
                 full_features = FeatureComputer.compute_all(
                     data, symbol=symbol, timeframe=tf,
                     regime_params_file=regime_params_file
                 )
-                if active_mode and data_window_meta:
-                    windows = data_window_meta.get("windows", {})
-                    hist_meta = windows.get("historical_stress_audit", {})
-                    active_meta = windows.get("active_universe", {})
-                    stage2_meta = windows.get("stage2_selection", {})
-                    stage2_warm_meta = windows.get("stage2_selection_with_warmup", {})
-
-                    hist_start = pd.Timestamp(hist_meta["start_ts"]) if hist_meta.get("start_ts") else None
-                    hist_end = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
-                    active_start = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
-                    stage2_start = pd.Timestamp(stage2_meta["start_ts"]) if stage2_meta.get("start_ts") else active_start
-                    stage2_warm_start = (
-                        pd.Timestamp(stage2_warm_meta["start_ts"])
-                        if stage2_warm_meta.get("start_ts") else stage2_start
-                    )
-
-                    active_features = self._slice_time_window(full_features, active_start, None)
-                    stage2_features = self._slice_time_window(full_features, stage2_warm_start, None)
-                    historical_features = self._slice_time_window(full_features, hist_start, hist_end)
-                    if len(active_features) >= 200:
-                        train_features_by_tf[tf] = active_features
-                    if len(stage2_features) >= 50:
-                        val_features_by_tf[tf] = stage2_features
-                        stage3_features_by_tf[tf] = stage2_features.copy()
-                        val_warmup_by_tf[tf] = int((stage2_features.index < stage2_start).sum()) if stage2_start is not None else 0
-                        stage3_warmup_by_tf[tf] = val_warmup_by_tf[tf]
-                    if len(historical_features) >= 50:
-                        historical_features_by_tf[tf] = historical_features
-                else:
-                    split_idx = self.splitter.get_split_indices(len(data))
-                    train_start, train_end = split_idx['train']
-                    val_start, val_end = split_idx['validation_with_warmup']
-                    holdout_start, holdout_end = split_idx['holdout_with_warmup']
-
-                    train_features_by_tf[tf] = full_features.iloc[train_start:train_end].copy()
-                    val_features_by_tf[tf] = full_features.iloc[val_start:val_end].copy()
-                    val_warmup_by_tf[tf] = max(0, split_idx['validation'][0] - val_start)
-                    holdout_features_by_tf[tf] = full_features.iloc[holdout_start:holdout_end].copy()
-                    holdout_warmup_by_tf[tf] = max(0, split_idx['holdout'][0] - holdout_start)
-                    stage3_features_by_tf[tf] = holdout_features_by_tf[tf].copy()
-                    stage3_warmup_by_tf[tf] = holdout_warmup_by_tf[tf]
+                active_features = self._slice_time_window(full_features, active_start, None)
+                stage2_features = self._slice_time_window(full_features, stage2_warm_start, None)
+                historical_features = self._slice_time_window(full_features, hist_start, hist_end)
+                if len(active_features) >= 200:
+                    train_features_by_tf[tf] = active_features
+                if len(stage2_features) >= 50:
+                    val_features_by_tf[tf] = stage2_features
+                    stage3_features_by_tf[tf] = stage2_features.copy()
+                    val_warmup_by_tf[tf] = int((stage2_features.index < stage2_start).sum()) if stage2_start is not None else 0
+                    stage3_warmup_by_tf[tf] = val_warmup_by_tf[tf]
+                if len(historical_features) >= 50:
+                    historical_features_by_tf[tf] = historical_features
             
             # Run regime-aware optimization
             with Timer(f"[{symbol}] Regime Optimization"):

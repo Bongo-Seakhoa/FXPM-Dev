@@ -27,7 +27,6 @@ def make_trader():
         live_bars_count=200,
         live_min_bars=2,
         regime_params_file="regime_params.json",
-        regime_freshness_decay=1.0,
         regime_min_val_profit_factor=1.0,
         regime_min_val_return_pct=0.0,
         fx_val_max_drawdown=35.0,
@@ -47,7 +46,9 @@ def make_features():
     return pd.DataFrame(
         {
             "REGIME": ["TREND", "TREND", "TREND"],
+            "REGIME_LIVE": ["TREND", "TREND", "TREND"],
             "REGIME_STRENGTH": [0.8, 0.8, 0.8],
+            "REGIME_STRENGTH_LIVE": [0.8, 0.8, 0.8],
         },
         index=idx,
     )

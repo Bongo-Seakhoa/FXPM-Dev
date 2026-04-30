@@ -626,6 +626,63 @@ class LiveLoopIntegrationTests(unittest.TestCase):
         self.assertEqual(candidates[0]["regime"], "TREND")
         self.assertAlmostEqual(candidates[0]["regime_strength"], 0.9)
 
+    def test_regime_candidate_selection_requires_regime_live(self):
+        from types import SimpleNamespace
+        from pm_main import LiveTrader
+        from pm_pipeline import RegimeConfig, SymbolConfig
+
+        trader = LiveTrader.__new__(LiveTrader)
+        trader.pipeline_config = SimpleNamespace(
+            regime_params_file="regime_params.json",
+            live_bars_count=10,
+            live_min_bars=2,
+            regime_min_val_profit_factor=1.0,
+            regime_min_val_return_pct=0.0,
+            fx_val_max_drawdown=35.0,
+            regime_min_val_return_dd_ratio=0.0,
+        )
+        trader._candidate_cache = {}
+        trader._cache_hits = 0
+        trader._cache_misses = 0
+        trader._last_bar_times = {}
+        trader._is_symbol_timeframe_due = Mock(return_value=True)
+        trader._prune_cache = Mock()
+        trader.logger = Mock()
+        trader.pm = None
+        bars = _make_ohlcv(3)
+        trader._get_live_bars = Mock(return_value=bars)
+
+        features = bars.copy()
+        features["REGIME"] = ["CHOP", "TREND", "RANGE"]
+        features["REGIME_STRENGTH"] = [0.4, 0.9, 0.2]
+
+        config = SymbolConfig(
+            symbol="EURUSD",
+            regime_configs={
+                "M5": {
+                    "TREND": RegimeConfig(
+                        strategy_name="ShouldNotTrade",
+                        parameters={},
+                        quality_score=0.8,
+                        val_metrics={
+                            "profit_factor": 1.5,
+                            "total_return_pct": 5.0,
+                            "max_drawdown_pct": 2.0,
+                        },
+                    ),
+                }
+            },
+        )
+
+        with patch("pm_main.FeatureComputer.compute_all", return_value=features), \
+             patch("pm_main.StrategyRegistry.get") as registry_get:
+            candidates, stats = trader._evaluate_regime_candidates("EURUSD", "EURUSD", config)
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(stats["missing_regime_live"], 1)
+        registry_get.assert_not_called()
+        trader.logger.warning.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()
