@@ -1,16 +1,16 @@
 {
   "freshness": {
-    "as_of": "2026-04-29T10:17:33.539401",
+    "as_of": "2026-04-30T18:37:43.149201",
     "last_housekeeping_age_seconds": 0,
-    "last_housekeeping_at": "2026-04-29T10:17:33.494883",
+    "last_housekeeping_at": "2026-04-30T18:37:43.075968",
     "last_housekeeping_is_fresh": true,
-    "last_sweep_age_seconds": 123,
+    "last_sweep_age_seconds": 116533,
     "last_sweep_at": "2026-04-29T10:15:30.081014",
-    "last_sweep_is_fresh": true
+    "last_sweep_is_fresh": false
   },
   "last_free_gb": 0.39,
   "last_housekeeping": {
-    "free_gb": 0.39,
+    "free_gb": 3.18,
     "metaquotes": {},
     "observe_only": true,
     "pm_owned_cleanup": {
@@ -21,12 +21,12 @@
     },
     "pm_sizes": {
       "cache_dir_bytes": 667208587,
-      "data_dir_bytes": 2050624889,
+      "data_dir_bytes": 2030475489,
       "live_dir_bytes": 24992443,
-      "log_dir_bytes": 378112,
-      "output_dir_bytes": 838923
+      "log_dir_bytes": 392076,
+      "output_dir_bytes": 838927
     },
-    "ran_at": "2026-04-29T10:17:33.494883",
+    "ran_at": "2026-04-30T18:37:43.075968",
     "trigger": "shutdown"
   },
   "last_optimization_at": "2026-04-27T15:42:26.146746",
@@ -43,5 +43,5 @@
   "next_metaquotes_review_at": "2026-04-29T11:00:39.449632",
   "order_governance": {},
   "pressure_level": "critical",
-  "state_updated_at": "2026-04-29T10:17:33.539401"
+  "state_updated_at": "2026-04-30T18:37:43.149201"
 }
