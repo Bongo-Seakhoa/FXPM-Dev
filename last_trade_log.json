@@ -1,77 +1,77 @@
 {
   "GBPCAD": {
     "symbol": "GBPCAD",
-    "decision_key": "0286207a57efb112",
+    "decision_key": "d1568c55e3fc261e",
     "decision_keys": [
-      "0286207a57efb112"
+      "d1568c55e3fc261e"
     ],
-    "bar_time": "2026-04-29 01:30:00",
+    "bar_time": "2026-04-29 11:00:00",
     "timeframe": "M15",
     "regime": "TREND",
     "strategy_name": "KeltnerPullbackStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:20.470137",
+    "action_time": "2026-04-29T10:15:25.898005",
     "context": {}
   },
   "NZDJPY": {
     "symbol": "NZDJPY",
-    "decision_key": "ef93cb18b5f6980f",
+    "decision_key": "7988296b657f6586",
     "decision_keys": [
-      "ef93cb18b5f6980f"
+      "7988296b657f6586"
     ],
-    "bar_time": "2026-04-29 01:30:00",
-    "timeframe": "M15",
-    "regime": "TREND",
-    "strategy_name": "MomentumBurstStrategy",
+    "bar_time": "2026-04-29 10:30:00",
+    "timeframe": "M30",
+    "regime": "CHOP",
+    "strategy_name": "ChoppinessCompressionBreakoutStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:21.397052",
+    "action_time": "2026-04-29T10:00:28.100195",
     "context": {}
   },
   "AUDCHF": {
     "symbol": "AUDCHF",
-    "decision_key": "7bcbc7731334c9ef",
+    "decision_key": "1bff8e9cb00976a9",
     "decision_keys": [
-      "7bcbc7731334c9ef"
+      "1bff8e9cb00976a9"
     ],
-    "bar_time": "2026-04-28 00:00:00",
-    "timeframe": "D1",
-    "regime": "CHOP",
-    "strategy_name": "RelativeVigorIndexStrategy",
+    "bar_time": "2026-04-29 04:00:00",
+    "timeframe": "H4",
+    "regime": "TREND",
+    "strategy_name": "ROCExhaustionReversalStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-28T23:04:44.187006",
+    "action_time": "2026-04-29T07:00:48.370125",
     "context": {}
   },
   "CADCHF": {
     "symbol": "CADCHF",
-    "decision_key": "fe9c8b2b1c5193d4",
+    "decision_key": "db18221417adab9b",
     "decision_keys": [
-      "fe9c8b2b1c5193d4"
+      "db18221417adab9b"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
+    "bar_time": "2026-04-29 10:30:00",
+    "timeframe": "M30",
     "regime": "CHOP",
-    "strategy_name": "StochRSITrendGateStrategy",
+    "strategy_name": "RSITrendFilteredMRStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-28T23:04:52.536037",
+    "action_time": "2026-04-29T10:01:01.512443",
     "context": {}
   },
   "CADJPY": {
     "symbol": "CADJPY",
-    "decision_key": "2c5f3af11139a3d6",
+    "decision_key": "1d91aa1d029111a8",
     "decision_keys": [
-      "2c5f3af11139a3d6"
+      "1d91aa1d029111a8"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
     "regime": "CHOP",
-    "strategy_name": "StochRSITrendGateStrategy",
+    "strategy_name": "ADXDIStrengthStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:21:45.422479",
+    "action_time": "2026-04-29T10:00:30.942091",
     "context": {}
   },
   "AUDCAD": {
@@ -91,437 +91,559 @@
   },
   "NZDCHF": {
     "symbol": "NZDCHF",
-    "decision_key": "72f46daa96c7fb33",
+    "decision_key": "d2c1704ce2ac4968",
     "decision_keys": [
-      "72f46daa96c7fb33"
+      "d2c1704ce2ac4968"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
-    "regime": "CHOP",
-    "strategy_name": "ZScoreVWAPReversionStrategy",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
+    "regime": "TREND",
+    "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:32.937727",
+    "action_time": "2026-04-29T10:15:28.653295",
     "context": {}
   },
   "NZDCAD": {
     "symbol": "NZDCAD",
-    "decision_key": "b588f3460dc04f2c",
+    "decision_key": "055f19811b28620d",
     "decision_keys": [
-      "b588f3460dc04f2c"
+      "055f19811b28620d"
     ],
-    "bar_time": "2026-04-29 01:30:00",
+    "bar_time": "2026-04-29 11:00:00",
     "timeframe": "M15",
     "regime": "CHOP",
     "strategy_name": "ATRPercentileBreakoutStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:43.993355",
+    "action_time": "2026-04-29T10:15:05.581793",
     "context": {}
   },
   "CHFJPY": {
     "symbol": "CHFJPY",
-    "decision_key": "4d215d83635d35bc",
+    "decision_key": "9aa7d228ecb113a1",
     "decision_keys": [
-      "4d215d83635d35bc"
+      "9aa7d228ecb113a1"
     ],
-    "bar_time": "2026-04-29 01:30:00",
+    "bar_time": "2026-04-29 11:00:00",
     "timeframe": "M15",
     "regime": "CHOP",
     "strategy_name": "KeltnerPullbackStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:27.989311",
+    "action_time": "2026-04-29T10:15:29.333256",
     "context": {}
   },
   "USDNOK": {
     "symbol": "USDNOK",
-    "decision_key": "62e55b6832634511",
+    "decision_key": "0de154fe470265cd",
     "decision_keys": [
-      "62e55b6832634511"
+      "76d97664b90ec459",
+      "0de154fe470265cd"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
     "regime": "CHOP",
-    "strategy_name": "KeltnerPullbackStrategy",
+    "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:36.471632",
+    "action_time": "2026-04-29T10:00:38.054244",
     "context": {}
   },
   "USDSGD": {
     "symbol": "USDSGD",
-    "decision_key": "ea97d73ffd00d7a1",
+    "decision_key": "1a0c761c1e223a03",
     "decision_keys": [
-      "ea97d73ffd00d7a1"
+      "4ef486111660db1e",
+      "1a0c761c1e223a03"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
     "regime": "CHOP",
-    "strategy_name": "MACDHistogramMomentumStrategy",
+    "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:22:41.561364",
+    "action_time": "2026-04-29T10:00:39.528643",
     "context": {}
   },
   "USDMXN": {
     "symbol": "USDMXN",
-    "decision_key": "2c8c1fb91ea2dda3",
+    "decision_key": "4f7f0a0451b6b5c2",
     "decision_keys": [
-      "2c8c1fb91ea2dda3"
+      "931b110d092fbfed",
+      "4f7f0a0451b6b5c2"
     ],
-    "bar_time": "2026-04-29 01:30:00",
-    "timeframe": "M15",
-    "regime": "RANGE",
-    "strategy_name": "MACDTrendStrategy",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
+    "regime": "CHOP",
+    "strategy_name": "KeltnerPullbackStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:31.085860",
+    "action_time": "2026-04-29T10:00:41.063124",
     "context": {}
   },
   "GBPNZD": {
     "symbol": "GBPNZD",
-    "decision_key": "c131b8d0c3e3e4df",
+    "decision_key": "e4d8ecf1f47c5b6e",
     "decision_keys": [
-      "c131b8d0c3e3e4df"
+      "e4d8ecf1f47c5b6e"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
-    "regime": "CHOP",
-    "strategy_name": "RSITrendFilteredMRStrategy",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
+    "regime": "TREND",
+    "strategy_name": "MACDHistogramMomentumStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:40.022223",
+    "action_time": "2026-04-29T10:00:42.490676",
     "context": {}
   },
   "USDSEK": {
     "symbol": "USDSEK",
-    "decision_key": "6b8c80af08d9ae91",
+    "decision_key": "47ff3054fa514930",
     "decision_keys": [
-      "6b8c80af08d9ae91"
+      "ef10b8c0375d15d1",
+      "47ff3054fa514930"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
-    "regime": "CHOP",
-    "strategy_name": "AroonTrendStrategy",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
+    "regime": "TREND",
+    "strategy_name": "SqueezeBreakoutStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:23:10.589365",
+    "action_time": "2026-04-29T10:00:43.906275",
     "context": {}
   },
   "USDZAR": {
     "symbol": "USDZAR",
-    "decision_key": "2c9d8fcf68411d0a",
+    "decision_key": "a396ffbe4e9a5efd",
     "decision_keys": [
-      "2c9d8fcf68411d0a"
+      "a396ffbe4e9a5efd"
     ],
-    "bar_time": "2026-04-29 01:00:00",
+    "bar_time": "2026-04-29 10:30:00",
     "timeframe": "M30",
     "regime": "CHOP",
     "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:43.199837",
+    "action_time": "2026-04-29T10:00:45.343718",
     "context": {}
   },
   "US30": {
     "symbol": "US30",
-    "decision_key": "0a0dbc4e41d0a987",
+    "decision_key": "aff590c97c30ab85",
     "decision_keys": [
-      "0a0dbc4e41d0a987"
+      "aff590c97c30ab85"
     ],
-    "bar_time": "2026-04-29 01:30:00",
-    "timeframe": "M15",
+    "bar_time": "2026-04-29 05:00:00",
+    "timeframe": "H1",
     "regime": "CHOP",
-    "strategy_name": "KeltnerPullbackStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:35.420554",
-    "context": {}
+    "strategy_name": "EMAPullbackContinuationStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-04-29T05:00:26.757057",
+    "context": {
+      "secondary_trade": false,
+      "secondary_reason": "",
+      "position_context": {
+        "open_positions_total": 0,
+        "open_timeframes": [],
+        "open_has_d1": false,
+        "open_has_non_d1": false,
+        "open_has_unknown": false,
+        "open_tag_sources": {
+          "comment": 0,
+          "magic": 0,
+          "unknown": 0
+        },
+        "open_positions": [],
+        "fresh_open_positions_total": 0,
+        "fresh_open_timeframes": [],
+        "fresh_open_has_d1": false,
+        "fresh_open_has_non_d1": false,
+        "fresh_open_has_unknown": false
+      },
+      "selection_score": 0.24871882638072262,
+      "quality_score": 0.5586820958928728,
+      "freshness": 1.0,
+      "regime_strength": 0.44518846801994966,
+      "governance_policy": "control_fixed"
+    }
   },
   "XAGUSD": {
     "symbol": "XAGUSD",
-    "decision_key": "06abc6c775c5a49c",
+    "decision_key": "e369a07b6edd01f4",
     "decision_keys": [
-      "06abc6c775c5a49c"
+      "e369a07b6edd01f4"
     ],
-    "bar_time": "2026-04-29 01:50:00",
-    "timeframe": "M5",
-    "regime": "TREND",
-    "strategy_name": "RSITrendFilteredMRStrategy",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
+    "regime": "CHOP",
+    "strategy_name": "EMAPullbackContinuationStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:55:15.781505",
+    "action_time": "2026-04-29T10:15:10.313485",
     "context": {}
   },
   "UK100": {
     "symbol": "UK100",
-    "decision_key": "c8a52d7ada034aee",
+    "decision_key": "5c951689acfabdaa",
     "decision_keys": [
-      "c8a52d7ada034aee"
+      "5c951689acfabdaa"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
-    "regime": "CHOP",
-    "strategy_name": "MACDHistogramMomentumStrategy",
+    "bar_time": "2026-04-29 11:10:00",
+    "timeframe": "M5",
+    "regime": "TREND",
+    "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:02:37.254926",
+    "action_time": "2026-04-29T10:15:11.004801",
     "context": {}
   },
   "HK50": {
     "symbol": "HK50",
-    "decision_key": "7ceed361e97a4545",
+    "decision_key": "dd84c3baf4f5e892",
     "decision_keys": [
-      "7ceed361e97a4545"
+      "dd84c3baf4f5e892"
     ],
-    "bar_time": "2026-04-27 00:00:00",
-    "timeframe": "D1",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
     "regime": "CHOP",
-    "strategy_name": "NarrowRangeBreakoutStrategy",
+    "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-28T04:39:51.039707",
+    "action_time": "2026-04-29T10:15:11.746390",
     "context": {}
   },
   "JP225": {
     "symbol": "JP225",
-    "decision_key": "edbc04753c470980",
+    "decision_key": "b269ad0d20bacfd6",
     "decision_keys": [
-      "edbc04753c470980"
+      "b269ad0d20bacfd6"
     ],
-    "bar_time": "2026-04-29 01:50:00",
-    "timeframe": "M5",
-    "regime": "RANGE",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
+    "regime": "TREND",
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:55:08.103004",
+    "action_time": "2026-04-29T10:15:13.113162",
     "context": {}
   },
   "XRPUSD": {
     "symbol": "XRPUSD",
-    "decision_key": "d3dceb7b0c6c1595",
+    "decision_key": "d8e00d335eef7adb",
     "decision_keys": [
-      "d3dceb7b0c6c1595"
+      "d8e00d335eef7adb"
     ],
-    "bar_time": "2026-04-29 01:00:00",
+    "bar_time": "2026-04-29 08:00:00",
     "timeframe": "M30",
-    "regime": "CHOP",
-    "strategy_name": "MomentumBurstStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:49.684660",
-    "context": {}
+    "regime": "RANGE",
+    "strategy_name": "EMAPullbackContinuationStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-04-29T07:30:44.819639",
+    "context": {
+      "secondary_trade": false,
+      "secondary_reason": "",
+      "position_context": {
+        "open_positions_total": 0,
+        "open_timeframes": [],
+        "open_has_d1": false,
+        "open_has_non_d1": false,
+        "open_has_unknown": false,
+        "open_tag_sources": {
+          "comment": 0,
+          "magic": 0,
+          "unknown": 0
+        },
+        "open_positions": [],
+        "fresh_open_positions_total": 0,
+        "fresh_open_timeframes": [],
+        "fresh_open_has_d1": false,
+        "fresh_open_has_non_d1": false,
+        "fresh_open_has_unknown": false
+      },
+      "selection_score": 0.1653135726522841,
+      "quality_score": 0.5094850688789155,
+      "freshness": 1.0,
+      "regime_strength": 0.32447186924642263,
+      "governance_policy": "control_fixed"
+    }
   },
   "XAUUSD": {
     "symbol": "XAUUSD",
-    "decision_key": "4c36ce4103f215da",
+    "decision_key": "ce3905dcb496129f",
     "decision_keys": [
-      "4c36ce4103f215da"
+      "ce3905dcb496129f"
     ],
-    "bar_time": "2026-04-29 01:50:00",
-    "timeframe": "M5",
-    "regime": "CHOP",
-    "strategy_name": "ChoppinessCompressionBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:55:16.233175",
-    "context": {}
-  },
-  "LTCUSD": {
-    "symbol": "LTCUSD",
-    "decision_key": "0e1d235a74fd6ed8",
-    "decision_keys": [
-      "0e1d235a74fd6ed8"
-    ],
-    "bar_time": "2026-04-28 00:00:00",
-    "timeframe": "D1",
-    "regime": "CHOP",
-    "strategy_name": "VolatilityBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:24:42.702077",
-    "context": {}
-  },
-  "DOGUSD": {
-    "symbol": "DOGUSD",
-    "decision_key": "33f8de17ddc071e3",
-    "decision_keys": [
-      "33f8de17ddc071e3"
-    ],
-    "bar_time": "2026-04-28 00:00:00",
-    "timeframe": "D1",
-    "regime": "CHOP",
-    "strategy_name": "DonchianBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-28T23:24:53.557984",
-    "context": {}
-  },
-  "ETHUSD": {
-    "symbol": "ETHUSD",
-    "decision_key": "690e5b27ffa9b6aa",
-    "decision_keys": [
-      "690e5b27ffa9b6aa"
-    ],
-    "bar_time": "2026-04-29 01:50:00",
-    "timeframe": "M5",
-    "regime": "CHOP",
-    "strategy_name": "KeltnerPullbackStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:55:09.566661",
-    "context": {}
-  },
-  "USDCAD": {
-    "symbol": "USDCAD",
-    "decision_key": "4cfe12a75c01bbfd",
-    "decision_keys": [
-      "4cfe12a75c01bbfd"
-    ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
-    "regime": "TREND",
-    "strategy_name": "ChoppinessCompressionBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:07.214581",
-    "context": {}
-  },
-  "AUDUSD": {
-    "symbol": "AUDUSD",
-    "decision_key": "1773de43f4f7f4df",
-    "decision_keys": [
-      "1773de43f4f7f4df"
-    ],
-    "bar_time": "2026-04-29 01:30:00",
+    "bar_time": "2026-04-29 11:00:00",
     "timeframe": "M15",
     "regime": "TREND",
     "strategy_name": "RSITrendFilteredMRStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:42.080638",
+    "action_time": "2026-04-29T10:15:14.490665",
+    "context": {}
+  },
+  "LTCUSD": {
+    "symbol": "LTCUSD",
+    "decision_key": "e7830f9682c4fa87",
+    "decision_keys": [
+      "e7830f9682c4fa87"
+    ],
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
+    "regime": "CHOP",
+    "strategy_name": "ADXDIStrengthStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-04-29T10:00:56.570232",
+    "context": {}
+  },
+  "DOGUSD": {
+    "symbol": "DOGUSD",
+    "decision_key": "2ed62562b716c88e",
+    "decision_keys": [
+      "2ed62562b716c88e"
+    ],
+    "bar_time": "2026-04-29 04:00:00",
+    "timeframe": "H4",
+    "regime": "TREND",
+    "strategy_name": "RSIExtremesStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-04-29T07:01:32.685415",
+    "context": {}
+  },
+  "ETHUSD": {
+    "symbol": "ETHUSD",
+    "decision_key": "77e001af6a9760f6",
+    "decision_keys": [
+      "77e001af6a9760f6"
+    ],
+    "bar_time": "2026-04-29 11:10:00",
+    "timeframe": "M5",
+    "regime": "CHOP",
+    "strategy_name": "KeltnerPullbackStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-04-29T10:15:16.520352",
+    "context": {}
+  },
+  "USDCAD": {
+    "symbol": "USDCAD",
+    "decision_key": "0c45933c0a2cdea5",
+    "decision_keys": [
+      "91e6eb7df6038a3b",
+      "0c45933c0a2cdea5"
+    ],
+    "bar_time": "2026-04-29 08:00:00",
+    "timeframe": "H1",
+    "regime": "TREND",
+    "strategy_name": "EMAPullbackContinuationStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-04-29T08:00:14.357508",
+    "context": {
+      "secondary_trade": false,
+      "secondary_reason": "",
+      "position_context": {
+        "open_positions_total": 0,
+        "open_timeframes": [],
+        "open_has_d1": false,
+        "open_has_non_d1": false,
+        "open_has_unknown": false,
+        "open_tag_sources": {
+          "comment": 0,
+          "magic": 0,
+          "unknown": 0
+        },
+        "open_positions": [],
+        "fresh_open_positions_total": 0,
+        "fresh_open_timeframes": [],
+        "fresh_open_has_d1": false,
+        "fresh_open_has_non_d1": false,
+        "fresh_open_has_unknown": false
+      },
+      "selection_score": 0.2109457127880877,
+      "quality_score": 0.5948904691871997,
+      "freshness": 1.0,
+      "regime_strength": 0.3545958856532083,
+      "governance_policy": "control_fixed"
+    }
+  },
+  "AUDUSD": {
+    "symbol": "AUDUSD",
+    "decision_key": "01fa68880c8db5bc",
+    "decision_keys": [
+      "25117e31c88b91d8",
+      "01fa68880c8db5bc"
+    ],
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
+    "regime": "CHOP",
+    "strategy_name": "ChoppinessCompressionBreakoutStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-04-29T10:00:08.012192",
     "context": {}
   },
   "USDJPY": {
     "symbol": "USDJPY",
-    "decision_key": "7308ee3e4b510849",
+    "decision_key": "1470283f7de1b61e",
     "decision_keys": [
-      "7308ee3e4b510849"
+      "1470283f7de1b61e"
     ],
-    "bar_time": "2026-04-29 01:50:00",
-    "timeframe": "M5",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
     "regime": "CHOP",
     "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:55:00.950838",
+    "action_time": "2026-04-29T10:15:17.786324",
     "context": {}
   },
   "AUDNZD": {
     "symbol": "AUDNZD",
-    "decision_key": "4885b4c1354d8d1d",
+    "decision_key": "37d0ce99cbdb1d43",
     "decision_keys": [
-      "4885b4c1354d8d1d"
+      "37d0ce99cbdb1d43"
     ],
-    "bar_time": "2026-04-29 00:00:00",
+    "bar_time": "2026-04-29 10:00:00",
     "timeframe": "H1",
     "regime": "TREND",
     "strategy_name": "KeltnerFadeStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:00:27.335340",
+    "action_time": "2026-04-29T10:00:09.492871",
     "context": {}
   },
   "NZDUSD": {
     "symbol": "NZDUSD",
-    "decision_key": "94912f367e31fdd8",
+    "decision_key": "23a92e61624bf2b6",
     "decision_keys": [
-      "94912f367e31fdd8"
+      "23a92e61624bf2b6"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
     "regime": "TREND",
-    "strategy_name": "SqueezeBreakoutStrategy",
+    "strategy_name": "KeltnerFadeStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:19:08.885037",
+    "action_time": "2026-04-29T10:00:10.930718",
     "context": {}
   },
   "GBPUSD": {
     "symbol": "GBPUSD",
-    "decision_key": "67763c2236e41faa",
+    "decision_key": "181240ede5d99b5a",
     "decision_keys": [
-      "67763c2236e41faa"
+      "af73e0986447a128",
+      "181240ede5d99b5a"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
+    "bar_time": "2026-04-29 02:00:00",
+    "timeframe": "H1",
     "regime": "TREND",
-    "strategy_name": "ChoppinessCompressionBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:12.847959",
-    "context": {}
+    "strategy_name": "EMAPullbackContinuationStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-04-29T02:00:15.165248",
+    "context": {
+      "secondary_trade": false,
+      "secondary_reason": "",
+      "position_context": {
+        "open_positions_total": 0,
+        "open_timeframes": [],
+        "open_has_d1": false,
+        "open_has_non_d1": false,
+        "open_has_unknown": false,
+        "open_tag_sources": {
+          "comment": 0,
+          "magic": 0,
+          "unknown": 0
+        },
+        "open_positions": [],
+        "fresh_open_positions_total": 0,
+        "fresh_open_timeframes": [],
+        "fresh_open_has_d1": false,
+        "fresh_open_has_non_d1": false,
+        "fresh_open_has_unknown": false
+      },
+      "selection_score": 0.20448661659167913,
+      "quality_score": 0.5430485675761153,
+      "freshness": 1.0,
+      "regime_strength": 0.37655309083016353,
+      "governance_policy": "control_fixed"
+    }
   },
   "EURGBP": {
     "symbol": "EURGBP",
-    "decision_key": "fad8ec04dce74c73",
+    "decision_key": "ddfb81b54bd8a564",
     "decision_keys": [
-      "fad8ec04dce74c73"
+      "ddfb81b54bd8a564"
     ],
-    "bar_time": "2026-04-28 00:00:00",
-    "timeframe": "D1",
+    "bar_time": "2026-04-29 04:00:00",
+    "timeframe": "H4",
     "regime": "CHOP",
-    "strategy_name": "VolatilityBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:20:38.394603",
-    "context": {}
+    "strategy_name": "VortexTrendStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-04-29T07:00:36.479967",
+    "context": {
+      "secondary_trade": false,
+      "secondary_reason": "",
+      "position_context": {
+        "open_positions_total": 0,
+        "open_timeframes": [],
+        "open_has_d1": false,
+        "open_has_non_d1": false,
+        "open_has_unknown": false,
+        "open_tag_sources": {
+          "comment": 0,
+          "magic": 0,
+          "unknown": 0
+        },
+        "open_positions": [],
+        "fresh_open_positions_total": 0,
+        "fresh_open_timeframes": [],
+        "fresh_open_has_d1": false,
+        "fresh_open_has_non_d1": false,
+        "fresh_open_has_unknown": false
+      },
+      "selection_score": 0.2757166426850502,
+      "quality_score": 0.6442627306531877,
+      "freshness": 1.0,
+      "regime_strength": 0.427956840535404,
+      "governance_policy": "control_fixed"
+    }
   },
   "EURJPY": {
     "symbol": "EURJPY",
-    "decision_key": "6b844ba151184958",
+    "decision_key": "4a600e9c306577ad",
     "decision_keys": [
-      "6b844ba151184958"
+      "4a600e9c306577ad"
     ],
-    "bar_time": "2026-04-29 01:30:00",
+    "bar_time": "2026-04-29 11:00:00",
     "timeframe": "M15",
-    "regime": "TREND",
+    "regime": "CHOP",
     "strategy_name": "KeltnerPullbackStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:10.685281",
+    "action_time": "2026-04-29T10:15:21.766139",
     "context": {}
   },
   "EURAUD": {
     "symbol": "EURAUD",
-    "decision_key": "983c90506755415b",
+    "decision_key": "51c648a13bde94a6",
     "decision_keys": [
-      "983c90506755415b"
+      "51c648a13bde94a6"
     ],
-    "bar_time": "2026-04-29 01:30:00",
-    "timeframe": "M15",
-    "regime": "CHOP",
-    "strategy_name": "ZScoreVWAPReversionStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:45:11.787559",
-    "context": {}
-  },
-  "AUDJPY": {
-    "symbol": "AUDJPY",
-    "decision_key": "c10118cee25be487",
-    "decision_keys": [
-      "c10118cee25be487"
-    ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
+    "bar_time": "2026-04-29 05:00:00",
+    "timeframe": "H1",
     "regime": "RANGE",
-    "strategy_name": "EMAPullbackContinuationStrategy",
+    "strategy_name": "SqueezeBreakoutStrategy",
     "direction": 1,
     "action": "EXECUTED",
-    "action_time": "2026-04-29T00:30:16.394573",
+    "action_time": "2026-04-29T05:00:08.588228",
     "context": {
       "secondary_trade": false,
       "secondary_reason": "",
@@ -543,112 +665,166 @@
         "fresh_open_has_non_d1": false,
         "fresh_open_has_unknown": false
       },
-      "selection_score": 0.19913677342564748,
-      "quality_score": 0.5293984861031429,
+      "selection_score": 0.25790008707167567,
+      "quality_score": 0.588395104084271,
       "freshness": 1.0,
-      "regime_strength": 0.37615667338128655,
-      "governance_policy": "breakeven_1r"
+      "regime_strength": 0.43831106901042255,
+      "governance_policy": "control_fixed"
     }
+  },
+  "AUDJPY": {
+    "symbol": "AUDJPY",
+    "decision_key": "60ca37b1a62d93d6",
+    "decision_keys": [
+      "60ca37b1a62d93d6"
+    ],
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
+    "regime": "CHOP",
+    "strategy_name": "MomentumBurstStrategy",
+    "direction": 0,
+    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
+    "action_time": "2026-04-29T10:15:22.440943",
+    "context": {}
   },
   "EURCAD": {
     "symbol": "EURCAD",
-    "decision_key": "297b76e856c11431",
+    "decision_key": "45b83e80530229e1",
     "decision_keys": [
-      "297b76e856c11431"
+      "45b83e80530229e1"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
+    "bar_time": "2026-04-29 10:00:00",
+    "timeframe": "H1",
     "regime": "CHOP",
-    "strategy_name": "EMAPullbackContinuationStrategy",
+    "strategy_name": "ADXDIStrengthStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:19:58.682720",
+    "action_time": "2026-04-29T10:00:18.064609",
     "context": {}
   },
   "EURNZD": {
     "symbol": "EURNZD",
-    "decision_key": "af0e64436279f9aa",
+    "decision_key": "ca0c0ba9f89b1cf2",
     "decision_keys": [
-      "af0e64436279f9aa"
+      "ca0c0ba9f89b1cf2"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
-    "regime": "CHOP",
-    "strategy_name": "TRIXSignalStrategy",
+    "bar_time": "2026-04-28 00:00:00",
+    "timeframe": "D1",
+    "regime": "TREND",
+    "strategy_name": "BollingerBounceStrategy",
     "direction": 1,
     "action": "EXECUTED",
-    "action_time": "2026-04-29T00:20:09.502032",
+    "action_time": "2026-04-29T01:12:08.209672",
     "context": {
-      "secondary_trade": false,
-      "secondary_reason": "",
+      "secondary_trade": true,
+      "secondary_reason": "lower_plus_d1",
       "position_context": {
-        "open_positions_total": 0,
-        "open_timeframes": [],
+        "open_positions_total": 1,
+        "open_timeframes": [
+          "H4"
+        ],
         "open_has_d1": false,
-        "open_has_non_d1": false,
+        "open_has_non_d1": true,
         "open_has_unknown": false,
         "open_tag_sources": {
-          "comment": 0,
+          "comment": 1,
           "magic": 0,
           "unknown": 0
         },
-        "open_positions": [],
-        "fresh_open_positions_total": 0,
-        "fresh_open_timeframes": [],
+        "open_positions": [
+          {
+            "magic": 1027737832,
+            "timeframe": "H4",
+            "regime": "CHOP",
+            "tag_source": "comment",
+            "direction": "LONG"
+          }
+        ],
+        "fresh_open_positions_total": 1,
+        "fresh_open_timeframes": [
+          "H4"
+        ],
         "fresh_open_has_d1": false,
-        "fresh_open_has_non_d1": false,
+        "fresh_open_has_non_d1": true,
         "fresh_open_has_unknown": false
       },
-      "selection_score": 0.2959782250516245,
-      "quality_score": 0.6934861374083209,
+      "selection_score": 0.236699966463124,
+      "quality_score": 0.6487795494875187,
       "freshness": 1.0,
-      "regime_strength": 0.42679760861226,
+      "regime_strength": 0.3648388218310782,
       "governance_policy": "control_fixed"
     }
   },
   "GBPAUD": {
     "symbol": "GBPAUD",
-    "decision_key": "ee41f267c20f104f",
+    "decision_key": "5920e5bcc2a9f41d",
     "decision_keys": [
-      "ee41f267c20f104f"
+      "8890805a2848c130",
+      "5920e5bcc2a9f41d"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
+    "bar_time": "2026-04-29 07:00:00",
+    "timeframe": "H1",
     "regime": "RANGE",
-    "strategy_name": "KeltnerBreakoutStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:19.848518",
-    "context": {}
+    "strategy_name": "StochRSITrendGateStrategy",
+    "direction": -1,
+    "action": "EXECUTED",
+    "action_time": "2026-04-29T07:00:29.189262",
+    "context": {
+      "secondary_trade": false,
+      "secondary_reason": "",
+      "position_context": {
+        "open_positions_total": 0,
+        "open_timeframes": [],
+        "open_has_d1": false,
+        "open_has_non_d1": false,
+        "open_has_unknown": false,
+        "open_tag_sources": {
+          "comment": 0,
+          "magic": 0,
+          "unknown": 0
+        },
+        "open_positions": [],
+        "fresh_open_positions_total": 0,
+        "fresh_open_timeframes": [],
+        "fresh_open_has_d1": false,
+        "fresh_open_has_non_d1": false,
+        "fresh_open_has_unknown": false
+      },
+      "selection_score": 0.2793454540864072,
+      "quality_score": 0.7228948866878572,
+      "freshness": 1.0,
+      "regime_strength": 0.38642610320057136,
+      "governance_policy": "control_fixed"
+    }
   },
   "GBPJPY": {
     "symbol": "GBPJPY",
-    "decision_key": "b98011cf3beadf19",
+    "decision_key": "74ccf9f419765298",
     "decision_keys": [
-      "b98011cf3beadf19"
+      "74ccf9f419765298"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
-    "regime": "RANGE",
-    "strategy_name": "KeltnerPullbackStrategy",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
+    "regime": "CHOP",
+    "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:20.927214",
+    "action_time": "2026-04-29T10:15:23.826664",
     "context": {}
   },
   "EURCHF": {
     "symbol": "EURCHF",
-    "decision_key": "8e0fd74770c7d36a",
+    "decision_key": "3ff554ca78769e3c",
     "decision_keys": [
-      "8e0fd74770c7d36a"
+      "3ff554ca78769e3c"
     ],
-    "bar_time": "2026-04-28 20:00:00",
-    "timeframe": "H4",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
     "regime": "CHOP",
-    "strategy_name": "VIDYABandTrendStrategy",
+    "strategy_name": "ZScoreVWAPReversionStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-28T23:02:12.317064",
+    "action_time": "2026-04-29T10:15:03.521910",
     "context": {}
   },
   "EURUSD": {
@@ -668,47 +844,73 @@
   },
   "USDCHF": {
     "symbol": "USDCHF",
-    "decision_key": "761cdd3580e4a521",
+    "decision_key": "c43820f60d9b46a1",
     "decision_keys": [
-      "761cdd3580e4a521"
+      "c43820f60d9b46a1"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
-    "regime": "CHOP",
-    "strategy_name": "ZScoreVWAPReversionStrategy",
+    "bar_time": "2026-04-29 11:00:00",
+    "timeframe": "M15",
+    "regime": "RANGE",
+    "strategy_name": "MomentumBurstStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:08.510359",
+    "action_time": "2026-04-29T10:15:19.737937",
     "context": {}
   },
   "GBPCHF": {
     "symbol": "GBPCHF",
-    "decision_key": "2815abb0ecde89cd",
+    "decision_key": "28606fcc1d294458",
     "decision_keys": [
-      "2815abb0ecde89cd"
+      "28606fcc1d294458"
     ],
-    "bar_time": "2026-04-29 01:00:00",
-    "timeframe": "M30",
+    "bar_time": "2026-04-29 00:00:00",
+    "timeframe": "H4",
     "regime": "CHOP",
-    "strategy_name": "RSITrendFilteredMRStrategy",
-    "direction": 0,
-    "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:30:24.183370",
-    "context": {}
+    "strategy_name": "EMAPullbackContinuationStrategy",
+    "direction": 1,
+    "action": "EXECUTED",
+    "action_time": "2026-04-29T03:00:35.210124",
+    "context": {
+      "secondary_trade": false,
+      "secondary_reason": "",
+      "position_context": {
+        "open_positions_total": 0,
+        "open_timeframes": [],
+        "open_has_d1": false,
+        "open_has_non_d1": false,
+        "open_has_unknown": false,
+        "open_tag_sources": {
+          "comment": 0,
+          "magic": 0,
+          "unknown": 0
+        },
+        "open_positions": [],
+        "fresh_open_positions_total": 0,
+        "fresh_open_timeframes": [],
+        "fresh_open_has_d1": false,
+        "fresh_open_has_non_d1": false,
+        "fresh_open_has_unknown": false
+      },
+      "selection_score": 0.21259539947483663,
+      "quality_score": 0.6042450813682129,
+      "freshness": 1.0,
+      "regime_strength": 0.35183637571935145,
+      "governance_policy": "control_fixed"
+    }
   },
   "BTCUSD": {
     "symbol": "BTCUSD",
-    "decision_key": "5b76f258bc1a0936",
+    "decision_key": "bd1d3848593b1e9b",
     "decision_keys": [
-      "5b76f258bc1a0936"
+      "bd1d3848593b1e9b"
     ],
-    "bar_time": "2026-04-29 01:45:00",
+    "bar_time": "2026-04-29 07:50:00",
     "timeframe": "M5",
     "regime": "RANGE",
     "strategy_name": "ChoppinessCompressionBreakoutStrategy",
     "direction": 0,
     "action": "NO_ACTIONABLE_WINNER_SIGNAL",
-    "action_time": "2026-04-29T00:50:28.777129",
+    "action_time": "2026-04-29T06:55:06.783436",
     "context": {}
   }
 }

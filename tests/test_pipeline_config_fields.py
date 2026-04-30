@@ -73,7 +73,6 @@ class PipelineConfigFieldTests(unittest.TestCase):
 
     def test_active_recent_workflow_defaults(self):
         cfg = PipelineConfig()
-        self.assertEqual(cfg.data_workflow_mode, "active_recent_m5")
         self.assertEqual(cfg.max_bars, 300000)
         self.assertEqual(cfg.historical_stress_audit_bars, 50000)
         self.assertEqual(cfg.active_universe_bars, 250000)

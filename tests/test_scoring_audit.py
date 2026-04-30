@@ -22,7 +22,7 @@ class TestScoringFeatureFlags(unittest.TestCase):
     """Verify feature flags control new scoring terms."""
 
     def _make_scorer(self, **overrides):
-        cfg = PipelineConfig(scoring_mode="fx_backtester", **overrides)
+        cfg = PipelineConfig(**overrides)
         return StrategyScorer(cfg)
 
     def _base_metrics(self, **overrides):
@@ -178,7 +178,7 @@ class TestOptScoreCalibration(unittest.TestCase):
     """Test calculate_fx_opt_score calibration extensions."""
 
     def _make_scorer(self, **overrides):
-        cfg = PipelineConfig(scoring_mode="fx_backtester", **overrides)
+        cfg = PipelineConfig(**overrides)
         return StrategyScorer(cfg)
 
     def _base_metrics(self, **overrides):
@@ -331,7 +331,6 @@ class TestCandidateDescentSelection(unittest.TestCase):
 
     def test_rank1_fail_rank2_pass_selects_rank2(self):
         cfg = PipelineConfig(
-            scoring_mode="fx_backtester",
             regime_enable_hyperparam_tuning=False,
             regime_validation_top_k=5,
         )
@@ -362,7 +361,6 @@ class TestCandidateDescentSelection(unittest.TestCase):
 
     def test_top_k_cap_limits_validation_attempts(self):
         cfg = PipelineConfig(
-            scoring_mode="fx_backtester",
             regime_enable_hyperparam_tuning=False,
             regime_validation_top_k=1,
         )
@@ -392,7 +390,7 @@ class TestStabilityPenalty(unittest.TestCase):
     in fx_generalization_score. Default k=2.0; setting 0 disables the penalty."""
 
     def _make_scorer(self, **overrides):
-        cfg = PipelineConfig(scoring_mode="fx_backtester", **overrides)
+        cfg = PipelineConfig(**overrides)
         return StrategyScorer(cfg)
 
     def _metrics(self, std_weekly_return=0.0, **overrides):

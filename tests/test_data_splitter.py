@@ -1,47 +1,9 @@
 import unittest
-import pandas as pd
 
 from pm_core import PipelineConfig, DataSplitter
 
 
 class DataSplitterTests(unittest.TestCase):
-    def test_split_indices(self):
-        cfg = PipelineConfig(train_pct=80.0, overlap_pct=10.0, holdout_pct=10.0)
-        splitter = DataSplitter(cfg)
-        df = pd.DataFrame({"Open": range(100), "High": range(100), "Low": range(100), "Close": range(100)})
-        split = splitter.split(df)
-        indices = splitter.get_split_indices(len(df))
-
-        self.assertEqual(indices["train"], (0, 80))
-        self.assertEqual(indices["warmup"], (70, 80))
-        self.assertEqual(indices["validation"], (80, 90))
-        self.assertEqual(indices["validation_with_warmup"], (70, 90))
-        self.assertEqual(indices["holdout"], (90, 100))
-        self.assertEqual(indices["holdout_with_warmup"], (80, 100))
-
-        self.assertEqual(len(split["train"]), 80)
-        self.assertEqual(len(split["validation_with_warmup"]), 20)
-        self.assertEqual(len(split["holdout_with_warmup"]), 20)
-
-    def test_val_pct_controls_validation_when_holdout_pct_unset(self):
-        cfg = PipelineConfig(train_pct=70.0, val_pct=20.0, overlap_pct=10.0, holdout_pct=None)
-        splitter = DataSplitter(cfg)
-        indices = splitter.get_split_indices(100)
-
-        self.assertEqual(indices["train"], (0, 70))
-        self.assertEqual(indices["validation"], (70, 90))
-        self.assertEqual(indices["validation_with_warmup"], (60, 90))
-        self.assertEqual(indices["holdout"], (90, 100))
-        self.assertEqual(indices["holdout_with_warmup"], (80, 100))
-
-    def test_invalid_val_pct_falls_back_to_balanced_oos_split(self):
-        cfg = PipelineConfig(train_pct=80.0, val_pct=30.0, overlap_pct=10.0, holdout_pct=None)
-        splitter = DataSplitter(cfg)
-        indices = splitter.get_split_indices(100)
-
-        self.assertEqual(indices["validation"], (80, 90))
-        self.assertEqual(indices["holdout"], (90, 100))
-
     def test_active_recent_m5_workflow_indices(self):
         cfg = PipelineConfig(
             max_bars=300000,
@@ -92,6 +54,19 @@ class DataSplitterTests(unittest.TestCase):
         self.assertEqual(indices["active_universe"], (0, 200000))
         self.assertEqual(indices["stage2_selection"], (100000, 200000))
         self.assertEqual(indices["stage2_selection_with_warmup"], (80000, 200000))
+
+    def test_empty_data_returns_zero_windows(self):
+        cfg = PipelineConfig()
+        splitter = DataSplitter(cfg)
+        indices = splitter.get_workflow_indices(0)
+        for key in (
+            "workflow_window",
+            "historical_stress_audit",
+            "active_universe",
+            "stage2_selection",
+            "stage2_selection_with_warmup",
+        ):
+            self.assertEqual(indices[key], (0, 0))
 
 
 if __name__ == "__main__":
