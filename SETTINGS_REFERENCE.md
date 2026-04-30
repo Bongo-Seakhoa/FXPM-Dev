@@ -33,14 +33,14 @@ Use this as the reference for the live codebase. The `Default` column documents 
 
 ### 2.1a Active recent M5 workflow
 
-The active repo profile uses `data_workflow_mode = "active_recent_m5"`. The bar counts below refer to base `M5` bars; higher timeframes are derived from the same timestamp-bounded M5 source so the tournament uses one coherent calendar window.
+The pipeline uses the active-recent M5 workflow exclusively. The bar counts below refer to base `M5` bars; higher timeframes are derived from the same timestamp-bounded M5 source so the tournament uses one coherent calendar window.
 
 | Key | Type | Default | Active profile | Description |
 |---|---|---:|---:|---|
-| `data_workflow_mode` | enum | `"active_recent_m5"` | `"active_recent_m5"` | Production data workflow. `"active_recent_m5"` uses explicit M5 windows; `"legacy_percentage"` keeps the older percentage split behavior. |
 | `historical_stress_audit_bars` | int | `50000` | `50000` | Oldest bars inside the latest 300k M5 window. This is an older out-of-selection stress audit, not a forward-looking holdout selector. |
 | `active_universe_bars` | int | `250000` | `250000` | Newest M5 bars that drive production strategy discovery and Stage 1 baseline eligibility. |
 | `active_stage2_pct` | float | `50.0` | `50.0` | Newest percentage of the active universe used for Stage 2 optimization / production-selection surfaces, with overlap warmup retained as context. |
+| `overlap_pct` | float | `10.0` | `10.0` | Warmup window expressed as a percentage of the active universe size. Bars in the warmup are not scored. |
 
 ### 2.1b Storage governance
 
@@ -76,34 +76,23 @@ These controls are part of `pipeline` because the live runtime reads them throug
 
 Resample-cache telemetry now records memory hits, disk hits, misses, invalidations, read/write bytes, and read/write seconds. Use that evidence before reducing or increasing cache size; cache policy should support PM quality and throughput, not pursue smallness for its own sake.
 
-### 2.2 Train/validation split
+### 2.2 Workflow split behavior
 
-| Key | Type | Default | Description |
-|---|---|---:|---|
-| `train_pct` | float | `80.0` | Percentage of bars used for training. |
-| `val_pct` | float | `10.0` | Legacy percentage validation field. In `active_recent_m5`, the explicit active-window controls above are the production selectors. |
-| `overlap_pct` | float | `10.0` | Shared overlap between train and validation windows. |
+The active-recent M5 workflow drives all selection windows from the bar counts in §2.1a (no separate `train_pct`/`val_pct`/`holdout_pct` percentages).
 
-Legacy percentage split behavior:
-
-- Training: start to `train_pct`
-- Validation: `(train_pct - overlap_pct)` to end
-- The overlap is intentional in the legacy methodology
-
-Active workflow behavior:
-
-- The latest `300000` M5 bars are loaded per symbol by the checked-in profile.
-- The oldest `50000` M5 bars are `historical_stress_audit`, used to detect catastrophic older-window fragility after winners are selected.
-- The newest `250000` M5 bars are the active universe for Stage 1/Stage 2 discovery.
+- The latest `max_bars` M5 bars are loaded per symbol (active profile: `300000`).
+- The oldest `historical_stress_audit_bars` of that window are the historical stress audit, used to detect catastrophic older-window fragility after winners are selected.
+- The newest `active_universe_bars` are the active universe for Stage 1/Stage 2 discovery.
 - Stage 1 baseline eligibility runs across the full active universe.
-- The newest `50%` of that active universe is used as the fresh Stage 2 optimization/risk-management surface when `risk_management_selection_stage = "stage3"`, with warmup retained as context.
+- The newest `active_stage2_pct` percent of the active universe is the Stage 2 optimization/risk-management surface when `risk_management_selection_stage = "stage3"`, with `overlap_pct` worth of warmup retained as context.
 
 ### 2.3 Capital and base risk
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
 | `initial_capital` | float | `10000.0` | Starting capital for backtests and analytics. |
-| `risk_per_trade_pct` | float | `1.0` | Base backtest/optimization risk percentage. It only backfills live sizing when `position.risk_per_trade_pct` is absent. |
+| `risk_per_trade_pct` | float | `1.0` | Legacy pipeline risk percentage. It only backfills live sizing when `position.risk_per_trade_pct` is absent. |
+| `discovery_risk_per_trade_pct` | float | `1.0` | Fixed backtest/optimization risk percentage used for discovery so winner ranking stays invariant across live account modes. |
 
 ### 2.4 Cost modeling
 
@@ -123,29 +112,23 @@ Active workflow behavior:
 | `timeframes` | list | `["M5","M15","M30","H1","H4","D1"]` | Timeframes evaluated during optimization. |
 | `optuna_family_size_aware_budget` | bool | `false` | Scales per-strategy Optuna trial budgets by parameter-grid size. The active profile enables it. |
 | `optuna_min_trials_per_strategy` | int | `50` | Lower bound for family-size-aware strategy trials. The active profile uses `200`. |
-| `optuna_max_trials_per_strategy` | int | `500` | Upper bound for family-size-aware strategy trials. The active profile uses `1000`. |
+| `optuna_max_trials_per_strategy` | int | `5000` | Upper bound for family-size-aware strategy trials. The active profile uses `5000`. |
 | `optuna_target_coverage_pct` | float | `0.10` | Target percentage of a strategy grid to cover before clamping by the min/max trial bounds. The active profile uses `0.15`. |
 
 The active Stage 1/Stage 2 presets are currently treated as the recommended production baseline. Stage 1 is an eligibility gate over the full active universe; any "Top-K-like" Stage 1 wording means a survivor pool from pass/fail gates, not a Stage 2-style Top-K optimizer. The presets are intentionally quality-first and live-relevance-first; changing them should be evidence-led from regenerated artifacts, one-symbol experiments, or paper/live outcome data.
 
-### 2.6 Legacy weighted-score thresholds
-
-These mainly matter when `scoring_mode = "pm_weighted"`.
+### 2.6 Minimum trade gate
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
-| `min_trades` | int | `25` | Minimum trades for consideration. |
-| `min_robustness` | float | `0.2` | Minimum robustness threshold in legacy weighted mode. |
-| `min_win_rate` | float | `40.0` | Minimum win rate in legacy weighted mode. |
-| `min_profit_factor` | float | `1.1` | Minimum profit factor in legacy weighted mode. |
-| `min_sharpe` | float | `0.5` | Minimum Sharpe ratio in legacy weighted mode. |
-| `max_drawdown` | float | `18.0` | Maximum drawdown in legacy weighted mode. |
+| `min_trades` | int | `25` | Minimum total trades required before a strategy/timeframe candidate can be ranked during the train pass. |
 
-### 2.7 Primary scoring and FX validation controls
+### 2.7 FX backtester scoring and validation controls
+
+The pipeline uses the FX backtester scoring path exclusively (no `scoring_mode` switch).
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
-| `scoring_mode` | string | `"fx_backtester"` | Primary scoring methodology. Recommended active mode. |
 | `fx_opt_min_trades` | int | `15` | Minimum training trades during parameter search. |
 | `fx_val_min_trades` | int | `15` | Minimum validation trades required. |
 | `fx_val_max_drawdown` | float | `12.0` | Maximum allowed validation drawdown. |
@@ -155,14 +138,9 @@ These mainly matter when `scoring_mode = "pm_weighted"`.
 | `fx_gap_penalty_lambda` | float | `0.7` | Train-to-validation gap penalty strength. |
 | `fx_robustness_boost` | float | `0.15` | Reward weight for strategies that generalize better. |
 | `fx_min_robustness_ratio` | float | `0.80` | Minimum validation-to-training robustness ratio in code defaults. |
+| `fx_stability_penalty_k` | float | `2.0` | Multiplicative `exp(-k * std_weekly_return)` penalty applied on the validation side. Set `0` to disable. |
 
-### 2.8 Score weights
-
-| Key | Type | Default | Description |
-|---|---|---:|---|
-| `score_weights` | object | see code | Composite weights for metrics such as Sharpe, PF, return, drawdown, and trade count. |
-
-Additional score-shaping flags:
+### 2.8 Score-shaping flags
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
@@ -179,8 +157,6 @@ Additional score-shaping flags:
 | `use_regime_optimization` | bool | `true` | Enable regime-aware optimization. |
 | `regime_min_train_trades` | int | `25` | Minimum training trades per regime bucket. |
 | `regime_min_val_trades` | int | `15` | Minimum validation trades per regime bucket. |
-| `regime_freshness_decay` | float | `0.85` | Penalty/decay for stale signals. |
-| `regime_chop_no_trade` | bool | `false` | If true, CHOP can force no-trade behavior. |
 | `regime_params_file` | string | `"regime_params.json"` | Tuned regime parameter file path. Entries are keyed `{symbol: {timeframe: {field: value, ...}}}` and deserialize into `RegimeParams`. **E3**: if an entry omits `adx_trend_threshold`, the asset-class default (`fx=25`, `metal=22`, `crypto=30`, `index=25`) is applied at resolution time; entries that pin `adx_trend_threshold` keep the pinned value. All other fields fall back to `DEFAULT_PARAMS_BY_TIMEFRAME[timeframe]` and then to the `RegimeParams()` defaults. |
 | `regime_enable_hyperparam_tuning` | bool | `true` | Enable regime-aware hyperparameter tuning. |
 | `regime_hyperparam_top_k` | int | `3` | Code default Top-K strategies to tune per regime. The active profile uses `5`. |
@@ -467,6 +443,7 @@ To add a symbol:
 - Live risk precedence is `position.risk_per_trade_pct` -> optional explicitly enabled overlays -> `position.max_risk_pct`.
 - The active live sizing basis is either `balance` or `equity`; `free_margin` is not an active documented option.
 - `risk_tolerance_pct` is currently much less operationally important than:
+  - `pipeline.discovery_risk_per_trade_pct`
   - `pipeline.risk_per_trade_pct`
   - `position.risk_per_trade_pct`
   - `position.risk_basis`

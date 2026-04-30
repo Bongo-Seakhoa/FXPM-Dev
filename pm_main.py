@@ -103,7 +103,6 @@ def log_resolved_config_summary(logger: logging.Logger,
         tf_str = ",".join(getattr(p, "timeframes", []) or [])
         logger.info(
             "  pipeline: "
-            f"scoring={getattr(p, 'scoring_mode', None)} | "
             f"bars={getattr(p, 'max_bars', None)} | "
             f"tfs={tf_str} | "
             f"live={getattr(p, 'live_bars_count', None)}/{getattr(p, 'live_min_bars', None)} | "
@@ -2926,6 +2925,7 @@ class LiveTrader:
                     f"{eval_stats.get('timeframes_total', 0)} | winners=0 | actionable=0 "
                     f"(no_winner={eval_stats.get('no_winner', 0)}, "
                     f"failed_gate={eval_stats.get('winner_failed_gate', 0)}, "
+                    f"missing_regime_live={eval_stats.get('missing_regime_live', 0)}, "
                     f"insufficient_bars={eval_stats.get('insufficient_bars', 0)}, "
                     f"stale_skipped={eval_stats.get('timeframes_skipped_stale', 0)})"
                 )
@@ -3014,7 +3014,9 @@ class LiveTrader:
         self.logger.debug(
             f"[{symbol}] Winners-only eval: tfs={eval_stats.get('timeframes_evaluated', 0)}/"
             f"{eval_stats.get('timeframes_total', 0)} | winners={len(candidates)} | "
-            f"actionable={len(actionable)} | stale_skipped={eval_stats.get('timeframes_skipped_stale', 0)}"
+            f"actionable={len(actionable)} | "
+            f"missing_regime_live={eval_stats.get('missing_regime_live', 0)} | "
+            f"stale_skipped={eval_stats.get('timeframes_skipped_stale', 0)}"
         )
         
         if not actionable:
@@ -3187,6 +3189,7 @@ class LiveTrader:
             "no_winner": 0,
             "winner_failed_gate": 0,
             "insufficient_bars": 0,
+            "missing_regime_live": 0,
         }
         
         # Check if config has regime configs
@@ -3286,26 +3289,25 @@ class LiveTrader:
                 
                 # Get current regime from the decision-time surface on the
                 # last closed bar. REGIME_LIVE is the optimizer/backtester
-                # contract; REGIME remains a legacy fallback for old fixtures.
+                # contract, so live trading fails closed if it is unavailable.
                 if len(features) < 2:
                     continue
-                regime_col = 'REGIME_LIVE' if 'REGIME_LIVE' in features.columns else (
-                    'REGIME' if 'REGIME' in features.columns else None
-                )
-                strength_col = 'REGIME_STRENGTH_LIVE' if 'REGIME_STRENGTH_LIVE' in features.columns else (
-                    'REGIME_STRENGTH' if 'REGIME_STRENGTH' in features.columns else None
-                )
-                if regime_col is None:
+                if 'REGIME_LIVE' not in features.columns:
+                    stats["missing_regime_live"] += 1
+                    self.logger.warning(
+                        f"[{symbol}] [{tf}] REGIME_LIVE missing, refusing to trade this bar"
+                    )
                     continue
 
-                current_regime = features[regime_col].iloc[-2]
+                current_regime = features['REGIME_LIVE'].iloc[-2]
+                strength_col = 'REGIME_STRENGTH_LIVE' if 'REGIME_STRENGTH_LIVE' in features.columns else None
                 regime_strength = features[strength_col].iloc[-2] if strength_col else 0.5
-                if (current_regime is None or pd.isna(current_regime)) and regime_col == 'REGIME_LIVE' and 'REGIME' in features.columns:
-                    current_regime = features['REGIME'].iloc[-2]
-                    if 'REGIME_STRENGTH' in features.columns:
-                        regime_strength = features['REGIME_STRENGTH'].iloc[-2]
                 
                 if current_regime is None or pd.isna(current_regime):
+                    stats["missing_regime_live"] += 1
+                    self.logger.warning(
+                        f"[{symbol}] [{tf}] REGIME_LIVE is empty on the decision bar, refusing to trade"
+                    )
                     continue
                 
                 # ===== WINNERS-ONLY LADDER =====

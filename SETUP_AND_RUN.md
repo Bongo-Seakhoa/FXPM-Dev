@@ -112,9 +112,8 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "log_dir": "./logs",
     "initial_capital": 10000.0,
     "risk_per_trade_pct": 1.0,
-    "scoring_mode": "fx_backtester",
+    "discovery_risk_per_trade_pct": 1.0,
     "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
-    "data_workflow_mode": "active_recent_m5",
     "max_bars": 300000,
     "historical_stress_audit_bars": 50000,
     "active_universe_bars": 250000,
@@ -185,7 +184,7 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
   - `notify`: tell the operator the PM is due, but do not auto-run optimization
   - `off`: disable schedule checks
 - `execution_spread_spike_mult` is the live spread-spike blocker threshold.
-- `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.risk_per_trade_pct` is the research/backtest value and only backfills live sizing if the `position` value is absent.
+- `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.discovery_risk_per_trade_pct` is the fixed discovery/backtest sizing value, while `pipeline.risk_per_trade_pct` only remains as a compatibility backfill if the `position` value is absent.
 - `live_risk_scalars_mode = "shadow"` records the would-be risk-scalar effect without changing live position sizing.
 - `local_governance_live_mode = "shadow"` keeps governance policy selection observable before broker-side stop management is made authoritative.
 - storage governance is now config-backed through `pipeline.storage_*`.

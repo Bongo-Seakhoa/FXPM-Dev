@@ -22,7 +22,6 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_regime_selection_accounts_for_search_trial_breadth(self):
         cfg = PipelineConfig(
-            scoring_mode="fx_backtester",
             regime_min_train_trades=1,
             regime_min_val_trades=1,
             regime_min_val_profit_factor=0.0,
@@ -81,6 +80,56 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertTrue(is_valid)
         self.assertIsNotNone(best_config)
         self.assertEqual(best_config.strategy_name, "LowTrialStrategy")
+
+    def test_regime_selection_tie_breaks_on_trade_count(self):
+        cfg = PipelineConfig(
+            regime_min_train_trades=1,
+            regime_min_val_trades=1,
+            regime_min_val_profit_factor=0.0,
+            regime_min_val_return_pct=-100.0,
+            regime_min_val_return_dd_ratio=0.1,
+            fx_val_max_drawdown=50.0,
+            fx_min_robustness_ratio=0.0,
+            fx_val_sharpe_override=-99.0,
+        )
+        optimizer = RegimeOptimizer(cfg)
+        optimizer._compute_regime_score = lambda train, val: 100.0
+        optimizer._validate_regime_winner = lambda train, val, regime, candidate_name="": (True, "forced pass")
+
+        def candidate(name, train_trades):
+            train = {
+                "total_trades": train_trades,
+                "profit_factor": 1.5,
+                "win_rate": 55.0,
+                "total_return_pct": 10.0,
+                "max_drawdown_pct": 5.0,
+            }
+            val = {
+                "total_trades": 20,
+                "profit_factor": 1.5,
+                "win_rate": 55.0,
+                "total_return_pct": 10.0,
+                "max_drawdown_pct": 5.0,
+            }
+            return {
+                "strategy_name": name,
+                "params": {},
+                "train_regime_metrics": {"TREND": train},
+                "val_regime_metrics": {"TREND": val},
+            }
+
+        best_config, is_valid, _ = optimizer._select_best_for_regime(
+            "EURUSD",
+            "H1",
+            "TREND",
+            [
+                candidate("AlphaLowerSampleStrategy", 10),
+                candidate("ZetaHigherSampleStrategy", 40),
+            ],
+        )
+
+        self.assertTrue(is_valid)
+        self.assertEqual(best_config.strategy_name, "ZetaHigherSampleStrategy")
 
     def test_regime_bucket_uses_signal_bar_not_entry_bar(self):
         cfg = PipelineConfig(

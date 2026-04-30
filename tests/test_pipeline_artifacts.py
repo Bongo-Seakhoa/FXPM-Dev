@@ -25,8 +25,8 @@ class PipelineArtifactTests(unittest.TestCase):
                 output_dir=tmp / "out",
             )
             artifact_meta = build_artifact_meta(cfg)
-            self.assertEqual(artifact_meta["data_workflow_mode"], "active_recent_m5")
             self.assertEqual(artifact_meta["max_bars"], 300000)
+            self.assertEqual(artifact_meta["discovery_risk_per_trade_pct"], 1.0)
             self.assertTrue(artifact_meta["risk_management_optimization_enabled"])
             self.assertEqual(artifact_meta["risk_management_selection_stage"], "stage3")
             ledger_path = tmp / "pm_configs.json"

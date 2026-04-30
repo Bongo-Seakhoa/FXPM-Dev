@@ -493,29 +493,24 @@ class PipelineConfig:
     output_dir: Path = field(default_factory=lambda: Path("./pm_outputs"))
     log_dir: Path = field(default_factory=lambda: Path("./logs"))
     
-    # Data workflow:
-    # - active_recent_m5 uses the latest max_bars M5 rows, reserves the oldest
-    #   historical_stress_audit_bars as audit-only context, and lets the newest
-    #   active_universe_bars drive production strategy selection.
-    # - legacy_percentage keeps the old train/validation/freshest-holdout split.
-    data_workflow_mode: str = "active_recent_m5"
+    # Active-recent M5 workflow:
+    # The pipeline uses the latest `max_bars` M5 rows, reserves the oldest
+    # `historical_stress_audit_bars` as audit-only context, and lets the
+    # newest `active_universe_bars` drive production strategy selection.
+    # Stage 2/risk-management selection uses the newest `active_stage2_pct`
+    # percent of the active universe (with `overlap_pct` worth of warmup).
     historical_stress_audit_bars: int = 50000
     active_universe_bars: int = 250000
     active_stage2_pct: float = 50.0
+    overlap_pct: float = 10.0  # Warmup window as a fraction of the active universe size
 
-    # Legacy percentage split ratios. In active_recent_m5 mode these are still
-    # used for warmup sizing and compatibility, but the production window comes
-    # from the explicit M5 workflow above.
-    train_pct: float = 80.0
-    val_pct: float = 10.0
-    overlap_pct: float = 10.0
-    holdout_pct: Optional[float] = None
-    
     # Backtest settings
     initial_capital: float = 10000.0
     risk_per_trade_pct: float = 1.0
-    position_size_pct: float = 1.0  # Alias for risk_per_trade_pct
-    
+    # Fixed research/discovery sizing. This is intentionally separate from
+    # operator/live risk so winner ranking stays invariant across account modes.
+    discovery_risk_per_trade_pct: float = 1.0
+
     # Cost modeling
     # - Spread: fixed/average per-symbol from config.json (use_spread=True).
     #   Broker-provided spread_avg in pips. Applied to every entry.
@@ -534,7 +529,6 @@ class PipelineConfig:
     # Optimization settings
     max_param_combos: int = 150
     min_trades: int = 25
-    min_robustness: float = 0.20
     optimization_max_workers: int = 1  # 1 = sequential
 
     # Optional family-size-aware search budget.
@@ -546,21 +540,8 @@ class PipelineConfig:
     #     n = clamp(min, max, max(min, round(coverage * cartesian_size)))
     optuna_family_size_aware_budget: bool = False
     optuna_min_trials_per_strategy: int = 50
-    optuna_max_trials_per_strategy: int = 500
+    optuna_max_trials_per_strategy: int = 5000
     optuna_target_coverage_pct: float = 0.10  # 10% of cartesian; capped by max
-    
-    # Evaluation thresholds
-    min_win_rate: float = 40.0
-    min_profit_factor: float = 1.1
-    min_sharpe: float = 0.5
-    max_drawdown: float = 18.0
-    
-
-
-    # Scoring / validation mode
-    # - "pm_weighted": original PM behavior (weighted composite + strict minimum criteria)
-    # - "fx_backtester": align selection/tuning/validation with the simulator/backtester
-    scoring_mode: str = "fx_backtester"
 
     # FX backtester-aligned optimization/validation thresholds
     fx_opt_min_trades: int = 15          # used during param search (train only)
@@ -686,8 +667,6 @@ class PipelineConfig:
     use_regime_optimization: bool = True
     regime_min_train_trades: int = 25  # Minimum trades per regime bucket in training
     regime_min_val_trades: int = 15    # Minimum trades per regime bucket in validation
-    regime_freshness_decay: float = 0.85  # Freshness decay for stale timeframe signals
-    regime_chop_no_trade: bool = False  # Hard no-trade when in CHOP with no winner
     regime_params_file: str = "regime_params.json"  # Path to tuned regime params
     # Live-only optional TP overlay. Discovery/backtesting keeps this neutral so
     # the tournament trades the SL/TP surface that actually won.
@@ -755,17 +734,7 @@ class PipelineConfig:
     # Compatibility alias for older artifacts/metrics. Production validity now
     # comes from the fixed calendar schedule above.
     optimization_valid_days: int = 14
-    
-    # Scoring weights for strategy selection
-    score_weights: Dict[str, float] = field(default_factory=lambda: {
-        'sharpe': 0.25,
-        'profit_factor': 0.20,
-        'win_rate': 0.15,
-        'total_return': 0.15,
-        'max_drawdown': 0.15,
-        'trade_count': 0.10
-    })
-    
+
     def __post_init__(self):
         """Ensure directories exist and sync aliases."""
         self.data_dir = Path(self.data_dir)
@@ -779,10 +748,12 @@ class PipelineConfig:
             self.optimization_max_workers = max(1, int(self.optimization_max_workers))
         except Exception:
             self.optimization_max_workers = 1
-        # Normalize scoring mode
-        self.scoring_mode = str(self.scoring_mode).strip().lower()
-        if self.scoring_mode not in {"pm_weighted", "fx_backtester"}:
-            raise ValueError(f"Invalid scoring_mode: {self.scoring_mode}. Use 'pm_weighted' or 'fx_backtester'.")
+
+        try:
+            risk = float(self.discovery_risk_per_trade_pct)
+            self.discovery_risk_per_trade_pct = risk if math.isfinite(risk) and risk > 0 else 1.0
+        except Exception:
+            self.discovery_risk_per_trade_pct = 1.0
 
         # Clamp regime validation descent depth to a safe minimum.
         try:
@@ -817,7 +788,6 @@ class PipelineConfig:
                 "CHOP": 1.0,
             }
 
-        self.position_size_pct = self.risk_per_trade_pct
         self.production_retrain_mode = str(self.production_retrain_mode or "auto").strip().lower()
         if self.production_retrain_mode not in {"auto", "notify", "off"}:
             raise ValueError(
@@ -941,13 +911,6 @@ class PipelineConfig:
         self.walk_forward_audit_enabled = bool(self.walk_forward_audit_enabled)
         self.local_governance_tournament_enabled = bool(self.local_governance_tournament_enabled)
         self.risk_management_optimization_enabled = bool(self.risk_management_optimization_enabled)
-        self.data_workflow_mode = str(getattr(self, "data_workflow_mode", "active_recent_m5") or "").strip().lower()
-        if self.data_workflow_mode not in {"active_recent_m5", "legacy_percentage"}:
-            logger.warning(
-                "Invalid data_workflow_mode=%r; falling back to active_recent_m5.",
-                getattr(self, "data_workflow_mode", None),
-            )
-            self.data_workflow_mode = "active_recent_m5"
         self.risk_management_selection_stage = str(
             getattr(self, "risk_management_selection_stage", "stage3") or ""
         ).strip().lower()
@@ -1158,14 +1121,8 @@ class PipelineConfig:
             self.fixed_retrain_days = 14
         self.optimization_valid_days = self.fixed_retrain_days
 
-        oos_pct = 100.0 - float(self.train_pct)
-        if oos_pct <= 0.0:
-            raise ValueError("train_pct must leave room for scored out-of-sample data")
-        if self.holdout_pct is not None:
-            if float(self.holdout_pct) <= 0.0 or float(self.holdout_pct) >= oos_pct:
-                raise ValueError("holdout_pct must be positive and smaller than the out-of-sample share")
-        if float(self.overlap_pct) < 0.0 or float(self.overlap_pct) > float(self.train_pct):
-            raise ValueError("overlap_pct must be between 0 and train_pct")
+        if not 0.0 <= float(self.overlap_pct) <= 100.0:
+            raise ValueError("overlap_pct must be between 0 and 100")
 
     @property
     def retrain_weekday_index(self) -> int:
@@ -3608,41 +3565,11 @@ class DataSplitter:
     def __init__(self, config: PipelineConfig):
         """
         Initialize DataSplitter.
-        
+
         Args:
             config: Pipeline configuration with split ratios
         """
         self.config = config
-    
-    def _holdout_bars(self, n: int, scored_oos_bars: int) -> int:
-        if scored_oos_bars <= 1:
-            return 0
-        if self.config.holdout_pct is not None:
-            return min(scored_oos_bars - 1, int(n * (float(self.config.holdout_pct) / 100.0)))
-        try:
-            validation_bars = int(n * (float(self.config.val_pct) / 100.0))
-        except Exception:
-            validation_bars = 0
-        if 0 < validation_bars < scored_oos_bars:
-            return scored_oos_bars - validation_bars
-        return max(1, scored_oos_bars // 2)
-
-    def split(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        """
-        Split data into training and scored out-of-sample regions.
-        
-        Args:
-            df: Full dataset
-            
-        Returns:
-            Dict of named split DataFrames
-        """
-        indices = self.get_split_indices(len(df))
-        return {name: df.iloc[start:end].copy() for name, (start, end) in indices.items()}
-
-    def workflow_enabled(self) -> bool:
-        """Return True when the production active-recent M5 workflow is enabled."""
-        return str(getattr(self.config, "data_workflow_mode", "active_recent_m5")).lower() == "active_recent_m5"
 
     def get_workflow_indices(self, n: int) -> Dict[str, Tuple[int, int]]:
         """
@@ -3698,36 +3625,6 @@ class DataSplitter:
             "stage2_selection": (stage2_start, stage2_end),
             "stage2_selection_with_warmup": (stage2_warmup_start, stage2_end),
         }
-    
-    def get_split_indices(self, n: int) -> Dict[str, Tuple[int, int]]:
-        """
-        Get split indices without actually splitting.
-        
-        Args:
-            n: Total number of rows
-            
-        Returns:
-            Dict with named train/warmup/validation/holdout windows
-        """
-        train_end = int(n * (self.config.train_pct / 100.0))
-        warmup_bars = int(n * (self.config.overlap_pct / 100.0))
-        warmup_start = max(0, train_end - warmup_bars)
-
-        scored_oos_start = train_end
-        scored_oos_bars = max(0, n - scored_oos_start)
-        holdout_bars = self._holdout_bars(n, scored_oos_bars)
-        holdout_start = max(scored_oos_start, n - holdout_bars)
-        validation_end = holdout_start
-        holdout_warmup_start = max(scored_oos_start, holdout_start - warmup_bars)
-
-        return {
-            'train': (0, train_end),
-            'warmup': (warmup_start, train_end),
-            'validation': (scored_oos_start, validation_end),
-            'validation_with_warmup': (warmup_start, validation_end),
-            'holdout': (holdout_start, n),
-            'holdout_with_warmup': (holdout_warmup_start, n),
-        }
 
 
 # =============================================================================
@@ -3769,6 +3666,13 @@ class Backtester:
         self.config = config
         # Discovery/backtest scoring must not use live-only regime TP overlays.
         # Stage 2 can still search `tp_atr_mult` normally via strategy grids.
+
+    def _discovery_risk_per_trade_pct(self) -> float:
+        try:
+            risk = float(getattr(self.config, "discovery_risk_per_trade_pct", 1.0))
+            return risk if math.isfinite(risk) and risk > 0 else 1.0
+        except Exception:
+            return 1.0
     
     def run(self,
             features: pd.DataFrame,
@@ -3941,6 +3845,7 @@ class Backtester:
         # ----------------------------------------------------------------
         # RUN BACKTEST LOOP (Numba JIT or Pure Python)
         # ----------------------------------------------------------------
+        discovery_risk_per_trade_pct = self._discovery_risk_per_trade_pct()
         if NUMBA_AVAILABLE and normalized_governance is None:
             # Use Numba JIT-compiled kernel with live-equity sizing
             (
@@ -3953,7 +3858,7 @@ class Backtester:
                 open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
                 self.config.initial_capital,
-                self.config.position_size_pct,
+                discovery_risk_per_trade_pct,
                 half_spread, slippage_price,
                 self.config.use_spread, self.config.use_slippage,
                 self.config.use_commission, spec.commission_per_lot,
@@ -4003,6 +3908,7 @@ class Backtester:
                 half_spread, slippage_price, spec, warmup_bars,
                 atr_arr=atr_arr,
                 governance_policy=normalized_governance,
+                discovery_risk_per_trade_pct=discovery_risk_per_trade_pct,
             )
         
         return self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
@@ -4012,7 +3918,8 @@ class Backtester:
                          half_spread, slippage_price, spec,
                          warmup_bars: int = 0,
                          atr_arr: Optional[np.ndarray] = None,
-                         governance_policy: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict], float, float, List[float]]:
+                         governance_policy: Optional[Dict[str, Any]] = None,
+                         discovery_risk_per_trade_pct: float = 1.0) -> Tuple[List[Dict], float, float, List[float]]:
         """
         Pure Python backtest loop (fallback when Numba not available).
         
@@ -4194,9 +4101,9 @@ class Backtester:
                         take_profit_candidate = tp_prices[i]
                         
                         # ============================================================
-                        # POSITION SIZING FROM LIVE EQUITY (compounding preserved)
+                        # POSITION SIZING FROM DISCOVERY RISK AND LIVE EQUITY
                         # ============================================================
-                        risk_amount_at_entry = equity * (self.config.position_size_pct / 100.0)
+                        risk_amount_at_entry = equity * (discovery_risk_per_trade_pct / 100.0)
                         
                         # Calculate loss per lot at stop
                         loss_per_lot = spec.calculate_loss_at_stop(
@@ -4729,69 +4636,16 @@ class Backtester:
 
 class StrategyScorer:
     """
-    Scores and ranks strategy performance.
-    
-    Uses weighted composite scoring to select the best strategy
-    for a given symbol and timeframe.
-    """
-    
-    def __init__(self, config: PipelineConfig):
-        """
-        Initialize StrategyScorer.
-        
-        Args:
-            config: Pipeline configuration with score weights
-        """
-        self.config = config
-        self.weights = config.score_weights
-    
-    def calculate_composite_score(self, metrics: Dict[str, Any]) -> float:
-        """
-        Calculate composite score from metrics.
-        
-        Args:
-            metrics: Backtest result metrics
-            
-        Returns:
-            Composite score (0-100)
-        """
-        if metrics['total_trades'] < self.config.min_trades:
-            return 0.0
-        
-        # Normalize each metric to 0-100 scale
-        scores = {}
-        
-        # Sharpe ratio: target 2.0 = 100
-        scores['sharpe'] = min(100, max(0, metrics['sharpe_ratio'] / 2.0 * 100))
-        
-        # Profit factor: 1.0 = 0, 3.0+ = 100
-        pf = metrics['profit_factor']
-        scores['profit_factor'] = min(100, max(0, (pf - 1.0) / 2.0 * 100))
-        
-        # Win rate: 40% = 0, 70%+ = 100
-        wr = metrics['win_rate']
-        scores['win_rate'] = min(100, max(0, (wr - 40) / 30 * 100))
-        
-        # Total return: 0% = 0, 100%+ = 100
-        ret = metrics['total_return_pct']
-        scores['total_return'] = min(100, max(0, ret))
-        
-        # Max drawdown: 0% = 100, 30%+ = 0 (inverted)
-        dd = metrics['max_drawdown_pct']
-        scores['max_drawdown'] = max(0, 100 - (dd / 30 * 100))
-        
-        # Trade count: 20 = 0, 100+ = 100
-        tc = metrics['total_trades']
-        scores['trade_count'] = min(100, max(0, (tc - 20) / 80 * 100))
-        
-        # Calculate weighted composite
-        composite = 0.0
-        for metric, weight in self.weights.items():
-            if metric in scores:
-                composite += scores[metric] * weight
-        
-        return round(composite, 2)
+    Scores and ranks strategy performance using the FX backtester-aligned scoring.
 
+    `score()` is the public entry point; `purpose="selection"` is used during
+    rolling-window strategy/timeframe selection, `purpose="opt"` during
+    hyperparameter tuning. `fx_generalization_score()` blends train and val
+    metrics for the validation-aware selection pass.
+    """
+
+    def __init__(self, config: PipelineConfig):
+        self.config = config
 
     def calculate_fx_selection_score(self, metrics: Dict[str, Any]) -> float:
         """Backtester-aligned strategy selection score (training data only).
@@ -4909,23 +4763,6 @@ class StrategyScorer:
             dd_penalty = 1.0 if dd < 15.0 else 0.8 if dd < 25.0 else 0.5
 
         return float(base * dd_penalty)
-    def calculate_return_robustness_ratio(self,
-                                          train_metrics: Dict[str, Any],
-                                          val_metrics: Dict[str, Any]) -> float:
-        """Backtester-aligned robustness ratio.
-
-        Historical versions used val_return / abs(train_return). In practice that ratio becomes
-        uninformative under large compounded returns (it collapses toward ~0 even when validation
-        is objectively strong).
-
-        We now define robustness as a *score* generalization ratio:
-            robustness = val_selection_score / max(train_selection_score, eps)
-
-        This correlates with out-of-sample stability while remaining aligned to the PM objectives
-        (Sharpe, PF, WR, return/DD, expectancy).
-        """
-        return self.calculate_fx_score_robustness_ratio(train_metrics, val_metrics, purpose="selection")
-
     def calculate_fx_score_robustness_ratio(self,
                                             train_metrics: Dict[str, Any],
                                             val_metrics: Dict[str, Any],
@@ -4972,69 +4809,15 @@ class StrategyScorer:
         return float(final_score), float(train_score), float(val_score), float(rr)
 
     def score(self, metrics: Dict[str, Any], purpose: str = "selection") -> float:
-        """Unified scoring honoring config.scoring_mode.
+        """FX backtester-aligned score.
 
         purpose:
           - "selection": strategy selection / rolling window scoring
           - "opt": hyperparameter tuning comparisons
         """
-        mode = getattr(self.config, "scoring_mode", "pm_weighted")
-        if mode == "fx_backtester":
-            if purpose == "opt":
-                return self.calculate_fx_opt_score(metrics)
-            return self.calculate_fx_selection_score(metrics)
-        return self.calculate_composite_score(metrics)
-    
-    def passes_minimum_criteria(self, metrics: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        Check if metrics pass minimum criteria.
-        
-        Args:
-            metrics: Backtest result metrics
-            
-        Returns:
-            Tuple of (passes, reason_if_failed)
-        """
-        if metrics['total_trades'] < self.config.min_trades:
-            return False, f"Insufficient trades: {metrics['total_trades']} < {self.config.min_trades}"
-        
-        if metrics['win_rate'] < self.config.min_win_rate:
-            return False, f"Low win rate: {metrics['win_rate']}% < {self.config.min_win_rate}%"
-        
-        if metrics['profit_factor'] < self.config.min_profit_factor:
-            return False, f"Low profit factor: {metrics['profit_factor']} < {self.config.min_profit_factor}"
-        
-        if metrics['sharpe_ratio'] < self.config.min_sharpe:
-            return False, f"Low Sharpe ratio: {metrics['sharpe_ratio']} < {self.config.min_sharpe}"
-        
-        if metrics['max_drawdown_pct'] > self.config.max_drawdown:
-            return False, f"High drawdown: {metrics['max_drawdown_pct']}% > {self.config.max_drawdown}%"
-        
-        return True, "OK"
-    
-    def calculate_robustness_ratio(self, 
-                                    train_metrics: Dict[str, Any],
-                                    val_metrics: Dict[str, Any]) -> float:
-        """
-        Calculate robustness ratio between training and validation.
-        
-        A ratio close to 1.0 indicates good generalization.
-        
-        Args:
-            train_metrics: Training period metrics
-            val_metrics: Validation period metrics
-            
-        Returns:
-            Robustness ratio (val_sharpe / train_sharpe)
-        """
-        train_sharpe = train_metrics.get('sharpe_ratio', 0)
-        val_sharpe = val_metrics.get('sharpe_ratio', 0)
-        
-        if train_sharpe <= 0:
-            return 0.0
-        
-        ratio = val_sharpe / train_sharpe
-        return round(min(ratio, 2.0), 3)  # Cap at 2.0
+        if purpose == "opt":
+            return self.calculate_fx_opt_score(metrics)
+        return self.calculate_fx_selection_score(metrics)
 
 
 # =============================================================================
@@ -5078,7 +4861,7 @@ if __name__ == "__main__":
     
     # Test data splitter
     splitter = DataSplitter(config)
-    indices = splitter.get_split_indices(1000)
-    print(f"\nSplit indices for 1000 rows: {indices}")
+    indices = splitter.get_workflow_indices(1000)
+    print(f"\nWorkflow indices for 1000 rows: {indices}")
     
     print("\npm_core.py loaded successfully!")

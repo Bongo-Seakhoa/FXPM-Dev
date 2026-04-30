@@ -237,6 +237,7 @@ Minimum keys to understand before first run:
 
 - `pipeline.data_dir`
 - `pipeline.output_dir`
+- `pipeline.discovery_risk_per_trade_pct`
 - `pipeline.risk_per_trade_pct`
 - `pipeline.live_risk_scalars_enabled`
 - `pipeline.target_annual_vol`
@@ -293,9 +294,8 @@ python pm_main.py --trade
     "output_dir": "./pm_outputs",
     "initial_capital": 10000.0,
     "risk_per_trade_pct": 1.0,
-    "scoring_mode": "fx_backtester",
+    "discovery_risk_per_trade_pct": 1.0,
     "timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
-    "data_workflow_mode": "active_recent_m5",
     "max_bars": 300000,
     "historical_stress_audit_bars": 50000,
     "active_universe_bars": 250000,
@@ -339,7 +339,7 @@ python pm_main.py --trade
 - Stage 2 freshness is intentional: the newest half of the active universe is used as the fresh selection surface, with warmup context retained, rather than adding a stale walk-forward layer between selection and live implementation.
 - `risk_management_selection_stage = "stage3"` means governance/risk policies are selected on the newest Stage 2 selection surface. Setting it to `"stage2"` evaluates policies on the active optimization universe instead.
 - `logs/` is not controlled by `pipeline.output_dir`; runtime logs always go to the root `logs/` folder.
-- `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.risk_per_trade_pct` is the research/backtest value and only backfills the position value when the `position` key is absent.
+- `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.discovery_risk_per_trade_pct` is the fixed discovery/backtest sizing value, while `pipeline.risk_per_trade_pct` only remains as a compatibility backfill when the `position` key is absent.
 - `live_risk_scalars_mode = "shadow"` records would-be risk-scalar changes but does not alter live sizing.
 - `pipeline.production_retrain_mode` supports `auto`, `notify`, and `off`.
 - `pipeline.execution_spread_spike_mult` is the live spread-spike blocker threshold.
@@ -414,7 +414,7 @@ The intended live precedence is:
 - `position.max_risk_pct` = per-trade hard cap after sizing
 - `pipeline.max_combined_risk_pct` = same-symbol combined cap, not a portfolio-wide cap, and the live runtime estimates existing open-position exposure from actual geometry before falling back to comment tags
 
-`pipeline.risk_per_trade_pct` remains important for research and as a compatibility backfill, but it is not meant to silently override the live `position` section.
+`pipeline.discovery_risk_per_trade_pct` remains fixed for research/discovery comparability. `pipeline.risk_per_trade_pct` is only a compatibility backfill and is not meant to silently override the live `position` section.
 
 ### Live protections
 
@@ -475,7 +475,7 @@ Before deploying live:
 - risk-management/governance policy selection is attached to optimized winners, defaulting to the Stage 3 selection surface
 - the historical stress audit is an older-window severe-fragility report, not the primary selector
 - `optimization_max_workers` controls concurrency
-- `scoring_mode = "fx_backtester"` remains the primary intended mode
+- the FX backtester scoring path is the only scoring path; there is no `scoring_mode` switch
 - artifact invalidation compares only the semantic optimizer/backtester contract, so volatile ledger completion metadata does not make a freshly optimized config appear stale
 - resample-cache telemetry records memory hits, disk hits, misses, invalidations, bytes, and read/write seconds so cache sizing can be judged by measured benefit. The active high-risk profile keeps a 4 GB cache quota; larger 5-10 GB quotas can be justified later if telemetry proves a quality-preserving efficiency gain.
 
