@@ -36691,7 +36691,7 @@
         "artifact_contract_counts": {
           "2026-04-25-active-recent-risk-mgmt|2026-04-25-active-recent-m5": 62
         },
-        "updated_at": "2026-04-27T23:42:31.292165"
+        "updated_at": "2026-04-29T07:45:02.690484"
       }
     },
     "live_observability": {
@@ -37746,8 +37746,13 @@
             "selection_score_raw": 44.95471904708432
           },
           "live_observability": {
-            "last_seen_drift": {},
-            "recent_consecutive_losses": 0,
+            "last_seen_drift": {
+              "trade_count": 2,
+              "live_win_rate": 50.0,
+              "live_avg_r": null,
+              "updated_at": "2026-04-29T07:45:02.688967"
+            },
+            "recent_consecutive_losses": 1,
             "last_review_ts": null,
             "operator_note": "",
             "operator_state": "ACTIVE"
@@ -40940,7 +40945,7 @@
         "artifact_contract_counts": {
           "2026-04-25-active-recent-risk-mgmt|2026-04-25-active-recent-m5": 62
         },
-        "updated_at": "2026-04-27T23:44:56.312166"
+        "updated_at": "2026-04-29T07:40:04.382522"
       }
     },
     "live_observability": {
@@ -42296,8 +42301,13 @@
             "selection_score_raw": 48.531892107117805
           },
           "live_observability": {
-            "last_seen_drift": {},
-            "recent_consecutive_losses": 0,
+            "last_seen_drift": {
+              "trade_count": 1,
+              "live_win_rate": 0.0,
+              "live_avg_r": null,
+              "updated_at": "2026-04-29T07:40:04.381518"
+            },
+            "recent_consecutive_losses": 1,
             "last_review_ts": null,
             "operator_note": "",
             "operator_state": "ACTIVE"
@@ -175472,7 +175482,7 @@
         "artifact_contract_counts": {
           "2026-04-25-active-recent-risk-mgmt|2026-04-25-active-recent-m5": 62
         },
-        "updated_at": "2026-04-29T00:25:03.420088"
+        "updated_at": "2026-04-29T06:05:06.516339"
       }
     },
     "live_observability": {
@@ -176503,8 +176513,13 @@
             "selection_score_raw": 63.83143623240189
           },
           "live_observability": {
-            "last_seen_drift": {},
-            "recent_consecutive_losses": 0,
+            "last_seen_drift": {
+              "trade_count": 3,
+              "live_win_rate": 0.0,
+              "live_avg_r": null,
+              "updated_at": "2026-04-29T06:05:06.514799"
+            },
+            "recent_consecutive_losses": 1,
             "last_review_ts": null,
             "operator_note": "",
             "operator_state": "ACTIVE"
@@ -176804,9 +176819,9 @@
               "trade_count": 2,
               "live_win_rate": 0.0,
               "live_avg_r": null,
-              "updated_at": "2026-04-29T00:25:03.420088"
+              "updated_at": "2026-04-29T01:16:31.040725"
             },
-            "recent_consecutive_losses": 6,
+            "recent_consecutive_losses": 8,
             "last_review_ts": null,
             "operator_note": "",
             "operator_state": "ACTIVE"
@@ -214062,21 +214077,13 @@
       "metric_contract": "net_dollar_mtm_equity_v1",
       "ledger_status": {
         "configured_symbol_count": 62,
-        "optimized_symbol_count": 55,
-        "complete_universe": false,
-        "missing_symbols": [
-          "BCHUSD",
-          "DOGUSD",
-          "ETHUSD",
-          "LTCUSD",
-          "SOLUSD",
-          "TRXUSD",
-          "XAUUSD"
-        ],
+        "optimized_symbol_count": 62,
+        "complete_universe": true,
+        "missing_symbols": [],
         "artifact_contract_counts": {
-          "2026-04-25-active-recent-risk-mgmt|2026-04-25-active-recent-m5": 55
+          "2026-04-25-active-recent-risk-mgmt|2026-04-25-active-recent-m5": 62
         },
-        "updated_at": "2026-04-26T22:27:59.194610"
+        "updated_at": "2026-04-29T09:35:10.904120"
       }
     },
     "live_observability": {
@@ -215252,8 +215259,13 @@
             "selection_score_raw": 46.13834482915776
           },
           "live_observability": {
-            "last_seen_drift": {},
-            "recent_consecutive_losses": 0,
+            "last_seen_drift": {
+              "trade_count": 1,
+              "live_win_rate": 0.0,
+              "live_avg_r": null,
+              "updated_at": "2026-04-29T09:35:10.904120"
+            },
+            "recent_consecutive_losses": 1,
             "last_review_ts": null,
             "operator_note": "",
             "operator_state": "ACTIVE"

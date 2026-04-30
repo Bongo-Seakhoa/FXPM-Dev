@@ -10,6 +10,7 @@ _test_tmp/
 .claude/
 logs/
 data/.cache/
+data/.live/
 last_actionable_log.json
 last_trade_log.json
 pm_outputs/historical_data/

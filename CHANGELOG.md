@@ -9,7 +9,37 @@ Notes:
 
 ---
 
-## [1.4.8] - 2026-04-25 (Current)
+## [1.4.9] - 2026-04-29 (Current)
+
+### Configuration cleanup — single workflow, single scoring path
+
+The pipeline already used the active-recent M5 workflow and the FX backtester scoring path in production. The legacy alternates were dormant code and dormant config keys. This release deletes them so the codebase has one well-defined path for each axis.
+
+Removed config keys (no behavior change for the active path):
+
+- `data_workflow_mode` and the entire `legacy_percentage` workflow path (legacy splitter, `train_pct`, `val_pct`, `holdout_pct`).
+- `scoring_mode` and the entire `pm_weighted` scoring path (`min_robustness`, `min_win_rate`, `min_profit_factor`, `min_sharpe`, `max_drawdown`, `score_weights`).
+- `regime_freshness_decay`, `regime_chop_no_trade` — declared on `PipelineConfig` but never read anywhere in production code.
+- `position_size_pct` — was a `__post_init__`-synced alias for `risk_per_trade_pct`; the dataclass now exposes only `risk_per_trade_pct`.
+
+Removed code:
+
+- `DataSplitter.get_split_indices`, `DataSplitter.split`, `DataSplitter._holdout_bars`, `DataSplitter.workflow_enabled` (all served the legacy splitter).
+- `StrategyScorer.calculate_composite_score`, `StrategyScorer.passes_minimum_criteria` (pm_weighted-only).
+- The `if scoring_mode == "fx_backtester"` and `if active_mode` branches in `pm_pipeline.py` collapse to the single FX/active path.
+- `Validator.validate` keeps only the FX-aligned validation rules (early-return branch is now the only branch).
+- `RegimeOptimizer.use_fx_scoring` and the legacy fallback math in `_compute_regime_score` / `_validate_regime_winner`.
+
+Repo hygiene:
+
+- `__pycache__/` and `data/.live/` are no longer tracked in git. Working files remain on disk; `.gitignore` already excluded `__pycache__/`, and now also excludes `data/.live/`.
+- Saved artifact metadata no longer carries `data_workflow_mode`, `train_pct`, `val_pct`, `holdout_pct`, or `scoring_mode`. The artifact contract view ignores keys absent from the current contract, so existing winner ledgers do not invalidate.
+
+Tests: `tests/test_data_splitter.py` was rewritten to cover only the active workflow (the legacy splitter cases were removed). `568 → 566` total tests, 1 new empty-window test. All pass.
+
+---
+
+## [1.4.8] - 2026-04-25
 
 ### Neutral discovery exit surface
 

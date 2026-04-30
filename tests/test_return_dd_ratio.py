@@ -18,7 +18,6 @@ from pm_pipeline import RegimeOptimizer
 
 def _make_optimizer(**overrides):
     cfg = PipelineConfig(
-        scoring_mode="fx_backtester",
         regime_enable_hyperparam_tuning=False,
         **overrides,
     )

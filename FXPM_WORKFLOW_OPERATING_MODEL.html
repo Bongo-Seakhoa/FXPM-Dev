@@ -1,0 +1,1627 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FxPM Practical Workflow Operating Model</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #607080;
+      --line: #d9e1e8;
+      --accent: #0f766e;
+      --accent-soft: #e6f4f1;
+      --code-bg: #111827;
+      --code-ink: #edf2f7;
+      --table-head: #edf3f7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.62;
+    }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }
+    article {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 42px 48px;
+      box-shadow: 0 12px 30px rgba(20, 35, 50, 0.06);
+    }
+    h1, h2, h3 {
+      color: #10202c;
+      line-height: 1.2;
+      margin: 1.55em 0 0.55em;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 2.1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 3px solid var(--accent);
+    }
+    h2 {
+      font-size: 1.45rem;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 0.35rem;
+    }
+    h3 { font-size: 1.12rem; }
+    p { margin: 0.75em 0; }
+    a { color: var(--accent); text-decoration-thickness: 1px; }
+    blockquote {
+      margin: 1rem 0;
+      padding: 0.75rem 1rem;
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      color: #21443f;
+    }
+    .toc {
+      margin: 1.25rem 0 2rem;
+      padding: 1rem 1.25rem;
+      background: #f3f7fa;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .toc ul { margin: 0.35rem 0 0.35rem 1.25rem; padding: 0; }
+    .toc li { margin: 0.18rem 0; }
+    code {
+      font-family: Consolas, "SFMono-Regular", Menlo, Monaco, monospace;
+      font-size: 0.92em;
+      background: #eef3f7;
+      padding: 0.12rem 0.3rem;
+      border-radius: 4px;
+    }
+    pre {
+      overflow-x: auto;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      padding: 1rem 1.1rem;
+      border-radius: 8px;
+      border: 1px solid #1f2937;
+    }
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+      border-radius: 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0 1.4rem;
+      font-size: 0.94rem;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 0.55rem 0.7rem;
+      vertical-align: top;
+    }
+    th {
+      background: var(--table-head);
+      text-align: left;
+      font-weight: 650;
+    }
+    tr:nth-child(even) td { background: #fbfcfd; }
+    hr { border: 0; border-top: 1px solid var(--line); margin: 2rem 0; }
+    ul, ol { padding-left: 1.45rem; }
+    li { margin: 0.28rem 0; }
+    .meta {
+      margin: -0.25rem 0 1.5rem;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+    @media (max-width: 760px) {
+      .page { padding: 0; }
+      article {
+        border: 0;
+        border-radius: 0;
+        padding: 28px 18px 42px;
+        box-shadow: none;
+      }
+      h1 { font-size: 1.72rem; }
+      h2 { font-size: 1.25rem; }
+      table { display: block; overflow-x: auto; white-space: nowrap; }
+    }
+    @media print {
+      body { background: white; }
+      .page { max-width: none; padding: 0; }
+      article { border: 0; box-shadow: none; padding: 0; }
+      a { color: inherit; }
+      pre { white-space: pre-wrap; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <article>
+      <p class="meta">Generated from <code>FXPM_WORKFLOW_OPERATING_MODEL.md</code> on 2026-04-29 08:21</p>
+      <div class="toc">
+<ul>
+<li><a href="#fxpm-practical-workflow-operating-model">FxPM Practical Workflow Operating Model</a><ul>
+<li><a href="#1-operating-thesis">1. Operating Thesis</a></li>
+<li><a href="#2-current-local-profile-snapshot">2. Current Local Profile Snapshot</a></li>
+<li><a href="#3-end-outcome-definition">3. End Outcome Definition</a><ul>
+<li><a href="#hard-outcomes">Hard Outcomes</a></li>
+<li><a href="#internal-quality-outcomes">Internal Quality Outcomes</a></li>
+</ul>
+</li>
+<li><a href="#4-whole-system-input-transform-output-map">4. Whole System Input -&gt; Transform -&gt; Output Map</a></li>
+<li><a href="#5-pipeline-a-configuration-and-startup">5. Pipeline A: Configuration And Startup</a><ul>
+<li><a href="#inputs">Inputs</a></li>
+<li><a href="#transform">Transform</a></li>
+<li><a href="#outputs">Outputs</a></li>
+<li><a href="#deviation-checkpoints">Deviation Checkpoints</a></li>
+</ul>
+</li>
+<li><a href="#6-pipeline-b-market-data-features-and-regime-state">6. Pipeline B: Market Data, Features, And Regime State</a><ul>
+<li><a href="#inputs_1">Inputs</a></li>
+<li><a href="#discovery-transform">Discovery Transform</a></li>
+<li><a href="#regime-transform">Regime Transform</a></li>
+<li><a href="#live-transform">Live Transform</a></li>
+<li><a href="#outputs_1">Outputs</a></li>
+<li><a href="#deviation-checkpoints_1">Deviation Checkpoints</a></li>
+</ul>
+</li>
+<li><a href="#7-pipeline-c-discovery-and-optimization">7. Pipeline C: Discovery And Optimization</a><ul>
+<li><a href="#purpose">Purpose</a></li>
+<li><a href="#inputs_2">Inputs</a></li>
+<li><a href="#high-level-sequence">High-Level Sequence</a></li>
+<li><a href="#stage-1-baseline-eligibility">Stage 1: Baseline Eligibility</a></li>
+<li><a href="#stage-2-parameter-search-and-winner-discovery">Stage 2: Parameter Search And Winner Discovery</a></li>
+<li><a href="#stage-3-governance-risk-management-selection">Stage 3: Governance / Risk-Management Selection</a></li>
+<li><a href="#backtest-and-scoring-semantics">Backtest And Scoring Semantics</a></li>
+<li><a href="#validation-gates">Validation Gates</a></li>
+<li><a href="#discovery-outputs">Discovery Outputs</a></li>
+<li><a href="#discovery-deviation-checkpoints">Discovery Deviation Checkpoints</a></li>
+</ul>
+</li>
+<li><a href="#8-pipeline-d-winner-ledger-artifact-drift-and-retrain-lifecycle">8. Pipeline D: Winner Ledger, Artifact Drift, And Retrain Lifecycle</a><ul>
+<li><a href="#purpose_1">Purpose</a></li>
+<li><a href="#inputs_3">Inputs</a></li>
+<li><a href="#validity-rules">Validity Rules</a></li>
+<li><a href="#artifact-contract">Artifact Contract</a></li>
+<li><a href="#retrain-schedule">Retrain Schedule</a></li>
+<li><a href="#live-eligibility">Live Eligibility</a></li>
+<li><a href="#advisory-versus-blocking">Advisory Versus Blocking</a></li>
+<li><a href="#state-outputs">State Outputs</a></li>
+<li><a href="#deviation-checkpoints_2">Deviation Checkpoints</a></li>
+</ul>
+</li>
+<li><a href="#9-pipeline-e-live-trading-runtime">9. Pipeline E: Live Trading Runtime</a><ul>
+<li><a href="#purpose_2">Purpose</a></li>
+<li><a href="#startup-inputs">Startup Inputs</a></li>
+<li><a href="#bar-gated-runtime-loop">Bar-Gated Runtime Loop</a></li>
+<li><a href="#per-sweep-safety">Per-Sweep Safety</a></li>
+<li><a href="#candidate-selection">Candidate Selection</a></li>
+<li><a href="#trade-intent">Trade Intent</a></li>
+<li><a href="#entry-gates">Entry Gates</a></li>
+<li><a href="#position-management">Position Management</a></li>
+<li><a href="#live-outputs">Live Outputs</a></li>
+<li><a href="#live-deviation-checkpoints">Live Deviation Checkpoints</a></li>
+</ul>
+</li>
+<li><a href="#10-pipeline-f-observability-and-human-review">10. Pipeline F: Observability And Human Review</a><ul>
+<li><a href="#primary-surfaces">Primary Surfaces</a></li>
+<li><a href="#what-to-watch-daily">What To Watch Daily</a></li>
+<li><a href="#what-to-watch-weekly">What To Watch Weekly</a></li>
+</ul>
+</li>
+<li><a href="#11-practical-success-matrix">11. Practical Success Matrix</a></li>
+<li><a href="#12-critical-deviation-register">12. Critical Deviation Register</a></li>
+<li><a href="#13-how-to-use-this-document">13. How To Use This Document</a></li>
+<li><a href="#14-minimal-operator-review-checklist">14. Minimal Operator Review Checklist</a></li>
+<li><a href="#15-source-anchor-index">15. Source Anchor Index</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<h1 id="fxpm-practical-workflow-operating-model">FxPM Practical Workflow Operating Model</h1>
+<p>Snapshot date: 2026-04-29</p>
+<p>This document explains how the current FxPM system functions as an operating workflow. It is not a full audit and it is not a setup guide. Its purpose is to make the practical machine visible:</p>
+<ul>
+<li>what enters the system</li>
+<li>what transforms those inputs</li>
+<li>what outputs are produced</li>
+<li>what outcomes the system is meant to create</li>
+<li>where the actual live/research behavior can deviate from the expected narrative</li>
+</ul>
+<p>Use this as a working reference when asking: &ldquo;Is FxPM doing what I think it is doing?&rdquo;</p>
+<hr>
+<h2 id="1-operating-thesis">1. Operating Thesis</h2>
+<p>FxPM is a regime-aware strategy discovery and live execution system. It does not train one fixed model. It runs a structured competition between many strategy candidates, selects validated winners per market context, stores those winners in a stateful ledger, and then trades only the winner that matches the current live symbol, timeframe, and regime.</p>
+<p>The practical goal is:</p>
+<blockquote>
+<p>Select and execute the strategy package most likely to be profitable, robust, current-market relevant, broker-executable, and operationally understandable.</p>
+</blockquote>
+<p>The hard measurable outcomes include profitability, drawdown control, trade count, robustness, live eligibility, broker feasibility, and actual live decisions. The internal quality outcomes include fairness of the candidate tournament, explainability of why trades did or did not happen, controlled retrain cadence, and operator confidence that live behavior matches the intended research surface.</p>
+<p>The current system is best understood as four coupled loops:</p>
+<pre><code class="language-text">1. Discovery loop
+   config + M5 data + strategies + regimes
+   -&gt; features/backtests/scoring/validation
+   -&gt; winner ledger
+
+2. Live execution loop
+   winner ledger + MT5 bars + broker/account state
+   -&gt; live candidate selection + risk/execution gates
+   -&gt; order, paper action, or no-action reason
+
+3. State and retrain loop
+   ledger expiry + artifact contract + retrain schedule
+   -&gt; optimize/skip/warn/block decisions
+   -&gt; refreshed or stale winner universe
+
+4. Observability loop
+   logs + status + signal ledger + dashboard + storage state
+   -&gt; operator understanding
+   -&gt; deviation detection
+</code></pre>
+<p>Primary code anchors:</p>
+<ul>
+<li>CLI and app startup: <code>pm_main.py:5380</code>, <code>pm_main.py:5461</code></li>
+<li>optimization pipeline: <code>pm_pipeline.py:2907</code>, <code>pm_pipeline.py:3426</code></li>
+<li>active data split: <code>pm_core.py:3647</code></li>
+<li>backtester and scoring: <code>pm_core.py:3737</code>, <code>pm_core.py:4796</code></li>
+<li>live loop: <code>pm_main.py:5083</code>, <code>pm_main.py:5146</code>, <code>pm_main.py:5202</code></li>
+<li>live eligibility: <code>pm_pipeline.py:4064</code>, <code>pm_pipeline.py:4099</code></li>
+<li>storage and signal ledger: <code>pm_storage.py:133</code>, <code>pm_storage.py:528</code></li>
+</ul>
+<hr>
+<h2 id="2-current-local-profile-snapshot">2. Current Local Profile Snapshot</h2>
+<p>These values are read from the local <code>config.json</code> at the time this document was created. They matter because the live runtime posture can differ from older documentation or from the pushed baseline.</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th style="text-align: right;">Current local value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Symbols</td>
+<td style="text-align: right;"><code>62</code></td>
+<td>Configured trade universe.</td>
+</tr>
+<tr>
+<td>Data workflow</td>
+<td style="text-align: right;"><code>active_recent_m5</code></td>
+<td>Production uses the active recent M5 workflow.</td>
+</tr>
+<tr>
+<td>Scoring mode</td>
+<td style="text-align: right;"><code>fx_backtester</code></td>
+<td>Active scoring uses the FX backtester-oriented scorer, not the legacy weighted scorer.</td>
+</tr>
+<tr>
+<td>Max base bars</td>
+<td style="text-align: right;"><code>300000</code></td>
+<td>Latest M5 bars loaded per symbol.</td>
+</tr>
+<tr>
+<td>Historical audit</td>
+<td style="text-align: right;"><code>50000</code></td>
+<td>Oldest slice inside the workflow window, used as stress/audit rather than primary selector.</td>
+</tr>
+<tr>
+<td>Active universe</td>
+<td style="text-align: right;"><code>250000</code></td>
+<td>Newest M5 bars that drive active strategy selection.</td>
+</tr>
+<tr>
+<td>Stage 2 percentage</td>
+<td style="text-align: right;"><code>50.0</code></td>
+<td>Newest half of active universe is used for fresh Stage 2/selection surface.</td>
+</tr>
+<tr>
+<td>Winner ledger</td>
+<td style="text-align: right;"><code>pm_configs_high_risk.json</code></td>
+<td>Active validated-winner ledger.</td>
+</tr>
+<tr>
+<td>Retrain mode</td>
+<td style="text-align: right;"><code>notify</code></td>
+<td>Due retrain logs a warning but does not auto-run optimization.</td>
+</tr>
+<tr>
+<td>Retrain schedule</td>
+<td style="text-align: right;">every 2 weeks Sunday <code>00:01</code></td>
+<td>Calendar-anchored production cycle.</td>
+</tr>
+<tr>
+<td>Live artifact drift</td>
+<td style="text-align: right;"><code>warn</code></td>
+<td>Drift warns in live eligibility but does not block live trading under current local profile.</td>
+</tr>
+<tr>
+<td>Live loop trigger</td>
+<td style="text-align: right;"><code>bar</code></td>
+<td>MT5 bar timestamp changes trigger live checks.</td>
+</tr>
+<tr>
+<td>Governance live mode</td>
+<td style="text-align: right;"><code>on</code></td>
+<td>Selected local governance can actively modify open-trade SL/TP.</td>
+</tr>
+<tr>
+<td>Risk-management selection stage</td>
+<td style="text-align: right;"><code>stage3</code></td>
+<td>Governance/risk policy selected after strategy winner discovery.</td>
+</tr>
+<tr>
+<td>Walk-forward audit</td>
+<td style="text-align: right;"><code>false</code></td>
+<td>Walk-forward audit is not an active promotion gate.</td>
+</tr>
+<tr>
+<td>Regime TP multipliers</td>
+<td style="text-align: right;">all <code>1.0</code></td>
+<td>Live overlay defaults neutral; discovery disables the overlay.</td>
+</tr>
+<tr>
+<td>Live risk target</td>
+<td style="text-align: right;"><code>position.risk_per_trade_pct = 0.5</code></td>
+<td>Position config is the authoritative live risk source.</td>
+</tr>
+<tr>
+<td>Live hard risk cap</td>
+<td style="text-align: right;"><code>position.max_risk_pct = 0.8</code></td>
+<td>Entries above cap block.</td>
+</tr>
+<tr>
+<td>Risk tolerance warning</td>
+<td style="text-align: right;"><code>position.risk_tolerance_pct = 8.0</code></td>
+<td>Lot-normalization drift tolerance before warning/block classification.</td>
+</tr>
+</tbody>
+</table>
+<p>Deviation note: some root docs still describe <code>live_artifact_drift_policy = block</code> and <code>local_governance_live_mode = shadow</code> as the active profile. The local config currently says <code>warn</code> and <code>on</code> (<code>config.json:79</code>, <code>config.json:114</code>). Treat this as a real narrative-vs-runtime checkpoint.</p>
+<hr>
+<h2 id="3-end-outcome-definition">3. End Outcome Definition</h2>
+<p>FxPM has two kinds of outcomes.</p>
+<h3 id="hard-outcomes">Hard Outcomes</h3>
+<p>These are physically measurable:</p>
+<table>
+<thead>
+<tr>
+<th>Outcome</th>
+<th>Measured by</th>
+<th>Where to inspect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Profitability</td>
+<td><code>total_return_pct</code>, <code>total_pnl</code>, <code>profit_factor</code>, <code>expectancy_pips</code></td>
+<td>backtest metrics in winner ledger and <code>pm_core.py:4538</code></td>
+</tr>
+<tr>
+<td>Drawdown control</td>
+<td><code>max_drawdown_pct</code>, <code>return_dd_ratio</code>, <code>calmar_ratio</code></td>
+<td>validation evidence and backtest metrics</td>
+</tr>
+<tr>
+<td>Risk-adjusted quality</td>
+<td><code>sharpe_ratio</code>, <code>sortino_ratio</code>, <code>mean_r</code>, <code>worst_5pct_r</code></td>
+<td>backtest metrics and scorer</td>
+</tr>
+<tr>
+<td>Robustness</td>
+<td><code>robustness_ratio</code>, train/validation gap, stability penalty</td>
+<td><code>validation_evidence</code>, <code>pm_core.py:4934</code></td>
+</tr>
+<tr>
+<td>Live tradability</td>
+<td><code>Live eligible</code>, exact regime/timeframe winner, not expired, not <code>NO_TRADE</code></td>
+<td><code>python pm_main.py --status</code>, <code>pm_pipeline.py:4099</code></td>
+</tr>
+<tr>
+<td>Broker feasibility</td>
+<td>symbol visible/tradeable, valid tick, valid stops, margin, min lot, order check</td>
+<td>live logs and actionable ledger</td>
+</tr>
+<tr>
+<td>Execution action</td>
+<td>order placed, paper action, skipped, blocked, no actionable setup</td>
+<td><code>last_actionable_log.json</code>, <code>pm_outputs/signal_ledger_YYYYMM.jsonl</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="internal-quality-outcomes">Internal Quality Outcomes</h3>
+<p>These are not just financial, but they decide whether the system is trustworthy:</p>
+<table>
+<thead>
+<tr>
+<th>Objective</th>
+<th>Practical meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fair discovery</td>
+<td>Stage 1 starts from neutral baseline defaults. Live-only TP overlays are not part of winner discovery.</td>
+</tr>
+<tr>
+<td>Current-market relevance</td>
+<td>Newest active universe drives selection; older data is audit/stress, not the main selector.</td>
+</tr>
+<tr>
+<td>Explainable no-trade</td>
+<td>No action should have a reason: no winner, no signal, spread, margin, risk, symbol, stale bar, expiry, etc.</td>
+</tr>
+<tr>
+<td>Statefulness</td>
+<td>Optimization can resume without losing prior symbols; configs are saved atomically.</td>
+</tr>
+<tr>
+<td>Fail-closed safety</td>
+<td>Missing account/position/tick/margin information blocks or skips entries rather than trading blind.</td>
+</tr>
+<tr>
+<td>Operator control</td>
+<td>Retrain mode, artifact drift policy, governance mode, storage policy, and risk posture are config-driven.</td>
+</tr>
+<tr>
+<td>Live/research alignment</td>
+<td>The live strategy, timeframe, regime, stops, and risk surfaces should trace back to the selected artifact.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="4-whole-system-input-transform-output-map">4. Whole System Input -&gt; Transform -&gt; Output Map</h2>
+<pre><code class="language-text">Input Layer
+  config.json
+  instrument specs / broker specs
+  data/{SYMBOL}_M5.csv
+  regime_params.json or defaults
+  strategy registry
+  MT5 account, broker symbols, ticks, positions, bars
+  winner ledger from previous optimization
+
+Discovery Transform
+  load latest bounded M5
+  resample configured timeframes
+  compute features and causal regimes
+  Stage 1 baseline screening
+  Stage 2 parameter optimization
+  Stage 3 governance/risk policy selection
+  validation and artifact fingerprinting
+
+Discovery Output
+  pm_configs_high_risk.json
+  validation evidence
+  historical audit evidence
+  NO_TRADE markers
+  governance policy evidence
+  artifact metadata and expiry
+
+Live Transform
+  load live-eligible configs
+  poll MT5 changed bars
+  compute current live regime and signal on closed bar
+  require exact winner for symbol/timeframe/regime
+  build TradeIntent
+  apply live gates: spread, risk, margin, broker stops, same-symbol exposure
+  send order or record no-action/block reason
+
+Live Output
+  MT5 order / paper order / no action
+  last_trade_log.json
+  last_actionable_log.json
+  pm_outputs/signal_ledger_YYYYMM.jsonl
+  logs/pm_YYYYMMDD.log
+  dashboard/status surfaces
+</code></pre>
+<p>The key operational rule is that a validated research winner is not automatically a live trade. It must survive live eligibility, exact live context matching, signal generation, risk gates, broker gates, spread gates, margin gates, and final quote refresh.</p>
+<hr>
+<h2 id="5-pipeline-a-configuration-and-startup">5. Pipeline A: Configuration And Startup</h2>
+<h3 id="inputs">Inputs</h3>
+<ul>
+<li><code>config.json</code></li>
+<li>optional CLI overrides:</li>
+<li><code>--config</code></li>
+<li><code>--symbols</code></li>
+<li><code>--data-dir</code></li>
+<li><code>--output-dir</code></li>
+<li><code>--winner-ledger</code></li>
+<li><code>--optimize</code></li>
+<li><code>--trade</code></li>
+<li><code>--paper</code></li>
+<li><code>--status</code></li>
+<li>instrument specs and broker specs</li>
+<li>MT5 login/session settings</li>
+</ul>
+<h3 id="transform">Transform</h3>
+<p><code>pm_main.py</code> parses CLI arguments, loads JSON, normalizes the storage section into <code>PipelineConfig</code>, builds <code>PipelineConfig</code>, <code>PositionConfig</code>, and <code>MT5Config</code>, applies position-risk precedence, loads broker/instrument specs, and creates <code>FXPortfolioManagerApp</code>.</p>
+<p>Important anchors:</p>
+<ul>
+<li>CLI parse: <code>pm_main.py:5380</code></li>
+<li>config load and dataclass construction: <code>pm_main.py:5461</code>, <code>pm_main.py:5481</code></li>
+<li>position risk backfill from pipeline only if position risk is absent: <code>pm_main.py:5486</code></li>
+<li>winner ledger override: <code>pm_main.py:5497</code></li>
+<li>app creation: <code>pm_main.py:5529</code></li>
+</ul>
+<h3 id="outputs">Outputs</h3>
+<ul>
+<li>resolved runtime config summary in logs</li>
+<li>initialized app</li>
+<li>initialized <code>PortfolioManager</code></li>
+<li>connected MT5 session if running live/trade path</li>
+</ul>
+<h3 id="deviation-checkpoints">Deviation Checkpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Expected narrative</th>
+<th>Actual checkpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&ldquo;Pipeline risk controls live risk.&rdquo;</td>
+<td>Live risk is primarily <code>PositionConfig</code>; pipeline risk only backfills if position risk is missing.</td>
+</tr>
+<tr>
+<td>&ldquo;Docs describe active profile.&rdquo;</td>
+<td>Local config can drift from docs. Check <code>config.json</code> directly.</td>
+</tr>
+<tr>
+<td>&ldquo;Changing config always changes live immediately.&rdquo;</td>
+<td>Some changes only matter after optimization because they affect artifact contract/winner discovery.</td>
+</tr>
+<tr>
+<td>&ldquo;MT5 credentials are in config.&rdquo;</td>
+<td><code>login=0</code> can use current MT5 session. Do not assume credentials are embedded.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="6-pipeline-b-market-data-features-and-regime-state">6. Pipeline B: Market Data, Features, And Regime State</h2>
+<h3 id="inputs_1">Inputs</h3>
+<ul>
+<li>canonical <code>data/{SYMBOL}_M5.csv</code></li>
+<li>live MT5 bars</li>
+<li>data cache under <code>data/.cache</code></li>
+<li>live cache under <code>data/.live/{SYMBOL}_{TF}.csv</code></li>
+<li>configured timeframes</li>
+<li>regime params file or defaults</li>
+</ul>
+<h3 id="discovery-transform">Discovery Transform</h3>
+<p>Optimization loads the latest bounded M5 data and derives all configured higher timeframes from the same source. This matters because the M5 source creates one coherent calendar window instead of independently sampling each timeframe.</p>
+<p>Active data workflow:</p>
+<pre><code class="language-text">latest 300000 M5 bars
+  oldest 50000 -&gt; historical_stress_audit
+  newest 250000 -&gt; active_universe
+      newest 50% -&gt; Stage 2 / fresh selection surface
+      overlap -&gt; warmup only, not scored
+</code></pre>
+<p>Code anchors:</p>
+<ul>
+<li>data loading: <code>pm_core.py:2274</code></li>
+<li>resampling/cache: <code>pm_core.py:2430</code>, <code>pm_core.py:2478</code></li>
+<li>active workflow split: <code>pm_core.py:3647</code></li>
+<li>workflow metadata: <code>pm_pipeline.py:2962</code></li>
+<li>symbol/timeframe data load: <code>pm_pipeline.py:3005</code></li>
+</ul>
+<h3 id="regime-transform">Regime Transform</h3>
+<p>The regime engine writes causal regime columns and shifted live-decision columns:</p>
+<ul>
+<li><code>REGIME</code></li>
+<li><code>REGIME_STRENGTH</code></li>
+<li><code>REGIME_LIVE</code></li>
+<li><code>REGIME_STRENGTH_LIVE</code></li>
+</ul>
+<p>The live path prefers <code>REGIME_LIVE</code> so it does not choose using information from the current unfinished bar.</p>
+<p>Code anchors:</p>
+<ul>
+<li>regime feature generation: <code>pm_regime.py:547</code></li>
+<li>shifted live-decision columns: <code>pm_regime.py:743</code></li>
+<li>hysteresis behavior: <code>pm_regime.py:1252</code></li>
+<li>feature computation: <code>pm_core.py:3543</code></li>
+</ul>
+<h3 id="live-transform">Live Transform</h3>
+<p>Live trading uses bounded local-first caches where possible, repairs gaps with MT5 reseed, and falls back to direct MT5 bars when local data is insufficient.</p>
+<p>Code anchors:</p>
+<ul>
+<li>live cache path: <code>pm_main.py:888</code></li>
+<li>local-to-live cache sync: <code>pm_main.py:968</code></li>
+<li>MT5 reseed/repair path: <code>pm_main.py:1081</code></li>
+<li>final bar fetch: <code>pm_main.py:1205</code></li>
+</ul>
+<h3 id="outputs_1">Outputs</h3>
+<ul>
+<li>feature-enriched dataframes for discovery</li>
+<li>cached resampled data</li>
+<li>bounded live cache files</li>
+<li>regime fallback logs when tuned regime params are missing</li>
+</ul>
+<h3 id="deviation-checkpoints_1">Deviation Checkpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Expected narrative</th>
+<th>Actual checkpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&ldquo;All timeframes have independent datasets.&rdquo;</td>
+<td>Higher timeframes are derived from the bounded M5 source in active workflow.</td>
+</tr>
+<tr>
+<td>&ldquo;Old data participates equally in selection.&rdquo;</td>
+<td>Oldest 50k M5 bars are audit/stress; newest active universe drives selection.</td>
+</tr>
+<tr>
+<td>&ldquo;Live evaluates every symbol every timer tick.&rdquo;</td>
+<td>Bar mode evaluates only changed symbol/timeframe branches.</td>
+</tr>
+<tr>
+<td>&ldquo;Regime params are always tuned.&rdquo;</td>
+<td>Missing <code>(symbol,timeframe)</code> regime params fall back to timeframe/default params and log a fallback.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7-pipeline-c-discovery-and-optimization">7. Pipeline C: Discovery And Optimization</h2>
+<h3 id="purpose">Purpose</h3>
+<p>Discovery answers:</p>
+<blockquote>
+<p>Which strategy package should be eligible to trade each symbol, timeframe, and regime?</p>
+</blockquote>
+<p>The output is not a trade. The output is a validated winner artifact.</p>
+<h3 id="inputs_2">Inputs</h3>
+<ul>
+<li>resolved <code>PipelineConfig</code></li>
+<li>latest M5-derived timeframe data</li>
+<li>47-strategy registry</li>
+<li>neutral Stage 1 defaults</li>
+<li>global parameter grids and optional Optuna</li>
+<li>regime labels</li>
+<li>instrument specs</li>
+<li>existing winner ledger for skip/resume</li>
+</ul>
+<h3 id="high-level-sequence">High-Level Sequence</h3>
+<pre><code class="language-text">PortfolioManager.initial_optimization()
+  -&gt; decide optimize vs skip using ledger validity and artifact contract
+  -&gt; OptimizationPipeline.run_for_symbol(symbol)
+      -&gt; load M5 and resample timeframes
+      -&gt; compute features and regimes
+      -&gt; create active/audit/stage2 windows
+      -&gt; RegimeOptimizer.optimize_symbol()
+          -&gt; Stage 1 baseline screening
+          -&gt; Stage 2 parameter optimization
+          -&gt; final validation
+          -&gt; NO_TRADE markers where no candidate survives
+      -&gt; attach historical stress audit
+      -&gt; attach governance/risk policy evidence
+      -&gt; build SymbolConfig
+  -&gt; save each symbol atomically to winner ledger
+</code></pre>
+<p>Code anchors:</p>
+<ul>
+<li><code>PortfolioManager.initial_optimization()</code>: <code>pm_pipeline.py:3927</code></li>
+<li>optimize/skip partition: <code>pm_pipeline.py:3947</code></li>
+<li>pipeline symbol run: <code>pm_pipeline.py:3426</code></li>
+<li>regime optimizer entry: <code>pm_pipeline.py:1698</code></li>
+<li>atomic save: <code>pm_pipeline.py:354</code>, <code>pm_pipeline.py:3844</code></li>
+</ul>
+<h3 id="stage-1-baseline-eligibility">Stage 1: Baseline Eligibility</h3>
+<p>Stage 1 is a viability filter, not the final judge. It uses default strategy parameters over the full active universe to decide which baseline strategies are worth deeper search.</p>
+<p>Recent correction: Stage 1 exit defaults are neutral <code>2.0 / 2.0</code>, and the minimum stop/target floor is symmetric <code>5.0 / 5.0</code>. That means Stage 1 is no longer advantaging a wider default TP or a hidden larger TP floor.</p>
+<p>Code anchors:</p>
+<ul>
+<li>Stage 1 screening: <code>pm_pipeline.py:1939</code>, <code>pm_pipeline.py:1987</code></li>
+<li>regime-local rescue: <code>pm_pipeline.py:1825</code></li>
+<li>neutral exit defaults: <code>pm_strategies.py:577</code></li>
+<li>symmetric floor: <code>pm_strategies.py:579</code></li>
+</ul>
+<p>Stage 1 answers:</p>
+<ul>
+<li>did the strategy generate enough trades?</li>
+<li>was drawdown survivable?</li>
+<li>did it show enough baseline viability?</li>
+<li>should it enter the expensive search?</li>
+</ul>
+<p>Stage 1 does not answer:</p>
+<ul>
+<li>is this the final best parameter set?</li>
+<li>is this the final live strategy package?</li>
+<li>is this ready to trade without Stage 2/validation?</li>
+</ul>
+<h3 id="stage-2-parameter-search-and-winner-discovery">Stage 2: Parameter Search And Winner Discovery</h3>
+<p>Stage 2 searches the strategy parameter surface for candidates that are stronger than the baseline. The active config uses Top-K per regime, a max combination budget, and Optuna family-size-aware budgeting.</p>
+<p>Code anchors:</p>
+<ul>
+<li>Stage 2 tuning: <code>pm_pipeline.py:2004</code>, <code>pm_pipeline.py:2084</code></li>
+<li>Optuna objective: <code>pm_optuna.py:607</code></li>
+<li>global SL/TP grids and strategy registry: <code>pm_strategies.py:91</code>, <code>pm_strategies.py:3832</code></li>
+</ul>
+<p>Stage 2 answers:</p>
+<ul>
+<li>which parameterized strategy is strongest for this symbol/timeframe/regime?</li>
+<li>does the optimized candidate pass validation gates?</li>
+<li>should the regime receive a tradeable winner or an explicit <code>NO_TRADE</code> marker?</li>
+</ul>
+<h3 id="stage-3-governance-risk-management-selection">Stage 3: Governance / Risk-Management Selection</h3>
+<p>After a strategy winner exists, the pipeline can select a local order-governance/risk-management policy. With <code>risk_management_selection_stage = "stage3"</code>, the current active workflow uses the freshest tail surface copied into <code>stage3_features_by_tf</code>.</p>
+<p>This is a deviation checkpoint: Stage 3 is a post-winner governance selection step, but in active mode it is not a fully independent third holdout universe.</p>
+<p>Code anchors:</p>
+<ul>
+<li>Stage 3 feature surface: <code>pm_pipeline.py:3501</code></li>
+<li>governance selection stage routing: <code>pm_pipeline.py:3548</code></li>
+<li>governance policy implementation: <code>pm_order_governance.py:184</code></li>
+</ul>
+<h3 id="backtest-and-scoring-semantics">Backtest And Scoring Semantics</h3>
+<p>Backtester behavior:</p>
+<ul>
+<li>previous closed-bar signal</li>
+<li>next-bar open entry</li>
+<li>spread/slippage/commission modeling</li>
+<li>broker-aware tick/pip sizing</li>
+<li>Numba-compatible semantics</li>
+<li>live-only regime TP overlay disabled during discovery</li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li>backtester entry: <code>pm_core.py:3737</code></li>
+<li>signal validation and backtest loop: <code>pm_core.py:3773</code></li>
+<li><code>build_trade_intent(..., apply_regime_tp_multiplier=False)</code>: <code>pm_core.py:3891</code></li>
+<li>metrics output: <code>pm_core.py:4538</code></li>
+<li>FX scorer: <code>pm_core.py:4796</code>, <code>pm_core.py:4934</code>, <code>pm_core.py:4941</code></li>
+</ul>
+<p>Primary metrics:</p>
+<ul>
+<li><code>total_pnl</code></li>
+<li><code>total_return_pct</code></li>
+<li><code>profit_factor</code></li>
+<li><code>max_drawdown_pct</code></li>
+<li><code>expectancy_pips</code></li>
+<li><code>sharpe_ratio</code></li>
+<li><code>sortino_ratio</code></li>
+<li><code>calmar_ratio</code></li>
+<li><code>mean_r</code></li>
+<li><code>worst_5pct_r</code></li>
+<li>streak and duration metrics</li>
+</ul>
+<h3 id="validation-gates">Validation Gates</h3>
+<p>The active regime winner path applies gates around:</p>
+<ul>
+<li>minimum train trades</li>
+<li>minimum validation trades</li>
+<li>validation drawdown</li>
+<li>train drawdown</li>
+<li>return/drawdown ratio</li>
+<li>profit factor</li>
+<li>return floor</li>
+<li>DSR-adjusted Sharpe scoring</li>
+<li>robustness ratio</li>
+<li>weak-train exceptional validation rescue</li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li>candidate gates: <code>pm_pipeline.py:2420</code>, <code>pm_pipeline.py:2438</code>, <code>pm_pipeline.py:2452</code>, <code>pm_pipeline.py:2460</code>, <code>pm_pipeline.py:2493</code></li>
+<li>final validation: <code>pm_pipeline.py:2598</code>, <code>pm_pipeline.py:2640</code>, <code>pm_pipeline.py:2655</code>, <code>pm_pipeline.py:2698</code>, <code>pm_pipeline.py:2708</code>, <code>pm_pipeline.py:2719</code></li>
+<li>persisted validation evidence: <code>pm_pipeline.py:2737</code></li>
+</ul>
+<h3 id="discovery-outputs">Discovery Outputs</h3>
+<p>Each saved winner artifact can include:</p>
+<ul>
+<li>symbol-level config</li>
+<li>regime configs per timeframe</li>
+<li>default winner</li>
+<li>explicit <code>NO_TRADE</code> markers</li>
+<li>metrics</li>
+<li>validation evidence</li>
+<li>data window metadata</li>
+<li>historical stress audit</li>
+<li>governance policy</li>
+<li>live observability</li>
+<li>artifact contract metadata</li>
+<li>expiry / <code>valid_until</code></li>
+</ul>
+<p>Primary file:</p>
+<ul>
+<li><code>pm_configs_high_risk.json</code> unless overridden by <code>winner_ledger_path</code></li>
+</ul>
+<p>Additional output:</p>
+<ul>
+<li><code>pm_outputs/optimization_summary.csv</code></li>
+</ul>
+<h3 id="discovery-deviation-checkpoints">Discovery Deviation Checkpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Expected narrative</th>
+<th>Actual checkpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&ldquo;Stage 1 is Top-K.&rdquo;</td>
+<td>Stage 1 is baseline eligibility; Top-K belongs primarily to Stage 2.</td>
+</tr>
+<tr>
+<td>&ldquo;Stage 2 is a classical independent validation split.&rdquo;</td>
+<td>Active workflow is freshness-weighted; Stage 2 uses newest subset of the active universe.</td>
+</tr>
+<tr>
+<td>&ldquo;Stage 3 is an independent final holdout.&rdquo;</td>
+<td>In active mode, Stage 3 governance uses the fresh selection surface copy, not a separate holdout.</td>
+</tr>
+<tr>
+<td>&ldquo;use_regime_optimization can disable regime path.&rdquo;</td>
+<td>Production always instantiates <code>RegimeOptimizer</code>; legacy selector classes remain but are not the production path.</td>
+</tr>
+<tr>
+<td>&ldquo;A configured symbol means tradeable.&rdquo;</td>
+<td>A symbol may be validated but contain only <code>NO_TRADE</code> markers or no tradeable regime winner.</td>
+</tr>
+<tr>
+<td>&ldquo;Discovery uses live regime TP multipliers.&rdquo;</td>
+<td>Discovery disables live-only regime TP overlay.</td>
+</tr>
+<tr>
+<td>&ldquo;Historical stress audit selects winners.&rdquo;</td>
+<td>It attaches audit evidence; it is not the primary selector.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="8-pipeline-d-winner-ledger-artifact-drift-and-retrain-lifecycle">8. Pipeline D: Winner Ledger, Artifact Drift, And Retrain Lifecycle</h2>
+<h3 id="purpose_1">Purpose</h3>
+<p>This pipeline decides whether saved winners are still valid enough to use, whether optimization should run again, and whether live trading is allowed to use a saved artifact.</p>
+<h3 id="inputs_3">Inputs</h3>
+<ul>
+<li>active winner ledger</li>
+<li>current artifact contract</li>
+<li><code>valid_until</code></li>
+<li>production retrain schedule</li>
+<li>current config and regime param file metadata</li>
+</ul>
+<h3 id="validity-rules">Validity Rules</h3>
+<p>A raw config is valid only if:</p>
+<ul>
+<li>it exists in the ledger</li>
+<li><code>is_validated = true</code></li>
+<li><code>valid_until</code> exists</li>
+<li>current time is before <code>valid_until</code></li>
+</ul>
+<p>Code anchor:</p>
+<ul>
+<li><code>has_valid_config()</code>: <code>pm_pipeline.py:423</code></li>
+</ul>
+<p>Optimization is needed when:</p>
+<ul>
+<li>overwrite is enabled</li>
+<li>config is missing</li>
+<li>config is invalid</li>
+<li>config is expired</li>
+<li>artifact fingerprint changed</li>
+<li>regime parameter version changed</li>
+</ul>
+<p>Code anchor:</p>
+<ul>
+<li><code>should_optimize()</code>: <code>pm_pipeline.py:455</code></li>
+</ul>
+<h3 id="artifact-contract">Artifact Contract</h3>
+<p><code>build_artifact_meta()</code> fingerprints the semantic contract behind winners. This includes:</p>
+<ul>
+<li>pipeline artifact version</li>
+<li>feature cache version</li>
+<li>split contract</li>
+<li>workflow mode and bar counts</li>
+<li>scoring mode</li>
+<li>retrain schedule</li>
+<li>governance/risk settings</li>
+<li>risk-management selection stage</li>
+<li>exit-surface contract</li>
+<li>regime params fingerprint</li>
+<li>strategy surface hash</li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li>artifact meta: <code>pm_pipeline.py:136</code></li>
+<li>contract match ignoring volatile metadata: <code>pm_pipeline.py:184</code></li>
+</ul>
+<p>Practical meaning:</p>
+<blockquote>
+<p>If the system&rsquo;s research/execution contract changes, old winners may be due for optimization even if their date has not expired.</p>
+</blockquote>
+<h3 id="retrain-schedule">Retrain Schedule</h3>
+<p>The current profile is <code>production_retrain_mode = notify</code>. This means:</p>
+<ul>
+<li>due retrain logs a warning</li>
+<li>it does not block the PM by itself</li>
+<li>it does not auto-run optimization</li>
+<li>it tells the operator to run <code>python pm_main.py --optimize --config config.json</code></li>
+</ul>
+<p>If mode is <code>auto</code>, the app fetches data, retrains needed symbols, invalidates runtime caches, and marks storage optimization completion.</p>
+<p>Code anchors:</p>
+<ul>
+<li>schedule math: <code>pm_core.py:1191</code></li>
+<li>retrain check: <code>pm_main.py:4964</code></li>
+<li>notify branch: <code>pm_main.py:4980</code></li>
+<li>auto branch: <code>pm_main.py:4991</code></li>
+</ul>
+<h3 id="live-eligibility">Live Eligibility</h3>
+<p>Live eligibility is stricter than raw validation. It blocks or excludes configs when:</p>
+<ul>
+<li>not validated</li>
+<li>missing expiry</li>
+<li>expired</li>
+<li>no tradeable regime winners</li>
+<li>default/symbol config is <code>NO_TRADE</code></li>
+<li>artifact drift exists and policy is <code>block</code></li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li>live eligibility reason: <code>pm_pipeline.py:4064</code></li>
+<li>live eligibility collector: <code>pm_pipeline.py:4099</code></li>
+</ul>
+<p>Policy behavior:</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Live behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>block</code></td>
+<td>Artifact drift blocks live eligibility.</td>
+</tr>
+<tr>
+<td><code>warn</code></td>
+<td>Artifact drift logs a live warning but allows trading.</td>
+</tr>
+<tr>
+<td><code>ignore</code></td>
+<td>Artifact drift live gate is suppressed.</td>
+</tr>
+</tbody>
+</table>
+<p>Current local profile is <code>warn</code>, so artifact drift is advisory for live eligibility, but it still makes symbols due for optimization.</p>
+<h3 id="advisory-versus-blocking">Advisory Versus Blocking</h3>
+<p>Advisory examples:</p>
+<ul>
+<li>retrain due when <code>production_retrain_mode = notify</code></li>
+<li>artifact drift when <code>live_artifact_drift_policy = warn</code></li>
+<li>storage pressure unless <code>storage_pause_entries_below_free_gb</code> is set</li>
+<li>storage cleanup when <code>storage_observe_only = true</code></li>
+<li>daily/session loss advisory logs</li>
+<li>live drift monitor warnings</li>
+<li>lot-normalization drift that stays under hard cap</li>
+</ul>
+<p>Blocking examples:</p>
+<ul>
+<li>expired or invalid config</li>
+<li>no live-eligible configs and no open positions</li>
+<li>artifact drift when policy is <code>block</code></li>
+<li>missing account/position snapshot</li>
+<li>margin block/reopen cooldown</li>
+<li>spread filter</li>
+<li>invalid tick/stops/loss calculation</li>
+<li>actual risk above hard cap</li>
+<li>insufficient free margin</li>
+<li>broker order preflight failure</li>
+</ul>
+<h3 id="state-outputs">State Outputs</h3>
+<ul>
+<li><code>pm_configs_high_risk.json</code></li>
+<li><code>pm_outputs/storage_state.json</code></li>
+<li><code>pm_outputs/storage_manifest.jsonl</code></li>
+<li><code>last_trade_log.json</code></li>
+<li><code>last_actionable_log.json</code></li>
+<li><code>pm_outputs/signal_ledger_YYYYMM.jsonl</code></li>
+</ul>
+<h3 id="deviation-checkpoints_2">Deviation Checkpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Expected narrative</th>
+<th>Actual checkpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&ldquo;Retrain due blocks PM.&rdquo;</td>
+<td>In <code>notify</code> mode it logs only; expired configs/live eligibility can still block new entries separately.</td>
+</tr>
+<tr>
+<td>&ldquo;Raw validated configs are live configs.&rdquo;</td>
+<td>Live eligibility is stricter than raw validation.</td>
+</tr>
+<tr>
+<td>&ldquo;Artifact drift always blocks.&rdquo;</td>
+<td>It depends on <code>live_artifact_drift_policy</code>; current local profile is <code>warn</code>.</td>
+</tr>
+<tr>
+<td>&ldquo;Ledger complete means all symbols trade.&rdquo;</td>
+<td>Ledger can contain <code>NO_TRADE</code>, expired, drifted, or no-winner configs.</td>
+</tr>
+<tr>
+<td>&ldquo;Status only reports optimization.&rdquo;</td>
+<td>Status separates valid, live eligible, expired, invalid, and due.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="9-pipeline-e-live-trading-runtime">9. Pipeline E: Live Trading Runtime</h2>
+<h3 id="purpose_2">Purpose</h3>
+<p>The live runtime answers:</p>
+<blockquote>
+<p>Given the current broker state and the current closed bar, is there an exact validated winner that produces an actionable signal, and can it be executed safely now?</p>
+</blockquote>
+<h3 id="startup-inputs">Startup Inputs</h3>
+<ul>
+<li>active winner ledger</li>
+<li>live-eligible configs</li>
+<li>MT5 connection</li>
+<li>broker symbol metadata</li>
+<li>account info</li>
+<li>open positions</li>
+<li>position config</li>
+<li>storage manager</li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li><code>run_trading()</code>: <code>pm_main.py:5083</code></li>
+<li>live eligibility at startup: <code>pm_main.py:5118</code></li>
+<li>management-only mode if open positions exist but no entry configs: <code>pm_main.py:5120</code></li>
+<li>live trader creation: <code>pm_main.py:5135</code></li>
+</ul>
+<h3 id="bar-gated-runtime-loop">Bar-Gated Runtime Loop</h3>
+<p>Default live mode is <code>bar</code>. The loop polls MT5 for changed bar timestamps and processes only affected symbol/timeframe branches.</p>
+<p>Code anchors:</p>
+<ul>
+<li>trigger normalization: <code>pm_main.py:5146</code></li>
+<li>main loop: <code>pm_main.py:5202</code></li>
+<li>changed-bar probe: <code>pm_main.py:1318</code></li>
+<li>commit probe times only after successful processing: <code>pm_main.py:1383</code></li>
+</ul>
+<p>Practical result:</p>
+<ul>
+<li>no changed bar means no new signal evaluation</li>
+<li>margin/governance can still run as runtime-only safety work</li>
+<li>poll interval is CPU idle behavior, not signal timing logic</li>
+</ul>
+<h3 id="per-sweep-safety">Per-Sweep Safety</h3>
+<p>Each sweep:</p>
+<ul>
+<li>takes position snapshot</li>
+<li>takes account snapshot</li>
+<li>fails closed if snapshots are unavailable</li>
+<li>blocks non-tradable account states</li>
+<li>runs margin protection</li>
+<li>runs local order governance</li>
+<li>then evaluates entry signals</li>
+</ul>
+<p>Code anchor:</p>
+<ul>
+<li><code>process_all_symbols()</code>: <code>pm_main.py:1450</code></li>
+</ul>
+<h3 id="candidate-selection">Candidate Selection</h3>
+<p>For each symbol:</p>
+<ol>
+<li>Resolve broker symbol.</li>
+<li>Recover/infer existing position timeframe and regime context.</li>
+<li>Enforce same-symbol position rules.</li>
+<li>Load live bars.</li>
+<li>Use the last closed bar.</li>
+<li>Read <code>REGIME_LIVE</code> and <code>REGIME_STRENGTH_LIVE</code>.</li>
+<li>Require exact validated winner for <code>(timeframe, regime)</code>.</li>
+<li>Apply live quality gates.</li>
+<li>Generate signal from the selected strategy.</li>
+<li>Rank candidates by live context quality.</li>
+</ol>
+<p>Code anchors:</p>
+<ul>
+<li>symbol processing: <code>pm_main.py:2745</code></li>
+<li>candidate evaluation: <code>pm_main.py:3160</code></li>
+<li>exact winner requirement: <code>pm_main.py:3311</code></li>
+<li>live gates: <code>pm_main.py:3349</code></li>
+<li>candidate rank: <code>pm_main.py:3379</code></li>
+</ul>
+<h3 id="trade-intent">Trade Intent</h3>
+<p>The selected candidate builds a typed <code>TradeIntent</code> with:</p>
+<ul>
+<li>symbol</li>
+<li>timeframe</li>
+<li>regime</li>
+<li>signal</li>
+<li>SL pips</li>
+<li>TP pips</li>
+<li>score context</li>
+<li>governance hint</li>
+<li>bar metadata</li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li>trade intent build in live path: <code>pm_main.py:3077</code></li>
+<li><code>BaseStrategy.build_trade_intent()</code>: <code>pm_strategies.py:597</code></li>
+<li>optional live TP overlay: <code>pm_strategies.py:622</code></li>
+</ul>
+<p>Important current contract:</p>
+<ul>
+<li>discovery disables live-only regime TP overlay</li>
+<li>live can apply the overlay only if non-neutral values are configured</li>
+<li>current multipliers are all <code>1.0</code></li>
+</ul>
+<h3 id="entry-gates">Entry Gates</h3>
+<p>Before an order is sent, <code>_execute_entry()</code> checks:</p>
+<ul>
+<li>storage pressure</li>
+<li>order rate limit</li>
+<li>fresh duplicate/same-symbol position state</li>
+<li>symbol visibility/trade mode</li>
+<li>account and margin state</li>
+<li>margin reopen/cooldown</li>
+<li>tick availability</li>
+<li>spread filter</li>
+<li>stop distances</li>
+<li>risk scalar mode</li>
+<li>secondary risk adjustments</li>
+<li>minimum risk</li>
+<li>broker volume min/max/step</li>
+<li>MT5/tick/pip stop-loss math</li>
+<li>lot-normalization drift</li>
+<li>same-symbol combined risk</li>
+<li>required margin versus free margin</li>
+<li>final quote refresh</li>
+<li>final risk and margin recheck</li>
+<li>MT5 <code>order_check</code></li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li>entry start/action logging: <code>pm_main.py:3542</code></li>
+<li>position state and symbol checks: <code>pm_main.py:3680</code>, <code>pm_main.py:3698</code></li>
+<li>margin gates: <code>pm_main.py:3869</code></li>
+<li>spread overlay: <code>pm_main.py:3949</code></li>
+<li>sizing/risk: <code>pm_main.py:4017</code></li>
+<li>actual risk hard cap: <code>pm_main.py:4281</code></li>
+<li>required margin: <code>pm_main.py:4334</code></li>
+<li>final quote refresh: <code>pm_main.py:4425</code></li>
+<li>order send: <code>pm_main.py:4633</code></li>
+<li>MT5 order preflight: <code>pm_mt5.py:706</code></li>
+</ul>
+<h3 id="position-management">Position Management</h3>
+<p>Live runtime also manages open positions:</p>
+<ul>
+<li>optional close-on-opposite-signal behavior</li>
+<li>margin protection states: <code>NORMAL</code>, <code>BLOCKED</code>, <code>RECOVERY</code>, <code>PANIC</code></li>
+<li>forced loser closes during margin stress</li>
+<li>margin reopen cooldown</li>
+<li>local governance policies such as breakeven and ATR trails</li>
+<li>shadow or active governance depending on config</li>
+</ul>
+<p>Code anchors:</p>
+<ul>
+<li>close-on-opposite: <code>pm_main.py:3120</code>, <code>pm_main.py:4727</code></li>
+<li>margin protection: <code>pm_main.py:2577</code>, <code>pm_main.py:2622</code></li>
+<li>governance loop: <code>pm_main.py:1697</code>, <code>pm_main.py:1733</code></li>
+<li>governance policy code: <code>pm_order_governance.py:184</code></li>
+</ul>
+<h3 id="live-outputs">Live Outputs</h3>
+<ul>
+<li>real MT5 order or paper order log</li>
+<li>no-action/no-signal reason</li>
+<li>blocked/skipped reason</li>
+<li>decision throttle state</li>
+<li>actionable state</li>
+<li>monthly signal ledger</li>
+<li>PM log</li>
+<li>optional shutdown trade JSON</li>
+</ul>
+<h3 id="live-deviation-checkpoints">Live Deviation Checkpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Expected narrative</th>
+<th>Actual checkpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&ldquo;Validated winner means trade.&rdquo;</td>
+<td>Winner must match live symbol/timeframe/regime and produce signal on last closed bar.</td>
+</tr>
+<tr>
+<td>&ldquo;Spread filter is only informational.&rdquo;</td>
+<td>Spread filter can block entries.</td>
+</tr>
+<tr>
+<td>&ldquo;Broker universe misses are fatal.&rdquo;</td>
+<td>Missing broker symbols fail that symbol path but do not remove it from config. Recent log noise is debug-only for bar fetch misses.</td>
+</tr>
+<tr>
+<td>&ldquo;Paper/live use same decision path.&rdquo;</td>
+<td>Paper skips broker order send but still goes through most selection and risk logic.</td>
+</tr>
+<tr>
+<td>&ldquo;Final price is the same as signal price.&rdquo;</td>
+<td>Final quote refresh re-anchors price, stops, risk, and margin before submit.</td>
+</tr>
+<tr>
+<td>&ldquo;Governance is shadow.&rdquo;</td>
+<td>Current local config says governance live mode is <code>on</code>.</td>
+</tr>
+<tr>
+<td>&ldquo;Daily/session loss advisory stops entries.&rdquo;</td>
+<td>It is advisory unless implemented as a blocking policy.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="10-pipeline-f-observability-and-human-review">10. Pipeline F: Observability And Human Review</h2>
+<h3 id="primary-surfaces">Primary Surfaces</h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>logs/pm_YYYYMMDD.log</code></td>
+<td>Full runtime history and warnings.</td>
+</tr>
+<tr>
+<td><code>python pm_main.py --status</code></td>
+<td>Valid/live/due/blocked status summary.</td>
+</tr>
+<tr>
+<td><code>pm_configs_high_risk.json</code></td>
+<td>Winner artifacts, validation evidence, expiry, ledger status.</td>
+</tr>
+<tr>
+<td><code>last_actionable_log.json</code></td>
+<td>Latest actionable/no-action decision state.</td>
+</tr>
+<tr>
+<td><code>last_trade_log.json</code></td>
+<td>Decision throttle state to prevent duplicate actions.</td>
+</tr>
+<tr>
+<td><code>pm_outputs/signal_ledger_YYYYMM.jsonl</code></td>
+<td>Monthly actionable decision ledger.</td>
+</tr>
+<tr>
+<td><code>pm_outputs/storage_state.json</code></td>
+<td>Storage sweep/housekeeping freshness and pressure.</td>
+</tr>
+<tr>
+<td>dashboard</td>
+<td>Operator overview, readiness, strategies, trades, analytics.</td>
+</tr>
+</tbody>
+</table>
+<p>Code anchors:</p>
+<ul>
+<li>actionable logging: <code>pm_main.py:3634</code></li>
+<li>throttle state: <code>pm_main.py:351</code></li>
+<li>actionable cache: <code>pm_main.py:580</code></li>
+<li>signal ledger: <code>pm_storage.py:133</code>, <code>pm_storage.py:205</code></li>
+<li>storage freshness: <code>pm_storage.py:528</code></li>
+<li>PM status: <code>pm_pipeline.py:4280</code></li>
+<li>dashboard readiness: <code>pm_dashboard/app.py:536</code></li>
+</ul>
+<h3 id="what-to-watch-daily">What To Watch Daily</h3>
+<ul>
+<li>no live-eligible configs</li>
+<li>retrain due warnings</li>
+<li>artifact drift warnings/blocks</li>
+<li>repeated <code>NO_ACTIONABLE</code> by symbol/regime</li>
+<li>repeated spread blocks</li>
+<li>repeated margin blocks</li>
+<li>repeated broker symbol misses</li>
+<li>skipped risk due to min lot or hard cap</li>
+<li>stale storage state</li>
+<li>open-position management-only mode</li>
+</ul>
+<h3 id="what-to-watch-weekly">What To Watch Weekly</h3>
+<ul>
+<li>live eligibility count versus configured symbol count</li>
+<li>due symbols count</li>
+<li>missing symbols in <code>ledger_status</code></li>
+<li>validation evidence quality</li>
+<li>live-vs-validation drift</li>
+<li>repeated no-winner regimes</li>
+<li>historical audit fragility</li>
+<li>governance policy performance and mode</li>
+<li>config values that have drifted from docs or intention</li>
+</ul>
+<hr>
+<h2 id="11-practical-success-matrix">11. Practical Success Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Goal</th>
+<th>Input required</th>
+<th>Transform</th>
+<th>Desired output</th>
+<th>Deviation signal</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Current-market relevance</td>
+<td>latest M5 data</td>
+<td>active recent workflow</td>
+<td>winners based on recent active universe</td>
+<td>old data dominating selection, stale source metadata</td>
+</tr>
+<tr>
+<td>Fair baseline competition</td>
+<td>neutral strategy defaults</td>
+<td>Stage 1 baseline screen</td>
+<td>no strategy advantaged by default SL/TP asymmetry</td>
+<td>non-neutral defaults, hidden floors, live overlay in discovery</td>
+</tr>
+<tr>
+<td>Robust strategy selection</td>
+<td>enough active data and regimes</td>
+<td>Stage 2 tuning and validation</td>
+<td>validated winner per tradeable regime</td>
+<td>low trades, high DD, weak PF, poor robustness</td>
+</tr>
+<tr>
+<td>Broker-executable live trading</td>
+<td>MT5 symbols, specs, account, ticks</td>
+<td>live gates and preflight</td>
+<td>order accepted or clear block reason</td>
+<td>symbol missing, invalid stops, min-lot risk drift, margin failure</td>
+</tr>
+<tr>
+<td>Risk containment</td>
+<td>position config and broker account</td>
+<td>sizing, hard cap, margin checks</td>
+<td>risk within target/cap</td>
+<td><code>SKIPPED_RISK_CAP</code>, <code>BLOCKED_MIN_LOT_EXCEEDS_CAP</code>, margin blocks</td>
+</tr>
+<tr>
+<td>Explainable no-trade</td>
+<td>decision and logging surfaces</td>
+<td>throttled action records</td>
+<td>clear reason for no action</td>
+<td>silence, missing actionable record, repeated vague logs</td>
+</tr>
+<tr>
+<td>Operational continuity</td>
+<td>winner ledger and retrain schedule</td>
+<td>validity/drift checks</td>
+<td>live-eligible configs or retrain instruction</td>
+<td>expired configs, artifact drift, incomplete ledger</td>
+</tr>
+<tr>
+<td>Human confidence</td>
+<td>status, dashboard, logs, evidence</td>
+<td>observability loop</td>
+<td>operator can explain PM state</td>
+<td>docs/config mismatch, hidden mode changes, stale dashboards</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="12-critical-deviation-register">12. Critical Deviation Register</h2>
+<p>This section is the practical bridge between planned narrative and live reality.</p>
+<table>
+<thead>
+<tr>
+<th>Deviation</th>
+<th>Why it matters</th>
+<th>How to detect</th>
+<th>Current posture</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Docs say drift blocking, local config says drift warning</td>
+<td>Stale artifacts may still trade if policy is <code>warn</code></td>
+<td>check <code>config.json:79</code>, live logs for <code>LIVE WARN</code></td>
+<td>local <code>warn</code></td>
+</tr>
+<tr>
+<td>Docs say governance shadow, local config says on</td>
+<td>Broker SL/TP may be actively modified</td>
+<td>check <code>config.json:114</code>, governance logs</td>
+<td>local <code>on</code></td>
+</tr>
+<tr>
+<td>Stage 3 is named like a separate stage but uses fresh-tail surface copy</td>
+<td>May be mistaken for independent holdout validation</td>
+<td>inspect <code>pm_pipeline.py:3501</code>, <code>pm_pipeline.py:3548</code></td>
+<td>active workflow behavior</td>
+</tr>
+<tr>
+<td><code>use_regime_optimization</code> exists but production always uses <code>RegimeOptimizer</code></td>
+<td>Config knob can create false expectation</td>
+<td>inspect <code>pm_pipeline.py:2925</code>, <code>pm_pipeline.py:2930</code></td>
+<td>regime path active</td>
+</tr>
+<tr>
+<td>Legacy selector/validator classes still exist</td>
+<td>Readers can confuse dead/offline paths with production</td>
+<td>production pipeline comments and instantiation</td>
+<td>production bypasses legacy</td>
+</tr>
+<tr>
+<td><code>NO_TRADE</code> artifacts can be present in a valid ledger</td>
+<td>Configured does not mean tradeable</td>
+<td>status live-eligible count, no-trade metadata</td>
+<td>expected behavior</td>
+</tr>
+<tr>
+<td>Retrain warning does not block in <code>notify</code> mode</td>
+<td>Operator may assume PM stopped</td>
+<td>check logs and mode</td>
+<td>advisory only</td>
+</tr>
+<tr>
+<td>Artifact drift can still trigger optimization even if live warns only</td>
+<td>Optimize due and live eligibility are related but not identical</td>
+<td><code>should_optimize()</code> vs <code>get_live_eligible_configs()</code></td>
+<td>due can exist while live trades</td>
+</tr>
+<tr>
+<td>Live bar gate evaluates changed bars only</td>
+<td>No signal checks on unchanged bars</td>
+<td>bar trigger logs, changed bar probes</td>
+<td>expected behavior</td>
+</tr>
+<tr>
+<td>Broker symbol universe mismatch</td>
+<td>Symbols may remain in config but not trade at current broker</td>
+<td>MT5 spec sync failures, debug bar misses</td>
+<td>expected if broker lacks symbols</td>
+</tr>
+<tr>
+<td>Position risk config overrides pipeline risk</td>
+<td>Risk may not match research value</td>
+<td>resolved config summary, <code>position</code> section</td>
+<td>position authoritative</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="13-how-to-use-this-document">13. How To Use This Document</h2>
+<p>When the system behaves differently than expected, work through this sequence:</p>
+<ol>
+<li>
+<p>Identify the observed output.
+   Example: no trade, retrain warning, spread block, no live-eligible configs, or order rejection.</p>
+</li>
+<li>
+<p>Locate the pipeline that owns that output.
+   Discovery, live execution, state/retrain, or observability.</p>
+</li>
+<li>
+<p>Check the relevant input.
+   Config value, data freshness, winner ledger, MT5 symbol, account state, open positions, or broker tick.</p>
+</li>
+<li>
+<p>Check the transform stage.
+   Stage 1, Stage 2, live eligibility, bar gate, candidate selection, risk gates, or order preflight.</p>
+</li>
+<li>
+<p>Compare intended narrative with actual code/config.
+   Use the deviation register above.</p>
+</li>
+<li>
+<p>Decide whether the behavior is:
+   - correct and expected
+   - correct but poorly documented
+   - config drift
+   - code drift
+   - broker/environment constraint
+   - a real implementation bug</p>
+</li>
+</ol>
+<hr>
+<h2 id="14-minimal-operator-review-checklist">14. Minimal Operator Review Checklist</h2>
+<p>Before live trading:</p>
+<pre><code class="language-text">python pm_main.py --status --config config.json
+</code></pre>
+<p>Review:</p>
+<ul>
+<li><code>Valid</code> count</li>
+<li><code>Live eligible</code> count</li>
+<li><code>Need optimization</code></li>
+<li><code>Live artifact policy</code></li>
+<li>expired symbols</li>
+<li>blocked symbols</li>
+<li>missing symbols</li>
+<li><code>NO_TRADE</code> regimes</li>
+</ul>
+<p>Then inspect:</p>
+<ul>
+<li><code>config.json</code> for drift policy, governance mode, risk, and retrain mode</li>
+<li><code>pm_configs_high_risk.json</code> for <code>valid_until</code>, <code>artifact_meta</code>, <code>validation_evidence</code></li>
+<li><code>last_actionable_log.json</code> for latest decision reasons</li>
+<li><code>pm_outputs/signal_ledger_YYYYMM.jsonl</code> for repeated blocks</li>
+<li><code>logs/pm_YYYYMMDD.log</code> for broker/spec/margin/spread warnings</li>
+</ul>
+<p>If retrain is due:</p>
+<pre><code class="language-text">python pm_main.py --optimize --config config.json
+</code></pre>
+<p>If the research/execution contract changed substantially:</p>
+<pre><code class="language-text">python pm_main.py --optimize --overwrite --config config.json
+</code></pre>
+<p>Use overwrite with care because it intentionally ignores existing validity.</p>
+<hr>
+<h2 id="15-source-anchor-index">15. Source Anchor Index</h2>
+<p>Core architecture:</p>
+<ul>
+<li><code>pm_main.py:5380</code> - CLI and main entrypoint</li>
+<li><code>pm_main.py:4805</code> - app class</li>
+<li><code>pm_pipeline.py:3762</code> - <code>PortfolioManager</code></li>
+<li><code>pm_pipeline.py:2907</code> - <code>OptimizationPipeline</code></li>
+<li><code>pm_core.py:480</code> - <code>PipelineConfig</code></li>
+<li><code>pm_position.py:253</code> - <code>PositionConfig</code></li>
+</ul>
+<p>Discovery:</p>
+<ul>
+<li><code>pm_pipeline.py:3005</code> - load M5-derived timeframe data</li>
+<li><code>pm_core.py:3647</code> - active recent M5 workflow indices</li>
+<li><code>pm_pipeline.py:1698</code> - regime optimizer</li>
+<li><code>pm_pipeline.py:1939</code> - Stage 1 screen</li>
+<li><code>pm_pipeline.py:2004</code> - Stage 2 tuning</li>
+<li><code>pm_pipeline.py:2598</code> - final validation</li>
+<li><code>pm_pipeline.py:3081</code> - historical stress audit</li>
+<li><code>pm_pipeline.py:3148</code> - walk-forward audit attachment</li>
+</ul>
+<p>Scoring and exits:</p>
+<ul>
+<li><code>pm_core.py:3737</code> - backtester</li>
+<li><code>pm_core.py:3891</code> - discovery disables live-only TP overlay</li>
+<li><code>pm_core.py:4538</code> - metrics</li>
+<li><code>pm_core.py:4796</code> - FX selection score</li>
+<li><code>pm_strategies.py:577</code> - neutral default TP fallback</li>
+<li><code>pm_strategies.py:579</code> - symmetric minimum exit floor</li>
+<li><code>pm_strategies.py:597</code> - trade intent</li>
+</ul>
+<p>State and live eligibility:</p>
+<ul>
+<li><code>pm_pipeline.py:136</code> - artifact metadata</li>
+<li><code>pm_pipeline.py:184</code> - artifact contract match</li>
+<li><code>pm_pipeline.py:423</code> - raw validity</li>
+<li><code>pm_pipeline.py:455</code> - should optimize</li>
+<li><code>pm_pipeline.py:4064</code> - live eligibility reason</li>
+<li><code>pm_pipeline.py:4099</code> - live eligible configs</li>
+<li><code>pm_main.py:4964</code> - production retrain check</li>
+</ul>
+<p>Live:</p>
+<ul>
+<li><code>pm_main.py:5083</code> - run trading</li>
+<li><code>pm_main.py:5146</code> - live trigger mode</li>
+<li><code>pm_main.py:5202</code> - live loop</li>
+<li><code>pm_main.py:1450</code> - process all symbols</li>
+<li><code>pm_main.py:2745</code> - process symbol</li>
+<li><code>pm_main.py:3160</code> - candidate evaluation</li>
+<li><code>pm_main.py:3311</code> - exact winner requirement</li>
+<li><code>pm_main.py:3542</code> - entry execution</li>
+<li><code>pm_mt5.py:706</code> - MT5 order preflight/send</li>
+</ul>
+<p>Observability:</p>
+<ul>
+<li><code>pm_main.py:351</code> - decision throttle persistence</li>
+<li><code>pm_main.py:580</code> - actionable cache</li>
+<li><code>pm_storage.py:133</code> - signal ledger</li>
+<li><code>pm_storage.py:528</code> - storage freshness</li>
+<li><code>pm_pipeline.py:4280</code> - status report</li>
+<li><code>pm_dashboard/app.py:536</code> - dashboard readiness</li>
+</ul>
+    </article>
+  </main>
+</body>
+</html>

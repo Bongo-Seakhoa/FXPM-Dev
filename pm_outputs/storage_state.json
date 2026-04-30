@@ -1,16 +1,16 @@
 {
   "freshness": {
-    "as_of": "2026-04-29T00:55:32.726630",
+    "as_of": "2026-04-29T10:17:33.539401",
     "last_housekeeping_age_seconds": 0,
-    "last_housekeeping_at": "2026-04-29T00:55:32.665061",
+    "last_housekeeping_at": "2026-04-29T10:17:33.494883",
     "last_housekeeping_is_fresh": true,
-    "last_sweep_age_seconds": 7,
-    "last_sweep_at": "2026-04-29T00:55:24.814509",
+    "last_sweep_age_seconds": 123,
+    "last_sweep_at": "2026-04-29T10:15:30.081014",
     "last_sweep_is_fresh": true
   },
-  "last_free_gb": 3.15,
+  "last_free_gb": 0.39,
   "last_housekeeping": {
-    "free_gb": 3.15,
+    "free_gb": 0.39,
     "metaquotes": {},
     "observe_only": true,
     "pm_owned_cleanup": {
@@ -21,27 +21,27 @@
     },
     "pm_sizes": {
       "cache_dir_bytes": 667208587,
-      "data_dir_bytes": 2051910645,
-      "live_dir_bytes": 26278199,
-      "log_dir_bytes": 89278,
-      "output_dir_bytes": 816793
+      "data_dir_bytes": 2050624889,
+      "live_dir_bytes": 24992443,
+      "log_dir_bytes": 378112,
+      "output_dir_bytes": 838923
     },
-    "ran_at": "2026-04-29T00:55:32.665061",
+    "ran_at": "2026-04-29T10:17:33.494883",
     "trigger": "shutdown"
   },
   "last_optimization_at": "2026-04-27T15:42:26.146746",
   "last_sweep": {
-    "at": "2026-04-29T00:55:24.814509",
-    "free_gb": 3.15,
-    "live_equity": 4832.39,
-    "open_positions": 4,
-    "sweep_duration_seconds": 0.546,
+    "at": "2026-04-29T10:15:30.081014",
+    "free_gb": 0.39,
+    "live_equity": 4670.85,
+    "open_positions": 12,
+    "sweep_duration_seconds": 12.969,
     "symbol_count": 62
   },
-  "next_housekeep_at": "2026-04-29T00:55:31.418169",
-  "next_measure_at": "2026-04-29T01:00:09.573190",
-  "next_metaquotes_review_at": "2026-04-29T05:00:15.339540",
+  "next_housekeep_at": "2026-04-29T10:25:14.240949",
+  "next_measure_at": "2026-04-29T10:20:16.541774",
+  "next_metaquotes_review_at": "2026-04-29T11:00:39.449632",
   "order_governance": {},
   "pressure_level": "critical",
-  "state_updated_at": "2026-04-29T00:55:32.726630"
+  "state_updated_at": "2026-04-29T10:17:33.539401"
 }
