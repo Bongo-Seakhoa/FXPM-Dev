@@ -1,6 +1,8 @@
-# FX Portfolio Manager v3.1
+# FXPM-Dev
 
-FX Portfolio Manager is a production-focused automated trading system with regime-aware strategy selection, stateful optimization, Numba-accelerated backtesting, MetaTrader 5 execution, and a companion dashboard.
+FXPM-Dev is the development repository for FX Portfolio Manager, a production-focused automated trading system with regime-aware strategy selection, stateful optimization, Numba-accelerated backtesting, MetaTrader 5 execution, and a companion dashboard.
+
+The public repository/folder name is `FXPM-Dev`. The internal runtime banner currently remains `FX PORTFOLIO MANAGER v3.1`, and the repository changelog continues on the `1.4.x` track until a deliberate internal version bump is chosen.
 
 Archived audit and planning documents live in `documentation_archive/`.
 
@@ -10,6 +12,7 @@ Archived audit and planning documents live in `documentation_archive/`.
 
 - Primary run/setup guide: `SETUP_AND_RUN.md`
 - Settings reference: `SETTINGS_REFERENCE.md`
+- Config recommendation review: `best_config_reccomendations_gpt.html`
 - Change history: `CHANGELOG.md` and `PATCH_NOTES.md`
 - Dashboard guide: `pm_dashboard/README.md`
 - Margin protection policy: `README.md` (Risk Management -> Margin Protection)
@@ -46,13 +49,13 @@ Archived audit and planning documents live in `documentation_archive/`.
 The current PM:
 
 1. Detects one of 4 active market regimes: `TREND`, `RANGE`, `BREAKOUT`, `CHOP`
-2. Evaluates a 47-strategy pool across configured timeframes
+2. Evaluates a 50-strategy pool across configured timeframes
 3. Tunes shortlisted candidates with grid search and optional Optuna
 4. Uses the active recent M5 workflow for eligibility, optimization, and production selection
 5. Persists optimization state incrementally and atomically
 6. Trades only validated winners for the exact `(timeframe, regime)` live context
-7. Stores historical-stress audit, no-trade, and risk-management evidence on artifacts
-8. Uses MT5 contract math, broker metadata, margin protection, and spread-quality filters in live execution
+7. Stores historical-stress audit, walk-forward promotion, no-trade, and risk-management evidence on artifacts
+8. Uses fail-closed live readiness, hard-breakpoint supervision, cycle-drift monitoring, MT5 contract math, broker metadata, margin protection, and spread-quality filters in live execution
 
 The checked-in `config.json` is deployment-specific and currently reflects a high-risk low-balance profile. Treat it as the active repo configuration, not a universal recommendation.
 
@@ -63,7 +66,8 @@ The checked-in `config.json` is deployment-specific and currently reflects a hig
 ### Core facts
 
 - Runtime banner: `FX PORTFOLIO MANAGER v3.1`
-- Strategy pool: `47` registered strategies
+- Repository/folder name: `FXPM-Dev`
+- Strategy pool: `50` registered strategies
 - Active regime engine: score-based 4-regime detector in `pm_regime.py`
 - Active data workflow: latest `300,000` M5 bars, with oldest `50,000` as `historical_stress_audit` and newest `250,000` as the active universe
 - Live retrain model: calendar-anchored schedule from `config.json`
@@ -79,11 +83,18 @@ The checked-in `config.json` is deployment-specific and currently reflects a hig
 - Validation-aware regime Optuna scoring and signal-bar regime bucketing
 - Explicit `NO_TRADE` markers for evaluated no-winner regime slots
 - Historical stress audit metrics on winner artifacts
+- Walk-forward promotion status (`PROMOTED`, `PROMOTE_SMALL`, `PAPER_ONLY`, `NO_TRADE`, `BLOCKED`) on winner artifacts
 - Mandatory per-winner risk-management/governance policy evidence
+- Fail-closed live readiness before real trading starts
+- Hard-breakpoint institutional supervisor with persisted latch state
+- Lightweight cycle-drift sentinel for degraded live contexts
 - Live margin-protection pass before governance and new entries
 - MT5 symbol-resolution and order-preflight hardening
 - Spread-aware live execution overlay driven by config
-- 5 added strategies:
+- Recent strategy additions:
+  - `SessionVWAPReversionStrategy`
+  - `LiquiditySweepReversalStrategy`
+  - `RegimeTransitionBreakoutStrategy`
   - `VortexTrendStrategy`
   - `TRIXSignalStrategy`
   - `RelativeVigorIndexStrategy`
@@ -103,7 +114,7 @@ The checked-in `config.json` is deployment-specific and currently reflects a hig
 
 | Dimension | Typical Retail PM | Current FxPM |
 |---|---|---|
-| Strategy selection | one or a few fixed systems | 47-strategy competition across timeframes and regimes |
+| Strategy selection | one or a few fixed systems | 50-strategy competition across timeframes and regimes |
 | Market adaptation | static logic | regime-aware winner selection |
 | Data relevance | broad/stale history can dominate | newest 250k M5 active universe drives selection |
 | Optimization persistence | restart from scratch on interruption | atomic stateful ledger |
@@ -184,8 +195,13 @@ FX_Portfolio_Manager/
 |-- pm_pipeline.py            # Optimization pipeline, ledger, portfolio orchestration
 |-- pm_main.py                # CLI entrypoint and live trading loop
 |-- pm_mt5.py                 # MT5 connection, broker metadata, order handling
+|-- pm_live_readiness.py      # Fail-closed funded-live startup validation
+|-- pm_institutional_supervisor.py # Hard-breakpoint portfolio/account supervisor
+|-- pm_cycle_drift.py         # Lightweight live-cycle drift sentinel
+|-- pm_order_governance.py    # Post-selection order-governance policies
 |-- pm_position.py            # Position sizing and order-management helpers
 |-- pm_regime.py              # Active score-based regime detector
+|-- pm_regime_audit.py        # Regime profitability/boundary evidence
 |-- pm_regime_tuner.py        # Regime parameter optimization
 |-- pm_optuna.py              # Optuna integration
 |-- config.json               # Primary PM configuration
@@ -205,20 +221,22 @@ FX_Portfolio_Manager/
 3. The oldest 50,000 M5 bars are reserved for `historical_stress_audit`; the newest 250,000 M5 bars form the active universe.
 4. Stage 1 baseline eligibility runs across the full active 250,000 M5-bar universe. Stage 2 optimization/risk selection uses the newest half of that active universe with warmup context retained.
 5. `pm_regime.py` supplies causal regime labels; `pm_regime_tuner.py` can tune regime parameters.
-6. `pm_strategies.py` evaluates the 47-strategy pool across configured timeframes.
+6. `pm_strategies.py` evaluates the 50-strategy pool across configured timeframes.
 7. `pm_optuna.py` tunes shortlisted candidates; regime search uses validation bucket evidence where available.
-8. Validated winners, `NO_TRADE` markers, historical audit metrics, validation evidence, ledger-completion status, and governance/risk policy evidence are written atomically to the configured winner ledger (`pipeline.winner_ledger_path`; the shipped high-risk profile uses `pm_configs_high_risk.json`).
+8. Validated winners, `NO_TRADE` markers, promotion status, historical audit metrics, regime audit evidence, validation evidence, ledger-completion status, and governance/risk policy evidence are written atomically to the configured winner ledger (`pipeline.winner_ledger_path`; the shipped high-risk profile uses `pm_configs_high_risk.json`).
 
 ### Live trading flow
 
-1. `pm_main.py` loads `config.json`, the configured winner ledger, and MT5 broker metadata.
-2. The live loop is triggered by changed MT5 bar timestamps by default (`pipeline.live_loop_trigger_mode = "bar"`), then refreshes bars, computes features, and derives the active regime only when the broker/live data shows a new candle is available.
+1. `pm_main.py --trade` runs the live readiness gate before funded trading. The gate blocks real live startup when artifact-drift policy is not `"block"`, the winner ledger is unreadable/empty, there are no tradeable winners, or a previous institutional-supervisor hard block is still latched.
+2. `pm_main.py` loads `config.json`, the configured winner ledger, and MT5 broker metadata.
+3. The live loop is triggered by changed MT5 bar timestamps by default (`pipeline.live_loop_trigger_mode = "bar"`), then refreshes bars, computes features, and derives the active regime only when the broker/live data shows a new candle is available.
    It now does this through bounded timeframe-specific `.live/<symbol>_<TF>.csv` caches rather than rereading full canonical datasets on every sweep. If the local seed is too stale to bridge safely with a small delta, the PM re-seeds that cache from MT5 instead of carrying a discontinuous series forward.
-3. Only validated winners for the exact `(timeframe, regime)` combination are considered.
-4. Position sizing uses the configured `risk_basis` (`balance` or `equity`), broker contract math, spread-quality filters, broker lot constraints, and optional live risk scalars only when they are explicitly enabled in config.
-5. Existing MT5 positions are reclassified through comment, magic, and opening-metadata recovery before same-symbol secondary-trade rules are applied.
-6. Same-symbol exposure checks are based on live open-position geometry (`entry`, `SL`, `volume`) first and use comment metadata only as a fallback.
-7. Orders are placed through `pm_mt5.py`, while decisions and outcomes are written to `logs/` and `pm_outputs/`.
+4. Only validated winners for the exact `(timeframe, regime)` combination are considered. `BLOCKED`, `PAPER_ONLY`, and `NO_TRADE` winners are skipped; `PROMOTE_SMALL` winners remain eligible with the configured risk multiplier.
+5. Position sizing uses the configured `risk_basis` (`balance` or `equity`), broker contract math, promotion/risk scalars, spread-quality filters, broker lot constraints, and optional live risk scalars only when they are explicitly enabled in config.
+6. Existing MT5 positions are reclassified through comment, magic, and opening-metadata recovery before same-symbol secondary-trade rules are applied.
+7. Same-symbol exposure checks are based on live open-position geometry (`entry`, `SL`, `volume`) first and use comment metadata only as a fallback.
+8. The institutional supervisor and cycle-drift sentinel run before sizing finalization and again after the final quote refresh, so portfolio/account hard breaks and degraded execution context can block before order send.
+9. Orders are placed through `pm_mt5.py`, while decisions and outcomes are written to `logs/` and `pm_outputs/`.
 
 ---
 
@@ -313,6 +331,15 @@ python pm_main.py --trade
     "production_retrain_time": "00:01",
     "production_retrain_anchor_date": "2026-03-29",
     "winner_ledger_path": "pm_configs_high_risk.json",
+    "live_artifact_drift_policy": "block",
+    "institutional_supervisor_enabled": true,
+    "institutional_supervisor_mode": "circuit_breaker",
+    "hard_block_reopen_mode": "manual_or_next_cycle",
+    "cycle_drift_monitor_enabled": true,
+    "cycle_drift_mode": "lightweight",
+    "walk_forward_audit_enabled": true,
+    "walk_forward_promotion_policy": "block_severe_only",
+    "promote_small_risk_multiplier": 0.5,
     "local_governance_tournament_enabled": true,
     "local_governance_live_mode": "shadow",
     "live_risk_scalars_mode": "shadow",
@@ -340,6 +367,7 @@ python pm_main.py --trade
 - `risk_management_selection_stage = "stage3"` means governance/risk policies are selected on the newest Stage 2 selection surface. Setting it to `"stage2"` evaluates policies on the active optimization universe instead.
 - `logs/` is not controlled by `pipeline.output_dir`; runtime logs always go to the root `logs/` folder.
 - `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.discovery_risk_per_trade_pct` is the fixed discovery/backtest sizing value, while `pipeline.risk_per_trade_pct` only remains as a compatibility backfill when the `position` key is absent.
+- `PROMOTE_SMALL` winners are live-eligible but derated by `pipeline.promote_small_risk_multiplier`; `BLOCKED`, `PAPER_ONLY`, and `NO_TRADE` winners are not live-tradeable.
 - `live_risk_scalars_mode = "shadow"` records would-be risk-scalar changes but does not alter live sizing.
 - `pipeline.production_retrain_mode` supports `auto`, `notify`, and `off`.
 - `pipeline.execution_spread_spike_mult` is the live spread-spike blocker threshold.
@@ -350,19 +378,19 @@ For full key-by-key details, see [SETTINGS_REFERENCE.md](SETTINGS_REFERENCE.md).
 
 ## Strategy Pool
 
-The registry currently groups the 47 strategies into 3 operational families:
+The registry currently groups the 50 strategies into 3 operational families:
 
 ### Trend (`18`)
 
 `EMACrossoverStrategy`, `SupertrendStrategy`, `MACDTrendStrategy`, `ADXTrendStrategy`, `IchimokuStrategy`, `HullMATrendStrategy`, `EMARibbonADXStrategy`, `AroonTrendStrategy`, `ADXDIStrengthStrategy`, `KeltnerPullbackStrategy`, `OBVDivergenceStrategy`, `EMAPullbackContinuationStrategy`, `ParabolicSARTrendStrategy`, `KaufmanAMATrendStrategy`, `VortexTrendStrategy`, `TRIXSignalStrategy`, `RelativeVigorIndexStrategy`, `VIDYABandTrendStrategy`
 
-### Mean Reversion (`17`)
+### Mean Reversion (`19`)
 
-`RSIExtremesStrategy`, `BollingerBounceStrategy`, `ZScoreMRStrategy`, `StochasticReversalStrategy`, `CCIReversalStrategy`, `WilliamsRStrategy`, `RSITrendFilteredMRStrategy`, `StochRSITrendGateStrategy`, `FisherTransformMRStrategy`, `ZScoreVWAPReversionStrategy`, `TurtleSoupReversalStrategy`, `PinBarReversalStrategy`, `EngulfingPatternStrategy`, `RSIDivergenceStrategy`, `MACDDivergenceStrategy`, `KeltnerFadeStrategy`, `ROCExhaustionReversalStrategy`
+`RSIExtremesStrategy`, `BollingerBounceStrategy`, `ZScoreMRStrategy`, `StochasticReversalStrategy`, `CCIReversalStrategy`, `WilliamsRStrategy`, `RSITrendFilteredMRStrategy`, `StochRSITrendGateStrategy`, `FisherTransformMRStrategy`, `ZScoreVWAPReversionStrategy`, `SessionVWAPReversionStrategy`, `LiquiditySweepReversalStrategy`, `TurtleSoupReversalStrategy`, `PinBarReversalStrategy`, `EngulfingPatternStrategy`, `RSIDivergenceStrategy`, `MACDDivergenceStrategy`, `KeltnerFadeStrategy`, `ROCExhaustionReversalStrategy`
 
-### Breakout (`12`)
+### Breakout (`13`)
 
-`DonchianBreakoutStrategy`, `VolatilityBreakoutStrategy`, `MomentumBurstStrategy`, `SqueezeBreakoutStrategy`, `KeltnerBreakoutStrategy`, `PivotBreakoutStrategy`, `MACDHistogramMomentumStrategy`, `InsideBarBreakoutStrategy`, `NarrowRangeBreakoutStrategy`, `VolumeSpikeMomentumStrategy`, `ATRPercentileBreakoutStrategy`, `ChoppinessCompressionBreakoutStrategy`
+`DonchianBreakoutStrategy`, `VolatilityBreakoutStrategy`, `MomentumBurstStrategy`, `SqueezeBreakoutStrategy`, `KeltnerBreakoutStrategy`, `PivotBreakoutStrategy`, `MACDHistogramMomentumStrategy`, `RegimeTransitionBreakoutStrategy`, `InsideBarBreakoutStrategy`, `NarrowRangeBreakoutStrategy`, `VolumeSpikeMomentumStrategy`, `ATRPercentileBreakoutStrategy`, `ChoppinessCompressionBreakoutStrategy`
 
 Live trading uses validated winners only. There is no production fallback to an unvalidated "best available" strategy.
 
@@ -420,6 +448,9 @@ The intended live precedence is:
 
 - Broker-aware min/max/step lot normalization
 - Auto-widen stop support for broker stop-distance constraints
+- Promotion-status gating: `BLOCKED`, `PAPER_ONLY`, and `NO_TRADE` are skipped; `PROMOTE_SMALL` applies `promote_small_risk_multiplier`
+- Institutional supervisor hard blocks for configured daily/session/weekly loss, open drawdown, and total open-risk breakpoints
+- Cycle-drift sentinel for severe consecutive local losses, execution slippage, and spread degradation
 - Spread-quality overlay:
   - weak edge rejection via `execution_spread_min_edge_mult`
   - spike blocking via `execution_spread_spike_mult`
@@ -446,10 +477,13 @@ Before deploying live:
 2. Confirm MT5 resolves and enables every intended broker symbol.
 3. Verify the configured winner ledger is current and due-state is understood via `python pm_main.py --status`.
    The status view now separates raw validated configs from live-eligible configs; expired configs and artifact-drifted configs are blocked when `live_artifact_drift_policy = "block"`.
-4. Review recent runtime logs in `logs/`.
-5. Confirm spread filter thresholds and risk settings match the intended operating profile.
-6. Confirm `pipeline.live_loop_trigger_mode` is `bar` for MT5 bar-gated live operation, or intentionally set to `scheduled` only if you want the legacy due-time fallback.
-7. Confirm the production retrain mode in `config.json` is what you actually want: `auto`, `notify`, or `off`.
+4. Confirm `logs/institutional_supervisor_state.json` is not latched from a previous hard block, unless the next retrain cycle has intentionally reopened it.
+5. Review recent runtime logs in `logs/`.
+6. Confirm spread filter thresholds and risk settings match the intended operating profile.
+7. Confirm `pipeline.live_loop_trigger_mode` is `bar` for MT5 bar-gated live operation, or intentionally set to `scheduled` only if you want the legacy due-time fallback.
+8. Confirm the production retrain mode in `config.json` is what you actually want: `auto`, `notify`, or `off`.
+
+`python pm_main.py --trade` returns exit code `2` when the funded-live readiness gate fails. Paper mode still runs so you can diagnose stale ledgers, promotion states, broker data, and latch files without sending orders.
 
 ---
 
@@ -616,8 +650,9 @@ Useful places to inspect:
 ## Versioning
 
 - Runtime/application banner: `v3.1`
+- Repository/folder name: `FXPM-Dev`
 - Repository release log: `CHANGELOG.md`
-- Current repository changelog entry: `1.4.8`
+- Current repository changelog entry: `1.4.10` unreleased
 
 ---
 

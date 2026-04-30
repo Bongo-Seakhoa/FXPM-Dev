@@ -3732,7 +3732,7 @@ class LiveTrader:
                 'regime_config': regime_config,
                 'eligibility_report': eligibility_report,
                 'promotion_status': str(getattr(regime_config, "promotion_status", "PROMOTED") or "PROMOTED"),
-                'promotion_risk_multiplier': 0.5
+                'promotion_risk_multiplier': float(getattr(self.pipeline_config, "promote_small_risk_multiplier", 0.5))
                 if str(getattr(regime_config, "promotion_status", "") or "").upper() == "PROMOTE_SMALL"
                 else 1.0,
                 'bar_time': str(features.index[-2]) if len(features) > 1 else '',

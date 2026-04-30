@@ -2,6 +2,12 @@
 Scope: Comprehensive change history for this repository.
 Status: Canonical patch note file (single source of truth).
 
+## 2026-05-01 - Documentation Cleanup and Config Recommendation Review
+- Removed the implemented v2 profitability-readiness blueprint from the active root documentation surface after code and integration signoff.
+- Kept archived audit/planning documents under `documentation_archive/` for traceability.
+- Added `best_config_reccomendations_gpt.html` as a separate GPT-authored review of the current `config.json` target settings.
+- Aligned active documentation with the `FXPM-Dev` repository/folder rename while keeping the internal runtime banner on `v3.1`.
+
 ## 2026-04-29 - Neutral Discovery Exit Surface
 - Reset Stage 1 strategy defaults to a neutral `2.0` ATR stop / `2.0` ATR take-profit across all registered strategies.
 - Made the fallback stop/target floor symmetric at `5.0` pips so the neutral baseline remains neutral even on tiny-ATR bars.
@@ -370,8 +376,8 @@ Source scope: full adoption of scoring-audit workstreams (A-F).
 - Full suite snapshot: `160 passed, 2 skipped`
 
 ## 2026-02-12 - Selective Non-Regressive Merge
-Target repo: `FxPM 1.4 - backup`  
-Source merged: `FxPM 1.4 - Obtimized` (selective merge)
+Historical target repo: `FxPM 1.4 - backup`
+Historical source merged: `FxPM 1.4 - Obtimized` (selective merge before the later `FXPM-Dev` rename)
 
 ### Summary
 - Preserved backup cache copy-safety and legacy compatibility paths.

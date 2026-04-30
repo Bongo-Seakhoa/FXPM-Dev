@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FxPM Practical Workflow Operating Model</title>
+  <title>FXPM-Dev Practical Workflow Operating Model</title>
   <style>
     :root {
       --bg: #f7f8fa;
@@ -146,7 +146,7 @@
       <p class="meta">Generated from <code>FXPM_WORKFLOW_OPERATING_MODEL.md</code> on 2026-04-29 08:21</p>
       <div class="toc">
 <ul>
-<li><a href="#fxpm-practical-workflow-operating-model">FxPM Practical Workflow Operating Model</a><ul>
+<li><a href="#fxpm-dev-practical-workflow-operating-model">FXPM-Dev Practical Workflow Operating Model</a><ul>
 <li><a href="#1-operating-thesis">1. Operating Thesis</a></li>
 <li><a href="#2-current-local-profile-snapshot">2. Current Local Profile Snapshot</a></li>
 <li><a href="#3-end-outcome-definition">3. End Outcome Definition</a><ul>
@@ -224,7 +224,7 @@
 </li>
 </ul>
 </div>
-<h1 id="fxpm-practical-workflow-operating-model">FxPM Practical Workflow Operating Model</h1>
+<h1 id="fxpm-dev-practical-workflow-operating-model">FXPM-Dev Practical Workflow Operating Model</h1>
 <p>Snapshot date: 2026-04-29</p>
 <p>This document explains how the current FxPM system functions as an operating workflow. It is not a full audit and it is not a setup guide. Its purpose is to make the practical machine visible:</p>
 <ul>
@@ -338,8 +338,8 @@
 </tr>
 <tr>
 <td>Live artifact drift</td>
-<td style="text-align: right;"><code>warn</code></td>
-<td>Drift warns in live eligibility but does not block live trading under current local profile.</td>
+<td style="text-align: right;"><code>block</code></td>
+<td>Stale artifact contracts fail live eligibility and funded-live readiness.</td>
 </tr>
 <tr>
 <td>Live loop trigger</td>
@@ -348,8 +348,8 @@
 </tr>
 <tr>
 <td>Governance live mode</td>
-<td style="text-align: right;"><code>on</code></td>
-<td>Selected local governance can actively modify open-trade SL/TP.</td>
+<td style="text-align: right;"><code>shadow</code></td>
+<td>Selected local governance is observable before broker-side SL/TP changes are made authoritative.</td>
 </tr>
 <tr>
 <td>Risk-management selection stage</td>
@@ -358,8 +358,18 @@
 </tr>
 <tr>
 <td>Walk-forward audit</td>
-<td style="text-align: right;"><code>false</code></td>
-<td>Walk-forward audit is not an active promotion gate.</td>
+<td style="text-align: right;"><code>true</code></td>
+<td>Severe walk-forward fragility affects promotion status without displacing the newest selection surface.</td>
+</tr>
+<tr>
+<td>Institutional supervisor</td>
+<td style="text-align: right;"><code>circuit_breaker</code></td>
+<td>Hard breakpoints can latch and block funded live startup until reset or next cycle.</td>
+</tr>
+<tr>
+<td>Cycle drift</td>
+<td style="text-align: right;"><code>lightweight</code></td>
+<td>Severe local execution/spread/loss drift can pause a specific live context.</td>
 </tr>
 <tr>
 <td>Regime TP multipliers</td>
@@ -383,7 +393,6 @@
 </tr>
 </tbody>
 </table>
-<p>Deviation note: some root docs still describe <code>live_artifact_drift_policy = block</code> and <code>local_governance_live_mode = shadow</code> as the active profile. The local config currently says <code>warn</code> and <code>on</code> (<code>config.json:79</code>, <code>config.json:114</code>). Treat this as a real narrative-vs-runtime checkpoint.</p>
 <hr>
 <h2 id="3-end-outcome-definition">3. End Outcome Definition</h2>
 <p>FxPM has two kinds of outcomes.</p>
@@ -682,7 +691,7 @@ Live Output
 <ul>
 <li>resolved <code>PipelineConfig</code></li>
 <li>latest M5-derived timeframe data</li>
-<li>47-strategy registry</li>
+<li>50-strategy registry</li>
 <li>neutral Stage 1 defaults</li>
 <li>global parameter grids and optional Optuna</li>
 <li>regime labels</li>
@@ -990,16 +999,22 @@ Live Output
 </tr>
 </tbody>
 </table>
-<p>Current local profile is <code>warn</code>, so artifact drift is advisory for live eligibility, but it still makes symbols due for optimization.</p>
+<p>Current local profile is <code>block</code>, so artifact drift blocks live eligibility and funded-live readiness.</p>
+<p>Before real live trading starts, <code>pm_live_readiness.py</code> also checks that:</p>
+<ul>
+<li><code>live_artifact_drift_policy</code> is <code>block</code></li>
+<li>the configured winner ledger is readable and non-empty</li>
+<li>the ledger contains at least one live-tradeable winner</li>
+<li><code>logs/institutional_supervisor_state.json</code> is not actively latched from a previous hard block</li>
+</ul>
 <h3 id="advisory-versus-blocking">Advisory Versus Blocking</h3>
 <p>Advisory examples:</p>
 <ul>
 <li>retrain due when <code>production_retrain_mode = notify</code></li>
-<li>artifact drift when <code>live_artifact_drift_policy = warn</code></li>
 <li>storage pressure unless <code>storage_pause_entries_below_free_gb</code> is set</li>
 <li>storage cleanup when <code>storage_observe_only = true</code></li>
 <li>daily/session loss advisory logs</li>
-<li>live drift monitor warnings</li>
+<li>cycle drift in observe mode</li>
 <li>lot-normalization drift that stays under hard cap</li>
 </ul>
 <p>Blocking examples:</p>
@@ -1007,6 +1022,9 @@ Live Output
 <li>expired or invalid config</li>
 <li>no live-eligible configs and no open positions</li>
 <li>artifact drift when policy is <code>block</code></li>
+<li>funded-live readiness failure</li>
+<li>latched institutional-supervisor hard block</li>
+<li>cycle drift pause in lightweight mode</li>
 <li>missing account/position snapshot</li>
 <li>margin block/reopen cooldown</li>
 <li>spread filter</li>
@@ -1023,6 +1041,8 @@ Live Output
 <li><code>last_trade_log.json</code></li>
 <li><code>last_actionable_log.json</code></li>
 <li><code>pm_outputs/signal_ledger_YYYYMM.jsonl</code></li>
+<li><code>logs/institutional_supervisor_state.json</code></li>
+<li><code>logs/cycle_drift_state.json</code></li>
 </ul>
 <h3 id="deviation-checkpoints_2">Deviation Checkpoints</h3>
 <table>
@@ -1253,7 +1273,7 @@ Live Output
 </tr>
 <tr>
 <td>&ldquo;Governance is shadow.&rdquo;</td>
-<td>Current local config says governance live mode is <code>on</code>.</td>
+<td>Current local config says governance live mode is <code>shadow</code>, so decisions are observable before being made authoritative.</td>
 </tr>
 <tr>
 <td>&ldquo;Daily/session loss advisory stops entries.&rdquo;</td>
@@ -1426,16 +1446,16 @@ Live Output
 </thead>
 <tbody>
 <tr>
-<td>Docs say drift blocking, local config says drift warning</td>
-<td>Stale artifacts may still trade if policy is <code>warn</code></td>
-<td>check <code>config.json:79</code>, live logs for <code>LIVE WARN</code></td>
-<td>local <code>warn</code></td>
+<td>Funded-live readiness can block before the live loop starts</td>
+<td>A stale ledger, non-blocking artifact policy, or latched supervisor prevents real orders</td>
+<td><code>pm_live_readiness.py</code>, startup logs, exit code <code>2</code></td>
+<td>expected safety behavior</td>
 </tr>
 <tr>
-<td>Docs say governance shadow, local config says on</td>
-<td>Broker SL/TP may be actively modified</td>
-<td>check <code>config.json:114</code>, governance logs</td>
-<td>local <code>on</code></td>
+<td>Governance is selected but live mode is shadow</td>
+<td>Broker SL/TP is not modified until the mode is intentionally changed to <code>on</code></td>
+<td>check <code>config.json</code>, governance logs</td>
+<td>local <code>shadow</code></td>
 </tr>
 <tr>
 <td>Stage 3 is named like a separate stage but uses fresh-tail surface copy</td>
@@ -1456,9 +1476,9 @@ Live Output
 <td>production bypasses legacy</td>
 </tr>
 <tr>
-<td><code>NO_TRADE</code> artifacts can be present in a valid ledger</td>
+<td><code>NO_TRADE</code>/<code>PAPER_ONLY</code>/<code>BLOCKED</code> artifacts can be present in a valid ledger</td>
 <td>Configured does not mean tradeable</td>
-<td>status live-eligible count, no-trade metadata</td>
+<td>status live-eligible count, promotion metadata</td>
 <td>expected behavior</td>
 </tr>
 <tr>
@@ -1468,10 +1488,10 @@ Live Output
 <td>advisory only</td>
 </tr>
 <tr>
-<td>Artifact drift can still trigger optimization even if live warns only</td>
-<td>Optimize due and live eligibility are related but not identical</td>
+<td>Artifact drift can trigger both optimization due-state and live blocking</td>
+<td>Optimize due and live eligibility are related but not identical surfaces</td>
 <td><code>should_optimize()</code> vs <code>get_live_eligible_configs()</code></td>
-<td>due can exist while live trades</td>
+<td>current policy blocks live</td>
 </tr>
 <tr>
 <td>Live bar gate evaluates changed bars only</td>

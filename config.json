@@ -113,6 +113,7 @@
     "walk_forward_audit_mode": "severe_fragility_only",
     "walk_forward_promotion_policy": "block_severe_only",
     "walk_forward_do_not_displace_latest_surface": true,
+    "promote_small_risk_multiplier": 0.5,
     "local_governance_tournament_enabled": true,
     "local_governance_live_mode": "shadow",
     "local_governance_candidate_policies": [

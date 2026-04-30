@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -94,6 +95,45 @@ def validate_live_readiness(config: Any,
 
     if not bool(getattr(config, "institutional_supervisor_enabled", True)):
         add("warning", "supervisor_disabled", "institutional supervisor is disabled")
+    else:
+        # Check whether a previous run latched the supervisor, while preserving
+        # the supervisor's manual_or_next_cycle reopen semantics.
+        try:
+            raw_log_dir = getattr(config, "log_dir", "logs")
+            log_dir = Path(raw_log_dir if isinstance(raw_log_dir, (str, Path)) else "logs")
+            supervisor_state_path = log_dir / "institutional_supervisor_state.json"
+            if supervisor_state_path.exists():
+                state = _load_json_file(supervisor_state_path) or {}
+                if bool(state.get("active_block")):
+                    reopen_mode = str(
+                        getattr(config, "hard_block_reopen_mode", "manual_or_next_cycle") or ""
+                    ).strip().lower()
+                    blocked_cycle = str(state.get("cycle_id", "") or "")
+                    try:
+                        current_cycle = str(config.get_last_retrain_slot(datetime.now()).isoformat())
+                    except Exception:
+                        current_cycle = ""
+                    next_cycle_reopens = (
+                        reopen_mode in {"manual_or_next_cycle", "next_cycle"}
+                        and bool(current_cycle)
+                        and bool(blocked_cycle)
+                        and current_cycle != blocked_cycle
+                    )
+                    if next_cycle_reopens:
+                        add(
+                            "warning",
+                            "supervisor_latch_from_previous_cycle",
+                            "institutional supervisor latch belongs to a previous cycle; supervisor will reopen on evaluation",
+                        )
+                    else:
+                        reasons = ", ".join(str(r) for r in (state.get("block_reasons") or [])) or "unknown"
+                        add(
+                            "error",
+                            "supervisor_latched_from_previous_run",
+                            f"institutional supervisor is latched (reasons: {reasons}); reset before live trading",
+                        )
+        except Exception:
+            pass
     if not bool(getattr(config, "walk_forward_audit_enabled", False)):
         add("warning", "walk_forward_disabled", "walk-forward audit is disabled; promotion falls back to validation/historical audit")
 

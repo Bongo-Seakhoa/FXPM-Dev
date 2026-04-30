@@ -13,7 +13,7 @@ from pm_cycle_drift import CycleDriftContext, CycleDriftMonitor
 from pm_institutional_supervisor import InstitutionalSupervisor, SupervisorContext
 from pm_live_readiness import validate_live_readiness
 from pm_main import LiveTrader
-from pm_order_governance import GovernanceContext, candidate_policy_names, evaluate_policy
+from pm_order_governance import GovernanceContext, candidate_policy_names, evaluate_policy, normalize_policy_name
 from pm_pipeline import RegimeConfig
 from pm_strategies import (
     LiquiditySweepReversalStrategy,
@@ -449,6 +449,117 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
             signals = strategy.generate_signals(features.copy(), "EURUSD")
             self.assertEqual(len(signals), len(features))
             self.assertTrue(set(signals.unique()).issubset({-1, 0, 1}))
+
+    # ---------- audit fix regressions ----------
+
+    def test_swing_trail_alias_resolves_to_structure_trail(self):
+        self.assertEqual(normalize_policy_name("swing_trail"), "structure_trail")
+
+    def test_promote_small_risk_multiplier_is_config_driven_and_clamped(self):
+        cfg = PipelineConfig(promote_small_risk_multiplier=0.25)
+        self.assertAlmostEqual(cfg.promote_small_risk_multiplier, 0.25)
+        # Out-of-range values clamp to [0, 1].
+        self.assertAlmostEqual(PipelineConfig(promote_small_risk_multiplier=1.5).promote_small_risk_multiplier, 1.0)
+        self.assertAlmostEqual(PipelineConfig(promote_small_risk_multiplier=-1.0).promote_small_risk_multiplier, 0.0)
+
+    def test_live_readiness_blocks_when_supervisor_latched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "logs"
+            log_dir.mkdir()
+            (log_dir / "institutional_supervisor_state.json").write_text(
+                json.dumps(
+                    {
+                        "active_block": True,
+                        "block_reasons": ["daily_loss 4.2% >= 3.0%"],
+                        "cycle_id": "cycle-x",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = Path(tmp) / "pm_configs.json"
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "regime_configs": {
+                                "H1": {"TREND": {"strategy_name": "EMACrossoverStrategy"}}
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                log_dir=str(log_dir),
+                hard_block_reopen_mode="manual",
+            )
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "supervisor_latched_from_previous_run" for item in report.errors))
+
+    def test_live_readiness_allows_supervisor_latch_from_previous_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "logs"
+            log_dir.mkdir()
+            (log_dir / "institutional_supervisor_state.json").write_text(
+                json.dumps(
+                    {
+                        "active_block": True,
+                        "block_reasons": ["daily_loss 4.2% >= 3.0%"],
+                        "cycle_id": "2026-04-01T00:00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = Path(tmp) / "pm_configs.json"
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "regime_configs": {
+                                "H1": {"TREND": {"strategy_name": "EMACrossoverStrategy"}}
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                log_dir=str(log_dir),
+                hard_block_reopen_mode="manual_or_next_cycle",
+                walk_forward_audit_enabled=True,
+            )
+            cfg.get_last_retrain_slot = Mock(return_value=datetime(2026, 4, 15))
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+            self.assertTrue(report.ok)
+            self.assertTrue(any(item.code == "supervisor_latch_from_previous_cycle" for item in report.warnings))
+
+    def test_cycle_drift_record_trade_captures_execution_quality(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = PipelineConfig()
+            state_path = Path(tmp) / "cycle.json"
+            monitor = CycleDriftMonitor(cfg, state_path=state_path)
+            monitor.record_trade(
+                "EURUSD",
+                "H1",
+                "TREND",
+                "Demo",
+                pnl_dollars=-25.0,
+                execution_slippage_mult=2.7,
+                spread_degradation_mult=2.4,
+            )
+            reloaded = CycleDriftMonitor(cfg, state_path=state_path)
+            snapshot = reloaded.snapshot("EURUSD", "H1", "TREND", "Demo")
+            self.assertAlmostEqual(snapshot["max_execution_slippage_mult"], 2.7)
+            self.assertAlmostEqual(snapshot["max_spread_degradation_mult"], 2.4)
 
 
 if __name__ == "__main__":

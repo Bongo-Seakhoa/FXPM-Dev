@@ -1,4 +1,4 @@
-# FxPM 1.4 Changelog
+# FXPM-Dev Changelog
 
 All notable repository-level changes are documented here.
 
@@ -6,6 +6,25 @@ Notes:
 
 - The application/runtime banner remains `v3.1`
 - The repository changelog uses the `1.4.x` track
+- The repository/folder name is now `FXPM-Dev`
+
+---
+
+## [1.4.10] - Unreleased
+
+### Profitability-readiness integration hardening
+
+- added regression coverage for the latest audit fixes:
+  - `swing_trail` now normalizes to `structure_trail`
+  - `promote_small_risk_multiplier` is a clamped `PipelineConfig` field instead of a hardcoded live multiplier
+  - funded-live readiness now refuses startup while a prior institutional-supervisor hard block remains latched
+  - funded-live readiness now mirrors `manual_or_next_cycle` reopen semantics so previous-cycle latches warn instead of creating a permanent startup dead end
+  - `CycleDriftMonitor.record_trade()` can persist execution-slippage and spread-degradation observations when the live caller supplies them
+- refreshed operator documentation for the current 50-strategy registry, 11-policy governance pool, live readiness gate, promotion-status behavior, supervisor/cycle-drift state files, swap modeling, regime audit fields, and event-calendar settings
+- removed the implemented v2 profitability-readiness blueprint from the active root documentation surface after signoff; historical audit/planning material remains in `documentation_archive/`
+- added `best_config_reccomendations_gpt.html` as a fresh settings review document for the current `config.json` profile
+- aligned active documentation with the `FXPM-Dev` repository/folder rename while preserving internal `v3.1` runtime versioning and the `1.4.x` changelog track
+- verification: `python -m pytest -q`: `593 passed, 1 skipped, 356 subtests passed`
 
 ---
 
