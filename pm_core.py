@@ -573,6 +573,7 @@ class PipelineConfig:
     scoring_use_tail_risk: bool = True
     scoring_use_consistency: bool = True
     scoring_use_trade_frequency_bonus: bool = True
+    regime_trade_stability_floor: float = 0.7  # 0.7 legacy; 0.9 is Phase-1 experiment candidate
 
     # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
     # to be considered actionable in live trading. Signals below this are logged but
@@ -1066,6 +1067,11 @@ class PipelineConfig:
         ).strip().lower()
         if self.walk_forward_promotion_policy not in {"observe_only", "block_severe_only"}:
             self.walk_forward_promotion_policy = "block_severe_only"
+        try:
+            stability_floor = float(getattr(self, "regime_trade_stability_floor", 0.7))
+        except Exception:
+            stability_floor = 0.7
+        self.regime_trade_stability_floor = max(0.0, min(1.0, stability_floor))
         try:
             mult = float(getattr(self, "promote_small_risk_multiplier", 0.5) or 0.0)
         except Exception:

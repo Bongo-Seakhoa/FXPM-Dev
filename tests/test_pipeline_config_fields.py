@@ -106,6 +106,12 @@ class PipelineConfigFieldTests(unittest.TestCase):
         cfg = PipelineConfig(backtest_spread_mode="wishful")
         self.assertEqual(cfg.backtest_spread_mode, "fixed_spec")
 
+    def test_regime_trade_stability_floor_defaults_and_clamps(self):
+        self.assertAlmostEqual(PipelineConfig().regime_trade_stability_floor, 0.7, places=6)
+        self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=0.9).regime_trade_stability_floor, 0.9, places=6)
+        self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=-1.0).regime_trade_stability_floor, 0.0, places=6)
+        self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=2.0).regime_trade_stability_floor, 1.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
