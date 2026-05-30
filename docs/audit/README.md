@@ -80,10 +80,11 @@ fixed, accepted risk, deferred with reason, or invalid with evidence.
 
 ## Current Standing Rules
 
-- Freeze the strategy roster at 76 before Phase-1 scoring experiments.
-- Compare scoring changes only as same-roster 76-vs-76 experiments.
+- Freeze the deterministic strategy roster at 100 before the full discovery re-optimization.
+- Compare scoring changes only as same-roster 100-vs-100 experiments after the honest-control
+  baseline exists.
 - Treat prospect screens as hypothesis evidence only, not promotion evidence.
 - Do not add ML/meta-model selection unless the user explicitly changes the
   directive.
 - Do not promote a strategy or scoring change without honest-cost simulation,
-  validation/holdout evidence, and Tenet-5 gating.
+  validation/holdout evidence, C3 false-discovery evidence, and Tenet-5 gating.

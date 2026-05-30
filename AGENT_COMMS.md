@@ -2971,3 +2971,20 @@ Verification:
 
 - `python -m pytest tests/test_pbo_tool.py -q` -> `3 passed`
 - `python -m py_compile tools/pbo.py`
+
+---
+
+### [CODEX] 2026-05-30 - Audit artifact lifecycle cleanup
+
+Applied the user's disposable-audit-file directive:
+
+- Updated `docs/audit/README.md` standing rules from the stale 76-strategy checkpoint to the current
+  100-strategy roster and C3/PBO gate.
+- Retired stale untracked scratch files:
+  - `docs/audit/independent_audit_001.md`
+  - `INTERAGENT_PM_AUDIT_NOTES.txt`
+
+Rationale: `independent_audit_001.md` had become materially stale. Its C1/C2/C3/H1/H2/H4/H5 load-bearing
+findings are now fixed or superseded in code/tests/changelog/comms; the remaining general cautions are
+already captured by the active protocol and the next-step plan. `AGENT_COMMS.md` remains the active
+coordination channel, and `CHANGELOG.md` remains the evergreen record.
