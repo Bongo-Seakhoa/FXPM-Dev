@@ -131,6 +131,17 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(cfg.false_discovery_holdout_min_trades, 0)
         self.assertAlmostEqual(cfg.false_discovery_holdout_min_profit_factor, 0.0, places=6)
 
+    def test_oos_evidence_controls_default_off_and_clamp(self):
+        cfg = PipelineConfig(
+            oos_evidence_periods=1,
+            oos_evidence_min_periods=999,
+            oos_evidence_dirname="../bad",
+        )
+        self.assertFalse(cfg.oos_evidence_export_enabled)
+        self.assertEqual(cfg.oos_evidence_periods, 2)
+        self.assertEqual(cfg.oos_evidence_min_periods, 2)
+        self.assertEqual(cfg.oos_evidence_dirname, "oos_evidence")
+
 
 if __name__ == "__main__":
     unittest.main()

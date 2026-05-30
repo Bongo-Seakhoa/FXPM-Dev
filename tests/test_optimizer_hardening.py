@@ -279,6 +279,135 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(status, "BLOCKED")
         self.assertTrue(any("holdout PF" in reason for reason in reasons))
 
+    def test_oos_evidence_record_is_compact_and_stable(self):
+        cfg = PipelineConfig(
+            oos_evidence_export_enabled=True,
+            oos_evidence_periods=4,
+            oos_evidence_min_periods=2,
+        )
+        optimizer = RegimeOptimizer(cfg)
+        features = pd.DataFrame(index=pd.date_range("2026-01-01", periods=5, freq="h"))
+        candidate = {
+            "strategy_name": "DemoStrategy",
+            "params": {"window": 10},
+            "is_tuned": True,
+            "tuned_for_regime": "TREND",
+            "search_trials": 25,
+            "local_search_trials_total": 100,
+            "strategy_roster_count": 100,
+        }
+        val_result = {
+            "equity_curve": [100.0, 101.0, 100.0, 103.0, 102.0],
+            "total_trades": 3,
+            "profit_factor": 1.2,
+            "total_return_pct": 2.0,
+            "max_drawdown_pct": 1.0,
+            "win_rate": 66.7,
+        }
+
+        first = optimizer._build_oos_evidence_record(
+            "EURUSD",
+            "H1",
+            candidate,
+            val_result,
+            features,
+            val_warmup_bars=1,
+        )
+        second = optimizer._build_oos_evidence_record(
+            "EURUSD",
+            "H1",
+            {**candidate, "params": {"window": 10}},
+            val_result,
+            features,
+            val_warmup_bars=1,
+        )
+
+        self.assertEqual(first["format_version"], "oos_candidate_returns_v1")
+        self.assertEqual(first["candidate_id"], second["candidate_id"])
+        self.assertEqual(first["return_index"], "relative_equal_blocks")
+        self.assertEqual(first["period_count"], 4)
+        self.assertEqual(len(first["period_returns"]), 4)
+        self.assertNotIn("equity_curve", first)
+        self.assertEqual(first["metrics"]["total_trades"], 3)
+
+    def test_oos_evidence_record_keeps_no_trade_candidates_as_zero_returns(self):
+        cfg = PipelineConfig(
+            oos_evidence_export_enabled=True,
+            oos_evidence_periods=5,
+            oos_evidence_min_periods=2,
+        )
+        optimizer = RegimeOptimizer(cfg)
+        features = pd.DataFrame(index=pd.date_range("2026-01-01", periods=12, freq="h"))
+
+        record = optimizer._build_oos_evidence_record(
+            "EURUSD",
+            "H1",
+            {"strategy_name": "NoTradeStrategy", "params": {}},
+            {
+                "equity_curve": [100.0],
+                "total_trades": 0,
+                "profit_factor": 0.0,
+                "total_return_pct": 0.0,
+                "max_drawdown_pct": 0.0,
+                "win_rate": 0.0,
+            },
+            features,
+            val_warmup_bars=0,
+        )
+
+        self.assertIsNotNone(record)
+        self.assertEqual(record["period_returns"], [0.0] * 5)
+        self.assertEqual(record["metrics"]["total_trades"], 0)
+
+    def test_oos_evidence_attach_collects_final_candidate_records(self):
+        class FakeStrategy:
+            name = "FakeEvidenceStrategy"
+
+            def generate_signals(self, features, symbol):
+                return pd.Series([1] * len(features), index=features.index)
+
+        class FakeBacktester:
+            def run(self, features, signals, symbol, strategy, timeframe=None, warmup_bars=0):
+                return {
+                    "equity_curve": [100.0, 101.0, 100.5, 102.0, 101.5, 103.0],
+                    "total_trades": 4,
+                    "profit_factor": 1.3,
+                    "total_return_pct": 3.0,
+                    "max_drawdown_pct": 1.0,
+                    "win_rate": 50.0,
+                }
+
+        cfg = PipelineConfig(
+            oos_evidence_export_enabled=True,
+            oos_evidence_periods=5,
+            oos_evidence_min_periods=2,
+        )
+        optimizer = RegimeOptimizer(cfg)
+        optimizer.backtester = FakeBacktester()
+        features = pd.DataFrame(
+            {"Close": [1, 2, 3, 4, 5, 6]},
+            index=pd.date_range("2026-01-01", periods=6, freq="h"),
+        )
+        candidate = {
+            "strategy": FakeStrategy(),
+            "strategy_name": "FakeEvidenceStrategy",
+            "params": {"p": 1},
+            "search_trials": 1,
+        }
+
+        optimizer._attach_oos_evidence_to_candidates(
+            "EURUSD",
+            "H1",
+            features,
+            0,
+            [candidate],
+        )
+
+        self.assertIn("oos_evidence", candidate)
+        records = optimizer.consume_oos_candidate_evidence()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["strategy_name"], "FakeEvidenceStrategy")
+
     def test_regime_selection_tie_breaks_on_trade_count(self):
         cfg = PipelineConfig(
             regime_min_train_trades=1,

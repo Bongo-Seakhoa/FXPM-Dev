@@ -190,6 +190,10 @@ def build_artifact_meta(config: PipelineConfig,
         "false_discovery_holdout_min_return_pct": float(
             getattr(config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0
         ),
+        "oos_evidence_export_enabled": bool(getattr(config, "oos_evidence_export_enabled", False)),
+        "oos_evidence_periods": int(getattr(config, "oos_evidence_periods", 64) or 64),
+        "oos_evidence_min_periods": int(getattr(config, "oos_evidence_min_periods", 8) or 8),
+        "oos_evidence_dirname": str(getattr(config, "oos_evidence_dirname", "oos_evidence") or "oos_evidence"),
         "local_governance_tournament_enabled": bool(getattr(config, "local_governance_tournament_enabled", False)),
         "local_governance_candidate_policies": candidate_policy_names(
             getattr(config, "local_governance_candidate_policies", None)
@@ -581,6 +585,13 @@ class ConfigLedger:
                 stored_artifact = getattr(self.configs[symbol], "artifact_meta", {}) or {}
                 if not artifact_contract_matches(stored_artifact, current_artifact_meta):
                     return True, "artifact fingerprint changed"
+                if bool(current_artifact_meta.get("oos_evidence_export_enabled", False)):
+                    sidecar_ok, sidecar_reason = self._oos_evidence_sidecar_valid(
+                        self.configs[symbol],
+                        current_artifact_meta,
+                    )
+                    if not sidecar_ok:
+                        return True, sidecar_reason
             # Extra check: regime detection params changed since optimization
             if current_regime_version and symbol in self.configs:
                 stored = self.configs[symbol].regime_detection_version
@@ -589,6 +600,61 @@ class ConfigLedger:
             return False, reason  # Skip - config is valid
 
         return True, reason  # Optimize - config is missing/expired/invalid
+
+    @staticmethod
+    def _oos_evidence_sidecar_valid(config: 'SymbolConfig',
+                                    current_artifact_meta: Dict[str, Any]) -> Tuple[bool, str]:
+        pointer = dict((getattr(config, "data_window_meta", {}) or {}).get("oos_candidate_evidence") or {})
+        manifest_value = pointer.get("path")
+        if not manifest_value:
+            return False, "OOS evidence sidecar missing"
+        manifest_path = Path(str(manifest_value))
+        if not manifest_path.exists():
+            return False, "OOS evidence manifest missing"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False, "OOS evidence manifest unreadable"
+        if manifest.get("format_version") != "oos_candidate_matrix_v1":
+            return False, "OOS evidence manifest version changed"
+        if not artifact_contract_matches(
+            dict(manifest.get("artifact_meta") or {}),
+            current_artifact_meta,
+        ):
+            return False, "OOS evidence artifact fingerprint changed"
+        matrix_value = manifest.get("matrix_path")
+        if not matrix_value:
+            return False, "OOS evidence matrix missing"
+        matrix_path = Path(str(matrix_value))
+        if not matrix_path.exists():
+            fallback = manifest_path.parent / matrix_path.name
+            matrix_path = fallback if fallback.exists() else matrix_path
+        if not matrix_path.exists():
+            return False, "OOS evidence matrix missing"
+        try:
+            with np.load(matrix_path) as matrix:
+                returns = np.asarray(matrix["returns"], dtype=np.float32)
+                candidate_ids = np.asarray(matrix["candidate_ids"])
+        except Exception:
+            return False, "OOS evidence matrix unreadable"
+        contract = dict(manifest.get("matrix_contract") or {})
+        expected_shape = contract.get("returns_shape")
+        if expected_shape and list(returns.shape) != list(expected_shape):
+            return False, "OOS evidence matrix shape mismatch"
+        record_count = int(manifest.get("record_count", 0) or 0)
+        pointer_count = int(pointer.get("record_count", record_count) or 0)
+        if record_count <= 0 or returns.ndim != 2 or returns.shape[1] != record_count:
+            return False, "OOS evidence record count mismatch"
+        if pointer_count != record_count or len(candidate_ids) != record_count:
+            return False, "OOS evidence pointer count mismatch"
+        digest_payload = returns.tobytes() + json.dumps(
+            candidate_ids.tolist(),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha1(digest_payload).hexdigest()
+        if digest != str(manifest.get("matrix_digest_sha1", "")):
+            return False, "OOS evidence matrix digest mismatch"
+        return True, "OOS evidence sidecar valid"
     
     def get_symbols_to_optimize(self,
                                 symbols: List[str],
@@ -1677,6 +1743,7 @@ class RegimeOptimizer:
         self.min_val_return_dd_ratio = _raw_ratio if math.isfinite(_raw_ratio) and _raw_ratio > 0 else 1.0
         
         self.training_gate_telemetry: Dict[str, Any] = {}
+        self.oos_candidate_evidence_records: List[Dict[str, Any]] = []
         
         # Initialize Optuna optimizer for regime tuning
         if OPTUNA_AVAILABLE and self.enable_hyperparam_tuning:
@@ -1743,6 +1810,7 @@ class RegimeOptimizer:
             - int: count of unvalidated (rejected) winners
         """
         logger.info(f"[{symbol}] Regime Optimization: {len(strategies)} strategies x {len(train_features_by_tf)} timeframes x {len(self.REGIMES)} regimes")
+        self.oos_candidate_evidence_records = []
         
         # Result structure: {timeframe: {regime: RegimeConfig}}
         regime_configs: Dict[str, Dict[str, RegimeConfig]] = {}
@@ -1846,6 +1914,173 @@ class RegimeOptimizer:
         telemetry = dict(self.training_gate_telemetry or {})
         self.training_gate_telemetry = {}
         return telemetry
+
+    def consume_oos_candidate_evidence(self) -> List[Dict[str, Any]]:
+        """Return and clear compact OOS return evidence for the latest symbol run."""
+        records = list(self.oos_candidate_evidence_records or [])
+        self.oos_candidate_evidence_records = []
+        return records
+
+    @staticmethod
+    def _clean_candidate_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        clean: Dict[str, Any] = {}
+        for key, value in dict(params or {}).items():
+            if hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, np.integer):
+                value = int(value)
+            elif isinstance(value, np.floating):
+                value = float(value)
+            clean[str(key)] = value
+        return clean
+
+    @staticmethod
+    def _period_returns_from_equity(equity_curve: Any,
+                                    periods: int,
+                                    min_periods: int) -> List[float]:
+        try:
+            if equity_curve is None:
+                return []
+            equity = np.asarray(equity_curve, dtype=np.float64)
+        except Exception:
+            return []
+        if equity.size < 3:
+            return []
+        base = np.where(np.abs(equity[:-1]) > 1e-12, equity[:-1], 1.0)
+        returns = np.diff(equity) / base
+        returns = returns[np.isfinite(returns)]
+        if returns.size < min_periods:
+            return []
+        block_count = min(max(2, int(periods)), int(returns.size))
+        if block_count < min_periods:
+            return []
+        period_returns = []
+        for block in np.array_split(returns, block_count):
+            if block.size == 0:
+                continue
+            value = float(np.prod(1.0 + block) - 1.0)
+            if math.isfinite(value):
+                period_returns.append(value)
+        if len(period_returns) < min_periods:
+            return []
+        return period_returns
+
+    def _build_oos_evidence_record(self,
+                                   symbol: str,
+                                   timeframe: str,
+                                   candidate: Dict[str, Any],
+                                   val_result: Dict[str, Any],
+                                   val_features: pd.DataFrame,
+                                   val_warmup_bars: int) -> Optional[Dict[str, Any]]:
+        periods = int(getattr(self.config, "oos_evidence_periods", 64) or 64)
+        min_periods = int(getattr(self.config, "oos_evidence_min_periods", 8) or 8)
+        period_returns = self._period_returns_from_equity(
+            val_result.get("equity_curve", []),
+            periods=periods,
+            min_periods=min_periods,
+        )
+        if not period_returns and int(val_result.get("total_trades", 0) or 0) == 0:
+            try:
+                usable_returns = max(0, int(len(val_features)) - int(val_warmup_bars or 0) - 1)
+            except Exception:
+                usable_returns = 0
+            zero_periods = min(max(2, periods), usable_returns)
+            if zero_periods >= min_periods:
+                period_returns = [0.0] * zero_periods
+        if not period_returns:
+            return None
+        params = self._clean_candidate_params(candidate.get("params", {}))
+        strategy_name = str(candidate.get("strategy_name", "Unknown"))
+        candidate_key = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy_name": strategy_name,
+            "parameters": params,
+        }
+        candidate_id = _stable_hash(candidate_key)
+        start_ts = None
+        end_ts = None
+        try:
+            if val_features is not None and len(val_features.index):
+                start_ts = pd.Timestamp(val_features.index[0]).isoformat()
+                end_ts = pd.Timestamp(val_features.index[-1]).isoformat()
+        except Exception:
+            start_ts = None
+            end_ts = None
+        return {
+            "format_version": "oos_candidate_returns_v1",
+            "candidate_id": candidate_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy_name": strategy_name,
+            "parameters": params,
+            "is_tuned": bool(candidate.get("is_tuned", False)),
+            "tuned_for_regime": candidate.get("tuned_for_regime"),
+            "search_trials": int(candidate.get("search_trials", 1) or 1),
+            "local_search_trials_total": int(candidate.get("local_search_trials_total", 0) or 0),
+            "strategy_roster_count": int(candidate.get("strategy_roster_count", 0) or 0),
+            "oos_surface": "stage3_selection",
+            "return_index": "relative_equal_blocks",
+            "period_count": int(len(period_returns)),
+            "period_returns": period_returns,
+            "metrics": {
+                "total_trades": int(val_result.get("total_trades", 0) or 0),
+                "profit_factor": float(val_result.get("profit_factor", 0.0) or 0.0),
+                "total_return_pct": float(val_result.get("total_return_pct", 0.0) or 0.0),
+                "max_drawdown_pct": float(val_result.get("max_drawdown_pct", 0.0) or 0.0),
+                "win_rate": float(val_result.get("win_rate", 0.0) or 0.0),
+            },
+            "window": {
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "bars": int(len(val_features)) if val_features is not None else 0,
+                "warmup_bars": int(val_warmup_bars or 0),
+            },
+        }
+
+    def _attach_oos_evidence_to_candidates(self,
+                                           symbol: str,
+                                           timeframe: str,
+                                           val_features: Optional[pd.DataFrame],
+                                           val_warmup_bars: int,
+                                           candidates: List[Dict[str, Any]]) -> None:
+        if not bool(getattr(self.config, "oos_evidence_export_enabled", False)):
+            return
+        if val_features is None or len(val_features) <= max(2, int(val_warmup_bars or 0)):
+            return
+        records_by_id: Dict[str, Dict[str, Any]] = {}
+        for cand in candidates:
+            try:
+                strategy = cand.get("strategy")
+                if strategy is None:
+                    strategy = StrategyRegistry.get(cand.get("strategy_name", ""), **(cand.get("params", {}) or {}))
+                signals = strategy.generate_signals(val_features, symbol)
+                val_result = self.backtester.run(
+                    val_features,
+                    signals,
+                    symbol,
+                    strategy,
+                    timeframe=timeframe,
+                    warmup_bars=val_warmup_bars,
+                )
+                record = self._build_oos_evidence_record(
+                    symbol,
+                    timeframe,
+                    cand,
+                    val_result,
+                    val_features,
+                    val_warmup_bars,
+                )
+                if record:
+                    cand["oos_evidence"] = record
+                    records_by_id[record["candidate_id"]] = record
+            except Exception as exc:
+                logger.debug(
+                    f"[{symbol}] [{timeframe}] OOS evidence skipped for "
+                    f"{cand.get('strategy_name', 'Unknown')}: {exc}"
+                )
+        if records_by_id:
+            self.oos_candidate_evidence_records.extend(records_by_id.values())
 
     def _apply_training_eligibility_gates(self,
                                           candidates: List[Dict[str, Any]],
@@ -2028,6 +2263,13 @@ class RegimeOptimizer:
             for cand in eligible_candidates:
                 cand['local_search_trials_total'] = int(local_trials)
                 cand['strategy_roster_count'] = int(len(strategies))
+            self._attach_oos_evidence_to_candidates(
+                symbol,
+                timeframe,
+                val_features,
+                val_warmup_bars,
+                eligible_candidates,
+            )
             return eligible_candidates
 
         # Phase 2: Hyperparameter tuning for top-K strategies per regime
@@ -2044,6 +2286,17 @@ class RegimeOptimizer:
         
         if not strategies_to_tune:
             logger.debug(f"[{symbol}] [{timeframe}] No strategies eligible for hyperparameter tuning")
+            local_trials = len(screening_candidates)
+            for cand in eligible_candidates:
+                cand['local_search_trials_total'] = int(local_trials)
+                cand['strategy_roster_count'] = int(len(strategies))
+            self._attach_oos_evidence_to_candidates(
+                symbol,
+                timeframe,
+                val_features,
+                val_warmup_bars,
+                eligible_candidates,
+            )
             return eligible_candidates
 
         logger.info(f"[{symbol}] [{timeframe}] Hyperparameter tuning {len(strategies_to_tune)} strategies")
@@ -2078,6 +2331,13 @@ class RegimeOptimizer:
         for cand in all_candidates:
             cand['local_search_trials_total'] = local_trials
             cand['strategy_roster_count'] = int(len(strategies))
+        self._attach_oos_evidence_to_candidates(
+            symbol,
+            timeframe,
+            val_features,
+            val_warmup_bars,
+            all_candidates,
+        )
 
         return all_candidates
     
@@ -3545,6 +3805,95 @@ class OptimizationPipeline:
                     selection_surface=selection_surface,
                 )
 
+    def _write_oos_candidate_evidence(self,
+                                      symbol: str,
+                                      records: List[Dict[str, Any]],
+                                      *,
+                                      artifact_meta: Dict[str, Any],
+                                      data_window_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not records:
+            return None
+        evidence_dir = Path(self.config.output_dir) / str(
+            getattr(self.config, "oos_evidence_dirname", "oos_evidence") or "oos_evidence"
+        )
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        safe_symbol = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(symbol))
+        unique_records = {str(record.get("candidate_id")): record for record in records if record.get("candidate_id")}
+        ordered_records = sorted(unique_records.values(), key=lambda item: str(item.get("candidate_id", "")))
+        if not ordered_records:
+            return None
+        min_periods = min(int(record.get("period_count", 0) or 0) for record in ordered_records)
+        min_required = int(getattr(self.config, "oos_evidence_min_periods", 8) or 8)
+        if min_periods < min_required:
+            logger.info(
+                f"[{symbol}] OOS candidate evidence skipped: common periods {min_periods} < {min_required}"
+            )
+            return None
+
+        returns = np.column_stack([
+            np.asarray(record.get("period_returns", [])[-min_periods:], dtype=np.float32)
+            for record in ordered_records
+        ]).astype(np.float32, copy=False)
+        candidate_ids = np.asarray([record["candidate_id"] for record in ordered_records], dtype=str)
+        digest_payload = returns.tobytes() + json.dumps(
+            candidate_ids.tolist(),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        matrix_digest = hashlib.sha1(digest_payload).hexdigest()
+        matrix_path = evidence_dir / f"{safe_symbol}_oos_returns_{matrix_digest[:12]}.npz"
+        if not matrix_path.exists():
+            tmp_matrix_path = evidence_dir / f"{safe_symbol}_oos_returns_{matrix_digest[:12]}.tmp.npz"
+            np.savez_compressed(
+                tmp_matrix_path,
+                returns=returns,
+                candidate_ids=candidate_ids,
+            )
+            tmp_matrix_path.replace(matrix_path)
+
+        manifest_path = evidence_dir / f"{safe_symbol}_oos_manifest.json"
+        tmp_manifest_path = manifest_path.with_suffix(".json.tmp")
+        manifest_records = []
+        for record in ordered_records:
+            compact = {key: value for key, value in record.items() if key != "period_returns"}
+            compact["matrix_column"] = len(manifest_records)
+            manifest_records.append(compact)
+        payload = {
+            "format_version": "oos_candidate_matrix_v1",
+            "scope": "final_candidate_pool",
+            "purpose": "C3_PBO_false_discovery_measurement",
+            "symbol": symbol,
+            "created_at": datetime.now().isoformat(),
+            "record_count": len(ordered_records),
+            "return_index": "relative_equal_blocks",
+            "matrix_contract": {
+                "returns_shape": [int(returns.shape[0]), int(returns.shape[1])],
+                "rows": "common trailing OOS periods",
+                "columns": "candidate_id in manifest order",
+                "alignment": "per-candidate relative OOS periods truncated to a common T",
+                "regime_scope": "all_regimes_validation_equity",
+            },
+            "matrix_path": str(matrix_path),
+            "matrix_digest_sha1": matrix_digest,
+            "artifact_meta": artifact_meta,
+            "data_window_fingerprint": (data_window_meta or {}).get("data_window_fingerprint"),
+            "records": manifest_records,
+        }
+        with tmp_manifest_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=str)
+        tmp_manifest_path.replace(manifest_path)
+        logger.info(
+            f"[{symbol}] Wrote OOS candidate evidence: {manifest_path} "
+            f"matrix={returns.shape[0]}x{returns.shape[1]}"
+        )
+        return {
+            "path": str(manifest_path),
+            "format_version": "oos_candidate_matrix_v1",
+            "record_count": len(ordered_records),
+            "returns_shape": [int(returns.shape[0]), int(returns.shape[1])],
+            "matrix_path": str(matrix_path),
+            "matrix_digest_sha1": matrix_digest,
+        }
+
     def _apply_promotion_statuses(self,
                                   regime_configs: Dict[str, Dict[str, RegimeConfig]],
                                   default_config: Optional[RegimeConfig]) -> None:
@@ -3674,6 +4023,16 @@ class OptimizationPipeline:
                     symbol, train_features_by_tf, val_features_by_tf, strategies,
                     val_warmup_by_tf=val_warmup_by_tf,
                 )
+            oos_evidence_records = self.regime_optimizer.consume_oos_candidate_evidence()
+            oos_evidence_pointer = self._write_oos_candidate_evidence(
+                symbol,
+                oos_evidence_records,
+                artifact_meta=artifact_meta,
+                data_window_meta=data_window_meta,
+            ) if bool(getattr(self.config, "oos_evidence_export_enabled", False)) else None
+            if oos_evidence_pointer:
+                data_window_meta = dict(data_window_meta or {})
+                data_window_meta["oos_candidate_evidence"] = oos_evidence_pointer
             
             # Count only tradeable validated winners; explicit NO_TRADE markers are slots, not winners.
             total_winners = sum(

@@ -73,6 +73,19 @@ Notes:
 - added tests for artifact invalidation, config normalization, evidence persistence, promotion
   blocking, and descent behavior that skips false-discovery-failed candidates before validation
 
+### OOS candidate evidence for PBO
+
+- added opt-in OOS candidate evidence export for discovery runs so every final candidate can emit
+  compact validation-period returns for CSCV/PBO measurement without bloating the winner ledger
+- discovery-honest config now writes a sidecar `oos_candidate_matrix_v1` manifest plus compressed
+  NPZ return matrix under the output directory; default production behavior remains off
+- kept no-trade validation candidates in the evidence matrix as zero-return columns so PBO does not
+  overstate robustness by dropping weak candidates
+- added cache invalidation for missing, corrupt, or artifact-mismatched OOS sidecars when evidence
+  export is enabled, plus content-addressed matrix files to avoid stale manifest/matrix pairings
+- documented the current PBO scope honestly as all-regimes validation equity, not regime-filtered
+  folds; this is the bridge artifact for Claude's `tools/pbo.py` measurement layer
+
 ### Audit artifact lifecycle
 
 - clarified that audit outputs, agent communication files, experiment notes, and review documents
