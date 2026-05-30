@@ -32,6 +32,7 @@ from typing import Dict, List, Any, Optional, Tuple, Union, Set
 import numpy as np
 import pandas as pd
 from pm_order_governance import candidate_policy_names, evaluate_policy, make_policy, GovernanceContext
+from pm_symbol import infer_asset_class
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -1622,9 +1623,15 @@ class InstrumentSpec:
     stops_level: int = 0  # trade_stops_level from MT5 (in points)
     point: float = 0.0  # point from MT5 (minimum price change)
     digits: int = 0  # digits from MT5; 0 means infer for offline defaults
+    asset_class: str = "unknown"
     
     def __post_init__(self):
         """Initialize derived values if not set."""
+        self.asset_class = infer_asset_class(
+            self.symbol,
+            broker_data={"asset_class": self.asset_class},
+            default="unknown",
+        )
         if not self.digits or self.digits <= 0:
             self.digits = _infer_default_digits(self.symbol, self.pip_position)
         # Derive point from digits if not explicitly set.
@@ -1806,6 +1813,14 @@ def sync_instrument_spec_from_mt5(spec: InstrumentSpec, mt5_symbol_info) -> Inst
     spec.swap_mode = int(raw_swap_mode if raw_swap_mode is not None else -1)
     raw_triple_rollover = getattr(mt5_symbol_info, "swap_rollover3days", 3)
     spec.swap_rollover3days = int(raw_triple_rollover if raw_triple_rollover is not None else 3)
+    spec.asset_class = infer_asset_class(
+        spec.symbol,
+        broker_data={
+            "asset_class": getattr(mt5_symbol_info, "asset_class", ""),
+            "path": getattr(mt5_symbol_info, "path", ""),
+        },
+        default="unknown",
+    )
 
     return spec
 
@@ -2310,13 +2325,18 @@ def _create_spec_from_broker_data(
             tick_value=tick_value,
             contract_size=contract_size,
             stops_level=int(broker_data.get('stops_level', broker_data.get('trade_stops_level', 0)) or 0),
+            asset_class=infer_asset_class(symbol, broker_data=broker_data, default="unknown"),
         )
     except (TypeError, ValueError, KeyError) as e:
         logger.warning(
             f"InstrumentSpec construction failed for {symbol}: {e}. "
             f"Broker data keys: {list(broker_data.keys())}. Using safe defaults."
         )
-        return InstrumentSpec(symbol=symbol)
+        return InstrumentSpec(
+            symbol=symbol,
+            pip_position=4,
+            asset_class=infer_asset_class(symbol, broker_data=broker_data, default="unknown"),
+        )
 
 
 def get_instrument_spec(symbol: str) -> InstrumentSpec:

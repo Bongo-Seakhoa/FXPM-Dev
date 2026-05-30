@@ -35,6 +35,7 @@ except ImportError:
     mt5 = None
 
 from pm_core import get_instrument_spec, InstrumentSpec
+from pm_symbol import infer_asset_class
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -101,6 +102,8 @@ class MT5SymbolInfo:
     filling_mode: int = 0
     trade_exemode: int = 0
     trade_freeze_level: int = 0
+    path: str = ""
+    asset_class: str = "unknown"
     
     # Calculated values
     pip_size: float = 0.0
@@ -133,6 +136,11 @@ class MT5SymbolInfo:
             self.pip_value = (self.pip_size / self.trade_tick_size) * self.trade_tick_value
         else:
             self.pip_value = float(self.trade_tick_value or 0.0)
+        self.asset_class = infer_asset_class(
+            self.symbol,
+            broker_data={"path": self.path, "asset_class": self.asset_class},
+            default="unknown",
+        )
     
     def to_instrument_spec(self,
                            base_spec: Optional[InstrumentSpec] = None,
@@ -172,6 +180,7 @@ class MT5SymbolInfo:
             stops_level=self.trade_stops_level,
             point=self.point,
             digits=self.digits,
+            asset_class=self.asset_class,
         )
 
 
@@ -522,6 +531,12 @@ class MT5Connector:
             filling_mode=int(getattr(info, "filling_mode", 0) or 0),
             trade_exemode=int(getattr(info, "trade_exemode", 0) or 0),
             trade_freeze_level=int(getattr(info, "trade_freeze_level", 0) or 0),
+            path=str(getattr(info, "path", "") or ""),
+            asset_class=infer_asset_class(
+                getattr(info, "name", resolved_symbol),
+                broker_data={"path": str(getattr(info, "path", "") or "")},
+                default="unknown",
+            ),
         )
         
         # Cache it under both the requested alias and the broker symbol.
@@ -1456,6 +1471,8 @@ class MT5Connector:
             specs[symbol] = {
                 'symbol': symbol,
                 'broker_symbol': broker_symbol,
+                'asset_class': info.asset_class,
+                'path': info.path,
                 'digits': info.digits,
                 'point': info.point,
                 'tick_size': info.trade_tick_size,

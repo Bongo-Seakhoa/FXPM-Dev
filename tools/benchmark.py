@@ -23,16 +23,15 @@ sys.path.insert(0, str(REPO))
 
 from pm_core import PipelineConfig, DataLoader, FeatureComputer, Backtester, get_instrument_spec
 from pm_strategies import StrategyRegistry
+from pm_symbol import is_fiat_fx_symbol
 
 DEFAULT_POOL = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"]
 SPREAD_MODES = ("fixed_spec", "historical_max", "conservative_max")
-FIAT = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "NOK", "SEK",
-        "MXN", "ZAR", "SGD", "PLN", "TRY", "HKD", "CNH", "DKK", "CZK", "HUF"}
 
 
 def is_fx(symbol):
     """Pure FX = two fiat currency legs. Excludes crypto (BTCETH), metals (XAU), indices."""
-    return len(symbol) == 6 and symbol[:3] in FIAT and symbol[3:] in FIAT
+    return is_fiat_fx_symbol(symbol)
 
 
 def build_config(spread_mode="fixed_spec"):

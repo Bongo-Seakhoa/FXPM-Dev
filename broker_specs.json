@@ -2,6 +2,7 @@
   "AU200": {
     "symbol": "AU200",
     "broker_symbol": "AU200",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -23,6 +24,7 @@
   "AUDCAD": {
     "symbol": "AUDCAD",
     "broker_symbol": "AUDCAD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -44,6 +46,7 @@
   "AUDCHF": {
     "symbol": "AUDCHF",
     "broker_symbol": "AUDCHF",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -65,6 +68,7 @@
   "AUDJPY": {
     "symbol": "AUDJPY",
     "broker_symbol": "AUDJPY",
+    "asset_class": "fx",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -86,6 +90,7 @@
   "AUDNZD": {
     "symbol": "AUDNZD",
     "broker_symbol": "AUDNZD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -107,6 +112,7 @@
   "AUDUSD": {
     "symbol": "AUDUSD",
     "broker_symbol": "AUDUSD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -128,6 +134,7 @@
   "BCHUSD": {
     "symbol": "BCHUSD",
     "broker_symbol": "BCHUSD",
+    "asset_class": "crypto",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -149,6 +156,7 @@
   "BTCETH": {
     "symbol": "BTCETH",
     "broker_symbol": "BTCETH",
+    "asset_class": "crypto",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -170,6 +178,7 @@
   "BTCUSD": {
     "symbol": "BTCUSD",
     "broker_symbol": "BTCUSD",
+    "asset_class": "crypto",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -191,6 +200,7 @@
   "CADCHF": {
     "symbol": "CADCHF",
     "broker_symbol": "CADCHF",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -212,6 +222,7 @@
   "CADJPY": {
     "symbol": "CADJPY",
     "broker_symbol": "CADJPY",
+    "asset_class": "fx",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -233,6 +244,7 @@
   "CHFJPY": {
     "symbol": "CHFJPY",
     "broker_symbol": "CHFJPY",
+    "asset_class": "fx",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -254,6 +266,7 @@
   "DE30": {
     "symbol": "DE30",
     "broker_symbol": "DE30",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -275,6 +288,7 @@
   "DOGUSD": {
     "symbol": "DOGUSD",
     "broker_symbol": "DOGUSD",
+    "asset_class": "crypto",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -296,6 +310,7 @@
   "ES35": {
     "symbol": "ES35",
     "broker_symbol": "ES35",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -317,6 +332,7 @@
   "ETHUSD": {
     "symbol": "ETHUSD",
     "broker_symbol": "ETHUSD",
+    "asset_class": "crypto",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -338,6 +354,7 @@
   "EU50": {
     "symbol": "EU50",
     "broker_symbol": "EU50",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -359,6 +376,7 @@
   "EURAUD": {
     "symbol": "EURAUD",
     "broker_symbol": "EURAUD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -380,6 +398,7 @@
   "EURCAD": {
     "symbol": "EURCAD",
     "broker_symbol": "EURCAD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -401,6 +420,7 @@
   "EURCHF": {
     "symbol": "EURCHF",
     "broker_symbol": "EURCHF",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -422,6 +442,7 @@
   "EURGBP": {
     "symbol": "EURGBP",
     "broker_symbol": "EURGBP",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -443,6 +464,7 @@
   "EURJPY": {
     "symbol": "EURJPY",
     "broker_symbol": "EURJPY",
+    "asset_class": "fx",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -464,6 +486,7 @@
   "EURNZD": {
     "symbol": "EURNZD",
     "broker_symbol": "EURNZD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -485,6 +508,7 @@
   "EURUSD": {
     "symbol": "EURUSD",
     "broker_symbol": "EURUSD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -506,6 +530,7 @@
   "EURZAR": {
     "symbol": "EURZAR",
     "broker_symbol": "EURZAR",
+    "asset_class": "fx",
     "digits": 4,
     "point": 0.0001,
     "tick_size": 0.0001,
@@ -527,6 +552,7 @@
   "FR40": {
     "symbol": "FR40",
     "broker_symbol": "FR40",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -548,6 +574,7 @@
   "GBPAUD": {
     "symbol": "GBPAUD",
     "broker_symbol": "GBPAUD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -569,6 +596,7 @@
   "GBPCAD": {
     "symbol": "GBPCAD",
     "broker_symbol": "GBPCAD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -590,6 +618,7 @@
   "GBPCHF": {
     "symbol": "GBPCHF",
     "broker_symbol": "GBPCHF",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -611,6 +640,7 @@
   "GBPJPY": {
     "symbol": "GBPJPY",
     "broker_symbol": "GBPJPY",
+    "asset_class": "fx",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -632,6 +662,7 @@
   "GBPNZD": {
     "symbol": "GBPNZD",
     "broker_symbol": "GBPNZD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -653,6 +684,7 @@
   "GBPUSD": {
     "symbol": "GBPUSD",
     "broker_symbol": "GBPUSD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -674,6 +706,7 @@
   "GBPZAR": {
     "symbol": "GBPZAR",
     "broker_symbol": "GBPZAR",
+    "asset_class": "fx",
     "digits": 4,
     "point": 0.0001,
     "tick_size": 0.0001,
@@ -695,6 +728,7 @@
   "HK50": {
     "symbol": "HK50",
     "broker_symbol": "HK50",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -716,6 +750,7 @@
   "JP225": {
     "symbol": "JP225",
     "broker_symbol": "JP225",
+    "asset_class": "index",
     "digits": 0,
     "point": 1.0,
     "tick_size": 1.0,
@@ -737,6 +772,7 @@
   "LTCUSD": {
     "symbol": "LTCUSD",
     "broker_symbol": "LTCUSD",
+    "asset_class": "crypto",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -758,6 +794,7 @@
   "NZDCAD": {
     "symbol": "NZDCAD",
     "broker_symbol": "NZDCAD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -779,6 +816,7 @@
   "NZDCHF": {
     "symbol": "NZDCHF",
     "broker_symbol": "NZDCHF",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -800,6 +838,7 @@
   "NZDJPY": {
     "symbol": "NZDJPY",
     "broker_symbol": "NZDJPY",
+    "asset_class": "fx",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -821,6 +860,7 @@
   "NZDUSD": {
     "symbol": "NZDUSD",
     "broker_symbol": "NZDUSD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -842,6 +882,7 @@
   "SOLUSD": {
     "symbol": "SOLUSD",
     "broker_symbol": "SOLUSD",
+    "asset_class": "crypto",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -863,6 +904,7 @@
   "TONUSD": {
     "symbol": "TONUSD",
     "broker_symbol": "TONUSD",
+    "asset_class": "crypto",
     "digits": 4,
     "point": 0.0001,
     "tick_size": 0.0001,
@@ -884,6 +926,7 @@
   "TRXUSD": {
     "symbol": "TRXUSD",
     "broker_symbol": "TRXUSD",
+    "asset_class": "crypto",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -905,6 +948,7 @@
   "UK100": {
     "symbol": "UK100",
     "broker_symbol": "UK100",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -926,6 +970,7 @@
   "US100": {
     "symbol": "US100",
     "broker_symbol": "US100",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -947,6 +992,7 @@
   "US30": {
     "symbol": "US30",
     "broker_symbol": "US30",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -968,6 +1014,7 @@
   "US500": {
     "symbol": "US500",
     "broker_symbol": "US500",
+    "asset_class": "index",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -989,6 +1036,7 @@
   "USDCAD": {
     "symbol": "USDCAD",
     "broker_symbol": "USDCAD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -1010,6 +1058,7 @@
   "USDCHF": {
     "symbol": "USDCHF",
     "broker_symbol": "USDCHF",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -1031,6 +1080,7 @@
   "USDJPY": {
     "symbol": "USDJPY",
     "broker_symbol": "USDJPY",
+    "asset_class": "fx",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -1052,6 +1102,7 @@
   "USDMXN": {
     "symbol": "USDMXN",
     "broker_symbol": "USDMXN",
+    "asset_class": "fx",
     "digits": 4,
     "point": 0.0001,
     "tick_size": 0.0001,
@@ -1073,6 +1124,7 @@
   "USDNOK": {
     "symbol": "USDNOK",
     "broker_symbol": "USDNOK",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -1094,6 +1146,7 @@
   "USDPLN": {
     "symbol": "USDPLN",
     "broker_symbol": "USDPLN",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -1115,6 +1168,7 @@
   "USDSEK": {
     "symbol": "USDSEK",
     "broker_symbol": "USDSEK",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -1136,6 +1190,7 @@
   "USDSGD": {
     "symbol": "USDSGD",
     "broker_symbol": "USDSGD",
+    "asset_class": "fx",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -1157,6 +1212,7 @@
   "USDZAR": {
     "symbol": "USDZAR",
     "broker_symbol": "USDZAR",
+    "asset_class": "fx",
     "digits": 4,
     "point": 0.0001,
     "tick_size": 0.0001,
@@ -1178,6 +1234,7 @@
   "XAGUSD": {
     "symbol": "XAGUSD",
     "broker_symbol": "XAGUSD",
+    "asset_class": "metal",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -1199,6 +1256,7 @@
   "XAUUSD": {
     "symbol": "XAUUSD",
     "broker_symbol": "XAUUSD",
+    "asset_class": "metal",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -1220,6 +1278,7 @@
   "XBRUSD": {
     "symbol": "XBRUSD",
     "broker_symbol": "XBRUSD",
+    "asset_class": "energy",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,
@@ -1241,6 +1300,7 @@
   "XNGUSD": {
     "symbol": "XNGUSD",
     "broker_symbol": "XNGUSD",
+    "asset_class": "energy",
     "digits": 3,
     "point": 0.001,
     "tick_size": 0.001,
@@ -1262,6 +1322,7 @@
   "XRPUSD": {
     "symbol": "XRPUSD",
     "broker_symbol": "XRPUSD",
+    "asset_class": "crypto",
     "digits": 5,
     "point": 1e-05,
     "tick_size": 1e-05,
@@ -1283,6 +1344,7 @@
   "XTIUSD": {
     "symbol": "XTIUSD",
     "broker_symbol": "XTIUSD",
+    "asset_class": "energy",
     "digits": 2,
     "point": 0.01,
     "tick_size": 0.01,

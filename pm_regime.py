@@ -363,14 +363,15 @@ def _infer_asset_class(symbol: str) -> str:
     # Crypto — prefix match covers majors (BTC, ETH, LTC, XRP, SOL, ADA, DOT,
     # DOGE, BCH) plus any pair that crosses two crypto tickers (BTCETH, BTCXAU
     # is treated as crypto because its volatility profile is crypto-driven).
-    crypto_prefixes = ('BTC', 'ETH', 'LTC', 'XRP', 'SOL', 'ADA', 'DOT', 'DOGE', 'BCH')
+    crypto_prefixes = ('BTC', 'ETH', 'LTC', 'XRP', 'SOL', 'ADA', 'DOT', 'DOGE', 'DOG', 'BCH', 'TRX', 'TON')
     if up.startswith(crypto_prefixes):
         return 'crypto'
     # Indices — common ticker shorthand used by MT5 brokers.
     index_tickers = {
         'SP500', 'SPX500', 'US500', 'US30', 'US100', 'NAS100', 'USTEC',
         'DAX', 'DE30', 'DE40', 'GER30', 'GER40', 'FTSE', 'UK100',
-        'NIKKEI', 'JP225', 'AUS200', 'HK50', 'CHINA50',
+        'NIKKEI', 'JP225', 'AUS200', 'AU200', 'HK50', 'CHINA50',
+        'EU50', 'ES35', 'FR40',
     }
     if up in index_tickers or 'INDEX' in up:
         return 'index'
