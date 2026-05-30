@@ -530,7 +530,7 @@ class PipelineConfig:
     use_commission: bool = True
     use_slippage: bool = True
     slippage_pips: float = 0.5
-    backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max
+    backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max|stress_max
     swap_model_enabled: bool = True
     swap_model_triple_rollover_day: str = "wednesday"
     swap_model_min_holding_hours: float = 20.0
@@ -1155,7 +1155,7 @@ class PipelineConfig:
         self.promote_small_risk_multiplier = max(0.0, min(1.0, mult))
         self.swap_model_enabled = bool(self.swap_model_enabled)
         _spread_mode = str(getattr(self, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
-        if _spread_mode not in {"fixed_spec", "historical_bar", "historical_max", "conservative_max"}:
+        if _spread_mode not in {"fixed_spec", "historical_bar", "historical_max", "conservative_max", "stress_max"}:
             logger.warning("Invalid backtest_spread_mode=%r; falling back to fixed_spec.", _spread_mode)
             _spread_mode = "fixed_spec"
         self.backtest_spread_mode = _spread_mode
@@ -4076,7 +4076,9 @@ class Backtester:
 
         Default `fixed_spec` preserves the historical behavior. Evidence modes use
         MT5 bar Spread columns, which are stored in points and converted via the
-        instrument spec's broker point.
+        instrument spec's broker point. `conservative_max` keeps entry at bar-open
+        spread and uses max spread intrabar; `stress_max` charges max spread on
+        entry as well for stricter stress validation.
         """
         n_bars = len(features)
         fixed_half = spec.get_half_spread_price() if bool(getattr(self.config, "use_spread", True)) else 0.0
@@ -4091,8 +4093,11 @@ class Backtester:
         if not bool(getattr(self.config, "use_spread", True)) or mode == "fixed_spec" or n_bars <= 0:
             return fixed_arr, fixed_arr, meta
 
-        entry_col = "SpreadOpen" if "SpreadOpen" in features.columns else "Spread"
-        if mode in {"historical_max", "conservative_max"} and "SpreadMax" in features.columns:
+        if mode == "stress_max" and "SpreadMax" in features.columns:
+            entry_col = "SpreadMax"
+        else:
+            entry_col = "SpreadOpen" if "SpreadOpen" in features.columns else "Spread"
+        if mode in {"historical_max", "conservative_max", "stress_max"} and "SpreadMax" in features.columns:
             bar_col = "SpreadMax"
         else:
             bar_col = "Spread"
@@ -4111,7 +4116,7 @@ class Backtester:
 
         entry_hist = np.where(np.isfinite(entry_hist), entry_hist, fixed_arr)
         bar_hist = np.where(np.isfinite(bar_hist), bar_hist, fixed_arr)
-        if mode == "conservative_max":
+        if mode in {"conservative_max", "stress_max"}:
             entry_arr = np.maximum(fixed_arr, entry_hist)
             bar_arr = np.maximum(fixed_arr, bar_hist)
         else:
@@ -4122,6 +4127,7 @@ class Backtester:
             "source": "historical_spread_points",
             "entry_column": entry_col,
             "bar_column": bar_col,
+            "entry_model": "max_spread_stress" if mode == "stress_max" else "bar_open_or_mean",
         })
         try:
             effective_spread_price = bar_arr * 2.0

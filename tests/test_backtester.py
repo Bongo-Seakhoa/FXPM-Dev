@@ -170,6 +170,43 @@ class BacktesterTests(unittest.TestCase):
         self.assertAlmostEqual(historical["spread_model"]["mean_effective_spread_price"], 0.10, places=8)
         self.assertAlmostEqual(historical["spread_model"]["mean_effective_spread_cash_per_lot"], 100.0, places=8)
 
+    def test_stress_max_spread_mode_charges_max_spread_at_entry(self):
+        idx = pd.date_range("2024-01-01", periods=3, freq="h")
+        df = pd.DataFrame({
+            "Open": [100.0, 100.0, 100.0],
+            "High": [100.0, 100.05, 100.05],
+            "Low": [100.0, 99.95, 99.95],
+            "Close": [100.0, 100.10, 100.20],
+            "Volume": [100, 100, 100],
+            "Spread": [2.0, 2.0, 2.0],
+            "SpreadOpen": [2.0, 2.0, 2.0],
+            "SpreadMax": [10.0, 10.0, 10.0],
+        }, index=idx)
+        spec = InstrumentSpec(
+            symbol="TEST",
+            pip_position=2,
+            pip_value=10.0,
+            spread_avg=0.0,
+            point=0.01,
+            tick_size=0.01,
+            tick_value=10.0,
+        )
+
+        conservative_entry, conservative_bar, conservative_meta = Backtester(
+            PipelineConfig(use_spread=True, backtest_spread_mode="conservative_max")
+        )._build_half_spread_arrays(df, spec)
+        stress_entry, stress_bar, stress_meta = Backtester(
+            PipelineConfig(use_spread=True, backtest_spread_mode="stress_max")
+        )._build_half_spread_arrays(df, spec)
+
+        self.assertAlmostEqual(conservative_entry[1], 0.01, places=8)
+        self.assertAlmostEqual(conservative_bar[1], 0.05, places=8)
+        self.assertEqual(conservative_meta["entry_column"], "SpreadOpen")
+        self.assertAlmostEqual(stress_entry[1], 0.05, places=8)
+        self.assertAlmostEqual(stress_bar[1], 0.05, places=8)
+        self.assertEqual(stress_meta["entry_column"], "SpreadMax")
+        self.assertEqual(stress_meta["entry_model"], "max_spread_stress")
+
 
 if __name__ == "__main__":
     unittest.main()

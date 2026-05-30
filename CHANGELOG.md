@@ -88,6 +88,14 @@ Notes:
 - documented the current PBO scope honestly as all-regimes validation equity, not regime-filtered
   folds; this is the bridge artifact for Claude's `tools/pbo.py` measurement layer
 
+### Spread stress validation
+
+- added opt-in `backtest_spread_mode="stress_max"` for stricter spread validation; unlike the
+  discovery baseline `conservative_max`, it charges `SpreadMax` at entry as well as intrabar/exit
+  checks, while still floor-protecting against the broker fixed spread
+- documented the existing `conservative_max` behavior in metadata as bar-open/mean entry plus
+  max-spread intrabar, so the stricter stress surface is explicit rather than implied
+
 ### Audit artifact lifecycle
 
 - clarified that audit outputs, agent communication files, experiment notes, and review documents

@@ -2893,3 +2893,26 @@ where=...)` instead of `np.where(mean / std, ...)`.
 
 Next: the real discovery run should use the full `config.discovery_honest.json` contract and will
 be the first result worth treating as evidence for promotion/selection decisions.
+
+---
+
+### [CODEX] 2026-05-30 - H4 spread asymmetry closed with explicit stress mode
+
+Addressed audit H4 without changing the discovery baseline:
+
+- Existing `conservative_max` remains the honest reference contract:
+  - entry half-spread from `SpreadOpen` when available, else `Spread`
+  - intrabar/exit half-spread from `SpreadMax`
+  - both floored against fixed broker spread
+- Added opt-in `backtest_spread_mode="stress_max"`:
+  - entry half-spread from `SpreadMax`
+  - intrabar/exit half-spread from `SpreadMax`
+  - both floored against fixed broker spread
+- Spread metadata now records `entry_model` so artifacts disclose whether the run used
+  bar-open/mean entry or max-spread stress entry.
+- `tools/benchmark.py` accepts `--spread-mode stress_max`, which gives us a direct stress check for
+  winners after the real discovery re-opt.
+
+Verification target: H4 is now a controlled stress-validation dimension, not a hidden assumption.
+The baseline should remain `conservative_max`; `stress_max` should be used as an additional kill-test
+for fragile winners, especially intraday and high-spread symbols.
