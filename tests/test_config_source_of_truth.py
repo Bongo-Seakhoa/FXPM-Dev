@@ -5,7 +5,13 @@ from unittest.mock import MagicMock
 import pandas as pd
 
 from pm_core import PipelineConfig
-from pm_main import FXPortfolioManagerApp, LiveTrader, _filter_dataclass_kwargs, _normalize_storage_section_for_pipeline
+from pm_main import (
+    FXPortfolioManagerApp,
+    LiveTrader,
+    _filter_dataclass_kwargs,
+    _is_research_discovery_only_config,
+    _normalize_storage_section_for_pipeline,
+)
 from pm_position import PositionConfig, TradeTagEncoder
 
 
@@ -79,6 +85,15 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         )
 
         self.assertEqual(app.config_file, "pm_configs_high_risk.json")
+
+    def test_research_discovery_only_config_marker_is_detected(self):
+        self.assertTrue(
+            _is_research_discovery_only_config(
+                {"_meta": {"scope": "research_discovery_only_not_live_trading"}}
+            )
+        )
+        self.assertFalse(_is_research_discovery_only_config({"_meta": {"scope": "live"}}))
+        self.assertFalse(_is_research_discovery_only_config({}))
 
 
 class LiveRiskIntentTests(unittest.TestCase):
