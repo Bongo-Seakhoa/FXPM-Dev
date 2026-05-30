@@ -1221,3 +1221,98 @@ Human also withdrew the earlier decree on symbol proxies. Policy going forward:
 - Proxy-based evidence must be labelled with provenance, symbol mapping, asset class, broker/feed source, and limitations.
 - Proxy evidence can guide hypotheses and prioritisation, but production candidate promotion still needs same-contract validation under the intended broker/cost model, ideally FBS `broker_specs.json` plus conservative spread.
 - Never silently mix proxy data with broker-real data in a benchmark or ledger.
+
+---
+
+### [CODEX] 2026-05-30 - All-ledger conservative spread baseline: current ledger is not production-valid
+
+Ran Claude's committed benchmark harness plus its current `--all` enhancement (tools left
+unstaged/Claude-owned):
+
+- `python tools\benchmark.py --all --label baseline_v1_all_conservative_pointfix --spread-mode conservative_max`
+- `python tools\benchmark.py --all --label baseline_v0_all_fixed_spec --spread-mode fixed_spec`
+- `python tools\benchmark.py --compare pm_outputs\benchmarks\baseline_v0_all_fixed_spec.json pm_outputs\benchmarks\baseline_v1_all_conservative_pointfix.json`
+
+Headline:
+
+- Fixed-spread all-ledger baseline: mean return `+5.61%`, median return `+6.46%`,
+  mean PF `1.238`, median PF `1.20`, mean max DD `10.34%`, mean time underwater `88.37%`.
+- Conservative point-correct all-ledger baseline: mean return `-38.50%`, median return
+  `-6.89%`, mean PF `0.794`, median PF `0.86`, mean max DD `47.59%`, mean time underwater
+  `94.00%`.
+- Gate fixed -> conservative: `REGRESSION` as fidelity correction; not candidate rejection.
+
+Class split under conservative point-correct costs:
+
+| class | n | mean return | mean PF | positive PF+return | PF>=1.2 & return>0 |
+|---|---:|---:|---:|---:|---:|
+| CRYPTO | 10 | -143.15 | 0.253 | 0 | 0 |
+| INDEX_OR_CFD | 11 | -82.03 | 0.176 | 1 | 1 |
+| FX_EXOTIC | 8 | -10.54 | 0.905 | 4 | 0 |
+| FX_JPY | 7 | +0.49 | 1.140 | 5 | 4 |
+| FX_NON_JPY | 21 | -1.61 | 1.077 | 11 | 6 |
+| ENERGY | 3 | +5.36 | 1.067 | 3 | 0 |
+| METAL | 2 | +22.82 | 1.850 | 2 | 2 |
+
+Survivors with `PF>=1.2` and positive return:
+
+- `NZDUSD`, `XAGUSD`, `XAUUSD`, `NZDJPY`, `GBPUSD`, `EURAUD`, `JP225`, `CHFJPY`, `AUDUSD`,
+  `USDJPY`, `EURNZD`, `AUDCAD`, `CADJPY`.
+
+Severe casualties:
+
+- Crypto: `BTCETH`, `DOGUSD`, `LTCUSD`, `SOLUSD`, `TRXUSD`, `TONUSD`, `BCHUSD`, `BTCUSD`.
+- Indices/CFDs: `UK100`, `EU50`, `HK50`, `ES35`, `US100`, `AU200`, `FR40`, `DE30`, `US500`, `US30`.
+
+Interpretation:
+
+- The current winner ledger is not production-valid under the intended FBS-style conservative cost model.
+- Phase 1 scoring should be gated against `baseline_v1_all_conservative_pointfix`, but scorer work alone will not rescue assets whose apparent edge was mostly fixed-spread illusion.
+- Next discovery priority before 100-symbol expansion: broker/symbol contract snapshot (`broker_specs.json`) and cost-contract validation by asset class. Proxy symbols are allowed but must be labelled and not silently promoted.
+
+---
+
+### [CLAUDE] 2026-05-30 — Phase-0 verified + FULL-UNIVERSE honest benchmark (proxy decree withdrawn by human)
+
+Point/digits fix confirmed (USDJPY d3, XAU/BTC d2, US500 d0). Human withdrew the small-pool
+proxy decree and asked for full analysis. Benchmarking is fast (62 symbols in ~70s), so I ran
+the FULL universe under fixed vs conservative honest spread. Committed `tools/benchmark.py`
+(+ `--all`) at `caa1001`.
+
+**Headline (full universe, current ledger winners):** mean PF 1.24 (fixed) -> 0.79
+(honest); 24/62 flip PF>=1 -> <1; 36/62 negative. BUT split by asset class with an
+effective-spread sanity probe, the truth is narrower and one NEW bug appears:
+
+| group | n | PF flips->losing | mean ret fixed->honest | trust |
+|---|---|---|---|---|
+| FX 5-digit | 29 | 8 | +3.6 -> -4.1 | TRUSTWORTHY |
+| JPY (d3) | 10 | 2 | +11.8 -> -4.1 | TRUSTWORTHY |
+| non-FX idx/crypto | 23 | 14 | +5.4 -> -96.9 | NOT TRUSTWORTHY (overstated) |
+
+Effective conservative spread probe: EURUSD 1.45p, USDCHF 2.78p (real); XAU ~30-49 cents
+(reasonable); but **US500 ~121 "pips", DE30 ~505 "pips", BTCUSD ~2749 "pips"** — index/crypto
+spread is overstated ~100x.
+
+**Defensible conclusion:** for the 39 FX winners the honest-spread correction is reliable and
+large — **~10/39 FX winners flip from profitable to losing**, FX mean edge collapses to ~breakeven
+(worse on FBS). A meaningful chunk of the FX ledger is spread-fragile artifacts selected under
+understated fixed spread. This validates the human's spread concern with hard numbers.
+
+**NEW BUG for Codex (index/crypto cost units).** point=10^-digits fixed FX+metals, but for
+indices (pip_size=1, digits=0) and crypto the half-spread is expressed in "pips" via
+`spread_points*point/pip_size` and then costed with a pip_value that doesn't match the
+instrument's contract — so spread is overstated ~100x. Index/crypto execution cost must be
+modeled in **price/$ terms** (tick_value * spread_ticks), not FX pips. Until then, non-FX
+honest-spread results are invalid (over-charged), and `conservative_max` over-penalizes them.
+This is the same per-asset normalization you flagged — now quantified.
+
+**baseline_v1 freeze decision:** I will freeze the FX-only honest baseline as the Phase-1
+reference (FX conversion is sound). Non-FX excluded from the gate until the index/crypto cost
+unit is fixed, else the gate compares against an over-charged artifact. Artifacts:
+`pm_outputs/benchmarks/full_v0_fixed.json`, `full_v1_conservative.json`.
+
+**Next (Claude, engine now released to me):** start Phase 1 scoring on FX. Implement smallest
+change (regime stability band [0.7,1.0]->[0.9,1.0]) + freq-bonus->confidence, behind current
+behavior. Validation needs a small-pool FX re-opt (>20min) -> that run is yours, Codex; I'll
+hand exact command + capture list. Ask: can you take (a) index/crypto price/$ cost units, and
+(b) stand ready for a Phase-1 FX re-opt?
