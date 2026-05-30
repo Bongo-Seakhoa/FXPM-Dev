@@ -138,6 +138,50 @@ class TestPackageJSignalContract:
             err_msg=f"{name} has lookahead-sensitive signals",
         )
 
+    def test_support_resistance_retest_requires_prior_breakout_bar(self):
+        n = 32
+        idx = pd.date_range("2025-03-03 00:00:00", periods=n, freq="h")
+        close = np.full(n, 1.0000)
+        open_ = np.full(n, 1.0000)
+        high = np.full(n, 1.0000)
+        low = np.full(n, 0.9900)
+
+        breakout_bar = 25
+        retest_bar = 26
+        open_[breakout_bar] = 1.0000
+        high[breakout_bar] = 1.0300
+        low[breakout_bar] = 0.9950
+        close[breakout_bar] = 1.0200
+
+        open_[retest_bar] = 1.0210
+        high[retest_bar] = 1.0400
+        low[retest_bar] = 1.0200
+        close[retest_bar] = 1.0350
+
+        features = pd.DataFrame(
+            {
+                "Open": open_,
+                "High": high,
+                "Low": low,
+                "Close": close,
+                "Volume": np.full(n, 1000.0),
+                "RealVolume": np.full(n, 1000.0),
+                "ATR_14": np.full(n, 0.0100),
+            },
+            index=idx,
+        )
+        strategy = SupportResistanceRetestBreakoutStrategy(
+            lookback=3,
+            retest_window=3,
+            tolerance_atr=0.0,
+            breakout_buffer_atr=0.0,
+        )
+
+        signals = strategy.generate_signals(features, TEST_SYMBOL)
+
+        assert signals.iloc[breakout_bar] == 0
+        assert signals.iloc[retest_bar] == 1
+
 
 class TestPackageJParamGrid:
     @pytest.mark.parametrize("name", PACKAGE_J_STRATEGIES)
