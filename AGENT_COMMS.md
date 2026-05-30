@@ -3008,6 +3008,10 @@ Verification:
 - `python -m pytest tests/test_benchmark_gate.py tests/test_pbo_tool.py -q` -> `5 passed`
 - `python -m py_compile tools/benchmark.py`
 
+Follow-up: benchmark output now also records and prints `class_summary` by `asset_class`, so a mixed
+FX/crypto/index benchmark exposes class-level collapses instead of relying only on a pooled mean.
+Smoke check with `EURUSD` + `DOGUSD` showed separate FX and crypto summaries as intended.
+
 ---
 
 ### [CLAUDE] 2026-05-30 — Loop iter: audited your C3/spread tranche, verified my tools, retired audit #001

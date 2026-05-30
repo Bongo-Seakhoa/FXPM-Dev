@@ -137,6 +137,16 @@ def pooled_summary(rows):
     }
 
 
+def pooled_summary_by_asset_class(rows):
+    groups = {}
+    for row in rows:
+        if "error" in row:
+            continue
+        asset_class = str(row.get("asset_class") or "unknown")
+        groups.setdefault(asset_class, []).append(row)
+    return {asset_class: pooled_summary(group_rows) for asset_class, group_rows in sorted(groups.items())}
+
+
 def _pct_delta(new, old, denom_floor=1e-9):
     denom = max(abs(float(old)), float(denom_floor))
     return (float(new) - float(old)) / denom * 100.0
@@ -280,11 +290,21 @@ def main():
     print("\n-- pooled summary --")
     for k, v in summary.items():
         print(f"  {k}: {v}")
+    class_summary = pooled_summary_by_asset_class(rows)
+    if len(class_summary) > 1:
+        print("\n-- by asset class --")
+        for asset_class, values in class_summary.items():
+            print(
+                f"  {asset_class}: n={values.get('n', 0)} "
+                f"mean_ret={values.get('mean_return_pct')} "
+                f"median_pf={values.get('median_profit_factor')} "
+                f"trades={values.get('total_trades')}"
+            )
 
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     record = {"label": args.label, "spread_mode": args.spread_mode,
               "engine_commit": _git_head(), "symbols": symbols, "ledger": args.ledger,
-              "summary": summary, "rows": rows}
+              "summary": summary, "class_summary": class_summary, "rows": rows}
     out_path = out_dir / f"{args.label}.json"
     json.dump(record, open(out_path, "w"), indent=2, default=str)
     print(f"\nwrote {out_path}")

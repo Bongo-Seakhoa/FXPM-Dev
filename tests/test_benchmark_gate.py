@@ -1,6 +1,6 @@
 import unittest
 
-from tools.benchmark import is_improvement
+from tools.benchmark import is_improvement, pooled_summary_by_asset_class
 
 
 def _record(mean_pf, row_pf=None):
@@ -41,6 +41,38 @@ class BenchmarkGateTests(unittest.TestCase):
 
         self.assertEqual(verdict["verdict"], "REGRESSION")
         self.assertAlmostEqual(verdict["absolute_deltas"]["pf"], -0.1)
+
+    def test_pooled_summary_by_asset_class_keeps_classes_separate(self):
+        rows = [
+            {
+                "symbol": "EURUSD",
+                "asset_class": "fx",
+                "return_pct": 2.0,
+                "profit_factor": 1.1,
+                "max_dd_pct": 3.0,
+                "ulcer_index": 1.0,
+                "time_underwater_pct": 20.0,
+                "trades": 10,
+                "win_rate": 55.0,
+            },
+            {
+                "symbol": "DOGUSD",
+                "asset_class": "crypto",
+                "return_pct": -50.0,
+                "profit_factor": 0.2,
+                "max_dd_pct": 60.0,
+                "ulcer_index": 40.0,
+                "time_underwater_pct": 99.0,
+                "trades": 20,
+                "win_rate": 30.0,
+            },
+        ]
+
+        summary = pooled_summary_by_asset_class(rows)
+
+        self.assertEqual(set(summary), {"crypto", "fx"})
+        self.assertEqual(summary["fx"]["n"], 1)
+        self.assertEqual(summary["crypto"]["mean_return_pct"], -50.0)
 
 
 if __name__ == "__main__":
