@@ -2313,3 +2313,19 @@ Verification:
   -> `78 passed, 2 skipped, 228 subtests passed`
 - `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_structural_sl_wrapper.py tests/test_strategy_search_budget_fairness.py tests/test_pipeline_perf_smoke.py -q`
   -> `290 passed, 5 skipped, 334 subtests passed`
+
+Post-fix prospect verification:
+
+- Command:
+  `python tools/strategy_prospect.py --strategies DoubleTopBottomReversalStrategy TriangleCompressionBreakoutStrategy FlagPullbackContinuationStrategy GapFadeStrategy OpeningDriveFailureStrategy PreviousSessionLevelRejectionStrategy SupportResistanceRetestBreakoutStrategy MoneyFlowIndexReversalStrategy ChaikinMoneyFlowTrendStrategy AccumulationDistributionBreakoutStrategy --pool EURUSD USDJPY XAUUSD US500 BTCUSD --samples 10 --timeframes H1 H4 --label package_j_robust_verify_ba84fdc`
+- Artifact:
+  `pm_outputs/experiments/package_j_robust_verify_ba84fdc.json`
+- Engine commit: `ba84fdc`
+- Result: `5` VIABLE, `5` WEAK under the robust screener.
+- VIABLE: `TriangleCompressionBreakoutStrategy`, `FlagPullbackContinuationStrategy`,
+  `SupportResistanceRetestBreakoutStrategy`, `ChaikinMoneyFlowTrendStrategy`,
+  `AccumulationDistributionBreakoutStrategy`.
+- WEAK: `DoubleTopBottomReversalStrategy`, `GapFadeStrategy`, `OpeningDriveFailureStrategy`,
+  `PreviousSessionLevelRejectionStrategy`, `MoneyFlowIndexReversalStrategy`.
+- `SupportResistanceRetestBreakoutStrategy` stayed robust after the prior-breakout retest fix:
+  `32/50` profitable runs, median PF `1.045`, best `BTCUSD H1` return `59.3%`, PF `1.27`.
