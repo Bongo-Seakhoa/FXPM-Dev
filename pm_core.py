@@ -4023,9 +4023,16 @@ class Backtester:
             "bar_column": bar_col,
         })
         try:
+            effective_spread_price = bar_arr * 2.0
+            meta["mean_effective_spread_price"] = float(np.nanmean(effective_spread_price))
+            meta["max_effective_spread_price"] = float(np.nanmax(effective_spread_price))
+            if spec.tick_size > 0 and spec.tick_value > 0:
+                effective_spread_cash = effective_spread_price / spec.tick_size * spec.tick_value
+                meta["mean_effective_spread_cash_per_lot"] = float(np.nanmean(effective_spread_cash))
+                meta["max_effective_spread_cash_per_lot"] = float(np.nanmax(effective_spread_cash))
             if spec.pip_size > 0:
-                meta["mean_effective_spread_pips"] = float(np.nanmean(bar_arr * 2.0 / spec.pip_size))
-                meta["max_effective_spread_pips"] = float(np.nanmax(bar_arr * 2.0 / spec.pip_size))
+                meta["mean_effective_spread_pips"] = float(np.nanmean(effective_spread_price / spec.pip_size))
+                meta["max_effective_spread_pips"] = float(np.nanmax(effective_spread_price / spec.pip_size))
         except Exception:
             pass
         return entry_arr.astype(np.float64), bar_arr.astype(np.float64), meta
