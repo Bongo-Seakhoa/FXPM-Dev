@@ -96,8 +96,12 @@ def evaluate_winner(cfg, loader, winner):
         return {"symbol": symbol, "error": "no_signals"}
     r = Backtester(cfg).run(feats, signals, symbol, strategy, spec=get_instrument_spec(symbol), timeframe=tf)
     pdd = path_dependent_dd(r.get("equity_curve", []))
+    spread_model = dict(r.get("spread_model", {}) or {})
     return {
         "symbol": symbol, "strategy": name, "tf": tf,
+        "asset_class": spread_model.get("asset_class", ""),
+        "spread_provenance_status": spread_model.get("spread_provenance_status", ""),
+        "mean_to_broker_spread_ratio": float(spread_model.get("mean_to_broker_spread_ratio", 0.0) or 0.0),
         "trades": int(r.get("total_trades", 0)),
         "return_pct": float(r.get("total_return_pct", 0.0)),
         "profit_factor": float(r.get("profit_factor", 0.0)),
@@ -250,7 +254,8 @@ def main():
             rows.append({"symbol": sym, "error": f"{type(e).__name__}: {e}"})
 
     summary = pooled_summary(rows)
-    cols = ["symbol", "strategy", "tf", "trades", "return_pct", "profit_factor", "win_rate",
+    cols = ["symbol", "asset_class", "spread_provenance_status", "mean_to_broker_spread_ratio",
+            "strategy", "tf", "trades", "return_pct", "profit_factor", "win_rate",
             "max_dd_pct", "ulcer_index", "time_underwater_pct", "max_dd_duration",
             "recovery_factor", "max_consec_losses"]
     print(f"\n=== BENCHMARK [{args.label}] spread_mode={args.spread_mode} ===")
