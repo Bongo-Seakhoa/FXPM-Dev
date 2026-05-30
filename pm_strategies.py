@@ -3,10 +3,10 @@ FX Portfolio Manager - Trading Strategies
 ==========================================
 
 Contains all trading strategy implementations.
-Includes 76 strategies across categories:
-- Trend Following (24 strategies)
-- Mean Reversion (31 strategies)
-- Breakout/Momentum (21 strategies)
+Includes 84 strategies across categories:
+- Trend Following (29 strategies)
+- Mean Reversion (33 strategies)
+- Breakout/Momentum (22 strategies)
 
 Each strategy provides:
 - Signal generation (returns -1, 0, 1)
@@ -5958,16 +5958,28 @@ def _index_dom(features: pd.DataFrame) -> pd.Series:
 
 
 def _carry_direction(symbol: str, min_diff: float) -> int:
-    """+1 if holding long earns/saves more swap than short, -1 if short is favored, else 0.
-    Static per symbol/broker spec; signal-only (no lookahead)."""
+    """+1 for positive long carry, -1 for positive short carry, else 0.
+
+    Static per symbol/broker spec; signal-only (no lookahead). If both sides
+    are negative, the carry strategies stay flat instead of picking the less
+    expensive bleed side.
+    """
     try:
         spec = get_instrument_spec(symbol)
-        diff = float(spec.swap_long) - float(spec.swap_short)
+        swap_long = float(spec.swap_long)
+        swap_short = float(spec.swap_short)
     except Exception:
         return 0
+    if max(swap_long, swap_short) <= 0.0:
+        return 0
+    diff = swap_long - swap_short
     if abs(diff) < float(min_diff):
         return 0
-    return 1 if diff > 0 else -1
+    if diff > 0 and swap_long > 0.0:
+        return 1
+    if diff < 0 and swap_short > 0.0:
+        return -1
+    return 0
 
 
 class TimeOfDayMomentumStrategy(BaseStrategy):
@@ -6005,7 +6017,7 @@ class TimeOfDayMomentumStrategy(BaseStrategy):
         return self._zero_warmup(signals, lb + 2)
 
     def get_param_grid(self) -> Dict[str, List]:
-        return {"start_hour": [0, 7, 8, 13], "end_hour": [12, 16, 20, 24],
+        return {"start_hour": [0, 7, 8, 13], "end_hour": [16, 20, 24],
                 "mom_lookback": [6, 12, 24], "atr_buffer": [0.0, 0.1, 0.25],
                 **self._base_sl_tp_grid(), **self._structural_sl_grid()}
 
@@ -6023,7 +6035,7 @@ class SessionCloseReversionStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {"session_start_hour": 0, "late_start_hour": 19, "ext_atr": 1.0,
-                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {"ATR_14"}
@@ -6045,7 +6057,7 @@ class SessionCloseReversionStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {"session_start_hour": [0, 8], "late_start_hour": [16, 19, 21],
-                "ext_atr": [0.5, 1.0, 1.5], **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+                "ext_atr": [0.5, 1.0, 1.5], **self._base_sl_tp_grid()}
 
 
 class DayOfWeekBiasStrategy(BaseStrategy):
@@ -6162,9 +6174,11 @@ class OvernightDriftStrategy(BaseStrategy):
         keys = _session_keys(features, ss)
         close = features["Close"]
         atr = _get_atr(features, 14)
-        session_open = close.groupby(keys).transform("first")
+        open_source = features["Open"] if "Open" in features.columns else close
+        session_open = open_source.groupby(keys).transform("first")
         move = close - session_open
-        at_entry = hour == eh
+        previous_hour_in_session = hour.groupby(keys).shift(1)
+        at_entry = (hour == eh) & (previous_hour_in_session != eh)
         band = mm * atr
         signals = pd.Series(0, index=features.index, dtype=int)
         signals[at_entry & (move > band)] = 1
@@ -6189,8 +6203,7 @@ class IntradayRangeFadeStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {"session_start_hour": 0, "quiet_start_hour": 1, "quiet_end_hour": 7,
-                "ext_atr": 0.5, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0,
-                **self._structural_sl_defaults()}
+                "ext_atr": 0.5, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
 
     def get_required_features(self) -> Set[str]:
         return {"ATR_14"}
@@ -6204,8 +6217,8 @@ class IntradayRangeFadeStrategy(BaseStrategy):
         keys = _session_keys(features, ss)
         close = features["Close"]
         atr = _get_atr(features, 14)
-        dev_high = features["High"].groupby(keys).cummax().shift(1)
-        dev_low = features["Low"].groupby(keys).cummin().shift(1)
+        dev_high = features["High"].groupby(keys).cummax().groupby(keys).shift(1)
+        dev_low = features["Low"].groupby(keys).cummin().groupby(keys).shift(1)
         quiet = (hour >= qs) & (hour < qe)
         band = ext * atr
         signals = pd.Series(0, index=features.index, dtype=int)
@@ -6216,7 +6229,7 @@ class IntradayRangeFadeStrategy(BaseStrategy):
     def get_param_grid(self) -> Dict[str, List]:
         return {"session_start_hour": [0, 8], "quiet_start_hour": [0, 1, 2],
                 "quiet_end_hour": [5, 7, 9], "ext_atr": [0.25, 0.5, 1.0],
-                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+                **self._base_sl_tp_grid()}
 
 
 class SwapCarryTrendStrategy(BaseStrategy):
@@ -6561,6 +6574,15 @@ __all__ = [
     'MoneyFlowIndexReversalStrategy',
     'ChaikinMoneyFlowTrendStrategy',
     'AccumulationDistributionBreakoutStrategy',
+    # Package K
+    'TimeOfDayMomentumStrategy',
+    'SessionCloseReversionStrategy',
+    'DayOfWeekBiasStrategy',
+    'TurnOfMonthStrategy',
+    'OvernightDriftStrategy',
+    'IntradayRangeFadeStrategy',
+    'SwapCarryTrendStrategy',
+    'CarryFilteredPullbackStrategy',
 ]
 
 # Migration map for retired strategy names → current names

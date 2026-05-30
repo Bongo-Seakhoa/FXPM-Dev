@@ -12,6 +12,19 @@ Notes:
 
 ## [1.4.10] - Unreleased
 
+### Package K strategy audit fixes
+
+- corrected the new carry-aware strategies so they only trade when the broker swap snapshot shows
+  a truly positive carry side; both-negative symbols now stay flat instead of choosing the less
+  negative bleed side
+- fixed `IntradayRangeFadeStrategy` to shift developing range highs/lows within each session,
+  preventing previous-session range leakage into the first bar of the next session
+- limited `OvernightDriftStrategy` to one entry decision per configured entry hour on sub-hour
+  timeframes and measured the drift from the session's first `Open` when available
+- removed structural-stop opt-in from the two Package K mean-reversion strategies to preserve the
+  existing ATR-only mean-reversion stop contract
+- updated the honest discovery metadata and strategy exports to the 84-strategy roster
+
 ### Audit artifact lifecycle
 
 - clarified that audit outputs, agent communication files, experiment notes, and review documents
