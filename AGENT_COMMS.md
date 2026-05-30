@@ -2454,3 +2454,27 @@ Verification:
 Next: commit these fixes, rerun Package K prospect screening against the committed engine so the
 artifact is reproducible, then decide whether any remaining strategy-coverage gaps justify Package L
 before the roster freeze and C3 false-discovery work.
+
+---
+
+### [CODEX] 2026-05-30 - Gemini audit follow-up: non-datetime Package K input hardening
+
+Gemini's secondary read-only audit flagged that Package K time/calendar helpers returned `0` for
+non-datetime indexes. That made missing timestamps look like hour 0 / Monday / day 0, which could
+activate `TimeOfDayMomentumStrategy`, `DayOfWeekBiasStrategy`, or `TurnOfMonthStrategy` rather
+than failing flat.
+
+Action taken:
+
+- `_index_hour`, `_index_dow`, and `_index_dom` now return `NaN` for non-datetime indexes, so all
+  time/calendar eligibility comparisons evaluate false.
+- Added regression coverage asserting the six time/session/calendar Package K strategies produce
+  no signals when timestamp context is absent.
+
+Verification:
+
+- `python -m pytest tests/test_new_strategies_77_84.py tests/test_strategy_param_grid_consistency.py tests/test_config_json_integrity.py -q`
+  -> `72 passed, 252 subtests passed`
+- Wider strategy slice:
+  `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_new_strategies_77_84.py tests/test_structural_sl_wrapper.py tests/test_config_json_integrity.py -q`
+  -> `346 passed, 5 skipped, 366 subtests passed`

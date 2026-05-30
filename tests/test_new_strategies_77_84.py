@@ -35,6 +35,15 @@ PACKAGE_K_STRATEGIES = [
     "CarryFilteredPullbackStrategy",
 ]
 
+TIME_INDEX_STRATEGIES = [
+    "TimeOfDayMomentumStrategy",
+    "SessionCloseReversionStrategy",
+    "DayOfWeekBiasStrategy",
+    "TurnOfMonthStrategy",
+    "OvernightDriftStrategy",
+    "IntradayRangeFadeStrategy",
+]
+
 EXPECTED_CATEGORIES = {
     "TimeOfDayMomentumStrategy": StrategyCategory.BREAKOUT_MOMENTUM,
     "SessionCloseReversionStrategy": StrategyCategory.MEAN_REVERSION,
@@ -103,6 +112,12 @@ class TestPackageKSignalContract:
             full.iloc[:cutoff].values, trunc.values,
             err_msg=f"{name} has lookahead-sensitive signals",
         )
+
+    @pytest.mark.parametrize("name", TIME_INDEX_STRATEGIES)
+    def test_time_calendar_strategies_flat_without_datetime_index(self, name):
+        features = _make_features().reset_index(drop=True)
+        sig = StrategyRegistry.get(name).generate_signals(features.copy(), TEST_SYMBOL)
+        assert (sig != 0).sum() == 0
 
     def test_carry_direction_gates_eurusd_short(self):
         # EURUSD default spec carry favors short (swap_long < swap_short) -> no long signals.
