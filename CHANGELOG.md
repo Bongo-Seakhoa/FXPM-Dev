@@ -54,7 +54,8 @@ Notes:
   - autocorrelation reversal
 - reconciled independent Package M audit findings by using broker-aligned week periods, debouncing
   same-level rejection signals per day/period, removing the dead `adr_period` axis from prior-day
-  reclaim, and adding timezone/week-boundary regression tests
+  reclaim, optimizing the head-and-shoulders detector to scan confirmed pivot events instead of
+  every bar, and adding timezone/week-boundary regression tests
 - updated discovery metadata and registry tests to the 100-strategy roster
 
 ### Audit artifact lifecycle
