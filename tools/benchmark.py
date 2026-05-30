@@ -155,13 +155,19 @@ def is_improvement(baseline, candidate, material=5.0):
     }
     bmap = {r["symbol"]: r for r in baseline.get("rows", []) if "error" not in r}
     cmap = {r["symbol"]: r for r in candidate.get("rows", []) if "error" not in r}
+    # Per-symbol scan covers return, PF, AND path-dependent risk (Tenet 2): a pooled mean
+    # cannot hide a single-symbol drawdown/time-underwater blowup.
     per_symbol = []
     for sym in sorted(set(bmap) & set(cmap)):
         rd = _pct_delta(cmap[sym]["return_pct"], bmap[sym]["return_pct"])
         pfd = _pct_delta(cmap[sym]["profit_factor"], bmap[sym]["profit_factor"])
-        if rd < -material or pfd < -material:
+        ddd = _pct_delta(cmap[sym]["max_dd_pct"], bmap[sym]["max_dd_pct"])
+        uld = _pct_delta(cmap[sym]["ulcer_index"], bmap[sym]["ulcer_index"])
+        tud = _pct_delta(cmap[sym]["time_underwater_pct"], bmap[sym]["time_underwater_pct"])
+        if rd < -material or pfd < -material or ddd > material or uld > material or tud > material:
             per_symbol.append({"symbol": sym, "return_delta_pct": round(rd, 2),
-                               "pf_delta_pct": round(pfd, 2)})
+                               "pf_delta_pct": round(pfd, 2), "max_dd_delta_pct": round(ddd, 2),
+                               "ulcer_delta_pct": round(uld, 2), "time_uw_delta_pct": round(tud, 2)})
 
     def result(verdict):
         if per_symbol and verdict in ("IMPROVEMENT", "NO_CHANGE", "TRADE_OFF_ACCEPT"):
@@ -169,15 +175,16 @@ def is_improvement(baseline, candidate, material=5.0):
         return {"verdict": verdict, "deltas_pct": {k: round(v, 2) for k, v in d.items()},
                 "per_symbol_regressions": per_symbol}
 
-    if all(abs(v) < material for v in (d["return"], d["pf"], d["max_dd"], d["ulcer"])):
+    if all(abs(v) < material for v in (d["return"], d["pf"], d["max_dd"], d["ulcer"], d["time_uw"])):
         return result("NO_CHANGE")
 
     profit_down = d["return"] < -material
     pf_down = d["pf"] < -material
     profit_up = d["return"] > material
     pf_up = d["pf"] > material
-    risk_better = d["max_dd"] <= 0 and d["ulcer"] <= 0
-    risk_worse = d["max_dd"] > material or d["ulcer"] > material
+    # Path-dependent DD (max_dd, ulcer, time-underwater) is first-class risk per Tenet 2.
+    risk_better = d["max_dd"] <= 0 and d["ulcer"] <= 0 and d["time_uw"] <= 0
+    risk_worse = d["max_dd"] > material or d["ulcer"] > material or d["time_uw"] > material
 
     if profit_down or pf_down:
         if (profit_up or pf_up) and risk_better:
@@ -221,7 +228,9 @@ def main():
         if v.get("per_symbol_regressions"):
             print("  per-symbol regressions (hidden by pooled mean):")
             for ps in v["per_symbol_regressions"]:
-                print(f"    {ps['symbol']:8} return {ps['return_delta_pct']:+.1f}%  pf {ps['pf_delta_pct']:+.1f}%")
+                print(f"    {ps['symbol']:8} ret {ps['return_delta_pct']:+.1f}%  pf {ps['pf_delta_pct']:+.1f}%  "
+                      f"dd {ps['max_dd_delta_pct']:+.1f}%  ulcer {ps['ulcer_delta_pct']:+.1f}%  "
+                      f"time_uw {ps['time_uw_delta_pct']:+.1f}%")
         return
 
     cfg = build_config(args.spread_mode)

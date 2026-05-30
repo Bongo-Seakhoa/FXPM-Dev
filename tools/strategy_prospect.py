@@ -69,22 +69,30 @@ def _run(cfg, loader, name, params, symbol, tfs):
 
 
 def screen(name, cfg, loader, pool, samples, seed, tfs):
+    """In-sample prospect screen for CANDIDATE ADMISSION only — not leakage-safe validation.
+    A genuine edge should be profitable across a meaningful FRACTION of reasonable params/
+    symbols with median PF >= 1 (robustness), not just in a best-of-N outlier. Promotion still
+    requires full re-opt + holdout + global-family DSR/PBO (see audit C3)."""
     grid = StrategyRegistry.get(name).get_param_grid()
     param_sets = _sample_grid(grid, samples, seed)
-    runs, tradeful, profitable, best = 0, 0, 0, None
+    pfs, profitable, best = [], 0, None
     for params in param_sets:
         for symbol in pool:
             res = _run(cfg, loader, name, params, symbol, tfs)
             if res is None:
                 continue
-            runs += 1
-            tradeful += 1
+            pfs.append(res["profit_factor"])
             if res["profit_factor"] >= 1.0 and res["return_pct"] > 0:
                 profitable += 1
                 if best is None or res["return_pct"] > best["return_pct"]:
                     best = {**res, "params": params}
-    verdict = "VIABLE" if profitable >= max(3, runs * 0.05) else "WEAK"
+    tradeful = len(pfs)
+    frac = (profitable / tradeful) if tradeful else 0.0
+    median_pf = float(np.median(pfs)) if pfs else 0.0
+    # Robustness bar: enough tradeful samples, a real fraction profitable, typical config >= breakeven.
+    verdict = "VIABLE" if (tradeful >= 8 and frac >= 0.30 and median_pf >= 1.0) else "WEAK"
     return {"strategy": name, "tradeful_runs": tradeful, "profitable_runs": profitable,
+            "frac_profitable": round(frac, 2), "median_pf": round(median_pf, 3),
             "verdict": verdict, "best": best}
 
 
@@ -114,13 +122,14 @@ def main():
             rows.append({"strategy": name, "error": f"{type(e).__name__}: {e}"})
 
     print(f"\n=== STRATEGY PROSPECT SCREEN [{args.label}] {args.spread_mode} engine={_git_head()} ===")
-    print(f"{'strategy':40} {'tradeful':>9} {'profit>=1':>10} {'verdict':>8}  best")
+    print(f"{'strategy':40} {'tradeful':>9} {'frac_pf':>8} {'med_pf':>7} {'verdict':>8}  best")
     for r in rows:
         if "error" in r:
             print(f"{r['strategy']:40} ERROR {r['error']}"); continue
         b = r["best"]
         bs = f"{b['symbol']} {b['tf']} ret={b['return_pct']:.1f} pf={b['profit_factor']:.2f}" if b else "-"
-        print(f"{r['strategy']:40} {r['tradeful_runs']:>9} {r['profitable_runs']:>10} {r['verdict']:>8}  {bs}")
+        print(f"{r['strategy']:40} {r['tradeful_runs']:>9} {r['frac_profitable']:>8} "
+              f"{r['median_pf']:>7} {r['verdict']:>8}  {bs}")
 
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     rec = {"label": args.label, "engine_commit": _git_head(), "spread_mode": args.spread_mode,
