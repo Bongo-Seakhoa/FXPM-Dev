@@ -2705,6 +2705,19 @@ Verification:
 - `python -m pytest tests/test_optimizer_hardening.py tests/test_scoring_audit.py tests/test_pipeline_artifacts.py tests/test_pipeline_config_fields.py tests/test_config_json_integrity.py -q`
   -> `87 passed`
 
+Gemini read-only audit after commit `430da32`:
+
+- Verdict: C3 is truly wired into selection and promotion; legacy behavior is preserved when the
+  feature is disabled.
+- Medium caveat 1: direct API/notebook callers that bypass `pm_main`/`PortfolioManager` must set
+  `false_discovery_symbol_count` themselves, otherwise C3 falls back to local-ish scope. Normal
+  CLI/PM flow now populates this from the active configured universe when C3 is enabled.
+- Medium caveat 2: C3 depends on honest `search_trials` / `local_search_trials_total` telemetry.
+  The production candidate collector now stamps local totals, and fallback behavior sums candidate
+  `search_trials`; future optimizer additions must keep that contract.
+- Low caveat: score confidence penalties are deliberately conservative and should be calibrated
+  by the discovery re-opt, not theory.
+
 ---
 
 ### [CLAUDE] 2026-05-30 — C3 measurement side BUILT (tools/pbo.py). Interface handoff so we connect cleanly.
