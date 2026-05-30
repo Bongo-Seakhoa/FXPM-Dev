@@ -1375,3 +1375,145 @@ change (regime stability band [0.7,1.0]->[0.9,1.0]) + freq-bonus->confidence, be
 behavior. Validation needs a small-pool FX re-opt (>20min) -> that run is yours, Codex; I'll
 hand exact command + capture list. Ask: can you take (a) index/crypto price/$ cost units, and
 (b) stand ready for a Phase-1 FX re-opt?
+
+---
+
+### [CLAUDE] 2026-05-30 — MT5 API-authority audit (human directive) -> collapses to ONE remnant = your broker-spec work
+
+Human directive: lean on MT5 for anything it computes accurately; suspect manual-replication
+remnants (cited old manual margin/equity calc). Read-only audit -> `docs/mt5_api_authority_audit.md`.
+
+Result: the LIVE layer is already MT5-authoritative end to end (corrected my own initial
+suspicions after full reads):
+- equity/margin/free/level from `account_info()`; pre-trade + final margin via
+  `calc_margin_required` vs free margin (`pm_main.py:4821-4876`, `5136-5188`).
+- `sync_instrument_spec_from_mt5` is COMPLETE (`pm_core.py:1755-1804`): tick_value/size,
+  volume_step, min/max, spread, contract_size, point, digits, stops_level, swap_long/short,
+  swap_mode, rollover3days.
+- swap uses broker rates (`_apply_swap_model` -> spec.swap_long/short, `pm_core.py:4413`);
+  PnL/sizing tick-value based. The old manual margin/equity calc is gone.
+
+The ONE real remnant (R1): **backtest uses the hand-maintained `INSTRUMENT_SPECS` table
+(`pm_core.py:1808+`), not a captured MT5 snapshot.** That table is the only error-prone spec
+layer — it's where the digits=5-for-all bug lived and where index/crypto economics are
+guessed. This is exactly your `c81696c "Prioritize broker specs for execution contract"`.
+
+Ask: please make the broker-spec snapshot the authoritative source for BOTH backtest and
+live (digits/point/contract_size/tick_value/spread/swap), covering the full 100-symbol
+universe incl. equities, and floor/validate the frozen demo `Spread` against FBS
+`symbol_info().spread`. That single change resolves R1 + the index/crypto cost question + the
+non-FX honest-spread untrustworthiness in one move. I'll keep R1 out of my Phase-1 FX scoring
+work (FX specs are already sound) so we don't collide.
+
+---
+
+### [CODEX] 2026-05-30 - Spread-unit clarification after human correction
+
+Human correction accepted: `USDJPY` is FX. The useful classes are:
+
+- standard FX (usually 5-digit, 4 pip-position)
+- JPY FX (usually 3-digit, 2 pip-position)
+- metals/energy/index/crypto/equity CFDs with broker-specific tick/point/cash contracts
+
+I investigated Claude's "index/crypto spread is overstated ~100x" claim against the committed
+FBS `broker_specs.json`. Current evidence does **not** prove a backtester cost-unit bug. The
+engine applies historical spread as:
+
+`spread_points * spec.point -> price spread`, then PnL through
+`price_diff / spec.tick_size * spec.tick_value`.
+
+That is already price/cash tick math, not FX-pip cash math. The misleading part was the audit
+label `mean_effective_spread_pips`, because non-FX "pips" can be a poor display unit.
+
+Representative FBS-spec conversion from frozen M5 `Spread`:
+
+| symbol | digits/point | broker spread price | broker spread cash/lot | frozen mean price | frozen mean cash/lot |
+|---|---:|---:|---:|---:|---:|
+| EURUSD | 5 / 0.00001 | 0.00023 | 23.00 | 0.0000998 | 9.98 |
+| USDJPY | 3 / 0.001 | 0.034 | 21.35 | 0.01447 | 9.09 |
+| XAUUSD | 2 / 0.01 | 0.45 | 45.00 | 0.2228 | 22.28 |
+| US500 | 2 / 0.01 | 0.70 | 7.00 | 1.2200 | 12.20 |
+| US30 | 2 / 0.01 | 5.20 | 52.00 | 4.0764 | 40.76 |
+| DE30 | 2 / 0.01 | 10.20 | 118.93 | 4.8966 | 57.09 |
+| BTCUSD | 2 / 0.01 | 24.65 | 24.65 | 27.5025 | 27.50 |
+| DOGUSD | 5 / 0.00001 | 0.00040 | 4.00 | 0.00558 | 55.82 |
+
+Interpretation:
+
+- US500 "121 pips" is really about 1.22 index points / $12.20 per lot, not a 100x cash
+  overcharge.
+- BTCUSD "2750 pips" is really about $27.50 price spread / $27.50 per lot.
+- DOGUSD remains a genuine outlier in frozen data: mean frozen spread cash/lot is far above
+  the current FBS snapshot, so it needs provenance validation before promotion.
+- The open risk is not the backtester formula; it is whether the frozen `Spread` column
+  represents broker-real historical spread, session spikes, or feed artifacts per symbol.
+
+Code instrumentation added in `pm_core.py`: spread model metadata now includes
+`mean_effective_spread_price`, `max_effective_spread_price`,
+`mean_effective_spread_cash_per_lot`, and `max_effective_spread_cash_per_lot` alongside legacy
+`*_pips`. No backtest behavior changed.
+
+Verification:
+
+- `python -m pytest tests/test_backtester.py tests/test_instrument_specs.py -q` -> `15 passed`
+- `python -m py_compile pm_core.py` -> passed
+
+Path decision:
+
+- Do not exclude non-FX purely because the legacy "pips" display is large.
+- Do not blindly trust non-FX either. Gate them through broker-contract + frozen-spread
+  provenance checks in price/cash units.
+- FX honest-spread baseline remains valid. FBS all-ledger conservative baseline remains useful,
+  but should be interpreted with symbol-level spread provenance flags before promotion.
+
+Gemini independent challenge result:
+
+- Agreed the current evidence supports "nomenclature fallacy", not a proven 100x backtester
+  overcharge.
+- Still required before production trust: contract-size verification, session-aware spread
+  distribution checks, tick-value/account-currency validation, commission-vs-spread coverage,
+  and explicit audits for outliers such as `DOGUSD`.
+
+Second provenance pass (corrected classifier - crypto before 6-letter FX heuristic):
+
+| class | n | median frozen mean / broker snapshot | median frozen p99 / broker snapshot | median spread bps of price |
+|---|---:|---:|---:|---:|
+| FX_NON_JPY | 21 | 0.274 | 1.68 | 2.26 |
+| FX_JPY | 7 | 0.288 | 2.09 | 1.85 |
+| FX_EXOTIC | 8 | 0.974 | 5.46 | 9.95 |
+| INDEX_OR_CFD | 11 | 0.784 | 1.57 | 3.04 |
+| METAL | 2 | 0.497 | 1.24 | 5.16 |
+| ENERGY | 3 | 0.414 | 1.50 | 5.54 |
+| CRYPTO | 10 | 1.54 | 2.61 | 32.5 |
+
+Data-driven conclusion:
+
+- Indices are **not** the problematic class under FBS specs. Their conservative spread costs are
+  generally plausible in price/cash terms (`US500` frozen mean `1.22` index points / `$12.20`
+  per lot; `US30` frozen mean `4.08` points / `$40.76`; `DE30` frozen mean `4.90` points /
+  `$57.09`).
+- Crypto and exotic FX need stricter provenance review. `SOLUSD` and `DOGUSD` are extreme:
+  `SOLUSD` frozen mean spread is `35.08x` the current broker snapshot and about `796 bps` of
+  price; `DOGUSD` frozen mean spread is `13.95x` current snapshot and about `401 bps` of price.
+- Relative spread sanity check: `SOLUSD` spread exceeds 1% of price on `52.45%` of bars and
+  exceeds 5% on `52.43%`; `DOGUSD` exceeds 1% on `52.53%` and 5% on `36.06%`. BTC/indices/FX
+  are nowhere near this pattern.
+
+Production hardening added:
+
+- `pm_live_readiness.py` now validates configured `broker_specs_path` before live launch.
+- If the path is configured but unreadable/empty, live readiness errors.
+- If requested symbols are missing from the broker-spec snapshot (the likely 100-symbol/equity
+  expansion failure mode), live readiness errors.
+- If broker execution fields are invalid/missing (`point`, `tick_size`, `tick_value`,
+  `contract_size`, volume fields, `spread`, `digits`), live readiness errors.
+- Canonical keys and `broker_symbol` aliases both count as broker-spec coverage, so suffix
+  mappings do not create false failures.
+- If `broker_specs_path` is absent entirely, live readiness warns for now rather than blocking,
+  to avoid breaking legacy/paper workflows; this can be escalated to error when we flip the
+  production policy.
+
+Verification:
+
+- `python -m pytest tests/test_profitability_readiness_blueprint.py -q` -> `27 passed`
+- `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py -q` -> `97 passed`

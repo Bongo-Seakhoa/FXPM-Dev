@@ -37,6 +37,66 @@ def _load_json_file(path: Path) -> Optional[Any]:
         return None
 
 
+def _resolve_relative_to_config(path_raw: Any, config_path: str) -> Path:
+    path = Path(str(path_raw))
+    if path.is_absolute():
+        return path
+    return Path(config_path).resolve().parent / path
+
+
+def _broker_specs_by_symbol(specs: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for key, payload in specs.items():
+        if not isinstance(payload, dict):
+            continue
+        for candidate in (key, payload.get("symbol"), payload.get("broker_symbol")):
+            if str(candidate or "").strip():
+                mapping[str(candidate).upper()] = payload
+    return mapping
+
+
+def _broker_spec_field_issues(specs: Dict[str, Any], symbols: Iterable[str]) -> List[str]:
+    required_positive = (
+        "point",
+        "tick_size",
+        "tick_value",
+        "contract_size",
+        "volume_min",
+        "volume_max",
+        "volume_step",
+    )
+    issues: List[str] = []
+    spec_by_symbol = _broker_specs_by_symbol(specs)
+    for symbol in symbols:
+        payload = spec_by_symbol.get(str(symbol).upper())
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("digits") is None:
+            issues.append(f"{symbol}: missing digits")
+        else:
+            try:
+                if int(payload.get("digits")) < 0:
+                    issues.append(f"{symbol}: invalid digits={payload.get('digits')}")
+            except Exception:
+                issues.append(f"{symbol}: invalid digits={payload.get('digits')}")
+        if payload.get("spread") is None:
+            issues.append(f"{symbol}: missing spread")
+        else:
+            try:
+                if float(payload.get("spread")) < 0.0:
+                    issues.append(f"{symbol}: invalid spread={payload.get('spread')}")
+            except Exception:
+                issues.append(f"{symbol}: invalid spread={payload.get('spread')}")
+        for field_name in required_positive:
+            try:
+                value = float(payload.get(field_name, 0.0) or 0.0)
+            except Exception:
+                value = 0.0
+            if value <= 0.0:
+                issues.append(f"{symbol}: invalid {field_name}={payload.get(field_name)}")
+    return issues
+
+
 def _iter_symbol_configs(ledger: Any) -> Iterable[Dict[str, Any]]:
     if isinstance(ledger, dict):
         if isinstance(ledger.get("symbols"), dict):
@@ -141,6 +201,40 @@ def validate_live_readiness(config: Any,
     if regime_params_file and not Path(regime_params_file).exists():
         add("warning", "regime_params_missing", f"regime params file not found: {regime_params_file}")
 
+    requested_symbols = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+    config_payload = _load_json_file(Path(config_path)) or {}
+    broker_specs_raw = config_payload.get("broker_specs_path") if isinstance(config_payload, dict) else None
+    if not broker_specs_raw:
+        add(
+            "warning",
+            "broker_specs_path_missing",
+            "broker_specs_path is not configured; backtest/live contract parity cannot be verified before launch",
+        )
+    else:
+        broker_specs_path = _resolve_relative_to_config(broker_specs_raw, config_path)
+        broker_specs = _load_json_file(broker_specs_path)
+        if not isinstance(broker_specs, dict) or not broker_specs:
+            add(
+                "error",
+                "broker_specs_unreadable",
+                f"broker specs file is missing, empty, or unreadable: {broker_specs_path}",
+            )
+        else:
+            covered_symbols = set(_broker_specs_by_symbol(broker_specs))
+            missing_specs = sorted(set(requested_symbols) - covered_symbols)
+            if missing_specs:
+                add(
+                    "error",
+                    "broker_specs_missing_symbols",
+                    f"broker specs missing symbols: {', '.join(missing_specs)}",
+                )
+            field_issues = _broker_spec_field_issues(broker_specs, requested_symbols)
+            if field_issues:
+                preview = "; ".join(field_issues[:8])
+                if len(field_issues) > 8:
+                    preview += f"; +{len(field_issues) - 8} more"
+                add("error", "broker_specs_invalid_fields", f"broker specs contain invalid execution fields: {preview}")
+
     ledger_raw = winner_ledger_path or getattr(config, "winner_ledger_path", "pm_configs.json")
     ledger_path = Path(str(ledger_raw))
     if not ledger_path.is_absolute():
@@ -159,7 +253,7 @@ def validate_live_readiness(config: Any,
             for payload in symbol_configs
             if str(payload.get("symbol", "") or "").strip()
         }
-        missing = sorted({str(symbol).upper() for symbol in symbols} - ledger_symbols)
+        missing = sorted(set(requested_symbols) - ledger_symbols)
         if missing:
             add("warning", "symbols_missing_from_ledger", f"symbols missing from winner ledger: {', '.join(missing)}")
 

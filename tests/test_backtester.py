@@ -167,6 +167,8 @@ class BacktesterTests(unittest.TestCase):
         self.assertAlmostEqual(fixed["trades"][0]["pnl_pips"], 20.0, places=6)
         self.assertAlmostEqual(historical["trades"][0]["pnl_pips"], 10.0, places=6)
         self.assertEqual(historical["spread_model"]["source"], "historical_spread_points")
+        self.assertAlmostEqual(historical["spread_model"]["mean_effective_spread_price"], 0.10, places=8)
+        self.assertAlmostEqual(historical["spread_model"]["mean_effective_spread_cash_per_lot"], 100.0, places=8)
 
 
 if __name__ == "__main__":

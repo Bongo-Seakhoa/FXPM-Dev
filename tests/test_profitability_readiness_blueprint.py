@@ -173,6 +173,133 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(item.code == "winner_ledger_no_tradeable_winners" for item in report.errors))
 
+    def test_live_readiness_blocks_symbols_missing_from_broker_specs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.00001,
+                            "tick_value": 1.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {"symbol": "EURUSD", "strategy_name": "EMACrossoverStrategy"},
+                        "AAPL": {"symbol": "AAPL", "strategy_name": "EMACrossoverStrategy"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD", "AAPL"], config_path=str(root / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "broker_specs_missing_symbols" for item in report.errors))
+
+    def test_live_readiness_blocks_invalid_broker_spec_execution_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.00001,
+                            "tick_value": 0.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            ledger.write_text(
+                json.dumps({"EURUSD": {"symbol": "EURUSD", "strategy_name": "EMACrossoverStrategy"}}),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(root / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "broker_specs_invalid_fields" for item in report.errors))
+
+    def test_live_readiness_accepts_broker_symbol_alias_in_specs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "broker_symbol": "EURUSD.a",
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.00001,
+                            "tick_value": 1.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            ledger.write_text(
+                json.dumps({"EURUSD.a": {"symbol": "EURUSD.a", "strategy_name": "EMACrossoverStrategy"}}),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD.a"], config_path=str(root / "config.json"))
+
+            self.assertTrue(report.ok)
+            self.assertFalse(any(item.code == "broker_specs_missing_symbols" for item in report.errors))
+
     def test_event_calendar_matches_symbol_currencies_and_minutes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "events.csv"
