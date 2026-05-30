@@ -115,6 +115,11 @@ Notes:
 - added spread provenance flags to backtest metadata and benchmark output so non-FX frozen-feed
   spread outliers are marked for review instead of being treated as clean promotion evidence
 
+### Benchmark gate hardening
+
+- hardened the Tenet-5 benchmark gate so profit-factor deltas near zero use a stable denominator and
+  absolute PF movement, preventing tiny 0.00-to-0.01 changes from being treated as infinite evidence
+
 ### Audit artifact lifecycle
 
 - clarified that audit outputs, agent communication files, experiment notes, and review documents
