@@ -83,6 +83,8 @@ Notes:
   overstate robustness by dropping weak candidates
 - added cache invalidation for missing, corrupt, or artifact-mismatched OOS sidecars when evidence
   export is enabled, plus content-addressed matrix files to avoid stale manifest/matrix pairings
+- added `tools/pbo.py --manifest` support to load and verify engine-emitted sidecars directly
+  before running CSCV/PBO
 - documented the current PBO scope honestly as all-regimes validation equity, not regime-filtered
   folds; this is the bridge artifact for Claude's `tools/pbo.py` measurement layer
 

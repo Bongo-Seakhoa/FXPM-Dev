@@ -10,7 +10,7 @@ engine-agnostic: feed it any returns matrix. The CLI builds one matrix from a si
 param-grid backtests as a demonstration; the real use is the GLOBAL family matrix (all configs
 across strategies/symbols) once the engine preserves per-candidate OOS returns.
 """
-import json, sys, argparse, itertools
+import argparse, hashlib, itertools, json, sys
 from pathlib import Path
 import numpy as np
 
@@ -58,6 +58,37 @@ def pbo_cscv(M, n_blocks=16):
             "logit_median": round(float(np.median(logits)), 4)}
 
 
+def load_oos_manifest_matrix(manifest_path):
+    """Load and verify an engine-emitted oos_candidate_matrix_v1 manifest."""
+    manifest_path = Path(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format_version") != "oos_candidate_matrix_v1":
+        raise ValueError(f"unsupported OOS manifest format: {manifest.get('format_version')}")
+    matrix_path = Path(str(manifest.get("matrix_path", "")))
+    if not matrix_path.exists():
+        fallback = manifest_path.parent / matrix_path.name
+        matrix_path = fallback if fallback.exists() else matrix_path
+    if not matrix_path.exists():
+        raise FileNotFoundError(f"OOS matrix not found: {manifest.get('matrix_path')}")
+    with np.load(matrix_path) as data:
+        returns = np.asarray(data["returns"], dtype=np.float32)
+        candidate_ids = np.asarray(data["candidate_ids"]).astype(str)
+    expected_shape = (manifest.get("matrix_contract") or {}).get("returns_shape")
+    if expected_shape and list(returns.shape) != list(expected_shape):
+        raise ValueError(f"OOS matrix shape mismatch: {returns.shape} != {expected_shape}")
+    record_count = int(manifest.get("record_count", 0) or 0)
+    if returns.ndim != 2 or returns.shape[1] != record_count or len(candidate_ids) != record_count:
+        raise ValueError("OOS matrix candidate count mismatch")
+    digest_payload = returns.tobytes() + json.dumps(
+        candidate_ids.tolist(),
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha1(digest_payload).hexdigest()
+    if digest != str(manifest.get("matrix_digest_sha1", "")):
+        raise ValueError("OOS matrix digest mismatch")
+    return returns, manifest, candidate_ids.tolist()
+
+
 def build_returns_matrix(cfg, loader, strategy_name, symbol, tf, samples, seed):
     grid = StrategyRegistry.get(strategy_name).get_param_grid()
     keys = list(grid.keys())
@@ -93,7 +124,8 @@ def build_returns_matrix(cfg, loader, strategy_name, symbol, tf, samples, seed):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy", required=True)
+    ap.add_argument("--manifest", help="Path to an oos_candidate_matrix_v1 manifest from the engine")
+    ap.add_argument("--strategy")
     ap.add_argument("--symbol", default="EURUSD")
     ap.add_argument("--tf", default="H4")
     ap.add_argument("--samples", type=int, default=32)
@@ -101,6 +133,34 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--spread-mode", default="conservative_max")
     args = ap.parse_args()
+
+    if args.manifest:
+        M, manifest, candidate_ids = load_oos_manifest_matrix(args.manifest)
+        res = pbo_cscv(M, n_blocks=args.blocks)
+        symbol = manifest.get("symbol", Path(args.manifest).stem)
+        res.update({
+            "source": "oos_candidate_matrix_v1",
+            "manifest": str(Path(args.manifest)),
+            "symbol": symbol,
+            "record_count": manifest.get("record_count"),
+            "matrix_digest_sha1": manifest.get("matrix_digest_sha1"),
+            "candidate_id_sample": candidate_ids[:5],
+            "engine_commit": _git_head(),
+        })
+        print(f"\n=== PBO (CSCV) [manifest {symbol}] engine={res['engine_commit']} ===")
+        for k in ("n_configs", "n_obs", "n_combos", "logit_median", "pbo"):
+            print(f"  {k}: {res.get(k)}")
+        if res.get("pbo") is not None:
+            verdict = "HIGH overfit risk" if res["pbo"] > 0.5 else ("MODERATE" if res["pbo"] > 0.25 else "LOW")
+            print(f"  interpretation: PBO={res['pbo']:.0%} selection overfit -> {verdict}")
+        out = REPO / "pm_outputs" / "experiments" / f"pbo_manifest_{symbol}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        json.dump(res, open(out, "w"), indent=2, default=str)
+        print(f"\nwrote {out}")
+        return
+
+    if not args.strategy:
+        ap.error("--strategy is required unless --manifest is supplied")
 
     cfg = build_config(args.spread_mode)
     loader = DataLoader(cfg.data_dir)
