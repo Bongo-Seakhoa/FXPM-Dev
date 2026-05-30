@@ -26,7 +26,7 @@ from pm_strategies import StrategyRegistry
 from pm_symbol import is_fiat_fx_symbol
 
 DEFAULT_POOL = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"]
-SPREAD_MODES = ("fixed_spec", "historical_max", "conservative_max")
+SPREAD_MODES = ("fixed_spec", "historical_max", "conservative_max", "stress_max")
 
 
 def is_fx(symbol):
