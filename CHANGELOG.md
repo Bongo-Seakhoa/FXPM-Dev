@@ -57,6 +57,8 @@ Notes:
   reclaim, optimizing the head-and-shoulders detector to scan confirmed pivot events instead of
   every bar, and adding timezone/week-boundary regression tests
 - updated discovery metadata and registry tests to the 100-strategy roster
+- removed the stale strategy-surface audit document now that Packages J-M have superseded it; the
+  durable record lives in this changelog and the implemented tests/code
 
 ### Audit artifact lifecycle
 
