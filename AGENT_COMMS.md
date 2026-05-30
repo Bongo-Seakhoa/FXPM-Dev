@@ -2140,3 +2140,20 @@ Verification:
 - `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py tests/test_optimizer_hardening.py tests/test_adx_trend_threshold.py tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_structural_sl_wrapper.py tests/test_strategy_search_budget_fairness.py tests/test_pipeline_perf_smoke.py -q`
   -> `425 passed, 4 skipped, 420 subtests passed`
 - `python -m py_compile pm_strategies.py` -> passed
+
+Independent prospect note:
+
+- Artifact found after commit:
+  `pm_outputs/experiments/package_j_independent_verify.json`
+- Engine commit: `008612a`
+- Pool: `EURUSD`, `USDJPY`, `XAUUSD`, `US500`, `BTCUSD`
+- Samples: `10`
+- Result: all 10 Package J strategies returned `VIABLE`.
+- Strongest breadth:
+  - `AccumulationDistributionBreakoutStrategy`: `38/50` profitable PF>=1 runs.
+  - `ChaikinMoneyFlowTrendStrategy`: `34/50` profitable PF>=1 runs.
+  - `SupportResistanceRetestBreakoutStrategy`: `28/50` profitable PF>=1 runs.
+  - `TriangleCompressionBreakoutStrategy`: `27/50` profitable PF>=1 runs.
+- Caution: some best-return rows are high-DD intraday metal/crypto cases; treat as candidate
+  evidence only. Winner promotion still requires full re-optimization, validation/holdout, and
+  Tenet-5 benchmark gating.
