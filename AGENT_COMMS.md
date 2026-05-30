@@ -1976,3 +1976,81 @@ Important coordination note:
 - If the purpose is to isolate scoring-only impact, run both CONTROL and CANDIDATE with the same
   strategy roster. Either both include Package H, or both pin to the pre-H roster. Do not compare
   old-50 control vs new-58 candidate and call it a scoring result.
+
+---
+
+### [CODEX] 2026-05-30 - Package I conventional candlestick/pattern expansion + surface audit
+
+The user correctly challenged that conventional candlestick/pattern setups were underrepresented.
+There were already a few pattern strategies (`PinBarReversal`, `EngulfingPattern`,
+`InsideBarBreakout`, `NarrowRangeBreakout`, `TurtleSoupReversal`), but the family was too narrow.
+
+Implemented eight additional full candidate strategies:
+
+- `MorningStarEveningStarStrategy`
+- `PiercingDarkCloudStrategy`
+- `HaramiReversalStrategy`
+- `TweezerReversalStrategy`
+- `ThreeBarReversalStrategy`
+- `DojiBreakoutStrategy`
+- `MarubozuMomentumStrategy`
+- `ThreeSoldiersCrowsStrategy`
+
+Registry count is now `66`:
+
+- Trend following: `22`
+- Mean reversion: `26`
+- Breakout/momentum: `18`
+
+Also added `docs/strategy_surface_coverage_audit.md`, which separates:
+
+- currently covered families,
+- still-underrepresented single-symbol strategy families,
+- and families that require pipeline work before honest implementation
+  (true MTF, cross-sectional/pairs, ML/meta-models).
+
+Honest-cost default smoke:
+
+- Artifact:
+  `pm_outputs/experiments/package_i_pattern_strategy_smoke_20260530/package_i_default_honest_cost_smoke.json`
+- Scope: defaults across `USDJPY`, `GBPUSD`, `XAUUSD`, `US500` on `M15/H1/H4/D1`
+- Cost model: `conservative_max`, commission on, slippage on.
+
+Default prospect highlights:
+
+- `MarubozuMomentumStrategy`: `5/16` profitable PF>=1 runs; best `USDJPY H4`,
+  return `32.99%`, PF `1.15`, max DD `14.86%`.
+- `ThreeSoldiersCrowsStrategy`: `7/16` profitable PF>=1 runs; best `US500 H1`,
+  return `24.63%`, PF `1.07`, max DD `15.94%`; best lower-DD examples include
+  `USDJPY H4` return `11.07%`, PF `1.14`, max DD `8.11%`.
+- `MorningStarEveningStarStrategy`: `3/16` profitable PF>=1 runs; best `XAUUSD H1`,
+  return `40.96%`, PF `1.10`.
+- `DojiBreakoutStrategy`: `3/16` profitable PF>=1 runs; best `XAUUSD H4`,
+  return `16.43%`, PF `1.16`, max DD `9.03%`.
+- `ThreeBarReversalStrategy`: `4/16` profitable PF>=1 runs; best `XAUUSD H4`,
+  return `10.43%`, PF `1.07`.
+
+`TweezerReversalStrategy` was weak on defaults, so I ran a bounded parameter prospect sweep
+instead of accepting it on theory:
+
+- Artifact:
+  `pm_outputs/experiments/package_i_pattern_strategy_smoke_20260530/package_i_tweezer_prospect_sweep.json`
+- `105` profitable PF>=1 runs from `1835` evaluated runs.
+- Best: `US500 M15`, `184` trades, return `35.57%`, PF `1.31`, max DD `7.77%`.
+
+Important coordination note:
+
+- Strategy count is now `66`. Any scoring-control/candidate re-opt must use the same strategy
+  roster. Compare 66-vs-66 for scoring effects, not 58-vs-66 or 50-vs-66.
+- These are still candidate-pool additions. Winner promotion requires full re-optimization,
+  evidence artifact match, validation/holdout checks, and Tenet-5 benchmark gating.
+
+Verification:
+
+- `python -m pytest tests/test_new_strategies_59_66.py tests/test_new_strategies_51_58.py tests/test_new_strategies_42_50.py tests/test_strategy_param_grid_consistency.py -q`
+  -> `169 passed, 3 skipped, 198 subtests passed`
+- `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_structural_sl_wrapper.py tests/test_strategy_search_budget_fairness.py tests/test_pipeline_perf_smoke.py -q`
+  -> `219 passed, 3 skipped, 294 subtests passed`
+- `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py tests/test_optimizer_hardening.py tests/test_adx_trend_threshold.py tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_structural_sl_wrapper.py tests/test_strategy_search_budget_fairness.py tests/test_pipeline_perf_smoke.py -q`
+  -> `354 passed, 3 skipped, 380 subtests passed`
+- `python -m py_compile pm_strategies.py` -> passed
