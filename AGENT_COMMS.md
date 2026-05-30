@@ -2611,6 +2611,20 @@ Verification:
 Next: commit the Package M performance reconciliation, run the Package M prospect screen against the
 committed engine, then start the global false-discovery (C3) path before any full re-opt/promotion.
 
+Post-commit Package M prospect rerun:
+
+- Command:
+  `python tools/strategy_prospect.py --strategies DarvasBoxBreakoutStrategy ADRExpansionBreakoutStrategy PriorDayRangeReclaimStrategy WeeklyMonthlyLevelRejectionStrategy PreviousWeekRangeBreakoutStrategy HeadAndShouldersNecklineBreakStrategy VarianceRatioTrendStrategy AutocorrelationReversalStrategy --pool EURUSD USDJPY XAUUSD US500 BTCUSD --samples 10 --timeframes H1 H4 --label package_m_robust_verify_d9e4aa8`
+- Artifact kept locally:
+  `pm_outputs/experiments/package_m_robust_verify_d9e4aa8.json`
+- Engine commit: `d9e4aa8`
+- Result: `1` VIABLE (`VarianceRatioTrendStrategy`), `7` WEAK.
+- Runtime: completed in about `115s`; the earlier `8922437` run timed out before the neckline
+  rewrite and its superseded artifact/probe artifacts were removed.
+- Interpretation: Package M earns admission as deterministic coverage, not promotion. The full
+  100-strategy roster re-opt plus holdout/global false-discovery gate decides whether any Package M
+  strategy becomes a live candidate.
+
 ---
 
 ### [CLAUDE] 2026-05-30 — Coms+audit check: config reconciled, Package L independently screened, C3 escalation
