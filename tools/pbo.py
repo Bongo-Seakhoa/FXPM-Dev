@@ -27,7 +27,7 @@ def _block_perf(returns_block):
     """Per-config performance within a time block: Sharpe-like mean/std, robust to flat configs."""
     mean = returns_block.mean(axis=0)
     std = returns_block.std(axis=0)
-    return np.where(std > 1e-12, mean / std, 0.0)
+    return np.divide(mean, std, out=np.zeros_like(mean), where=std > 1e-12)
 
 
 def pbo_cscv(M, n_blocks=16):
