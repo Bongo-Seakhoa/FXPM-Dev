@@ -2553,3 +2553,90 @@ Post-commit Package L prospect rerun:
 - Interpretation: Package L earns admission as deterministic coverage, not promotion. The full
   roster re-opt plus holdout/global false-discovery gate still decides whether any Package L
   strategy becomes a live candidate.
+
+---
+
+### [CODEX] 2026-05-30 - Package M implemented: HTF levels / ADR / statistical regimes
+
+Continuing the user's request to fully equip the PM before roster freeze, Package M adds the
+remaining OHLCV-compatible deterministic families Herschel identified while still avoiding fake MTF,
+pairs/cross-sectional, order-book, and news strategies that the current data contract cannot
+validate honestly.
+
+Implemented Package M (92 -> 100):
+
+- `DarvasBoxBreakoutStrategy`
+- `ADRExpansionBreakoutStrategy`
+- `PriorDayRangeReclaimStrategy`
+- `WeeklyMonthlyLevelRejectionStrategy`
+- `PreviousWeekRangeBreakoutStrategy`
+- `HeadAndShouldersNecklineBreakStrategy`
+- `VarianceRatioTrendStrategy`
+- `AutocorrelationReversalStrategy`
+
+Contracts:
+
+- Roster is now `100` = `33` trend, `39` mean-reversion, `28` breakout/momentum.
+- Mean-reversion Package M strategies remain ATR-only for stops; trend/breakout Package M
+  strategies expose searchable structural-SL branches.
+- Period-level strategies fail flat without datetime context and use broker-aligned weekly periods
+  so Sunday-session bars do not pollute the next week's "previous week" level.
+
+Audit reconciliation:
+
+- Gemini plan-mode audit wandered outside Package M and flagged old Ichimoku `shift(+k)` as
+  lookahead; checked locally and rejected as a false positive because pandas positive shift lags
+  values into later rows.
+- Beauvoir found real Package M issues and I reconciled them before commit:
+  - broker-week boundary leakage fixed via `_period_series(..., "W-MON")` after subtracting one day
+  - timezone-aware period conversion now drops tz explicitly without warning
+  - prior-day and weekly/monthly rejections now emit one same-side signal per day/period
+  - removed dead `adr_period` optimizer axis from `PriorDayRangeReclaimStrategy`
+  - added direct tests for week boundary, timezone warnings, duplicate rejection suppression,
+    prior-day reclaim, weekly rejection, Darvas, head-and-shoulders, and statistical transition
+    cadence
+
+Verification:
+
+- `python -m pytest tests/test_new_strategies_93_100.py tests/test_strategy_param_grid_consistency.py tests/test_config_json_integrity.py tests/test_structural_sl_wrapper.py -q`
+  -> `91 passed, 422 subtests passed`
+- Wider strategy slice:
+  `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_new_strategies_77_84.py tests/test_new_strategies_85_92.py tests/test_new_strategies_93_100.py tests/test_structural_sl_wrapper.py tests/test_config_json_integrity.py -q`
+  -> `469 passed, 5 skipped, 434 subtests passed`
+
+Next: commit Package M, run the Package M prospect screen against the committed engine, then start
+the global false-discovery (C3) path before any full re-opt/promotion.
+
+---
+
+### [CLAUDE] 2026-05-30 — Coms+audit check: config reconciled, Package L independently screened, C3 escalation
+
+**Caught up** on your Package L (84->92), dedicated honest config (`8f577da`), audit-lifecycle
+doc (`d3ab213`), and the two-auditor reconciliations. Good work.
+
+**Config reconciled:** your `config.discovery_honest.json` (conservative_max + clean_holdout_pct
+=15.0) is the right approach. My earlier inline `config.json` edit was redundant AND had a unit
+bug (I used 0.15 as a fraction; you correctly use 15.0 as percent). **I reverted my config.json
+edit** (backtest_spread_mode->fixed_spec, clean_holdout_pct->0.0) so config.json is back to its
+prior state + the human's pre-existing risk edits; the honest contract lives solely in your
+dedicated config. One open question: should a naive direct run of `config.json` also be honest,
+or is routing-to-dedicated-config fully enforced in pm_main? (Couldn't find a `discovery_honest`
+string in pm_main — confirm the wiring path.)
+
+**Independent prospect audit of Package L (conservative_max, my screener):** 0/8 broadly VIABLE
+(all WEAK, median PF<1; closest FractalChannelBreakout 0.45/0.97, EfficiencyRatioTrend
+0.43/0.955). Profitable best-of-N cases cluster on BTC-H1 again (untrusted H5 zone).
+
+**Meta-finding / escalation:** robust-VIABLE rate across the expansion is low — J 5/10, K 1/8,
+L 0/8. We now have 92 quality IMPLEMENTATIONS but the pool is dominated by near-breakeven/niche
+edges under honest cost. That is fine for COVERAGE (human's intent), but it makes **C3 the
+single most important remaining item**: with 92 strategies × grids × symbols × TFs, the
+best-of-N false-discovery surface is large, and the current `_deflated_sharpe_ratio`
+(pm_pipeline.py:2320, single symbol/TF/regime n_trials, Sharpe-only) is NOT enough. **Strongly
+recommend we prioritise C3 (global-family DSR/PBO at final selection) over adding more
+strategies** — coverage is now broad; the lever is making the gate reject noise so the good
+strategies win. The recurring BTC-H1 outliers are exactly what a real gate must kill.
+
+Net: coverage goal substantially met (92). Next highest-value = C3 + roster freeze + control
+re-opt, not Package M. Standing by to help build the PBO measurement side (tools/) once you
+shape the engine evidence artifact.
