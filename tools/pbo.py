@@ -30,17 +30,29 @@ def _block_perf(returns_block):
     return np.divide(mean, std, out=np.zeros_like(mean), where=std > 1e-12)
 
 
-def pbo_cscv(M, n_blocks=16):
+def pbo_cscv(M, n_blocks=16, candidate_ids=None):
     """M: ndarray [T, N] of per-period returns. Returns PBO and the logit distribution.
     PBO = P(IS-best config ranks below OOS median)."""
+    M = np.asarray(M, dtype=np.float64)
+    if M.ndim != 2:
+        raise ValueError("PBO matrix must be 2D [T observations x N configurations]")
     T, N = M.shape
+    n_blocks = max(2, int(n_blocks))
+    n_blocks -= n_blocks % 2
     if N < 2 or T < n_blocks * 2:
         return {"pbo": None, "reason": f"insufficient data T={T} N={N}", "n_combos": 0}
-    n_blocks -= n_blocks % 2
+    ids = [str(value) for value in candidate_ids] if candidate_ids is not None else [str(i) for i in range(N)]
+    if len(ids) != N:
+        raise ValueError(f"candidate_ids length {len(ids)} does not match matrix columns {N}")
     edges = np.array_split(np.arange(T), n_blocks)
     blocks = [M[idx, :] for idx in edges]
     half = n_blocks // 2
     logits = []
+    selected_counts = np.zeros(N, dtype=np.int64)
+    selected_below_median = np.zeros(N, dtype=np.int64)
+    selected_rank_sum = np.zeros(N, dtype=np.float64)
+    all_rank_sum = np.zeros(N, dtype=np.float64)
+    all_below_median = np.zeros(N, dtype=np.int64)
     for is_idx in itertools.combinations(range(n_blocks), half):
         is_set = set(is_idx)
         is_mat = np.vstack([blocks[b] for b in range(n_blocks) if b in is_set])
@@ -49,13 +61,41 @@ def pbo_cscv(M, n_blocks=16):
         oos_perf = _block_perf(oos_mat)
         best = int(np.argmax(is_perf))
         # OOS relative rank of the IS-best config in [0,1]
-        rank = (oos_perf < oos_perf[best]).sum() / max(1, (N - 1))
+        sorted_oos = np.sort(oos_perf)
+        ranks = np.searchsorted(sorted_oos, oos_perf, side="left") / max(1, (N - 1))
+        rank = float(ranks[best])
         w = min(max(rank, 1.0 / (N + 1)), 1.0 - 1.0 / (N + 1))
         logits.append(float(np.log(w / (1.0 - w))))
+        selected_counts[best] += 1
+        selected_rank_sum[best] += rank
+        if rank < 0.5:
+            selected_below_median[best] += 1
+        all_rank_sum += ranks
+        all_below_median += (ranks < 0.5).astype(np.int64)
     logits = np.array(logits)
     pbo = float((logits < 0).mean())
-    return {"pbo": round(pbo, 4), "n_combos": len(logits), "n_configs": N, "n_obs": T,
-            "logit_median": round(float(np.median(logits)), 4)}
+    n_combos = len(logits)
+    candidate_stats = []
+    for idx, candidate_id in enumerate(ids):
+        selected = int(selected_counts[idx])
+        stat = {
+            "candidate_id": candidate_id,
+            "matrix_column": idx,
+            "selected_count": selected,
+            "selection_rate": round(float(selected / n_combos), 4) if n_combos else 0.0,
+            "all_oos_mean_rank": round(float(all_rank_sum[idx] / n_combos), 4) if n_combos else 0.0,
+            "all_oos_below_median_rate": round(float(all_below_median[idx] / n_combos), 4) if n_combos else 0.0,
+        }
+        if selected > 0:
+            stat["selected_oos_pbo"] = round(float(selected_below_median[idx] / selected), 4)
+            stat["selected_oos_mean_rank"] = round(float(selected_rank_sum[idx] / selected), 4)
+        else:
+            stat["selected_oos_pbo"] = None
+            stat["selected_oos_mean_rank"] = None
+        candidate_stats.append(stat)
+    return {"pbo": round(pbo, 4), "n_combos": n_combos, "n_configs": N, "n_obs": T,
+            "logit_median": round(float(np.median(logits)), 4),
+            "candidate_stats": candidate_stats}
 
 
 def load_oos_manifest_matrix(manifest_path):
@@ -136,7 +176,7 @@ def main():
 
     if args.manifest:
         M, manifest, candidate_ids = load_oos_manifest_matrix(args.manifest)
-        res = pbo_cscv(M, n_blocks=args.blocks)
+        res = pbo_cscv(M, n_blocks=args.blocks, candidate_ids=candidate_ids)
         symbol = manifest.get("symbol", Path(args.manifest).stem)
         res.update({
             "source": "oos_candidate_matrix_v1",
@@ -153,6 +193,22 @@ def main():
         if res.get("pbo") is not None:
             verdict = "HIGH overfit risk" if res["pbo"] > 0.5 else ("MODERATE" if res["pbo"] > 0.25 else "LOW")
             print(f"  interpretation: PBO={res['pbo']:.0%} selection overfit -> {verdict}")
+        selected = [s for s in res.get("candidate_stats", []) if s.get("selected_count", 0) > 0]
+        if selected:
+            selected.sort(
+                key=lambda item: (
+                    -int(item.get("selected_count", 0) or 0),
+                    float(item.get("selected_oos_pbo", 1.0) or 1.0),
+                )
+            )
+            print("  top IS-selected candidates:")
+            for stat in selected[:5]:
+                print(
+                    f"    col={stat['matrix_column']} selected={stat['selected_count']} "
+                    f"sel_pbo={stat['selected_oos_pbo']} "
+                    f"mean_oos_rank={stat['selected_oos_mean_rank']} "
+                    f"id={stat['candidate_id'][:12]}"
+                )
         out = REPO / "pm_outputs" / "experiments" / f"pbo_manifest_{symbol}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         json.dump(res, open(out, "w"), indent=2, default=str)

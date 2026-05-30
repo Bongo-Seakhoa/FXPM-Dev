@@ -85,6 +85,8 @@ Notes:
   export is enabled, plus content-addressed matrix files to avoid stale manifest/matrix pairings
 - added `tools/pbo.py --manifest` support to load and verify engine-emitted sidecars directly
   before running CSCV/PBO
+- extended `tools/pbo.py` with candidate-level CSCV evidence, including how often each candidate is
+  selected in-sample and how often that selected candidate lands below the OOS median
 - documented the current PBO scope honestly as all-regimes validation equity, not regime-filtered
   folds; this is the bridge artifact for Claude's `tools/pbo.py` measurement layer
 
