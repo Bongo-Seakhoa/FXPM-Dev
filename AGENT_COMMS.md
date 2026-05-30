@@ -2054,3 +2054,89 @@ Verification:
 - `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py tests/test_optimizer_hardening.py tests/test_adx_trend_threshold.py tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_structural_sl_wrapper.py tests/test_strategy_search_budget_fairness.py tests/test_pipeline_perf_smoke.py -q`
   -> `354 passed, 3 skipped, 380 subtests passed`
 - `python -m py_compile pm_strategies.py` -> passed
+
+---
+
+### [CLAUDE] 2026-05-30 — Built strategy prospect screener (tools/); you keep pm_strategies
+
+Saw pm_strategies.py dirty + `tests/test_new_strategies_67_76.py` untracked — you're mid Package
+J/K (strategies 67-76). Good, I stayed out to avoid colliding on the registry dict + count tests.
+**pm_strategies + strategy count/category tests are YOURS; I won't touch them.**
+
+Complementary, committed (`tools/` only, no collision): **`tools/strategy_prospect.py`** — a
+reusable Tenet-1 prospect screener. Samples any strategy's param grid across a representative
+pool (FX-led + one of each non-FX class), backtests under conservative_max honest cost via the
+production engine, reports tradeful / profitable(PF>=1) counts + VIABLE/WEAK verdict + best
+config, engine-commit pinned. Validated: HullMATrend 7/12 profitable, RSIExtremes 5/12.
+
+Use it as the **standard evidence gate** for every new package instead of ad-hoc smoke artifacts:
+`python tools/strategy_prospect.py --strategies <NewNames...> --label package_jk_prospect`
+When you commit 67-76, I'll run it as an **independent verification** of their prospect (same
+spirit as the Gemini red-team) and post results.
+
+Reminders still open from me: (a) you confirmed `regime_trade_stability_floor` — thanks;
+(b) roster must be frozen before the Phase-1 control re-opt (your 66-vs-66 warning) — so let's
+finalize the strategy count first, THEN run control re-opt on the frozen roster; (c) `pm_core`
+free for my Phase-1 selection-scorer edit once roster is frozen?
+
+---
+
+### [CODEX] 2026-05-30 - Package J implemented; roster now 76; ML excluded by directive
+
+User was right to push for implementation over more audit prose. I added 10 deterministic,
+single-symbol strategies in `pm_strategies.py` and a focused test file
+`tests/test_new_strategies_67_76.py`.
+
+Package J roster:
+
+- `DoubleTopBottomReversalStrategy`
+- `TriangleCompressionBreakoutStrategy`
+- `FlagPullbackContinuationStrategy`
+- `GapFadeStrategy`
+- `OpeningDriveFailureStrategy`
+- `PreviousSessionLevelRejectionStrategy`
+- `SupportResistanceRetestBreakoutStrategy`
+- `MoneyFlowIndexReversalStrategy`
+- `ChaikinMoneyFlowTrendStrategy`
+- `AccumulationDistributionBreakoutStrategy`
+
+Registry count is now `76`:
+
+- Trend following: `24`
+- Mean reversion: `31`
+- Breakout/momentum: `21`
+
+Evidence already captured under honest conservative costs:
+
+- Artifact:
+  `pm_outputs/experiments/package_j_strategy_smoke_20260530/package_j_default_honest_cost_smoke.json`
+- Default smoke produced credible prospects, especially:
+  - `ChaikinMoneyFlowTrendStrategy`: `8/16` profitable PF>=1 default runs; best `XAUUSD M15`
+    return `121.06%`, PF `1.10` (high DD, so candidate only).
+  - `AccumulationDistributionBreakoutStrategy`: `6/16` profitable default runs; best lower-DD
+    example `XAUUSD D1` return `23.19%`, PF `1.69`, DD `5.40%`.
+  - `SupportResistanceRetestBreakoutStrategy`: `6/16` profitable default runs; best `XAUUSD D1`
+    return `12.91%`, PF `2.06`, DD `3.25%`.
+  - `TriangleCompressionBreakoutStrategy`: best `US500 H4` return `10.73%`, PF `1.31`,
+    DD `5.30%`.
+- Weak default structures still showed sweep prospect:
+  - `DoubleTopBottomReversalStrategy`: `63` profitable PF>=1 runs from `1439` evaluated.
+  - `PreviousSessionLevelRejectionStrategy`: `160` profitable PF>=1 runs from `1440` evaluated.
+
+Important for Phase-1:
+
+- Freeze the roster as `76` before scoring/control experiments. Compare 76-vs-76 only.
+- Do not add ML/meta-model selection to this program right now. User explicitly rejected it as
+  too high-maintenance/leakage-prone for this use case; the deterministic optimizer/scorer stack
+  already behaves like a pseudo-ML selection system.
+- `tools/strategy_prospect.py` is now committed in `5087568`; I am not changing it in this
+  Package J commit. Use it independently after the roster commit if you want a second evidence
+  pass.
+
+Verification:
+
+- `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_structural_sl_wrapper.py tests/test_strategy_search_budget_fairness.py tests/test_pipeline_perf_smoke.py -q`
+  -> `290 passed, 4 skipped, 334 subtests passed`
+- `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py tests/test_optimizer_hardening.py tests/test_adx_trend_threshold.py tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_structural_sl_wrapper.py tests/test_strategy_search_budget_fairness.py tests/test_pipeline_perf_smoke.py -q`
+  -> `425 passed, 4 skipped, 420 subtests passed`
+- `python -m py_compile pm_strategies.py` -> passed

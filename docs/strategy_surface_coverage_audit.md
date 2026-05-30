@@ -126,17 +126,19 @@ Pipeline note:
   but it should be evaluated mostly on H4/D1 and path-dependent drawdown, not
   intraday win rate.
 
-### ML/Meta-Model Selection
+### Explicitly Excluded: ML/Meta-Model Selection
 
-Candidate package:
+ML/meta-model selection is not a target for this codebase right now.
 
-- Meta-labeling of existing signals.
-- Candidate-ranking model trained only on walk-forward-safe evidence.
+Reason:
 
-Pipeline note:
-
-- This is not a first implementation target. It needs clean purged/embargoed
-  validation and strict leakage controls before it can be trusted.
+- The optimizer, scorer, validation path, and winner ledger already behave like
+  a pseudo-ML selection system over a large strategy/configuration surface.
+- Adding a learned model on top would increase maintenance burden and leakage
+  risk before the simpler deterministic candidate families have been fully
+  exhausted.
+- The current priority is broader deterministic strategy coverage plus strict
+  evidence gating, not another modeling layer.
 
 ## Expansion Rule
 
@@ -156,8 +158,7 @@ More strategies are acceptable when all of the following are true:
 
 Recommended next packages:
 
-1. Package J: chart/market-structure patterns.
-2. Package K: gap fade and session reversal.
-3. Package L: asset-class-aware volume/profile strategies.
-4. Package M: MTF pipeline support before true multi-timeframe strategies.
-5. Package N: cross-sectional/pairs architecture for equities expansion.
+1. Package J: chart/market-structure, session-fade, and money-flow strategies.
+2. Package K: carry/swap-aware deterministic strategies.
+3. Package L: MTF pipeline support before true multi-timeframe strategies.
+4. Package M: cross-sectional/pairs architecture for equities expansion.
