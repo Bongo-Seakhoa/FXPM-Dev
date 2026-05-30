@@ -98,6 +98,47 @@ def pbo_cscv(M, n_blocks=16, candidate_ids=None):
             "candidate_stats": candidate_stats}
 
 
+def pbo_by_aligned_group(M, manifest, n_blocks=16, candidate_ids=None):
+    """Audit-002 H1 fix: CSCV assumes all columns share one calendar time axis. The engine
+    emits one matrix per symbol mixing timeframes, whose relative-block rows are NOT coincident
+    across timeframes. Partition columns into ALIGNED groups by (timeframe, start_ts, end_ts) —
+    within a group the OOS windows are identical so the block rows ARE coincident — run CSCV per
+    group, and aggregate. Running CSCV across mixed timeframes would bias PBO uncontrollably."""
+    M = np.asarray(M, dtype=np.float64)
+    N = M.shape[1]
+    records = manifest.get("records") if isinstance(manifest, dict) else None
+    groups = {}
+    if records:
+        for rec in records:
+            col = rec.get("matrix_column")
+            if not isinstance(col, int) or not (0 <= col < N):
+                continue
+            key = (str(rec.get("timeframe", "")), str(rec.get("start_ts", "")), str(rec.get("end_ts", "")))
+            groups.setdefault(key, []).append(col)
+    if not groups:
+        # No per-candidate window metadata -> cannot prove alignment; treat as one group but flag.
+        res = pbo_cscv(M, n_blocks, candidate_ids=candidate_ids)
+        res["alignment"] = "UNVERIFIED_single_group"
+        return {"aggregate_pbo": res.get("pbo"), "alignment": "UNVERIFIED", "groups": [res]}
+
+    out_groups, weighted_num, weighted_den = [], 0.0, 0
+    ids = [str(v) for v in candidate_ids] if candidate_ids is not None else [str(i) for i in range(N)]
+    for (tf, s, e), cols in sorted(groups.items()):
+        sub = M[:, cols]
+        sub_ids = [ids[c] for c in cols]
+        r = pbo_cscv(sub, n_blocks, candidate_ids=sub_ids)
+        r.update({"timeframe": tf, "start_ts": s, "end_ts": e, "n_candidates": len(cols)})
+        out_groups.append(r)
+        if r.get("pbo") is not None:
+            weighted_num += r["pbo"] * len(cols)
+            weighted_den += len(cols)
+    agg = round(weighted_num / weighted_den, 4) if weighted_den else None
+    scored = [g for g in out_groups if g.get("pbo") is not None]
+    worst = max((g["pbo"] for g in scored), default=None)
+    return {"aggregate_pbo": agg, "worst_group_pbo": worst, "alignment": "per_timeframe_window",
+            "n_groups": len(out_groups), "n_scored_groups": len(scored), "groups": out_groups}
+
+
 def load_oos_manifest_matrix(manifest_path):
     """Load and verify an engine-emitted oos_candidate_matrix_v1 manifest."""
     manifest_path = Path(manifest_path)
@@ -176,7 +217,9 @@ def main():
 
     if args.manifest:
         M, manifest, candidate_ids = load_oos_manifest_matrix(args.manifest)
-        res = pbo_cscv(M, n_blocks=args.blocks, candidate_ids=candidate_ids)
+        # H1 fix: partition by aligned (timeframe, window) before CSCV; mixing timeframes on one
+        # row axis biases PBO. Aggregate is candidate-weighted; worst-group is the conservative read.
+        res = pbo_by_aligned_group(M, manifest, n_blocks=args.blocks, candidate_ids=candidate_ids)
         symbol = manifest.get("symbol", Path(args.manifest).stem)
         res.update({
             "source": "oos_candidate_matrix_v1",
@@ -184,31 +227,20 @@ def main():
             "symbol": symbol,
             "record_count": manifest.get("record_count"),
             "matrix_digest_sha1": manifest.get("matrix_digest_sha1"),
-            "candidate_id_sample": candidate_ids[:5],
             "engine_commit": _git_head(),
         })
-        print(f"\n=== PBO (CSCV) [manifest {symbol}] engine={res['engine_commit']} ===")
-        for k in ("n_configs", "n_obs", "n_combos", "logit_median", "pbo"):
-            print(f"  {k}: {res.get(k)}")
-        if res.get("pbo") is not None:
-            verdict = "HIGH overfit risk" if res["pbo"] > 0.5 else ("MODERATE" if res["pbo"] > 0.25 else "LOW")
-            print(f"  interpretation: PBO={res['pbo']:.0%} selection overfit -> {verdict}")
-        selected = [s for s in res.get("candidate_stats", []) if s.get("selected_count", 0) > 0]
-        if selected:
-            selected.sort(
-                key=lambda item: (
-                    -int(item.get("selected_count", 0) or 0),
-                    float(item.get("selected_oos_pbo", 1.0) or 1.0),
-                )
-            )
-            print("  top IS-selected candidates:")
-            for stat in selected[:5]:
-                print(
-                    f"    col={stat['matrix_column']} selected={stat['selected_count']} "
-                    f"sel_pbo={stat['selected_oos_pbo']} "
-                    f"mean_oos_rank={stat['selected_oos_mean_rank']} "
-                    f"id={stat['candidate_id'][:12]}"
-                )
+        print(f"\n=== PBO (CSCV, timeframe-aligned) [manifest {symbol}] engine={res['engine_commit']} ===")
+        print(f"  alignment={res.get('alignment')} groups={res.get('n_groups')} "
+              f"scored={res.get('n_scored_groups')}")
+        for g in res.get("groups", []):
+            print(f"    [{g.get('timeframe','?')}] n_candidates={g.get('n_candidates')} "
+                  f"n_obs={g.get('n_obs')} pbo={g.get('pbo')}"
+                  + (f"  ({g.get('reason')})" if g.get('pbo') is None else ""))
+        agg, worst = res.get("aggregate_pbo"), res.get("worst_group_pbo")
+        print(f"  aggregate_pbo={agg}  worst_group_pbo={worst}")
+        if worst is not None:
+            verdict = "HIGH overfit risk" if worst > 0.5 else ("MODERATE" if worst > 0.25 else "LOW")
+            print(f"  interpretation (worst group): {verdict}")
         out = REPO / "pm_outputs" / "experiments" / f"pbo_manifest_{symbol}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         json.dump(res, open(out, "w"), indent=2, default=str)
