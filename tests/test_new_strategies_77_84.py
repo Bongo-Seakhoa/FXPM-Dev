@@ -1,9 +1,12 @@
 """Tests for Package K time/session/calendar and carry-aware strategies."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
 
+import pm_strategies
 from pm_strategies import (
     CarryFilteredPullbackStrategy,
     DayOfWeekBiasStrategy,
@@ -107,6 +110,63 @@ class TestPackageKSignalContract:
         sig = SwapCarryTrendStrategy().generate_signals(features.copy(), TEST_SYMBOL)
         assert (sig == 1).sum() == 0
 
+    def test_carry_direction_requires_positive_swap(self, monkeypatch):
+        monkeypatch.setattr(
+            pm_strategies,
+            "get_instrument_spec",
+            lambda _symbol: SimpleNamespace(swap_long=-10.0, swap_short=-1.0),
+        )
+        features = _make_features()
+        assert pm_strategies._carry_direction("BTCUSD", 0.5) == 0
+        sig = SwapCarryTrendStrategy(min_swap_diff=0.5).generate_signals(features.copy(), "BTCUSD")
+        assert (sig != 0).sum() == 0
+
+    def test_overnight_drift_enters_once_per_entry_hour_on_intraday_data(self):
+        idx = pd.date_range("2025-01-01 00:00:00", periods=192, freq="15min")
+        close = 1.1000 + np.arange(len(idx)) * 0.0001
+        features = pd.DataFrame(
+            {
+                "Open": close - 0.00002,
+                "High": close + 0.0001,
+                "Low": close - 0.0001,
+                "Close": close,
+                "Volume": 1000.0,
+                "RealVolume": 1000.0,
+                "ATR_14": 0.0001,
+            },
+            index=idx,
+        )
+        sig = OvernightDriftStrategy(entry_hour=21, min_move_atr=0.0).generate_signals(
+            features.copy(), TEST_SYMBOL
+        )
+        entry_hour_signals = sig[sig.index.hour == 21]
+        per_day = entry_hour_signals.ne(0).groupby(entry_hour_signals.index.date).sum()
+        assert per_day.max() == 1
+
+    def test_intraday_range_fade_does_not_carry_previous_session_range(self):
+        idx = pd.date_range("2025-01-01 00:00:00", periods=48, freq="h")
+        close = np.full(len(idx), 100.0)
+        close[24:] = 200.0
+        features = pd.DataFrame(
+            {
+                "Open": close,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Close": close,
+                "Volume": 1000.0,
+                "RealVolume": 1000.0,
+                "ATR_14": 1.0,
+            },
+            index=idx,
+        )
+        sig = IntradayRangeFadeStrategy(
+            session_start_hour=0,
+            quiet_start_hour=0,
+            quiet_end_hour=1,
+            ext_atr=0.0,
+        ).generate_signals(features.copy(), TEST_SYMBOL)
+        assert sig.iloc[24] == 0
+
 
 class TestPackageKParamGridAndStops:
     @pytest.mark.parametrize("name", PACKAGE_K_STRATEGIES)
@@ -125,6 +185,16 @@ class TestPackageKParamGridAndStops:
                 continue
             if key in grid:
                 assert val in grid[key], f"{name}: default {key}={val} missing from grid"
+
+    def test_time_of_day_momentum_grid_has_no_empty_windows(self):
+        grid = TimeOfDayMomentumStrategy().get_param_grid()
+        for start_hour in grid["start_hour"]:
+            for end_hour in grid["end_hour"]:
+                assert start_hour < end_hour
+
+    def test_package_k_in_all_exports(self):
+        for name in PACKAGE_K_STRATEGIES:
+            assert name in pm_strategies.__all__
 
     @pytest.mark.parametrize("name", PACKAGE_K_STRATEGIES)
     def test_calculate_stops_valid(self, name):

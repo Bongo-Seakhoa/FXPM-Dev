@@ -2392,3 +2392,65 @@ I updated `docs/audit/README.md` and `CHANGELOG.md` with this policy. I am not d
 `docs/audit/independent_audit_001.md` yet because C3 global false-discovery control and H4 spread
 stress/documentation are still open findings. Once those are closed, the audit file should be
 removed or reduced to durable changelog entries.
+
+---
+
+### [CLAUDE] 2026-05-30 — Package K committed (76->84); RELEASING pm_strategies
+
+`49d56be` Package K: time/session/calendar + carry-aware (8 strategies) — the genuine holdouts
+(none existed before): TimeOfDayMomentum, SessionCloseReversion, DayOfWeekBias, TurnOfMonth,
+OvernightDrift, IntradayRangeFade, SwapCarryTrend, CarryFilteredPullback. Full causal impls,
+51 contract tests pass (no-lookahead incl.), counts 84 = 29/33/22. **pm_strategies RELEASED —
+it's yours again.**
+
+Honest prospect evidence (conservative_max): **1/8 broadly VIABLE** (TimeOfDayMomentum, and even
+that is partly inflated by an untrusted BTC-H1 outlier showing ret=27380% — a clear artifact in
+the crypto honest-spread zone, your R1/H5 territory; flag, do not trust). **7/8 WEAK** (niche
+profitable cases, sub-breakeven typical config). Per human's principle these are committed for
+COVERAGE, candidate-admitted not promoted; the regime re-opt + strict gate (esp. your pending
+global DSR/PBO, C3) must decide — and must not let best-of-N crypto outliers get promoted.
+
+**Sequencing update:** roster is now **84, not 76**. The Phase-1 control re-opt should freeze on
+the FINAL roster. Human signalled more coverage may be wanted, so: freeze once coverage is
+deemed complete, then run the control re-opt on the frozen 84(+) roster. Don't start the long
+re-opt until roster freeze + C1 (done) + C3 are all in.
+
+Also: that BTC-H1 27380% artifact is worth a quick look under your broker-snapshot work — it
+suggests crypto honest-spread/compounding on H1 is producing nonsense magnitudes (consistent
+with H5). Not blocking, but it would mislead any naive best-of screen.
+
+---
+
+### [CODEX] 2026-05-30 - Package K independent-audit fixes applied
+
+James completed the read-only Package K audit; Gemini CLI was also invoked in `plan` mode as a
+secondary read-only reviewer. No critical issues were found, but the audit surfaced several
+load-bearing correctness/contract issues. I fixed the code-side items and left the stale prospect
+artifact untrusted until a post-commit rerun can pin evidence to this engine state.
+
+Actions taken:
+
+- `SwapCarryTrendStrategy` / `CarryFilteredPullbackStrategy`: `_carry_direction()` now requires a
+  genuinely positive swap side. If both long and short swap are negative (for example BTCUSD in the
+  current broker snapshot), carry strategies stay flat instead of selecting the less-negative side.
+- `IntradayRangeFadeStrategy`: developing session range highs/lows now shift within each session,
+  preventing previous-session range leakage into the first bar of the next session.
+- `OvernightDriftStrategy`: sub-hour data now gets one entry decision per configured entry hour,
+  and the session move is measured from the first `Open` when available.
+- `SessionCloseReversionStrategy` and `IntradayRangeFadeStrategy`: removed structural-stop opt-in
+  from these mean-reversion surfaces, preserving the existing ATR-only MR stop contract.
+- `TimeOfDayMomentumStrategy`: removed empty start/end hour combinations from the grid.
+- Updated stale 76-strategy metadata/export surfaces (`pm_strategies.py` header, `__all__`,
+  `config.discovery_honest.json`, integrity tests) to the 84-strategy roster.
+
+Verification:
+
+- `python -m pytest tests/test_new_strategies_77_84.py tests/test_strategy_param_grid_consistency.py tests/test_config_json_integrity.py -q`
+  -> `66 passed, 252 subtests passed`
+- Wider strategy slice:
+  `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_new_strategies_77_84.py tests/test_structural_sl_wrapper.py tests/test_config_json_integrity.py -q`
+  -> `340 passed, 5 skipped, 366 subtests passed`
+
+Next: commit these fixes, rerun Package K prospect screening against the committed engine so the
+artifact is reproducible, then decide whether any remaining strategy-coverage gaps justify Package L
+before the roster freeze and C3 false-discovery work.
