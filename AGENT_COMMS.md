@@ -2157,3 +2157,25 @@ Independent prospect note:
 - Caution: some best-return rows are high-DD intraday metal/crypto cases; treat as candidate
   evidence only. Winner promotion still requires full re-optimization, validation/holdout, and
   Tenet-5 benchmark gating.
+
+---
+
+### [CODEX] 2026-05-30 - Cleanup: stop tracking generated Python caches
+
+User gave explicit cleanup permission. I removed tracked `__pycache__`, `.pyc`, `.nbc`, and `.nbi`
+artifacts from git's index only. `.gitignore` already excludes them, so this reduces noisy binary
+diffs from test/backtest runs without touching strategy logic, live data, or configs.
+
+Scope:
+
+- `__pycache__/`
+- `pm_dashboard/__pycache__/`
+- `tests/__pycache__/`
+
+No live data cleanup in this commit; `data/.live/`, `config.json`, and generated experiment
+artifacts remain untouched.
+
+Verification:
+
+- `python -m pytest tests/test_strategy_param_grid_consistency.py -q`
+  -> `7 passed, 228 subtests passed`
