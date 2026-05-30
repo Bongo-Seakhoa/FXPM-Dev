@@ -24,6 +24,13 @@ class DummyStrategy:
         return 10.0, 10.0
 
 
+class WideStopStrategy(DummyStrategy):
+    name = "WideStop"
+
+    def calculate_stops(self, features, signal, symbol, spec=None, bar_index=None):
+        return 100.0, 100.0
+
+
 class BacktesterTests(unittest.TestCase):
     def test_entry_timing_and_exit(self):
         cfg = PipelineConfig(
@@ -119,6 +126,47 @@ class BacktesterTests(unittest.TestCase):
         bad_signals = pd.Series([1, 0, 0], index=pd.date_range("2024-02-01", periods=3, freq="h"))
         with self.assertRaises(ValueError):
             bt.run(df, bad_signals, "EURUSD", strat, spec=spec)
+
+    def test_historical_spread_mode_uses_bar_spread_column(self):
+        idx = pd.date_range("2024-01-01", periods=3, freq="h")
+        df = pd.DataFrame({
+            "Open": [100.0, 100.0, 100.0],
+            "High": [100.0, 100.05, 100.05],
+            "Low": [100.0, 99.95, 99.95],
+            "Close": [100.0, 100.10, 100.20],
+            "Volume": [100, 100, 100],
+            # MT5 spread points. With point=0.01 and pip_size=0.01 this is 10 pips.
+            "Spread": [10.0, 10.0, 10.0],
+        }, index=idx)
+        spec = InstrumentSpec(
+            symbol="TEST",
+            pip_position=2,
+            pip_value=10.0,
+            spread_avg=0.0,
+            point=0.01,
+            tick_size=0.01,
+            tick_value=10.0,
+        )
+        strat = WideStopStrategy()
+        signals = strat.generate_signals(df, "TEST")
+
+        fixed = Backtester(PipelineConfig(
+            use_spread=True,
+            use_slippage=False,
+            use_commission=False,
+            backtest_spread_mode="fixed_spec",
+        )).run(df, signals, "TEST", strat, spec=spec)
+        historical = Backtester(PipelineConfig(
+            use_spread=True,
+            use_slippage=False,
+            use_commission=False,
+            backtest_spread_mode="historical_bar",
+        )).run(df, signals, "TEST", strat, spec=spec)
+
+        self.assertGreater(fixed["trades"][0]["pnl_pips"], historical["trades"][0]["pnl_pips"])
+        self.assertAlmostEqual(fixed["trades"][0]["pnl_pips"], 20.0, places=6)
+        self.assertAlmostEqual(historical["trades"][0]["pnl_pips"], 10.0, places=6)
+        self.assertEqual(historical["spread_model"]["source"], "historical_spread_points")
 
 
 if __name__ == "__main__":

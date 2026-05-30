@@ -1,5 +1,6 @@
 import unittest
 import logging
+from datetime import datetime
 from types import SimpleNamespace
 
 import pm_mt5
@@ -66,6 +67,20 @@ class _FakeMT5:
             last=1.10010,
             volume=100,
         )
+
+    def copy_rates_range(self, symbol, timeframe, start_date, end_date):
+        if symbol != "EURUSD.a":
+            return []
+        return [{
+            "time": 1711843200,
+            "open": 1.10000,
+            "high": 1.10100,
+            "low": 1.09900,
+            "close": 1.10050,
+            "tick_volume": 100,
+            "spread": 17,
+            "real_volume": 3,
+        }]
 
     def order_check(self, request):
         self.order_check_request = dict(request)
@@ -196,6 +211,23 @@ class MT5ConnectorTests(unittest.TestCase):
             [record for record in records if record.levelno >= logging.WARNING],
             "Missing broker-universe symbols should stay below terminal log levels.",
         )
+
+    def test_get_bars_range_preserves_spread_and_real_volume(self):
+        connector = MT5Connector(MT5Config())
+        connector._connected = True
+
+        bars = connector.get_bars_range(
+            "EURUSD",
+            "M5",
+            start_date=datetime(2024, 1, 1),
+            end_date=datetime(2024, 1, 2),
+        )
+
+        self.assertIsNotNone(bars)
+        self.assertIn("Spread", bars.columns)
+        self.assertIn("RealVolume", bars.columns)
+        self.assertEqual(float(bars["Spread"].iloc[0]), 17.0)
+        self.assertEqual(float(bars["RealVolume"].iloc[0]), 3.0)
 
 
 if __name__ == "__main__":

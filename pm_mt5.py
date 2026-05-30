@@ -703,7 +703,9 @@ class MT5Connector:
             'high': 'High',
             'low': 'Low',
             'close': 'Close',
-            'tick_volume': 'Volume'
+            'tick_volume': 'Volume',
+            'spread': 'Spread',
+            'real_volume': 'RealVolume'
         })
         
         return df
