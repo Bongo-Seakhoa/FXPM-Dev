@@ -137,10 +137,9 @@ def pooled_summary(rows):
     }
 
 
-def _pct_delta(new, old):
-    if old == 0:
-        return float("inf") if new > 0 else (float("-inf") if new < 0 else 0.0)
-    return (new - old) / abs(old) * 100.0
+def _pct_delta(new, old, denom_floor=1e-9):
+    denom = max(abs(float(old)), float(denom_floor))
+    return (float(new) - float(old)) / denom * 100.0
 
 
 def is_improvement(baseline, candidate, material=5.0):
@@ -150,12 +149,22 @@ def is_improvement(baseline, candidate, material=5.0):
     b, c = baseline["summary"], candidate["summary"]
     d = {
         "return": _pct_delta(c["mean_return_pct"], b["mean_return_pct"]),
-        "pf": _pct_delta(c["mean_profit_factor"], b["mean_profit_factor"]),
+        # PF sits on an absolute breakeven hinge around 1.0; relative deltas near zero
+        # are numerically dramatic but not decision-grade evidence.
+        "pf": _pct_delta(c["mean_profit_factor"], b["mean_profit_factor"], denom_floor=1.0),
         "max_dd": _pct_delta(c["mean_max_dd_pct"], b["mean_max_dd_pct"]),       # lower better
         "ulcer": _pct_delta(c["mean_ulcer_index"], b["mean_ulcer_index"]),     # lower better
         "time_uw": _pct_delta(c["mean_time_underwater_pct"], b["mean_time_underwater_pct"]),  # lower better
         "trades": _pct_delta(c["total_trades"], b["total_trades"]),
         "win_rate": _pct_delta(c["mean_win_rate"], b["mean_win_rate"]),
+    }
+    abs_d = {
+        "return_pp": float(c["mean_return_pct"] - b["mean_return_pct"]),
+        "pf": float(c["mean_profit_factor"] - b["mean_profit_factor"]),
+        "max_dd_pp": float(c["mean_max_dd_pct"] - b["mean_max_dd_pct"]),
+        "ulcer": float(c["mean_ulcer_index"] - b["mean_ulcer_index"]),
+        "time_uw_pp": float(c["mean_time_underwater_pct"] - b["mean_time_underwater_pct"]),
+        "win_rate_pp": float(c["mean_win_rate"] - b["mean_win_rate"]),
     }
     bmap = {r["symbol"]: r for r in baseline.get("rows", []) if "error" not in r}
     cmap = {r["symbol"]: r for r in candidate.get("rows", []) if "error" not in r}
@@ -164,28 +173,31 @@ def is_improvement(baseline, candidate, material=5.0):
     per_symbol = []
     for sym in sorted(set(bmap) & set(cmap)):
         rd = _pct_delta(cmap[sym]["return_pct"], bmap[sym]["return_pct"])
-        pfd = _pct_delta(cmap[sym]["profit_factor"], bmap[sym]["profit_factor"])
+        pf_abs = float(cmap[sym]["profit_factor"] - bmap[sym]["profit_factor"])
+        pfd = _pct_delta(cmap[sym]["profit_factor"], bmap[sym]["profit_factor"], denom_floor=1.0)
         ddd = _pct_delta(cmap[sym]["max_dd_pct"], bmap[sym]["max_dd_pct"])
         uld = _pct_delta(cmap[sym]["ulcer_index"], bmap[sym]["ulcer_index"])
         tud = _pct_delta(cmap[sym]["time_underwater_pct"], bmap[sym]["time_underwater_pct"])
-        if rd < -material or pfd < -material or ddd > material or uld > material or tud > material:
+        if rd < -material or (pfd < -material and pf_abs < -0.05) or ddd > material or uld > material or tud > material:
             per_symbol.append({"symbol": sym, "return_delta_pct": round(rd, 2),
-                               "pf_delta_pct": round(pfd, 2), "max_dd_delta_pct": round(ddd, 2),
+                               "pf_delta_pct": round(pfd, 2), "pf_delta_abs": round(pf_abs, 4),
+                               "max_dd_delta_pct": round(ddd, 2),
                                "ulcer_delta_pct": round(uld, 2), "time_uw_delta_pct": round(tud, 2)})
 
     def result(verdict):
         if per_symbol and verdict in ("IMPROVEMENT", "NO_CHANGE", "TRADE_OFF_ACCEPT"):
             verdict = "NEEDS_REVIEW"
         return {"verdict": verdict, "deltas_pct": {k: round(v, 2) for k, v in d.items()},
+                "absolute_deltas": {k: round(v, 4) for k, v in abs_d.items()},
                 "per_symbol_regressions": per_symbol}
 
     if all(abs(v) < material for v in (d["return"], d["pf"], d["max_dd"], d["ulcer"], d["time_uw"])):
         return result("NO_CHANGE")
 
     profit_down = d["return"] < -material
-    pf_down = d["pf"] < -material
+    pf_down = d["pf"] < -material and abs_d["pf"] < -0.05
     profit_up = d["return"] > material
-    pf_up = d["pf"] > material
+    pf_up = d["pf"] > material and abs_d["pf"] > 0.05
     # Path-dependent DD (max_dd, ulcer, time-underwater) is first-class risk per Tenet 2.
     risk_better = d["max_dd"] <= 0 and d["ulcer"] <= 0 and d["time_uw"] <= 0
     risk_worse = d["max_dd"] > material or d["ulcer"] > material or d["time_uw"] > material
