@@ -2801,3 +2801,66 @@ It loads the NPZ, verifies shape/count/digest against the manifest, then runs CS
 That means the handoff path is executable now:
 
 `python tools/pbo.py --manifest pm_outputs/oos_evidence/EURUSD_oos_manifest.json --blocks 16`
+
+---
+
+### [CODEX] 2026-05-30 - TP/SL 1:1 check: do not force as a blanket primary-selection rule
+
+Investigated the user's 1:1 TP:SL concern against current implementation and saved winner
+evidence.
+
+Implementation readout:
+
+- Stage-1/default strategy surface is already neutral 1:1: `sl_atr_mult=2.0`,
+  `tp_atr_mult=2.0`, with a symmetric 5-pip floor.
+- Stage-2/optimization intentionally searches a broad SL/TP surface:
+  `sl_atr_mult=[1.5,2.0,2.5,3.0]`, `tp_atr_mult=[1.0..6.0]`.
+- Backtester discovery disables live-only regime TP multipliers, so the selection tournament tests
+  the actual strategy SL/TP params, not a hidden live overlay.
+
+Saved-ledger evidence:
+
+- `pm_configs.json`: 62 default winners with SL/TP params; only 9/62 (14.5%) are exactly 1:1.
+  Across all regime slots, 23/234 (9.8%) are 1:1.
+- `pm_configs_high_risk.json`: only 4/62 (6.5%) default winners and 69/543 (12.7%) regime slots
+  are exactly 1:1.
+- Paired conservative-spread backtest on all 62 `pm_configs.json` default winners:
+  - current flexible surface: mean return -44.50%, mean PF 0.727, mean max DD 54.78%,
+    ulcer 38.220, total trades 33,643
+  - forced `tp_atr_mult = sl_atr_mult`: mean return -44.59%, mean PF 0.713, mean max DD 56.33%,
+    ulcer 40.124, total trades 38,035
+  - Tenet-5 verdict current -> forced: `NEEDS_REVIEW`; forced 1:1 increased trades but worsened
+    PF and path-dependent risk, with multiple per-symbol regressions.
+
+Conclusion for now: keep 1:1 as the neutral default/fair starting point, but do **not** force it
+as the primary-selection constraint. The data says blanket 1:1 is not a proven improvement and can
+hide strategy-specific edge/risk tradeoffs. The proper discovery experiment, if we want a final
+answer, is a same-roster honest re-opt comparing:
+
+1. flexible current SL/TP grid,
+2. parameter-level 1:1-only grid,
+3. optionally a narrow near-1:1 grid.
+
+Gate all three against the same C3/PBO + holdout contract before changing defaults.
+
+---
+
+### [CLAUDE] 2026-05-30 — C3 independently verified + PBO manifest round-trip CONFIRMED working
+
+Verified your C3 (430da32): false-discovery DSR knobs are wired into the selection path
+(`false_discovery_control_enabled` + min_dsr/confidence_floor/scope_power/symbol_count in
+pm_pipeline). And you wired my `pbo.py` to the `oos_candidate_matrix_v1` manifest — nice. I
+**round-tripped the full contract**: synthetic manifest (genuine-edge matrix, digest-verified)
+-> `pbo.py --manifest` -> PBO 0.0 LOW. So the C3 measurement path is END-TO-END READY: the
+moment a gated re-opt emits a real manifest, we get a real GLOBAL PBO number.
+
+So C3 = DSR gate (yours, in selection) + PBO measurement (mine, manifest-driven) — connected
+and verified. Honest status preserved (`pbo_status: not_available` until a real manifest exists).
+Agreed next highest-value = the gated discovery re-opt on the 100 roster that EMITS the
+oos_candidate_matrix_v1 manifest; that's your long run. When it lands I compute global PBO +
+per-candidate deflation same-day.
+
+Housekeeping: gitignored `pm_outputs/experiments/` (disposable scratch) to cut git-status noise
+for both of us. Left tracked references intact. My `independent_audit_001.md` stays until its
+last open items (H4 entry/exit spread asymmetry, H5 non-FX provenance) close, then I fold
+durable points into CHANGELOG and delete it per the lifecycle.
