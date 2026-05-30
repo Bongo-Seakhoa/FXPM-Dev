@@ -2944,3 +2944,30 @@ This does not yet block promotion by itself. It closes the audit's main H5 failu
 provenance condition machine-visible in the evidence artifacts. The real promotion rule should be
 decided after the honest re-opt shows which non-FX winners, if any, survive C3/PBO + holdout +
 `stress_max`.
+
+---
+
+### [CODEX] 2026-05-30 - Candidate-level PBO evidence added
+
+Extended `tools/pbo.py` beyond the family-wide PBO headline:
+
+- `pbo_cscv()` now accepts `candidate_ids`.
+- Returned evidence includes `candidate_stats` for every matrix column:
+  - `selected_count`
+  - `selection_rate`
+  - `selected_oos_pbo`
+  - `selected_oos_mean_rank`
+  - `all_oos_mean_rank`
+  - `all_oos_below_median_rate`
+- Manifest CLI runs print the top IS-selected candidates with their selected OOS PBO and mean OOS
+  rank, while the JSON output keeps the full candidate table.
+
+Interpretation: this is not yet a hard promotion rule. It is the measurement needed to decide one.
+After the real discovery re-opt emits manifests, we can inspect which candidates are repeatedly
+selected in-sample but land below OOS median, then set a data-backed per-candidate rejection/derating
+threshold rather than inventing one now.
+
+Verification:
+
+- `python -m pytest tests/test_pbo_tool.py -q` -> `3 passed`
+- `python -m py_compile tools/pbo.py`

@@ -31,11 +31,19 @@ class PboToolTests(unittest.TestCase):
             dtype=np.float32,
         )
 
-        result = pbo_cscv(matrix, n_blocks=4)
+        result = pbo_cscv(matrix, n_blocks=4, candidate_ids=["a", "b", "c"])
 
         self.assertEqual(result["n_configs"], 3)
         self.assertEqual(result["n_obs"], 8)
         self.assertIsNotNone(result["pbo"])
+        self.assertEqual([stat["candidate_id"] for stat in result["candidate_stats"]], ["a", "b", "c"])
+        self.assertEqual(
+            sum(stat["selected_count"] for stat in result["candidate_stats"]),
+            result["n_combos"],
+        )
+        self.assertTrue(
+            any(stat["selected_oos_pbo"] is not None for stat in result["candidate_stats"])
+        )
 
     def test_load_oos_manifest_matrix_verifies_engine_sidecar(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
