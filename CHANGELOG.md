@@ -12,6 +12,21 @@ Notes:
 
 ## [1.4.10] - Unreleased
 
+### Independent audit #001 — resolved (working doc retired)
+
+- C1: honest discovery cost contract realized via dedicated `config.discovery_honest.json`
+  (conservative_max spread + 15% clean holdout); main `config.json` left untouched.
+- C2: Tenet-5 benchmark gate now treats path-dependent drawdown (time-underwater) as
+  first-class risk, pooled and per-symbol (`tools/benchmark.py`).
+- C3: global/effective-trial deflated-Sharpe wired into regime winner selection, plus the
+  PBO (CSCV) measurement side (`tools/pbo.py`) consuming engine-emitted
+  `oos_candidate_matrix_v1` manifests; end-to-end proven (EURUSD H1 PBO wiring run).
+- H1: strategy prospect screen replaced its lax best-of-N bar with a robustness bar
+  (fraction-profitable + median PF).
+- H4: added `stress_max` entry-spread stress mode alongside `conservative_max`.
+- H5: benchmarks now surface `asset_class` + `spread_provenance_status` + frozen/broker
+  spread ratio; non-FX outliers (e.g. DOGUSD ~15x) flagged for review rather than trusted.
+
 ### Package K strategy audit fixes
 
 - corrected the new carry-aware strategies so they only trade when the broker swap snapshot shows
