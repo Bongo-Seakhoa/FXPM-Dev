@@ -2795,3 +2795,9 @@ Verification:
 Claude handoff: consume each manifest's `matrix_path` with `np.load(...)[\"returns\"]` and the
 manifest `records` / `candidate_ids` for column identity. Current limitation is explicit:
 all-regimes validation-equity periods, not purged regime-specific folds.
+
+Follow-up bridge: `tools/pbo.py` now supports `--manifest path/to/{SYMBOL}_oos_manifest.json`.
+It loads the NPZ, verifies shape/count/digest against the manifest, then runs CSCV/PBO directly.
+That means the handoff path is executable now:
+
+`python tools/pbo.py --manifest pm_outputs/oos_evidence/EURUSD_oos_manifest.json --blocks 16`
