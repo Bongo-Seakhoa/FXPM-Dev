@@ -14,7 +14,7 @@ from pm_institutional_supervisor import InstitutionalSupervisor, SupervisorConte
 from pm_live_readiness import validate_live_readiness
 from pm_main import LiveTrader
 from pm_order_governance import GovernanceContext, candidate_policy_names, evaluate_policy, normalize_policy_name
-from pm_pipeline import RegimeConfig
+from pm_pipeline import RegimeConfig, build_artifact_meta
 from pm_strategies import (
     LiquiditySweepReversalStrategy,
     RegimeTransitionBreakoutStrategy,
@@ -144,6 +144,35 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             self.assertFalse(report.ok)
             self.assertTrue(any(item.code == "artifact_drift_not_blocking" for item in report.errors))
+
+    def test_live_readiness_blocks_winner_ledger_artifact_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                log_dir=Path(tmp) / "logs",
+            )
+            stale_artifact = build_artifact_meta(cfg)
+            stale_artifact.pop("backtest_spread_mode")
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "artifact_meta": stale_artifact,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "winner_ledger_artifact_drift" for item in report.errors))
 
     def test_live_readiness_rejects_paper_only_winners(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -283,16 +312,24 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 encoding="utf-8",
             )
             ledger = root / "pm_configs.json"
-            ledger.write_text(
-                json.dumps({"EURUSD.a": {"symbol": "EURUSD.a", "strategy_name": "EMACrossoverStrategy"}}),
-                encoding="utf-8",
-            )
             cfg = PipelineConfig(
                 live_artifact_drift_policy="block",
                 winner_ledger_path=str(ledger),
                 regime_params_file="",
                 walk_forward_audit_enabled=True,
                 log_dir=str(root / "logs"),
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD.a": {
+                            "symbol": "EURUSD.a",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
             )
 
             report = validate_live_readiness(cfg, symbols=["EURUSD.a"], config_path=str(root / "config.json"))
@@ -604,19 +641,6 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 encoding="utf-8",
             )
             ledger = Path(tmp) / "pm_configs.json"
-            ledger.write_text(
-                json.dumps(
-                    {
-                        "EURUSD": {
-                            "symbol": "EURUSD",
-                            "regime_configs": {
-                                "H1": {"TREND": {"strategy_name": "EMACrossoverStrategy"}}
-                            },
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
             cfg = PipelineConfig(
                 live_artifact_drift_policy="block",
                 winner_ledger_path=str(ledger),
@@ -665,6 +689,20 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 walk_forward_audit_enabled=True,
             )
             cfg.get_last_retrain_slot = Mock(return_value=datetime(2026, 4, 15))
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "artifact_meta": build_artifact_meta(cfg),
+                            "regime_configs": {
+                                "H1": {"TREND": {"strategy_name": "EMACrossoverStrategy"}}
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
             report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
             self.assertTrue(report.ok)
             self.assertTrue(any(item.code == "supervisor_latch_from_previous_cycle" for item in report.warnings))

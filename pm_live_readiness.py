@@ -140,6 +140,11 @@ def _config_has_tradeable_winner(config: Dict[str, Any]) -> bool:
     return _tradeable(config)
 
 
+def _symbol_label(config: Dict[str, Any], fallback: str = "unknown") -> str:
+    value = str(config.get("symbol", "") or "").strip().upper()
+    return value or fallback
+
+
 def validate_live_readiness(config: Any,
                             *,
                             symbols: Iterable[str],
@@ -256,6 +261,32 @@ def validate_live_readiness(config: Any,
         missing = sorted(set(requested_symbols) - ledger_symbols)
         if missing:
             add("warning", "symbols_missing_from_ledger", f"symbols missing from winner ledger: {', '.join(missing)}")
+        try:
+            from pm_pipeline import artifact_contract_matches, build_artifact_meta
+
+            current_artifact_meta = build_artifact_meta(config)
+            drifted_symbols = []
+            for idx, payload in enumerate(symbol_configs):
+                if not _config_has_tradeable_winner(payload):
+                    continue
+                stored_artifact = payload.get("artifact_meta") if isinstance(payload.get("artifact_meta"), dict) else {}
+                if not artifact_contract_matches(stored_artifact, current_artifact_meta):
+                    drifted_symbols.append(_symbol_label(payload, fallback=f"entry_{idx}"))
+            if drifted_symbols:
+                preview = ", ".join(drifted_symbols[:12])
+                if len(drifted_symbols) > 12:
+                    preview += f", +{len(drifted_symbols) - 12} more"
+                add(
+                    "error",
+                    "winner_ledger_artifact_drift",
+                    f"winner ledger artifacts do not match the current optimization/cost contract: {preview}",
+                )
+        except Exception as exc:
+            add(
+                "warning",
+                "winner_ledger_artifact_check_failed",
+                f"could not verify winner ledger artifact contract: {type(exc).__name__}: {exc}",
+            )
 
     return ReadinessReport(ok=not any(f.severity == "error" for f in findings), findings=findings)
 
