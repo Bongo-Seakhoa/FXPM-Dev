@@ -23,8 +23,8 @@ class StrategyParamGridConsistencyTests(unittest.TestCase):
                         f"{name}: grid key '{key}' not in defaults {list(defaults.keys())}"
                     )
 
-    def test_strategy_count_is_50(self):
-        self.assertEqual(StrategyRegistry.count(), 50)
+    def test_strategy_count_is_58(self):
+        self.assertEqual(StrategyRegistry.count(), 58)
 
     def test_all_strategies_instantiate(self):
         """Every registered strategy can be instantiated with defaults."""
