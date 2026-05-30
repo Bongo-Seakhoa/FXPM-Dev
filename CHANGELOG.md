@@ -27,6 +27,20 @@ Notes:
   existing ATR-only mean-reversion stop contract
 - updated the honest discovery metadata and strategy exports to the 84-strategy roster
 
+### Package L strategy expansion
+
+- added Package L, expanding the deterministic strategy roster from 84 to 92 with:
+  - confirmed-fractal channel breakout
+  - swing-failure reversal
+  - session VWAP reclaim and pullback trend variants
+  - volume-climax reversal
+  - efficiency-ratio trend and mean-reversion regimes
+  - opening-range retest continuation
+- reconciled independent Package L audit findings by guarding session-shift comparisons, making
+  retest/efficiency/VWAP entries event-like rather than every-bar state signals, and adding direct
+  behavioral regression tests for the new strategy semantics
+- updated discovery metadata and registry tests to the 92-strategy roster
+
 ### Audit artifact lifecycle
 
 - clarified that audit outputs, agent communication files, experiment notes, and review documents
