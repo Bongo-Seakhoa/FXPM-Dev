@@ -3,10 +3,10 @@ FX Portfolio Manager - Trading Strategies
 ==========================================
 
 Contains all trading strategy implementations.
-Includes 58 strategies across categories:
-- Trend Following (21 strategies)
-- Mean Reversion (21 strategies)
-- Breakout/Momentum (16 strategies)
+Includes 66 strategies across categories:
+- Trend Following (22 strategies)
+- Mean Reversion (26 strategies)
+- Breakout/Momentum (18 strategies)
 
 Each strategy provides:
 - Signal generation (returns -1, 0, 1)
@@ -464,6 +464,21 @@ def _heikin_ashi(features: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
         ha_open_arr[i] = (ha_open_arr[i - 1] + ha_close_arr[i - 1]) / 2.0
     ha_open.iloc[:] = ha_open_arr
     return ha_open, ha_close
+
+
+def _candle_parts(features: pd.DataFrame) -> Tuple[pd.Series, ...]:
+    """Return open/high/low/close/body/range/wicks/bull/bear series."""
+    open_ = pd.to_numeric(features["Open"], errors="coerce")
+    high = pd.to_numeric(features["High"], errors="coerce")
+    low = pd.to_numeric(features["Low"], errors="coerce")
+    close = pd.to_numeric(features["Close"], errors="coerce")
+    body = (close - open_).abs()
+    candle_range = (high - low).abs()
+    upper_wick = high - pd.concat([open_, close], axis=1).max(axis=1)
+    lower_wick = pd.concat([open_, close], axis=1).min(axis=1) - low
+    bull = close > open_
+    bear = close < open_
+    return open_, high, low, close, body, candle_range, upper_wick, lower_wick, bull, bear
 
 
 # =============================================================================
@@ -4722,6 +4737,570 @@ class PercentileChannelReversionStrategy(BaseStrategy):
         }
 
 
+class MorningStarEveningStarStrategy(BaseStrategy):
+    """Three-candle morning/evening star reversal pattern."""
+
+    @property
+    def name(self) -> str:
+        return "MorningStarEveningStarStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "atr_period": 14,
+            "body_atr_mult": 0.40,
+            "star_body_frac": 0.35,
+            "penetration": 0.50,
+            "trend_ema_period": 0,
+            "require_gap": False,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        atr_period = int(self.params.get("atr_period", 14))
+        body_atr = float(self.params.get("body_atr_mult", 0.40))
+        star_frac = float(self.params.get("star_body_frac", 0.35))
+        penetration = float(self.params.get("penetration", 0.50))
+        require_gap = bool(self.params.get("require_gap", False))
+        open_, high, low, close, body, _, _, _, bull, bear = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+
+        body_2 = body.shift(2)
+        open_2 = open_.shift(2)
+        close_2 = close.shift(2)
+        body_1 = body.shift(1)
+        open_1 = open_.shift(1)
+        close_1 = close.shift(1)
+        large_2 = body_2 >= body_atr * atr.shift(2)
+        small_star = body_1 <= star_frac * body_2
+        prev_mid = close_2 + penetration * (open_2 - close_2)
+        bull_star = bear.shift(2) & large_2 & small_star & bull & (close >= prev_mid)
+        bear_mid = close_2 - penetration * (close_2 - open_2)
+        bear_star = bull.shift(2) & large_2 & small_star & bear & (close <= bear_mid)
+
+        if require_gap:
+            bull_star = bull_star & (pd.concat([open_1, close_1], axis=1).max(axis=1) < close_2)
+            bear_star = bear_star & (pd.concat([open_1, close_1], axis=1).min(axis=1) > close_2)
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            bull_star = bull_star & (close.shift(1) <= ema.shift(1))
+            bear_star = bear_star & (close.shift(1) >= ema.shift(1))
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[bull_star] = 1
+        signals[bear_star] = -1
+        return self._zero_warmup(signals, max(atr_period + 3, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "atr_period": [10, 14, 20],
+            "body_atr_mult": [0.25, 0.40, 0.60],
+            "star_body_frac": [0.25, 0.35, 0.50],
+            "penetration": [0.40, 0.50, 0.60],
+            "trend_ema_period": [0, 100, 200],
+            "require_gap": [False, True],
+            **self._base_sl_tp_grid(),
+        }
+
+
+class PiercingDarkCloudStrategy(BaseStrategy):
+    """Piercing line and dark-cloud-cover two-candle reversal pattern."""
+
+    @property
+    def name(self) -> str:
+        return "PiercingDarkCloudStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "atr_period": 14,
+            "body_atr_mult": 0.40,
+            "penetration": 0.50,
+            "require_gap": False,
+            "trend_ema_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        atr_period = int(self.params.get("atr_period", 14))
+        body_atr = float(self.params.get("body_atr_mult", 0.40))
+        penetration = float(self.params.get("penetration", 0.50))
+        require_gap = bool(self.params.get("require_gap", False))
+        open_, _, _, close, body, _, _, _, bull, bear = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+        prev_large = body.shift(1) >= body_atr * atr.shift(1)
+        prev_mid_bear = close.shift(1) + penetration * (open_.shift(1) - close.shift(1))
+        prev_mid_bull = close.shift(1) - penetration * (close.shift(1) - open_.shift(1))
+
+        piercing = bear.shift(1) & prev_large & bull & (close >= prev_mid_bear) & (close < open_.shift(1))
+        dark_cloud = bull.shift(1) & prev_large & bear & (close <= prev_mid_bull) & (close > open_.shift(1))
+        if require_gap:
+            piercing = piercing & (open_ < close.shift(1))
+            dark_cloud = dark_cloud & (open_ > close.shift(1))
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            piercing = piercing & (close.shift(1) <= ema.shift(1))
+            dark_cloud = dark_cloud & (close.shift(1) >= ema.shift(1))
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[piercing] = 1
+        signals[dark_cloud] = -1
+        return self._zero_warmup(signals, max(atr_period + 2, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "atr_period": [10, 14, 20],
+            "body_atr_mult": [0.25, 0.40, 0.60],
+            "penetration": [0.45, 0.50, 0.60],
+            "require_gap": [False, True],
+            "trend_ema_period": [0, 100, 200],
+            **self._base_sl_tp_grid(),
+        }
+
+
+class HaramiReversalStrategy(BaseStrategy):
+    """Bullish/bearish harami reversal after a large parent candle."""
+
+    @property
+    def name(self) -> str:
+        return "HaramiReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "atr_period": 14,
+            "min_parent_atr": 0.40,
+            "child_body_ratio": 0.50,
+            "require_opposite": True,
+            "trend_ema_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        atr_period = int(self.params.get("atr_period", 14))
+        min_parent_atr = float(self.params.get("min_parent_atr", 0.40))
+        child_ratio = float(self.params.get("child_body_ratio", 0.50))
+        require_opposite = bool(self.params.get("require_opposite", True))
+        open_, _, _, close, body, _, _, _, bull, bear = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+
+        parent_top = pd.concat([open_.shift(1), close.shift(1)], axis=1).max(axis=1)
+        parent_bottom = pd.concat([open_.shift(1), close.shift(1)], axis=1).min(axis=1)
+        child_top = pd.concat([open_, close], axis=1).max(axis=1)
+        child_bottom = pd.concat([open_, close], axis=1).min(axis=1)
+        inside_parent = (child_top <= parent_top) & (child_bottom >= parent_bottom)
+        large_parent = body.shift(1) >= min_parent_atr * atr.shift(1)
+        small_child = body <= child_ratio * body.shift(1)
+
+        bullish = bear.shift(1) & large_parent & small_child & inside_parent
+        bearish = bull.shift(1) & large_parent & small_child & inside_parent
+        if require_opposite:
+            bullish = bullish & bull
+            bearish = bearish & bear
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            bullish = bullish & (close.shift(1) <= ema.shift(1))
+            bearish = bearish & (close.shift(1) >= ema.shift(1))
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[bullish] = 1
+        signals[bearish] = -1
+        return self._zero_warmup(signals, max(atr_period + 2, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "atr_period": [10, 14, 20],
+            "min_parent_atr": [0.25, 0.40, 0.60],
+            "child_body_ratio": [0.35, 0.50, 0.65],
+            "require_opposite": [True, False],
+            "trend_ema_period": [0, 100, 200],
+            **self._base_sl_tp_grid(),
+        }
+
+
+class TweezerReversalStrategy(BaseStrategy):
+    """Tweezer top/bottom reversal near a rolling high or low."""
+
+    @property
+    def name(self) -> str:
+        return "TweezerReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "lookback": 20,
+            "atr_period": 14,
+            "tolerance_atr": 0.10,
+            "min_body_atr": 0.15,
+            "trend_ema_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        lookback = int(self.params.get("lookback", 20))
+        atr_period = int(self.params.get("atr_period", 14))
+        tolerance = float(self.params.get("tolerance_atr", 0.10))
+        min_body = float(self.params.get("min_body_atr", 0.15))
+        _, high, low, close, body, _, _, _, bull, bear = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+        same_low = (low - low.shift(1)).abs() <= tolerance * atr
+        same_high = (high - high.shift(1)).abs() <= tolerance * atr
+        at_low = low <= low.shift(1).rolling(lookback, min_periods=lookback).min() + tolerance * atr
+        at_high = high >= high.shift(1).rolling(lookback, min_periods=lookback).max() - tolerance * atr
+        meaningful = body >= min_body * atr
+
+        bullish = bear.shift(1) & bull & same_low & at_low & meaningful
+        bearish = bull.shift(1) & bear & same_high & at_high & meaningful
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            bullish = bullish & (close.shift(1) <= ema.shift(1))
+            bearish = bearish & (close.shift(1) >= ema.shift(1))
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[bullish] = 1
+        signals[bearish] = -1
+        return self._zero_warmup(signals, max(lookback + 2, atr_period + 2, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "lookback": [10, 20, 40],
+            "atr_period": [10, 14, 20],
+            "tolerance_atr": [0.05, 0.10, 0.20],
+            "min_body_atr": [0.0, 0.15, 0.30],
+            "trend_ema_period": [0, 100],
+            **self._base_sl_tp_grid(),
+        }
+
+
+class ThreeBarReversalStrategy(BaseStrategy):
+    """Three-bar reversal that breaks the prior short swing."""
+
+    @property
+    def name(self) -> str:
+        return "ThreeBarReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "swing_bars": 2,
+            "atr_period": 14,
+            "break_buffer_atr": 0.05,
+            "min_reversal_atr": 0.25,
+            "trend_ema_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        swing_bars = max(2, int(self.params.get("swing_bars", 2)))
+        atr_period = int(self.params.get("atr_period", 14))
+        buffer_atr = float(self.params.get("break_buffer_atr", 0.05))
+        min_reversal = float(self.params.get("min_reversal_atr", 0.25))
+        _, high, low, close, body, _, _, _, bull, bear = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+        prior_high = high.shift(1).rolling(swing_bars, min_periods=swing_bars).max()
+        prior_low = low.shift(1).rolling(swing_bars, min_periods=swing_bars).min()
+        made_lower_low = low.shift(1) <= low.shift(2).rolling(swing_bars, min_periods=swing_bars).min()
+        made_higher_high = high.shift(1) >= high.shift(2).rolling(swing_bars, min_periods=swing_bars).max()
+        meaningful = body >= min_reversal * atr
+
+        bullish = made_lower_low & bull & meaningful & (close > prior_high + buffer_atr * atr)
+        bearish = made_higher_high & bear & meaningful & (close < prior_low - buffer_atr * atr)
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            bullish = bullish & (close.shift(1) <= ema.shift(1))
+            bearish = bearish & (close.shift(1) >= ema.shift(1))
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[bullish] = 1
+        signals[bearish] = -1
+        return self._zero_warmup(signals, max(swing_bars + atr_period + 2, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "swing_bars": [2, 3, 4],
+            "atr_period": [10, 14, 20],
+            "break_buffer_atr": [0.0, 0.05, 0.10],
+            "min_reversal_atr": [0.0, 0.25, 0.50],
+            "trend_ema_period": [0, 100, 200],
+            **self._base_sl_tp_grid(),
+        }
+
+
+class DojiBreakoutStrategy(BaseStrategy):
+    """Breakout from a doji/indecision candle."""
+
+    @property
+    def name(self) -> str:
+        return "DojiBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "atr_period": 14,
+            "doji_body_frac": 0.10,
+            "min_range_atr": 0.25,
+            "breakout_buffer_atr": 0.05,
+            "trend_ema_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+            **self._structural_sl_defaults(),
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        atr_period = int(self.params.get("atr_period", 14))
+        doji_frac = float(self.params.get("doji_body_frac", 0.10))
+        min_range = float(self.params.get("min_range_atr", 0.25))
+        buffer_atr = float(self.params.get("breakout_buffer_atr", 0.05))
+        _, high, low, close, body, rng, _, _, _, _ = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+        prior_doji = (body.shift(1) <= doji_frac * rng.shift(1)) & (rng.shift(1) >= min_range * atr.shift(1))
+        long_entry = prior_doji & (close > high.shift(1) + buffer_atr * atr)
+        short_entry = prior_doji & (close < low.shift(1) - buffer_atr * atr)
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            long_entry = long_entry & (close >= ema)
+            short_entry = short_entry & (close <= ema)
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, max(atr_period + 2, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "atr_period": [10, 14, 20],
+            "doji_body_frac": [0.05, 0.10, 0.15],
+            "min_range_atr": [0.10, 0.25, 0.50],
+            "breakout_buffer_atr": [0.0, 0.05, 0.10],
+            "trend_ema_period": [0, 100, 200],
+            **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
+        }
+
+
+class MarubozuMomentumStrategy(BaseStrategy):
+    """Large-bodied low-wick candle momentum continuation."""
+
+    @property
+    def name(self) -> str:
+        return "MarubozuMomentumStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "atr_period": 14,
+            "min_body_frac": 0.75,
+            "max_wick_frac": 0.20,
+            "min_range_atr": 0.75,
+            "trend_ema_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+            **self._structural_sl_defaults(),
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        atr_period = int(self.params.get("atr_period", 14))
+        min_body_frac = float(self.params.get("min_body_frac", 0.75))
+        max_wick_frac = float(self.params.get("max_wick_frac", 0.20))
+        min_range_atr = float(self.params.get("min_range_atr", 0.75))
+        _, _, _, close, body, rng, upper, lower, bull, bear = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+        valid_range = rng > 1e-10
+        body_ok = valid_range & (body / rng >= min_body_frac) & (rng >= min_range_atr * atr)
+        long_entry = bull & body_ok & (upper / rng <= max_wick_frac)
+        short_entry = bear & body_ok & (lower / rng <= max_wick_frac)
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            long_entry = long_entry & (close >= ema)
+            short_entry = short_entry & (close <= ema)
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, max(atr_period + 2, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "atr_period": [10, 14, 20],
+            "min_body_frac": [0.65, 0.75, 0.85],
+            "max_wick_frac": [0.10, 0.20, 0.30],
+            "min_range_atr": [0.50, 0.75, 1.00],
+            "trend_ema_period": [0, 100, 200],
+            **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
+        }
+
+
+class ThreeSoldiersCrowsStrategy(BaseStrategy):
+    """Three white soldiers / three black crows continuation pattern."""
+
+    @property
+    def name(self) -> str:
+        return "ThreeSoldiersCrowsStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {
+            "confirm_bars": 3,
+            "atr_period": 14,
+            "min_body_atr": 0.30,
+            "max_wick_frac": 0.40,
+            "trend_ema_period": 0,
+            "sl_atr_mult": 2.0,
+            "tp_atr_mult": 2.0,
+            **self._structural_sl_defaults(),
+        }
+
+    def get_required_features(self) -> Set[str]:
+        atr_period = int(self.params.get("atr_period", 14))
+        required = {f"ATR_{atr_period}"}
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            required.add(f"EMA_{ema_period}")
+        return required
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        confirm = max(2, int(self.params.get("confirm_bars", 3)))
+        atr_period = int(self.params.get("atr_period", 14))
+        min_body_atr = float(self.params.get("min_body_atr", 0.30))
+        max_wick = float(self.params.get("max_wick_frac", 0.40))
+        open_, _, _, close, body, rng, upper, lower, bull, bear = _candle_parts(features)
+        atr = _get_atr(features, atr_period)
+        valid_range = rng > 1e-10
+        strong = valid_range & (body >= min_body_atr * atr)
+        bull_quality = bull & strong & (upper / rng <= max_wick)
+        bear_quality = bear & strong & (lower / rng <= max_wick)
+        bull_run = bull_quality.rolling(confirm, min_periods=confirm).sum() >= confirm
+        bear_run = bear_quality.rolling(confirm, min_periods=confirm).sum() >= confirm
+        higher_closes = close > close.shift(1)
+        lower_closes = close < close.shift(1)
+        bull_closes = higher_closes.rolling(confirm - 1, min_periods=confirm - 1).sum() >= (confirm - 1)
+        bear_closes = lower_closes.rolling(confirm - 1, min_periods=confirm - 1).sum() >= (confirm - 1)
+        long_entry = bull_run & bull_closes & ~bull_run.shift(1, fill_value=False)
+        short_entry = bear_run & bear_closes & ~bear_run.shift(1, fill_value=False)
+
+        ema_period = int(self.params.get("trend_ema_period", 0))
+        if ema_period > 0:
+            ema = _get_ema(features, ema_period)
+            long_entry = long_entry & (close >= ema)
+            short_entry = short_entry & (close <= ema)
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, max(atr_period + confirm + 2, ema_period))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {
+            "confirm_bars": [3, 4],
+            "atr_period": [10, 14, 20],
+            "min_body_atr": [0.20, 0.30, 0.50],
+            "max_wick_frac": [0.30, 0.40, 0.50],
+            "trend_ema_period": [0, 100, 200],
+            **self._base_sl_tp_grid(),
+            **self._structural_sl_grid(),
+        }
+
+
 # =============================================================================
 # STRATEGY REGISTRY
 # =============================================================================
@@ -4810,6 +5389,16 @@ class StrategyRegistry:
         'HeikinAshiTrendStrategy': HeikinAshiTrendStrategy,
         'BollingerBandWalkStrategy': BollingerBandWalkStrategy,
         'PercentileChannelReversionStrategy': PercentileChannelReversionStrategy,
+
+        # Package I strategies: conventional candlestick and multi-candle patterns
+        'MorningStarEveningStarStrategy': MorningStarEveningStarStrategy,
+        'PiercingDarkCloudStrategy': PiercingDarkCloudStrategy,
+        'HaramiReversalStrategy': HaramiReversalStrategy,
+        'TweezerReversalStrategy': TweezerReversalStrategy,
+        'ThreeBarReversalStrategy': ThreeBarReversalStrategy,
+        'DojiBreakoutStrategy': DojiBreakoutStrategy,
+        'MarubozuMomentumStrategy': MarubozuMomentumStrategy,
+        'ThreeSoldiersCrowsStrategy': ThreeSoldiersCrowsStrategy,
     }
     
     @classmethod
@@ -4929,6 +5518,15 @@ __all__ = [
     'HeikinAshiTrendStrategy',
     'BollingerBandWalkStrategy',
     'PercentileChannelReversionStrategy',
+    # Package I
+    'MorningStarEveningStarStrategy',
+    'PiercingDarkCloudStrategy',
+    'HaramiReversalStrategy',
+    'TweezerReversalStrategy',
+    'ThreeBarReversalStrategy',
+    'DojiBreakoutStrategy',
+    'MarubozuMomentumStrategy',
+    'ThreeSoldiersCrowsStrategy',
 ]
 
 # Migration map for retired strategy names → current names
