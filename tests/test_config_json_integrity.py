@@ -36,7 +36,7 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
 
         self.assertEqual(pipeline["backtest_spread_mode"], "conservative_max")
         self.assertEqual(pipeline["clean_holdout_pct"], 15.0)
-        self.assertEqual(data["_meta"]["strategy_roster_count"], 84)
+        self.assertEqual(data["_meta"]["strategy_roster_count"], 92)
         self.assertEqual(data["_meta"]["holdout_unit"], "percent_of_stage2_selection")
         self.assertEqual(data["_meta"]["scope"], "research_discovery_only_not_live_trading")
         self.assertNotIn("position", data)

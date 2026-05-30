@@ -3,10 +3,10 @@ FX Portfolio Manager - Trading Strategies
 ==========================================
 
 Contains all trading strategy implementations.
-Includes 84 strategies across categories:
-- Trend Following (29 strategies)
-- Mean Reversion (33 strategies)
-- Breakout/Momentum (22 strategies)
+Includes 92 strategies across categories:
+- Trend Following (32 strategies)
+- Mean Reversion (36 strategies)
+- Breakout/Momentum (24 strategies)
 
 Each strategy provides:
 - Signal generation (returns -1, 0, 1)
@@ -6316,6 +6316,386 @@ class CarryFilteredPullbackStrategy(BaseStrategy):
 
 
 # =============================================================================
+# PACKAGE L: STRUCTURE / VWAP / EFFICIENCY-RATIO COVERAGE STRATEGIES
+# =============================================================================
+
+
+def _efficiency_ratio(close: pd.Series, period: int) -> pd.Series:
+    direction = (close - close.shift(period)).abs()
+    volatility = close.diff().abs().rolling(period, min_periods=period).sum()
+    return (direction / (volatility.replace(0.0, np.nan) + 1e-12)).fillna(0.0).clip(0.0, 1.0)
+
+
+class FractalChannelBreakoutStrategy(BaseStrategy):
+    """Break confirmed swing/fractal highs/lows, using only already-confirmed pivots."""
+
+    @property
+    def name(self) -> str:
+        return "FractalChannelBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"wing_bars": 2, "atr_buffer": 0.1, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0,
+                **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        return {"ATR_14", f"EMA_{ema_p}"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        wing = max(1, int(self.params.get("wing_bars", 2)))
+        buf = float(self.params.get("atr_buffer", 0.1))
+        high, low, close = features["High"], features["Low"], features["Close"]
+        atr = _get_atr(features, 14)
+
+        center_high = high.shift(wing + 1)
+        center_low = low.shift(wing + 1)
+        left_high = high.shift(wing + 2).rolling(wing, min_periods=wing).max()
+        left_low = low.shift(wing + 2).rolling(wing, min_periods=wing).min()
+        right_high = high.shift(1).rolling(wing, min_periods=wing).max()
+        right_low = low.shift(1).rolling(wing, min_periods=wing).min()
+
+        fractal_high = center_high.where((center_high > left_high) & (center_high >= right_high)).ffill()
+        fractal_low = center_low.where((center_low < left_low) & (center_low <= right_low)).ffill()
+        upper = fractal_high + buf * atr
+        lower = fractal_low - buf * atr
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[(close > upper) & (close.shift(1) <= upper.shift(1))] = 1
+        signals[(close < lower) & (close.shift(1) >= lower.shift(1))] = -1
+        return self._zero_warmup(signals, wing * 2 + 20)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"wing_bars": [2, 3, 5], "atr_buffer": [0.0, 0.1, 0.25],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class SwingFailureReversalStrategy(BaseStrategy):
+    """Fade failed sweeps of recent swing highs/lows after price closes back inside."""
+
+    @property
+    def name(self) -> str:
+        return "SwingFailureReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"lookback": 20, "sweep_atr": 0.05, "close_back_atr": 0.0,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        lb = max(3, int(self.params.get("lookback", 20)))
+        sweep = float(self.params.get("sweep_atr", 0.05))
+        back = float(self.params.get("close_back_atr", 0.0))
+        atr = _get_atr(features, 14)
+        high, low, close = features["High"], features["Low"], features["Close"]
+        prev_high = high.shift(1).rolling(lb, min_periods=lb).max()
+        prev_low = low.shift(1).rolling(lb, min_periods=lb).min()
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[(low < prev_low - sweep * atr) & (close > prev_low + back * atr)] = 1
+        signals[(high > prev_high + sweep * atr) & (close < prev_high - back * atr)] = -1
+        return self._zero_warmup(signals, lb + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"lookback": [10, 20, 40], "sweep_atr": [0.0, 0.05, 0.15],
+                "close_back_atr": [0.0, 0.05], **self._base_sl_tp_grid()}
+
+
+class AnchoredVWAPReclaimStrategy(BaseStrategy):
+    """Reclaim session VWAP after an ATR-sized flush, filtered by the broader trend."""
+
+    @property
+    def name(self) -> str:
+        return "AnchoredVWAPReclaimStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"session_start_hour": 0, "ema_period": 100, "flush_atr": 0.5,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ss = int(self.params.get("session_start_hour", 0))
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        flush = float(self.params.get("flush_atr", 0.5))
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        keys = _session_keys(features, ss)
+        same_session_prev = keys == keys.shift(1)
+        vwap = _get_session_vwap(features, ss)
+        ema = _get_ema(features, ema_p)
+        band = flush * atr
+
+        long_entry = (same_session_prev & (close.shift(1) < vwap.shift(1) - band.shift(1))
+                      & (close > vwap) & (close > ema))
+        short_entry = (same_session_prev & (close.shift(1) > vwap.shift(1) + band.shift(1))
+                       & (close < vwap) & (close < ema))
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, ema_p + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"session_start_hour": [0, 8], "ema_period": [50, 100, 200],
+                "flush_atr": [0.25, 0.5, 1.0], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
+
+
+class VolumeClimaxReversalStrategy(BaseStrategy):
+    """Fade capitulation bars with unusually high volume, large range, and rejection wick."""
+
+    @property
+    def name(self) -> str:
+        return "VolumeClimaxReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"vol_lookback": 30, "volume_mult": 2.0, "range_atr": 1.5, "wick_frac": 0.35,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        return {"ATR_14", f"EMA_{ema_p}"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        lb = max(5, int(self.params.get("vol_lookback", 30)))
+        vm = float(self.params.get("volume_mult", 2.0))
+        rm = float(self.params.get("range_atr", 1.5))
+        wf = float(self.params.get("wick_frac", 0.35))
+        open_, high, low, close = features["Open"], features["High"], features["Low"], features["Close"]
+        atr = _get_atr(features, 14)
+        volume = _get_volume(features)
+        avg_volume = volume.shift(1).rolling(lb, min_periods=lb).mean()
+        bar_range = (high - low).replace(0.0, np.nan)
+        upper_wick = high - pd.concat([open_, close], axis=1).max(axis=1)
+        lower_wick = pd.concat([open_, close], axis=1).min(axis=1) - low
+        climax = (volume >= vm * avg_volume) & ((high - low) >= rm * atr)
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[climax & (lower_wick / bar_range >= wf) & (close > open_)] = 1
+        signals[climax & (upper_wick / bar_range >= wf) & (close < open_)] = -1
+        return self._zero_warmup(signals, max(lb, 20) + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"vol_lookback": [20, 30, 50], "volume_mult": [1.5, 2.0, 3.0],
+                "range_atr": [1.0, 1.5, 2.0], "wick_frac": [0.25, 0.35, 0.50],
+                **self._base_sl_tp_grid()}
+
+
+class EfficiencyRatioTrendStrategy(BaseStrategy):
+    """Trend continuation when Kaufman's efficiency ratio shows directional movement."""
+
+    @property
+    def name(self) -> str:
+        return "EfficiencyRatioTrendStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"er_period": 20, "min_er": 0.35, "ema_period": 100, "slope_bars": 10,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        er_p = max(2, int(self.params.get("er_period", 20)))
+        min_er = float(self.params.get("min_er", 0.35))
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        slope = max(1, int(self.params.get("slope_bars", 10)))
+        close = features["Close"]
+        ema = _get_ema(features, ema_p)
+        er = _efficiency_ratio(close, er_p)
+        long_state = (er >= min_er) & (close > ema) & (ema > ema.shift(slope))
+        short_state = (er >= min_er) & (close < ema) & (ema < ema.shift(slope))
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_state & ~long_state.shift(1, fill_value=False)] = 1
+        signals[short_state & ~short_state.shift(1, fill_value=False)] = -1
+        return self._zero_warmup(signals, max(er_p, ema_p + slope) + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"er_period": [10, 20, 40], "min_er": [0.25, 0.35, 0.50],
+                "ema_period": [50, 100, 200], "slope_bars": [5, 10, 20],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class EfficiencyRatioMeanReversionStrategy(BaseStrategy):
+    """Fade z-score extremes only when efficiency ratio says price is not trending."""
+
+    @property
+    def name(self) -> str:
+        return "EfficiencyRatioMeanReversionStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"er_period": 20, "max_er": 0.25, "z_period": 30, "z_entry": 1.5,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        er_p = max(2, int(self.params.get("er_period", 20)))
+        max_er = float(self.params.get("max_er", 0.25))
+        z_p = max(5, int(self.params.get("z_period", 30)))
+        z_entry = float(self.params.get("z_entry", 1.5))
+        close = features["Close"]
+        er = _efficiency_ratio(close, er_p)
+        mean = close.rolling(z_p, min_periods=z_p).mean()
+        std = close.rolling(z_p, min_periods=z_p).std().replace(0.0, np.nan)
+        z = (close - mean) / (std + 1e-12)
+        choppy = er <= max_er
+        long_state = choppy & (z <= -z_entry)
+        short_state = choppy & (z >= z_entry)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_state & ~long_state.shift(1, fill_value=False)] = 1
+        signals[short_state & ~short_state.shift(1, fill_value=False)] = -1
+        return self._zero_warmup(signals, max(er_p, z_p) + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"er_period": [10, 20, 40], "max_er": [0.15, 0.25, 0.35],
+                "z_period": [20, 30, 50], "z_entry": [1.0, 1.5, 2.0],
+                **self._base_sl_tp_grid()}
+
+
+class OpeningRangeRetestStrategy(BaseStrategy):
+    """Enter after an opening-range break survives a pullback/retest."""
+
+    @property
+    def name(self) -> str:
+        return "OpeningRangeRetestStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"session_start_hour": 8, "range_bars": 6, "retest_window": 12, "retest_atr": 0.25,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ss = int(self.params.get("session_start_hour", 8))
+        range_bars = max(1, int(self.params.get("range_bars", 6)))
+        retest_window = max(1, int(self.params.get("retest_window", 12)))
+        retest_atr = float(self.params.get("retest_atr", 0.25))
+        keys = _session_keys(features, ss)
+        bar_no = _bar_number_in_session(features, ss)
+        in_range = bar_no < range_bars
+        range_high = features["High"].where(in_range).groupby(keys).cummax().groupby(keys).ffill()
+        range_low = features["Low"].where(in_range).groupby(keys).cummin().groupby(keys).ffill()
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        same_session_prev = keys == keys.shift(1)
+        ready = bar_no >= range_bars
+        broke_up = ready & same_session_prev & (close > range_high) & (close.shift(1) <= range_high.shift(1))
+        broke_down = ready & same_session_prev & (close < range_low) & (close.shift(1) >= range_low.shift(1))
+        prior_up = broke_up.shift(1, fill_value=False).astype(int)
+        prior_down = broke_down.shift(1, fill_value=False).astype(int)
+        recent_up = (
+            prior_up.groupby(keys).rolling(retest_window, min_periods=1).max()
+            .reset_index(level=0, drop=True).astype(bool)
+        )
+        recent_down = (
+            prior_down.groupby(keys).rolling(retest_window, min_periods=1).max()
+            .reset_index(level=0, drop=True).astype(bool)
+        )
+        long_touch = recent_up & (features["Low"] <= range_high + retest_atr * atr) & (close > range_high)
+        short_touch = recent_down & (features["High"] >= range_low - retest_atr * atr) & (close < range_low)
+        up_event_id = broke_up.astype(int).groupby(keys).cumsum()
+        down_event_id = broke_down.astype(int).groupby(keys).cumsum()
+        long_retest = long_touch & (up_event_id > 0) & (
+            long_touch.astype(int).groupby([keys, up_event_id]).cumsum() == 1
+        )
+        short_retest = short_touch & (down_event_id > 0) & (
+            short_touch.astype(int).groupby([keys, down_event_id]).cumsum() == 1
+        )
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_retest] = 1
+        signals[short_retest] = -1
+        return self._zero_warmup(signals, max(range_bars + retest_window + 2, 20))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"session_start_hour": [0, 8, 13], "range_bars": [3, 6, 12],
+                "retest_window": [6, 12, 24], "retest_atr": [0.0, 0.25, 0.50],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class SessionVWAPPullbackTrendStrategy(BaseStrategy):
+    """Trend-following pullback to session VWAP, then continuation away from value."""
+
+    @property
+    def name(self) -> str:
+        return "SessionVWAPPullbackTrendStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"session_start_hour": 0, "ema_period": 100, "slope_bars": 10, "pullback_atr": 0.25,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        return {"ATR_14", f"EMA_{ema_p}"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ss = int(self.params.get("session_start_hour", 0))
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        slope = max(1, int(self.params.get("slope_bars", 10)))
+        pb = float(self.params.get("pullback_atr", 0.25))
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        keys = _session_keys(features, ss)
+        same_session_prev = keys == keys.shift(1)
+        vwap = _get_session_vwap(features, ss)
+        ema = _get_ema(features, ema_p)
+        band = pb * atr
+        uptrend = (close > ema) & (ema > ema.shift(slope))
+        downtrend = (close < ema) & (ema < ema.shift(slope))
+        long_state = (same_session_prev & uptrend & (close > vwap)
+                      & (close.shift(1) <= vwap.shift(1) + band.shift(1)))
+        short_state = (same_session_prev & downtrend & (close < vwap)
+                       & (close.shift(1) >= vwap.shift(1) - band.shift(1)))
+
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_state & ~long_state.shift(1, fill_value=False)] = 1
+        signals[short_state & ~short_state.shift(1, fill_value=False)] = -1
+        return self._zero_warmup(signals, max(ema_p + slope, 20) + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"session_start_hour": [0, 8], "ema_period": [50, 100, 200],
+                "slope_bars": [5, 10, 20], "pullback_atr": [0.0, 0.25, 0.5],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+# =============================================================================
 # STRATEGY REGISTRY
 # =============================================================================
 
@@ -6435,6 +6815,16 @@ class StrategyRegistry:
         'IntradayRangeFadeStrategy': IntradayRangeFadeStrategy,
         'SwapCarryTrendStrategy': SwapCarryTrendStrategy,
         'CarryFilteredPullbackStrategy': CarryFilteredPullbackStrategy,
+
+        # Package L strategies: structure, VWAP, volume climax, and efficiency-ratio surfaces
+        'FractalChannelBreakoutStrategy': FractalChannelBreakoutStrategy,
+        'SwingFailureReversalStrategy': SwingFailureReversalStrategy,
+        'AnchoredVWAPReclaimStrategy': AnchoredVWAPReclaimStrategy,
+        'VolumeClimaxReversalStrategy': VolumeClimaxReversalStrategy,
+        'EfficiencyRatioTrendStrategy': EfficiencyRatioTrendStrategy,
+        'EfficiencyRatioMeanReversionStrategy': EfficiencyRatioMeanReversionStrategy,
+        'OpeningRangeRetestStrategy': OpeningRangeRetestStrategy,
+        'SessionVWAPPullbackTrendStrategy': SessionVWAPPullbackTrendStrategy,
     }
     
     @classmethod
@@ -6583,6 +6973,15 @@ __all__ = [
     'IntradayRangeFadeStrategy',
     'SwapCarryTrendStrategy',
     'CarryFilteredPullbackStrategy',
+    # Package L
+    'FractalChannelBreakoutStrategy',
+    'SwingFailureReversalStrategy',
+    'AnchoredVWAPReclaimStrategy',
+    'VolumeClimaxReversalStrategy',
+    'EfficiencyRatioTrendStrategy',
+    'EfficiencyRatioMeanReversionStrategy',
+    'OpeningRangeRetestStrategy',
+    'SessionVWAPPullbackTrendStrategy',
 ]
 
 # Migration map for retired strategy names → current names

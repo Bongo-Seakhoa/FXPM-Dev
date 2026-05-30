@@ -2490,3 +2490,54 @@ Post-commit Package K prospect rerun:
 - Superseded Package K artifacts removed:
   `package_k_prospect.json` (dirty/unreproducible engine state) and
   `package_k_robust_verify_7e09851.json` (superseded by the non-datetime fallback commit).
+
+---
+
+### [CODEX] 2026-05-30 - Package L implemented: deterministic structure/VWAP/ER coverage
+
+Human asked to keep expanding the deterministic strategy pool while avoiding ML-model maintenance
+burden. I spawned Herschel for a read-only coverage audit; it confirmed the remaining unsupported
+families should not be faked under the current single-symbol/single-timeframe API (true MTF,
+pairs/relative value, order book, and historical news/event reaction). It recommended deterministic
+OHLCV-compatible gaps: anchored/session VWAP, volume climax, variance/efficiency-ratio regimes,
+opening-range retests, and deeper swing structure.
+
+Implemented Package L (84 -> 92):
+
+- `FractalChannelBreakoutStrategy`
+- `SwingFailureReversalStrategy`
+- `AnchoredVWAPReclaimStrategy`
+- `VolumeClimaxReversalStrategy`
+- `EfficiencyRatioTrendStrategy`
+- `EfficiencyRatioMeanReversionStrategy`
+- `OpeningRangeRetestStrategy`
+- `SessionVWAPPullbackTrendStrategy`
+
+Contracts:
+
+- Roster is now `92` = `32` trend, `36` mean-reversion, `24` breakout/momentum.
+- Mean-reversion Package L strategies remain ATR-only for stops; trend/breakout Package L
+  strategies expose searchable structural-SL branches.
+- Opening-range retest evidence rolls within each session, so a prior-session breakout cannot
+  qualify a new-session retest.
+- Sagan independent audit found and I reconciled:
+  - session VWAP strategies now guard all shifted VWAP comparisons with same-session checks
+  - opening-range retest now uses first breakout events and first retests per breakout, not a
+    continuously refreshed outside-range state
+  - efficiency-ratio trend/MR and session-VWAP pullback now emit state transitions rather than
+    every-bar state signals
+  - EMA-dependent Package L strategies now advertise parameterized EMA columns in
+    `get_required_features()`
+  - direct behavioral tests now cover swing failure, VWAP session boundaries, volume climax,
+    ER transition cadence, fractal confirmation, and opening-range retest semantics
+
+Verification:
+
+- `python -m pytest tests/test_new_strategies_85_92.py tests/test_strategy_param_grid_consistency.py tests/test_config_json_integrity.py tests/test_structural_sl_wrapper.py -q`
+  -> `88 passed, 388 subtests passed`
+- Wider strategy slice:
+  `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_new_strategies_77_84.py tests/test_new_strategies_85_92.py tests/test_structural_sl_wrapper.py tests/test_config_json_integrity.py -q`
+  -> `406 passed, 5 skipped, 400 subtests passed`
+
+Gemini plan-mode audit found no high-priority Package L correctness issue; Sagan's later findings
+were reconciled before commit.
