@@ -2592,6 +2592,8 @@ Audit reconciliation:
   - timezone-aware period conversion now drops tz explicitly without warning
   - prior-day and weekly/monthly rejections now emit one same-side signal per day/period
   - removed dead `adr_period` optimizer axis from `PriorDayRangeReclaimStrategy`
+  - initial Package M prospect screen timed out at commit `8922437`; root cause was the Python
+    per-bar head-and-shoulders detector, now rewritten to scan confirmed pivot events instead
   - added direct tests for week boundary, timezone warnings, duplicate rejection suppression,
     prior-day reclaim, weekly rejection, Darvas, head-and-shoulders, and statistical transition
     cadence
@@ -2603,9 +2605,11 @@ Verification:
 - Wider strategy slice:
   `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_new_strategies_77_84.py tests/test_new_strategies_85_92.py tests/test_new_strategies_93_100.py tests/test_structural_sl_wrapper.py tests/test_config_json_integrity.py -q`
   -> `469 passed, 5 skipped, 434 subtests passed`
+- Performance probe: small `HeadAndShouldersNecklineBreakStrategy` H1 prospect probe improved from
+  about `64s` to about `12s` after the pivot-event rewrite, with the same Package M tests passing.
 
-Next: commit Package M, run the Package M prospect screen against the committed engine, then start
-the global false-discovery (C3) path before any full re-opt/promotion.
+Next: commit the Package M performance reconciliation, run the Package M prospect screen against the
+committed engine, then start the global false-discovery (C3) path before any full re-opt/promotion.
 
 ---
 

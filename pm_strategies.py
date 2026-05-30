@@ -6980,47 +6980,70 @@ class HeadAndShouldersNecklineBreakStrategy(BaseStrategy):
         high, low, close = features["High"], features["Low"], features["Close"]
         atr = _get_atr(features, 14).ffill()
         n = len(features)
-        signals = pd.Series(0, index=features.index, dtype=int)
+
+        center_high = high.shift(wing + 1)
+        center_low = low.shift(wing + 1)
+        left_high = high.shift(wing + 2).rolling(wing, min_periods=wing).max()
+        left_low = low.shift(wing + 2).rolling(wing, min_periods=wing).min()
+        right_high = high.shift(1).rolling(wing, min_periods=wing).max()
+        right_low = low.shift(1).rolling(wing, min_periods=wing).min()
+        pivot_high = center_high.where((center_high > left_high) & (center_high >= right_high))
+        pivot_low = center_low.where((center_low < left_low) & (center_low <= right_low))
+
+        short_level = np.full(n, np.nan, dtype=float)
+        short_pid = np.full(n, np.nan, dtype=float)
+        long_level = np.full(n, np.nan, dtype=float)
+        long_pid = np.full(n, np.nan, dtype=float)
         piv_hi: List[Tuple[int, float]] = []
         piv_lo: List[Tuple[int, float]] = []
-        last_short_pattern: Optional[Tuple[int, int, int]] = None
-        last_long_pattern: Optional[Tuple[int, int, int]] = None
+        short_pattern_id = 0
+        long_pattern_id = 0
 
-        for i in range(wing * 2 + 1, n):
-            c = i - wing
-            if c - wing < 0:
+        for pos in np.flatnonzero(pivot_high.notna().to_numpy()):
+            center_pos = pos - wing - 1
+            if center_pos < 0:
                 continue
-            h = float(high.iat[c])
-            l = float(low.iat[c])
-            if h >= float(high.iloc[c - wing:c].max()) and h > float(high.iloc[c + 1:i + 1].max()):
-                piv_hi.append((c, h))
-                piv_hi = piv_hi[-6:]
-            if l <= float(low.iloc[c - wing:c].min()) and l < float(low.iloc[c + 1:i + 1].min()):
-                piv_lo.append((c, l))
-                piv_lo = piv_lo[-6:]
+            piv_hi.append((center_pos, float(pivot_high.iat[pos])))
+            piv_hi = piv_hi[-6:]
+            if len(piv_hi) < 3:
+                continue
+            (a_i, a), (b_i, b), (c_i, c_hi) = piv_hi[-3:]
+            atr_now = float(atr.iat[pos]) if pd.notna(atr.iat[pos]) else 0.0
+            tol = shoulder_tol * atr_now
+            if a_i < b_i < c_i and b > a and b > c_hi and abs(a - c_hi) <= tol:
+                short_pattern_id += 1
+                short_level[pos] = float(low.iloc[a_i:c_i + 1].min())
+                short_pid[pos] = float(short_pattern_id)
 
-            if len(piv_hi) >= 3:
-                (a_i, a), (b_i, b), (c_i, c_hi) = piv_hi[-3:]
-                tol = shoulder_tol * float(atr.iat[i] if pd.notna(atr.iat[i]) else 0.0)
-                if a_i < b_i < c_i and b > a and b > c_hi and abs(a - c_hi) <= tol:
-                    neckline = float(low.iloc[a_i:c_i + 1].min())
-                    pattern = (a_i, b_i, c_i)
-                    if (last_short_pattern != pattern and close.iat[i] < neckline - buf * atr.iat[i]
-                            and close.iat[i - 1] >= neckline - buf * atr.iat[i - 1]):
-                        signals.iat[i] = -1
-                        last_short_pattern = pattern
+        for pos in np.flatnonzero(pivot_low.notna().to_numpy()):
+            center_pos = pos - wing - 1
+            if center_pos < 0:
+                continue
+            piv_lo.append((center_pos, float(pivot_low.iat[pos])))
+            piv_lo = piv_lo[-6:]
+            if len(piv_lo) < 3:
+                continue
+            (a_i, a), (b_i, b), (c_i, c_lo) = piv_lo[-3:]
+            atr_now = float(atr.iat[pos]) if pd.notna(atr.iat[pos]) else 0.0
+            tol = shoulder_tol * atr_now
+            if a_i < b_i < c_i and b < a and b < c_lo and abs(a - c_lo) <= tol:
+                long_pattern_id += 1
+                long_level[pos] = float(high.iloc[a_i:c_i + 1].max())
+                long_pid[pos] = float(long_pattern_id)
 
-            if len(piv_lo) >= 3:
-                (a_i, a), (b_i, b), (c_i, c_lo) = piv_lo[-3:]
-                tol = shoulder_tol * float(atr.iat[i] if pd.notna(atr.iat[i]) else 0.0)
-                if a_i < b_i < c_i and b < a and b < c_lo and abs(a - c_lo) <= tol:
-                    neckline = float(high.iloc[a_i:c_i + 1].max())
-                    pattern = (a_i, b_i, c_i)
-                    if (last_long_pattern != pattern and close.iat[i] > neckline + buf * atr.iat[i]
-                            and close.iat[i - 1] <= neckline + buf * atr.iat[i - 1]):
-                        signals.iat[i] = 1
-                        last_long_pattern = pattern
-
+        short_level_s = pd.Series(short_level, index=features.index).ffill()
+        long_level_s = pd.Series(long_level, index=features.index).ffill()
+        short_pid_s = pd.Series(short_pid, index=features.index).ffill()
+        long_pid_s = pd.Series(long_pid, index=features.index).ffill()
+        short_break = (short_pid_s.notna() & (close < short_level_s - buf * atr)
+                       & (close.shift(1) >= short_level_s.shift(1) - buf * atr.shift(1)))
+        long_break = (long_pid_s.notna() & (close > long_level_s + buf * atr)
+                      & (close.shift(1) <= long_level_s.shift(1) + buf * atr.shift(1)))
+        short_first = short_break & (short_break.astype(int).groupby(short_pid_s).cumsum() == 1)
+        long_first = long_break & (long_break.astype(int).groupby(long_pid_s).cumsum() == 1)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[short_first] = -1
+        signals[long_first] = 1
         return self._zero_warmup(signals, wing * 2 + 20)
 
     def get_param_grid(self) -> Dict[str, List]:
