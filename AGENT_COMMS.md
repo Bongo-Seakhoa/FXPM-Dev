@@ -2478,3 +2478,15 @@ Verification:
 - Wider strategy slice:
   `python -m pytest tests/test_strategy_regressions.py tests/test_strategy_registry_compat.py tests/test_strategy_param_grid_consistency.py tests/test_new_strategies_42_50.py tests/test_new_strategies_51_58.py tests/test_new_strategies_59_66.py tests/test_new_strategies_67_76.py tests/test_new_strategies_77_84.py tests/test_structural_sl_wrapper.py tests/test_config_json_integrity.py -q`
   -> `346 passed, 5 skipped, 366 subtests passed`
+
+Post-commit Package K prospect rerun:
+
+- Command:
+  `python tools/strategy_prospect.py --strategies TimeOfDayMomentumStrategy SessionCloseReversionStrategy DayOfWeekBiasStrategy TurnOfMonthStrategy OvernightDriftStrategy IntradayRangeFadeStrategy SwapCarryTrendStrategy CarryFilteredPullbackStrategy --pool EURUSD USDJPY XAUUSD US500 BTCUSD --samples 10 --timeframes H1 H4 --label package_k_robust_verify_8addbf6`
+- Artifact kept locally:
+  `pm_outputs/experiments/package_k_robust_verify_8addbf6.json`
+- Engine commit: `8addbf6`
+- Result: `1` VIABLE (`TimeOfDayMomentumStrategy`), `7` WEAK.
+- Superseded Package K artifacts removed:
+  `package_k_prospect.json` (dirty/unreproducible engine state) and
+  `package_k_robust_verify_7e09851.json` (superseded by the non-datetime fallback commit).
