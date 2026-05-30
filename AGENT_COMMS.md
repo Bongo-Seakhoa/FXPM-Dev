@@ -2541,3 +2541,15 @@ Verification:
 
 Gemini plan-mode audit found no high-priority Package L correctness issue; Sagan's later findings
 were reconciled before commit.
+
+Post-commit Package L prospect rerun:
+
+- Command:
+  `python tools/strategy_prospect.py --strategies FractalChannelBreakoutStrategy SwingFailureReversalStrategy AnchoredVWAPReclaimStrategy VolumeClimaxReversalStrategy EfficiencyRatioTrendStrategy EfficiencyRatioMeanReversionStrategy OpeningRangeRetestStrategy SessionVWAPPullbackTrendStrategy --pool EURUSD USDJPY XAUUSD US500 BTCUSD --samples 10 --timeframes H1 H4 --label package_l_robust_verify_7943f50`
+- Artifact kept locally:
+  `pm_outputs/experiments/package_l_robust_verify_7943f50.json`
+- Engine commit: `7943f50`
+- Result: `1` VIABLE (`FractalChannelBreakoutStrategy`), `7` WEAK.
+- Interpretation: Package L earns admission as deterministic coverage, not promotion. The full
+  roster re-opt plus holdout/global false-discovery gate still decides whether any Package L
+  strategy becomes a live candidate.
