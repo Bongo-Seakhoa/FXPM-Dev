@@ -587,6 +587,10 @@ class PipelineConfig:
     false_discovery_holdout_min_trades: int = 5
     false_discovery_holdout_min_profit_factor: float = 1.0
     false_discovery_holdout_min_return_pct: float = 0.0
+    oos_evidence_export_enabled: bool = False
+    oos_evidence_periods: int = 64
+    oos_evidence_min_periods: int = 8
+    oos_evidence_dirname: str = "oos_evidence"
 
     # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
     # to be considered actionable in live trading. Signals below this are logged but
@@ -1127,6 +1131,23 @@ class PipelineConfig:
         except Exception:
             holdout_min_return = 0.0
         self.false_discovery_holdout_min_return_pct = holdout_min_return
+        self.oos_evidence_export_enabled = bool(
+            getattr(self, "oos_evidence_export_enabled", False)
+        )
+        try:
+            evidence_periods = int(getattr(self, "oos_evidence_periods", 64) or 64)
+        except Exception:
+            evidence_periods = 64
+        self.oos_evidence_periods = max(2, evidence_periods)
+        try:
+            evidence_min_periods = int(getattr(self, "oos_evidence_min_periods", 8) or 8)
+        except Exception:
+            evidence_min_periods = 8
+        self.oos_evidence_min_periods = max(2, min(evidence_min_periods, self.oos_evidence_periods))
+        evidence_dirname = str(getattr(self, "oos_evidence_dirname", "oos_evidence") or "oos_evidence").strip()
+        if not evidence_dirname or any(sep in evidence_dirname for sep in ("/", "\\")):
+            evidence_dirname = "oos_evidence"
+        self.oos_evidence_dirname = evidence_dirname
         try:
             mult = float(getattr(self, "promote_small_risk_multiplier", 0.5) or 0.0)
         except Exception:

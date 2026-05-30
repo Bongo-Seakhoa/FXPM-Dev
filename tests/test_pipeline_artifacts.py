@@ -1,11 +1,15 @@
 import unittest
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 import shutil
 
+import numpy as np
+
 from pm_core import PipelineConfig
 from pm_pipeline import (
     ConfigLedger,
+    OptimizationPipeline,
     PortfolioManager,
     RegimeConfig,
     SymbolConfig,
@@ -133,9 +137,17 @@ class PipelineArtifactTests(unittest.TestCase):
         self.assertEqual(current["false_discovery_holdout_min_trades"], 5)
         self.assertAlmostEqual(current["false_discovery_holdout_min_profit_factor"], 1.0)
         self.assertAlmostEqual(current["false_discovery_holdout_min_return_pct"], 0.0)
+        self.assertFalse(current["oos_evidence_export_enabled"])
+        self.assertEqual(current["oos_evidence_periods"], 64)
+        self.assertEqual(current["oos_evidence_min_periods"], 8)
+        self.assertEqual(current["oos_evidence_dirname"], "oos_evidence")
 
         changed = dict(current)
         changed["false_discovery_symbol_count"] = 62
+        self.assertFalse(artifact_contract_matches(current, changed))
+
+        changed = dict(current)
+        changed["oos_evidence_export_enabled"] = True
         self.assertFalse(artifact_contract_matches(current, changed))
 
     def test_portfolio_manager_sets_false_discovery_symbol_scope(self):
@@ -173,6 +185,108 @@ class PipelineArtifactTests(unittest.TestCase):
 
             self.assertFalse(manager.config.false_discovery_control_enabled)
             self.assertEqual(manager.config.false_discovery_symbol_count, 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_oos_candidate_evidence_writer_is_separate_from_ledger(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_oos_evidence_writer")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+                oos_evidence_export_enabled=True,
+            )
+            pipeline = OptimizationPipeline(cfg)
+            artifact_meta = build_artifact_meta(cfg)
+            pointer = pipeline._write_oos_candidate_evidence(
+                "EURUSD",
+                [
+                    {
+                        "format_version": "oos_candidate_returns_v1",
+                        "candidate_id": "abc",
+                        "symbol": "EURUSD",
+                        "timeframe": "H1",
+                        "strategy_name": "Demo",
+                        "parameters": {},
+                        "period_returns": [0.01, -0.02, 0.03, 0.01, 0.0, 0.02, -0.01, 0.01],
+                        "period_count": 8,
+                    }
+                ],
+                artifact_meta=artifact_meta,
+                data_window_meta={"data_window_fingerprint": "window-hash"},
+            )
+
+            path = pointer["path"]
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(payload["format_version"], "oos_candidate_matrix_v1")
+            self.assertEqual(payload["record_count"], 1)
+            self.assertEqual(pointer["record_count"], payload["record_count"])
+            self.assertEqual(payload["records"][0]["candidate_id"], "abc")
+            self.assertNotIn("period_returns", payload["records"][0])
+            matrix = np.load(payload["matrix_path"])
+            self.assertEqual(matrix["returns"].shape, (8, 1))
+            self.assertEqual(matrix["candidate_ids"].tolist(), ["abc"])
+            self.assertIn("artifact_meta", payload)
+            self.assertFalse((tmp / "pm_configs.json").exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_valid_config_reoptimizes_when_oos_sidecar_is_missing(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_oos_evidence_cache")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+                oos_evidence_export_enabled=True,
+            )
+            pipeline = OptimizationPipeline(cfg)
+            artifact_meta = build_artifact_meta(cfg)
+            pointer = pipeline._write_oos_candidate_evidence(
+                "EURUSD",
+                [
+                    {
+                        "format_version": "oos_candidate_returns_v1",
+                        "candidate_id": "abc",
+                        "symbol": "EURUSD",
+                        "timeframe": "H1",
+                        "strategy_name": "Demo",
+                        "parameters": {},
+                        "period_returns": [0.01, -0.02, 0.03, 0.01, 0.0, 0.02, -0.01, 0.01],
+                        "period_count": 8,
+                    }
+                ],
+                artifact_meta=artifact_meta,
+                data_window_meta={},
+            )
+            symbol_config = SymbolConfig(
+                symbol="EURUSD",
+                is_validated=True,
+                validation_reason="ok",
+                data_window_meta={"oos_candidate_evidence": pointer},
+                artifact_meta=artifact_meta,
+                valid_until=datetime.now() + timedelta(days=1),
+            )
+            ledger = ConfigLedger(str(tmp / "pm_configs.json"))
+            ledger.configs = {"EURUSD": symbol_config}
+            ledger._loaded = True
+
+            should_optimize, reason = ledger.should_optimize(
+                "EURUSD",
+                current_artifact_meta=artifact_meta,
+            )
+            self.assertFalse(should_optimize, reason)
+
+            Path(pointer["matrix_path"]).unlink()
+            should_optimize, reason = ledger.should_optimize(
+                "EURUSD",
+                current_artifact_meta=artifact_meta,
+            )
+            self.assertTrue(should_optimize)
+            self.assertIn("OOS evidence", reason)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
