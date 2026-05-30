@@ -2193,7 +2193,11 @@ def save_broker_specs(specs: Dict[str, Dict[str, Any]], filepath: str = "broker_
     logger.info(f"Saved broker specs for {len(specs)} symbols to {filepath}")
 
 
-def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> InstrumentSpec:
+def _create_spec_from_broker_data(
+    symbol: str,
+    broker_data: Dict[str, Any],
+    base_spec: Optional[InstrumentSpec] = None,
+) -> InstrumentSpec:
     """Create an InstrumentSpec from broker spec data.
 
     This function must be robust to broker/MT5 edge-cases where certain fields
@@ -2204,6 +2208,8 @@ def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> I
     Args:
         symbol: Symbol name
         broker_data: Dict with MT5 symbol info fields
+        base_spec: Optional config/default spec used only for fields the broker
+            snapshot does not carry, such as explicit commission.
 
     Returns:
         InstrumentSpec populated with broker-real values (sanitized)
@@ -2264,7 +2270,11 @@ def _create_spec_from_broker_data(symbol: str, broker_data: Dict[str, Any]) -> I
     else:
         spread_avg = 2.0
 
-    commission_raw = broker_data.get('commission_per_lot', 7.0)
+    commission_raw = broker_data.get('commission_per_lot', None)
+    if commission_raw is None and base_spec is not None:
+        commission_raw = getattr(base_spec, "commission_per_lot", None)
+    if commission_raw is None:
+        commission_raw = 7.0
     try:
         commission_per_lot = float(commission_raw if commission_raw is not None else 7.0)
     except (TypeError, ValueError):
@@ -2308,8 +2318,9 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
     Get instrument specification for a symbol.
     
     Priority:
-    1. Config-provided instrument_specs overrides
-    2. Broker specs from broker_specs.json (if available)
+    1. Broker specs from broker_specs.json (if available) for execution fields,
+       with config specs used as commercial fallbacks such as commission.
+    2. Config-provided instrument_specs overrides
     3. Default hardcoded specs
     4. Generic fallback spec
     
@@ -2323,17 +2334,19 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
         _maybe_load_config_specs()
     symbol_key = _normalize_symbol(symbol)
 
-    # 1) Config-provided overrides
-    if symbol_key in _CONFIG_INSTRUMENT_SPECS:
-        return _apply_spec_defaults(_clone_spec(_CONFIG_INSTRUMENT_SPECS[symbol_key], symbol_override=symbol))
-    
-    # 2) Broker specs
+    config_spec = _CONFIG_INSTRUMENT_SPECS.get(symbol_key)
+
+    # 1) Broker specs are the source of truth for point/digits/tick/spread.
     broker_specs = load_broker_specs()
     if symbol in broker_specs:
-        return _create_spec_from_broker_data(symbol, broker_specs[symbol])
+        return _create_spec_from_broker_data(symbol, broker_specs[symbol], base_spec=config_spec)
     
     if symbol_key in broker_specs:
-        return _create_spec_from_broker_data(symbol, broker_specs[symbol_key])
+        return _create_spec_from_broker_data(symbol, broker_specs[symbol_key], base_spec=config_spec)
+
+    # 2) Config-provided overrides
+    if config_spec is not None:
+        return _apply_spec_defaults(_clone_spec(config_spec, symbol_override=symbol))
     
     # 3) Hardcoded defaults
     if symbol in INSTRUMENT_SPECS:

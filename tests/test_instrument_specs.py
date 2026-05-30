@@ -1,4 +1,5 @@
 import unittest
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -22,11 +23,18 @@ class InstrumentSpecTests(unittest.TestCase):
         shutil.rmtree(path, ignore_errors=True)
         path.mkdir(parents=True, exist_ok=True)
         self._tmpdir = path
+        self._old_pm_config_path = os.environ.get("PM_CONFIG_PATH")
+        os.environ["PM_CONFIG_PATH"] = str(path / "missing_config.json")
         set_broker_specs_path(str(path / "no_broker_specs.json"))
+        set_instrument_specs({}, {})
 
     def tearDown(self):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         set_instrument_specs({}, {})
+        if self._old_pm_config_path is None:
+            os.environ.pop("PM_CONFIG_PATH", None)
+        else:
+            os.environ["PM_CONFIG_PATH"] = self._old_pm_config_path
 
     def test_config_override_and_defaults(self):
         defaults = {"commission_per_lot": 12.0}
@@ -123,6 +131,52 @@ class InstrumentSpecTests(unittest.TestCase):
 
         set_broker_specs_path(str(self._tmpdir / "missing_broker_specs.json"))
         self.assertEqual(load_broker_specs(), {})
+
+    def test_broker_specs_override_config_execution_fields_and_preserve_commission(self):
+        broker_path = self._tmpdir / "broker_specs.json"
+        broker_path.write_text(
+            """{
+              "EURUSD": {
+                "digits": 3,
+                "point": 0.001,
+                "tick_size": 0.001,
+                "tick_value": 9.5,
+                "contract_size": 100000,
+                "volume_min": 0.01,
+                "volume_max": 50,
+                "volume_step": 0.01,
+                "spread": 25,
+                "swap_long": -1.0,
+                "swap_short": 0.5,
+                "stops_level": 12
+              }
+            }""",
+            encoding="utf-8",
+        )
+        set_broker_specs_path(str(broker_path))
+        set_instrument_specs(
+            specs={
+                "EURUSD": {
+                    "pip_position": 4,
+                    "pip_value": 10.0,
+                    "spread_avg": 1.2,
+                    "min_lot": 0.01,
+                    "max_lot": 100.0,
+                    "commission_per_lot": 0.0,
+                }
+            },
+            defaults={},
+        )
+
+        spec = get_instrument_spec("EURUSD")
+
+        self.assertEqual(spec.digits, 3)
+        self.assertAlmostEqual(spec.point, 0.001, places=8)
+        self.assertAlmostEqual(spec.tick_value, 9.5, places=8)
+        self.assertAlmostEqual(spec.spread_avg, 2.5, places=8)
+        self.assertEqual(spec.max_lot, 50)
+        self.assertEqual(spec.stops_level, 12)
+        self.assertEqual(spec.commission_per_lot, 0.0)
 
     def test_offline_specs_infer_symbol_class_points(self):
         eurusd = get_instrument_spec("EURUSD")

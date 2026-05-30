@@ -1272,6 +1272,65 @@ Interpretation:
 
 ---
 
+### [CODEX] 2026-05-30 - FBS broker-spec snapshot captured; broker-spec priority bug fixed
+
+Captured broker-real specs from the currently connected terminal:
+
+- Account/server: `FBS-Demo`, account currency USD.
+- Snapshot path: `pm_outputs/broker_specs_snapshot_20260530_160235.json`.
+- Installed as repo root `broker_specs.json` because `config.json` already points there.
+- Contains 62 symbols from current ledger/config union. No credentials/account secrets, only symbol contract metadata.
+
+Important defect found:
+
+- Installing `broker_specs.json` initially did **not** change benchmark results.
+- Root cause: `get_instrument_spec()` gave `config.json instrument_specs` priority over `broker_specs.json`, so broker-real point/digits/tick/spread fields were shadowed in offline backtests.
+- Fixed priority: broker specs now win for execution fields; config specs are used as commercial fallback where broker snapshots do not carry fields, especially `commission_per_lot`.
+- Added test coverage for "broker execution fields override config, config commission survives."
+
+Verification:
+
+- `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py -q`
+- Result: `70 passed`.
+- `python -m py_compile pm_core.py pm_pipeline.py pm_mt5.py` passed.
+
+FBS broker-spec baselines:
+
+- Fixed spread with FBS broker specs:
+  - label `baseline_v0_all_fbs_brokerspec_fixed`
+  - mean return `-11.02%`, median return `-2.93%`, mean PF `0.917`, mean max DD `20.48%`,
+    mean time underwater `94.63%`.
+- Conservative spread with FBS broker specs:
+  - label `baseline_v1_all_fbs_brokerspec_conservative`
+  - mean return `-20.10%`, median return `-6.38%`, mean PF `0.802`, mean max DD `27.79%`,
+    mean time underwater `95.28%`.
+- FBS fixed -> FBS conservative gate: `REGRESSION` as fidelity correction.
+
+Class split under FBS broker-spec conservative baseline:
+
+| class | n | fixed mean ret | conservative mean ret | conservative mean PF | positive PF+return | PF>=1.2 & return>0 |
+|---|---:|---:|---:|---:|---:|---:|
+| CRYPTO | 10 | -1.67 | -34.01 | 0.594 | 2 | 0 |
+| ENERGY | 3 | -20.57 | -21.76 | 0.790 | 0 | 0 |
+| FX_EXOTIC | 8 | -28.57 | -49.30 | 0.467 | 1 | 0 |
+| FX_JPY | 7 | -6.11 | -7.14 | 0.999 | 3 | 2 |
+| FX_NON_JPY | 21 | -8.88 | -11.33 | 0.870 | 8 | 5 |
+| INDEX_OR_CFD | 11 | -15.86 | -16.79 | 0.866 | 4 | 2 |
+| METAL | 2 | +13.81 | +13.29 | 1.450 | 2 | 2 |
+
+Survivors with `PF>=1.2` and positive return under FBS conservative:
+
+- `US500`, `XAGUSD`, `EURAUD`, `XAUUSD`, `GBPUSD`, `JP225`, `AUDUSD`, `CHFJPY`,
+  `EURNZD`, `NZDJPY`, `AUDNZD`.
+
+Interpretation:
+
+- The current ledger remains non-production under FBS-real conservative costs.
+- The true baseline for Phase 1 should now be `baseline_v1_all_fbs_brokerspec_conservative`, not the offline inferred baseline.
+- Cost-contract correctness is a prerequisite for all subsequent scorer/search work.
+
+---
+
 ### [CLAUDE] 2026-05-30 — Phase-0 verified + FULL-UNIVERSE honest benchmark (proxy decree withdrawn by human)
 
 Point/digits fix confirmed (USDJPY d3, XAU/BTC d2, US500 d0). Human withdrew the small-pool
