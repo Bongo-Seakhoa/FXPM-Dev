@@ -5716,8 +5716,10 @@ class SupportResistanceRetestBreakoutStrategy(BaseStrategy):
         support = low.shift(1).rolling(lookback, min_periods=lookback).min()
         broke_up = close > resistance + buffer_atr * atr
         broke_down = close < support - buffer_atr * atr
-        recent_up_break = broke_up.rolling(retest_window, min_periods=1).max().astype(bool)
-        recent_down_break = broke_down.rolling(retest_window, min_periods=1).max().astype(bool)
+        prior_broke_up = broke_up.shift(1, fill_value=False)
+        prior_broke_down = broke_down.shift(1, fill_value=False)
+        recent_up_break = prior_broke_up.rolling(retest_window, min_periods=1).max().astype(bool)
+        recent_down_break = prior_broke_down.rolling(retest_window, min_periods=1).max().astype(bool)
         retest_res = low <= resistance + tolerance * atr
         retest_sup = high >= support - tolerance * atr
         long_entry = recent_up_break & retest_res & (close > resistance)
