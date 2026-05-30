@@ -90,8 +90,8 @@ def _make_features(n: int = 500, seed: int = 42) -> pd.DataFrame:
 
 
 class TestRegistryExpansion:
-    def test_total_count_is_92(self):
-        assert StrategyRegistry.count() == 92
+    def test_total_count_is_100(self):
+        assert StrategyRegistry.count() == 100
 
     def test_all_current_expansion_strategies_registered(self):
         names = set(StrategyRegistry.list_all())
@@ -102,9 +102,9 @@ class TestRegistryExpansion:
         trend = StrategyRegistry.list_by_category(StrategyCategory.TREND_FOLLOWING)
         mr = StrategyRegistry.list_by_category(StrategyCategory.MEAN_REVERSION)
         breakout = StrategyRegistry.list_by_category(StrategyCategory.BREAKOUT_MOMENTUM)
-        assert len(trend) == 32
-        assert len(mr) == 36
-        assert len(breakout) == 24
+        assert len(trend) == 33
+        assert len(mr) == 39
+        assert len(breakout) == 28
 
     @pytest.mark.parametrize("name", NEW_STRATEGY_NAMES)
     def test_category_assignment(self, name):

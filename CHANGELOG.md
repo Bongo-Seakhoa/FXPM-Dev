@@ -41,6 +41,22 @@ Notes:
   behavioral regression tests for the new strategy semantics
 - updated discovery metadata and registry tests to the 92-strategy roster
 
+### Package M strategy expansion
+
+- added Package M, expanding the deterministic strategy roster from 92 to 100 with:
+  - Darvas-box breakout
+  - ADR expansion breakout
+  - prior-day range reclaim
+  - weekly/monthly level rejection
+  - previous-week range breakout
+  - head-and-shoulders neckline break
+  - variance-ratio trend
+  - autocorrelation reversal
+- reconciled independent Package M audit findings by using broker-aligned week periods, debouncing
+  same-level rejection signals per day/period, removing the dead `adr_period` axis from prior-day
+  reclaim, and adding timezone/week-boundary regression tests
+- updated discovery metadata and registry tests to the 100-strategy roster
+
 ### Audit artifact lifecycle
 
 - clarified that audit outputs, agent communication files, experiment notes, and review documents

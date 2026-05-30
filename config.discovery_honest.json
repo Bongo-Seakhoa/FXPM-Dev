@@ -2,7 +2,7 @@
   "_meta": {
     "purpose": "Dedicated discovery/re-optimization contract. Use with pm_main.py --optimize --config config.discovery_honest.json.",
     "scope": "research_discovery_only_not_live_trading",
-    "strategy_roster_count": 92,
+    "strategy_roster_count": 100,
     "holdout_unit": "percent_of_stage2_selection"
   },
   "pipeline": {

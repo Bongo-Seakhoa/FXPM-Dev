@@ -3,10 +3,10 @@ FX Portfolio Manager - Trading Strategies
 ==========================================
 
 Contains all trading strategy implementations.
-Includes 92 strategies across categories:
-- Trend Following (32 strategies)
-- Mean Reversion (36 strategies)
-- Breakout/Momentum (24 strategies)
+Includes 100 strategies across categories:
+- Trend Following (33 strategies)
+- Mean Reversion (39 strategies)
+- Breakout/Momentum (28 strategies)
 
 Each strategy provides:
 - Signal generation (returns -1, 0, 1)
@@ -6696,6 +6696,424 @@ class SessionVWAPPullbackTrendStrategy(BaseStrategy):
 
 
 # =============================================================================
+# PACKAGE M: HIGHER-TIMEFRAME LEVELS / ADR / STATISTICAL REGIME STRATEGIES
+# =============================================================================
+
+
+def _period_series(features: pd.DataFrame, freq: str) -> Optional[pd.Series]:
+    idx = features.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        return None
+    naive_idx = idx.tz_localize(None) if idx.tz is not None else idx
+    freq = str(freq).upper()
+    if freq.startswith("W"):
+        shifted = naive_idx - pd.Timedelta(hours=24)
+        return pd.Series(shifted.to_period("W-MON"), index=idx)
+    return pd.Series(naive_idx.to_period(freq), index=idx)
+
+
+def _previous_period_levels(features: pd.DataFrame, freq: str) -> Tuple[pd.Series, pd.Series]:
+    periods = _period_series(features, freq)
+    if periods is None:
+        idx = features.index
+        nan = pd.Series(np.nan, index=idx, dtype=float)
+        return nan, nan
+    period_high = features["High"].groupby(periods).max()
+    period_low = features["Low"].groupby(periods).min()
+    prev_high = periods.map(period_high.shift(1)).astype(float)
+    prev_low = periods.map(period_low.shift(1)).astype(float)
+    return pd.Series(prev_high, index=features.index), pd.Series(prev_low, index=features.index)
+
+
+def _previous_day_context(features: pd.DataFrame, adr_period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    idx = features.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        nan = pd.Series(np.nan, index=idx, dtype=float)
+        return nan, nan, nan
+    naive_idx = idx.tz_localize(None) if idx.tz is not None else idx
+    days = pd.Series(naive_idx.date, index=idx)
+    daily_high = features["High"].groupby(days).max()
+    daily_low = features["Low"].groupby(days).min()
+    daily_range = daily_high - daily_low
+    prev_high = days.map(daily_high.shift(1)).astype(float)
+    prev_low = days.map(daily_low.shift(1)).astype(float)
+    adr = days.map(daily_range.shift(1).rolling(max(1, int(adr_period)), min_periods=1).mean()).astype(float)
+    return pd.Series(prev_high, index=idx), pd.Series(prev_low, index=idx), pd.Series(adr, index=idx)
+
+
+def _variance_ratio(close: pd.Series, period: int, lag: int) -> pd.Series:
+    lag = max(2, int(lag))
+    period = max(lag + 2, int(period))
+    ret_1 = close.diff()
+    ret_lag = close - close.shift(lag)
+    var_1 = ret_1.rolling(period, min_periods=period).var()
+    var_lag = ret_lag.rolling(period, min_periods=period).var()
+    return (var_lag / (lag * var_1.replace(0.0, np.nan) + 1e-12)).replace([np.inf, -np.inf], np.nan)
+
+
+class DarvasBoxBreakoutStrategy(BaseStrategy):
+    """Break compact rolling boxes; avoids broad Donchian-style channels."""
+
+    @property
+    def name(self) -> str:
+        return "DarvasBoxBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"lookback": 20, "max_box_atr": 4.0, "breakout_atr": 0.1, "volume_mult": 0.0,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        lb = max(5, int(self.params.get("lookback", 20)))
+        max_box = float(self.params.get("max_box_atr", 4.0))
+        buf = float(self.params.get("breakout_atr", 0.1))
+        vol_mult = float(self.params.get("volume_mult", 0.0))
+        high, low, close = features["High"], features["Low"], features["Close"]
+        atr = _get_atr(features, 14)
+        box_high = high.shift(1).rolling(lb, min_periods=lb).max()
+        box_low = low.shift(1).rolling(lb, min_periods=lb).min()
+        compact = (box_high - box_low) <= max_box * atr
+        long_entry = compact & (close > box_high + buf * atr) & (close.shift(1) <= box_high.shift(1))
+        short_entry = compact & (close < box_low - buf * atr) & (close.shift(1) >= box_low.shift(1))
+        if vol_mult > 0:
+            vol = _get_volume(features)
+            avg_vol = vol.shift(1).rolling(lb, min_periods=lb).mean()
+            vol_ok = vol >= vol_mult * avg_vol
+            long_entry &= vol_ok
+            short_entry &= vol_ok
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_entry] = 1
+        signals[short_entry] = -1
+        return self._zero_warmup(signals, lb + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"lookback": [10, 20, 40], "max_box_atr": [2.5, 4.0, 6.0],
+                "breakout_atr": [0.0, 0.1, 0.25], "volume_mult": [0.0, 1.25],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class ADRExpansionBreakoutStrategy(BaseStrategy):
+    """Trade prior-day range breaks only when the day has room for ADR expansion."""
+
+    @property
+    def name(self) -> str:
+        return "ADRExpansionBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"adr_period": 10, "adr_extension": 0.25, "atr_buffer": 0.1,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        adr_p = max(2, int(self.params.get("adr_period", 10)))
+        ext = float(self.params.get("adr_extension", 0.25))
+        buf = float(self.params.get("atr_buffer", 0.1))
+        prev_high, prev_low, adr = _previous_day_context(features, adr_p)
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        upper = prev_high + ext * adr + buf * atr
+        lower = prev_low - ext * adr - buf * atr
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[(close > upper) & (close.shift(1) <= upper.shift(1))] = 1
+        signals[(close < lower) & (close.shift(1) >= lower.shift(1))] = -1
+        return self._zero_warmup(signals, adr_p + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"adr_period": [5, 10, 20], "adr_extension": [0.0, 0.25, 0.50],
+                "atr_buffer": [0.0, 0.1, 0.25], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
+
+
+class PriorDayRangeReclaimStrategy(BaseStrategy):
+    """Fade failed breaks of the prior day's high/low after close reclaims the level."""
+
+    @property
+    def name(self) -> str:
+        return "PriorDayRangeReclaimStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"sweep_atr": 0.05, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        sweep = float(self.params.get("sweep_atr", 0.05))
+        prev_high, prev_low, _adr = _previous_day_context(features, 2)
+        atr = _get_atr(features, 14)
+        high, low, close = features["High"], features["Low"], features["Close"]
+        idx = features.index
+        if isinstance(idx, pd.DatetimeIndex):
+            naive_idx = idx.tz_localize(None) if idx.tz is not None else idx
+            keys: Any = pd.Series(naive_idx.date, index=idx)
+        else:
+            keys = pd.Series(0, index=idx)
+        long_touch = (low < prev_low - sweep * atr) & (close > prev_low)
+        short_touch = (high > prev_high + sweep * atr) & (close < prev_high)
+        long_once = long_touch & (long_touch.astype(int).groupby(keys).cumsum() == 1)
+        short_once = short_touch & (short_touch.astype(int).groupby(keys).cumsum() == 1)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_once] = 1
+        signals[short_once] = -1
+        return self._zero_warmup(signals, 20)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"sweep_atr": [0.0, 0.05, 0.15], **self._base_sl_tp_grid()}
+
+
+class WeeklyMonthlyLevelRejectionStrategy(BaseStrategy):
+    """Reject prior week/month extremes; low-frequency and spread-tolerant by design."""
+
+    @property
+    def name(self) -> str:
+        return "WeeklyMonthlyLevelRejectionStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"period_type": "W", "sweep_atr": 0.1, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        freq = "M" if str(self.params.get("period_type", "W")).upper().startswith("M") else "W"
+        sweep = float(self.params.get("sweep_atr", 0.1))
+        prev_high, prev_low = _previous_period_levels(features, freq)
+        atr = _get_atr(features, 14)
+        high, low, close = features["High"], features["Low"], features["Close"]
+        keys = _period_series(features, freq)
+        if keys is None:
+            keys = pd.Series(0, index=features.index)
+        long_touch = (low < prev_low - sweep * atr) & (close > prev_low)
+        short_touch = (high > prev_high + sweep * atr) & (close < prev_high)
+        long_once = long_touch & (long_touch.astype(int).groupby(keys).cumsum() == 1)
+        short_once = short_touch & (short_touch.astype(int).groupby(keys).cumsum() == 1)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_once] = 1
+        signals[short_once] = -1
+        return self._zero_warmup(signals, 20)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"period_type": ["W", "M"], "sweep_atr": [0.0, 0.1, 0.25],
+                **self._base_sl_tp_grid()}
+
+
+class PreviousWeekRangeBreakoutStrategy(BaseStrategy):
+    """Break prior-week high/low with ATR buffer; a slower companion to daily breakouts."""
+
+    @property
+    def name(self) -> str:
+        return "PreviousWeekRangeBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"atr_buffer": 0.1, "ema_period": 100, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0,
+                **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        return {"ATR_14", f"EMA_{ema_p}"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        buf = float(self.params.get("atr_buffer", 0.1))
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        prev_high, prev_low = _previous_period_levels(features, "W")
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        ema = _get_ema(features, ema_p)
+        upper = prev_high + buf * atr
+        lower = prev_low - buf * atr
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[(close > upper) & (close.shift(1) <= upper.shift(1)) & (close > ema)] = 1
+        signals[(close < lower) & (close.shift(1) >= lower.shift(1)) & (close < ema)] = -1
+        return self._zero_warmup(signals, ema_p + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"atr_buffer": [0.0, 0.1, 0.25], "ema_period": [50, 100, 200],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class HeadAndShouldersNecklineBreakStrategy(BaseStrategy):
+    """Approximate three-swing neckline break using confirmed pivots only."""
+
+    @property
+    def name(self) -> str:
+        return "HeadAndShouldersNecklineBreakStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"wing_bars": 2, "shoulder_tolerance_atr": 1.5, "neckline_buffer_atr": 0.1,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        wing = max(1, int(self.params.get("wing_bars", 2)))
+        shoulder_tol = float(self.params.get("shoulder_tolerance_atr", 1.5))
+        buf = float(self.params.get("neckline_buffer_atr", 0.1))
+        high, low, close = features["High"], features["Low"], features["Close"]
+        atr = _get_atr(features, 14).ffill()
+        n = len(features)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        piv_hi: List[Tuple[int, float]] = []
+        piv_lo: List[Tuple[int, float]] = []
+        last_short_pattern: Optional[Tuple[int, int, int]] = None
+        last_long_pattern: Optional[Tuple[int, int, int]] = None
+
+        for i in range(wing * 2 + 1, n):
+            c = i - wing
+            if c - wing < 0:
+                continue
+            h = float(high.iat[c])
+            l = float(low.iat[c])
+            if h >= float(high.iloc[c - wing:c].max()) and h > float(high.iloc[c + 1:i + 1].max()):
+                piv_hi.append((c, h))
+                piv_hi = piv_hi[-6:]
+            if l <= float(low.iloc[c - wing:c].min()) and l < float(low.iloc[c + 1:i + 1].min()):
+                piv_lo.append((c, l))
+                piv_lo = piv_lo[-6:]
+
+            if len(piv_hi) >= 3:
+                (a_i, a), (b_i, b), (c_i, c_hi) = piv_hi[-3:]
+                tol = shoulder_tol * float(atr.iat[i] if pd.notna(atr.iat[i]) else 0.0)
+                if a_i < b_i < c_i and b > a and b > c_hi and abs(a - c_hi) <= tol:
+                    neckline = float(low.iloc[a_i:c_i + 1].min())
+                    pattern = (a_i, b_i, c_i)
+                    if (last_short_pattern != pattern and close.iat[i] < neckline - buf * atr.iat[i]
+                            and close.iat[i - 1] >= neckline - buf * atr.iat[i - 1]):
+                        signals.iat[i] = -1
+                        last_short_pattern = pattern
+
+            if len(piv_lo) >= 3:
+                (a_i, a), (b_i, b), (c_i, c_lo) = piv_lo[-3:]
+                tol = shoulder_tol * float(atr.iat[i] if pd.notna(atr.iat[i]) else 0.0)
+                if a_i < b_i < c_i and b < a and b < c_lo and abs(a - c_lo) <= tol:
+                    neckline = float(high.iloc[a_i:c_i + 1].max())
+                    pattern = (a_i, b_i, c_i)
+                    if (last_long_pattern != pattern and close.iat[i] > neckline + buf * atr.iat[i]
+                            and close.iat[i - 1] <= neckline + buf * atr.iat[i - 1]):
+                        signals.iat[i] = 1
+                        last_long_pattern = pattern
+
+        return self._zero_warmup(signals, wing * 2 + 20)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"wing_bars": [1, 2, 3], "shoulder_tolerance_atr": [1.0, 1.5, 2.5],
+                "neckline_buffer_atr": [0.0, 0.1, 0.25], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
+
+
+class VarianceRatioTrendStrategy(BaseStrategy):
+    """Trend event when variance ratio indicates persistence and EMA direction agrees."""
+
+    @property
+    def name(self) -> str:
+        return "VarianceRatioTrendStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"vr_period": 40, "lag": 4, "min_vr": 1.15, "ema_period": 100,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        return {"ATR_14", f"EMA_{ema_p}"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        period = max(5, int(self.params.get("vr_period", 40)))
+        lag = max(2, int(self.params.get("lag", 4)))
+        min_vr = float(self.params.get("min_vr", 1.15))
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        close = features["Close"]
+        vr = _variance_ratio(close, period, lag)
+        ema = _get_ema(features, ema_p)
+        long_state = (vr >= min_vr) & (close > ema)
+        short_state = (vr >= min_vr) & (close < ema)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_state & ~long_state.shift(1, fill_value=False)] = 1
+        signals[short_state & ~short_state.shift(1, fill_value=False)] = -1
+        return self._zero_warmup(signals, max(period + lag, ema_p) + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"vr_period": [20, 40, 80], "lag": [2, 4, 8], "min_vr": [1.05, 1.15, 1.30],
+                "ema_period": [50, 100, 200], **self._base_sl_tp_grid(),
+                **self._structural_sl_grid()}
+
+
+class AutocorrelationReversalStrategy(BaseStrategy):
+    """Fade return extremes when short-lag autocorrelation is negative."""
+
+    @property
+    def name(self) -> str:
+        return "AutocorrelationReversalStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"corr_period": 30, "lag": 1, "max_autocorr": -0.10, "z_period": 20, "z_entry": 1.5,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        corr_p = max(5, int(self.params.get("corr_period", 30)))
+        lag = max(1, int(self.params.get("lag", 1)))
+        max_ac = float(self.params.get("max_autocorr", -0.10))
+        z_p = max(5, int(self.params.get("z_period", 20)))
+        z_entry = float(self.params.get("z_entry", 1.5))
+        close = features["Close"]
+        ret = close.pct_change()
+        autocorr = ret.rolling(corr_p, min_periods=corr_p).corr(ret.shift(lag))
+        mean = ret.rolling(z_p, min_periods=z_p).mean()
+        std = ret.rolling(z_p, min_periods=z_p).std().replace(0.0, np.nan)
+        z = (ret - mean) / (std + 1e-12)
+        mr_state = autocorr <= max_ac
+        long_state = mr_state & (z <= -z_entry)
+        short_state = mr_state & (z >= z_entry)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[long_state & ~long_state.shift(1, fill_value=False)] = 1
+        signals[short_state & ~short_state.shift(1, fill_value=False)] = -1
+        return self._zero_warmup(signals, max(corr_p + lag, z_p) + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"corr_period": [20, 30, 50], "lag": [1, 2], "max_autocorr": [-0.20, -0.10, 0.0],
+                "z_period": [10, 20, 40], "z_entry": [1.0, 1.5, 2.0],
+                **self._base_sl_tp_grid()}
+
+
+# =============================================================================
 # STRATEGY REGISTRY
 # =============================================================================
 
@@ -6825,6 +7243,16 @@ class StrategyRegistry:
         'EfficiencyRatioMeanReversionStrategy': EfficiencyRatioMeanReversionStrategy,
         'OpeningRangeRetestStrategy': OpeningRangeRetestStrategy,
         'SessionVWAPPullbackTrendStrategy': SessionVWAPPullbackTrendStrategy,
+
+        # Package M strategies: HTF levels, ADR, and deterministic statistical regimes
+        'DarvasBoxBreakoutStrategy': DarvasBoxBreakoutStrategy,
+        'ADRExpansionBreakoutStrategy': ADRExpansionBreakoutStrategy,
+        'PriorDayRangeReclaimStrategy': PriorDayRangeReclaimStrategy,
+        'WeeklyMonthlyLevelRejectionStrategy': WeeklyMonthlyLevelRejectionStrategy,
+        'PreviousWeekRangeBreakoutStrategy': PreviousWeekRangeBreakoutStrategy,
+        'HeadAndShouldersNecklineBreakStrategy': HeadAndShouldersNecklineBreakStrategy,
+        'VarianceRatioTrendStrategy': VarianceRatioTrendStrategy,
+        'AutocorrelationReversalStrategy': AutocorrelationReversalStrategy,
     }
     
     @classmethod
@@ -6982,6 +7410,15 @@ __all__ = [
     'EfficiencyRatioMeanReversionStrategy',
     'OpeningRangeRetestStrategy',
     'SessionVWAPPullbackTrendStrategy',
+    # Package M
+    'DarvasBoxBreakoutStrategy',
+    'ADRExpansionBreakoutStrategy',
+    'PriorDayRangeReclaimStrategy',
+    'WeeklyMonthlyLevelRejectionStrategy',
+    'PreviousWeekRangeBreakoutStrategy',
+    'HeadAndShouldersNecklineBreakStrategy',
+    'VarianceRatioTrendStrategy',
+    'AutocorrelationReversalStrategy',
 ]
 
 # Migration map for retired strategy names → current names
