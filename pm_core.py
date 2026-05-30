@@ -4084,11 +4084,16 @@ class Backtester:
         fixed_half = spec.get_half_spread_price() if bool(getattr(self.config, "use_spread", True)) else 0.0
         fixed_arr = np.full(n_bars, float(fixed_half), dtype=np.float64)
         mode = str(getattr(self.config, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
+        asset_class = str(getattr(spec, "asset_class", "unknown") or "unknown").strip().lower()
+        broker_fixed_spread_price = float(fixed_half) * 2.0
         meta: Dict[str, Any] = {
             "mode": mode,
             "source": "fixed_spec",
             "units": "price",
             "fallback_to_fixed": False,
+            "asset_class": asset_class,
+            "broker_fixed_spread_price": broker_fixed_spread_price,
+            "spread_provenance_status": "disabled" if not bool(getattr(self.config, "use_spread", True)) else "fixed_spec",
         }
         if not bool(getattr(self.config, "use_spread", True)) or mode == "fixed_spec" or n_bars <= 0:
             return fixed_arr, fixed_arr, meta
@@ -4133,6 +4138,13 @@ class Backtester:
             effective_spread_price = bar_arr * 2.0
             meta["mean_effective_spread_price"] = float(np.nanmean(effective_spread_price))
             meta["max_effective_spread_price"] = float(np.nanmax(effective_spread_price))
+            if broker_fixed_spread_price > 0:
+                meta["mean_to_broker_spread_ratio"] = float(
+                    meta["mean_effective_spread_price"] / broker_fixed_spread_price
+                )
+                meta["max_to_broker_spread_ratio"] = float(
+                    meta["max_effective_spread_price"] / broker_fixed_spread_price
+                )
             if spec.tick_size > 0 and spec.tick_value > 0:
                 effective_spread_cash = effective_spread_price / spec.tick_size * spec.tick_value
                 meta["mean_effective_spread_cash_per_lot"] = float(np.nanmean(effective_spread_cash))
@@ -4140,6 +4152,17 @@ class Backtester:
             if spec.pip_size > 0:
                 meta["mean_effective_spread_pips"] = float(np.nanmean(effective_spread_price / spec.pip_size))
                 meta["max_effective_spread_pips"] = float(np.nanmax(effective_spread_price / spec.pip_size))
+            if broker_fixed_spread_price <= 0:
+                meta["spread_provenance_status"] = "missing_broker_spread_review"
+            elif asset_class == "fx":
+                meta["spread_provenance_status"] = "fx_historical_spread"
+            else:
+                mean_ratio = float(meta.get("mean_to_broker_spread_ratio", 0.0) or 0.0)
+                max_ratio = float(meta.get("max_to_broker_spread_ratio", 0.0) or 0.0)
+                if mean_ratio >= 5.0 or max_ratio >= 25.0:
+                    meta["spread_provenance_status"] = "non_fx_spread_outlier_review"
+                else:
+                    meta["spread_provenance_status"] = "non_fx_spread_review"
         except Exception:
             pass
         return entry_arr.astype(np.float64), bar_arr.astype(np.float64), meta

@@ -207,6 +207,38 @@ class BacktesterTests(unittest.TestCase):
         self.assertEqual(stress_meta["entry_column"], "SpreadMax")
         self.assertEqual(stress_meta["entry_model"], "max_spread_stress")
 
+    def test_non_fx_spread_outlier_is_flagged_for_provenance_review(self):
+        idx = pd.date_range("2024-01-01", periods=3, freq="h")
+        df = pd.DataFrame({
+            "Open": [100.0, 100.0, 100.0],
+            "High": [100.0, 100.05, 100.05],
+            "Low": [100.0, 99.95, 99.95],
+            "Close": [100.0, 100.10, 100.20],
+            "Volume": [100, 100, 100],
+            "Spread": [200.0, 200.0, 200.0],
+            "SpreadOpen": [200.0, 200.0, 200.0],
+            "SpreadMax": [200.0, 200.0, 200.0],
+        }, index=idx)
+        spec = InstrumentSpec(
+            symbol="DOGUSD",
+            pip_position=2,
+            pip_value=10.0,
+            spread_avg=2.0,
+            point=0.01,
+            tick_size=0.01,
+            tick_value=1.0,
+            asset_class="crypto",
+        )
+
+        _, _, meta = Backtester(PipelineConfig(
+            use_spread=True,
+            backtest_spread_mode="conservative_max",
+        ))._build_half_spread_arrays(df, spec)
+
+        self.assertEqual(meta["asset_class"], "crypto")
+        self.assertGreaterEqual(meta["mean_to_broker_spread_ratio"], 5.0)
+        self.assertEqual(meta["spread_provenance_status"], "non_fx_spread_outlier_review")
+
 
 if __name__ == "__main__":
     unittest.main()

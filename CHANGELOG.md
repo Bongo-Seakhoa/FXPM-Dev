@@ -95,6 +95,8 @@ Notes:
   checks, while still floor-protecting against the broker fixed spread
 - documented the existing `conservative_max` behavior in metadata as bar-open/mean entry plus
   max-spread intrabar, so the stricter stress surface is explicit rather than implied
+- added spread provenance flags to backtest metadata and benchmark output so non-FX frozen-feed
+  spread outliers are marked for review instead of being treated as clean promotion evidence
 
 ### Audit artifact lifecycle
 

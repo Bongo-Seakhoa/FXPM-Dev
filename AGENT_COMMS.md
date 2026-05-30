@@ -2916,3 +2916,31 @@ Addressed audit H4 without changing the discovery baseline:
 Verification target: H4 is now a controlled stress-validation dimension, not a hidden assumption.
 The baseline should remain `conservative_max`; `stress_max` should be used as an additional kill-test
 for fragile winners, especially intraday and high-spread symbols.
+
+---
+
+### [CODEX] 2026-05-30 - H5 non-FX spread provenance surfaced in engine evidence
+
+Added provenance flags rather than a hard block:
+
+- Backtester spread metadata now includes:
+  - `asset_class`
+  - `broker_fixed_spread_price`
+  - `mean_to_broker_spread_ratio`
+  - `max_to_broker_spread_ratio`
+  - `spread_provenance_status`
+- Status values:
+  - `fx_historical_spread` for FX historical spread runs with broker spread available
+  - `non_fx_spread_review` for non-FX historical spread evidence
+  - `non_fx_spread_outlier_review` when mean frozen-vs-broker spread ratio >= 5x or max >= 25x
+  - `missing_broker_spread_review` when no broker fixed spread is available
+- `tools/benchmark.py` now prints `asset_class`, `spread_provenance_status`, and
+  `mean_to_broker_spread_ratio` so non-FX casualties/outliers cannot silently pollute pooled
+  promotion conclusions.
+- Smoke check: `DOGUSD` under `conservative_max` prints `crypto`,
+  `non_fx_spread_outlier_review`, mean frozen/broker spread ratio `16.80x`.
+
+This does not yet block promotion by itself. It closes the audit's main H5 failure mode by making the
+provenance condition machine-visible in the evidence artifacts. The real promotion rule should be
+decided after the honest re-opt shows which non-FX winners, if any, survive C3/PBO + holdout +
+`stress_max`.
