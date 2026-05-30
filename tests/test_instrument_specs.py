@@ -124,6 +124,24 @@ class InstrumentSpecTests(unittest.TestCase):
         set_broker_specs_path(str(self._tmpdir / "missing_broker_specs.json"))
         self.assertEqual(load_broker_specs(), {})
 
+    def test_offline_specs_infer_symbol_class_points(self):
+        eurusd = get_instrument_spec("EURUSD")
+        usdjpy = get_instrument_spec("USDJPY")
+        xauusd = get_instrument_spec("XAUUSD")
+        btcusd = get_instrument_spec("BTCUSD")
+        us30 = get_instrument_spec("US30")
+
+        self.assertEqual(eurusd.digits, 5)
+        self.assertAlmostEqual(eurusd.point, 0.00001, places=8)
+        self.assertEqual(usdjpy.digits, 3)
+        self.assertAlmostEqual(usdjpy.point, 0.001, places=8)
+        self.assertEqual(xauusd.digits, 2)
+        self.assertAlmostEqual(xauusd.point, 0.01, places=8)
+        self.assertEqual(btcusd.digits, 2)
+        self.assertAlmostEqual(btcusd.point, 0.01, places=8)
+        self.assertEqual(us30.digits, 0)
+        self.assertAlmostEqual(us30.point, 1.0, places=8)
+
     def test_sync_from_mt5_updates_spec(self):
         """Test that sync_instrument_spec_from_mt5 updates InstrumentSpec with MT5 values."""
         # Create a mock MT5SymbolInfo

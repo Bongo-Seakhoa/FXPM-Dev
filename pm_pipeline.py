@@ -146,6 +146,7 @@ def build_artifact_meta(config: PipelineConfig,
         "historical_stress_audit_bars": int(getattr(config, "historical_stress_audit_bars", 50000)),
         "active_universe_bars": int(getattr(config, "active_universe_bars", 250000)),
         "active_stage2_pct": float(getattr(config, "active_stage2_pct", 50.0)),
+        "clean_holdout_pct": float(getattr(config, "clean_holdout_pct", 0.0)),
         "overlap_pct": float(config.overlap_pct),
         "discovery_risk_per_trade_pct": float(getattr(config, "discovery_risk_per_trade_pct", 1.0)),
         "fixed_retrain_days": int(getattr(config, "fixed_retrain_days", getattr(config, "optimization_valid_days", 14))),
@@ -2922,12 +2923,17 @@ class OptimizationPipeline:
             "historical_stress_audit_bars": int(getattr(self.config, "historical_stress_audit_bars", 50000)),
             "active_universe_bars": int(getattr(self.config, "active_universe_bars", 250000)),
             "active_stage2_pct": float(getattr(self.config, "active_stage2_pct", 50.0)),
+            "clean_holdout_pct": float(getattr(self.config, "clean_holdout_pct", 0.0)),
             "windows": {
                 "workflow_window": _meta("workflow_window"),
                 "historical_stress_audit": _meta("historical_stress_audit"),
                 "active_universe": _meta("active_universe"),
                 "stage2_selection": _meta("stage2_selection"),
                 "stage2_selection_with_warmup": _meta("stage2_selection_with_warmup"),
+                "stage2_training_selection": _meta("stage2_training_selection"),
+                "stage2_training_selection_with_warmup": _meta("stage2_training_selection_with_warmup"),
+                "clean_holdout": _meta("clean_holdout"),
+                "clean_holdout_with_warmup": _meta("clean_holdout_with_warmup"),
             },
         }
 
@@ -3441,14 +3447,32 @@ class OptimizationPipeline:
             active_meta = windows.get("active_universe", {})
             stage2_meta = windows.get("stage2_selection", {})
             stage2_warm_meta = windows.get("stage2_selection_with_warmup", {})
+            stage2_train_meta = windows.get("stage2_training_selection", stage2_meta)
+            stage2_train_warm_meta = windows.get("stage2_training_selection_with_warmup", stage2_warm_meta)
+            holdout_meta = windows.get("clean_holdout", {})
+            holdout_warm_meta = windows.get("clean_holdout_with_warmup", {})
 
             hist_start = pd.Timestamp(hist_meta["start_ts"]) if hist_meta.get("start_ts") else None
             hist_end = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
             active_start = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
+            holdout_start = pd.Timestamp(holdout_meta["start_ts"]) if holdout_meta.get("start_ts") else None
             stage2_start = pd.Timestamp(stage2_meta["start_ts"]) if stage2_meta.get("start_ts") else active_start
             stage2_warm_start = (
                 pd.Timestamp(stage2_warm_meta["start_ts"])
                 if stage2_warm_meta.get("start_ts") else stage2_start
+            )
+            stage2_train_end = holdout_start if holdout_start is not None else None
+            stage2_train_start = (
+                pd.Timestamp(stage2_train_meta["start_ts"])
+                if stage2_train_meta.get("start_ts") else stage2_start
+            )
+            stage2_train_warm_start = (
+                pd.Timestamp(stage2_train_warm_meta["start_ts"])
+                if stage2_train_warm_meta.get("start_ts") else stage2_warm_start
+            )
+            holdout_warm_start = (
+                pd.Timestamp(holdout_warm_meta["start_ts"])
+                if holdout_warm_meta.get("start_ts") else holdout_start
             )
 
             for tf, data in data_by_tf.items():
@@ -3456,18 +3480,23 @@ class OptimizationPipeline:
                     data, symbol=symbol, timeframe=tf,
                     regime_params_file=regime_params_file
                 )
-                active_features = self._slice_time_window(full_features, active_start, None)
-                stage2_features = self._slice_time_window(full_features, stage2_warm_start, None)
+                active_features = self._slice_time_window(full_features, active_start, holdout_start)
+                stage2_features = self._slice_time_window(full_features, stage2_train_warm_start, stage2_train_end)
                 historical_features = self._slice_time_window(full_features, hist_start, hist_end)
+                holdout_features = self._slice_time_window(full_features, holdout_warm_start, None) if holdout_start is not None else pd.DataFrame()
                 if len(active_features) >= 200:
                     train_features_by_tf[tf] = active_features
                 if len(stage2_features) >= 50:
                     val_features_by_tf[tf] = stage2_features
                     stage3_features_by_tf[tf] = stage2_features.copy()
-                    val_warmup_by_tf[tf] = int((stage2_features.index < stage2_start).sum()) if stage2_start is not None else 0
+                    scored_stage2_start = stage2_train_start if holdout_start is not None else stage2_start
+                    val_warmup_by_tf[tf] = int((stage2_features.index < scored_stage2_start).sum()) if scored_stage2_start is not None else 0
                     stage3_warmup_by_tf[tf] = val_warmup_by_tf[tf]
                 if len(historical_features) >= 50:
                     historical_features_by_tf[tf] = historical_features
+                if holdout_start is not None and len(holdout_features) >= 50:
+                    holdout_features_by_tf[tf] = holdout_features
+                    holdout_warmup_by_tf[tf] = int((holdout_features.index < holdout_start).sum())
             
             # Run regime-aware optimization
             with Timer(f"[{symbol}] Regime Optimization"):

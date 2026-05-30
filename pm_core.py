@@ -158,7 +158,7 @@ def _backtest_loop_numba(
     # Config values
     initial_capital: float,
     position_size_pct: float,
-    half_spread: float,
+    half_spread_arr: np.ndarray,
     slippage_price: float,
     use_spread: bool,
     use_slippage: bool,
@@ -246,6 +246,7 @@ def _backtest_loop_numba(
         low_price = low_arr[i]
         close_price = close_arr[i]
 
+        half_spread = half_spread_arr[i] if i < len(half_spread_arr) else 0.0
         if use_spread:
             bid_open = open_price - half_spread
             ask_open = open_price + half_spread
@@ -419,6 +420,7 @@ def _backtest_loop_numba(
                 max_drawdown = dd
 
     if in_position:
+        half_spread = half_spread_arr[n_bars - 1] if n_bars - 1 < len(half_spread_arr) else 0.0
         if use_spread:
             exit_price = close_arr[n_bars - 1] - half_spread if position_direction == 1 else close_arr[n_bars - 1] + half_spread
         else:
@@ -502,6 +504,7 @@ class PipelineConfig:
     historical_stress_audit_bars: int = 50000
     active_universe_bars: int = 250000
     active_stage2_pct: float = 50.0
+    clean_holdout_pct: float = 0.0  # Percent of stage2 reserved as newest unseen holdout; 0 preserves legacy flow
     overlap_pct: float = 10.0  # Warmup window as a fraction of the active universe size
 
     # Backtest settings
@@ -512,8 +515,9 @@ class PipelineConfig:
     discovery_risk_per_trade_pct: float = 1.0
 
     # Cost modeling
-    # - Spread: fixed/average per-symbol from config.json (use_spread=True).
-    #   Broker-provided spread_avg in pips. Applied to every entry.
+    # - Spread: fixed/average per-symbol from config.json by default. Evidence
+    #   modes can use historical bar-level Spread columns once broker point/pip
+    #   units are trusted.
     # - Commission: per-lot fee (use_commission=True). Set to False for
     #   spread-only accounts where commission is embedded in the spread.
     # - Slippage: applied only to SL exits (market orders). TP exits are
@@ -525,6 +529,7 @@ class PipelineConfig:
     use_commission: bool = True
     use_slippage: bool = True
     slippage_pips: float = 0.5
+    backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max
     swap_model_enabled: bool = True
     swap_model_triple_rollover_day: str = "wednesday"
     swap_model_min_holding_hours: float = 20.0
@@ -1067,6 +1072,11 @@ class PipelineConfig:
             mult = 0.5
         self.promote_small_risk_multiplier = max(0.0, min(1.0, mult))
         self.swap_model_enabled = bool(self.swap_model_enabled)
+        _spread_mode = str(getattr(self, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
+        if _spread_mode not in {"fixed_spec", "historical_bar", "historical_max", "conservative_max"}:
+            logger.warning("Invalid backtest_spread_mode=%r; falling back to fixed_spec.", _spread_mode)
+            _spread_mode = "fixed_spec"
+        self.backtest_spread_mode = _spread_mode
         _rollover_day = str(getattr(self, "swap_model_triple_rollover_day", "wednesday") or "").strip().lower()
         if _rollover_day not in _WEEKDAY_NAME_TO_INDEX:
             logger.warning(
@@ -1122,6 +1132,10 @@ class PipelineConfig:
             self.active_stage2_pct = max(1.0, min(100.0, float(self.active_stage2_pct)))
         except Exception:
             self.active_stage2_pct = 50.0
+        try:
+            self.clean_holdout_pct = max(0.0, min(50.0, float(self.clean_holdout_pct)))
+        except Exception:
+            self.clean_holdout_pct = 0.0
         try:
             self.historical_audit_min_trades = max(0, int(self.historical_audit_min_trades))
         except Exception:
@@ -1539,6 +1553,27 @@ class StorageConfig:
         self.storage_metaquotes_active_root_allowlist = list(self.metaquotes_active_root_allowlist)
 
 
+def _infer_default_digits(symbol: str, pip_position: int) -> int:
+    """Infer offline digits when no broker snapshot is available."""
+    try:
+        pip_pos = max(0, int(pip_position))
+    except Exception:
+        pip_pos = 4
+    sym = (symbol or "").split(".")[0].split("#")[0].upper()
+    non_fx_prefixes = (
+        "XAU", "XAG", "XTI", "XBR", "XNG",
+        "BTC", "ETH", "LTC", "SOL", "BCH", "DOG", "TRX", "XRP", "TON",
+    )
+    if sym.startswith(non_fx_prefixes):
+        return pip_pos
+    if len(sym) == 6 and sym.isalpha():
+        if sym.endswith("JPY") and pip_pos == 2:
+            return 3
+        if pip_pos == 4:
+            return 5
+    return pip_pos
+
+
 @dataclass
 class InstrumentSpec:
     """
@@ -1580,13 +1615,15 @@ class InstrumentSpec:
     volume_step: float = 0.01  # volume_step from MT5
     stops_level: int = 0  # trade_stops_level from MT5 (in points)
     point: float = 0.0  # point from MT5 (minimum price change)
-    digits: int = 5  # digits from MT5
+    digits: int = 0  # digits from MT5; 0 means infer for offline defaults
     
     def __post_init__(self):
         """Initialize derived values if not set."""
-        # Derive point from pip_position if not explicitly set
+        if not self.digits or self.digits <= 0:
+            self.digits = _infer_default_digits(self.symbol, self.pip_position)
+        # Derive point from digits if not explicitly set.
         if self.point == 0.0:
-            self.point = 10 ** (-self.digits) if self.digits > 0 else 10 ** (-self.pip_position)
+            self.point = 10 ** (-self.digits) if self.digits >= 0 else 10 ** (-self.pip_position)
         # Derive tick_size from point if not set
         if self.tick_size == 0.0:
             self.tick_size = self.point
@@ -2598,18 +2635,25 @@ class DataLoader:
         resample_rule = self.RESAMPLE_MAP[target_timeframe]
         
         # Resample OHLCV
-        resampled = df.resample(resample_rule).agg({
+        agg_map = {
             'Open': 'first',
             'High': 'max',
             'Low': 'min',
             'Close': 'last',
             'Volume': 'sum'
-        }).dropna()
+        }
+        if 'RealVolume' in df.columns:
+            agg_map['RealVolume'] = 'sum'
+        resampled = df.resample(resample_rule).agg(agg_map).dropna()
         
         # Handle Spread if present
         if 'Spread' in df.columns:
-            spread_resampled = df['Spread'].resample(resample_rule).mean()
-            resampled['Spread'] = spread_resampled
+            spread_numeric = pd.to_numeric(df['Spread'], errors='coerce')
+            grouped_spread = spread_numeric.resample(resample_rule)
+            resampled['Spread'] = grouped_spread.mean()
+            resampled['SpreadOpen'] = grouped_spread.first()
+            resampled['SpreadMax'] = grouped_spread.max()
+            resampled['SpreadP90'] = grouped_spread.quantile(0.90)
         
         return resampled
 
@@ -3787,6 +3831,10 @@ class DataSplitter:
                 "active_universe": (0, 0),
                 "stage2_selection": (0, 0),
                 "stage2_selection_with_warmup": (0, 0),
+                "stage2_training_selection": (0, 0),
+                "stage2_training_selection_with_warmup": (0, 0),
+                "clean_holdout": (0, 0),
+                "clean_holdout_with_warmup": (0, 0),
             }
 
         max_bars = max(1, int(getattr(self.config, "max_bars", 300000)))
@@ -3814,6 +3862,18 @@ class DataSplitter:
 
         warmup_bars = int(active_size * (float(getattr(self.config, "overlap_pct", 0.0)) / 100.0))
         stage2_warmup_start = max(active_start, stage2_start - max(0, warmup_bars))
+        clean_holdout_pct = max(0.0, min(50.0, float(getattr(self.config, "clean_holdout_pct", 0.0) or 0.0)))
+        clean_holdout_size = 0
+        if clean_holdout_pct > 0.0 and stage2_size > 1:
+            clean_holdout_size = int(math.ceil(stage2_size * (clean_holdout_pct / 100.0)))
+            clean_holdout_size = min(max(1, clean_holdout_size), max(0, stage2_size - 1))
+
+        clean_holdout_start = stage2_end - clean_holdout_size
+        stage2_train_end = clean_holdout_start if clean_holdout_size > 0 else stage2_end
+        clean_holdout_warmup_start = (
+            max(active_start, clean_holdout_start - max(0, warmup_bars))
+            if clean_holdout_size > 0 else stage2_end
+        )
 
         return {
             "workflow_window": (workflow_start, workflow_end),
@@ -3821,6 +3881,14 @@ class DataSplitter:
             "active_universe": (active_start, active_end),
             "stage2_selection": (stage2_start, stage2_end),
             "stage2_selection_with_warmup": (stage2_warmup_start, stage2_end),
+            "stage2_training_selection": (stage2_start, stage2_train_end),
+            "stage2_training_selection_with_warmup": (stage2_warmup_start, stage2_train_end),
+            "clean_holdout": (
+                (clean_holdout_start, stage2_end) if clean_holdout_size > 0 else (stage2_end, stage2_end)
+            ),
+            "clean_holdout_with_warmup": (
+                (clean_holdout_warmup_start, stage2_end) if clean_holdout_size > 0 else (stage2_end, stage2_end)
+            ),
         }
 
 
@@ -3870,7 +3938,85 @@ class Backtester:
             return risk if math.isfinite(risk) and risk > 0 else 1.0
         except Exception:
             return 1.0
-    
+
+    @staticmethod
+    def _spread_points_to_half_price(raw: Any, spec: InstrumentSpec) -> Optional[np.ndarray]:
+        """Convert MT5 spread points to half-spread price units for each bar."""
+        try:
+            point = float(getattr(spec, "point", 0.0) or 0.0)
+        except Exception:
+            point = 0.0
+        if point <= 0.0:
+            return None
+        values = pd.to_numeric(raw, errors="coerce").to_numpy(dtype=np.float64)
+        values = np.where(np.isfinite(values) & (values >= 0.0), values, np.nan)
+        return values * point * 0.5
+
+    def _build_half_spread_arrays(
+        self,
+        features: pd.DataFrame,
+        spec: InstrumentSpec,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Build entry and intrabar half-spread arrays.
+
+        Default `fixed_spec` preserves the historical behavior. Evidence modes use
+        MT5 bar Spread columns, which are stored in points and converted via the
+        instrument spec's broker point.
+        """
+        n_bars = len(features)
+        fixed_half = spec.get_half_spread_price() if bool(getattr(self.config, "use_spread", True)) else 0.0
+        fixed_arr = np.full(n_bars, float(fixed_half), dtype=np.float64)
+        mode = str(getattr(self.config, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
+        meta: Dict[str, Any] = {
+            "mode": mode,
+            "source": "fixed_spec",
+            "units": "price",
+            "fallback_to_fixed": False,
+        }
+        if not bool(getattr(self.config, "use_spread", True)) or mode == "fixed_spec" or n_bars <= 0:
+            return fixed_arr, fixed_arr, meta
+
+        entry_col = "SpreadOpen" if "SpreadOpen" in features.columns else "Spread"
+        if mode in {"historical_max", "conservative_max"} and "SpreadMax" in features.columns:
+            bar_col = "SpreadMax"
+        else:
+            bar_col = "Spread"
+
+        if entry_col not in features.columns or bar_col not in features.columns:
+            meta["fallback_to_fixed"] = True
+            meta["missing_columns"] = [col for col in {entry_col, bar_col} if col not in features.columns]
+            return fixed_arr, fixed_arr, meta
+
+        entry_hist = self._spread_points_to_half_price(features[entry_col], spec)
+        bar_hist = self._spread_points_to_half_price(features[bar_col], spec)
+        if entry_hist is None or bar_hist is None:
+            meta["fallback_to_fixed"] = True
+            meta["reason"] = "invalid_spec_point"
+            return fixed_arr, fixed_arr, meta
+
+        entry_hist = np.where(np.isfinite(entry_hist), entry_hist, fixed_arr)
+        bar_hist = np.where(np.isfinite(bar_hist), bar_hist, fixed_arr)
+        if mode == "conservative_max":
+            entry_arr = np.maximum(fixed_arr, entry_hist)
+            bar_arr = np.maximum(fixed_arr, bar_hist)
+        else:
+            entry_arr = entry_hist
+            bar_arr = bar_hist
+
+        meta.update({
+            "source": "historical_spread_points",
+            "entry_column": entry_col,
+            "bar_column": bar_col,
+        })
+        try:
+            if spec.pip_size > 0:
+                meta["mean_effective_spread_pips"] = float(np.nanmean(bar_arr * 2.0 / spec.pip_size))
+                meta["max_effective_spread_pips"] = float(np.nanmax(bar_arr * 2.0 / spec.pip_size))
+        except Exception:
+            pass
+        return entry_arr.astype(np.float64), bar_arr.astype(np.float64), meta
+     
     def run(self,
             features: pd.DataFrame,
             signals: pd.Series,
@@ -3938,8 +4084,10 @@ class Backtester:
         close_arr = features['Close'].to_numpy().astype(np.float64)
         sig_arr = signal_numeric.to_numpy().astype(np.int32)
         
-        # Cache spread-related constants
-        half_spread = spec.get_half_spread_price() if self.config.use_spread else 0.0
+        # Cache spread-related arrays. The default mode is a fixed per-symbol
+        # spread to preserve benchmark behavior; evidence modes can consume
+        # historical bar-level spread columns.
+        entry_half_spread_arr, half_spread_arr, spread_meta = self._build_half_spread_arrays(features, spec)
         slippage_price = spec.pips_to_price(self.config.slippage_pips) if self.config.use_slippage else 0.0
         
         n_bars = len(features)
@@ -4021,8 +4169,9 @@ class Backtester:
                 
                 # Entry price: Open of ENTRY bar (i) + spread
                 open_price = open_arr[i]
+                entry_half_spread = entry_half_spread_arr[i] if i < len(entry_half_spread_arr) else 0.0
                 if self.config.use_spread:
-                    entry_price = open_price + half_spread if is_long else open_price - half_spread
+                    entry_price = open_price + entry_half_spread if is_long else open_price - entry_half_spread
                 else:
                     entry_price = open_price
                 
@@ -4056,7 +4205,7 @@ class Backtester:
                 sl_prices, tp_prices, entry_prices,
                 self.config.initial_capital,
                 discovery_risk_per_trade_pct,
-                half_spread, slippage_price,
+                half_spread_arr, slippage_price,
                 self.config.use_spread, self.config.use_slippage,
                 self.config.use_commission, spec.commission_per_lot,
                 spec.tick_size, spec.tick_value, spec.pip_size, spec.pip_value,
@@ -4102,7 +4251,7 @@ class Backtester:
             trades, final_equity, max_drawdown, equity_curve = self._run_python_loop(
                 features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
-                half_spread, slippage_price, spec, warmup_bars,
+                half_spread_arr, slippage_price, spec, warmup_bars,
                 atr_arr=atr_arr,
                 governance_policy=normalized_governance,
                 discovery_risk_per_trade_pct=discovery_risk_per_trade_pct,
@@ -4118,7 +4267,9 @@ class Backtester:
             timeframe=timeframe,
         )
 
-        return self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
+        metrics = self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
+        metrics["spread_model"] = spread_meta
+        return metrics
 
     @staticmethod
     def _max_drawdown_from_equity_curve(equity_curve: List[float]) -> float:
@@ -4289,7 +4440,7 @@ class Backtester:
     
     def _run_python_loop(self, features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                          sl_prices, tp_prices, entry_prices,
-                         half_spread, slippage_price, spec,
+                         half_spread_arr, slippage_price, spec,
                          warmup_bars: int = 0,
                          atr_arr: Optional[np.ndarray] = None,
                          governance_policy: Optional[Dict[str, Any]] = None,
@@ -4335,6 +4486,7 @@ class Backtester:
             high_price = high_arr[i]
             low_price = low_arr[i]
             close_price = close_arr[i]
+            half_spread = half_spread_arr[i] if i < len(half_spread_arr) else 0.0
 
             if self.config.use_spread:
                 bid_open = open_price - half_spread
@@ -4681,6 +4833,7 @@ class Backtester:
         # CLOSE ANY REMAINING POSITION AT END
         if in_position:
             is_long = position_direction == 1
+            half_spread = half_spread_arr[-1] if len(half_spread_arr) else 0.0
             if self.config.use_spread:
                 exit_price = close_arr[-1] - half_spread if is_long else close_arr[-1] + half_spread
             else:

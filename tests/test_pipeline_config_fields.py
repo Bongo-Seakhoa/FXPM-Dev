@@ -77,6 +77,7 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(cfg.historical_stress_audit_bars, 50000)
         self.assertEqual(cfg.active_universe_bars, 250000)
         self.assertAlmostEqual(cfg.active_stage2_pct, 50.0, places=6)
+        self.assertAlmostEqual(cfg.clean_holdout_pct, 0.0, places=6)
 
     def test_risk_management_optimization_is_enabled_by_default(self):
         cfg = PipelineConfig()
@@ -96,6 +97,14 @@ class PipelineConfigFieldTests(unittest.TestCase):
         cfg = PipelineConfig(live_bar_poll_seconds=-1.0)
         self.assertAlmostEqual(cfg.live_bar_poll_seconds, 0.05, places=6)
         self.assertAlmostEqual(cfg.live_tick_poll_seconds, 0.05, places=6)
+
+    def test_backtest_spread_mode_defaults_to_fixed_spec(self):
+        cfg = PipelineConfig()
+        self.assertEqual(cfg.backtest_spread_mode, "fixed_spec")
+
+    def test_backtest_spread_mode_invalid_falls_back_to_fixed_spec(self):
+        cfg = PipelineConfig(backtest_spread_mode="wishful")
+        self.assertEqual(cfg.backtest_spread_mode, "fixed_spec")
 
 
 if __name__ == "__main__":
