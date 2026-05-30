@@ -5940,21 +5940,21 @@ def _index_hour(features: pd.DataFrame) -> pd.Series:
     idx = features.index
     if isinstance(idx, pd.DatetimeIndex):
         return pd.Series(idx.hour, index=idx)
-    return pd.Series(np.zeros(len(idx)), index=idx)
+    return pd.Series(np.nan, index=idx, dtype=float)
 
 
 def _index_dow(features: pd.DataFrame) -> pd.Series:
     idx = features.index
     if isinstance(idx, pd.DatetimeIndex):
         return pd.Series(idx.dayofweek, index=idx)
-    return pd.Series(np.zeros(len(idx)), index=idx)
+    return pd.Series(np.nan, index=idx, dtype=float)
 
 
 def _index_dom(features: pd.DataFrame) -> pd.Series:
     idx = features.index
     if isinstance(idx, pd.DatetimeIndex):
         return pd.Series(idx.day, index=idx)
-    return pd.Series(np.zeros(len(idx)), index=idx)
+    return pd.Series(np.nan, index=idx, dtype=float)
 
 
 def _carry_direction(symbol: str, min_diff: float) -> int:

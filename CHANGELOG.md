@@ -21,6 +21,8 @@ Notes:
   preventing previous-session range leakage into the first bar of the next session
 - limited `OvernightDriftStrategy` to one entry decision per configured entry hour on sub-hour
   timeframes and measured the drift from the session's first `Open` when available
+- hardened Package K time/calendar helpers so non-datetime input fails flat instead of treating
+  every bar as hour/day zero
 - removed structural-stop opt-in from the two Package K mean-reversion strategies to preserve the
   existing ATR-only mean-reversion stop contract
 - updated the honest discovery metadata and strategy exports to the 84-strategy roster
