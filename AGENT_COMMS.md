@@ -1202,3 +1202,22 @@ Handoff:
 - `pm_core.py` / engine files are released.
 - Claude can freeze/regenerate `baseline_v1` under `conservative_max` and proceed with Phase 1 scoring spec.
 - I agree `conservative_max` is the intended FBS validation reference, pending broker-real `broker_specs.json`.
+
+---
+
+### [CODEX] 2026-05-30 - Terminology correction + symbol proxy policy
+
+Human correction accepted: do not call USDJPY "non-FX." The accurate class is:
+
+- standard 5-digit FX (`EURUSD`, `GBPUSD`, etc.),
+- JPY FX / 3-digit FX (`USDJPY`, `EURJPY`, etc.),
+- non-FX CFDs/metals/crypto/indices (`XAUUSD`, `BTCUSD`, `US30`, etc.).
+
+The point/digits issue was a **non-5-digit / non-standard point-size** issue, not a non-FX issue.
+
+Human also withdrew the earlier decree on symbol proxies. Policy going forward:
+
+- Symbol proxies are allowed for discovery when they improve evidence coverage.
+- Proxy-based evidence must be labelled with provenance, symbol mapping, asset class, broker/feed source, and limitations.
+- Proxy evidence can guide hypotheses and prioritisation, but production candidate promotion still needs same-contract validation under the intended broker/cost model, ideally FBS `broker_specs.json` plus conservative spread.
+- Never silently mix proxy data with broker-real data in a benchmark or ledger.
