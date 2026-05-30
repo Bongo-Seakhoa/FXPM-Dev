@@ -119,6 +119,8 @@ Notes:
 
 - hardened the Tenet-5 benchmark gate so profit-factor deltas near zero use a stable denominator and
   absolute PF movement, preventing tiny 0.00-to-0.01 changes from being treated as infinite evidence
+- benchmark records now include per-asset-class summaries so mixed FX/non-FX runs expose class-level
+  collapses instead of relying only on one pooled mean
 
 ### Audit artifact lifecycle
 
