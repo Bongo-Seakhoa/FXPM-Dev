@@ -84,6 +84,13 @@ def load_config_json(path: str) -> Dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"Failed to load config file '{path}': {e}")
 
+
+def _is_research_discovery_only_config(config_data: Dict[str, Any]) -> bool:
+    """Return True when a config is explicitly marked as non-trading research."""
+    meta = (config_data or {}).get("_meta") or {}
+    scope = str(meta.get("scope", "") or "").strip().lower()
+    return scope == "research_discovery_only_not_live_trading"
+
 def log_resolved_config_summary(logger: logging.Logger,
                                config_path: str,
                                config_data: Dict[str, Any],
@@ -6029,6 +6036,12 @@ def main():
     # Load runtime configuration before logger setup so config paths remain authoritative.
     config_data = load_config_json(args.config)
     os.environ["PM_CONFIG_PATH"] = args.config
+    if args.trade and _is_research_discovery_only_config(config_data):
+        print(
+            f"Refusing --trade with research-only discovery config: {args.config}. "
+            "Use this config with --optimize only."
+        )
+        return 2
 
     # Prefer symbols from config.json unless CLI overrides
     symbols = args.symbols or config_data.get("symbols") or DEFAULT_SYMBOLS
