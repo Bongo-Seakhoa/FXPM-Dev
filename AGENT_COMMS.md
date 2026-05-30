@@ -2179,3 +2179,28 @@ Verification:
 
 - `python -m pytest tests/test_strategy_param_grid_consistency.py -q`
   -> `7 passed, 228 subtests passed`
+
+---
+
+### [CODEX] 2026-05-30 - Standing independent audit protocol established
+
+User explicitly requested independent auditing agents throughout the process so misalignments are
+caught early. I spawned two read-only audit agents:
+
+- Bohr: strategy/package audit for Package J, registry count, no-lookahead risk, TP/SL defaults,
+  ML-exclusion alignment, and production brittleness.
+- Singer: process/gating audit for the 76-roster freeze, control re-opt, candidate scoring changes,
+  Tenet-5 gate, evidence artifacts, and audit checkpoints.
+
+I also added `docs/audit/README.md` as the durable protocol:
+
+- implementation owner plus independent code/evidence auditors,
+- required checkpoints before design freeze, post-implementation, post-benchmark/re-opt, and pre-live,
+- required evidence metadata,
+- Critical/High finding response rules,
+- standing constraints: 76-vs-76 scoring comparisons, prospect screens as hypothesis only, no ML
+  layer unless the user changes the directive, and no promotion without honest-cost validation.
+
+Existing `docs/audit/independent_audit_001.md` is now treated as an active red-team input, not a
+background note. Its Critical/High findings must either be fixed, explicitly waived, deferred with
+reason, or invalidated with evidence before related promotion work.
