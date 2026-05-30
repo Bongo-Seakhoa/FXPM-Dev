@@ -1781,3 +1781,57 @@ Verification:
 - `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py tests/test_optimizer_hardening.py tests/test_adx_trend_threshold.py tests/test_strategy_regressions.py -q`
   -> `155 passed, 98 subtests passed`
 - `python -m py_compile pm_pipeline.py pm_live_readiness.py` -> passed
+
+---
+
+### [CODEX] 2026-05-30 - Phase-0 final FX diagnostic frozen at current HEAD
+
+Ran a fresh pure-FX diagnostic benchmark against current HEAD after the asset-class and
+cost-contract commits:
+
+- Engine commit: `30c60f9`
+- Command:
+  `python tools/benchmark.py --all --fx-only --spread-mode conservative_max --label phase0_final_fx_diagnostic_30c60f9 --out pm_outputs/benchmarks`
+- Artifact:
+  `pm_outputs/benchmarks/phase0_final_fx_diagnostic_30c60f9.json`
+
+This is a stale-ledger diagnostic, not a promotion baseline. It measures the current old
+`pm_configs_high_risk.json` winners under the final Phase-0 conservative FBS cost model.
+
+Summary:
+
+- `n=36` pure-fiat FX symbols
+- Mean return: `-18.96%`
+- Median return: `-7.09%`
+- Mean PF: `0.806`
+- Median PF: `0.795`
+- Mean max DD: `25.83%`
+- Mean Ulcer Index: `17.587`
+- Mean time underwater: `95.02%`
+- Total trades: `7317`
+- Profitable + PF >= 1 symbols: `12/36`
+- Negative-return symbols: `24/36`
+
+Worst stale winners under honest spread/cost:
+
+- `USDZAR`: return `-132.25%`, PF `0.11`, max DD `132.03%`, time underwater `99.67%`
+- `EURZAR`: return `-85.10%`, PF `0.11`, max DD `85.23%`, time underwater `99.63%`
+- `EURJPY`: return `-76.41%`, PF `0.66`, max DD `76.96%`, time underwater `99.04%`
+- `GBPZAR`: return `-71.13%`, PF `0.09`, max DD `71.25%`, time underwater `99.39%`
+- `USDMXN`: return `-69.63%`, PF `0.13`, max DD `70.10%`, time underwater `99.74%`
+
+Best survivors worth preserving as controls during re-optimization:
+
+- `USDJPY`: return `22.07%`, PF `1.19`, max DD `17.49%`
+- `EURAUD`: return `10.43%`, PF `1.43`, max DD `2.85%`
+- `EURNZD`: return `9.46%`, PF `1.24`, max DD `10.38%`
+- `NZDJPY`: return `8.65%`, PF `1.24`, max DD `11.30%`
+- `GBPUSD`: return `6.57%`, PF `1.36`, max DD `3.08%`
+
+Interpretation:
+
+- The spread thesis is now proven at the final Phase-0 contract: the old ledger is not live/test
+  eligible under realistic FBS costs.
+- The new `winner_ledger_artifact_drift` readiness blocker is correct and should remain hard.
+- Claude can start Phase-1 scoring/re-opt analysis from this current commit, but acceptance must
+  compare against freshly regenerated candidates using the same cost-contract fingerprint.
