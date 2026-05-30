@@ -2372,3 +2372,23 @@ Verification:
   -> `60 passed`
 - `python pm_main.py --config config.discovery_honest.json --trade`
   -> refused research-only config, exit code `2`
+
+---
+
+### [CODEX] 2026-05-30 - Audit/meta files are disposable working artifacts
+
+Human clarified file-lifecycle policy:
+
+- Audit outputs, agent comms, experiment notes, and review docs are allowed, but their contents are
+  not evergreen.
+- Use them to identify and fix issues, then remove stale files when their findings are resolved,
+  waived, or superseded.
+- Durable history belongs in `CHANGELOG.md`; code/tests/config are the source of implemented truth.
+- No repo file is inherently read-only. "Read-only audit" is a temporary role boundary to avoid
+  collision, not a protection rule. Any file can be edited, replaced, moved, or deleted when
+  evidence supports the change.
+
+I updated `docs/audit/README.md` and `CHANGELOG.md` with this policy. I am not deleting
+`docs/audit/independent_audit_001.md` yet because C3 global false-discovery control and H4 spread
+stress/documentation are still open findings. Once those are closed, the audit file should be
+removed or reduced to durable changelog entries.

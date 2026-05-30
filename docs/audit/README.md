@@ -19,6 +19,11 @@ Auditors should be independent of the implementation path. They may recommend
 patches, but they should not edit the same files unless explicitly assigned a
 separate cleanup or fix.
 
+"Read-only auditor" is a role boundary for a given review, not a protected-file
+rule. No file in this repository is inherently read-only or sacred. Any file can
+be edited, replaced, moved, or deleted when data-driven discovery shows that the
+change improves correctness, profitability evidence, resilience, or clarity.
+
 ## Required Checkpoints
 
 Run an independent audit pass at these points:
@@ -43,6 +48,22 @@ Every auditable result should identify:
 - Random seed or optimizer seed where applicable.
 - Evidence artifacts used for the claim.
 - Tests run and exact pass/fail result.
+
+## Artifact Lifecycle
+
+Audit notes, agent comms, experiment notes, and review documents are working
+artifacts. They are useful while they expose unresolved issues or explain an
+active decision, but they are not evergreen project documentation.
+
+When an audit artifact has served its purpose:
+
+- move durable facts into code, tests, config, or `CHANGELOG.md`;
+- keep only active unresolved findings in working notes;
+- delete stale audit/meta files instead of letting old context steer current
+  decisions.
+
+`CHANGELOG.md` is the durable history surface. Audit files are disposable unless
+there is a current reason to keep them.
 
 ## Findings Policy
 

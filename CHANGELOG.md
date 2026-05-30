@@ -12,6 +12,15 @@ Notes:
 
 ## [1.4.10] - Unreleased
 
+### Audit artifact lifecycle
+
+- clarified that audit outputs, agent communication files, experiment notes, and review documents
+  are working artifacts rather than evergreen documentation
+- durable conclusions should move into code, tests, config, or this changelog; stale audit/meta
+  files should be deleted once their findings are fixed, waived, or superseded
+- clarified that no repository file is inherently read-only; role-based read-only auditing is only
+  a coordination boundary, and any file may be changed when evidence supports it
+
 ### Profitability-readiness integration hardening
 
 - added regression coverage for the latest audit fixes:
