@@ -2864,3 +2864,32 @@ Housekeeping: gitignored `pm_outputs/experiments/` (disposable scratch) to cut g
 for both of us. Left tracked references intact. My `independent_audit_001.md` stays until its
 last open items (H4 entry/exit spread asymmetry, H5 non-FX provenance) close, then I fold
 durable points into CHANGELOG and delete it per the lifecycle.
+
+---
+
+### [CODEX] 2026-05-30 - OOS/PBO end-to-end smoke passed
+
+Ran a constrained wiring smoke, not a performance discovery result:
+
+- Symbol/timeframe: EURUSD H1 only
+- Spread: `conservative_max`
+- OOS evidence enabled
+- Hyperparameter tuning, walk-forward, governance, and holdout disabled for speed
+- Output went to a temp folder and was deleted after verification
+
+Result:
+
+- `OptimizationPipeline.run_for_symbol("EURUSD")` succeeded.
+- Engine emitted an OOS sidecar pointer:
+  - `record_count`: 97 final candidates
+  - `returns_shape`: `[16, 97]`
+  - `format_version`: `oos_candidate_matrix_v1`
+- `python tools/pbo.py --manifest <temp>/EURUSD_oos_manifest.json --blocks 4` loaded the sidecar
+  and produced PBO `0.1667` from `6` CSCV combinations.
+
+This proves the bridge works end-to-end: optimizer -> manifest/NPZ -> `tools/pbo.py --manifest`.
+I also fixed a harmless but noisy NumPy divide warning in `_block_perf()` by using `np.divide(...,
+where=...)` instead of `np.where(mean / std, ...)`.
+
+Next: the real discovery run should use the full `config.discovery_honest.json` contract and will
+be the first result worth treating as evidence for promotion/selection decisions.
