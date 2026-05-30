@@ -1517,3 +1517,36 @@ Verification:
 
 - `python -m pytest tests/test_profitability_readiness_blueprint.py -q` -> `27 passed`
 - `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py -q` -> `97 passed`
+
+---
+
+### [CODEX] 2026-05-30 - Phase-1 scoring experiment knob, no behavior change
+
+Implemented the smallest Phase-1 scorer infrastructure change without flipping production
+selection:
+
+- Added `PipelineConfig.regime_trade_stability_floor`, default `0.7`.
+- `_compute_regime_score()` now computes the raw trade-count stability multiplier as
+  `floor + (1-floor) * stability`, preserving the legacy `[0.7, 1.0]` band at default.
+- Setting `regime_trade_stability_floor=0.9` gives the proposed `[0.9, 1.0]` experiment band
+  while keeping the hard trade-count floors intact.
+
+This is not an accepted strategy-quality change yet; it is the controlled switch needed for the
+data-driven re-optimization test. Production behavior remains unchanged until a config/experiment
+enables the `0.9` floor and the resulting winners beat the FBS conservative baseline.
+
+Verification:
+
+- `python -m pytest tests/test_pipeline_config_fields.py tests/test_optimizer_hardening.py -q` -> `31 passed`
+- `python -m py_compile pm_core.py pm_pipeline.py` -> passed
+- `python -m pytest tests/test_instrument_specs.py tests/test_backtester.py tests/test_data_loader_contract.py tests/test_mt5_connector.py tests/test_storage_live_data.py tests/test_data_splitter.py tests/test_pipeline_config_fields.py tests/test_pipeline_artifacts.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py tests/test_optimizer_hardening.py -q` -> `105 passed`
+
+Next proof step:
+
+- Run a small-pool FX re-optimization twice with all else equal:
+  - control: `regime_trade_stability_floor=0.7`
+  - candidate: `regime_trade_stability_floor=0.9`
+- Benchmark both new winner ledgers under `backtest_spread_mode=conservative_max` with the FBS
+  broker specs.
+- Accept the `0.9` floor only if it improves net profit/PF and path-dependent DD, or if any
+  trade-frequency regression is dominated by materially better profit/DD as per Tenet 5.

@@ -2762,8 +2762,10 @@ class RegimeOptimizer:
 
         # Combined stability factor (weighted average favoring validation)
         stability_factor = 0.3 * train_stability + 0.7 * val_stability
-        # Clamp to reasonable range [0.7, 1.0] - don't over-penalize low counts
-        stability_factor = 0.7 + 0.3 * stability_factor
+        # Legacy floor is 0.7. Phase-1 can raise this to test less raw-count reward
+        # without changing the trade-count hard floors.
+        stability_floor = max(0.0, min(1.0, float(getattr(self.config, "regime_trade_stability_floor", 0.7))))
+        stability_factor = stability_floor + (1.0 - stability_floor) * stability_factor
 
         # Build pseudo-metrics dicts for the scorer (regime bucket metrics -> full metrics format)
         train_full = self._bucket_to_full_metrics(train_metrics)

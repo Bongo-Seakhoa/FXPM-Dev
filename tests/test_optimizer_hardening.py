@@ -131,6 +131,41 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertTrue(is_valid)
         self.assertEqual(best_config.strategy_name, "ZetaHigherSampleStrategy")
 
+    def test_regime_score_uses_configured_trade_stability_floor(self):
+        def make_optimizer(floor):
+            cfg = PipelineConfig(
+                regime_min_train_trades=15,
+                regime_min_val_trades=15,
+                regime_trade_stability_floor=floor,
+            )
+            return RegimeOptimizer(cfg)
+
+        train = {
+            "total_trades": 15,
+            "profit_factor": 1.7,
+            "win_rate": 55.0,
+            "sharpe_approx": 1.2,
+            "total_return_pct": 10.0,
+            "max_drawdown_pct": 5.0,
+            "avg_win": 100.0,
+            "avg_loss": -60.0,
+        }
+        val = {
+            "total_trades": 15,
+            "profit_factor": 1.6,
+            "win_rate": 54.0,
+            "sharpe_approx": 1.1,
+            "total_return_pct": 8.0,
+            "max_drawdown_pct": 5.0,
+            "avg_win": 90.0,
+            "avg_loss": -55.0,
+        }
+
+        legacy_floor_score = make_optimizer(0.7)._compute_regime_score(train, val)
+        experiment_floor_score = make_optimizer(0.9)._compute_regime_score(train, val)
+
+        self.assertGreater(experiment_floor_score, legacy_floor_score)
+
     def test_regime_bucket_uses_signal_bar_not_entry_bar(self):
         cfg = PipelineConfig(
             regime_enable_hyperparam_tuning=False,
