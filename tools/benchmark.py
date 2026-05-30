@@ -4,10 +4,19 @@ Reconstructs winners from a ledger, re-runs the production Backtester, and repor
 Tenet-2 performance hallmarks including path-dependent drawdown. Produces a reproducible
 baseline JSON used as the Tenet-5 improvement gate. Read-only against the engine.
 """
-import json, sys, math, argparse
+import json, sys, math, argparse, subprocess
 from pathlib import Path
 from dataclasses import fields
 import numpy as np
+
+
+def _git_head():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       cwd=str(Path(__file__).resolve().parent.parent),
+                                       text=True).strip()
+    except Exception:
+        return "unknown"
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -17,6 +26,13 @@ from pm_strategies import StrategyRegistry
 
 DEFAULT_POOL = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"]
 SPREAD_MODES = ("fixed_spec", "historical_max", "conservative_max")
+FIAT = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "NOK", "SEK",
+        "MXN", "ZAR", "SGD", "PLN", "TRY", "HKD", "CNH", "DKK", "CZK", "HUF"}
+
+
+def is_fx(symbol):
+    """Pure FX = two fiat currency legs. Excludes crypto (BTCETH), metals (XAU), indices."""
+    return len(symbol) == 6 and symbol[:3] in FIAT and symbol[3:] in FIAT
 
 
 def build_config(spread_mode="fixed_spec"):
@@ -183,6 +199,8 @@ def main():
     ap.add_argument("--compare", nargs=2, metavar=("BASELINE_JSON", "CANDIDATE_JSON"),
                     help="Compare two benchmark records and emit a Tenet-5 verdict, then exit.")
     ap.add_argument("--symbols", nargs="*", default=DEFAULT_POOL)
+    ap.add_argument("--all", action="store_true", help="Benchmark every symbol in the ledger.")
+    ap.add_argument("--fx-only", action="store_true", help="Restrict to pure FX (fiat/fiat) symbols.")
     ap.add_argument("--ledger", default=str(REPO / "pm_configs_high_risk.json"))
     ap.add_argument("--spread-mode", default="fixed_spec")
     ap.add_argument("--label", default="baseline_v0")
@@ -193,6 +211,10 @@ def main():
         base = json.load(open(args.compare[0]))
         cand = json.load(open(args.compare[1]))
         v = is_improvement(base, cand)
+        bc, cc = base.get("engine_commit", "?"), cand.get("engine_commit", "?")
+        if bc != cc:
+            print(f"WARNING: cross-engine comparison ({bc} vs {cc}) — verdict may be invalid; "
+                  f"regenerate both on the same commit.")
         print(f"\n=== TENET-5 GATE: {base.get('label')} -> {cand.get('label')} ===")
         print(f"VERDICT: {v['verdict']}")
         for k, dv in v["deltas_pct"].items():
@@ -206,9 +228,12 @@ def main():
     cfg = build_config(args.spread_mode)
     loader = DataLoader(cfg.data_dir)
     ledger = json.load(open(args.ledger))
+    symbols = sorted(ledger.keys()) if args.all else args.symbols
+    if args.fx_only:
+        symbols = [s for s in symbols if is_fx(s)]
 
     rows = []
-    for sym in args.symbols:
+    for sym in symbols:
         if sym not in ledger:
             rows.append({"symbol": sym, "error": "not_in_ledger"}); continue
         try:
@@ -233,7 +258,7 @@ def main():
 
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     record = {"label": args.label, "spread_mode": args.spread_mode,
-              "symbols": args.symbols, "ledger": args.ledger,
+              "engine_commit": _git_head(), "symbols": symbols, "ledger": args.ledger,
               "summary": summary, "rows": rows}
     out_path = out_dir / f"{args.label}.json"
     json.dump(record, open(out_path, "w"), indent=2, default=str)
