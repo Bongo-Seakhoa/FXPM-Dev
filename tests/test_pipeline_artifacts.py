@@ -72,6 +72,47 @@ class PipelineArtifactTests(unittest.TestCase):
         self.assertEqual(current["exit_surface_contract"], "neutral_discovery_sl_tp_v1")
         self.assertNotIn("regime_tp_multipliers", current)
 
+    def test_artifact_meta_includes_execution_cost_contract(self):
+        cfg = PipelineConfig(
+            backtest_spread_mode="conservative_max",
+            use_spread=True,
+            use_commission=True,
+            use_slippage=True,
+            slippage_pips=0.75,
+            swap_model_enabled=True,
+            swap_model_min_holding_hours=12.0,
+            swap_model_triple_rollover_day="Friday",
+        )
+        current = build_artifact_meta(cfg)
+
+        self.assertEqual(current["backtest_spread_mode"], "conservative_max")
+        self.assertTrue(current["use_spread"])
+        self.assertTrue(current["use_commission"])
+        self.assertTrue(current["use_slippage"])
+        self.assertAlmostEqual(current["slippage_pips"], 0.75)
+        self.assertTrue(current["swap_model_enabled"])
+        self.assertAlmostEqual(current["swap_model_min_holding_hours"], 12.0)
+        self.assertEqual(current["swap_model_triple_rollover_day"], "friday")
+
+        legacy_without_cost_contract = {
+            k: v for k, v in current.items()
+            if k not in {
+                "use_spread",
+                "backtest_spread_mode",
+                "use_commission",
+                "use_slippage",
+                "slippage_pips",
+                "swap_model_enabled",
+                "swap_model_min_holding_hours",
+                "swap_model_triple_rollover_day",
+            }
+        }
+        changed = dict(current)
+        changed["backtest_spread_mode"] = "fixed_spec"
+
+        self.assertFalse(artifact_contract_matches(legacy_without_cost_contract, current))
+        self.assertFalse(artifact_contract_matches(current, changed))
+
     def test_live_eligible_configs_exclude_expired_and_artifact_drift_when_blocking(self):
         tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_live_eligibility")
         shutil.rmtree(tmp, ignore_errors=True)
