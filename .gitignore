@@ -15,3 +15,6 @@ last_actionable_log.json
 last_trade_log.json
 pm_outputs/historical_data/
 pm_outputs/trades_*.json
+
+# Disposable analysis scratch (prospect screens, PBO runs, ad-hoc benchmarks)
+pm_outputs/experiments/
