@@ -384,6 +384,50 @@ class TestCandidateDescentSelection(unittest.TestCase):
         self.assertEqual(cfg_out.strategy_name, "S1")
         self.assertIn("failed validation", reason)
 
+    def test_false_discovery_rejection_happens_before_descent_validation(self):
+        cfg = PipelineConfig(
+            regime_enable_hyperparam_tuning=False,
+            regime_validation_top_k=5,
+            regime_min_train_trades=1,
+            regime_min_val_trades=1,
+            regime_min_val_profit_factor=0.0,
+            regime_min_val_return_pct=-100.0,
+            regime_min_val_return_dd_ratio=0.1,
+            fx_val_max_drawdown=50.0,
+            fx_min_robustness_ratio=0.0,
+            fx_val_sharpe_override=-99.0,
+            false_discovery_control_enabled=True,
+            false_discovery_symbol_count=40,
+            false_discovery_scope_power=1.0,
+            false_discovery_min_dsr=0.5,
+        )
+        opt = RegimeOptimizer(cfg)
+        opt._compute_regime_score = lambda train_m, val_m: float(val_m.get('_score', 0.0))
+        validated = []
+
+        def fake_validate(train_m, val_m, regime, candidate_name="Unknown"):
+            validated.append(candidate_name)
+            return True, "forced pass"
+
+        opt._validate_regime_winner = fake_validate
+
+        c1 = self._candidate("C3Failed", 100.0)
+        c1["search_trials"] = 100
+        c1["local_search_trials_total"] = 100
+        c1["train_regime_metrics"]["TREND"]["sharpe_approx"] = 2.0
+        c1["val_regime_metrics"]["TREND"]["sharpe_approx"] = 2.0
+        c2 = self._candidate("C3Passed", 10.0)
+        c2["search_trials"] = 100
+        c2["local_search_trials_total"] = 100
+        c2["train_regime_metrics"]["TREND"]["sharpe_approx"] = 6.0
+        c2["val_regime_metrics"]["TREND"]["sharpe_approx"] = 6.0
+
+        cfg_out, is_valid, _ = opt._select_best_for_regime("SYM", "H1", "TREND", [c1, c2])
+
+        self.assertTrue(is_valid)
+        self.assertEqual(cfg_out.strategy_name, "C3Passed")
+        self.assertEqual(validated, ["C3Passed"])
+
 
 class TestStabilityPenalty(unittest.TestCase):
     """findings.html §C4: multiplicative exp(-k * std_weekly_return) on val side

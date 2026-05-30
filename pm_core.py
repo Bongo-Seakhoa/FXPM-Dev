@@ -576,6 +576,18 @@ class PipelineConfig:
     scoring_use_trade_frequency_bonus: bool = True
     regime_trade_stability_floor: float = 0.7  # 0.7 legacy; 0.9 is Phase-1 experiment candidate
 
+    # Global false-discovery controls. These are opt-in for legacy compatibility;
+    # the discovery contract enables them before any broad roster re-optimization.
+    false_discovery_control_enabled: bool = False
+    false_discovery_min_dsr: float = 0.0
+    false_discovery_confidence_floor: float = 0.35
+    false_discovery_scope_power: float = 0.25
+    false_discovery_symbol_count: int = 0
+    false_discovery_holdout_policy: str = "promote_small"  # off|promote_small|block
+    false_discovery_holdout_min_trades: int = 5
+    false_discovery_holdout_min_profit_factor: float = 1.0
+    false_discovery_holdout_min_return_pct: float = 0.0
+
     # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
     # to be considered actionable in live trading. Signals below this are logged but
     # not executed. Default 0.95 is strict; lower values (e.g. 0.9) allow more trades.
@@ -1073,6 +1085,48 @@ class PipelineConfig:
         except Exception:
             stability_floor = 0.7
         self.regime_trade_stability_floor = max(0.0, min(1.0, stability_floor))
+        self.false_discovery_control_enabled = bool(
+            getattr(self, "false_discovery_control_enabled", False)
+        )
+        try:
+            min_dsr = float(getattr(self, "false_discovery_min_dsr", 0.0) or 0.0)
+        except Exception:
+            min_dsr = 0.0
+        self.false_discovery_min_dsr = max(0.0, min(1.0, min_dsr))
+        try:
+            confidence_floor = float(getattr(self, "false_discovery_confidence_floor", 0.35) or 0.0)
+        except Exception:
+            confidence_floor = 0.35
+        self.false_discovery_confidence_floor = max(0.0, min(1.0, confidence_floor))
+        try:
+            scope_power = float(getattr(self, "false_discovery_scope_power", 0.25) or 0.0)
+        except Exception:
+            scope_power = 0.25
+        self.false_discovery_scope_power = max(0.0, min(1.0, scope_power))
+        try:
+            symbol_count = int(getattr(self, "false_discovery_symbol_count", 0) or 0)
+        except Exception:
+            symbol_count = 0
+        self.false_discovery_symbol_count = max(0, symbol_count)
+        policy = str(getattr(self, "false_discovery_holdout_policy", "promote_small") or "promote_small").strip().lower()
+        if policy not in {"off", "promote_small", "block"}:
+            policy = "promote_small"
+        self.false_discovery_holdout_policy = policy
+        try:
+            holdout_min_trades = int(getattr(self, "false_discovery_holdout_min_trades", 5) or 0)
+        except Exception:
+            holdout_min_trades = 5
+        self.false_discovery_holdout_min_trades = max(0, holdout_min_trades)
+        try:
+            holdout_min_pf = float(getattr(self, "false_discovery_holdout_min_profit_factor", 1.0) or 0.0)
+        except Exception:
+            holdout_min_pf = 1.0
+        self.false_discovery_holdout_min_profit_factor = max(0.0, holdout_min_pf)
+        try:
+            holdout_min_return = float(getattr(self, "false_discovery_holdout_min_return_pct", 0.0) or 0.0)
+        except Exception:
+            holdout_min_return = 0.0
+        self.false_discovery_holdout_min_return_pct = holdout_min_return
         try:
             mult = float(getattr(self, "promote_small_risk_multiplier", 0.5) or 0.0)
         except Exception:

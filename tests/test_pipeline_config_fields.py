@@ -112,6 +112,25 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=-1.0).regime_trade_stability_floor, 0.0, places=6)
         self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=2.0).regime_trade_stability_floor, 1.0, places=6)
 
+    def test_false_discovery_controls_default_off_and_clamp(self):
+        cfg = PipelineConfig(
+            false_discovery_min_dsr=2.0,
+            false_discovery_confidence_floor=-1.0,
+            false_discovery_scope_power=3.0,
+            false_discovery_symbol_count=-5,
+            false_discovery_holdout_policy="mystery",
+            false_discovery_holdout_min_trades=-1,
+            false_discovery_holdout_min_profit_factor=-2.0,
+        )
+        self.assertFalse(cfg.false_discovery_control_enabled)
+        self.assertAlmostEqual(cfg.false_discovery_min_dsr, 1.0, places=6)
+        self.assertAlmostEqual(cfg.false_discovery_confidence_floor, 0.0, places=6)
+        self.assertAlmostEqual(cfg.false_discovery_scope_power, 1.0, places=6)
+        self.assertEqual(cfg.false_discovery_symbol_count, 0)
+        self.assertEqual(cfg.false_discovery_holdout_policy, "promote_small")
+        self.assertEqual(cfg.false_discovery_holdout_min_trades, 0)
+        self.assertAlmostEqual(cfg.false_discovery_holdout_min_profit_factor, 0.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

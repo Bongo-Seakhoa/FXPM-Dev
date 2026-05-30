@@ -60,6 +60,19 @@ Notes:
 - removed the stale strategy-surface audit document now that Packages J-M have superseded it; the
   durable record lives in this changelog and the implemented tests/code
 
+### Global false-discovery gate
+
+- added opt-in global false-discovery controls to `PipelineConfig` so broad roster re-optimization
+  can account for strategy x parameter x symbol x timeframe search breadth instead of only local
+  candidate counts
+- wired global DSR evidence into regime winner selection, including score confidence penalties,
+  optional minimum-DSR rejection, persisted validation evidence, and explicit `pbo_status:
+  not_available` until a real candidate-by-fold PBO implementation exists
+- enabled the discovery-honest contract to use global false-discovery scoring and to block winners
+  that fail the freshest holdout once the holdout has enough trades
+- added tests for artifact invalidation, config normalization, evidence persistence, promotion
+  blocking, and descent behavior that skips false-discovery-failed candidates before validation
+
 ### Audit artifact lifecycle
 
 - clarified that audit outputs, agent communication files, experiment notes, and review documents

@@ -4,7 +4,13 @@ import pandas as pd
 
 from pm_core import PipelineConfig
 from pm_optuna import OptunaConfig, OptunaTPEOptimizer, _stable_seed as optuna_stable_seed
-from pm_pipeline import RegimeConfig, RegimeOptimizer, SymbolConfig, _stable_seed as pipeline_stable_seed
+from pm_pipeline import (
+    RegimeConfig,
+    RegimeOptimizer,
+    SymbolConfig,
+    _stable_seed as pipeline_stable_seed,
+    classify_promotion_status,
+)
 
 
 class OptimizerHardeningTests(unittest.TestCase):
@@ -80,6 +86,198 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertTrue(is_valid)
         self.assertIsNotNone(best_config)
         self.assertEqual(best_config.strategy_name, "LowTrialStrategy")
+
+    def test_global_false_discovery_scales_trials_and_penalizes_score(self):
+        cfg = PipelineConfig(
+            regime_min_train_trades=1,
+            regime_min_val_trades=1,
+            regime_min_val_profit_factor=0.0,
+            regime_min_val_return_pct=-100.0,
+            regime_min_val_return_dd_ratio=0.1,
+            fx_val_max_drawdown=50.0,
+            fx_min_robustness_ratio=0.0,
+            fx_val_sharpe_override=-99.0,
+            false_discovery_control_enabled=True,
+            false_discovery_symbol_count=50,
+            false_discovery_scope_power=1.0,
+            false_discovery_confidence_floor=0.25,
+        )
+        optimizer = RegimeOptimizer(cfg)
+        optimizer._compute_regime_score = lambda train, val: 100.0
+
+        train = {
+            "total_trades": 100,
+            "profit_factor": 1.8,
+            "win_rate": 55.0,
+            "sharpe_approx": 2.0,
+            "total_return_pct": 20.0,
+            "max_drawdown_pct": 5.0,
+        }
+        val = dict(train)
+        val["total_return_pct"] = 12.0
+        candidates = [{
+            "strategy_name": "CandidateStrategy",
+            "params": {},
+            "search_trials": 100,
+            "local_search_trials_total": 100,
+            "train_regime_metrics": {"TREND": train},
+            "val_regime_metrics": {"TREND": val},
+        }]
+
+        best_config, is_valid, _ = optimizer._select_best_for_regime(
+            "EURUSD",
+            "H1",
+            "TREND",
+            candidates,
+        )
+
+        self.assertTrue(is_valid)
+        evidence = best_config.validation_evidence["false_discovery"]
+        self.assertTrue(evidence["enabled"])
+        self.assertEqual(evidence["local_trials"], 100)
+        self.assertEqual(evidence["scope_multiplier"], 50 * 6 * 4)
+        self.assertGreater(evidence["effective_trials"], evidence["local_trials"])
+        self.assertLess(best_config.validation_evidence["selection_score_raw"], 100.0)
+
+    def test_false_discovery_min_dsr_can_reject_noise_candidates(self):
+        cfg = PipelineConfig(
+            regime_min_train_trades=1,
+            regime_min_val_trades=1,
+            regime_min_val_profit_factor=0.0,
+            regime_min_val_return_pct=-100.0,
+            regime_min_val_return_dd_ratio=0.1,
+            fx_val_max_drawdown=50.0,
+            false_discovery_control_enabled=True,
+            false_discovery_symbol_count=50,
+            false_discovery_scope_power=1.0,
+            false_discovery_min_dsr=0.5,
+        )
+        optimizer = RegimeOptimizer(cfg)
+
+        train = {
+            "total_trades": 100,
+            "profit_factor": 1.8,
+            "win_rate": 55.0,
+            "sharpe_approx": 0.2,
+            "total_return_pct": 20.0,
+            "max_drawdown_pct": 5.0,
+        }
+        val = dict(train)
+        val["total_return_pct"] = 12.0
+        candidates = [{
+            "strategy_name": "NoiseStrategy",
+            "params": {},
+            "search_trials": 100,
+            "local_search_trials_total": 100,
+            "train_regime_metrics": {"TREND": train},
+            "val_regime_metrics": {"TREND": val},
+        }]
+
+        best_config, is_valid, reason = optimizer._select_best_for_regime(
+            "EURUSD",
+            "H1",
+            "TREND",
+            candidates,
+        )
+
+        self.assertFalse(is_valid)
+        self.assertIsNone(best_config)
+        self.assertIn("false-discovery DSR", reason)
+
+    def test_false_discovery_rejects_flashy_noise_and_selects_next_candidate(self):
+        cfg = PipelineConfig(
+            regime_min_train_trades=1,
+            regime_min_val_trades=1,
+            regime_min_val_profit_factor=0.0,
+            regime_min_val_return_pct=-100.0,
+            regime_min_val_return_dd_ratio=0.1,
+            fx_val_max_drawdown=50.0,
+            fx_min_robustness_ratio=0.0,
+            fx_val_sharpe_override=-99.0,
+            false_discovery_control_enabled=True,
+            false_discovery_symbol_count=40,
+            false_discovery_scope_power=1.0,
+            false_discovery_min_dsr=0.5,
+        )
+        optimizer = RegimeOptimizer(cfg)
+        optimizer._compute_regime_score = lambda train, val: float(val.get("_score", 0.0))
+
+        def candidate(name, raw_score, sharpe):
+            train = {
+                "total_trades": 500,
+                "profit_factor": 1.8,
+                "win_rate": 55.0,
+                "sharpe_approx": sharpe,
+                "total_return_pct": 20.0,
+                "max_drawdown_pct": 5.0,
+            }
+            val = dict(train)
+            val.update({"total_return_pct": 12.0, "_score": raw_score})
+            return {
+                "strategy_name": name,
+                "params": {},
+                "search_trials": 100,
+                "local_search_trials_total": 100,
+                "train_regime_metrics": {"TREND": train},
+                "val_regime_metrics": {"TREND": val},
+            }
+
+        best_config, is_valid, _ = optimizer._select_best_for_regime(
+            "EURUSD",
+            "H1",
+            "TREND",
+            [
+                candidate("FlashyNoiseStrategy", 100.0, 2.0),
+                candidate("DefensibleStrategy", 10.0, 6.0),
+            ],
+        )
+
+        self.assertTrue(is_valid)
+        self.assertEqual(best_config.strategy_name, "DefensibleStrategy")
+        evidence = best_config.validation_evidence["false_discovery"]
+        self.assertGreaterEqual(evidence["deflated_sharpe"], 0.5)
+        self.assertEqual(evidence["pbo_status"], "not_available")
+
+    def test_false_discovery_promotion_blocks_low_dsr(self):
+        cfg = PipelineConfig(
+            false_discovery_control_enabled=True,
+            false_discovery_min_dsr=0.10,
+        )
+        winner = RegimeConfig(
+            strategy_name="SomeStrategy",
+            parameters={},
+            quality_score=0.5,
+            validation_evidence={"false_discovery": {"deflated_sharpe": 0.01}},
+        )
+
+        status, reasons = classify_promotion_status(winner, cfg)
+
+        self.assertEqual(status, "BLOCKED")
+        self.assertIn("false-discovery DSR", reasons[0])
+
+    def test_false_discovery_holdout_policy_blocks_failed_holdout(self):
+        cfg = PipelineConfig(
+            false_discovery_control_enabled=True,
+            false_discovery_holdout_policy="block",
+            false_discovery_holdout_min_trades=5,
+            false_discovery_holdout_min_profit_factor=1.0,
+            false_discovery_holdout_min_return_pct=0.0,
+        )
+        winner = RegimeConfig(
+            strategy_name="SomeStrategy",
+            parameters={},
+            quality_score=0.5,
+            holdout_metrics={
+                "total_trades": 5,
+                "profit_factor": 0.8,
+                "total_return_pct": -1.0,
+            },
+        )
+
+        status, reasons = classify_promotion_status(winner, cfg)
+
+        self.assertEqual(status, "BLOCKED")
+        self.assertTrue(any("holdout PF" in reason for reason in reasons))
 
     def test_regime_selection_tie_breaks_on_trade_count(self):
         cfg = PipelineConfig(
