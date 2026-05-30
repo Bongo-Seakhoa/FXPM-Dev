@@ -20,7 +20,18 @@ from benchmark import build_config, _git_head, is_fx
 # Representative FX-led pool + one of each non-FX class for coverage.
 DEFAULT_POOL = ["EURUSD", "GBPUSD", "USDJPY", "EURJPY", "AUDNZD", "USDCAD",
                 "XAUUSD", "US500", "BTCUSD"]
+DEFAULT_TFS = ("H1", "H4")
 MIN_TRADES = 20
+
+_RESAMPLE_CACHE = {}  # (symbol, tf) -> resampled df (param-independent)
+
+
+def _resampled(loader, symbol, tf):
+    key = (symbol, tf)
+    if key not in _RESAMPLE_CACHE:
+        base = loader.load_symbol(symbol)
+        _RESAMPLE_CACHE[key] = loader.resample(base, tf) if base is not None and len(base) else None
+    return _RESAMPLE_CACHE[key]
 
 
 def _sample_grid(grid, n, seed):
@@ -32,14 +43,10 @@ def _sample_grid(grid, n, seed):
     return [dict(zip(keys, c)) for c in combos]
 
 
-def _run(cfg, loader, name, params, symbol):
-    base = loader.load_symbol(symbol)
-    if base is None or len(base) == 0:
-        return None
-    feats_by_tf = {}
+def _run(cfg, loader, name, params, symbol, tfs):
     best = None
-    for tf in ("M15", "H1", "H4", "D1"):
-        df = loader.resample(base, tf)
+    for tf in tfs:
+        df = _resampled(loader, symbol, tf)
         if df is None or len(df) < 300:
             continue
         strat = StrategyRegistry.get(name, **params)
@@ -61,13 +68,13 @@ def _run(cfg, loader, name, params, symbol):
     return best
 
 
-def screen(name, cfg, loader, pool, samples, seed):
+def screen(name, cfg, loader, pool, samples, seed, tfs):
     grid = StrategyRegistry.get(name).get_param_grid()
     param_sets = _sample_grid(grid, samples, seed)
     runs, tradeful, profitable, best = 0, 0, 0, None
     for params in param_sets:
         for symbol in pool:
-            res = _run(cfg, loader, name, params, symbol)
+            res = _run(cfg, loader, name, params, symbol, tfs)
             if res is None:
                 continue
             runs += 1
@@ -87,6 +94,7 @@ def main():
     ap.add_argument("--pool", nargs="*", default=DEFAULT_POOL)
     ap.add_argument("--fx-only", action="store_true")
     ap.add_argument("--samples", type=int, default=24)
+    ap.add_argument("--timeframes", nargs="*", default=list(DEFAULT_TFS))
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--spread-mode", default="conservative_max")
     ap.add_argument("--label", default="prospect_screen")
@@ -101,7 +109,7 @@ def main():
     rows = []
     for name in names:
         try:
-            rows.append(screen(name, cfg, loader, pool, args.samples, args.seed))
+            rows.append(screen(name, cfg, loader, pool, args.samples, args.seed, tuple(args.timeframes)))
         except Exception as e:
             rows.append({"strategy": name, "error": f"{type(e).__name__}: {e}"})
 
