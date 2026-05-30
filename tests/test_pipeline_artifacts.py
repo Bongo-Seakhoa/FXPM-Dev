@@ -113,6 +113,69 @@ class PipelineArtifactTests(unittest.TestCase):
         self.assertFalse(artifact_contract_matches(legacy_without_cost_contract, current))
         self.assertFalse(artifact_contract_matches(current, changed))
 
+    def test_artifact_meta_includes_false_discovery_contract(self):
+        cfg = PipelineConfig(
+            false_discovery_control_enabled=True,
+            false_discovery_min_dsr=0.05,
+            false_discovery_confidence_floor=0.4,
+            false_discovery_scope_power=0.5,
+            false_discovery_symbol_count=61,
+            false_discovery_holdout_policy="block",
+        )
+        current = build_artifact_meta(cfg)
+
+        self.assertTrue(current["false_discovery_control_enabled"])
+        self.assertAlmostEqual(current["false_discovery_min_dsr"], 0.05)
+        self.assertAlmostEqual(current["false_discovery_confidence_floor"], 0.4)
+        self.assertAlmostEqual(current["false_discovery_scope_power"], 0.5)
+        self.assertEqual(current["false_discovery_symbol_count"], 61)
+        self.assertEqual(current["false_discovery_holdout_policy"], "block")
+        self.assertEqual(current["false_discovery_holdout_min_trades"], 5)
+        self.assertAlmostEqual(current["false_discovery_holdout_min_profit_factor"], 1.0)
+        self.assertAlmostEqual(current["false_discovery_holdout_min_return_pct"], 0.0)
+
+        changed = dict(current)
+        changed["false_discovery_symbol_count"] = 62
+        self.assertFalse(artifact_contract_matches(current, changed))
+
+    def test_portfolio_manager_sets_false_discovery_symbol_scope(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_false_discovery_scope")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+                false_discovery_control_enabled=True,
+            )
+            manager = PortfolioManager(
+                cfg,
+                ["EURUSD", "GBPUSD", "USDJPY"],
+                config_file=str(tmp / "pm_configs.json"),
+            )
+
+            self.assertEqual(manager.config.false_discovery_symbol_count, 3)
+            self.assertEqual(manager.pipeline.config.false_discovery_symbol_count, 3)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_portfolio_manager_leaves_disabled_false_discovery_scope_legacy_neutral(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_false_discovery_scope_disabled")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(data_dir=tmp / "data", output_dir=tmp / "out")
+            manager = PortfolioManager(
+                cfg,
+                ["EURUSD", "GBPUSD", "USDJPY"],
+                config_file=str(tmp / "pm_configs.json"),
+            )
+
+            self.assertFalse(manager.config.false_discovery_control_enabled)
+            self.assertEqual(manager.config.false_discovery_symbol_count, 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_live_eligible_configs_exclude_expired_and_artifact_drift_when_blocking(self):
         tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_live_eligibility")
         shutil.rmtree(tmp, ignore_errors=True)
@@ -207,6 +270,29 @@ class PipelineArtifactTests(unittest.TestCase):
         restored = RegimeConfig.from_dict(cfg.to_dict())
         self.assertTrue(restored.is_no_trade_marker())
         self.assertEqual(restored.artifact_meta["reason"], "no validated winner")
+
+    def test_regime_config_persists_false_discovery_evidence(self):
+        cfg = RegimeConfig(
+            strategy_name="SomeStrategy",
+            parameters={},
+            quality_score=0.5,
+            validation_evidence={
+                "false_discovery": {
+                    "enabled": True,
+                    "deflated_sharpe": 0.42,
+                    "effective_trials": 1234,
+                    "pbo_status": "not_available",
+                }
+            },
+        )
+
+        restored = RegimeConfig.from_dict(cfg.to_dict())
+
+        evidence = restored.validation_evidence["false_discovery"]
+        self.assertTrue(evidence["enabled"])
+        self.assertAlmostEqual(evidence["deflated_sharpe"], 0.42)
+        self.assertEqual(evidence["effective_trials"], 1234)
+        self.assertEqual(evidence["pbo_status"], "not_available")
 
     def test_symbol_config_persists_validation_evidence_and_robustness(self):
         cfg = SymbolConfig(

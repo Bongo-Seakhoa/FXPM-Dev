@@ -6063,6 +6063,11 @@ def main():
     pipeline_config = PipelineConfig(**_filter_dataclass_kwargs(PipelineConfig, pipeline_section))
     position_config = PositionConfig(**_filter_dataclass_kwargs(PositionConfig, config_data.get("position", {})))
     mt5_config = MT5Config(**_filter_dataclass_kwargs(MT5Config, mt5_section))
+    if (
+        bool(getattr(pipeline_config, "false_discovery_control_enabled", False))
+        and int(getattr(pipeline_config, "false_discovery_symbol_count", 0) or 0) <= 0
+    ):
+        pipeline_config.false_discovery_symbol_count = len(symbols)
 
     # If position risk not set explicitly, inherit from pipeline risk (backward compatible)
     if "risk_per_trade_pct" not in (config_data.get("position") or {}) and hasattr(pipeline_config, "risk_per_trade_pct"):

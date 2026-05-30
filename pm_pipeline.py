@@ -167,6 +167,29 @@ def build_artifact_meta(config: PipelineConfig,
         "production_retrain_anchor_date": str(getattr(config, "production_retrain_anchor_date", "2026-03-29")),
         "walk_forward_audit_enabled": bool(getattr(config, "walk_forward_audit_enabled", False)),
         "walk_forward_audit_windows": int(getattr(config, "walk_forward_audit_windows", 3)),
+        "false_discovery_control_enabled": bool(
+            getattr(config, "false_discovery_control_enabled", False)
+        ),
+        "false_discovery_min_dsr": float(getattr(config, "false_discovery_min_dsr", 0.0) or 0.0),
+        "false_discovery_confidence_floor": float(
+            getattr(config, "false_discovery_confidence_floor", 0.35) or 0.0
+        ),
+        "false_discovery_scope_power": float(
+            getattr(config, "false_discovery_scope_power", 0.25) or 0.0
+        ),
+        "false_discovery_symbol_count": int(getattr(config, "false_discovery_symbol_count", 0) or 0),
+        "false_discovery_holdout_policy": str(
+            getattr(config, "false_discovery_holdout_policy", "promote_small") or "promote_small"
+        ).lower(),
+        "false_discovery_holdout_min_trades": int(
+            getattr(config, "false_discovery_holdout_min_trades", 5) or 0
+        ),
+        "false_discovery_holdout_min_profit_factor": float(
+            getattr(config, "false_discovery_holdout_min_profit_factor", 1.0) or 0.0
+        ),
+        "false_discovery_holdout_min_return_pct": float(
+            getattr(config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0
+        ),
         "local_governance_tournament_enabled": bool(getattr(config, "local_governance_tournament_enabled", False)),
         "local_governance_candidate_policies": candidate_policy_names(
             getattr(config, "local_governance_candidate_policies", None)
@@ -285,6 +308,44 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
     holdout = dict(getattr(regime_config, "holdout_metrics", {}) or {})
     holdout_trades = int(holdout.get("total_trades", 0) or 0)
     holdout_return = float(holdout.get("total_return_pct", 0.0) or 0.0)
+    if bool(getattr(config, "false_discovery_control_enabled", False)):
+        evidence = dict(getattr(regime_config, "validation_evidence", {}) or {})
+        false_discovery = dict(evidence.get("false_discovery", {}) or {})
+        min_dsr = float(getattr(config, "false_discovery_min_dsr", 0.0) or 0.0)
+        if false_discovery and min_dsr > 0.0:
+            dsr = float(false_discovery.get("deflated_sharpe", 1.0) or 0.0)
+            if dsr < min_dsr:
+                return "BLOCKED", [
+                    f"false-discovery DSR {dsr:.4f} < {min_dsr:.4f}"
+                ]
+
+        holdout_policy = str(
+            getattr(config, "false_discovery_holdout_policy", "promote_small") or "promote_small"
+        ).lower()
+        if holdout_policy != "off":
+            min_holdout_trades = int(getattr(config, "false_discovery_holdout_min_trades", 5) or 0)
+            if holdout_trades >= min_holdout_trades > 0:
+                holdout_pf = float(holdout.get("profit_factor", 0.0) or 0.0)
+                min_holdout_pf = float(
+                    getattr(config, "false_discovery_holdout_min_profit_factor", 1.0) or 0.0
+                )
+                min_holdout_return = float(
+                    getattr(config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0
+                )
+                holdout_reasons = []
+                if holdout_pf < min_holdout_pf:
+                    holdout_reasons.append(
+                        f"holdout PF {holdout_pf:.2f} < {min_holdout_pf:.2f}"
+                    )
+                if holdout_return < min_holdout_return:
+                    holdout_reasons.append(
+                        f"holdout return {holdout_return:.1f}% < {min_holdout_return:.1f}%"
+                    )
+                if holdout_reasons:
+                    if holdout_policy == "block":
+                        return "BLOCKED", holdout_reasons
+                    return "PROMOTE_SMALL", holdout_reasons
+
     if holdout_trades > 0 and holdout_return <= 0.0:
         return "PROMOTE_SMALL", ["freshest holdout non-positive; risk derated"]
     return "PROMOTED", []
@@ -1963,6 +2024,10 @@ class RegimeOptimizer:
             return []  # Return empty list - no candidates to optimize
 
         if not self.enable_hyperparam_tuning:
+            local_trials = len(screening_candidates)
+            for cand in eligible_candidates:
+                cand['local_search_trials_total'] = int(local_trials)
+                cand['strategy_roster_count'] = int(len(strategies))
             return eligible_candidates
 
         # Phase 2: Hyperparameter tuning for top-K strategies per regime
@@ -2008,6 +2073,11 @@ class RegimeOptimizer:
         # Combine eligible candidates with tuned candidates
         # The tuned candidates may replace or augment the defaults
         all_candidates = eligible_candidates + tuned_candidates
+        tuned_trials = sum(max(int(cand.get('search_trials', 1) or 1), 1) for cand in tuned_candidates)
+        local_trials = int(len(screening_candidates) + tuned_trials)
+        for cand in all_candidates:
+            cand['local_search_trials_total'] = local_trials
+            cand['strategy_roster_count'] = int(len(strategies))
 
         return all_candidates
     
@@ -2350,10 +2420,79 @@ class RegimeOptimizer:
 
     @staticmethod
     def _effective_search_trials(candidates: List[Dict[str, Any]]) -> int:
+        declared_totals = [
+            int(cand.get('local_search_trials_total', 0) or 0)
+            for cand in candidates
+            if int(cand.get('local_search_trials_total', 0) or 0) > 0
+        ]
+        if declared_totals:
+            return max(max(declared_totals), 1)
         total = 0
         for cand in candidates:
             total += max(int(cand.get('search_trials', 1) or 1), 1)
         return max(total, 1)
+
+    def _false_discovery_scope_multiplier(self) -> int:
+        symbol_count = int(getattr(self.config, 'false_discovery_symbol_count', 0) or 0)
+        symbol_count = max(1, symbol_count)
+        try:
+            timeframe_count = len(getattr(self.config, 'timeframes', []) or [])
+        except Exception:
+            timeframe_count = 1
+        timeframe_count = max(1, timeframe_count)
+        return max(1, symbol_count * timeframe_count * len(self.REGIMES))
+
+    def _build_false_discovery_evidence(self,
+                                        val_metrics: Dict[str, Any],
+                                        candidates: List[Dict[str, Any]],
+                                        candidate: Dict[str, Any]) -> Dict[str, Any]:
+        enabled = bool(getattr(self.config, 'false_discovery_control_enabled', False))
+        local_trials = self._effective_search_trials(candidates)
+        scope_multiplier = self._false_discovery_scope_multiplier()
+        try:
+            scope_power = float(getattr(self.config, 'false_discovery_scope_power', 0.25) or 0.0)
+        except Exception:
+            scope_power = 0.25
+        scope_power = max(0.0, min(1.0, scope_power))
+        if enabled:
+            effective_trials = int(math.ceil(local_trials * (scope_multiplier ** scope_power)))
+        else:
+            effective_trials = local_trials
+        candidate_trials = max(int(candidate.get('search_trials', 1) or 1), 1)
+        effective_trials = max(effective_trials, candidate_trials, 1)
+
+        val_sharpe = float(val_metrics.get('sharpe_approx', val_metrics.get('sharpe_ratio', 0.0)) or 0.0)
+        val_trades = int(val_metrics.get('total_trades', 0) or 0)
+        dsr = self._deflated_sharpe_ratio(
+            sharpe=val_sharpe,
+            n_trades=val_trades,
+            n_trials=effective_trials,
+        )
+        try:
+            confidence_floor = float(getattr(self.config, 'false_discovery_confidence_floor', 0.35) or 0.0)
+        except Exception:
+            confidence_floor = 0.35
+        confidence_floor = max(0.0, min(1.0, confidence_floor))
+        confidence_multiplier = (
+            confidence_floor + (1.0 - confidence_floor) * dsr
+            if enabled and val_sharpe > 0.0
+            else 1.0
+        )
+        return {
+            "enabled": enabled,
+            "pbo_status": "not_available",
+            "val_sharpe": val_sharpe,
+            "val_trades": val_trades,
+            "local_trials": int(local_trials),
+            "candidate_trials": int(candidate_trials),
+            "scope_multiplier": int(scope_multiplier),
+            "scope_power": float(scope_power),
+            "effective_trials": int(effective_trials),
+            "deflated_sharpe": round(float(dsr), 6),
+            "confidence_floor": float(confidence_floor),
+            "confidence_multiplier": round(float(confidence_multiplier), 6),
+            "min_dsr": float(getattr(self.config, 'false_discovery_min_dsr', 0.0) or 0.0),
+        }
 
     def _select_best_for_regime(self,
                                  symbol: str,
@@ -2369,7 +2508,7 @@ class RegimeOptimizer:
         Returns:
             Tuple of (RegimeConfig or None, is_validated, validation_reason)
         """
-        scored_candidates = []  # List of (score, candidate) tuples
+        scored_candidates = []  # List of (score, candidate, false_discovery) tuples
         rejection_reasons = []  # Track why candidates were rejected at gate level
         best_score = -float('inf')
         best_candidate = None
@@ -2421,25 +2560,36 @@ class RegimeOptimizer:
                     rejection_reasons.append(f"{cand['strategy_name']}: return={val_return:.1f}% < {self.min_val_return_pct}")
                     continue
             
-            # Apply Deflated Sharpe Ratio as a Sharpe-only confidence adjustment.
+            # Apply Deflated Sharpe Ratio as a confidence adjustment.
             adjusted_val_metrics = dict(val_metrics)
 
-            # This keeps the multiple-testing penalty aligned to the metric DSR models.
-            # Positive Sharpe inputs are deflated; non-positive Sharpe is left unchanged.
             val_sharpe = val_metrics.get('sharpe_approx', val_metrics.get('sharpe_ratio', 0.0))
-            n_trials = self._effective_search_trials(candidates)
-            dsr = self._deflated_sharpe_ratio(
-                sharpe=val_sharpe,
-                n_trades=val_trades,
-                n_trials=n_trials,
+            false_discovery = self._build_false_discovery_evidence(
+                val_metrics,
+                candidates,
+                cand,
             )
-            # Score based on validation metrics (with train as fallback).
-            # DSR=1.0 → no penalty; DSR=0.0 → score halved
+            min_dsr = float(false_discovery.get("min_dsr", 0.0) or 0.0)
+            dsr = float(false_discovery.get("deflated_sharpe", 0.0) or 0.0)
+            if (
+                bool(false_discovery.get("enabled", False))
+                and min_dsr > 0.0
+                and float(val_sharpe or 0.0) > 0.0
+                and dsr < min_dsr
+            ):
+                rejection_reasons.append(
+                    f"{cand['strategy_name']}: false-discovery DSR={dsr:.4f} < {min_dsr:.4f} "
+                    f"(trials={false_discovery.get('effective_trials')})"
+                )
+                continue
+
             if val_sharpe > 0:
                 adjusted_val_metrics['sharpe_approx'] = val_sharpe * dsr
                 adjusted_val_metrics['sharpe_ratio'] = adjusted_val_metrics['sharpe_approx']
             score = self._compute_regime_score(train_metrics, adjusted_val_metrics)
-            scored_candidates.append((score, cand))
+            if bool(false_discovery.get("enabled", False)):
+                score *= float(false_discovery.get("confidence_multiplier", 1.0) or 1.0)
+            scored_candidates.append((score, cand, false_discovery))
 
             if score > best_score:
                 best_score = score
@@ -2448,7 +2598,10 @@ class RegimeOptimizer:
         if not scored_candidates or best_candidate is None:
             reason = "No candidates met minimum trade/drawdown/profitability thresholds"
             if rejection_reasons:
-                reason += f" (rejected: {len(rejection_reasons)} candidates by gate checks)"
+                reason += (
+                    f" (rejected: {len(rejection_reasons)} candidates by gate checks; "
+                    f"first={rejection_reasons[0]})"
+                )
             return None, False, reason
 
         scored_candidates.sort(
@@ -2470,7 +2623,7 @@ class RegimeOptimizer:
 
         # Iterate top-K candidates, return first that passes validation
         validation_failures = []
-        for rank, (score, cand) in enumerate(scored_candidates[:top_k], start=1):
+        for rank, (score, cand, false_discovery) in enumerate(scored_candidates[:top_k], start=1):
             train_metrics = cand['train_regime_metrics'].get(regime, {})
             val_metrics = cand['val_regime_metrics'].get(regime, {})
             strategy_name = cand.get('strategy_name', 'Unknown')
@@ -2511,6 +2664,7 @@ class RegimeOptimizer:
                         score=score,
                         validation_reason=validation_reason,
                         candidate=cand,
+                        false_discovery_evidence=false_discovery,
                     ),
                 )
 
@@ -2523,7 +2677,7 @@ class RegimeOptimizer:
                 )
 
         # All top-K candidates failed validation - return the best one as unvalidated
-        best_score, best_candidate = scored_candidates[0]
+        best_score, best_candidate, false_discovery = scored_candidates[0]
         train_metrics = best_candidate['train_regime_metrics'].get(regime, {})
         val_metrics = best_candidate['val_regime_metrics'].get(regime, {})
         
@@ -2552,6 +2706,7 @@ class RegimeOptimizer:
                 score=best_score,
                 validation_reason=validation_reason,
                 candidate=best_candidate,
+                false_discovery_evidence=false_discovery,
             ),
         )
 
@@ -2707,7 +2862,8 @@ class RegimeOptimizer:
                                    *,
                                    score: Optional[float] = None,
                                    validation_reason: str = "",
-                                   candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                   candidate: Optional[Dict[str, Any]] = None,
+                                   false_discovery_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build compact, persisted validation evidence for dashboards and review."""
         train_full = self._bucket_to_full_metrics(train_metrics or {})
         val_full = self._bucket_to_full_metrics(val_metrics or {})
@@ -2741,6 +2897,8 @@ class RegimeOptimizer:
             except Exception:
                 strategy = None
             evidence["fairness_evidence"] = build_fairness_evidence(candidate, strategy=strategy)
+        if isinstance(false_discovery_evidence, dict):
+            evidence["false_discovery"] = dict(false_discovery_evidence)
         return evidence
     
     def _compute_regime_score(self,
@@ -3695,6 +3853,11 @@ class OptimizationPipeline:
             Dict mapping symbol to PipelineResult
         """
         results = {}
+        if (
+            bool(getattr(self.config, "false_discovery_control_enabled", False))
+            and int(getattr(self.config, "false_discovery_symbol_count", 0) or 0) <= 0
+        ):
+            self.config.false_discovery_symbol_count = len(symbols or [])
         
         total_start = time.time()
         
@@ -3787,6 +3950,11 @@ class PortfolioManager:
         """
         self.config = config
         self.symbols = symbols
+        if (
+            bool(getattr(self.config, "false_discovery_control_enabled", False))
+            and int(getattr(self.config, "false_discovery_symbol_count", 0) or 0) <= 0
+        ):
+            self.config.false_discovery_symbol_count = len(symbols or [])
         self.config_file = Path(config_file)
         
         # Pipeline

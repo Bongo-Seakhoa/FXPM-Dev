@@ -36,6 +36,8 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
 
         self.assertEqual(pipeline["backtest_spread_mode"], "conservative_max")
         self.assertEqual(pipeline["clean_holdout_pct"], 15.0)
+        self.assertTrue(pipeline["false_discovery_control_enabled"])
+        self.assertEqual(pipeline["false_discovery_holdout_policy"], "block")
         self.assertEqual(data["_meta"]["strategy_roster_count"], 100)
         self.assertEqual(data["_meta"]["holdout_unit"], "percent_of_stage2_selection")
         self.assertEqual(data["_meta"]["scope"], "research_discovery_only_not_live_trading")
@@ -55,6 +57,8 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertEqual(cfg.backtest_spread_mode, "conservative_max")
         self.assertAlmostEqual(cfg.clean_holdout_pct, 15.0, places=6)
         self.assertGreater(cfg.clean_holdout_pct, 1.0)
+        self.assertTrue(cfg.false_discovery_control_enabled)
+        self.assertEqual(cfg.false_discovery_holdout_policy, "block")
 
 
 if __name__ == "__main__":
