@@ -5932,6 +5932,377 @@ class AccumulationDistributionBreakoutStrategy(BaseStrategy):
 
 
 # =============================================================================
+# PACKAGE K: TIME / SESSION / CALENDAR AND CARRY-AWARE STRATEGIES
+# =============================================================================
+
+
+def _index_hour(features: pd.DataFrame) -> pd.Series:
+    idx = features.index
+    if isinstance(idx, pd.DatetimeIndex):
+        return pd.Series(idx.hour, index=idx)
+    return pd.Series(np.zeros(len(idx)), index=idx)
+
+
+def _index_dow(features: pd.DataFrame) -> pd.Series:
+    idx = features.index
+    if isinstance(idx, pd.DatetimeIndex):
+        return pd.Series(idx.dayofweek, index=idx)
+    return pd.Series(np.zeros(len(idx)), index=idx)
+
+
+def _index_dom(features: pd.DataFrame) -> pd.Series:
+    idx = features.index
+    if isinstance(idx, pd.DatetimeIndex):
+        return pd.Series(idx.day, index=idx)
+    return pd.Series(np.zeros(len(idx)), index=idx)
+
+
+def _carry_direction(symbol: str, min_diff: float) -> int:
+    """+1 if holding long earns/saves more swap than short, -1 if short is favored, else 0.
+    Static per symbol/broker spec; signal-only (no lookahead)."""
+    try:
+        spec = get_instrument_spec(symbol)
+        diff = float(spec.swap_long) - float(spec.swap_short)
+    except Exception:
+        return 0
+    if abs(diff) < float(min_diff):
+        return 0
+    return 1 if diff > 0 else -1
+
+
+class TimeOfDayMomentumStrategy(BaseStrategy):
+    """Directional momentum gated to an intraday hour window (e.g. London/NY drive). Flat
+    outside the window so the edge is the session, not 24h noise."""
+
+    @property
+    def name(self) -> str:
+        return "TimeOfDayMomentumStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"start_hour": 8, "end_hour": 16, "mom_lookback": 12, "atr_buffer": 0.1,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        sh, eh = int(self.params.get("start_hour", 8)), int(self.params.get("end_hour", 16))
+        lb = max(1, int(self.params.get("mom_lookback", 12)))
+        buf = float(self.params.get("atr_buffer", 0.1))
+        hour = _index_hour(features)
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        in_window = (hour >= sh) & (hour < eh)
+        mom = close - close.shift(lb)
+        thresh = buf * atr
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[in_window & (mom > thresh)] = 1
+        signals[in_window & (mom < -thresh)] = -1
+        return self._zero_warmup(signals, lb + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"start_hour": [0, 7, 8, 13], "end_hour": [12, 16, 20, 24],
+                "mom_lookback": [6, 12, 24], "atr_buffer": [0.0, 0.1, 0.25],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class SessionCloseReversionStrategy(BaseStrategy):
+    """Fade intraday over-extension vs the session VWAP during the late session hours."""
+
+    @property
+    def name(self) -> str:
+        return "SessionCloseReversionStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"session_start_hour": 0, "late_start_hour": 19, "ext_atr": 1.0,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ss = int(self.params.get("session_start_hour", 0))
+        late = int(self.params.get("late_start_hour", 20))
+        ext = float(self.params.get("ext_atr", 1.0))
+        hour = _index_hour(features)
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        vwap = _get_session_vwap(features, ss)
+        band = ext * atr
+        in_late = hour >= late
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[in_late & (close < vwap - band)] = 1
+        signals[in_late & (close > vwap + band)] = -1
+        return self._zero_warmup(signals, 20)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"session_start_hour": [0, 8], "late_start_hour": [16, 19, 21],
+                "ext_atr": [0.5, 1.0, 1.5], **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class DayOfWeekBiasStrategy(BaseStrategy):
+    """Trade a configured weekday's known momentum/reversion tendency only (calendar effect)."""
+
+    @property
+    def name(self) -> str:
+        return "DayOfWeekBiasStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"weekday": 0, "mode": "momentum", "lookback": 5, "atr_buffer": 0.1,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        wd = int(self.params.get("weekday", 0))
+        mode = str(self.params.get("mode", "momentum"))
+        lb = max(1, int(self.params.get("lookback", 5)))
+        buf = float(self.params.get("atr_buffer", 0.1))
+        dow = _index_dow(features)
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        target = dow == wd
+        mom = close - close.shift(lb)
+        thresh = buf * atr
+        up = target & (mom > thresh)
+        dn = target & (mom < -thresh)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        if mode == "reversion":
+            signals[up] = -1
+            signals[dn] = 1
+        else:
+            signals[up] = 1
+            signals[dn] = -1
+        return self._zero_warmup(signals, lb + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"weekday": [0, 1, 2, 3, 4], "mode": ["momentum", "reversion"],
+                "lookback": [3, 5, 10], "atr_buffer": [0.0, 0.1, 0.25],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class TurnOfMonthStrategy(BaseStrategy):
+    """Turn-of-month seasonal bias (last/first calendar days), with optional trend agreement.
+    Most relevant for indices/equities; the optimizer picks the per-symbol direction."""
+
+    @property
+    def name(self) -> str:
+        return "TurnOfMonthStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"tom_start_day": 26, "tom_end_day": 3, "bias": 1, "trend_ema": 0,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ts = int(self.params.get("tom_start_day", 26))
+        te = int(self.params.get("tom_end_day", 3))
+        bias = 1 if int(self.params.get("bias", 1)) >= 0 else -1
+        ema_p = int(self.params.get("trend_ema", 0))
+        dom = _index_dom(features)
+        close = features["Close"]
+        in_window = (dom >= ts) | (dom <= te)
+        trend_ok = pd.Series(True, index=features.index)
+        if ema_p > 0:
+            ema = _get_ema(features, ema_p)
+            trend_ok = (close >= ema) if bias == 1 else (close <= ema)
+        entry = in_window & trend_ok
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[entry] = bias
+        return self._zero_warmup(signals, max(ema_p, 5) + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"tom_start_day": [24, 26, 28], "tom_end_day": [2, 3, 5], "bias": [1, -1],
+                "trend_ema": [0, 100, 200], **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class OvernightDriftStrategy(BaseStrategy):
+    """At a pre-close hour, enter in the direction of the day's move vs the session open to
+    capture overnight drift continuation."""
+
+    @property
+    def name(self) -> str:
+        return "OvernightDriftStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"session_start_hour": 0, "entry_hour": 21, "min_move_atr": 0.5,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ss = int(self.params.get("session_start_hour", 0))
+        eh = int(self.params.get("entry_hour", 21))
+        mm = float(self.params.get("min_move_atr", 0.5))
+        hour = _index_hour(features)
+        keys = _session_keys(features, ss)
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        session_open = close.groupby(keys).transform("first")
+        move = close - session_open
+        at_entry = hour == eh
+        band = mm * atr
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[at_entry & (move > band)] = 1
+        signals[at_entry & (move < -band)] = -1
+        return self._zero_warmup(signals, 20)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"session_start_hour": [0, 8], "entry_hour": [17, 20, 21, 22],
+                "min_move_atr": [0.0, 0.5, 1.0], **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class IntradayRangeFadeStrategy(BaseStrategy):
+    """During quiet hours, fade breaks beyond the developing session range (mean reversion)."""
+
+    @property
+    def name(self) -> str:
+        return "IntradayRangeFadeStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.MEAN_REVERSION
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"session_start_hour": 0, "quiet_start_hour": 1, "quiet_end_hour": 7,
+                "ext_atr": 0.5, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0,
+                **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ss = int(self.params.get("session_start_hour", 0))
+        qs = int(self.params.get("quiet_start_hour", 1))
+        qe = int(self.params.get("quiet_end_hour", 7))
+        ext = float(self.params.get("ext_atr", 0.5))
+        hour = _index_hour(features)
+        keys = _session_keys(features, ss)
+        close = features["Close"]
+        atr = _get_atr(features, 14)
+        dev_high = features["High"].groupby(keys).cummax().shift(1)
+        dev_low = features["Low"].groupby(keys).cummin().shift(1)
+        quiet = (hour >= qs) & (hour < qe)
+        band = ext * atr
+        signals = pd.Series(0, index=features.index, dtype=int)
+        signals[quiet & (close < dev_low - band)] = 1
+        signals[quiet & (close > dev_high + band)] = -1
+        return self._zero_warmup(signals, 20)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"session_start_hour": [0, 8], "quiet_start_hour": [0, 1, 2],
+                "quiet_end_hour": [5, 7, 9], "ext_atr": [0.25, 0.5, 1.0],
+                **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class SwapCarryTrendStrategy(BaseStrategy):
+    """Trade only in the positive-carry direction (from broker swap) when a slow trend agrees,
+    so longer holds are paid by carry rather than bleeding negative swap. H4/D1 in spirit."""
+
+    @property
+    def name(self) -> str:
+        return "SwapCarryTrendStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"ema_period": 100, "slope_bars": 20, "min_swap_diff": 1.0,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ema_p = max(2, int(self.params.get("ema_period", 100)))
+        slope = max(1, int(self.params.get("slope_bars", 20)))
+        carry_dir = _carry_direction(symbol, float(self.params.get("min_swap_diff", 1.0)))
+        signals = pd.Series(0, index=features.index, dtype=int)
+        if carry_dir == 0:
+            return signals
+        close = features["Close"]
+        ema = _get_ema(features, ema_p)
+        rising = ema > ema.shift(slope)
+        falling = ema < ema.shift(slope)
+        if carry_dir == 1:
+            signals[rising & (close > ema)] = 1
+        else:
+            signals[falling & (close < ema)] = -1
+        return self._zero_warmup(signals, ema_p + slope + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"ema_period": [50, 100, 200], "slope_bars": [10, 20, 40],
+                "min_swap_diff": [0.5, 1.0, 2.0], **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+class CarryFilteredPullbackStrategy(BaseStrategy):
+    """Pullback-continuation entries taken only in the positive-carry direction."""
+
+    @property
+    def name(self) -> str:
+        return "CarryFilteredPullbackStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.TREND_FOLLOWING
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"ema_period": 50, "pullback_atr": 1.0, "min_swap_diff": 1.0,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        ema_p = max(2, int(self.params.get("ema_period", 50)))
+        pb = float(self.params.get("pullback_atr", 1.0))
+        carry_dir = _carry_direction(symbol, float(self.params.get("min_swap_diff", 1.0)))
+        signals = pd.Series(0, index=features.index, dtype=int)
+        if carry_dir == 0:
+            return signals
+        close = features["Close"]
+        ema = _get_ema(features, ema_p)
+        atr = _get_atr(features, 14)
+        band = pb * atr
+        if carry_dir == 1:
+            dipped = close.shift(1) < (ema.shift(1) - band.shift(1))
+            signals[dipped & (close > ema)] = 1
+        else:
+            popped = close.shift(1) > (ema.shift(1) + band.shift(1))
+            signals[popped & (close < ema)] = -1
+        return self._zero_warmup(signals, ema_p + 2)
+
+    def get_param_grid(self) -> Dict[str, List]:
+        return {"ema_period": [20, 50, 100], "pullback_atr": [0.5, 1.0, 1.5],
+                "min_swap_diff": [0.5, 1.0, 2.0], **self._base_sl_tp_grid(), **self._structural_sl_grid()}
+
+
+# =============================================================================
 # STRATEGY REGISTRY
 # =============================================================================
 
@@ -6041,6 +6412,16 @@ class StrategyRegistry:
         'MoneyFlowIndexReversalStrategy': MoneyFlowIndexReversalStrategy,
         'ChaikinMoneyFlowTrendStrategy': ChaikinMoneyFlowTrendStrategy,
         'AccumulationDistributionBreakoutStrategy': AccumulationDistributionBreakoutStrategy,
+
+        # Package K strategies: time/session/calendar and carry-aware surfaces
+        'TimeOfDayMomentumStrategy': TimeOfDayMomentumStrategy,
+        'SessionCloseReversionStrategy': SessionCloseReversionStrategy,
+        'DayOfWeekBiasStrategy': DayOfWeekBiasStrategy,
+        'TurnOfMonthStrategy': TurnOfMonthStrategy,
+        'OvernightDriftStrategy': OvernightDriftStrategy,
+        'IntradayRangeFadeStrategy': IntradayRangeFadeStrategy,
+        'SwapCarryTrendStrategy': SwapCarryTrendStrategy,
+        'CarryFilteredPullbackStrategy': CarryFilteredPullbackStrategy,
     }
     
     @classmethod
