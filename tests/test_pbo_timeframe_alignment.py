@@ -32,8 +32,9 @@ def test_pbo_partitions_by_timeframe():
     M[:, :3] = rng.randn(T, 3) * 0.01
     M[:, 0] += 0.002          # H1 group: one genuine persistent edge -> low PBO
     M[:, 3:] = rng.randn(T, 3) * 0.01  # M5 group: pure noise -> high PBO
+    # min_candidates=2 so the 3-col groups are scored (this test targets the grouping logic).
     res = pbo_by_aligned_group(M, _two_tf_manifest(), n_blocks=16,
-                               candidate_ids=[f"c{i}" for i in range(6)])
+                               candidate_ids=[f"c{i}" for i in range(6)], min_candidates=2)
     assert res["alignment"] == "per_timeframe_window"
     assert res["n_groups"] == 2
     by_tf = {g["timeframe"]: g for g in res["groups"]}
@@ -41,6 +42,25 @@ def test_pbo_partitions_by_timeframe():
     assert by_tf["M5"]["pbo"] > 0.4, "noise timeframe group should have high PBO"
     # Worst-group is the conservative gate read and must surface the noise group.
     assert res["worst_group_pbo"] == by_tf["M5"]["pbo"]
+
+
+def test_thin_groups_excluded_from_worst_and_aggregate():
+    # A 2-candidate group must NOT dominate the gate (degenerate CSCV). With the default
+    # min_candidates, the thin group is flagged and excluded; the deep group drives the read.
+    rng = np.random.RandomState(3)
+    T = 2000
+    M = rng.randn(T, 14) * 0.01      # cols 0-11 = deep H1 group, cols 12-13 = thin M5 group
+    M[:, 0] += 0.002
+    recs = [{"matrix_column": i, "timeframe": "H1", "start_ts": "a", "end_ts": "b"} for i in range(12)]
+    recs += [{"matrix_column": 12, "timeframe": "M5", "start_ts": "c", "end_ts": "d"},
+             {"matrix_column": 13, "timeframe": "M5", "start_ts": "c", "end_ts": "d"}]
+    res = pbo_by_aligned_group(M, {"records": recs}, n_blocks=16,
+                               candidate_ids=[f"c{i}" for i in range(14)])  # default min_candidates=10
+    by_tf = {g["timeframe"]: g for g in res["groups"]}
+    assert by_tf["M5"]["pbo"] is None and "insufficient" in by_tf["M5"]["reason"]
+    assert "M5" in res["insufficient_groups"]
+    assert res["n_scored_groups"] == 1
+    assert res["worst_group_pbo"] == by_tf["H1"]["pbo"]  # thin group did not dominate
 
 
 def test_missing_window_metadata_flags_unverified():
