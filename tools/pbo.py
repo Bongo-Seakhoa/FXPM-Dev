@@ -98,12 +98,17 @@ def pbo_cscv(M, n_blocks=16, candidate_ids=None):
             "candidate_stats": candidate_stats}
 
 
-def pbo_by_aligned_group(M, manifest, n_blocks=16, candidate_ids=None):
+def pbo_by_aligned_group(M, manifest, n_blocks=16, candidate_ids=None, min_candidates=10):
     """Audit-002 H1 fix: CSCV assumes all columns share one calendar time axis. The engine
     emits one matrix per symbol mixing timeframes, whose relative-block rows are NOT coincident
     across timeframes. Partition columns into ALIGNED groups by (timeframe, start_ts, end_ts) —
     within a group the OOS windows are identical so the block rows ARE coincident — run CSCV per
-    group, and aggregate. Running CSCV across mixed timeframes would bias PBO uncontrollably."""
+    group, and aggregate. Running CSCV across mixed timeframes would bias PBO uncontrollably.
+
+    Groups with fewer than `min_candidates` are flagged `insufficient_candidates` and EXCLUDED
+    from the aggregate/worst-group reads: CSCV on 1-2 candidates is degenerate (e.g. PBO=1.0 on
+    2 columns) and must not dominate the gate or wrongly reject a symbol whose deep-pool
+    timeframes are fine."""
     M = np.asarray(M, dtype=np.float64)
     N = M.shape[1]
     records = manifest.get("records") if isinstance(manifest, dict) else None
@@ -124,6 +129,10 @@ def pbo_by_aligned_group(M, manifest, n_blocks=16, candidate_ids=None):
     out_groups, weighted_num, weighted_den = [], 0.0, 0
     ids = [str(v) for v in candidate_ids] if candidate_ids is not None else [str(i) for i in range(N)]
     for (tf, s, e), cols in sorted(groups.items()):
+        if len(cols) < min_candidates:
+            out_groups.append({"timeframe": tf, "start_ts": s, "end_ts": e, "n_candidates": len(cols),
+                               "pbo": None, "reason": f"insufficient_candidates ({len(cols)}<{min_candidates})"})
+            continue
         sub = M[:, cols]
         sub_ids = [ids[c] for c in cols]
         r = pbo_cscv(sub, n_blocks, candidate_ids=sub_ids)
@@ -135,8 +144,10 @@ def pbo_by_aligned_group(M, manifest, n_blocks=16, candidate_ids=None):
     agg = round(weighted_num / weighted_den, 4) if weighted_den else None
     scored = [g for g in out_groups if g.get("pbo") is not None]
     worst = max((g["pbo"] for g in scored), default=None)
+    insufficient = [g["timeframe"] for g in out_groups if g.get("pbo") is None]
     return {"aggregate_pbo": agg, "worst_group_pbo": worst, "alignment": "per_timeframe_window",
-            "n_groups": len(out_groups), "n_scored_groups": len(scored), "groups": out_groups}
+            "n_groups": len(out_groups), "n_scored_groups": len(scored),
+            "insufficient_groups": insufficient, "min_candidates": min_candidates, "groups": out_groups}
 
 
 def load_oos_manifest_matrix(manifest_path):
