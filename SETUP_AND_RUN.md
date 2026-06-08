@@ -27,7 +27,7 @@ This guide covers installation, configuration, optimization, paper trading, live
 | Requirement | Minimum | Recommended |
 |---|---:|---:|
 | OS | Windows 10 | Windows 10/11 |
-| Python | 3.8 | 3.10+ |
+| Python | 3.10 | 3.11+ |
 | RAM | 4 GB | 8+ GB |
 | Disk | 2 GB free | 10+ GB free |
 
@@ -35,7 +35,7 @@ MetaTrader 5 Python integration requires Windows.
 
 ### Required software
 
-1. Python 3.8+
+1. Python 3.10+
 2. MetaTrader 5 installed and logged in
 3. AutoTrading enabled in MT5
 
@@ -125,7 +125,7 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "risk_management_optimization_enabled": true,
     "risk_management_selection_stage": "stage3",
     "production_retrain_mode": "notify",
-    "production_retrain_interval_weeks": 2,
+    "production_retrain_interval_weeks": 4,
     "production_retrain_weekday": "sunday",
     "production_retrain_time": "00:01",
     "production_retrain_anchor_date": "2026-03-29",
@@ -134,6 +134,7 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "storage_signal_ledger_enabled": true,
     "storage_warn_free_gb": 15.0,
     "storage_critical_free_gb": 10.0,
+    "storage_pause_entries_below_free_gb": 10.0,
     "storage_local_data_first_enabled": true,
     "storage_live_sync_bars": 3000,
     "storage_live_sync_overlap_bars": 100,
@@ -148,14 +149,18 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "institutional_supervisor_enabled": true,
     "institutional_supervisor_mode": "circuit_breaker",
     "hard_block_reopen_mode": "manual_or_next_cycle",
+    "daily_loss_hard_block_pct": 2.0,
+    "session_loss_hard_block_pct": 1.0,
+    "weekly_loss_hard_block_pct": 4.0,
+    "open_drawdown_hard_block_pct": 3.0,
     "cycle_drift_monitor_enabled": true,
     "cycle_drift_mode": "lightweight",
     "walk_forward_audit_enabled": true,
-    "walk_forward_promotion_policy": "block_severe_only",
+    "walk_forward_promotion_policy": "observe_only",
     "promote_small_risk_multiplier": 0.5,
     "local_governance_tournament_enabled": true,
     "local_governance_live_mode": "shadow",
-    "winner_ledger_path": "pm_configs_high_risk.json",
+    "winner_ledger_path": "pm_configs.json",
     "target_annual_vol": 0.10,
     "execution_spread_filter_enabled": true,
     "execution_spread_min_edge_mult": 1.25,
@@ -264,7 +269,7 @@ FX PORTFOLIO MANAGER v3.1
 Connected to MT5
 Portfolio Manager initialized
   Symbols: 62
-  Strategies: 50
+  Strategies: 100
 ```
 
 Example optimization flow:
@@ -272,7 +277,7 @@ Example optimization flow:
 ```text
 RUNNING OPTIMIZATION
 MODE: OVERWRITE
-[EURUSD] Regime Optimization: 50 strategies x 6 timeframes x 4 regimes
+[EURUSD] Regime Optimization: 100 strategies x 6 timeframes x 4 regimes
 [EURUSD] [H1] [TREND] Winner: SupertrendStrategy
 SAVED EURUSD to <configured winner ledger>
 ```
@@ -494,14 +499,11 @@ Options:
 - `notify`: tell the operator when due
 - `off`: do not schedule production retrains
 
-### Multiple config files
+### Runtime config source
 
-You can run different PM profiles with separate config files:
-
-```bash
-python pm_main.py --trade --config config_conservative.json
-python pm_main.py --trade --config config_aggressive.json
-```
+The active runtime path is consolidated to `config.json`. Alternative research or
+operator profiles should be temporary, explicit inputs and should not replace the universal
+production config file.
 
 ---
 
@@ -616,7 +618,7 @@ python -m pm_dashboard.app --pm-root "."
 | File | Purpose |
 |---|---|
 | `config.json` | Primary PM configuration |
-| `pm_configs*.json` | Saved validated winners; active path comes from `pipeline.winner_ledger_path` |
+| `pm_configs.json` | Universal saved validated-winner ledger |
 | `regime_params.json` | Tuned regime parameters |
 | `last_trade_log.json` | Decision throttle state |
 | `last_actionable_log.json` | Latest actionable decision feed |

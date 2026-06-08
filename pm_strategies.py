@@ -31,6 +31,11 @@ from typing import Dict, List, Any, Tuple, Optional, Set
 
 from pm_core import StrategyCategory, get_instrument_spec, InstrumentSpec, FeatureComputer
 
+try:
+    from numba import njit as _numba_njit
+except Exception:  # pragma: no cover - optional acceleration path
+    _numba_njit = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +93,7 @@ def get_regime_tp_multipliers() -> Dict[str, float]:
 # GLOBAL SL/TP PARAM GRID — single source of truth for all strategies
 # =============================================================================
 
-_GLOBAL_SL_GRID: List[float] = list(np.arange(1.5, 3.5, 0.5))   # [1.5, 2.0, 2.5, 3.0]
+_GLOBAL_SL_GRID: List[float] = list(np.arange(1.0, 3.5, 0.5))   # [1.0, 1.5, 2.0, 2.5, 3.0]
 _GLOBAL_TP_GRID: List[float] = list(np.arange(1.0, 6.5, 0.5))   # [1.0 .. 6.0]
 _STRATEGY_HELPER_CACHE: Dict[int, Dict[Tuple[Any, ...], Any]] = {}
 _STRATEGY_HELPER_FINALIZERS: Dict[int, weakref.finalize] = {}
@@ -296,6 +301,141 @@ def _rolling_percentile_rank(series: pd.Series, window: int) -> pd.Series:
         current = arr[-1]
         return (np.sum(arr[:-1] < current) / (len(arr) - 1)) * 100.0
     return series.rolling(window, min_periods=window).apply(_pct_rank, raw=True)
+
+
+if _numba_njit is not None:
+    @_numba_njit(cache=True)
+    def _rolling_mad_array(values: np.ndarray, window: int) -> np.ndarray:
+        out = np.empty(values.shape[0], dtype=np.float64)
+        for i in range(out.shape[0]):
+            out[i] = np.nan
+        if window <= 0:
+            return out
+
+        for end in range(window - 1, values.shape[0]):
+            start = end - window + 1
+            total = 0.0
+            valid = True
+            for idx in range(start, end + 1):
+                value = values[idx]
+                if np.isnan(value):
+                    valid = False
+                    break
+                total += value
+            if not valid:
+                continue
+
+            mean = total / window
+            abs_total = 0.0
+            for idx in range(start, end + 1):
+                abs_total += abs(values[idx] - mean)
+            out[end] = abs_total / window
+        return out
+else:
+    _rolling_mad_array = None
+
+
+def _mean_abs_deviation_raw(arr: np.ndarray) -> float:
+    if arr.size == 0 or np.isnan(arr).any():
+        return np.nan
+    mean = float(np.mean(arr))
+    return float(np.mean(np.abs(arr - mean)))
+
+
+def _rolling_mean_abs_deviation(series: pd.Series, window: int) -> pd.Series:
+    """Rolling MAD matching ``Series.rolling(window).apply(lambda...)``."""
+    window = int(window)
+    if _rolling_mad_array is not None:
+        values = series.to_numpy(dtype=np.float64, copy=False)
+        return pd.Series(_rolling_mad_array(values, window), index=series.index, name=series.name)
+    return series.rolling(window, min_periods=window).apply(_mean_abs_deviation_raw, raw=True)
+
+
+if _numba_njit is not None:
+    @_numba_njit(cache=True)
+    def _divergence_signals_array(
+        close: np.ndarray,
+        indicator: np.ndarray,
+        lows: np.ndarray,
+        highs: np.ndarray,
+        order: int,
+    ) -> np.ndarray:
+        out = np.zeros(close.shape[0], dtype=np.int64)
+        if order <= 0:
+            return out
+        lookback = 5 * order
+        for i in range(2 * order + 1, close.shape[0]):
+            if lows[i]:
+                start = i - lookback
+                if start < 0:
+                    start = 0
+                prev = -1
+                for j in range(i - 1, start - 1, -1):
+                    if lows[j]:
+                        prev = j
+                        break
+                if prev >= 0:
+                    ci = close[i]
+                    cp = close[prev]
+                    ii = indicator[i]
+                    ip = indicator[prev]
+                    if not (np.isnan(ci) or np.isnan(cp) or np.isnan(ii) or np.isnan(ip)):
+                        if ci < cp and ii > ip:
+                            out[i] = 1
+
+            if highs[i]:
+                start = i - lookback
+                if start < 0:
+                    start = 0
+                prev = -1
+                for j in range(i - 1, start - 1, -1):
+                    if highs[j]:
+                        prev = j
+                        break
+                if prev >= 0:
+                    ci = close[i]
+                    cp = close[prev]
+                    ii = indicator[i]
+                    ip = indicator[prev]
+                    if not (np.isnan(ci) or np.isnan(cp) or np.isnan(ii) or np.isnan(ip)):
+                        if ci > cp and ii < ip:
+                            out[i] = -1
+        return out
+else:
+    _divergence_signals_array = None
+
+
+def _price_indicator_divergence_signals(
+    index: pd.Index,
+    close: pd.Series,
+    indicator: pd.Series,
+    price_lows: pd.Series,
+    price_highs: pd.Series,
+    order: int,
+) -> pd.Series:
+    """Divergence signals matching the legacy per-row swing lookup loop."""
+    close_arr = close.to_numpy(dtype=np.float64, copy=False)
+    ind_arr = indicator.to_numpy(dtype=np.float64, copy=False)
+    low_arr = price_lows.to_numpy(dtype=bool, copy=False)
+    high_arr = price_highs.to_numpy(dtype=bool, copy=False)
+
+    if _divergence_signals_array is not None:
+        out = _divergence_signals_array(close_arr, ind_arr, low_arr, high_arr, int(order))
+    else:
+        out = np.zeros(len(index), dtype=np.int64)
+        lookback = 5 * int(order)
+        for i in range(2 * int(order) + 1, len(index)):
+            if low_arr[i]:
+                start = max(0, i - lookback)
+                prev = next((j for j in range(i - 1, start - 1, -1) if low_arr[j]), -1)
+                if prev >= 0 and close_arr[i] < close_arr[prev] and ind_arr[i] > ind_arr[prev]:
+                    out[i] = 1
+            if high_arr[i]:
+                start = max(0, i - lookback)
+                prev = next((j for j in range(i - 1, start - 1, -1) if high_arr[j]), -1)
+                if prev >= 0 and close_arr[i] > close_arr[prev] and ind_arr[i] < ind_arr[prev]:
+                    out[i] = -1
+    return pd.Series(out, index=index, dtype=int)
 
 
 def _get_adx_di(features: pd.DataFrame, period: int = 14
@@ -797,19 +937,42 @@ class BaseStrategy(ABC):
         if not np.isfinite(current_close):
             return None
 
+        cache = features.attrs.setdefault('_fxpm_structural_sl_cache', {})
+        cache_key = int(lookback)
+        cached = cache.get(cache_key)
+        if (
+            not isinstance(cached, dict)
+            or cached.get('length') != len(features)
+            or 'rolling_low' not in cached
+            or 'rolling_high' not in cached
+        ):
+            rolling_low = (
+                features['Low']
+                .rolling(window=lookback, min_periods=1)
+                .min()
+                .to_numpy(dtype=float, copy=False)
+            )
+            rolling_high = (
+                features['High']
+                .rolling(window=lookback, min_periods=1)
+                .max()
+                .to_numpy(dtype=float, copy=False)
+            )
+            cached = {
+                'length': len(features),
+                'rolling_low': rolling_low,
+                'rolling_high': rolling_high,
+            }
+            cache[cache_key] = cached
+
+        idx = end - 1
         if signal > 0:
-            window = features['Low'].to_numpy()[start:end]
-            if window.size == 0:
-                return None
-            ref = float(np.nanmin(window))
+            ref = float(cached['rolling_low'][idx])
             if not np.isfinite(ref) or ref >= current_close:
                 return None
             distance = current_close - ref
         elif signal < 0:
-            window = features['High'].to_numpy()[start:end]
-            if window.size == 0:
-                return None
-            ref = float(np.nanmax(window))
+            ref = float(cached['rolling_high'][idx])
             if not np.isfinite(ref) or ref <= current_close:
                 return None
             distance = ref - current_close
@@ -1760,7 +1923,7 @@ class CCIReversalStrategy(BaseStrategy):
 
         tp = (features['High'] + features['Low'] + features['Close']) / 3
         sma = tp.rolling(period).mean()
-        mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean())
+        mad = _rolling_mean_abs_deviation(tp, period)
         cci = (tp - sma) / (0.015 * mad + 1e-10)
 
         signals = pd.Series(0, index=features.index)
@@ -3352,25 +3515,9 @@ class RSIDivergenceStrategy(BaseStrategy):
         close = features['Close']
         _, price_lows = _detect_swing_points(close, order)
         price_highs, _ = _detect_swing_points(close, order)
-        signals = pd.Series(0, index=features.index, dtype=int)
-        # Bullish divergence: price lower low, RSI higher low
-        for i in range(2 * order + 1, len(features)):
-            if price_lows.iloc[i]:
-                # Find previous swing low
-                prev_lows = price_lows.iloc[max(0, i - 5 * order):i]
-                prev_idx = prev_lows[prev_lows].index
-                if len(prev_idx) > 0:
-                    j = features.index.get_loc(prev_idx[-1])
-                    if close.iloc[i] < close.iloc[j] and rsi.iloc[i] > rsi.iloc[j]:
-                        signals.iloc[i] = 1
-            if price_highs.iloc[i]:
-                prev_highs = price_highs.iloc[max(0, i - 5 * order):i]
-                prev_idx = prev_highs[prev_highs].index
-                if len(prev_idx) > 0:
-                    j = features.index.get_loc(prev_idx[-1])
-                    if close.iloc[i] > close.iloc[j] and rsi.iloc[i] < rsi.iloc[j]:
-                        signals.iloc[i] = -1
-        return signals
+        return _price_indicator_divergence_signals(
+            features.index, close, rsi, price_lows, price_highs, order
+        )
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'rsi_period': [7, 14, 21], 'swing_order': [3, 5, 7],
@@ -3403,23 +3550,9 @@ class MACDDivergenceStrategy(BaseStrategy):
         close = features['Close']
         _, price_lows = _detect_swing_points(close, order)
         price_highs, _ = _detect_swing_points(close, order)
-        signals = pd.Series(0, index=features.index, dtype=int)
-        for i in range(2 * order + 1, len(features)):
-            if price_lows.iloc[i]:
-                prev_lows = price_lows.iloc[max(0, i - 5 * order):i]
-                prev_idx = prev_lows[prev_lows].index
-                if len(prev_idx) > 0:
-                    j = features.index.get_loc(prev_idx[-1])
-                    if close.iloc[i] < close.iloc[j] and hist.iloc[i] > hist.iloc[j]:
-                        signals.iloc[i] = 1
-            if price_highs.iloc[i]:
-                prev_highs = price_highs.iloc[max(0, i - 5 * order):i]
-                prev_idx = prev_highs[prev_highs].index
-                if len(prev_idx) > 0:
-                    j = features.index.get_loc(prev_idx[-1])
-                    if close.iloc[i] > close.iloc[j] and hist.iloc[i] < hist.iloc[j]:
-                        signals.iloc[i] = -1
-        return signals
+        return _price_indicator_divergence_signals(
+            features.index, close, hist, price_lows, price_highs, order
+        )
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'swing_order': [3, 5, 7], 'macd_fast': [8, 12],
@@ -3457,23 +3590,9 @@ class OBVDivergenceStrategy(BaseStrategy):
         close = features['Close']
         _, price_lows = _detect_swing_points(close, order)
         price_highs, _ = _detect_swing_points(close, order)
-        signals = pd.Series(0, index=features.index, dtype=int)
-        for i in range(2 * order + 1, len(features)):
-            if price_lows.iloc[i]:
-                prev_lows = price_lows.iloc[max(0, i - 5 * order):i]
-                prev_idx = prev_lows[prev_lows].index
-                if len(prev_idx) > 0:
-                    j = features.index.get_loc(prev_idx[-1])
-                    if close.iloc[i] < close.iloc[j] and obv.iloc[i] > obv.iloc[j]:
-                        signals.iloc[i] = 1
-            if price_highs.iloc[i]:
-                prev_highs = price_highs.iloc[max(0, i - 5 * order):i]
-                prev_idx = prev_highs[prev_highs].index
-                if len(prev_idx) > 0:
-                    j = features.index.get_loc(prev_idx[-1])
-                    if close.iloc[i] > close.iloc[j] and obv.iloc[i] < obv.iloc[j]:
-                        signals.iloc[i] = -1
-        return signals
+        return _price_indicator_divergence_signals(
+            features.index, close, obv, price_lows, price_highs, order
+        )
 
     def get_param_grid(self) -> Dict[str, List]:
         return {'swing_order': [3, 5, 7], 'obv_smooth': [0, 5, 10],

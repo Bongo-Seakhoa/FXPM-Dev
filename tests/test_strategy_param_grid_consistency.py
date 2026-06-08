@@ -5,6 +5,8 @@ from pm_strategies import (
     StrategyRegistry,
     _LARGE_GRID_WARN_EMITTED,
     _LARGE_PARAM_GRID_WARN_THRESHOLD,
+    _GLOBAL_SL_GRID,
+    _GLOBAL_TP_GRID,
 )
 
 
@@ -25,6 +27,11 @@ class StrategyParamGridConsistencyTests(unittest.TestCase):
 
     def test_strategy_count_is_100(self):
         self.assertEqual(StrategyRegistry.count(), 100)
+
+    def test_global_atr_exit_grid_contains_initial_anchor_ranges(self):
+        for value in (1.0, 2.0, 3.0):
+            self.assertIn(value, _GLOBAL_SL_GRID)
+            self.assertIn(value, _GLOBAL_TP_GRID)
 
     def test_all_strategies_instantiate(self):
         """Every registered strategy can be instantiated with defaults."""

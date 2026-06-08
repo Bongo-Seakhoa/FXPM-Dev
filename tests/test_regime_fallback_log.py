@@ -5,13 +5,16 @@ import logging
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from pm_regime import (
     DEFAULT_PARAMS_BY_TIMEFRAME,
     clear_regime_fallback_log,
     clear_regime_params_cache,
     get_regime_fallback_record,
+    has_tuned_regime_params,
     load_regime_params,
+    materialize_regime_params_for_cells,
 )
 
 
@@ -73,6 +76,24 @@ class RegimeFallbackLoggingTests(unittest.TestCase):
         self.assertTrue(get_regime_fallback_record())
         clear_regime_fallback_log()
         self.assertFalse(get_regime_fallback_record())
+
+    def test_has_tuned_regime_params_does_not_record_fallback(self):
+        path = self._missing_params_path()
+        self.assertFalse(has_tuned_regime_params("EURUSD", "H1", filepath=path))
+        self.assertFalse(get_regime_fallback_record())
+
+    def test_materialized_surface_matches_validation_no_file_surface(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            regime_path = Path(tmp) / "regime_params.json"
+            added = materialize_regime_params_for_cells([("BTCUSD", "H4")], str(regime_path))
+            self.assertEqual(added, 1)
+
+            clear_regime_params_cache()
+            explicit = load_regime_params("BTCUSD", "H4", filepath=str(regime_path)).to_dict()
+            clear_regime_params_cache()
+            fallback = load_regime_params("BTCUSD", "H4", filepath=self._missing_params_path()).to_dict()
+
+            self.assertEqual(explicit, fallback)
 
 
 class DefaultParamsByTimeframeTests(unittest.TestCase):

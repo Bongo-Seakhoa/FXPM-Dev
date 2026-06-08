@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FxPM 1.4 — Best Config Recommendations</title>
+<style>
+  :root {
+    --bg: #0e1218; --bg-soft: #151b24; --card: #1a2230; --card-soft: #202a3b;
+    --border: #2a3444; --border-strong: #3a4658;
+    --ink: #e8eef6; --ink-strong: #ffffff; --muted: #a4afbc;
+    --accent: #2dd4bf; --accent-soft: rgba(45, 212, 191, 0.13);
+    --warn: #f59e0b; --warn-soft: rgba(245, 158, 11, 0.12);
+    --danger: #f87171; --danger-soft: rgba(248, 113, 113, 0.12);
+    --good: #34d399; --good-soft: rgba(52, 211, 153, 0.13);
+    --code-bg: #0b0f15; --code-border: #2a3444;
+    --link: #60a5fa; --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.25);
+    --radius: 10px; --radius-sm: 6px;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono","SF Mono",Consolas,Menlo,monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#f7f8fa;--bg-soft:#fff;--card:#fff;--card-soft:#f3f5f8;--border:#e1e5ec;--border-strong:#c8cfda;
+      --ink:#1c222b;--ink-strong:#050810;--muted:#5f6774;
+      --accent:#0d9488;--accent-soft:rgba(13,148,136,0.10);
+      --warn:#b45309;--warn-soft:rgba(180,83,9,0.10);
+      --danger:#b83333;--danger-soft:rgba(184,51,51,0.10);
+      --good:#047857;--good-soft:rgba(4,120,87,0.10);
+      --code-bg:#f0f3f7;--code-border:#e1e5ec;--link:#1d4ed8;
+      --shadow:0 1px 2px rgba(0,0,0,0.04),0 4px 16px rgba(0,0,0,0.06);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--font-sans); font-size:15px; line-height:1.62; -webkit-font-smoothing:antialiased; }
+  .page { max-width:1180px; margin:0 auto; padding:48px 28px 96px; }
+  header.top { border-bottom:1px solid var(--border); padding-bottom:22px; margin-bottom:32px; }
+  .eyebrow { color:var(--accent); font-family:var(--font-mono); font-size:12px; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:10px; }
+  h1 { margin:0 0 12px; font-size:30px; line-height:1.2; letter-spacing:-0.01em; color:var(--ink-strong); }
+  header.top .meta { color:var(--muted); font-family:var(--font-mono); font-size:13px; line-height:1.7; }
+  header.top .meta code { background:var(--card-soft); border:1px solid var(--border); padding:1px 6px; border-radius:4px; font-size:12px; }
+  h2 { margin:48px 0 14px; font-size:21px; color:var(--ink-strong); padding-bottom:6px; border-bottom:1px solid var(--border); }
+  h2:first-of-type { margin-top:0; }
+  h3 { margin:24px 0 10px; font-size:16px; color:var(--ink-strong); font-weight:650; }
+  p { margin:0 0 14px; }
+  a { color:var(--link); text-decoration:none; border-bottom:1px solid transparent; transition:border-color 0.12s; }
+  a:hover { border-bottom-color:currentColor; }
+  code { font-family:var(--font-mono); font-size:0.88em; background:var(--code-bg); border:1px solid var(--code-border); padding:1px 5px; border-radius:4px; color:var(--ink); }
+  pre { background:var(--code-bg); border:1px solid var(--code-border); border-radius:var(--radius); padding:16px 18px; overflow-x:auto; margin:16px 0 22px; font-family:var(--font-mono); font-size:13px; line-height:1.55; box-shadow:var(--shadow); }
+  pre code { background:none; border:0; padding:0; font-size:inherit; }
+  ul, ol { margin:6px 0 16px; padding-left:24px; }
+  li { margin:3px 0; }
+  hr { border:0; border-top:1px solid var(--border); margin:36px 0; }
+  table { width:100%; border-collapse:collapse; margin:14px 0 22px; font-size:13.5px; background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow); table-layout:fixed; }
+  thead th { background:var(--card-soft); color:var(--muted); font-weight:600; text-align:left; padding:10px 12px; border-bottom:1px solid var(--border-strong); font-size:12px; text-transform:uppercase; letter-spacing:0.04em; }
+  tbody td { padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top; word-wrap:break-word; }
+  tbody tr:last-child td { border-bottom:0; }
+  tbody tr:hover { background:var(--card-soft); }
+  th.col-key   { width: 26%; }
+  th.col-type  { width: 8%; }
+  th.col-rec   { width: 16%; }
+  th.col-why   { width: 50%; }
+  td.cell-key  { font-family:var(--font-mono); font-size:12.5px; color:var(--ink); }
+  td.cell-rec  { font-family:var(--font-mono); font-size:12.5px; color:var(--accent); white-space:nowrap; }
+  td.cell-rec.changed { color:var(--warn); }
+  .pill { display:inline-block; font-family:var(--font-mono); font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; padding:1px 7px; border-radius:999px; border:1px solid; line-height:1.5; margin-left:6px; vertical-align:middle; }
+  .pill-keep   { background:var(--good-soft);   color:var(--good);   border-color:var(--good); }
+  .pill-tune   { background:var(--warn-soft);   color:var(--warn);   border-color:var(--warn); }
+  .pill-strict { background:var(--danger-soft); color:var(--danger); border-color:var(--danger); }
+  .pill-info   { background:var(--accent-soft); color:var(--accent); border-color:var(--accent); }
+  .callout { background:var(--accent-soft); border-left:3px solid var(--accent); padding:14px 18px; border-radius:var(--radius-sm); margin:20px 0; }
+  .callout strong { color:var(--ink-strong); }
+  .toc { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:18px 22px; margin:0 0 36px; box-shadow:var(--shadow); }
+  .toc h3 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); font-weight:700; }
+  .toc ol { margin:0; padding-left:22px; columns:2; column-gap:24px; }
+  .toc li { margin:3px 0; break-inside:avoid; }
+  .toc a { color:var(--ink); }
+  .footer-note { margin-top:56px; padding-top:22px; border-top:1px solid var(--border); color:var(--muted); font-size:13px; }
+  @media (max-width:760px) {
+    .page { padding:28px 16px 64px; }
+    h1 { font-size:24px; }
+    h2 { font-size:18px; }
+    .toc ol { columns:1; }
+    table { font-size:12.5px; table-layout:auto; }
+    thead th, tbody td { padding:8px 9px; }
+    th.col-key, th.col-type, th.col-rec, th.col-why { width:auto; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="top">
+  <div class="eyebrow">Recommended profile · 2026-04-30</div>
+  <h1>FxPM 1.4 — Best Config Recommendations</h1>
+  <div class="meta">
+    Target operator: $10K–$50K equity · MT5 broker · Windows host<br />
+    Profile philosophy: <strong style="color:var(--ink)">balanced specialist tournament + lightweight institutional shell + fail-closed live</strong><br />
+    Source: walks every key in <code>config.json</code> against the post-v2 codebase.
+  </div>
+</header>
+
+<div class="callout">
+  <strong>How to read this document.</strong>
+  Each setting is tagged <span class="pill pill-keep">keep</span> if the current value is what I'd recommend, <span class="pill pill-tune">tune</span> if I'd change it, <span class="pill pill-strict">strict</span> if it's a non-negotiable safety knob, and <span class="pill pill-info">info</span> for environment-specific values. The <em>Recommended</em> column gives the value I'd set; the <em>Why</em> column gives one or two sentences of operator-level reasoning.
+</div>
+
+<div class="callout" style="background:var(--warn-soft);border-left-color:var(--warn);">
+  <strong>What this profile optimizes for.</strong> Long-term capital preservation while letting the specialist tournament keep its edge. It is <em>not</em> the most aggressive configuration possible. If you have a $5K account and want to compound fast, raise <code>position.risk_per_trade_pct</code> to 1.5–2.0; if you have a $50K+ account and want survival above all, drop it to 0.5–0.75. The discovery layer is risk-invariant in this profile (<code>discovery_risk_per_trade_pct = 1.0</code> is fixed), so changing live risk does not re-rank winners.
+</div>
+
+<nav class="toc">
+  <h3>Sections</h3>
+  <ol>
+    <li><a href="#paths">1. Paths and dataset controls</a></li>
+    <li><a href="#capital">2. Capital and base risk</a></li>
+    <li><a href="#costs">3. Cost modelling</a></li>
+    <li><a href="#optimization">4. Optimization controls</a></li>
+    <li><a href="#fx-scoring">5. FX scoring &amp; validation</a></li>
+    <li><a href="#optuna">6. Optuna search budget</a></li>
+    <li><a href="#timeframes">7. Timeframes &amp; symbols</a></li>
+    <li><a href="#retrain">8. Production retrain schedule</a></li>
+    <li><a href="#workflow">9. Active recent M5 workflow</a></li>
+    <li><a href="#stage3">10. Stage-3 / risk-management selection</a></li>
+    <li><a href="#historical-audit">11. Historical stress audit</a></li>
+    <li><a href="#regime">12. Regime optimization &amp; gates</a></li>
+    <li><a href="#promotion">13. Walk-forward &amp; promotion</a></li>
+    <li><a href="#live-loop">14. Live loop &amp; readiness</a></li>
+    <li><a href="#supervisor">15. Institutional supervisor</a></li>
+    <li><a href="#cycle-drift">16. Cycle drift sentinel</a></li>
+    <li><a href="#governance">17. Local governance / order management</a></li>
+    <li><a href="#exec-quality">18. Execution-quality filters</a></li>
+    <li><a href="#margin">19. Margin protection</a></li>
+    <li><a href="#secondary">20. Secondary trade / D1+lower</a></li>
+    <li><a href="#swap">21. Swap modelling</a></li>
+    <li><a href="#regime-audit">22. Regime audit &amp; events</a></li>
+    <li><a href="#storage">23. Storage governance</a></li>
+    <li><a href="#position">24. Position section</a></li>
+    <li><a href="#mt5">25. MT5 connection</a></li>
+    <li><a href="#instrument-specs">26. Instrument specs &amp; symbol list</a></li>
+    <li><a href="#do-not-touch">27. Knobs not to touch without paper evidence</a></li>
+  </ol>
+</nav>
+
+<hr />
+
+<!-- ============== 1. PATHS ============== -->
+<h2 id="paths">1. Paths and dataset controls</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">data_dir <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"./data"</td><td>Repo-relative root for <code>{SYMBOL}_M5.csv</code> seeds. Higher timeframes are derived in-memory; never load them from disk separately.</td></tr>
+    <tr><td class="cell-key">output_dir <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"./pm_outputs"</td><td>Optimization summaries, trade artifacts, signal ledgers. Runtime <em>logs</em> do not go here.</td></tr>
+    <tr><td class="cell-key">log_dir <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"./logs"</td><td>Runtime logs and supervisor / cycle-drift state JSONs. Already gitignored.</td></tr>
+    <tr><td class="cell-key">max_bars <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">300000</td><td>~2.85 years of M5 bars. Sufficient to size a 250 000-bar active universe plus 50 000-bar audit. Raising it without raising <code>active_universe_bars</code> just expands the audit window.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 2. CAPITAL ============== -->
+<h2 id="capital">2. Capital and base risk</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">initial_capital <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">10000.0</td><td>Used by backtests, analytics, and the dashboard's equity curve. Match it to your live account size to make backtest equity readable.</td></tr>
+    <tr><td class="cell-key">risk_per_trade_pct <span class="pill pill-info">compat</span></td><td>float</td><td class="cell-rec">1.0</td><td>Compatibility backfill only — live sizing reads <code>position.risk_per_trade_pct</code>. Keep at 1.0 so legacy callers see a sensible default.</td></tr>
+    <tr><td class="cell-key">discovery_risk_per_trade_pct <span class="pill pill-strict">strict</span></td><td>float</td><td class="cell-rec">1.0</td><td><strong>Do not change.</strong> This pinning is what makes winners identical across low-risk and high-risk modes. The audit found that varying it re-ranks strategies due to non-linear DD penalties.</td></tr>
+    <tr><td class="cell-key">overlap_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">10.0</td><td>10 % of the active universe (~25 000 M5 bars) is plenty of warmup for indicators like ADX(14)+EMA(200). Below 5 % risks under-warming long-period strategies.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 3. COSTS ============== -->
+<h2 id="costs">3. Cost modelling</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">use_spread <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Always model spread. Disabling this inflates discovery PnL and produces winners that don't survive live execution.</td></tr>
+    <tr><td class="cell-key">use_commission <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Per-lot commission applies to most ECN brokers. Set to <code>false</code> only on spread-only accounts (commission is embedded in the spread there).</td></tr>
+    <tr><td class="cell-key">use_slippage <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Applies only on stop exits (market orders). TP exits are limit fills with no slippage.</td></tr>
+    <tr><td class="cell-key">slippage_pips <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.5</td><td>Conservative for major FX. If live logs show consistent &gt;1 pip slippage on stops, raise to 1.0; if &lt;0.2, lower to 0.3 to avoid pessimistic backtests.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 4. OPTIMIZATION ============== -->
+<h2 id="optimization">4. Optimization controls</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">max_param_combos <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">200</td><td>Cap on grid-search combos when Optuna is unavailable. Optuna path uses <code>regime_hyperparam_max_combos</code> instead.</td></tr>
+    <tr><td class="cell-key">optimization_max_workers <span class="pill pill-tune">tune</span></td><td>int</td><td class="cell-rec">4 (or N-1 cores)</td><td>4 is right for a 6-core desktop. On a 12-core / 16-core workstation set to 8 — Numba parallelism does not stack well above that.</td></tr>
+    <tr><td class="cell-key">min_trades <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">25</td><td>Floor for any candidate to be ranked at all. Below this is statistical noise.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 5. FX SCORING ============== -->
+<h2 id="fx-scoring">5. FX scoring &amp; validation thresholds</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">fx_opt_min_trades <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">15</td><td>Lower than <code>min_trades</code> by design — Optuna sees more trial-trades than the live-relevant Stage-2 surface.</td></tr>
+    <tr><td class="cell-key">fx_val_min_trades <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">15</td><td>Stage-2 validation needs ≥15 trades for the score's variance to stabilize.</td></tr>
+    <tr><td class="cell-key">fx_val_max_drawdown <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">12.0</td><td>Validation DD ceiling. Conservative — combined with promote-small derate, anything above 12 % is treated as fragile. Loosen to 15 only on aggressive accounts.</td></tr>
+    <tr><td class="cell-key">fx_val_sharpe_override <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.3</td><td>Sharpe ≥0.3 can override a weak robustness ratio. Lower than 0.3 risks letting noise pass; higher than 0.5 starves selection.</td></tr>
+    <tr><td class="cell-key">fx_selection_top_k <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5</td><td>5 candidates per regime → enough diversity without blowing out compute. Each must pass full validation.</td></tr>
+    <tr><td class="cell-key">fx_opt_top_k <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5</td><td>Hyperparam Top-K. Same trade-off as above.</td></tr>
+    <tr><td class="cell-key">fx_gap_penalty_lambda <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.7</td><td>Train→val score gap is multiplied by 0.7. Above 1.0 is harsh and suppresses survivors; below 0.5 is too lenient and lets overfit train-leaders through.</td></tr>
+    <tr><td class="cell-key">fx_robustness_boost <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.15</td><td>15 % score boost weight for robust strategies. The audit's recommendation. Already calibrated for the current scoring scale.</td></tr>
+    <tr><td class="cell-key">fx_min_robustness_ratio <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.80</td><td>val_score ≥ 0.80 × train_score. Combined with the Sharpe override, this is strict but not punitive.</td></tr>
+    <tr><td class="cell-key">fx_stability_penalty_k <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">2.0</td><td>Validation-side <code>exp(-k·std_weekly_return)</code> stability penalty. k=2.0 → 5 % std maps to 0.90 multiplier — fair tax on noisy strategies.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 6. OPTUNA ============== -->
+<h2 id="optuna">6. Optuna search budget</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">optuna_family_size_aware_budget <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Enable. Without this, large-grid families (50 K+ combos) get the same flat budget as 50-combo families and lose the tournament unfairly.</td></tr>
+    <tr><td class="cell-key">optuna_min_trials_per_strategy <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">200</td><td>Minimum is high enough that small-grid families still get meaningful TPE warmup, not just 5–10 random trials.</td></tr>
+    <tr><td class="cell-key">optuna_max_trials_per_strategy <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5000</td><td>Audit raised from 1000 to 5000. At 15 % coverage that lets a 33 K-combo family hit its target instead of being capped at 2 % coverage.</td></tr>
+    <tr><td class="cell-key">optuna_target_coverage_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.15</td><td>15 % cartesian coverage. The clamp by min/max keeps small families exhaustive and large families bounded.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 7. TIMEFRAMES ============== -->
+<h2 id="timeframes">7. Timeframes &amp; symbols</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">timeframes <span class="pill pill-keep">keep</span></td><td>list</td><td class="cell-rec">["M5","M15","M30","H1","H4","D1"]</td><td>Six timeframes is the sweet spot — adds D1 swing edge, but compute cost is still acceptable. Drop M5 if you only run swing strategies; that ~halves discovery time.</td></tr>
+    <tr><td class="cell-key">symbols <span class="pill pill-info">env</span></td><td>list</td><td class="cell-rec">62 (current)</td><td>Wide universe = more specialists. Trim to FX-only if your broker spreads on indices/cryptos are punitive (e.g., spread &gt; 1 pip-equivalent on indices).</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 8. RETRAIN ============== -->
+<h2 id="retrain">8. Production retrain schedule</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">production_retrain_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"notify"</td><td>Operator-supervised. Auto-retrain in production is a footgun: a bad data-feed week silently rebuilds winners on broken bars. Switch to "auto" only after weeks of clean notify-mode runs.</td></tr>
+    <tr><td class="cell-key">production_retrain_interval_weeks <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">2</td><td>Two-week cadence is the v2 doc's edge thesis. Shorter risks overfitting noise; longer lets edge decay.</td></tr>
+    <tr><td class="cell-key">production_retrain_weekday <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"sunday"</td><td>FX market closed → fresh data window cleanly bounded. Don't retrain mid-trading-week.</td></tr>
+    <tr><td class="cell-key">production_retrain_time <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"00:01"</td><td>Just past midnight broker-time. Avoids any Sunday-evening session-open noise.</td></tr>
+    <tr><td class="cell-key">production_retrain_anchor_date <span class="pill pill-info">env</span></td><td>str</td><td class="cell-rec">"2026-03-29"</td><td>Reference Sunday for the cadence. Pick a recent Sunday and leave it; the schedule advances by 2 weeks from this anchor.</td></tr>
+    <tr><td class="cell-key">production_retrain_poll_seconds <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">60</td><td>1-minute poll. No reason to be tighter or looser.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 9. WORKFLOW ============== -->
+<h2 id="workflow">9. Active recent M5 workflow</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">historical_stress_audit_bars <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">50000</td><td>~6 months of older M5 used as a fragility audit on selected winners. Out-of-selection by design — never feeds Stage-1 ranking.</td></tr>
+    <tr><td class="cell-key">active_universe_bars <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">250000</td><td>~2.4 years of M5. Wide enough for D1 strategies to accumulate 200+ bars, narrow enough that ancient market-microstructure changes don't dominate.</td></tr>
+    <tr><td class="cell-key">active_stage2_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">50.0</td><td>Newest 50 % of the active universe is the Stage-2 selection surface. 50 % keeps train and val balanced.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 10. STAGE3 ============== -->
+<h2 id="stage3">10. Stage-3 / risk-management selection</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">risk_management_optimization_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Per-winner governance/risk policy selection runs as a second layer after the strategy is chosen. This is where the 11-policy expansion pays off.</td></tr>
+    <tr><td class="cell-key">risk_management_selection_stage <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"stage3"</td><td>Stage-3 = freshest 50 % of active universe. The right surface for picking the order-policy that fits the most recent market behaviour.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 11. HISTORICAL AUDIT ============== -->
+<h2 id="historical-audit">11. Historical stress audit thresholds</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">historical_audit_min_trades <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5</td><td>Lenient. Audit only flags if there's enough activity to draw a conclusion.</td></tr>
+    <tr><td class="cell-key">historical_audit_max_drawdown <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">35.0</td><td>Lenient ceiling. The audit catches catastrophic older-window blowups, not normal underperformance.</td></tr>
+    <tr><td class="cell-key">historical_audit_min_profit_factor <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.6</td><td>PF≥0.6 = "didn't bleed out". Above 1.0 would over-restrict winners that simply had a flat older period.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 12. REGIME ============== -->
+<h2 id="regime">12. Regime optimization &amp; gates</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">use_regime_optimization <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>The whole specialist-per-regime model depends on this.</td></tr>
+    <tr><td class="cell-key">regime_min_train_trades <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">25</td><td>Per-regime trade floor on train. Below this the bucket is too sparse to score honestly.</td></tr>
+    <tr><td class="cell-key">regime_min_val_trades <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">15</td><td>Per-regime trade floor on val. Cycle-drift sentinel kicks in at <code>cycle_drift_min_trades=6</code> after live deployment, which is a different gate.</td></tr>
+    <tr><td class="cell-key">regime_params_file <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"regime_params.json"</td><td>Tuned regime parameters; fall back to asset-class defaults when missing per the project memory.</td></tr>
+    <tr><td class="cell-key">regime_enable_hyperparam_tuning <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Top-K strategies per regime get Optuna tuning. Disabling cuts compute by ~80 % at the cost of weaker winners.</td></tr>
+    <tr><td class="cell-key">regime_hyperparam_top_k <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5</td><td>Tune top-5 strategies per regime. 3 misses local optima for borderline strategies; 7+ doubles compute for diminishing return.</td></tr>
+    <tr><td class="cell-key">regime_hyperparam_max_combos <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">200</td><td>Per-strategy combos when grid search is used. Optuna ignores this in favour of <code>optuna_*</code> budget.</td></tr>
+    <tr><td class="cell-key">regime_min_val_profit_factor <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">1.05</td><td>Storage gate: PF&lt;1.05 → no_trade marker. Below 1.0 lets unprofitable winners survive; above 1.10 starves regimes with thin samples.</td></tr>
+    <tr><td class="cell-key">regime_min_val_return_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">5.0</td><td>5 % return on the validation window. Combined with the return/DD ratio gate this is the right firmness.</td></tr>
+    <tr><td class="cell-key">regime_min_val_return_dd_ratio <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">1.0</td><td>Return/DD ≥ 1.0 means a strategy made at least as much as the worst dip cost. Hard gate.</td></tr>
+    <tr><td class="cell-key">regime_allow_losing_winners <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Never allow PF&lt;1 winners. The exceptional-val rescue is the only path through, and it requires Sharpe ≥0.5, win rate &gt;50 %, and ≥50 val trades.</td></tr>
+    <tr><td class="cell-key">regime_no_winner_marker <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"NO_TRADE"</td><td>Explicit marker that the live trader honors; do not change.</td></tr>
+    <tr><td class="cell-key">regime_validation_top_k <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5</td><td>Validation descent depth — try the top-5 ranked candidates before declaring no winner.</td></tr>
+    <tr><td class="cell-key">train_min_profit_factor <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.80</td><td>Pre-tuning lenient floor — strategies whose default params are catastrophically bad (PF&lt;0.80 on train) skip tuning. 0.80 catches blowups without over-pruning.</td></tr>
+    <tr><td class="cell-key">train_min_return_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">-15.0</td><td>Allow up to -15 % train return into tuning — many strategies with bad defaults find their edge after Optuna.</td></tr>
+    <tr><td class="cell-key">train_max_drawdown <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">20.0</td><td>Lenient train DD ceiling.</td></tr>
+    <tr><td class="cell-key">exceptional_val_profit_factor <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">1.50</td><td>Weak-train rescue requires val PF ≥1.50 — strong evidence the edge is real on out-of-sample.</td></tr>
+    <tr><td class="cell-key">exceptional_val_return_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">10.0</td><td>Weak-train rescue requires val return ≥10 %.</td></tr>
+    <tr><td class="cell-key">actionable_score_margin <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.92</td><td>Live-actionable signal margin. Below this and the signal is logged but not acted on.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 13. PROMOTION ============== -->
+<h2 id="promotion">13. Walk-forward audit &amp; promotion</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">walk_forward_audit_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Severe-fragility audit on top of selection. Adds ~10 % to discovery time; cheap insurance.</td></tr>
+    <tr><td class="cell-key">walk_forward_audit_windows <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">3</td><td>Three rolling audit windows. Below this and you can't detect a pattern; above this and audit cost grows linearly without much extra signal.</td></tr>
+    <tr><td class="cell-key">walk_forward_audit_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"severe_fragility_only"</td><td>v2 doc's mandate — do <em>not</em> displace the latest selection surface for older window-best parameters.</td></tr>
+    <tr><td class="cell-key">walk_forward_promotion_policy <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"block_severe_only"</td><td>Block only severe failures. <code>"observe_only"</code> would skip promotion gating entirely.</td></tr>
+    <tr><td class="cell-key">walk_forward_do_not_displace_latest_surface <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Hard contract: walk-forward never overrides the latest-window winner.</td></tr>
+    <tr><td class="cell-key">promote_small_risk_multiplier <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.5</td><td>PROMOTE_SMALL winners (negative holdout but still passing val gates) trade at 0.5× risk. Tighten to 0.3 for ultra-cautious accounts; 0.5 is the recommended default.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 14. LIVE LOOP ============== -->
+<h2 id="live-loop">14. Live loop &amp; readiness</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">live_bars_count <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">1500</td><td>Bars to load on each live evaluation cycle. Enough for any indicator's full lookback (e.g., EMA-200 on H1 needs ~600 bars).</td></tr>
+    <tr><td class="cell-key">live_min_bars <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">300</td><td>Floor; below this MT5 hasn't seeded enough for a clean signal.</td></tr>
+    <tr><td class="cell-key">live_loop_trigger_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"bar"</td><td>Bar-timestamp triggered. <code>"scheduled"</code> is the older wall-clock fallback — keep it only for offline tests.</td></tr>
+    <tr><td class="cell-key">live_bar_poll_seconds <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.25</td><td>250 ms poll interval. Below this and you waste CPU; above this and entries lag fresh bars.</td></tr>
+    <tr><td class="cell-key">live_artifact_drift_policy <span class="pill pill-strict">strict</span></td><td>str</td><td class="cell-rec">"block"</td><td><strong>Required for live.</strong> <code>"warn"</code> trades stale-artifact configs silently. The readiness gate refuses to start if this is anything other than "block".</td></tr>
+    <tr><td class="cell-key">live_config_expiry_grace_minutes <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">0</td><td>No grace period. If valid_until expires mid-trading-day, that symbol stops new entries until retrain.</td></tr>
+    <tr><td class="cell-key">live_risk_scalars_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Volatility scalar overlay is dormant by default. Once <code>live_risk_scalars_mode = "shadow"</code> has produced evidence, flip to <code>true</code> with mode "on".</td></tr>
+    <tr><td class="cell-key">live_risk_scalars_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"shadow"</td><td>Records would-be effect without changing live size.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 15. SUPERVISOR ============== -->
+<h2 id="supervisor">15. Institutional supervisor (hard breakpoints)</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">institutional_supervisor_enabled <span class="pill pill-strict">strict</span></td><td>bool</td><td class="cell-rec">true</td><td>Capital-preservation circuit breaker. Disabling it removes the only safety net against an aggregate loss day.</td></tr>
+    <tr><td class="cell-key">institutional_supervisor_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"circuit_breaker"</td><td>Active blocking on threshold breach. Use <code>"observe"</code> for the first paper week to validate thresholds, then flip.</td></tr>
+    <tr><td class="cell-key">portfolio_control_policy <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"hard_breakpoints_only"</td><td>The whole architecture's contract. The supervisor never vetoes for soft reasons (correlation, etc.) — only hard limits.</td></tr>
+    <tr><td class="cell-key">max_total_open_risk_pct <span class="pill pill-tune">tune</span></td><td>float</td><td class="cell-rec">6.0</td><td>I'd tighten from 8 → 6 for a balanced $10K–$50K profile. With 3–5 specialists active simultaneously, 6 % keeps any one bad day survivable.</td></tr>
+    <tr><td class="cell-key">max_new_entries_when_total_open_risk_above_pct <span class="pill pill-tune">tune</span></td><td>float</td><td class="cell-rec">4.5</td><td>Pause new entries once existing open risk reaches 4.5 %. Forces the system to let existing positions resolve before stacking.</td></tr>
+    <tr><td class="cell-key">open_risk_action <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"pause_new_entries"</td><td>Hard pause is cleaner than derate at this layer; the local cycle-drift sentinel handles graduated derate.</td></tr>
+    <tr><td class="cell-key">daily_loss_hard_block_pct <span class="pill pill-tune">tune</span></td><td>float</td><td class="cell-rec">2.5</td><td>Tighten from 3 → 2.5. A 2.5 % daily loss is the right "stop trading and review" threshold for a balanced profile; 3 % is closer to aggressive.</td></tr>
+    <tr><td class="cell-key">session_loss_hard_block_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">2.0</td><td>Session-window loss ceiling. Captures fast accidents inside a quieter day.</td></tr>
+    <tr><td class="cell-key">weekly_loss_hard_block_pct <span class="pill pill-tune">tune</span></td><td>float</td><td class="cell-rec">5.0</td><td>Tighten from 6 → 5. Forces a week-end review if losses compound.</td></tr>
+    <tr><td class="cell-key">open_drawdown_hard_block_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">8.0</td><td>Open-equity drawdown ceiling. Stops adding when the book is already underwater 8 %.</td></tr>
+    <tr><td class="cell-key">hard_block_reopen_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"manual_or_next_cycle"</td><td>Forces operator review or natural retrain reset. <code>"manual"</code> alone is too rigid; <code>"next_cycle"</code> alone is too automatic.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 16. CYCLE DRIFT ============== -->
+<h2 id="cycle-drift">16. Cycle-drift sentinel</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">cycle_drift_monitor_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Lightweight per-context kill-switch for execution-degraded specialists. Cheap, contained, no false vetoes.</td></tr>
+    <tr><td class="cell-key">cycle_drift_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"lightweight"</td><td>Active. <code>"observe"</code> only logs; flip to lightweight after a paper cycle confirms thresholds.</td></tr>
+    <tr><td class="cell-key">cycle_drift_min_trades <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">6</td><td>Minimum sample before the consecutive-loss gate fires.</td></tr>
+    <tr><td class="cell-key">cycle_drift_consecutive_losses <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5</td><td>5 consecutive losses (within ≥6 trades) is a real signal. 4 is too jittery, 6 lets too much damage land.</td></tr>
+    <tr><td class="cell-key">cycle_drift_execution_slippage_mult <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">2.5</td><td>Slippage 2.5× expected → context paused. Plumbing is in place; needs MT5 deal-history wiring to fire.</td></tr>
+    <tr><td class="cell-key">cycle_drift_spread_degradation_mult <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">2.0</td><td>Spread 2× rolling median → pause. Already wired live.</td></tr>
+    <tr><td class="cell-key">cycle_drift_action <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"pause_context"</td><td>Pause is the right action. <code>"derate_context"</code> halves risk but keeps trading; only useful once you have evidence the drift is mild.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 17. GOVERNANCE ============== -->
+<h2 id="governance">17. Local governance / order management</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">local_governance_tournament_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Per-winner second tournament across the 11-policy pool. The v2 doc's biggest profitability lever after entry quality.</td></tr>
+    <tr><td class="cell-key">local_governance_live_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"shadow"</td><td>Shadow logs decisions without changing live SL/TP. Keep until paper evidence shows the chosen policy actually beats fixed stops; then flip to <code>"on"</code>.</td></tr>
+    <tr><td class="cell-key">local_governance_candidate_policies <span class="pill pill-keep">keep</span></td><td>list (11)</td><td class="cell-rec">[control_fixed, breakeven_1r, stepped_breakeven, atr_trail_capped, chandelier_atr, structure_trail, partial_tp_runner, time_decay_exit, volatility_contraction_exit, regime_flip_reduce, pure_atr]</td><td>The full v2 pool. Don't trim until per-policy artifact evidence shows one is dominated.</td></tr>
+    <tr><td class="cell-key">market_driven_exit_pack_mode <span class="pill pill-tune">tune</span></td><td>str</td><td class="cell-rec">"paper"</td><td>Move from <code>"off"</code> → <code>"paper"</code>. Paper mode records what the exit pack would have done without changing live behaviour, so you accumulate evidence.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 18. EXEC QUALITY ============== -->
+<h2 id="exec-quality">18. Execution-quality filters</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">execution_spread_filter_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Spread-quality gate. The most common live "why didn't this fire?" reason; keeping it on protects edge.</td></tr>
+    <tr><td class="cell-key">execution_spread_min_edge_mult <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">1.25</td><td>ATR ≥1.25× spread for entry. Below 1.25, the spread eats the edge; above 2.0 starves intraday strategies on tight markets.</td></tr>
+    <tr><td class="cell-key">execution_spread_spike_mult <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">3.0</td><td>3× rolling median = spike. News-window protection.</td></tr>
+    <tr><td class="cell-key">execution_spread_penalty_start_mult <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.75</td><td>Soft-derate threshold. Below the spike but above normal.</td></tr>
+    <tr><td class="cell-key">min_trade_risk_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.05</td><td>Floor below which a "trade" is just noise. 0.05 % = $5 on a $10K account.</td></tr>
+    <tr><td class="cell-key">target_annual_vol <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.10</td><td>Target 10 % annualized vol when the vol-scalar overlay is on. Standard moderate-risk number.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 19. MARGIN ============== -->
+<h2 id="margin">19. Margin protection</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">margin_entry_block_level <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">80.0</td><td>New entries blocked when margin level &lt;80 %. Standard prudent threshold.</td></tr>
+    <tr><td class="cell-key">margin_recovery_start_level <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">65.0</td><td>Active reduction when level &lt;65 %.</td></tr>
+    <tr><td class="cell-key">margin_panic_level <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">50.0</td><td>Forced close threshold. Below 50 % broker stop-out is imminent.</td></tr>
+    <tr><td class="cell-key">margin_reopen_level <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">90.0</td><td>Resume entries only after recovering to 90 %. Hysteresis prevents oscillation.</td></tr>
+    <tr><td class="cell-key">margin_reopen_cooldown_minutes <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">5.0</td><td>5-minute cooldown after recovery. Avoids re-entering into a still-fragile margin state.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 20. SECONDARY ============== -->
+<h2 id="secondary">20. Secondary trade / D1 + lower-TF coordination</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">allow_d1_plus_lower_tf <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Lets a D1 swing co-exist with a faster intraday signal in the same symbol. Disabling halves diversification on swing-friendly pairs.</td></tr>
+    <tr><td class="cell-key">d1_secondary_risk_multiplier <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">1.0</td><td>Neutral. Tighten to 0.5 if you want D1 trades smaller when a faster trade is open.</td></tr>
+    <tr><td class="cell-key">secondary_trade_max_risk_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.5</td><td>Secondary trades capped at 0.5 %. Prevents stacking three positions at full risk on the same symbol.</td></tr>
+    <tr><td class="cell-key">max_combined_risk_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">1.5</td><td>Sum of all open same-symbol positions ≤1.5 %. The supervisor's <code>max_total_open_risk_pct</code> is the cross-symbol cap.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 21. SWAP ============== -->
+<h2 id="swap">21. Swap modelling</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">swap_model_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Apply overnight swap to backtests. Without this, D1 and exotic crosses look more profitable than they really are.</td></tr>
+    <tr><td class="cell-key">swap_model_triple_rollover_day <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"wednesday"</td><td>Standard FX broker convention. Confirm with your broker; some use Friday.</td></tr>
+    <tr><td class="cell-key">swap_model_min_holding_hours <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">20.0</td><td>Trades closed within 20 h pay no swap (no rollover crossed). 24 would slightly under-bill near-rollover trades; 20 is a safer overestimate.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 22. REGIME AUDIT + EVENT ============== -->
+<h2 id="regime-audit">22. Regime audit &amp; event calendar</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">regime_profitability_audit_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Persists per-regime PnL evidence on each winner. Telemetry-only; doesn't gate selection.</td></tr>
+    <tr><td class="cell-key">regime_boundary_audit_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Persists boundary diagnostics (REGIME_GAP distribution).</td></tr>
+    <tr><td class="cell-key">regime_ambiguity_policy <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"observe_only"</td><td>Don't suppress low-gap signals yet — accumulate evidence first. Move to <code>"derate"</code> if data shows low-gap trades systematically lose.</td></tr>
+    <tr><td class="cell-key">regime_min_live_gap_warn <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.05</td><td>Warn-threshold. 5 % gap is the minimum for confident regime attribution.</td></tr>
+    <tr><td class="cell-key">event_calendar_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Enable only if you ship an <code>events.csv</code>. Without one, the calendar adds noise to logs.</td></tr>
+    <tr><td class="cell-key">event_calendar_mode <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">"observe"</td><td>Annotate-only when enabled. Hard blocking on news windows is documented in v2 as evidence-required, not default-on.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== Advisory thresholds ============== -->
+<h3>Advisory loss thresholds (logging only)</h3>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">daily_loss_advisory_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">10.0</td><td>Logged-only "loud" threshold. The <code>daily_loss_hard_block_pct</code> is the actual block.</td></tr>
+    <tr><td class="cell-key">session_loss_advisory_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">10.0</td><td>Same — advisory level above which you'll see a banner in logs.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 23. STORAGE ============== -->
+<h2 id="storage">23. Storage governance</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">storage_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Master switch.</td></tr>
+    <tr><td class="cell-key">storage_observe_only <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Don't delete files yet — record candidates. Safe rollout default.</td></tr>
+    <tr><td class="cell-key">storage_signal_ledger_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Monthly actionable-signal JSONL is the dashboard's source of truth.</td></tr>
+    <tr><td class="cell-key">storage_warn_free_gb <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">15.0</td><td>Operator-friendly early warning.</td></tr>
+    <tr><td class="cell-key">storage_critical_free_gb <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">10.0</td><td>Forces immediate housekeeping below this floor.</td></tr>
+    <tr><td class="cell-key">storage_pause_entries_below_free_gb <span class="pill pill-keep">keep</span></td><td>float|null</td><td class="cell-rec">null</td><td>Optional emergency pause. Leave null unless you've seen a runaway disk.</td></tr>
+    <tr><td class="cell-key">storage_measure_interval_seconds <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">300</td><td>5-minute storage telemetry; cheap.</td></tr>
+    <tr><td class="cell-key">storage_housekeeping_interval_seconds <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">900</td><td>15-minute housekeeping. Below this and you waste IO; above and stale state lingers.</td></tr>
+    <tr><td class="cell-key">storage_metaquotes_review_interval_seconds <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">21600</td><td>6-hour MetaQuotes review.</td></tr>
+    <tr><td class="cell-key">storage_write_protect_minutes <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">5</td><td>5-minute write-quiet window before any cleanup acts.</td></tr>
+    <tr><td class="cell-key">storage_local_data_first_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Use bounded <code>data/.live/*.csv</code> caches for live; reseed only when local continuity breaks.</td></tr>
+    <tr><td class="cell-key">storage_live_sync_bars <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">3000</td><td>Direct-MT5 reseed floor. Code clamps to 100 minimum.</td></tr>
+    <tr><td class="cell-key">storage_live_sync_overlap_bars <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">100</td><td>Safety overlap when delta-refreshing the live cache.</td></tr>
+    <tr><td class="cell-key">storage_live_cache_max_age_days <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">7</td><td>Stale-cache age cap.</td></tr>
+    <tr><td class="cell-key">storage_delta_sync_overlap_minutes <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">1440</td><td>24-h overlap for canonical M5 delta refresh.</td></tr>
+    <tr><td class="cell-key">storage_resample_cache_max_gb <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">4.0</td><td>4 GB resample cache is a measured-good size for the 62-symbol × 6-TF universe. Halve to 2 GB only if disk pressure is real.</td></tr>
+    <tr><td class="cell-key">storage_resample_cache_max_age_days <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">14</td><td>2-week age window matches the retrain cadence.</td></tr>
+    <tr><td class="cell-key">storage_logs_keep_days <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">14</td><td>Two weeks is enough to debug a failed cycle.</td></tr>
+    <tr><td class="cell-key">storage_pm_outputs_keep_days <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">14</td><td>Same window; matches logs.</td></tr>
+    <tr><td class="cell-key">storage_pm_outputs_keep_count <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">30</td><td>Count-based floor in case time-based deletion would otherwise drop everything.</td></tr>
+    <tr><td class="cell-key">storage_metaquotes_cleanup_enabled <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Keep destructive cleanup OFF until observe-only output has been validated.</td></tr>
+    <tr><td class="cell-key">storage_metaquotes_active_root_allowlist <span class="pill pill-info">env</span></td><td>list</td><td class="cell-rec">[]</td><td>Add your live MT5 root path here to protect it from review.</td></tr>
+    <tr><td class="cell-key">storage_metaquotes_demo_servers <span class="pill pill-keep">keep</span></td><td>list</td><td class="cell-rec">["FBS-Demo","MetaQuotes-Demo"]</td><td>Demo servers eligible for reclaim.</td></tr>
+    <tr><td class="cell-key">storage_metaquotes_stale_tester_days <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">14</td><td>Stale tester base age threshold.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 24. POSITION ============== -->
+<h2 id="position">24. Position section</h2>
+
+<p>Independent of <code>pipeline.*</code>; this drives <em>live</em> sizing only. Discovery uses <code>discovery_risk_per_trade_pct</code> and is unaffected.</p>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">position.risk_per_trade_pct <span class="pill pill-tune">tune</span></td><td>float</td><td class="cell-rec">1.0 (balanced)</td><td>1.0 % is the right neutral. Use 0.5 for $50K+ accounts that prioritise survival; 1.5–2.0 for $5K–$10K accounts compounding aggressively. Recent active config swung between 0.5 and 2.0 — pick one and commit.</td></tr>
+    <tr><td class="cell-key">position.max_position_size <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.0</td><td>0 = no config-side cap; broker max is the only ceiling.</td></tr>
+    <tr><td class="cell-key">position.min_position_size <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.01</td><td>Standard 0.01-lot floor matches most brokers.</td></tr>
+    <tr><td class="cell-key">position.risk_basis <span class="pill pill-tune">tune</span></td><td>str</td><td class="cell-rec">"equity"</td><td>"equity" preserves compounding (risk grows with profits, shrinks with losses). "balance" keeps risk static; choose this only if your broker's equity reads unreliably.</td></tr>
+    <tr><td class="cell-key">position.max_risk_pct <span class="pill pill-tune">tune</span></td><td>float</td><td class="cell-rec">1.5</td><td>Hard cap at 1.5 % even if upstream calc requested more. Should sit above <code>risk_per_trade_pct</code> by ~50 % to allow legitimate volatility scalar boosts.</td></tr>
+    <tr><td class="cell-key">position.risk_tolerance_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">8.0</td><td>Soft tolerance that allows minor over-cap in rare cases. 8 % is loose enough not to interfere normally.</td></tr>
+    <tr><td class="cell-key">position.auto_widen_sl <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Lets the system widen SL when broker stop-distance forbids the tight one. Without this, brokers with 5+ pip stop levels would block ~30 % of entries.</td></tr>
+    <tr><td class="cell-key">position.allow_min_lot_risk_clamp <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">true</td><td>Allows clamping risk when min_lot would otherwise force a lower-than-target risk. Lets small accounts trade major pairs.</td></tr>
+    <tr><td class="cell-key">position.use_trailing_stop <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Static-config trailing is replaced by the governance pool. Keep off.</td></tr>
+    <tr><td class="cell-key">position.trailing_stop_pips <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.0</td><td>Disabled.</td></tr>
+    <tr><td class="cell-key">position.trailing_activation_pips <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.0</td><td>Disabled.</td></tr>
+    <tr><td class="cell-key">position.use_breakeven_stop <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Replaced by <code>breakeven_1r</code> / <code>stepped_breakeven</code> governance policies.</td></tr>
+    <tr><td class="cell-key">position.breakeven_trigger_pips <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">0.0</td><td>Disabled.</td></tr>
+    <tr><td class="cell-key">position.breakeven_offset_pips <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">1.0</td><td>1-pip offset if breakeven is ever enabled — covers cost of spread on close.</td></tr>
+    <tr><td class="cell-key">position.allow_scaling <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Pyramiding is off by default. Adds complexity to the risk model; keep off until the partial-TP-runner policy has a track record.</td></tr>
+    <tr><td class="cell-key">position.max_scale_ins <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">3</td><td>Cap if scaling is ever turned on.</td></tr>
+    <tr><td class="cell-key">position.scale_in_pct <span class="pill pill-keep">keep</span></td><td>float</td><td class="cell-rec">50.0</td><td>Each scale-in adds 50 % of the original size.</td></tr>
+    <tr><td class="cell-key">position.max_trade_duration_bars <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">0</td><td>0 = no time exit. <code>time_decay_exit</code> governance policy handles this contextually.</td></tr>
+    <tr><td class="cell-key">position.regime_tp_multipliers <span class="pill pill-keep">keep</span></td><td>dict</td><td class="cell-rec">{TREND:1.0, BREAKOUT:1.0, RANGE:1.0, CHOP:1.0}</td><td>Neutral. The fair-tournament discovery requires this to be 1.0 across the board; non-neutral values are a live overlay only.</td></tr>
+    <tr><td class="cell-key">position.use_spread, position.use_slippage, position.slippage_pips <span class="pill pill-tune">tune</span></td><td>bool/float</td><td class="cell-rec">delete (mirror from pipeline.*)</td><td>These three duplicate <code>pipeline.use_*</code>. Quality.md flagged this. Recommend deleting from <code>position</code> so there's one source of truth.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 25. MT5 ============== -->
+<h2 id="mt5">25. MT5 connection</h2>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">mt5.login <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">0</td><td>0 = use the currently logged-in MT5 session. Safer than embedding credentials in the JSON.</td></tr>
+    <tr><td class="cell-key">mt5.password <span class="pill pill-strict">strict</span></td><td>str</td><td class="cell-rec">""</td><td><strong>Never</strong> commit credentials. Leave empty; if you need scripted login, use environment variables.</td></tr>
+    <tr><td class="cell-key">mt5.server <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">""</td><td>Same: empty unless scripted login is required.</td></tr>
+    <tr><td class="cell-key">mt5.path <span class="pill pill-keep">keep</span></td><td>str</td><td class="cell-rec">""</td><td>Empty = auto-detect terminal.exe location.</td></tr>
+    <tr><td class="cell-key">mt5.timeout <span class="pill pill-keep">keep</span></td><td>int</td><td class="cell-rec">60000</td><td>60-s connect timeout. Tighten only if your MT5 reliably connects in seconds.</td></tr>
+    <tr><td class="cell-key">mt5.portable <span class="pill pill-keep">keep</span></td><td>bool</td><td class="cell-rec">false</td><td>Standard install. Enable only for portable MT5 installs.</td></tr>
+  </tbody>
+</table>
+
+<!-- ============== 26. INSTRUMENT SPECS ============== -->
+<h2 id="instrument-specs">26. Instrument specs &amp; symbol list</h2>
+
+<p>The 62-entry <code>instrument_specs</code> block and <code>symbols</code> list are environment data, not tunable knobs. Recommended treatment:</p>
+
+<ul>
+  <li><strong>instrument_spec_defaults.commission_per_lot</strong>: <code>7.0</code> is right for ECN brokers; ECN-Plus or commission-free brokers should set this to their actual rate (often 0).</li>
+  <li><strong>instrument_specs[SYMBOL]</strong>: keep as fallbacks. The <code>MT5Connector</code> overrides these with broker-reported values on connect, so they only matter offline / for symbols MT5 can't resolve.</li>
+  <li><strong>swap_long / swap_short</strong>: refresh from broker quarterly. They drive the swap model and stale values silently bias D1/exotic backtests.</li>
+  <li><strong>spread_avg</strong>: fallback baseline used by the spread filter when rolling median isn't yet established. Keep close to your broker's typical spread; e.g., 1.0 for EURUSD majors, higher (5–30) for exotics and indices.</li>
+  <li><strong>symbols</strong>: 62 is a generous universe. For a fresh live deployment I'd start with the top 12 most-liquid pairs/indices (EURUSD, GBPUSD, USDJPY, USDCHF, USDCAD, AUDUSD, NZDUSD, EURJPY, EURGBP, XAUUSD, US100, US500), prove out the supervisor and cycle-drift behaviour, then expand.</li>
+</ul>
+
+<!-- ============== 27. DON'T TOUCH ============== -->
+<h2 id="do-not-touch">27. Knobs not to touch without paper evidence</h2>
+
+<p>These are knobs the rest of the system has been calibrated against. Changing them without paper-mode evidence will produce surprising results.</p>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-type">Type</th><th class="col-rec">Lock at</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr><td class="cell-key">discovery_risk_per_trade_pct</td><td>float</td><td class="cell-rec">1.0</td><td>The whole "winners are identical across modes" property depends on this being fixed. Change → re-run discovery for both ledgers.</td></tr>
+    <tr><td class="cell-key">live_artifact_drift_policy</td><td>str</td><td class="cell-rec">"block"</td><td>Required for the readiness gate to allow live. "warn" silently trades stale-artifact configs.</td></tr>
+    <tr><td class="cell-key">walk_forward_do_not_displace_latest_surface</td><td>bool</td><td class="cell-rec">true</td><td>The architectural contract that walk-forward never overrides the latest selection. Flipping this resurrects a dormant code path.</td></tr>
+    <tr><td class="cell-key">portfolio_control_policy</td><td>str</td><td class="cell-rec">"hard_breakpoints_only"</td><td>The supervisor's explicit narrowness. Changing this would invite top-down vetoes the architecture rejects by design.</td></tr>
+    <tr><td class="cell-key">institutional_supervisor_enabled</td><td>bool</td><td class="cell-rec">true</td><td>The only firm-level capital-preservation layer. Disabling removes the safety net.</td></tr>
+    <tr><td class="cell-key">fx_gap_penalty_lambda, fx_robustness_boost, fx_min_robustness_ratio, fx_stability_penalty_k</td><td>float</td><td class="cell-rec">[as-is]</td><td>Score-shape constants the test suite is calibrated against. Adjust together if at all; never one in isolation.</td></tr>
+    <tr><td class="cell-key">regime_min_val_profit_factor, regime_min_val_return_pct, regime_min_val_return_dd_ratio</td><td>float</td><td class="cell-rec">[as-is]</td><td>The validation gate triplet. Tested as a unit; weakening any one without weakening the others undermines the rescue/exception logic.</td></tr>
+  </tbody>
+</table>
+
+<hr />
+
+<h2>Summary of the changes from the current active config</h2>
+
+<p>If you adopt this profile, the actual diffs against the checked-in <code>config.json</code> are:</p>
+
+<table>
+  <thead><tr><th class="col-key">Key</th><th class="col-rec">Current</th><th class="col-rec">Recommended</th><th class="col-why">Why</th></tr></thead>
+  <tbody>
+    <tr>
+      <td class="cell-key">max_total_open_risk_pct</td>
+      <td class="cell-rec">8.0</td>
+      <td class="cell-rec changed">6.0</td>
+      <td>Tighten the cross-symbol open-risk ceiling for a balanced profile.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">max_new_entries_when_total_open_risk_above_pct</td>
+      <td class="cell-rec">6.0</td>
+      <td class="cell-rec changed">4.5</td>
+      <td>Pause new entries earlier; let existing positions resolve before stacking.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">daily_loss_hard_block_pct</td>
+      <td class="cell-rec">3.0</td>
+      <td class="cell-rec changed">2.5</td>
+      <td>2.5 % is the right "stop trading and review" threshold for a balanced profile.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">weekly_loss_hard_block_pct</td>
+      <td class="cell-rec">6.0</td>
+      <td class="cell-rec changed">5.0</td>
+      <td>Force a week-end review if losses compound.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">market_driven_exit_pack_mode</td>
+      <td class="cell-rec">"off"</td>
+      <td class="cell-rec changed">"paper"</td>
+      <td>Accumulate evidence on what the exit pack would do without changing live.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">position.risk_per_trade_pct</td>
+      <td class="cell-rec">0.5 / 2.0 (varies)</td>
+      <td class="cell-rec changed">1.0</td>
+      <td>Commit to a balanced 1 % live risk per trade.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">position.max_risk_pct</td>
+      <td class="cell-rec">0.8 or 3.0</td>
+      <td class="cell-rec changed">1.5</td>
+      <td>Hard cap that sits ~50 % above target risk to allow legitimate volatility-scalar boosts.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">position.risk_basis</td>
+      <td class="cell-rec">"equity" or "balance"</td>
+      <td class="cell-rec changed">"equity"</td>
+      <td>Equity preserves compounding; choose "balance" only if equity reads unreliably.</td>
+    </tr>
+    <tr>
+      <td class="cell-key">position.use_spread / position.use_slippage / position.slippage_pips</td>
+      <td class="cell-rec">duplicates</td>
+      <td class="cell-rec changed">delete</td>
+      <td>Pipeline already owns these. Single source of truth.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Everything else is recommended <strong>as the current config sets it</strong>. The bulk of this document explains why.</p>
+
+<div class="footer-note">
+  Generated 2026-04-30 against post-v2 codebase (<code>592 passed, 1 skipped, 356 subtests</code>). This is one informed opinion calibrated for survival-first deployment; live evidence trumps any recommendation. Keep paper-mode runs going for at least one full retrain cycle before flipping <code>local_governance_live_mode</code>, <code>live_risk_scalars_enabled</code>, or <code>market_driven_exit_pack_mode</code> to "on".
+</div>
+
+</div>
+</body>
+</html>

@@ -14,6 +14,8 @@ from pm_strategies import (
     _get_adx_di,
     _get_bb,
     _get_keltner,
+    _price_indicator_divergence_signals,
+    _rolling_mean_abs_deviation,
 )
 
 
@@ -44,6 +46,63 @@ class StrategyRegressionTests(unittest.TestCase):
         np.testing.assert_allclose(adx.to_numpy(), features["ADX"].to_numpy(), equal_nan=True)
         np.testing.assert_allclose(plus_di.to_numpy(), features["PLUS_DI"].to_numpy(), equal_nan=True)
         np.testing.assert_allclose(minus_di.to_numpy(), features["MINUS_DI"].to_numpy(), equal_nan=True)
+
+    def test_rolling_mad_helper_matches_legacy_pandas_lambda(self):
+        rng = np.random.default_rng(42)
+        values = rng.normal(100.0, 3.0, 240)
+        values[17] = np.nan
+        values[121] = np.nan
+        series = pd.Series(values)
+
+        for window in (5, 14, 20, 30):
+            with self.subTest(window=window):
+                expected = series.rolling(window).apply(
+                    lambda x: np.abs(x - x.mean()).mean()
+                )
+                actual = _rolling_mean_abs_deviation(series, window)
+                np.testing.assert_allclose(
+                    actual.to_numpy(),
+                    expected.to_numpy(),
+                    rtol=0.0,
+                    atol=1e-12,
+                    equal_nan=True,
+                )
+
+    def test_divergence_helper_matches_legacy_loop(self):
+        index = pd.date_range("2025-01-01", periods=180, freq="5min")
+        rng = np.random.default_rng(123)
+        close = pd.Series(100 + rng.normal(0, 1.2, len(index)).cumsum(), index=index)
+        indicator = pd.Series(rng.normal(0, 2.0, len(index)).cumsum(), index=index)
+        close.iloc[[37, 88]] = np.nan
+        indicator.iloc[[54, 121]] = np.nan
+
+        lows = pd.Series(False, index=index)
+        highs = pd.Series(False, index=index)
+        lows.iloc[[15, 28, 47, 69, 95, 130, 161]] = True
+        highs.iloc[[18, 31, 47, 73, 104, 137, 166]] = True
+        order = 5
+
+        expected = pd.Series(0, index=index, dtype=int)
+        for i in range(2 * order + 1, len(index)):
+            if lows.iloc[i]:
+                prev_lows = lows.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_lows[prev_lows].index
+                if len(prev_idx) > 0:
+                    j = index.get_loc(prev_idx[-1])
+                    if close.iloc[i] < close.iloc[j] and indicator.iloc[i] > indicator.iloc[j]:
+                        expected.iloc[i] = 1
+            if highs.iloc[i]:
+                prev_highs = highs.iloc[max(0, i - 5 * order):i]
+                prev_idx = prev_highs[prev_highs].index
+                if len(prev_idx) > 0:
+                    j = index.get_loc(prev_idx[-1])
+                    if close.iloc[i] > close.iloc[j] and indicator.iloc[i] < indicator.iloc[j]:
+                        expected.iloc[i] = -1
+
+        actual = _price_indicator_divergence_signals(
+            index, close, indicator, lows, highs, order
+        )
+        pd.testing.assert_series_equal(actual, expected)
 
     def test_supertrend_emits_first_real_transition(self):
         rng = np.random.default_rng(0)

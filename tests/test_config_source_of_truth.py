@@ -76,7 +76,7 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertEqual(normalized["state_filename"], "custom_state.json")
 
     def test_app_defaults_to_pipeline_winner_ledger_path(self):
-        pipeline_config = PipelineConfig(winner_ledger_path="pm_configs_high_risk.json")
+        pipeline_config = PipelineConfig(winner_ledger_path="custom_pm_configs.json")
         app = FXPortfolioManagerApp(
             symbols=["EURUSD"],
             pipeline_config=pipeline_config,
@@ -84,7 +84,7 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
             mt5_config=SimpleNamespace(),
         )
 
-        self.assertEqual(app.config_file, "pm_configs_high_risk.json")
+        self.assertEqual(app.config_file, "custom_pm_configs.json")
 
     def test_research_discovery_only_config_marker_is_detected(self):
         self.assertTrue(
@@ -618,6 +618,220 @@ class LiveRiskIntentTests(unittest.TestCase):
         self.assertAlmostEqual(kwargs["sl"], 1.1950, places=6)
         self.assertAlmostEqual(kwargs["tp"], 1.2250, places=6)
         self.assertIs(kwargs["symbol_info"], trader.mt5.get_symbol_info.return_value)
+
+    def test_execute_entry_reconciles_ambiguous_timeout_to_open_position(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        trader.mt5.get_positions.return_value = []
+        reconciled_position = SimpleNamespace(
+            symbol="XAUUSD",
+            magic=12345,
+            ticket=777,
+            volume=0.05,
+            price_open=1.2050,
+        )
+        trader.mt5.get_position_by_symbol_magic.side_effect = [None, reconciled_position]
+        trader.mt5.send_market_order.return_value = SimpleNamespace(
+            success=False,
+            retcode=10012,
+            retcode_description="Request canceled by timeout",
+            error_message="",
+        )
+
+        features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
+
+        trader._execute_entry(
+            symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
+            magic=12345,
+            config=SimpleNamespace(symbol="XAUUSD"),
+            decision_key="ambiguous-reconciled",
+            bar_time_iso="2026-04-02T15:15:52",
+            best_candidate={
+                "timeframe": "M15",
+                "regime": "CHOP",
+                "strategy_name": "MomentumBurstStrategy",
+                "signal": 1,
+            },
+            trade_intent=SimpleNamespace(stop_loss_pips=10.0, take_profit_pips=20.0),
+            positions_snapshot=[],
+            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0, margin_free=10000.0),
+        )
+
+        actionable_payload = trader._actionable_log.record.call_args[0][1]
+        self.assertEqual(actionable_payload["action"], "EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND")
+        trader._decision_throttle.record_decision.assert_called()
+        self.assertEqual(
+            trader._decision_throttle.record_decision.call_args.kwargs["action"],
+            "EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND",
+        )
+        trader._log_trade.assert_called()
+        self.assertIn("XAUUSD", trader._last_order_times)
+
+    def test_execute_entry_reconciles_explicit_ambiguous_order_result(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        reconciled_position = SimpleNamespace(
+            symbol="XAUUSD",
+            magic=12345,
+            ticket=888,
+            volume=0.05,
+            price_open=1.2050,
+        )
+        trader.mt5.get_position_by_symbol_magic.side_effect = [None, reconciled_position]
+        trader.mt5.get_positions.return_value = []
+        trader.mt5.send_market_order.return_value = SimpleNamespace(
+            success=False,
+            retcode=0,
+            retcode_description="ok",
+            error_message="",
+            ambiguous=True,
+        )
+
+        features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
+
+        trader._execute_entry(
+            symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
+            magic=12345,
+            config=SimpleNamespace(symbol="XAUUSD"),
+            decision_key="ambiguous-flag-reconciled",
+            bar_time_iso="2026-04-02T15:15:52",
+            best_candidate={
+                "timeframe": "M15",
+                "regime": "CHOP",
+                "strategy_name": "MomentumBurstStrategy",
+                "signal": 1,
+            },
+            trade_intent=SimpleNamespace(stop_loss_pips=10.0, take_profit_pips=20.0),
+            positions_snapshot=[],
+            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0, margin_free=10000.0),
+        )
+
+        actionable_payload = trader._actionable_log.record.call_args[0][1]
+        self.assertEqual(actionable_payload["action"], "EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND")
+
+    def test_execute_entry_blocks_after_unreconciled_ambiguous_timeout(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        trader.pipeline_config.ambiguous_order_cooldown_seconds = 90
+        trader.mt5.get_positions.return_value = []
+        trader.mt5.get_position_by_symbol_magic.return_value = None
+        trader.mt5.send_market_order.return_value = SimpleNamespace(
+            success=False,
+            retcode=10012,
+            retcode_description="Request canceled by timeout",
+            error_message="",
+        )
+
+        features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
+
+        trader._execute_entry(
+            symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
+            magic=12345,
+            config=SimpleNamespace(symbol="XAUUSD"),
+            decision_key="ambiguous-unreconciled",
+            bar_time_iso="2026-04-02T15:15:52",
+            best_candidate={
+                "timeframe": "M15",
+                "regime": "CHOP",
+                "strategy_name": "MomentumBurstStrategy",
+                "signal": 1,
+            },
+            trade_intent=SimpleNamespace(stop_loss_pips=10.0, take_profit_pips=20.0),
+            positions_snapshot=[],
+            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0, margin_free=10000.0),
+        )
+
+        actionable_payload = trader._actionable_log.record.call_args[0][1]
+        self.assertEqual(actionable_payload["action"], "BLOCKED_AMBIGUOUS_ORDER_UNRECONCILED")
+        self.assertIn("XAUUSD", trader._ambiguous_order_block_until)
+        self.assertEqual(
+            trader._decision_throttle.record_decision.call_args.kwargs["cooldown_seconds"],
+            90,
+        )
+
+    def test_execute_entry_manual_kill_switch_blocks_new_entries(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        trader.pipeline_config.manual_new_entries_enabled = False
+
+        features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
+
+        trader._execute_entry(
+            symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
+            magic=12345,
+            config=SimpleNamespace(symbol="XAUUSD"),
+            decision_key="manual-block",
+            bar_time_iso="2026-04-02T15:15:52",
+            best_candidate={
+                "timeframe": "M15",
+                "regime": "CHOP",
+                "strategy_name": "MomentumBurstStrategy",
+                "signal": 1,
+            },
+            trade_intent=SimpleNamespace(stop_loss_pips=10.0, take_profit_pips=20.0),
+            positions_snapshot=[],
+            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0, margin_free=10000.0),
+        )
+
+        actionable_payload = trader._actionable_log.record.call_args[0][1]
+        self.assertEqual(actionable_payload["action"], "BLOCKED_MANUAL_KILL_SWITCH")
+        trader.mt5.send_market_order.assert_not_called()
 
     def test_execute_entry_records_hidden_symbol_skip(self):
         trader = self._make_trader(

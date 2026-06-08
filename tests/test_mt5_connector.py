@@ -151,6 +151,28 @@ class MT5ConnectorTests(unittest.TestCase):
         self.assertEqual(self.fake_mt5.tick_calls, 0)
         self.assertEqual(self.fake_mt5.order_send_request["price"], 1.10123)
 
+    def test_order_send_none_is_marked_ambiguous(self):
+        connector = MT5Connector(MT5Config())
+        connector._connected = True
+
+        def _none_order_send(request):
+            self.fake_mt5.order_send_request = dict(request)
+            return None
+
+        self.fake_mt5.order_send = _none_order_send
+
+        result = connector.send_market_order(
+            symbol="EURUSD",
+            order_type=OrderType.BUY,
+            volume=0.17,
+            sl=1.09800,
+            tp=1.10300,
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.ambiguous)
+        self.assertIsNotNone(self.fake_mt5.order_send_request)
+
     def test_normalize_volume_preserves_broker_step_precision(self):
         connector = MT5Connector(MT5Config())
         symbol_info = SimpleNamespace(

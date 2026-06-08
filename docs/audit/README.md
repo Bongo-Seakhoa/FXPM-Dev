@@ -80,11 +80,14 @@ fixed, accepted risk, deferred with reason, or invalid with evidence.
 
 ## Current Standing Rules
 
-- Freeze the deterministic strategy roster at 100 before the full discovery re-optimization.
-- Compare scoring changes only as same-roster 100-vs-100 experiments after the honest-control
-  baseline exists.
-- Treat prospect screens as hypothesis evidence only, not promotion evidence.
+- Read `docs/ACTIVE_DISCOVERY_STATE.md` before starting any audit. It is the current alignment
+  surface for active runs, active scorer variants, and next actions.
+- Compare scoring changes only as same-roster, like-for-like experiments unless the experiment is
+  explicitly about roster expansion.
+- Treat prospect screens and proxy tools as hypothesis evidence only, not promotion evidence.
 - Do not add ML/meta-model selection unless the user explicitly changes the
   directive.
 - Do not promote a strategy or scoring change without honest-cost simulation,
   validation/holdout evidence, C3 false-discovery evidence, and Tenet-5 gating.
+- Archive or delete resolved audit notes after durable facts have moved into code, tests, config,
+  `CHANGELOG.md`, or `docs/ACTIVE_DISCOVERY_STATE.md`.

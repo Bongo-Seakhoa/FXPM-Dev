@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import product
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 
 import pandas as pd
 import numpy as np
@@ -47,7 +47,11 @@ from pm_strategies import (
     _STRATEGY_MIGRATION,
 )
 from pm_position import PositionConfig, PositionManager
-from pm_regime import load_regime_params
+from pm_regime import (
+    load_regime_params,
+    materialize_regime_params_from_symbol_config,
+    validated_regime_params_for_timeframe,
+)
 from pm_order_governance import candidate_policy_names, make_policy, policy_name_from_artifact
 from pm_fairness_audit import build_fairness_evidence, build_fairness_report
 from pm_regime_audit import audit_regime_profitability
@@ -143,9 +147,15 @@ def build_artifact_meta(config: PipelineConfig,
         "feature_cache_version": FeatureComputer.FEATURE_CACHE_VERSION,
         "split_contract_version": DataSplitter.SPLIT_CONTRACT_VERSION,
         "max_bars": int(getattr(config, "max_bars", 300000)),
+        "screening_atr_anchor_enabled": bool(getattr(config, "screening_atr_anchor_enabled", False)),
+        "screening_atr_anchor_multipliers": [
+            float(value) for value in (getattr(config, "screening_atr_anchor_multipliers", [2.0]) or [2.0])
+        ],
         "historical_stress_audit_bars": int(getattr(config, "historical_stress_audit_bars", 50000)),
         "active_universe_bars": int(getattr(config, "active_universe_bars", 250000)),
         "active_stage2_pct": float(getattr(config, "active_stage2_pct", 50.0)),
+        "production_split_mode": str(getattr(config, "production_split_mode", "bleeding_edge") or "bleeding_edge"),
+        "walk_forward_validation_bars": int(getattr(config, "walk_forward_validation_bars", 50000) or 0),
         "clean_holdout_pct": float(getattr(config, "clean_holdout_pct", 0.0)),
         "overlap_pct": float(config.overlap_pct),
         "discovery_risk_per_trade_pct": float(getattr(config, "discovery_risk_per_trade_pct", 1.0)),
@@ -159,13 +169,7 @@ def build_artifact_meta(config: PipelineConfig,
         "swap_model_triple_rollover_day": str(
             getattr(config, "swap_model_triple_rollover_day", "wednesday") or "wednesday"
         ).lower(),
-        "fixed_retrain_days": int(getattr(config, "fixed_retrain_days", getattr(config, "optimization_valid_days", 14))),
-        "production_retrain_mode": str(getattr(config, "production_retrain_mode", "auto")),
-        "production_retrain_interval_weeks": int(getattr(config, "production_retrain_interval_weeks", 2)),
-        "production_retrain_weekday": str(getattr(config, "production_retrain_weekday", "sunday")),
-        "production_retrain_time": str(getattr(config, "production_retrain_time", "00:01")),
-        "production_retrain_anchor_date": str(getattr(config, "production_retrain_anchor_date", "2026-03-29")),
-        "walk_forward_audit_enabled": bool(getattr(config, "walk_forward_audit_enabled", False)),
+        "walk_forward_audit_enabled": bool(getattr(config, "walk_forward_audit_enabled", True)),
         "walk_forward_audit_windows": int(getattr(config, "walk_forward_audit_windows", 3)),
         "false_discovery_control_enabled": bool(
             getattr(config, "false_discovery_control_enabled", False)
@@ -179,7 +183,7 @@ def build_artifact_meta(config: PipelineConfig,
         ),
         "false_discovery_symbol_count": int(getattr(config, "false_discovery_symbol_count", 0) or 0),
         "false_discovery_holdout_policy": str(
-            getattr(config, "false_discovery_holdout_policy", "promote_small") or "promote_small"
+            getattr(config, "false_discovery_holdout_policy", "off") or "off"
         ).lower(),
         "false_discovery_holdout_min_trades": int(
             getattr(config, "false_discovery_holdout_min_trades", 5) or 0
@@ -190,10 +194,67 @@ def build_artifact_meta(config: PipelineConfig,
         "false_discovery_holdout_min_return_pct": float(
             getattr(config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0
         ),
+        "oos_validation_mode": str(getattr(config, "oos_validation_mode", "fixed_holdout") or "fixed_holdout"),
+        "oos_kfold_splits": int(getattr(config, "oos_kfold_splits", 5) or 5),
+        "oos_embargo_bars": int(getattr(config, "oos_embargo_bars", 1) or 0),
+        "oos_min_trades": int(getattr(config, "oos_min_trades", 5) or 0),
+        "oos_aggregate_policy": str(
+            getattr(config, "oos_aggregate_policy", "aggregate_with_worst_fold_floor")
+            or "aggregate_with_worst_fold_floor"
+        ),
         "oos_evidence_export_enabled": bool(getattr(config, "oos_evidence_export_enabled", False)),
         "oos_evidence_periods": int(getattr(config, "oos_evidence_periods", 64) or 64),
         "oos_evidence_min_periods": int(getattr(config, "oos_evidence_min_periods", 8) or 8),
         "oos_evidence_dirname": str(getattr(config, "oos_evidence_dirname", "oos_evidence") or "oos_evidence"),
+        "oos_evidence_record_schema": "oos_candidate_returns_v3_spoke_evidence",
+        "oos_evidence_trade_path_max_points": int(
+            getattr(config, "oos_evidence_trade_path_max_points", 256) or 0
+        ),
+        "oos_evidence_include_execution_cost_survival": bool(
+            getattr(config, "oos_evidence_include_execution_cost_survival", False)
+        ),
+        "oos_evidence_execution_stress_mode": str(
+            getattr(config, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95"
+        ),
+        "oos_evidence_execution_cost_max_candidates_per_tf": int(
+            getattr(config, "oos_evidence_execution_cost_max_candidates_per_tf", 0) or 0
+        ),
+        "threadspark_selection_surface": str(
+            getattr(config, "threadspark_selection_surface", "validation") or "validation"
+        ),
+        "threadspark_use_historical_cost_evidence": bool(
+            getattr(config, "threadspark_use_historical_cost_evidence", True)
+        ),
+        "threadspark_historical_cost_scope": str(
+            getattr(config, "threadspark_historical_cost_scope", "workflow") or "workflow"
+        ),
+        "threadspark_historical_chunk_count": int(
+            getattr(config, "threadspark_historical_chunk_count", 5) or 5
+        ),
+        "optuna_family_size_aware_budget": bool(getattr(config, "optuna_family_size_aware_budget", False)),
+        "optuna_min_trials_per_strategy": int(getattr(config, "optuna_min_trials_per_strategy", 0) or 0),
+        "optuna_max_trials_per_strategy": int(getattr(config, "optuna_max_trials_per_strategy", 0) or 0),
+        "optuna_target_coverage_pct": float(getattr(config, "optuna_target_coverage_pct", 0.0) or 0.0),
+        "scoring_use_consistency": bool(getattr(config, "scoring_use_consistency", False)),
+        "scoring_use_continuous_dd": bool(getattr(config, "scoring_use_continuous_dd", False)),
+        "scoring_use_sortino_blend": bool(getattr(config, "scoring_use_sortino_blend", False)),
+        "scoring_use_tail_risk": bool(getattr(config, "scoring_use_tail_risk", False)),
+        "scoring_use_trade_frequency_bonus": bool(getattr(config, "scoring_use_trade_frequency_bonus", False)),
+        "legacy_confidence_bonus_cap": float(getattr(config, "legacy_confidence_bonus_cap", 0.08) or 0.0),
+        "regime_scoring_model": str(getattr(config, "regime_scoring_model", "legacy") or "legacy"),
+        "specialist_spokes_v2_cost_frequency_strength": float(
+            getattr(config, "specialist_spokes_v2_cost_frequency_strength", 0.50) or 0.0
+        ),
+        "specialist_spokes_v2_default_fallback_enabled": bool(
+            getattr(config, "specialist_spokes_v2_default_fallback_enabled", True)
+        ),
+        "specialist_spokes_v2_allow_promote_small_default": bool(
+            getattr(config, "specialist_spokes_v2_allow_promote_small_default", True)
+        ),
+        "specialist_spokes_v2_max_validation_sharpe": float(
+            getattr(config, "specialist_spokes_v2_max_validation_sharpe", 0.0) or 0.0
+        ),
+        "regime_trade_stability_floor": float(getattr(config, "regime_trade_stability_floor", 0.7) or 0.7),
         "local_governance_tournament_enabled": bool(getattr(config, "local_governance_tournament_enabled", False)),
         "local_governance_candidate_policies": candidate_policy_names(
             getattr(config, "local_governance_candidate_policies", None)
@@ -231,12 +292,47 @@ def _artifact_contract_view(stored_artifact: Dict[str, Any],
     return {key: stored.get(key) for key in current.keys()}
 
 
+def _regime_params_contract_token(meta: Any) -> Any:
+    """Normalize materialized no-file detector rows to the validation contract."""
+    if not isinstance(meta, dict):
+        return meta
+    if meta.get("mtime_ns") is None and meta.get("size") is None:
+        return {"contract": "validation_no_file_timeframe_surface"}
+    path_raw = str(meta.get("path", "") or "").strip()
+    if not path_raw:
+        return meta
+    path = Path(path_raw)
+    if not path.exists():
+        return meta
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return meta
+    if not isinstance(payload, dict) or not payload:
+        return meta
+    for symbol, tf_map in payload.items():
+        if not isinstance(tf_map, dict) or not tf_map:
+            return meta
+        for timeframe, params in tf_map.items():
+            if not isinstance(params, dict):
+                return meta
+            expected = validated_regime_params_for_timeframe(str(symbol), str(timeframe)).to_dict()
+            if params != expected:
+                return meta
+    return {"contract": "validation_no_file_timeframe_surface"}
+
+
 def artifact_contract_matches(stored_artifact: Dict[str, Any],
                               current_artifact_meta: Dict[str, Any]) -> bool:
     """Return True when the persisted artifact matches the current contract."""
     if not current_artifact_meta:
         return True
-    return _artifact_contract_view(stored_artifact, current_artifact_meta) == current_artifact_meta
+    stored_view = _artifact_contract_view(stored_artifact, current_artifact_meta)
+    current_view = dict(current_artifact_meta)
+    if "regime_params" in current_view:
+        stored_view["regime_params"] = _regime_params_contract_token(stored_view.get("regime_params"))
+        current_view["regime_params"] = _regime_params_contract_token(current_view.get("regime_params"))
+    return stored_view == current_view
 
 
 def _default_live_observability() -> Dict[str, Any]:
@@ -288,13 +384,25 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
     if regime_config is None or regime_config.is_no_trade_marker():
         return "NO_TRADE", ["no trade marker"]
 
+    scoring_model = str(getattr(config, "regime_scoring_model", "legacy") or "legacy").lower()
     historical = dict(getattr(regime_config, "historical_audit_metrics", {}) or {})
+    historical_severe_reasons: List[str] = []
     if bool(historical.get("severe_failure", False)):
-        reasons.extend(str(reason) for reason in historical.get("failure_reasons", []) or [])
+        historical_severe_reasons.extend(str(reason) for reason in historical.get("failure_reasons", []) or [])
+        if scoring_model != "specialist_spokes_v2":
+            reasons.extend(historical_severe_reasons)
+    regime_profitability_audit = historical.get("regime_profitability_audit")
+    if (
+        scoring_model != "specialist_spokes_v2" and
+        isinstance(regime_profitability_audit, dict) and
+        bool(regime_profitability_audit.get("severe_failure", False))
+    ):
+        reasons.extend(str(reason) for reason in regime_profitability_audit.get("warnings", []) or [])
 
     walk_forward = dict(getattr(regime_config, "walk_forward_audit", {}) or {})
-    wf_policy = str(getattr(config, "walk_forward_promotion_policy", "block_severe_only") or "").lower()
-    if wf_policy == "block_severe_only":
+    wf_policy = str(getattr(config, "walk_forward_promotion_policy", "observe_only") or "").lower()
+    wf_live_blocking = bool(getattr(config, "walk_forward_live_blocking_enabled", False))
+    if wf_live_blocking and wf_policy == "block_severe_only":
         summary = walk_forward.get("summary") if isinstance(walk_forward.get("summary"), dict) else {}
         windows = walk_forward.get("windows") if isinstance(walk_forward.get("windows"), list) else []
         audited = [window for window in windows if int(window.get("total_trades", 0) or 0) > 0]
@@ -312,7 +420,8 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
     holdout = dict(getattr(regime_config, "holdout_metrics", {}) or {})
     holdout_trades = int(holdout.get("total_trades", 0) or 0)
     holdout_return = float(holdout.get("total_return_pct", 0.0) or 0.0)
-    if bool(getattr(config, "false_discovery_control_enabled", False)):
+    false_discovery_enabled = bool(getattr(config, "false_discovery_control_enabled", False))
+    if false_discovery_enabled:
         evidence = dict(getattr(regime_config, "validation_evidence", {}) or {})
         false_discovery = dict(evidence.get("false_discovery", {}) or {})
         min_dsr = float(getattr(config, "false_discovery_min_dsr", 0.0) or 0.0)
@@ -323,11 +432,45 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                     f"false-discovery DSR {dsr:.4f} < {min_dsr:.4f}"
                 ]
 
+    holdout_gate_enabled = false_discovery_enabled or scoring_model == "specialist_spokes_v2"
+    if holdout_gate_enabled:
         holdout_policy = str(
-            getattr(config, "false_discovery_holdout_policy", "promote_small") or "promote_small"
+            getattr(config, "false_discovery_holdout_policy", "off") or "off"
         ).lower()
+        split_mode = str(getattr(config, "production_split_mode", "bleeding_edge") or "bleeding_edge").lower()
+        if (
+            split_mode == "bleeding_edge"
+            and not holdout
+            and str(getattr(config, "oos_validation_mode", "fixed_holdout") or "fixed_holdout").lower()
+            != "purged_kfold"
+        ):
+            holdout_policy = "off"
         if holdout_policy != "off":
             min_holdout_trades = int(getattr(config, "false_discovery_holdout_min_trades", 5) or 0)
+            if str(holdout.get("validation_mode", "") or "").lower() == "purged_kfold":
+                min_holdout_trades = int(getattr(config, "oos_min_trades", min_holdout_trades) or 0)
+            if 0 < min_holdout_trades and holdout_trades < min_holdout_trades:
+                reason = f"holdout trades {holdout_trades} < {min_holdout_trades}"
+                if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
+                    return "BLOCKED", [
+                        "historical severe confirmed by weak holdout",
+                        *historical_severe_reasons,
+                        reason,
+                    ]
+                if holdout_policy == "block":
+                    return "BLOCKED", [reason]
+                return "PROMOTE_SMALL", [reason]
+            if str(holdout.get("policy_status", "") or "").upper() == "FAIL":
+                reason = str(holdout.get("policy_reason", "") or "purged-kfold OOS policy failed")
+                if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
+                    return "BLOCKED", [
+                        "historical severe confirmed by weak holdout",
+                        *historical_severe_reasons,
+                        reason,
+                    ]
+                if holdout_policy == "block":
+                    return "BLOCKED", [reason]
+                return "PROMOTE_SMALL", [reason]
             if holdout_trades >= min_holdout_trades > 0:
                 holdout_pf = float(holdout.get("profit_factor", 0.0) or 0.0)
                 min_holdout_pf = float(
@@ -346,11 +489,23 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                         f"holdout return {holdout_return:.1f}% < {min_holdout_return:.1f}%"
                     )
                 if holdout_reasons:
+                    if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
+                        return "BLOCKED", [
+                            "historical severe confirmed by weak holdout",
+                            *historical_severe_reasons,
+                            *holdout_reasons,
+                        ]
                     if holdout_policy == "block":
                         return "BLOCKED", holdout_reasons
                     return "PROMOTE_SMALL", holdout_reasons
 
     if holdout_trades > 0 and holdout_return <= 0.0:
+        if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
+            return "BLOCKED", [
+                "historical severe confirmed by weak holdout",
+                *historical_severe_reasons,
+                "freshest holdout non-positive; risk derated",
+            ]
         return "PROMOTE_SMALL", ["freshest holdout non-positive; risk derated"]
     return "PROMOTED", []
 
@@ -377,6 +532,25 @@ def _optimize_symbol_worker(config_dict: Dict[str, Any], symbol: str) -> Tuple[s
         return symbol, result
     except Exception as exc:
         return symbol, PipelineResult(symbol=symbol, success=False, error_message=str(exc))
+    finally:
+        FeatureComputer.clear_cache()
+
+
+def _precompute_feature_cache_worker(config_dict: Dict[str, Any], symbol: str) -> Tuple[str, Dict[str, Any]]:
+    """Worker for disk-backed feature-cache precompute."""
+    try:
+        cfg = PipelineConfig(**config_dict)
+        pipeline = OptimizationPipeline(cfg)
+        stats = pipeline.precompute_feature_cache([symbol])
+        return symbol, stats
+    except Exception as exc:
+        return symbol, {
+            "symbols_requested": 1,
+            "symbols_failed": 1,
+            "errors": {symbol: str(exc)},
+        }
+    finally:
+        FeatureComputer.clear_cache()
 
 
 # =============================================================================
@@ -419,6 +593,23 @@ class ConfigLedger:
         self.filepath = Path(filepath)
         self.configs: Dict[str, SymbolConfig] = {}
         self._loaded = False
+        self._file_signature: Optional[Tuple[int, int]] = None
+
+    def _current_file_signature(self) -> Optional[Tuple[int, int]]:
+        """Return a cheap change signature for the on-disk ledger."""
+        if not self.filepath.exists():
+            return None
+        stat = self.filepath.stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _refresh_if_changed(self) -> None:
+        """Reload the ledger when another process has atomically replaced it."""
+        if not self._loaded:
+            self.load()
+            return
+        current_signature = self._current_file_signature()
+        if current_signature != self._file_signature:
+            self.load()
     
     def load(self) -> int:
         """
@@ -434,6 +625,7 @@ class ConfigLedger:
             logger.info(f"Config file not found: {self.filepath} (starting fresh)")
             self.configs = {}
             self._loaded = True
+            self._file_signature = None
             return 0
         
         try:
@@ -448,6 +640,7 @@ class ConfigLedger:
                     logger.warning(f"Could not parse config for {symbol}: {e}")
             
             self._loaded = True
+            self._file_signature = self._current_file_signature()
             logger.info(f"Loaded {len(self.configs)} existing configs from {self.filepath}")
             return len(self.configs)
             
@@ -482,14 +675,15 @@ class ConfigLedger:
             
             # Atomic rename (on POSIX systems)
             temp_path.replace(self.filepath)
+            self._file_signature = self._current_file_signature()
             
         except Exception as e:
             # Clean up temp file on failure
             if temp_path.exists():
                 try:
                     temp_path.unlink()
-                except:
-                    pass
+                except OSError as cleanup_exc:
+                    logger.debug("Failed to remove temporary config file %s: %s", temp_path, cleanup_exc)
             raise RuntimeError(f"Failed to save configs: {e}")
     
     def update_symbol(self, symbol: str, config: 'SymbolConfig') -> bool:
@@ -507,6 +701,8 @@ class ConfigLedger:
         """
         if not self._loaded:
             self.load()
+        else:
+            self._refresh_if_changed()
         
         previous = self.configs.get(symbol)
         self.configs[symbol] = config
@@ -525,8 +721,7 @@ class ConfigLedger:
     
     def get_config(self, symbol: str) -> Optional['SymbolConfig']:
         """Get config for a symbol."""
-        if not self._loaded:
-            self.load()
+        self._refresh_if_changed()
         return self.configs.get(symbol)
     
     def has_valid_config(self, symbol: str) -> Tuple[bool, str]:
@@ -536,16 +731,16 @@ class ConfigLedger:
         Returns:
             Tuple of (is_valid, reason_string)
         """
-        if not self._loaded:
-            self.load()
+        self._refresh_if_changed()
         
         if symbol not in self.configs:
             return False, "missing"
         
         config = self.configs[symbol]
+        has_tradeable_regime_winners = config.has_tradeable_regime_winners()
         
         # Check validation status
-        if not config.is_validated:
+        if not config.is_validated and not has_tradeable_regime_winners:
             return False, f"invalid ({config.validation_reason or 'not validated'})"
         
         # Check expiry
@@ -671,8 +866,7 @@ class ConfigLedger:
         Returns:
             Tuple of (symbols_to_optimize, symbols_to_skip)
         """
-        if not self._loaded:
-            self.load()
+        self._refresh_if_changed()
         
         to_optimize = []
         to_skip = []
@@ -692,8 +886,7 @@ class ConfigLedger:
     
     def get_all_configs(self) -> Dict[str, 'SymbolConfig']:
         """Get all loaded configs."""
-        if not self._loaded:
-            self.load()
+        self._refresh_if_changed()
         return self.configs.copy()
     
     def remove_symbol(self, symbol: str) -> bool:
@@ -706,8 +899,7 @@ class ConfigLedger:
         Returns:
             True if removed and saved
         """
-        if not self._loaded:
-            self.load()
+        self._refresh_if_changed()
         
         if symbol not in self.configs:
             return False
@@ -724,8 +916,7 @@ class ConfigLedger:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get ledger statistics."""
-        if not self._loaded:
-            self.load()
+        self._refresh_if_changed()
         
         now = datetime.now()
         valid = 0
@@ -854,6 +1045,10 @@ class RegimeConfig:
             'regime_val_trades': self.regime_val_trades,
             'trained_at': self.trained_at.isoformat() if self.trained_at else None,
             'valid_until': self.valid_until.isoformat() if self.valid_until else None,
+            'is_validated': (
+                not self.is_no_trade_marker()
+                and str(self.promotion_status or "PROMOTED").upper() in {"PROMOTED", "PROMOTE_SMALL"}
+            ),
             'train_metrics': {k: v for k, v in self.train_metrics.items() 
                             if k not in ['equity_curve', 'trades']},
             'val_metrics': {k: v for k, v in self.val_metrics.items() 
@@ -977,12 +1172,22 @@ class SymbolConfig:
     
     def count_regime_winners(self) -> int:
         """Count validated tradeable regime winners across all timeframes."""
+        non_live_statuses = {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}
         return sum(
             1
             for regimes in self.regime_configs.values()
             for cfg in regimes.values()
-            if cfg is not None and not cfg.is_no_trade_marker()
+            if (
+                cfg is not None
+                and not cfg.is_no_trade_marker()
+                and str(getattr(cfg, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+                not in non_live_statuses
+            )
         )
+
+    def has_tradeable_regime_winners(self) -> bool:
+        """True when at least one regime/timeframe cell is live-tradeable."""
+        return self.has_regime_configs() and self.count_regime_winners() > 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -994,7 +1199,7 @@ class SymbolConfig:
             'retrain_days': self.retrain_days,
             'composite_score': self.composite_score,
             'robustness_ratio': self.robustness_ratio,
-            'is_validated': self.is_validated,
+            'is_validated': bool(self.is_validated or self.has_tradeable_regime_winners()),
             'validation_reason': self.validation_reason,
             'validation_evidence': dict(self.validation_evidence or {}),
             'train_return': float(self.train_metrics.get('total_return_pct', 0.0)) if self.train_metrics else 0.0,
@@ -1018,6 +1223,9 @@ class SymbolConfig:
             'live_observability': dict(self.live_observability or _default_live_observability()),
             'walk_forward_audit': dict(self.walk_forward_audit or _default_walk_forward_audit()),
         }
+        if self.default_config:
+            result['promotion_status'] = str(self.default_config.promotion_status or "PROMOTED")
+            result['promotion_reasons'] = list(self.default_config.promotion_reasons or [])
 
         if self.regime_detection_version:
             result['regime_detection_version'] = self.regime_detection_version
@@ -1286,7 +1494,8 @@ class HyperparameterOptimizer:
                  symbol: str,
                  strategy_name: str,
                  train_features: pd.DataFrame,
-                 val_features: pd.DataFrame) -> Tuple[Dict[str, Any], Dict, Dict]:
+                 val_features: pd.DataFrame,
+                 timeframe: str = "") -> Tuple[Dict[str, Any], Dict, Dict]:
         """
         Optimize strategy parameters using Optuna TPE.
         
@@ -1308,11 +1517,15 @@ class HyperparameterOptimizer:
             logger.info(f"[{symbol}] No param grid for {strategy_name}, using defaults")
             
             signals = strategy.generate_signals(train_features, symbol)
-            train_metrics = self.backtester.run(train_features, signals, symbol, strategy)
+            train_metrics = self.backtester.run(
+                train_features, signals, symbol, strategy, timeframe=timeframe
+            )
             
             if val_features is not None and len(val_features) >= 50:
                 signals = strategy.generate_signals(val_features, symbol)
-                val_metrics = self.backtester.run(val_features, signals, symbol, strategy)
+                val_metrics = self.backtester.run(
+                    val_features, signals, symbol, strategy, timeframe=timeframe
+                )
             else:
                 val_metrics = {'total_return_pct': 0.0, 'sharpe_ratio': 0.0,
                                'max_drawdown_pct': 0.0, 'total_trades': 0}
@@ -1322,12 +1535,12 @@ class HyperparameterOptimizer:
         # Use Optuna TPE if available
         if self.optuna_optimizer is not None:
             return self._optimize_with_optuna(
-                symbol, strategy_name, param_grid, train_features, val_features
+                symbol, strategy_name, param_grid, train_features, val_features, timeframe
             )
         
         # Fallback to grid search
         return self._optimize_grid_search(
-            symbol, strategy_name, param_grid, train_features, val_features
+            symbol, strategy_name, param_grid, train_features, val_features, timeframe
         )
     
     def _optimize_with_optuna(self,
@@ -1335,7 +1548,8 @@ class HyperparameterOptimizer:
                               strategy_name: str,
                               param_grid: Dict[str, List],
                               train_features: pd.DataFrame,
-                              val_features: pd.DataFrame) -> Tuple[Dict[str, Any], Dict, Dict]:
+                              val_features: pd.DataFrame,
+                              timeframe: str = "") -> Tuple[Dict[str, Any], Dict, Dict]:
         """Optimize using Optuna TPE."""
         
         # FX backtester scoring: validation-aware when enough val trades, otherwise train-with-discount
@@ -1361,6 +1575,7 @@ class HyperparameterOptimizer:
         # Run optimization
         result = self.optuna_optimizer.optimize(
             symbol=symbol,
+            timeframe=timeframe,
             strategy_name=strategy_name,
             param_grid=param_grid,
             train_features=train_features,
@@ -1379,7 +1594,8 @@ class HyperparameterOptimizer:
                               strategy_name: str,
                               param_grid: Dict[str, List],
                               train_features: pd.DataFrame,
-                              val_features: pd.DataFrame) -> Tuple[Dict[str, Any], Dict, Dict]:
+                              val_features: pd.DataFrame,
+                              timeframe: str = "") -> Tuple[Dict[str, Any], Dict, Dict]:
         """Fallback grid search optimization."""
         strategy = StrategyRegistry.get(strategy_name)
         default_params = strategy.get_params()
@@ -1417,7 +1633,9 @@ class HyperparameterOptimizer:
 
             try:
                 signals = test_strategy.generate_signals(train_features, symbol)
-                train_metrics = self.backtester.run(train_features, signals, symbol, test_strategy)
+                train_metrics = self.backtester.run(
+                    train_features, signals, symbol, test_strategy, timeframe=timeframe
+                )
 
                 if train_metrics.get('total_trades', 0) < self.config.fx_opt_min_trades:
                     continue
@@ -1456,7 +1674,9 @@ class HyperparameterOptimizer:
             if not train_metrics:
                 try:
                     signals = test_strategy.generate_signals(train_features, symbol)
-                    train_metrics = self.backtester.run(train_features, signals, symbol, test_strategy)
+                    train_metrics = self.backtester.run(
+                        train_features, signals, symbol, test_strategy, timeframe=timeframe
+                    )
                 except Exception as e:
                     logger.debug(f"[{symbol}] Val-shortlist train {strategy_name} failed: {e}")
                     continue
@@ -1467,7 +1687,9 @@ class HyperparameterOptimizer:
             else:
                 try:
                     signals = test_strategy.generate_signals(val_features, symbol)
-                    val_metrics = self.backtester.run(val_features, signals, symbol, test_strategy)
+                    val_metrics = self.backtester.run(
+                        val_features, signals, symbol, test_strategy, timeframe=timeframe
+                    )
                 except Exception as e:
                     logger.debug(f"[{symbol}] Val-shortlist val {strategy_name} failed: {e}")
                     continue
@@ -1737,6 +1959,13 @@ class RegimeOptimizer:
         self.min_val_return_pct = getattr(config, 'regime_min_val_return_pct', 5.0)
         self.allow_losing_winners = getattr(config, 'regime_allow_losing_winners', False)
         self.no_winner_marker = getattr(config, 'regime_no_winner_marker', 'NO_TRADE')
+        self.screening_atr_anchor_enabled = bool(
+            getattr(config, 'screening_atr_anchor_enabled', False)
+        )
+        self.screening_atr_anchor_multipliers = [
+            float(value)
+            for value in (getattr(config, 'screening_atr_anchor_multipliers', [2.0]) or [2.0])
+        ]
 
         # Return-to-DD efficiency gate (unconditional hard gate)
         _raw_ratio = float(getattr(config, 'regime_min_val_return_dd_ratio', 1.0))
@@ -1792,14 +2021,19 @@ class RegimeOptimizer:
                         train_features_by_tf: Dict[str, pd.DataFrame],
                         val_features_by_tf: Dict[str, pd.DataFrame],
                         strategies: List[BaseStrategy],
-                        val_warmup_by_tf: Optional[Dict[str, int]] = None) -> Tuple[Dict[str, Dict[str, RegimeConfig]], Optional[RegimeConfig], int, int]:
+                        val_warmup_by_tf: Optional[Dict[str, int]] = None,
+                        eligibility_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
+                        selection_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
+                        selection_warmup_by_tf: Optional[Dict[str, int]] = None,
+                        selection_surface_by_tf: Optional[Dict[str, str]] = None,
+                        historical_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None) -> Tuple[Dict[str, Dict[str, RegimeConfig]], Optional[RegimeConfig], int, int]:
         """
         Optimize for all (timeframe, regime) combinations with validation.
         
         Args:
             symbol: Symbol name
-            train_features_by_tf: Dict mapping timeframe -> training features (with regime columns)
-            val_features_by_tf: Dict mapping timeframe -> validation features (with regime columns)
+            train_features_by_tf: Dict mapping timeframe -> optimization features (with regime columns)
+            val_features_by_tf: Dict mapping timeframe -> validation/audit features (with regime columns)
             strategies: List of strategy instances
             
         Returns:
@@ -1826,7 +2060,18 @@ class RegimeOptimizer:
         tf_iter = tqdm(train_features_by_tf.items(), desc=f"[{symbol}] Timeframes", unit="tf", leave=False) if _TQDM else train_features_by_tf.items()
         for tf, train_features in tf_iter:
             val_features = val_features_by_tf.get(tf)
+            eligibility_features = (
+                None if eligibility_features_by_tf is None else eligibility_features_by_tf.get(tf)
+            )
             val_warmup_bars = 0 if val_warmup_by_tf is None else int(val_warmup_by_tf.get(tf, 0) or 0)
+            selection_features = None if selection_features_by_tf is None else selection_features_by_tf.get(tf)
+            selection_warmup_bars = (
+                0 if selection_warmup_by_tf is None else int(selection_warmup_by_tf.get(tf, 0) or 0)
+            )
+            selection_surface = (
+                "validation" if selection_surface_by_tf is None else str(selection_surface_by_tf.get(tf, "validation") or "validation")
+            )
+            historical_features = None if historical_features_by_tf is None else historical_features_by_tf.get(tf)
             
             if train_features is None or len(train_features) < 200:
                 logger.debug(f"[{symbol}] [{tf}] Skipping - insufficient data")
@@ -1841,7 +2086,17 @@ class RegimeOptimizer:
             
             # Collect all candidates for this timeframe
             tf_candidates = self._collect_candidates(
-                symbol, tf, train_features, val_features, strategies, val_warmup_bars=val_warmup_bars
+                symbol,
+                tf,
+                train_features,
+                val_features,
+                strategies,
+                val_warmup_bars=val_warmup_bars,
+                eligibility_features=eligibility_features,
+                selection_features=selection_features,
+                selection_warmup_bars=selection_warmup_bars,
+                selection_surface=selection_surface,
+                historical_features=historical_features,
             )
             
             if not tf_candidates:
@@ -1935,6 +2190,43 @@ class RegimeOptimizer:
         return clean
 
     @staticmethod
+    def _compact_backtest_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Keep scalar metrics only after trades were bucketed."""
+        if not isinstance(result, dict):
+            return {}
+        return {
+            key: value
+            for key, value in result.items()
+            if key not in {"equity_curve", "trades"}
+        }
+
+    @staticmethod
+    def _compact_metric_tree(value: Any) -> Any:
+        """JSON-safe scalar/nested metric snapshot for evidence manifests."""
+        if isinstance(value, dict):
+            return {
+                str(key): RegimeOptimizer._compact_metric_tree(item)
+                for key, item in value.items()
+                if key not in {"equity_curve", "trades"}
+            }
+        if isinstance(value, (list, tuple)):
+            return [RegimeOptimizer._compact_metric_tree(item) for item in value]
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except Exception:
+                pass
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            value = float(value)
+        if isinstance(value, float):
+            return value if math.isfinite(value) else 0.0
+        if isinstance(value, (int, str, bool)) or value is None:
+            return value
+        return str(value)
+
+    @staticmethod
     def _period_returns_from_equity(equity_curve: Any,
                                     periods: int,
                                     min_periods: int) -> List[float]:
@@ -1965,17 +2257,194 @@ class RegimeOptimizer:
             return []
         return period_returns
 
+    @staticmethod
+    def _trim_equity_curve_for_warmup(equity_curve: Any, warmup_bars: int) -> List[float]:
+        """Return the scored equity path while keeping the pre-score baseline point."""
+
+        try:
+            equity = np.asarray(equity_curve, dtype=np.float64)
+        except Exception:
+            return []
+        if equity.size <= 2:
+            return equity.tolist()
+        warmup = max(0, int(warmup_bars or 0))
+        if warmup <= 0:
+            return equity.tolist()
+        start = max(0, min(warmup - 1, int(equity.size) - 2))
+        return equity[start:].tolist()
+
+    @staticmethod
+    def _trade_path_evidence(trades: Any, max_points: int = 256) -> Dict[str, Any]:
+        """Compact trade-index evidence for path/spoke discovery.
+
+        Uses R multiples when present so the path is comparable across instruments.
+        This is evidence only; it does not change candidate selection.
+        """
+        if not isinstance(trades, list) or not trades:
+            return {
+                "status": "no_trades",
+                "trade_count": 0,
+                "r_multiple_sequence": [],
+                "cumulative_r_blocks": [],
+            }
+        r_values: List[float] = []
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            value = trade.get("r_multiple")
+            if value is None:
+                pnl = trade.get("pnl_dollars")
+                risk = trade.get("risk_amount")
+                try:
+                    value = float(pnl) / float(risk) if abs(float(risk)) > 1e-12 else 0.0
+                except Exception:
+                    value = 0.0
+            try:
+                value = float(value)
+            except Exception:
+                value = 0.0
+            if math.isfinite(value):
+                r_values.append(value)
+        if not r_values:
+            return {
+                "status": "unavailable",
+                "trade_count": len(trades),
+                "r_multiple_sequence": [],
+                "cumulative_r_blocks": [],
+            }
+        capped = max(0, int(max_points or 0))
+        sequence = r_values[-capped:] if capped > 0 and len(r_values) > capped else list(r_values)
+        cumulative = np.cumsum(np.asarray(sequence, dtype=np.float64))
+        block_count = min(64, max(1, len(cumulative)))
+        blocks = [
+            float(block[-1]) if len(block) else 0.0
+            for block in np.array_split(cumulative, block_count)
+        ]
+        gains = np.maximum(np.asarray(sequence, dtype=np.float64), 0.0)
+        total_gain = float(gains.sum())
+        last_quarter_gain = float(gains[int(max(0, len(gains) * 0.75)):].sum()) if gains.size else 0.0
+        cluster = 3 if len(sequence) >= 3 else max(1, len(sequence))
+        rolling_cluster = [
+            float(sum(sequence[idx:idx + cluster]))
+            for idx in range(0, max(1, len(sequence) - cluster + 1))
+        ]
+        return {
+            "status": "available",
+            "trade_count": len(r_values),
+            "stored_points": len(sequence),
+            "truncated": bool(len(sequence) < len(r_values)),
+            "r_multiple_sequence": [round(float(value), 6) for value in sequence],
+            "cumulative_r_blocks": [round(float(value), 6) for value in blocks],
+            "mean_r": round(float(np.mean(sequence)), 6),
+            "median_r": round(float(np.median(sequence)), 6),
+            "positive_trade_fraction": round(float((np.asarray(sequence) > 0.0).mean()), 6),
+            "worst_trade_r": round(float(np.min(sequence)), 6),
+            "worst_cluster_r": round(float(min(rolling_cluster)), 6) if rolling_cluster else 0.0,
+            "late_gain_share": round(float(last_quarter_gain / total_gain), 6) if total_gain > 1e-12 else 0.0,
+        }
+
+    @staticmethod
+    def _equity_path_evidence(equity_curve: Any, max_points: int = 256) -> Dict[str, Any]:
+        """Compact equity evidence with higher-is-better capital preservation blocks."""
+
+        try:
+            equity = np.asarray(equity_curve, dtype=np.float64)
+        except Exception:
+            equity = np.asarray([], dtype=np.float64)
+        equity = equity[np.isfinite(equity)]
+        if equity.size < 2:
+            return {
+                "status": "unavailable",
+                "stored_points": 0,
+                "return_pct_blocks": [],
+                "capital_preservation_blocks": [],
+            }
+        capped = max(0, int(max_points or 0))
+        path = equity[-capped:] if capped > 0 and equity.size > capped else equity
+        if path.size < 2:
+            return {
+                "status": "unavailable",
+                "stored_points": int(path.size),
+                "return_pct_blocks": [],
+                "capital_preservation_blocks": [],
+            }
+        start = float(path[0]) if abs(float(path[0])) > 1e-12 else 1.0
+        returns_pct = ((path / start) - 1.0) * 100.0
+        peak = np.maximum.accumulate(path)
+        drawdown_pct = np.where(peak > 1e-12, (peak - path) / peak, 0.0) * 100.0
+        capital_preservation = np.clip(1.0 - (drawdown_pct / 100.0), 0.0, 1.0)
+        block_count = min(64, max(2, int(path.size)))
+
+        def _last_blocks(values: np.ndarray) -> List[float]:
+            return [
+                round(float(block[-1]), 6) if len(block) else 0.0
+                for block in np.array_split(values, block_count)
+            ]
+
+        return {
+            "status": "available",
+            "stored_points": int(path.size),
+            "truncated": bool(path.size < equity.size),
+            "return_pct_blocks": _last_blocks(returns_pct),
+            "drawdown_pct_blocks": _last_blocks(drawdown_pct),
+            "capital_preservation_blocks": _last_blocks(capital_preservation),
+            "max_drawdown_pct": round(float(np.max(drawdown_pct)), 6),
+            "time_underwater_fraction": round(float((drawdown_pct > 1e-9).mean()), 6),
+        }
+
+    @staticmethod
+    def _execution_cost_survival_evidence(baseline: Dict[str, Any],
+                                          stress: Optional[Dict[str, Any]],
+                                          stress_mode: str) -> Dict[str, Any]:
+        if not isinstance(stress, dict):
+            return {"status": "not_requested", "stress_mode": stress_mode}
+        status = str(stress.get("status", "") or "").strip().lower()
+        if status in {"capped", "error"}:
+            payload = {"status": status, "stress_mode": stress_mode}
+            if stress.get("error"):
+                payload["error"] = str(stress.get("error"))[:240]
+            return payload
+        base_ret = float(baseline.get("total_return_pct", 0.0) or 0.0)
+        stress_ret = float(stress.get("total_return_pct", 0.0) or 0.0)
+        base_pf = float(baseline.get("profit_factor", 0.0) or 0.0)
+        stress_pf = float(stress.get("profit_factor", 0.0) or 0.0)
+        base_dd = float(baseline.get("max_drawdown_pct", 0.0) or 0.0)
+        stress_dd = float(stress.get("max_drawdown_pct", 0.0) or 0.0)
+        return {
+            "status": "available",
+            "stress_mode": stress_mode,
+            "baseline_return_pct": round(base_ret, 6),
+            "stress_return_pct": round(stress_ret, 6),
+            "baseline_profit_factor": round(base_pf, 6),
+            "stress_profit_factor": round(stress_pf, 6),
+            "baseline_max_drawdown_pct": round(base_dd, 6),
+            "stress_max_drawdown_pct": round(stress_dd, 6),
+            "return_retention": round(float(stress_ret / base_ret), 6)
+            if abs(base_ret) > 1e-9 else 0.0,
+            "profit_factor_retention": round(float(stress_pf / base_pf), 6)
+            if base_pf > 1e-9 else 0.0,
+            "drawdown_delta_pct": round(float(stress_dd - base_dd), 6),
+            "survives_positive_return": bool(stress_ret > 0.0),
+            "survives_pf_ge_1": bool(stress_pf >= 1.0),
+        }
+
     def _build_oos_evidence_record(self,
                                    symbol: str,
                                    timeframe: str,
                                    candidate: Dict[str, Any],
                                    val_result: Dict[str, Any],
                                    val_features: pd.DataFrame,
-                                   val_warmup_bars: int) -> Optional[Dict[str, Any]]:
+                                   val_warmup_bars: int,
+                                   stress_result: Optional[Dict[str, Any]] = None,
+                                   stress_mode: str = "") -> Optional[Dict[str, Any]]:
         periods = int(getattr(self.config, "oos_evidence_periods", 64) or 64)
         min_periods = int(getattr(self.config, "oos_evidence_min_periods", 8) or 8)
-        period_returns = self._period_returns_from_equity(
+        scored_equity_curve = self._trim_equity_curve_for_warmup(
             val_result.get("equity_curve", []),
+            val_warmup_bars,
+        )
+        period_returns = self._period_returns_from_equity(
+            scored_equity_curve,
             periods=periods,
             min_periods=min_periods,
         )
@@ -2007,8 +2476,24 @@ class RegimeOptimizer:
         except Exception:
             start_ts = None
             end_ts = None
+        train_metrics = self._compact_metric_tree(candidate.get("train_result", {}))
+        train_regime_metrics = self._compact_metric_tree(candidate.get("train_regime_metrics", {}))
+        val_regime_metrics = self._compact_metric_tree(candidate.get("val_regime_metrics", {}))
+        val_metrics = {
+            "total_trades": int(val_result.get("total_trades", 0) or 0),
+            "profit_factor": float(val_result.get("profit_factor", 0.0) or 0.0),
+            "total_return_pct": float(val_result.get("total_return_pct", 0.0) or 0.0),
+            "max_drawdown_pct": float(val_result.get("max_drawdown_pct", 0.0) or 0.0),
+            "win_rate": float(val_result.get("win_rate", 0.0) or 0.0),
+        }
+        train_return = float(train_metrics.get("total_return_pct", 0.0) or 0.0) if isinstance(train_metrics, dict) else 0.0
+        train_pf = float(train_metrics.get("profit_factor", 0.0) or 0.0) if isinstance(train_metrics, dict) else 0.0
+        val_return = float(val_metrics.get("total_return_pct", 0.0) or 0.0)
+        val_pf = float(val_metrics.get("profit_factor", 0.0) or 0.0)
+        return_retention = val_return / train_return if abs(train_return) > 1e-9 else 0.0
+        pf_retention = val_pf / train_pf if train_pf > 1e-9 else 0.0
         return {
-            "format_version": "oos_candidate_returns_v1",
+            "format_version": "oos_candidate_returns_v3",
             "candidate_id": candidate_id,
             "symbol": symbol,
             "timeframe": timeframe,
@@ -2023,12 +2508,33 @@ class RegimeOptimizer:
             "return_index": "relative_equal_blocks",
             "period_count": int(len(period_returns)),
             "period_returns": period_returns,
-            "metrics": {
-                "total_trades": int(val_result.get("total_trades", 0) or 0),
-                "profit_factor": float(val_result.get("profit_factor", 0.0) or 0.0),
-                "total_return_pct": float(val_result.get("total_return_pct", 0.0) or 0.0),
-                "max_drawdown_pct": float(val_result.get("max_drawdown_pct", 0.0) or 0.0),
-                "win_rate": float(val_result.get("win_rate", 0.0) or 0.0),
+            "trade_path_evidence": self._trade_path_evidence(
+                val_result.get("trades", []),
+                max_points=int(getattr(self.config, "oos_evidence_trade_path_max_points", 256) or 0),
+            ),
+            "equity_path_evidence": self._equity_path_evidence(
+                scored_equity_curve,
+                max_points=int(getattr(self.config, "oos_evidence_trade_path_max_points", 256) or 0),
+            ),
+            "metrics": val_metrics,
+            "train_metrics": train_metrics,
+            "train_regime_metrics": train_regime_metrics,
+            "val_regime_metrics": val_regime_metrics,
+            "execution_cost_survival": self._execution_cost_survival_evidence(
+                val_metrics,
+                stress_result,
+                stress_mode or str(getattr(self.config, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95"),
+            ),
+            "parameter_stability_evidence": self._compact_metric_tree(
+                candidate.get("parameter_stability_evidence", {"status": "not_available"})
+            ),
+            "generalization_metrics": {
+                "train_total_return_pct": train_return,
+                "val_total_return_pct": val_return,
+                "return_retention": return_retention if math.isfinite(return_retention) else 0.0,
+                "train_profit_factor": train_pf,
+                "val_profit_factor": val_pf,
+                "profit_factor_retention": pf_retention if math.isfinite(pf_retention) else 0.0,
             },
             "window": {
                 "start_ts": start_ts,
@@ -2049,6 +2555,21 @@ class RegimeOptimizer:
         if val_features is None or len(val_features) <= max(2, int(val_warmup_bars or 0)):
             return
         records_by_id: Dict[str, Dict[str, Any]] = {}
+        stress_enabled = bool(getattr(self.config, "oos_evidence_include_execution_cost_survival", False))
+        stress_mode = str(getattr(self.config, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95")
+        stress_cap = int(getattr(self.config, "oos_evidence_execution_cost_max_candidates_per_tf", 0) or 0)
+        stress_backtester = None
+        stress_attempts = 0
+        if stress_enabled:
+            try:
+                stress_config = replace(self.config, backtest_spread_mode=stress_mode)
+                stress_backtester = Backtester(stress_config)
+            except Exception as exc:
+                logger.warning(
+                    f"[{symbol}] [{timeframe}] Execution-cost evidence disabled: "
+                    f"failed to build stress backtester ({exc})"
+                )
+                stress_enabled = False
         for cand in candidates:
             try:
                 strategy = cand.get("strategy")
@@ -2063,6 +2584,27 @@ class RegimeOptimizer:
                     timeframe=timeframe,
                     warmup_bars=val_warmup_bars,
                 )
+                stress_result = None
+                if stress_enabled and stress_backtester is not None:
+                    if stress_cap > 0 and stress_attempts >= stress_cap:
+                        stress_result = {"status": "capped", "stress_mode": stress_mode}
+                    else:
+                        stress_attempts += 1
+                        try:
+                            stress_result = stress_backtester.run(
+                                val_features,
+                                signals,
+                                symbol,
+                                strategy,
+                                timeframe=timeframe,
+                                warmup_bars=val_warmup_bars,
+                            )
+                        except Exception as stress_exc:
+                            stress_result = {
+                                "status": "error",
+                                "stress_mode": stress_mode,
+                                "error": f"{type(stress_exc).__name__}: {stress_exc}",
+                            }
                 record = self._build_oos_evidence_record(
                     symbol,
                     timeframe,
@@ -2070,9 +2612,14 @@ class RegimeOptimizer:
                     val_result,
                     val_features,
                     val_warmup_bars,
+                    stress_result=stress_result,
+                    stress_mode=stress_mode,
                 )
                 if record:
                     cand["oos_evidence"] = record
+                    cost_evidence = record.get("execution_cost_survival")
+                    if isinstance(cost_evidence, dict):
+                        cand["selection_execution_cost_survival"] = cost_evidence
                     records_by_id[record["candidate_id"]] = record
             except Exception as exc:
                 logger.debug(
@@ -2081,6 +2628,164 @@ class RegimeOptimizer:
                 )
         if records_by_id:
             self.oos_candidate_evidence_records.extend(records_by_id.values())
+
+    def _attach_threadspark_selection_evidence_to_candidates(self,
+                                                             symbol: str,
+                                                             timeframe: str,
+                                                             selection_features: Optional[pd.DataFrame],
+                                                             selection_warmup_bars: int,
+                                                             historical_features: Optional[pd.DataFrame],
+                                                             candidates: List[Dict[str, Any]],
+                                                             *,
+                                                             selection_surface: str) -> None:
+        """Attach post-search evidence used only by the ThreadSpark selector.
+
+        This runs after the Optuna candidate pool is fixed. It deliberately writes
+        evidence onto candidate dictionaries instead of mutating train/validation
+        metrics, so the inner TPE objective remains stationary and leak-clean.
+        """
+
+        scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+        if scoring_model != "specialist_spokes_threadspark":
+            return
+
+        surface_name = str(selection_surface or "validation")
+        has_selection = selection_features is not None and len(selection_features) > max(2, int(selection_warmup_bars or 0))
+        if has_selection and "REGIME_LIVE" not in selection_features.columns:
+            has_selection = False
+        requested_clean_holdout_missing = surface_name == "clean_holdout" and not has_selection
+        has_historical = (
+            bool(getattr(self.config, "threadspark_use_historical_cost_evidence", True))
+            and historical_features is not None
+            and len(historical_features) >= 50
+            and "REGIME_LIVE" in historical_features.columns
+        )
+        if not has_selection and not has_historical and not requested_clean_holdout_missing:
+            return
+
+        historical_chunk_count = max(1, int(getattr(self.config, "threadspark_historical_chunk_count", 5) or 1))
+
+        def _historical_chunk_buckets(
+            trades: List[Dict[str, Any]],
+            features: pd.DataFrame,
+        ) -> List[Dict[str, Dict[str, Any]]]:
+            if historical_chunk_count <= 1 or features is None or len(features) < 100:
+                return []
+            chunks = [chunk for chunk in np.array_split(np.arange(len(features)), historical_chunk_count) if len(chunk)]
+            chunk_buckets: List[Dict[str, Dict[str, Any]]] = []
+            for chunk in chunks:
+                start = int(chunk[0])
+                end = int(chunk[-1]) + 1
+                if end - start < 20:
+                    continue
+                adjusted_trades: List[Dict[str, Any]] = []
+                for trade in trades:
+                    raw_signal = trade.get("signal_bar", trade.get("entry_bar", None))
+                    try:
+                        signal_bar = int(raw_signal)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (start <= signal_bar < end):
+                        continue
+                    adjusted = dict(trade)
+                    for key in ("signal_bar", "entry_bar", "exit_bar"):
+                        if key in adjusted:
+                            try:
+                                adjusted[key] = int(adjusted[key]) - start
+                            except (TypeError, ValueError):
+                                pass
+                    adjusted_trades.append(adjusted)
+                if not adjusted_trades:
+                    continue
+                chunk_features = features.iloc[start:end].copy()
+                chunk_buckets.append(
+                    self._bucket_trades_by_regime(
+                        adjusted_trades,
+                        chunk_features,
+                        timeframe=timeframe,
+                    )
+                )
+            return chunk_buckets
+
+        for cand in candidates:
+            cand["threadspark_selection_requested_surface"] = surface_name
+            cand["threadspark_selection_missing"] = bool(requested_clean_holdout_missing)
+            if requested_clean_holdout_missing:
+                cand["threadspark_selection_surface"] = "clean_holdout_missing"
+                cand["threadspark_selection_missing_reason"] = (
+                    "requested_clean_holdout_unavailable_or_too_thin"
+                )
+            try:
+                strategy = cand.get("strategy")
+                if strategy is None:
+                    strategy = StrategyRegistry.get(cand.get("strategy_name", ""), **(cand.get("params", {}) or {}))
+            except Exception as exc:
+                logger.debug(
+                    f"[{symbol}] [{timeframe}] ThreadSpark evidence skipped for "
+                    f"{cand.get('strategy_name', 'Unknown')}: {exc}"
+                )
+                continue
+
+            if has_selection:
+                try:
+                    signals = strategy.generate_signals(selection_features, symbol)
+                    result = self.backtester.run(
+                        selection_features,
+                        signals,
+                        symbol,
+                        strategy,
+                        timeframe=timeframe,
+                        warmup_bars=selection_warmup_bars,
+                    )
+                    cand["threadspark_selection_regime_metrics"] = self._bucket_trades_by_regime(
+                        result.get("trades", []),
+                        selection_features,
+                        timeframe=timeframe,
+                    )
+                    cand["threadspark_selection_surface"] = surface_name
+                    cand["threadspark_selection_missing"] = False
+                    record = self._build_oos_evidence_record(
+                        symbol,
+                        timeframe,
+                        cand,
+                        result,
+                        selection_features,
+                        selection_warmup_bars,
+                    )
+                    if record:
+                        record["oos_surface"] = f"threadspark_{surface_name}"
+                        cand["threadspark_selection_evidence"] = record
+                except Exception as exc:
+                    logger.debug(
+                        f"[{symbol}] [{timeframe}] ThreadSpark selection surface failed for "
+                        f"{cand.get('strategy_name', 'Unknown')}: {exc}"
+                    )
+
+            if has_historical:
+                try:
+                    hist_signals = strategy.generate_signals(historical_features, symbol)
+                    hist_result = self.backtester.run(
+                        historical_features,
+                        hist_signals,
+                        symbol,
+                        strategy,
+                        timeframe=timeframe,
+                    )
+                    hist_trades = hist_result.get("trades", [])
+                    cand["threadspark_historical_regime_metrics"] = self._bucket_trades_by_regime(
+                        hist_trades,
+                        historical_features,
+                        timeframe=timeframe,
+                    )
+                    historical_chunks = _historical_chunk_buckets(hist_trades, historical_features)
+                    if historical_chunks:
+                        cand["threadspark_historical_chunk_regime_metrics"] = historical_chunks
+                        cand["threadspark_historical_chunk_count"] = int(len(historical_chunks))
+                except Exception as exc:
+                    logger.debug(
+                        f"[{symbol}] [{timeframe}] ThreadSpark historical surface failed for "
+                        f"{cand.get('strategy_name', 'Unknown')}: {exc}"
+                    )
 
     def _apply_training_eligibility_gates(self,
                                           candidates: List[Dict[str, Any]],
@@ -2093,7 +2798,7 @@ class RegimeOptimizer:
         This is applied BEFORE hyperparameter tuning to save compute on losing strategies.
         Thresholds must be LENIENT since strategies run with default (untuned) params.
 
-        Checks (applied to full training backtest, NOT regime buckets):
+        Checks (applied to broad eligibility backtest when available, NOT regime buckets):
         - train_min_profit_factor: Default 0.5 (reject only catastrophic)
         - train_min_return_pct: Default -30.0% (allow moderate losses)
         - train_max_drawdown: Default 60.0% (reject only blowups)
@@ -2117,8 +2822,10 @@ class RegimeOptimizer:
         train_dd_ceiling = float(self.config.train_max_drawdown)
 
         for cand in candidates:
-            # Use FULL training metrics as primary gate
-            train_result = cand.get('train_result', {})
+            # Use the full active-universe eligibility surface as the primary
+            # broad gate when present. Stored train metrics stay on the
+            # bleeding-edge optimization surface.
+            train_result = cand.get('eligibility_result') or cand.get('train_result', {})
 
             train_pf = float(train_result.get('profit_factor', 0))
             train_return = float(train_result.get('total_return_pct', 0))
@@ -2143,7 +2850,7 @@ class RegimeOptimizer:
             else:
                 # Regime-local rescue: preserve strategies that are strong in at
                 # least one regime even if full-sample is weak (regime specialists)
-                regime_metrics = cand.get('train_regime_metrics', {})
+                regime_metrics = cand.get('eligibility_regime_metrics') or cand.get('train_regime_metrics', {})
                 rescued = False
                 for _rname, rm in regime_metrics.items():
                     regime_pf = float(rm.get('profit_factor', 0))
@@ -2181,68 +2888,125 @@ class RegimeOptimizer:
 
         return eligible
 
+    def _screening_variants_for_strategy(self, strategy: BaseStrategy) -> List[Tuple[BaseStrategy, Optional[float]]]:
+        """Return first-pass strategy variants used before deeper optimization.
+
+        Discovery can evaluate coarse paired ATR exit anchors at screening time
+        so a strategy is not rejected solely because its default 2xATR exit was
+        the wrong starting range.
+        """
+        if not self.screening_atr_anchor_enabled:
+            return [(strategy, None)]
+
+        variants: List[Tuple[BaseStrategy, Optional[float]]] = []
+        base_params = dict(strategy.get_params() or {})
+        for anchor in self.screening_atr_anchor_multipliers:
+            params = dict(base_params)
+            params['sl_atr_mult'] = float(anchor)
+            params['tp_atr_mult'] = float(anchor)
+            try:
+                variants.append((StrategyRegistry.get(strategy.name, **params), float(anchor)))
+            except Exception as exc:
+                logger.debug(
+                    f"{strategy.name} screening ATR anchor {anchor} skipped: {exc}"
+                )
+        return variants or [(strategy, None)]
+
     def _collect_candidates(self,
                             symbol: str,
                             timeframe: str,
                             train_features: pd.DataFrame,
                             val_features: Optional[pd.DataFrame],
                             strategies: List[BaseStrategy],
-                            val_warmup_bars: int = 0) -> List[Dict[str, Any]]:
+                            val_warmup_bars: int = 0,
+                            eligibility_features: Optional[pd.DataFrame] = None,
+                            selection_features: Optional[pd.DataFrame] = None,
+                            selection_warmup_bars: int = 0,
+                            selection_surface: str = "validation",
+                            historical_features: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
         """
         Collect all strategy candidates with per-regime metrics.
         
-        Phase 1 (Screening): Run all strategies with default params, bucket by regime.
+        Phase 1 (Screening): Run all strategies with configured first-pass variants, bucket by regime.
         Phase 2 (Tuning): For top-K strategies per regime, run hyperparameter optimization.
         
         Returns list of candidate dicts with bucketed metrics (including tuned variants).
         """
+        eligibility_features = (
+            eligibility_features
+            if eligibility_features is not None and len(eligibility_features) >= 200
+            else train_features
+        )
         # Phase 1: Quick screening with default params
         screening_candidates = []
+        screening_trials_evaluated = 0
         
         for strategy in strategies:
-            try:
-                # Run backtest on full training data with default params
-                signals = strategy.generate_signals(train_features, symbol)
-                train_result = self.backtester.run(
-                    train_features, signals, symbol, strategy
-                )
-                
-                # Skip if no trades
-                if train_result.get('total_trades', 0) == 0:
+            for screening_strategy, atr_anchor in self._screening_variants_for_strategy(strategy):
+                screening_trials_evaluated += 1
+                try:
+                    # Broad eligibility uses the full active universe. Final train metrics
+                    # remain on the bleeding-edge optimization window.
+                    eligibility_signals = screening_strategy.generate_signals(eligibility_features, symbol)
+                    eligibility_result = self.backtester.run(
+                        eligibility_features, eligibility_signals, symbol, screening_strategy
+                    )
+
+                    # Skip if no broad active-universe evidence exists.
+                    if eligibility_result.get('total_trades', 0) == 0:
+                        continue
+
+                    eligibility_trades = eligibility_result.get('trades', [])
+                    eligibility_regime_metrics = self._bucket_trades_by_regime(
+                        eligibility_trades, eligibility_features, timeframe=timeframe
+                    )
+
+                    if eligibility_features is train_features:
+                        train_result = eligibility_result
+                        train_regime_metrics = eligibility_regime_metrics
+                    else:
+                        signals = screening_strategy.generate_signals(train_features, symbol)
+                        train_result = self.backtester.run(
+                            train_features, signals, symbol, screening_strategy
+                        )
+                        train_trades = train_result.get('trades', [])
+                        train_regime_metrics = self._bucket_trades_by_regime(
+                            train_trades, train_features, timeframe=timeframe
+                        )
+
+                    train_trades = train_result.get('trades', [])
+                    compact_train_result = self._compact_backtest_result(train_result)
+                    compact_eligibility_result = self._compact_backtest_result(eligibility_result)
+
+                    # Run validation if available
+                    val_regime_metrics = {}
+                    if val_features is not None and len(val_features) >= 50:
+                        val_signals = screening_strategy.generate_signals(val_features, symbol)
+                        val_result = self.backtester.run(
+                            val_features, val_signals, symbol, screening_strategy, warmup_bars=val_warmup_bars
+                        )
+                        val_trades = val_result.get('trades', [])
+                        val_regime_metrics = self._bucket_trades_by_regime(
+                            val_trades, val_features, timeframe=timeframe
+                        )
+
+                    screening_candidates.append({
+                        'strategy': screening_strategy,
+                        'strategy_name': screening_strategy.name,
+                        'params': screening_strategy.get_params(),
+                        'train_result': compact_train_result,
+                        'train_regime_metrics': train_regime_metrics,
+                        'eligibility_result': compact_eligibility_result,
+                        'eligibility_regime_metrics': eligibility_regime_metrics,
+                        'val_regime_metrics': val_regime_metrics,
+                        'is_tuned': False,
+                        'screening_atr_anchor_mult': atr_anchor,
+                        'search_trials': 1,
+                    })
+
+                except Exception as e:
+                    logger.debug(f"[{symbol}] [{timeframe}] {screening_strategy.name} failed: {e}")
                     continue
-                
-                # Bucket trades by regime
-                train_trades = train_result.get('trades', [])
-                train_regime_metrics = self._bucket_trades_by_regime(
-                    train_trades, train_features, timeframe=timeframe
-                )
-                
-                # Run validation if available
-                val_regime_metrics = {}
-                if val_features is not None and len(val_features) >= 50:
-                    val_signals = strategy.generate_signals(val_features, symbol)
-                    val_result = self.backtester.run(
-                        val_features, val_signals, symbol, strategy, warmup_bars=val_warmup_bars
-                    )
-                    val_trades = val_result.get('trades', [])
-                    val_regime_metrics = self._bucket_trades_by_regime(
-                        val_trades, val_features, timeframe=timeframe
-                    )
-                
-                screening_candidates.append({
-                    'strategy': strategy,
-                    'strategy_name': strategy.name,
-                    'params': strategy.get_params(),
-                    'train_result': train_result,
-                    'train_regime_metrics': train_regime_metrics,
-                    'val_regime_metrics': val_regime_metrics,
-                    'is_tuned': False,
-                    'search_trials': 1,
-                })
-                
-            except Exception as e:
-                logger.debug(f"[{symbol}] [{timeframe}] {strategy.name} failed: {e}")
-                continue
 
         # ===== NEW: Apply training eligibility gates =====
         # Filter out strategies that are "obviously bad" on training data
@@ -2259,7 +3023,7 @@ class RegimeOptimizer:
             return []  # Return empty list - no candidates to optimize
 
         if not self.enable_hyperparam_tuning:
-            local_trials = len(screening_candidates)
+            local_trials = max(screening_trials_evaluated, len(screening_candidates))
             for cand in eligible_candidates:
                 cand['local_search_trials_total'] = int(local_trials)
                 cand['strategy_roster_count'] = int(len(strategies))
@@ -2269,6 +3033,15 @@ class RegimeOptimizer:
                 val_features,
                 val_warmup_bars,
                 eligible_candidates,
+            )
+            self._attach_threadspark_selection_evidence_to_candidates(
+                symbol,
+                timeframe,
+                selection_features,
+                selection_warmup_bars,
+                historical_features,
+                eligible_candidates,
+                selection_surface=selection_surface,
             )
             return eligible_candidates
 
@@ -2286,7 +3059,7 @@ class RegimeOptimizer:
         
         if not strategies_to_tune:
             logger.debug(f"[{symbol}] [{timeframe}] No strategies eligible for hyperparameter tuning")
-            local_trials = len(screening_candidates)
+            local_trials = max(screening_trials_evaluated, len(screening_candidates))
             for cand in eligible_candidates:
                 cand['local_search_trials_total'] = int(local_trials)
                 cand['strategy_roster_count'] = int(len(strategies))
@@ -2296,6 +3069,15 @@ class RegimeOptimizer:
                 val_features,
                 val_warmup_bars,
                 eligible_candidates,
+            )
+            self._attach_threadspark_selection_evidence_to_candidates(
+                symbol,
+                timeframe,
+                selection_features,
+                selection_warmup_bars,
+                historical_features,
+                eligible_candidates,
+                selection_surface=selection_surface,
             )
             return eligible_candidates
 
@@ -2327,7 +3109,7 @@ class RegimeOptimizer:
         # The tuned candidates may replace or augment the defaults
         all_candidates = eligible_candidates + tuned_candidates
         tuned_trials = sum(max(int(cand.get('search_trials', 1) or 1), 1) for cand in tuned_candidates)
-        local_trials = int(len(screening_candidates) + tuned_trials)
+        local_trials = int(max(screening_trials_evaluated, len(screening_candidates)) + tuned_trials)
         for cand in all_candidates:
             cand['local_search_trials_total'] = local_trials
             cand['strategy_roster_count'] = int(len(strategies))
@@ -2337,6 +3119,15 @@ class RegimeOptimizer:
             val_features,
             val_warmup_bars,
             all_candidates,
+        )
+        self._attach_threadspark_selection_evidence_to_candidates(
+            symbol,
+            timeframe,
+            selection_features,
+            selection_warmup_bars,
+            historical_features,
+            all_candidates,
+            selection_surface=selection_surface,
         )
 
         return all_candidates
@@ -2349,11 +3140,14 @@ class RegimeOptimizer:
         
         Returns dict mapping regime -> list of strategy names to tune.
         """
-        regime_scores: Dict[str, List[Tuple[str, float]]] = {r: [] for r in self.REGIMES}
+        regime_scores: Dict[str, Dict[str, float]] = {r: {} for r in self.REGIMES}
         
         for cand in candidates:
             for regime in self.REGIMES:
-                train_metrics = cand['train_regime_metrics'].get(regime, {})
+                train_metrics = (
+                    cand.get('eligibility_regime_metrics')
+                    or cand.get('train_regime_metrics', {})
+                ).get(regime, {})
                 
                 train_trades = train_metrics.get('total_trades', 0)
                 
@@ -2362,14 +3156,17 @@ class RegimeOptimizer:
                     continue
                 
                 score = self._compute_regime_score(train_metrics, {})
-                regime_scores[regime].append((cand['strategy_name'], score))
+                strategy_name = cand['strategy_name']
+                previous_score = regime_scores[regime].get(strategy_name)
+                if previous_score is None or score > previous_score:
+                    regime_scores[regime][strategy_name] = score
         
         # Select top-K for each regime
         result = {}
         for regime, scores in regime_scores.items():
             if scores:
-                scores.sort(key=lambda x: x[1], reverse=True)
-                result[regime] = [name for name, _ in scores[:top_k]]
+                ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                result[regime] = [name for name, _ in ranked[:top_k]]
             else:
                 result[regime] = []
         
@@ -2412,6 +3209,9 @@ class RegimeOptimizer:
             tuned_candidates = []
             for regime, candidate in regime_results.items():
                 candidate['tuned_for_regime'] = regime
+                candidate['train_result'] = self._compact_backtest_result(
+                    candidate.get('train_result')
+                )
                 tuned_candidates.append(candidate)
             
             if tuned_candidates:
@@ -2487,6 +3287,7 @@ class RegimeOptimizer:
                 train_regime_metrics = self._bucket_trades_by_regime(
                     train_trades, train_features, timeframe=timeframe
                 )
+                compact_train_result = self._compact_backtest_result(train_result)
                 
                 # Validation
                 val_regime_metrics = {}
@@ -2524,7 +3325,7 @@ class RegimeOptimizer:
                             'strategy': test_strategy,
                             'strategy_name': strategy_name,
                             'params': clean_params,
-                            'train_result': train_result,
+                            'train_result': compact_train_result,
                             'train_regime_metrics': train_regime_metrics,
                             'val_regime_metrics': val_regime_metrics,
                             'is_tuned': True,
@@ -2633,6 +3434,7 @@ class RegimeOptimizer:
             timeframe=timeframe,
         )
         return {
+            'bars': int(len(features)) if features is not None else 0,
             'total_trades': metrics.get('total_trades', 0),
             'win_rate': metrics.get('win_rate', 0.0),
             'profit_factor': metrics.get('profit_factor', 0.0),
@@ -2642,10 +3444,312 @@ class RegimeOptimizer:
             'avg_win': metrics.get('avg_win_dollars', 0.0),
             'avg_loss': metrics.get('avg_loss_dollars', 0.0),
             'sharpe_approx': metrics.get('sharpe_ratio', 0.0),
+            'sortino_approx': metrics.get('sortino_ratio', 0.0),
+            'calmar_ratio': metrics.get('calmar_ratio', 0.0),
+            'std_weekly_return': metrics.get('std_weekly_return', 0.0),
+            'r_count': metrics.get('r_count', 0),
+            'mean_r': metrics.get('mean_r', 0.0),
+            'median_r': metrics.get('median_r', 0.0),
+            'std_r': metrics.get('std_r', 0.0),
+            'se_r': metrics.get('se_r', 0.0),
+            'edge_t_stat_r': metrics.get('edge_t_stat_r', 0.0),
+            'pct_positive_r': metrics.get('pct_positive_r', 0.0),
+            'worst_5pct_r': metrics.get('worst_5pct_r', 0.0),
+            'r_downside_deviation': metrics.get('r_downside_deviation', 0.0),
+            'r_block_downside_deviation': metrics.get('r_block_downside_deviation', 0.0),
+            'r_block_cvar': metrics.get('r_block_cvar', 0.0),
+            'max_consecutive_losses': metrics.get('max_consecutive_losses', 0),
             'max_drawdown_pct': metrics.get('max_drawdown_pct', 0.0),
             'total_return_pct': metrics.get('total_return_pct', 0.0),
         }
-    
+
+    @staticmethod
+    def _build_purged_kfold_ranges(n_bars: int,
+                                   scored_start: int = 0,
+                                   *,
+                                   splits: int = 5,
+                                   embargo_bars: int = 1,
+                                   warmup_bars: int = 0) -> List[Dict[str, Any]]:
+        """Build half-open fold scoring windows with adjacent purge/embargo metadata."""
+        try:
+            n_bars = max(0, int(n_bars))
+            scored_start = max(0, min(n_bars, int(scored_start or 0)))
+            splits = max(2, int(splits or 5))
+            embargo_bars = max(0, int(embargo_bars or 0))
+            warmup_bars = max(0, int(warmup_bars or 0))
+        except Exception:
+            return []
+        scored_count = n_bars - scored_start
+        if scored_count < 2:
+            return []
+        fold_count = min(splits, scored_count)
+        chunks = [chunk for chunk in np.array_split(np.arange(scored_start, n_bars), fold_count) if chunk.size]
+        ranges: List[Dict[str, Any]] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            test_start = int(chunk[0])
+            test_end = int(chunk[-1]) + 1
+            warmup_start = max(0, test_start - warmup_bars)
+            purge_start = max(scored_start, test_start - embargo_bars)
+            embargo_end = min(n_bars, test_end + embargo_bars)
+            train_segments = []
+            if scored_start < purge_start:
+                train_segments.append({"start": int(scored_start), "end": int(purge_start)})
+            if embargo_end < n_bars:
+                train_segments.append({"start": int(embargo_end), "end": int(n_bars)})
+            ranges.append({
+                "fold": idx,
+                "fold_count": len(chunks),
+                "test_start": test_start,
+                "test_end": test_end,
+                "warmup_start": warmup_start,
+                "warmup_bars": int(test_start - warmup_start),
+                "purge_start": purge_start,
+                "embargo_end": embargo_end,
+                "purge_before_bars": int(test_start - purge_start),
+                "embargo_after_bars": int(embargo_end - test_end),
+                "train_segments": train_segments,
+            })
+        return ranges
+
+    @staticmethod
+    def _aggregate_purged_kfold_metrics(fold_metrics: List[Dict[str, Any]],
+                                        *,
+                                        initial_capital: float,
+                                        min_trades: int,
+                                        min_profit_factor: float,
+                                        min_return_pct: float,
+                                        aggregate_policy: str) -> Dict[str, Any]:
+        """Aggregate independent OOS folds without pretending they form one equity path."""
+        folds = list(fold_metrics or [])
+        fold_count = len(folds)
+        if fold_count <= 0:
+            return {
+                "validation_mode": "purged_kfold",
+                "total_trades": 0,
+                "fold_count": 0,
+                "policy_status": "FAIL",
+                "policy_reason": "no purged-kfold folds available",
+            }
+
+        def _f(metric: Dict[str, Any], key: str, default: float = 0.0) -> float:
+            try:
+                value = float(metric.get(key, default) or default)
+            except Exception:
+                return default
+            return value if math.isfinite(value) else default
+
+        def _fold_profit_factor(metric: Dict[str, Any]) -> float:
+            gross_profit_value = max(0.0, _f(metric, "gross_profit"))
+            gross_loss_value = abs(_f(metric, "gross_loss"))
+            if gross_loss_value > 1e-12:
+                return gross_profit_value / gross_loss_value
+            if gross_profit_value > 0.0:
+                return float("inf")
+            return _f(metric, "profit_factor")
+
+        total_trades = sum(int(metric.get("total_trades", 0) or 0) for metric in folds)
+        gross_profit = sum(max(0.0, _f(metric, "gross_profit")) for metric in folds)
+        gross_loss = sum(abs(_f(metric, "gross_loss")) for metric in folds)
+        total_pnl = sum(_f(metric, "total_pnl") for metric in folds)
+        max_drawdown = max((_f(metric, "max_drawdown_pct") for metric in folds), default=0.0)
+        weighted_win_rate_n = sum(
+            _f(metric, "win_rate") * int(metric.get("total_trades", 0) or 0)
+            for metric in folds
+        )
+        win_rate = weighted_win_rate_n / total_trades if total_trades > 0 else 0.0
+        if gross_loss > 1e-12:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0.0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = 0.0
+        base_capital = max(float(initial_capital or 0.0), 1.0)
+        total_return_pct = (total_pnl / base_capital) * 100.0
+
+        traded_folds = [metric for metric in folds if int(metric.get("total_trades", 0) or 0) > 0]
+        passing_folds = [
+            metric for metric in traded_folds
+            if (
+                int(metric.get("total_trades", 0) or 0) >= int(min_trades or 0)
+                and _fold_profit_factor(metric) >= float(min_profit_factor or 0.0)
+                and _f(metric, "total_return_pct") >= float(min_return_pct or 0.0)
+            )
+        ]
+        soft_passing_folds = [
+            metric for metric in traded_folds
+            if (
+                _fold_profit_factor(metric) >= float(min_profit_factor or 0.0)
+                and _f(metric, "total_return_pct") >= float(min_return_pct or 0.0)
+            )
+        ]
+        worst_fold = min(
+            folds,
+            key=lambda metric: (
+                _f(metric, "total_return_pct"),
+                _fold_profit_factor(metric),
+                -int(metric.get("total_trades", 0) or 0),
+            ),
+        )
+        aggregate_pass = (
+            total_trades >= int(min_trades or 0)
+            and profit_factor >= float(min_profit_factor or 0.0)
+            and total_return_pct >= float(min_return_pct or 0.0)
+        )
+        policy = str(aggregate_policy or "aggregate_with_worst_fold_floor").lower()
+        if policy == "all_folds":
+            policy_pass = (
+                aggregate_pass
+                and len(traded_folds) == fold_count
+                and len(passing_folds) == fold_count
+            )
+            policy_reason = (
+                "all folds meet trade/PF/return floors"
+                if policy_pass else "not every fold meets trade/PF/return floors"
+            )
+        else:
+            worst_floor_pass = len(soft_passing_folds) == len(traded_folds)
+            policy_pass = aggregate_pass and worst_floor_pass
+            policy_reason = (
+                "aggregate OOS passes and every traded fold clears PF/return floors"
+                if policy_pass else "aggregate OOS or traded-fold PF/return floor failed"
+            )
+
+        return {
+            "validation_mode": "purged_kfold",
+            "aggregate_policy": policy,
+            "fold_count": int(fold_count),
+            "folds_with_trades": int(len(traded_folds)),
+            "folds_passing": int(len(passing_folds)),
+            "fold_pass_rate": round(float(len(passing_folds) / fold_count), 6) if fold_count else 0.0,
+            "fold_profitability_pass_rate": (
+                round(float(len(soft_passing_folds) / len(traded_folds)), 6) if traded_folds else 0.0
+            ),
+            "total_trades": int(total_trades),
+            "profit_factor": round(float(profit_factor), 6) if math.isfinite(profit_factor) else profit_factor,
+            "total_return_pct": round(float(total_return_pct), 6),
+            "max_drawdown_pct": round(float(max_drawdown), 6),
+            "capital_preservation": round(max(0.0, 1.0 - (float(max_drawdown) / 100.0)), 6),
+            "total_pnl": round(float(total_pnl), 6),
+            "gross_profit": round(float(gross_profit), 6),
+            "gross_loss": round(float(gross_loss), 6),
+            "win_rate": round(float(win_rate), 6),
+            "worst_fold": {
+                "fold": int(worst_fold.get("fold", 0) or 0),
+                "total_trades": int(worst_fold.get("total_trades", 0) or 0),
+                "profit_factor": (
+                    round(float(_fold_profit_factor(worst_fold)), 6)
+                    if math.isfinite(_fold_profit_factor(worst_fold)) else _fold_profit_factor(worst_fold)
+                ),
+                "total_return_pct": _f(worst_fold, "total_return_pct"),
+                "max_drawdown_pct": _f(worst_fold, "max_drawdown_pct"),
+            },
+            "policy_status": "PASS" if policy_pass else "FAIL",
+            "policy_reason": policy_reason,
+            "min_trades": int(min_trades or 0),
+            "min_profit_factor": float(min_profit_factor or 0.0),
+            "min_return_pct": float(min_return_pct or 0.0),
+        }
+
+    def evaluate_purged_kfold_oos(self,
+                                  symbol: str,
+                                  timeframe: str,
+                                  regime: str,
+                                  cfg: RegimeConfig,
+                                  features: pd.DataFrame,
+                                  scored_start: int) -> Optional[Dict[str, Any]]:
+        """Evaluate one selected specialist over purged/embargoed OOS folds."""
+        if cfg is None or cfg.is_no_trade_marker():
+            return None
+        if features is None or len(features) < 3 or "REGIME_LIVE" not in features.columns:
+            return None
+        ranges = self._build_purged_kfold_ranges(
+            len(features),
+            scored_start=scored_start,
+            splits=int(getattr(self.config, "oos_kfold_splits", 5) or 5),
+            embargo_bars=int(getattr(self.config, "oos_embargo_bars", 1) or 0),
+            warmup_bars=int(scored_start or 0),
+        )
+        if not ranges:
+            return None
+
+        try:
+            strategy = StrategyRegistry.get(cfg.strategy_name, **cfg.parameters)
+        except Exception as exc:
+            logger.warning(f"[{symbol}] [{timeframe}] [{regime}] Purged-kfold strategy load failed: {exc}")
+            return None
+
+        fold_metrics: List[Dict[str, Any]] = []
+        for fold_range in ranges:
+            test_start = int(fold_range["test_start"])
+            test_end = int(fold_range["test_end"])
+            warmup_start = int(fold_range["warmup_start"])
+            fold_features = features.iloc[warmup_start:test_end].copy()
+            fold_warmup = int(test_start - warmup_start)
+            try:
+                signals = strategy.generate_signals(fold_features, symbol)
+                fold_result = self.backtester.run(
+                    fold_features,
+                    signals,
+                    symbol,
+                    strategy,
+                    timeframe=timeframe,
+                    warmup_bars=fold_warmup,
+                )
+                bucket = self._bucket_trades_by_regime(
+                    fold_result.get("trades", []),
+                    fold_features,
+                    timeframe=timeframe,
+                )
+                metrics = self._compact_metric_tree(bucket.get(regime, {"total_trades": 0}))
+            except Exception as exc:
+                logger.debug(
+                    f"[{symbol}] [{timeframe}] [{regime}] Purged-kfold fold "
+                    f"{fold_range.get('fold')} skipped: {exc}"
+                )
+                metrics = {"total_trades": 0, "error": f"{type(exc).__name__}: {exc}"}
+
+            try:
+                start_ts = pd.Timestamp(features.index[test_start]).isoformat()
+                end_ts = pd.Timestamp(features.index[test_end - 1]).isoformat()
+            except Exception:
+                start_ts = None
+                end_ts = None
+            metrics.update({
+                "fold": int(fold_range["fold"]),
+                "fold_count": int(fold_range["fold_count"]),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "scored_bars": int(test_end - test_start),
+                "warmup_bars": int(fold_warmup),
+                "purge_before_bars": int(fold_range["purge_before_bars"]),
+                "embargo_after_bars": int(fold_range["embargo_after_bars"]),
+                "test_start": int(test_start),
+                "test_end": int(test_end),
+                "train_segments": fold_range.get("train_segments", []),
+            })
+            fold_metrics.append(metrics)
+
+        aggregate = self._aggregate_purged_kfold_metrics(
+            fold_metrics,
+            initial_capital=float(getattr(self.config, "initial_capital", 10000.0) or 10000.0),
+            min_trades=int(getattr(self.config, "oos_min_trades", 5) or 0),
+            min_profit_factor=float(getattr(self.config, "false_discovery_holdout_min_profit_factor", 1.0) or 0.0),
+            min_return_pct=float(getattr(self.config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0),
+            aggregate_policy=str(
+                getattr(self.config, "oos_aggregate_policy", "aggregate_with_worst_fold_floor")
+                or "aggregate_with_worst_fold_floor"
+            ),
+        )
+        aggregate["folds"] = fold_metrics
+        aggregate["window"] = {
+            "start_ts": fold_metrics[0].get("start_ts") if fold_metrics else None,
+            "end_ts": fold_metrics[-1].get("end_ts") if fold_metrics else None,
+            "bars": int(len(features)),
+            "scored_start": int(scored_start or 0),
+            "embargo_bars": int(getattr(self.config, "oos_embargo_bars", 1) or 0),
+        }
+        return aggregate
+
     @staticmethod
     def _deflated_sharpe_ratio(sharpe: float, n_trades: int, skew: float = 0.0,
                                 kurt: float = 3.0, n_trials: int = 1,
@@ -2754,6 +3858,46 @@ class RegimeOptimizer:
             "min_dsr": float(getattr(self.config, 'false_discovery_min_dsr', 0.0) or 0.0),
         }
 
+    def _call_regime_score(self,
+                           train_metrics: Dict[str, Any],
+                           val_metrics: Dict[str, Any],
+                           candidate: Optional[Dict[str, Any]] = None) -> float:
+        score_fn = self._compute_regime_score
+        if candidate is not None:
+            try:
+                return float(score_fn(train_metrics, val_metrics, candidate=candidate))
+            except TypeError as exc:
+                message = str(exc)
+                if "candidate" not in message and "unexpected keyword" not in message:
+                    raise
+        return float(score_fn(train_metrics, val_metrics))
+
+    def _build_legacy_confidence_evidence(self, val_metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """Build positive-edge confidence evidence for post-search legacy reranking."""
+        r_count = int(val_metrics.get("r_count", val_metrics.get("total_trades", 0)) or 0)
+        mean_r = float(val_metrics.get("mean_r", 0.0) or 0.0)
+        std_r = float(val_metrics.get("std_r", 0.0) or 0.0)
+        se_r = float(val_metrics.get("se_r", 0.0) or 0.0)
+        if se_r <= 1e-12 and r_count >= 2 and std_r > 1e-12:
+            se_r = std_r / math.sqrt(float(r_count))
+        t_stat = mean_r / se_r if mean_r > 0.0 and se_r > 1e-12 else 0.0
+        confidence = max(0.0, min(1.0, 1.0 - (1.0 / t_stat))) if t_stat > 1.0 else 0.0
+        cap = max(0.0, min(0.50, float(getattr(self.config, "legacy_confidence_bonus_cap", 0.08) or 0.0)))
+        multiplier = 1.0 + cap * confidence
+        return {
+            "enabled": True,
+            "surface": "validation",
+            "positive_edge_only": True,
+            "r_count": r_count,
+            "mean_r": round(mean_r, 6),
+            "std_r": round(std_r, 6),
+            "se_r": round(se_r, 6),
+            "edge_t_stat_r": round(t_stat, 6),
+            "confidence": round(confidence, 6),
+            "bonus_cap": round(cap, 6),
+            "multiplier": round(multiplier, 6),
+        }
+
     def _select_best_for_regime(self,
                                  symbol: str,
                                  timeframe: str,
@@ -2768,7 +3912,7 @@ class RegimeOptimizer:
         Returns:
             Tuple of (RegimeConfig or None, is_validated, validation_reason)
         """
-        scored_candidates = []  # List of (score, candidate, false_discovery) tuples
+        scored_candidates = []  # List of (score, candidate, false_discovery, legacy_confidence) tuples
         rejection_reasons = []  # Track why candidates were rejected at gate level
         best_score = -float('inf')
         best_candidate = None
@@ -2820,9 +3964,9 @@ class RegimeOptimizer:
                     rejection_reasons.append(f"{cand['strategy_name']}: return={val_return:.1f}% < {self.min_val_return_pct}")
                     continue
             
-            # Apply Deflated Sharpe Ratio as a confidence adjustment.
-            adjusted_val_metrics = dict(val_metrics)
-
+            # Apply Deflated Sharpe Ratio through one explicit confidence channel only.
+            # Do not mutate validation Sharpe in the metric surface; that created
+            # model-dependent double weighting and also ran when false discovery was off.
             val_sharpe = val_metrics.get('sharpe_approx', val_metrics.get('sharpe_ratio', 0.0))
             false_discovery = self._build_false_discovery_evidence(
                 val_metrics,
@@ -2843,13 +3987,28 @@ class RegimeOptimizer:
                 )
                 continue
 
-            if val_sharpe > 0:
-                adjusted_val_metrics['sharpe_approx'] = val_sharpe * dsr
-                adjusted_val_metrics['sharpe_ratio'] = adjusted_val_metrics['sharpe_approx']
-            score = self._compute_regime_score(train_metrics, adjusted_val_metrics)
+            scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+            if scoring_model == "specialist_spokes_threadspark":
+                cand["_threadspark_l1_base_score"] = self._compute_threadspark_l1_score(
+                    train_metrics,
+                    val_metrics,
+                    cand,
+                )
+                score = self._compute_threadspark_spoke_score(
+                    train_metrics,
+                    val_metrics,
+                    candidate=cand,
+                    regime=regime,
+                )
+            else:
+                score = self._call_regime_score(train_metrics, val_metrics, candidate=cand)
+            legacy_confidence = None
+            if scoring_model == "legacy_confidence":
+                legacy_confidence = self._build_legacy_confidence_evidence(val_metrics)
+                score *= float(legacy_confidence.get("multiplier", 1.0) or 1.0)
             if bool(false_discovery.get("enabled", False)):
                 score *= float(false_discovery.get("confidence_multiplier", 1.0) or 1.0)
-            scored_candidates.append((score, cand, false_discovery))
+            scored_candidates.append((score, cand, false_discovery, legacy_confidence))
 
             if score > best_score:
                 best_score = score
@@ -2864,14 +4023,34 @@ class RegimeOptimizer:
                 )
             return None, False, reason
 
-        scored_candidates.sort(
-            key=lambda item: (
-                -float(item[0]),
-                -int(item[1]['train_regime_metrics'].get(regime, {}).get('total_trades', 0) or 0),
-                int(item[1].get('search_trials', 1) or 1),
-                str(item[1].get('strategy_name', '')),
+        scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+        if scoring_model == "specialist_spokes_threadspark":
+            scored_candidates.sort(
+                key=lambda item: (
+                    -float(item[1].get("_threadspark_l1_base_score", item[0]) or 0.0),
+                    int(item[1].get('search_trials', 1) or 1),
+                    str(item[1].get('strategy_name', '')),
+                )
             )
-        )
+            l1_top_k = min(self.regime_validation_top_k, len(scored_candidates))
+            scored_candidates = sorted(
+                scored_candidates[:l1_top_k],
+                key=lambda item: (
+                    -float(item[0]),
+                    -float(item[1].get("_threadspark_l1_base_score", item[0]) or 0.0),
+                    int(item[1].get('search_trials', 1) or 1),
+                    str(item[1].get('strategy_name', '')),
+                ),
+            )
+        else:
+            scored_candidates.sort(
+                key=lambda item: (
+                    -float(item[0]),
+                    -int(item[1]['train_regime_metrics'].get(regime, {}).get('total_trades', 0) or 0),
+                    int(item[1].get('search_trials', 1) or 1),
+                    str(item[1].get('strategy_name', '')),
+                )
+            )
 
         # Cap the number of validation attempts
         top_k = min(self.regime_validation_top_k, len(scored_candidates))
@@ -2883,7 +4062,7 @@ class RegimeOptimizer:
 
         # Iterate top-K candidates, return first that passes validation
         validation_failures = []
-        for rank, (score, cand, false_discovery) in enumerate(scored_candidates[:top_k], start=1):
+        for rank, (score, cand, false_discovery, legacy_confidence) in enumerate(scored_candidates[:top_k], start=1):
             train_metrics = cand['train_regime_metrics'].get(regime, {})
             val_metrics = cand['val_regime_metrics'].get(regime, {})
             strategy_name = cand.get('strategy_name', 'Unknown')
@@ -2925,8 +4104,16 @@ class RegimeOptimizer:
                         validation_reason=validation_reason,
                         candidate=cand,
                         false_discovery_evidence=false_discovery,
+                        legacy_confidence_evidence=legacy_confidence,
                     ),
                 )
+                if scoring_model == "specialist_spokes_threadspark":
+                    config.validation_evidence["threadspark_selector"] = self._compute_threadspark_spoke_evidence(
+                        train_metrics,
+                        val_metrics,
+                        cand,
+                        regime=regime,
+                    )
 
                 return config, True, validation_reason
             else:
@@ -2937,7 +4124,7 @@ class RegimeOptimizer:
                 )
 
         # All top-K candidates failed validation - return the best one as unvalidated
-        best_score, best_candidate, false_discovery = scored_candidates[0]
+        best_score, best_candidate, false_discovery, legacy_confidence = scored_candidates[0]
         train_metrics = best_candidate['train_regime_metrics'].get(regime, {})
         val_metrics = best_candidate['val_regime_metrics'].get(regime, {})
         
@@ -2967,8 +4154,16 @@ class RegimeOptimizer:
                 validation_reason=validation_reason,
                 candidate=best_candidate,
                 false_discovery_evidence=false_discovery,
+                legacy_confidence_evidence=legacy_confidence,
             ),
         )
+        if str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower() == "specialist_spokes_threadspark":
+            config.validation_evidence["threadspark_selector"] = self._compute_threadspark_spoke_evidence(
+                train_metrics,
+                val_metrics,
+                best_candidate,
+                regime=regime,
+            )
 
         descent_summary = "; ".join(validation_failures)
         final_reason = (
@@ -3120,10 +4315,11 @@ class RegimeOptimizer:
                                    train_metrics: Dict[str, Any],
                                    val_metrics: Dict[str, Any],
                                    *,
-                                   score: Optional[float] = None,
-                                   validation_reason: str = "",
-                                   candidate: Optional[Dict[str, Any]] = None,
-                                   false_discovery_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                    score: Optional[float] = None,
+                                    validation_reason: str = "",
+                                    candidate: Optional[Dict[str, Any]] = None,
+                                    false_discovery_evidence: Optional[Dict[str, Any]] = None,
+                                    legacy_confidence_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build compact, persisted validation evidence for dashboards and review."""
         train_full = self._bucket_to_full_metrics(train_metrics or {})
         val_full = self._bucket_to_full_metrics(val_metrics or {})
@@ -3142,11 +4338,17 @@ class RegimeOptimizer:
             "val_max_drawdown_pct": val_dd,
             "validation_reason": validation_reason,
             "fresh_edge_policy": {
-                "winner_source": "active_recent_stage3",
+                "winner_source": (
+                    "threadspark_post_search_surface"
+                    if str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+                    == "specialist_spokes_threadspark"
+                    else "active_recent_stage3"
+                ),
                 "no_fallback_to_best_train": True,
                 "holdout_does_not_displace_latest_surface": bool(
                     getattr(self.config, "walk_forward_do_not_displace_latest_surface", True)
-                ),
+                ) and str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+                != "specialist_spokes_threadspark",
             },
         }
         if score is not None:
@@ -3159,11 +4361,952 @@ class RegimeOptimizer:
             evidence["fairness_evidence"] = build_fairness_evidence(candidate, strategy=strategy)
         if isinstance(false_discovery_evidence, dict):
             evidence["false_discovery"] = dict(false_discovery_evidence)
+        if isinstance(legacy_confidence_evidence, dict):
+            evidence["legacy_confidence"] = dict(legacy_confidence_evidence)
         return evidence
-    
+
+    @staticmethod
+    def _geo_mean(values: np.ndarray) -> float:
+        arr = np.asarray(values, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return 0.0
+        arr = np.clip(arr, 1e-9, 1.0)
+        return float(np.exp(np.mean(np.log(arr))))
+
+    @staticmethod
+    def _face_balance(values: np.ndarray) -> float:
+        arr = np.asarray(values, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return 0.0
+        arr = np.clip(arr, 1e-9, 1.0)
+        mean = float(np.mean(arr))
+        return float(RegimeOptimizer._geo_mean(arr) / mean) if mean > 1e-12 else 0.0
+
+    SPECIALIST_SPOKES = (
+        "edge_survival",
+        "profit_structure_quality",
+        "capital_preservation",
+        "tail_risk_control",
+        "temporal_consistency",
+        "generalization_survival",
+        "execution_cost_survival",
+        "parameter_stability",
+    )
+    THREADSPARK_SPOKES = (
+        "edge_survival",
+        "profit_structure_quality",
+        "capital_preservation",
+        "tail_risk_control",
+        "path_persistence",
+        "generalization_survival",
+        "execution_cost_survival",
+        "parameter_stability",
+    )
+
+    @staticmethod
+    def _execution_cost_axis(metrics: Dict[str, Any]) -> Tuple[float, str]:
+        """Return a non-leaky execution-cost spoke from the current metric surface."""
+
+        ret = float(metrics.get("total_return_pct", 0.0) or 0.0)
+        gross_profit_present = "gross_profit" in metrics
+        total_pnl_present = "total_pnl" in metrics
+        gross_profit = max(0.0, float(metrics.get("gross_profit", 0.0) or 0.0))
+        total_pnl = float(metrics.get("total_pnl", 0.0) or 0.0)
+        if gross_profit > 1e-9:
+            return max(0.0, min(1.0, total_pnl / gross_profit)), "net_to_gross_available"
+        if not gross_profit_present and not total_pnl_present and ret > 0.0:
+            return 1.0, "not_available_neutral"
+        return 0.0, "not_available_zero"
+
+    @staticmethod
+    def _surface_spoke_axes(metrics: Dict[str, Any], *, drawdown_limit: float) -> Dict[str, float]:
+        """Non-leaky single-metric specialist axes from one evaluation surface."""
+
+        trades = max(0, int(metrics.get("total_trades", 0) or 0))
+        ret = float(metrics.get("total_return_pct", 0.0) or 0.0)
+        dd = max(0.0, float(metrics.get("max_drawdown_pct", 100.0) or 0.0))
+        pf = max(0.0, float(metrics.get("profit_factor", 0.0) or 0.0))
+        worst_5 = float(metrics.get("worst_5pct_r", 0.0) or 0.0)
+        r_downside = max(0.0, float(metrics.get("r_downside_deviation", 0.0) or 0.0))
+        r_block_downside = max(0.0, float(metrics.get("r_block_downside_deviation", 0.0) or 0.0))
+        r_block_cvar = max(0.0, float(metrics.get("r_block_cvar", 0.0) or 0.0))
+        max_consec = max(0, int(metrics.get("max_consecutive_losses", 0) or 0))
+        mean_r = float(metrics.get("mean_r", 0.0) or 0.0)
+        pct_positive_r = float(metrics.get("pct_positive_r", metrics.get("win_rate", 0.0)) or 0.0)
+        positive_fraction = max(0.0, min(1.0, pct_positive_r / 100.0 if pct_positive_r > 1.0 else pct_positive_r))
+        std_weekly = max(0.0, float(metrics.get("std_weekly_return", 0.0) or 0.0))
+
+        edge = ret / (ret + dd + 1.0) if ret > 0.0 else 0.0
+        profit_structure = (1.0 - (1.0 / pf)) if pf > 1.0 else 0.0
+        boundary = max(1e-9, float(drawdown_limit or 1.0))
+        capital_preservation = max(0.0, min(1.0, 1.0 - (dd / boundary)))
+        if r_block_downside > 1e-12 or r_block_cvar > 1e-12 or r_downside > 1e-12:
+            block_downside = r_block_downside if r_block_downside > 1e-12 else r_downside
+            block_cvar = r_block_cvar if r_block_cvar > 1e-12 else max(0.0, -worst_5)
+            tail_risk_control = 0.55 * (1.0 / (1.0 + block_downside)) + 0.45 * (1.0 / (1.0 + block_cvar))
+        else:
+            tail_risk_control = 1.0 / (1.0 + max(0.0, -worst_5))
+        temporal_consistency = (
+            1.0 / (1.0 + (float(max_consec) / math.sqrt(float(trades))))
+            if trades > 0 else 0.0
+        )
+        edge_reappearance = RegimeOptimizer._sigmoid_score(positive_fraction, center=0.50, scale=0.12)
+        expectancy_reappearance = RegimeOptimizer._sigmoid_score(mean_r, center=0.0, scale=0.25)
+        variance_drag = math.exp(-min(10.0, std_weekly * 20.0))
+        path_persistence = 0.55 * edge_reappearance + 0.25 * expectancy_reappearance + 0.20 * variance_drag
+        execution_cost_survival, _cost_status = RegimeOptimizer._execution_cost_axis(metrics)
+        return {
+            "edge_survival": max(0.0, min(1.0, edge)),
+            "profit_structure_quality": max(0.0, min(1.0, profit_structure)),
+            "capital_preservation": max(0.0, min(1.0, capital_preservation)),
+            "tail_risk_control": max(0.0, min(1.0, tail_risk_control)),
+            "temporal_consistency": max(0.0, min(1.0, temporal_consistency)),
+            "path_persistence": max(0.0, min(1.0, path_persistence)),
+            "execution_cost_survival": max(0.0, min(1.0, execution_cost_survival)),
+        }
+
+    @staticmethod
+    def _generalization_axis(train_metrics: Dict[str, Any], val_metrics: Dict[str, Any]) -> float:
+        train_ret = float(train_metrics.get("total_return_pct", 0.0) or 0.0)
+        val_ret = float(val_metrics.get("total_return_pct", 0.0) or 0.0)
+        if train_ret <= 0.0 or val_ret <= 0.0:
+            return 0.0
+        return float(max(0.0, min(1.0, val_ret / train_ret)))
+
+    @staticmethod
+    def _dent_health(train_face: np.ndarray, final_face: np.ndarray) -> float:
+        ratios = []
+        for before, after in zip(np.asarray(train_face, dtype=np.float64), np.asarray(final_face, dtype=np.float64)):
+            if before > 1e-9:
+                ratios.append(max(0.0, min(1.0, float(after / before))))
+            else:
+                ratios.append(1.0 if after <= 1e-9 else 0.0)
+        return float(np.mean(ratios)) if ratios else 0.0
+
+    @staticmethod
+    def _parameter_stability_axis(candidate: Optional[Dict[str, Any]]) -> Tuple[float, str]:
+        if not isinstance(candidate, dict):
+            return 1.0, "not_available_neutral"
+        evidence = candidate.get("parameter_stability_evidence") or {}
+        if isinstance(evidence, dict) and evidence.get("status") == "available":
+            value = evidence.get("nearest_neighbor_median_score_ratio")
+            try:
+                return max(0.0, min(1.0, float(value))), "available"
+            except Exception:
+                return 1.0, "invalid_neutral"
+        return 1.0, str(evidence.get("status", "not_available_neutral")) if isinstance(evidence, dict) else "not_available_neutral"
+
+    ASYM_SPECIALIST_SPOKES = (
+        "risk_adjusted_edge",
+        "trade_quality",
+        "gain_pain_efficiency",
+        "capital_preservation",
+        "tail_risk_control",
+        "generalization_survival",
+        "execution_cost_survival",
+        "parameter_stability",
+    )
+    ASYM_DIAGNOSTIC_SPOKES = (
+        "conditional_upside_capture",
+        "path_persistence",
+    )
+    ASYM_ALPHA_SPOKES = (
+        "risk_adjusted_edge",
+        "trade_quality",
+        "gain_pain_efficiency",
+        "generalization_survival",
+    )
+    ASYM_RISK_SPOKES = (
+        "capital_preservation",
+        "tail_risk_control",
+    )
+
+    @staticmethod
+    def _metric_float(metrics: Dict[str, Any], key: str, default: float = 0.0) -> float:
+        try:
+            raw_value = metrics.get(key, default)
+            if raw_value is None:
+                raw_value = default
+            value = float(raw_value)
+            return value if math.isfinite(value) else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _bounded_positive_metric(metrics: Dict[str, Any],
+                                 key: str,
+                                 *,
+                                 default: float = 0.0,
+                                 inf_value: float = 10.0,
+                                 cap: float = 10.0) -> float:
+        try:
+            raw_value = metrics.get(key, default)
+            if raw_value is None:
+                raw_value = default
+            value = float(raw_value)
+            if math.isinf(value):
+                value = inf_value if value > 0.0 else default
+            if math.isnan(value):
+                value = default
+            return max(0.0, min(float(cap), value))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _sigmoid_score(value: float, *, center: float, scale: float) -> float:
+        scale = max(1e-9, float(scale or 1.0))
+        x = max(-60.0, min(60.0, (float(value) - float(center)) / scale))
+        return float(1.0 / (1.0 + math.exp(-x)))
+
+    @staticmethod
+    def _smoothstep_score(value: float, *, floor: float, ceiling: float) -> float:
+        if ceiling <= floor:
+            return 1.0 if value >= ceiling else 0.0
+        x = max(0.0, min(1.0, (float(value) - float(floor)) / float(ceiling - floor)))
+        return float(x * x * (3.0 - 2.0 * x))
+
+    @staticmethod
+    def _trimmed_mean(values: np.ndarray, trim: float = 0.15) -> float:
+        arr = np.asarray(values, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return 0.0
+        arr = np.sort(np.clip(arr, 0.0, 1.0))
+        n_trim = int(math.floor(arr.size * max(0.0, min(0.45, trim))))
+        if n_trim > 0 and arr.size > n_trim * 2:
+            arr = arr[n_trim:-n_trim]
+        return float(np.mean(arr)) if arr.size else 0.0
+
+    @staticmethod
+    def _execution_cost_survival_axis(metrics: Dict[str, Any],
+                                      candidate: Optional[Dict[str, Any]]) -> Tuple[float, str]:
+        evidence: Any = {}
+        if isinstance(candidate, dict):
+            evidence = candidate.get("selection_execution_cost_survival") or {}
+        if isinstance(evidence, dict) and evidence.get("status") == "available":
+            base_ret = RegimeOptimizer._metric_float(evidence, "baseline_return_pct", 0.0)
+            stress_ret = RegimeOptimizer._metric_float(evidence, "stress_return_pct", 0.0)
+            base_pf = RegimeOptimizer._metric_float(evidence, "baseline_profit_factor", 0.0)
+            stress_pf = RegimeOptimizer._metric_float(evidence, "stress_profit_factor", 0.0)
+            ret_retention = max(0.0, min(1.0, stress_ret / base_ret)) if base_ret > 1e-9 else 0.0
+            pf_retention = max(0.0, min(1.0, stress_pf / base_pf)) if base_pf > 1e-9 else 0.0
+            survives = 1.0 if bool(evidence.get("survives_positive_return")) and bool(evidence.get("survives_pf_ge_1")) else 0.0
+            score = 0.45 * ret_retention + 0.35 * pf_retention + 0.20 * survives
+            return max(0.0, min(1.0, score)), "stress_degradation_available"
+        fallback, status = RegimeOptimizer._execution_cost_axis(metrics)
+        return fallback, f"{status}_fallback"
+
+    @staticmethod
+    def _asym_surface_spoke_axes(metrics: Dict[str, Any],
+                                 *,
+                                 drawdown_limit: float,
+                                 train_metrics: Optional[Dict[str, Any]] = None,
+                                 candidate: Optional[Dict[str, Any]] = None,
+                                 parameter_stability: float = 1.0) -> Tuple[Dict[str, float], Dict[str, str]]:
+        trades = max(0, int(metrics.get("total_trades", 0) or 0))
+        ret = RegimeOptimizer._metric_float(metrics, "total_return_pct", 0.0)
+        dd = max(0.0, RegimeOptimizer._metric_float(metrics, "max_drawdown_pct", 100.0))
+        pf = RegimeOptimizer._bounded_positive_metric(metrics, "profit_factor", default=0.0, inf_value=10.0, cap=10.0)
+        calmar = RegimeOptimizer._metric_float(metrics, "calmar_ratio", 0.0)
+        sortino = RegimeOptimizer._metric_float(
+            metrics,
+            "sortino_approx",
+            RegimeOptimizer._metric_float(metrics, "sortino_ratio", 0.0),
+        )
+        mean_r = RegimeOptimizer._metric_float(metrics, "mean_r", 0.0)
+        median_r = RegimeOptimizer._metric_float(metrics, "median_r", 0.0)
+        pct_positive_r = RegimeOptimizer._metric_float(metrics, "pct_positive_r", metrics.get("win_rate", 0.0)) / 100.0
+        worst_5 = RegimeOptimizer._metric_float(metrics, "worst_5pct_r", 0.0)
+        r_downside_dev = max(0.0, RegimeOptimizer._metric_float(metrics, "r_downside_deviation", 0.0))
+        r_block_downside_dev = max(0.0, RegimeOptimizer._metric_float(metrics, "r_block_downside_deviation", 0.0))
+        r_block_cvar = max(0.0, RegimeOptimizer._metric_float(metrics, "r_block_cvar", 0.0))
+        max_consec = max(0, int(metrics.get("max_consecutive_losses", 0) or 0))
+        std_weekly = max(0.0, RegimeOptimizer._metric_float(metrics, "std_weekly_return", 0.0))
+
+        return_dd = ret / (dd + 1.0) if ret > 0.0 else 0.0
+        risk_adjusted_edge = (
+            0.45 * RegimeOptimizer._sigmoid_score(return_dd, center=1.0, scale=1.25) +
+            0.35 * RegimeOptimizer._sigmoid_score(calmar, center=1.0, scale=2.0) +
+            0.20 * RegimeOptimizer._sigmoid_score(sortino, center=0.5, scale=2.0)
+        )
+        if ret <= 0.0:
+            risk_adjusted_edge *= 0.35
+
+        trade_quality = (
+            0.55 * RegimeOptimizer._sigmoid_score(mean_r, center=0.05, scale=0.25) +
+            0.30 * RegimeOptimizer._sigmoid_score(median_r, center=0.05, scale=0.35) +
+            0.15 * RegimeOptimizer._sigmoid_score(pct_positive_r, center=0.50, scale=0.12)
+        )
+        if mean_r <= 0.0 and median_r <= 0.0:
+            trade_quality *= 0.55
+
+        gross_profit = max(0.0, RegimeOptimizer._metric_float(metrics, "gross_profit", 0.0))
+        gross_loss = abs(RegimeOptimizer._metric_float(metrics, "gross_loss", 0.0))
+        total_pnl = RegimeOptimizer._metric_float(metrics, "total_pnl", ret)
+        if gross_loss > 1e-9:
+            gain_pain = gross_profit / gross_loss
+        else:
+            gain_pain = 3.0 if gross_profit > 0.0 else 0.0
+        net_to_gross = max(0.0, min(1.0, total_pnl / gross_profit)) if gross_profit > 1e-9 else 0.0
+        gain_pain_efficiency = (
+            0.70 * RegimeOptimizer._sigmoid_score(gain_pain, center=1.20, scale=0.75) +
+            0.30 * RegimeOptimizer._sigmoid_score(net_to_gross, center=0.25, scale=0.25)
+        )
+        if ret <= 0.0 or total_pnl <= 0.0:
+            gain_pain_efficiency *= 0.50
+
+        boundary = max(1e-9, float(drawdown_limit or 1.0))
+        capital_preservation = max(0.0, min(1.0, 1.0 - (dd / boundary)))
+        if dd <= 1e-12 and 0 < trades < 50:
+            confidence = min(1.0, math.sqrt(float(trades) / 50.0))
+            capital_preservation = min(capital_preservation, 0.90 + 0.10 * confidence)
+
+        block_downside = r_block_downside_dev if r_block_downside_dev > 1e-12 else r_downside_dev
+        block_cvar = r_block_cvar if r_block_cvar > 1e-12 else max(0.0, -worst_5)
+        downside_score = 1.0 / (1.0 + math.exp(max(-60.0, min(60.0, (block_downside - 0.65) / 0.25))))
+        block_cvar_score = 1.0 / (1.0 + math.exp(max(-60.0, min(60.0, (block_cvar - 1.10) / 0.40))))
+        cluster_score = 1.0 / (1.0 + (float(max_consec) / math.sqrt(float(trades)))) if trades > 0 else 0.0
+        tail_risk_control = 0.60 * downside_score + 0.30 * block_cvar_score + 0.10 * cluster_score
+        if block_downside <= 1e-12 and block_cvar <= 1e-12 and 0 < trades < 50:
+            confidence = min(1.0, math.sqrt(float(trades) / 50.0))
+            tail_risk_control = min(tail_risk_control, 0.85 + 0.15 * confidence)
+
+        avg_win = max(0.0, RegimeOptimizer._metric_float(metrics, "avg_win", 0.0))
+        avg_loss = abs(RegimeOptimizer._metric_float(metrics, "avg_loss", 0.0))
+        if avg_loss <= 1e-9:
+            payoff_ratio = 3.0 if avg_win > 0.0 else 0.0
+        else:
+            payoff_ratio = avg_win / avg_loss
+        payoff_score = RegimeOptimizer._sigmoid_score(payoff_ratio, center=1.15, scale=0.75)
+        upside_base = (
+            0.60 * payoff_score +
+            0.25 * RegimeOptimizer._sigmoid_score(mean_r, center=0.05, scale=0.25) +
+            0.15 * RegimeOptimizer._sigmoid_score(ret, center=2.0, scale=5.0)
+        )
+        downside_guard = math.sqrt(max(0.0, min(1.0, capital_preservation)) * max(0.0, min(1.0, tail_risk_control)))
+        conditional_upside_capture = upside_base * downside_guard
+
+        positive_fraction = max(0.0, min(1.0, pct_positive_r))
+        edge_reappearance = RegimeOptimizer._sigmoid_score(positive_fraction, center=0.50, scale=0.12)
+        expectancy_reappearance = RegimeOptimizer._sigmoid_score(mean_r, center=0.0, scale=0.25)
+        variance_drag = math.exp(-min(10.0, std_weekly * 20.0))
+        path_persistence = 0.55 * edge_reappearance + 0.25 * expectancy_reappearance + 0.20 * variance_drag
+
+        if train_metrics is None:
+            generalization_survival = 1.0 if ret > 0.0 else 0.0
+        else:
+            train_ret = RegimeOptimizer._metric_float(train_metrics, "total_return_pct", 0.0)
+            train_pf = RegimeOptimizer._bounded_positive_metric(train_metrics, "profit_factor", default=0.0, inf_value=10.0, cap=10.0)
+            ret_retention = max(0.0, min(1.0, ret / train_ret)) if train_ret > 0.0 and ret > 0.0 else 0.0
+            pf_retention = max(0.0, min(1.0, pf / train_pf)) if train_pf > 1.0 and pf > 1.0 else 0.0
+            generalization_survival = 0.70 * ret_retention + 0.30 * pf_retention
+
+        execution_cost_survival, cost_status = RegimeOptimizer._execution_cost_survival_axis(metrics, candidate)
+        axes = {
+            "risk_adjusted_edge": risk_adjusted_edge,
+            "trade_quality": trade_quality,
+            "gain_pain_efficiency": gain_pain_efficiency,
+            "capital_preservation": capital_preservation,
+            "tail_risk_control": tail_risk_control,
+            "generalization_survival": generalization_survival,
+            "execution_cost_survival": execution_cost_survival,
+            "parameter_stability": parameter_stability,
+            "conditional_upside_capture": conditional_upside_capture,
+            "path_persistence": path_persistence,
+        }
+        return (
+            {name: max(0.0, min(1.0, float(value))) for name, value in axes.items()},
+            {"execution_cost_survival": cost_status},
+        )
+
+    def _asym_specialist_spoke_vector(self,
+                                      train_metrics: Dict[str, Any],
+                                      val_metrics: Dict[str, Any],
+                                      candidate: Optional[Dict[str, Any]] = None
+                                      ) -> Tuple[np.ndarray, np.ndarray, Dict[str, str], Dict[str, float], Dict[str, float]]:
+        stability, stability_status = self._parameter_stability_axis(candidate)
+        train_axes, train_status = self._asym_surface_spoke_axes(
+            train_metrics,
+            drawdown_limit=float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
+            train_metrics=None,
+            candidate=candidate,
+            parameter_stability=stability,
+        )
+        val_has_evidence = max(0, int(val_metrics.get("total_trades", 0) or 0)) >= self.min_val_trades
+        final_surface = val_metrics if val_has_evidence else train_metrics
+        final_axes, final_status = self._asym_surface_spoke_axes(
+            final_surface,
+            drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0)
+            if val_has_evidence else float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
+            train_metrics=train_metrics if val_has_evidence else None,
+            candidate=candidate,
+            parameter_stability=stability,
+        )
+        status = {
+            name: "available"
+            for name in self.ASYM_SPECIALIST_SPOKES
+        }
+        status["generalization_survival"] = "available" if val_has_evidence else "train_only"
+        status["execution_cost_survival"] = final_status.get(
+            "execution_cost_survival",
+            train_status.get("execution_cost_survival", "unknown"),
+        )
+        status["parameter_stability"] = stability_status
+        return (
+            np.asarray([train_axes[name] for name in self.ASYM_SPECIALIST_SPOKES], dtype=np.float64),
+            np.asarray([final_axes[name] for name in self.ASYM_SPECIALIST_SPOKES], dtype=np.float64),
+            status,
+            {name: float(train_axes[name]) for name in self.ASYM_DIAGNOSTIC_SPOKES},
+            {name: float(final_axes[name]) for name in self.ASYM_DIAGNOSTIC_SPOKES},
+        )
+
+    def _asym_shape_aggregation(self, train_face: np.ndarray, final_face: np.ndarray) -> Dict[str, float]:
+        values = {
+            name: float(final_face[idx])
+            for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
+        }
+        train_values = {
+            name: float(train_face[idx])
+            for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
+        }
+        core_names = [name for name in self.ASYM_SPECIALIST_SPOKES if name != "parameter_stability"]
+        core = np.asarray([values[name] for name in core_names], dtype=np.float64)
+        central_contour = float(np.median(core)) if core.size else 0.0
+        corridor = 0.05
+        inward = np.asarray([max(0.0, central_contour - values[name] - corridor) for name in core_names], dtype=np.float64)
+        outward = np.asarray([max(0.0, values[name] - central_contour - corridor) for name in self.ASYM_ALPHA_SPOKES], dtype=np.float64)
+        inward_divot = float(np.mean(inward)) if inward.size else 0.0
+        outward_extension = float(np.mean(outward)) if outward.size else 0.0
+        core_level = self._trimmed_mean(core)
+        base_shape = max(0.0, min(1.0, core_level + 0.30 * min(1.0, outward_extension / 0.20) - 0.60 * min(1.0, inward_divot / 0.30)))
+
+        capital_gate = self._smoothstep_score(values["capital_preservation"], floor=0.20, ceiling=0.65)
+        tail_gate = self._smoothstep_score(values["tail_risk_control"], floor=0.20, ceiling=0.65)
+        risk_gate = capital_gate * tail_gate
+        generalization_gate = 0.65 + 0.35 * self._smoothstep_score(values["generalization_survival"], floor=0.10, ceiling=0.65)
+        cost_gate = 0.75 + 0.25 * self._smoothstep_score(values["execution_cost_survival"], floor=0.10, ceiling=0.65)
+        stability_factor = 0.80 + 0.20 * values["parameter_stability"]
+        outpush_credit = 1.0 + 0.20 * min(1.0, outward_extension / 0.20)
+
+        critical_dents = []
+        for name in ("capital_preservation", "tail_risk_control", "generalization_survival", "execution_cost_survival"):
+            before = train_values[name]
+            after = values[name]
+            critical_dents.append(max(0.0, before - after - corridor))
+        critical_dent = float(np.mean(critical_dents)) if critical_dents else 0.0
+        dent_health = max(0.65, 1.0 - 0.70 * min(1.0, critical_dent / 0.30))
+        score = base_shape * risk_gate * generalization_gate * cost_gate * stability_factor * outpush_credit * dent_health
+        return {
+            "core_level": float(core_level),
+            "central_contour": float(central_contour),
+            "inward_divot": float(inward_divot),
+            "outward_extension": float(outward_extension),
+            "base_shape_quality": float(base_shape),
+            "capital_gate": float(capital_gate),
+            "tail_gate": float(tail_gate),
+            "risk_gate": float(risk_gate),
+            "generalization_gate": float(generalization_gate),
+            "cost_gate": float(cost_gate),
+            "stability_factor": float(stability_factor),
+            "outpush_credit": float(outpush_credit),
+            "critical_dent": float(critical_dent),
+            "dent_health": float(dent_health),
+            "directional_topology_score": float(max(0.0, min(1.5, score))),
+        }
+
+    def _compute_asym_specialist_spoke_evidence(self,
+                                                train_metrics: Dict[str, Any],
+                                                val_metrics: Dict[str, Any],
+                                                candidate: Optional[Dict[str, Any]] = None
+                                                ) -> Dict[str, Any]:
+        train_trades = max(0, int(train_metrics.get("total_trades", 0) or 0))
+        val_trades = max(0, int(val_metrics.get("total_trades", 0) or 0))
+        train_face, final_face, status, train_diagnostics, final_diagnostics = self._asym_specialist_spoke_vector(
+            train_metrics,
+            val_metrics,
+            candidate,
+        )
+        if val_trades >= self.min_val_trades:
+            target = max(1, self.min_val_trades * 2)
+            evidence_confidence = min(1.0, math.sqrt(float(val_trades) / float(target)))
+        else:
+            target = max(1, self.min_train_trades * 2)
+            evidence_confidence = 0.70 * min(1.0, math.sqrt(float(train_trades) / float(target)))
+        shape = self._asym_shape_aggregation(train_face, final_face)
+        score = 100.0 * evidence_confidence * float(shape["directional_topology_score"])
+        score = float(score if math.isfinite(score) else 0.0)
+        return {
+            "spokes": {
+                name: float(final_face[idx])
+                for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
+            },
+            "train_spokes": {
+                name: float(train_face[idx])
+                for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
+            },
+            "diagnostic_spokes": final_diagnostics,
+            "diagnostic_train_spokes": train_diagnostics,
+            "spoke_status": status,
+            "derived_shape_features": {
+                **shape,
+                "evidence_confidence": float(evidence_confidence),
+            },
+            "score": score,
+        }
+
+    def _compute_asym_specialist_spoke_score(self,
+                                             train_metrics: Dict[str, Any],
+                                             val_metrics: Dict[str, Any],
+                                             candidate: Optional[Dict[str, Any]] = None) -> float:
+        return float(
+            self._compute_asym_specialist_spoke_evidence(
+                train_metrics,
+                val_metrics,
+                candidate,
+            )["score"]
+        )
+
+    def _specialist_spoke_vector(self,
+                                 train_metrics: Dict[str, Any],
+                                 val_metrics: Dict[str, Any],
+                                 candidate: Optional[Dict[str, Any]] = None,
+                                 spoke_names: Optional[Tuple[str, ...]] = None
+                                 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, str]]:
+        names = tuple(spoke_names or self.SPECIALIST_SPOKES)
+        train_axes = self._surface_spoke_axes(
+            train_metrics,
+            drawdown_limit=float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
+        )
+        val_has_evidence = max(0, int(val_metrics.get("total_trades", 0) or 0)) >= self.min_val_trades
+        final_surface = val_metrics if val_has_evidence else train_metrics
+        final_axes = self._surface_spoke_axes(
+            final_surface,
+            drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0)
+            if val_has_evidence else float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
+        )
+        final_axes["generalization_survival"] = (
+            self._generalization_axis(train_metrics, val_metrics)
+            if val_has_evidence else
+            (1.0 if float(train_metrics.get("total_return_pct", 0.0) or 0.0) > 0.0 else 0.0)
+        )
+        train_axes["generalization_survival"] = 1.0 if float(train_metrics.get("total_return_pct", 0.0) or 0.0) > 0.0 else 0.0
+        stability, stability_status = self._parameter_stability_axis(candidate)
+        train_axes["parameter_stability"] = stability
+        final_axes["parameter_stability"] = stability
+        _cost_value, cost_status = self._execution_cost_axis(final_surface)
+        status = {
+            "edge_survival": "available",
+            "profit_structure_quality": "available",
+            "capital_preservation": "available",
+            "tail_risk_control": "available",
+            "temporal_consistency": "available",
+            "path_persistence": "available",
+            "generalization_survival": "available" if val_has_evidence else "train_only",
+            "execution_cost_survival": cost_status,
+            "parameter_stability": stability_status,
+        }
+        return (
+            np.asarray([train_axes[name] for name in names], dtype=np.float64),
+            np.asarray([final_axes[name] for name in names], dtype=np.float64),
+            status,
+        )
+
+    def _compute_specialist_spoke_evidence(self,
+                                           train_metrics: Dict[str, Any],
+                                           val_metrics: Dict[str, Any],
+                                           candidate: Optional[Dict[str, Any]] = None,
+                                           spoke_names: Optional[Tuple[str, ...]] = None
+                                           ) -> Dict[str, Any]:
+        names = tuple(spoke_names or self.SPECIALIST_SPOKES)
+        train_trades = max(0, int(train_metrics.get("total_trades", 0) or 0))
+        val_trades = max(0, int(val_metrics.get("total_trades", 0) or 0))
+        train_face, final_face, status = self._specialist_spoke_vector(
+            train_metrics,
+            val_metrics,
+            candidate,
+            spoke_names=names,
+        )
+        if val_trades >= self.min_val_trades:
+            target = max(1, self.min_val_trades * 2)
+            evidence_confidence = min(1.0, math.sqrt(float(val_trades) / float(target)))
+        else:
+            target = max(1, self.min_train_trades * 2)
+            evidence_confidence = 0.70 * min(1.0, math.sqrt(float(train_trades) / float(target)))
+
+        final_quality = self._geo_mean(final_face)
+        train_quality = self._geo_mean(train_face)
+        path_quality = 0.5 * (train_quality + final_quality)
+        balance = self._face_balance(final_face)
+        dent_health = self._dent_health(train_face, final_face)
+        score = 100.0 * evidence_confidence * final_quality * path_quality * balance * dent_health
+        score = float(score if math.isfinite(score) else 0.0)
+        return {
+            "spokes": {
+                name: float(final_face[idx])
+                for idx, name in enumerate(names)
+            },
+            "train_spokes": {
+                name: float(train_face[idx])
+                for idx, name in enumerate(names)
+            },
+            "spoke_status": status,
+            "derived_shape_features": {
+                "final_face_quality": float(final_quality),
+                "path_average_quality": float(path_quality),
+                "cross_axis_balance": float(balance),
+                "dent_health": float(dent_health),
+                "evidence_confidence": float(evidence_confidence),
+            },
+            "score": score,
+        }
+
+    def _compute_specialist_spoke_score(self,
+                                        train_metrics: Dict[str, Any],
+                                        val_metrics: Dict[str, Any],
+                                        candidate: Optional[Dict[str, Any]] = None) -> float:
+        """Experimental specialist-first scorer for like-for-like discovery runs.
+
+        This is an optimization-time approximation of the evidence geometry:
+        final face quality, path average quality, shape balance, dent health,
+        and saturating evidence confidence. It is not a promotion gate.
+        """
+
+        return float(
+            self._compute_specialist_spoke_evidence(
+                train_metrics,
+                val_metrics,
+                candidate,
+            )["score"]
+        )
+
+    def _compute_threadspark_l1_score(self,
+                                      train_metrics: Dict[str, Any],
+                                      val_metrics: Dict[str, Any],
+                                      candidate: Optional[Dict[str, Any]] = None) -> float:
+        """ThreadSpark shortlist score using the volume-neutral spoke set."""
+
+        return float(
+            self._compute_specialist_spoke_evidence(
+                train_metrics,
+                val_metrics,
+                candidate,
+                spoke_names=self.THREADSPARK_SPOKES,
+            )["score"]
+        )
+
+    def _threadspark_face(self,
+                          train_metrics: Dict[str, Any],
+                          surface_metrics: Dict[str, Any],
+                          candidate: Optional[Dict[str, Any]],
+                          *,
+                          drawdown_limit: float,
+                          surface_name: str) -> Tuple[np.ndarray, Dict[str, str]]:
+        has_evidence = max(0, int(surface_metrics.get("total_trades", 0) or 0)) >= self.min_val_trades
+        axes = self._surface_spoke_axes(
+            surface_metrics,
+            drawdown_limit=float(drawdown_limit or 1.0),
+        )
+        axes["generalization_survival"] = (
+            self._generalization_axis(train_metrics, surface_metrics)
+            if has_evidence else 0.0
+        )
+        stability, stability_status = self._parameter_stability_axis(candidate)
+        axes["parameter_stability"] = stability
+        _cost_value, cost_status = self._execution_cost_axis(surface_metrics)
+        status = {
+            "surface": surface_name,
+            "evidence": "available" if has_evidence else "thin_or_missing",
+            "execution_cost_survival": cost_status,
+            "parameter_stability": stability_status,
+        }
+        return np.asarray([axes[name] for name in self.THREADSPARK_SPOKES], dtype=np.float64), status
+
+    def _compute_threadspark_spoke_evidence(self,
+                                            train_metrics: Dict[str, Any],
+                                            val_metrics: Dict[str, Any],
+                                            candidate: Optional[Dict[str, Any]] = None,
+                                            regime: Optional[str] = None) -> Dict[str, Any]:
+        """Post-search candidate x evidence_step x spoke selector evidence.
+
+        Inner Optuna calls may not have post-search surfaces yet; in that case
+        this safely falls back to the old two-face spoke approximation. Once
+        `_attach_threadspark_selection_evidence_to_candidates()` has run, the
+        final selector uses train -> validation -> selection -> historical-cost
+        faces as the evidence path.
+        """
+
+        if not isinstance(candidate, dict) or not regime:
+            evidence = self._compute_specialist_spoke_evidence(train_metrics, val_metrics, candidate)
+            evidence["selector_model"] = "specialist_spokes_threadspark_fallback"
+            return evidence
+
+        selection_by_regime = candidate.get("threadspark_selection_regime_metrics") or {}
+        historical_by_regime = candidate.get("threadspark_historical_regime_metrics") or {}
+        historical_chunk_sets = candidate.get("threadspark_historical_chunk_regime_metrics") or []
+        selection_metrics = selection_by_regime.get(regime) if isinstance(selection_by_regime, dict) else None
+        historical_metrics = historical_by_regime.get(regime) if isinstance(historical_by_regime, dict) else None
+
+        train_face = self._surface_spoke_axes(
+            train_metrics,
+            drawdown_limit=float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
+        )
+        train_face["generalization_survival"] = (
+            1.0 if float(train_metrics.get("total_return_pct", 0.0) or 0.0) > 0.0 else 0.0
+        )
+        stability, stability_status = self._parameter_stability_axis(candidate)
+        train_face["parameter_stability"] = stability
+        faces: List[np.ndarray] = [
+            np.asarray([train_face[name] for name in self.THREADSPARK_SPOKES], dtype=np.float64)
+        ]
+        statuses: List[Dict[str, str]] = [{
+            "surface": "train",
+            "evidence": "available" if int(train_metrics.get("total_trades", 0) or 0) >= self.min_train_trades else "thin_or_missing",
+            "execution_cost_survival": self._execution_cost_axis(train_metrics)[1],
+            "parameter_stability": stability_status,
+        }]
+
+        val_face, val_status = self._threadspark_face(
+            train_metrics,
+            val_metrics,
+            candidate,
+            drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0),
+            surface_name="validation",
+        )
+        faces.append(val_face)
+        statuses.append(val_status)
+
+        final_surface_name = "validation"
+        final_metrics = val_metrics
+        final_face_index = len(faces) - 1
+        selection_missing = bool(candidate.get("threadspark_selection_missing", False))
+        if isinstance(selection_metrics, dict) and selection_metrics:
+            final_surface_name = str(candidate.get("threadspark_selection_surface", "selection") or "selection")
+            final_metrics = selection_metrics
+            selection_face, selection_status = self._threadspark_face(
+                train_metrics,
+                selection_metrics,
+                candidate,
+                drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0),
+                surface_name=final_surface_name,
+            )
+            faces.append(selection_face)
+            statuses.append(selection_status)
+            final_face_index = len(faces) - 1
+        elif selection_missing:
+            final_surface_name = str(candidate.get("threadspark_selection_surface", "clean_holdout_missing") or "clean_holdout_missing")
+            faces.append(np.zeros(len(self.THREADSPARK_SPOKES), dtype=np.float64))
+            statuses.append({
+                "surface": final_surface_name,
+                "evidence": "missing_requested_surface",
+                "execution_cost_survival": "unmeasurable",
+                "parameter_stability": stability_status,
+            })
+            final_face_index = len(faces) - 1
+
+        if isinstance(historical_chunk_sets, list):
+            for chunk_idx, chunk_by_regime in enumerate(historical_chunk_sets, start=1):
+                if not isinstance(chunk_by_regime, dict):
+                    continue
+                chunk_metrics = chunk_by_regime.get(regime)
+                if not isinstance(chunk_metrics, dict) or int(chunk_metrics.get("total_trades", 0) or 0) <= 0:
+                    continue
+                chunk_face, chunk_status = self._threadspark_face(
+                    train_metrics,
+                    chunk_metrics,
+                    candidate,
+                    drawdown_limit=float(getattr(self.config, "historical_audit_max_drawdown", 35.0) or 35.0),
+                    surface_name=f"historical_cost_chunk_{chunk_idx}",
+                )
+                faces.append(chunk_face)
+                statuses.append(chunk_status)
+
+        if isinstance(historical_metrics, dict) and int(historical_metrics.get("total_trades", 0) or 0) > 0:
+            historical_face, historical_status = self._threadspark_face(
+                train_metrics,
+                historical_metrics,
+                candidate,
+                drawdown_limit=float(getattr(self.config, "historical_audit_max_drawdown", 35.0) or 35.0),
+                surface_name="historical_cost",
+            )
+            faces.append(historical_face)
+            statuses.append(historical_status)
+
+        tensor = np.vstack(faces)
+        face_qualities = np.asarray([self._geo_mean(face) for face in tensor], dtype=np.float64)
+        final_face = tensor[max(0, min(final_face_index, tensor.shape[0] - 1))]
+        final_quality = self._geo_mean(final_face)
+        path_quality = float(np.mean(face_qualities)) if face_qualities.size else 0.0
+        balance = self._face_balance(final_face)
+        dent_values = [
+            self._dent_health(tensor[idx - 1], tensor[idx])
+            for idx in range(1, tensor.shape[0])
+        ]
+        dent_health = float(min(dent_values)) if dent_values else 0.0
+        selection_trades = max(0, int(final_metrics.get("total_trades", 0) or 0))
+        if selection_trades >= self.min_val_trades:
+            target = max(1, self.min_val_trades * 2)
+            evidence_confidence = min(1.0, math.sqrt(float(selection_trades) / float(target)))
+        else:
+            target = max(1, self.min_train_trades * 2)
+            train_trades = max(0, int(train_metrics.get("total_trades", 0) or 0))
+            evidence_confidence = 0.55 * min(1.0, math.sqrt(float(train_trades) / float(target)))
+        if selection_missing:
+            evidence_confidence *= 0.35
+
+        score = 100.0 * evidence_confidence * final_quality * path_quality * balance * dent_health
+        score = float(score if math.isfinite(score) else 0.0)
+        return {
+            "selector_model": "specialist_spokes_threadspark",
+            "score": score,
+            "spokes": {
+                name: float(final_face[idx])
+                for idx, name in enumerate(self.THREADSPARK_SPOKES)
+            },
+            "train_spokes": {
+                name: float(tensor[0, idx])
+                for idx, name in enumerate(self.THREADSPARK_SPOKES)
+            },
+            "evidence_steps": [
+                {
+                    "surface": statuses[idx].get("surface", f"step_{idx}"),
+                    "quality": float(face_qualities[idx]) if idx < len(face_qualities) else 0.0,
+                    "spokes": {
+                        name: float(tensor[idx, spoke_idx])
+                        for spoke_idx, name in enumerate(self.THREADSPARK_SPOKES)
+                    },
+                    "status": statuses[idx],
+                }
+                for idx in range(tensor.shape[0])
+            ],
+            "derived_shape_features": {
+                "final_face_quality": float(final_quality),
+                "path_average_quality": float(path_quality),
+                "cross_axis_balance": float(balance),
+                "dent_health": float(dent_health),
+                "evidence_confidence": float(evidence_confidence),
+                "evidence_step_count": int(tensor.shape[0]),
+                "final_surface": final_surface_name,
+                "selection_surface_available": bool(
+                    isinstance(selection_metrics, dict) and bool(selection_metrics)
+                ),
+                "selection_missing_reason": str(
+                    candidate.get("threadspark_selection_missing_reason", "")
+                ),
+            },
+        }
+
+    def _compute_threadspark_spoke_score(self,
+                                         train_metrics: Dict[str, Any],
+                                         val_metrics: Dict[str, Any],
+                                         candidate: Optional[Dict[str, Any]] = None,
+                                         regime: Optional[str] = None) -> float:
+        return float(
+            self._compute_threadspark_spoke_evidence(
+                train_metrics,
+                val_metrics,
+                candidate,
+                regime=regime,
+            )["score"]
+        )
+
+    @staticmethod
+    def _cost_frequency_surface(metrics: Dict[str, Any], *, min_trades: int) -> Dict[str, float]:
+        trades = max(0, int(metrics.get("total_trades", 0) or 0))
+        ret = RegimeOptimizer._metric_float(metrics, "total_return_pct", 0.0)
+        pf = RegimeOptimizer._bounded_positive_metric(metrics, "profit_factor", default=0.0, inf_value=10.0, cap=10.0)
+        mean_r = RegimeOptimizer._metric_float(metrics, "mean_r", 0.0)
+        gross_profit = max(0.0, RegimeOptimizer._metric_float(metrics, "gross_profit", 0.0))
+        total_pnl = RegimeOptimizer._metric_float(metrics, "total_pnl", ret)
+        net_to_gross = max(0.0, min(1.0, total_pnl / gross_profit)) if gross_profit > 1e-9 else (1.0 if ret > 0.0 else 0.0)
+        target_trades = max(1, int(min_trades) * 2)
+        excess = max(0.0, (float(trades) - float(target_trades)) / float(target_trades))
+        edge_quality = (
+            0.40 * net_to_gross +
+            0.35 * RegimeOptimizer._smoothstep_score(mean_r, floor=0.0, ceiling=0.25) +
+            0.25 * RegimeOptimizer._smoothstep_score(pf, floor=1.0, ceiling=1.8)
+        )
+        return {
+            "trades": float(trades),
+            "target_trades": float(target_trades),
+            "excess_ratio": float(excess),
+            "net_to_gross": float(net_to_gross),
+            "mean_r": float(mean_r),
+            "profit_factor": float(pf),
+            "edge_quality": float(max(0.0, min(1.0, edge_quality))),
+        }
+
+    def _specialist_spokes_v2_cost_frequency_factor(self,
+                                                    train_metrics: Dict[str, Any],
+                                                    val_metrics: Dict[str, Any]) -> Dict[str, Any]:
+        val_trades = max(0, int(val_metrics.get("total_trades", 0) or 0))
+        val_has_evidence = val_trades >= self.min_val_trades
+        train_surface = self._cost_frequency_surface(train_metrics, min_trades=self.min_train_trades)
+        validation_surface = (
+            self._cost_frequency_surface(val_metrics, min_trades=self.min_val_trades)
+            if val_has_evidence else None
+        )
+        strength = float(getattr(self.config, "specialist_spokes_v2_cost_frequency_strength", 0.50) or 0.0)
+
+        def _surface_factor(surface: Dict[str, float]) -> float:
+            weakness = max(0.0, 0.75 - float(surface["edge_quality"])) / 0.75
+            excess_pressure = min(1.0, float(surface["excess_ratio"]))
+            factor = 1.0 - strength * excess_pressure * weakness
+            return float(max(0.35, min(1.0, factor)))
+
+        train_factor = _surface_factor(train_surface)
+        validation_factor = _surface_factor(validation_surface) if validation_surface is not None else 1.0
+        factor = min(train_factor, validation_factor)
+        limiting_surface = "train" if train_factor <= validation_factor else "validation"
+        active_surface = validation_surface if val_has_evidence else train_surface
+        return {
+            **dict(active_surface),
+            "surface": "validation" if val_has_evidence else "train",
+            "strength": float(strength),
+            "train": {**train_surface, "factor": train_factor},
+            "validation": (
+                {**validation_surface, "factor": validation_factor}
+                if validation_surface is not None else None
+            ),
+            "limiting_surface": limiting_surface,
+            "factor": float(factor),
+        }
+
+    def _compute_specialist_spoke_v2_evidence(self,
+                                              train_metrics: Dict[str, Any],
+                                              val_metrics: Dict[str, Any],
+                                              candidate: Optional[Dict[str, Any]] = None
+                                              ) -> Dict[str, Any]:
+        evidence = self._compute_specialist_spoke_evidence(train_metrics, val_metrics, candidate)
+        cost_frequency = self._specialist_spokes_v2_cost_frequency_factor(train_metrics, val_metrics)
+        base_score = float(evidence.get("score", 0.0) or 0.0)
+        score = base_score * float(cost_frequency["factor"])
+        evidence["score"] = float(score if math.isfinite(score) else 0.0)
+        evidence["derived_shape_features"] = {
+            **dict(evidence.get("derived_shape_features", {}) or {}),
+            "base_old_spoke_score": float(base_score),
+            "cost_frequency_factor": float(cost_frequency["factor"]),
+        }
+        evidence["cost_frequency_evidence"] = cost_frequency
+        return evidence
+
+    def _compute_specialist_spoke_v2_score(self,
+                                           train_metrics: Dict[str, Any],
+                                           val_metrics: Dict[str, Any],
+                                           candidate: Optional[Dict[str, Any]] = None) -> float:
+        return float(
+            self._compute_specialist_spoke_v2_evidence(
+                train_metrics,
+                val_metrics,
+                candidate,
+            )["score"]
+        )
+
     def _compute_regime_score(self,
                                train_metrics: Dict[str, Any],
-                               val_metrics: Dict[str, Any]) -> float:
+                               val_metrics: Dict[str, Any],
+                               candidate: Optional[Dict[str, Any]] = None) -> float:
         """
         Compute score for a regime bucket using fx_backtester generalization scoring.
 
@@ -3178,6 +5321,16 @@ class RegimeOptimizer:
         # Uses log scaling: log1p(trades) / log1p(target) capped at 1.0
         train_trades = train_metrics.get('total_trades', 0)
         val_trades = val_metrics.get('total_trades', 0)
+
+        scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+        if scoring_model == "specialist_spokes":
+            return self._compute_specialist_spoke_score(train_metrics, val_metrics, candidate)
+        if scoring_model == "specialist_spokes_threadspark":
+            return self._compute_threadspark_spoke_score(train_metrics, val_metrics, candidate)
+        if scoring_model == "specialist_spokes_v2":
+            return self._compute_specialist_spoke_v2_score(train_metrics, val_metrics, candidate)
+        if scoring_model == "specialist_spokes_asym":
+            return self._compute_asym_specialist_spoke_score(train_metrics, val_metrics, candidate)
 
         # Target trade counts for full stability bonus
         # (2x minimum is considered "healthy")
@@ -3236,8 +5389,17 @@ class RegimeOptimizer:
             'sortino_ratio': bucket_metrics.get('sortino_approx', 0),
             'calmar_ratio': bucket_metrics.get('calmar_ratio', 0),
             'std_weekly_return': bucket_metrics.get('std_weekly_return', 0.0),
+            'r_count': bucket_metrics.get('r_count', bucket_metrics.get('total_trades', 0)),
             'mean_r': bucket_metrics.get('mean_r', 0),
+            'median_r': bucket_metrics.get('median_r', 0),
+            'std_r': bucket_metrics.get('std_r', 0),
+            'se_r': bucket_metrics.get('se_r', 0),
+            'edge_t_stat_r': bucket_metrics.get('edge_t_stat_r', 0),
+            'pct_positive_r': bucket_metrics.get('pct_positive_r', 0),
             'worst_5pct_r': bucket_metrics.get('worst_5pct_r', 0),
+            'r_downside_deviation': bucket_metrics.get('r_downside_deviation', 0),
+            'r_block_downside_deviation': bucket_metrics.get('r_block_downside_deviation', 0),
+            'r_block_cvar': bucket_metrics.get('r_block_cvar', 0),
             'max_consecutive_losses': bucket_metrics.get('max_consecutive_losses', 0),
         }
     
@@ -3279,6 +5441,13 @@ class OptimizationPipeline:
     
     def __init__(self, config: PipelineConfig):
         self.config = config
+        FeatureComputer.configure_cache(
+            getattr(config, "feature_cache_max_entries", 24),
+            disk_enabled=getattr(config, "feature_disk_cache_enabled", False),
+            disk_dir=getattr(config, "feature_disk_cache_dir", ""),
+            disk_max_gb=getattr(config, "feature_disk_cache_max_gb", 0.0),
+            disk_min_free_gb=getattr(config, "feature_disk_cache_min_free_gb", 0.0),
+        )
         self.data_loader = DataLoader(config.data_dir)
         self.splitter = DataSplitter(config)
         self.enhancement_seams: EnhancementSeams = create_default_enhancement_seams(config)
@@ -3298,6 +5467,10 @@ class OptimizationPipeline:
         """Locate the timeframe/regime source of the chosen default config."""
         if default_config is None:
             return None, None
+        for tf, regimes in regime_configs.items():
+            for regime, cfg in regimes.items():
+                if cfg is default_config:
+                    return tf, regime
         for tf, regimes in regime_configs.items():
             for regime, cfg in regimes.items():
                 if (
@@ -3353,11 +5526,24 @@ class OptimizationPipeline:
             "historical_stress_audit_bars": int(getattr(self.config, "historical_stress_audit_bars", 50000)),
             "active_universe_bars": int(getattr(self.config, "active_universe_bars", 250000)),
             "active_stage2_pct": float(getattr(self.config, "active_stage2_pct", 50.0)),
+            "production_split_mode": str(getattr(self.config, "production_split_mode", "bleeding_edge") or "bleeding_edge"),
+            "walk_forward_validation_bars": int(getattr(self.config, "walk_forward_validation_bars", 50000) or 0),
             "clean_holdout_pct": float(getattr(self.config, "clean_holdout_pct", 0.0)),
+            "effective_clean_holdout_pct": (
+                0.0
+                if str(getattr(self.config, "oos_validation_mode", "fixed_holdout") or "fixed_holdout").lower()
+                == "purged_kfold"
+                else float(getattr(self.config, "clean_holdout_pct", 0.0))
+            ),
+            "oos_validation_mode": str(getattr(self.config, "oos_validation_mode", "fixed_holdout") or "fixed_holdout"),
             "windows": {
                 "workflow_window": _meta("workflow_window"),
                 "historical_stress_audit": _meta("historical_stress_audit"),
                 "active_universe": _meta("active_universe"),
+                "base_selection": _meta("base_selection"),
+                "walk_forward_validation": _meta("walk_forward_validation"),
+                "optimization_train": _meta("optimization_train"),
+                "optimization_train_with_warmup": _meta("optimization_train_with_warmup"),
                 "stage2_selection": _meta("stage2_selection"),
                 "stage2_selection_with_warmup": _meta("stage2_selection_with_warmup"),
                 "stage2_training_selection": _meta("stage2_training_selection"),
@@ -3393,6 +5579,7 @@ class OptimizationPipeline:
             "symbol": symbol,
             "source": workflow_meta["source"],
             "workflow_window": workflow_window,
+            "windows": workflow_meta.get("windows", {}),
         })
         data_by_tf: Dict[str, pd.DataFrame] = {}
         for tf in self.config.timeframes:
@@ -3407,6 +5594,45 @@ class OptimizationPipeline:
             except Exception as exc:
                 logger.warning(f"[{symbol}] [{tf_name}] Data preparation failed: {exc}")
         return data_by_tf, workflow_meta
+
+    def precompute_feature_cache(self, symbols: List[str]) -> Dict[str, Any]:
+        """Warm the disk-backed full-feature cache without producing strategy evidence."""
+        started = time.time()
+        stats: Dict[str, Any] = {
+            "symbols_requested": len(symbols or []),
+            "symbols_completed": 0,
+            "symbols_failed": 0,
+            "timeframes_computed_or_retrieved": 0,
+            "errors": {},
+        }
+        regime_params_file = getattr(self.config, 'regime_params_file', 'regime_params.json')
+
+        for symbol in symbols or []:
+            try:
+                data_by_tf, _data_window_meta = self._load_symbol_timeframe_data(symbol)
+                if not data_by_tf:
+                    stats["symbols_failed"] += 1
+                    stats["errors"][symbol] = "No valid data available"
+                    continue
+                for tf, data in data_by_tf.items():
+                    FeatureComputer.compute_all(
+                        data,
+                        symbol=symbol,
+                        timeframe=tf,
+                        regime_params_file=regime_params_file,
+                    )
+                    stats["timeframes_computed_or_retrieved"] += 1
+                stats["symbols_completed"] += 1
+            except Exception as exc:
+                stats["symbols_failed"] += 1
+                stats["errors"][symbol] = str(exc)
+            finally:
+                self.data_loader.clear_cache()
+                FeatureComputer.clear_cache()
+
+        stats["duration_seconds"] = time.time() - started
+        stats["feature_cache"] = FeatureComputer.get_cache_stats(reset=True)
+        return stats
 
     def _attach_holdout_metrics(self,
                                 symbol: str,
@@ -3442,6 +5668,43 @@ class OptimizationPipeline:
                     cfg.holdout_metrics = holdout_bucket.get(regime, {'total_trades': 0})
                 except Exception as exc:
                     logger.warning(f"[{symbol}] [{tf}] [{regime}] Holdout evaluation failed: {exc}")
+
+    def _attach_purged_kfold_oos_metrics(self,
+                                         symbol: str,
+                                         regime_configs: Dict[str, Dict[str, RegimeConfig]],
+                                         oos_features_by_tf: Dict[str, pd.DataFrame],
+                                         oos_warmup_by_tf: Dict[str, int]) -> None:
+        """Attach opt-in purged/embargoed k-fold OOS evidence to selected specialists."""
+        for tf, regimes in regime_configs.items():
+            oos_features = oos_features_by_tf.get(tf)
+            scored_start = int(oos_warmup_by_tf.get(tf, 0) or 0)
+            if oos_features is None or len(oos_features) <= max(scored_start + 1, 3):
+                continue
+            if "REGIME_LIVE" not in oos_features.columns:
+                continue
+            for regime, cfg in regimes.items():
+                if cfg.is_no_trade_marker():
+                    continue
+                try:
+                    evidence = self.regime_optimizer.evaluate_purged_kfold_oos(
+                        symbol,
+                        tf,
+                        regime,
+                        cfg,
+                        oos_features,
+                        scored_start,
+                    )
+                    if not evidence:
+                        continue
+                    cfg.holdout_metrics = {
+                        key: value for key, value in evidence.items()
+                        if key != "folds"
+                    }
+                    validation_evidence = dict(getattr(cfg, "validation_evidence", {}) or {})
+                    validation_evidence["oos_validation"] = evidence
+                    cfg.validation_evidence = validation_evidence
+                except Exception as exc:
+                    logger.warning(f"[{symbol}] [{tf}] [{regime}] Purged-kfold OOS evaluation failed: {exc}")
 
     def _attach_historical_stress_audit(self,
                                         symbol: str,
@@ -3535,7 +5798,7 @@ class OptimizationPipeline:
                                   validation_features: Optional[pd.DataFrame],
                                   validation_warmup: int) -> Dict[str, Any]:
         audit = _default_walk_forward_audit()
-        audit["enabled"] = bool(getattr(self.config, "walk_forward_audit_enabled", False))
+        audit["enabled"] = bool(getattr(self.config, "walk_forward_audit_enabled", True))
         if not audit["enabled"]:
             return audit
         if validation_features is None or len(validation_features) <= max(1, validation_warmup):
@@ -3623,7 +5886,7 @@ class OptimizationPipeline:
                                    regime_configs: Dict[str, Dict[str, RegimeConfig]],
                                    validation_features_by_tf: Dict[str, pd.DataFrame],
                                    validation_warmup_by_tf: Dict[str, int]) -> None:
-        if not bool(getattr(self.config, "walk_forward_audit_enabled", False)):
+        if not bool(getattr(self.config, "walk_forward_audit_enabled", True)):
             return
         for timeframe, regimes in regime_configs.items():
             validation_features = validation_features_by_tf.get(timeframe)
@@ -3811,8 +6074,6 @@ class OptimizationPipeline:
                                       *,
                                       artifact_meta: Dict[str, Any],
                                       data_window_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not records:
-            return None
         evidence_dir = Path(self.config.output_dir) / str(
             getattr(self.config, "oos_evidence_dirname", "oos_evidence") or "oos_evidence"
         )
@@ -3820,8 +6081,65 @@ class OptimizationPipeline:
         safe_symbol = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(symbol))
         unique_records = {str(record.get("candidate_id")): record for record in records if record.get("candidate_id")}
         ordered_records = sorted(unique_records.values(), key=lambda item: str(item.get("candidate_id", "")))
+        manifest_path = evidence_dir / f"{safe_symbol}_oos_manifest.json"
+        tmp_manifest_path = manifest_path.with_suffix(".json.tmp")
         if not ordered_records:
-            return None
+            returns = np.zeros((0, 0), dtype=np.float32)
+            candidate_ids = np.asarray([], dtype=str)
+            digest_payload = returns.tobytes() + json.dumps(
+                candidate_ids.tolist(),
+                separators=(",", ":"),
+            ).encode("utf-8")
+            matrix_digest = hashlib.sha1(digest_payload).hexdigest()
+            matrix_path = evidence_dir / f"{safe_symbol}_oos_returns_{matrix_digest[:12]}.npz"
+            if not matrix_path.exists():
+                tmp_matrix_path = evidence_dir / f"{safe_symbol}_oos_returns_{matrix_digest[:12]}.tmp.npz"
+                np.savez_compressed(
+                    tmp_matrix_path,
+                    returns=returns,
+                    candidate_ids=candidate_ids,
+                )
+                tmp_matrix_path.replace(matrix_path)
+            payload = {
+                "format_version": "oos_candidate_matrix_v1",
+                "scope": "final_candidate_pool",
+                "purpose": "C3_PBO_false_discovery_measurement",
+                "symbol": symbol,
+                "created_at": datetime.now().isoformat(),
+                "record_count": 0,
+                "return_index": "relative_equal_blocks",
+                "record_schema": "oos_candidate_returns_v3_spoke_evidence",
+                "completion_status": "NO_CANDIDATE_RECORDS",
+                "completion_reason": "no candidates survived training eligibility/evidence gates",
+                "matrix_contract": {
+                    "returns_shape": [0, 0],
+                    "rows": "no OOS periods because no candidates survived",
+                    "columns": "no candidate columns",
+                    "alignment": "not_applicable_empty_candidate_pool",
+                    "regime_scope": "all_regimes_validation_equity",
+                },
+                "matrix_path": str(matrix_path),
+                "matrix_digest_sha1": matrix_digest,
+                "artifact_meta": artifact_meta,
+                "data_window_fingerprint": (data_window_meta or {}).get("data_window_fingerprint"),
+                "records": [],
+            }
+            with tmp_manifest_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, default=str)
+            tmp_manifest_path.replace(manifest_path)
+            logger.info(
+                f"[{symbol}] Wrote empty OOS candidate evidence: {manifest_path} "
+                "matrix=0x0 (no candidate records)"
+            )
+            return {
+                "path": str(manifest_path),
+                "format_version": "oos_candidate_matrix_v1",
+                "record_count": 0,
+                "returns_shape": [0, 0],
+                "matrix_path": str(matrix_path),
+                "matrix_digest_sha1": matrix_digest,
+                "completion_status": "NO_CANDIDATE_RECORDS",
+            }
         min_periods = min(int(record.get("period_count", 0) or 0) for record in ordered_records)
         min_required = int(getattr(self.config, "oos_evidence_min_periods", 8) or 8)
         if min_periods < min_required:
@@ -3850,8 +6168,6 @@ class OptimizationPipeline:
             )
             tmp_matrix_path.replace(matrix_path)
 
-        manifest_path = evidence_dir / f"{safe_symbol}_oos_manifest.json"
-        tmp_manifest_path = manifest_path.with_suffix(".json.tmp")
         manifest_records = []
         for record in ordered_records:
             compact = {key: value for key, value in record.items() if key != "period_returns"}
@@ -3865,6 +6181,7 @@ class OptimizationPipeline:
             "created_at": datetime.now().isoformat(),
             "record_count": len(ordered_records),
             "return_index": "relative_equal_blocks",
+            "record_schema": "oos_candidate_returns_v3_spoke_evidence",
             "matrix_contract": {
                 "returns_shape": [int(returns.shape[0]), int(returns.shape[1])],
                 "rows": "common trailing OOS periods",
@@ -3906,6 +6223,166 @@ class OptimizationPipeline:
             status, reasons = classify_promotion_status(default_config, self.config)
             default_config.promotion_status = status
             default_config.promotion_reasons = reasons
+
+    @staticmethod
+    def _historical_severe_reasons(cfg: RegimeConfig) -> List[str]:
+        historical = dict(getattr(cfg, "historical_audit_metrics", {}) or {})
+        reasons: List[str] = []
+        if bool(historical.get("severe_failure", False)):
+            reasons.extend(str(reason) for reason in historical.get("failure_reasons", []) or [])
+        return reasons
+
+    @staticmethod
+    def _regime_profitability_severe_reasons(cfg: RegimeConfig) -> List[str]:
+        historical = dict(getattr(cfg, "historical_audit_metrics", {}) or {})
+        reasons: List[str] = []
+        regime_audit = historical.get("regime_profitability_audit")
+        if isinstance(regime_audit, dict) and bool(regime_audit.get("severe_failure", False)):
+            reasons.extend(str(reason) for reason in regime_audit.get("warnings", []) or [])
+        return reasons
+
+    def _v2_holdout_quality_reasons(self, cfg: RegimeConfig) -> List[str]:
+        holdout = dict(getattr(cfg, "holdout_metrics", {}) or {})
+        policy = str(getattr(self.config, "false_discovery_holdout_policy", "off") or "off").lower()
+        split_mode = str(getattr(self.config, "production_split_mode", "bleeding_edge") or "bleeding_edge").lower()
+        if split_mode == "bleeding_edge" and not holdout:
+            return []
+        if policy == "off":
+            return []
+        min_trades = int(getattr(self.config, "false_discovery_holdout_min_trades", 5) or 0)
+        if str(holdout.get("validation_mode", "") or "").lower() == "purged_kfold":
+            min_trades = int(getattr(self.config, "oos_min_trades", min_trades) or 0)
+        trades = int(holdout.get("total_trades", 0) or 0)
+        reasons: List[str] = []
+        if 0 < min_trades and trades < min_trades:
+            reasons.append(f"holdout trades {trades} < {min_trades}")
+        if str(holdout.get("policy_status", "") or "").upper() == "FAIL":
+            reasons.append(str(holdout.get("policy_reason", "") or "purged-kfold OOS policy failed"))
+        if trades >= min_trades > 0:
+            pf = float(holdout.get("profit_factor", 0.0) or 0.0)
+            ret = float(holdout.get("total_return_pct", 0.0) or 0.0)
+            min_pf = float(getattr(self.config, "false_discovery_holdout_min_profit_factor", 1.0) or 0.0)
+            min_ret = float(getattr(self.config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0)
+            if pf < min_pf:
+                reasons.append(f"holdout PF {pf:.2f} < {min_pf:.2f}")
+            if ret < min_ret:
+                reasons.append(f"holdout return {ret:.1f}% < {min_ret:.1f}%")
+        return reasons
+
+    def _v2_default_rejection_reasons(self,
+                                      cfg: Optional[RegimeConfig],
+                                      *,
+                                      allow_promote_small: Optional[bool] = None) -> List[str]:
+        if cfg is None or cfg.is_no_trade_marker():
+            return ["no trade marker"]
+        reasons: List[str] = []
+        status = str(getattr(cfg, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+        allow_small = (
+            bool(getattr(self.config, "specialist_spokes_v2_allow_promote_small_default", True))
+            if allow_promote_small is None else bool(allow_promote_small)
+        )
+        if status == "BLOCKED":
+            reasons.append("promotion BLOCKED")
+        elif status == "PROMOTE_SMALL" and not allow_small:
+            reasons.append("promotion PROMOTE_SMALL not allowed for v2 default")
+        historical_severe_reasons = self._historical_severe_reasons(cfg)
+        holdout_reasons = self._v2_holdout_quality_reasons(cfg)
+        if historical_severe_reasons and holdout_reasons:
+            reasons.append("historical severe confirmed by weak holdout")
+            reasons.extend(historical_severe_reasons)
+            reasons.extend(holdout_reasons)
+        regime_severe_reasons = self._regime_profitability_severe_reasons(cfg)
+        if regime_severe_reasons and holdout_reasons:
+            reasons.append("regime severe confirmed by weak holdout")
+            reasons.extend(regime_severe_reasons)
+            reasons.extend(holdout_reasons)
+
+        evidence = dict(getattr(cfg, "validation_evidence", {}) or {})
+        false_discovery = dict(evidence.get("false_discovery", {}) or {})
+        max_val_sharpe = float(getattr(self.config, "specialist_spokes_v2_max_validation_sharpe", 0.0) or 0.0)
+        if max_val_sharpe > 0.0:
+            if false_discovery and "val_sharpe" in false_discovery:
+                val_sharpe = float(false_discovery.get("val_sharpe", 0.0) or 0.0)
+            else:
+                val_sharpe = float(
+                    (getattr(cfg, "val_metrics", {}) or {}).get(
+                        "sharpe_approx",
+                        (getattr(cfg, "val_metrics", {}) or {}).get("sharpe_ratio", 0.0),
+                    ) or 0.0
+                )
+            pbo_status = str(false_discovery.get("pbo_status", "") or "").lower()
+            if val_sharpe > max_val_sharpe and pbo_status in {"", "not_available", "unavailable"}:
+                reasons.append(f"validation Sharpe {val_sharpe:.2f} > {max_val_sharpe:.2f} with PBO unavailable")
+        return reasons
+
+    def _select_v2_symbol_default(self,
+                                  regime_configs: Dict[str, Dict[str, RegimeConfig]],
+                                  current_default: Optional[RegimeConfig]
+                                  ) -> Tuple[Optional[RegimeConfig], Optional[str], Optional[str], Dict[str, Any]]:
+        candidates: List[Tuple[float, str, str, RegimeConfig]] = []
+        for tf, regimes in regime_configs.items():
+            for regime, cfg in regimes.items():
+                if cfg is not None and not cfg.is_no_trade_marker():
+                    candidates.append((float(cfg.quality_score or 0.0), tf, regime, cfg))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        def _reject_record(tf: str, regime: str, cfg: RegimeConfig, reasons: List[str]) -> Dict[str, Any]:
+            return {
+                "tf": tf,
+                "regime": regime,
+                "strategy": cfg.strategy_name,
+                "promotion_status": str(getattr(cfg, "promotion_status", "PROMOTED") or "PROMOTED"),
+                "quality_score": float(cfg.quality_score or 0.0),
+                "reasons": reasons,
+            }
+
+        strict_rejected: List[Dict[str, Any]] = []
+        for _score, tf, regime, cfg in candidates:
+            reasons = self._v2_default_rejection_reasons(cfg, allow_promote_small=False)
+            if not reasons:
+                return cfg, tf, regime, {
+                    "selected_tf": tf,
+                    "selected_regime": regime,
+                    "selected_strategy": cfg.strategy_name,
+                    "selection_pass": "promoted_only",
+                    "rejected_before_selection": strict_rejected,
+                }
+            strict_rejected.append(_reject_record(tf, regime, cfg, reasons))
+
+        allow_small = bool(getattr(self.config, "specialist_spokes_v2_allow_promote_small_default", True))
+        small_rejected: List[Dict[str, Any]] = []
+        if allow_small:
+            for _score, tf, regime, cfg in candidates:
+                reasons = self._v2_default_rejection_reasons(cfg, allow_promote_small=True)
+                if not reasons:
+                    return cfg, tf, regime, {
+                        "selected_tf": tf,
+                        "selected_regime": regime,
+                        "selected_strategy": cfg.strategy_name,
+                        "selection_pass": "promote_small_allowed",
+                        "rejected_before_selection": strict_rejected,
+                        "fallback_rejected_before_selection": small_rejected,
+                    }
+                small_rejected.append(_reject_record(tf, regime, cfg, reasons))
+
+        current_reasons = self._v2_default_rejection_reasons(
+            current_default,
+            allow_promote_small=allow_small,
+        )
+        if current_default is not None and not current_reasons:
+            return current_default, None, None, {
+                "selected_strategy": current_default.strategy_name,
+                "selected_current_default": True,
+                "selection_pass": "current_default",
+                "rejected_before_selection": strict_rejected,
+                "fallback_rejected_before_selection": small_rejected,
+            }
+        return None, None, None, {
+            "selected_strategy": None,
+            "rejected_before_selection": strict_rejected,
+            "fallback_rejected_before_selection": small_rejected,
+            "no_acceptable_default": True,
+        }
     
     def run_for_symbol(self, symbol: str) -> PipelineResult:
         """
@@ -3942,15 +6419,15 @@ class OptimizationPipeline:
             result.strategies_tested = len(strategies)
             artifact_meta = build_artifact_meta(self.config, strategies)
             
-            # Split data and compute features once on the full series.
-            train_features_by_tf = {}
-            val_features_by_tf = {}
-            val_warmup_by_tf = {}
-            holdout_features_by_tf = {}
-            holdout_warmup_by_tf = {}
-            historical_features_by_tf = {}
-            stage3_features_by_tf = {}
-            stage3_warmup_by_tf = {}
+            # Stream one timeframe through optimization and audits at a time.
+            # Holding M5 plus five higher-TF feature frames at once overwhelms
+            # low-RAM discovery machines and is unnecessary for per-TF winners.
+            regime_configs: Dict[str, Dict[str, RegimeConfig]] = {}
+            default_config: Optional[RegimeConfig] = None
+            best_overall_score = -float("inf")
+            validated_count = 0
+            unvalidated_count = 0
+            oos_evidence_records: List[Dict[str, Any]] = []
             
             regime_params_file = getattr(self.config, 'regime_params_file', 'regime_params.json')
 
@@ -3964,6 +6441,10 @@ class OptimizationPipeline:
             windows = data_window_meta.get("windows", {})
             hist_meta = windows.get("historical_stress_audit", {})
             active_meta = windows.get("active_universe", {})
+            base_meta = windows.get("base_selection", active_meta)
+            wf_meta = windows.get("walk_forward_validation", {})
+            opt_train_meta = windows.get("optimization_train", active_meta)
+            opt_train_warm_meta = windows.get("optimization_train_with_warmup", opt_train_meta)
             stage2_meta = windows.get("stage2_selection", {})
             stage2_warm_meta = windows.get("stage2_selection_with_warmup", {})
             stage2_train_meta = windows.get("stage2_training_selection", stage2_meta)
@@ -3974,13 +6455,28 @@ class OptimizationPipeline:
             hist_start = pd.Timestamp(hist_meta["start_ts"]) if hist_meta.get("start_ts") else None
             hist_end = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
             active_start = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
+            active_end = pd.Timestamp(active_meta["end_ts"]) if active_meta.get("end_ts") else None
+            base_start = pd.Timestamp(base_meta["start_ts"]) if base_meta.get("start_ts") else active_start
+            base_end = pd.Timestamp(base_meta["end_ts"]) if base_meta.get("end_ts") else active_end
+            wf_start = pd.Timestamp(wf_meta["start_ts"]) if wf_meta.get("start_ts") else None
+            wf_end = pd.Timestamp(wf_meta["end_ts"]) if wf_meta.get("end_ts") else None
+            opt_train_start = pd.Timestamp(opt_train_meta["start_ts"]) if opt_train_meta.get("start_ts") else active_start
+            opt_train_end = pd.Timestamp(opt_train_meta["end_ts"]) if opt_train_meta.get("end_ts") else None
+            opt_train_warm_start = (
+                pd.Timestamp(opt_train_warm_meta["start_ts"])
+                if opt_train_warm_meta.get("start_ts") else opt_train_start
+            )
             holdout_start = pd.Timestamp(holdout_meta["start_ts"]) if holdout_meta.get("start_ts") else None
             stage2_start = pd.Timestamp(stage2_meta["start_ts"]) if stage2_meta.get("start_ts") else active_start
             stage2_warm_start = (
                 pd.Timestamp(stage2_warm_meta["start_ts"])
                 if stage2_warm_meta.get("start_ts") else stage2_start
             )
-            stage2_train_end = holdout_start if holdout_start is not None else None
+            stage2_train_end = (
+                pd.Timestamp(stage2_train_meta["end_ts"])
+                if stage2_train_meta.get("end_ts")
+                else (holdout_start if holdout_start is not None else None)
+            )
             stage2_train_start = (
                 pd.Timestamp(stage2_train_meta["start_ts"])
                 if stage2_train_meta.get("start_ts") else stage2_start
@@ -3994,36 +6490,149 @@ class OptimizationPipeline:
                 if holdout_warm_meta.get("start_ts") else holdout_start
             )
 
+            import gc
+
             for tf, data in data_by_tf.items():
                 full_features = FeatureComputer.compute_all(
                     data, symbol=symbol, timeframe=tf,
                     regime_params_file=regime_params_file
                 )
-                active_features = self._slice_time_window(full_features, active_start, holdout_start)
-                stage2_features = self._slice_time_window(full_features, stage2_train_warm_start, stage2_train_end)
+                eligibility_features = self._slice_time_window(full_features, base_start, base_end)
+                active_features = self._slice_time_window(full_features, opt_train_start, opt_train_end)
+                validation_start = wf_start if wf_start is not None else stage2_train_start
+                validation_end = wf_end if wf_end is not None else stage2_train_end
+                stage2_features = self._slice_time_window(full_features, validation_start, validation_end)
                 historical_features = self._slice_time_window(full_features, hist_start, hist_end)
                 holdout_features = self._slice_time_window(full_features, holdout_warm_start, None) if holdout_start is not None else pd.DataFrame()
-                if len(active_features) >= 200:
-                    train_features_by_tf[tf] = active_features
+
+                if len(active_features) < 200:
+                    logger.debug(f"[{symbol}] [{tf}] Skipping - insufficient active data")
+                    del full_features, eligibility_features, active_features, stage2_features, historical_features, holdout_features
+                    FeatureComputer.clear_cache()
+                    gc.collect()
+                    continue
+
+                train_features_by_tf = {tf: active_features}
+                eligibility_features_by_tf = {tf: eligibility_features} if len(eligibility_features) >= 200 else {}
+                val_features_by_tf: Dict[str, pd.DataFrame] = {}
+                val_warmup_by_tf: Dict[str, int] = {}
+                selection_features_by_tf: Dict[str, pd.DataFrame] = {}
+                selection_warmup_by_tf: Dict[str, int] = {}
+                selection_surface_by_tf: Dict[str, str] = {}
+                scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+                threadspark_surface = str(
+                    getattr(self.config, "threadspark_selection_surface", "validation") or "validation"
+                ).lower()
+                threadspark_history_scope = str(
+                    getattr(self.config, "threadspark_historical_cost_scope", "workflow") or "workflow"
+                ).lower()
+                threadspark_historical_features = (
+                    full_features
+                    if scoring_model == "specialist_spokes_threadspark" and threadspark_history_scope == "workflow"
+                    else historical_features
+                )
                 if len(stage2_features) >= 50:
                     val_features_by_tf[tf] = stage2_features
-                    stage3_features_by_tf[tf] = stage2_features.copy()
-                    scored_stage2_start = stage2_train_start if holdout_start is not None else stage2_start
-                    val_warmup_by_tf[tf] = int((stage2_features.index < scored_stage2_start).sum()) if scored_stage2_start is not None else 0
-                    stage3_warmup_by_tf[tf] = val_warmup_by_tf[tf]
-                if len(historical_features) >= 50:
-                    historical_features_by_tf[tf] = historical_features
-                if holdout_start is not None and len(holdout_features) >= 50:
-                    holdout_features_by_tf[tf] = holdout_features
-                    holdout_warmup_by_tf[tf] = int((holdout_features.index < holdout_start).sum())
-            
-            # Run regime-aware optimization
-            with Timer(f"[{symbol}] Regime Optimization"):
-                regime_configs, default_config, validated_count, unvalidated_count = self.regime_optimizer.optimize_symbol(
-                    symbol, train_features_by_tf, val_features_by_tf, strategies,
-                    val_warmup_by_tf=val_warmup_by_tf,
-                )
-            oos_evidence_records = self.regime_optimizer.consume_oos_candidate_evidence()
+                    val_warmup_by_tf[tf] = int((stage2_features.index < validation_start).sum()) if validation_start is not None else 0
+                    if not (
+                        scoring_model == "specialist_spokes_threadspark"
+                        and threadspark_surface == "clean_holdout"
+                    ):
+                        selection_features_by_tf[tf] = stage2_features
+                        selection_warmup_by_tf[tf] = val_warmup_by_tf[tf]
+                        selection_surface_by_tf[tf] = "validation"
+
+                if (
+                    threadspark_surface == "clean_holdout"
+                    and holdout_start is not None
+                    and len(holdout_features) >= 50
+                ):
+                    selection_features_by_tf[tf] = holdout_features
+                    selection_warmup_by_tf[tf] = int((holdout_features.index < holdout_start).sum())
+                    selection_surface_by_tf[tf] = "clean_holdout"
+                elif (
+                    scoring_model == "specialist_spokes_threadspark"
+                    and threadspark_surface == "clean_holdout"
+                ):
+                    selection_surface_by_tf[tf] = "clean_holdout"
+
+                with Timer(f"[{symbol}] [{tf}] Regime Optimization"):
+                    tf_regime_configs, tf_default_config, tf_validated, tf_unvalidated = self.regime_optimizer.optimize_symbol(
+                        symbol,
+                        train_features_by_tf,
+                        val_features_by_tf,
+                        strategies,
+                        val_warmup_by_tf=val_warmup_by_tf,
+                        eligibility_features_by_tf=eligibility_features_by_tf,
+                        selection_features_by_tf=selection_features_by_tf,
+                        selection_warmup_by_tf=selection_warmup_by_tf,
+                        selection_surface_by_tf=selection_surface_by_tf,
+                        historical_features_by_tf={tf: threadspark_historical_features} if len(threadspark_historical_features) >= 50 else {},
+                    )
+
+                regime_configs.update(tf_regime_configs)
+                validated_count += int(tf_validated or 0)
+                unvalidated_count += int(tf_unvalidated or 0)
+                oos_evidence_records.extend(self.regime_optimizer.consume_oos_candidate_evidence())
+
+                if tf_default_config is not None and tf_default_config.quality_score > best_overall_score:
+                    best_overall_score = float(tf_default_config.quality_score)
+                    default_config = tf_default_config
+
+                if tf_regime_configs:
+                    oos_mode = str(getattr(self.config, "oos_validation_mode", "fixed_holdout") or "fixed_holdout").lower()
+                    if oos_mode == "purged_kfold":
+                        self._attach_purged_kfold_oos_metrics(
+                            symbol,
+                            tf_regime_configs,
+                            val_features_by_tf,
+                            val_warmup_by_tf,
+                        )
+                    elif holdout_start is not None and len(holdout_features) >= 50:
+                        self._attach_holdout_metrics(
+                            symbol,
+                            tf_regime_configs,
+                            {tf: holdout_features},
+                            {tf: int((holdout_features.index < holdout_start).sum())},
+                        )
+                    if len(historical_features) >= 50:
+                        self._attach_historical_stress_audit(
+                            symbol,
+                            tf_regime_configs,
+                            {tf: historical_features},
+                        )
+                    self._attach_walk_forward_audit(
+                        symbol,
+                        tf_regime_configs,
+                        val_features_by_tf,
+                        val_warmup_by_tf,
+                    )
+                    risk_selection_stage = str(
+                        getattr(self.config, "risk_management_selection_stage", "stage3") or "stage3"
+                    ).lower()
+                    if risk_selection_stage == "stage2":
+                        governance_features_by_tf = eligibility_features_by_tf or train_features_by_tf
+                        governance_warmup_by_tf = {tf: 0}
+                        governance_surface = "stage2_active_universe"
+                    else:
+                        governance_features_by_tf = train_features_by_tf
+                        governance_warmup_by_tf = {tf: 0}
+                        governance_surface = "bleeding_edge_optimization"
+                    self._attach_governance_policies(
+                        symbol,
+                        tf_regime_configs,
+                        governance_features_by_tf,
+                        governance_warmup_by_tf,
+                        selection_surface=governance_surface,
+                    )
+
+                self._log_regime_coverage(symbol, train_features_by_tf, val_features_by_tf)
+                del train_features_by_tf, val_features_by_tf, val_warmup_by_tf
+                del eligibility_features_by_tf
+                del full_features, eligibility_features, active_features, stage2_features, historical_features, holdout_features
+                FeatureComputer.clear_cache()
+                gc.collect()
+
             oos_evidence_pointer = self._write_oos_candidate_evidence(
                 symbol,
                 oos_evidence_records,
@@ -4050,28 +6659,6 @@ class OptimizationPipeline:
                     result.error_message = "No valid regime winners found"
                 return result
             
-            if holdout_features_by_tf:
-                self._attach_holdout_metrics(symbol, regime_configs, holdout_features_by_tf, holdout_warmup_by_tf)
-            self._attach_historical_stress_audit(symbol, regime_configs, historical_features_by_tf)
-            self._attach_walk_forward_audit(symbol, regime_configs, val_features_by_tf, val_warmup_by_tf)
-            risk_selection_stage = str(
-                getattr(self.config, "risk_management_selection_stage", "stage3") or "stage3"
-            ).lower()
-            if risk_selection_stage == "stage2":
-                governance_features_by_tf = train_features_by_tf
-                governance_warmup_by_tf = {tf: 0 for tf in train_features_by_tf}
-                governance_surface = "stage2_active_universe"
-            else:
-                governance_features_by_tf = stage3_features_by_tf
-                governance_warmup_by_tf = stage3_warmup_by_tf
-                governance_surface = "stage3_selection"
-            self._attach_governance_policies(
-                symbol,
-                regime_configs,
-                governance_features_by_tf,
-                governance_warmup_by_tf,
-                selection_surface=governance_surface,
-            )
             best_overall_tf, best_overall_regime = self._locate_default_origin(default_config, regime_configs)
             if best_overall_tf and best_overall_regime and default_config is not None:
                 matched_cfg = regime_configs[best_overall_tf][best_overall_regime]
@@ -4085,6 +6672,34 @@ class OptimizationPipeline:
 
             self._apply_promotion_statuses(regime_configs, default_config)
 
+            scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
+            default_selection_evidence: Dict[str, Any] = {}
+            if (
+                scoring_model == "specialist_spokes_v2"
+                and bool(getattr(self.config, "specialist_spokes_v2_default_fallback_enabled", True))
+            ):
+                selected_default, selected_tf, selected_regime, default_selection_evidence = self._select_v2_symbol_default(
+                    regime_configs,
+                    default_config,
+                )
+                if selected_default is None:
+                    result.error_message = "No acceptable v2 symbol default after catastrophe fallback"
+                    result.regime_winners = total_winners
+                    logger.warning(f"[{symbol}] No acceptable specialist_spokes_v2 default after fallback")
+                    return result
+                if selected_default is not default_config:
+                    logger.info(
+                        f"[{symbol}] specialist_spokes_v2 default fallback: "
+                        f"{getattr(default_config, 'strategy_name', 'None')} -> "
+                        f"{selected_default.strategy_name} @ {selected_tf}/{selected_regime}"
+                    )
+                default_config = selected_default
+                if selected_tf and selected_regime:
+                    best_overall_tf, best_overall_regime = selected_tf, selected_regime
+                else:
+                    best_overall_tf, best_overall_regime = self._locate_default_origin(default_config, regime_configs)
+                best_overall_score = float(default_config.quality_score or 0.0)
+
             for regimes in regime_configs.values():
                 for cfg in regimes.values():
                     cfg.artifact_meta = {**artifact_meta, **dict(cfg.artifact_meta or {})}
@@ -4095,9 +6710,12 @@ class OptimizationPipeline:
                 dict(getattr(default_config, "validation_evidence", {}) or {})
                 if default_config is not None else {}
             )
+            if default_selection_evidence:
+                default_validation_evidence["default_selection_evidence"] = default_selection_evidence
             optimizer_telemetry = {
                 "training_gates": self.regime_optimizer.consume_training_gate_telemetry(),
                 "resample_cache": self.data_loader.get_resample_cache_stats(reset=False),
+                "feature_cache": FeatureComputer.get_cache_stats(reset=False),
             }
             default_validation_evidence["optimizer_telemetry"] = optimizer_telemetry
             default_validation_evidence["fairness_report"] = build_fairness_report(regime_configs)
@@ -4156,8 +6774,6 @@ class OptimizationPipeline:
                     logger.info(f"  [{tf}] {regime_summary}")
 
             # findings.html §C6: regime coverage report — one line per (symbol, tf)
-            # showing the realized regime distribution across train+val features.
-            self._log_regime_coverage(symbol, train_features_by_tf, val_features_by_tf)
             
         except Exception as e:
             logger.exception(f"[{symbol}] Pipeline error: {e}")
@@ -4379,6 +6995,79 @@ class PortfolioManager:
         }
         if not self.ledger.update_symbol(symbol, config):
             logger.warning(f"Failed to persist config for {symbol}")
+            return
+        try:
+            added = materialize_regime_params_from_symbol_config(
+                config,
+                filepath=str(getattr(self.config, "regime_params_file", "regime_params.json") or "regime_params.json"),
+            )
+            if added:
+                logger.info(
+                    "Materialized %d regime detector row(s) for %s into %s",
+                    added,
+                    symbol,
+                    getattr(self.config, "regime_params_file", "regime_params.json"),
+                )
+        except Exception as exc:
+            logger.warning("Failed to materialize regime detector rows for %s: %s", symbol, exc)
+
+    def _save_no_trade_config(self, symbol: str, reason: str, *, failure_kind: str) -> SymbolConfig:
+        """Persist an explicit NO_TRADE config for symbols that cannot be safely traded."""
+        now = datetime.now()
+        regime_optimizer = self.pipeline.regime_optimizer
+        failure_kind = str(failure_kind or "optimization_failure")
+        regime_configs: Dict[str, Dict[str, RegimeConfig]] = {}
+        for timeframe in list(getattr(self.config, "timeframes", []) or []):
+            regime_configs[timeframe] = {}
+            for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP"):
+                regime_configs[timeframe][regime] = regime_optimizer._make_no_trade_marker(reason, now=now)
+
+        default_config = regime_optimizer._make_no_trade_marker(reason, now=now)
+        validation_evidence = {
+            "validation_reason": reason,
+            "tradeable": False,
+            "no_trade": True,
+            failure_kind: True,
+        }
+        artifact_meta = {
+            **build_artifact_meta(self.config),
+            "no_trade": True,
+            "reason": reason,
+            failure_kind: True,
+        }
+        config = SymbolConfig(
+            symbol=symbol,
+            regime_configs=regime_configs,
+            default_config=default_config,
+            strategy_name="NO_TRADE",
+            timeframe="",
+            parameters={},
+            retrain_days=int(getattr(self.config, "fixed_retrain_days", 14) or 14),
+            train_metrics={"total_trades": 0},
+            val_metrics={"total_trades": 0, "validation_status": "no_trade", "reason": reason},
+            holdout_metrics={},
+            historical_audit_metrics=_default_historical_audit(),
+            data_window_meta={failure_kind: True, "reason": reason},
+            composite_score=0.0,
+            robustness_ratio=0.0,
+            is_validated=False,
+            validation_reason=reason,
+            validation_evidence=validation_evidence,
+            artifact_meta=artifact_meta,
+            optimized_at=now,
+            valid_until=_scheduled_valid_until(self.config, now),
+        )
+        self._save_symbol_config(symbol, config)
+        logger.info(f"SAVED {symbol} NO_TRADE {failure_kind} marker to {self.config_file} (atomic)")
+        return config
+
+    def save_data_no_trade_config(self, symbol: str, reason: str) -> SymbolConfig:
+        """Persist an explicit NO_TRADE config for symbols with insufficient historical data."""
+        return self._save_no_trade_config(symbol, reason, failure_kind="data_failure")
+
+    def save_optimization_no_trade_config(self, symbol: str, reason: str) -> SymbolConfig:
+        """Persist an explicit NO_TRADE config when optimization cannot produce a live-safe winner."""
+        return self._save_no_trade_config(symbol, reason, failure_kind="optimization_failure")
     
     def needs_retraining(self, symbol: str) -> bool:
         """
@@ -4447,6 +7136,100 @@ class PortfolioManager:
             results[symbol] = self.retrain_symbol(symbol)
         
         return results
+
+    def _precompute_feature_cache_for_symbols(self, symbols: List[str]) -> Dict[str, Any]:
+        """Precompute disk feature frames before strategy optimization starts."""
+        if not symbols:
+            return {}
+        workers = int(getattr(self.config, "feature_disk_cache_precompute_workers", 1) or 1)
+        workers = max(1, min(workers, len(symbols)))
+        started = time.time()
+        summary: Dict[str, Any] = {
+            "symbols_requested": len(symbols),
+            "symbols_completed": 0,
+            "symbols_failed": 0,
+            "timeframes_computed_or_retrieved": 0,
+            "workers": workers,
+            "errors": {},
+            "feature_cache": {
+                "disk_hits": 0,
+                "disk_misses": 0,
+                "disk_writes": 0,
+                "disk_skipped_storage": 0,
+                "disk_write_failures": 0,
+                "disk_read_failures": 0,
+                "disk_invalidations": 0,
+                "disk_bytes_read": 0,
+                "disk_bytes_written": 0,
+            },
+        }
+
+        def _merge_feature_cache_stats(stats: Dict[str, Any]) -> None:
+            feature_stats = dict(stats.get("feature_cache", {}) or {})
+            summary_stats = summary["feature_cache"]
+            for key in list(summary_stats.keys()):
+                try:
+                    summary_stats[key] += int(feature_stats.get(key, 0) or 0)
+                except Exception:
+                    continue
+
+        logger.info(
+            f"Precomputing feature disk cache for {len(symbols)} symbols "
+            f"(workers={workers}, dir={getattr(self.config, 'feature_disk_cache_dir', '')})"
+        )
+
+        if workers > 1 and len(symbols) > 1:
+            cfg_dict = _pipeline_config_to_dict(self.config)
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(_precompute_feature_cache_worker, cfg_dict, symbol): symbol
+                    for symbol in symbols
+                }
+                future_iter = tqdm(as_completed(future_map), total=len(future_map), desc="Feature cache", unit="sym") if _TQDM else as_completed(future_map)
+                for future in future_iter:
+                    symbol = future_map[future]
+                    try:
+                        _sym, stats = future.result()
+                    except Exception as exc:
+                        stats = {"symbols_failed": 1, "errors": {symbol: str(exc)}}
+                    summary["symbols_completed"] += int(stats.get("symbols_completed", 0) or 0)
+                    summary["symbols_failed"] += int(stats.get("symbols_failed", 0) or 0)
+                    summary["timeframes_computed_or_retrieved"] += int(
+                        stats.get("timeframes_computed_or_retrieved", 0) or 0
+                    )
+                    summary["errors"].update(dict(stats.get("errors", {}) or {}))
+                    _merge_feature_cache_stats(stats)
+        else:
+            stats = self.pipeline.precompute_feature_cache(symbols)
+            summary["symbols_completed"] += int(stats.get("symbols_completed", 0) or 0)
+            summary["symbols_failed"] += int(stats.get("symbols_failed", 0) or 0)
+            summary["timeframes_computed_or_retrieved"] += int(
+                stats.get("timeframes_computed_or_retrieved", 0) or 0
+            )
+            summary["errors"].update(dict(stats.get("errors", {}) or {}))
+            _merge_feature_cache_stats(stats)
+
+        summary["duration_seconds"] = time.time() - started
+        logger.info(
+            "Feature disk cache precompute complete: "
+            f"{summary['symbols_completed']}/{summary['symbols_requested']} symbols, "
+            f"{summary['timeframes_computed_or_retrieved']} timeframe frames, "
+            f"hits={summary['feature_cache']['disk_hits']}, "
+            f"writes={summary['feature_cache']['disk_writes']}, "
+            f"skipped={summary['feature_cache']['disk_skipped_storage']}, "
+            f"write_failures={summary['feature_cache']['disk_write_failures']}, "
+            f"failed={summary['symbols_failed']}, duration={summary['duration_seconds']:.1f}s"
+        )
+        if summary["errors"]:
+            first_errors = list(summary["errors"].items())[:3]
+            logger.warning(f"Feature disk cache precompute errors: {first_errors}")
+        if (
+            summary["feature_cache"]["disk_skipped_storage"]
+            or summary["feature_cache"]["disk_write_failures"]
+            or summary["feature_cache"]["disk_read_failures"]
+        ):
+            logger.warning(f"Feature disk cache precompute had cache-level issues: {summary['feature_cache']}")
+        return summary
     
     def initial_optimization(self, overwrite: bool = False) -> Dict[str, PipelineResult]:
         """
@@ -4491,6 +7274,12 @@ class PortfolioManager:
             return results
         
         max_workers = int(getattr(self.config, "optimization_max_workers", 1) or 1)
+        if (
+            bool(getattr(self.config, "feature_disk_cache_enabled", False))
+            and bool(getattr(self.config, "feature_disk_cache_precompute_enabled", False))
+        ):
+            precompute_stats = self._precompute_feature_cache_for_symbols(to_optimize)
+            logger.info(f"Feature cache precompute summary: {precompute_stats}")
 
         if max_workers > 1 and len(to_optimize) > 1:
             cfg_dict = _pipeline_config_to_dict(self.config)
@@ -4525,7 +7314,13 @@ class PortfolioManager:
                         self._save_symbol_config(symbol_for_save, result.config)
                         logger.info(f"SAVED {symbol_for_save} to {self.config_file} (atomic)")
                     else:
-                        logger.warning(f"FAILED {symbol_for_save}: keeping existing config (if any)")
+                        detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
+                        reason = (
+                            f"Optimization failed or produced no live-safe winner: {detail}. "
+                            "Live trading disabled for this symbol."
+                        )
+                        self.save_optimization_no_trade_config(symbol_for_save, reason)
+                        logger.warning(f"FAILED {symbol_for_save}: saved NO_TRADE optimization-failure marker")
 
             # Clear any in-process cache after parallel run
             self.pipeline.data_loader.clear_cache()
@@ -4546,14 +7341,22 @@ class PortfolioManager:
                         self._save_symbol_config(symbol, result.config)
                         logger.info(f"SAVED {symbol} to {self.config_file} (atomic)")
                     else:
-                        # Keep existing config on failure (if any)
-                        logger.warning(f"FAILED {symbol}: keeping existing config (if any)")
+                        detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
+                        reason = (
+                            f"Optimization failed or produced no live-safe winner: {detail}. "
+                            "Live trading disabled for this symbol."
+                        )
+                        self.save_optimization_no_trade_config(symbol, reason)
+                        logger.warning(f"FAILED {symbol}: saved NO_TRADE optimization-failure marker")
                     
                 except Exception as e:
                     logger.exception(f"[{symbol}] Optimization error: {e}")
-                    # Create a failure result but don't overwrite existing config
-                    from pm_pipeline import PipelineResult
                     results[symbol] = PipelineResult(symbol=symbol, error_message=str(e))
+                    reason = (
+                        f"Optimization raised an exception: {e}. "
+                        "Live trading disabled for this symbol."
+                    )
+                    self.save_optimization_no_trade_config(symbol, reason)
                 
                 # Clear data cache after each symbol to prevent memory leaks
                 self.pipeline.data_loader.clear_cache()
@@ -4583,7 +7386,11 @@ class PortfolioManager:
         """Get only validated configurations."""
         # Refresh from ledger to ensure consistency
         self.symbol_configs = self.ledger.get_all_configs()
-        return {s: c for s, c in self.symbol_configs.items() if c.is_validated}
+        return {
+            s: c
+            for s, c in self.symbol_configs.items()
+            if c.is_validated or c.has_tradeable_regime_winners()
+        }
 
     def _live_eligibility_reason(self,
                                  symbol: str,
@@ -4594,7 +7401,8 @@ class PortfolioManager:
                                  artifact_policy: str,
                                  expiry_grace_minutes: int) -> Tuple[bool, str]:
         """Evaluate the live-trading eligibility contract for one config."""
-        if not config.is_validated:
+        has_tradeable_regime_winners = config.has_tradeable_regime_winners()
+        if not config.is_validated and not has_tradeable_regime_winners:
             return False, f"invalid ({config.validation_reason or 'not validated'})"
         if config.valid_until is None:
             return False, "no expiry date"
@@ -4602,7 +7410,7 @@ class PortfolioManager:
         valid_deadline = config.valid_until + pd.Timedelta(minutes=grace).to_pytimedelta()
         if now >= valid_deadline:
             return False, f"expired at {config.valid_until.strftime('%Y-%m-%d %H:%M')}"
-        if config.has_regime_configs() and config.count_regime_winners() <= 0:
+        if config.has_regime_configs() and not has_tradeable_regime_winners:
             return False, "no tradeable regime winners"
         if not config.has_regime_configs():
             default_cfg = config.default_config
@@ -4901,7 +7709,7 @@ if __name__ == "__main__":
         data_dir=Path("./data"),
         timeframes=['H1', 'H4'],
         production_retrain_mode="notify",
-        production_retrain_interval_weeks=2,
+        production_retrain_interval_weeks=4,
     )
     
     pm = PortfolioManager(

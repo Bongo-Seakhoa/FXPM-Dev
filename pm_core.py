@@ -18,13 +18,15 @@ Version: 3.1 (Portfolio Manager - Numba backtester optimization)
 """
 
 import io
+import json
 import os
+import shutil
 import time
 import math
 import hashlib
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field, fields, asdict
 from enum import Enum
 from typing import Dict, List, Any, Optional, Tuple, Union, Set
@@ -324,6 +326,13 @@ def _backtest_loop_numba(
                 stop_loss_candidate = sl_prices[i]
                 take_profit_candidate = tp_prices[i]
                 if np.isnan(entry_price_candidate) or np.isnan(stop_loss_candidate) or np.isnan(take_profit_candidate):
+                    equity_curve[i] = equity
+                    if equity > peak_equity:
+                        peak_equity = equity
+                    if peak_equity > 0:
+                        dd = (peak_equity - equity) / peak_equity * 100.0
+                        if dd > max_drawdown:
+                            max_drawdown = dd
                     continue
 
                 risk_amount_at_entry = equity * (position_size_pct / 100.0)
@@ -340,11 +349,25 @@ def _backtest_loop_numba(
                     pips = dist / pip_size
                     loss_per_lot = pips * pip_value
                 if loss_per_lot <= 0.0:
+                    equity_curve[i] = equity
+                    if equity > peak_equity:
+                        peak_equity = equity
+                    if peak_equity > 0:
+                        dd = (peak_equity - equity) / peak_equity * 100.0
+                        if dd > max_drawdown:
+                            max_drawdown = dd
                     continue
 
                 raw_size = risk_amount_at_entry / loss_per_lot
                 position_size = _round_volume_numba(raw_size, min_lot, max_lot, volume_step)
                 if position_size <= 0.0:
+                    equity_curve[i] = equity
+                    if equity > peak_equity:
+                        peak_equity = equity
+                    if peak_equity > 0:
+                        dd = (peak_equity - equity) / peak_equity * 100.0
+                        if dd > max_drawdown:
+                            max_drawdown = dd
                     continue
 
                 entry_price = entry_price_candidate
@@ -500,12 +523,18 @@ class PipelineConfig:
     # The pipeline uses the latest `max_bars` M5 rows, reserves the oldest
     # `historical_stress_audit_bars` as audit-only context, and lets the
     # newest `active_universe_bars` drive production strategy selection.
-    # Stage 2/risk-management selection uses the newest `active_stage2_pct`
-    # percent of the active universe (with `overlap_pct` worth of warmup).
+    # Production split mode:
+    # - bleeding_edge: full active universe is used for broad eligibility,
+    #   newest `active_stage2_pct` drives optimization up to the live edge,
+    #   and the immediately prior `walk_forward_validation_bars` are production
+    #   validation with an embargo before optimization.
+    # - research_clean_holdout: retains the older academic clean-holdout split.
     historical_stress_audit_bars: int = 50000
     active_universe_bars: int = 250000
     active_stage2_pct: float = 50.0
-    clean_holdout_pct: float = 0.0  # Percent of stage2 reserved as newest unseen holdout; 0 preserves legacy flow
+    production_split_mode: str = "bleeding_edge"
+    walk_forward_validation_bars: int = 50000
+    clean_holdout_pct: float = 0.0  # Research-only percent of stage2 reserved as newest unseen holdout.
     overlap_pct: float = 10.0  # Warmup window as a fraction of the active universe size
 
     # Backtest settings
@@ -530,7 +559,7 @@ class PipelineConfig:
     use_commission: bool = True
     use_slippage: bool = True
     slippage_pips: float = 0.5
-    backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max|stress_max
+    backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max|stress_p90|stress_p95|stress_max
     swap_model_enabled: bool = True
     swap_model_triple_rollover_day: str = "wednesday"
     swap_model_min_holding_hours: float = 20.0
@@ -539,6 +568,15 @@ class PipelineConfig:
     max_param_combos: int = 150
     min_trades: int = 25
     optimization_max_workers: int = 1  # 1 = sequential
+    feature_cache_max_entries: int = 24  # 0 disables in-memory feature-frame caching
+    feature_disk_cache_enabled: bool = False
+    feature_disk_cache_dir: str = ""
+    feature_disk_cache_max_gb: float = 0.0
+    feature_disk_cache_min_free_gb: float = 4.0
+    feature_disk_cache_precompute_enabled: bool = False
+    feature_disk_cache_precompute_workers: int = 1
+    screening_atr_anchor_enabled: bool = False
+    screening_atr_anchor_multipliers: List[float] = field(default_factory=lambda: [2.0])
 
     # Optional family-size-aware search budget.
     # When enabled, the per-strategy Optuna trial budget scales with the cartesian
@@ -574,7 +612,13 @@ class PipelineConfig:
     scoring_use_tail_risk: bool = True
     scoring_use_consistency: bool = True
     scoring_use_trade_frequency_bonus: bool = True
+    legacy_confidence_bonus_cap: float = 0.08
+    regime_scoring_model: str = "legacy"  # legacy|legacy_confidence|specialist_spokes|specialist_spokes_v2|specialist_spokes_asym|specialist_spokes_threadspark
     regime_trade_stability_floor: float = 0.7  # 0.7 legacy; 0.9 is Phase-1 experiment candidate
+    specialist_spokes_v2_cost_frequency_strength: float = 0.50
+    specialist_spokes_v2_default_fallback_enabled: bool = True
+    specialist_spokes_v2_allow_promote_small_default: bool = True
+    specialist_spokes_v2_max_validation_sharpe: float = 0.0
 
     # Global false-discovery controls. These are opt-in for legacy compatibility;
     # the discovery contract enables them before any broad roster re-optimization.
@@ -583,14 +627,27 @@ class PipelineConfig:
     false_discovery_confidence_floor: float = 0.35
     false_discovery_scope_power: float = 0.25
     false_discovery_symbol_count: int = 0
-    false_discovery_holdout_policy: str = "promote_small"  # off|promote_small|block
+    false_discovery_holdout_policy: str = "off"  # off|promote_small|block
     false_discovery_holdout_min_trades: int = 5
     false_discovery_holdout_min_profit_factor: float = 1.0
     false_discovery_holdout_min_return_pct: float = 0.0
+    oos_validation_mode: str = "fixed_holdout"  # fixed_holdout|purged_kfold
+    oos_kfold_splits: int = 5
+    oos_embargo_bars: int = 1
+    oos_min_trades: int = 5
+    oos_aggregate_policy: str = "aggregate_with_worst_fold_floor"  # all_folds|aggregate_with_worst_fold_floor
     oos_evidence_export_enabled: bool = False
     oos_evidence_periods: int = 64
     oos_evidence_min_periods: int = 8
     oos_evidence_dirname: str = "oos_evidence"
+    oos_evidence_trade_path_max_points: int = 256
+    oos_evidence_include_execution_cost_survival: bool = False
+    oos_evidence_execution_stress_mode: str = "stress_p95"
+    oos_evidence_execution_cost_max_candidates_per_tf: int = 0  # 0 = no cap when enabled
+    threadspark_selection_surface: str = "validation"  # validation|clean_holdout
+    threadspark_use_historical_cost_evidence: bool = True
+    threadspark_historical_cost_scope: str = "workflow"  # workflow|audit
+    threadspark_historical_chunk_count: int = 5
 
     # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
     # to be considered actionable in live trading. Signals below this are logged but
@@ -611,6 +668,19 @@ class PipelineConfig:
     live_stale_retry_seconds: int = 15
     live_artifact_drift_policy: str = "block"  # block|warn|ignore
     live_config_expiry_grace_minutes: int = 0
+    manual_new_entries_enabled: bool = True
+    manual_kill_switch_path: str = ""
+    production_require_promotion_gate: bool = False
+    production_promotion_gate_mode: str = "external_review_exact"  # external_review_exact|ledger_status
+    production_promotion_review_path: str = ""
+    production_promotion_cell_safety_path: str = ""
+    production_completion_marker_path: str = ""
+    production_expected_promote_cells: List[str] = field(default_factory=list)
+    production_require_full_symbol_ledger: bool = False
+    live_allow_partial_symbol_ledger: bool = False
+    production_symbol_pool_target_count: int = 0
+    live_min_account_equity: float = 0.0
+    live_min_account_equity_currency: str = ""
     reconnect_max_attempts: int = 5
     reconnect_attempt_interval_seconds: int = 5
     reconnect_failure_retry_seconds: int = 30
@@ -641,10 +711,11 @@ class PipelineConfig:
     cycle_drift_execution_slippage_mult: float = 2.5
     cycle_drift_spread_degradation_mult: float = 2.0
     cycle_drift_action: str = "pause_context"  # observe|pause_context|derate_context
-    walk_forward_audit_enabled: bool = False
+    walk_forward_audit_enabled: bool = True
     walk_forward_audit_windows: int = 3
     walk_forward_audit_mode: str = "severe_fragility_only"
-    walk_forward_promotion_policy: str = "block_severe_only"
+    walk_forward_promotion_policy: str = "observe_only"
+    walk_forward_live_blocking_enabled: bool = False
     walk_forward_do_not_displace_latest_surface: bool = True
     # PROMOTE_SMALL winners trade live with a derated risk multiplier (0..1).
     promote_small_risk_multiplier: float = 0.5
@@ -724,7 +795,7 @@ class PipelineConfig:
     retrain_periods: List[int] = field(default_factory=lambda: [7, 14, 30, 60, 90])
     fixed_retrain_days: int = 14
     production_retrain_mode: str = "auto"
-    production_retrain_interval_weeks: int = 2
+    production_retrain_interval_weeks: int = 4
     production_retrain_weekday: str = "sunday"
     production_retrain_time: str = "00:01"
     production_retrain_anchor_date: str = "2026-03-29"
@@ -732,12 +803,20 @@ class PipelineConfig:
     
     # Maximum base M5 bars to load per symbol for optimization.
     max_bars: int = 300000
+    # Optional strict data-completeness gate for production optimization.
+    # When >0, symbols with fewer M5 bars after retry are left unoptimized.
+    optimization_min_m5_bars: int = 0
+    historical_fetch_retry_attempts: int = 1
+    historical_fetch_retry_sleep_seconds: float = 2.0
+    historical_fetch_deep_backfill_enabled: bool = False
+    historical_fetch_deep_backfill_years: int = 18
     
     # Regime-aware optimization settings
     use_regime_optimization: bool = True
     regime_min_train_trades: int = 25  # Minimum trades per regime bucket in training
     regime_min_val_trades: int = 15    # Minimum trades per regime bucket in validation
     regime_params_file: str = "regime_params.json"  # Path to tuned regime params
+    live_require_tuned_regime_params: bool = True  # Live entries require an explicit tuned params row
     # Live-only optional TP overlay. Discovery/backtesting keeps this neutral so
     # the tournament trades the SL/TP surface that actually won.
     regime_tp_multipliers: Dict[str, float] = field(default_factory=lambda: {
@@ -816,27 +895,59 @@ class PipelineConfig:
         # Clamp workers to sane minimum
         try:
             self.optimization_max_workers = max(1, int(self.optimization_max_workers))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             self.optimization_max_workers = 1
+        try:
+            self.feature_cache_max_entries = max(0, int(self.feature_cache_max_entries))
+        except (TypeError, ValueError, OverflowError):
+            self.feature_cache_max_entries = 24
+        self.feature_disk_cache_enabled = bool(self.feature_disk_cache_enabled)
+        self.feature_disk_cache_dir = str(self.feature_disk_cache_dir or "").strip()
+        try:
+            self.feature_disk_cache_max_gb = max(0.0, float(self.feature_disk_cache_max_gb))
+        except (TypeError, ValueError, OverflowError):
+            self.feature_disk_cache_max_gb = 0.0
+        try:
+            self.feature_disk_cache_min_free_gb = max(0.0, float(self.feature_disk_cache_min_free_gb))
+        except (TypeError, ValueError, OverflowError):
+            self.feature_disk_cache_min_free_gb = 4.0
+        self.feature_disk_cache_precompute_enabled = bool(self.feature_disk_cache_precompute_enabled)
+        try:
+            self.feature_disk_cache_precompute_workers = max(1, int(self.feature_disk_cache_precompute_workers))
+        except (TypeError, ValueError, OverflowError):
+            self.feature_disk_cache_precompute_workers = 1
+        try:
+            anchors = []
+            for value in self.screening_atr_anchor_multipliers or []:
+                anchor = float(value)
+                if math.isfinite(anchor) and anchor > 0:
+                    anchors.append(round(anchor, 6))
+            self.screening_atr_anchor_multipliers = sorted(set(anchors)) or [2.0]
+        except (TypeError, ValueError, OverflowError):
+            self.screening_atr_anchor_multipliers = [2.0]
+        self.screening_atr_anchor_enabled = bool(self.screening_atr_anchor_enabled)
 
         try:
             risk = float(self.discovery_risk_per_trade_pct)
             self.discovery_risk_per_trade_pct = risk if math.isfinite(risk) and risk > 0 else 1.0
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             self.discovery_risk_per_trade_pct = 1.0
 
         # Clamp regime validation descent depth to a safe minimum.
         try:
             self.regime_validation_top_k = max(1, int(self.regime_validation_top_k))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             self.regime_validation_top_k = 5
 
         # Clamp return/DD hard gate threshold to a safe positive value.
         try:
             ratio = float(self.regime_min_val_return_dd_ratio)
             self.regime_min_val_return_dd_ratio = ratio if math.isfinite(ratio) and ratio > 0 else 1.0
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             self.regime_min_val_return_dd_ratio = 1.0
+        self.live_require_tuned_regime_params = bool(
+            getattr(self, "live_require_tuned_regime_params", True)
+        )
         try:
             normalized_regime_tp: Dict[str, float] = {}
             for key, value in (self.regime_tp_multipliers or {}).items():
@@ -850,7 +961,7 @@ class PipelineConfig:
                 "RANGE": 1.0,
                 "CHOP": 1.0,
             }
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             self.regime_tp_multipliers = {
                 "TREND": 1.0,
                 "BREAKOUT": 1.0,
@@ -867,7 +978,7 @@ class PipelineConfig:
         try:
             self.production_retrain_interval_weeks = max(1, int(self.production_retrain_interval_weeks))
         except Exception:
-            self.production_retrain_interval_weeks = 2
+            self.production_retrain_interval_weeks = 4
         self.production_retrain_weekday = str(self.production_retrain_weekday or "sunday").strip().lower()
         if self.production_retrain_weekday not in _WEEKDAY_NAME_TO_INDEX:
             raise ValueError(
@@ -893,6 +1004,20 @@ class PipelineConfig:
             self.production_retrain_poll_seconds = max(1, int(self.production_retrain_poll_seconds))
         except Exception:
             self.production_retrain_poll_seconds = 60
+        self.production_require_full_symbol_ledger = bool(self.production_require_full_symbol_ledger)
+        self.live_allow_partial_symbol_ledger = bool(
+            getattr(self, "live_allow_partial_symbol_ledger", False)
+        )
+        try:
+            self.production_symbol_pool_target_count = max(0, int(self.production_symbol_pool_target_count))
+        except Exception:
+            self.production_symbol_pool_target_count = 0
+        try:
+            min_equity = float(self.live_min_account_equity)
+            self.live_min_account_equity = min_equity if math.isfinite(min_equity) and min_equity > 0 else 0.0
+        except (TypeError, ValueError, OverflowError):
+            self.live_min_account_equity = 0.0
+        self.live_min_account_equity_currency = str(self.live_min_account_equity_currency or "").strip().upper()
         self.execution_spread_filter_enabled = bool(self.execution_spread_filter_enabled)
         self.live_risk_scalars_enabled = bool(self.live_risk_scalars_enabled)
         raw_loop_mode = getattr(self, "live_loop_trigger_mode", "bar")
@@ -1028,13 +1153,13 @@ class PipelineConfig:
                 if high is not None:
                     value = min(high, value)
                 setattr(self, name, value)
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 setattr(self, name, default)
 
         def _clamp_int_attr(name: str, default: int, low: int = 0) -> None:
             try:
                 setattr(self, name, max(low, int(getattr(self, name, default))))
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 setattr(self, name, default)
 
         for _name, _default in {
@@ -1048,8 +1173,12 @@ class PipelineConfig:
             "cycle_drift_spread_degradation_mult": 2.0,
             "swap_model_min_holding_hours": 20.0,
             "regime_min_live_gap_warn": 0.05,
+            "legacy_confidence_bonus_cap": 0.08,
         }.items():
-            _clamp_float_attr(_name, _default)
+            if _name == "legacy_confidence_bonus_cap":
+                _clamp_float_attr(_name, _default, low=0.0, high=0.50)
+            else:
+                _clamp_float_attr(_name, _default)
         _clamp_int_attr("cycle_drift_min_trades", 6, low=1)
         _clamp_int_attr("cycle_drift_consecutive_losses", 5, low=1)
 
@@ -1080,13 +1209,44 @@ class PipelineConfig:
         if self.walk_forward_audit_mode not in {"off", "observe", "severe_fragility_only"}:
             self.walk_forward_audit_mode = "severe_fragility_only"
         self.walk_forward_promotion_policy = str(
-            getattr(self, "walk_forward_promotion_policy", "block_severe_only") or "block_severe_only"
+            getattr(self, "walk_forward_promotion_policy", "observe_only") or "observe_only"
         ).strip().lower()
         if self.walk_forward_promotion_policy not in {"observe_only", "block_severe_only"}:
-            self.walk_forward_promotion_policy = "block_severe_only"
+            self.walk_forward_promotion_policy = "observe_only"
+        self.walk_forward_live_blocking_enabled = bool(
+            getattr(self, "walk_forward_live_blocking_enabled", False)
+        )
+        regime_scoring_model = str(getattr(self, "regime_scoring_model", "legacy") or "legacy").strip().lower()
+        if regime_scoring_model not in {
+            "legacy",
+            "legacy_confidence",
+            "specialist_spokes",
+            "specialist_spokes_v2",
+            "specialist_spokes_asym",
+            "specialist_spokes_threadspark",
+        }:
+            logger.warning("Invalid regime_scoring_model=%r; falling back to legacy.", regime_scoring_model)
+            regime_scoring_model = "legacy"
+        self.regime_scoring_model = regime_scoring_model
+        try:
+            v2_strength = float(getattr(self, "specialist_spokes_v2_cost_frequency_strength", 0.50))
+        except (TypeError, ValueError, OverflowError):
+            v2_strength = 0.50
+        self.specialist_spokes_v2_cost_frequency_strength = max(0.0, min(1.0, v2_strength))
+        self.specialist_spokes_v2_default_fallback_enabled = bool(
+            getattr(self, "specialist_spokes_v2_default_fallback_enabled", True)
+        )
+        self.specialist_spokes_v2_allow_promote_small_default = bool(
+            getattr(self, "specialist_spokes_v2_allow_promote_small_default", True)
+        )
+        try:
+            v2_max_sharpe = float(getattr(self, "specialist_spokes_v2_max_validation_sharpe", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            v2_max_sharpe = 0.0
+        self.specialist_spokes_v2_max_validation_sharpe = max(0.0, v2_max_sharpe)
         try:
             stability_floor = float(getattr(self, "regime_trade_stability_floor", 0.7))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             stability_floor = 0.7
         self.regime_trade_stability_floor = max(0.0, min(1.0, stability_floor))
         self.false_discovery_control_enabled = bool(
@@ -1094,54 +1254,80 @@ class PipelineConfig:
         )
         try:
             min_dsr = float(getattr(self, "false_discovery_min_dsr", 0.0) or 0.0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             min_dsr = 0.0
         self.false_discovery_min_dsr = max(0.0, min(1.0, min_dsr))
         try:
             confidence_floor = float(getattr(self, "false_discovery_confidence_floor", 0.35) or 0.0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             confidence_floor = 0.35
         self.false_discovery_confidence_floor = max(0.0, min(1.0, confidence_floor))
         try:
             scope_power = float(getattr(self, "false_discovery_scope_power", 0.25) or 0.0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             scope_power = 0.25
         self.false_discovery_scope_power = max(0.0, min(1.0, scope_power))
         try:
             symbol_count = int(getattr(self, "false_discovery_symbol_count", 0) or 0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             symbol_count = 0
         self.false_discovery_symbol_count = max(0, symbol_count)
-        policy = str(getattr(self, "false_discovery_holdout_policy", "promote_small") or "promote_small").strip().lower()
+        policy = str(getattr(self, "false_discovery_holdout_policy", "off") or "off").strip().lower()
         if policy not in {"off", "promote_small", "block"}:
-            policy = "promote_small"
+            policy = "off"
         self.false_discovery_holdout_policy = policy
         try:
             holdout_min_trades = int(getattr(self, "false_discovery_holdout_min_trades", 5) or 0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             holdout_min_trades = 5
         self.false_discovery_holdout_min_trades = max(0, holdout_min_trades)
         try:
             holdout_min_pf = float(getattr(self, "false_discovery_holdout_min_profit_factor", 1.0) or 0.0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             holdout_min_pf = 1.0
         self.false_discovery_holdout_min_profit_factor = max(0.0, holdout_min_pf)
         try:
             holdout_min_return = float(getattr(self, "false_discovery_holdout_min_return_pct", 0.0) or 0.0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             holdout_min_return = 0.0
         self.false_discovery_holdout_min_return_pct = holdout_min_return
+        oos_mode = str(getattr(self, "oos_validation_mode", "fixed_holdout") or "fixed_holdout").strip().lower()
+        if oos_mode not in {"fixed_holdout", "purged_kfold"}:
+            oos_mode = "fixed_holdout"
+        self.oos_validation_mode = oos_mode
+        try:
+            kfold_splits = int(getattr(self, "oos_kfold_splits", 5) or 5)
+        except (TypeError, ValueError, OverflowError):
+            kfold_splits = 5
+        self.oos_kfold_splits = max(2, min(20, kfold_splits))
+        try:
+            embargo_bars = int(getattr(self, "oos_embargo_bars", 1) or 0)
+        except (TypeError, ValueError, OverflowError):
+            embargo_bars = 1
+        self.oos_embargo_bars = max(0, embargo_bars)
+        try:
+            oos_min_trades = int(getattr(self, "oos_min_trades", 5) or 0)
+        except (TypeError, ValueError, OverflowError):
+            oos_min_trades = 5
+        self.oos_min_trades = max(0, oos_min_trades)
+        oos_policy = str(
+            getattr(self, "oos_aggregate_policy", "aggregate_with_worst_fold_floor")
+            or "aggregate_with_worst_fold_floor"
+        ).strip().lower()
+        if oos_policy not in {"all_folds", "aggregate_with_worst_fold_floor"}:
+            oos_policy = "aggregate_with_worst_fold_floor"
+        self.oos_aggregate_policy = oos_policy
         self.oos_evidence_export_enabled = bool(
             getattr(self, "oos_evidence_export_enabled", False)
         )
         try:
             evidence_periods = int(getattr(self, "oos_evidence_periods", 64) or 64)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             evidence_periods = 64
         self.oos_evidence_periods = max(2, evidence_periods)
         try:
             evidence_min_periods = int(getattr(self, "oos_evidence_min_periods", 8) or 8)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             evidence_min_periods = 8
         self.oos_evidence_min_periods = max(2, min(evidence_min_periods, self.oos_evidence_periods))
         evidence_dirname = str(getattr(self, "oos_evidence_dirname", "oos_evidence") or "oos_evidence").strip()
@@ -1149,13 +1335,64 @@ class PipelineConfig:
             evidence_dirname = "oos_evidence"
         self.oos_evidence_dirname = evidence_dirname
         try:
+            trade_path_points = int(getattr(self, "oos_evidence_trade_path_max_points", 256) or 0)
+        except (TypeError, ValueError, OverflowError):
+            trade_path_points = 256
+        self.oos_evidence_trade_path_max_points = max(0, min(5000, trade_path_points))
+        self.oos_evidence_include_execution_cost_survival = bool(
+            getattr(self, "oos_evidence_include_execution_cost_survival", False)
+        )
+        selection_surface = str(
+            getattr(self, "threadspark_selection_surface", "validation") or "validation"
+        ).strip().lower()
+        if selection_surface not in {"clean_holdout", "validation"}:
+            selection_surface = "validation"
+        self.threadspark_selection_surface = selection_surface
+        self.threadspark_use_historical_cost_evidence = bool(
+            getattr(self, "threadspark_use_historical_cost_evidence", True)
+        )
+        historical_scope = str(
+            getattr(self, "threadspark_historical_cost_scope", "workflow") or "workflow"
+        ).strip().lower()
+        if historical_scope not in {"workflow", "audit"}:
+            historical_scope = "workflow"
+        self.threadspark_historical_cost_scope = historical_scope
+        try:
+            historical_chunks = int(getattr(self, "threadspark_historical_chunk_count", 5) or 0)
+        except (TypeError, ValueError, OverflowError):
+            historical_chunks = 5
+        self.threadspark_historical_chunk_count = max(1, min(12, historical_chunks))
+        stress_mode = str(
+            getattr(self, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95"
+        ).strip().lower()
+        if stress_mode not in {"stress_p90", "stress_p95", "stress_max"}:
+            logger.warning(
+                "Invalid oos_evidence_execution_stress_mode=%r; falling back to stress_p95.",
+                stress_mode,
+            )
+            stress_mode = "stress_p95"
+        self.oos_evidence_execution_stress_mode = stress_mode
+        try:
+            stress_cap = int(getattr(self, "oos_evidence_execution_cost_max_candidates_per_tf", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            stress_cap = 0
+        self.oos_evidence_execution_cost_max_candidates_per_tf = max(0, stress_cap)
+        try:
             mult = float(getattr(self, "promote_small_risk_multiplier", 0.5) or 0.0)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             mult = 0.5
         self.promote_small_risk_multiplier = max(0.0, min(1.0, mult))
         self.swap_model_enabled = bool(self.swap_model_enabled)
         _spread_mode = str(getattr(self, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
-        if _spread_mode not in {"fixed_spec", "historical_bar", "historical_max", "conservative_max", "stress_max"}:
+        if _spread_mode not in {
+            "fixed_spec",
+            "historical_bar",
+            "historical_max",
+            "conservative_max",
+            "stress_p90",
+            "stress_p95",
+            "stress_max",
+        }:
             logger.warning("Invalid backtest_spread_mode=%r; falling back to fixed_spec.", _spread_mode)
             _spread_mode = "fixed_spec"
         self.backtest_spread_mode = _spread_mode
@@ -1203,6 +1440,24 @@ class PipelineConfig:
         except Exception:
             self.max_bars = 300000
         try:
+            self.optimization_min_m5_bars = max(0, int(self.optimization_min_m5_bars))
+        except Exception:
+            self.optimization_min_m5_bars = 0
+        try:
+            self.historical_fetch_retry_attempts = max(1, int(self.historical_fetch_retry_attempts))
+        except Exception:
+            self.historical_fetch_retry_attempts = 1
+        try:
+            retry_sleep = float(self.historical_fetch_retry_sleep_seconds)
+            self.historical_fetch_retry_sleep_seconds = retry_sleep if math.isfinite(retry_sleep) and retry_sleep >= 0 else 2.0
+        except (TypeError, ValueError, OverflowError):
+            self.historical_fetch_retry_sleep_seconds = 2.0
+        self.historical_fetch_deep_backfill_enabled = bool(self.historical_fetch_deep_backfill_enabled)
+        try:
+            self.historical_fetch_deep_backfill_years = max(1, int(self.historical_fetch_deep_backfill_years))
+        except Exception:
+            self.historical_fetch_deep_backfill_years = 18
+        try:
             self.historical_stress_audit_bars = max(0, int(self.historical_stress_audit_bars))
         except Exception:
             self.historical_stress_audit_bars = 50000
@@ -1214,6 +1469,21 @@ class PipelineConfig:
             self.active_stage2_pct = max(1.0, min(100.0, float(self.active_stage2_pct)))
         except Exception:
             self.active_stage2_pct = 50.0
+        split_mode = str(getattr(self, "production_split_mode", "bleeding_edge") or "bleeding_edge").strip().lower()
+        split_aliases = {
+            "production": "bleeding_edge",
+            "practical": "bleeding_edge",
+            "clean_holdout": "research_clean_holdout",
+            "legacy_clean_holdout": "research_clean_holdout",
+        }
+        split_mode = split_aliases.get(split_mode, split_mode)
+        if split_mode not in {"bleeding_edge", "research_clean_holdout"}:
+            split_mode = "bleeding_edge"
+        self.production_split_mode = split_mode
+        try:
+            self.walk_forward_validation_bars = max(0, int(self.walk_forward_validation_bars))
+        except Exception:
+            self.walk_forward_validation_bars = 50000
         try:
             self.clean_holdout_pct = max(0.0, min(50.0, float(self.clean_holdout_pct)))
         except Exception:
@@ -1291,6 +1561,46 @@ class PipelineConfig:
             self.session_loss_advisory_pct = max(0.0, float(self.session_loss_advisory_pct))
         except Exception:
             self.session_loss_advisory_pct = 0.0
+        self.manual_new_entries_enabled = bool(getattr(self, "manual_new_entries_enabled", True))
+        self.manual_kill_switch_path = str(getattr(self, "manual_kill_switch_path", "") or "").strip()
+        self.production_require_promotion_gate = bool(
+            getattr(self, "production_require_promotion_gate", False)
+        )
+        gate_mode = str(getattr(self, "production_promotion_gate_mode", "external_review_exact") or "").strip().lower()
+        gate_mode_aliases = {
+            "external": "external_review_exact",
+            "exact": "external_review_exact",
+            "review_exact": "external_review_exact",
+            "review": "external_review_exact",
+            "ledger": "ledger_status",
+            "current_ledger": "ledger_status",
+            "ledger_authoritative": "ledger_status",
+        }
+        gate_mode = gate_mode_aliases.get(gate_mode, gate_mode)
+        if gate_mode not in {"external_review_exact", "ledger_status"}:
+            logger.warning(
+                "Invalid production_promotion_gate_mode=%r; falling back to 'external_review_exact'.",
+                getattr(self, "production_promotion_gate_mode", None),
+            )
+            gate_mode = "external_review_exact"
+        self.production_promotion_gate_mode = gate_mode
+        self.production_promotion_review_path = str(
+            getattr(self, "production_promotion_review_path", "") or ""
+        ).strip()
+        self.production_promotion_cell_safety_path = str(
+            getattr(self, "production_promotion_cell_safety_path", "") or ""
+        ).strip()
+        self.production_completion_marker_path = str(
+            getattr(self, "production_completion_marker_path", "") or ""
+        ).strip()
+        raw_cells = getattr(self, "production_expected_promote_cells", []) or []
+        if isinstance(raw_cells, str):
+            raw_cells = [raw_cells]
+        self.production_expected_promote_cells = [
+            str(cell or "").strip().upper()
+            for cell in raw_cells
+            if str(cell or "").strip()
+        ]
         try:
             self.storage_warn_free_gb = max(0.0, float(self.storage_warn_free_gb))
         except Exception:
@@ -1928,8 +2238,6 @@ INSTRUMENT_SPECS = {
     'USDSGD': InstrumentSpec('USDSGD', 4, 7.5, 2.0, 0.01, 100.0, 8.0, 1.5, -6.0),
     'USDTRY': InstrumentSpec('USDTRY', 4, 0.035, 100.0, 0.01, 100.0, 20.0, 50.0, -150.0),
     'USDZAR': InstrumentSpec('USDZAR', 4, 0.55, 50.0, 0.01, 100.0, 15.0, 12.0, -35.0),
-    'EURZAR': InstrumentSpec('EURZAR', 4, 0.55, 70.0, 0.01, 100.0, 15.0, 10.0, -30.0),
-    'GBPZAR': InstrumentSpec('GBPZAR', 4, 0.55, 80.0, 0.01, 100.0, 15.0, 12.0, -35.0),
     'USDCNH': InstrumentSpec('USDCNH', 4, 1.4, 20.0, 0.01, 100.0, 10.0, 2.0, -10.0),
     'EURCNH': InstrumentSpec('EURCNH', 4, 1.4, 10.0, 0.01, 100.0, 10.0, 2.0, -10.0),
     'EURPLN': InstrumentSpec('EURPLN', 4, 2.5, 25.0, 0.01, 100.0, 10.0, 3.0, -12.0),
@@ -1954,11 +2262,6 @@ INSTRUMENT_SPECS = {
     'XAUAUD': InstrumentSpec('XAUAUD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
     'XAGEUR': InstrumentSpec('XAGEUR', 3, 5.0, 2.0, 0.01, 100.0, 5.0, -3.0, -2.0),
     'XRX': InstrumentSpec('XRX', 3, 1.0, 5.0, 0.01, 100.0, 5.0, 0.0, 0.0),
-    # Energy CFDs
-    'XTIUSD': InstrumentSpec('XTIUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, 0.0, 0.0),
-    'XBRUSD': InstrumentSpec('XBRUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, 0.0, 0.0),
-    'XNGUSD': InstrumentSpec('XNGUSD', 3, 1.0, 4.0, 0.01, 100.0, 5.0, 0.0, 0.0),
-
     # Additional FX Pairs (aligned with config)
     'AUDJPY': InstrumentSpec('AUDJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -4.0, 1.0),
     'EURAUD': InstrumentSpec('EURAUD', 4, 7.0, 2.0, 0.01, 100.0, 7.0, -4.0, 0.5),
@@ -1979,15 +2282,6 @@ INSTRUMENT_SPECS = {
     'GBPNZD': InstrumentSpec('GBPNZD', 4, 6.0, 3.0, 0.01, 100.0, 7.0, -4.0, 0.5),
 
     # Crypto (CFDs) - defaults used mainly for offline backtests; live trading overrides via broker specs
-    'BTCUSD': InstrumentSpec('BTCUSD', 2, 1.0, 20.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'ETHUSD': InstrumentSpec('ETHUSD', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'LTCUSD': InstrumentSpec('LTCUSD', 2, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'SOLUSD': InstrumentSpec('SOLUSD', 2, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'BCHUSD': InstrumentSpec('BCHUSD', 2, 1.0, 20.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'DOGUSD': InstrumentSpec('DOGUSD', 4, 1.0, 20.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'TRXUSD': InstrumentSpec('TRXUSD', 4, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'XRPUSD': InstrumentSpec('XRPUSD', 4, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'TONUSD': InstrumentSpec('TONUSD', 3, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'BTCETH': InstrumentSpec('BTCETH', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
     'BTCXAU': InstrumentSpec('BTCXAU', 2, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
 
@@ -2211,14 +2505,14 @@ def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
         if k in filtered and filtered[k] is not None:
             try:
                 filtered[k] = float(filtered[k])
-            except Exception:
-                pass
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.debug("Ignoring invalid float instrument spec field %s=%r: %s", k, filtered[k], exc)
     for k in int_fields:
         if k in filtered and filtered[k] is not None:
             try:
                 filtered[k] = int(filtered[k])
-            except Exception:
-                pass
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.debug("Ignoring invalid int instrument spec field %s=%r: %s", k, filtered[k], exc)
 
     return InstrumentSpec(**filtered)
 
@@ -2512,6 +2806,7 @@ class DataLoader:
         'H4': 2000,    # ~6 months of H4 data minimum  
         'D1': 500,     # ~2 years of D1 data minimum
     }
+    RESAMPLE_CACHE_SCHEMA_VERSION = 2
     
     def __init__(self, data_dir: Path, cache_resampled: bool = True, cache_dir: Optional[Path] = None):
         """
@@ -2768,6 +3063,7 @@ class DataLoader:
             resampled['SpreadOpen'] = grouped_spread.first()
             resampled['SpreadMax'] = grouped_spread.max()
             resampled['SpreadP90'] = grouped_spread.quantile(0.90)
+            resampled['SpreadP95'] = grouped_spread.quantile(0.95)
         
         return resampled
 
@@ -2782,6 +3078,7 @@ class DataLoader:
         if not meta or not source_meta:
             return False
         return (
+            meta.get("schema_version") == self.RESAMPLE_CACHE_SCHEMA_VERSION and
             meta.get("source_mtime") == source_meta.get("mtime") and
             meta.get("source_rows") == source_meta.get("rows") and
             meta.get("source_last_index") == source_meta.get("last_index")
@@ -2838,6 +3135,7 @@ class DataLoader:
                              df: pd.DataFrame) -> None:
         cache_key = self._resample_cache_key(symbol, timeframe)
         meta = {
+            "schema_version": self.RESAMPLE_CACHE_SCHEMA_VERSION,
             "source_mtime": source_meta.get("mtime"),
             "source_rows": source_meta.get("rows"),
             "source_last_index": source_meta.get("last_index"),
@@ -3258,7 +3556,66 @@ class FeatureComputer:
     _FEATURE_CACHE_MAX = 24
     _FEATURE_CACHE_HITS = 0
     _FEATURE_CACHE_MISSES = 0
-    FEATURE_CACHE_VERSION = "2026-03-29a"
+    _FEATURE_DISK_CACHE_ENABLED = False
+    _FEATURE_DISK_CACHE_DIR: Optional[Path] = None
+    _FEATURE_DISK_CACHE_MAX_BYTES = 0
+    _FEATURE_DISK_CACHE_MIN_FREE_BYTES = 0
+    _FEATURE_DISK_CACHE_HITS = 0
+    _FEATURE_DISK_CACHE_MISSES = 0
+    _FEATURE_DISK_CACHE_WRITES = 0
+    _FEATURE_DISK_CACHE_SKIPPED_STORAGE = 0
+    _FEATURE_DISK_CACHE_INVALIDATIONS = 0
+    _FEATURE_DISK_CACHE_READ_FAILURES = 0
+    _FEATURE_DISK_CACHE_WRITE_FAILURES = 0
+    _FEATURE_DISK_CACHE_BYTES_READ = 0
+    _FEATURE_DISK_CACHE_BYTES_WRITTEN = 0
+    _FEATURE_DISK_CACHE_READ_SECONDS = 0.0
+    _FEATURE_DISK_CACHE_WRITE_SECONDS = 0.0
+    _FEATURE_CODE_FINGERPRINT: Optional[str] = None
+    FEATURE_CACHE_VERSION = "2026-05-30-disk-v2"
+
+    @classmethod
+    def configure_cache(cls,
+                        max_entries: Optional[int] = None,
+                        *,
+                        disk_enabled: Optional[bool] = None,
+                        disk_dir: Optional[Union[str, Path]] = None,
+                        disk_max_gb: Optional[float] = None,
+                        disk_min_free_gb: Optional[float] = None) -> None:
+        """Configure feature caching and drop stale in-memory entries."""
+        if max_entries is not None:
+            try:
+                limit = max(0, int(max_entries))
+            except Exception:
+                limit = 24
+            if limit != cls._FEATURE_CACHE_MAX:
+                cls.clear_cache()
+                cls._FEATURE_CACHE_MAX = limit
+
+        if disk_enabled is not None:
+            cls._FEATURE_DISK_CACHE_ENABLED = bool(disk_enabled)
+        if disk_dir is not None:
+            disk_path = Path(disk_dir)
+            if disk_path:
+                cls._FEATURE_DISK_CACHE_DIR = disk_path
+        if disk_max_gb is not None:
+            try:
+                cls._FEATURE_DISK_CACHE_MAX_BYTES = int(max(0.0, float(disk_max_gb)) * (1024 ** 3))
+            except Exception:
+                cls._FEATURE_DISK_CACHE_MAX_BYTES = 0
+        if disk_min_free_gb is not None:
+            try:
+                cls._FEATURE_DISK_CACHE_MIN_FREE_BYTES = int(max(0.0, float(disk_min_free_gb)) * (1024 ** 3))
+            except Exception:
+                cls._FEATURE_DISK_CACHE_MIN_FREE_BYTES = 0
+        if cls._FEATURE_DISK_CACHE_ENABLED:
+            if cls._FEATURE_DISK_CACHE_DIR is None:
+                cls._FEATURE_DISK_CACHE_DIR = Path("artifact/fxpm_runtime/feature_cache")
+            try:
+                cls._FEATURE_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                logger.warning(f"Feature disk cache disabled; cannot create cache dir: {exc}")
+                cls._FEATURE_DISK_CACHE_ENABLED = False
 
     @classmethod
     def clear_cache(cls) -> None:
@@ -3278,6 +3635,48 @@ class FeatureComputer:
         cls._FEATURE_CACHE_HITS = 0
         cls._FEATURE_CACHE_MISSES = 0
 
+    @classmethod
+    def get_cache_stats(cls, reset: bool = False) -> Dict[str, Any]:
+        """Return feature-cache telemetry without exposing cached frames."""
+        stats = {
+            "memory_cap": int(cls._FEATURE_CACHE_MAX),
+            "memory_entries": len(cls._FEATURE_CACHE),
+            "memory_hits": int(cls._FEATURE_CACHE_HITS),
+            "memory_misses": int(cls._FEATURE_CACHE_MISSES),
+            "disk_enabled": bool(cls._FEATURE_DISK_CACHE_ENABLED),
+            "disk_dir": str(cls._FEATURE_DISK_CACHE_DIR or ""),
+            "disk_max_bytes": int(cls._FEATURE_DISK_CACHE_MAX_BYTES),
+            "disk_min_free_bytes": int(cls._FEATURE_DISK_CACHE_MIN_FREE_BYTES),
+            "disk_free_bytes": cls._disk_free_bytes(),
+            "disk_cache_bytes": cls._disk_cache_bytes(),
+            "disk_hits": int(cls._FEATURE_DISK_CACHE_HITS),
+            "disk_misses": int(cls._FEATURE_DISK_CACHE_MISSES),
+            "disk_writes": int(cls._FEATURE_DISK_CACHE_WRITES),
+            "disk_skipped_storage": int(cls._FEATURE_DISK_CACHE_SKIPPED_STORAGE),
+            "disk_invalidations": int(cls._FEATURE_DISK_CACHE_INVALIDATIONS),
+            "disk_read_failures": int(cls._FEATURE_DISK_CACHE_READ_FAILURES),
+            "disk_write_failures": int(cls._FEATURE_DISK_CACHE_WRITE_FAILURES),
+            "disk_bytes_read": int(cls._FEATURE_DISK_CACHE_BYTES_READ),
+            "disk_bytes_written": int(cls._FEATURE_DISK_CACHE_BYTES_WRITTEN),
+            "disk_read_seconds": float(cls._FEATURE_DISK_CACHE_READ_SECONDS),
+            "disk_write_seconds": float(cls._FEATURE_DISK_CACHE_WRITE_SECONDS),
+        }
+        if reset:
+            cls._FEATURE_CACHE_HITS = 0
+            cls._FEATURE_CACHE_MISSES = 0
+            cls._FEATURE_DISK_CACHE_HITS = 0
+            cls._FEATURE_DISK_CACHE_MISSES = 0
+            cls._FEATURE_DISK_CACHE_WRITES = 0
+            cls._FEATURE_DISK_CACHE_SKIPPED_STORAGE = 0
+            cls._FEATURE_DISK_CACHE_INVALIDATIONS = 0
+            cls._FEATURE_DISK_CACHE_READ_FAILURES = 0
+            cls._FEATURE_DISK_CACHE_WRITE_FAILURES = 0
+            cls._FEATURE_DISK_CACHE_BYTES_READ = 0
+            cls._FEATURE_DISK_CACHE_BYTES_WRITTEN = 0
+            cls._FEATURE_DISK_CACHE_READ_SECONDS = 0.0
+            cls._FEATURE_DISK_CACHE_WRITE_SECONDS = 0.0
+        return stats
+
     # Per-DataFrame attribute key recording which precomputed columns use which
     # parameter tuples. Kept here as a string constant to avoid a circular import.
     _PRECOMPUTED_ATTR = '_fxpm_precomputed_params'
@@ -3296,20 +3695,38 @@ class FeatureComputer:
         try:
             path = Path(regime_params_file)
             resolved = str(path.resolve())
-            stat = path.stat()
-            return resolved, stat.st_mtime_ns, stat.st_size
+            data = path.read_bytes()
+            digest = hashlib.sha1(data).hexdigest()
+            return resolved, digest, len(data)
         except Exception:
             return str(regime_params_file), None, None
+
+    @classmethod
+    def _feature_code_fingerprint(cls) -> str:
+        """Hash feature/regime implementation files so code edits invalidate disk cache."""
+        if cls._FEATURE_CODE_FINGERPRINT:
+            return cls._FEATURE_CODE_FINGERPRINT
+        digest = hashlib.sha1()
+        for path in [Path(__file__), Path(__file__).with_name("pm_regime.py")]:
+            try:
+                digest.update(str(path.name).encode("utf-8"))
+                digest.update(path.read_bytes())
+            except Exception:
+                digest.update(str(path).encode("utf-8"))
+        cls._FEATURE_CODE_FINGERPRINT = digest.hexdigest()
+        return cls._FEATURE_CODE_FINGERPRINT
 
     @staticmethod
     def _data_fingerprint(df: pd.DataFrame) -> str:
         try:
-            sample_rows = [0, len(df) - 1]
-            if len(df) > 2:
-                sample_rows.insert(1, len(df) // 2)
-            sample = df.iloc[sorted(set(sample_rows))].copy()
-            sample = sample[[c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in sample.columns]]
-            hashed = pd.util.hash_pandas_object(sample, index=True).to_numpy(dtype=np.uint64)
+            raw_cols = [
+                c for c in [
+                    'Open', 'High', 'Low', 'Close', 'Volume', 'RealVolume',
+                    'Spread', 'SpreadOpen', 'SpreadMax', 'SpreadP90', 'SpreadP95',
+                ] if c in df.columns
+            ]
+            source = df.loc[:, raw_cols].copy() if raw_cols else df.copy()
+            hashed = pd.util.hash_pandas_object(source, index=True).to_numpy(dtype=np.uint64)
             digest = hashlib.sha1(hashed.tobytes()).hexdigest()
             return digest
         except Exception:
@@ -3329,6 +3746,7 @@ class FeatureComputer:
         return (
             tag,
             FeatureComputer.FEATURE_CACHE_VERSION,
+            FeatureComputer._feature_code_fingerprint(),
             symbol,
             timeframe,
             FeatureComputer._regime_params_fingerprint(regime_params_file),
@@ -3341,19 +3759,310 @@ class FeatureComputer:
 
     @classmethod
     def _cache_get(cls, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
-        if key in cls._FEATURE_CACHE:
+        if cls._FEATURE_CACHE_MAX <= 0:
+            cls._FEATURE_CACHE_MISSES += 1
+        elif key in cls._FEATURE_CACHE:
             cls._FEATURE_CACHE_HITS += 1
             return cls._FEATURE_CACHE[key].copy()
-        cls._FEATURE_CACHE_MISSES += 1
-        return None
+        else:
+            cls._FEATURE_CACHE_MISSES += 1
+        return cls._disk_cache_get(key)
 
     @classmethod
     def _cache_put(cls, key: Tuple[Any, ...], value: pd.DataFrame) -> None:
-        cls._FEATURE_CACHE[key] = value.copy()
-        cls._FEATURE_CACHE_ORDER.append(key)
-        if len(cls._FEATURE_CACHE_ORDER) > cls._FEATURE_CACHE_MAX:
-            oldest = cls._FEATURE_CACHE_ORDER.pop(0)
-            cls._FEATURE_CACHE.pop(oldest, None)
+        if cls._FEATURE_CACHE_MAX > 0:
+            cls._FEATURE_CACHE[key] = value.copy()
+            cls._FEATURE_CACHE_ORDER.append(key)
+            if len(cls._FEATURE_CACHE_ORDER) > cls._FEATURE_CACHE_MAX:
+                oldest = cls._FEATURE_CACHE_ORDER.pop(0)
+                cls._FEATURE_CACHE.pop(oldest, None)
+        cls._disk_cache_put(key, value)
+
+    @staticmethod
+    def _cache_key_digest(key: Tuple[Any, ...]) -> str:
+        payload = json.dumps(key, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha1(payload).hexdigest()
+
+    @classmethod
+    def _disk_free_bytes(cls) -> Optional[int]:
+        cache_dir = cls._FEATURE_DISK_CACHE_DIR
+        if cache_dir is None:
+            return None
+        try:
+            target = cache_dir if cache_dir.exists() else cache_dir.parent
+            usage = shutil.disk_usage(target)
+            return int(usage.free)
+        except Exception:
+            return None
+
+    @classmethod
+    def _disk_cache_bytes(cls) -> int:
+        cache_dir = cls._FEATURE_DISK_CACHE_DIR
+        if cache_dir is None or not cache_dir.exists():
+            return 0
+        total = 0
+        try:
+            for path in cache_dir.glob("feature_*"):
+                if path.is_file() and path.suffix in {".json", ".parquet", ".pkl"}:
+                    total += int(path.stat().st_size)
+        except Exception:
+            return total
+        return total
+
+    @classmethod
+    def _estimated_payload_bytes(cls, value: pd.DataFrame) -> int:
+        try:
+            raw = int(value.memory_usage(index=True, deep=True).sum())
+        except Exception:
+            raw = 0
+        return max(raw * 2, raw + (64 * 1024 * 1024), 8 * 1024 * 1024)
+
+    @classmethod
+    def _has_disk_headroom(cls, reserve_bytes: int = 0) -> bool:
+        min_free = int(cls._FEATURE_DISK_CACHE_MIN_FREE_BYTES or 0)
+        if min_free <= 0:
+            return True
+        free = cls._disk_free_bytes()
+        if free is None:
+            return True
+        return int(free) >= int(min_free) + max(0, int(reserve_bytes))
+
+    @classmethod
+    def _disk_cache_paths(cls, key: Tuple[Any, ...]) -> Optional[Dict[str, Path]]:
+        if not cls._FEATURE_DISK_CACHE_ENABLED or cls._FEATURE_DISK_CACHE_DIR is None:
+            return None
+        digest = cls._cache_key_digest(key)
+        base = cls._FEATURE_DISK_CACHE_DIR / f"feature_{digest}"
+        return {
+            "manifest": base.with_suffix(".json"),
+            "parquet": base.with_suffix(".parquet"),
+            "pickle": base.with_suffix(".pkl"),
+        }
+
+    @classmethod
+    def _disk_cache_get(cls, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
+        paths = cls._disk_cache_paths(key)
+        if paths is None:
+            return None
+        expected_digest = cls._cache_key_digest(key)
+        manifest_path = paths["manifest"]
+        pickle_path = paths["pickle"]
+        if not manifest_path.exists() and not pickle_path.exists():
+            cls._FEATURE_DISK_CACHE_MISSES += 1
+            return None
+        start = time.perf_counter()
+        try:
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(manifest, dict):
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                if manifest.get("format_version") != "feature_cache_manifest_v2":
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                if manifest.get("key_digest") != expected_digest:
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                if manifest.get("feature_cache_version") != cls.FEATURE_CACHE_VERSION:
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                if manifest.get("feature_code_fingerprint") != cls._feature_code_fingerprint():
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                data_path = Path(manifest.get("data_path", ""))
+                if not data_path.is_absolute():
+                    data_path = manifest_path.parent / data_path
+                if not data_path.exists():
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                data = pd.read_parquet(data_path)
+                if int(manifest.get("rows", -1)) != int(len(data)):
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                manifest_columns = [str(col) for col in (manifest.get("columns", []) or [])]
+                if manifest_columns and manifest_columns != [str(col) for col in data.columns]:
+                    cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                    return None
+                cls._FEATURE_DISK_CACHE_READ_SECONDS += max(0.0, time.perf_counter() - start)
+                cls._FEATURE_DISK_CACHE_BYTES_READ += int(data_path.stat().st_size + manifest_path.stat().st_size)
+                cls._FEATURE_DISK_CACHE_HITS += 1
+                return data.copy()
+
+            size_bytes = pickle_path.stat().st_size
+            payload = pd.read_pickle(pickle_path)
+            cls._FEATURE_DISK_CACHE_READ_SECONDS += max(0.0, time.perf_counter() - start)
+            cls._FEATURE_DISK_CACHE_BYTES_READ += int(size_bytes)
+            if not isinstance(payload, dict):
+                cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                return None
+            if payload.get("format_version") != "feature_cache_v1":
+                cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                return None
+            if payload.get("feature_cache_version") != cls.FEATURE_CACHE_VERSION:
+                cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                return None
+            if payload.get("feature_code_fingerprint") != cls._feature_code_fingerprint():
+                cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                return None
+            if payload.get("key_digest") != expected_digest or payload.get("key") != key:
+                cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                return None
+            data = payload.get("data")
+            if not isinstance(data, pd.DataFrame):
+                cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                return None
+            cls._FEATURE_DISK_CACHE_HITS += 1
+            return data.copy()
+        except Exception:
+            cls._FEATURE_DISK_CACHE_READ_FAILURES += 1
+            return None
+
+    @classmethod
+    def _disk_cache_put(cls, key: Tuple[Any, ...], value: pd.DataFrame) -> None:
+        paths = cls._disk_cache_paths(key)
+        if paths is None:
+            return
+        estimated_bytes = cls._estimated_payload_bytes(value)
+        cls._prune_disk_cache(reserve_bytes=estimated_bytes)
+        if not cls._has_disk_headroom(estimated_bytes):
+            cls._FEATURE_DISK_CACHE_SKIPPED_STORAGE += 1
+            logger.debug(
+                "Feature disk cache write skipped: free-space reserve would be breached "
+                f"(estimated={estimated_bytes / (1024 ** 2):.1f} MB, "
+                f"free={(cls._disk_free_bytes() or 0) / (1024 ** 3):.2f} GB)"
+            )
+            return
+        key_digest = cls._cache_key_digest(key)
+        data_path = paths["parquet"]
+        manifest_path = paths["manifest"]
+        pickle_path = paths["pickle"]
+        tmp_data_path = data_path.with_name(f"{data_path.stem}.{os.getpid()}.tmp.parquet")
+        tmp_manifest_path = manifest_path.with_name(f"{manifest_path.stem}.{os.getpid()}.tmp.json")
+        start = time.perf_counter()
+        try:
+            value.to_parquet(tmp_data_path, index=True)
+            tmp_size = int(tmp_data_path.stat().st_size)
+            cls._prune_disk_cache(reserve_bytes=tmp_size)
+            if not cls._has_disk_headroom(0):
+                cls._FEATURE_DISK_CACHE_SKIPPED_STORAGE += 1
+                try:
+                    tmp_data_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.debug("Feature disk cache temp cleanup failed for %s: %s", tmp_data_path, exc)
+                return
+            manifest = {
+                "format_version": "feature_cache_manifest_v2",
+                "storage_format": "parquet",
+                "feature_cache_version": cls.FEATURE_CACHE_VERSION,
+                "feature_code_fingerprint": cls._feature_code_fingerprint(),
+                "key_digest": key_digest,
+                "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "data_path": data_path.name,
+                "rows": int(len(value)),
+                "columns": [str(col) for col in value.columns],
+            }
+            tmp_manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+            os.replace(tmp_data_path, data_path)
+            os.replace(tmp_manifest_path, manifest_path)
+            try:
+                pickle_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("Feature disk cache legacy pickle cleanup failed for %s: %s", pickle_path, exc)
+            cls._FEATURE_DISK_CACHE_WRITE_SECONDS += max(0.0, time.perf_counter() - start)
+            cls._FEATURE_DISK_CACHE_WRITES += 1
+            try:
+                cls._FEATURE_DISK_CACHE_BYTES_WRITTEN += int(data_path.stat().st_size + manifest_path.stat().st_size)
+            except OSError:
+                pass
+            cls._prune_disk_cache()
+        except Exception:
+            cls._FEATURE_DISK_CACHE_WRITE_FAILURES += 1
+            try:
+                tmp_data_path.unlink(missing_ok=True)
+                tmp_manifest_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("Feature disk cache temp cleanup failed after write error: %s", exc)
+            cls._disk_cache_put_pickle_fallback(key, value)
+
+    @classmethod
+    def _disk_cache_put_pickle_fallback(cls, key: Tuple[Any, ...], value: pd.DataFrame) -> None:
+        paths = cls._disk_cache_paths(key)
+        if paths is None:
+            return
+        pickle_path = paths["pickle"]
+        tmp_path = pickle_path.with_name(f"{pickle_path.name}.{os.getpid()}.tmp")
+        payload = {
+            "format_version": "feature_cache_v1",
+            "feature_cache_version": cls.FEATURE_CACHE_VERSION,
+            "feature_code_fingerprint": cls._feature_code_fingerprint(),
+            "key": key,
+            "key_digest": cls._cache_key_digest(key),
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "data": value.copy(),
+        }
+        try:
+            pd.to_pickle(payload, tmp_path)
+            tmp_size = int(tmp_path.stat().st_size)
+            cls._prune_disk_cache(reserve_bytes=tmp_size)
+            if not cls._has_disk_headroom(0):
+                cls._FEATURE_DISK_CACHE_SKIPPED_STORAGE += 1
+                tmp_path.unlink(missing_ok=True)
+                return
+            os.replace(tmp_path, pickle_path)
+            cls._FEATURE_DISK_CACHE_WRITES += 1
+            cls._FEATURE_DISK_CACHE_BYTES_WRITTEN += int(pickle_path.stat().st_size)
+        except Exception:
+            cls._FEATURE_DISK_CACHE_WRITE_FAILURES += 1
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("Feature disk cache pickle temp cleanup failed for %s: %s", tmp_path, exc)
+
+    @classmethod
+    def _prune_disk_cache(cls, reserve_bytes: int = 0) -> None:
+        max_bytes = int(cls._FEATURE_DISK_CACHE_MAX_BYTES or 0)
+        cache_dir = cls._FEATURE_DISK_CACHE_DIR
+        if cache_dir is None:
+            return
+        try:
+            grouped: Dict[str, Dict[str, Any]] = {}
+            for path in cache_dir.glob("feature_*"):
+                if not path.is_file():
+                    continue
+                if ".tmp." in path.name:
+                    continue
+                if path.suffix not in {".json", ".parquet", ".pkl"}:
+                    continue
+                stat = path.stat()
+                stem = path.stem
+                entry = grouped.setdefault(stem, {"mtime": float(stat.st_mtime), "size": 0, "paths": []})
+                entry["mtime"] = min(float(entry["mtime"]), float(stat.st_mtime))
+                entry["size"] += int(stat.st_size)
+                entry["paths"].append(path)
+            entries = list(grouped.values())
+            total_bytes = sum(int(entry["size"]) for entry in entries)
+            free_bytes = cls._disk_free_bytes()
+            min_free_target = int(cls._FEATURE_DISK_CACHE_MIN_FREE_BYTES or 0) + max(0, int(reserve_bytes))
+            max_ok = max_bytes <= 0 or total_bytes <= max_bytes
+            free_ok = free_bytes is None or int(free_bytes) >= min_free_target
+            if max_ok and free_ok:
+                return
+            for entry in sorted(entries, key=lambda item: float(item["mtime"])):
+                free_bytes = cls._disk_free_bytes()
+                max_ok = max_bytes <= 0 or total_bytes <= max_bytes
+                free_ok = free_bytes is None or int(free_bytes) >= min_free_target
+                if max_ok and free_ok:
+                    break
+                for path in entry["paths"]:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.debug("Feature disk cache prune could not remove %s: %s", path, exc)
+                        continue
+                total_bytes -= int(entry["size"])
+        except OSError as exc:
+            logger.debug("Feature disk cache prune skipped after filesystem error: %s", exc)
+            return
     
     # Feature dependencies - maps feature names to their computation requirements
     _FEATURE_DEPS = {
@@ -3915,7 +4624,7 @@ class DataSplitter:
 
     The overlap window is warmup-only and is never scored.
     """
-    SPLIT_CONTRACT_VERSION = "2026-04-25-active-recent-m5"
+    SPLIT_CONTRACT_VERSION = "2026-06-09-bleeding-edge-production-split"
     
     def __init__(self, config: PipelineConfig):
         """
@@ -3943,6 +4652,10 @@ class DataSplitter:
                 "workflow_window": (0, 0),
                 "historical_stress_audit": (0, 0),
                 "active_universe": (0, 0),
+                "base_selection": (0, 0),
+                "walk_forward_validation": (0, 0),
+                "optimization_train": (0, 0),
+                "optimization_train_with_warmup": (0, 0),
                 "stage2_selection": (0, 0),
                 "stage2_selection_with_warmup": (0, 0),
                 "stage2_training_selection": (0, 0),
@@ -3973,17 +4686,46 @@ class DataSplitter:
         stage2_size = max(1, int(math.ceil(active_size * (stage2_pct / 100.0))))
         stage2_start = active_end - min(active_size, stage2_size)
         stage2_end = active_end
+        embargo_bars = max(0, int(getattr(self.config, "oos_embargo_bars", 0) or 0))
 
         warmup_bars = int(active_size * (float(getattr(self.config, "overlap_pct", 0.0)) / 100.0))
         stage2_warmup_start = max(active_start, stage2_start - max(0, warmup_bars))
+        split_mode = str(getattr(self.config, "production_split_mode", "bleeding_edge") or "bleeding_edge").lower()
+        if split_mode == "bleeding_edge":
+            walk_forward_bars = max(0, int(getattr(self.config, "walk_forward_validation_bars", 50000) or 0))
+            walk_forward_end = max(active_start, stage2_start - embargo_bars)
+            walk_forward_start = max(active_start, walk_forward_end - walk_forward_bars)
+            return {
+                "workflow_window": (workflow_start, workflow_end),
+                "historical_stress_audit": (audit_start, audit_end),
+                "active_universe": (active_start, active_end),
+                "base_selection": (active_start, active_end),
+                "walk_forward_validation": (walk_forward_start, walk_forward_end),
+                "optimization_train": (stage2_start, stage2_end),
+                "optimization_train_with_warmup": (stage2_warmup_start, stage2_end),
+                "stage2_selection": (stage2_start, stage2_end),
+                "stage2_selection_with_warmup": (stage2_warmup_start, stage2_end),
+                "stage2_training_selection": (stage2_start, stage2_end),
+                "stage2_training_selection_with_warmup": (stage2_warmup_start, stage2_end),
+                "clean_holdout": (stage2_end, stage2_end),
+                "clean_holdout_with_warmup": (stage2_end, stage2_end),
+            }
+
+        oos_mode = str(getattr(self.config, "oos_validation_mode", "fixed_holdout") or "fixed_holdout").lower()
         clean_holdout_pct = max(0.0, min(50.0, float(getattr(self.config, "clean_holdout_pct", 0.0) or 0.0)))
+        if oos_mode == "purged_kfold":
+            clean_holdout_pct = 0.0
         clean_holdout_size = 0
         if clean_holdout_pct > 0.0 and stage2_size > 1:
             clean_holdout_size = int(math.ceil(stage2_size * (clean_holdout_pct / 100.0)))
             clean_holdout_size = min(max(1, clean_holdout_size), max(0, stage2_size - 1))
 
         clean_holdout_start = stage2_end - clean_holdout_size
-        stage2_train_end = clean_holdout_start if clean_holdout_size > 0 else stage2_end
+        stage2_train_end = (
+            max(stage2_start, clean_holdout_start - embargo_bars)
+            if clean_holdout_size > 0 else stage2_end
+        )
+        optimization_train_end = stage2_train_end
         clean_holdout_warmup_start = (
             max(active_start, clean_holdout_start - max(0, warmup_bars))
             if clean_holdout_size > 0 else stage2_end
@@ -3993,6 +4735,10 @@ class DataSplitter:
             "workflow_window": (workflow_start, workflow_end),
             "historical_stress_audit": (audit_start, audit_end),
             "active_universe": (active_start, active_end),
+            "base_selection": (active_start, active_end),
+            "walk_forward_validation": (stage2_start, stage2_train_end),
+            "optimization_train": (active_start, optimization_train_end),
+            "optimization_train_with_warmup": (active_start, optimization_train_end),
             "stage2_selection": (stage2_start, stage2_end),
             "stage2_selection_with_warmup": (stage2_warmup_start, stage2_end),
             "stage2_training_selection": (stage2_start, stage2_train_end),
@@ -4077,8 +4823,9 @@ class Backtester:
         Default `fixed_spec` preserves the historical behavior. Evidence modes use
         MT5 bar Spread columns, which are stored in points and converted via the
         instrument spec's broker point. `conservative_max` keeps entry at bar-open
-        spread and uses max spread intrabar; `stress_max` charges max spread on
-        entry as well for stricter stress validation.
+        spread and uses max spread intrabar. Stress modes keep the same intrabar
+        max-spread protection while changing only the entry-fill assumption:
+        p90, p95, or max spread inside the entry bar.
         """
         n_bars = len(features)
         fixed_half = spec.get_half_spread_price() if bool(getattr(self.config, "use_spread", True)) else 0.0
@@ -4098,11 +4845,20 @@ class Backtester:
         if not bool(getattr(self.config, "use_spread", True)) or mode == "fixed_spec" or n_bars <= 0:
             return fixed_arr, fixed_arr, meta
 
-        if mode == "stress_max" and "SpreadMax" in features.columns:
-            entry_col = "SpreadMax"
-        else:
+        stress_entry_preferences = {
+            "stress_p90": ("SpreadP90", "SpreadMax"),
+            "stress_p95": ("SpreadP95", "SpreadMax", "SpreadP90"),
+            "stress_max": ("SpreadMax",),
+        }
+        requested_stress_cols = stress_entry_preferences.get(mode, ())
+        entry_col = ""
+        for candidate_col in requested_stress_cols:
+            if candidate_col in features.columns:
+                entry_col = candidate_col
+                break
+        if not entry_col:
             entry_col = "SpreadOpen" if "SpreadOpen" in features.columns else "Spread"
-        if mode in {"historical_max", "conservative_max", "stress_max"} and "SpreadMax" in features.columns:
+        if mode in {"historical_max", "conservative_max", "stress_p90", "stress_p95", "stress_max"} and "SpreadMax" in features.columns:
             bar_col = "SpreadMax"
         else:
             bar_col = "Spread"
@@ -4121,18 +4877,25 @@ class Backtester:
 
         entry_hist = np.where(np.isfinite(entry_hist), entry_hist, fixed_arr)
         bar_hist = np.where(np.isfinite(bar_hist), bar_hist, fixed_arr)
-        if mode in {"conservative_max", "stress_max"}:
+        if mode in {"conservative_max", "stress_p90", "stress_p95", "stress_max"}:
             entry_arr = np.maximum(fixed_arr, entry_hist)
             bar_arr = np.maximum(fixed_arr, bar_hist)
         else:
             entry_arr = entry_hist
             bar_arr = bar_hist
 
+        entry_model = {
+            "SpreadP90": "p90_spread_stress",
+            "SpreadP95": "p95_spread_stress",
+            "SpreadMax": "max_spread_stress",
+        }.get(entry_col, "bar_open_or_mean")
         meta.update({
             "source": "historical_spread_points",
+            "requested_entry_columns": list(requested_stress_cols),
             "entry_column": entry_col,
             "bar_column": bar_col,
-            "entry_model": "max_spread_stress" if mode == "stress_max" else "bar_open_or_mean",
+            "entry_model": entry_model,
+            "stress_entry_fallback": bool(requested_stress_cols and entry_col != requested_stress_cols[0]),
         })
         try:
             effective_spread_price = bar_arr * 2.0
@@ -4163,8 +4926,8 @@ class Backtester:
                     meta["spread_provenance_status"] = "non_fx_spread_outlier_review"
                 else:
                     meta["spread_provenance_status"] = "non_fx_spread_review"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Spread provenance metadata enrichment failed for %s: %s", spec.symbol, exc)
         return entry_arr.astype(np.float64), bar_arr.astype(np.float64), meta
      
     def run(self,
@@ -4254,89 +5017,145 @@ class Backtester:
         sl_prices = np.full(n_bars, np.nan, dtype=np.float64)
         tp_prices = np.full(n_bars, np.nan, dtype=np.float64)
         entry_prices = np.full(n_bars, np.nan, dtype=np.float64)
-        
-        for i in range(max(1, warmup_bars), n_bars):
-            signal = sig_arr[i - 1]  # Signal from previous bar
-            
-            if signal != 0:
-                direction = int(signal)
-                is_long = direction == 1
-                signal_bar_index = i - 1
-                
-                # Build the same execution intent live trading uses, evaluated at
-                # the SIGNAL bar (i-1). This keeps optimization, governance policy
-                # selection, and live execution on one exit surface.
-                try:
-                    if callable(getattr(strategy, "build_trade_intent", None)):
-                        regime_label = ""
-                        regime_col = (
-                            "REGIME_LIVE" if "REGIME_LIVE" in features.columns
-                            else "REGIME" if "REGIME" in features.columns
-                            else None
-                        )
-                        if regime_col is not None:
-                            try:
-                                regime_label = str(features[regime_col].iat[signal_bar_index])
-                            except Exception:
-                                regime_label = ""
-                        intent = strategy.build_trade_intent(
-                            features,
-                            symbol=symbol,
-                            timeframe=timeframe,
-                            regime=regime_label,
-                            signal=direction,
-                            spec=spec,
-                            bar_index=signal_bar_index,
-                            apply_regime_tp_multiplier=False,
-                        )
-                        sl_pips = float(intent.stop_loss_pips)
-                        tp_pips = float(intent.take_profit_pips)
-                    else:
-                        sl_pips, tp_pips = strategy.calculate_stops(
-                            features, direction, symbol, spec=spec, bar_index=signal_bar_index
-                        )
-                except TypeError:
-                    # Fallback for legacy strategies/test doubles without the
-                    # trade-intent or bar_index-aware stop signature.
+
+        strategy_cls_dict = getattr(getattr(strategy, "__class__", object), "__dict__", {})
+        strategy_params = getattr(strategy, "params", {}) or {}
+        default_atr_stop_fast_path = (
+            strategy_cls_dict.get("calculate_stops") is None
+            and strategy_cls_dict.get("build_trade_intent") is None
+            and not bool(strategy_params.get("use_structural_sl", False))
+            and "ATR_14" in features.columns
+            and spec.pip_size > 0
+        )
+
+        start_i = max(1, warmup_bars)
+        if default_atr_stop_fast_path and start_i < n_bars:
+            entry_idx_all = np.arange(start_i, n_bars, dtype=np.int64)
+            signal_idx_all = entry_idx_all - 1
+            directions_all = sig_arr[signal_idx_all]
+            active_mask = directions_all != 0
+            if np.any(active_mask):
+                entry_idx = entry_idx_all[active_mask]
+                signal_idx = signal_idx_all[active_mask]
+                directions = directions_all[active_mask]
+
+                sl_mult = float(strategy_params.get("sl_atr_mult", 2.0) or 2.0)
+                tp_mult = float(strategy_params.get("tp_atr_mult", 2.0) or 2.0)
+                atr_pips = atr_arr[signal_idx] / float(spec.pip_size)
+                raw_sl_pips = atr_pips * sl_mult
+                raw_tp_pips = atr_pips * tp_mult
+                sl_pips_arr = np.where(np.isnan(raw_sl_pips), 5.0, np.maximum(5.0, raw_sl_pips))
+                tp_pips_arr = np.where(np.isnan(raw_tp_pips), 5.0, np.maximum(5.0, raw_tp_pips))
+
+                bad_mask = (
+                    np.isnan(sl_pips_arr) | np.isnan(tp_pips_arr)
+                    | (sl_pips_arr <= 0) | (tp_pips_arr <= 0)
+                )
+                if np.any(bad_mask):
+                    bad_pos = int(np.flatnonzero(bad_mask)[0])
+                    raise ValueError(
+                        f"{strategy_name} produced invalid stops at bar {int(signal_idx[bad_pos])} on {symbol}: "
+                        f"sl={float(sl_pips_arr[bad_pos])}, tp={float(tp_pips_arr[bad_pos])}"
+                    )
+
+                entry_half_spreads = entry_half_spread_arr[entry_idx]
+                if self.config.use_spread:
+                    entry_px = np.where(
+                        directions == 1,
+                        open_arr[entry_idx] + entry_half_spreads,
+                        open_arr[entry_idx] - entry_half_spreads,
+                    )
+                else:
+                    entry_px = open_arr[entry_idx]
+
+                sl_delta = sl_pips_arr * float(spec.pip_size)
+                tp_delta = tp_pips_arr * float(spec.pip_size)
+                entry_prices[entry_idx] = entry_px
+                sl_prices[entry_idx] = np.where(directions == 1, entry_px - sl_delta, entry_px + sl_delta)
+                tp_prices[entry_idx] = np.where(directions == 1, entry_px + tp_delta, entry_px - tp_delta)
+        else:
+            for i in range(start_i, n_bars):
+                signal = sig_arr[i - 1]  # Signal from previous bar
+
+                if signal != 0:
+                    direction = int(signal)
+                    is_long = direction == 1
+                    signal_bar_index = i - 1
+
+                    # Build the same execution intent live trading uses, evaluated at
+                    # the SIGNAL bar (i-1). This keeps optimization, governance policy
+                    # selection, and live execution on one exit surface.
                     try:
-                        sl_pips, tp_pips = strategy.calculate_stops(
-                            features.iloc[:signal_bar_index + 1].copy(), direction, symbol
-                        )
+                        if callable(getattr(strategy, "build_trade_intent", None)):
+                            regime_label = ""
+                            regime_col = (
+                                "REGIME_LIVE" if "REGIME_LIVE" in features.columns
+                                else "REGIME" if "REGIME" in features.columns
+                                else None
+                            )
+                            if regime_col is not None:
+                                try:
+                                    regime_label = str(features[regime_col].iat[signal_bar_index])
+                                except Exception:
+                                    regime_label = ""
+                            intent = strategy.build_trade_intent(
+                                features,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                regime=regime_label,
+                                signal=direction,
+                                spec=spec,
+                                bar_index=signal_bar_index,
+                                apply_regime_tp_multiplier=False,
+                            )
+                            sl_pips = float(intent.stop_loss_pips)
+                            tp_pips = float(intent.take_profit_pips)
+                        else:
+                            sl_pips, tp_pips = strategy.calculate_stops(
+                                features, direction, symbol, spec=spec, bar_index=signal_bar_index
+                            )
+                    except TypeError:
+                        # Fallback for legacy strategies/test doubles without the
+                        # trade-intent or bar_index-aware stop signature.
+                        try:
+                            sl_pips, tp_pips = strategy.calculate_stops(
+                                features.iloc[:signal_bar_index + 1].copy(), direction, symbol
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"{strategy_name} stop calculation failed at bar {signal_bar_index} on {symbol}"
+                            ) from exc
                     except Exception as exc:
                         raise RuntimeError(
                             f"{strategy_name} stop calculation failed at bar {signal_bar_index} on {symbol}"
                         ) from exc
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"{strategy_name} stop calculation failed at bar {signal_bar_index} on {symbol}"
-                    ) from exc
-                
-                if np.isnan(sl_pips) or np.isnan(tp_pips) or sl_pips <= 0 or tp_pips <= 0:
-                    raise ValueError(
-                        f"{strategy_name} produced invalid stops at bar {signal_bar_index} on {symbol}: "
-                        f"sl={sl_pips}, tp={tp_pips}"
-                    )
-                
-                # Entry price: Open of ENTRY bar (i) + spread
-                open_price = open_arr[i]
-                entry_half_spread = entry_half_spread_arr[i] if i < len(entry_half_spread_arr) else 0.0
-                if self.config.use_spread:
-                    entry_price = open_price + entry_half_spread if is_long else open_price - entry_half_spread
-                else:
-                    entry_price = open_price
-                
-                # Set SL/TP prices
-                if direction == 1:
-                    stop_loss = entry_price - spec.pips_to_price(sl_pips)
-                    take_profit = entry_price + spec.pips_to_price(tp_pips)
-                else:
-                    stop_loss = entry_price + spec.pips_to_price(sl_pips)
-                    take_profit = entry_price - spec.pips_to_price(tp_pips)
-                
-                # Store pre-computed prices (NOT sizes - those use live equity)
-                entry_prices[i] = entry_price
-                sl_prices[i] = stop_loss
-                tp_prices[i] = take_profit
+
+                    if np.isnan(sl_pips) or np.isnan(tp_pips) or sl_pips <= 0 or tp_pips <= 0:
+                        raise ValueError(
+                            f"{strategy_name} produced invalid stops at bar {signal_bar_index} on {symbol}: "
+                            f"sl={sl_pips}, tp={tp_pips}"
+                        )
+
+                    # Entry price: Open of ENTRY bar (i) + spread
+                    open_price = open_arr[i]
+                    entry_half_spread = entry_half_spread_arr[i] if i < len(entry_half_spread_arr) else 0.0
+                    if self.config.use_spread:
+                        entry_price = open_price + entry_half_spread if is_long else open_price - entry_half_spread
+                    else:
+                        entry_price = open_price
+
+                    # Set SL/TP prices
+                    if direction == 1:
+                        stop_loss = entry_price - spec.pips_to_price(sl_pips)
+                        take_profit = entry_price + spec.pips_to_price(tp_pips)
+                    else:
+                        stop_loss = entry_price + spec.pips_to_price(sl_pips)
+                        take_profit = entry_price - spec.pips_to_price(tp_pips)
+
+                    # Store pre-computed prices (NOT sizes - those use live equity)
+                    entry_prices[i] = entry_price
+                    sl_prices[i] = stop_loss
+                    tp_prices[i] = take_profit
         
         # ----------------------------------------------------------------
         # RUN BACKTEST LOOP (Numba JIT or Pure Python)
@@ -4417,7 +5236,15 @@ class Backtester:
             timeframe=timeframe,
         )
 
-        metrics = self._calculate_metrics(trades, final_equity, equity_curve, max_drawdown, features, timeframe)
+        metrics = self._calculate_metrics(
+            trades,
+            final_equity,
+            equity_curve,
+            max_drawdown,
+            features,
+            timeframe,
+            warmup_bars=warmup_bars,
+        )
         metrics["spread_model"] = spread_meta
         return metrics
 
@@ -4472,8 +5299,8 @@ class Backtester:
                     units += 3 if int(cursor.weekday()) == rollover_day else 1
                     cursor += pd.Timedelta(days=1)
                 return max(0, units)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Swap calendar holding-day estimate failed; falling back to bar estimate: %s", exc)
 
         try:
             entry_bar = int(trade.get("entry_bar", 0) or 0)
@@ -4873,11 +5700,9 @@ class Backtester:
                         
                         if loss_per_lot > 0:
                             raw_size = risk_amount_at_entry / loss_per_lot
+                            position_size = spec.round_volume(raw_size)
                         else:
-                            continue
-                        
-                        # Round volume
-                        position_size = spec.round_volume(raw_size)
+                            position_size = 0.0
                         
                         if position_size > 0:
                             entry_price = entry_price_candidate
@@ -5115,6 +5940,9 @@ class Backtester:
         if len(equity_curve) > 2:
             # Convert equity curve to returns
             equity_arr = np.array(equity_curve)
+            if warmup_bars > 0 and len(equity_arr) > 2:
+                risk_start = max(0, min(int(warmup_bars) - 1, len(equity_arr) - 2))
+                equity_arr = equity_arr[risk_start:]
             # Per-bar returns (percentage)
             bar_returns = np.diff(equity_arr) / np.where(equity_arr[:-1] != 0, equity_arr[:-1], 1.0)
             
@@ -5128,8 +5956,8 @@ class Backtester:
                     if time_diff > 0:
                         bars_per_day = 86400 / time_diff
                         bars_per_year = bars_per_day * 252
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Could not infer bars_per_year from feature index; using fallback: %s", exc)
 
             if bars_per_year <= 0:
                 bars_per_year = 252 * 24  # H1 default
@@ -5181,10 +6009,42 @@ class Backtester:
         if r_multiples:
             mean_r = float(np.mean(r_multiples))
             median_r = float(np.median(r_multiples))
+            r_count = int(len(r_multiples))
             pct_positive_r = len([r for r in r_multiples if r > 0]) / len(r_multiples) * 100
             worst_5pct_r = float(np.percentile(r_multiples, 5)) if len(r_multiples) >= 20 else min(r_multiples)
+            r_arr = np.asarray(r_multiples, dtype=np.float64)
+            std_r = float(np.std(r_arr, ddof=1)) if r_count >= 2 else 0.0
+            se_r = float(std_r / math.sqrt(r_count)) if r_count >= 2 and std_r > 1e-12 else 0.0
+            edge_t_stat_r = float(mean_r / se_r) if se_r > 1e-12 else 0.0
+            downside_r = r_arr[r_arr < 0.0]
+            if len(downside_r) >= 2:
+                r_downside_deviation = float(np.std(downside_r, ddof=1))
+            elif len(downside_r) == 1:
+                r_downside_deviation = float(abs(downside_r[0]))
+            else:
+                r_downside_deviation = 0.0
+            block_count = min(16, max(1, len(r_arr)))
+            block_sums = np.asarray(
+                [float(np.sum(block)) for block in np.array_split(r_arr, block_count) if len(block)],
+                dtype=np.float64,
+            )
+            negative_blocks = block_sums[block_sums < 0.0]
+            if len(negative_blocks) >= 2:
+                r_block_downside_deviation = float(np.std(negative_blocks, ddof=1))
+            elif len(negative_blocks) == 1:
+                r_block_downside_deviation = float(abs(negative_blocks[0]))
+            else:
+                r_block_downside_deviation = 0.0
+            if len(block_sums) > 0:
+                tail_n = max(1, int(math.ceil(len(block_sums) * 0.20)))
+                r_block_cvar = float(abs(np.mean(np.sort(block_sums)[:tail_n])))
+            else:
+                r_block_cvar = 0.0
         else:
             mean_r = median_r = pct_positive_r = worst_5pct_r = 0.0
+            r_count = 0
+            std_r = se_r = edge_t_stat_r = 0.0
+            r_downside_deviation = r_block_downside_deviation = r_block_cvar = 0.0
         
         # Calmar ratio
         total_return_pct = (final_equity - self.config.initial_capital) / self.config.initial_capital * 100
@@ -5248,10 +6108,17 @@ class Backtester:
             'std_weekly_return': round(std_weekly_return, 6),
             
             # R-Multiple metrics (risk-normalized)
+            'r_count': r_count,
             'mean_r': round(mean_r, 3),
             'median_r': round(median_r, 3),
+            'std_r': round(std_r, 6),
+            'se_r': round(se_r, 6),
+            'edge_t_stat_r': round(edge_t_stat_r, 6),
             'pct_positive_r': round(pct_positive_r, 2),
             'worst_5pct_r': round(worst_5pct_r, 3),
+            'r_downside_deviation': round(r_downside_deviation, 6),
+            'r_block_downside_deviation': round(r_block_downside_deviation, 6),
+            'r_block_cvar': round(r_block_cvar, 6),
             
             # Streak metrics
             'max_consecutive_wins': max_consec_wins,
@@ -5384,10 +6251,17 @@ class Backtester:
             'sortino_ratio': 0,
             'calmar_ratio': 0,
             'std_weekly_return': 0.0,
+            'r_count': 0,
             'mean_r': 0,
             'median_r': 0,
+            'std_r': 0,
+            'se_r': 0,
+            'edge_t_stat_r': 0,
             'pct_positive_r': 0,
             'worst_5pct_r': 0,
+            'r_downside_deviation': 0,
+            'r_block_downside_deviation': 0,
+            'r_block_cvar': 0,
             'max_consecutive_wins': 0,
             'max_consecutive_losses': 0,
             'avg_trade_duration': 0,

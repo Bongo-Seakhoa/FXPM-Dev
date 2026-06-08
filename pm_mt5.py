@@ -72,6 +72,9 @@ class MT5Config:
     login: int = 0
     password: str = ""
     server: str = ""
+    expected_login: int = 0
+    expected_server: str = ""
+    expected_currency: str = ""
     path: str = ""
     timeout: int = 60000
     portable: bool = False
@@ -244,6 +247,7 @@ class MT5OrderResult:
     volume: float = 0.0
     price: float = 0.0
     error_message: str = ""
+    ambiguous: bool = False
 
 
 # Return code descriptions
@@ -858,7 +862,7 @@ class MT5Connector:
         
         if result is None:
             error = mt5.last_error()
-            return MT5OrderResult(False, error[0], str(error[1]))
+            return MT5OrderResult(False, error[0], str(error[1]), ambiguous=True)
         
         retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
         
@@ -1028,7 +1032,7 @@ class MT5Connector:
         result = mt5.order_send(request)
         if result is None:
             error = mt5.last_error()
-            return MT5OrderResult(False, error[0], str(error[1]))
+            return MT5OrderResult(False, error[0], str(error[1]), ambiguous=True)
 
         retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
         result_price = float(getattr(result, "price", 0.0) or 0.0)

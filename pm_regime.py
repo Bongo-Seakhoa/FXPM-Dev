@@ -20,6 +20,7 @@ Version: 3.1 (Portfolio Manager - Numba optimizations)
 import json
 import logging
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 
 import numpy as np
@@ -389,11 +390,176 @@ def _resolve_adx_trend_threshold(symbol: str) -> float:
 # Global cache for loaded regime params
 _REGIME_PARAMS_CACHE: Dict[str, Dict[str, RegimeParams]] = {}
 _REGIME_PARAMS_LOADED: bool = False
+_REGIME_PARAMS_LOADED_PATH: Optional[str] = None
 # Track fallback use so the startup summary can surface tuning gaps once.
 _REGIME_FALLBACK_LOGGED: Set[Tuple[str, str]] = set()
 _REGIME_FALLBACK_RECORD: Dict[Tuple[str, str], str] = {}
 # Pairs whose JSON explicitly pinned adx_trend_threshold.
 _REGIME_ADX_THRESHOLD_EXPLICIT: Set[Tuple[str, str]] = set()
+
+
+def _ensure_regime_params_loaded(filepath: str = "regime_params.json") -> None:
+    """Load tuned regime params once for the requested path without recording fallbacks."""
+    global _REGIME_PARAMS_CACHE, _REGIME_PARAMS_LOADED, _REGIME_PARAMS_LOADED_PATH
+
+    cache_path = str(filepath or "")
+    if _REGIME_PARAMS_LOADED and _REGIME_PARAMS_LOADED_PATH == cache_path:
+        return
+
+    _REGIME_PARAMS_CACHE = {}
+    _REGIME_ADX_THRESHOLD_EXPLICIT.clear()
+    try:
+        with open(cache_path, 'r') as f:
+            raw_data = json.load(f)
+
+        for sym, tf_dict in raw_data.items():
+            _REGIME_PARAMS_CACHE[sym] = {}
+            if not isinstance(tf_dict, dict):
+                continue
+            for tf, params_dict in tf_dict.items():
+                _REGIME_PARAMS_CACHE[sym][tf] = RegimeParams.from_dict(params_dict)
+                # Preserve JSON-pinned ADX anchors for this pair.
+                if isinstance(params_dict, dict) and 'adx_trend_threshold' in params_dict:
+                    _REGIME_ADX_THRESHOLD_EXPLICIT.add((sym, tf))
+
+        logger.info(f"Loaded regime params for {len(_REGIME_PARAMS_CACHE)} symbols from {cache_path}")
+    except FileNotFoundError:
+        logger.debug(f"No regime_params.json found at {cache_path}, using defaults")
+    except Exception as e:
+        logger.warning(f"Failed to load regime params from {cache_path}: {e}")
+
+    _REGIME_PARAMS_LOADED = True
+    _REGIME_PARAMS_LOADED_PATH = cache_path
+
+
+def _find_tuned_regime_params(symbol: str, timeframe: str) -> Optional[Tuple[Tuple[str, str], RegimeParams]]:
+    """Return the tuned JSON entry for symbol/timeframe without falling back."""
+    symbol_key = str(symbol or "").strip()
+    timeframe_key = str(timeframe or "").strip()
+    if not symbol_key or not timeframe_key:
+        return None
+
+    if symbol_key in _REGIME_PARAMS_CACHE and timeframe_key in _REGIME_PARAMS_CACHE[symbol_key]:
+        return (symbol_key, timeframe_key), _REGIME_PARAMS_CACHE[symbol_key][timeframe_key]
+
+    symbol_upper = symbol_key.upper()
+    timeframe_upper = timeframe_key.upper()
+    for cached_symbol, tf_map in _REGIME_PARAMS_CACHE.items():
+        if str(cached_symbol or "").upper() != symbol_upper or not isinstance(tf_map, dict):
+            continue
+        for cached_tf, params in tf_map.items():
+            if str(cached_tf or "").upper() == timeframe_upper:
+                return (cached_symbol, cached_tf), params
+    return None
+
+
+def has_tuned_regime_params(symbol: str, timeframe: str,
+                            filepath: str = "regime_params.json") -> bool:
+    """
+    True only when regime params contain an explicit tuned entry.
+
+    This intentionally does not call ``load_regime_params`` because live
+    readiness must distinguish trained params from research/default fallbacks.
+    """
+    _ensure_regime_params_loaded(filepath)
+    return _find_tuned_regime_params(symbol, timeframe) is not None
+
+
+def validated_regime_params_for_timeframe(symbol: str, timeframe: str) -> RegimeParams:
+    """
+    Return the explicit detector row matching the optimizer's no-file surface.
+
+    When optimization validated winners without a tuned ``regime_params.json``
+    file, the operative detector was the timeframe regime surface plus the
+    asset-class ADX anchor. Materializing that row into JSON makes live carry
+    over the same surface without relying on implicit fallback behavior.
+    """
+    tf_key = str(timeframe or "").strip().upper()
+    base = DEFAULT_PARAMS_BY_TIMEFRAME.get(tf_key, RegimeParams())
+    return _with_asset_class_adx_threshold(base, str(symbol or "").strip().upper())
+
+
+def materialize_regime_params_for_cells(
+    cells: List[Tuple[str, str]],
+    filepath: str = "regime_params.json",
+) -> int:
+    """
+    Ensure ``filepath`` has explicit regime params for each symbol/timeframe.
+
+    Existing tuned rows are preserved. Missing rows are filled with the exact
+    no-file detector surface used during optimization/backtesting.
+    """
+    path_raw = str(filepath or "").strip()
+    if not path_raw:
+        return 0
+    path = Path(path_raw)
+    payload: Dict[str, Dict[str, Any]] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = {
+                    str(sym): dict(tf_map)
+                    for sym, tf_map in loaded.items()
+                    if isinstance(tf_map, dict)
+                }
+        except Exception as exc:
+            logger.warning("Failed to read existing regime params from %s: %s", path, exc)
+
+    added = 0
+    for symbol, timeframe in sorted({(str(s).strip().upper(), str(tf).strip().upper()) for s, tf in cells}):
+        if not symbol or not timeframe:
+            continue
+        symbol_payload = payload.setdefault(symbol, {})
+        if timeframe in symbol_payload:
+            continue
+        symbol_payload[timeframe] = validated_regime_params_for_timeframe(symbol, timeframe).to_dict()
+        added += 1
+
+    if added <= 0:
+        return 0
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
+    clear_regime_params_cache()
+    logger.info("Materialized %d explicit validated regime-param rows into %s", added, path)
+    return added
+
+
+def _object_get(payload: Any, key: str, default: Any = None) -> Any:
+    if isinstance(payload, dict):
+        return payload.get(key, default)
+    return getattr(payload, key, default)
+
+
+def _regime_payload_tradeable(payload: Any) -> bool:
+    name = str(_object_get(payload, "strategy_name", "") or "").upper()
+    if not name or name == "NO_TRADE":
+        return False
+    artifact_meta = _object_get(payload, "artifact_meta", {}) or {}
+    if isinstance(artifact_meta, dict) and artifact_meta.get("no_trade"):
+        return False
+    status = str(_object_get(payload, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+    return status not in {"NO_TRADE", "BLOCKED", "PAPER_ONLY"}
+
+
+def materialize_regime_params_from_symbol_config(
+    symbol_config: Any,
+    filepath: str = "regime_params.json",
+) -> int:
+    """Materialize explicit detector rows for a saved symbol winner config."""
+    symbol = str(_object_get(symbol_config, "symbol", "") or "").strip().upper()
+    regimes = _object_get(symbol_config, "regime_configs", {}) or {}
+    cells: Set[Tuple[str, str]] = set()
+    if symbol and isinstance(regimes, dict):
+        for timeframe, regime_map in regimes.items():
+            if not isinstance(regime_map, dict):
+                continue
+            if any(_regime_payload_tradeable(cfg) for cfg in regime_map.values()):
+                cells.add((symbol, str(timeframe or "").strip().upper()))
+    return materialize_regime_params_for_cells(list(cells), filepath=filepath)
 
 
 def load_regime_params(symbol: str, timeframe: str, 
@@ -414,38 +580,16 @@ def load_regime_params(symbol: str, timeframe: str,
     Returns:
         RegimeParams for the symbol/timeframe
     """
-    global _REGIME_PARAMS_CACHE, _REGIME_PARAMS_LOADED
-
-    # Load cache if not loaded
-    if not _REGIME_PARAMS_LOADED:
-        try:
-            with open(filepath, 'r') as f:
-                raw_data = json.load(f)
-
-            for sym, tf_dict in raw_data.items():
-                _REGIME_PARAMS_CACHE[sym] = {}
-                for tf, params_dict in tf_dict.items():
-                    _REGIME_PARAMS_CACHE[sym][tf] = RegimeParams.from_dict(params_dict)
-                    # Preserve JSON-pinned ADX anchors for this pair.
-                    if isinstance(params_dict, dict) and 'adx_trend_threshold' in params_dict:
-                        _REGIME_ADX_THRESHOLD_EXPLICIT.add((sym, tf))
-
-            logger.info(f"Loaded regime params for {len(_REGIME_PARAMS_CACHE)} symbols from {filepath}")
-        except FileNotFoundError:
-            logger.debug(f"No regime_params.json found at {filepath}, using defaults")
-        except Exception as e:
-            logger.warning(f"Failed to load regime params from {filepath}: {e}")
-
-        _REGIME_PARAMS_LOADED = True
+    _ensure_regime_params_loaded(filepath)
 
     # Try symbol + timeframe specific
-    if symbol in _REGIME_PARAMS_CACHE:
-        if timeframe in _REGIME_PARAMS_CACHE[symbol]:
-            cached = _REGIME_PARAMS_CACHE[symbol][timeframe]
-            # Respect explicit JSON thresholds; otherwise apply the asset-class default.
-            if (symbol, timeframe) in _REGIME_ADX_THRESHOLD_EXPLICIT:
-                return cached
-            return _with_asset_class_adx_threshold(cached, symbol)
+    tuned = _find_tuned_regime_params(symbol, timeframe)
+    if tuned is not None:
+        tuned_key, cached = tuned
+        # Respect explicit JSON thresholds; otherwise apply the asset-class default.
+        if tuned_key in _REGIME_ADX_THRESHOLD_EXPLICIT:
+            return cached
+        return _with_asset_class_adx_threshold(cached, symbol)
 
     # Record fallback sources for the startup summary.
     fallback_key = (symbol, timeframe)
@@ -510,9 +654,10 @@ def save_regime_params(params_dict: Dict[str, Dict[str, RegimeParams]],
 
 def clear_regime_params_cache():
     """Clear the cached regime parameters (useful for reloading)."""
-    global _REGIME_PARAMS_CACHE, _REGIME_PARAMS_LOADED
+    global _REGIME_PARAMS_CACHE, _REGIME_PARAMS_LOADED, _REGIME_PARAMS_LOADED_PATH
     _REGIME_PARAMS_CACHE = {}
     _REGIME_PARAMS_LOADED = False
+    _REGIME_PARAMS_LOADED_PATH = None
     _REGIME_ADX_THRESHOLD_EXPLICIT.clear()
     clear_regime_fallback_log()
 
@@ -1395,6 +1540,10 @@ __all__ = [
     'RegimeParams',
     'MarketRegimeDetector',
     'load_regime_params',
+    'has_tuned_regime_params',
+    'validated_regime_params_for_timeframe',
+    'materialize_regime_params_for_cells',
+    'materialize_regime_params_from_symbol_config',
     'save_regime_params',
     'clear_regime_params_cache',
     'compute_regime_for_features',

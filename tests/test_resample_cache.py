@@ -10,7 +10,7 @@ from pm_core import DataLoader
 
 
 class ResampleCacheTests(unittest.TestCase):
-    def _write_csv(self, path, start_time, rows):
+    def _write_csv(self, path, start_time, rows, include_spread=False):
         times = [start_time + timedelta(minutes=5 * i) for i in range(rows)]
         df = pd.DataFrame({
             "time": times,
@@ -20,6 +20,8 @@ class ResampleCacheTests(unittest.TestCase):
             "close": [1.0 + i * 0.001 for i in range(rows)],
             "volume": [100] * rows,
         })
+        if include_spread:
+            df["spread"] = [10 + (i % 5) for i in range(rows)]
         df.to_csv(path, index=False)
 
     def test_resample_cache_invalidates_on_source_change(self):
@@ -120,6 +122,41 @@ class ResampleCacheTests(unittest.TestCase):
                 second_stats = loader2.get_resample_cache_stats()
                 self.assertEqual(second_stats["disk_hits"], 1)
                 self.assertGreater(second_stats["bytes_read"], 0)
+            finally:
+                DataLoader.MIN_BARS["H1"] = original_h1_min
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_resample_cache_invalidates_old_schema_without_spread_p95(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_resample_cache_schema")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            csv_path = os.path.join(tmp, "EURUSD_M5.csv")
+            start = datetime(2024, 1, 1, 0, 0, 0)
+            self._write_csv(csv_path, start, 180, include_spread=True)
+
+            original_h1_min = DataLoader.MIN_BARS.get("H1", 5000)
+            DataLoader.MIN_BARS["H1"] = 1
+            try:
+                loader = DataLoader(tmp)
+                first = loader.get_data("EURUSD", "H1")
+                self.assertIsNotNone(first)
+                self.assertIn("SpreadP95", first.columns)
+
+                cache_file = tmp / ".cache" / "EURUSD_H1.pkl"
+                payload = pd.read_pickle(cache_file)
+                payload["meta"].pop("schema_version", None)
+                payload["data"] = payload["data"].drop(columns=["SpreadP95"], errors="ignore")
+                pd.to_pickle(payload, cache_file)
+
+                loader2 = DataLoader(tmp)
+                second = loader2.get_data("EURUSD", "H1")
+                stats = loader2.get_resample_cache_stats()
+                self.assertIsNotNone(second)
+                self.assertIn("SpreadP95", second.columns)
+                self.assertEqual(stats["invalidations"], 1)
+                self.assertEqual(stats["disk_hits"], 0)
             finally:
                 DataLoader.MIN_BARS["H1"] = original_h1_min
         finally:

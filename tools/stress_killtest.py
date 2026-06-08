@@ -50,7 +50,7 @@ def killtest(ledger, symbols, collapse_frac=0.5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ledger", default=str(REPO / "pm_configs_high_risk.json"))
+    ap.add_argument("--ledger", default=str(REPO / "pm_configs.json"))
     ap.add_argument("--symbols", nargs="*")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--fx-only", action="store_true")

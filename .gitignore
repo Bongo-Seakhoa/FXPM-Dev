@@ -16,5 +16,11 @@ last_trade_log.json
 pm_outputs/historical_data/
 pm_outputs/trades_*.json
 
+# Local/private operator configuration. Keep tracked config.json credential-free.
+.env
+.env.*
+config.local.json
+config.*.local.json
+
 # Disposable analysis scratch (prospect screens, PBO runs, ad-hoc benchmarks)
 pm_outputs/experiments/

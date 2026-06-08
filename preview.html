@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FXPM Evidence Geometry Scoring Framework</title>
+<style>
+  :root{
+    --bg:#090d13;
+    --panel:#121823;
+    --panel2:#182132;
+    --panel3:#0f1420;
+    --ink:#e9f0f8;
+    --mut:#a4b1c1;
+    --dim:#6f7d8d;
+    --line:#2a3545;
+    --blue:#7aa2ff;
+    --blue2:#355dca;
+    --cyan:#5ed8ff;
+    --green:#5ce0a4;
+    --green2:#1d9a67;
+    --yellow:#ffd166;
+    --orange:#ff9d5c;
+    --red:#ff6f7a;
+    --purple:#c89bff;
+    --pink:#ff8ed2;
+    --shadow:0 22px 60px rgba(0,0,0,.25);
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    background:
+      radial-gradient(circle at 18% 0%, rgba(122,162,255,.18), transparent 36%),
+      radial-gradient(circle at 88% 8%, rgba(94,216,255,.10), transparent 30%),
+      radial-gradient(circle at 45% 100%, rgba(92,224,164,.10), transparent 34%),
+      var(--bg);
+    color:var(--ink);
+    font:15px/1.6 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow-x:hidden;
+  }
+  .wrap{max-width:1220px;margin:0 auto;padding:36px 22px 84px}
+  .hero{
+    padding:34px 30px 28px;
+    border:1px solid rgba(122,162,255,.26);
+    border-radius:22px;
+    background:linear-gradient(145deg, rgba(18,24,35,.94), rgba(15,20,32,.80));
+    box-shadow:var(--shadow);
+    position:relative;
+    overflow:hidden;
+  }
+  .hero:before{
+    content:"";position:absolute;inset:-80px -80px auto auto;width:290px;height:290px;
+    background:radial-gradient(circle, rgba(122,162,255,.18), transparent 65%);
+    pointer-events:none;
+  }
+  h1{font-size:38px;line-height:1.08;letter-spacing:-.035em;margin:0 0 12px;max-width:980px}
+  h2{font-size:25px;line-height:1.2;letter-spacing:-.02em;margin:48px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  h3{font-size:17px;margin:0 0 10px;line-height:1.3}
+  p{margin:0 0 14px;color:var(--mut)}
+  b,strong{color:var(--ink)}
+  a{color:var(--blue)}
+  code{background:#080c12;border:1px solid var(--line);padding:2px 6px;border-radius:6px;color:#dbe7f5;font-size:12.5px;white-space:normal;overflow-wrap:anywhere}
+  pre{background:#080c12;border:1px solid var(--line);border-radius:12px;padding:15px 16px;color:#dbe7f5;overflow-x:auto;font-size:12.5px;line-height:1.5;margin:12px 0 0}
+  .sub{font-size:17px;max-width:980px;color:#b8c5d8}
+  .meta{font-size:12.5px;color:var(--dim)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;min-width:0}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;min-width:0}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;min-width:0}
+  @media(max-width:930px){.grid2,.grid3,.grid4{grid-template-columns:1fr}.hero{padding:26px 20px}h1{font-size:30px}}
+  .card,.fig,.note,.metric-card{
+    background:linear-gradient(180deg, rgba(18,24,35,.96), rgba(14,20,31,.96));
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:18px 20px;
+    min-width:0;
+    overflow-wrap:anywhere;
+  }
+  .fig{background:linear-gradient(180deg, rgba(24,33,50,.96), rgba(15,20,32,.96));padding:20px;text-align:center}
+  .cap{text-align:left;color:var(--mut);font-size:13px;margin-top:12px}
+  .small{font-size:12.5px;color:var(--dim)}
+  .note{border-left:4px solid var(--yellow);background:linear-gradient(180deg, rgba(255,209,102,.09), rgba(18,24,35,.95));}
+  .note.good{border-left-color:var(--green);background:linear-gradient(180deg, rgba(92,224,164,.08), rgba(18,24,35,.95));}
+  .note.bad{border-left-color:var(--red);background:linear-gradient(180deg, rgba(255,111,122,.08), rgba(18,24,35,.95));}
+  .tag{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;border-radius:999px;padding:5px 10px;margin:0 0 10px;color:var(--blue);background:rgba(122,162,255,.12);border:1px solid rgba(122,162,255,.35)}
+  .tag.green{color:var(--green);background:rgba(92,224,164,.10);border-color:rgba(92,224,164,.35)}
+  .tag.yellow{color:var(--yellow);background:rgba(255,209,102,.10);border-color:rgba(255,209,102,.32)}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--blue)}
+  ul{margin:8px 0 0;padding-left:20px;color:var(--mut)}
+  li{margin:6px 0}
+  .pill{display:inline-block;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:800;white-space:nowrap}
+  .pill.good{background:rgba(92,224,164,.13);color:var(--green)}
+  .pill.warn{background:rgba(255,209,102,.13);color:var(--yellow)}
+  .pill.bad{background:rgba(255,111,122,.13);color:var(--red)}
+  .kpi{background:rgba(24,33,50,.72);border:1px solid var(--line);border-radius:14px;padding:15px 16px}
+  .kpi .n{font-size:28px;font-weight:850;letter-spacing:-.03em;color:var(--ink)}
+  .kpi .l{font-size:12px;color:var(--mut);margin-top:2px}
+  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13.5px;display:block;overflow-x:auto}
+  th,td{border-bottom:1px solid var(--line);padding:10px 11px;text-align:left;vertical-align:top;min-width:120px}
+  th{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em}
+  .eq{font:13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;background:#080c12;border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:12px 0;color:#dce8f6;overflow-x:auto;text-align:left}
+  .legend{display:flex;gap:18px;justify-content:center;align-items:center;flex-wrap:wrap;font-size:12.5px;color:var(--mut);margin-top:6px}
+  .scroll-x{overflow-x:auto;max-width:100%;padding-bottom:6px}
+  .scroll-x svg{min-width:900px}
+  .toc{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+  .toc a{text-decoration:none;color:#cfe0f7;background:rgba(122,162,255,.10);border:1px solid rgba(122,162,255,.22);border-radius:999px;padding:7px 10px;font-size:12px}
+  .formula-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:18px;align-items:stretch}
+  @media(max-width:930px){.formula-grid{grid-template-columns:1fr}.scroll-x svg{min-width:760px}}
+  .axis-list{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:10px}
+  @media(max-width:720px){.axis-list{grid-template-columns:1fr}}
+  .metric-card{padding:14px 15px;background:rgba(24,33,50,.62)}
+  .metric-card b{display:block;margin-bottom:4px}
+  .warningline{color:var(--yellow);font-weight:700}
+  .goodline{color:var(--green);font-weight:700}
+  .badline{color:var(--red);font-weight:700}
+  .footer{margin-top:54px;padding-top:20px;border-top:1px solid var(--line);color:var(--dim);font-size:12.5px}
+  .svgtext{font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;}
+  button,input{font:inherit}
+  .control{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;margin-top:10px;color:var(--mut);font-size:13px}
+  input[type="range"]{accent-color:var(--blue);width:260px;max-width:100%}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="hero">
+    <span class="tag"><span class="dot"></span>FXPM scoring concept artifact</span>
+    <h1>Path-Dependent Evidence Geometry for Strategy Scoring</h1>
+    <p class="sub">A content-rich explanation of the scoring concept: the spider graph is not a final radar chart. It is a 3D evidence object where the central axis is <strong>n trades / time</strong>, and every quality metric is a curve over that evidence axis.</p>
+    <p class="meta">Illustrative dummy data · self-contained HTML · created for conceptual alignment between human intent, AI coding agents, and future implementation work.</p>
+    <div class="toc">
+      <a href="#core">Core idea</a><a href="#object">3D object</a><a href="#curves">Metric curves</a><a href="#goodbad">Good vs bad</a><a href="#scoring">Scoring model</a><a href="#implementation">Implementation language</a><a href="#prompt">Prompt block</a>
+    </div>
+  </section>
+
+  <section id="core">
+    <h2>1 · The correction: this is not just a radar chart with a final score</h2>
+    <div class="grid2">
+      <div class="card">
+        <span class="tag yellow">Wrong / watered-down version</span>
+        <h3>“Take a final spider chart and reward the biggest balanced polygon.”</h3>
+        <p>This is useful, but it is incomplete. A final radar face can hide how the candidate got there. A specialist can look good at the end because of a late profit spike, a lucky cluster, or one narrow slice of evidence doing all the work.</p>
+        <ul>
+          <li>It over-focuses on the <b>final face</b>.</li>
+          <li>It can miss <b>path deformities</b>.</li>
+          <li>It treats evidence as a scoreboard instead of a structural dimension.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="tag green">Correct conceptual version</span>
+        <h3>“Build a 3D quality object as evidence accumulates.”</h3>
+        <p>The middle of the spider has a downward evidence spine. That spine is <b>trade count n</b>, <b>time t</b>, or a normalized evidence-progress index. Every side metric is a function over that spine.</p>
+        <ul>
+          <li><code>profit_factor(n)</code></li>
+          <li><code>tail_CVaR(n)</code></li>
+          <li><code>capital_preservation(n)</code> <span class="small">(reverse path-dependent drawdown; higher is better)</span></li>
+          <li><code>generalization_survival(n)</code> <span class="small">(reverse train&#8594;OOS gap; higher is better)</span></li>
+          <li><code>temporal_consistency(n)</code></li>
+          <li><code>parameter_stability(n)</code></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="note good" style="margin-top:18px">
+      <h3>The main purpose is not speed</h3>
+      <p>Efficiency is a byproduct. The main goal is <strong>better winner selection</strong>: selecting candidates whose profitability, capital preservation, robustness, and live-market reliability are supported throughout the evidence path, not merely by a good final scalar score.</p>
+    </div>
+
+    <div class="note warn" style="margin-top:18px">
+      <h3>Specialist-first hierarchy</h3>
+      <p>The primary optimisation unit is the specialist cell: <strong>symbol × timeframe × regime</strong>. The scorer should ask which candidate is the best live-capable specialist inside that cell. Portfolio balance, symbol balance, regime balance, correlation, alpha/beta, and crowding are account-level diagnostics or future research layers; they should not suppress a specialist merely for being specialized. The portfolio layer is a survival governor first: margin safety, account drawdown, exposure limits, broker close-out prevention, and emergency kill conditions.</p>
+    </div>
+  </section>
+
+  <section id="object">
+    <h2>2 · The 3D object: central evidence spine + metric surfaces</h2>
+    <div class="fig">
+      <svg viewBox="0 0 980 460" width="100%" height="460" role="img" aria-label="3D evidence geometry concept">
+        <defs>
+          <linearGradient id="faceGood" x1="0" x2="1">
+            <stop offset="0" stop-color="#5ce0a4" stop-opacity=".20"/>
+            <stop offset="1" stop-color="#7aa2ff" stop-opacity=".18"/>
+          </linearGradient>
+          <linearGradient id="faceBad" x1="0" x2="1">
+            <stop offset="0" stop-color="#ff6f7a" stop-opacity=".18"/>
+            <stop offset="1" stop-color="#ff9d5c" stop-opacity=".15"/>
+          </linearGradient>
+          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="2.5" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+
+        <!-- coordinate guide -->
+        <rect x="18" y="18" width="944" height="424" rx="18" fill="#101725" stroke="#2a3545"/>
+        <text x="54" y="52" class="svgtext" fill="#e9f0f8" font-size="18" font-weight="800">Conceptual 3D evidence object</text>
+        <text x="54" y="76" class="svgtext" fill="#a4b1c1" font-size="12">Each polygon is a cross-section of all metrics at one evidence point. The vertical spine is n trades / time.</text>
+
+        <!-- central spine -->
+        <line x1="490" y1="90" x2="490" y2="378" stroke="#7aa2ff" stroke-width="3" stroke-dasharray="6 7" filter="url(#glow)"/>
+        <circle cx="490" cy="96" r="7" fill="#7aa2ff"/>
+        <circle cx="490" cy="378" r="7" fill="#7aa2ff"/>
+        <text x="506" y="100" class="svgtext" fill="#cfe0f7" font-size="12">start / low evidence</text>
+        <text x="506" y="382" class="svgtext" fill="#cfe0f7" font-size="12">higher n trades / later time</text>
+        <text x="506" y="236" class="svgtext" fill="#7aa2ff" font-size="12" font-weight="800">central evidence axis</text>
+
+        <!-- cross-section polygons as isometric octagons -->
+        <g fill="url(#faceGood)" stroke="#5ce0a4" stroke-width="2">
+          <polygon points="490,112 520,123 532,147 520,171 490,182 460,171 448,147 460,123" opacity=".42"/>
+          <polygon points="490,165 548,184 572,225 548,266 490,285 432,266 408,225 432,184" opacity=".46"/>
+          <polygon points="490,228 586,258 625,318 586,378 490,408 394,378 355,318 394,258" opacity=".55"/>
+        </g>
+        <g stroke="#5ce0a4" stroke-width="1.2" opacity=".7">
+          <line x1="520" y1="123" x2="548" y2="184"/><line x1="532" y1="147" x2="572" y2="225"/><line x1="520" y1="171" x2="548" y2="266"/>
+          <line x1="460" y1="171" x2="432" y2="266"/><line x1="448" y1="147" x2="408" y2="225"/><line x1="460" y1="123" x2="432" y2="184"/>
+          <line x1="548" y1="184" x2="586" y2="258"/><line x1="572" y1="225" x2="625" y2="318"/><line x1="548" y1="266" x2="586" y2="378"/>
+          <line x1="432" y1="266" x2="394" y2="378"/><line x1="408" y1="225" x2="355" y2="318"/><line x1="432" y1="184" x2="394" y2="258"/>
+        </g>
+
+        <!-- radial labels -->
+        <g class="svgtext" fill="#a4b1c1" font-size="11">
+          <text x="490" y="73" text-anchor="middle">profit factor</text>
+          <text x="650" y="232">expectancy</text>
+          <text x="640" y="337">capital preservation</text>
+          <text x="490" y="432" text-anchor="middle">tail-CVaR control</text>
+          <text x="246" y="337">temporal consistency</text>
+          <text x="260" y="232">parameter stability</text>
+          <text x="331" y="154">generalization</text>
+          <text x="586" y="154">execution reliability</text>
+        </g>
+
+        <!-- explanatory panels -->
+        <g>
+          <rect x="56" y="104" width="218" height="118" rx="12" fill="#0f1420" stroke="#2a3545"/>
+          <text x="74" y="130" class="svgtext" fill="#e9f0f8" font-size="13" font-weight="800">At each evidence point</text>
+          <text x="74" y="154" class="svgtext" fill="#a4b1c1" font-size="11">you get a radar cross-section:</text>
+          <text x="74" y="176" class="svgtext" fill="#dbe7f5" font-size="11">metric_vector[n] = {PF, CVaR, capital preservation…}</text>
+          <text x="74" y="198" class="svgtext" fill="#a4b1c1" font-size="11">The final face is only one slice.</text>
+        </g>
+        <g>
+          <rect x="708" y="104" width="218" height="118" rx="12" fill="#0f1420" stroke="#2a3545"/>
+          <text x="726" y="130" class="svgtext" fill="#e9f0f8" font-size="13" font-weight="800">The full object</text>
+          <text x="726" y="154" class="svgtext" fill="#a4b1c1" font-size="11">is all cross-sections together:</text>
+          <text x="726" y="176" class="svgtext" fill="#dbe7f5" font-size="11">candidate × evidence_step × metric</text>
+          <text x="726" y="198" class="svgtext" fill="#a4b1c1" font-size="11">Shape integrity is the scoring signal.</text>
+        </g>
+      </svg>
+      <div class="cap">This figure is intentionally conceptual. The system does not need to build a literal 3D mesh. The machine representation can be a tensor: <code>quality_tensor[candidate, evidence_step, metric]</code>. The visual language helps humans and agents understand what the tensor means.</div>
+    </div>
+  </section>
+
+  <section id="curves">
+    <h2>3 · Every side metric is a 2D curve over evidence</h2>
+    <p>Each radial metric can be plotted against the central evidence axis. The spider object is formed by wrapping these metric-over-evidence curves around the same spine.</p>
+    <div class="fig">
+      <svg viewBox="0 0 1080 520" width="100%" height="520" role="img" aria-label="metric curves over evidence">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L7,3 z" fill="#6f7d8d"/></marker>
+        </defs>
+        <rect x="20" y="20" width="1040" height="480" rx="18" fill="#101725" stroke="#2a3545"/>
+        <text x="56" y="56" class="svgtext" fill="#e9f0f8" font-size="18" font-weight="800">Metric-over-evidence curves</text>
+        <text x="56" y="79" class="svgtext" fill="#a4b1c1" font-size="12">Dummy data: a healthy candidate should show stable quality formation, not just a good final endpoint.</text>
+
+        <!-- chart panels, 2 rows x 3 cols -->
+        <g class="chart" transform="translate(60,110)">
+          <text x="0" y="-16" class="svgtext" fill="#e9f0f8" font-size="12" font-weight="800">profit_factor(n)</text>
+          <rect x="0" y="0" width="280" height="125" rx="10" fill="#0b1018" stroke="#2a3545"/>
+          <line x1="24" y1="98" x2="258" y2="98" stroke="#2a3545"/><line x1="24" y1="18" x2="24" y2="98" stroke="#2a3545"/>
+          <path d="M24,86 C60,80 82,68 112,62 S170,55 204,48 S238,42 258,40" fill="none" stroke="#5ce0a4" stroke-width="3"/>
+          <path d="M24,88 C80,95 126,90 154,70 S198,38 258,34" fill="none" stroke="#ff6f7a" stroke-width="2.5" stroke-dasharray="6 4"/>
+          <text x="24" y="116" class="svgtext" fill="#6f7d8d" font-size="10">early</text><text x="232" y="116" class="svgtext" fill="#6f7d8d" font-size="10">late</text>
+        </g>
+
+        <g class="chart" transform="translate(400,110)">
+          <text x="0" y="-16" class="svgtext" fill="#e9f0f8" font-size="12" font-weight="800">tail_CVaR_control(n)</text>
+          <rect x="0" y="0" width="280" height="125" rx="10" fill="#0b1018" stroke="#2a3545"/>
+          <line x1="24" y1="98" x2="258" y2="98" stroke="#2a3545"/><line x1="24" y1="18" x2="24" y2="98" stroke="#2a3545"/>
+          <path d="M24,72 C54,68 84,66 114,62 S176,58 210,56 S244,54 258,52" fill="none" stroke="#5ed8ff" stroke-width="3"/>
+          <path d="M24,78 C60,100 90,106 124,100 S174,92 204,76 S236,48 258,44" fill="none" stroke="#ff6f7a" stroke-width="2.5" stroke-dasharray="6 4"/>
+          <text x="112" y="109" class="svgtext" fill="#ff6f7a" font-size="10">persistent dent</text>
+        </g>
+
+        <g class="chart" transform="translate(740,110)">
+          <text x="0" y="-16" class="svgtext" fill="#e9f0f8" font-size="12" font-weight="800">capital_preservation(n)</text>
+          <rect x="0" y="0" width="280" height="125" rx="10" fill="#0b1018" stroke="#2a3545"/>
+          <line x1="24" y1="98" x2="258" y2="98" stroke="#2a3545"/><line x1="24" y1="18" x2="24" y2="98" stroke="#2a3545"/>
+          <path d="M24,62 C60,58 92,63 124,60 S188,57 220,55 S246,54 258,53" fill="none" stroke="#c89bff" stroke-width="3"/>
+          <path d="M24,60 C70,55 116,58 148,92 S208,90 258,70" fill="none" stroke="#ff9d5c" stroke-width="2.5" stroke-dasharray="6 4"/>
+          <text x="146" y="107" class="svgtext" fill="#ff9d5c" font-size="10">deep concentrated dent</text>
+        </g>
+
+        <g class="chart" transform="translate(60,330)">
+          <text x="0" y="-16" class="svgtext" fill="#e9f0f8" font-size="12" font-weight="800">generalization_survival(n)</text>
+          <rect x="0" y="0" width="280" height="125" rx="10" fill="#0b1018" stroke="#2a3545"/>
+          <line x1="24" y1="98" x2="258" y2="98" stroke="#2a3545"/><line x1="24" y1="18" x2="24" y2="98" stroke="#2a3545"/>
+          <text x="14" y="22" class="svgtext" fill="#6f7d8d" font-size="10">good</text><text x="12" y="100" class="svgtext" fill="#6f7d8d" font-size="10">bad</text>
+          <path d="M24,40 C70,38 112,37 150,36 S226,35 258,34" fill="none" stroke="#5ce0a4" stroke-width="3"/>
+          <path d="M24,42 C78,48 124,60 168,74 S230,86 258,92" fill="none" stroke="#ff6f7a" stroke-width="2.5" stroke-dasharray="6 4"/>
+          <text x="150" y="86" class="svgtext" fill="#ff6f7a" font-size="10">OOS collapse</text>
+        </g>
+
+        <g class="chart" transform="translate(400,330)">
+          <text x="0" y="-16" class="svgtext" fill="#e9f0f8" font-size="12" font-weight="800">temporal_consistency(n)</text>
+          <rect x="0" y="0" width="280" height="125" rx="10" fill="#0b1018" stroke="#2a3545"/>
+          <line x1="24" y1="98" x2="258" y2="98" stroke="#2a3545"/><line x1="24" y1="18" x2="24" y2="98" stroke="#2a3545"/>
+          <path d="M24,74 C66,68 112,64 154,63 S220,61 258,60" fill="none" stroke="#5ce0a4" stroke-width="3"/>
+          <path d="M24,70 C68,70 112,74 154,80 S226,90 258,96" fill="none" stroke="#ff6f7a" stroke-width="2.5" stroke-dasharray="6 4"/>
+        </g>
+
+        <g class="chart" transform="translate(740,330)">
+          <text x="0" y="-16" class="svgtext" fill="#e9f0f8" font-size="12" font-weight="800">evidence sufficiency</text>
+          <rect x="0" y="0" width="280" height="125" rx="10" fill="#0b1018" stroke="#2a3545"/>
+          <line x1="24" y1="98" x2="258" y2="98" stroke="#2a3545"/><line x1="24" y1="18" x2="24" y2="98" stroke="#2a3545"/>
+          <path d="M24,94 C52,78 84,58 122,44 S196,34 258,32" fill="none" stroke="#ffd166" stroke-width="3"/>
+          <line x1="174" y1="16" x2="174" y2="104" stroke="#ffd166" stroke-dasharray="4 4" opacity=".8"/>
+          <text x="184" y="28" class="svgtext" fill="#ffd166" font-size="10">saturates</text>
+          <text x="52" y="116" class="svgtext" fill="#6f7d8d" font-size="10">more evidence helps</text><text x="174" y="116" class="svgtext" fill="#6f7d8d" font-size="10">not a reward forever</text>
+        </g>
+      </svg>
+      <div class="legend"><span><span class="dot" style="background:#5ce0a4"></span>healthy path</span><span><span class="dot" style="background:#ff6f7a"></span>deformed path</span><span><span class="dot" style="background:#ffd166"></span>evidence saturation</span></div>
+      <div class="cap">The central point: the path is scored. A candidate that only becomes good at the end is not equivalent to one that builds reliable quality throughout the evidence path.</div>
+    </div>
+  </section>
+
+  <section id="goodbad">
+    <h2>4 · Same final face, different path: why the 3D view matters</h2>
+    <div class="grid2">
+      <div class="fig">
+        <h3>Candidate A: evidence-coherent winner</h3>
+        <svg viewBox="0 0 420 330" width="100%" height="330" role="img" aria-label="healthy candidate radar slices">
+          <g transform="translate(210,166)">
+            <g stroke="#2a3545" fill="none"><polygon points="0,-110 78,-78 110,0 78,78 0,110 -78,78 -110,0 -78,-78"/><polygon points="0,-72 51,-51 72,0 51,51 0,72 -51,51 -72,0 -51,-51"/></g>
+            <g stroke="#37475d"><line x1="0" y1="0" x2="0" y2="-110"/><line x1="0" y1="0" x2="78" y2="-78"/><line x1="0" y1="0" x2="110" y2="0"/><line x1="0" y1="0" x2="78" y2="78"/><line x1="0" y1="0" x2="0" y2="110"/><line x1="0" y1="0" x2="-78" y2="78"/><line x1="0" y1="0" x2="-110" y2="0"/><line x1="0" y1="0" x2="-78" y2="-78"/></g>
+            <polygon points="0,-46 34,-35 48,0 35,35 0,48 -34,35 -47,0 -34,-35" fill="rgba(92,224,164,.10)" stroke="#5ce0a4" stroke-width="1.5" opacity=".55"/>
+            <polygon points="0,-72 51,-52 73,0 53,53 0,74 -52,52 -72,0 -51,-52" fill="rgba(92,224,164,.13)" stroke="#5ce0a4" stroke-width="1.8" opacity=".72"/>
+            <polygon points="0,-97 70,-70 98,0 71,71 0,99 -70,70 -98,0 -70,-70" fill="rgba(92,224,164,.20)" stroke="#5ce0a4" stroke-width="2.2"/>
+          </g>
+          <text x="210" y="304" class="svgtext" fill="#a4b1c1" font-size="12" text-anchor="middle">cross-sections expand smoothly and evenly</text>
+        </svg>
+        <div class="cap">A strong candidate can have noise, but the shape expands with balance: profit, risk, stability, generalization, and distribution improve together.</div>
+      </div>
+      <div class="fig">
+        <h3>Candidate B: late-rescued / misshapen</h3>
+        <svg viewBox="0 0 420 330" width="100%" height="330" role="img" aria-label="bad candidate radar slices">
+          <g transform="translate(210,166)">
+            <g stroke="#2a3545" fill="none"><polygon points="0,-110 78,-78 110,0 78,78 0,110 -78,78 -110,0 -78,-78"/><polygon points="0,-72 51,-51 72,0 51,51 0,72 -51,51 -72,0 -51,-51"/></g>
+            <g stroke="#37475d"><line x1="0" y1="0" x2="0" y2="-110"/><line x1="0" y1="0" x2="78" y2="-78"/><line x1="0" y1="0" x2="110" y2="0"/><line x1="0" y1="0" x2="78" y2="78"/><line x1="0" y1="0" x2="0" y2="110"/><line x1="0" y1="0" x2="-78" y2="78"/><line x1="0" y1="0" x2="-110" y2="0"/><line x1="0" y1="0" x2="-78" y2="-78"/></g>
+            <polygon points="0,-38 26,-26 34,0 20,20 0,36 -23,23 -30,0 -26,-26" fill="rgba(255,111,122,.09)" stroke="#ff6f7a" stroke-width="1.5" opacity=".58"/>
+            <polygon points="0,-45 85,-68 92,0 24,24 0,24 -46,46 -74,0 -39,-39" fill="rgba(255,111,122,.12)" stroke="#ff6f7a" stroke-width="1.8" opacity=".78"/>
+            <polygon points="0,-98 78,-78 96,0 38,38 0,44 -72,72 -100,0 -70,-70" fill="rgba(255,111,122,.18)" stroke="#ff6f7a" stroke-width="2.2"/>
+          </g>
+          <text x="210" y="304" class="svgtext" fill="#a4b1c1" font-size="12" text-anchor="middle">final face may look large, but the path is distorted</text>
+        </svg>
+        <div class="cap">This candidate may end with good return/PF, but one or more sides remain dented. The system should not crown it unless it proves the deformity is temporary, recovered, and not structurally meaningful.</div>
+      </div>
+    </div>
+
+    <div class="note bad" style="margin-top:18px">
+      <h3>Important: do not require a perfect shape</h3>
+      <p>Trading paths are noisy. Temporary dents are allowed. The framework should penalize <strong>persistent, concentrated, unrecovered, or structurally meaningful deformities</strong> — not every wiggle.</p>
+    </div>
+  </section>
+
+  <section id="interactive">
+    <h2>5 · Interactive dummy cross-section: move along the evidence axis</h2>
+    <div class="fig">
+      <svg id="radarSvg" viewBox="0 0 760 420" width="100%" height="420" role="img" aria-label="interactive radar chart by evidence step">
+        <rect x="18" y="18" width="724" height="384" rx="18" fill="#101725" stroke="#2a3545"/>
+        <text x="46" y="54" class="svgtext" fill="#e9f0f8" font-size="18" font-weight="800">Radar cross-section at evidence step <tspan id="stepLabel">1</tspan>/6</text>
+        <text x="46" y="78" class="svgtext" fill="#a4b1c1" font-size="12">The final face matters, but the sequence of faces is the actual object.</text>
+        <g id="radarGroup" transform="translate(245,224)"></g>
+        <g transform="translate(470,126)">
+          <text x="0" y="0" class="svgtext" fill="#e9f0f8" font-size="13" font-weight="800">Current interpretation</text>
+          <rect x="0" y="16" width="220" height="170" rx="12" fill="#0b1018" stroke="#2a3545"/>
+          <text id="interp" x="16" y="44" class="svgtext" fill="#a4b1c1" font-size="12">Early evidence: shape is still forming.</text>
+        </g>
+      </svg>
+      <div class="control">
+        <label for="stepRange">Evidence step</label>
+        <input id="stepRange" type="range" min="1" max="6" value="1" />
+        <span class="small">dummy data · green = healthy · red = deformed candidate</span>
+      </div>
+      <div class="cap">This simple widget shows the difference between judging a final polygon and judging how the polygon develops. A live implementation does not need a UI; it just needs the tensor and the derived path features.</div>
+    </div>
+  </section>
+
+  <section id="scoring">
+    <h2>6 · Scoring model: what should be measured</h2>
+    <div class="formula-grid">
+      <div class="card">
+        <span class="tag green">Core tensor</span>
+        <h3>Machine representation</h3>
+        <div class="eq">quality_tensor[candidate, evidence_step, metric]</div>
+        <p>Each metric is normalized so “higher is better.” For example, raw path-dependent drawdown is reversed into <strong>capital_preservation(n)</strong>, and raw CVaR is transformed into a tail-risk-control score.</p>
+        <div class="note good">
+          <h3>Orientation note: preserve the shape by reversing drawdown</h3>
+          <p>Drawdown itself is lower-is-better, which fights the geometry. The scoring axis should therefore use <strong>capital preservation</strong>: a higher-is-better curve over evidence that rises when equity avoids deep/time-persistent drawdown and dents when capital is trapped underwater. This keeps every radial metric aligned in the same positive direction.</p>
+        </div>
+        <div class="axis-list">
+          <div class="metric-card"><b>Final face quality</b><span class="small">How strong the last cross-section is after sufficient evidence.</span></div>
+          <div class="metric-card"><b>Average path quality</b><span class="small">How strong the candidate was throughout the evidence path.</span></div>
+          <div class="metric-card"><b>Shape balance</b><span class="small">Whether one metric is carrying the whole result.</span></div>
+          <div class="metric-card"><b>Dent severity</b><span class="small">Worst axis deformation relative to the candidate’s own path and the pool.</span></div>
+          <div class="metric-card"><b>Dent duration</b><span class="small">How long a metric stays damaged.</span></div>
+          <div class="metric-card"><b>Dent recovery</b><span class="small">Whether a dent heals or remains structurally unresolved.</span></div>
+          <div class="metric-card"><b>Late-rescue dependence</b><span class="small">Whether final performance is rescued by one late cluster.</span></div>
+          <div class="metric-card"><b>Train→OOS divergence</b><span class="small">Whether the path survives outside the fitting window.</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <span class="tag yellow">Important distinction</span>
+        <h3>Trade count is evidence resolution, not the prize</h3>
+        <p>More trades are useful because they give more detail about the shape. But once evidence sufficiency is reached, trade count should not keep boosting the candidate.</p>
+        <div class="eq">if trades &lt; hard_min: reject<br>coverage = min(1, sqrt(trades / target_trades))</div>
+        <p>The coverage term prevents under-observed candidates from winning. It does <strong>not</strong> turn high turnover into a dominant profitability reward.</p>
+      </div>
+    </div>
+
+    <h3 style="margin-top:22px">Suggested decomposition</h3>
+    <table>
+      <tr><th>Component</th><th>What it asks</th><th>Example calculation</th><th>Why it matters</th></tr>
+      <tr><td><b>Final face</b></td><td>How good is the final metric cross-section?</td><td><code>geomean(metrics_at_final_step)</code></td><td>Prevents weak final candidates from passing only because they were stable earlier.</td></tr>
+      <tr><td><b>Path area</b></td><td>Was quality present throughout the path?</td><td><code>mean_over_steps(geomean(metrics_step))</code></td><td>Rejects late-rescued candidates.</td></tr>
+      <tr><td><b>Balance</b></td><td>Is the shape evenly supported?</td><td><code>geomean / arithmetic_mean</code></td><td>Prevents one metric from carrying the shape.</td></tr>
+      <tr><td><b>Dent severity</b></td><td>How bad was the worst deformation?</td><td><code>min_axis_score or max_capital_preservation_dent</code></td><td>Finds structurally damaged sides.</td></tr>
+      <tr><td><b>Dent duration</b></td><td>How long did the deformation persist?</td><td><code>count(score &lt; threshold) / steps</code></td><td>Separates temporary noise from structural weakness.</td></tr>
+      <tr><td><b>Dent recovery</b></td><td>Did damaged axes recover?</td><td><code>final_axis_score - worst_axis_score</code></td><td>Allows temporary dents if the strategy heals.</td></tr>
+      <tr><td><b>Concentration</b></td><td>Did one evidence period or trade cluster carry the specialist result?</td><td><code>top_segment_profit_share</code></td><td>Flags fragile, non-repeatable candidates without turning portfolio balance into a per-cell axis.</td></tr>
+      <tr><td><b>OOS path survival</b></td><td>Does the shape survive outside train?</td><td><code>distance(train_path, oos_path)</code></td><td>Reduces overfitting risk.</td></tr>
+    </table>
+
+    <div class="note" style="margin-top:18px">
+      <h3>Use volume, but do not worship volume</h3>
+      <p>Volume is useful only when combined with integrity checks. A large misshapen object is not automatically better. The best candidate is the one with strong final quality, strong path quality, controlled dents, low concentration, and good OOS survival.</p>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <h2>7 · Candidate selection flow</h2>
+    <div class="fig">
+      <div class="scroll-x">
+        <svg viewBox="0 0 1180 180" width="100%" height="180" role="img" aria-label="candidate selection pipeline">
+          <defs><marker id="arrow2" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0,0 L0,8 L8,4 z" fill="#6f7d8d"/></marker></defs>
+          <rect x="10" y="20" width="1160" height="132" rx="18" fill="#101725" stroke="#2a3545"/>
+          <g class="svgtext" text-anchor="middle">
+            <rect x="42" y="60" width="150" height="58" rx="12" fill="#0b1018" stroke="#ffd166"/>
+            <text x="117" y="84" fill="#e9f0f8" font-size="13" font-weight="800">Evidence gate</text>
+            <text x="117" y="102" fill="#a4b1c1" font-size="10">minimum trades/time</text>
+            <line x1="202" y1="89" x2="244" y2="89" stroke="#6f7d8d" stroke-width="2" marker-end="url(#arrow2)"/>
+
+            <rect x="254" y="60" width="158" height="58" rx="12" fill="#0b1018" stroke="#5ce0a4"/>
+            <text x="333" y="84" fill="#e9f0f8" font-size="13" font-weight="800">Build tensor</text>
+            <text x="333" y="102" fill="#a4b1c1" font-size="10">candidate × step × metric</text>
+            <line x1="422" y1="89" x2="464" y2="89" stroke="#6f7d8d" stroke-width="2" marker-end="url(#arrow2)"/>
+
+            <rect x="474" y="60" width="160" height="58" rx="12" fill="#0b1018" stroke="#7aa2ff"/>
+            <text x="554" y="84" fill="#e9f0f8" font-size="13" font-weight="800">Shape features</text>
+            <text x="554" y="102" fill="#a4b1c1" font-size="10">face · path · dents</text>
+            <line x1="644" y1="89" x2="686" y2="89" stroke="#6f7d8d" stroke-width="2" marker-end="url(#arrow2)"/>
+
+            <rect x="696" y="60" width="160" height="58" rx="12" fill="#0b1018" stroke="#c89bff"/>
+            <text x="776" y="84" fill="#e9f0f8" font-size="13" font-weight="800">Pareto compare</text>
+            <text x="776" y="102" fill="#a4b1c1" font-size="10">incumbent/challenger</text>
+            <line x1="866" y1="89" x2="908" y2="89" stroke="#6f7d8d" stroke-width="2" marker-end="url(#arrow2)"/>
+
+            <rect x="918" y="60" width="160" height="58" rx="12" fill="#0b1018" stroke="#ff9d5c"/>
+            <text x="998" y="84" fill="#e9f0f8" font-size="13" font-weight="800">Stress finalists</text>
+            <text x="998" y="102" fill="#a4b1c1" font-size="10">path/execution/cost</text>
+            <line x1="1088" y1="89" x2="1122" y2="89" stroke="#6f7d8d" stroke-width="2" marker-end="url(#arrow2)"/>
+
+            <circle cx="1140" cy="89" r="19" fill="rgba(92,224,164,.13)" stroke="#5ce0a4"/>
+            <text x="1140" y="94" fill="#5ce0a4" font-size="16" font-weight="900">✓</text>
+          </g>
+        </svg>
+      </div>
+      <div class="cap">The process is not “speed first.” The process is “quality first, with conservative pruning only when a candidate’s evidence object is already structurally incapable of matching the incumbent or entering the Pareto set.”</div>
+    </div>
+  </section>
+
+  <section id="implementation">
+    <h2>8 · Implementation language for the dev/AI system</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Minimal data structure</h3>
+        <pre>CandidateQualityTensor:
+  candidate_id: str
+  scorer_fingerprint: str
+  evidence_axis:
+    type: "trade_bucket" | "calendar_bucket" | "fold" | "oos_slice"
+    steps: [0.10, 0.20, ..., 1.00]
+  metrics:
+    - edge_survival
+    - profit_structure_quality
+    - capital_preservation
+    - tail_risk_control
+    - temporal_consistency
+    - generalization_survival
+    - cost_execution_survival
+    - parameter_stability
+  values: float[step][metric]</pre>
+      </div>
+      <div class="card">
+        <h3>Derived features</h3>
+        <pre>final_face_quality
+path_average_quality
+cross_axis_balance_mean
+cross_axis_balance_worst
+worst_dent_depth
+worst_dent_duration
+dent_recovery
+late_rescue_dependence
+profit_concentration
+trade_cluster_concentration
+evidence_slice_concentration
+train_oos_path_distance
+evidence_confidence
+stress_survival_flag</pre>
+      </div>
+    </div>
+
+    <div class="note good" style="margin-top:18px">
+      <h3>Recommended implementation stance</h3>
+      <p>Start with the simplest clean representation: <code>candidate × evidence_step × metric</code>. Do not over-engineer a literal 3D mesh. The geometry is the conceptual model; the tensor and derived path features are the implementation.</p>
+    </div>
+
+    <div class="note warn" style="margin-top:18px">
+      <h3>Transparent spokes, not opaque clusters</h3>
+      <p>The eight primary spokes are independent specialist-survival questions. Each spoke should have a clear headline curve and explicit sensor provenance. Supporting sensors may inform a spoke, but they must not become a hidden black-box average. If a raw metric gives the clearest path signal, use that raw metric; if several raw metrics are highly redundant, combine or choose among them only after evidence shows the combined spoke predicts forward survival better.</p>
+    </div>
+  </section>
+
+  <section id="language">
+    <h2>9 · Human translation: what this framework is really saying</h2>
+    <div class="grid3">
+      <div class="card"><span class="tag green">Good winner</span><h3>Evidence-coherent</h3><p>The candidate becomes profitable in a way that remains supported as trades/time accumulate. Risk metrics, distribution, and OOS behavior do not break while profit improves.</p></div>
+      <div class="card"><span class="tag yellow">Suspicious winner</span><h3>Late-rescued</h3><p>The final score looks good, but most of the evidence path was weak. One late cluster or one narrow evidence slice rescued the specialist.</p></div>
+      <div class="card"><span class="tag" style="color:var(--red);border-color:rgba(255,111,122,.35);background:rgba(255,111,122,.10)">Bad winner</span><h3>Structurally deformed</h3><p>The candidate has persistent dents: capital-preservation damage, CVaR damage, train/OOS collapse, cluster dependence, or unrecovered instability.</p></div>
+    </div>
+  </section>
+
+  <section id="prompt">
+    <h2>10 · Clean prompt block to give to the coding agent</h2>
+    <div class="card">
+      <pre>I want the scoring system to use a path-dependent 3D evidence geometry model.
+
+Do not treat the spider chart as only a final radar chart. The center of the spider has a downward evidence axis. This axis represents n trades, chronological time, OOS slice progression, or normalized evidence progress.
+
+Each radial metric is a function over this evidence axis:
+
+edge_survival(n)
+profit_structure_quality(n)
+capital_preservation(n)
+tail_risk_control(n)
+temporal_consistency(n)
+generalization_survival(n)
+cost_execution_survival(n)
+parameter_stability(n)
+
+At each evidence point, the candidate has a radar cross-section. The full scoring object is the evolution of these cross-sections through the evidence axis.
+
+The machine representation can be:
+
+quality_tensor[candidate, evidence_step, metric]
+
+Do not reduce the concept to geomean alone. Geomean may describe one face, but the full model must evaluate the trajectory of the shape.
+
+The scoring should measure:
+
+1. final face quality,
+2. average path quality,
+3. shape balance,
+4. worst dent depth,
+5. dent duration,
+6. dent recovery,
+7. capital-preservation damage and tail-risk concentration,
+8. late-rescue dependence,
+9. evidence-slice / trade-cluster concentration,
+10. train-to-OOS path divergence.
+
+Trade count is not the prize. Trade count is evidence resolution. Use it as a sufficiency gate and saturating confidence term, not as a dominant profitability reward.
+
+The main goal is not speed. Efficiency is only a byproduct of identifying structurally inferior candidates earlier. The main goal is better live-market winner selection.
+
+A candidate should be promoted only if its quality is supported across the evidence path, not merely because its final scalar score is high.
+
+Temporary dents are acceptable. Persistent, concentrated, unrecovered, or structurally meaningful deformities should penalize or reject the candidate.
+
+Implement this in the simplest clean way inside the existing FXPM-Dev scoring architecture. Preserve cache/fingerprint safety. Make every pruning or promotion decision explainable.</pre>
+    </div>
+
+    <div class="note warn" style="margin-top:18px">
+      <h3>Do not portfolio-balance the specialist</h3>
+      <p>Do not penalize a candidate inside a symbol/timeframe/regime cell because it is specialized. Portfolio diagnostics such as symbol balance, regime balance, exposure concentration, correlation, and crowding may be measured later, but they are not primary candidate-scoring axes unless a future experiment proves they improve live outcomes without reducing edge.</p>
+    </div>
+  </section>
+
+  <section id="acceptance">
+    <h2>11 · Acceptance criteria</h2>
+    <table>
+      <tr><th>Requirement</th><th>Pass condition</th></tr>
+      <tr><td>Evidence axis exists</td><td>Candidate metrics can be evaluated over trade buckets, time buckets, OOS slices, folds, or another explicit evidence progression.</td></tr>
+      <tr><td>Each metric is path-aware</td><td>Profit factor, CVaR, capital preservation, expectancy, temporal consistency, and generalization are represented as trajectories inside the specialist cell, not only final values.</td></tr>
+      <tr><td>Trade count is not over-rewarded</td><td>Trade count acts as a hard floor and saturating evidence-confidence term, not a dominant return/profitability reward.</td></tr>
+      <tr><td>Final face and path both matter</td><td>A candidate cannot win purely from a good final face if its path was structurally damaged.</td></tr>
+      <tr><td>Dents are explainable</td><td>The system can say which metric dented, how badly, for how long, and whether it recovered.</td></tr>
+      <tr><td>Late rescue is detected</td><td>The system flags candidates where final performance depends heavily on a late or concentrated cluster.</td></tr>
+      <tr><td>OOS survival is explicit</td><td>Train and OOS paths can be compared as shapes, not only as final scalar gap.</td></tr>
+      <tr><td>Promotion remains conservative</td><td>Stress tests and hard gates remain finalist/promotion requirements.</td></tr>
+      <tr><td>Implementation is simple</td><td>Uses tensors/features/artifacts, not unnecessary visual or mesh complexity.</td></tr>
+    </table>
+  </section>
+
+  <div class="footer">
+    <p><strong>Note:</strong> All plotted data in this document is dummy data. The purpose is to communicate the conceptual scoring architecture clearly. The actual implementation should compute these features from real candidate backtest/OOS/stress data.</p>
+    <p>Generated as a standalone HTML artifact for FXPM scoring concept alignment.</p>
+  </div>
+</div>
+
+<script>
+(function(){
+  const labels = ['Edge','Profit','CapPres','Tail','Temp','Gen','Exec','Param'];
+  const healthy = [
+    [.42,.40,.45,.44,.41,.40,.43,.42],
+    [.52,.51,.55,.53,.50,.51,.52,.51],
+    [.62,.60,.64,.63,.59,.61,.60,.62],
+    [.72,.71,.73,.72,.70,.72,.69,.72],
+    [.82,.80,.81,.83,.79,.81,.78,.80],
+    [.91,.88,.89,.90,.87,.89,.86,.88]
+  ];
+  const deformed = [
+    [.40,.38,.43,.42,.40,.38,.41,.39],
+    [.46,.70,.35,.30,.42,.39,.44,.41],
+    [.50,.78,.28,.24,.38,.35,.41,.42],
+    [.62,.84,.38,.32,.33,.33,.38,.44],
+    [.77,.88,.47,.42,.35,.34,.37,.52],
+    [.92,.90,.58,.51,.39,.36,.40,.63]
+  ];
+  const interp = [
+    'Early evidence: both candidates are still forming. Do not over-read the first slice.',
+    'The deformed candidate starts improving PF quickly, but risk sides are already denting.',
+    'Profitability keeps expanding, but CVaR and capital preservation remain structurally damaged.',
+    'A healthy candidate expands evenly; the deformed candidate is becoming spiky.',
+    'Late rescue begins: return-like metrics improve, but temporal consistency and generalization remain weak.',
+    'Final face: the bad candidate looks tempting on PF, but its path shows unrecovered deformation.'
+  ];
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const group = document.getElementById('radarGroup');
+  const range = document.getElementById('stepRange');
+  const stepLabel = document.getElementById('stepLabel');
+  const interpEl = document.getElementById('interp');
+  function pt(i, r){
+    const angle = -Math.PI/2 + i * 2*Math.PI/labels.length;
+    return [Math.cos(angle)*r, Math.sin(angle)*r];
+  }
+  function poly(values, radius){
+    return values.map((v,i)=>pt(i, radius*v).join(',')).join(' ');
+  }
+  function el(name, attrs){
+    const e = document.createElementNS(svgNS,name);
+    for(const k in attrs) e.setAttribute(k,attrs[k]);
+    return e;
+  }
+  function textWrap(txt, x, y, width){
+    const words = txt.split(' '); let line='', lines=[];
+    for(const w of words){ if((line+' '+w).length>31){lines.push(line.trim()); line=w;} else line += ' '+w; }
+    if(line.trim()) lines.push(line.trim());
+    return lines.map((l,i)=>el('text',{x:x,y:y+i*18,fill:'#a4b1c1','font-size':'12','class':'svgtext'})).map((t,i)=>{t.textContent=lines[i]; return t;});
+  }
+  function draw(step){
+    group.innerHTML='';
+    const R=128;
+    [0.33,0.66,1].forEach(s=>group.appendChild(el('polygon',{points:poly(Array(labels.length).fill(s),R),fill:'none',stroke:'#2a3545','stroke-width':'1'})));
+    for(let i=0;i<labels.length;i++){
+      const [x,y]=pt(i,R);
+      group.appendChild(el('line',{x1:0,y1:0,x2:x,y2:y,stroke:'#37475d','stroke-width':'1'}));
+      const [lx,ly]=pt(i,R+26);
+      const t=el('text',{x:lx,y:ly+4,fill:'#a4b1c1','font-size':'11','text-anchor':'middle','class':'svgtext'});
+      t.textContent=labels[i]; group.appendChild(t);
+    }
+    group.appendChild(el('polygon',{points:poly(healthy[step-1],R),fill:'rgba(92,224,164,.20)',stroke:'#5ce0a4','stroke-width':'3'}));
+    group.appendChild(el('polygon',{points:poly(deformed[step-1],R),fill:'rgba(255,111,122,.14)',stroke:'#ff6f7a','stroke-width':'2.5','stroke-dasharray':'7 4'}));
+    const l1=el('text',{x:-130,y:170,fill:'#5ce0a4','font-size':'12','class':'svgtext'}); l1.textContent='healthy evidence path'; group.appendChild(l1);
+    const l2=el('text',{x:20,y:170,fill:'#ff6f7a','font-size':'12','class':'svgtext'}); l2.textContent='deformed / late-rescued path'; group.appendChild(l2);
+    stepLabel.textContent = step;
+    interpEl.textContent='';
+    const parent = interpEl.parentNode;
+    parent.querySelectorAll('.wrapline').forEach(n=>n.remove());
+    textWrap(interp[step-1],16,44,190).forEach(t=>{t.classList.add('wrapline'); parent.appendChild(t);});
+  }
+  range.addEventListener('input', e=>draw(+e.target.value));
+  draw(1);
+})();
+</script>
+</body>
+</html>
