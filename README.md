@@ -49,12 +49,12 @@ Archived audit and planning documents live in `documentation_archive/`.
 The current PM:
 
 1. Detects one of 4 active market regimes: `TREND`, `RANGE`, `BREAKOUT`, `CHOP`
-2. Evaluates a 50-strategy pool across configured timeframes
+2. Evaluates a 100-strategy pool across configured timeframes
 3. Tunes shortlisted candidates with grid search and optional Optuna
 4. Uses the active recent M5 workflow for eligibility, optimization, and production selection
 5. Persists optimization state incrementally and atomically
 6. Trades only validated winners for the exact `(timeframe, regime)` live context
-7. Stores historical-stress audit, walk-forward promotion, no-trade, and risk-management evidence on artifacts
+7. Stores historical-stress audit, walk-forward research telemetry, no-trade, and risk-management evidence on artifacts
 8. Uses fail-closed live readiness, hard-breakpoint supervision, cycle-drift monitoring, MT5 contract math, broker metadata, margin protection, and spread-quality filters in live execution
 
 The checked-in `config.json` is deployment-specific and currently reflects a high-risk low-balance profile. Treat it as the active repo configuration, not a universal recommendation.
@@ -67,7 +67,7 @@ The checked-in `config.json` is deployment-specific and currently reflects a hig
 
 - Runtime banner: `FX PORTFOLIO MANAGER v3.1`
 - Repository/folder name: `FXPM-Dev`
-- Strategy pool: `50` registered strategies
+- Strategy pool: `100` registered strategies
 - Active regime engine: score-based 4-regime detector in `pm_regime.py`
 - Active data workflow: latest `300,000` M5 bars, with oldest `50,000` as `historical_stress_audit` and newest `250,000` as the active universe
 - Live retrain model: calendar-anchored schedule from `config.json`
@@ -114,7 +114,7 @@ The checked-in `config.json` is deployment-specific and currently reflects a hig
 
 | Dimension | Typical Retail PM | Current FxPM |
 |---|---|---|
-| Strategy selection | one or a few fixed systems | 50-strategy competition across timeframes and regimes |
+| Strategy selection | one or a few fixed systems | 100-strategy competition across timeframes and regimes |
 | Market adaptation | static logic | regime-aware winner selection |
 | Data relevance | broad/stale history can dominate | newest 250k M5 active universe drives selection |
 | Optimization persistence | restart from scratch on interruption | atomic stateful ledger |
@@ -205,7 +205,7 @@ FX_Portfolio_Manager/
 |-- pm_regime_tuner.py        # Regime parameter optimization
 |-- pm_optuna.py              # Optuna integration
 |-- config.json               # Primary PM configuration
-|-- pm_configs*.json          # Saved validated winners; active path comes from pipeline.winner_ledger_path
+|-- pm_configs.json           # Universal saved validated-winner ledger
 |-- regime_params.json        # Tuned regime params (optional)
 |-- last_trade_log.json       # Decision throttle state (auto-generated)
 |-- last_actionable_log.json  # Last actionable decision feed (auto-generated)
@@ -219,11 +219,11 @@ FX_Portfolio_Manager/
 1. `config.json` defines symbols, thresholds, schedule, and paths.
 2. `pm_pipeline.py` loads the latest base M5 workflow window and derives higher timeframes from those timestamp boundaries.
 3. The oldest 50,000 M5 bars are reserved for `historical_stress_audit`; the newest 250,000 M5 bars form the active universe.
-4. Stage 1 baseline eligibility runs across the full active 250,000 M5-bar universe. Stage 2 optimization/risk selection uses the newest half of that active universe with warmup context retained.
+4. Stage 1 baseline eligibility runs across the full active 250,000 M5-bar universe. Stage 2 optimization/risk selection uses the newest half of that active universe up to the bleeding edge; the prior 50,000 M5 bars are adjacent walk-forward validation.
 5. `pm_regime.py` supplies causal regime labels; `pm_regime_tuner.py` can tune regime parameters.
-6. `pm_strategies.py` evaluates the 50-strategy pool across configured timeframes.
+6. `pm_strategies.py` evaluates the 100-strategy pool across configured timeframes.
 7. `pm_optuna.py` tunes shortlisted candidates; regime search uses validation bucket evidence where available.
-8. Validated winners, `NO_TRADE` markers, promotion status, historical audit metrics, regime audit evidence, validation evidence, ledger-completion status, and governance/risk policy evidence are written atomically to the configured winner ledger (`pipeline.winner_ledger_path`; the shipped high-risk profile uses `pm_configs_high_risk.json`).
+8. Validated winners, `NO_TRADE` markers, promotion status, historical audit metrics, regime audit evidence, validation evidence, ledger-completion status, and governance/risk policy evidence are written atomically to the universal winner ledger (`pm_configs.json` via `pipeline.winner_ledger_path`).
 
 ### Live trading flow
 
@@ -318,6 +318,11 @@ python pm_main.py --trade
     "historical_stress_audit_bars": 50000,
     "active_universe_bars": 250000,
     "active_stage2_pct": 50.0,
+    "production_split_mode": "bleeding_edge",
+    "walk_forward_validation_bars": 50000,
+    "clean_holdout_pct": 0.0,
+    "threadspark_selection_surface": "validation",
+    "false_discovery_holdout_policy": "off",
     "max_param_combos": 200,
     "optimization_max_workers": 4,
     "regime_hyperparam_top_k": 5,
@@ -326,19 +331,24 @@ python pm_main.py --trade
     "risk_management_optimization_enabled": true,
     "risk_management_selection_stage": "stage3",
     "production_retrain_mode": "notify",
-    "production_retrain_interval_weeks": 2,
+    "production_retrain_interval_weeks": 4,
     "production_retrain_weekday": "sunday",
     "production_retrain_time": "00:01",
     "production_retrain_anchor_date": "2026-03-29",
-    "winner_ledger_path": "pm_configs_high_risk.json",
+    "winner_ledger_path": "pm_configs.json",
     "live_artifact_drift_policy": "block",
     "institutional_supervisor_enabled": true,
     "institutional_supervisor_mode": "circuit_breaker",
     "hard_block_reopen_mode": "manual_or_next_cycle",
+    "storage_pause_entries_below_free_gb": 10.0,
+    "daily_loss_hard_block_pct": 2.0,
+    "session_loss_hard_block_pct": 1.0,
+    "weekly_loss_hard_block_pct": 4.0,
+    "open_drawdown_hard_block_pct": 3.0,
     "cycle_drift_monitor_enabled": true,
     "cycle_drift_mode": "lightweight",
     "walk_forward_audit_enabled": true,
-    "walk_forward_promotion_policy": "block_severe_only",
+    "walk_forward_promotion_policy": "observe_only",
     "promote_small_risk_multiplier": 0.5,
     "local_governance_tournament_enabled": true,
     "local_governance_live_mode": "shadow",
@@ -361,15 +371,16 @@ python pm_main.py --trade
 ### Notes
 
 - The committed config currently uses a high-risk low-balance profile.
-- Stage 1/Stage 2 use the active recent M5 workflow: latest 300k M5 bars, oldest 50k as `historical_stress_audit`, newest 250k as the active optimization universe. Stage 1 runs baseline eligibility across the full active universe; Stage 2 uses the newest half as the fresh optimization/risk-selection surface.
+- Stage 1/Stage 2 use the active recent M5 workflow: latest 300k M5 bars, oldest 50k as `historical_stress_audit`, newest 250k as the active universe. Stage 1 runs baseline eligibility across the full active universe; Stage 2 optimizes on the newest half through the market edge.
 - The current presets are the recommended baseline for this workflow. They are designed to favor quality, profitability, and live relevance; do not loosen them without comparing regenerated artifacts and live rejection/outcome data.
-- Stage 2 freshness is intentional: the newest half of the active universe is used as the fresh selection surface, with warmup context retained, rather than adding a stale walk-forward layer between selection and live implementation.
+- Stage 2 freshness is intentional: production `clean_holdout` is disabled so the optimizer can use the freshest bars. The immediately prior 50k M5 bars are adjacent walk-forward validation evidence used by candidate validation, not pristine forward OOS.
+- `threadspark_selection_surface = "validation"` and `false_discovery_holdout_policy = "off"` keep production validation pointed at the adjacent WFV slice instead of asking missing clean-holdout metrics to gate winners.
 - `risk_management_selection_stage = "stage3"` means governance/risk policies are selected on the newest Stage 2 selection surface. Setting it to `"stage2"` evaluates policies on the active optimization universe instead.
 - `logs/` is not controlled by `pipeline.output_dir`; runtime logs always go to the root `logs/` folder.
 - `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.discovery_risk_per_trade_pct` is the fixed discovery/backtest sizing value, while `pipeline.risk_per_trade_pct` only remains as a compatibility backfill when the `position` key is absent.
 - `PROMOTE_SMALL` winners are live-eligible but derated by `pipeline.promote_small_risk_multiplier`; `BLOCKED`, `PAPER_ONLY`, and `NO_TRADE` winners are not live-tradeable.
 - `live_risk_scalars_mode = "shadow"` records would-be risk-scalar changes but does not alter live sizing.
-- `pipeline.production_retrain_mode` supports `auto`, `notify`, and `off`.
+- `pipeline.production_retrain_mode` supports `auto`, `notify`, and `off`. The current production profile uses a four-week notify cadence so H4 specialists have more time to express live edge before forced reproduction.
 - `pipeline.execution_spread_spike_mult` is the live spread-spike blocker threshold.
 
 For full key-by-key details, see [SETTINGS_REFERENCE.md](SETTINGS_REFERENCE.md).
@@ -378,19 +389,13 @@ For full key-by-key details, see [SETTINGS_REFERENCE.md](SETTINGS_REFERENCE.md).
 
 ## Strategy Pool
 
-The registry currently groups the 50 strategies into 3 operational families:
+The registry currently contains 100 strategies grouped into 3 operational families:
 
-### Trend (`18`)
+- Trend following: 33 strategies
+- Mean reversion: 39 strategies
+- Breakout/momentum: 28 strategies
 
-`EMACrossoverStrategy`, `SupertrendStrategy`, `MACDTrendStrategy`, `ADXTrendStrategy`, `IchimokuStrategy`, `HullMATrendStrategy`, `EMARibbonADXStrategy`, `AroonTrendStrategy`, `ADXDIStrengthStrategy`, `KeltnerPullbackStrategy`, `OBVDivergenceStrategy`, `EMAPullbackContinuationStrategy`, `ParabolicSARTrendStrategy`, `KaufmanAMATrendStrategy`, `VortexTrendStrategy`, `TRIXSignalStrategy`, `RelativeVigorIndexStrategy`, `VIDYABandTrendStrategy`
-
-### Mean Reversion (`19`)
-
-`RSIExtremesStrategy`, `BollingerBounceStrategy`, `ZScoreMRStrategy`, `StochasticReversalStrategy`, `CCIReversalStrategy`, `WilliamsRStrategy`, `RSITrendFilteredMRStrategy`, `StochRSITrendGateStrategy`, `FisherTransformMRStrategy`, `ZScoreVWAPReversionStrategy`, `SessionVWAPReversionStrategy`, `LiquiditySweepReversalStrategy`, `TurtleSoupReversalStrategy`, `PinBarReversalStrategy`, `EngulfingPatternStrategy`, `RSIDivergenceStrategy`, `MACDDivergenceStrategy`, `KeltnerFadeStrategy`, `ROCExhaustionReversalStrategy`
-
-### Breakout (`13`)
-
-`DonchianBreakoutStrategy`, `VolatilityBreakoutStrategy`, `MomentumBurstStrategy`, `SqueezeBreakoutStrategy`, `KeltnerBreakoutStrategy`, `PivotBreakoutStrategy`, `MACDHistogramMomentumStrategy`, `RegimeTransitionBreakoutStrategy`, `InsideBarBreakoutStrategy`, `NarrowRangeBreakoutStrategy`, `VolumeSpikeMomentumStrategy`, `ATRPercentileBreakoutStrategy`, `ChoppinessCompressionBreakoutStrategy`
+See `pm_strategies.py` for the exact active roster and parameter grids.
 
 Live trading uses validated winners only. There is no production fallback to an unvalidated "best available" strategy.
 
@@ -540,7 +545,7 @@ Validation and ranking also incorporate robustness and train-to-validation gap b
 ### Core artifacts
 
 - `config.json`: primary PM configuration
-- `pm_configs.json` / `pm_configs_high_risk.json`: validated winner configurations; the active file is selected by `pipeline.winner_ledger_path` and now carries validation evidence plus ledger-completion metadata on saved artifacts
+- `pm_configs.json`: universal validated-winner ledger selected by `pipeline.winner_ledger_path`; it carries validation evidence plus ledger-completion metadata on saved artifacts
 - `regime_params.json`: optional tuned regime parameters
 - `last_trade_log.json`: throttle state
 - `last_actionable_log.json`: current actionable decision feed
@@ -554,7 +559,7 @@ Validation and ranking also incorporate robustness and train-to-validation gap b
 ```text
 FX_Portfolio_Manager/
 |-- config.json
-|-- pm_configs*.json
+|-- pm_configs.json
 |-- regime_params.json
 |-- last_trade_log.json
 |-- last_actionable_log.json

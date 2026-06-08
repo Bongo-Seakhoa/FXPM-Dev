@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FXPM Live Production Architecture Review - 2026-06-08</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18202a;
+      --muted: #5b6675;
+      --line: #d8dde6;
+      --panel: #f6f8fb;
+      --ok: #0b6b43;
+      --warn: #9a5b00;
+      --bad: #a52020;
+      --blue: #1d4f8f;
+      --bg: #ffffff;
+    }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      line-height: 1.5;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    main {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 28px 0 56px;
+    }
+    h1, h2, h3 {
+      line-height: 1.2;
+      margin: 0 0 12px;
+    }
+    h1 {
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+    h2 {
+      font-size: 21px;
+      margin-top: 30px;
+      border-top: 1px solid var(--line);
+      padding-top: 22px;
+    }
+    h3 {
+      font-size: 16px;
+      margin-top: 20px;
+    }
+    p {
+      margin: 0 0 12px;
+    }
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.94em;
+      background: #eef2f7;
+      border: 1px solid #d7dee8;
+      padding: 1px 4px;
+      border-radius: 4px;
+    }
+    .lede {
+      font-size: 16px;
+      color: var(--muted);
+      max-width: 960px;
+      margin-bottom: 18px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }
+    .metric, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .metric strong {
+      display: block;
+      font-size: 24px;
+      margin-bottom: 2px;
+    }
+    .metric span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .ok { color: var(--ok); font-weight: 700; }
+    .warn { color: var(--warn); font-weight: 700; }
+    .bad { color: var(--bad); font-weight: 700; }
+    .blue { color: var(--blue); font-weight: 700; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 20px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th {
+      background: #eef2f7;
+    }
+    ul {
+      margin-top: 6px;
+      padding-left: 22px;
+    }
+    li {
+      margin: 5px 0;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .step {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px;
+      background: #fff;
+    }
+    .step b {
+      display: block;
+      margin-bottom: 5px;
+    }
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .mono-list {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 13px;
+      word-break: break-word;
+    }
+    @media (max-width: 900px) {
+      .grid, .flow {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>FXPM Live Production Architecture Review</h1>
+  <p class="lede">
+    This report documents the current end-to-end behavior of the FX Portfolio Manager codebase,
+    the live/research separation, the promotion gate, the risk controls, and the current state of
+    the 100-symbol production universe. It is intended as an operator review artifact, not a claim
+    of guaranteed profitability.
+  </p>
+  <p class="small">Generated: 2026-06-08 Europe/Budapest. Source root: <code>c:\Users\Bongo\OneDrive\Desktop\FxPM-Dev</code>.</p>
+
+  <div class="grid">
+    <div class="metric"><strong>100</strong><span>configured production symbols</span></div>
+    <div class="metric"><strong>83</strong><span>symbols currently in <code>pm_configs.json</code></span></div>
+    <div class="metric"><strong>14</strong><span>promoted tradeable cells</span></div>
+    <div class="metric"><strong>9</strong><span>symbols with at least one promoted live cell</span></div>
+  </div>
+
+  <h2>Executive Decision State</h2>
+  <div class="panel">
+    <p><span class="ok">Live readiness gate:</span> passed in the latest direct readiness probe against the pinned MT5 demo account, with zero errors.</p>
+    <p><span class="warn">Remaining warning:</span> 17 symbols are still missing from the winner ledger because the 4-worker optimizer is still processing them.</p>
+    <p><span class="ok">Hardcoded expected promote cells:</span> removed from the active production config. <code>production_expected_promote_cells</code> is an empty list.</p>
+    <p><span class="ok">Stale external promotion artifacts:</span> removed from the active production config. The promotion gate now uses <code>ledger_status</code>, not fixed review files.</p>
+    <p><span class="ok">Walk-forward validation:</span> retained by default on the adjacent pre-optimization window. It participates in candidate validation and records production evidence; only additional post-selection hard blocking is controlled by <code>walk_forward_live_blocking_enabled</code>.</p>
+    <p><span class="ok">Regime detector parity:</span> <code>regime_params.json</code> now contains explicit detector rows for every currently promoted symbol/timeframe. The parity audit passed across all 14 promoted cells with zero regime-surface mismatches.</p>
+  </div>
+
+  <h2>Source Of Truth</h2>
+  <table>
+    <thead>
+      <tr><th>Artifact</th><th>Current role</th><th>Production interpretation</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>config.json</code></td>
+        <td>Universal runtime and optimization configuration.</td>
+        <td>Defines the 100-symbol universe, optimization workers, validation thresholds, risk controls, live gate mode, MT5 account pinning, and storage policy.</td>
+      </tr>
+      <tr>
+        <td><code>pm_configs.json</code></td>
+        <td>Universal winner ledger.</td>
+        <td>Authoritative source for which symbols, timeframes, and regimes may trade. Missing symbols are not tradeable. <code>NO_TRADE</code>, <code>BLOCKED</code>, and <code>PAPER_ONLY</code> cells are not tradeable.</td>
+      </tr>
+      <tr>
+        <td><code>regime_params.json</code></td>
+        <td>Explicit live regime-detector contract for promoted symbol/timeframe cells.</td>
+        <td>Rows are materialized from the same no-file timeframe detector surface recorded in the validation metadata. Live readiness requires a row before a promoted regime cell may trade.</td>
+      </tr>
+      <tr>
+        <td><code>broker_specs.json</code></td>
+        <td>Broker execution contract snapshot.</td>
+        <td>Used to verify point, tick size, tick value, lot size, volume step, spread, and contract-size parity before live startup.</td>
+      </tr>
+      <tr>
+        <td><code>data/*.csv</code> and <code>data/.live/*.csv</code></td>
+        <td>Historical and live cache data.</td>
+        <td>Optimization requires enough M5 history. Live evaluation uses direct MT5 or live cache data without creating winners from insufficient data.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Live Startup Flow</h2>
+  <div class="flow">
+    <div class="step">
+      <b>1. Load configuration</b>
+      <p>Command entry is <code>pm_main.py</code>. It loads <code>config.json</code>, applies dataclass filtering, loads broker specs, and initializes <code>PipelineConfig</code>, <code>PositionConfig</code>, and <code>MT5Config</code>.</p>
+    </div>
+    <div class="step">
+      <b>2. Connect to MT5</b>
+      <p>The system connects to the existing MT5 session or configured terminal. Live readiness validates account identity against <code>expected_login</code>, <code>expected_server</code>, and <code>expected_currency</code>.</p>
+    </div>
+    <div class="step">
+      <b>3. Validate live readiness</b>
+      <p><code>pm_live_readiness.validate_live_readiness</code> checks kill switch, account equity, risk bounds, storage floor, broker specs, ledger availability, expiry, artifact drift, promotion gate, symbol coverage, and explicit live regime-detector rows.</p>
+    </div>
+    <div class="step">
+      <b>4. Load live-eligible ledger</b>
+      <p><code>PortfolioManager.get_live_eligible_configs</code> returns only current, non-expired, artifact-compatible configs with at least one tradeable promoted regime cell.</p>
+    </div>
+    <div class="step">
+      <b>5. Evaluate signals</b>
+      <p><code>LiveTrader</code> evaluates only exact symbol/timeframe/regime winners. It computes live features from explicit detector rows, reads <code>REGIME_LIVE</code>, rejects missing regime cells, and skips all blocked or no-trade cells.</p>
+    </div>
+    <div class="step">
+      <b>6. Execute with risk gates</b>
+      <p>Orders pass spread, margin, per-trade risk, min-lot hard-cap, symbol combined-risk, session/daily/weekly loss, open-drawdown, and supervisor checks before being sent.</p>
+    </div>
+  </div>
+
+  <h2>Promotion Gate</h2>
+  <table>
+    <thead>
+      <tr><th>Setting</th><th>Current value</th><th>Meaning</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>production_require_promotion_gate</code></td>
+        <td><code>true</code></td>
+        <td>A live promotion gate is required before startup.</td>
+      </tr>
+      <tr>
+        <td><code>production_promotion_gate_mode</code></td>
+        <td><code>ledger_status</code></td>
+        <td>The current winner ledger is authoritative. The gate requires non-empty tradeable promoted cells and does not compare against a stale fixed review list.</td>
+      </tr>
+      <tr>
+        <td><code>production_expected_promote_cells</code></td>
+        <td><code>[]</code></td>
+        <td>No hardcoded expected live winners are allowed in the active production config.</td>
+      </tr>
+      <tr>
+        <td><code>production_promotion_review_path</code>, <code>production_promotion_cell_safety_path</code>, <code>production_completion_marker_path</code></td>
+        <td><code>""</code></td>
+        <td>External review artifacts are not part of the active live gate. They may still exist historically, but they are not referenced by production live startup.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Walk-Forward Validation Separation</h2>
+  <p>
+    Walk-forward validation is the adjacent validation surface before bleeding-edge optimization. The live layer uses
+    currently validated promoted ledger cells; additional post-selection WFV hard blocking is controlled separately by
+    the live-blocking policy.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Setting</th><th>Current value</th><th>Production interpretation</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>walk_forward_audit_enabled</code></td>
+        <td><code>true</code></td>
+        <td>WFV evidence may be produced during optimization/research.</td>
+      </tr>
+      <tr>
+        <td><code>walk_forward_promotion_policy</code></td>
+        <td><code>observe_only</code></td>
+        <td>WFV does not block promotion.</td>
+      </tr>
+      <tr>
+        <td><code>walk_forward_live_blocking_enabled</code></td>
+        <td><code>false</code></td>
+        <td>Even if a research config uses a block policy, production live does not block on WFV unless this is explicitly enabled.</td>
+      </tr>
+      <tr>
+        <td><code>walk_forward_do_not_displace_latest_surface</code></td>
+        <td><code>true</code></td>
+        <td>The newest selected surface remains the live candidate source; WFV should not consume the freshest live edge before execution.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Optimization And Validation Flow</h2>
+  <ol>
+    <li><b>Symbol universe:</b> <code>config.json</code> defines 100 symbols. The optimizer works through symbols using <code>optimization_max_workers=4</code>.</li>
+    <li><b>Data fetch:</b> historical M5 data is fetched with retry and deep backfill. If data remains insufficient, the symbol receives a <code>NO_TRADE</code> data-failure marker.</li>
+    <li><b>Feature construction:</b> indicators and regime features are generated per timeframe. Live depends on <code>REGIME_LIVE</code>, not a hindsight regime label. Promoted live cells require explicit regime-detector rows that reproduce the validation detector surface.</li>
+    <li><b>Candidate search:</b> strategy families are screened, tuned, and evaluated across the configured timeframes and regimes.</li>
+    <li><b>Validation gates:</b> candidates must satisfy trade count, profit factor, return, drawdown, robustness, holdout, and execution-cost checks. No fallback to best train is allowed when validation fails.</li>
+    <li><b>Promotion status:</b> validated cells are classified as <code>PROMOTED</code>, <code>PROMOTE_SMALL</code>, <code>BLOCKED</code>, <code>PAPER_ONLY</code>, or <code>NO_TRADE</code>.</li>
+    <li><b>Atomic ledger write:</b> each completed symbol is written atomically into <code>pm_configs.json</code>. A failed optimization produces a fail-closed no-trade marker rather than a weak winner.</li>
+  </ol>
+
+  <h2>Live Candidate Selection</h2>
+  <p>
+    Live trading uses a strict winners-only ladder. The current implementation refuses to trade if there is no exact
+    winner for the current symbol, timeframe, and live regime. This is the key alignment point with the principle
+    "no trade is better than an inaccurate strategy winner."
+  </p>
+  <table>
+    <thead>
+      <tr><th>Condition</th><th>Live behavior</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Symbol missing from ledger</td><td>Cannot trade. In partial-live mode this is a warning, not a startup error.</td></tr>
+      <tr><td>Symbol has only <code>NO_TRADE</code> cells</td><td>Cannot trade.</td></tr>
+      <tr><td>Symbol has only <code>BLOCKED</code> or <code>PAPER_ONLY</code> cells</td><td>Cannot trade. Status view now reports this as not live eligible.</td></tr>
+      <tr><td>Current live regime lacks an exact promoted cell</td><td>No trade for that timeframe/regime.</td></tr>
+      <tr><td>Promoted cell exists but signal is zero</td><td>No trade for that bar.</td></tr>
+      <tr><td>Promoted cell has signal and passes risk/execution gates</td><td>Eligible for live order submission.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Risk And Execution Controls</h2>
+  <table>
+    <thead>
+      <tr><th>Control</th><th>Current value</th><th>Purpose</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Minimum live equity</td><td><code>20.0 USD</code></td><td>Blocks startup below the configured account size.</td></tr>
+      <tr><td>Per-trade target risk</td><td><code>2.5%</code></td><td>Target before broker min-lot and stop-distance normalization.</td></tr>
+      <tr><td>Per-trade hard cap</td><td><code>50.0%</code></td><td>Blocks trades where min-lot or execution normalization would exceed the cap.</td></tr>
+      <tr><td>Daily realized loss block</td><td><code>50.0%</code></td><td>High-risk account-level stop requested for the small account profile.</td></tr>
+      <tr><td>Session realized loss block</td><td><code>40.0%</code></td><td>High-risk session stop.</td></tr>
+      <tr><td>Weekly realized loss block</td><td><code>60.0%</code></td><td>High-risk weekly stop.</td></tr>
+      <tr><td>Open drawdown block</td><td><code>50.0%</code></td><td>High-risk open-equity stop.</td></tr>
+      <tr><td>Margin entry block</td><td><code>60.0%</code></td><td>Blocks new entries at low margin level.</td></tr>
+      <tr><td>Spread filter</td><td><code>enabled</code>, <code>min_edge=1.5x</code></td><td>Rejects trades where spread materially weakens expected edge.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Current Ledger State</h2>
+  <table>
+    <thead>
+      <tr><th>Category</th><th>Value</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Configured symbols</td><td>100</td></tr>
+      <tr><td>Ledger symbols</td><td>83</td></tr>
+      <tr><td>Symbols still missing from ledger</td><td>17</td></tr>
+      <tr><td>Promoted cells</td><td>14</td></tr>
+      <tr><td>Symbols with promoted cells</td><td>9</td></tr>
+      <tr><td>Readiness probe result</td><td><span class="ok">OK</span>, 0 errors, 1 warning for missing symbols still optimizing</td></tr>
+      <tr><td>Optimizer status</td><td><span class="blue">Running</span>, four worker processes responding</td></tr>
+    </tbody>
+  </table>
+  <h3>Missing Symbols Still Optimizing</h3>
+  <p class="mono-list">JP225, US100, US30, US500, USDCHF, USDMXN, USDNOK, USDPLN, USDSEK, USDSGD, USDZAR, XAGUSD, XAUUSD, XBRUSD, XNGUSD, XRPUSD, XTIUSD</p>
+  <h3>Current Promoted Cells</h3>
+  <p class="mono-list">USDJPY|H4|CHOP, USDJPY|D1|CHOP, AUDJPY|H1|RANGE, DE30|H4|CHOP, EURAUD|H4|CHOP, EURCAD|H4|TREND, BTCUSD|M30|TREND, BTCUSD|H4|TREND, BTCUSD|D1|CHOP, ETHUSD|M30|CHOP, GBPUSD|H1|CHOP, GBPUSD|H4|CHOP, GBPUSD|D1|CHOP, NZDCAD|H4|CHOP</p>
+
+  <h2>Changes Made For Alignment</h2>
+  <table>
+    <thead>
+      <tr><th>File</th><th>Change</th><th>Reason</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>config.json</code></td><td>Removed stale promotion review paths and hardcoded expected cells from active live config.</td><td>Prevents stale static artifacts from influencing or confusing dynamic live selection.</td></tr>
+      <tr><td><code>pm_core.py</code></td><td>Added <code>production_promotion_gate_mode</code>, <code>live_allow_partial_symbol_ledger</code>, <code>walk_forward_live_blocking_enabled</code>, and <code>live_require_tuned_regime_params</code>.</td><td>Makes live-vs-research policy and detector parity explicit and testable.</td></tr>
+      <tr><td><code>pm_live_readiness.py</code></td><td>Ledger-status gate uses current ledger cells, treats incomplete symbol coverage as a warning only when partial-live mode is enabled, and blocks promoted cells without explicit detector rows.</td><td>Allows live trading to proceed from approved winners while preventing implicit regime fallbacks.</td></tr>
+      <tr><td><code>pm_pipeline.py</code></td><td>Live eligibility now excludes blocked and paper-only regime cells. WFV blocking requires explicit live opt-in. Saving a promoted symbol materializes explicit regime-detector rows.</td><td>Aligns status, startup, execution, and detector parity with the same live-tradeable definition.</td></tr>
+      <tr><td><code>pm_regime.py</code></td><td>Added tuned-row detection and materialization helpers for the validation no-file detector surface.</td><td>Prevents silent live fallbacks while preserving 1:1 detector parity for validated winners.</td></tr>
+      <tr><td><code>pm_main.py</code></td><td>Legacy fallback skips blocked, paper-only, and no-trade default configs. Live candidate evaluation refuses missing explicit detector rows when strict parity is enabled.</td><td>Prevents legacy top-level winners or implicit detector defaults from bypassing promotion status.</td></tr>
+      <tr><td><code>regime_params.json</code></td><td>Added explicit rows for the 14 currently promoted symbol/timeframes.</td><td>Live no longer relies on implicit timeframe defaults for those winners.</td></tr>
+      <tr><td><code>tools/regime_param_parity_audit.py</code></td><td>Added a reproducible audit that compares validation no-file detector output against explicit live detector output.</td><td>Provides evidence that live and validation regime surfaces match.</td></tr>
+      <tr><td><code>tests/*</code></td><td>Added/updated regression tests for partial ledgers, ledger-status promotion, empty external paths, WFV live opt-in, blocked-cell live eligibility, and regime-detector parity.</td><td>Keeps the production path from drifting back toward stale, hardcoded, or implicit gates.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Tests And Verification</h2>
+  <ul>
+    <li><code>pytest tests/test_pipeline_artifacts.py tests/test_regime_fallback_log.py tests/test_pipeline_config_fields.py tests/test_config_json_integrity.py tests/test_profitability_readiness_blueprint.py tests/test_winners_only.py tests/test_live_loop_integration.py -q</code> passed: 150 tests and 10 subtests.</li>
+    <li><code>python tools/regime_param_parity_audit.py --config config.json --ledger pm_configs.json --output pm_outputs/production_live/regime_param_parity_audit_20260608.json</code> passed with <code>ok=true</code> across all 14 promoted symbol/timeframes.</li>
+    <li>Direct MT5 readiness probe passed with <code>readiness_ok=True</code>, zero errors, and one warning for the 17 missing symbols.</li>
+    <li><code>python pm_main.py --status</code> loaded the production config and reported 9 live-eligible symbols, matching the promoted-cell surface.</li>
+    <li>Four optimizer workers remain active and continue to process the incomplete symbol set.</li>
+  </ul>
+
+  <h2>Review Checklist</h2>
+  <ul>
+    <li>Confirm that <code>production_promotion_gate_mode=ledger_status</code> is the desired production gate.</li>
+    <li>Confirm that no static expected-winner list should ever be present in <code>config.json</code>.</li>
+    <li>Confirm that WFV should remain research evidence and not live-blocking unless <code>walk_forward_live_blocking_enabled=true</code>.</li>
+    <li>Confirm the high-risk small-account thresholds are intentional and acceptable for the $20 account profile.</li>
+    <li>Wait for the 4-worker optimizer to finish writing either validated winners or explicit <code>NO_TRADE</code> markers for the remaining 17 symbols.</li>
+  </ul>
+
+  <h2>Residual Risks</h2>
+  <ul>
+    <li>No trading system can guarantee live profitability. This codebase can only improve selection discipline, execution controls, and fail-closed behavior.</li>
+    <li>The current live surface is limited to 14 promoted cells across 9 symbols until the optimizer finishes the remaining symbols.</li>
+    <li>A $20 account is highly sensitive to broker minimum lot size, spread, slippage, and margin changes. The min-lot hard cap helps, but small-account execution remains fragile.</li>
+    <li>Symbols that fail validation or data sufficiency will intentionally produce no trade, which may reduce activity but protects against inaccurate winners.</li>
+  </ul>
+</main>
+</body>
+</html>

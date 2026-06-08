@@ -24,14 +24,11 @@ Version: 3.1 (Portfolio Manager)
 """
 
 import argparse
-import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from itertools import product
-from collections import Counter
 
-import numpy as np
 import pandas as pd
 
 from pm_regime import (
@@ -155,10 +152,16 @@ class TunerDataLoader:
         
         rule = self.RESAMPLE_MAP.get(timeframe, '1h')
         
-        resampled = df.resample(rule).agg({
-            'Open': 'first', 'High': 'max', 'Low': 'min', 
-            'Close': 'last', 'Volume': 'sum'
-        }).dropna()
+        resampler = df.resample(rule)
+        resampled = pd.DataFrame(
+            {
+                'Open': resampler['Open'].first(),
+                'High': resampler['High'].max(),
+                'Low': resampler['Low'].min(),
+                'Close': resampler['Close'].last(),
+                'Volume': resampler['Volume'].sum(),
+            }
+        ).dropna()
         
         return resampled
     

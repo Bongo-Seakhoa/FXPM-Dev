@@ -107,6 +107,7 @@ class DataLoaderContractTests(unittest.TestCase):
         self.assertEqual(float(resampled["SpreadOpen"].iloc[0]), 10.0)
         self.assertEqual(float(resampled["SpreadMax"].iloc[0]), 30.0)
         self.assertAlmostEqual(float(resampled["SpreadP90"].iloc[0]), 28.0, places=6)
+        self.assertAlmostEqual(float(resampled["SpreadP95"].iloc[0]), 29.0, places=6)
         self.assertEqual(float(resampled["RealVolume"].iloc[0]), 6.0)
 
 

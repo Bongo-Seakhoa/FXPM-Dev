@@ -23,6 +23,7 @@ Version: 1.1 (Updated with ExperimentalWarning suppression)
 
 import logging
 import hashlib
+import math
 import time
 from typing import Dict, List, Any, Optional, Tuple, Callable, Union
 from dataclasses import dataclass, field
@@ -401,6 +402,7 @@ class OptunaTPEOptimizer:
     
     def optimize(self,
                  symbol: str,
+                 timeframe: str,
                  strategy_name: str,
                  param_grid: Dict[str, List],
                  train_features: pd.DataFrame,
@@ -427,7 +429,8 @@ class OptunaTPEOptimizer:
         if not OPTUNA_AVAILABLE:
             return self._fallback_random_search(
                 symbol, strategy_name, param_grid, train_features, 
-                val_features, scoring_fn, min_trades, max_drawdown_pct
+                val_features, scoring_fn, min_trades, max_drawdown_pct,
+                timeframe=timeframe,
             )
         
         start_time = time.time()
@@ -440,7 +443,8 @@ class OptunaTPEOptimizer:
         if not param_grid:
             return self._evaluate_default_only(
                 symbol, strategy_name, default_params,
-                train_features, val_features, scoring_fn
+                train_features, val_features, scoring_fn,
+                timeframe=timeframe,
             )
         
         # Create parameter space
@@ -450,8 +454,8 @@ class OptunaTPEOptimizer:
         # D4 — emit one-time WARN if cartesian > threshold (observability only)
         try:
             base_strategy.warn_if_param_grid_large()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Param-grid size warning hook failed for %s: %s", strategy_name, exc)
 
         # Resolve effective trial budget — flat by default, family-size-aware when enabled (D3)
         n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
@@ -499,7 +503,7 @@ class OptunaTPEOptimizer:
                     return self.config.penalty_no_trades
 
                 train_metrics = self.backtester.run(
-                    train_features, signals, symbol, strategy
+                    train_features, signals, symbol, strategy, timeframe=timeframe
                 )
 
                 # EARLY REJECTION 1: Minimum trades
@@ -525,7 +529,7 @@ class OptunaTPEOptimizer:
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_metrics = self.backtester.run(
-                        val_features, val_signals, symbol, strategy
+                        val_features, val_signals, symbol, strategy, timeframe=timeframe
                     )
                     
                     # EARLY REJECTION 3: Validation drawdown
@@ -665,8 +669,8 @@ class OptunaTPEOptimizer:
         # D4 — emit one-time WARN if cartesian > threshold (observability only)
         try:
             base_strategy.warn_if_param_grid_large()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Param-grid size warning hook failed for %s: %s", strategy_name, exc)
 
         # Resolve effective trial budget — flat by default, family-size-aware when enabled (D3)
         n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
@@ -704,7 +708,7 @@ class OptunaTPEOptimizer:
                     return self.config.penalty_no_trades
 
                 train_result = self.backtester.run(
-                    train_features, signals, symbol, strategy
+                    train_features, signals, symbol, strategy, timeframe=timeframe
                 )
 
                 # ===== EARLY REJECTION 1: Minimum trades =====
@@ -740,7 +744,12 @@ class OptunaTPEOptimizer:
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_result = self.backtester.run(
-                        val_features, val_signals, symbol, strategy, warmup_bars=val_warmup_bars
+                        val_features,
+                        val_signals,
+                        symbol,
+                        strategy,
+                        warmup_bars=val_warmup_bars,
+                        timeframe=timeframe,
                     )
 
                     # Early rejection if validation DD too high
@@ -759,6 +768,7 @@ class OptunaTPEOptimizer:
 
                 # Score each regime and track best
                 regime_scores = []
+                regime_score_map: Dict[str, float] = {}
                 clean_params = self._clean_params(params)
 
                 for regime in regimes:
@@ -780,6 +790,7 @@ class OptunaTPEOptimizer:
                     
                     score = compute_score_fn(train_m, val_m)
                     regime_scores.append(score)
+                    regime_score_map[regime] = float(score)
                     
                     # Update best for this regime (only if passes DD check)
                     if score > best_by_regime[regime][0]:
@@ -793,6 +804,9 @@ class OptunaTPEOptimizer:
                             'is_tuned': True,
                         })
                 
+                if regime_score_map:
+                    trial.set_user_attr("clean_params", clean_params)
+                    trial.set_user_attr("regime_scores", regime_score_map)
                 # Return the mean score so a single lucky regime cannot dominate the search.
                 return float(np.mean(regime_scores)) if regime_scores else -1000.0
                 
@@ -838,9 +852,141 @@ class OptunaTPEOptimizer:
         for regime, (score, candidate) in best_by_regime.items():
             if candidate is not None:
                 candidate['search_trials'] = int(n_trials)
+                candidate['parameter_stability_evidence'] = self._build_parameter_stability_evidence(
+                    study,
+                    regime,
+                    candidate.get('params', {}),
+                    float(score),
+                    param_space,
+                )
                 results[regime] = candidate
         
         return results
+
+    @staticmethod
+    def _param_distance(params_a: Dict[str, Any],
+                        params_b: Dict[str, Any],
+                        param_space: ParameterSpace) -> float:
+        distances: List[float] = []
+        for name, info in param_space.param_info.items():
+            choices = list(info.get("choices", []))
+            if not choices:
+                continue
+            a = params_a.get(name)
+            b = params_b.get(name)
+            if a == b:
+                distances.append(0.0)
+                continue
+            try:
+                ia = choices.index(a)
+                ib = choices.index(b)
+                distances.append(abs(float(ia - ib)) / max(1.0, float(len(choices) - 1)))
+            except Exception:
+                distances.append(1.0)
+        if not distances:
+            return 0.0
+        return float(np.sqrt(np.mean(np.asarray(distances, dtype=np.float64) ** 2)))
+
+    @staticmethod
+    def _local_neighbor_radius(param_space: ParameterSpace) -> float:
+        """One-grid-step radius in the normalized parameter-distance space."""
+
+        active_dims = 0
+        one_step_widths: List[float] = []
+        for info in param_space.param_info.values():
+            choices = list(info.get("choices", []))
+            if len(choices) < 2:
+                continue
+            active_dims += 1
+            one_step_widths.append(1.0 / max(1.0, float(len(choices) - 1)))
+        if active_dims <= 0 or not one_step_widths:
+            return 0.0
+        # A single one-step move in the widest normalized dimension, with a tiny
+        # tolerance for floating arithmetic. Multi-step/multi-param moves remain
+        # diagnostic, but not plateau evidence.
+        return float(max(one_step_widths) / math.sqrt(float(active_dims)) * 1.05)
+
+    def _build_parameter_stability_evidence(self,
+                                            study: 'optuna.Study',
+                                            regime: str,
+                                            best_params: Dict[str, Any],
+                                            best_score: float,
+                                            param_space: ParameterSpace) -> Dict[str, Any]:
+        """Compact Optuna landscape evidence for plateau-vs-needle analysis.
+
+        This is raw discovery evidence. The scorer decides later whether it predicts
+        forward survival; we do not turn it into a production score here.
+        """
+        if not OPTUNA_AVAILABLE or study is None:
+            return {"status": "not_available", "reason": "optuna_unavailable"}
+        rows: List[Dict[str, Any]] = []
+        for trial in getattr(study, "trials", []):
+            if getattr(trial, "state", None) != TrialState.COMPLETE:
+                continue
+            attrs = getattr(trial, "user_attrs", {}) or {}
+            scores = attrs.get("regime_scores") or {}
+            if regime not in scores:
+                continue
+            params = attrs.get("clean_params") or getattr(trial, "params", {}) or {}
+            try:
+                score = float(scores.get(regime))
+            except Exception:
+                continue
+            if not math.isfinite(score):
+                continue
+            rows.append({
+                "score": score,
+                "distance": self._param_distance(best_params, params, param_space),
+            })
+        if not rows:
+            return {
+                "status": "insufficient_trials",
+                "reason": "no_completed_trials_for_regime",
+                "regime": regime,
+            }
+        scores = np.asarray([row["score"] for row in rows], dtype=np.float64)
+        distances = np.asarray([row["distance"] for row in rows], dtype=np.float64)
+        finite_best = float(best_score) if math.isfinite(float(best_score)) else float(np.max(scores))
+        denom = abs(finite_best) if abs(finite_best) > 1e-9 else 1.0
+        nearest = sorted(rows, key=lambda item: (float(item["distance"]), -float(item["score"])))
+        nearest_non_exact = [row for row in nearest if float(row["distance"]) > 1e-12]
+        local_radius = self._local_neighbor_radius(param_space)
+        local_neighbors = [
+            row for row in nearest_non_exact
+            if local_radius > 0.0 and float(row["distance"]) <= local_radius
+        ]
+        min_local_neighbors = 3
+        sample_source = local_neighbors if len(local_neighbors) >= min_local_neighbors else nearest_non_exact
+        sample = sample_source[: min(12, len(sample_source))]
+        sample_scores = np.asarray([row["score"] for row in sample], dtype=np.float64) if sample else np.asarray([])
+        status = "available" if len(local_neighbors) >= min_local_neighbors else "insufficient_neighbors"
+        return {
+            "status": status,
+            "method": "optuna_nearest_neighbor_scores_v1",
+            "regime": regime,
+            "completed_regime_trials": int(len(rows)),
+            "best_score": round(finite_best, 6),
+            "score_percentile": round(float((scores <= finite_best).mean()), 6),
+            "exact_param_trial_count": int((distances <= 1e-12).sum()),
+            "local_neighbor_radius": round(float(local_radius), 6),
+            "local_neighbor_count": int(len(local_neighbors)),
+            "min_local_neighbors": int(min_local_neighbors),
+            "nearest_neighbor_count": int(len(sample)),
+            "nearest_neighbor_mean_distance": round(float(np.mean([row["distance"] for row in sample])), 6)
+            if sample else None,
+            "nearest_neighbor_median_score_ratio": round(float(np.median(sample_scores) / denom), 6)
+            if sample_scores.size else None,
+            "nearest_neighbor_min_score_ratio": round(float(np.min(sample_scores) / denom), 6)
+            if sample_scores.size else None,
+            "nearest_neighbors": [
+                {
+                    "distance": round(float(row["distance"]), 6),
+                    "score": round(float(row["score"]), 6),
+                    "score_ratio": round(float(row["score"]) / denom, 6),
+                }
+                for row in sample
+            ],
+        }
     
     def _evaluate_default_only(self,
                                symbol: str,
@@ -848,18 +994,23 @@ class OptunaTPEOptimizer:
                                default_params: Dict[str, Any],
                                train_features: pd.DataFrame,
                                val_features: Optional[pd.DataFrame],
-                               scoring_fn: Callable) -> OptimizationResult:
+                               scoring_fn: Callable,
+                               timeframe: str) -> OptimizationResult:
         """Evaluate strategy with default parameters only."""
         start_time = time.time()
         
         strategy = self.strategy_registry.get(strategy_name, **default_params)
         
         signals = strategy.generate_signals(train_features, symbol)
-        train_metrics = self.backtester.run(train_features, signals, symbol, strategy)
+        train_metrics = self.backtester.run(
+            train_features, signals, symbol, strategy, timeframe=timeframe
+        )
         
         if val_features is not None and len(val_features) >= 50:
             val_signals = strategy.generate_signals(val_features, symbol)
-            val_metrics = self.backtester.run(val_features, val_signals, symbol, strategy)
+            val_metrics = self.backtester.run(
+                val_features, val_signals, symbol, strategy, timeframe=timeframe
+            )
         else:
             val_metrics = self._empty_val_metrics()
         
@@ -889,7 +1040,8 @@ class OptunaTPEOptimizer:
                                 val_features: Optional[pd.DataFrame],
                                 scoring_fn: Callable,
                                 min_trades: int,
-                                max_drawdown_pct: float = 30.0) -> OptimizationResult:
+                                max_drawdown_pct: float = 30.0,
+                                timeframe: str = "") -> OptimizationResult:
         """Fallback to random search when Optuna unavailable (with drawdown early rejection)."""
         from itertools import product
         
@@ -901,7 +1053,8 @@ class OptunaTPEOptimizer:
         if not param_grid:
             return self._evaluate_default_only(
                 symbol, strategy_name, default_params,
-                train_features, val_features, scoring_fn
+                train_features, val_features, scoring_fn,
+                timeframe=timeframe,
             )
         
         # Generate combinations with Latin Hypercube sampling
@@ -948,7 +1101,7 @@ class OptunaTPEOptimizer:
 
                 signals = strategy.generate_signals(train_features, symbol)
                 train_metrics = self.backtester.run(
-                    train_features, signals, symbol, strategy
+                    train_features, signals, symbol, strategy, timeframe=timeframe
                 )
 
                 # EARLY REJECTION 1: Minimum trades
@@ -965,7 +1118,7 @@ class OptunaTPEOptimizer:
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_metrics = self.backtester.run(
-                        val_features, val_signals, symbol, strategy
+                        val_features, val_signals, symbol, strategy, timeframe=timeframe
                     )
 
                     # EARLY REJECTION 3: Validation drawdown
@@ -1074,7 +1227,7 @@ class OptunaTPEOptimizer:
 
                 signals = strategy.generate_signals(train_features, symbol)
                 train_result = self.backtester.run(
-                    train_features, signals, symbol, strategy
+                    train_features, signals, symbol, strategy, timeframe=timeframe
                 )
 
                 # EARLY REJECTION 1: Minimum trades
@@ -1100,7 +1253,12 @@ class OptunaTPEOptimizer:
                 if val_features is not None and len(val_features) >= 50:
                     val_signals = strategy.generate_signals(val_features, symbol)
                     val_result = self.backtester.run(
-                        val_features, val_signals, symbol, strategy, warmup_bars=val_warmup_bars
+                        val_features,
+                        val_signals,
+                        symbol,
+                        strategy,
+                        warmup_bars=val_warmup_bars,
+                        timeframe=timeframe,
                     )
 
                     # Early rejection if validation DD too high

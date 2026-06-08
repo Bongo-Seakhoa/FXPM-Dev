@@ -16,6 +16,7 @@ from pm_pipeline import (
     artifact_contract_matches,
     build_artifact_meta,
 )
+from pm_regime import materialize_regime_params_for_cells
 
 
 class PipelineArtifactTests(unittest.TestCase):
@@ -56,6 +57,49 @@ class PipelineArtifactTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_ledger_reader_refreshes_after_external_atomic_update(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_ledger_external_refresh")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            ledger_path = tmp / "pm_configs.json"
+            writer = ConfigLedger(str(ledger_path))
+            writer.load()
+            self.assertTrue(
+                writer.update_symbol(
+                    "EURUSD",
+                    SymbolConfig(
+                        symbol="EURUSD",
+                        strategy_name="FirstStrategy",
+                        timeframe="H1",
+                        is_validated=True,
+                        valid_until=datetime.now() + timedelta(days=7),
+                    ),
+                )
+            )
+
+            reader = ConfigLedger(str(ledger_path))
+            self.assertEqual(sorted(reader.get_all_configs()), ["EURUSD"])
+
+            external_writer = ConfigLedger(str(ledger_path))
+            external_writer.load()
+            self.assertTrue(
+                external_writer.update_symbol(
+                    "GBPUSD",
+                    SymbolConfig(
+                        symbol="GBPUSD",
+                        strategy_name="SecondStrategy",
+                        timeframe="H1",
+                        is_validated=True,
+                        valid_until=datetime.now() + timedelta(days=7),
+                    ),
+                )
+            )
+
+            self.assertEqual(sorted(reader.get_all_configs()), ["EURUSD", "GBPUSD"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_artifact_contract_ignores_volatile_ledger_metadata(self):
         cfg = PipelineConfig()
         current = build_artifact_meta(cfg)
@@ -75,6 +119,51 @@ class PipelineArtifactTests(unittest.TestCase):
 
         self.assertEqual(current["exit_surface_contract"], "neutral_discovery_sl_tp_v1")
         self.assertNotIn("regime_tp_multipliers", current)
+
+    def test_artifact_meta_keeps_production_schedule_out_of_discovery_contract(self):
+        two_week = build_artifact_meta(PipelineConfig(production_retrain_interval_weeks=2))
+        four_week = build_artifact_meta(PipelineConfig(production_retrain_interval_weeks=4))
+
+        for key in {
+            "fixed_retrain_days",
+            "production_retrain_mode",
+            "production_retrain_interval_weeks",
+            "production_retrain_weekday",
+            "production_retrain_time",
+            "production_retrain_anchor_date",
+        }:
+            self.assertNotIn(key, four_week)
+
+        self.assertTrue(artifact_contract_matches(two_week, four_week))
+
+    def test_artifact_contract_accepts_materialized_no_file_regime_surface_only(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_materialized_regime_surface")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            regime_path = tmp / "regime_params.json"
+            cfg = PipelineConfig(
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+                log_dir=tmp / "logs",
+                regime_params_file=str(regime_path),
+            )
+            stored = build_artifact_meta(cfg)
+            self.assertIsNone(stored["regime_params"]["mtime_ns"])
+
+            materialize_regime_params_for_cells([("BTCUSD", "H4")], str(regime_path))
+            current = build_artifact_meta(cfg)
+
+            self.assertTrue(artifact_contract_matches(stored, current))
+
+            payload = json.loads(regime_path.read_text(encoding="utf-8"))
+            payload["BTCUSD"]["H4"]["k_hold"] += 1
+            regime_path.write_text(json.dumps(payload), encoding="utf-8")
+            changed = build_artifact_meta(cfg)
+
+            self.assertFalse(artifact_contract_matches(stored, changed))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_artifact_meta_includes_execution_cost_contract(self):
         cfg = PipelineConfig(
@@ -137,6 +226,13 @@ class PipelineArtifactTests(unittest.TestCase):
         self.assertEqual(current["false_discovery_holdout_min_trades"], 5)
         self.assertAlmostEqual(current["false_discovery_holdout_min_profit_factor"], 1.0)
         self.assertAlmostEqual(current["false_discovery_holdout_min_return_pct"], 0.0)
+        self.assertEqual(current["production_split_mode"], "bleeding_edge")
+        self.assertEqual(current["walk_forward_validation_bars"], 50000)
+        self.assertEqual(current["oos_validation_mode"], "fixed_holdout")
+        self.assertEqual(current["oos_kfold_splits"], 5)
+        self.assertEqual(current["oos_embargo_bars"], 1)
+        self.assertEqual(current["oos_min_trades"], 5)
+        self.assertEqual(current["oos_aggregate_policy"], "aggregate_with_worst_fold_floor")
         self.assertFalse(current["oos_evidence_export_enabled"])
         self.assertEqual(current["oos_evidence_periods"], 64)
         self.assertEqual(current["oos_evidence_min_periods"], 8)
@@ -149,6 +245,40 @@ class PipelineArtifactTests(unittest.TestCase):
         changed = dict(current)
         changed["oos_evidence_export_enabled"] = True
         self.assertFalse(artifact_contract_matches(current, changed))
+
+        changed = dict(current)
+        changed["oos_validation_mode"] = "purged_kfold"
+        self.assertFalse(artifact_contract_matches(current, changed))
+
+        changed = dict(current)
+        changed["production_split_mode"] = "research_clean_holdout"
+        self.assertFalse(artifact_contract_matches(current, changed))
+
+    def test_artifact_meta_includes_specialist_spokes_v2_contract(self):
+        cfg = PipelineConfig(
+            regime_scoring_model="specialist_spokes_v2",
+            specialist_spokes_v2_cost_frequency_strength=0.42,
+            specialist_spokes_v2_default_fallback_enabled=True,
+            specialist_spokes_v2_allow_promote_small_default=True,
+            specialist_spokes_v2_max_validation_sharpe=0.0,
+        )
+        current = build_artifact_meta(cfg)
+
+        self.assertEqual(current["regime_scoring_model"], "specialist_spokes_v2")
+        self.assertAlmostEqual(current["specialist_spokes_v2_cost_frequency_strength"], 0.42)
+        self.assertTrue(current["specialist_spokes_v2_default_fallback_enabled"])
+        self.assertTrue(current["specialist_spokes_v2_allow_promote_small_default"])
+        self.assertAlmostEqual(current["specialist_spokes_v2_max_validation_sharpe"], 0.0)
+
+        for key, value in {
+            "specialist_spokes_v2_cost_frequency_strength": 0.10,
+            "specialist_spokes_v2_default_fallback_enabled": False,
+            "specialist_spokes_v2_allow_promote_small_default": False,
+            "specialist_spokes_v2_max_validation_sharpe": 250.0,
+        }.items():
+            changed = dict(current)
+            changed[key] = value
+            self.assertFalse(artifact_contract_matches(current, changed), key)
 
     def test_portfolio_manager_sets_false_discovery_symbol_scope(self):
         tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_false_discovery_scope")
@@ -204,7 +334,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 "EURUSD",
                 [
                     {
-                        "format_version": "oos_candidate_returns_v1",
+                        "format_version": "oos_candidate_returns_v3",
                         "candidate_id": "abc",
                         "symbol": "EURUSD",
                         "timeframe": "H1",
@@ -212,6 +342,23 @@ class PipelineArtifactTests(unittest.TestCase):
                         "parameters": {},
                         "period_returns": [0.01, -0.02, 0.03, 0.01, 0.0, 0.02, -0.01, 0.01],
                         "period_count": 8,
+                        "trade_path_evidence": {
+                            "status": "available",
+                            "r_multiple_sequence": [1.0, -0.5],
+                        },
+                        "equity_path_evidence": {
+                            "status": "available",
+                            "capital_preservation_blocks": [1.0, 0.99],
+                        },
+                        "execution_cost_survival": {
+                            "status": "available",
+                            "stress_mode": "stress_p95",
+                            "stress_return_pct": 1.0,
+                        },
+                        "parameter_stability_evidence": {
+                            "status": "available",
+                            "nearest_neighbor_median_score_ratio": 0.9,
+                        },
                     }
                 ],
                 artifact_meta=artifact_meta,
@@ -221,15 +368,58 @@ class PipelineArtifactTests(unittest.TestCase):
             path = pointer["path"]
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             self.assertEqual(payload["format_version"], "oos_candidate_matrix_v1")
+            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v3_spoke_evidence")
             self.assertEqual(payload["record_count"], 1)
             self.assertEqual(pointer["record_count"], payload["record_count"])
             self.assertEqual(payload["records"][0]["candidate_id"], "abc")
             self.assertNotIn("period_returns", payload["records"][0])
+            self.assertEqual(payload["records"][0]["trade_path_evidence"]["status"], "available")
+            self.assertEqual(payload["records"][0]["equity_path_evidence"]["status"], "available")
+            self.assertEqual(payload["records"][0]["execution_cost_survival"]["stress_mode"], "stress_p95")
+            self.assertAlmostEqual(
+                payload["records"][0]["parameter_stability_evidence"]["nearest_neighbor_median_score_ratio"],
+                0.9,
+            )
             matrix = np.load(payload["matrix_path"])
             self.assertEqual(matrix["returns"].shape, (8, 1))
             self.assertEqual(matrix["candidate_ids"].tolist(), ["abc"])
             self.assertIn("artifact_meta", payload)
             self.assertFalse((tmp / "pm_configs.json").exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_oos_candidate_evidence_writer_records_empty_candidate_pool(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_empty_oos_evidence_writer")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+                oos_evidence_export_enabled=True,
+            )
+            pipeline = OptimizationPipeline(cfg)
+            artifact_meta = build_artifact_meta(cfg)
+            pointer = pipeline._write_oos_candidate_evidence(
+                "BTCETH",
+                [],
+                artifact_meta=artifact_meta,
+                data_window_meta={"data_window_fingerprint": "window-hash"},
+            )
+
+            self.assertIsNotNone(pointer)
+            self.assertEqual(pointer["record_count"], 0)
+            self.assertEqual(pointer["returns_shape"], [0, 0])
+            self.assertEqual(pointer["completion_status"], "NO_CANDIDATE_RECORDS")
+            payload = json.loads(Path(pointer["path"]).read_text(encoding="utf-8"))
+            self.assertEqual(payload["format_version"], "oos_candidate_matrix_v1")
+            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v3_spoke_evidence")
+            self.assertEqual(payload["record_count"], 0)
+            self.assertEqual(payload["completion_status"], "NO_CANDIDATE_RECORDS")
+            self.assertEqual(payload["records"], [])
+            matrix = np.load(payload["matrix_path"])
+            self.assertEqual(matrix["returns"].shape, (0, 0))
+            self.assertEqual(matrix["candidate_ids"].tolist(), [])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -249,7 +439,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 "EURUSD",
                 [
                     {
-                        "format_version": "oos_candidate_returns_v1",
+                        "format_version": "oos_candidate_returns_v3",
                         "candidate_id": "abc",
                         "symbol": "EURUSD",
                         "timeframe": "H1",
@@ -371,6 +561,83 @@ class PipelineArtifactTests(unittest.TestCase):
                 manager._last_live_eligibility_warnings,
                 {"EURUSD": "artifact fingerprint changed"},
             )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_live_eligible_configs_exclude_symbols_with_only_blocked_regime_cells(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_live_eligibility_blocked_regimes")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+            )
+            artifact_meta = build_artifact_meta(cfg)
+            manager = PortfolioManager(cfg, ["EURUSD"], config_file=str(tmp / "pm_configs.json"))
+            blocked_cell = RegimeConfig(
+                strategy_name="TestStrategy",
+                parameters={},
+                quality_score=0.8,
+                promotion_status="BLOCKED",
+                promotion_reasons=["holdout failed"],
+            )
+            symbol_cfg = SymbolConfig(
+                symbol="EURUSD",
+                strategy_name="TestStrategy",
+                is_validated=True,
+                valid_until=datetime.now() + timedelta(days=1),
+                artifact_meta=artifact_meta,
+                regime_configs={"H1": {"TREND": blocked_cell}},
+            )
+            self.assertEqual(symbol_cfg.count_regime_winners(), 0)
+            self.assertTrue(manager.ledger.update_symbol("EURUSD", symbol_cfg))
+
+            live_eligible = manager.get_live_eligible_configs(current_artifact_meta=artifact_meta)
+
+            self.assertEqual(live_eligible, {})
+            self.assertEqual(manager._last_live_eligibility_rejections["EURUSD"], "no tradeable regime winners")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_promoted_regime_cell_overrides_stale_top_level_invalid_flag(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_cell_level_live_validity")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+            )
+            artifact_meta = build_artifact_meta(cfg)
+            ledger_path = tmp / "pm_configs.json"
+            cell = RegimeConfig(
+                strategy_name="TestStrategy",
+                parameters={},
+                quality_score=0.8,
+                promotion_status="PROMOTED",
+            )
+            symbol_cfg = SymbolConfig(
+                symbol="EURUSD",
+                strategy_name="",
+                is_validated=False,
+                valid_until=datetime.now() + timedelta(days=1),
+                artifact_meta=artifact_meta,
+                regime_configs={"H1": {"TREND": cell}},
+            )
+            payload = symbol_cfg.to_dict()
+            payload["is_validated"] = False
+            ledger_path.write_text(json.dumps({"EURUSD": payload}, indent=2), encoding="utf-8")
+
+            ledger = ConfigLedger(str(ledger_path))
+            self.assertTrue(ledger.has_valid_config("EURUSD")[0])
+
+            manager = PortfolioManager(cfg, ["EURUSD"], config_file=str(ledger_path))
+            raw_validated = manager.get_validated_configs()
+            live_eligible = manager.get_live_eligible_configs(current_artifact_meta=artifact_meta)
+
+            self.assertEqual(set(raw_validated), {"EURUSD"})
+            self.assertEqual(set(live_eligible), {"EURUSD"})
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

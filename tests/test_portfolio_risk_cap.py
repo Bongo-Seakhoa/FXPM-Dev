@@ -550,6 +550,55 @@ class TestPortfolioRiskCap:
         assert any("DAILY LOSS ADVISORY" in message for message in caplog.messages)
         assert trader._daily_advisory_state["daily"] == "tripped"
 
+    def test_hard_realized_loss_guard_blocks_even_without_supervisor(self):
+        mock_mt5 = Mock()
+        account = MockAccountInfo(equity=10000, balance=10000)
+        mock_mt5.get_account_info.return_value = account
+        mock_mt5.is_connected.return_value = False
+
+        mock_pm = Mock()
+        mock_pm.symbols = []
+
+        pipeline_config = SimpleNamespace(
+            max_combined_risk_pct=3.0,
+            daily_loss_advisory_pct=0.0,
+            session_loss_advisory_pct=0.0,
+            daily_loss_hard_block_pct=1.0,
+            session_loss_hard_block_pct=0.0,
+            weekly_loss_hard_block_pct=1.0,
+            institutional_supervisor_enabled=False,
+            institutional_supervisor_mode="off",
+            live_risk_scalars_enabled=False,
+            live_risk_scalars_mode="off",
+            market_driven_exit_pack_mode="off",
+            portfolio_observatory_enabled=False,
+            local_governance_live_mode="off",
+            target_annual_vol=0.10,
+            execution_spread_filter_enabled=False,
+            execution_spread_min_edge_mult=1.5,
+            execution_spread_spike_mult=2.0,
+            execution_spread_penalty_start_mult=0.5,
+            get_last_retrain_slot=lambda now: datetime(now.year, now.month, now.day),
+        )
+
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            pipeline_config=pipeline_config,
+            enable_trading=False,
+        )
+        trader._recent_closing_deals = [{"profit": -150.0, "time": datetime.now()}]
+        trader._recent_closing_deals_lookback_hours = 24 * 8
+
+        reasons = trader._realized_loss_hard_block_reasons(account)
+
+        assert "daily_loss 1.50% >= 1.00%" in reasons
+        assert "weekly_loss 1.50% >= 1.00%" in reasons
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -1,15 +1,51 @@
 import logging
+import os
+import json
+import shutil
 import unittest
 import warnings
+from pathlib import Path
 import pandas as pd
 
-from pm_core import FeatureComputer
+from pm_core import FeatureComputer, PipelineConfig
+from pm_pipeline import OptimizationPipeline
 from pm_strategies import EMACrossoverStrategy, StrategyRegistry
 
 
 class FeatureCacheTests(unittest.TestCase):
     def setUp(self):
+        FeatureComputer.configure_cache(
+            24,
+            disk_enabled=False,
+            disk_dir=None,
+            disk_max_gb=0,
+            disk_min_free_gb=0,
+        )
         FeatureComputer.clear_cache()
+        FeatureComputer.get_cache_stats(reset=True)
+
+    def tearDown(self):
+        FeatureComputer.configure_cache(
+            24,
+            disk_enabled=False,
+            disk_dir=None,
+            disk_max_gb=0,
+            disk_min_free_gb=0,
+        )
+        FeatureComputer.clear_cache()
+        FeatureComputer.get_cache_stats(reset=True)
+
+    def _sample_ohlcv(self, rows=80):
+        return pd.DataFrame(
+            {
+                "Open": [1.0 + i * 0.01 for i in range(rows)],
+                "High": [1.1 + i * 0.01 for i in range(rows)],
+                "Low": [0.9 + i * 0.01 for i in range(rows)],
+                "Close": [1.0 + i * 0.01 for i in range(rows)],
+                "Volume": [100] * rows,
+            },
+            index=pd.date_range("2026-01-01", periods=rows, freq="h"),
+        )
 
     def test_compute_all_cache(self):
         df = pd.DataFrame({
@@ -140,6 +176,215 @@ class FeatureCacheTests(unittest.TestCase):
         FeatureComputer.clear_cache()
         self.assertEqual(FeatureComputer._FEATURE_CACHE_HITS, 0)
         self.assertEqual(FeatureComputer._FEATURE_CACHE_MISSES, 0)
+
+    def test_disk_feature_cache_round_trips_without_memory_cache(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_feature_disk_cache_roundtrip")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            FeatureComputer.configure_cache(
+                0,
+                disk_enabled=True,
+                disk_dir=tmp,
+                disk_max_gb=0.01,
+            )
+            df = self._sample_ohlcv()
+            first = FeatureComputer.compute_all(df, symbol="TEST", timeframe="H1", regime_params_file="")
+            self.assertTrue((tmp).exists())
+            FeatureComputer.clear_cache()
+            FeatureComputer.get_cache_stats(reset=True)
+
+            second = FeatureComputer.compute_all(df, symbol="TEST", timeframe="H1", regime_params_file="")
+            stats = FeatureComputer.get_cache_stats()
+
+            self.assertTrue(first.equals(second))
+            self.assertEqual(stats["memory_cap"], 0)
+            self.assertEqual(stats["disk_hits"], 1)
+            self.assertGreater(stats["disk_bytes_read"], 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_disk_feature_cache_key_hashes_full_source_not_sample_only(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_feature_disk_cache_full_hash")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            FeatureComputer.configure_cache(
+                0,
+                disk_enabled=True,
+                disk_dir=tmp,
+                disk_max_gb=0.01,
+            )
+            df = self._sample_ohlcv()
+            FeatureComputer.compute_all(df, symbol="TEST", timeframe="H1", regime_params_file="")
+            FeatureComputer.clear_cache()
+            FeatureComputer.get_cache_stats(reset=True)
+
+            changed = df.copy()
+            changed.iloc[len(changed) // 3, changed.columns.get_loc("Close")] = 99.0
+            result = FeatureComputer.compute_all(changed, symbol="TEST", timeframe="H1", regime_params_file="")
+            stats = FeatureComputer.get_cache_stats()
+
+            self.assertEqual(float(result.iloc[len(changed) // 3]["Close"]), 99.0)
+            self.assertEqual(stats["disk_hits"], 0)
+            self.assertEqual(stats["disk_misses"], 1)
+            self.assertEqual(stats["disk_writes"], 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_disk_feature_cache_respects_free_space_reserve(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_feature_disk_cache_reserve")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            FeatureComputer.configure_cache(
+                0,
+                disk_enabled=True,
+                disk_dir=tmp,
+                disk_max_gb=0.01,
+                disk_min_free_gb=999999.0,
+            )
+            df = self._sample_ohlcv()
+            FeatureComputer.compute_all(df, symbol="TEST", timeframe="H1", regime_params_file="")
+            stats = FeatureComputer.get_cache_stats()
+
+            self.assertEqual(stats["disk_writes"], 0)
+            self.assertGreaterEqual(stats["disk_skipped_storage"], 1)
+            self.assertEqual(list(tmp.glob("feature_*")), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_regime_params_content_change_invalidates_feature_cache_key(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_feature_regime_fingerprint")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            regime_file = tmp / "regime_params.json"
+            regime_file.write_text('{"a":1}', encoding="utf-8")
+            df = self._sample_ohlcv()
+            first_key = FeatureComputer._make_cache_key(df, "TEST", "H1", str(regime_file))
+            regime_file.write_text('{"a":2}', encoding="utf-8")
+            second_key = FeatureComputer._make_cache_key(df, "TEST", "H1", str(regime_file))
+
+            self.assertNotEqual(first_key, second_key)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_disk_feature_cache_prunes_whole_entry_groups(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_feature_disk_cache_prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            FeatureComputer.configure_cache(
+                0,
+                disk_enabled=True,
+                disk_dir=tmp,
+                disk_max_gb=0.00001,
+                disk_min_free_gb=0,
+            )
+            old_parquet = tmp / "feature_old.parquet"
+            old_manifest = tmp / "feature_old.json"
+            new_parquet = tmp / "feature_new.parquet"
+            new_manifest = tmp / "feature_new.json"
+            for path in [old_parquet, old_manifest, new_parquet, new_manifest]:
+                path.write_bytes(b"x" * 4096)
+            old_time = 1_700_000_000
+            new_time = old_time + 100
+            for path in [old_parquet, old_manifest]:
+                os.utime(path, (old_time, old_time))
+            for path in [new_parquet, new_manifest]:
+                os.utime(path, (new_time, new_time))
+
+            FeatureComputer._prune_disk_cache()
+
+            self.assertFalse(old_parquet.exists())
+            self.assertFalse(old_manifest.exists())
+            self.assertTrue(new_parquet.exists() or new_manifest.exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_disk_feature_cache_prune_ignores_inflight_temp_files(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_feature_disk_cache_prune_temp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            FeatureComputer.configure_cache(
+                0,
+                disk_enabled=True,
+                disk_dir=tmp,
+                disk_max_gb=0.000001,
+                disk_min_free_gb=0,
+            )
+            temp_file = tmp / "feature_abc.123.tmp.parquet"
+            old_file = tmp / "feature_old.parquet"
+            temp_file.write_bytes(b"x" * 4096)
+            old_file.write_bytes(b"x" * 4096)
+
+            FeatureComputer._prune_disk_cache()
+
+            self.assertTrue(temp_file.exists())
+            self.assertFalse(old_file.exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_disk_feature_cache_invalidates_manifest_shape_mismatch(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_feature_disk_cache_manifest_shape")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            FeatureComputer.configure_cache(
+                0,
+                disk_enabled=True,
+                disk_dir=tmp,
+                disk_max_gb=0.01,
+                disk_min_free_gb=0,
+            )
+            df = self._sample_ohlcv()
+            FeatureComputer.compute_all(df, symbol="TEST", timeframe="H1", regime_params_file="")
+            FeatureComputer.clear_cache()
+            FeatureComputer.get_cache_stats(reset=True)
+            manifest_path = next(tmp.glob("feature_*.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["rows"] = -1
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            FeatureComputer.compute_all(df, symbol="TEST", timeframe="H1", regime_params_file="")
+            stats = FeatureComputer.get_cache_stats()
+
+            self.assertGreaterEqual(stats["disk_invalidations"], 1)
+            self.assertEqual(stats["disk_hits"], 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_pipeline_precompute_feature_cache_warms_disk_cache(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_pipeline_feature_precompute")
+        data_dir = tmp / "data"
+        cache_dir = tmp / "feature_cache"
+        shutil.rmtree(tmp, ignore_errors=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            df = self._sample_ohlcv(rows=240).reset_index().rename(columns={"index": "time"})
+            df.to_csv(data_dir / "TEST_M5.csv", index=False)
+            cfg = PipelineConfig(
+                data_dir=data_dir,
+                timeframes=["M5"],
+                feature_cache_max_entries=0,
+                feature_disk_cache_enabled=True,
+                feature_disk_cache_dir=str(cache_dir),
+                feature_disk_cache_max_gb=0.01,
+                feature_disk_cache_min_free_gb=0,
+                regime_params_file="",
+            )
+            pipeline = OptimizationPipeline(cfg)
+
+            stats = pipeline.precompute_feature_cache(["TEST"])
+
+            self.assertEqual(stats["symbols_completed"], 1)
+            self.assertEqual(stats["symbols_failed"], 0)
+            self.assertEqual(stats["timeframes_computed_or_retrieved"], 1)
+            self.assertGreater(len(list(cache_dir.glob("feature_*"))), 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_strategy_helpers_do_not_warn_on_slice_views(self):
         df = pd.DataFrame({

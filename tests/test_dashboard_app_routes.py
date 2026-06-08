@@ -167,7 +167,7 @@ class DashboardAppRouteTests(unittest.TestCase):
         self.assertEqual(saved["refresh_interval_sec"], 9)
 
     def test_strategies_follow_pipeline_winner_ledger_when_auto(self) -> None:
-        self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})
+        self._write_root_config({"pipeline": {"winner_ledger_path": "custom_pm_configs.json"}})
         self._write_pm_configs(
             "pm_configs.json",
             {
@@ -179,7 +179,7 @@ class DashboardAppRouteTests(unittest.TestCase):
             },
         )
         self._write_pm_configs(
-            "pm_configs_high_risk.json",
+            "custom_pm_configs.json",
             {
                 "XAUUSD": {
                     "symbol": "XAUUSD",
@@ -199,9 +199,9 @@ class DashboardAppRouteTests(unittest.TestCase):
         self.assertEqual(symbols, {"XAUUSD"})
 
     def test_strategies_preserve_zero_scores_and_trade_counts(self) -> None:
-        self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})
+        self._write_root_config({"pipeline": {"winner_ledger_path": "custom_pm_configs.json"}})
         self._write_pm_configs(
-            "pm_configs_high_risk.json",
+            "custom_pm_configs.json",
             {
                 "EURUSD": {
                     "symbol": "EURUSD",
@@ -231,9 +231,9 @@ class DashboardAppRouteTests(unittest.TestCase):
         self.assertEqual(row["regime_val_trades"], 0)
 
     def test_strategies_emit_strict_json_when_metrics_are_non_finite(self) -> None:
-        self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})
+        self._write_root_config({"pipeline": {"winner_ledger_path": "custom_pm_configs.json"}})
         self._write_pm_configs(
-            "pm_configs_high_risk.json",
+            "custom_pm_configs.json",
             {
                 "EURUSD": {
                     "symbol": "EURUSD",
@@ -270,9 +270,9 @@ class DashboardAppRouteTests(unittest.TestCase):
         self.assertIsNone(row["train_metrics"]["profit_factor"])
 
     def test_strategies_handle_regime_invalid_status_and_timezone_valid_until(self) -> None:
-        self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})
+        self._write_root_config({"pipeline": {"winner_ledger_path": "custom_pm_configs.json"}})
         self._write_pm_configs(
-            "pm_configs_high_risk.json",
+            "custom_pm_configs.json",
             {
                 "GBPUSD": {
                     "symbol": "GBPUSD",
@@ -305,9 +305,9 @@ class DashboardAppRouteTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["invalid"], 1)
 
     def test_trade_history_uses_pipeline_winner_ledger_for_enrichment(self) -> None:
-        self._write_root_config({"pipeline": {"winner_ledger_path": "pm_configs_high_risk.json"}})
+        self._write_root_config({"pipeline": {"winner_ledger_path": "custom_pm_configs.json"}})
         self._write_pm_configs(
-            "pm_configs_high_risk.json",
+            "custom_pm_configs.json",
             {
                 "GBPUSD": {
                     "symbol": "GBPUSD",
@@ -348,12 +348,12 @@ class DashboardAppRouteTests(unittest.TestCase):
         self._write_root_config({
             "symbols": ["EURUSD", "GBPUSD"],
             "pipeline": {
-                "winner_ledger_path": "pm_configs_high_risk.json",
+                "winner_ledger_path": "custom_pm_configs.json",
                 "initial_capital": 5000,
             },
         })
         self._write_pm_configs(
-            "pm_configs_high_risk.json",
+            "custom_pm_configs.json",
             {
                 "EURUSD": {
                     "symbol": "EURUSD",
@@ -379,7 +379,7 @@ class DashboardAppRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["active_pm_configs_path"], "pm_configs_high_risk.json")
+        self.assertEqual(payload["active_pm_configs_path"], "custom_pm_configs.json")
         self.assertEqual(payload["ledger"]["configured_symbol_count"], 2)
         self.assertEqual(payload["ledger"]["optimized_symbol_count"], 1)
         self.assertEqual(payload["ledger"]["missing_symbol_count"], 1)
