@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from pm_main import load_config_json
+from pm_regime import has_tuned_regime_params
 
 
 class ConfigJsonIntegrityTests(unittest.TestCase):
@@ -71,7 +72,8 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertFalse(pipeline["scoring_use_trade_frequency_bonus"])
         self.assertAlmostEqual(pipeline["legacy_confidence_bonus_cap"], 0.08, places=6)
         self.assertTrue(pipeline["walk_forward_audit_enabled"])
-        self.assertEqual(pipeline["walk_forward_promotion_policy"], "observe_only")
+        self.assertEqual(pipeline["walk_forward_promotion_policy"], "promotion_gate")
+        self.assertTrue(pipeline["walk_forward_live_blocking_enabled"])
         self.assertTrue(pipeline["live_require_tuned_regime_params"])
         self.assertEqual(pipeline["production_retrain_mode"], "notify")
         self.assertEqual(pipeline["production_retrain_interval_weeks"], 4)
@@ -96,11 +98,12 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertTrue(pipeline["walk_forward_audit_enabled"])
         self.assertTrue(pipeline["production_require_promotion_gate"])
         self.assertEqual(pipeline["production_promotion_gate_mode"], "ledger_status")
+        self.assertEqual(pipeline["live_artifact_drift_policy"], "block")
         self.assertEqual(pipeline["production_promotion_review_path"], "")
         self.assertEqual(pipeline["production_promotion_cell_safety_path"], "")
         self.assertEqual(pipeline["production_completion_marker_path"], "")
-        self.assertEqual(pipeline["walk_forward_promotion_policy"], "observe_only")
-        self.assertFalse(pipeline["walk_forward_live_blocking_enabled"])
+        self.assertEqual(pipeline["walk_forward_promotion_policy"], "promotion_gate")
+        self.assertTrue(pipeline["walk_forward_live_blocking_enabled"])
         self.assertTrue(pipeline["live_require_tuned_regime_params"])
         self.assertEqual(pipeline["production_retrain_mode"], "notify")
         self.assertEqual(pipeline["production_retrain_interval_weeks"], 4)
@@ -109,8 +112,9 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertEqual(pipeline["session_loss_hard_block_pct"], 40.0)
         self.assertEqual(pipeline["weekly_loss_hard_block_pct"], 60.0)
         self.assertEqual(pipeline["open_drawdown_hard_block_pct"], 50.0)
-        self.assertEqual(pipeline["max_total_open_risk_pct"], 50.0)
-        self.assertEqual(pipeline["max_new_entries_when_total_open_risk_above_pct"], 40.0)
+        self.assertEqual(pipeline["max_total_open_risk_pct"], 75.0)
+        self.assertEqual(pipeline["max_new_entries_when_total_open_risk_above_pct"], 50.0)
+        self.assertEqual(pipeline["open_risk_action"], "derate")
         self.assertEqual(pipeline["margin_entry_block_level"], 60.0)
         self.assertEqual(pipeline["margin_recovery_start_level"], 55.0)
         self.assertEqual(pipeline["margin_panic_level"], 50.0)
@@ -133,7 +137,7 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertEqual(pipeline["live_min_account_equity"], 20.0)
         self.assertEqual(pipeline["live_min_account_equity_currency"], "USD")
         self.assertEqual(pipeline["risk_per_trade_pct"], 1.5)
-        self.assertEqual(data["position"]["risk_per_trade_pct"], 1.5)
+        self.assertEqual(data["position"]["risk_per_trade_pct"], 0.5)
         self.assertEqual(data["position"]["max_risk_pct"], 25.0)
         self.assertEqual(data["position"]["risk_tolerance_pct"], 25.0)
         for symbol in ["AUDUSD", "EURUSD", "USDCAD", "USDJPY"]:
@@ -158,7 +162,7 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
             default_config = payload.get("default_config") or {}
             status = payload.get("promotion_status") or default_config.get("promotion_status")
             if payload.get("strategy_name") != "NO_TRADE":
-                self.assertIn(status, {"PROMOTED", "BLOCKED"})
+                self.assertIn(status, {"PROMOTED", "PROMOTE_SMALL", "PAPER_ONLY", "BLOCKED"})
                 if status == "PROMOTED":
                     self.assertTrue(payload.get("is_validated") or default_config.get("is_validated"))
                 if status == "BLOCKED":
@@ -170,15 +174,23 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
                     self.assertIn(regime, {"TREND", "RANGE", "BREAKOUT", "CHOP"})
                     if cfg.get("strategy_name") != "NO_TRADE":
                         cell_status = cfg.get("promotion_status")
-                        self.assertIn(cell_status, {"PROMOTED", "BLOCKED"})
+                        self.assertIn(cell_status, {"PROMOTED", "PROMOTE_SMALL", "PAPER_ONLY", "BLOCKED"})
                         if cell_status == "PROMOTED":
                             evidence = cfg.get("validation_evidence") or {}
                             self.assertTrue(
                                 cfg.get("is_validated")
                                 or str(evidence.get("validation_reason", "")).startswith("Validated")
                             )
-                            self.assertIn(symbol, regime_params)
-                            self.assertIn(timeframe, regime_params[symbol])
+                            # Check exactly what live checks: the regime-param
+                            # lookup is case-insensitive, so a promoted mixed-case
+                            # broker symbol (e.g. Platinum) resolves against the
+                            # materialized row regardless of key casing.
+                            self.assertTrue(
+                                has_tuned_regime_params(
+                                    symbol, timeframe, str(self.repo_root / "regime_params.json")
+                                ),
+                                f"PROMOTED {symbol}/{timeframe} has no tuned regime params; live would NO_TRADE it",
+                            )
                         if cell_status == "BLOCKED":
                             self.assertTrue(cfg.get("promotion_reasons"))
 

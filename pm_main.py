@@ -5812,7 +5812,7 @@ class FXPortfolioManagerApp:
                     len(incomplete) + len(no_data),
                     preview,
                 )
-                min_m5_bars = int(getattr(self.pipeline_config, "optimization_min_m5_bars", 0) or 0)
+                min_m5_bars = self._effective_min_m5_bars()
                 retry_attempts = int(getattr(self.pipeline_config, "historical_fetch_retry_attempts", 1) or 1)
                 for symbol, rows in incomplete.items():
                     reason = (
@@ -6181,14 +6181,14 @@ class FXPortfolioManagerApp:
             f"because {current_len} M5 bars is below required {required_bars}."
         )
 
-        range_bars = self.mt5.get_bars_range(broker_symbol, "M5", start_date, end_date)
+        range_bars = self.mt5.get_bars_range(broker_symbol, "M5", start_date, end_date, sync_retry=True)
         merged = self._merge_history_frames(existing_df, bars, range_bars)
         merged_len = 0 if merged is None else len(merged)
         if merged_len > current_len:
             self.logger.info(f"  {symbol}: Deep backfill expanded history to {merged_len} M5 bars.")
 
         if required_bars > 0 and merged_len < required_bars:
-            hydrated = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch)
+            hydrated = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
             merged = self._merge_history_frames(merged, hydrated)
             hydrated_len = 0 if merged is None else len(merged)
             if hydrated_len > merged_len:
@@ -6233,6 +6233,20 @@ class FXPortfolioManagerApp:
         )
         return False
 
+    def _effective_min_m5_bars(self) -> int:
+        """Validity floor for downloaded M5 history.
+
+        Fractional rule is the source of truth: a symbol is valid when it has at
+        least `optimization_min_m5_bars_fraction` of `max_bars` (e.g. 0.85 of 300k
+        = 255k). Keeps the 300k standard while admitting close-but-short symbols;
+        the absolute `optimization_min_m5_bars` is used only when no fraction is set.
+        """
+        max_bars = int(getattr(self.pipeline_config, "max_bars", 0) or 0)
+        frac = float(getattr(self.pipeline_config, "optimization_min_m5_bars_fraction", 0.0) or 0.0)
+        if frac > 0.0 and max_bars > 0:
+            return int(math.ceil(max_bars * frac))
+        return int(getattr(self.pipeline_config, "optimization_min_m5_bars", 0) or 0)
+
     def _fetch_historical_data(self, symbols: List[str] = None):
         """Fetch historical data from MT5 and save to data directory."""
         if not self.mt5 or not self.mt5.is_connected():
@@ -6248,7 +6262,7 @@ class FXPortfolioManagerApp:
             "no_data_symbols": [],
             "write_failed_symbols": [],
         }
-        min_m5_bars = int(getattr(self.pipeline_config, "optimization_min_m5_bars", 0) or 0)
+        min_m5_bars = self._effective_min_m5_bars()
         retry_attempts = max(1, int(getattr(self.pipeline_config, "historical_fetch_retry_attempts", 1) or 1))
         retry_sleep = max(0.0, float(getattr(self.pipeline_config, "historical_fetch_retry_sleep_seconds", 0.0) or 0.0))
         
@@ -6283,15 +6297,26 @@ class FXPortfolioManagerApp:
                 missing_bars = max(0, bars_to_fetch - len(existing_df))
                 if len(existing_df) > 1:
                     observed_span = existing_df.index[-1] - existing_df.index[0]
-                    seconds_per_bar = max(
-                        60.0,
-                        observed_span.total_seconds() / max(1, len(existing_df) - 1),
+                    # Cap per-bar seconds so a gappy/corrupt span (e.g. a stray old
+                    # row at index[0]) cannot inflate the backfill window. M5 with
+                    # weekend gaps averages well under 900s/bar.
+                    seconds_per_bar = min(
+                        900.0,
+                        max(60.0, observed_span.total_seconds() / max(1, len(existing_df) - 1)),
                     )
                 else:
                     seconds_per_bar = 5.0 * 60.0
                 padding_bars = max(1000, int(math.ceil(overlap_minutes / 5.0)))
                 backfill_seconds = seconds_per_bar * (missing_bars + padding_bars) * 1.25
                 backfill_start = existing_df.index[0] - timedelta(seconds=backfill_seconds)
+                # Clamp to a valid floor: never before the deep-backfill horizon or
+                # the epoch (MT5/Windows reject pre-1970 dates with Errno 22).
+                _years = max(1, int(getattr(self.pipeline_config, "historical_fetch_deep_backfill_years", 18) or 18))
+                _floor = pd.Timestamp(datetime.now() - timedelta(days=365.25 * _years))
+                if _floor.year < 1971:
+                    _floor = pd.Timestamp(year=1971, month=1, day=1)
+                if pd.Timestamp(backfill_start) < _floor:
+                    backfill_start = _floor
                 self.logger.info(
                     f"  {symbol}: Existing history has {len(existing_df)} M5 bars; "
                     f"target is {bars_to_fetch}. Backfilling from {backfill_start}."
@@ -6306,7 +6331,7 @@ class FXPortfolioManagerApp:
                     self.logger.warning(
                         f"  {symbol}: Range backfill returned no data; trying full target count fetch."
                     )
-                    bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch)
+                    bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
                 if bars is not None and len(bars) > 0:
                     bars = pd.concat([existing_df, bars])
                 else:
@@ -6323,7 +6348,7 @@ class FXPortfolioManagerApp:
                 else:
                     bars = existing_df
             else:
-                bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch)
+                bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
 
             best_len = 0 if bars is None else len(bars)
             for attempt in range(2, retry_attempts + 1):
@@ -6335,7 +6360,7 @@ class FXPortfolioManagerApp:
                 )
                 if retry_sleep > 0:
                     time.sleep(retry_sleep)
-                retry_bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch)
+                retry_bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
                 retry_len = 0 if retry_bars is None else len(retry_bars)
                 if retry_len > best_len:
                     bars = retry_bars

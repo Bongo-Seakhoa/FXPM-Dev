@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FxPM End-to-End Production Process &amp; Split Audit - 2026-06-09</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --ink: #16202b;
+      --muted: #5b6675;
+      --line: #d9dee7;
+      --panel: #ffffff;
+      --audit: #b84a4a;
+      --active: #2f6f7e;
+      --wfv: #c58a24;
+      --embargo: #394455;
+      --opt: #2f7d46;
+      --empty: #8b93a1;
+      --promoted: #2f7d46;
+      --small: #c58a24;
+      --blocked: #b84a4a;
+      --notrade: #8b93a1;
+      --accent: #345995;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, Segoe UI, Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.5;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 30px 18px 64px; }
+    h1, h2, h3 { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 30px; line-height: 1.15; }
+    h2 { font-size: 21px; margin-top: 8px; }
+    h3 { font-size: 16px; margin-top: 18px; }
+    p { margin: 8px 0; }
+    .lede { max-width: 940px; color: var(--muted); font-size: 16px; margin-top: 10px; }
+    .meta-line { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .toc { columns: 2; column-gap: 28px; font-size: 14px; margin: 8px 0 0; padding-left: 18px; }
+    .toc a { color: var(--accent); text-decoration: none; }
+    .toc a:hover { text-decoration: underline; }
+    .status {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 22px 0 8px;
+    }
+    .chip {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 12px;
+      min-height: 80px;
+    }
+    .chip b { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .chip span { display: block; font-size: 19px; font-weight: 700; margin-top: 6px; }
+    .chip small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 20px 22px;
+      margin-top: 18px;
+    }
+    .section > h2 { display: flex; align-items: baseline; gap: 10px; }
+    .section > h2 .num {
+      font-size: 13px; color: #fff; background: var(--accent);
+      border-radius: 6px; padding: 2px 9px; font-weight: 700;
+    }
+    /* timeline */
+    .timeline-wrap { position: relative; padding: 14px 0 4px; }
+    .axis {
+      display: grid;
+      grid-template-columns: 16.667% 24.9% 16.667% 0.1% 41.667%;
+      height: 60px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+    .seg {
+      color: #fff; display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 6px; font-size: 12.5px; font-weight: 700; min-width: 0; line-height: 1.25;
+    }
+    .audit { background: var(--audit); }
+    .middle { background: var(--active); }
+    .wfv { background: var(--wfv); }
+    .embargo { background: var(--embargo); font-size: 0; }
+    .opt { background: var(--opt); }
+    .labels {
+      display: grid;
+      grid-template-columns: 16.667% 24.9% 16.667% 0.1% 41.667%;
+      color: var(--muted); font-size: 11.5px; margin-top: 6px;
+    }
+    .labels div { min-width: 0; }
+    .base-band {
+      margin-top: 12px; margin-left: 16.667%; width: 83.333%;
+      background: rgba(47, 111, 126, 0.12);
+      border: 2px dashed var(--active); color: var(--active);
+      border-radius: 8px; padding: 9px 12px; font-weight: 700; font-size: 13px;
+    }
+    .opt-band {
+      margin-top: 8px; margin-left: 58.334%; width: 41.667%;
+      background: rgba(47, 125, 70, 0.12);
+      border: 2px dashed var(--opt); color: var(--opt);
+      border-radius: 8px; padding: 9px 12px; font-weight: 700; font-size: 13px;
+    }
+    .legend { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
+    .legend-item { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fff; font-size: 12.5px; }
+    .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 13.5px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; background: #fafbfc; letter-spacing: .03em; }
+    td.r, th.r { text-align: right; }
+    /* flow steps */
+    .flow { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-top: 14px; }
+    .step {
+      min-height: 120px; border: 1px solid var(--line); border-top: 5px solid var(--accent);
+      border-radius: 9px; padding: 11px 12px; background: #fff; position: relative;
+    }
+    .step .tag { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .step b { display: block; margin: 3px 0 5px; font-size: 14px; }
+    .step p { color: var(--muted); font-size: 12.5px; margin: 0; }
+    .step .where { display: block; margin-top: 7px; font-size: 11px; color: var(--accent); font-family: Consolas, Monaco, monospace; }
+    /* funnel */
+    .funnel { margin-top: 12px; }
+    .frow { display: flex; align-items: center; gap: 12px; margin: 7px 0; }
+    .fbar { height: 30px; border-radius: 5px; display: flex; align-items: center; padding-left: 10px; color: #fff; font-weight: 700; font-size: 12.5px; min-width: 80px; }
+    .flabel { width: 320px; font-size: 13px; }
+    .flabel b { display: inline-block; }
+    .flabel small { color: var(--muted); }
+    /* status pills */
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 20px; color: #fff; font-size: 11.5px; font-weight: 700; }
+    .p-promoted { background: var(--promoted); }
+    .p-small { background: var(--small); }
+    .p-paper { background: #6c5ce7; }
+    .p-notrade { background: var(--notrade); }
+    .p-blocked { background: var(--blocked); }
+    /* decision tree */
+    .tree { margin-top: 14px; font-size: 13px; }
+    .tnode { border: 1px solid var(--line); border-left: 5px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: #fff; }
+    .tnode .q { font-weight: 700; }
+    .tnode .branch { margin: 6px 0 0 14px; color: var(--muted); }
+    .tnode .branch span.out { font-family: Consolas, Monaco, monospace; }
+    .callout { border-left: 5px solid var(--wfv); padding: 11px 14px; background: #fff7e8; border-radius: 6px; margin-top: 14px; font-size: 13.5px; }
+    .callout.reject { border-left-color: var(--audit); background: #fff1f1; }
+    .callout.ok { border-left-color: var(--opt); background: #eff9f2; }
+    .callout.info { border-left-color: var(--accent); background: #eef3fb; }
+    code { background: #eef1f5; padding: 1px 5px; border-radius: 4px; font-family: Consolas, Monaco, monospace; font-size: 0.92em; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    ul.tight { margin: 8px 0; padding-left: 20px; }
+    ul.tight li { margin: 4px 0; font-size: 13.5px; }
+    .verdict { font-size: 15px; }
+    .rec { border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; margin-top: 10px; background: #fff; }
+    .rec .sev { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 5px; color: #fff; }
+    .sev-keep { background: var(--opt); }
+    .sev-watch { background: var(--wfv); }
+    .sev-act { background: var(--accent); }
+    .footer { color: var(--muted); font-size: 12px; margin-top: 26px; text-align: center; }
+    @media (max-width: 880px) {
+      .status, .legend, .flow, .grid2 { grid-template-columns: 1fr; }
+      .toc { columns: 1; }
+      .axis, .labels { grid-template-columns: 1fr; height: auto; }
+      .seg { min-height: 42px; }
+      .base-band, .opt-band { width: 100%; margin-left: 0; }
+      .flabel { width: 180px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>FxPM &mdash; End-to-End Production Process &amp; Split Audit</h1>
+  <p class="lede">
+    How the system trains, optimizes, validates, promotes, and live-trades strategies &mdash; and the audit verdict on
+    whether that pipeline actually puts the <em>best</em> strategy on the live market. This is the visual companion to
+    <code>docs/PRODUCTION_SPLIT_AND_PROCESS.md</code> and <code>implimentation.md</code>, expanded to the full
+    optimization &rarr; promotion &rarr; live flow.
+  </p>
+  <p class="meta-line">
+    Audit date 2026-06-09 &middot; Split contract <code>2026-06-09-bleeding-edge-production-split</code> &middot;
+    Runtime banner <code>FX PORTFOLIO MANAGER v3.1</code> &middot; Verified against committed <code>config.json</code>,
+    <code>pm_pipeline.py</code>, <code>pm_core.py</code>, <code>pm_main.py</code>, <code>pm_live_readiness.py</code>,
+    and live ledger <code>pm_configs.json</code>. Full test suite: <strong>passing</strong>.
+  </p>
+
+  <div class="status" aria-label="Current production snapshot">
+    <div class="chip"><b>Split Contract</b><span>bleeding_edge</span><small>newest 125k optimized</small></div>
+    <div class="chip"><b>Cells Live-Promoted</b><span>38 / 2,400</span><small>1.6% of all (sym&times;TF&times;regime) cells</small></div>
+    <div class="chip"><b>Live-Tradeable Symbols</b><span>18 / 100</span><small>&ge;1 PROMOTED or PROMOTE_SMALL cell</small></div>
+    <div class="chip"><b>Winners Valid Until</b><span>2026-07-05</span><small>retrain mode = notify (manual)</small></div>
+  </div>
+  <p class="meta-line">Ledger status distribution across 2,400 cells: <span class="pill p-promoted">PROMOTED 38</span>
+    <span class="pill p-blocked">BLOCKED 188</span> <span class="pill p-small">PROMOTE_SMALL 0</span>
+    <span class="pill p-notrade">NO_TRADE markers 2,174</span></p>
+
+  <section class="section">
+    <h2><span class="num">0</span> Contents</h2>
+    <div class="toc">
+      <a href="#verdict">1. Audit verdict (does the best strategy go live?)</a><br>
+      <a href="#geometry">2. Bar geometry &amp; the three data surfaces</a><br>
+      <a href="#pipeline">3. End-to-end pipeline at a glance</a><br>
+      <a href="#stages">4. Optimization stages (1&ndash;3) in detail</a><br>
+      <a href="#validation">5. Validation criteria (exact gates)</a><br>
+      <a href="#promotion">6. Promotion pathways &amp; decision tree</a><br>
+      <a href="#live">7. Live eligibility, sizing &amp; supervision</a><br>
+      <a href="#snapshot">8. Current ledger snapshot</a><br>
+      <a href="#tradeoff">9. The bleeding-edge tradeoff &amp; its mitigations</a><br>
+      <a href="#recs">10. Recommendations</a><br>
+      <a href="#settings">11. Required production settings</a><br>
+    </div>
+  </section>
+
+  <!-- 1. VERDICT -->
+  <section class="section" id="verdict">
+    <h2><span class="num">1</span> Audit verdict &mdash; does the best strategy reach the live market?</h2>
+    <p class="verdict"><strong>Yes, by construction, and the funnel is deliberately strict.</strong> Across all 100 symbols the
+    optimizer evaluates a 100-strategy pool against every <code>(timeframe, regime)</code> cell, scores each survivor on a
+    blend of its freshest-data performance and its persistence on the adjacent window, and stores <em>only validated
+    winners</em>. A separate promotion gate then blocks everything that fails walk-forward or historical-stress evidence.
+    Live trading consumes <em>only</em> promoted winners for the exact decision-time <code>(timeframe, regime)</code>;
+    there is no fallback to a "best available" unvalidated strategy.</p>
+    <div class="callout ok">
+      <b>What the audit confirmed:</b>
+      <ul class="tight">
+        <li>Split geometry in <code>DataSplitter.get_workflow_indices</code> reproduces the documented 300k bleeding-edge layout exactly (verified by arithmetic and <code>tests/test_data_splitter.py</code>).</li>
+        <li>Train, validation, and eligibility run on three distinct slices; the train (newest 125k) and validation (adjacent 50k) windows are disjoint with a 300-bar embargo, so the robustness ratio is meaningful.</li>
+        <li>The optimization-time validation thresholds and the live re-check gate read the <em>same</em> config keys &mdash; a stored winner cannot pass selection but silently fail live, nor vice versa.</li>
+        <li>The promotion classifier, NO_TRADE markers, and winners-only live lookup are mutually consistent. Blocked / paper / no-trade cells are excluded from live at three independent points.</li>
+        <li>Live startup is fail-closed: account identity, equity floor, artifact-drift policy, kill switch, ledger freshness, and supervisor latch are all checked before any order. <code>--trade</code> returns exit code <code>2</code> on failure.</li>
+      </ul>
+    </div>
+    <div class="callout">
+      <b>The one structural caveat (by design, not a bug):</b> the validation window is <em>older</em> than the training
+      window. Production optimizes on the freshest 125k bars and validates on the 50k bars immediately before them. This is
+      a <em>backward persistence</em> check, not a forward out-of-sample test &mdash; it cannot detect overfitting to the
+      newest window in the forward direction (there is no forward data; the newest bar is the live edge). The team chose
+      this deliberately for a decaying FX stack. Section&nbsp;9 details the tradeoff and the five mitigations that contain it.
+    </div>
+  </section>
+
+  <!-- 2. GEOMETRY -->
+  <section class="section" id="geometry">
+    <h2><span class="num">2</span> Bar geometry &amp; the three data surfaces</h2>
+    <p>Per symbol, the latest <code>300,000</code> M5 bars are loaded; higher timeframes are derived from the same timestamp
+      boundaries. Indexes are half-open (<code>start..end</code> includes <code>start</code>, excludes <code>end</code>);
+      the newest bar is at the right edge.</p>
+
+    <div class="timeline-wrap">
+      <div class="axis" role="img" aria-label="300k bar split timeline">
+        <div class="seg audit">Historical stress<br>0&ndash;50,000</div>
+        <div class="seg middle">Active (pre-WFV)<br>50,000&ndash;124,700</div>
+        <div class="seg wfv">WFV / validation<br>124,700&ndash;174,700</div>
+        <div class="seg embargo">Embargo</div>
+        <div class="seg opt">Optimization train<br>175,000&ndash;300,000</div>
+      </div>
+      <div class="labels">
+        <div>0 (oldest)</div>
+        <div>50,000</div>
+        <div>124,700</div>
+        <div>174,700 / 175,000</div>
+        <div>300,000 (live edge)</div>
+      </div>
+      <div class="base-band">Stage&nbsp;1 eligibility / screening sees the full active universe &rarr; 50,000&ndash;300,000 (250k)</div>
+      <div class="opt-band">Stage&nbsp;2 tuning + stored train metrics &rarr; 175,000&ndash;300,000 (125k)</div>
+    </div>
+
+    <div class="legend">
+      <div class="legend-item"><span class="swatch audit"></span><b>Historical stress</b><br>Oldest 50k. Severe-fragility audit only; never a selector.</div>
+      <div class="legend-item"><span class="swatch middle"></span><b>Active universe</b><br>Newest 250k. Broad eligibility surface.</div>
+      <div class="legend-item"><span class="swatch wfv"></span><b>WFV</b><br>Adjacent 50k. Validation + final selection surface.</div>
+      <div class="legend-item"><span class="swatch embargo"></span><b>Embargo</b><br>300-bar leakage buffer.</div>
+      <div class="legend-item"><span class="swatch opt"></span><b>Optimization</b><br>Newest 125k through the live edge.</div>
+    </div>
+
+    <h3>Exact windows (300,000 bars, <code>oos_embargo_bars=300</code>)</h3>
+    <table>
+      <thead><tr><th>Window</th><th>Index range</th><th class="r">Bars</th><th>Role in production</th></tr></thead>
+      <tbody>
+        <tr><td><code>historical_stress_audit</code></td><td><code>0..50000</code></td><td class="r">50,000</td><td>Older-regime fragility evidence. Severe failure here can BLOCK promotion.</td></tr>
+        <tr><td><code>active_universe</code> / <code>base_selection</code></td><td><code>50000..300000</code></td><td class="r">250,000</td><td>Broad strategy eligibility + screening + top-K identification.</td></tr>
+        <tr><td><code>walk_forward_validation</code></td><td><code>124700..174700</code></td><td class="r">50,000</td><td>Validation gate, final per-regime selection, and WFV persistence audit.</td></tr>
+        <tr><td><code>oos_embargo</code></td><td><code>174700..175000</code></td><td class="r">300</td><td>Leakage buffer between validation and optimization.</td></tr>
+        <tr><td><code>optimization_train</code></td><td><code>175000..300000</code></td><td class="r">125,000</td><td>Optuna/grid tuning and stored train metrics; ends at the live edge.</td></tr>
+        <tr><td><code>clean_holdout</code></td><td><code>300000..300000</code></td><td class="r">0</td><td>Disabled in production. Research mode (<code>research_clean_holdout</code>) only.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The three surfaces a candidate is measured on</h3>
+    <table>
+      <thead><tr><th>Surface</th><th>Slice</th><th>What it drives</th><th>Code</th></tr></thead>
+      <tbody>
+        <tr><td><b>Eligibility</b> <span class="swatch middle"></span></td><td>Active 250k</td><td>Screening backtest, training eligibility gates, top-K-per-regime identification.</td><td><code>eligibility_regime_metrics</code></td></tr>
+        <tr><td><b>Train</b> <span class="swatch opt"></span></td><td>Newest 125k</td><td>Optuna/grid tuning; stored <code>train_metrics</code>; the "train" half of the robustness ratio.</td><td><code>train_regime_metrics</code></td></tr>
+        <tr><td><b>Validation</b> <span class="swatch wfv"></span></td><td>Adjacent 50k</td><td>Final per-regime selection score, the validation gate, and the WFV sub-window audit.</td><td><code>val_regime_metrics</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout info">
+      <b>Acknowledged caveat (carried from <code>implimentation.md</code>):</b> because Stage&nbsp;1 eligibility inspects
+      the full active universe &mdash; which <em>contains</em> the WFV window &mdash; the WFV slice is adjacent
+      <em>resilience</em> evidence, not a pristine, untouched forward holdout. It is honest robustness signal, not an
+      unbiased forward return estimate.
+    </div>
+  </section>
+
+  <!-- 3. PIPELINE -->
+  <section class="section" id="pipeline">
+    <h2><span class="num">3</span> End-to-end pipeline at a glance</h2>
+    <p><code>python pm_main.py --optimize</code> runs the left half; <code>python pm_main.py --trade</code> runs the right half.
+      The universal winner ledger <code>pm_configs.json</code> is the only contract between them.</p>
+    <div class="flow">
+      <div class="step"><span class="tag">Ingest</span><b>Load &amp; split</b><p>Latest 300k M5 bars per symbol; derive higher TFs; emit the six windows above.</p><span class="where">pm_pipeline &middot; DataSplitter</span></div>
+      <div class="step"><span class="tag">Stage 1</span><b>Eligibility</b><p>Screen 100 strategies on active 250k; reject catastrophic; keep regime specialists.</p><span class="where">_collect_candidates &middot; _apply_training_eligibility_gates</span></div>
+      <div class="step"><span class="tag">Stage 2</span><b>Tune &amp; select</b><p>Optuna/grid-tune top-K on newest 125k; pick best per (TF,regime) by train+val score.</p><span class="where">_tune_strategy_params &middot; _select_best_for_regime</span></div>
+      <div class="step"><span class="tag">Validate</span><b>Winner gate</b><p>Each candidate must clear PF / return / DD / robustness on the WFV slice or it becomes NO_TRADE.</p><span class="where">_validate_regime_winner</span></div>
+      <div class="step"><span class="tag">Audit</span><b>WFV + history</b><p>Sub-window WFV persistence + oldest-50k stress audit attached to each winner.</p><span class="where">_attach_walk_forward_audit &middot; _attach_historical_stress_audit</span></div>
+      <div class="step"><span class="tag">Stage 3</span><b>Governance</b><p>Per-winner risk/governance policy chosen by tournament on the selection surface.</p><span class="where">_attach_governance_policies</span></div>
+      <div class="step"><span class="tag">Promote</span><b>Classify</b><p>PROMOTED / PROMOTE_SMALL / BLOCKED / NO_TRADE from WFV + historical + holdout evidence.</p><span class="where">classify_promotion_status</span></div>
+      <div class="step"><span class="tag">Persist</span><b>Ledger</b><p>Atomic write of winners, markers, evidence, and split contract to <code>pm_configs.json</code>.</p><span class="where">winner_ledger_path</span></div>
+      <div class="step"><span class="tag">Gate</span><b>Live readiness</b><p>Fail-closed: identity, equity, drift policy, kill switch, ledger freshness, supervisor latch.</p><span class="where">pm_live_readiness</span></div>
+      <div class="step"><span class="tag">Decide</span><b>Regime &amp; winner</b><p>On each new closed bar, detect regime, look up the exact promoted winner, generate signal.</p><span class="where">_evaluate_regime_candidates</span></div>
+      <div class="step"><span class="tag">Size</span><b>Risk &amp; filters</b><p>Broker contract math, PROMOTE_SMALL derate, spread/edge filters, lot normalization.</p><span class="where">pm_position &middot; pm_mt5</span></div>
+      <div class="step"><span class="tag">Protect</span><b>Supervise</b><p>Institutional hard-breaks, margin protection, cycle-drift, dup-position check, then order send.</p><span class="where">pm_institutional_supervisor</span></div>
+    </div>
+
+    <h3>The selection funnel (current ledger, 100 symbols)</h3>
+    <div class="funnel">
+      <div class="frow"><div class="flabel"><b>All cells</b> <small>100 sym &times; 6 TF &times; 4 regime</small></div><div class="fbar" style="width:100%;background:#5d6b7b;">2,400</div></div>
+      <div class="frow"><div class="flabel"><b>Produced a candidate winner</b> <small>passed gates &amp; validation</small></div><div class="fbar" style="width:55%;background:var(--active);">226</div></div>
+      <div class="frow"><div class="flabel"><b>Survived promotion gate</b> <small>not BLOCKED</small></div><div class="fbar" style="width:18%;background:var(--small);">38</div></div>
+      <div class="frow"><div class="flabel"><b>Live-tradeable</b> <small>PROMOTED + PROMOTE_SMALL</small></div><div class="fbar" style="width:18%;background:var(--promoted);">38</div></div>
+    </div>
+    <p class="meta-line">Of 226 validated winners, 188 (83%) are BLOCKED by the promotion gate (WFV / historical-stress evidence) and only
+      38 reach live. The strictness is the point: the gate is the system's primary overfitting defense given the bleeding-edge split.</p>
+  </section>
+
+  <!-- 4. STAGES -->
+  <section class="section" id="stages">
+    <h2><span class="num">4</span> Optimization stages (1&ndash;3) in detail</h2>
+
+    <h3>Stage&nbsp;1 &mdash; Eligibility &amp; screening <span class="swatch middle"></span> (active 250k)</h3>
+    <ul class="tight">
+      <li>Every strategy is backtested on the full active universe. Optional screening ATR anchors (<code>1&times;/2&times;/3&times;</code>) prevent rejecting a strategy only because its default exit range was wrong.</li>
+      <li>Hard training-eligibility gates remove "obviously bad" strategies <em>before</em> expensive tuning. Current config: train PF &ge; <code>0.8</code>, train return &ge; <code>-15%</code>, train DD &le; <code>20%</code>.</li>
+      <li><b>Regime-specialist rescue:</b> a strategy weak on the full sample is kept if it is strong in at least one regime (&ge;25 trades, PF&ge;1.0, return&ge;0, DD within ceiling) &mdash; specialists are not discarded for full-sample mediocrity.</li>
+      <li>Top-K strategies per regime are identified from screening scores and passed to Stage&nbsp;2.</li>
+    </ul>
+
+    <h3>Stage&nbsp;2 &mdash; Tuning &amp; per-regime selection <span class="swatch opt"></span> (newest 125k) + <span class="swatch wfv"></span> (WFV)</h3>
+    <ul class="tight">
+      <li>Top-K strategies are hyperparameter-tuned with Optuna TPE (size-aware budget; <code>120&ndash;1500</code> trials/strategy) or grid search, on the newest 125k optimization surface.</li>
+      <li>Trades are bucketed by the decision-time regime label (<code>REGIME_LIVE</code> at the signal bar) for exact backtest/live parity.</li>
+      <li>For each <code>(TF, regime)</code> the winner is the highest-scoring candidate, where the score blends train (newest) and validation (adjacent) metrics with a robustness gap penalty (<code>fx_gap_penalty_lambda=0.7</code>), then descends top-K candidates until one passes the validation gate.</li>
+      <li>Optional false-discovery confidence multiplier (deflated-Sharpe / PBO machinery) scales scores; the hard DSR block is inactive in production (<code>false_discovery_min_dsr=0.0</code>).</li>
+    </ul>
+
+    <h3>Stage&nbsp;3 &mdash; Governance / risk-management policy</h3>
+    <ul class="tight">
+      <li>Each surviving winner gets a risk/governance policy chosen by a local tournament (<code>local_governance_tournament_enabled=true</code>), selected on the <code>stage3</code> surface (the bleeding-edge optimization window) by default.</li>
+      <li>Live application of governance is currently <em>shadow</em> (<code>local_governance_live_mode="shadow"</code>) &mdash; it records what it would do without altering live orders yet. Same for live risk scalars (<code>live_risk_scalars_mode="shadow"</code>).</li>
+    </ul>
+    <div class="callout info">Stage outputs are attached to every winner: <code>walk_forward_audit</code>, <code>historical_audit_metrics</code>,
+      <code>governance_policy</code>, <code>validation_evidence</code>, then a promotion status &mdash; before the atomic ledger write.</div>
+  </section>
+
+  <!-- 5. VALIDATION -->
+  <section class="section" id="validation">
+    <h2><span class="num">5</span> Validation criteria (the exact gates a winner must clear)</h2>
+    <p>Applied by <code>_validate_regime_winner</code> on the <span class="swatch wfv"></span> WFV slice. All values are the
+      committed <code>config.json</code> production presets.</p>
+    <table>
+      <thead><tr><th>Check</th><th>Threshold</th><th>Config key</th></tr></thead>
+      <tbody>
+        <tr><td>Validation trades</td><td>&ge; 15</td><td><code>regime_min_val_trades</code> / <code>fx_val_min_trades</code></td></tr>
+        <tr><td>Validation max drawdown</td><td>&le; 12.0%</td><td><code>fx_val_max_drawdown</code></td></tr>
+        <tr><td>Train max drawdown (early reject)</td><td>&le; 15.0% (1.25&times; val cap)</td><td>derived</td></tr>
+        <tr><td>Validation profit factor</td><td>&ge; 1.05</td><td><code>regime_min_val_profit_factor</code></td></tr>
+        <tr><td>Validation return</td><td>&ge; 5.0%</td><td><code>regime_min_val_return_pct</code></td></tr>
+        <tr><td>Return / drawdown efficiency</td><td>&ge; 1.0 (unconditional)</td><td><code>regime_min_val_return_dd_ratio</code></td></tr>
+        <tr><td>Robustness ratio <b>OR</b> val Sharpe</td><td>robustness &ge; 0.8 <b>or</b> Sharpe &gt; 0.3</td><td><code>fx_min_robustness_ratio</code> / <code>fx_val_sharpe_override</code></td></tr>
+      </tbody>
+    </table>
+    <h3>Weak-train exception (specialists with a soft train but exceptional validation)</h3>
+    <p>If train PF &lt; 1.0 or train return &lt; 0, the winner is still allowed only if validation is <em>exceptional</em>:
+      val PF &ge; <code>1.5</code>, val return &ge; <code>10%</code>, val trades &ge; <code>max(2&times;min, 50)</code>,
+      val Sharpe &ge; <code>0.5</code>, and val win-rate &gt; <code>50%</code>. Otherwise it is rejected to NO_TRADE.</p>
+    <div class="callout ok"><b>Live re-check parity:</b> the live loop re-applies <code>is_valid_for_live(min_pf=1.05, min_return=5.0,
+      max_dd=12.0, return_dd_ratio=1.0)</code> using the same config keys, so a ledger winner that has drifted out of spec is
+      re-blocked at the door rather than trusted blindly.</div>
+  </section>
+
+  <!-- 6. PROMOTION -->
+  <section class="section" id="promotion">
+    <h2><span class="num">6</span> Promotion pathways &amp; decision tree</h2>
+    <p>After validation, <code>classify_promotion_status</code> assigns one of five states. Only PROMOTED and PROMOTE_SMALL
+      can ever place a live order.</p>
+    <table>
+      <thead><tr><th>Status</th><th>Meaning</th><th>Live behavior</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pill p-promoted">PROMOTED</span></td><td>Clean validation + WFV + historical evidence.</td><td>Trades at full configured risk.</td></tr>
+        <tr><td><span class="pill p-small">PROMOTE_SMALL</span></td><td>Weak/thin WFV, or non-positive freshest holdout.</td><td>Trades, risk &times; <code>0.5</code> (<code>promote_small_risk_multiplier</code>).</td></tr>
+        <tr><td><span class="pill p-paper">PAPER_ONLY</span></td><td>Reserved evidence-gathering state.</td><td>Never live; observation only.</td></tr>
+        <tr><td><span class="pill p-notrade">NO_TRADE</span></td><td>No validated winner for the cell.</td><td>Cell skipped; explicit marker stored.</td></tr>
+        <tr><td><span class="pill p-blocked">BLOCKED</span></td><td>All WFV windows negative, min score &lt; 0, severe historical fragility, or failed holdout under a blocking policy.</td><td>Never live.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="tree">
+      <div class="tnode"><span class="q">Is the cell a NO_TRADE marker?</span>
+        <div class="branch">yes &rarr; <span class="out">NO_TRADE</span> &middot; no &rarr; continue</div></div>
+      <div class="tnode"><span class="q">Severe historical-stress failure (oldest 50k) under legacy model?</span>
+        <div class="branch">yes &rarr; adds blocking reasons</div></div>
+      <div class="tnode"><span class="q">WFV promotion gate (policy = promotion_gate):</span>
+        <div class="branch">no audited windows &rarr; PROMOTE_SMALL evidence &middot;
+          all windows negative <b>or</b> min_score &lt; 0 &rarr; <span class="out">BLOCKED</span> &middot;
+          some non-positive / avg PF &lt; 1 / avg return &le; 0 &rarr; PROMOTE_SMALL evidence</div></div>
+      <div class="tnode"><span class="q">Any blocking reasons accumulated?</span>
+        <div class="branch">yes &rarr; <span class="out">BLOCKED</span></div></div>
+      <div class="tnode"><span class="q">Holdout gate (production: holdout empty &rArr; forced OFF) &amp; DSR (min_dsr=0 &rArr; inactive)</span>
+        <div class="branch">skipped in production bleeding-edge config</div></div>
+      <div class="tnode"><span class="q">Freshest holdout present and non-positive?</span>
+        <div class="branch">yes &rarr; PROMOTE_SMALL (no holdout in production, so skipped)</div></div>
+      <div class="tnode"><span class="q">Any PROMOTE_SMALL evidence left?</span>
+        <div class="branch">yes &rarr; <span class="out">PROMOTE_SMALL</span> &middot; no &rarr; <span class="out">PROMOTED</span></div></div>
+    </div>
+    <p class="meta-line">In the current ledger this produces 38 PROMOTED, 188 BLOCKED, and 0 PROMOTE_SMALL &mdash; i.e. winners
+      either clear WFV cleanly or are blocked outright; few land in the derated middle.</p>
+  </section>
+
+  <!-- 7. LIVE -->
+  <section class="section" id="live">
+    <h2><span class="num">7</span> Live eligibility, sizing &amp; supervision</h2>
+
+    <div class="grid2">
+      <div>
+        <h3>A. Fail-closed startup (before any order)</h3>
+        <ul class="tight">
+          <li><code>live_artifact_drift_policy</code> must be <code>block</code>.</li>
+          <li>MT5 account identity pinned &amp; verified: <code>expected_login / server / currency</code>.</li>
+          <li>Connected equity &ge; <code>live_min_account_equity</code> in the right currency.</li>
+          <li>Manual kill switch flag not active; <code>manual_new_entries_enabled</code> true.</li>
+          <li>Winner ledger readable, non-empty, with tradeable winners.</li>
+          <li>No latched institutional-supervisor hard block.</li>
+          <li>Failure &rarr; <code>--trade</code> exits <code>2</code>; paper mode still runs for diagnosis.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>B. Per-bar decision (winners-only)</h3>
+        <ul class="tight">
+          <li>Loop triggers on a changed MT5 bar timestamp (<code>live_loop_trigger_mode="bar"</code>).</li>
+          <li>Skip any TF with no promoted winner (cheap pre-filter).</li>
+          <li>Detect regime on the last <em>closed</em> bar (<code>REGIME_LIVE.iloc[-2]</code>); fail-closed if missing.</li>
+          <li>Look up the winner for the exact <code>(TF, regime)</code>; skip if none / NO_TRADE / BLOCKED / PAPER_ONLY.</li>
+          <li>Re-apply the live quality gate (<code>is_valid_for_live</code>).</li>
+          <li>Generate the signal from the same closed bar; PROMOTE_SMALL carries a 0.5 risk multiplier.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>C. Sizing, filters &amp; protection (before order send)</h3>
+    <ul class="tight">
+      <li><b>Sizing:</b> risk source = <code>balance</code> or <code>equity</code> (config: <code>equity</code>); <code>risk_amount = equity &times; risk_per_trade_pct/100</code> (1.5%); loss-per-lot from MT5 <code>order_calc_profit()</code> at the stop; lot normalized to broker min/max/step; per-trade cap <code>max_risk_pct</code> (25%).</li>
+      <li><b>Spread quality:</b> weak-edge rejection (<code>min_edge_mult=1.25</code>), spike block (<code>spike_mult=3.0</code>), soft penalty (<code>penalty_start_mult=0.75</code>).</li>
+      <li><b>Institutional supervisor (circuit breaker):</b> hard blocks on daily/session/weekly loss, open drawdown, and total open-risk breakpoints; latch persisted across restarts.</li>
+      <li><b>Margin protection:</b> entry block below level 60, recovery band from 55, panic forced-close at 50, stateful reopen only above 80; missing margin data fails closed when margin is in use.</li>
+      <li><b>Cycle-drift sentinel</b> for consecutive local losses, slippage, and spread degradation.</li>
+      <li><b>Duplicate-position protection:</b> sweep snapshot first, then a fresh broker-side position read immediately before send; same-symbol <code>D1 + lower TF</code> dual-trade controls.</li>
+    </ul>
+    <div class="callout"><b>Execution reality:</b> signals are generated on closed candles and executed on the next actionable broker
+      state, so live always has some inter-candle gap versus idealized backtest fills. The backtester models spread
+      (<code>conservative_max</code>), commission, slippage on stop exits, and swap to keep that gap honest.</div>
+  </section>
+
+  <!-- 8. SNAPSHOT -->
+  <section class="section" id="snapshot">
+    <h2><span class="num">8</span> Current ledger snapshot (verified 2026-06-09)</h2>
+    <div class="grid2">
+      <div>
+        <table>
+          <thead><tr><th>Metric</th><th class="r">Value</th></tr></thead>
+          <tbody>
+            <tr><td>Symbols in ledger</td><td class="r">100</td></tr>
+            <tr><td>Total cells (sym&times;TF&times;regime)</td><td class="r">2,400</td></tr>
+            <tr><td>Validated winner cells</td><td class="r">226</td></tr>
+            <tr><td>PROMOTED</td><td class="r">38</td></tr>
+            <tr><td>BLOCKED</td><td class="r">188</td></tr>
+            <tr><td>PROMOTE_SMALL</td><td class="r">0</td></tr>
+            <tr><td>NO_TRADE markers</td><td class="r">2,174</td></tr>
+            <tr><td>Live-tradeable symbols</td><td class="r">18</td></tr>
+            <tr><td>Winners valid until</td><td class="r">2026-07-05</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <h3>Where the winners live (top TF/regime cells)</h3>
+        <table>
+          <thead><tr><th>Timeframe &middot; regime</th><th class="r">Winner cells</th></tr></thead>
+          <tbody>
+            <tr><td>H4 &middot; CHOP</td><td class="r">34</td></tr>
+            <tr><td>H4 &middot; TREND</td><td class="r">27</td></tr>
+            <tr><td>H1 &middot; CHOP</td><td class="r">24</td></tr>
+            <tr><td>H1 &middot; TREND</td><td class="r">18</td></tr>
+            <tr><td>H1 &middot; RANGE / M30 &middot; CHOP</td><td class="r">15 / 15</td></tr>
+            <tr><td>M30 &middot; RANGE</td><td class="r">13</td></tr>
+            <tr><td>D1 &middot; CHOP / M30 &middot; TREND</td><td class="r">12 / 12</td></tr>
+          </tbody>
+        </table>
+        <p class="meta-line">Edge concentrates on higher timeframes (H4/H1). That is consistent with the 4-week notify cadence,
+          which intentionally gives H4 specialists more time to express live edge before forced reproduction.</p>
+      </div>
+    </div>
+    <div class="callout info"><b>Operational dependency:</b> <code>production_retrain_mode="notify"</code> means the system will
+      <em>not</em> auto-reoptimize. After 2026-07-05 every winner becomes live-ineligible (expired) until an operator runs
+      <code>python pm_main.py --optimize</code>. Track this date.</div>
+  </section>
+
+  <!-- 9. TRADEOFF -->
+  <section class="section" id="tradeoff">
+    <h2><span class="num">9</span> The bleeding-edge tradeoff &amp; its mitigations</h2>
+    <p>Optimizing on the newest 125k and validating on the older adjacent 50k maximizes <em>live relevance</em> (the model is
+      tuned on the market context closest to the next trade) at the cost of a <em>true forward holdout</em>. The forward
+      direction is unavailable by definition &mdash; the newest bar is the live edge. So overfitting-to-newest cannot be
+      caught by forward OOS; it is contained by five other defenses:</p>
+    <ul class="tight">
+      <li><b>Robustness / gap penalty</b> &mdash; a winner must perform consistently across the newest 125k and the adjacent 50k, not just on one.</li>
+      <li><b>WFV sub-window persistence audit</b> &mdash; the 50k validation slice is cut into 3 windows; all-negative or negative-min-score blocks promotion.</li>
+      <li><b>Historical stress audit</b> &mdash; the oldest 50k flags strategies that blow up in a different regime; severe failure blocks.</li>
+      <li><b>Live cycle-drift &amp; governance derating</b> &mdash; real trade evidence pauses or derates a context as it decays.</li>
+      <li><b>4-week retrain cadence</b> &mdash; bounds how stale any deployed winner can become.</li>
+    </ul>
+    <div class="callout reject"><b>Rejected production shape:</b> reserving the newest 15% as a hard clean holdout and selecting
+      on it. That improves academic honesty but withholds the exact bars most predictive of the next live trades, making
+      deployed strategies stale before use. It is retained only as the explicit <code>research_clean_holdout</code> mode for
+      offline comparison.</div>
+  </section>
+
+  <!-- 10. RECS -->
+  <section class="section" id="recs">
+    <h2><span class="num">10</span> Recommendations</h2>
+
+    <div class="rec"><span class="sev sev-keep">Keep</span> &nbsp;<b>Do not change the split direction or the promotion gate.</b>
+      The bleeding-edge geometry is implemented correctly, matches the documented contract, is locked by a versioned split
+      contract, and is the right tradeoff for a decaying FX stack. The strict gate (only 1.6% of cells reach live) is the
+      intended overfitting defense and should not be loosened without comparing regenerated artifacts and live outcome data.</div>
+
+    <div class="rec"><span class="sev sev-act">Act</span> &nbsp;<b>Periodically run <code>research_clean_holdout</code> as a shadow check.</b>
+      Bleeding-edge has no forward OOS. On a cadence (e.g. each retrain), run the same symbols in
+      <code>research_clean_holdout</code> mode offline and compare which cells survive. Large divergence between the two
+      flags cells that are likely overfit to the newest window &mdash; cheap insurance the production path can't give you.</div>
+
+    <div class="rec"><span class="sev sev-act">Act</span> &nbsp;<b>Decide on the "notify" retrain dependency before 2026-07-05.</b>
+      With <code>production_retrain_mode="notify"</code>, all 38 live cells expire on 2026-07-05 and the book goes flat until a
+      manual <code>--optimize</code>. Either commit to running the retrain on schedule, or switch to <code>auto</code> if
+      unattended continuity is the goal. This is the single highest-impact operational risk to live continuity.</div>
+
+    <div class="rec"><span class="sev sev-watch">Watch</span> &nbsp;<b>Governance and live-risk scalars are still in <code>shadow</code>.</b>
+      Stage&nbsp;3 governance policies and live risk scalars are computed but not applied to live orders. That is the safe
+      default, but it means the "best risk policy per winner" work is not yet shaping live sizing. Promote to active only
+      after reviewing the shadow logs against live outcomes &mdash; then the system more fully realizes "best optimized
+      strategy, best-managed, goes live."</div>
+
+    <div class="rec"><span class="sev sev-watch">Watch</span> &nbsp;<b>Harden config-default parity (low priority).</b>
+      The live gate and validator read the same config keys, so they agree today. Their hard-coded fallback defaults differ
+      (e.g. live <code>max_dd</code> default 35 vs validator 20) and would only diverge if a key were ever dropped from
+      <code>config.json</code>. <code>tests/test_config_json_integrity.py</code> guards the keys; keep that test authoritative
+      so the divergent defaults can never silently take effect.</div>
+
+    <div class="rec"><span class="sev sev-keep">Keep</span> &nbsp;<b>Concentration on H4/H1 is expected, not a defect.</b>
+      Lower timeframes face proportionally larger spread/commission drag and shorter persistence, so fewer M5/M15 cells clear
+      the gate. This is the cost model and validation doing their job, not a coverage gap to "fix".</div>
+  </section>
+
+  <!-- 11. SETTINGS -->
+  <section class="section" id="settings">
+    <h2><span class="num">11</span> Required production settings</h2>
+    <table>
+      <thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>production_split_mode</code></td><td><code>bleeding_edge</code></td><td>Optimize on the newest market-adjacent data.</td></tr>
+        <tr><td><code>active_universe_bars</code> / <code>max_bars</code></td><td><code>250000 / 300000</code></td><td>Active universe + oldest-50k audit reserve.</td></tr>
+        <tr><td><code>active_stage2_pct</code></td><td><code>50.0</code></td><td>Newest half of active universe is the optimization surface.</td></tr>
+        <tr><td><code>walk_forward_validation_bars</code></td><td><code>50000</code></td><td>Adjacent validation slice before optimization.</td></tr>
+        <tr><td><code>oos_embargo_bars</code></td><td><code>300</code></td><td>Leakage buffer between validation and train.</td></tr>
+        <tr><td><code>clean_holdout_pct</code></td><td><code>0.0</code></td><td>No production clean holdout; no freshest-bar sacrifice.</td></tr>
+        <tr><td><code>walk_forward_promotion_policy</code></td><td><code>promotion_gate</code></td><td>WFV is the production promotion evidence surface.</td></tr>
+        <tr><td><code>walk_forward_live_blocking_enabled</code></td><td><code>true</code></td><td>Severe WFV failures block live.</td></tr>
+        <tr><td><code>false_discovery_holdout_policy</code></td><td><code>off</code></td><td>Clean-holdout FD gate off (holdout empty); WFV gate stays on.</td></tr>
+        <tr><td><code>threadspark_selection_surface</code></td><td><code>validation</code></td><td>Selection evidence points at WFV, not clean holdout.</td></tr>
+        <tr><td><code>risk_management_selection_stage</code></td><td><code>stage3</code></td><td>Governance selected on the newest optimization surface.</td></tr>
+        <tr><td><code>live_artifact_drift_policy</code></td><td><code>block</code></td><td>Stale split contracts cannot trade live.</td></tr>
+        <tr><td><code>production_retrain_mode</code></td><td><code>notify</code></td><td>4-week cadence; manual reoptimize (see Recommendation #3).</td></tr>
+        <tr><td><code>optimization_max_workers</code></td><td><code>4</code></td><td>Production retrain worker count.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <p class="footer">FxPM production process &amp; split audit &middot; generated 2026-06-09 &middot; verified against source, config, ledger, and a passing test suite. Trading involves substantial risk of loss; validate in paper mode before live deployment.</p>
+</main>
+</body>
+</html>

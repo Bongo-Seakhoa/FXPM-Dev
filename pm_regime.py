@@ -507,7 +507,10 @@ def materialize_regime_params_for_cells(
             logger.warning("Failed to read existing regime params from %s: %s", path, exc)
 
     added = 0
-    for symbol, timeframe in sorted({(str(s).strip().upper(), str(tf).strip().upper()) for s, tf in cells}):
+    # Preserve the broker's original symbol case so regime-param keys match the
+    # ledger exactly (live lookup is case-insensitive, but the persisted keys
+    # should mirror config/ledger casing, e.g. "Platinum" not "PLATINUM").
+    for symbol, timeframe in sorted({(str(s).strip(), str(tf).strip().upper()) for s, tf in cells}):
         if not symbol or not timeframe:
             continue
         symbol_payload = payload.setdefault(symbol, {})
@@ -550,7 +553,7 @@ def materialize_regime_params_from_symbol_config(
     filepath: str = "regime_params.json",
 ) -> int:
     """Materialize explicit detector rows for a saved symbol winner config."""
-    symbol = str(_object_get(symbol_config, "symbol", "") or "").strip().upper()
+    symbol = str(_object_get(symbol_config, "symbol", "") or "").strip()
     regimes = _object_get(symbol_config, "regime_configs", {}) or {}
     cells: Set[Tuple[str, str]] = set()
     if symbol and isinstance(regimes, dict):

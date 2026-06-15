@@ -2,6 +2,9 @@
 
 This file documents the current `config.json` schema and the way FXPM-Dev uses those settings today. The repository name is `FXPM-Dev`; the internal runtime banner currently remains `FX PORTFOLIO MANAGER v3.1`.
 
+Canonical production split/process: `docs/PRODUCTION_SPLIT_AND_PROCESS.md`.
+Visual split confirmation: `docs/audit/production_split_process_20260609.html`.
+
 Use this as the reference for the live codebase. The `Default` column documents code defaults unless a row says otherwise. The checked-in `config.json` is the active repo profile and may intentionally override those defaults.
 
 ---
@@ -44,8 +47,23 @@ The pipeline uses the active-recent M5 workflow exclusively. The bar counts belo
 | `walk_forward_validation_bars` | int | `50000` | `50000` | Base M5 bars immediately before the bleeding-edge optimization half used as adjacent walk-forward validation. |
 | `clean_holdout_pct` | float | `0.0` | `0.0` | Research-only newest holdout percentage. Production keeps this at zero so the freshest active bars remain available to optimization. |
 | `threadspark_selection_surface` | enum | `"validation"` | `"validation"` | Final evidence surface for ThreadSpark-style scoring. Production points this at adjacent WFV/validation, not clean holdout. |
-| `false_discovery_holdout_policy` | enum | `"off"` | `"off"` | Clean-holdout gate policy. Production turns this off because production clean holdout is intentionally empty; other false-discovery controls can still run. |
+| `false_discovery_holdout_policy` | enum | `"off"` | `"off"` | Clean-holdout gate policy. Production turns this off because production clean holdout is intentionally empty; the WFV promotion gate remains active through `walk_forward_promotion_policy`. |
 | `overlap_pct` | float | `10.0` | `10.0` | Warmup window expressed as a percentage of the active universe size. Bars in the warmup are not scored. |
+
+### 2.1a-1 Historical data fetch and completeness
+
+These `pipeline` keys govern how the production fetch downloads M5 history from MT5 and decides whether a symbol has enough history to optimize.
+
+| Key | Type | Default | Active profile | Description |
+|---|---|---:|---:|---|
+| `optimization_min_m5_bars_fraction` | float | `0.0` | `0.85` | Source-of-truth completeness gate. A symbol is valid when its downloaded M5 bars are at least this fraction of `max_bars` (`0.85` → 255k of 300k). Keeps the 300k standard the majority meet while admitting close-but-short symbols; below the fraction the symbol becomes a genuine `NO_TRADE` `data_failure`. |
+| `optimization_min_m5_bars` | int | `0` | `300000` | Absolute completeness floor. Used only when `optimization_min_m5_bars_fraction` is `0`; otherwise the fraction takes precedence. |
+| `historical_fetch_retry_attempts` | int | `1` | `3` | Full-target fetch attempts before a symbol is marked incomplete. |
+| `historical_fetch_retry_sleep_seconds` | float | `2.0` | `2.0` | Sleep between fetch attempts. |
+| `historical_fetch_deep_backfill_enabled` | bool | `false` | `true` | Allow a deep date-range backfill when the first pass is short. |
+| `historical_fetch_deep_backfill_years` | int | `18` | `18` | Deep-backfill lookback span. |
+
+Connection-level fetch behavior lives in the `mt5` section: `history_page_size` (default `50000`) is the per-request page used while walking history backward by date, and `history_sync_max_attempts` / `history_sync_sleep_seconds` control how hard the terminal is pushed to download a freshly selected symbol. The terminal's own **Max bars in chart** setting must be Unlimited for full-depth pulls (see `SETUP_AND_RUN.md`).
 
 ### 2.1b Storage governance
 
@@ -326,10 +344,11 @@ These keys are post-selection research and execution-governance controls. They d
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
-| `walk_forward_audit_enabled` | bool | `true` | Runs adjacent walk-forward validation inside the normal retraining window. The validation slice is already used during candidate selection; this also records WFV evidence on winner artifacts. Additional post-selection hard live blocking remains controlled separately by `walk_forward_live_blocking_enabled`. |
+| `walk_forward_audit_enabled` | bool | `true` | Runs adjacent walk-forward validation inside the normal retraining window. The validation slice is used during candidate validation and production promotion, then recorded on winner artifacts. |
 | `walk_forward_audit_windows` | int | `3` | Number of audit windows used when `walk_forward_audit_enabled` is on. `PipelineConfig` normalizes this to at least `1`. |
-| `walk_forward_audit_mode` | enum | `"severe_fragility_only"` | Audit posture for walk-forward evidence. Production uses it as research telemetry after winner selection, not as a live-adjacent delay gate. |
-| `walk_forward_promotion_policy` | enum | `"observe_only"` | Promotion classifier policy. `"observe_only"` preserves walk-forward evidence as production validation telemetry; `"block_severe_only"` can block severe walk-forward failures when `walk_forward_live_blocking_enabled=true`. |
+| `walk_forward_audit_mode` | enum | `"severe_fragility_only"` | Audit posture for walk-forward evidence. Production uses the adjacent WFV surface as the promotion evidence gate while preserving the severe-fragility labels on artifacts. |
+| `walk_forward_promotion_policy` | enum | `"promotion_gate"` | Promotion classifier policy. `"promotion_gate"` uses adjacent WFV as the production promotion gate; `"observe_only"` records WFV without gating; `"block_severe_only"` is a legacy/research severe-failure gate when `walk_forward_live_blocking_enabled=true`. |
+| `walk_forward_live_blocking_enabled` | bool | `true` | Enables live-blocking behavior for severe WFV failures. With `walk_forward_promotion_policy="promotion_gate"`, weak or thin WFV derates to `PROMOTE_SMALL` and severe WFV blocks. |
 | `walk_forward_do_not_displace_latest_surface` | bool | `true` | Keeps the newest selection surface authoritative while attaching walk-forward evidence as audit/promotion telemetry. |
 | `promote_small_risk_multiplier` | float | `0.5` | Live risk multiplier for `PROMOTE_SMALL` winners. `PipelineConfig` clamps this to `[0.0, 1.0]`. |
 | `local_governance_tournament_enabled` | bool | `false` | Enables the per-context governance sweep that compares candidate order-management policies after a `(symbol, timeframe, regime, strategy)` winner already exists. The active profile enables it. |

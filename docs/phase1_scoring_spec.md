@@ -5,6 +5,11 @@ was pre-spokes and is retired). Operational run state lives in `docs/ACTIVE_DISC
 which links here. Default production model stays `legacy` until ThreadSpark wins an honest
 like-for-like.
 
+Production split note: current production uses `production_split_mode="bleeding_edge"` with
+adjacent WFV and no clean holdout. Clean-holdout ThreadSpark surfaces in this document are
+research-only unless an explicit research profile is configured. The canonical production
+geometry is `docs/PRODUCTION_SPLIT_AND_PROCESS.md`.
+
 ---
 
 ## 1. Objective (what we select for)
@@ -156,7 +161,7 @@ Tail axis now reads `r_block_downside_deviation` / `r_block_cvar` before falling
 | `regime_scoring_model` | `legacy` | per-arm (`legacy` / `specialist_spokes` / `specialist_spokes_threadspark`) |
 | `production_split_mode` | `bleeding_edge` | `research_clean_holdout` |
 | `walk_forward_validation_bars` | 50000 | 50000 |
-| `oos_embargo_bars` | 1 | 300 |
+| `oos_embargo_bars` | 300 | 300 |
 | `threadspark_selection_surface` | `validation` | `clean_holdout` |
 | `threadspark_use_historical_cost_evidence` | `true` | `true` |
 | `threadspark_historical_cost_scope` | `workflow` | `workflow` |

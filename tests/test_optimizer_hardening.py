@@ -22,6 +22,32 @@ from pm_strategies import StrategyRegistry
 
 
 class OptimizerHardeningTests(unittest.TestCase):
+    @staticmethod
+    def _walk_forward_audit(
+        returns,
+        *,
+        min_score=0.25,
+        avg_profit_factor=1.25,
+        reason="",
+    ):
+        windows = [
+            {"total_trades": 3, "total_return_pct": value}
+            for value in returns
+        ]
+        avg_return = sum(returns) / len(returns) if returns else 0.0
+        return {
+            "enabled": True,
+            "window_count": max(1, len(windows)),
+            "summary": {
+                "reason": reason,
+                "min_score": min_score,
+                "avg_profit_factor": avg_profit_factor,
+                "avg_total_return_pct": avg_return,
+            },
+            "windows": windows,
+            "audited_at": "2026-06-09T00:00:00",
+        }
+
     @unittest.skipIf(TrialState is None, "optuna not available")
     def test_parameter_stability_evidence_requires_local_neighbors(self):
         class FakeTrial:
@@ -448,6 +474,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             parameters={},
             quality_score=0.5,
             holdout_metrics={},
+            walk_forward_audit=self._walk_forward_audit([0.4, 0.6, 0.5]),
         )
 
         status, reasons = classify_promotion_status(winner, cfg)
@@ -560,7 +587,10 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertTrue(any("walk_forward" in reason for reason in reasons))
 
     def test_walk_forward_block_policy_without_live_opt_in_is_research_only(self):
-        cfg = PipelineConfig(walk_forward_promotion_policy="block_severe_only")
+        cfg = PipelineConfig(
+            walk_forward_promotion_policy="block_severe_only",
+            walk_forward_live_blocking_enabled=False,
+        )
         winner = RegimeConfig(
             strategy_name="SomeStrategy",
             parameters={},
@@ -578,6 +608,70 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         self.assertEqual(status, "PROMOTED")
         self.assertEqual(reasons, [])
+
+    def test_walk_forward_promotion_gate_promotes_clean_evidence(self):
+        cfg = PipelineConfig()
+        winner = RegimeConfig(
+            strategy_name="SomeStrategy",
+            parameters={},
+            quality_score=0.5,
+            walk_forward_audit=self._walk_forward_audit([0.4, 0.6, 0.5]),
+        )
+
+        status, reasons = classify_promotion_status(winner, cfg)
+
+        self.assertEqual(status, "PROMOTED")
+        self.assertEqual(reasons, [])
+
+    def test_walk_forward_promotion_gate_derates_missing_evidence(self):
+        cfg = PipelineConfig()
+        winner = RegimeConfig(
+            strategy_name="SomeStrategy",
+            parameters={},
+            quality_score=0.5,
+            walk_forward_audit={
+                "enabled": True,
+                "summary": {"reason": "no_regime_trades"},
+                "windows": [],
+            },
+        )
+
+        status, reasons = classify_promotion_status(winner, cfg)
+
+        self.assertEqual(status, "PROMOTE_SMALL")
+        self.assertTrue(any("insufficient promotion evidence" in reason for reason in reasons))
+
+    def test_walk_forward_promotion_gate_derates_weak_evidence(self):
+        cfg = PipelineConfig()
+        winner = RegimeConfig(
+            strategy_name="SomeStrategy",
+            parameters={},
+            quality_score=0.5,
+            walk_forward_audit=self._walk_forward_audit([0.3, 0.0, 0.2], avg_profit_factor=0.95),
+        )
+
+        status, reasons = classify_promotion_status(winner, cfg)
+
+        self.assertEqual(status, "PROMOTE_SMALL")
+        self.assertTrue(any("walk_forward" in reason for reason in reasons))
+
+    def test_walk_forward_promotion_gate_blocks_severe_evidence(self):
+        cfg = PipelineConfig()
+        winner = RegimeConfig(
+            strategy_name="SomeStrategy",
+            parameters={},
+            quality_score=0.5,
+            walk_forward_audit=self._walk_forward_audit(
+                [-0.4, -0.1, -0.2],
+                min_score=-1.0,
+                avg_profit_factor=0.7,
+            ),
+        )
+
+        status, reasons = classify_promotion_status(winner, cfg)
+
+        self.assertEqual(status, "BLOCKED")
+        self.assertTrue(any("walk_forward" in reason for reason in reasons))
 
     def test_promotion_blocks_nested_regime_profitability_severe_failure(self):
         cfg = PipelineConfig()
@@ -680,6 +774,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             strategy_name="ProductionWinner",
             parameters={},
             quality_score=0.5,
+            walk_forward_audit=self._walk_forward_audit([0.4, 0.6, 0.5]),
         )
 
         status, reasons = classify_promotion_status(winner, cfg)
@@ -794,6 +889,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             parameters={},
             quality_score=0.8,
             holdout_metrics={"total_trades": 8, "profit_factor": 1.4, "total_return_pct": 1.0},
+            walk_forward_audit=self._walk_forward_audit([0.4, 0.6, 0.5]),
             historical_audit_metrics={
                 "severe_failure": True,
                 "failure_reasons": ["historical replay drawdown warning"],
@@ -804,6 +900,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             parameters={},
             quality_score=0.9,
             holdout_metrics={"total_trades": 8, "profit_factor": 0.7, "total_return_pct": -1.0},
+            walk_forward_audit=self._walk_forward_audit([0.4, 0.6, 0.5]),
             historical_audit_metrics={
                 "severe_failure": True,
                 "failure_reasons": ["historical replay drawdown warning"],
@@ -3102,6 +3199,39 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(backtester.calls), 2)
         self.assertTrue(all(call.get("timeframe") == "H4" for call in backtester.calls))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TupleCategoricalSuggestTests(unittest.TestCase):
+    @unittest.skipIf(TrialState is None, "optuna not available")
+    def test_tuple_choices_suggested_without_warning(self):
+        import warnings
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        grid = {
+            "allowed_regimes": [("BREAKOUT", "TREND"), ("CHOP",), ("RANGE",)],
+            "period": [10, 20, 30],
+        }
+        space = ParameterSpace(grid, {"allowed_regimes": ("CHOP",), "period": 20})
+
+        def objective(trial):
+            params = space.suggest(trial)
+            # Tuple choice round-trips to the real tuple, not an index/string.
+            self.assertIsInstance(params["allowed_regimes"], tuple)
+            self.assertIn(params["allowed_regimes"], grid["allowed_regimes"])
+            self.assertIn(params["period"], grid["period"])
+            return float(params["period"])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)  # tuple-choice warning -> error
+            study = optuna.create_study(direction="maximize")
+            study.optimize(objective, n_trials=12, show_progress_bar=False)
+
+        self.assertEqual(len(study.trials), 12)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,25 @@ class RegimeFallbackLoggingTests(unittest.TestCase):
 
             self.assertEqual(explicit, fallback)
 
+    def test_materialize_preserves_broker_symbol_case(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            regime_path = Path(tmp) / "regime_params.json"
+            materialize_regime_params_for_cells(
+                [("Platinum", "H4"), ("EURUSD", "H1")], str(regime_path)
+            )
+            keys = set(json.loads(regime_path.read_text()).keys())
+            # Mixed-case broker symbols keep their case so keys match the ledger;
+            # already-uppercase symbols are unchanged.
+            self.assertIn("Platinum", keys)
+            self.assertNotIn("PLATINUM", keys)
+            self.assertIn("EURUSD", keys)
+            # Live lookup stays case-insensitive, so the cell still resolves.
+            clear_regime_params_cache()
+            self.assertTrue(has_tuned_regime_params("Platinum", "H4", filepath=str(regime_path)))
+            self.assertTrue(has_tuned_regime_params("platinum", "h4", filepath=str(regime_path)))
+
 
 class DefaultParamsByTimeframeTests(unittest.TestCase):
     """E5 — D1 hysteresis `k_hold` lifted 2 → 3.

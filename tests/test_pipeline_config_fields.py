@@ -29,12 +29,12 @@ class PipelineConfigFieldTests(unittest.TestCase):
         cfg = PipelineConfig(storage_observe_only=False)
         self.assertFalse(cfg.storage_observe_only)
 
-    def test_walk_forward_promotion_policy_defaults_to_observe_only(self):
+    def test_walk_forward_promotion_policy_defaults_to_production_gate(self):
         cfg = PipelineConfig()
-        self.assertEqual(cfg.walk_forward_promotion_policy, "observe_only")
-        self.assertFalse(cfg.walk_forward_live_blocking_enabled)
+        self.assertEqual(cfg.walk_forward_promotion_policy, "promotion_gate")
+        self.assertTrue(cfg.walk_forward_live_blocking_enabled)
 
-    def test_walk_forward_live_blocking_requires_explicit_opt_in(self):
+    def test_walk_forward_block_policy_can_be_configured(self):
         cfg = PipelineConfig(
             walk_forward_promotion_policy="block_severe_only",
             walk_forward_live_blocking_enabled=True,

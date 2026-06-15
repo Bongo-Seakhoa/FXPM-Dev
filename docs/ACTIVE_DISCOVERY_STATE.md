@@ -1,5 +1,11 @@
 # Active Discovery State
 
+> 2026-06-09 production split note: current production uses `production_split_mode="bleeding_edge"`.
+> The newest active half is the optimization surface, the immediately prior 50k bars are adjacent
+> WFV evidence, and production clean holdout is empty. Use `docs/PRODUCTION_SPLIT_AND_PROCESS.md`
+> and `docs/audit/production_split_process_20260609.html` as the canonical split/process references.
+> Older clean-holdout/disjoint material below is historical or research-only.
+
 > 2026-06-06 current note: scoring discovery is closed. Production scorer is `legacy`
 > with trade-frequency bonus off; see `docs/PROGRAM_PLAN.md` for the canonical state.
 > First-pass spent report/debug tools are archived under

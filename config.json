@@ -11,7 +11,7 @@
     "symbol_pool_note": "Expanded to 100 MT5 full-trade symbols; symbols remain non-live until optimized and validated into pm_configs.json.",
     "live_execution_note": "Missing symbols in the winner ledger are treated as still optimizing and cannot trade; only current promoted ledger cells are eligible for live execution.",
     "promotion_gate_note": "No hardcoded expected promote cells or stale external review artifacts are used in the active live gate.",
-    "walk_forward_note": "Walk-forward validation is retained by default on the adjacent 50000 bars before bleeding-edge optimization; it participates in candidate validation and records production evidence. Additional post-selection WFV hard-blocking is controlled by walk_forward_live_blocking_enabled."
+    "walk_forward_note": "Walk-forward validation is retained by default on the adjacent 50000 bars before bleeding-edge optimization; it replaces clean holdout as the production promotion evidence surface. Live cycle-drift/governance then derates or pauses contexts as real trade evidence accumulates."
   },
   "pipeline": {
     "data_dir": "./data",
@@ -86,8 +86,8 @@
     "walk_forward_audit_enabled": true,
     "walk_forward_audit_windows": 3,
     "walk_forward_audit_mode": "severe_fragility_only",
-    "walk_forward_promotion_policy": "observe_only",
-    "walk_forward_live_blocking_enabled": false,
+    "walk_forward_promotion_policy": "promotion_gate",
+    "walk_forward_live_blocking_enabled": true,
     "walk_forward_do_not_displace_latest_surface": true,
     "false_discovery_control_enabled": true,
     "false_discovery_symbol_count": 100,
@@ -133,6 +133,7 @@
     "optuna_target_coverage_pct": 0.1,
     "production_require_promotion_gate": true,
     "production_promotion_gate_mode": "ledger_status",
+    "live_artifact_drift_policy": "block",
     "production_promotion_review_path": "",
     "production_promotion_cell_safety_path": "",
     "production_completion_marker_path": "",
@@ -145,8 +146,9 @@
     "manual_new_entries_enabled": true,
     "manual_kill_switch_path": "runtime/manual_new_entries_enabled.flag",
     "storage_pause_entries_below_free_gb": null,
-    "max_total_open_risk_pct": 50.0,
-    "max_new_entries_when_total_open_risk_above_pct": 40.0,
+    "max_total_open_risk_pct": 75.0,
+    "max_new_entries_when_total_open_risk_above_pct": 50.0,
+    "open_risk_action": "derate",
     "daily_loss_hard_block_pct": 50.0,
     "session_loss_hard_block_pct": 40.0,
     "weekly_loss_hard_block_pct": 60.0,
@@ -162,6 +164,7 @@
     "live_allow_partial_symbol_ledger": true,
     "live_min_account_equity": 20.0,
     "live_min_account_equity_currency": "USD",
+    "optimization_min_m5_bars_fraction": 0.85,
     "optimization_min_m5_bars": 300000,
     "historical_fetch_retry_attempts": 3,
     "historical_fetch_retry_sleep_seconds": 2.0,
@@ -275,7 +278,7 @@
     "VISA"
   ],
   "position": {
-    "risk_per_trade_pct": 1.5,
+    "risk_per_trade_pct": 0.5,
     "max_position_size": 0.0,
     "min_position_size": 0.01,
     "risk_basis": "equity",

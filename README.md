@@ -10,9 +10,11 @@ Archived audit and planning documents live in `documentation_archive/`.
 
 ## Documentation Notes
 
+- Canonical production split/process: [docs/PRODUCTION_SPLIT_AND_PROCESS.md](docs/PRODUCTION_SPLIT_AND_PROCESS.md)
+- Visual production split/process: [docs/audit/production_split_process_20260609.html](docs/audit/production_split_process_20260609.html)
 - Primary run/setup guide: `SETUP_AND_RUN.md`
 - Settings reference: `SETTINGS_REFERENCE.md`
-- Config recommendation review: `best_config_reccomendations_gpt.html`
+- Independent split audit: `implimentation.md`
 - Change history: `CHANGELOG.md` and `PATCH_NOTES.md`
 - Dashboard guide: `pm_dashboard/README.md`
 - Margin protection policy: `README.md` (Risk Management -> Margin Protection)
@@ -54,7 +56,7 @@ The current PM:
 4. Uses the active recent M5 workflow for eligibility, optimization, and production selection
 5. Persists optimization state incrementally and atomically
 6. Trades only validated winners for the exact `(timeframe, regime)` live context
-7. Stores historical-stress audit, walk-forward research telemetry, no-trade, and risk-management evidence on artifacts
+7. Stores historical-stress audit, WFV promotion evidence, no-trade, and risk-management evidence on artifacts
 8. Uses fail-closed live readiness, hard-breakpoint supervision, cycle-drift monitoring, MT5 contract math, broker metadata, margin protection, and spread-quality filters in live execution
 
 The checked-in `config.json` is deployment-specific and currently reflects a high-risk low-balance profile. Treat it as the active repo configuration, not a universal recommendation.
@@ -107,6 +109,7 @@ The checked-in `config.json` is deployment-specific and currently reflects a hig
 - The active regime detector is not HMM-based
 - The full enhancement seam pack is not the default active backtest/live exit engine
 - The PM generates candle-close signals and the live loop is gated by MT5 bar availability rather than a wall-clock bar timer by default
+- Production does not use a newest-tail clean holdout. Any clean-holdout/disjoint references in archived docs are research-only unless `production_split_mode="research_clean_holdout"` is explicitly configured.
 
 ---
 
@@ -348,7 +351,8 @@ python pm_main.py --trade
     "cycle_drift_monitor_enabled": true,
     "cycle_drift_mode": "lightweight",
     "walk_forward_audit_enabled": true,
-    "walk_forward_promotion_policy": "observe_only",
+    "walk_forward_promotion_policy": "promotion_gate",
+    "walk_forward_live_blocking_enabled": true,
     "promote_small_risk_multiplier": 0.5,
     "local_governance_tournament_enabled": true,
     "local_governance_live_mode": "shadow",
@@ -373,8 +377,8 @@ python pm_main.py --trade
 - The committed config currently uses a high-risk low-balance profile.
 - Stage 1/Stage 2 use the active recent M5 workflow: latest 300k M5 bars, oldest 50k as `historical_stress_audit`, newest 250k as the active universe. Stage 1 runs baseline eligibility across the full active universe; Stage 2 optimizes on the newest half through the market edge.
 - The current presets are the recommended baseline for this workflow. They are designed to favor quality, profitability, and live relevance; do not loosen them without comparing regenerated artifacts and live rejection/outcome data.
-- Stage 2 freshness is intentional: production `clean_holdout` is disabled so the optimizer can use the freshest bars. The immediately prior 50k M5 bars are adjacent walk-forward validation evidence used by candidate validation, not pristine forward OOS.
-- `threadspark_selection_surface = "validation"` and `false_discovery_holdout_policy = "off"` keep production validation pointed at the adjacent WFV slice instead of asking missing clean-holdout metrics to gate winners.
+- Stage 2 freshness is intentional: production `clean_holdout` is disabled so the optimizer can use the freshest bars. The immediately prior 50k M5 bars are adjacent WFV evidence used by candidate validation and promotion, not pristine forward OOS.
+- `threadspark_selection_surface = "validation"` and `false_discovery_holdout_policy = "off"` keep production validation pointed at the adjacent WFV slice instead of asking missing clean-holdout metrics to gate winners. `walk_forward_promotion_policy = "promotion_gate"` is the active production promotion gate.
 - `risk_management_selection_stage = "stage3"` means governance/risk policies are selected on the newest Stage 2 selection surface. Setting it to `"stage2"` evaluates policies on the active optimization universe instead.
 - `logs/` is not controlled by `pipeline.output_dir`; runtime logs always go to the root `logs/` folder.
 - `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.discovery_risk_per_trade_pct` is the fixed discovery/backtest sizing value, while `pipeline.risk_per_trade_pct` only remains as a compatibility backfill when the `position` key is absent.

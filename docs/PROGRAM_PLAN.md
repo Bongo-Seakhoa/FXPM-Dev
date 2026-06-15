@@ -3,6 +3,12 @@
 **Owner:** Bongo · **Executors:** Claude (analysis/verify/<20min) + Codex (engine/runs/>20min)
 **Status date:** 2026-06-07 · **Living document** — update on every completed tangible.
 
+> 2026-06-09 production split note: the current production contract is
+> `production_split_mode="bleeding_edge"` with adjacent WFV and no production clean holdout.
+> Use `docs/PRODUCTION_SPLIT_AND_PROCESS.md` and
+> `docs/audit/production_split_process_20260609.html` as the canonical split/process references.
+> Older clean-holdout/disjoint language in this roadmap is historical or research-only.
+
 > Purpose: a single, tickable product-management record so (a) settled findings are never
 > re-litigated (no regression), (b) the active work is unambiguous, and (c) the forward
 > investigation tree and its branch outcomes are pre-registered. Scoring is closed;

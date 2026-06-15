@@ -2,6 +2,9 @@
 
 This guide covers installation, configuration, optimization, paper trading, live trading, monitoring, and maintenance for FXPM-Dev. The repository/folder name is `FXPM-Dev`; the internal runtime banner currently remains `FX PORTFOLIO MANAGER v3.1`.
 
+Canonical production split/process reference: `docs/PRODUCTION_SPLIT_AND_PROCESS.md`.
+Visual split confirmation: `docs/audit/production_split_process_20260609.html`.
+
 ---
 
 ## Table of Contents
@@ -38,6 +41,15 @@ MetaTrader 5 Python integration requires Windows.
 1. Python 3.10+
 2. MetaTrader 5 installed and logged in
 3. AutoTrading enabled in MT5
+
+### MT5 history depth (required for full optimization)
+
+The terminal only serves `copy_rates` history up to its **Tools → Options → Charts → "Max bars in chart"** limit. The default (e.g. `10000`) caps fresh symbols at 10k M5 bars and the loader will report `-2 'Invalid params'` for the full request.
+
+1. Set **"Max bars in chart" to Unlimited** and **restart MT5** before the first production fetch.
+2. The loader then walks history backward by date and pulls up to `max_bars` (300k) per symbol automatically; you do not need to open each chart manually.
+3. Some broker symbols genuinely hold less than 300k M5 history (e.g. an index back to 2013). Validity is fractional, not a hard 300k: a symbol is accepted when it has at least `optimization_min_m5_bars_fraction` of `max_bars` (default `0.85` → 255k); below that it is a genuine `NO_TRADE` `data_failure`.
+4. Diagnose any symbol with `python tools/diagnose_symbol_history.py <SYMBOL>` — it reports the true date-walk depth and whether a shortfall is the terminal cap or the broker's real history.
 
 ---
 
@@ -118,6 +130,11 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "historical_stress_audit_bars": 50000,
     "active_universe_bars": 250000,
     "active_stage2_pct": 50.0,
+    "production_split_mode": "bleeding_edge",
+    "walk_forward_validation_bars": 50000,
+    "clean_holdout_pct": 0.0,
+    "threadspark_selection_surface": "validation",
+    "false_discovery_holdout_policy": "off",
     "max_param_combos": 200,
     "optimization_max_workers": 4,
     "regime_hyperparam_top_k": 5,
@@ -156,7 +173,8 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "cycle_drift_monitor_enabled": true,
     "cycle_drift_mode": "lightweight",
     "walk_forward_audit_enabled": true,
-    "walk_forward_promotion_policy": "observe_only",
+    "walk_forward_promotion_policy": "promotion_gate",
+    "walk_forward_live_blocking_enabled": true,
     "promote_small_risk_multiplier": 0.5,
     "local_governance_tournament_enabled": true,
     "local_governance_live_mode": "shadow",
@@ -190,7 +208,9 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
 - `mt5.login = 0` means use the currently logged-in MT5 session.
 - Runtime logs go to `logs/`, not `pm_outputs/`.
 - `pipeline.output_dir` controls optimization summaries and trade artifacts.
-- Stage 1/Stage 2 currently use the active recent M5 workflow: latest 300,000 M5 bars, with the oldest 50,000 as `historical_stress_audit` and the newest 250,000 as the active universe. Stage 1 baseline eligibility runs across the full active universe; Stage 2 uses the newest active half as the fresh optimization/risk-selection surface.
+- Stage 1/Stage 2 currently use the active recent M5 workflow: latest 300,000 M5 bars, with the oldest 50,000 as `historical_stress_audit` and the newest 250,000 as the active universe. Stage 1 baseline eligibility runs across the full active universe; Stage 2 uses the newest active half as the fresh optimization/risk-selection surface. The 50,000 bars immediately before Stage 2 are adjacent WFV evidence with a 300-bar embargo.
+- Production clean holdout is intentionally empty (`clean_holdout_pct = 0.0`). Clean-holdout/disjoint layouts are research-only profiles and must not be mistaken for the production default.
+- WFV replaces clean holdout as the production promotion gate: clean WFV promotes, weak or thin WFV derates to `PROMOTE_SMALL`, and severe WFV blocks.
 - The checked-in Stage 1/Stage 2 presets are the current recommended production baseline. They favor quality, profitability, and live relevance over simply admitting more candidates.
 - `risk_management_selection_stage = "stage3"` means per-winner governance/risk policy selection runs on the newest fresh selection surface after the strategy/timeframe/regime winner is chosen.
 - `production_retrain_mode`:
