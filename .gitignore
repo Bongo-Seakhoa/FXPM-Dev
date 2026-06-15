@@ -38,3 +38,6 @@ config.*.local.json
 
 # Disposable analysis scratch (prospect screens, PBO runs, ad-hoc benchmarks)
 pm_outputs/experiments/
+
+# Large static reference docs (kept locally, not in git history)
+*.pdf
