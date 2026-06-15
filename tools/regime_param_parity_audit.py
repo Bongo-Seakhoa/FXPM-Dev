@@ -70,7 +70,7 @@ def _promoted_cells(ledger: Dict[str, Any]) -> List[Dict[str, Any]]:
                         artifact = symbol_payload.get("artifact_meta") if isinstance(symbol_payload.get("artifact_meta"), dict) else {}
                     cells.append(
                         {
-                            "symbol": str(symbol).upper(),
+                            "symbol": str(symbol),
                             "timeframe": str(timeframe).upper(),
                             "regime": str(regime).upper(),
                             "strategy_name": cfg.get("strategy_name"),

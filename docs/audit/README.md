@@ -55,6 +55,12 @@ Audit notes, agent comms, experiment notes, and review documents are working
 artifacts. They are useful while they expose unresolved issues or explain an
 active decision, but they are not evergreen project documentation.
 
+Current production split/process reference:
+
+- Visual: `docs/audit/production_split_process_20260609.html`
+- Canonical note: `docs/PRODUCTION_SPLIT_AND_PROCESS.md`
+- Independent audit: `implimentation.md`
+
 When an audit artifact has served its purpose:
 
 - move durable facts into code, tests, config, or `CHANGELOG.md`;

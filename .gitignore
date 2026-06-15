@@ -7,14 +7,28 @@ _test_tmp/
 .tmp_pytest/
 .tmp_test/
 *.tmp.*
+.pm_configs.json.*.tmp
 .claude/
 logs/
+runtime/
 data/.cache/
 data/.live/
+data/*.csv
 last_actionable_log.json
 last_trade_log.json
+last_trade_log.json.tmp.*
+pm_outputs/
 pm_outputs/historical_data/
 pm_outputs/trades_*.json
+pm_outputs/signal_ledger_*.jsonl
+pm_outputs/*_active_run.json
+pm_outputs/benchmarks/
+pm_outputs/broker_specs_snapshot_*.json
+pm_outputs/production_live/
+pm_outputs/production_live/feature_cache/
+pm_outputs/production_live/oos_evidence/
+pm_outputs/production_live/trades_*.json
+pm_outputs/production_live/reports/
 
 # Local/private operator configuration. Keep tracked config.json credential-free.
 .env

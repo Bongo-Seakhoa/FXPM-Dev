@@ -230,34 +230,50 @@ class ParameterSpace:
         
         return info
     
+    @staticmethod
+    def _is_scalar_choice(value: Any) -> bool:
+        """Optuna categoricals accept only None/bool/int/float/str (incl. numpy scalars)."""
+        return value is None or np.isscalar(value)
+
+    def _suggest_categorical(self, trial: 'optuna.Trial', name: str, choices) -> Any:
+        """Suggest one value from a discrete grid.
+
+        Non-scalar choices (e.g. regime-set tuples like ('BREAKOUT','TREND')) are
+        suggested by index and mapped back, so Optuna only ever receives scalar
+        choices (tuples are unsupported and emit persistent-storage warnings)
+        while the returned value remains the real choice.
+        """
+        choices = list(choices)
+        if not choices:
+            return None
+        if all(self._is_scalar_choice(c) for c in choices):
+            return trial.suggest_categorical(name, choices)
+        idx = trial.suggest_categorical(name, list(range(len(choices))))
+        return choices[int(idx)]
+
     def suggest(self, trial: 'optuna.Trial') -> Dict[str, Any]:
         """
         Suggest parameters using Optuna trial.
-        
+
         Handles parameter constraints by adjusting dependent parameters.
-        
+
         Args:
             trial: Optuna trial object
-            
+
         Returns:
             Dict of suggested parameters merged with defaults
         """
         params = self.default_params.copy()
-        
-        # Suggest each parameter
+
+        # int/float grids and categoricals all sample the discrete grid; tuple/list
+        # choices are index-encoded inside the helper so Optuna only sees scalars.
         for name, info in self.param_info.items():
-            if info['type'] == 'categorical':
-                params[name] = trial.suggest_categorical(name, info['choices'])
-            elif info['type'] == 'int':
-                # For discrete integers, use categorical to match grid exactly
-                params[name] = trial.suggest_categorical(name, info['choices'])
-            elif info['type'] == 'float':
-                # For floats, also use categorical to match grid
-                params[name] = trial.suggest_categorical(name, info['choices'])
-        
+            if info['type'] in ('categorical', 'int', 'float'):
+                params[name] = self._suggest_categorical(trial, name, info['choices'])
+
         # Apply constraints
         params = self._apply_constraints(params)
-        
+
         return params
     
     def _apply_constraints(self, params: Dict[str, Any]) -> Dict[str, Any]:

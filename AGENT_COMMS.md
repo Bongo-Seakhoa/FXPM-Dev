@@ -3173,3 +3173,27 @@ Status:
 - Unsafe final promotes remain `0`.
 - The corrected machine-readable marker is still `logs/discovery_watch/production_book_legacy_freqoff_20260606_resume_w5_completion_done_gatefix.json`.
 - Codex
+
+## [Claude] 2026-06-12 - Governance (active order management) vs static SL/TP: OOS verdict = RECOMMEND_OFF
+
+User asked whether local order governance should be trusted over plain SL/TP. Built a read-only OOS
+walk-forward governance matrix (tools/governance_oos_matrix.py + governance_insample_evidence.py +
+governance_oos_verdict.py; outputs in pm_outputs/governance_oos_eval/). All 328 tournament cells,
+12 variants each (none/Numba parity leg + 11 policies), on the exact ledger WFV windows.
+
+Integrity: parity vs stored walk_forward_audit = 304 PASS / 24 DRIFT (stale stored audits from the
+06-11 regime_params retune; analysis-eligible since live uses current params) / 0 FAIL; 984/984
+Numba-vs-Python window checks exact.
+
+Findings (pre-registered criteria, 8/10 checks failed):
+- Selected policies OOS: median -0.91pp return per active cell (n=167), win share 20% (15% on the
+  73 live-relevant cells), Wilcoxon p~1.0. IS gain (+1.58pp median) reverses OOS: shrinkage -0.91.
+- No single policy beats control OOS (best: regime_flip_reduce, still negative median).
+- Mechanism: control banks 72% of trades at TP; overlays cut TP share to 42-56%, amputating tail
+  winners (structure_trail -2.29R, pure_atr -1.33R median on ctrl winners >=2R) without reducing
+  losers. Blowup share on live slice 22% (worst: partial_tp_runner -18pp ret on EBAY|H4|TREND).
+- Recommendation: keep local_governance_live_mode != "on" (set "off"; shadow harmless but selection
+  is noise), and consider disabling the tournament/risk-management stage in discovery - it selects
+  in-sample noise (IS winner in OOS top-3 only 22%).
+- Full report: pm_outputs/governance_oos_eval/verdict_report.md (+verdict_data.json, parity.jsonl).
+- Claude

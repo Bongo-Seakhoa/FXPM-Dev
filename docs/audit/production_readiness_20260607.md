@@ -6,10 +6,10 @@ User asked Codex to continue without Claude, preserve the per-specialist rule, k
 data-driven, and move the code toward production readiness for live capital. Codex used three
 independent stand-in audits for live safety, config/artifact integrity, and monitoring.
 
-Follow-up scope: reassess walk-forward validation from first principles, especially whether it
-belongs between final validation and live execution. The production answer is no: walk-forward
-remains useful research telemetry, but it should not spend or delay a freshly approved specialist's
-live opportunity after final selection gates have passed.
+Superseded note as of 2026-06-09: the canonical production split is now
+`docs/PRODUCTION_SPLIT_AND_PROCESS.md`. Walk-forward validation uses the adjacent 50k bars before
+bleeding-edge optimization and replaces clean holdout as the production promotion evidence surface.
+The older telemetry-only conclusion below is retained as historical context for the June 7 book.
 
 ## Production Book
 
@@ -53,7 +53,8 @@ Audit result: 96 specialist cells inspected individually; 92 `NO_TRADE_ABSTAINED
 
 ## Walk-forward and Cadence Decision
 
-- Production profiles now use `walk_forward_promotion_policy = "observe_only"`.
+- Superseded on 2026-06-09: production profiles now use
+  `walk_forward_promotion_policy = "promotion_gate"` with WFV as the production promotion surface.
 - Research/discovery profiles can still use `block_severe_only` when the experiment intentionally
   wants severe walk-forward fragility to block candidates before any live-candidate handoff.
 - Default production retraining cadence is now four weeks, not the former 14-day cycle. The current promoted book

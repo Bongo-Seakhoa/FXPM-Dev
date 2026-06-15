@@ -707,6 +707,89 @@ class PipelineArtifactTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_ledger_status_completion_requires_current_contract(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_ledger_status_current_contract")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(data_dir=tmp / "data", output_dir=tmp / "out")
+            current_meta = build_artifact_meta(cfg)
+            stale_meta = dict(current_meta)
+            stale_meta["split_contract_version"] = "2026-06-04-disjoint-stage2-validation"
+            manager = PortfolioManager(
+                cfg,
+                ["EURUSD", "GBPUSD"],
+                config_file=str(tmp / "pm_configs.json"),
+            )
+            manager.symbol_configs = {
+                "EURUSD": SymbolConfig(
+                    symbol="EURUSD",
+                    is_validated=True,
+                    valid_until=datetime.now() + timedelta(days=7),
+                    artifact_meta=current_meta,
+                ),
+                "GBPUSD": SymbolConfig(
+                    symbol="GBPUSD",
+                    is_validated=True,
+                    valid_until=datetime.now() + timedelta(days=7),
+                    artifact_meta=stale_meta,
+                ),
+            }
+
+            status = manager._build_ledger_status()
+
+            expected_contract = "|".join([
+                current_meta["artifact_version"],
+                current_meta["split_contract_version"],
+            ])
+            self.assertEqual(status["current_artifact_contract"], expected_contract)
+            self.assertEqual(status["current_contract_symbol_count"], 1)
+            self.assertTrue(status["complete_symbol_universe"])
+            self.assertFalse(status["complete_universe"])
+            self.assertFalse(status["complete_current_contract_universe"])
+            self.assertEqual(status["missing_current_contract_symbols"], ["GBPUSD"])
+            self.assertEqual(status["missing_symbols"], ["GBPUSD"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_optimization_no_trade_marker_keeps_data_window_meta(self):
+        tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_no_trade_marker_windows")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = PipelineConfig(data_dir=tmp / "data", output_dir=tmp / "out")
+            manager = PortfolioManager(
+                cfg,
+                ["EURUSD"],
+                config_file=str(tmp / "pm_configs.json"),
+            )
+            data_window_meta = {
+                "windows": {
+                    "walk_forward_validation": {"start_index": 124700, "end_index": 174700},
+                    "optimization_train": {"start_index": 175000, "end_index": 300000},
+                    "clean_holdout": {"start_index": 300000, "end_index": 300000},
+                }
+            }
+
+            saved = manager.save_optimization_no_trade_config(
+                "EURUSD",
+                "No validated winner",
+                data_window_meta=data_window_meta,
+            )
+
+            self.assertEqual(
+                saved.data_window_meta["windows"]["walk_forward_validation"],
+                {"start_index": 124700, "end_index": 174700},
+            )
+            self.assertEqual(
+                saved.data_window_meta["windows"]["optimization_train"],
+                {"start_index": 175000, "end_index": 300000},
+            )
+            self.assertTrue(saved.data_window_meta["optimization_failure"])
+            self.assertEqual(saved.data_window_meta["reason"], "No validated winner")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

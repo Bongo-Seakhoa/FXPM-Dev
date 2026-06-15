@@ -69,7 +69,7 @@ The old clean-holdout design is retained only as explicit `production_split_mode
 - `pm_core.py`: `PipelineConfig` normalizes the new split fields. `DataSplitter.SPLIT_CONTRACT_VERSION` was bumped to invalidate stale ledgers/artifacts, and `DataSplitter` now emits `base_selection`, `walk_forward_validation`, `optimization_train`, and empty production `clean_holdout`.
 - `pm_pipeline.py`: artifact metadata includes the split mode and walk-forward validation bar count. Pipeline slicing now passes separate full-active eligibility features, latest-half optimization features, and prior-window validation features.
 - `RegimeOptimizer`: candidate collection now uses the broad eligibility surface for screening/gates and top-K strategy discovery, while stored train metrics and tuning remain on the bleeding-edge optimization surface.
-- Promotion logic: missing clean-holdout metrics no longer block production winners under `bleeding_edge`. Walk-forward evidence is retained as production validation evidence; hard live blocking remains controlled by the explicit walk-forward live-blocking policy.
+- Promotion logic: clean holdout is replaced by WFV as the production promotion evidence surface. Clean WFV promotes, weak or thin WFV derates to `PROMOTE_SMALL`, and severe WFV blocks promotion; live performance and drift governance can then derate or pause contexts as real trade evidence accumulates.
 - Tests/docs: splitter, config, artifact, promotion, optimizer, README, settings, and research docs were updated to lock the new production contract and demote clean holdout to research mode.
 
 ## Recommendation
@@ -85,7 +85,7 @@ Reject the previous clean-holdout split as production default. It was not just a
 - `DataSplitter` emits the exact 300k bleeding-edge geometry listed above.
 - `config.json` no longer reserves production clean holdout.
 - Optimizer screening can use full active 250k eligibility while train metrics remain on the newest 125k.
-- Missing production clean holdout does not block promotion.
+- Production promotion uses WFV evidence instead of production clean-holdout evidence.
 - Artifact metadata rejects old `2026-06-04-disjoint-stage2-validation` outputs.
 - Targeted tests pass for splitter, config, artifacts, optimizer gating, promotion, and holdout diagnostics.
 

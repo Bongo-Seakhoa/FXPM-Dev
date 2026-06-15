@@ -16,7 +16,7 @@ Version: 3.1 (Portfolio Manager)
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
@@ -79,6 +79,15 @@ class MT5Config:
     timeout: int = 60000
     portable: bool = False
     preferred_filling_type: str = "broker"
+    # History sync: how hard to push the terminal to download history for a
+    # symbol that was just added to Market Watch (stock CFDs / exotic metals are
+    # not in the default watch list, so the first copy_rates_* reads an empty
+    # local cache while the terminal downloads in the background).
+    history_sync_max_attempts: int = 6
+    history_sync_sleep_seconds: float = 0.6
+    # Historical fetch pages in chunks of this size so a count larger than the
+    # symbol's locally-synced depth never triggers MT5 (-2) 'Invalid params'.
+    history_page_size: int = 50000
 
 
 @dataclass
@@ -621,21 +630,270 @@ class MT5Connector:
     # =========================================================================
     # Historical Data
     # =========================================================================
-    
+
+    def _copy_rates_with_sync(self,
+                              broker_symbol: str,
+                              tf: Any,
+                              count: int,
+                              from_date: Optional[datetime] = None,
+                              force_full: bool = False):
+        """
+        Fetch rates, forcing a server-side history download so the terminal
+        returns the FULL requested ``count`` rather than only its local cache.
+
+        Two failure modes are handled, both rooted in the same cause (the
+        terminal only returns history it has already downloaded):
+
+        1. Empty result for a symbol just added to Market Watch (stock CFDs and
+           exotic metals like Platinum, Palladium, XAUEUR, APPLE, TESLA are not
+           in the default watch list). ``copy_rates_from_pos`` reads an empty
+           local cache while the terminal downloads in the background.
+        2. Short result (e.g. 266k of a requested 300k) because only part of the
+           history has been synchronized locally.
+
+        For both, a date-anchored ``copy_rates_from(symbol, tf, now, count)``
+        makes the terminal synchronize and return up to ``count`` bars. We poll,
+        keeping the largest result, until we reach ``count``, the available
+        history plateaus (broker's true maximum), or the attempt budget is spent.
+
+        When the first call already returns enough (the normal case for active FX
+        symbols) it returns immediately with no extra work.
+
+        Args:
+            force_full: escalate even when the first call returned *some* data but
+                fewer than ``count`` bars. Used by the historical fetch path,
+                which needs the full window; left off for the live hot path so a
+                normal short/empty live probe is not slowed.
+        """
+        def _len(arr) -> int:
+            return 0 if arr is None else len(arr)
+
+        def _rates(anchor: Optional[datetime]):
+            # MT5 stores bar open time in UTC; time-based calls must use UTC
+            # datetimes (per MetaTrader5 Python docs) or they query the wrong
+            # window. copy_rates_from is also a stronger download trigger than
+            # copy_rates_from_pos, which only reads the already-charted cache.
+            try:
+                if anchor is not None and hasattr(mt5, "copy_rates_from"):
+                    return mt5.copy_rates_from(broker_symbol, tf, anchor, count)
+                return mt5.copy_rates_from_pos(broker_symbol, tf, 0, count)
+            except Exception as exc:
+                logger.debug(f"copy_rates fetch failed for {broker_symbol}: {exc}")
+                return None
+
+        # A UTC anchor "now" is identical in epoch to a naive local now, but using
+        # tz-aware UTC keeps fixed historical anchors (deep backfill) correct too.
+        utc_now = datetime.now(timezone.utc)
+        rates = _rates(from_date)
+        best = rates
+        best_len = _len(rates)
+        if best_len >= count:
+            return rates
+        # Live/default path accepts whatever is cached and only escalates when the
+        # cache was completely empty. The historical fetch path (force_full) keeps
+        # pushing until it reaches the full requested count.
+        if best_len > 0 and not force_full:
+            return rates
+
+        max_attempts = max(0, int(getattr(self.config, "history_sync_max_attempts", 0) or 0))
+        sleep_s = max(0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0))
+        if max_attempts <= 0:
+            return best
+
+        # Force the terminal to (re)start / extend the history download. The
+        # terminal only serves bars it has loaded on a chart, so a symbol that was
+        # never charted has an empty history base until something requests it. We
+        # (1) select it into Market Watch, (2) nudge a quote subscription via
+        # symbol_info_tick, then (3) poll copy_rates_from with a UTC anchor while
+        # the background download runs.
+        try:
+            mt5.symbol_select(broker_symbol, True)
+        except Exception:
+            pass
+
+        stagnation = 0
+        for _ in range(max_attempts):
+            try:
+                if hasattr(mt5, "symbol_info_tick"):
+                    mt5.symbol_info_tick(broker_symbol)
+            except Exception:
+                pass
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            anchor = from_date or datetime.now(timezone.utc)
+            attempt_rates = _rates(anchor)
+            attempt_len = _len(attempt_rates)
+            if attempt_len >= count:
+                return attempt_rates
+            if attempt_len > best_len:
+                best = attempt_rates
+                best_len = attempt_len
+                stagnation = 0
+            else:
+                stagnation += 1
+                # Stop early only once we already have data and it has stopped
+                # growing (the broker's true maximum < count). Keep trying the
+                # full budget while still empty, to ride out a slow download.
+                if best_len > 0 and stagnation >= 2:
+                    break
+
+        if best_len == 0:
+            # Surface the real reason instead of a blind "no data". MT5 only
+            # reports it through last_error(); without this it is unknowable.
+            self._log_history_fetch_failure(broker_symbol, tf)
+        return best
+
+    def _log_history_fetch_failure(self, broker_symbol: str, tf: Any) -> None:
+        """Log the authoritative reason a history fetch came back empty.
+
+        MetaTrader5 returns None/empty from copy_rates_* on error and only exposes
+        the cause via last_error(); symbol_info flags reveal whether the symbol is
+        even selected/visible/synchronized on this account.
+        """
+        details: List[str] = []
+        try:
+            if hasattr(mt5, "last_error"):
+                details.append(f"last_error={mt5.last_error()}")
+        except Exception:
+            pass
+        try:
+            info = mt5.symbol_info(broker_symbol) if hasattr(mt5, "symbol_info") else None
+            if info is None:
+                details.append("symbol_info=None (symbol not in broker universe / not selectable)")
+            else:
+                for attr in ("visible", "select", "trade_mode"):
+                    if hasattr(info, attr):
+                        details.append(f"{attr}={getattr(info, attr)}")
+                bars_attr = getattr(info, "bars", None)
+                if bars_attr is not None:
+                    details.append(f"chart_bars={bars_attr}")
+        except Exception as exc:
+            details.append(f"symbol_info_error={exc}")
+        logger.warning(
+            f"History fetch empty for {broker_symbol}: {'; '.join(details) if details else 'no diagnostic available'}. "
+            f"Per MT5 docs the terminal only serves bars already loaded on a chart; if last_error is success the "
+            f"symbol has no synchronized M5 history on this account (open it once in the terminal or confirm the "
+            f"broker offers it)."
+        )
+
+    @staticmethod
+    def _is_invalid_params_error() -> bool:
+        try:
+            err = mt5.last_error() if hasattr(mt5, "last_error") else None
+        except Exception:
+            return False
+        return bool(err and isinstance(err, (tuple, list)) and len(err) and int(err[0]) == -2)
+
+    @staticmethod
+    def _rates_to_df(rates) -> Optional[pd.DataFrame]:
+        if rates is None or len(rates) == 0:
+            return None
+        df = pd.DataFrame(rates)
+        if df.empty or "time" not in df.columns:
+            return None
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df = df.set_index("time")
+        return df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low", "close": "Close",
+            "tick_volume": "Volume", "spread": "Spread", "real_volume": "RealVolume",
+        })
+
+    def _terminal_maxbars(self) -> int:
+        try:
+            ti = mt5.terminal_info() if hasattr(mt5, "terminal_info") else None
+            return int(getattr(ti, "maxbars", 0) or 0)
+        except Exception:
+            return 0
+
+    def _paged_history(self, broker_symbol: str, tf: Any, count: int) -> Optional[pd.DataFrame]:
+        """Retrieve up to ``count`` bars by walking the history backwards by date.
+
+        A single oversized request returns (-2, 'Invalid params') because the
+        terminal serves at most 'Max bars in chart' (terminal_info().maxbars)
+        bars per call. Paging by *date* (anchoring each request at the oldest bar
+        retrieved so far) stays under that cap and forces the terminal to fetch
+        progressively older windows from the server, accumulating well past the
+        per-call limit until ``count`` is reached or the broker's history ends.
+        """
+        max_attempts = max(1, int(getattr(self.config, "history_sync_max_attempts", 6) or 6))
+        sleep_s = max(0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.6) or 0.6))
+        page = max(1000, int(getattr(self.config, "history_page_size", 50000) or 50000))
+        maxbars = self._terminal_maxbars()
+        if maxbars > 0:
+            page = min(page, max(1000, maxbars - 1))  # stay strictly under the per-call cap
+        min_page = 500
+
+        try:
+            mt5.symbol_select(broker_symbol, True)
+            if hasattr(mt5, "symbol_info_tick"):
+                mt5.symbol_info_tick(broker_symbol)
+        except Exception:
+            pass
+
+        frames: List[pd.DataFrame] = []
+        total = 0
+        anchor = datetime.now(timezone.utc)
+        prev_oldest = None
+        while total < count:
+            n = min(page, count - total)
+            chunk = None
+            saw_invalid = False
+            for _ in range(max_attempts):
+                try:
+                    chunk = mt5.copy_rates_from(broker_symbol, tf, anchor, n)
+                except Exception as exc:
+                    logger.debug(f"paged copy_rates_from failed for {broker_symbol}: {exc}")
+                    chunk = None
+                if chunk is not None and len(chunk) > 0:
+                    break
+                if self._is_invalid_params_error():
+                    saw_invalid = True  # window too large for the cap: shrink, don't retry
+                    break
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+            got = 0 if chunk is None else len(chunk)
+            if got == 0:
+                if saw_invalid and n > min_page:
+                    page = max(min_page, n // 2)
+                    continue
+                break  # end of available history
+            cdf = pd.DataFrame(chunk)
+            frames.append(cdf)
+            total += got
+            oldest = int(cdf["time"].min())
+            if prev_oldest is not None and oldest >= prev_oldest:
+                break  # no older bars served -> reached start of broker history
+            prev_oldest = oldest
+            anchor = datetime.fromtimestamp(oldest, tz=timezone.utc) - timedelta(seconds=1)
+
+        if not frames:
+            return None
+        df = self._rates_to_df(pd.concat(frames, ignore_index=True))
+        if df is None:
+            return None
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        if count > 0 and len(df) > count:
+            df = df.iloc[-count:]
+        return df
+
     def get_bars(self,
                  symbol: str,
                  timeframe: str,
                  count: int = 1000,
-                 from_date: datetime = None) -> Optional[pd.DataFrame]:
+                 from_date: datetime = None,
+                 force_full: bool = False) -> Optional[pd.DataFrame]:
         """
         Get historical bars.
-        
+
         Args:
             symbol: Symbol name
             timeframe: Timeframe string (M5, H1, D1, etc.)
             count: Number of bars to fetch
             from_date: Optional start date
-            
+            force_full: keep escalating the history download until the full
+                ``count`` is retrieved (historical fetch path). Off by default so
+                the live hot path is not slowed by a normal short probe.
+
         Returns:
             DataFrame with OHLCV data or None
         """
@@ -653,21 +911,30 @@ class MT5Connector:
             logger.debug(f"Broker universe miss while fetching bars: {symbol}")
             return None
         
-        # Fetch bars
-        if from_date:
-            rates = mt5.copy_rates_from(broker_symbol, tf, from_date, count)
-        else:
-            rates = mt5.copy_rates_from_pos(broker_symbol, tf, 0, count)
-        
+        # Historical path pages the request so a count larger than the symbol's
+        # locally-synced depth does not trigger MT5 "Invalid params" (-2); the
+        # live path keeps the fast single-call + empty-sync behavior.
+        if force_full and from_date is None:
+            df = self._paged_history(broker_symbol, tf, count)
+            if df is None or df.empty:
+                logger.warning(f"No data returned for {symbol} {timeframe}")
+                self._log_history_fetch_failure(broker_symbol, tf)
+                return None
+            return df
+
+        rates = self._copy_rates_with_sync(
+            broker_symbol, tf, count, from_date=from_date, force_full=force_full
+        )
+
         if rates is None or len(rates) == 0:
             logger.warning(f"No data returned for {symbol} {timeframe}")
             return None
-        
+
         # Convert to DataFrame
         df = pd.DataFrame(rates)
         df['time'] = pd.to_datetime(df['time'], unit='s')
         df = df.set_index('time')
-        
+
         # Rename columns
         df = df.rename(columns={
             'open': 'Open',
@@ -685,33 +952,65 @@ class MT5Connector:
                        symbol: str,
                        timeframe: str,
                        start_date: datetime,
-                       end_date: datetime) -> Optional[pd.DataFrame]:
+                       end_date: datetime,
+                       sync_retry: bool = False) -> Optional[pd.DataFrame]:
         """
         Get historical bars within date range.
-        
+
         Args:
             symbol: Symbol name
             timeframe: Timeframe string
             start_date: Start date
             end_date: End date
-            
+            sync_retry: When True, retry on an empty result to give the terminal
+                time to download history for a freshly selected symbol. Off by
+                default so the live delta-sync hot path is not slowed by the
+                normal "no new bars" empty case.
+
         Returns:
             DataFrame with OHLCV data or None
         """
         if not self._check_connection():
             return None
-        
+
         tf = self.TIMEFRAME_MAP.get(timeframe)
         if tf is None:
             return None
-        
+
         broker_symbol = self.find_broker_symbol(symbol)
         if broker_symbol is None:
             return None
-        
-        rates = mt5.copy_rates_range(broker_symbol, tf, start_date, end_date)
-        
+
+        try:
+            rates = mt5.copy_rates_range(broker_symbol, tf, start_date, end_date)
+        except Exception as exc:
+            # MT5/Windows rejects out-of-range dates (e.g. pre-1970) with OSError
+            # Errno 22; never let that crash the fetch.
+            logger.debug(f"copy_rates_range failed for {broker_symbol} ({start_date}..{end_date}): {exc}")
+            rates = None
+
+        if (rates is None or len(rates) == 0) and sync_retry:
+            max_attempts = max(0, int(getattr(self.config, "history_sync_max_attempts", 0) or 0))
+            sleep_s = max(0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0))
+            if max_attempts > 0:
+                try:
+                    mt5.symbol_select(broker_symbol, True)
+                except Exception:
+                    pass
+                for _ in range(max_attempts):
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    try:
+                        rates = mt5.copy_rates_range(broker_symbol, tf, start_date, end_date)
+                    except Exception as exc:
+                        logger.debug(f"copy_rates_range retry failed for {broker_symbol}: {exc}")
+                        rates = None
+                    if rates is not None and len(rates) > 0:
+                        break
+
         if rates is None or len(rates) == 0:
+            if sync_retry:
+                self._log_history_fetch_failure(broker_symbol, tf)
             return None
         
         df = pd.DataFrame(rates)

@@ -714,8 +714,8 @@ class PipelineConfig:
     walk_forward_audit_enabled: bool = True
     walk_forward_audit_windows: int = 3
     walk_forward_audit_mode: str = "severe_fragility_only"
-    walk_forward_promotion_policy: str = "observe_only"
-    walk_forward_live_blocking_enabled: bool = False
+    walk_forward_promotion_policy: str = "promotion_gate"
+    walk_forward_live_blocking_enabled: bool = True
     walk_forward_do_not_displace_latest_surface: bool = True
     # PROMOTE_SMALL winners trade live with a derated risk multiplier (0..1).
     promote_small_risk_multiplier: float = 0.5
@@ -803,8 +803,13 @@ class PipelineConfig:
     
     # Maximum base M5 bars to load per symbol for optimization.
     max_bars: int = 300000
-    # Optional strict data-completeness gate for production optimization.
-    # When >0, symbols with fewer M5 bars after retry are left unoptimized.
+    # Data-completeness gate for production optimization. The fractional form is
+    # the source of truth: a symbol is valid when its downloaded M5 history is at
+    # least this fraction of `max_bars` (e.g. 0.85 -> 255k of 300k). It keeps the
+    # 300k standard the majority meet while admitting close-but-short symbols
+    # (ES35 ~267k) instead of failing them on a hard 300k rule. `optimization_min_m5_bars`
+    # remains an optional absolute floor used only when the fraction is unset.
+    optimization_min_m5_bars_fraction: float = 0.0
     optimization_min_m5_bars: int = 0
     historical_fetch_retry_attempts: int = 1
     historical_fetch_retry_sleep_seconds: float = 2.0
@@ -1209,12 +1214,12 @@ class PipelineConfig:
         if self.walk_forward_audit_mode not in {"off", "observe", "severe_fragility_only"}:
             self.walk_forward_audit_mode = "severe_fragility_only"
         self.walk_forward_promotion_policy = str(
-            getattr(self, "walk_forward_promotion_policy", "observe_only") or "observe_only"
+            getattr(self, "walk_forward_promotion_policy", "promotion_gate") or "promotion_gate"
         ).strip().lower()
-        if self.walk_forward_promotion_policy not in {"observe_only", "block_severe_only"}:
-            self.walk_forward_promotion_policy = "observe_only"
+        if self.walk_forward_promotion_policy not in {"observe_only", "block_severe_only", "promotion_gate"}:
+            self.walk_forward_promotion_policy = "promotion_gate"
         self.walk_forward_live_blocking_enabled = bool(
-            getattr(self, "walk_forward_live_blocking_enabled", False)
+            getattr(self, "walk_forward_live_blocking_enabled", True)
         )
         regime_scoring_model = str(getattr(self, "regime_scoring_model", "legacy") or "legacy").strip().lower()
         if regime_scoring_model not in {
@@ -1443,6 +1448,11 @@ class PipelineConfig:
             self.optimization_min_m5_bars = max(0, int(self.optimization_min_m5_bars))
         except Exception:
             self.optimization_min_m5_bars = 0
+        try:
+            frac = float(self.optimization_min_m5_bars_fraction)
+            self.optimization_min_m5_bars_fraction = frac if math.isfinite(frac) and 0.0 <= frac <= 1.0 else 0.0
+        except (TypeError, ValueError, OverflowError):
+            self.optimization_min_m5_bars_fraction = 0.0
         try:
             self.historical_fetch_retry_attempts = max(1, int(self.historical_fetch_retry_attempts))
         except Exception:

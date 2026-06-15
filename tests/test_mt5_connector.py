@@ -1,5 +1,6 @@
 import unittest
 import logging
+import math
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -250,6 +251,212 @@ class MT5ConnectorTests(unittest.TestCase):
         self.assertIn("RealVolume", bars.columns)
         self.assertEqual(float(bars["Spread"].iloc[0]), 17.0)
         self.assertEqual(float(bars["RealVolume"].iloc[0]), 3.0)
+
+
+class _SyncingMT5:
+    """Fake terminal where a freshly selected symbol has an empty local cache.
+
+    ``copy_rates_from_pos`` (local cache) returns nothing until the terminal has
+    "downloaded" enough history; a date-anchored ``copy_rates_from`` is what
+    forces/awaits that download. This reproduces stock-CFD / exotic-metal
+    symbols that are not in the default Market Watch.
+    """
+
+    def __init__(self, sync_after: int = 2):
+        self.sync_after = int(sync_after)
+        self.from_pos_calls = 0
+        self.from_calls = 0
+        self.range_calls = 0
+        self.selected = []
+
+    def _bar(self):
+        return {
+            "time": 1711843200,
+            "open": 1.0,
+            "high": 1.1,
+            "low": 0.9,
+            "close": 1.05,
+            "tick_volume": 100,
+            "spread": 3,
+            "real_volume": 0,
+        }
+
+    def symbol_select(self, symbol, enable):
+        self.selected.append(symbol)
+        return symbol == "PLATINUM"
+
+    def symbols_get(self):
+        return [SimpleNamespace(name="PLATINUM", custom=False)]
+
+    def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
+        self.from_pos_calls += 1
+        return []  # local cache is empty for a freshly selected symbol
+
+    def copy_rates_from(self, symbol, timeframe, date_from, count):
+        self.from_calls += 1
+        if self.from_calls >= self.sync_after:
+            return [self._bar()]
+        return []
+
+    def copy_rates_range(self, symbol, timeframe, start_date, end_date):
+        self.range_calls += 1
+        if self.range_calls >= self.sync_after:
+            return [self._bar()]
+        return []
+
+    def last_error(self):
+        return (0, "ok")
+
+
+class _ImmediateMT5(_SyncingMT5):
+    """Local cache already has data: first copy_rates_from_pos returns bars."""
+
+    def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
+        self.from_pos_calls += 1
+        return [self._bar()]
+
+
+class _PagedMT5(_SyncingMT5):
+    """A symbol with ``total`` bars served at most ``cap`` per call (the terminal
+    'Max bars in chart' limit), modelled date-anchored like real MT5.
+
+    A single copy_rates_from(now, 300000) errors with (-2) because 300000 > cap,
+    but walking the anchor date backwards accumulates the full ``total`` depth.
+    """
+
+    def __init__(self, total: int = 300000, maxbars: int = 10000, report_maxbars=None):
+        super().__init__()
+        self.total = int(total)
+        self.cap = int(maxbars)
+        self.report_maxbars = self.cap if report_maxbars is None else int(report_maxbars)
+        self.base = 1_700_000_000  # newest bar in the past so anchor=now includes it
+        self._err = (1, "Success")
+
+    def terminal_info(self):
+        return SimpleNamespace(maxbars=self.report_maxbars, build=5833, connected=True)
+
+    def copy_rates_from(self, symbol, timeframe, date_from, count):
+        self.from_calls += 1
+        if count > self.cap:
+            self._err = (-2, "Terminal: Invalid params")
+            return []
+        ts = int(date_from.timestamp()) if hasattr(date_from, "timestamp") else int(date_from)
+        i_start = max(0, math.ceil((self.base - ts) / 300))
+        if i_start >= self.total:
+            self._err = (1, "Success")
+            return []
+        idxs = range(i_start, min(self.total, i_start + int(count)))
+        self._err = (1, "Success")
+        return [dict(self._bar(), time=self.base - i * 300) for i in sorted(idxs, reverse=True)]
+
+    def last_error(self):
+        return self._err
+
+
+class HistorySyncTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_available = pm_mt5.MT5_AVAILABLE
+        self._orig_mt5 = pm_mt5.mt5
+        pm_mt5.MT5_AVAILABLE = True
+
+    def tearDown(self):
+        pm_mt5.mt5 = self._orig_mt5
+        pm_mt5.MT5_AVAILABLE = self._orig_available
+
+    def _connector(self, fake):
+        pm_mt5.mt5 = fake
+        # sleep=0 keeps the test fast; attempts high enough to cross sync_after
+        connector = MT5Connector(MT5Config(history_sync_max_attempts=6, history_sync_sleep_seconds=0.0))
+        connector._connected = True
+        return connector
+
+    def test_get_bars_forces_history_sync_for_fresh_symbol(self):
+        fake = _SyncingMT5(sync_after=2)
+        connector = self._connector(fake)
+
+        bars = connector.get_bars("PLATINUM", "M5", count=300000)
+
+        self.assertIsNotNone(bars, "fresh symbol should fetch after history sync")
+        self.assertEqual(len(bars), 1)
+        self.assertIn("Close", bars.columns)
+        # The date-anchored copy_rates_from is what actually returned data.
+        self.assertGreaterEqual(fake.from_calls, 2)
+
+    def test_get_bars_no_extra_calls_when_cache_ready(self):
+        fake = _ImmediateMT5()
+        connector = self._connector(fake)
+
+        bars = connector.get_bars("PLATINUM", "M5", count=1000)
+
+        self.assertIsNotNone(bars)
+        self.assertEqual(fake.from_pos_calls, 1, "no sync retries when data is already cached")
+        self.assertEqual(fake.from_calls, 0)
+
+    def test_get_bars_returns_none_when_truly_empty(self):
+        fake = _SyncingMT5(sync_after=999)  # never syncs within budget
+        connector = self._connector(fake)
+
+        bars = connector.get_bars("PLATINUM", "M5", count=1000)
+
+        self.assertIsNone(bars)
+
+    def test_get_bars_force_full_beats_maxbars_cap(self):
+        # Broker has 35k but the terminal serves only 10k/call; date-walk gets all 35k.
+        fake = _PagedMT5(total=35000, maxbars=10000)
+        connector = self._connector(fake)
+
+        df = connector.get_bars("PLATINUM", "M5", count=300000, force_full=True)
+        self.assertIsNotNone(df)
+        self.assertEqual(len(df), 35000)
+        self.assertGreaterEqual(fake.from_calls, 4)  # multiple windows, past the 10k cap
+
+    def test_get_bars_force_full_stops_at_true_broker_depth(self):
+        # Broker genuinely holds 25k; date-walk returns exactly that, not more.
+        fake = _PagedMT5(total=25000, maxbars=10000)
+        connector = self._connector(fake)
+
+        df = connector.get_bars("PLATINUM", "M5", count=300000, force_full=True)
+        self.assertIsNotNone(df)
+        self.assertEqual(len(df), 25000)
+
+    def test_get_bars_force_full_shrinks_when_call_cap_below_page(self):
+        # terminal_info under-reports (0); the real per-call cap forces an adaptive shrink.
+        fake = _PagedMT5(total=50000, maxbars=40000, report_maxbars=0)
+        connector = self._connector(fake)
+
+        df = connector.get_bars("PLATINUM", "M5", count=300000, force_full=True)
+        self.assertIsNotNone(df)
+        self.assertEqual(len(df), 50000)
+        self.assertGreaterEqual(fake.from_calls, 2)
+
+    def test_get_bars_range_survives_copy_rates_exception(self):
+        class _Boom(_SyncingMT5):
+            def copy_rates_range(self, *a, **k):
+                raise OSError(22, "Invalid argument")  # pre-1970 date in real MT5
+
+        connector = self._connector(_Boom())
+        out = connector.get_bars_range(
+            "PLATINUM", "M5", datetime(1937, 5, 23), datetime(2026, 1, 1)
+        )
+        self.assertIsNone(out)  # degrades to None instead of crashing
+
+    def test_get_bars_range_sync_retry_opt_in(self):
+        fake = _SyncingMT5(sync_after=2)
+        connector = self._connector(fake)
+
+        # Default: no retry -> empty first call returns None.
+        none_bars = connector.get_bars_range(
+            "PLATINUM", "M5", datetime(2024, 1, 1), datetime(2024, 1, 2)
+        )
+        self.assertIsNone(none_bars)
+        self.assertEqual(fake.range_calls, 1)
+
+        # Opt-in: retries until the download completes.
+        ok_bars = connector.get_bars_range(
+            "PLATINUM", "M5", datetime(2024, 1, 1), datetime(2024, 1, 2), sync_retry=True
+        )
+        self.assertIsNotNone(ok_bars)
+        self.assertEqual(len(ok_bars), 1)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import json
 import hashlib
 import logging
 import math
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -400,9 +401,35 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
         reasons.extend(str(reason) for reason in regime_profitability_audit.get("warnings", []) or [])
 
     walk_forward = dict(getattr(regime_config, "walk_forward_audit", {}) or {})
-    wf_policy = str(getattr(config, "walk_forward_promotion_policy", "observe_only") or "").lower()
+    wf_policy = str(getattr(config, "walk_forward_promotion_policy", "promotion_gate") or "").lower()
     wf_live_blocking = bool(getattr(config, "walk_forward_live_blocking_enabled", False))
-    if wf_live_blocking and wf_policy == "block_severe_only":
+    wf_promote_small_reasons: List[str] = []
+    if wf_policy == "promotion_gate":
+        summary = walk_forward.get("summary") if isinstance(walk_forward.get("summary"), dict) else {}
+        windows = walk_forward.get("windows") if isinstance(walk_forward.get("windows"), list) else []
+        audited = [window for window in windows if int(window.get("total_trades", 0) or 0) > 0]
+        if not audited:
+            reason = str(summary.get("reason", "") or "no_regime_trades")
+            wf_promote_small_reasons.append(f"walk_forward insufficient promotion evidence: {reason}")
+        else:
+            negative = [window for window in audited if float(window.get("total_return_pct", 0.0) or 0.0) < 0.0]
+            non_positive = [window for window in audited if float(window.get("total_return_pct", 0.0) or 0.0) <= 0.0]
+            min_score = float(summary.get("min_score", 0.0) or 0.0)
+            avg_pf = float(summary.get("avg_profit_factor", 0.0) or 0.0)
+            avg_return = float(summary.get("avg_total_return_pct", 0.0) or 0.0)
+            if len(negative) == len(audited):
+                reasons.append("walk_forward all audited windows negative")
+            if min_score < 0.0:
+                reasons.append(f"walk_forward min_score {min_score:.2f} < 0")
+            if not reasons and non_positive:
+                wf_promote_small_reasons.append(
+                    f"walk_forward non-positive windows {len(non_positive)}/{len(audited)}"
+                )
+            if not reasons and avg_pf < 1.0:
+                wf_promote_small_reasons.append(f"walk_forward avg PF {avg_pf:.2f} < 1.00")
+            if not reasons and avg_return <= 0.0:
+                wf_promote_small_reasons.append(f"walk_forward avg return {avg_return:.1f}% <= 0.0%")
+    elif wf_live_blocking and wf_policy == "block_severe_only":
         summary = walk_forward.get("summary") if isinstance(walk_forward.get("summary"), dict) else {}
         windows = walk_forward.get("windows") if isinstance(walk_forward.get("windows"), list) else []
         audited = [window for window in windows if int(window.get("total_trades", 0) or 0) > 0]
@@ -507,6 +534,8 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                 "freshest holdout non-positive; risk derated",
             ]
         return "PROMOTE_SMALL", ["freshest holdout non-positive; risk derated"]
+    if wf_promote_small_reasons:
+        return "PROMOTE_SMALL", wf_promote_small_reasons
     return "PROMOTED", []
 
 
@@ -582,6 +611,8 @@ class ConfigLedger:
     
     # Version for future migration support
     LEDGER_VERSION = "2.0"
+    IO_RETRIES = 3
+    IO_RETRY_SECONDS = 0.15
     
     def __init__(self, filepath: str = "pm_configs.json"):
         """
@@ -628,10 +659,29 @@ class ConfigLedger:
             self._file_signature = None
             return 0
         
+        data = None
+        for attempt in range(1, self.IO_RETRIES + 1):
+            try:
+                with open(self.filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                break
+            except json.JSONDecodeError as e:
+                if attempt < self.IO_RETRIES:
+                    time.sleep(self.IO_RETRY_SECONDS * attempt)
+                    continue
+                raise RuntimeError(
+                    f"Corrupted JSON in {self.filepath}: {e}\n"
+                    f"Please fix or remove the file manually, or backup to .corrupt and start fresh."
+                )
+            except OSError as e:
+                if attempt < self.IO_RETRIES:
+                    time.sleep(self.IO_RETRY_SECONDS * attempt)
+                    continue
+                raise RuntimeError(f"Failed to load {self.filepath}: {e}")
+
         try:
-            with open(self.filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
+            if data is None:
+                raise RuntimeError(f"Failed to load {self.filepath}: no data read")
             self.configs = {}
             for symbol, config_dict in data.items():
                 try:
@@ -643,13 +693,6 @@ class ConfigLedger:
             self._file_signature = self._current_file_signature()
             logger.info(f"Loaded {len(self.configs)} existing configs from {self.filepath}")
             return len(self.configs)
-            
-        except json.JSONDecodeError as e:
-            # Corrupted file - fail fast with clear message
-            raise RuntimeError(
-                f"Corrupted JSON in {self.filepath}: {e}\n"
-                f"Please fix or remove the file manually, or backup to .corrupt and start fresh."
-            )
         except Exception as e:
             raise RuntimeError(f"Failed to load {self.filepath}: {e}")
     
@@ -659,7 +702,9 @@ class ConfigLedger:
         
         This ensures configs are never corrupted if the process is interrupted.
         """
-        temp_path = self.filepath.with_suffix('.json.tmp')
+        temp_path = self.filepath.with_name(
+            f".{self.filepath.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
         
         # Serialize all configs
         data = {s: c.to_dict() for s, c in self.configs.items()}
@@ -670,12 +715,18 @@ class ConfigLedger:
                 json.dump(data, f, indent=2)
                 f.flush()
                 # fsync for durability (optional but recommended)
-                import os
                 os.fsync(f.fileno())
             
-            # Atomic rename (on POSIX systems)
-            temp_path.replace(self.filepath)
-            self._file_signature = self._current_file_signature()
+            # Atomic replace; retry handles transient Windows/OneDrive locks.
+            for attempt in range(1, self.IO_RETRIES + 1):
+                try:
+                    temp_path.replace(self.filepath)
+                    self._file_signature = self._current_file_signature()
+                    return
+                except OSError:
+                    if attempt >= self.IO_RETRIES:
+                        raise
+                    time.sleep(self.IO_RETRY_SECONDS * attempt)
             
         except Exception as e:
             # Clean up temp file on failure
@@ -1305,6 +1356,7 @@ class PipelineResult:
     timeframes_tested: int = 0
     param_combos_tested: int = 0
     regime_winners: int = 0
+    data_window_meta: Dict[str, Any] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -1986,7 +2038,13 @@ class RegimeOptimizer:
         else:
             self.optuna_optimizer = None
             if self.enable_hyperparam_tuning:
-                logger.debug("RegimeOptimizer using: Grid Search (Optuna not available)")
+                # Tuning is enabled but Optuna is missing: this silently degrades
+                # search quality to grid search. Surface it loudly, not at debug.
+                logger.warning(
+                    "Hyperparameter tuning is enabled but Optuna is unavailable; "
+                    "falling back to grid search (reduced search quality). "
+                    "Install optuna to restore TPE optimization."
+                )
 
     def _make_no_trade_marker(self, reason: str, now: Optional[datetime] = None) -> RegimeConfig:
         """Create an explicit non-tradeable marker for a regime slot with no validated winner."""
@@ -6407,6 +6465,7 @@ class OptimizationPipeline:
             # Load one base-M5 workflow window and derive all higher timeframes
             # from it so every timeframe shares the same calendar boundary.
             data_by_tf, data_window_meta = self._load_symbol_timeframe_data(symbol)
+            result.data_window_meta = dict(data_window_meta or {})
             
             if not data_by_tf:
                 result.error_message = "No valid data available"
@@ -6963,20 +7022,37 @@ class PortfolioManager:
         configured_symbols = [str(symbol) for symbol in (self.symbols or [])]
         optimized_symbols = sorted(str(symbol) for symbol in self.symbol_configs.keys())
         artifact_contract_counts: Dict[str, int] = {}
-        for cfg in self.symbol_configs.values():
+        artifact_contract_symbols: Dict[str, set] = {}
+        current_artifact_key = "|".join([
+            PIPELINE_ARTIFACT_VERSION,
+            DataSplitter.SPLIT_CONTRACT_VERSION,
+        ])
+        for symbol, cfg in self.symbol_configs.items():
             artifact = getattr(cfg, "artifact_meta", {}) or {}
             key = "|".join([
                 str(artifact.get("artifact_version", "missing")),
                 str(artifact.get("split_contract_version", "missing")),
             ])
             artifact_contract_counts[key] = artifact_contract_counts.get(key, 0) + 1
+            artifact_contract_symbols.setdefault(key, set()).add(str(symbol).upper())
         configured_set = {symbol.upper() for symbol in configured_symbols}
         optimized_set = {symbol.upper() for symbol in optimized_symbols}
+        current_contract_set = artifact_contract_symbols.get(current_artifact_key, set())
+        missing_symbol_entries = sorted(configured_set - optimized_set)
+        missing_current_contract = sorted(configured_set - current_contract_set)
+        complete_symbol_universe = bool(configured_set) and configured_set.issubset(optimized_set)
+        complete_current_contract = bool(configured_set) and configured_set.issubset(current_contract_set)
         return {
             "configured_symbol_count": len(configured_symbols),
             "optimized_symbol_count": len(optimized_symbols),
-            "complete_universe": bool(configured_set) and configured_set.issubset(optimized_set),
-            "missing_symbols": sorted(configured_set - optimized_set),
+            "current_artifact_contract": current_artifact_key,
+            "current_contract_symbol_count": len(current_contract_set),
+            "complete_universe": complete_current_contract,
+            "complete_symbol_universe": complete_symbol_universe,
+            "complete_current_contract_universe": complete_current_contract,
+            "missing_symbols": missing_current_contract,
+            "missing_symbol_entries": missing_symbol_entries,
+            "missing_current_contract_symbols": missing_current_contract,
             "artifact_contract_counts": artifact_contract_counts,
             "updated_at": datetime.now().isoformat(),
         }
@@ -7011,7 +7087,14 @@ class PortfolioManager:
         except Exception as exc:
             logger.warning("Failed to materialize regime detector rows for %s: %s", symbol, exc)
 
-    def _save_no_trade_config(self, symbol: str, reason: str, *, failure_kind: str) -> SymbolConfig:
+    def _save_no_trade_config(
+        self,
+        symbol: str,
+        reason: str,
+        *,
+        failure_kind: str,
+        data_window_meta: Optional[Dict[str, Any]] = None,
+    ) -> SymbolConfig:
         """Persist an explicit NO_TRADE config for symbols that cannot be safely traded."""
         now = datetime.now()
         regime_optimizer = self.pipeline.regime_optimizer
@@ -7035,6 +7118,8 @@ class PortfolioManager:
             "reason": reason,
             failure_kind: True,
         }
+        marker_data_window_meta = dict(data_window_meta or {})
+        marker_data_window_meta.update({failure_kind: True, "reason": reason})
         config = SymbolConfig(
             symbol=symbol,
             regime_configs=regime_configs,
@@ -7047,7 +7132,7 @@ class PortfolioManager:
             val_metrics={"total_trades": 0, "validation_status": "no_trade", "reason": reason},
             holdout_metrics={},
             historical_audit_metrics=_default_historical_audit(),
-            data_window_meta={failure_kind: True, "reason": reason},
+            data_window_meta=marker_data_window_meta,
             composite_score=0.0,
             robustness_ratio=0.0,
             is_validated=False,
@@ -7065,9 +7150,19 @@ class PortfolioManager:
         """Persist an explicit NO_TRADE config for symbols with insufficient historical data."""
         return self._save_no_trade_config(symbol, reason, failure_kind="data_failure")
 
-    def save_optimization_no_trade_config(self, symbol: str, reason: str) -> SymbolConfig:
+    def save_optimization_no_trade_config(
+        self,
+        symbol: str,
+        reason: str,
+        data_window_meta: Optional[Dict[str, Any]] = None,
+    ) -> SymbolConfig:
         """Persist an explicit NO_TRADE config when optimization cannot produce a live-safe winner."""
-        return self._save_no_trade_config(symbol, reason, failure_kind="optimization_failure")
+        return self._save_no_trade_config(
+            symbol,
+            reason,
+            failure_kind="optimization_failure",
+            data_window_meta=data_window_meta,
+        )
     
     def needs_retraining(self, symbol: str) -> bool:
         """
@@ -7319,7 +7414,11 @@ class PortfolioManager:
                             f"Optimization failed or produced no live-safe winner: {detail}. "
                             "Live trading disabled for this symbol."
                         )
-                        self.save_optimization_no_trade_config(symbol_for_save, reason)
+                        self.save_optimization_no_trade_config(
+                            symbol_for_save,
+                            reason,
+                            data_window_meta=getattr(result, "data_window_meta", None),
+                        )
                         logger.warning(f"FAILED {symbol_for_save}: saved NO_TRADE optimization-failure marker")
 
             # Clear any in-process cache after parallel run
@@ -7346,7 +7445,11 @@ class PortfolioManager:
                             f"Optimization failed or produced no live-safe winner: {detail}. "
                             "Live trading disabled for this symbol."
                         )
-                        self.save_optimization_no_trade_config(symbol, reason)
+                        self.save_optimization_no_trade_config(
+                            symbol,
+                            reason,
+                            data_window_meta=getattr(result, "data_window_meta", None),
+                        )
                         logger.warning(f"FAILED {symbol}: saved NO_TRADE optimization-failure marker")
                     
                 except Exception as e:
