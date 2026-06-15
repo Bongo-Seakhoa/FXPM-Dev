@@ -3197,3 +3197,36 @@ Findings (pre-registered criteria, 8/10 checks failed):
   in-sample noise (IS winner in OOS top-3 only 22%).
 - Full report: pm_outputs/governance_oos_eval/verdict_report.md (+verdict_data.json, parity.jsonl).
 - Claude
+
+## [Claude] 2026-06-16 - Repository cleanup: history rewrite + 24GB bloat removed (ACTION REQUIRED: re-clone)
+
+Bongo asked to clean the repo locally and on GitHub. Done. **This rewrote history - your existing
+clone is now incompatible.**
+
+What changed:
+- **History rewritten with git-filter-repo**: `data/` (all 499 market-data CSVs across history) and
+  `mql5.pdf` purged from every commit. Code/docs/config history fully preserved; only commits that
+  *only* touched data were dropped as empty.
+- **Force-pushed** to origin: `ai-commercialisation-sprint` -> `f6e322c`, `main` -> `12052ef`
+  (old tips were d967ee4 / 93a334c).
+- Repo size: a fresh clone is now **~41 MB** (was ~24 GB locally / ~1.4 GB on the remote pack).
+- Tracking already cleaned in commit "Clean repository runtime artifacts..." (data/ + .pkl caches
+  untracked); this pass also untracked `mql5.pdf` and added `*.pdf` to `.gitignore`.
+
+ACTION REQUIRED for Codex / any other clone:
+- Do **NOT** `git pull` an old clone (histories diverged - it will conflict / try to re-push old
+  data blobs). **Re-clone fresh**, or hard-reset: `git fetch origin && git reset --hard origin/<branch>`.
+
+Data policy going forward (already in `.gitignore`):
+- `data/` (incl. `data/*.csv`, `data/.cache/`, `data/.live/`), `pm_outputs/`, `logs/`, `runtime/`,
+  `*.pdf`, and `*.tmp.*` are **not tracked**. Market data is regenerated from MT5 (or copied locally) -
+  it never goes back into git. Operational ledgers (`pm_configs.json`, `regime_params.json`,
+  `config.json`) remain tracked.
+
+Recovery: pre-rewrite history is preserved in Bongo's working repo as tags
+`backup-pre-cleanup-acs-20260616` and `backup-pre-cleanup-main-20260616`.
+
+Root cause + follow-up: the repo lived under OneDrive (`OneDrive/Desktop/FxPM-Dev`), whose sync of
+`.git` generated ~22 GB of dangling objects. Planned follow-up: relocate the working repo out of
+OneDrive so the bloat cannot recur. The live demo loop was NOT disturbed during this cleanup.
+- Claude
