@@ -77,12 +77,19 @@ def _normalize_storage_section_for_pipeline(data: Dict[str, Any]) -> Dict[str, A
 def load_config_json(path: str) -> Dict[str, Any]:
     """Load config JSON. Returns empty dict if missing."""
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
     except Exception as e:
         raise RuntimeError(f"Failed to load config file '{path}': {e}")
+
+
+def _is_research_discovery_only_config(config_data: Dict[str, Any]) -> bool:
+    """Return True when a config is explicitly marked as non-trading research."""
+    meta = (config_data or {}).get("_meta") or {}
+    scope = str(meta.get("scope", "") or "").strip().lower()
+    return scope == "research_discovery_only_not_live_trading"
 
 def log_resolved_config_summary(logger: logging.Logger,
                                config_path: str,
@@ -761,6 +768,7 @@ class LiveTrader:
         self._shutdown_event = threading.Event()
         self._last_bar_times: Dict[str, datetime] = {}
         self._last_order_times: Dict[str, datetime] = {}  # For rate limiting
+        self._ambiguous_order_block_until: Dict[str, datetime] = {}
         self._unknown_tf_position_warnings: Set[int] = set()
         self._tf_recovery_cache: Dict[int, Optional[str]] = {}
         self._margin_state: str = "NORMAL"
@@ -1557,6 +1565,18 @@ class LiveTrader:
 
         self._run_order_governance_cycle(active_configs, positions_snapshot)
 
+        hard_loss_reasons = self._realized_loss_hard_block_reasons(account_info)
+        if hard_loss_reasons:
+            self.logger.warning(
+                "Hard realized-loss block active; skipping new entries: "
+                f"{'; '.join(hard_loss_reasons)}"
+            )
+            if not runtime_only:
+                self._sync_drift_monitor(active_configs, recent_deals=recent_deals)
+                self._evaluate_daily_loss_advisory(account_info, recent_deals)
+                self._run_portfolio_observatory(active_configs, positions_snapshot, account_info)
+            return False
+
         for symbol, config in signal_configs.items():
             try:
                 self._process_symbol(
@@ -2189,6 +2209,32 @@ class LiveTrader:
                 )
             self._daily_advisory_state[label] = state
 
+    def _realized_loss_hard_block_reasons(self, account_info: Optional[Any]) -> List[str]:
+        """Fail-closed realized-loss guard independent of the optional supervisor."""
+        if account_info is None:
+            return []
+
+        reasons: List[str] = []
+        for period, attr in (
+            ("daily", "daily_loss_hard_block_pct"),
+            ("session", "session_loss_hard_block_pct"),
+            ("weekly", "weekly_loss_hard_block_pct"),
+        ):
+            threshold = self._safe_finite_float(
+                getattr(self.pipeline_config, attr, 0.0),
+                default=0.0,
+            ) or 0.0
+            threshold = max(0.0, float(threshold))
+            if threshold <= 0.0:
+                continue
+            loss_pct = self._estimate_realized_loss_pct(period, account_info)
+            if loss_pct is None:
+                reasons.append(f"{period}_loss unavailable; fail-closed")
+                continue
+            if loss_pct >= threshold:
+                reasons.append(f"{period}_loss {loss_pct:.2f}% >= {threshold:.2f}%")
+        return reasons
+
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics for monitoring."""
         total = self._cache_hits + self._cache_misses
@@ -2784,18 +2830,18 @@ class LiveTrader:
             return 0.0
         return (balance - equity) / balance * 100.0
 
-    def _estimate_realized_loss_pct(self, period: str, account_info: Optional[Any]) -> float:
+    def _estimate_realized_loss_pct(self, period: str, account_info: Optional[Any]) -> Optional[float]:
         """Estimate realized loss percent from recent broker closing deals."""
         if account_info is None:
-            return 0.0
+            return None
         balance = self._safe_finite_float(getattr(account_info, "balance", 0.0), default=0.0) or 0.0
         if balance <= 0.0:
-            return 0.0
+            return None
 
         normalized_period = str(period or "daily").strip().lower()
         now = datetime.now()
         if normalized_period == "weekly":
-            boundary = datetime(now.year, now.month, now.day) - timedelta(days=now.weekday())
+            boundary = now - timedelta(days=7)
             lookback_hours = 24 * 8
         elif normalized_period == "session":
             boundary = getattr(self, "_live_session_started_at", None) or now
@@ -2815,8 +2861,8 @@ class LiveTrader:
                 self._recent_closing_deals = list(deals)
                 self._recent_closing_deals_lookback_hours = lookback_hours
             except Exception as exc:
-                self.logger.debug(f"Realized loss snapshot unavailable for {normalized_period}: {exc}")
-                return 0.0
+                self.logger.warning(f"Realized loss snapshot unavailable for {normalized_period}: {exc}")
+                return None
         if not deals:
             return 0.0
 
@@ -2826,7 +2872,11 @@ class LiveTrader:
             if deal_time is None:
                 continue
             try:
-                timestamp = pd.Timestamp(deal_time).to_pydatetime()
+                deal_timestamp = pd.Timestamp(deal_time)
+                if deal_timestamp.tzinfo is not None:
+                    local_tz = datetime.now().astimezone().tzinfo
+                    deal_timestamp = deal_timestamp.tz_convert(local_tz).tz_localize(None)
+                timestamp = deal_timestamp.to_pydatetime()
             except Exception:
                 continue
             if timestamp >= boundary:
@@ -2845,6 +2895,26 @@ class LiveTrader:
     def _account_margin_used(account_info: Any) -> bool:
         margin = LiveTrader._safe_finite_float(getattr(account_info, "margin", 0.0), default=0.0)
         return bool(margin is not None and margin > 0.0)
+
+    def _manual_new_entries_block_reason(self) -> Optional[str]:
+        """Return an operator-facing reason when manual controls pause new entries."""
+        if not bool(getattr(self.pipeline_config, "manual_new_entries_enabled", True)):
+            return "manual_new_entries_enabled=false"
+        path_raw = str(getattr(self.pipeline_config, "manual_kill_switch_path", "") or "").strip()
+        if not path_raw:
+            return None
+        path = Path(path_raw)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            return None
+        try:
+            content = path.read_text(encoding="utf-8").strip().lower()
+        except Exception as exc:
+            return f"manual kill switch unreadable at {path}: {exc}"
+        if content in {"0", "false", "off", "block", "blocked", "pause", "paused", "kill"}:
+            return f"manual kill switch active at {path}"
+        return None
 
     @staticmethod
     def _safe_account_margin_level(account_info: Any) -> Optional[float]:
@@ -3451,6 +3521,7 @@ class LiveTrader:
             "winner_failed_gate": 0,
             "insufficient_bars": 0,
             "missing_regime_live": 0,
+            "missing_tuned_regime_params": 0,
         }
         
         # Check if config has regime configs
@@ -3466,6 +3537,13 @@ class LiveTrader:
         available_timeframes = config.get_available_timeframes()
         stats["timeframes_total"] = len(available_timeframes)
         regime_params_file = getattr(self.pipeline_config, 'regime_params_file', 'regime_params.json') if self.pipeline_config else 'regime_params.json'
+        live_require_tuned_regime_params = bool(
+            getattr(self.pipeline_config, "live_require_tuned_regime_params", False)
+        )
+        has_tuned_regime_params = None
+        if live_require_tuned_regime_params:
+            from pm_regime import has_tuned_regime_params as _has_tuned_regime_params
+            has_tuned_regime_params = _has_tuned_regime_params
         probe_now = datetime.now()
         
         # Get live quality gate thresholds from config
@@ -3483,6 +3561,19 @@ class LiveTrader:
             if str(tf or "").strip()
         }
 
+        def _timeframe_has_possible_live_winner(timeframe: str) -> bool:
+            regimes = getattr(config, "regime_configs", {}) or {}
+            tf_payload = regimes.get(timeframe)
+            if not isinstance(tf_payload, dict):
+                return False
+            for candidate_cfg in tf_payload.values():
+                if candidate_cfg is None or candidate_cfg.is_no_trade_marker():
+                    continue
+                status = str(getattr(candidate_cfg, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+                if status not in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+                    return True
+            return False
+
         for tf in available_timeframes:
             normalized_tf = str(tf or "").upper()
             if normalized_filter and normalized_tf not in normalized_filter:
@@ -3490,6 +3581,12 @@ class LiveTrader:
                 continue
             if self._uses_scheduled_trigger() and not self._is_symbol_timeframe_due(symbol, tf, now=probe_now):
                 stats["timeframes_skipped_stale"] += 1
+                continue
+            if not _timeframe_has_possible_live_winner(tf):
+                stats["no_winner"] += 1
+                self.logger.debug(
+                    f"[{symbol}] [{tf}] No promoted live winner exists for this timeframe; skipping"
+                )
                 continue
             # Get bars for this timeframe (need at least the latest bar time)
             bars = self._get_live_bars(
@@ -3518,6 +3615,33 @@ class LiveTrader:
             # Feature/signal cache logic
             # Build cache key including bar_time to ensure we invalidate on new bar
             feature_cache_key = f"{symbol}_{tf}_{current_bar_time}"
+            if (
+                live_require_tuned_regime_params
+                and has_tuned_regime_params is not None
+                and not has_tuned_regime_params(symbol, tf, regime_params_file)
+            ):
+                stats["missing_tuned_regime_params"] += 1
+                logged_missing = getattr(self, "_live_missing_regime_params_logged", None)
+                if logged_missing is None:
+                    logged_missing = set()
+                    setattr(self, "_live_missing_regime_params_logged", logged_missing)
+                missing_key = f"{symbol}|{tf}"
+                if missing_key not in logged_missing:
+                    logged_missing.add(missing_key)
+                    self.logger.info(
+                        f"[{symbol}] [{tf}] No tuned regime params; default is NO_TRADE for live"
+                    )
+                self._last_bar_times[cache_key] = current_bar_time
+                self._candidate_cache[feature_cache_key] = {
+                    'features': None,
+                    'regime': None,
+                    'regime_strength': 0.0,
+                    'signal': 0,
+                    'strategy': None,
+                    'regime_config': None,
+                }
+                self._prune_cache()
+                continue
             cached = self._candidate_cache.get(feature_cache_key)
             
             if cached is not None:
@@ -3765,6 +3889,18 @@ class LiveTrader:
         val_return = config.val_metrics.get('total_return_pct', -100.0)
         val_dd = config.val_metrics.get('max_drawdown_pct', 100.0)
         val_return_dd_ratio = val_return / max(val_dd, 0.5)
+        default_config = getattr(config, "default_config", None)
+        legacy_status = str(
+            getattr(default_config, "promotion_status", "PROMOTED")
+            if default_config is not None
+            else "PROMOTED"
+        ).upper()
+        if legacy_status in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+            reasons = "; ".join(getattr(default_config, "promotion_reasons", []) or []) if default_config else ""
+            self.logger.debug(
+                f"[{symbol}] Legacy winner promotion status {legacy_status}; skipping live entry ({reasons})"
+            )
+            return []
         if (
             not config.is_validated or
             val_pf < min_pf or
@@ -3947,6 +4083,38 @@ class LiveTrader:
                 return False
             return any(hasattr(value, attr) for attr in ("ticket", "symbol", "magic", "volume", "comment"))
 
+        def _is_ambiguous_order_result(value: Any) -> bool:
+            if bool(getattr(value, "ambiguous", False)):
+                return True
+            retcode = getattr(value, "retcode", None)
+            try:
+                if int(retcode) == 10012:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            text = f"{getattr(value, 'retcode_description', '')} {getattr(value, 'error_message', '')}".lower()
+            return "timeout" in text or "timed out" in text
+
+        def _find_live_position_by_magic() -> Optional[Any]:
+            if hasattr(self.mt5, "get_position_by_symbol_magic"):
+                try:
+                    found = self.mt5.get_position_by_symbol_magic(broker_symbol, magic)
+                except Exception as exc:
+                    self.logger.debug(f"[{symbol}] Ambiguous-send exact-position reconciliation failed: {exc}")
+                    found = None
+                if _looks_like_position(found):
+                    return found
+            if hasattr(self.mt5, "get_positions"):
+                try:
+                    positions = self.mt5.get_positions(symbol=broker_symbol)
+                except Exception as exc:
+                    self.logger.debug(f"[{symbol}] Ambiguous-send position snapshot failed: {exc}")
+                    positions = None
+                for pos in list(positions or []):
+                    if int(getattr(pos, "magic", 0) or 0) == magic:
+                        return pos
+            return None
+
         selection_score = _safe_float(best_candidate.get('selection_score')) if best_candidate else None
         quality_score = _safe_float(best_candidate.get('quality_score')) if best_candidate else None
         freshness_score = _safe_float(best_candidate.get('freshness')) if best_candidate else None
@@ -4014,11 +4182,41 @@ class LiveTrader:
                 self.logger.debug(f"[{symbol}] Actionable log failed: {exc}")
 
         storage_manager = getattr(self, "storage_manager", None)
-        if storage_manager is not None and storage_manager.should_pause_new_entries():
-            self.logger.warning(f"[{symbol}] Skipping trade; storage pressure gate active")
-            _record_throttle("SKIPPED_STORAGE_PRESSURE")
-            _record_actionable(action="SKIPPED_STORAGE_PRESSURE")
+        manual_block_reason = self._manual_new_entries_block_reason()
+        if manual_block_reason:
+            self.logger.warning(f"[{symbol}] Skipping trade; {manual_block_reason}")
+            _record_throttle("BLOCKED_MANUAL_KILL_SWITCH")
+            _record_actionable(
+                action="BLOCKED_MANUAL_KILL_SWITCH",
+                context={"manual_block_reason": manual_block_reason},
+            )
             return
+
+        if storage_manager is not None and storage_manager.should_pause_new_entries():
+            self.logger.warning(
+                f"[{symbol}] Storage pressure advisory active; continuing with live entry"
+            )
+
+        ambiguous_blocks = getattr(self, "_ambiguous_order_block_until", None)
+        if ambiguous_blocks is None:
+            ambiguous_blocks = {}
+            self._ambiguous_order_block_until = ambiguous_blocks
+        block_until = ambiguous_blocks.get(symbol)
+        if block_until is not None:
+            now = datetime.now()
+            if now < block_until:
+                remaining = max(1, int((block_until - now).total_seconds()))
+                self.logger.warning(
+                    f"[{symbol}] Skipping trade; ambiguous order reconciliation pending "
+                    f"({remaining}s remaining)"
+                )
+                _record_throttle("BLOCKED_AMBIGUOUS_ORDER_PENDING", cooldown=remaining)
+                _record_actionable(
+                    action="BLOCKED_AMBIGUOUS_ORDER_PENDING",
+                    context={"ambiguous_order_block_remaining_seconds": remaining},
+                )
+                return
+            ambiguous_blocks.pop(symbol, None)
         
         # Check rate limit - prevent rapid order submission
         last_order_time = self._last_order_times.get(symbol)
@@ -5277,6 +5475,83 @@ class LiveTrader:
                 actual_risk_pct_value=actual_risk_pct_exec,
             )
         else:
+            if _is_ambiguous_order_result(result):
+                reconciled_position = _find_live_position_by_magic()
+                if _looks_like_position(reconciled_position):
+                    self.logger.warning(
+                        f"[{symbol}] Ambiguous order result reconciled to an open position "
+                        f"(retcode={getattr(result, 'retcode', None)}, magic={magic})"
+                    )
+                    self._log_trade(
+                        symbol,
+                        direction,
+                        float(getattr(reconciled_position, "volume", volume) or volume),
+                        float(getattr(reconciled_position, "price_open", entry_price) or entry_price),
+                        sl_price,
+                        tp_price,
+                        magic,
+                        "EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND",
+                    )
+                    self._last_order_times[symbol] = datetime.now()
+                    ambiguous_blocks = getattr(self, "_ambiguous_order_block_until", {})
+                    ambiguous_blocks.pop(symbol, None)
+                    _record_throttle("EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND")
+                    _record_actionable(
+                        action="EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND",
+                        entry_price_value=float(getattr(reconciled_position, "price_open", entry_price) or entry_price),
+                        sl_value=sl_price,
+                        tp_value=tp_price,
+                        volume_value=float(getattr(reconciled_position, "volume", volume) or volume),
+                        target_risk_pct_value=target_risk_pct,
+                        actual_risk_pct_value=actual_risk_pct,
+                        context={
+                            "ambiguous_retcode": getattr(result, "retcode", None),
+                            "position_ticket": getattr(reconciled_position, "ticket", None),
+                        },
+                    )
+                    return
+
+                cooldown = int(max(
+                    self.ORDER_RATE_LIMIT_SECONDS,
+                    float(getattr(self.pipeline_config, "ambiguous_order_cooldown_seconds", 60.0) or 60.0),
+                ))
+                ambiguous_blocks = getattr(self, "_ambiguous_order_block_until", None)
+                if ambiguous_blocks is None:
+                    ambiguous_blocks = {}
+                    self._ambiguous_order_block_until = ambiguous_blocks
+                ambiguous_blocks[symbol] = datetime.now() + timedelta(seconds=cooldown)
+                self._last_order_times[symbol] = datetime.now()
+                self.logger.error(
+                    f"[{symbol}] Ambiguous order result could not be reconciled; "
+                    f"blocking duplicate entries for {cooldown}s "
+                    f"(retcode={getattr(result, 'retcode', None)})"
+                )
+                self._log_trade(
+                    symbol,
+                    direction,
+                    volume,
+                    entry_price,
+                    sl_price,
+                    tp_price,
+                    magic,
+                    f"AMBIGUOUS_UNRECONCILED: {getattr(result, 'retcode_description', '')}",
+                )
+                _record_throttle("BLOCKED_AMBIGUOUS_ORDER_UNRECONCILED", cooldown=cooldown)
+                _record_actionable(
+                    action="BLOCKED_AMBIGUOUS_ORDER_UNRECONCILED",
+                    entry_price_value=entry_price,
+                    sl_value=sl_price,
+                    tp_value=tp_price,
+                    volume_value=volume,
+                    target_risk_pct_value=target_risk_pct,
+                    actual_risk_pct_value=actual_risk_pct,
+                    context={
+                        "ambiguous_retcode": getattr(result, "retcode", None),
+                        "ambiguous_cooldown_seconds": cooldown,
+                    },
+                )
+                return
+
             self.logger.warning(
                 f"[FAIL] [{symbol}] Order failed: {result.retcode} - {result.retcode_description}"
             )
@@ -5511,14 +5786,55 @@ class FXPortfolioManagerApp:
             self.logger.info("MODE: INCREMENTAL (skipping valid configs)")
         self.logger.info("=" * 60)
         
+        fetch_stats = None
+        original_pm_symbols = list(getattr(self.portfolio_manager, "symbols", []) or [])
+
         # Fetch data if MT5 connected
         if self.mt5 and self.mt5.is_connected():
-            self._fetch_historical_data()
+            fetch_stats = self._fetch_historical_data()
         else:
             self.logger.info("Using existing data files (MT5 not connected)")
+
+        if isinstance(fetch_stats, dict):
+            incomplete = dict(fetch_stats.get("incomplete_symbols") or {})
+            no_data = list(fetch_stats.get("no_data_symbols") or [])
+            ready_symbols = list(fetch_stats.get("ready_symbols") or [])
+            if incomplete or no_data:
+                preview_items = [
+                    f"{symbol}({rows})" for symbol, rows in list(incomplete.items())[:12]
+                ] + list(no_data[:12])
+                preview = ", ".join(preview_items)
+                omitted = max(0, len(incomplete) + len(no_data) - len(preview_items))
+                if omitted:
+                    preview += f", +{omitted} more"
+                self.logger.warning(
+                    "Data fetch incomplete; excluding %d symbols from this optimization pass: %s",
+                    len(incomplete) + len(no_data),
+                    preview,
+                )
+                min_m5_bars = self._effective_min_m5_bars()
+                retry_attempts = int(getattr(self.pipeline_config, "historical_fetch_retry_attempts", 1) or 1)
+                for symbol, rows in incomplete.items():
+                    reason = (
+                        f"Insufficient M5 history after {retry_attempts} fetch attempt(s): "
+                        f"{rows} bars available; required {min_m5_bars}. Live trading disabled for this symbol."
+                    )
+                    self.portfolio_manager.save_data_no_trade_config(symbol, reason)
+                for symbol in no_data:
+                    reason = (
+                        f"No M5 history returned after {retry_attempts} fetch attempt(s) and deep backfill. "
+                        "Live trading disabled for this symbol."
+                    )
+                    self.portfolio_manager.save_data_no_trade_config(symbol, reason)
+            if len(ready_symbols) < len(original_pm_symbols):
+                self.portfolio_manager.symbols = ready_symbols
         
         # Run optimization with stateful persistence
-        results = self.portfolio_manager.initial_optimization(overwrite=overwrite)
+        try:
+            results = self.portfolio_manager.initial_optimization(overwrite=overwrite)
+        finally:
+            if original_pm_symbols:
+                self.portfolio_manager.symbols = original_pm_symbols
         
         # Save results (legacy - now handled incrementally by ledger)
         self._save_results(results)
@@ -5823,6 +6139,114 @@ class FXPortfolioManagerApp:
         finally:
             self.shutdown()
     
+    @staticmethod
+    def _merge_history_frames(*frames: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        valid_frames = [
+            frame
+            for frame in frames
+            if isinstance(frame, pd.DataFrame) and not frame.empty
+        ]
+        if not valid_frames:
+            return None
+        merged = pd.concat(valid_frames)
+        merged.index = pd.to_datetime(merged.index)
+        return merged[~merged.index.duplicated(keep="last")].sort_index()
+
+    def _try_deep_m5_backfill(
+        self,
+        symbol: str,
+        broker_symbol: str,
+        existing_df: Optional[pd.DataFrame],
+        bars: Optional[pd.DataFrame],
+        bars_to_fetch: int,
+        required_bars: int,
+    ) -> Optional[pd.DataFrame]:
+        deep_enabled = bool(
+            getattr(self.pipeline_config, "historical_fetch_deep_backfill_enabled", False)
+        )
+        if not deep_enabled or bars_to_fetch <= 0:
+            return bars
+
+        required_bars = int(required_bars or bars_to_fetch or 0)
+        current_len = 0 if bars is None else len(bars)
+        if required_bars > 0 and current_len >= required_bars:
+            return bars
+
+        years = int(getattr(self.pipeline_config, "historical_fetch_deep_backfill_years", 18) or 18)
+        years = max(1, years)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=int(math.ceil(365.25 * years)))
+        self.logger.info(
+            f"  {symbol}: Deep backfill request from {start_date.date()} "
+            f"because {current_len} M5 bars is below required {required_bars}."
+        )
+
+        range_bars = self.mt5.get_bars_range(broker_symbol, "M5", start_date, end_date, sync_retry=True)
+        merged = self._merge_history_frames(existing_df, bars, range_bars)
+        merged_len = 0 if merged is None else len(merged)
+        if merged_len > current_len:
+            self.logger.info(f"  {symbol}: Deep backfill expanded history to {merged_len} M5 bars.")
+
+        if required_bars > 0 and merged_len < required_bars:
+            hydrated = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
+            merged = self._merge_history_frames(merged, hydrated)
+            hydrated_len = 0 if merged is None else len(merged)
+            if hydrated_len > merged_len:
+                self.logger.info(
+                    f"  {symbol}: Post-backfill count fetch expanded history to {hydrated_len} M5 bars."
+                )
+
+        return merged
+
+    def _write_history_csv_atomic(
+        self,
+        symbol: str,
+        bars: pd.DataFrame,
+        filepath: Path,
+        attempts: int = 3,
+    ) -> bool:
+        """Persist refreshed history without corrupting the existing CSV on write failure."""
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        attempts = max(1, int(attempts or 1))
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            tmp_path = filepath.with_name(f".{filepath.name}.{os.getpid()}.{attempt}.tmp")
+            try:
+                bars.to_csv(tmp_path, index_label="time")
+                os.replace(tmp_path, filepath)
+                return True
+            except Exception as exc:
+                last_error = exc
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if attempt < attempts:
+                    self.logger.warning(
+                        f"  {symbol}: History CSV write attempt {attempt}/{attempts} failed: "
+                        f"{type(exc).__name__}: {exc}; retrying."
+                    )
+                    time.sleep(min(2.0, 0.25 * attempt))
+        self.logger.error(
+            f"  {symbol}: Failed to write refreshed M5 history to {filepath} after "
+            f"{attempts} attempt(s): {type(last_error).__name__ if last_error else 'unknown'}: {last_error}"
+        )
+        return False
+
+    def _effective_min_m5_bars(self) -> int:
+        """Validity floor for downloaded M5 history.
+
+        Fractional rule is the source of truth: a symbol is valid when it has at
+        least `optimization_min_m5_bars_fraction` of `max_bars` (e.g. 0.85 of 300k
+        = 255k). Keeps the 300k standard while admitting close-but-short symbols;
+        the absolute `optimization_min_m5_bars` is used only when no fraction is set.
+        """
+        max_bars = int(getattr(self.pipeline_config, "max_bars", 0) or 0)
+        frac = float(getattr(self.pipeline_config, "optimization_min_m5_bars_fraction", 0.0) or 0.0)
+        if frac > 0.0 and max_bars > 0:
+            return int(math.ceil(max_bars * frac))
+        return int(getattr(self.pipeline_config, "optimization_min_m5_bars", 0) or 0)
+
     def _fetch_historical_data(self, symbols: List[str] = None):
         """Fetch historical data from MT5 and save to data directory."""
         if not self.mt5 or not self.mt5.is_connected():
@@ -5831,11 +6255,22 @@ class FXPortfolioManagerApp:
         symbols = symbols or self.symbols
         
         self.logger.info(f"Fetching historical data for {len(symbols)} symbols...")
+        stats = {
+            "symbols_requested": len(symbols),
+            "ready_symbols": [],
+            "incomplete_symbols": {},
+            "no_data_symbols": [],
+            "write_failed_symbols": [],
+        }
+        min_m5_bars = self._effective_min_m5_bars()
+        retry_attempts = max(1, int(getattr(self.pipeline_config, "historical_fetch_retry_attempts", 1) or 1))
+        retry_sleep = max(0.0, float(getattr(self.pipeline_config, "historical_fetch_retry_sleep_seconds", 0.0) or 0.0))
         
         for symbol in symbols:
             broker_symbol = self.mt5.find_broker_symbol(symbol)
             if broker_symbol is None:
                 self.logger.warning(f"Symbol not found: {symbol}")
+                stats["no_data_symbols"].append(symbol)
                 continue
 
             filepath = self.data_dir / f"{symbol}_M5.csv"
@@ -5853,7 +6288,59 @@ class FXPortfolioManagerApp:
                     self.logger.debug(f"[{symbol}] Existing history reload failed, refetching full file: {exc}")
                     existing_df = None
 
-            if existing_df is not None and not existing_df.empty:
+            if (
+                existing_df is not None
+                and not existing_df.empty
+                and bars_to_fetch > 0
+                and len(existing_df) < bars_to_fetch
+            ):
+                missing_bars = max(0, bars_to_fetch - len(existing_df))
+                if len(existing_df) > 1:
+                    observed_span = existing_df.index[-1] - existing_df.index[0]
+                    # Cap per-bar seconds so a gappy/corrupt span (e.g. a stray old
+                    # row at index[0]) cannot inflate the backfill window. M5 with
+                    # weekend gaps averages well under 900s/bar.
+                    seconds_per_bar = min(
+                        900.0,
+                        max(60.0, observed_span.total_seconds() / max(1, len(existing_df) - 1)),
+                    )
+                else:
+                    seconds_per_bar = 5.0 * 60.0
+                padding_bars = max(1000, int(math.ceil(overlap_minutes / 5.0)))
+                backfill_seconds = seconds_per_bar * (missing_bars + padding_bars) * 1.25
+                backfill_start = existing_df.index[0] - timedelta(seconds=backfill_seconds)
+                # Clamp to a valid floor: never before the deep-backfill horizon or
+                # the epoch (MT5/Windows reject pre-1970 dates with Errno 22).
+                _years = max(1, int(getattr(self.pipeline_config, "historical_fetch_deep_backfill_years", 18) or 18))
+                _floor = pd.Timestamp(datetime.now() - timedelta(days=365.25 * _years))
+                if _floor.year < 1971:
+                    _floor = pd.Timestamp(year=1971, month=1, day=1)
+                if pd.Timestamp(backfill_start) < _floor:
+                    backfill_start = _floor
+                self.logger.info(
+                    f"  {symbol}: Existing history has {len(existing_df)} M5 bars; "
+                    f"target is {bars_to_fetch}. Backfilling from {backfill_start}."
+                )
+                bars = self.mt5.get_bars_range(
+                    broker_symbol,
+                    "M5",
+                    backfill_start.to_pydatetime() if hasattr(backfill_start, "to_pydatetime") else backfill_start,
+                    datetime.now(),
+                )
+                if bars is None or len(bars) == 0:
+                    self.logger.warning(
+                        f"  {symbol}: Range backfill returned no data; trying full target count fetch."
+                    )
+                    bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
+                if bars is not None and len(bars) > 0:
+                    bars = pd.concat([existing_df, bars])
+                else:
+                    self.logger.warning(
+                        f"  {symbol}: Target backfill returned no data; "
+                        "falling back to existing history."
+                    )
+                    bars = existing_df
+            elif existing_df is not None and not existing_df.empty:
                 start_date = existing_df.index[-1] - timedelta(minutes=max(1, overlap_minutes))
                 bars = self.mt5.get_bars_range(broker_symbol, "M5", start_date, datetime.now())
                 if bars is not None and len(bars) > 0:
@@ -5861,21 +6348,58 @@ class FXPortfolioManagerApp:
                 else:
                     bars = existing_df
             else:
-                bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch)
+                bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
+
+            best_len = 0 if bars is None else len(bars)
+            for attempt in range(2, retry_attempts + 1):
+                if bars is not None and len(bars) > 0 and (min_m5_bars <= 0 or len(bars) >= min_m5_bars):
+                    break
+                reason = "no data" if bars is None or len(bars) == 0 else f"{len(bars)} bars below required {min_m5_bars}"
+                self.logger.warning(
+                    f"  {symbol}: Fetch attempt {attempt - 1}/{retry_attempts} ended with {reason}; retrying full target count fetch."
+                )
+                if retry_sleep > 0:
+                    time.sleep(retry_sleep)
+                retry_bars = self.mt5.get_bars(broker_symbol, "M5", count=bars_to_fetch, force_full=True)
+                retry_len = 0 if retry_bars is None else len(retry_bars)
+                if retry_len > best_len:
+                    bars = retry_bars
+                    best_len = retry_len
+
+            bars = self._try_deep_m5_backfill(
+                symbol,
+                broker_symbol,
+                existing_df,
+                bars,
+                bars_to_fetch,
+                min_m5_bars,
+            )
 
             if bars is None or len(bars) == 0:
                 self.logger.warning(f"  {symbol}: No data available")
+                stats["no_data_symbols"].append(symbol)
                 continue
 
             bars = bars[~bars.index.duplicated(keep="last")].sort_index()
             if bars_to_fetch > 0 and len(bars) > bars_to_fetch:
                 bars = bars.iloc[-bars_to_fetch:]
-            bars.to_csv(filepath, index_label="time")
+            if not self._write_history_csv_atomic(symbol, bars, filepath, attempts=3):
+                stats["write_failed_symbols"].append(symbol)
+                continue
             self.logger.info(f"  {symbol}: {len(bars)} bars saved")
+            if min_m5_bars > 0 and len(bars) < min_m5_bars:
+                self.logger.warning(
+                    f"  {symbol}: Only {len(bars)} M5 bars after {retry_attempts} fetch attempt(s); "
+                    f"minimum for optimization is {min_m5_bars}. Leaving symbol for retry."
+                )
+                stats["incomplete_symbols"][symbol] = len(bars)
+            else:
+                stats["ready_symbols"].append(symbol)
 
         data_loader = getattr(getattr(self.portfolio_manager, "pipeline", None), "data_loader", None)
         if isinstance(data_loader, DataLoader):
             data_loader.clear_cache()
+        return stats
     
     def _save_results(self, results: Dict):
         """Save optimization results."""
@@ -6029,6 +6553,12 @@ def main():
     # Load runtime configuration before logger setup so config paths remain authoritative.
     config_data = load_config_json(args.config)
     os.environ["PM_CONFIG_PATH"] = args.config
+    if args.trade and _is_research_discovery_only_config(config_data):
+        print(
+            f"Refusing --trade with research-only discovery config: {args.config}. "
+            "Use this config with --optimize only."
+        )
+        return 2
 
     # Prefer symbols from config.json unless CLI overrides
     symbols = args.symbols or config_data.get("symbols") or DEFAULT_SYMBOLS
@@ -6050,6 +6580,11 @@ def main():
     pipeline_config = PipelineConfig(**_filter_dataclass_kwargs(PipelineConfig, pipeline_section))
     position_config = PositionConfig(**_filter_dataclass_kwargs(PositionConfig, config_data.get("position", {})))
     mt5_config = MT5Config(**_filter_dataclass_kwargs(MT5Config, mt5_section))
+    if (
+        bool(getattr(pipeline_config, "false_discovery_control_enabled", False))
+        and int(getattr(pipeline_config, "false_discovery_symbol_count", 0) or 0) <= 0
+    ):
+        pipeline_config.false_discovery_symbol_count = len(symbols)
 
     # If position risk not set explicitly, inherit from pipeline risk (backward compatible)
     if "risk_per_trade_pct" not in (config_data.get("position") or {}) and hasattr(pipeline_config, "risk_per_trade_pct"):
@@ -6124,11 +6659,20 @@ def main():
         # Run trading
         if args.trade:
             if not args.paper:
+                account_info = None
+                try:
+                    if _app_instance.mt5 is not None and _app_instance.mt5.is_connected():
+                        account_info = _app_instance.mt5.get_account_info()
+                except Exception as exc:
+                    logger.warning(f"Could not fetch MT5 account info for readiness validation: {exc}")
                 readiness = validate_live_readiness(
                     pipeline_config,
                     symbols=symbols,
                     config_path=args.config,
                     winner_ledger_path=getattr(pipeline_config, "winner_ledger_path", None),
+                    mt5_config=mt5_config,
+                    account_info=account_info,
+                    position_config=position_config,
                 )
                 log_readiness_report(logger, readiness)
                 if not readiness.ok:

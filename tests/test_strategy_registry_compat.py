@@ -43,6 +43,7 @@ def test_registry_migrates_legacy_vwap_names():
 
 
 def test_pm_configs_strategy_names_remain_loadable():
+    non_strategy_markers = {"NO_TRADE"}
     pm_configs_path = Path("pm_configs.json")
     assert pm_configs_path.exists()
 
@@ -53,5 +54,8 @@ def test_pm_configs_strategy_names_remain_loadable():
     _collect_strategy_names(payload, strategy_names)
     assert strategy_names
 
-    for strategy_name in strategy_names:
+    tradeable_strategy_names = strategy_names - non_strategy_markers
+    assert tradeable_strategy_names
+
+    for strategy_name in tradeable_strategy_names:
         StrategyRegistry.get(strategy_name)

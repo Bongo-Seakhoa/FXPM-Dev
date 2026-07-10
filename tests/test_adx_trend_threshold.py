@@ -37,12 +37,13 @@ class AssetClassInferenceTests(unittest.TestCase):
 
     def test_crypto_majors(self):
         for sym in ("BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "SOLUSD",
-                    "ADAUSD", "DOTUSD", "DOGEUSD", "BCHUSD", "BTCETH"):
+                    "ADAUSD", "DOTUSD", "DOGEUSD", "DOGUSD", "BCHUSD", "BTCETH"):
             with self.subTest(symbol=sym):
                 self.assertEqual(_infer_asset_class(sym), "crypto")
 
     def test_indices(self):
-        for sym in ("SP500", "NAS100", "US30", "DAX", "FTSE", "NIKKEI", "JP225"):
+        for sym in ("SP500", "NAS100", "US30", "DAX", "FTSE", "NIKKEI", "JP225",
+                    "AU200", "EU50", "ES35", "FR40"):
             with self.subTest(symbol=sym):
                 self.assertEqual(_infer_asset_class(sym), "index")
 

@@ -29,7 +29,7 @@ class TestDashboardSignalDesk(unittest.TestCase):
         os.makedirs(root, exist_ok=True)
         return root
 
-    def test_parse_signal_ledger_jsonl(self) -> None:
+    def test_parse_signal_ledger_inline_jsonl(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)
         text = (
             '{"symbol":"XAUUSD","action":"EXECUTED","direction":"buy","timeframe":"M15","regime":"CHOP",'

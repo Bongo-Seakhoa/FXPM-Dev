@@ -237,6 +237,126 @@ class TestDDHardGateInvariants(unittest.TestCase):
         self.assertTrue(cfg.scoring_use_tail_risk)
         self.assertTrue(cfg.scoring_use_consistency)
         self.assertTrue(cfg.scoring_use_trade_frequency_bonus)
+        self.assertAlmostEqual(cfg.legacy_confidence_bonus_cap, 0.08)
+
+
+class TestLegacyConfidenceSelector(unittest.TestCase):
+    """Legacy-confidence is a post-search regime selector variant, not an Optuna objective."""
+
+    def _optimizer(self, **overrides):
+        cfg = PipelineConfig(
+            regime_scoring_model="legacy_confidence",
+            scoring_use_trade_frequency_bonus=False,
+            false_discovery_control_enabled=False,
+            regime_min_train_trades=5,
+            regime_min_val_trades=5,
+            fx_val_max_drawdown=20.0,
+            regime_min_val_profit_factor=1.0,
+            regime_min_val_return_pct=0.0,
+            fx_min_robustness_ratio=0.0,
+            regime_min_val_return_dd_ratio=0.1,
+            **overrides,
+        )
+        return RegimeOptimizer(cfg)
+
+    def _bucket(self, **overrides):
+        metrics = {
+            "total_trades": 50,
+            "win_rate": 55.0,
+            "profit_factor": 1.5,
+            "total_pnl": 100.0,
+            "gross_profit": 250.0,
+            "gross_loss": 150.0,
+            "avg_win": 10.0,
+            "avg_loss": 8.0,
+            "sharpe_approx": 1.0,
+            "sortino_approx": 1.2,
+            "calmar_ratio": 2.0,
+            "std_weekly_return": 0.01,
+            "r_count": 50,
+            "mean_r": 0.10,
+            "median_r": 0.08,
+            "std_r": 0.50,
+            "se_r": 0.070711,
+            "edge_t_stat_r": 1.414214,
+            "pct_positive_r": 55.0,
+            "worst_5pct_r": -1.0,
+            "r_downside_deviation": 0.2,
+            "r_block_downside_deviation": 0.2,
+            "r_block_cvar": 0.3,
+            "max_consecutive_losses": 3,
+            "max_drawdown_pct": 5.0,
+            "total_return_pct": 20.0,
+        }
+        metrics.update(overrides)
+        return metrics
+
+    def test_legacy_confidence_evidence_rewards_positive_edge_only(self):
+        opt = self._optimizer()
+        positive = opt._build_legacy_confidence_evidence(
+            self._bucket(r_count=100, mean_r=0.20, std_r=0.40, se_r=0.04)
+        )
+        negative = opt._build_legacy_confidence_evidence(
+            self._bucket(r_count=100, mean_r=-0.20, std_r=0.20, se_r=0.02)
+        )
+        no_variance = opt._build_legacy_confidence_evidence(
+            self._bucket(r_count=1, mean_r=1.0, std_r=0.0, se_r=0.0)
+        )
+
+        self.assertGreater(positive["multiplier"], 1.0)
+        self.assertLessEqual(positive["multiplier"], 1.08)
+        self.assertEqual(negative["multiplier"], 1.0)
+        self.assertEqual(no_variance["multiplier"], 1.0)
+
+    def test_legacy_confidence_does_not_change_base_regime_score(self):
+        legacy = RegimeOptimizer(PipelineConfig(
+            regime_scoring_model="legacy",
+            scoring_use_trade_frequency_bonus=False,
+            regime_min_train_trades=5,
+            regime_min_val_trades=5,
+        ))
+        confidence = self._optimizer()
+        train = self._bucket()
+        val = self._bucket(r_count=100, mean_r=0.20, std_r=0.40, se_r=0.04)
+
+        self.assertAlmostEqual(
+            confidence._compute_regime_score(train, val),
+            legacy._compute_regime_score(train, val),
+            places=8,
+        )
+
+    def test_legacy_confidence_can_rerank_fixed_candidate_pool(self):
+        opt = self._optimizer(regime_validation_top_k=2)
+        base_train = self._bucket(total_trades=50)
+        weak_conf_val = self._bucket(r_count=100, mean_r=0.01, std_r=1.0, se_r=0.1)
+        strong_conf_val = self._bucket(r_count=100, mean_r=0.20, std_r=0.40, se_r=0.04)
+        candidates = [
+            {
+                "strategy_name": "BaseHigher",
+                "params": {},
+                "search_trials": 10,
+                "train_regime_metrics": {"TREND": base_train},
+                "val_regime_metrics": {"TREND": weak_conf_val},
+            },
+            {
+                "strategy_name": "ConfidenceHigher",
+                "params": {},
+                "search_trials": 10,
+                "train_regime_metrics": {"TREND": base_train},
+                "val_regime_metrics": {"TREND": strong_conf_val},
+            },
+        ]
+
+        def fake_score(_train, _val, candidate=None):
+            return 100.0 if candidate["strategy_name"] == "BaseHigher" else 95.0
+
+        opt._call_regime_score = fake_score
+        config, validated, _reason = opt._select_best_for_regime("EURUSD", "H1", "TREND", candidates)
+
+        self.assertTrue(validated)
+        self.assertEqual(config.strategy_name, "ConfidenceHigher")
+        self.assertIn("legacy_confidence", config.validation_evidence)
+        self.assertGreater(config.validation_evidence["legacy_confidence"]["multiplier"], 1.0)
 
 
 class TestOptunaBlendKnobsRemoved(unittest.TestCase):
@@ -383,6 +503,50 @@ class TestCandidateDescentSelection(unittest.TestCase):
         self.assertIsNotNone(cfg_out)
         self.assertEqual(cfg_out.strategy_name, "S1")
         self.assertIn("failed validation", reason)
+
+    def test_false_discovery_rejection_happens_before_descent_validation(self):
+        cfg = PipelineConfig(
+            regime_enable_hyperparam_tuning=False,
+            regime_validation_top_k=5,
+            regime_min_train_trades=1,
+            regime_min_val_trades=1,
+            regime_min_val_profit_factor=0.0,
+            regime_min_val_return_pct=-100.0,
+            regime_min_val_return_dd_ratio=0.1,
+            fx_val_max_drawdown=50.0,
+            fx_min_robustness_ratio=0.0,
+            fx_val_sharpe_override=-99.0,
+            false_discovery_control_enabled=True,
+            false_discovery_symbol_count=40,
+            false_discovery_scope_power=1.0,
+            false_discovery_min_dsr=0.5,
+        )
+        opt = RegimeOptimizer(cfg)
+        opt._compute_regime_score = lambda train_m, val_m: float(val_m.get('_score', 0.0))
+        validated = []
+
+        def fake_validate(train_m, val_m, regime, candidate_name="Unknown"):
+            validated.append(candidate_name)
+            return True, "forced pass"
+
+        opt._validate_regime_winner = fake_validate
+
+        c1 = self._candidate("C3Failed", 100.0)
+        c1["search_trials"] = 100
+        c1["local_search_trials_total"] = 100
+        c1["train_regime_metrics"]["TREND"]["sharpe_approx"] = 2.0
+        c1["val_regime_metrics"]["TREND"]["sharpe_approx"] = 2.0
+        c2 = self._candidate("C3Passed", 10.0)
+        c2["search_trials"] = 100
+        c2["local_search_trials_total"] = 100
+        c2["train_regime_metrics"]["TREND"]["sharpe_approx"] = 6.0
+        c2["val_regime_metrics"]["TREND"]["sharpe_approx"] = 6.0
+
+        cfg_out, is_valid, _ = opt._select_best_for_regime("SYM", "H1", "TREND", [c1, c2])
+
+        self.assertTrue(is_valid)
+        self.assertEqual(cfg_out.strategy_name, "C3Passed")
+        self.assertEqual(validated, ["C3Passed"])
 
 
 class TestStabilityPenalty(unittest.TestCase):

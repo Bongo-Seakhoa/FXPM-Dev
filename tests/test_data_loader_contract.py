@@ -88,6 +88,28 @@ class DataLoaderContractTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_resample_preserves_spread_statistics(self):
+        idx = pd.date_range(datetime(2024, 1, 1), periods=3, freq="5min")
+        df = pd.DataFrame({
+            "Open": [1.0, 1.1, 1.2],
+            "High": [1.2, 1.3, 1.4],
+            "Low": [0.9, 1.0, 1.1],
+            "Close": [1.1, 1.2, 1.3],
+            "Volume": [100, 100, 100],
+            "RealVolume": [1, 2, 3],
+            "Spread": [10.0, 20.0, 30.0],
+        }, index=idx)
+
+        loader = DataLoader(Path("."))
+        resampled = loader.resample(df, "M15")
+
+        self.assertEqual(float(resampled["Spread"].iloc[0]), 20.0)
+        self.assertEqual(float(resampled["SpreadOpen"].iloc[0]), 10.0)
+        self.assertEqual(float(resampled["SpreadMax"].iloc[0]), 30.0)
+        self.assertAlmostEqual(float(resampled["SpreadP90"].iloc[0]), 28.0, places=6)
+        self.assertAlmostEqual(float(resampled["SpreadP95"].iloc[0]), 29.0, places=6)
+        self.assertEqual(float(resampled["RealVolume"].iloc[0]), 6.0)
+
 
 if __name__ == "__main__":
     unittest.main()

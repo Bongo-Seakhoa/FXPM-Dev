@@ -1,4 +1,5 @@
 import unittest
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ from pm_core import (
     sync_instrument_spec_from_mt5,
 )
 from pm_mt5 import MT5SymbolInfo
+from pm_symbol import infer_asset_class, is_fiat_fx_symbol
 
 
 class InstrumentSpecTests(unittest.TestCase):
@@ -22,11 +24,18 @@ class InstrumentSpecTests(unittest.TestCase):
         shutil.rmtree(path, ignore_errors=True)
         path.mkdir(parents=True, exist_ok=True)
         self._tmpdir = path
+        self._old_pm_config_path = os.environ.get("PM_CONFIG_PATH")
+        os.environ["PM_CONFIG_PATH"] = str(path / "missing_config.json")
         set_broker_specs_path(str(path / "no_broker_specs.json"))
+        set_instrument_specs({}, {})
 
     def tearDown(self):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         set_instrument_specs({}, {})
+        if self._old_pm_config_path is None:
+            os.environ.pop("PM_CONFIG_PATH", None)
+        else:
+            os.environ["PM_CONFIG_PATH"] = self._old_pm_config_path
 
     def test_config_override_and_defaults(self):
         defaults = {"commission_per_lot": 12.0}
@@ -113,6 +122,58 @@ class InstrumentSpecTests(unittest.TestCase):
         )
 
         self.assertEqual(spec.commission_per_lot, 0.0)
+        self.assertEqual(spec.asset_class, "index")
+
+    def test_asset_class_inference_avoids_crypto_fx_collision(self):
+        self.assertTrue(is_fiat_fx_symbol("USDJPY"))
+        self.assertFalse(is_fiat_fx_symbol("BTCETH"))
+        self.assertEqual(infer_asset_class("BTCETH"), "crypto")
+        self.assertEqual(infer_asset_class("DOGUSD"), "crypto")
+        self.assertEqual(infer_asset_class("USDJPY"), "fx")
+
+    def test_broker_spec_asset_class_prefers_snapshot_metadata(self):
+        explicit = _create_spec_from_broker_data(
+            "SYNTH1",
+            {
+                "asset_class": "index",
+                "digits": 2,
+                "point": 0.01,
+                "tick_size": 0.01,
+                "tick_value": 1.0,
+                "contract_size": 1.0,
+            },
+        )
+        equity = _create_spec_from_broker_data(
+            "AAPL",
+            {
+                "path": "Stocks\\US\\NASDAQ",
+                "digits": 2,
+                "point": 0.01,
+                "tick_size": 0.01,
+                "tick_value": 1.0,
+                "contract_size": 1.0,
+            },
+        )
+
+        self.assertEqual(explicit.asset_class, "index")
+        self.assertEqual(equity.asset_class, "equity")
+
+    def test_broker_spec_construction_fallback_remains_valid(self):
+        spec = _create_spec_from_broker_data(
+            "DOGUSD",
+            {
+                "digits": 5,
+                "point": 0.00001,
+                "tick_size": 0.00001,
+                "tick_value": 1.0,
+                "contract_size": 1000.0,
+                "volume_min": "not-a-number",
+            },
+        )
+
+        self.assertEqual(spec.symbol, "DOGUSD")
+        self.assertEqual(spec.pip_position, 4)
+        self.assertEqual(spec.asset_class, "crypto")
 
     def test_missing_broker_specs_path_clears_previous_cache(self):
         valid_path = self._tmpdir / "broker_specs.json"
@@ -123,6 +184,99 @@ class InstrumentSpecTests(unittest.TestCase):
 
         set_broker_specs_path(str(self._tmpdir / "missing_broker_specs.json"))
         self.assertEqual(load_broker_specs(), {})
+
+    def test_broker_specs_override_config_execution_fields_and_preserve_commission(self):
+        broker_path = self._tmpdir / "broker_specs.json"
+        broker_path.write_text(
+            """{
+              "EURUSD": {
+                "digits": 3,
+                "point": 0.001,
+                "tick_size": 0.001,
+                "tick_value": 9.5,
+                "contract_size": 100000,
+                "volume_min": 0.01,
+                "volume_max": 50,
+                "volume_step": 0.01,
+                "spread": 25,
+                "swap_long": -1.0,
+                "swap_short": 0.5,
+                "stops_level": 12
+              }
+            }""",
+            encoding="utf-8",
+        )
+        set_broker_specs_path(str(broker_path))
+        set_instrument_specs(
+            specs={
+                "EURUSD": {
+                    "pip_position": 4,
+                    "pip_value": 10.0,
+                    "spread_avg": 1.2,
+                    "min_lot": 0.01,
+                    "max_lot": 100.0,
+                    "commission_per_lot": 0.0,
+                }
+            },
+            defaults={},
+        )
+
+        spec = get_instrument_spec("EURUSD")
+
+        self.assertEqual(spec.digits, 3)
+        self.assertAlmostEqual(spec.point, 0.001, places=8)
+        self.assertAlmostEqual(spec.tick_value, 9.5, places=8)
+        self.assertAlmostEqual(spec.spread_avg, 2.5, places=8)
+        self.assertEqual(spec.max_lot, 50)
+        self.assertEqual(spec.stops_level, 12)
+        self.assertEqual(spec.commission_per_lot, 0.0)
+
+    def test_offline_specs_infer_symbol_class_points(self):
+        eurusd = get_instrument_spec("EURUSD")
+        usdjpy = get_instrument_spec("USDJPY")
+        xauusd = get_instrument_spec("XAUUSD")
+        btcusd = get_instrument_spec("BTCUSD")
+        us30 = get_instrument_spec("US30")
+
+        self.assertEqual(eurusd.digits, 5)
+        self.assertEqual(eurusd.asset_class, "fx")
+        self.assertAlmostEqual(eurusd.point, 0.00001, places=8)
+        self.assertEqual(usdjpy.digits, 3)
+        self.assertEqual(usdjpy.asset_class, "fx")
+        self.assertAlmostEqual(usdjpy.point, 0.001, places=8)
+        self.assertEqual(xauusd.digits, 2)
+        self.assertEqual(xauusd.asset_class, "metal")
+        self.assertAlmostEqual(xauusd.point, 0.01, places=8)
+        self.assertEqual(btcusd.digits, 2)
+        self.assertEqual(btcusd.asset_class, "crypto")
+        self.assertAlmostEqual(btcusd.point, 0.01, places=8)
+        self.assertEqual(us30.digits, 0)
+        self.assertEqual(us30.asset_class, "index")
+        self.assertAlmostEqual(us30.point, 1.0, places=8)
+
+    def test_mt5_symbol_info_to_spec_carries_asset_class_from_path(self):
+        symbol_info = MT5SymbolInfo(
+            symbol="AAPL",
+            digits=2,
+            point=0.01,
+            trade_tick_value=1.0,
+            trade_tick_size=0.01,
+            trade_contract_size=1.0,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            spread=2,
+            spread_float=True,
+            swap_long=0.0,
+            swap_short=0.0,
+            trade_stops_level=0,
+            path="Stocks\\US\\NASDAQ",
+        )
+
+        spec = symbol_info.to_instrument_spec()
+
+        self.assertEqual(symbol_info.asset_class, "equity")
+        self.assertEqual(spec.asset_class, "equity")
 
     def test_sync_from_mt5_updates_spec(self):
         """Test that sync_instrument_spec_from_mt5 updates InstrumentSpec with MT5 values."""

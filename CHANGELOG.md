@@ -12,6 +12,428 @@ Notes:
 
 ## [1.4.10] - Unreleased
 
+### Discovery context hygiene
+
+- Added `docs/ACTIVE_DISCOVERY_STATE.md` as the compact current source of truth for active
+  discovery runs, scorer alignment, leakage guardrails, and next actions.
+- Reset `AGENT_COMMS.md` to a short live coordination channel and archived the long prior history
+  under `docs/archive/AGENT_COMMS_2026-06-04.md` to reduce context drift.
+- Moved resolved audit material out of `docs/audit/` after durable conclusions were captured,
+  keeping active audit docs focused on unresolved findings.
+- Applied clean-coding audit follow-ups to the recently changed engine/tooling surface: removed
+  silent cleanup catches, added debug traces for best-effort fallbacks, tightened numeric config
+  coercion catches, and made `regime_scoring_model: legacy` explicit in both active configs.
+
+### Runtime hot-path cleanup
+
+- Replaced `CCIReversalStrategy`'s pandas `rolling.apply` mean-absolute-deviation calculation
+  with a Numba-backed helper plus pandas-compatible fallback. The helper is parity-tested against
+  the legacy lambda formula and removes a BTCUSD M5 Optuna hotspot discovered during the
+  `legacy` vs `specialist_spokes` like-for-like run.
+- Replaced the row-wise price/indicator divergence loop used by RSI/MACD/OBV divergence
+  strategies with a Numba-backed helper. The helper is parity-tested against the legacy loop and
+  removes another large-candidate-surface runtime hotspot found while unblocking the like-for-like
+  run.
+- Added a guarded vectorized fast path for inherited default ATR stop precompute in
+  `Backtester.run`. It applies only to default stop/intent behavior with `use_structural_sl=False`
+  and falls back to the existing per-signal trade-intent path for structural/custom behavior.
+  Focused parity tests confirm identical trades, equity curves, final equity, and scalar summaries;
+  an 80k-bar timing probe showed a `1.68x` end-to-end speedup on dense-signal default-stop trials.
+- Fixed backtest equity-curve bookkeeping for invalid-entry sizing paths. The Numba loop no
+  longer leaves phantom zero equity points before `continue`, and the Python fallback no longer
+  skips appending a bar's equity point when an entry is not sizeable. Warmup-prefixed equity is
+  now trimmed for Sharpe/Sortino/std-weekly and OOS period/equity-path evidence, so risk and
+  path metrics are computed on the scored window rather than the prepended warmup context.
+
+### Discovery W4 completion coverage
+
+- Completed the one missing configured symbol (`BTCETH`) after the W4 discovery run. The
+  symbol had data and was evaluated across M5/M15/M30/H1/H4/D1, but every timeframe had zero
+  candidates survive training eligibility; no winner was added to the ledger.
+- Added explicit empty OOS evidence manifests for all-no-candidate symbols so completed
+  symbols are not confused with missing symbols. `BTCETH_oos_manifest.json` now records
+  `completion_status: NO_CANDIDATE_RECORDS`, `record_count: 0`, and a verified `0x0` sidecar
+  matrix.
+- Updated discovery status/reporting to reflect `62/62` OOS manifests and to prefer the main
+  active-run log over a newer targeted single-symbol add-on log.
+- Removed the disposable feature disk cache after completion, restoring local disk headroom
+  from ~4.1 GB to ~17.9 GB while preserving ledger, OOS evidence, reports, logs, and benchmark
+  artifacts.
+
+### Stress-realism replay and safety gate cleanup
+
+- Added opt-in `stress_p90` and `stress_p95` backtest spread modes. These charge per-bar
+  `SpreadP90`/`SpreadP95` at entry while keeping `SpreadMax` for intrabar/exit protection,
+  leaving `stress_max` as the existing max-spread torture diagnostic.
+- Hardened percentile-stress fallback so a `stress_p90`/`stress_p95` frame missing its requested
+  percentile column falls forward to `SpreadMax` instead of silently de-escalating to
+  `SpreadOpen`.
+- Added `SpreadP95` to resampled data, feature-cache fingerprints, and resample-cache schema
+  invalidation so old cached frames without the new spread statistic are not reused silently.
+- Extended `tools/promotion_review.py` with `--stress-mode` so completed discovery ledgers can
+  be replayed under `stress_p90`, `stress_p95`, or `stress_max` without changing promotion
+  defaults.
+- Replayed W4 under current `stress_max`, `stress_p90`, and `stress_p95`. Result:
+  `stress_max` remains `2 PROMOTE / 75 REVIEW / 302 REJECT`; both realistic stress modes produce
+  `2 PROMOTE / 77 REVIEW / 300 REJECT`. Only two rows moved from stress rejection to holdout
+  review, so the evidence does not justify changing the default promotion gate yet.
+- Fixed weekly realized-loss protection to use a rolling 7-day boundary instead of calendar-week
+  start. This restores the broker refetch-beyond-cache safety behavior for losses that occurred
+  earlier in the rolling week.
+- Hardened realized-loss timestamp handling for timezone-aware broker deal times by converting
+  them to local time before the existing local-naive comparison.
+
+### Specialist spoke tooling audit
+
+- Completed the matched 11-symbol `legacy` vs `specialist_spokes` like-for-like scorer run
+  excluding BTCUSD after the user-directed BTC cap. The run resolved eight config-producing
+  symbols (`EURUSD`, `GBPUSD`, `USDJPY`, `EURAUD`, `AUDJPY`, `USDCAD`, `XAUUSD`, `XAGUSD`)
+  plus three explicit no-config symbols (`US30`, `US500`, `DOGUSD`) in both arms. Benchmark
+  artifacts live under
+  `pm_outputs/experiments/scoring_like_for_like_20260602/benchmark_w4_completion/`.
+- The pre-registered Tenet-5 comparison rejected the current `specialist_spokes` scorer as a
+  default candidate: verdict `REGRESSION`, mean return `6.21% -> -0.76%`, PF `1.194 -> 1.294`,
+  ulcer `7.098 -> 7.944`, trades `1513 -> 1322`. The spoke arm improved median return, PF, win
+  rate, and metals, but introduced unacceptable per-symbol FX blowups in `AUDJPY`, `EURUSD`,
+  and `USDJPY`.
+- Interpreted the result narrowly: this rejects the current spoke scorer calibration/integration
+  as unsafe to promote, not the broader path-dependent spoke/evidence-geometry concept.
+- Audited `tools/specialist_spokes.py` and changed its OOS evidence loading to use the
+  digest-verified `load_oos_manifest_matrix` manifest path instead of globbing the first matching
+  `.npz` sidecar. This removes a stale-sidecar risk while preserving the same forward-validation
+  result (`15,008` eligible candidates).
+- Added opt-in v3 OOS candidate evidence for the specialist 8-spoke discovery lane without changing
+  optimizer, scorer, or promotion defaults. Candidate records now preserve compact
+  `trade_path_evidence`, `equity_path_evidence` with higher-is-better
+  `capital_preservation_blocks`, explicit `execution_cost_survival` status/evidence, and
+  `parameter_stability_evidence` when available.
+- Added discovery-only config controls for the new evidence export:
+  `oos_evidence_trade_path_max_points`,
+  `oos_evidence_include_execution_cost_survival`,
+  `oos_evidence_execution_stress_mode`, and
+  `oos_evidence_execution_cost_max_candidates_per_tf`. Stress-cost replay remains disabled by
+  default and records explicit `not_requested`, `capped`, or `error` statuses instead of filling
+  missing evidence as neutral.
+- Attached compact Optuna parameter-neighborhood evidence to tuned candidates using only completed
+  same-regime trial scores. The evidence reports `available` only when enough true local
+  non-exact neighbors exist; sparse neighborhoods remain `insufficient_neighbors` so the 8th spoke
+  cannot pretend a one-point needle is a plateau.
+- Extended `tools/spoke_selector_validation.py` to represent all 8 specialist spokes while
+  remaining backward-compatible with old v2/W3 manifests. Missing engine-gated spokes are dropped
+  from ranking and reported dynamically via `spoke_availability` instead of being treated as
+  passed. A read-only check on EURAUD/USDJPY old evidence confirmed the new cost/stability spokes
+  remain `0%` available until a v3 run emits real evidence.
+- Added an opt-in in-framework optimizer scorer via `regime_scoring_model: specialist_spokes`.
+  The scorer uses exactly the established 8 specialist spokes, exposes the spoke evidence object
+  and derived shape features for audit, keeps trade count as saturating evidence confidence rather
+  than a raw reward, ignores holdout/promotion/future fields, and lets candidate-level
+  `parameter_stability_evidence` affect selection when available. Default remains `legacy` until a
+  like-for-like discovery run proves the new scorer improves out-of-sample results.
+- Added leakage/orientation and selection-pass-through tests for the opt-in spoke scorer, including
+  a final regime-selection case where two otherwise identical candidates are separated only by
+  parameter-stability evidence.
+- Verification for the evidence-export tranche: focused config/artifact/OOS/validator tests
+  `84 passed`; latest full suite `1066 passed, 5 skipped, 571 subtests passed`.
+
+### Specialist spokes asym like-for-like rejection
+
+- Added `regime_scoring_model: specialist_spokes_asym` as an opt-in scorer variant for discovery.
+  The variant replaced the old geomean veto with a vote-like asymmetric aggregate, kept the
+  validated specialist-spoke evidence surfaces behind a flag, and rebuilt the tail axis around
+  R-normalized downside/block-CVaR fields (`r_downside_deviation`, `r_block_downside_deviation`,
+  `r_block_cvar`) rather than the previously dead scalar tail proxy.
+- Completed the 11-symbol ex-BTC `specialist_spokes_asym` like-for-like run with 8 symbol-level
+  winners and explicit no-winner outcomes for `US30`, `US500`, and `DOGUSD`. The run completed
+  without the earlier 4-worker OOM failure and emitted 11 OOS manifests/matrices.
+- Reran legacy, old-spoke, and asym benchmarks under the same current engine (`c257c7a`) and
+  conservative honest-cost mode. The asym scorer was decisively rejected as a default candidate:
+  legacy mean/median return `+6.29% / +5.03%`, old-spoke `-0.69% / +8.74%`, asym
+  `-35.24% / -35.99%`; asym median PF `0.835`, mean drawdown `44.02%`, mean ulcer `29.853`,
+  time-underwater `98.39%`, and all 8 configured symbol-level winners negative.
+- Recorded the diagnosis as a scorer-objective failure rather than a run-health failure:
+  `specialist_spokes_asym` selected high-churn H1/M30 strategies that looked strong on short
+  train/validation surfaces but bled under full honest-cost benchmarking. The two promoted
+  regime cells in the promotion review do not make the asym symbol-level default ledger
+  deployable.
+- Default remains `legacy`. Do not rerun or promote `specialist_spokes_asym` v1 unchanged; any
+  asym v2 must first address cost/frequency-aware objective behavior and then beat legacy,
+  old-spoke, and a simple high-signal baseline under the robust like-for-like gate.
+
+### Holdout sufficiency diagnostics and status alignment
+
+- Added `tools/holdout_diagnostics.py`, a read-only W4 holdout diagnostic that reports holdout
+  trade-count histograms by timeframe/regime, min-trade threshold sensitivity, validation-vs-
+  holdout trade rates, and ledger/final-review status mismatches.
+- W4 diagnostic result: at the current 5-trade clean-holdout floor, the promotion baseline remains
+  `2 PROMOTE / 75 REVIEW / 302 REJECT`; holdout statuses are `60 PASS`, `73 FAIL`, and
+  `246 INSUFFICIENT`. The artifact also surfaces `61` rows where the ledger said `PROMOTED` even
+  though final review correctly held them at `REVIEW` for insufficient holdout evidence.
+- Aligned `classify_promotion_status()` with the final promotion gate: when false-discovery
+  control is enabled and `false_discovery_holdout_policy` is `block`, winners with fewer than
+  `false_discovery_holdout_min_trades` now become `BLOCKED` instead of being labelled promoted.
+  Under `promote_small`, insufficient holdout remains derated rather than clean-promoted.
+- Extended promotion/regime review artifacts to preserve all simultaneous gate failures per row
+  (`gate_failures`, `gate_failure_codes`, and non-exclusive gate counts), so ordered final reasons
+  no longer hide secondary blockers such as holdout/PBO behind an earlier stress rejection.
+- Parameterized the holdout min-trade threshold in the review tools and persisted it in review
+  output, reducing future config/tool drift during cross-run comparisons.
+- Extended the holdout diagnostic with construction projections before any default change:
+  trade-count anchored holdout and purged/embargoed k-fold OOS. W4 projection shows the clean
+  holdout tail has near-identical trade rate to validation (`0.985499` median ratio), so thinness
+  is bar-count/frequency, not a quiet tail. Both projections recover the same `10` currently
+  positive-but-thin candidates (`3 -> 13` quality-cautious ceiling), but flat tail enlargement
+  would imply a median `26.4712%` extra training-data loss for clean-feasible rows; purged-k-fold
+  gets the same sufficiency projection with `0%` permanent training-data loss at about `5x`
+  discovery runtime. Defaults remain unchanged pending an opt-in implementation/replay.
+- Added `docs/discovery_execution_roadmap.md` as the active PM/data-science roadmap for the next
+  discovery phase. It consolidates W4 evidence, the holdout/PBO sequence, the specialist-first
+  8-spoke evidence-geometry target, resource/resilience workstreams, and the rule that the roadmap
+  is disposable once durable conclusions are moved into code/tests/config or this changelog.
+- Added opt-in `oos_validation_mode: purged_kfold` support for selected specialist validation.
+  The default remains `fixed_holdout`, and `config.discovery_honest.json` now explicitly locks that
+  current baseline. The new prototype emits purged/embargoed fold boundaries, train-exclusion
+  metadata, fold trades/PF/return/drawdown/capital-preservation diagnostics, aggregate OOS metrics,
+  worst-fold details, fold pass rates, and conservative aggregate-policy status without changing
+  optimizer selection defaults.
+- In `purged_kfold` mode, the splitter now suppresses the fixed clean-holdout tail
+  (`effective_clean_holdout_pct: 0.0`) so the prototype actually avoids permanent training-data
+  loss. Fixed-holdout mode keeps the existing clean-holdout slicing.
+- Added artifact-fingerprint fields and tests for the new OOS validation contract so fixed-holdout
+  and purged-kfold ledgers cannot be silently reused across modes. Verification after the prototype:
+  focused OOS/config/artifact tests `79 passed`; full suite `1052 passed, 5 skipped, 571 subtests
+  passed`.
+- Added `tools/purged_kfold_replay.py` for bounded post-run replay of completed specialist rows.
+  Initial W4 representative replay artifact:
+  `pm_outputs/experiments/discovery_honest_w4_purged_kfold_bounded_replay.json`. On 8 sampled rows,
+  the prototype evaluated 8/8 without errors, recovered the 5-trade evidence floor on all 5
+  fixed-holdout-insufficient rows, produced 3 purged-kfold policy passes, and surfaced one manual
+  candidate after existing non-OOS gates (`AUDJPY H1 RANGE / EMAPullbackContinuationStrategy`).
+
+### Independent audit #001 — resolved (working doc retired)
+
+- C1: honest discovery cost contract realized via dedicated `config.discovery_honest.json`
+  (conservative_max spread + 15% clean holdout); main `config.json` left untouched.
+- C2: Tenet-5 benchmark gate now treats path-dependent drawdown (time-underwater) as
+  first-class risk, pooled and per-symbol (`tools/benchmark.py`).
+- C3: global/effective-trial deflated-Sharpe wired into regime winner selection, plus the
+  PBO (CSCV) measurement side (`tools/pbo.py`) consuming engine-emitted
+  `oos_candidate_matrix_v1` manifests; end-to-end proven (EURUSD H1 PBO wiring run).
+- H1: strategy prospect screen replaced its lax best-of-N bar with a robustness bar
+  (fraction-profitable + median PF).
+- H4: added `stress_max` entry-spread stress mode alongside `conservative_max`.
+- H5: benchmarks now surface `asset_class` + `spread_provenance_status` + frozen/broker
+  spread ratio; non-FX outliers (e.g. DOGUSD ~15x) flagged for review rather than trusted.
+
+### Numba JIT restoration + trial-budget calibration (efficiency, accuracy-neutral)
+
+- Root-caused the discovery slowdown: the installed `numpy 2.4.4` exceeded Numba's `<=2.3`
+  ceiling, so `NUMBA_AVAILABLE` was `False` and every backtest silently fell back to the pure
+  Python loop (`_run_python_loop`) instead of the JIT kernel `_backtest_loop_numba` — a 3–10x
+  penalty on the hottest path. Pinned `numpy>=2.2,<2.4` in `requirements.txt` and downgraded the
+  environment to `numpy 2.3.5`; `NUMBA_AVAILABLE` is `True` again.
+- Proved the JIT path is accuracy-neutral rather than assuming it: new
+  `tools/parity_numba_python.py` runs identical features/signals through both loops
+  (governance=None dispatch) and asserts discrete trade decisions match exactly and continuous
+  values within 1e-6. Result: 128 strategy×symbol cells across EURUSD/GBPUSD (H1), USDJPY
+  (M5/M15/H4), and XAUUSD/BTCUSD (H4) — worst absolute difference `0.000e+00`. Exposed as a
+  pytest (`test_numba_python_parity`) so the invariant is CI-guarded.
+- Calibrated the Optuna trial budget with evidence instead of a guess: new
+  `tools/optuna_convergence.py` captures the genuine Optuna study (no engine edit; monkeypatches
+  `_compile_stats` only) and reports best-score-so-far vs trial count for the largest search
+  spaces. Both giants converge by ~300 trials; `best@600` is 95.5–100% of `best@1500`, with the
+  residual arriving only at trial ~1345. Because the live failure mode is overfitting (holdout
+  collapse), in-sample score is not trusted on its own — the holdout/PBO gates are the overfit
+  backstop. Budget calibrated to span the measured convergence (the residual edge lands at
+  ~trial 1345) rather than the old 5000: `optuna_min_trials_per_strategy` 80→120,
+  `optuna_target_coverage_pct` 0.05→0.10, `optuna_max_trials_per_strategy` set to 1500.
+
+### Path-dependent selection geometry (post-run evidence, experimental)
+
+- added shape-aware post-run selection validation for Bongo's path-dependent quality geometry:
+  `tools/pareto_select.py` now exposes volume-balance/geomean ranking plus dent-sensitive path
+  topology features, while `tools/selection_validation.py` compares selectors by forward OOS
+  profitability, forward drawdown, and selector runtime
+- added `shape_gate_pf` and `shape_gate_geomean` validation rules: path topology acts as a
+  threshold-free Pareto survivor gate, then PF or volume-balance chooses among shape-healthy
+  candidates
+- added `trace_gate_pf` and `trace_gate_geomean` as the closer axis-by-time version of the
+  topology idea: each candidate is represented as a stage-by-quality-axis trace, but the trace is
+  normalized across the competing candidate pool at each stage/axis so a small single-axis wobble
+  is not amplified by self-scaling
+- added `tests/test_selection_geometry.py` to lock the intended behavior: one large path dent is
+  penalized, a path-dominated high-PF candidate is rejected by the shape gate, and a one-axis trace
+  dent is penalized without collapsing unrelated flat dimensions
+- fixed `tools/discovery_status.py` to read UTF-8 BOM active-run markers and auto-detect the
+  matching optimizer PID, so active W3 monitoring reports liveness instead of `run pid: n/a`
+- current status is deliberately experimental: on the 3-symbol partial evidence, max-PF still has
+  the strongest forward profitability/reliability, while path/geometry rules reduce forward
+  drawdown; defaults should only change after the full honest OOS evidence proves the rule wins on
+  profitability, drawdown/shape, and runtime/complexity
+- added `tools/spoke_selector_validation.py`, a digest-verified post-run validator for the locked
+  specialist-first spoke model. It tests selectors per `symbol/timeframe/regime` cell using only
+  selection-half OOS evidence to choose and forward-half OOS evidence to score, with training
+  metadata used for eligibility so full-OOS metrics cannot leak into the selection step.
+- added `tests/test_spoke_selector_validation.py` to lock no-forward-leakage behavior, digest-
+  verified synthetic manifest loading, specialist-cell grouping, and explicit reporting of missing
+  engine-gated spokes.
+- W4 available-spoke result across `62` manifests and `553` evaluated cells:
+  `spoke_face_geomean` achieved median forward return `0.830%`, `58.8%` profitable picks,
+  mean forward drawdown `4.509%`, reliability `0.488`, and drawdown-aware reliability `0.089`;
+  the `baseline_max_pf` control achieved median forward return `0.413%`, `54.1%` profitable picks,
+  mean forward drawdown `5.328%`, reliability `0.224`, and drawdown-aware reliability `0.035`.
+  Claude's paired audit reframed this correctly: `350/553` cells had identical picks, and among
+  the `203` differing picks `spoke_face_geomean` was `104` better / `99` worse with sign-test
+  `p=0.778988`. The advantage is therefore distributional and capital-preservation-oriented,
+  not systematic per-cell dominance, and it is not yet a default scorer change.
+- Added experimental ablation checks. Removing the tail-risk spoke slightly increased reliability
+  (`0.491` vs `0.488`) but worsened forward drawdown (`4.911%` vs `4.509%`), and tail-risk control
+  strongly predicted forward capital preservation (`+0.674` correlation), so the evidence supports
+  keeping tail risk as a risk spoke rather than dropping it for marginal return reliability.
+- Current spoke caveat: only six of eight locked spokes are available in the completed OOS manifests.
+  `execution_cost_survival` still needs per-candidate stress/cost replay evidence, and
+  `parameter_stability` still needs Optuna neighborhood/plateau evidence before the full 8-spoke
+  scorer can be honestly integrated into optimization defaults.
+
+### Package K strategy audit fixes
+
+- corrected the new carry-aware strategies so they only trade when the broker swap snapshot shows
+  a truly positive carry side; both-negative symbols now stay flat instead of choosing the less
+  negative bleed side
+- fixed `IntradayRangeFadeStrategy` to shift developing range highs/lows within each session,
+  preventing previous-session range leakage into the first bar of the next session
+- limited `OvernightDriftStrategy` to one entry decision per configured entry hour on sub-hour
+  timeframes and measured the drift from the session's first `Open` when available
+- hardened Package K time/calendar helpers so non-datetime input fails flat instead of treating
+  every bar as hour/day zero
+- removed structural-stop opt-in from the two Package K mean-reversion strategies to preserve the
+  existing ATR-only mean-reversion stop contract
+- updated the honest discovery metadata and strategy exports to the 84-strategy roster
+
+### Package L strategy expansion
+
+- added Package L, expanding the deterministic strategy roster from 84 to 92 with:
+  - confirmed-fractal channel breakout
+  - swing-failure reversal
+  - session VWAP reclaim and pullback trend variants
+  - volume-climax reversal
+  - efficiency-ratio trend and mean-reversion regimes
+  - opening-range retest continuation
+- reconciled independent Package L audit findings by guarding session-shift comparisons, making
+  retest/efficiency/VWAP entries event-like rather than every-bar state signals, and adding direct
+  behavioral regression tests for the new strategy semantics
+- updated discovery metadata and registry tests to the 92-strategy roster
+
+### Package M strategy expansion
+
+- added Package M, expanding the deterministic strategy roster from 92 to 100 with:
+  - Darvas-box breakout
+  - ADR expansion breakout
+  - prior-day range reclaim
+  - weekly/monthly level rejection
+  - previous-week range breakout
+  - head-and-shoulders neckline break
+  - variance-ratio trend
+  - autocorrelation reversal
+- reconciled independent Package M audit findings by using broker-aligned week periods, debouncing
+  same-level rejection signals per day/period, removing the dead `adr_period` axis from prior-day
+  reclaim, optimizing the head-and-shoulders detector to scan confirmed pivot events instead of
+  every bar, and adding timezone/week-boundary regression tests
+- updated discovery metadata and registry tests to the 100-strategy roster
+- removed the stale strategy-surface audit document now that Packages J-M have superseded it; the
+  durable record lives in this changelog and the implemented tests/code
+
+### Global false-discovery gate
+
+- added opt-in global false-discovery controls to `PipelineConfig` so broad roster re-optimization
+  can account for strategy x parameter x symbol x timeframe search breadth instead of only local
+  candidate counts
+- wired global DSR evidence into regime winner selection, including score confidence penalties,
+  optional minimum-DSR rejection, persisted validation evidence, and explicit `pbo_status:
+  not_available` until a real candidate-by-fold PBO implementation exists
+- enabled the discovery-honest contract to use global false-discovery scoring and to block winners
+  that fail the freshest holdout once the holdout has enough trades
+- added tests for artifact invalidation, config normalization, evidence persistence, promotion
+  blocking, and descent behavior that skips false-discovery-failed candidates before validation
+
+### OOS candidate evidence for PBO
+
+- added opt-in OOS candidate evidence export for discovery runs so every final candidate can emit
+  compact validation-period returns for CSCV/PBO measurement without bloating the winner ledger
+- discovery-honest config now writes a sidecar `oos_candidate_matrix_v1` manifest plus compressed
+  NPZ return matrix under the output directory; default production behavior remains off
+- kept no-trade validation candidates in the evidence matrix as zero-return columns so PBO does not
+  overstate robustness by dropping weak candidates
+- added cache invalidation for missing, corrupt, or artifact-mismatched OOS sidecars when evidence
+  export is enabled, plus content-addressed matrix files to avoid stale manifest/matrix pairings
+- added `tools/pbo.py --manifest` support to load and verify engine-emitted sidecars directly
+  before running CSCV/PBO
+- extended `tools/pbo.py` with candidate-level CSCV evidence, including how often each candidate is
+  selected in-sample and how often that selected candidate lands below the OOS median
+- documented the current PBO scope honestly as all-regimes validation equity, not regime-filtered
+  folds; this is the bridge artifact for Claude's `tools/pbo.py` measurement layer
+
+### Spread stress validation
+
+- added opt-in `backtest_spread_mode="stress_max"` for stricter spread validation; unlike the
+  discovery baseline `conservative_max`, it charges `SpreadMax` at entry as well as intrabar/exit
+  checks, while still floor-protecting against the broker fixed spread
+- documented the existing `conservative_max` behavior in metadata as bar-open/mean entry plus
+  max-spread intrabar, so the stricter stress surface is explicit rather than implied
+- added spread provenance flags to backtest metadata and benchmark output so non-FX frozen-feed
+  spread outliers are marked for review instead of being treated as clean promotion evidence
+
+### Benchmark gate hardening
+
+- hardened the Tenet-5 benchmark gate so profit-factor deltas near zero use a stable denominator and
+  absolute PF movement, preventing tiny 0.00-to-0.01 changes from being treated as infinite evidence
+- benchmark records now include per-asset-class summaries so mixed FX/non-FX runs expose class-level
+  collapses instead of relying only on one pooled mean
+
+### Discovery run resource hardening
+
+- added a configurable `feature_cache_max_entries` setting to disable in-memory feature-frame
+  caching during large discovery re-optimizations; the cache had no useful hit path in the full
+  per-timeframe discovery flow and doubled memory pressure by copying full feature frames
+- added a bounded disk-backed full-feature cache for discovery workloads; cache keys include the
+  feature-code version, regime-parameter fingerprint, full source-data fingerprint, symbol,
+  timeframe, and request tag so retrieval cannot silently reuse stale or mismatched features
+- changed `config.discovery_honest.json` to run the gated 100-strategy discovery contract with
+  two workers, no in-memory feature-frame cache, a bounded disk feature-cache budget, and a
+  precompute/retrieval phase before strategy optimization; this uses storage for repeat feature
+  frames while keeping RAM pressure low on the 8 GB machine
+- added a hard disk-cache free-space reserve and pre-write pruning/skip logic so feature-cache
+  writes cannot fill the drive or silently rely on a cache cap larger than current storage headroom
+- added `tools/precompute_feature_cache.py` so discovery feature frames can be warmed through the
+  same file-backed multiprocessing path used by Windows production launches
+- hardened the disk feature cache with content-hashed regime params, feature-code fingerprints,
+  parquet+manifest atomic writes, manifest shape validation, grouped LRU pruning, temp-file
+  protection, and worker-level precompute telemetry for hits/writes/skips/failures
+- added `tools/discovery_status.py`, a read-only status helper for long discovery runs that reports
+  process liveness, ledger progress, OOS sidecar counts, disk headroom, and recent log lines
+
+### ATR exit-surface discovery anchors
+
+- added an opt-in initial screening sweep for paired `1x/2x/3xATR` SL/TP anchors so base
+  strategies are not discarded before tuning solely because their default `2xATR` exit range was
+  the wrong first-pass assumption
+- enabled that sweep in `config.discovery_honest.json` for the gated discovery run and fingerprinted
+  the anchor contract in pipeline artifact metadata
+- expanded the global ATR stop-loss grid to include the missing `1.0xATR` anchor while retaining
+  the existing `1.5/2.0/2.5/3.0xATR` coverage; the take-profit grid already included
+  `1.0/2.0/3.0xATR`
+- added regression coverage that the first-pass screening layer evaluates the configured ATR
+  anchors and that duplicate anchor variants cannot crowd out strategy diversity in the tuning
+  shortlist
+
+### Audit artifact lifecycle
+
+- clarified that audit outputs, agent communication files, experiment notes, and review documents
+  are working artifacts rather than evergreen documentation
+- durable conclusions should move into code, tests, config, or this changelog; stale audit/meta
+  files should be deleted once their findings are fixed, waived, or superseded
+- clarified that no repository file is inherently read-only; role-based read-only auditing is only
+  a coordination boundary, and any file may be changed when evidence supports it
+
 ### Profitability-readiness integration hardening
 
 - added regression coverage for the latest audit fixes:

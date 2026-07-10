@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -14,7 +14,7 @@ from pm_institutional_supervisor import InstitutionalSupervisor, SupervisorConte
 from pm_live_readiness import validate_live_readiness
 from pm_main import LiveTrader
 from pm_order_governance import GovernanceContext, candidate_policy_names, evaluate_policy, normalize_policy_name
-from pm_pipeline import RegimeConfig
+from pm_pipeline import PortfolioManager, RegimeConfig, build_artifact_meta
 from pm_strategies import (
     LiquiditySweepReversalStrategy,
     RegimeTransitionBreakoutStrategy,
@@ -118,6 +118,41 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
         self.assertAlmostEqual(loss_pct, 5.0, places=6)
         trader.mt5.get_recent_closing_deals.assert_called_once_with(lookback_hours=24 * 8)
 
+    def test_realized_loss_hard_block_fails_closed_when_deals_unavailable(self):
+        trader = LiveTrader.__new__(LiveTrader)
+        trader.pipeline_config = PipelineConfig(
+            daily_loss_hard_block_pct=1.0,
+            session_loss_hard_block_pct=0.0,
+            weekly_loss_hard_block_pct=0.0,
+        )
+        trader._recent_closing_deals = []
+        trader._recent_closing_deals_lookback_hours = 0
+        trader._live_session_started_at = datetime.now() - timedelta(hours=1)
+        trader.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None, warning=lambda *_args, **_kwargs: None)
+        trader.mt5 = Mock()
+        trader.mt5.get_recent_closing_deals.side_effect = RuntimeError("broker history unavailable")
+
+        reasons = trader._realized_loss_hard_block_reasons(SimpleNamespace(balance=10000.0))
+
+        self.assertIn("daily_loss unavailable; fail-closed", reasons)
+
+    def test_realized_loss_pct_accepts_timezone_aware_deal_times(self):
+        trader = LiveTrader.__new__(LiveTrader)
+        trader.mt5 = None
+        trader.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+        now = datetime.now(timezone.utc)
+        trader._live_session_started_at = (now - timedelta(hours=2)).replace(tzinfo=None)
+        trader._recent_closing_deals = [
+            {"time": now - timedelta(hours=1), "profit": -125.0},
+        ]
+
+        loss_pct = trader._estimate_realized_loss_pct(
+            "session",
+            SimpleNamespace(balance=10000.0),
+        )
+
+        self.assertAlmostEqual(loss_pct, 1.25, places=6)
+
     def test_live_readiness_blocks_non_blocking_artifact_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Path(tmp) / "pm_configs.json"
@@ -144,6 +179,167 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             self.assertFalse(report.ok)
             self.assertTrue(any(item.code == "artifact_drift_not_blocking" for item in report.errors))
+
+    def test_live_readiness_blocks_winner_ledger_artifact_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                log_dir=Path(tmp) / "logs",
+            )
+            stale_artifact = build_artifact_meta(cfg)
+            stale_artifact.pop("backtest_spread_mode")
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "artifact_meta": stale_artifact,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "winner_ledger_artifact_drift" for item in report.errors))
+
+    def test_live_readiness_blocks_required_full_symbol_ledger_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                production_require_full_symbol_ledger=True,
+                production_symbol_pool_target_count=2,
+                log_dir=Path(tmp) / "logs",
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() + timedelta(days=7)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(
+                cfg,
+                symbols=["EURUSD", "GBPUSD"],
+                config_path=str(Path(tmp) / "config.json"),
+            )
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "production_symbol_ledger_incomplete" for item in report.errors))
+
+    def test_live_readiness_warns_optional_symbol_ledger_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                production_require_full_symbol_ledger=False,
+                production_symbol_pool_target_count=2,
+                log_dir=Path(tmp) / "logs",
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() + timedelta(days=7)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(
+                cfg,
+                symbols=["EURUSD", "GBPUSD"],
+                config_path=str(Path(tmp) / "config.json"),
+            )
+
+            self.assertTrue(report.ok)
+            self.assertTrue(any(item.code == "symbols_missing_from_ledger" for item in report.warnings))
+
+    def test_live_readiness_allows_partial_ledger_when_live_partial_mode_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                production_require_full_symbol_ledger=True,
+                live_allow_partial_symbol_ledger=True,
+                production_symbol_pool_target_count=2,
+                log_dir=Path(tmp) / "logs",
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() + timedelta(days=7)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(
+                cfg,
+                symbols=["EURUSD", "GBPUSD"],
+                config_path=str(Path(tmp) / "config.json"),
+            )
+
+            self.assertTrue(report.ok)
+            self.assertTrue(any(item.code == "symbols_missing_from_ledger" for item in report.warnings))
+            self.assertFalse(any(item.code == "production_symbol_ledger_incomplete" for item in report.errors))
+
+    def test_live_readiness_blocks_account_below_min_equity(self):
+        cfg = PipelineConfig(
+            live_artifact_drift_policy="block",
+            regime_params_file="",
+            live_min_account_equity=20.0,
+            live_min_account_equity_currency="USD",
+        )
+        report = validate_live_readiness(
+            cfg,
+            symbols=[],
+            account_info=SimpleNamespace(equity=19.99, currency="USD"),
+        )
+
+        self.assertFalse(report.ok)
+        self.assertTrue(any(item.code == "account_equity_below_live_minimum" for item in report.errors))
+
+    def test_live_readiness_blocks_risk_pct_above_hard_cap(self):
+        cfg = PipelineConfig(live_artifact_drift_policy="block", regime_params_file="")
+        report = validate_live_readiness(
+            cfg,
+            symbols=[],
+            account_info=SimpleNamespace(equity=20.0, currency="USD"),
+            position_config=SimpleNamespace(risk_per_trade_pct=0.5, max_risk_pct=0.35),
+        )
+
+        self.assertFalse(report.ok)
+        self.assertTrue(any(item.code == "risk_pct_exceeds_hard_cap" for item in report.errors))
 
     def test_live_readiness_rejects_paper_only_winners(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,6 +369,613 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(item.code == "winner_ledger_no_tradeable_winners" for item in report.errors))
 
+    def test_live_readiness_ignores_legacy_top_level_when_nested_candidates_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            blocked = {
+                "strategy_name": "EMACrossoverStrategy",
+                "promotion_status": "BLOCKED",
+                "promotion_reasons": ["holdout failed"],
+            }
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "default_config": blocked,
+                            "regime_configs": {"H1": {"TREND": blocked}},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(winner_ledger_path=str(ledger), regime_params_file="")
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "winner_ledger_no_tradeable_winners" for item in report.errors))
+
+    def test_data_failure_no_trade_marker_completes_symbol_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                data_dir=str(Path(tmp) / "data"),
+                timeframes=["M5", "H1"],
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+            )
+            manager = PortfolioManager(cfg, symbols=["EURCHF"], config_file=str(ledger))
+
+            manager.save_data_no_trade_config("EURCHF", "Insufficient M5 history after retry")
+
+            payload = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(set(payload), {"EURCHF"})
+            symbol_cfg = payload["EURCHF"]
+            self.assertEqual(symbol_cfg["strategy_name"], "NO_TRADE")
+            self.assertTrue(symbol_cfg["artifact_meta"]["data_failure"])
+            self.assertEqual(
+                {
+                    cell["promotion_status"]
+                    for regimes in symbol_cfg["regime_configs"].values()
+                    for cell in regimes.values()
+                },
+                {"NO_TRADE"},
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURCHF"], config_path=str(Path(tmp) / "config.json"))
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "winner_ledger_no_tradeable_winners" for item in report.errors))
+            self.assertFalse(any(item.code == "production_symbol_ledger_incomplete" for item in report.errors))
+
+    def test_optimization_failure_no_trade_marker_completes_symbol_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                data_dir=str(Path(tmp) / "data"),
+                timeframes=["M5"],
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+            )
+            manager = PortfolioManager(cfg, symbols=["AU200"], config_file=str(ledger))
+
+            manager.save_optimization_no_trade_config("AU200", "No validated strategy config produced")
+
+            payload = json.loads(ledger.read_text(encoding="utf-8"))
+            symbol_cfg = payload["AU200"]
+            self.assertEqual(symbol_cfg["strategy_name"], "NO_TRADE")
+            self.assertTrue(symbol_cfg["artifact_meta"]["optimization_failure"])
+            self.assertFalse(symbol_cfg["artifact_meta"].get("data_failure", False))
+
+    def test_live_readiness_blocks_expired_winner_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                log_dir=Path(tmp) / "logs",
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() - timedelta(minutes=1)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "winner_ledger_not_live_current" for item in report.errors))
+
+    def test_live_readiness_warns_storage_below_advisory_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                log_dir=str(Path(tmp) / "logs"),
+                institutional_supervisor_enabled=False,
+                storage_pause_entries_below_free_gb=999999999.0,
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() + timedelta(days=1)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+
+            self.assertTrue(report.ok)
+            self.assertTrue(
+                any(item.code == "storage_free_space_below_advisory_floor" for item in report.warnings)
+            )
+
+    def test_live_readiness_accepts_missing_regime_params_when_artifact_contract_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                winner_ledger_path=str(ledger),
+                regime_params_file=str(Path(tmp) / "missing_regime_params.json"),
+                live_require_tuned_regime_params=False,
+                log_dir=Path(tmp) / "logs",
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() + timedelta(days=1)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+
+            self.assertTrue(report.ok)
+            self.assertFalse(any(item.code == "regime_params_missing" for item in report.warnings))
+
+    def test_live_readiness_blocks_promoted_regime_cell_without_explicit_detector_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pm_configs.json"
+            cfg = PipelineConfig(
+                winner_ledger_path=str(ledger),
+                regime_params_file=str(Path(tmp) / "missing_regime_params.json"),
+                live_require_tuned_regime_params=True,
+                log_dir=Path(tmp) / "logs",
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "valid_until": (datetime.now() + timedelta(days=1)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                            "regime_configs": {
+                                "H1": {
+                                    "TREND": {
+                                        "strategy_name": "EMACrossoverStrategy",
+                                        "parameters": {},
+                                        "quality_score": 1.0,
+                                        "promotion_status": "PROMOTED",
+                                    }
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "live_tuned_regime_params_missing" for item in report.errors))
+
+    def test_live_readiness_requires_pinned_mt5_identity_when_mt5_config_supplied(self):
+        cfg = PipelineConfig(regime_params_file="")
+
+        report = validate_live_readiness(
+            cfg,
+            symbols=[],
+            config_path="config.json",
+            mt5_config=SimpleNamespace(expected_login=0, expected_server="", expected_currency=""),
+            account_info=None,
+        )
+
+        self.assertFalse(report.ok)
+        self.assertTrue(any(item.code == "mt5_account_identity_not_pinned" for item in report.errors))
+
+    def test_live_readiness_blocks_mt5_identity_mismatch(self):
+        cfg = PipelineConfig(regime_params_file="")
+
+        report = validate_live_readiness(
+            cfg,
+            symbols=[],
+            config_path="config.json",
+            mt5_config=SimpleNamespace(expected_login=123, expected_server="Broker-Live", expected_currency="USD"),
+            account_info=SimpleNamespace(login=456, server="Broker-Demo", currency="EUR"),
+        )
+
+        self.assertFalse(report.ok)
+        codes = {item.code for item in report.errors}
+        self.assertIn("mt5_account_login_mismatch", codes)
+        self.assertIn("mt5_account_server_mismatch", codes)
+        self.assertIn("mt5_account_currency_mismatch", codes)
+
+    def test_live_readiness_blocks_production_ledger_promotion_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "pm_configs.json"
+            review = root / "promotion.json"
+            safety = root / "safety.json"
+            marker = root / "done.json"
+            cfg = PipelineConfig(
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                production_require_promotion_gate=True,
+                production_promotion_review_path=str(review),
+                production_promotion_cell_safety_path=str(safety),
+                production_completion_marker_path=str(marker),
+                production_expected_promote_cells=["EURUSD|H1|TREND"],
+                log_dir=str(root / "logs"),
+            )
+            artifact = build_artifact_meta(cfg)
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "artifact_meta": artifact,
+                            "regime_configs": {
+                                "H1": {
+                                    "CHOP": {
+                                        "strategy_name": "EMACrossoverStrategy",
+                                        "parameters": {},
+                                        "quality_score": 1.0,
+                                        "promotion_status": "PROMOTED",
+                                    }
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            review.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "symbol": "EURUSD",
+                                "timeframe": "H1",
+                                "regime": "TREND",
+                                "strategy_name": "EMACrossoverStrategy",
+                                "final_verdict": "PROMOTE",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            safety.write_text(
+                json.dumps(
+                    {
+                        "navigation_counts": {
+                            "final_promotes": 1,
+                            "unsafe_promotes": 0,
+                            "fail_not_reject": 0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            marker.write_text(
+                json.dumps(
+                    {
+                        "verdict": "CANDIDATES_PROMOTABLE_AFTER_GATES_CELL_SAFE",
+                        "pid_alive": False,
+                        "stale": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(root / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(item.code == "production_winner_ledger_promotion_mismatch" for item in report.errors)
+            )
+
+    def test_live_readiness_ledger_status_gate_ignores_stale_external_review_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "pm_configs.json"
+            review = root / "promotion.json"
+            safety = root / "safety.json"
+            marker = root / "done.json"
+            cfg = PipelineConfig(
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                live_require_tuned_regime_params=False,
+                production_require_promotion_gate=True,
+                production_promotion_gate_mode="ledger_status",
+                production_promotion_review_path=str(review),
+                production_promotion_cell_safety_path=str(safety),
+                production_completion_marker_path=str(marker),
+                production_expected_promote_cells=["EURUSD|H1|TREND"],
+                log_dir=str(root / "logs"),
+            )
+            artifact = build_artifact_meta(cfg)
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "valid_until": (datetime.now() + timedelta(days=1)).isoformat(),
+                            "artifact_meta": artifact,
+                            "regime_configs": {
+                                "H1": {
+                                    "CHOP": {
+                                        "strategy_name": "EMACrossoverStrategy",
+                                        "parameters": {},
+                                        "quality_score": 1.0,
+                                        "promotion_status": "PROMOTED",
+                                    }
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            review.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "symbol": "EURUSD",
+                                "timeframe": "H1",
+                                "regime": "TREND",
+                                "strategy_name": "EMACrossoverStrategy",
+                                "final_verdict": "PROMOTE",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            safety.write_text(json.dumps({"navigation_counts": {"final_promotes": 1}}), encoding="utf-8")
+            marker.write_text(json.dumps({"pid_alive": True, "stale": True}), encoding="utf-8")
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(root / "config.json"))
+
+            self.assertTrue(report.ok)
+            self.assertFalse(
+                any(item.code == "production_winner_ledger_promotion_mismatch" for item in report.errors)
+            )
+
+    def test_live_readiness_requires_review_ready_completion_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "pm_configs.json"
+            review = root / "promotion.json"
+            safety = root / "safety.json"
+            marker = root / "done.json"
+            cfg = PipelineConfig(
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                production_require_promotion_gate=True,
+                production_promotion_review_path=str(review),
+                production_promotion_cell_safety_path=str(safety),
+                production_completion_marker_path=str(marker),
+                production_expected_promote_cells=["EURUSD|H1|TREND"],
+            )
+            artifact = build_artifact_meta(cfg)
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "valid_until": (datetime.now() + timedelta(days=1)).isoformat(),
+                            "artifact_meta": artifact,
+                            "regime_configs": {
+                                "H1": {
+                                    "TREND": {
+                                        "strategy_name": "EMACrossoverStrategy",
+                                        "parameters": {},
+                                        "quality_score": 1.0,
+                                        "promotion_status": "PROMOTED",
+                                    }
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            review.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "symbol": "EURUSD",
+                                "timeframe": "H1",
+                                "regime": "TREND",
+                                "strategy_name": "EMACrossoverStrategy",
+                                "final_verdict": "PROMOTE",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            safety.write_text(
+                json.dumps(
+                    {
+                        "navigation_counts": {
+                            "final_promotes": 1,
+                            "unsafe_promotes": 0,
+                            "fail_not_reject": 0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            marker.write_text(
+                json.dumps(
+                    {
+                        "verdict": "CANDIDATES_PROMOTABLE_AFTER_GATES_CELL_SAFE",
+                        "pid_alive": False,
+                        "stale": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(root / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(item.code == "production_completion_marker_not_review_ready" for item in report.errors)
+            )
+
+    def test_live_readiness_blocks_symbols_missing_from_broker_specs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.00001,
+                            "tick_value": 1.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {"symbol": "EURUSD", "strategy_name": "EMACrossoverStrategy"},
+                        "AAPL": {"symbol": "AAPL", "strategy_name": "EMACrossoverStrategy"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD", "AAPL"], config_path=str(root / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "broker_specs_missing_symbols" for item in report.errors))
+
+    def test_live_readiness_blocks_invalid_broker_spec_execution_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.00001,
+                            "tick_value": 0.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            ledger.write_text(
+                json.dumps({"EURUSD": {"symbol": "EURUSD", "strategy_name": "EMACrossoverStrategy"}}),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(root / "config.json"))
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "broker_specs_invalid_fields" for item in report.errors))
+
+    def test_live_readiness_accepts_broker_symbol_alias_in_specs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "broker_symbol": "EURUSD.a",
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.00001,
+                            "tick_value": 1.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD.a": {
+                            "symbol": "EURUSD.a",
+                            "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() + timedelta(days=1)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_live_readiness(cfg, symbols=["EURUSD.a"], config_path=str(root / "config.json"))
+
+            self.assertTrue(report.ok)
+            self.assertFalse(any(item.code == "broker_specs_missing_symbols" for item in report.errors))
+
     def test_event_calendar_matches_symbol_currencies_and_minutes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "events.csv"
@@ -187,7 +990,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertAlmostEqual(events[0].minutes_to_event(datetime.now()), 45, delta=1)
 
-    def test_live_entry_actionable_context_includes_event_calendar(self):
+    def test_storage_pressure_is_advisory_and_does_not_skip_live_entry(self):
         trader = LiveTrader.__new__(LiveTrader)
         event_time = datetime.now() + timedelta(minutes=30)
         trader.pipeline_config = PipelineConfig(event_calendar_enabled=True, event_calendar_mode="observe")
@@ -211,16 +1014,29 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 },
             )
         ]
-        trader.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None, warning=lambda *_args, **_kwargs: None)
+        trader.logger = Mock()
         trader.storage_manager = Mock()
         trader.storage_manager.should_pause_new_entries.return_value = True
         trader._decision_throttle = Mock()
         trader._actionable_log = Mock()
+        trader._manual_new_entries_block_reason = Mock(return_value="")
+        trader._ambiguous_order_block_until = {}
+        trader._last_order_times = {}
+        trader.mt5 = Mock()
+        trader.mt5.get_position_by_symbol_magic.return_value = None
+        trader.mt5.get_positions.return_value = []
+        trader.mt5.get_symbol_info.return_value = None
+        strategy = Mock()
+        strategy.build_trade_intent.return_value = SimpleNamespace(
+            stop_loss_pips=10.0,
+            take_profit_pips=20.0,
+            governance_hint={},
+        )
 
         trader._execute_entry(
             symbol="EURUSD",
             signal=1,
-            strategy=Mock(),
+            strategy=strategy,
             features=pd.DataFrame(),
             spec=SimpleNamespace(),
             magic=1,
@@ -231,9 +1047,16 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
         )
 
         payload = trader._actionable_log.record.call_args[0][1]
-        self.assertEqual(payload["action"], "SKIPPED_STORAGE_PRESSURE")
+        self.assertEqual(payload["action"], "SKIPPED_NO_SYMBOL_INFO")
         self.assertIn("event_calendar", payload["context"])
         self.assertEqual(payload["context"]["event_calendar"]["nearby_events"][0]["title"], "FOMC")
+        self.assertTrue(
+            any(
+                "Storage pressure advisory active; continuing" in str(call.args[0])
+                for call in trader.logger.warning.call_args_list
+                if call.args
+            )
+        )
 
     def test_governance_candidate_surface_includes_blueprint_policies(self):
         names = candidate_policy_names()
@@ -477,19 +1300,6 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 encoding="utf-8",
             )
             ledger = Path(tmp) / "pm_configs.json"
-            ledger.write_text(
-                json.dumps(
-                    {
-                        "EURUSD": {
-                            "symbol": "EURUSD",
-                            "regime_configs": {
-                                "H1": {"TREND": {"strategy_name": "EMACrossoverStrategy"}}
-                            },
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
             cfg = PipelineConfig(
                 live_artifact_drift_policy="block",
                 winner_ledger_path=str(ledger),
@@ -533,11 +1343,27 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 live_artifact_drift_policy="block",
                 winner_ledger_path=str(ledger),
                 regime_params_file="",
+                live_require_tuned_regime_params=False,
                 log_dir=str(log_dir),
                 hard_block_reopen_mode="manual_or_next_cycle",
                 walk_forward_audit_enabled=True,
             )
             cfg.get_last_retrain_slot = Mock(return_value=datetime(2026, 4, 15))
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "valid_until": (datetime.now() + timedelta(days=1)).isoformat(),
+                            "artifact_meta": build_artifact_meta(cfg),
+                            "regime_configs": {
+                                "H1": {"TREND": {"strategy_name": "EMACrossoverStrategy"}}
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
             report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
             self.assertTrue(report.ok)
             self.assertTrue(any(item.code == "supervisor_latch_from_previous_cycle" for item in report.warnings))

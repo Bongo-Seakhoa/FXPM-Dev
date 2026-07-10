@@ -2,6 +2,9 @@
 
 This file documents the current `config.json` schema and the way FXPM-Dev uses those settings today. The repository name is `FXPM-Dev`; the internal runtime banner currently remains `FX PORTFOLIO MANAGER v3.1`.
 
+Canonical production split/process: `docs/PRODUCTION_SPLIT_AND_PROCESS.md`.
+Visual split confirmation: `docs/audit/production_split_process_20260609.html`.
+
 Use this as the reference for the live codebase. The `Default` column documents code defaults unless a row says otherwise. The checked-in `config.json` is the active repo profile and may intentionally override those defaults.
 
 ---
@@ -40,7 +43,27 @@ The pipeline uses the active-recent M5 workflow exclusively. The bar counts belo
 | `historical_stress_audit_bars` | int | `50000` | `50000` | Oldest bars inside the latest 300k M5 window. This is an older out-of-selection stress audit, not a forward-looking holdout selector. |
 | `active_universe_bars` | int | `250000` | `250000` | Newest M5 bars that drive production strategy discovery and Stage 1 baseline eligibility. |
 | `active_stage2_pct` | float | `50.0` | `50.0` | Newest percentage of the active universe used for Stage 2 optimization / production-selection surfaces, with overlap warmup retained as context. |
+| `production_split_mode` | enum | `"bleeding_edge"` | `"bleeding_edge"` | Production split contract. `"bleeding_edge"` disables production clean holdout, optimizes on the newest active half, and uses the prior window for adjacent walk-forward validation. `"research_clean_holdout"` retains the academic clean-holdout split for explicit research profiles. |
+| `walk_forward_validation_bars` | int | `50000` | `50000` | Base M5 bars immediately before the bleeding-edge optimization half used as adjacent walk-forward validation. |
+| `clean_holdout_pct` | float | `0.0` | `0.0` | Research-only newest holdout percentage. Production keeps this at zero so the freshest active bars remain available to optimization. |
+| `threadspark_selection_surface` | enum | `"validation"` | `"validation"` | Final evidence surface for ThreadSpark-style scoring. Production points this at adjacent WFV/validation, not clean holdout. |
+| `false_discovery_holdout_policy` | enum | `"off"` | `"off"` | Clean-holdout gate policy. Production turns this off because production clean holdout is intentionally empty; the WFV promotion gate remains active through `walk_forward_promotion_policy`. |
 | `overlap_pct` | float | `10.0` | `10.0` | Warmup window expressed as a percentage of the active universe size. Bars in the warmup are not scored. |
+
+### 2.1a-1 Historical data fetch and completeness
+
+These `pipeline` keys govern how the production fetch downloads M5 history from MT5 and decides whether a symbol has enough history to optimize.
+
+| Key | Type | Default | Active profile | Description |
+|---|---|---:|---:|---|
+| `optimization_min_m5_bars_fraction` | float | `0.0` | `0.85` | Source-of-truth completeness gate. A symbol is valid when its downloaded M5 bars are at least this fraction of `max_bars` (`0.85` → 255k of 300k). Keeps the 300k standard the majority meet while admitting close-but-short symbols; below the fraction the symbol becomes a genuine `NO_TRADE` `data_failure`. |
+| `optimization_min_m5_bars` | int | `0` | `300000` | Absolute completeness floor. Used only when `optimization_min_m5_bars_fraction` is `0`; otherwise the fraction takes precedence. |
+| `historical_fetch_retry_attempts` | int | `1` | `3` | Full-target fetch attempts before a symbol is marked incomplete. |
+| `historical_fetch_retry_sleep_seconds` | float | `2.0` | `2.0` | Sleep between fetch attempts. |
+| `historical_fetch_deep_backfill_enabled` | bool | `false` | `true` | Allow a deep date-range backfill when the first pass is short. |
+| `historical_fetch_deep_backfill_years` | int | `18` | `18` | Deep-backfill lookback span. |
+
+Connection-level fetch behavior lives in the `mt5` section: `history_page_size` (default `50000`) is the per-request page used while walking history backward by date, and `history_sync_max_attempts` / `history_sync_sleep_seconds` control how hard the terminal is pushed to download a freshly selected symbol. The terminal's own **Max bars in chart** setting must be Unlimited for full-depth pulls (see `SETUP_AND_RUN.md`).
 
 ### 2.1b Storage governance
 
@@ -84,7 +107,9 @@ The active-recent M5 workflow drives all selection windows from the bar counts i
 - The oldest `historical_stress_audit_bars` of that window are the historical stress audit, used to detect catastrophic older-window fragility after winners are selected.
 - The newest `active_universe_bars` are the active universe for Stage 1/Stage 2 discovery.
 - Stage 1 baseline eligibility runs across the full active universe.
-- The newest `active_stage2_pct` percent of the active universe is the Stage 2 optimization/risk-management surface when `risk_management_selection_stage = "stage3"`, with `overlap_pct` worth of warmup retained as context.
+- In `"bleeding_edge"` production mode, the newest `active_stage2_pct` percent of the active universe is the optimization/risk-management surface and ends at the latest loaded bar.
+- The `walk_forward_validation_bars` immediately before that optimization surface are adjacent production validation evidence. They are not pristine forward OOS because broad Stage 1 eligibility can see the full active universe.
+- Production clean holdout is empty/disabled. Clean holdout remains available only through explicit research mode.
 
 ### 2.3 Capital and base risk
 
@@ -275,7 +300,7 @@ Missing or unparseable `margin_level` is neutral only when no margin is in use. 
 
 ### 2.15a Weekly-review observability surfaces
 
-These keys do not add a mid-cycle shutdown layer. They support the weekly review surface that sits inside the fixed two-week retraining cadence.
+These keys do not add a mid-cycle shutdown layer. They support the weekly review surface that sits inside the fixed four-week production retraining cadence.
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
@@ -300,10 +325,10 @@ These keys form the live protection shell around local winners. They are deliber
 | `max_total_open_risk_pct` | float | `8.0` | Maximum prospective total open risk percentage after adding the new trade. |
 | `max_new_entries_when_total_open_risk_above_pct` | float | `6.0` | Existing open-risk level where the supervisor starts applying `open_risk_action`. |
 | `open_risk_action` | enum | `"pause_new_entries"` | Action when existing open risk is elevated: `"observe"`, `"pause_new_entries"`, or `"derate"`. |
-| `daily_loss_hard_block_pct` | float | `0.0` | Daily realized-loss hard block. `0.0` disables the breakpoint. |
-| `session_loss_hard_block_pct` | float | `0.0` | Session realized-loss hard block. `0.0` disables the breakpoint. |
-| `weekly_loss_hard_block_pct` | float | `0.0` | Weekly realized-loss hard block. `0.0` disables the breakpoint. |
-| `open_drawdown_hard_block_pct` | float | `0.0` | Open drawdown hard block. `0.0` disables the breakpoint. |
+| `daily_loss_hard_block_pct` | float | `0.0` | Daily realized-loss hard block. `0.0` disables the breakpoint; production profiles should keep this non-zero. |
+| `session_loss_hard_block_pct` | float | `0.0` | Session realized-loss hard block. `0.0` disables the breakpoint; production profiles should keep this non-zero. |
+| `weekly_loss_hard_block_pct` | float | `0.0` | Weekly realized-loss hard block. `0.0` disables the breakpoint; production profiles should keep this non-zero. |
+| `open_drawdown_hard_block_pct` | float | `0.0` | Open drawdown hard block. `0.0` disables the breakpoint; production profiles should keep this non-zero. |
 | `hard_block_reopen_mode` | enum | `"manual_or_next_cycle"` | Latch recovery mode after a hard block: manual reset, next cycle, or either. The latch is persisted in `logs/institutional_supervisor_state.json`; funded-live readiness refuses to start while it remains active. |
 | `cycle_drift_monitor_enabled` | bool | `true` | Enables the lightweight local cycle-drift monitor. |
 | `cycle_drift_mode` | enum | `"lightweight"` | `"off"` disables, `"observe"` records without blocking, and `"lightweight"` applies the configured action when severe drift is detected. |
@@ -319,16 +344,17 @@ These keys are post-selection research and execution-governance controls. They d
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
-| `walk_forward_audit_enabled` | bool | `false` | Runs walk-forward analysis as an offline audit inside the normal retraining window. It records telemetry on winner artifacts but does not delay validation-to-live promotion. |
+| `walk_forward_audit_enabled` | bool | `true` | Runs adjacent walk-forward validation inside the normal retraining window. The validation slice is used during candidate validation and production promotion, then recorded on winner artifacts. |
 | `walk_forward_audit_windows` | int | `3` | Number of audit windows used when `walk_forward_audit_enabled` is on. `PipelineConfig` normalizes this to at least `1`. |
-| `walk_forward_audit_mode` | enum | `"severe_fragility_only"` | Audit posture for walk-forward evidence. Current live promotion classification is driven by the severe-fragility/block policy. |
-| `walk_forward_promotion_policy` | enum | `"block_severe_only"` | Promotion classifier policy. `"block_severe_only"` turns severe walk-forward failure into `BLOCKED`; non-positive freshest holdout can become `PROMOTE_SMALL`. |
+| `walk_forward_audit_mode` | enum | `"severe_fragility_only"` | Audit posture for walk-forward evidence. Production uses the adjacent WFV surface as the promotion evidence gate while preserving the severe-fragility labels on artifacts. |
+| `walk_forward_promotion_policy` | enum | `"promotion_gate"` | Promotion classifier policy. `"promotion_gate"` uses adjacent WFV as the production promotion gate; `"observe_only"` records WFV without gating; `"block_severe_only"` is a legacy/research severe-failure gate when `walk_forward_live_blocking_enabled=true`. |
+| `walk_forward_live_blocking_enabled` | bool | `true` | Enables live-blocking behavior for severe WFV failures. With `walk_forward_promotion_policy="promotion_gate"`, weak or thin WFV derates to `PROMOTE_SMALL` and severe WFV blocks. |
 | `walk_forward_do_not_displace_latest_surface` | bool | `true` | Keeps the newest selection surface authoritative while attaching walk-forward evidence as audit/promotion telemetry. |
 | `promote_small_risk_multiplier` | float | `0.5` | Live risk multiplier for `PROMOTE_SMALL` winners. `PipelineConfig` clamps this to `[0.0, 1.0]`. |
 | `local_governance_tournament_enabled` | bool | `false` | Enables the per-context governance sweep that compares candidate order-management policies after a `(symbol, timeframe, regime, strategy)` winner already exists. The active profile enables it. |
 | `local_governance_live_mode` | enum | `"off"` | Live runtime mode for the selected governance policy: `"off"` disables the layer, `"shadow"` logs would-be stop updates without modifying broker orders, `"on"` applies the chosen policy to open trades in that exact local context. Invalid values fall back to `"off"` with a WARN. The active profile uses `"shadow"`. |
 | `local_governance_candidate_policies` | list[string] | `["control_fixed","breakeven_1r","stepped_breakeven","atr_trail_capped","chandelier_atr","structure_trail","partial_tp_runner","time_decay_exit","volatility_contraction_exit","regime_flip_reduce","pure_atr"]` | Candidate governance policies normalized by `PipelineConfig`. Aliases such as `"control"`, `"swing_trail"`, and `"pure_atr_runner"` are mapped to canonical names. Unknown values are dropped. |
-| `winner_ledger_path` | string | `"pm_configs.json"` | Path to the validated-winner ledger used by `PortfolioManager`. The active high-risk profile uses `pm_configs_high_risk.json`. |
+| `winner_ledger_path` | string | `"pm_configs.json"` | Path to the universal validated-winner ledger used by `PortfolioManager`. |
 
 ### 2.15d Risk-management optimization and historical audit
 
@@ -349,7 +375,7 @@ These fields replaced the old rolling retrain-validity approach for production s
 | Key | Type | Default | Description |
 |---|---|---:|---|
 | `production_retrain_mode` | string | `"auto"` | `auto`, `notify`, or `off`. |
-| `production_retrain_interval_weeks` | int | `2` | Interval between scheduled retrain dates. |
+| `production_retrain_interval_weeks` | int | `4` | Interval between scheduled retrain dates. |
 | `production_retrain_weekday` | string | `"sunday"` | Scheduled retrain weekday. |
 | `production_retrain_time` | string | `"00:01"` | Scheduled retrain time in `HH:MM`. |
 | `production_retrain_anchor_date` | string | `"2026-03-29"` | Anchor date for the calendar schedule. Must match the configured weekday. |
@@ -359,7 +385,7 @@ Important:
 
 - The PM no longer documents `retrain_periods` as an active production control.
 - Production readiness is now governed by the fixed calendar schedule plus artifact/config invalidation.
-- The two-week retrain cadence is the freshness mechanism; weekly-review surfaces do not add an automatic mid-cycle shutdown path.
+- The four-week production cadence is the freshness baseline for the checked-in live profile; weekly-review surfaces do not add an automatic mid-cycle shutdown path.
 
 ---
 
