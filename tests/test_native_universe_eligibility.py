@@ -23,7 +23,9 @@ from tools.acquire_native_history import (
     SCHEMA_VERSION,
     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4,
     TIMEFRAME_SECONDS,
+    TWO_REFERENCE_CONSENSUS_POLICY,
     cross_resolution_reference_map,
 )
 from tools.audit_activate_native_history import audit_and_activate
@@ -108,7 +110,14 @@ def _availability_v4_request_contract(boundaries):
             "start_utc": start.isoformat(),
             "end_exclusive_utc": end.isoformat(),
         }
-    references = cross_resolution_reference_map(timeframes)
+    # This helper deliberately reconstructs the immutable V4 forensic graph.
+    # The production V5 authority returns two ordered references per target and
+    # must not be coerced back into the retired one-reference schema.
+    ordered = tuple(sorted(timeframes, key=lambda value: TIMEFRAME_SECONDS[value]))
+    references = {
+        timeframe: (ordered[1] if index == 0 else ordered[index - 1])
+        for index, timeframe in enumerate(ordered)
+    }
     source_intervals = {
         timeframe: dict(strategy_intervals[timeframe]) for timeframe in timeframes
     }
@@ -133,7 +142,7 @@ def _availability_v4_request_contract(boundaries):
     contract = {
         **_availability_request_contract(boundaries),
         "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
-        "timeframe_request_map_schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        "timeframe_request_map_schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4,
         "timeframe_window_years": years,
         "timeframe_calendar_boundaries": serialized,
         "timeframe_calendar_boundaries_sha256": _canonical_json_sha256(serialized),
@@ -144,7 +153,7 @@ def _availability_v4_request_contract(boundaries):
         "timeframe_audit_only_prefix_intervals": audit_prefixes,
     }
     request_map_payload = {
-        "schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        "schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4,
         "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
         "common_as_of_utc": common_as_of.isoformat(),
         "timeframe_window_years": years,
@@ -171,6 +180,160 @@ def _availability_v4_request_contract(boundaries):
             "strategy_evidence_interval": strategy_intervals[timeframe],
             "audit_only_prefix_interval": audit_prefixes[timeframe],
             "audit_reference_timeframe": references.get(timeframe),
+        }
+        for timeframe in timeframes
+    }
+    return contract, leaves
+
+
+def _availability_v5_request_contract(boundaries):
+    """Build the exact six-node/twelve-edge production request contract."""
+
+    timeframes = tuple(NATIVE_PRODUCTION_TIMEFRAMES)
+    common_start = pd.Timestamp(boundaries["optimizer_train"]["start_ts"])
+    common_as_of = pd.Timestamp(boundaries["final_lockbox"]["end_ts"])
+    serialized = {
+        timeframe: json.loads(json.dumps(boundaries)) for timeframe in timeframes
+    }
+    years = {
+        timeframe: {
+            "optimizer_train": 5,
+            "tuning_validation": 2,
+            "final_lockbox": 2,
+        }
+        for timeframe in timeframes
+    }
+    leads = {timeframe: common_start.isoformat() for timeframe in timeframes}
+
+    def source_interval(timeframe, start, end):
+        seconds = TIMEFRAME_SECONDS[timeframe]
+        start = pd.Timestamp(start)
+        end = pd.Timestamp(end)
+        if timeframe in {"H4", "D1"}:
+            start -= pd.Timedelta(seconds=seconds)
+            end += pd.Timedelta(seconds=1)
+        else:
+            start = start.floor(f"{seconds}s")
+            end = end.floor(f"{seconds}s")
+        return {
+            "start_utc": start.isoformat(),
+            "end_exclusive_utc": end.isoformat(),
+        }
+
+    strategy_intervals = {
+        timeframe: source_interval(timeframe, common_start, common_as_of)
+        for timeframe in timeframes
+    }
+    references = cross_resolution_reference_map(timeframes)
+    consumers = {timeframe: [] for timeframe in timeframes}
+    for target, target_references in references.items():
+        for reference in target_references:
+            consumers[reference].append(target)
+    audit_windows = {
+        target: {
+            "strategy_full_context": {
+                "start_utc": common_start.isoformat(),
+                "end_exclusive_utc": common_as_of.isoformat(),
+            },
+            **{
+                partition: {
+                    "start_utc": value["start_ts"],
+                    "end_exclusive_utc": value["end_ts"],
+                }
+                for partition, value in boundaries.items()
+            },
+        }
+        for target in timeframes
+    }
+    reference_intervals = {
+        target: {
+            reference: {
+                window: source_interval(
+                    reference,
+                    interval["start_utc"],
+                    interval["end_exclusive_utc"],
+                )
+                for window, interval in audit_windows[target].items()
+            }
+            for reference in references[target]
+        }
+        for target in timeframes
+    }
+    interval_parts = {
+        timeframe: [strategy_intervals[timeframe]] for timeframe in timeframes
+    }
+    for target_edges in reference_intervals.values():
+        for reference, windows in target_edges.items():
+            interval_parts[reference].extend(windows.values())
+    source_intervals = {
+        timeframe: {
+            "start_utc": min(
+                pd.Timestamp(value["start_utc"]) for value in values
+            ).isoformat(),
+            "end_exclusive_utc": max(
+                pd.Timestamp(value["end_exclusive_utc"]) for value in values
+            ).isoformat(),
+        }
+        for timeframe, values in interval_parts.items()
+    }
+    audit_only_intervals = {timeframe: [] for timeframe in timeframes}
+    contract = {
+        **_availability_request_contract(boundaries),
+        "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        "timeframe_request_map_schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        "timeframe_window_years": years,
+        "timeframe_calendar_boundaries": serialized,
+        "timeframe_calendar_boundaries_sha256": _canonical_json_sha256(serialized),
+        "timeframe_required_evidence_lead_start_utc": leads,
+        "timeframe_source_request_intervals": source_intervals,
+        "timeframe_strategy_evidence_intervals": strategy_intervals,
+        "timeframe_audit_reference_map": references,
+        "timeframe_audit_consumer_map": consumers,
+        "timeframe_audit_windows": audit_windows,
+        "timeframe_audit_reference_intervals": reference_intervals,
+        "timeframe_audit_only_intervals": audit_only_intervals,
+        "timeframe_consensus_policy": dict(TWO_REFERENCE_CONSENSUS_POLICY),
+    }
+    request_map_payload = {
+        "schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        "common_as_of_utc": common_as_of.isoformat(),
+        **{
+            field_name: contract[field_name]
+            for field_name in (
+                "timeframe_window_years",
+                "timeframe_calendar_boundaries",
+                "timeframe_required_evidence_lead_start_utc",
+                "timeframe_source_request_intervals",
+                "timeframe_strategy_evidence_intervals",
+                "timeframe_audit_reference_map",
+                "timeframe_audit_consumer_map",
+                "timeframe_audit_windows",
+                "timeframe_audit_reference_intervals",
+                "timeframe_audit_only_intervals",
+                "timeframe_consensus_policy",
+            )
+        },
+    }
+    contract["timeframe_request_map_sha256"] = _canonical_json_sha256(
+        request_map_payload
+    )
+    leaves = {
+        timeframe: {
+            **contract,
+            "window_years": years[timeframe],
+            "common_calendar_boundaries": serialized[timeframe],
+            "cell_timeframe": timeframe,
+            "cell_timeframe_window_years": years[timeframe],
+            "cell_calendar_boundaries": serialized[timeframe],
+            "cell_required_evidence_lead_start_utc": leads[timeframe],
+            "source_request_interval": source_intervals[timeframe],
+            "strategy_evidence_interval": strategy_intervals[timeframe],
+            "audit_reference_timeframes": references[timeframe],
+            "audit_consumer_targets": consumers[timeframe],
+            "audit_windows": audit_windows[timeframe],
+            "audit_reference_intervals": reference_intervals[timeframe],
+            "audit_only_intervals": audit_only_intervals[timeframe],
         }
         for timeframe in timeframes
     }
@@ -267,7 +430,10 @@ def _write_unavailable_run(
     symbol: str = "SOLUSD",
     failure_status: str = "no_history",
     production_v4: bool = False,
+    production_v5: bool = False,
 ) -> None:
+    if production_v4 and production_v5:
+        raise ValueError("an immutable run cannot claim both V4 and V5")
     run_root = native_root / "runs" / run_id
     run_root.mkdir(parents=True)
     boundaries = {
@@ -284,7 +450,11 @@ def _write_unavailable_run(
             "end_ts": "2026-01-15T00:00:00Z",
         },
     }
-    if production_v4:
+    if production_v5:
+        request_contract, leaf_contracts = _availability_v5_request_contract(
+            boundaries
+        )
+    elif production_v4:
         request_contract, leaf_contracts = _availability_v4_request_contract(
             boundaries
         )
@@ -428,7 +598,7 @@ def test_short_history_symbol_is_immutable_excluded_no_trade_not_activation_fail
         native_root,
         "short-sol",
         failure_status="partial_history",
-        production_v4=True,
+        production_v5=True,
     )
 
     result = audit_and_activate(
@@ -818,7 +988,7 @@ def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
         native_root,
         "new-ton",
         symbol="TONUSD",
-        production_v4=True,
+        production_v5=True,
     )
     audit_and_activate(
         native_root,
@@ -959,7 +1129,7 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
         native_root,
         "old-unavailable",
         symbol="TONUSD",
-        production_v4=True,
+        production_v5=True,
     )
     audit_and_activate(
         native_root,
