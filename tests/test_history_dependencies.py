@@ -15,6 +15,7 @@ from pm_history_dependencies import (
     WARMUP_SAFETY_MULTIPLIER,
     HistoryDependencyContractError,
     UnknownDependencyAxisError,
+    assert_history_dependency_contract_production_ready,
     build_history_dependency_contract,
     contract_content_sha256,
     find_unrecognized_dependency_like_keys,
@@ -142,11 +143,40 @@ def test_requirements_cover_all_components_and_stacked_maximum(
         requirement = contract["per_timeframe"][timeframe]
         raw_required = max(requirement["component_bars"].values())
         assert requirement["raw_required_bars"] == raw_required
-        assert requirement["required_pretrain_bars"] == (
+        assert requirement["candidate_pretrain_bars"] == (
             math.ceil(raw_required * WARMUP_SAFETY_MULTIPLIER)
             + WARMUP_SAFETY_BUFFER_BARS
         )
-        assert requirement["required_pretrain_bars"] > raw_required
+        assert requirement["candidate_pretrain_bars"] > raw_required
+
+
+def test_candidate_contract_is_explicitly_vetoed_for_production(
+    contract: dict[str, Any],
+) -> None:
+    assert contract["production_status"] == "RESEARCH_ONLY_VETOED"
+    assert contract["production_eligible"] is False
+    assert {
+        "PATH_DEPENDENT_STATE_HAS_NO_PROVEN_PREFIX_BOUND",
+        "RECURSIVE_NUMERICAL_CONVERGENCE_NOT_DERIVED",
+        "CANDIDATE_COMPOSITION_RULE_NOT_PROVEN",
+        "NUMERICAL_ERROR_NOT_BOUND_TO_SIGNAL_STABILITY",
+        "LIVE_INITIALIZATION_CONTEXT_NOT_AUTHENTICATED",
+        "CONTRACT_CHECKSUM_IS_NOT_TRUSTED_SOURCE_ATTESTATION",
+    } == set(contract["production_blockers"])
+    with pytest.raises(HistoryDependencyContractError, match="not production ready"):
+        assert_history_dependency_contract_production_ready(contract)
+
+    fabricated = {
+        "contract_version": "fabricated-v0",
+        "production_status": "PRODUCTION_READY",
+        "production_eligible": True,
+        "production_blockers": [],
+        "per_timeframe": {"D1": {"candidate_pretrain_bars": 1}},
+    }
+    fabricated["contract_sha256"] = contract_content_sha256(fabricated)
+    validate_history_dependency_contract_hash(fabricated)
+    with pytest.raises(HistoryDependencyContractError, match="code authority vetoed"):
+        assert_history_dependency_contract_production_ready(fabricated)
 
 
 def test_default_only_history_axes_are_included(contract: dict[str, Any]) -> None:
@@ -227,7 +257,7 @@ def test_hash_surface_authenticates_source_grid_defaults_and_contract_code(
 
 def test_tamper_is_detected(contract: dict[str, Any]) -> None:
     tampered = copy.deepcopy(contract)
-    tampered["per_timeframe"]["D1"]["required_pretrain_bars"] -= 1
+    tampered["per_timeframe"]["D1"]["candidate_pretrain_bars"] -= 1
     with pytest.raises(HistoryDependencyContractError, match="hash mismatch"):
         validate_history_dependency_contract_hash(tampered)
 

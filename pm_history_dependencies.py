@@ -31,14 +31,23 @@ from pm_regime import DEFAULT_PARAMS_BY_TIMEFRAME, MarketRegimeDetector, RegimeP
 from pm_strategies import StrategyRegistry
 
 
-HISTORY_DEPENDENCY_CONTRACT_VERSION = "fxpm-history-dependencies-v1"
+HISTORY_DEPENDENCY_CONTRACT_VERSION = "fxpm-history-dependencies-research-v2"
 HISTORY_DEPENDENCY_SERIALIZATION = "canonical-json-sort-keys-v1"
+HISTORY_DEPENDENCY_PRODUCTION_STATUS = "RESEARCH_ONLY_VETOED"
 CANONICAL_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
 
-# A stacked strategy inventory currently peaks slightly above 300 bars.  The
-# multiplier gives recursive indicators time to converge beyond their first
-# mathematically-defined value; the fixed buffer covers decision shifts,
-# crossings, and boundary inclusion without turning the rule into calendar days.
+PRODUCTION_BLOCKERS = (
+    "PATH_DEPENDENT_STATE_HAS_NO_PROVEN_PREFIX_BOUND",
+    "RECURSIVE_NUMERICAL_CONVERGENCE_NOT_DERIVED",
+    "CANDIDATE_COMPOSITION_RULE_NOT_PROVEN",
+    "NUMERICAL_ERROR_NOT_BOUND_TO_SIGNAL_STABILITY",
+    "LIVE_INITIALIZATION_CONTEXT_NOT_AUTHENTICATED",
+    "CONTRACT_CHECKSUM_IS_NOT_TRUSTED_SOURCE_ATTESTATION",
+)
+
+# These constants reproduce the original inventory heuristic for research and
+# comparison only.  A scalar multiplier and buffer cannot prove convergence of
+# recursive indicators or prefix invariance of path-dependent state.
 WARMUP_SAFETY_MULTIPLIER = 1.50
 WARMUP_SAFETY_BUFFER_BARS = 32
 
@@ -109,7 +118,9 @@ BAR_DEPENDENCY_AXES = frozenset(
         "obv_smooth",
         "pct_lookback",
         "period",
+        "pattern_max_age_bars",
         "pullback_bars",
+        "pivot_max_age_bars",
         "range_bars",
         "reclaim_window",
         "retest_window",
@@ -121,6 +132,7 @@ BAR_DEPENDENCY_AXES = frozenset(
         "slow_period",
         "smooth_d",
         "smooth_k",
+        "setup_max_age_bars",
         "stoch_period",
         "structural_sl_lookback",
         "swing_bars",
@@ -210,12 +222,14 @@ _PREVIOUS_WEEK_STRATEGIES = frozenset({"PreviousWeekRangeBreakoutStrategy"})
 _WEEK_MONTH_STRATEGIES = frozenset({"WeeklyMonthlyLevelRejectionStrategy"})
 
 _DERIVATION_RULE = (
-    "For each strategy, take the non-negative maximum of every reviewed native-bar "
-    "dependency axis across its optimization grid and defaults, then sum those axis "
-    "maxima so potentially sequential lookbacks remain covered. For each timeframe, "
-    "take max(strategy stacked maximum, FeatureComputer maximum, regime maximum, "
-    "live_min_bars), multiply by the safety multiplier, round up, and add the fixed "
-    "bar buffer. Calendar/session requirements are additional source-start constraints."
+    "Research-only legacy heuristic: for each strategy, take the non-negative maximum "
+    "of every reviewed native-bar dependency axis across its optimization grid and "
+    "defaults, then sum those maxima. For each timeframe, take max(strategy heuristic, "
+    "FeatureComputer heuristic, regime heuristic, live_min_bars), multiply by the "
+    "diagnostic multiplier, round up, and add the diagnostic buffer. This is not a "
+    "dependency DAG: it does not prove serial/parallel composition, recurrence "
+    "convergence, path-state reset, or signal stability. Calendar/session requirements "
+    "remain separate source-start constraints."
 )
 
 
@@ -724,13 +738,20 @@ def build_history_dependency_contract(
                 "live_minimum": effective_live_min,
             },
             "raw_required_bars": int(raw_required),
-            "required_pretrain_bars": int(required),
+            # This is retained as an auditable output of the original
+            # inventory formula, not as a production acquisition requirement.
+            # Adversarial prefix tests disproved that interpretation for
+            # unbounded discrete state and slowly converging recurrences.
+            "candidate_pretrain_bars": int(required),
             "calendar_context_requirement": "calendar_context_requirements",
         }
 
     payload: dict[str, Any] = {
         "contract_version": HISTORY_DEPENDENCY_CONTRACT_VERSION,
         "serialization": HISTORY_DEPENDENCY_SERIALIZATION,
+        "production_status": HISTORY_DEPENDENCY_PRODUCTION_STATUS,
+        "production_eligible": False,
+        "production_blockers": list(PRODUCTION_BLOCKERS),
         "timeframes": list(normalized_timeframes),
         "derivation_policy": {
             "rule": _DERIVATION_RULE,
@@ -773,7 +794,7 @@ def build_history_dependency_contract(
 
 
 def validate_history_dependency_contract_hash(contract: Mapping[str, Any]) -> None:
-    """Fail if an in-memory or persisted contract has been modified."""
+    """Verify document integrity only; this is not production authentication."""
     expected = str(contract.get("contract_sha256", ""))
     actual = contract_content_sha256(contract)
     if not expected or expected != actual:
@@ -783,18 +804,45 @@ def validate_history_dependency_contract_hash(contract: Mapping[str, Any]) -> No
         )
 
 
+def assert_history_dependency_contract_production_ready(
+    contract: Mapping[str, Any],
+) -> None:
+    """Fail closed until state, convergence, live, and trust blockers are closed."""
+
+    validate_history_dependency_contract_hash(contract)
+    # A caller may recompute a checksum over arbitrary JSON.  Production
+    # authorization therefore cannot be granted by document-controlled fields
+    # while the trusted code authority itself remains vetoed.
+    if HISTORY_DEPENDENCY_PRODUCTION_STATUS != "PRODUCTION_READY":
+        raise HistoryDependencyContractError(
+            "history dependency contract is not production ready: code authority vetoed"
+        )
+    if (
+        contract.get("production_eligible") is not True
+        or str(contract.get("production_status") or "") != "PRODUCTION_READY"
+        or contract.get("production_blockers")
+    ):
+        blockers = [str(value) for value in contract.get("production_blockers") or []]
+        raise HistoryDependencyContractError(
+            "history dependency contract is not production ready: "
+            + (", ".join(blockers) if blockers else "UNSPECIFIED_BLOCKER")
+        )
+
+
 __all__ = [
     "BAR_DEPENDENCY_AXES",
     "CALENDAR_DEPENDENCY_AXES",
     "CANONICAL_TIMEFRAMES",
     "DEPENDENCY_LIKE_NON_HISTORY_AXES",
     "HISTORY_DEPENDENCY_CONTRACT_VERSION",
+    "HISTORY_DEPENDENCY_PRODUCTION_STATUS",
     "HISTORY_DEPENDENCY_SERIALIZATION",
     "HistoryDependencyContractError",
     "IMPLIED_BAR_DEPENDENCY_AXES",
     "UnknownDependencyAxisError",
     "WARMUP_SAFETY_BUFFER_BARS",
     "WARMUP_SAFETY_MULTIPLIER",
+    "assert_history_dependency_contract_production_ready",
     "build_history_dependency_contract",
     "classify_dependency_axis",
     "contract_content_sha256",
