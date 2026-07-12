@@ -856,6 +856,34 @@ def test_successful_activation_pins_exact_hashes_and_resolver_uses_no_flat_fallb
         assert again.data_path == resolution.data_path
 
 
+def test_audit_only_writes_evidence_without_advancing_active_pointer():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        native_root = data_dir / "native"
+        native_root.mkdir(parents=True)
+        _write_run(native_root, "run-audit-only")
+        pointer_path = native_root / "ACTIVE.json"
+        pointer_path.write_text('{"existing": "pointer"}', encoding="utf-8")
+        before = pointer_path.read_bytes()
+
+        result = audit_and_activate(
+            native_root,
+            run_id="run-audit-only",
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-audit-only",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+            update_active_pointer=False,
+        )
+
+        assert result["status"] == "active", result
+        assert result["audit_only"] is True
+        assert result["active_pointer_updated"] is False
+        assert pointer_path.read_bytes() == before
+        assert Path(result["manifest_path"]).is_file()
+
+
 def test_segmented_v2_coverage_is_recomputed_and_authenticated():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "data"

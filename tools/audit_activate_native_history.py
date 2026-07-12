@@ -1201,6 +1201,7 @@ def audit_and_activate(
     minimum_session_coverage: float = NATIVE_MINIMUM_SESSION_COVERAGE,
     tick_tolerance_overrides: Optional[Mapping[str, float]] = None,
     now: Optional[datetime] = None,
+    update_active_pointer: bool = True,
 ) -> Dict[str, Any]:
     native_root = _safe_native_root(native_root)
     run_id = _safe_component(run_id, "run id")
@@ -1945,7 +1946,7 @@ def audit_and_activate(
     _atomic_create_json(manifest_path, manifest)
     manifest_sha = sha256_file(manifest_path)
     pointer_updated = False
-    if manifest_status == "active":
+    if manifest_status == "active" and bool(update_active_pointer):
         pointer = {
             "schema_version": ACTIVE_POINTER_SCHEMA,
             "activation_id": activation_id,
@@ -1960,6 +1961,7 @@ def audit_and_activate(
         "manifest_path": str(manifest_path),
         "manifest_sha256": manifest_sha,
         "active_pointer_updated": pointer_updated,
+        "audit_only": not bool(update_active_pointer),
     }
 
 
@@ -2000,6 +2002,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-compared-native-bars", type=int, default=20)
     parser.add_argument("--tick-tolerance", action="append", default=[])
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help=(
+            "execute the full immutable audit and write its manifest, but never "
+            "replace data/native/ACTIVE.json"
+        ),
+    )
     return parser
 
 
@@ -2037,7 +2047,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "--timeframes must equal the immutable acquisition run's requested timeframe roster"
         )
     plan = {
-        "mode": "execute" if args.execute else "plan_only",
+        "mode": (
+            "audit_only" if args.execute and args.audit_only
+            else ("execute" if args.execute else "plan_only")
+        ),
         "native_root": str(native_root),
         "run_id": args.run_id,
         "symbols": symbols,
@@ -2061,6 +2074,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         minimum_session_coverage=args.minimum_session_coverage,
         tick_tolerance_overrides=_parse_tolerances(args.tick_tolerance),
+        update_active_pointer=not bool(args.audit_only),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["status"] == "active" else (3 if result["status"] == "pending" else 4)
