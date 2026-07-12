@@ -18,6 +18,7 @@ if str(PATCH_ROOT) not in sys.path:
     sys.path.insert(0, str(PATCH_ROOT))
 
 from pm_native_consensus import CONSENSUS_POLICY, REFERENCE_GRAPH  # noqa: E402
+from pm_native_intervals import native_source_interval  # noqa: E402
 from tools.acquire_native_history import (  # noqa: E402
     ACQUISITION_CONTRACT_VERSION,
     DEFAULT_TIMEFRAMES,
@@ -1090,9 +1091,16 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             for target, references in acquirer.timeframe_audit_reference_map.items():
                 target_start = acquirer.timeframe_requested_start_utc[target]
                 for reference in references:
-                    edge_start = acquirer.timeframe_audit_reference_intervals[
+                    edge_interval = acquirer.timeframe_audit_reference_intervals[
                         target
-                    ][reference]["strategy_full_context"][0]
+                    ][reference]["strategy_full_context"]
+                    expected_interval = native_source_interval(
+                        reference,
+                        target_start,
+                        acquirer.as_of_utc,
+                    )
+                    self.assertEqual(edge_interval, expected_interval)
+                    edge_start, edge_end = edge_interval
                     self.assertLessEqual(
                         edge_start,
                         target_start,
@@ -1101,6 +1109,10 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                     self.assertLessEqual(
                         acquirer.timeframe_source_request_intervals[reference][0],
                         edge_start,
+                    )
+                    self.assertGreaterEqual(
+                        acquirer.timeframe_source_request_intervals[reference][1],
+                        edge_end,
                     )
 
             self.assertEqual(acquirer.as_of_utc.minute, 30)
@@ -1142,6 +1154,25 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             self.assertIn("timeframe_audit_only_intervals", resume_contract)
             self.assertIn("timeframe_consensus_policy", resume_contract)
             store.close()
+
+    def test_native_interval_transform_handles_nonaligned_start_and_end(self):
+        start = datetime(2026, 7, 12, 21, 7, 13, tzinfo=UTC)
+        end = datetime(2026, 7, 12, 21, 47, 19, tzinfo=UTC)
+
+        self.assertEqual(
+            native_source_interval("M30", start, end),
+            (
+                datetime(2026, 7, 12, 21, 0, tzinfo=UTC),
+                datetime(2026, 7, 12, 21, 30, tzinfo=UTC),
+            ),
+        )
+        self.assertEqual(
+            native_source_interval("H4", start, end),
+            (
+                datetime(2026, 7, 12, 17, 7, 13, tzinfo=UTC),
+                datetime(2026, 7, 12, 21, 47, 20, tzinfo=UTC),
+            ),
+        )
 
     def test_timeframe_v5_contract_is_canonical_under_reordered_roster(self):
         as_of = datetime(2026, 7, 12, 17, 33, 41, tzinfo=UTC)

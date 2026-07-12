@@ -58,6 +58,7 @@ from pm_native_consensus import (  # noqa: E402
     expected_reference_timeframes,
     validate_consensus_envelope,
 )
+from pm_native_intervals import native_source_interval  # noqa: E402
 from pm_native_parity import (  # noqa: E402
     CROSS_RESOLUTION_PARITY_SCHEMA_VERSION,
     PARITY_SCHEMA_VERSION,
@@ -1691,14 +1692,27 @@ def _v5_request_errors(
         strategy = _v5_interval(strategy_intervals.get(target))
         source = _v5_interval(source_intervals.get(target))
         full_context = parsed_windows.get("strategy_full_context")
+        expected_strategy: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None
+        if full_context is not None:
+            try:
+                transformed = native_source_interval(
+                    target,
+                    full_context[0].to_pydatetime(),
+                    full_context[1].to_pydatetime(),
+                )
+                expected_strategy = (
+                    pd.Timestamp(transformed[0]),
+                    pd.Timestamp(transformed[1]),
+                )
+            except (TypeError, ValueError, OverflowError):
+                expected_strategy = None
         if (
             strategy is None
             or source is None
-            or full_context is None
+            or expected_strategy is None
+            or strategy != expected_strategy
             or source[0] > strategy[0]
             or source[1] < strategy[1]
-            or strategy[0] > full_context[0]
-            or strategy[1] < full_context[1]
         ):
             errors.append(f"RUN_MANIFEST_V5_STRATEGY_CONTEXT_INVALID:{target}")
 
@@ -1722,12 +1736,26 @@ def _v5_request_errors(
             for window in REQUIRED_AUDIT_WINDOWS:
                 edge_interval = _v5_interval(edge_windows.get(window))
                 target_interval = parsed_windows.get(window)
+                expected_edge: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None
+                if target_interval is not None:
+                    try:
+                        transformed = native_source_interval(
+                            reference,
+                            target_interval[0].to_pydatetime(),
+                            target_interval[1].to_pydatetime(),
+                        )
+                        expected_edge = (
+                            pd.Timestamp(transformed[0]),
+                            pd.Timestamp(transformed[1]),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        expected_edge = None
                 if (
                     edge_interval is None
                     or target_interval is None
                     or reference_source is None
-                    or edge_interval[0] > target_interval[0]
-                    or edge_interval[1] < target_interval[1]
+                    or expected_edge is None
+                    or edge_interval != expected_edge
                     or reference_source[0] > edge_interval[0]
                     or reference_source[1] < edge_interval[1]
                 ):

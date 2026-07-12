@@ -49,6 +49,10 @@ from pm_evidence import (  # noqa: E402
     build_timeframe_calendar_boundaries,
     normalize_timeframe_window_years,
 )
+from pm_native_intervals import (  # noqa: E402
+    TIMEFRAME_SECONDS,
+    native_source_interval,
+)
 from pm_native_consensus import (  # noqa: E402
     CONSENSUS_POLICY as NATIVE_CONSENSUS_POLICY,
     PRODUCTION_TIMEFRAMES as NATIVE_PRODUCTION_TIMEFRAMES,
@@ -87,14 +91,6 @@ DEFAULT_WINDOW_YEARS: Dict[str, int] = {
     "optimizer_train": 5,
     "tuning_validation": 2,
     "final_lockbox": 2,
-}
-TIMEFRAME_SECONDS: Dict[str, int] = {
-    "M5": 5 * 60,
-    "M15": 15 * 60,
-    "M30": 30 * 60,
-    "H1": 60 * 60,
-    "H4": 4 * 60 * 60,
-    "D1": 24 * 60 * 60,
 }
 DEFAULT_TIMEFRAMES: Tuple[str, ...] = tuple(NATIVE_PRODUCTION_TIMEFRAMES)
 if set(DEFAULT_TIMEFRAMES) != set(TIMEFRAME_SECONDS):
@@ -2464,16 +2460,7 @@ class NativeHistoryAcquirer:
     ) -> Tuple[datetime, datetime]:
         """Expand one semantic window to the source's native fetch boundaries."""
 
-        seconds = TIMEFRAME_SECONDS[timeframe]
-        if timeframe in {"H4", "D1"}:
-            return (
-                _utc(window_start) - timedelta(seconds=seconds),
-                _utc(window_end) + timedelta(seconds=1),
-            )
-        return (
-            floor_utc_boundary(window_start, seconds),
-            floor_utc_boundary(window_end, seconds),
-        )
+        return native_source_interval(timeframe, window_start, window_end)
 
     def _serialized_timeframe_boundaries(self) -> Dict[str, Dict[str, Dict[str, str]]]:
         return {
