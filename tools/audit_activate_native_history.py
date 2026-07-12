@@ -43,6 +43,21 @@ from pm_native_activation import (  # noqa: E402
     classify_native_session_history,
     sha256_file,
 )
+from pm_native_consensus import (  # noqa: E402
+    CONSENSUS_SCHEMA_VERSION,
+    EVIDENCE_PASS,
+    EVIDENCE_PENDING,
+    EVIDENCE_SEMANTIC_FAIL,
+    EVIDENCE_TERMINAL_UNAVAILABLE,
+    INTEGRITY_ERROR,
+    INTEGRITY_PASS,
+    REQUIRED_AUDIT_WINDOWS,
+    build_consensus_envelope,
+    build_edge_report,
+    canonical_sha256,
+    expected_reference_timeframes,
+    validate_consensus_envelope,
+)
 from pm_native_parity import (  # noqa: E402
     CROSS_RESOLUTION_PARITY_SCHEMA_VERSION,
     PARITY_SCHEMA_VERSION,
@@ -61,10 +76,11 @@ from tools.acquire_native_history import (  # noqa: E402
     PAGINATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
     LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4,
     TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     TIMEFRAME_SECONDS,
+    TWO_REFERENCE_CONSENSUS_POLICY,
     ceil_utc_boundary,
-    cross_resolution_reference_map,
     expected_session_coverage_by_partition,
     floor_utc_boundary,
     SEGMENTED_SESSION_COVERAGE_METHOD_V2,
@@ -104,6 +120,15 @@ _V4_REQUEST_CONTRACT_FIELDS: Tuple[str, ...] = (
     "timeframe_strategy_evidence_intervals",
     "timeframe_audit_reference_map",
     "timeframe_audit_only_prefix_intervals",
+)
+_V5_REQUEST_CONTRACT_FIELDS: Tuple[str, ...] = (
+    "timeframe_strategy_evidence_intervals",
+    "timeframe_audit_reference_map",
+    "timeframe_audit_consumer_map",
+    "timeframe_audit_windows",
+    "timeframe_audit_reference_intervals",
+    "timeframe_audit_only_intervals",
+    "timeframe_consensus_policy",
 )
 _SOURCE_IDENTITY_FIELDS: Mapping[str, Tuple[str, ...]] = {
     "account": ("login", "server", "company", "currency"),
@@ -256,12 +281,15 @@ def _request_contract(value: Any) -> Optional[Dict[str, Any]]:
         )
         if request_map_version not in {
             LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4,
             TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
         }:
             return None
         fields = (*fields, *_V3_REQUEST_CONTRACT_FIELDS)
-        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4:
             fields = (*fields, *_V4_REQUEST_CONTRACT_FIELDS)
+        elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            fields = (*fields, *_V5_REQUEST_CONTRACT_FIELDS)
     elif version:
         return None
     if any(field_name not in value for field_name in fields):
@@ -288,9 +316,10 @@ def _request_contract(value: Any) -> Optional[Dict[str, Any]]:
                 "timeframe_source_request_intervals"
             ),
         }
-        if str(contract.get("timeframe_request_map_schema_version") or "") == (
-            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
-        ):
+        request_map_version = str(
+            contract.get("timeframe_request_map_schema_version") or ""
+        )
+        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4:
             request_map_payload.update(
                 {
                     "timeframe_strategy_evidence_intervals": contract.get(
@@ -302,6 +331,13 @@ def _request_contract(value: Any) -> Optional[Dict[str, Any]]:
                     "timeframe_audit_only_prefix_intervals": contract.get(
                         "timeframe_audit_only_prefix_intervals"
                     ),
+                }
+            )
+        elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            request_map_payload.update(
+                {
+                    field_name: contract.get(field_name)
+                    for field_name in _V5_REQUEST_CONTRACT_FIELDS
                 }
             )
         if str(contract.get("timeframe_request_map_sha256") or "") != (
@@ -874,9 +910,10 @@ def _source_leaf(
                 or {}
             ).get(timeframe),
         }
-        if str(
+        request_map_version = str(
             source_request_contract.get("timeframe_request_map_schema_version") or ""
-        ) == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+        )
+        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4:
             expected_projection.update(
                 {
                     "strategy_evidence_interval": (
@@ -893,6 +930,38 @@ def _source_leaf(
                     ).get(timeframe),
                     "audit_reference_timeframe": (
                         source_request_contract.get("timeframe_audit_reference_map")
+                        or {}
+                    ).get(timeframe),
+                }
+            )
+        elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            expected_projection.update(
+                {
+                    "strategy_evidence_interval": (
+                        source_request_contract.get(
+                            "timeframe_strategy_evidence_intervals"
+                        )
+                        or {}
+                    ).get(timeframe),
+                    "audit_reference_timeframes": (
+                        source_request_contract.get("timeframe_audit_reference_map")
+                        or {}
+                    ).get(timeframe),
+                    "audit_consumer_targets": (
+                        source_request_contract.get("timeframe_audit_consumer_map")
+                        or {}
+                    ).get(timeframe),
+                    "audit_windows": (
+                        source_request_contract.get("timeframe_audit_windows") or {}
+                    ).get(timeframe),
+                    "audit_reference_intervals": (
+                        source_request_contract.get(
+                            "timeframe_audit_reference_intervals"
+                        )
+                        or {}
+                    ).get(timeframe),
+                    "audit_only_intervals": (
+                        source_request_contract.get("timeframe_audit_only_intervals")
                         or {}
                     ).get(timeframe),
                 }
@@ -1500,6 +1569,858 @@ def _symbol_availability_decision(
     }
 
 
+def _legacy_cross_resolution_reference_map(
+    timeframes: Sequence[str],
+) -> Dict[str, str]:
+    """Reconstruct the immutable V4 one-reference graph for forensics."""
+
+    ordered = tuple(
+        sorted(
+            (str(value).upper() for value in timeframes),
+            key=lambda value: TIMEFRAME_SECONDS[value],
+        )
+    )
+    if len(ordered) < 2:
+        return {}
+    return {
+        timeframe: (ordered[1] if index == 0 else ordered[index - 1])
+        for index, timeframe in enumerate(ordered)
+    }
+
+
+def _v5_interval(value: Any) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "start_utc",
+        "end_exclusive_utc",
+    }:
+        return None
+    try:
+        start = pd.Timestamp(value.get("start_utc"))
+        end = pd.Timestamp(value.get("end_exclusive_utc"))
+        if start.tzinfo is None or end.tzinfo is None:
+            return None
+        start = start.tz_convert("UTC")
+        end = end.tz_convert("UTC")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return (start, end) if start < end else None
+
+
+def _v5_request_errors(
+    request: Mapping[str, Any],
+    timeframes: Sequence[str],
+) -> list[str]:
+    """Validate V5 graph semantics in addition to its immutable hash."""
+
+    errors: list[str] = []
+    roster = tuple(str(value).upper() for value in timeframes)
+    if roster != tuple(DEFAULT_TIMEFRAMES):
+        errors.append("RUN_MANIFEST_V5_SIX_TIMEFRAME_ROSTER_REQUIRED")
+        return errors
+    expected_graph = {
+        target: list(expected_reference_timeframes(target))
+        for target in DEFAULT_TIMEFRAMES
+    }
+    graph = request.get("timeframe_audit_reference_map")
+    if not isinstance(graph, Mapping) or dict(graph) != expected_graph:
+        errors.append("RUN_MANIFEST_V5_REFERENCE_GRAPH_INVALID")
+    expected_consumers = {timeframe: [] for timeframe in DEFAULT_TIMEFRAMES}
+    for target in DEFAULT_TIMEFRAMES:
+        for reference in expected_graph[target]:
+            expected_consumers[reference].append(target)
+    consumers = request.get("timeframe_audit_consumer_map")
+    if not isinstance(consumers, Mapping) or dict(consumers) != expected_consumers:
+        errors.append("RUN_MANIFEST_V5_CONSUMER_GRAPH_INVALID")
+    if request.get("timeframe_consensus_policy") != TWO_REFERENCE_CONSENSUS_POLICY:
+        errors.append("RUN_MANIFEST_V5_CONSENSUS_POLICY_INVALID")
+
+    audit_windows = request.get("timeframe_audit_windows")
+    reference_intervals = request.get("timeframe_audit_reference_intervals")
+    source_intervals = request.get("timeframe_source_request_intervals")
+    strategy_intervals = request.get("timeframe_strategy_evidence_intervals")
+    boundaries = request.get("timeframe_calendar_boundaries")
+    audit_only = request.get("timeframe_audit_only_intervals")
+    for field_name, value in (
+        ("AUDIT_WINDOWS", audit_windows),
+        ("AUDIT_REFERENCE_INTERVALS", reference_intervals),
+        ("SOURCE_INTERVALS", source_intervals),
+        ("STRATEGY_INTERVALS", strategy_intervals),
+        ("CALENDAR_BOUNDARIES", boundaries),
+        ("AUDIT_ONLY_INTERVALS", audit_only),
+    ):
+        if not isinstance(value, Mapping) or set(value) != set(DEFAULT_TIMEFRAMES):
+            errors.append(f"RUN_MANIFEST_V5_{field_name}_ROSTER_INVALID")
+
+    if errors:
+        return list(dict.fromkeys(errors))
+    assert isinstance(audit_windows, Mapping)
+    assert isinstance(reference_intervals, Mapping)
+    assert isinstance(source_intervals, Mapping)
+    assert isinstance(strategy_intervals, Mapping)
+    assert isinstance(boundaries, Mapping)
+    assert isinstance(audit_only, Mapping)
+    for target in DEFAULT_TIMEFRAMES:
+        target_windows = audit_windows.get(target)
+        if not isinstance(target_windows, Mapping) or set(target_windows) != set(
+            REQUIRED_AUDIT_WINDOWS
+        ):
+            errors.append(f"RUN_MANIFEST_V5_AUDIT_WINDOW_ROSTER_INVALID:{target}")
+            continue
+        parsed_windows: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+        for window in REQUIRED_AUDIT_WINDOWS:
+            parsed = _v5_interval(target_windows.get(window))
+            if parsed is None:
+                errors.append(
+                    f"RUN_MANIFEST_V5_AUDIT_WINDOW_INVALID:{target}:{window}"
+                )
+            else:
+                parsed_windows[window] = parsed
+            if window != "strategy_full_context":
+                declared_boundary = (boundaries.get(target) or {}).get(window)
+                if target_windows.get(window) != (
+                    {
+                        "start_utc": declared_boundary.get("start_ts"),
+                        "end_exclusive_utc": declared_boundary.get("end_ts"),
+                    }
+                    if isinstance(declared_boundary, Mapping)
+                    else None
+                ):
+                    errors.append(
+                        f"RUN_MANIFEST_V5_AUDIT_CALENDAR_MISMATCH:{target}:{window}"
+                    )
+        strategy = _v5_interval(strategy_intervals.get(target))
+        source = _v5_interval(source_intervals.get(target))
+        full_context = parsed_windows.get("strategy_full_context")
+        if (
+            strategy is None
+            or source is None
+            or full_context is None
+            or source[0] > strategy[0]
+            or source[1] < strategy[1]
+            or strategy[0] > full_context[0]
+            or strategy[1] < full_context[1]
+        ):
+            errors.append(f"RUN_MANIFEST_V5_STRATEGY_CONTEXT_INVALID:{target}")
+
+        target_edges = reference_intervals.get(target)
+        expected_references = expected_reference_timeframes(target)
+        if not isinstance(target_edges, Mapping) or set(target_edges) != set(
+            expected_references
+        ):
+            errors.append(f"RUN_MANIFEST_V5_EDGE_ROSTER_INVALID:{target}")
+            continue
+        for reference in expected_references:
+            edge_windows = target_edges.get(reference)
+            if not isinstance(edge_windows, Mapping) or set(edge_windows) != set(
+                REQUIRED_AUDIT_WINDOWS
+            ):
+                errors.append(
+                    f"RUN_MANIFEST_V5_EDGE_WINDOW_ROSTER_INVALID:{target}:{reference}"
+                )
+                continue
+            reference_source = _v5_interval(source_intervals.get(reference))
+            for window in REQUIRED_AUDIT_WINDOWS:
+                edge_interval = _v5_interval(edge_windows.get(window))
+                target_interval = parsed_windows.get(window)
+                if (
+                    edge_interval is None
+                    or target_interval is None
+                    or reference_source is None
+                    or edge_interval[0] > target_interval[0]
+                    or edge_interval[1] < target_interval[1]
+                    or reference_source[0] > edge_interval[0]
+                    or reference_source[1] < edge_interval[1]
+                ):
+                    errors.append(
+                        "RUN_MANIFEST_V5_EDGE_INTERVAL_INVALID:"
+                        f"{target}:{reference}:{window}"
+                    )
+        if not isinstance(audit_only.get(target), list):
+            errors.append(f"RUN_MANIFEST_V5_AUDIT_ONLY_INVALID:{target}")
+    return list(dict.fromkeys(errors))
+
+
+def _v5_audit_windows(
+    request: Mapping[str, Any],
+    target: str,
+) -> Dict[str, Tuple[datetime, datetime]]:
+    raw = (request.get("timeframe_audit_windows") or {}).get(target) or {}
+    result: Dict[str, Tuple[datetime, datetime]] = {}
+    for window in REQUIRED_AUDIT_WINDOWS:
+        parsed = _v5_interval(raw.get(window))
+        if parsed is not None:
+            result[window] = (parsed[0].to_pydatetime(), parsed[1].to_pydatetime())
+    return result
+
+
+def _v5_source_binding(source: Mapping[str, Any]) -> Dict[str, Any]:
+    def _digest(value: Any) -> str:
+        text = str(value or "").lower()
+        return (
+            text
+            if len(text) == 64
+            and all(character in "0123456789abcdef" for character in text)
+            else "0" * 64
+        )
+
+    return {
+        "availability_state": "AVAILABLE",
+        # A structurally valid placeholder lets the immutable failed audit be
+        # published when a technical source has no digest. Integrity remains
+        # ERROR and the entry continues to expose the actual null binding, so
+        # this can never turn missing bytes into an activatable cell.
+        "bars_sha256": _digest(source.get("bars_sha256")),
+        "provenance_sha256": _digest(source.get("provenance_sha256")),
+    }
+
+
+def _v5_unavailable_binding() -> Dict[str, Any]:
+    return {
+        "availability_state": EVIDENCE_TERMINAL_UNAVAILABLE,
+        "bars_sha256": None,
+        "provenance_sha256": None,
+    }
+
+
+def _v5_pair_window_states(
+    report: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    partitions = report.get("partitions")
+    result: Dict[str, Dict[str, Any]] = {}
+    for window in REQUIRED_AUDIT_WINDOWS:
+        detail = partitions.get(window) if isinstance(partitions, Mapping) else None
+        status = str(
+            detail.get("status") if isinstance(detail, Mapping) else ""
+        ).upper()
+        if status == "PASS":
+            evidence = EVIDENCE_PASS
+            integrity = INTEGRITY_PASS
+        elif status == "FAIL":
+            evidence = EVIDENCE_SEMANTIC_FAIL
+            integrity = INTEGRITY_PASS
+        elif status == "PENDING":
+            evidence = EVIDENCE_PENDING
+            integrity = INTEGRITY_PASS
+        else:
+            evidence = EVIDENCE_PENDING
+            integrity = INTEGRITY_ERROR
+        result[window] = {
+            "integrity_state": integrity,
+            "evidence_state": evidence,
+            "reason_codes": list(
+                detail.get("reason_codes") if isinstance(detail, Mapping) else []
+                or []
+            ),
+        }
+    return result
+
+
+def _v5_constant_edge_states(
+    *,
+    integrity: str,
+    evidence: str,
+    reasons: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    return {
+        window: {
+            "integrity_state": integrity,
+            "evidence_state": evidence,
+            "reason_codes": list(reasons),
+        }
+        for window in REQUIRED_AUDIT_WINDOWS
+    }
+
+
+def _v5_consensus_diagnostics(
+    envelope: Mapping[str, Any],
+) -> Dict[str, Any]:
+    per_window: Dict[str, Any] = {}
+    disagreement_count = 0
+    for window in REQUIRED_AUDIT_WINDOWS:
+        detail = (envelope.get("windows") or {}).get(window) or {}
+        edge_states = detail.get("edge_states") or {}
+        outcomes = {
+            str(reference): {
+                "integrity_state": state.get("integrity_state"),
+                "evidence_state": state.get("evidence_state"),
+            }
+            for reference, state in edge_states.items()
+            if isinstance(state, Mapping)
+        }
+        distinct = {
+            (value["integrity_state"], value["evidence_state"])
+            for value in outcomes.values()
+        }
+        disagrees = len(distinct) > 1
+        disagreement_count += int(disagrees)
+        per_window[window] = {
+            "consensus_status": detail.get("status"),
+            "disagreement": disagrees,
+            "edge_outcomes": outcomes,
+        }
+    return {
+        "window_disagreement_count": disagreement_count,
+        "windows_with_disagreement": [
+            window
+            for window in REQUIRED_AUDIT_WINDOWS
+            if per_window[window]["disagreement"]
+        ],
+        "per_window": per_window,
+    }
+
+
+def _v5_coverage_from_pairs(
+    envelope: Mapping[str, Any],
+    pair_reports: Mapping[str, Optional[Mapping[str, Any]]],
+) -> Dict[str, Optional[float]]:
+    coverage: Dict[str, Optional[float]] = {}
+    for partition in NATIVE_EVIDENCE_PARTITIONS:
+        status = str(
+            ((envelope.get("windows") or {}).get(partition) or {}).get("status")
+            or ""
+        ).upper()
+        values: list[float] = []
+        for report in pair_reports.values():
+            detail = (
+                (report.get("partitions") or {}).get(partition)
+                if isinstance(report, Mapping)
+                else None
+            )
+            if not isinstance(detail, Mapping) or str(
+                detail.get("status") or ""
+            ).upper() != "PASS":
+                continue
+            value = _strict_finite_number(
+                detail.get("bidirectional_coverage")
+            )
+            if value is not None and 0.0 <= value <= 1.0:
+                values.append(value)
+        if status == "PASS" and values:
+            coverage[partition] = max(values)
+        elif status == "FAIL":
+            coverage[partition] = 0.0
+        else:
+            coverage[partition] = None
+    return coverage
+
+
+def _v5_authenticated_tolerance(source: Mapping[str, Any]) -> Optional[float]:
+    instrument = (source.get("provenance") or {}).get("instrument")
+    try:
+        value = float(
+            instrument.get("parity_tick_tolerance")
+            if isinstance(instrument, Mapping)
+            else None
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0.0 else None
+
+
+def _v5_load_frame(source: Mapping[str, Any]) -> Optional[pd.DataFrame]:
+    path = source.get("bars_path")
+    if str(source.get("availability_class") or "") != "success":
+        return None
+    if not isinstance(path, Path) or not path.is_file():
+        return None
+    try:
+        return _read_bars(path)
+    except Exception:
+        return None
+
+
+def _v5_audit_symbol(
+    native_root: Path,
+    *,
+    audit_root: Path,
+    symbol: str,
+    timeframes: Sequence[str],
+    run_id: str,
+    activation_id: str,
+    run_manifest_cells: Mapping[Tuple[str, str], Mapping[str, Any]],
+    run_manifest_errors: Sequence[str],
+    run_request: Mapping[str, Any],
+    run_source_environment: Mapping[str, Any],
+    run_manifest_path: Path,
+    run_manifest_sha: Optional[str],
+    availability: Mapping[str, Any],
+    thresholds: ParityThresholds,
+    minimum_session_coverage: float,
+    overrides: Mapping[str, float],
+    audited_at: str,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], list[str]]:
+    """Audit one V5 symbol while retaining at most two bar frames at once."""
+
+    sources: Dict[str, Dict[str, Any]] = {}
+    for timeframe in timeframes:
+        loaded = _source_leaf(
+            native_root,
+            run_id,
+            symbol,
+            timeframe,
+            run_manifest_cells.get((symbol, timeframe)),
+            run_manifest_errors,
+            run_request,
+            run_source_environment,
+        )
+        # _source_leaf authenticates the bytes while the frame is resident.
+        # Retain metadata only; resolution and pair audits reload exactly the
+        # target/reference pair needed for the current calculation.
+        loaded.pop("frame", None)
+        sources[timeframe] = loaded
+
+    resolution_audits: Dict[str, Dict[str, Any]] = {}
+    d1_frame = _v5_load_frame(sources.get("D1", {}))
+    for timeframe in timeframes:
+        source = sources[timeframe]
+        frame = d1_frame if timeframe == "D1" else _v5_load_frame(source)
+        tolerance = _v5_authenticated_tolerance(source)
+        override = overrides.get(symbol)
+        source_errors = list(source.get("errors") or [])
+        if override is not None:
+            if tolerance is None or override > tolerance + 1e-12:
+                source_errors.append(
+                    "TICK_TOLERANCE_OVERRIDE_WEAKENS_AUTHENTICATED_BASE"
+                )
+            else:
+                tolerance = override
+        source["errors"] = list(dict.fromkeys(source_errors))
+        resolution_audits[timeframe] = audit_native_resolution(
+            frame,
+            symbol=symbol,
+            timeframe=timeframe,
+            daily_frame=d1_frame,
+            tick_tolerance=tolerance,
+        ).to_dict()
+        if timeframe != "D1":
+            del frame
+    del d1_frame
+
+    symbol_entries: Dict[str, Dict[str, Any]] = {}
+    audited_cells: Dict[str, Dict[str, Any]] = {}
+    blocking: list[str] = []
+    availability_cells = (
+        availability.get("availability_cells")
+        if isinstance(availability.get("availability_cells"), Mapping)
+        else {}
+    )
+    for timeframe in timeframes:
+        source = sources[timeframe]
+        provenance = source.get("provenance") or {}
+        source_errors = list(source.get("errors") or [])
+        classification, availability_error = classify_native_availability_cell(
+            (availability_cells.get(timeframe) or {}).get("status"),
+            (availability_cells.get(timeframe) or {}).get("failure_status"),
+            (availability_cells.get(timeframe) or {}).get("rows"),
+        )
+        resolution = resolution_audits[timeframe]
+        resolution_status = str(resolution.get("status") or "PENDING").upper()
+        resolution_reasons = [
+            str(value) for value in (resolution.get("reason_codes") or []) if str(value)
+        ]
+        references = expected_reference_timeframes(timeframe)
+        source_binding = _v5_source_binding(source)
+        pair_reports: Dict[str, Optional[Mapping[str, Any]]] = {
+            reference: None for reference in references
+        }
+        reference_bindings: Dict[str, Dict[str, Any]] = {}
+        edge_reports: Dict[str, Dict[str, Any]] = {}
+        target_frame = _v5_load_frame(source)
+        tolerance = _v5_authenticated_tolerance(source)
+        if overrides.get(symbol) is not None and tolerance is not None:
+            tolerance = min(tolerance, float(overrides[symbol]))
+
+        if classification == "success":
+            for reference in references:
+                reference_source = sources[reference]
+                reference_errors = list(reference_source.get("errors") or [])
+                reference_class = str(
+                    reference_source.get("availability_class") or "invalid"
+                )
+                reference_failure = str(
+                    ((reference_source.get("provenance") or {}).get("failure_status"))
+                    or ""
+                ).upper()
+                if reference_class == "unavailable" and not reference_errors:
+                    reference_binding = _v5_unavailable_binding()
+                    states = _v5_constant_edge_states(
+                        integrity=INTEGRITY_PASS,
+                        evidence=EVIDENCE_TERMINAL_UNAVAILABLE,
+                        reasons=[
+                            f"AUDIT_REFERENCE_UNAVAILABLE:{reference}:"
+                            f"{reference_failure or 'UNSPECIFIED'}"
+                        ],
+                    )
+                elif source_errors or target_frame is None:
+                    reference_binding = _v5_source_binding(reference_source)
+                    states = _v5_constant_edge_states(
+                        integrity=INTEGRITY_ERROR,
+                        evidence=EVIDENCE_PENDING,
+                        reasons=[
+                            "TARGET_SOURCE_INTEGRITY_ERROR",
+                            *(f"TARGET:{reason}" for reason in source_errors),
+                        ],
+                    )
+                elif reference_errors:
+                    reference_binding = _v5_source_binding(reference_source)
+                    states = _v5_constant_edge_states(
+                        integrity=INTEGRITY_ERROR,
+                        evidence=EVIDENCE_PENDING,
+                        reasons=[f"REFERENCE:{reference}:{reason}" for reason in reference_errors],
+                    )
+                else:
+                    reference_binding = _v5_source_binding(reference_source)
+                    reference_tolerance = _v5_authenticated_tolerance(reference_source)
+                    reference_frame = _v5_load_frame(reference_source)
+                    if (
+                        reference_frame is None
+                        or tolerance is None
+                        or reference_tolerance is None
+                    ):
+                        states = _v5_constant_edge_states(
+                            integrity=INTEGRITY_ERROR,
+                            evidence=EVIDENCE_PENDING,
+                            reasons=[
+                                f"REFERENCE_FRAME_OR_TOLERANCE_INVALID:{reference}"
+                            ],
+                        )
+                    else:
+                        if TIMEFRAME_SECONDS[reference] < TIMEFRAME_SECONDS[timeframe]:
+                            fine_tf, fine_frame = reference, reference_frame
+                            coarse_tf, coarse_frame = timeframe, target_frame
+                        else:
+                            fine_tf, fine_frame = timeframe, target_frame
+                            coarse_tf, coarse_frame = reference, reference_frame
+                        raw_report = audit_native_cross_resolution(
+                            fine_frame,
+                            coarse_frame,
+                            symbol=symbol,
+                            fine_timeframe=fine_tf,
+                            coarse_timeframe=coarse_tf,
+                            activation_target_timeframe=timeframe,
+                            # Cross-source metadata can disagree. The pair is
+                            # evaluated at the stricter authenticated precision;
+                            # it is never permitted to inherit the looser value.
+                            tick_tolerance=min(tolerance, reference_tolerance),
+                            partition_windows=_v5_audit_windows(
+                                run_request,
+                                timeframe,
+                            ),
+                            thresholds=thresholds,
+                        )
+                        raw_report = dict(raw_report)
+                        raw_report["reference_timeframe"] = reference
+                        pair_reports[reference] = raw_report
+                        states = _v5_pair_window_states(raw_report)
+                    del reference_frame
+                reference_bindings[reference] = reference_binding
+                edge_reports[reference] = build_edge_report(
+                    symbol=symbol,
+                    target_timeframe=timeframe,
+                    reference_timeframe=reference,
+                    source_binding=source_binding,
+                    reference_binding=reference_binding,
+                    window_states=states,
+                    pair_reports=(
+                        {
+                            window: pair_reports[reference]
+                            for window in REQUIRED_AUDIT_WINDOWS
+                        }
+                        if pair_reports[reference] is not None
+                        else None
+                    ),
+                )
+            envelope = build_consensus_envelope(
+                symbol=symbol,
+                target_timeframe=timeframe,
+                source_binding=source_binding,
+                reference_bindings=reference_bindings,
+                edge_reports=edge_reports,
+            )
+            diagnostics = _v5_consensus_diagnostics(envelope)
+            envelope["diagnostics"] = {
+                **dict(envelope.get("diagnostics") or {}),
+                **diagnostics,
+                "raw_pair_reports_recomputed_from_pinned_bars": True,
+            }
+            coverage = _v5_coverage_from_pairs(envelope, pair_reports)
+            consensus_status = str(envelope.get("status") or "ERROR").upper()
+        else:
+            # A missing target has no mathematically meaningful pair. Its
+            # acquisition proof is terminal and the cell is excluded without
+            # pretending that a consensus calculation occurred.
+            consensus_status = "FAIL" if classification == "unavailable" else "ERROR"
+            coverage = {partition: 0.0 for partition in NATIVE_EVIDENCE_PARTITIONS}
+            diagnostics = {
+                "window_disagreement_count": 0,
+                "windows_with_disagreement": [],
+                "per_window": {},
+            }
+            envelope = {
+                "schema_version": CONSENSUS_SCHEMA_VERSION,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "activation_target_timeframe": timeframe,
+                "status": consensus_status,
+                "reference_timeframes": list(references),
+                "source_unavailable": classification == "unavailable",
+                "diagnostics": {
+                    **diagnostics,
+                    "raw_pair_reports_recomputed_from_pinned_bars": False,
+                },
+            }
+        del target_frame
+
+        if consensus_status == "PASS":
+            history_status, coverage_reasons, normalized_coverage = (
+                classify_native_session_history(
+                    coverage,
+                    minimum=float(minimum_session_coverage),
+                )
+            )
+            coverage = normalized_coverage
+            coverage_status = (
+                "PASS"
+                if history_status == "sufficient"
+                else "FAIL"
+                if history_status == "insufficient"
+                else "ERROR"
+            )
+        elif consensus_status == "FAIL":
+            coverage_status = "FAIL"
+            coverage_reasons = ["CROSS_RESOLUTION_CONSENSUS_FAILED"]
+        elif consensus_status == "PENDING":
+            coverage_status = "PENDING"
+            coverage_reasons = ["CROSS_RESOLUTION_CONSENSUS_PENDING"]
+        else:
+            coverage_status = "ERROR"
+            coverage_reasons = ["CROSS_RESOLUTION_CONSENSUS_INTEGRITY_ERROR"]
+
+        reasons: list[str] = []
+        reasons.extend(f"SOURCE:{reason}" for reason in source_errors)
+        reasons.extend(f"RESOLUTION:{reason}" for reason in resolution_reasons)
+        reasons.extend(coverage_reasons)
+        for window, detail in diagnostics.get("per_window", {}).items():
+            if detail.get("disagreement"):
+                reasons.append(f"CONSENSUS_DISAGREEMENT:{window}")
+        reasons = list(dict.fromkeys(reasons))
+
+        if classification == "unavailable" and not source_errors:
+            final_status = "excluded_no_trade"
+            universe_status = "excluded_no_trade"
+            audit_status = "FAIL"
+            failure = str(
+                (availability_cells.get(timeframe) or {}).get("failure_status") or ""
+            ).upper()
+            reasons = [f"ACQUISITION_UNAVAILABLE:{failure}"]
+        elif classification != "success" or source_errors or consensus_status == "ERROR" or coverage_status == "ERROR":
+            final_status = "failed"
+            universe_status = "invalid"
+            audit_status = "FAIL"
+            if classification != "success" and not reasons:
+                reasons = [f"SOURCE_AVAILABILITY_INVALID:{availability_error or 'unknown'}"]
+            blocking.append("FAIL")
+        elif consensus_status == "PENDING" or coverage_status == "PENDING" or resolution_status == "PENDING":
+            final_status = "pending"
+            universe_status = "invalid"
+            audit_status = "PENDING"
+            blocking.append("PENDING")
+        elif consensus_status == "FAIL" or coverage_status == "FAIL" or resolution_status == "FAIL":
+            final_status = "excluded_no_trade"
+            universe_status = "excluded_no_trade"
+            audit_status = "FAIL"
+        elif resolution_status == "PASS":
+            final_status = "active"
+            universe_status = "eligible"
+            audit_status = "PASS"
+        else:
+            final_status = "failed"
+            universe_status = "invalid"
+            audit_status = "FAIL"
+            blocking.append("FAIL")
+
+        reference_binding_projection = {
+            reference: dict(reference_bindings.get(reference) or {})
+            for reference in references
+        }
+        envelope.update(
+            {
+                "activation_id": activation_id,
+                "run_id": run_id,
+                "cell_activation_status": audit_status,
+                "cell_reason_codes": reasons,
+                "expected_session_coverage_by_partition": coverage,
+                "coverage_method": NATIVE_SESSION_COVERAGE_METHOD,
+                "minimum_session_coverage": float(minimum_session_coverage),
+                "source_bars_sha256": source.get("bars_sha256"),
+                "source_provenance_sha256": source.get("provenance_sha256"),
+                "cross_resolution_reference_timeframes": list(references),
+                "cross_resolution_reference_bindings": reference_binding_projection,
+                "run_manifest_relative_path": str(
+                    run_manifest_path.relative_to(native_root)
+                ).replace("\\", "/"),
+                "run_manifest_sha256": run_manifest_sha,
+                "audited_at_utc": audited_at,
+            }
+        )
+        envelope["consensus_sha256"] = canonical_sha256(
+            {
+                key: value
+                for key, value in envelope.items()
+                if key != "consensus_sha256"
+            }
+        )
+        if classification == "success":
+            consensus_errors = validate_consensus_envelope(
+                envelope,
+                symbol=symbol,
+                target_timeframe=timeframe,
+                source_binding=source_binding,
+                reference_bindings=reference_bindings,
+            )
+            if consensus_errors:
+                final_status = "failed"
+                universe_status = "invalid"
+                audit_status = "FAIL"
+                reasons = list(
+                    dict.fromkeys([*reasons, *(f"CONSENSUS:{e}" for e in consensus_errors)])
+                )
+                envelope["cell_activation_status"] = audit_status
+                envelope["cell_reason_codes"] = reasons
+                envelope["consensus_sha256"] = canonical_sha256(
+                    {
+                        key: value
+                        for key, value in envelope.items()
+                        if key != "consensus_sha256"
+                    }
+                )
+                blocking.append("FAIL")
+
+        observed = provenance.get("observed_session_bars_by_partition")
+        expected = provenance.get("expected_session_bars_by_partition")
+        audited_sidecar = {
+            "schema_version": SCHEMA_VERSION,
+            "audited_sidecar_contract": AUDITED_SIDECAR_CONTRACT,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source_kind": "broker_native",
+            "timezone": "UTC",
+            "timestamp_semantics": "bar_open_utc",
+            "bar_interval_semantics": "half_open_[bar_open,bar_close)",
+            "bar_close_column": "_BAR_CLOSE_TS",
+            "sha256": source.get("bars_sha256"),
+            "rows": int((availability_cells.get(timeframe) or {}).get("rows") or 0),
+            "start_ts": provenance.get("start_ts"),
+            "end_ts": provenance.get("end_ts"),
+            "complete": audit_status == "PASS",
+            "resolution_audit": resolution,
+            "coverage_method": NATIVE_SESSION_COVERAGE_METHOD,
+            "expected_session_coverage_by_partition": coverage,
+            "source_timestamp_coverage_method": str(
+                ((provenance.get("expected_session_coverage_details_by_partition") or {}).get("method"))
+                or ""
+            ),
+            "source_timestamp_coverage_by_partition": provenance.get(
+                "expected_session_coverage_by_partition"
+            ),
+            "observed_session_bars_by_partition": observed,
+            "expected_session_bars_by_partition": expected,
+            "common_calendar_boundaries": ((provenance.get("request") or {}).get("cell_calendar_boundaries")),
+            "cell_calendar_boundaries": ((provenance.get("request") or {}).get("cell_calendar_boundaries")),
+            "timeframe_calendar_boundaries_sha256": ((provenance.get("request") or {}).get("timeframe_calendar_boundaries_sha256")),
+            "run_id": run_id,
+            "activation_id": activation_id,
+            "activation_status": audit_status,
+            "activation_reason_codes": reasons,
+            "parity_status": consensus_status,
+            "consensus_disagreement_count": diagnostics.get("window_disagreement_count", 0),
+            "consensus_window_diagnostics": diagnostics.get("per_window", {}),
+            "source_provenance_relative_path": str(
+                Path(source["provenance_path"]).resolve().relative_to(native_root)
+            ).replace("\\", "/"),
+            "source_provenance_sha256": source.get("provenance_sha256"),
+            "cross_resolution_reference_timeframes": list(references),
+            "cross_resolution_reference_bindings": reference_binding_projection,
+            "run_manifest_relative_path": str(
+                run_manifest_path.relative_to(native_root)
+            ).replace("\\", "/"),
+            "run_manifest_sha256": run_manifest_sha,
+            "audited_at_utc": audited_at,
+        }
+        parity_path, sidecar_path = _write_audit_leaf(
+            audit_root,
+            symbol,
+            timeframe,
+            envelope,
+            audited_sidecar,
+        )
+        parity_sha = sha256_file(parity_path)
+        sidecar_sha = sha256_file(sidecar_path)
+        audited_cells[timeframe] = {
+            "source_validation_status": (
+                "ACQUISITION_UNAVAILABLE"
+                if classification == "unavailable" and not source_errors
+                else "PASS"
+                if not source_errors
+                else "FAIL"
+            ),
+            "parity_status": consensus_status,
+            "coverage_status": (
+                "NOT_APPLICABLE"
+                if classification == "unavailable"
+                else "INSUFFICIENT"
+                if coverage_status == "FAIL"
+                else coverage_status
+            ),
+            "coverage_reason_codes": (
+                [] if classification == "unavailable" else list(coverage_reasons)
+            ),
+            "resolution_status": resolution_status,
+            "resolution_reason_codes": resolution_reasons,
+            "expected_session_coverage_by_partition": coverage,
+            "observed_session_bars_by_partition": observed,
+            "expected_session_bars_by_partition": expected,
+            "coverage_method": NATIVE_SESSION_COVERAGE_METHOD,
+            "source_provenance_sha256": source.get("provenance_sha256"),
+            "cross_resolution_reference_timeframes": list(references),
+            "cross_resolution_reference_bindings": reference_binding_projection,
+            "consensus_disagreement_count": diagnostics.get("window_disagreement_count", 0),
+            "consensus_window_diagnostics": diagnostics.get("per_window", {}),
+            "audited_sidecar_sha256": sidecar_sha,
+            "parity_sha256": parity_sha,
+        }
+        symbol_entries[timeframe] = {
+            "status": final_status,
+            "audit_status": audit_status,
+            "universe_eligibility_status": universe_status,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "run_id": run_id,
+            "bars_relative_path": str(
+                Path(source["bars_path"]).resolve().relative_to(native_root)
+            ).replace("\\", "/"),
+            "bars_sha256": source.get("bars_sha256"),
+            "run_manifest_sha256": run_manifest_sha,
+            "sidecar_relative_path": str(sidecar_path.relative_to(native_root)).replace("\\", "/"),
+            "sidecar_sha256": sidecar_sha,
+            "parity_relative_path": str(parity_path.relative_to(native_root)).replace("\\", "/"),
+            "parity_sha256": parity_sha,
+            "coverage_method": NATIVE_SESSION_COVERAGE_METHOD,
+            "cross_resolution_reference_timeframes": list(references),
+            "cross_resolution_reference_bindings": reference_binding_projection,
+            "consensus_status": consensus_status,
+            "consensus_disagreement_count": diagnostics.get("window_disagreement_count", 0),
+            "consensus_window_diagnostics": diagnostics.get("per_window", {}),
+            "resolution_status": resolution_status,
+            "resolution_reason_codes": resolution_reasons,
+            "expected_session_coverage_by_partition": coverage,
+            "observed_session_bars_by_partition": observed,
+            "expected_session_bars_by_partition": expected,
+            "reason_codes": reasons,
+        }
+    return symbol_entries, audited_cells, list(dict.fromkeys(blocking))
+
+
 def audit_and_activate(
     native_root: Path,
     *,
@@ -1712,16 +2633,33 @@ def audit_and_activate(
         else:
             run_manifest_errors.append("RUN_MANIFEST_RESULT_NOT_OBJECT")
 
-    cross_resolution_mode = str(
+    request_map_version = str(
         run_request.get("timeframe_request_map_schema_version") or ""
-    ) == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+    )
+    v5_consensus_mode = request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+    v4_cross_resolution_mode = (
+        request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4
+    )
+    cross_resolution_mode = v5_consensus_mode or v4_cross_resolution_mode
     audit_reference_map: Dict[str, str] = {}
-    if cross_resolution_mode:
+    if v5_consensus_mode:
+        run_manifest_errors.extend(
+            _v5_request_errors(run_request, canonical_timeframes)
+        )
         declared_references = run_request.get("timeframe_audit_reference_map")
-        try:
-            expected_references = cross_resolution_reference_map(canonical_timeframes)
-        except ValueError:
-            expected_references = {}
+        expected_references = {
+            target: list(expected_reference_timeframes(target))
+            for target in DEFAULT_TIMEFRAMES
+        }
+        if not isinstance(declared_references, Mapping) or dict(
+            declared_references
+        ) != expected_references:
+            run_manifest_errors.append("RUN_MANIFEST_AUDIT_REFERENCE_MAP_INVALID")
+    elif v4_cross_resolution_mode:
+        declared_references = run_request.get("timeframe_audit_reference_map")
+        expected_references = _legacy_cross_resolution_reference_map(
+            canonical_timeframes
+        )
         if not isinstance(declared_references, Mapping) or dict(
             declared_references
         ) != expected_references:
@@ -1749,6 +2687,33 @@ def audit_and_activate(
         availability_status = str(availability.get("status") or "invalid")
         if availability_status == "invalid":
             activation_blocking_statuses.append("FAIL")
+        if v5_consensus_mode:
+            (
+                entries[symbol],
+                audited_sufficiency_cells[symbol],
+                v5_blocking,
+            ) = _v5_audit_symbol(
+                native_root,
+                audit_root=audit_root,
+                symbol=symbol,
+                timeframes=canonical_timeframes,
+                run_id=run_id,
+                activation_id=activation_id,
+                run_manifest_cells=run_manifest_cells,
+                run_manifest_errors=run_manifest_errors,
+                run_request=run_request,
+                run_source_environment=run_source_environment,
+                run_manifest_path=run_manifest_path,
+                run_manifest_sha=run_manifest_sha,
+                availability=availability,
+                thresholds=thresholds,
+                minimum_session_coverage=float(minimum_session_coverage),
+                overrides=overrides,
+                audited_at=started,
+            )
+            activation_blocking_statuses.extend(v5_blocking)
+            declared_coverage_methods.add(NATIVE_SESSION_COVERAGE_METHOD)
+            continue
         sources = {
             timeframe: _source_leaf(
                 native_root,

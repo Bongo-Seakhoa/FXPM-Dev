@@ -17,8 +17,29 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import pandas as pd
+
 from pm_evidence import TIMEFRAME_EVIDENCE_CONTRACT_VERSION
-from pm_native_resolution import RESOLUTION_AUDIT_SCHEMA_VERSION
+from pm_native_consensus import (
+    CONSENSUS_POLICY,
+    EVIDENCE_PASS,
+    EVIDENCE_PENDING,
+    EVIDENCE_SEMANTIC_FAIL,
+    EVIDENCE_TERMINAL_UNAVAILABLE,
+    INTEGRITY_ERROR,
+    INTEGRITY_PASS,
+    REQUIRED_AUDIT_WINDOWS,
+    build_consensus_envelope,
+    build_edge_report,
+    expected_reference_timeframes,
+    validate_consensus_envelope,
+)
+from pm_native_parity import (
+    ParityThresholds,
+    audit_native_cross_resolution,
+    normalize_ohlc_frame,
+)
+from pm_native_resolution import RESOLUTION_AUDIT_SCHEMA_VERSION, audit_native_resolution
 
 
 ACTIVE_POINTER_SCHEMA = "fxpm-native-active-pointer-v1"
@@ -58,7 +79,10 @@ SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS = frozenset(
 LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = (
     "fxpm.native_history.timeframe_request_map.v3"
 )
-TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v4"
+FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = (
+    "fxpm.native_history.timeframe_request_map.v4"
+)
+TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v5"
 NATIVE_EVIDENCE_PARTITIONS: Tuple[str, ...] = (
     "optimizer_train",
     "tuning_validation",
@@ -424,6 +448,7 @@ def _validated_calendar_contract(
         )
         if request_map_version not in {
             LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+            FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
             TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
         }:
             errors.append("NATIVE_UNIVERSE_TIMEFRAME_REQUEST_MAP_SCHEMA_INVALID")
@@ -445,7 +470,7 @@ def _validated_calendar_contract(
                 "timeframe_source_request_intervals"
             ),
         }
-        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+        if request_map_version == FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
             request_map_fields.update(
                 {
                     "timeframe_strategy_evidence_intervals": request.get(
@@ -457,6 +482,21 @@ def _validated_calendar_contract(
                     "timeframe_audit_only_prefix_intervals": request.get(
                         "timeframe_audit_only_prefix_intervals"
                     ),
+                }
+            )
+        elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            request_map_fields.update(
+                {
+                    field_name: request.get(field_name)
+                    for field_name in (
+                        "timeframe_strategy_evidence_intervals",
+                        "timeframe_audit_reference_map",
+                        "timeframe_audit_consumer_map",
+                        "timeframe_audit_windows",
+                        "timeframe_audit_reference_intervals",
+                        "timeframe_audit_only_intervals",
+                        "timeframe_consensus_policy",
+                    )
                 }
             )
         if str(request.get("timeframe_request_map_sha256") or "") != (
@@ -473,6 +513,16 @@ def _validated_calendar_contract(
                     "timeframe_strategy_evidence_intervals",
                     "timeframe_audit_reference_map",
                     "timeframe_audit_only_prefix_intervals",
+                )
+                if request_map_version
+                == FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+                else (
+                    "timeframe_strategy_evidence_intervals",
+                    "timeframe_audit_reference_map",
+                    "timeframe_audit_consumer_map",
+                    "timeframe_audit_windows",
+                    "timeframe_audit_reference_intervals",
+                    "timeframe_audit_only_intervals",
                 )
                 if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
                 else ()
@@ -542,7 +592,10 @@ def _validated_calendar_contract(
                 errors.append(
                     f"NATIVE_UNIVERSE_TIMEFRAME_SOURCE_INTERVAL_INVALID:{timeframe}"
                 )
-            if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            if request_map_version in {
+                FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+                TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+            }:
                 strategy_interval = (
                     strategy_intervals.get(timeframe)
                     if isinstance(strategy_intervals, Mapping)
@@ -578,40 +631,48 @@ def _validated_calendar_contract(
                     if isinstance(audit_prefixes, Mapping)
                     else None
                 )
-                if prefix is None:
-                    if interval_start != strategy_start:
-                        errors.append(
-                            "NATIVE_UNIVERSE_TIMEFRAME_AUDIT_PREFIX_INVALID:"
-                            f"{timeframe}"
+                if request_map_version == FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+                    if prefix is None:
+                        if interval_start != strategy_start:
+                            errors.append(
+                                "NATIVE_UNIVERSE_TIMEFRAME_AUDIT_PREFIX_INVALID:"
+                                f"{timeframe}"
+                            )
+                    else:
+                        prefix_start = (
+                            _parse_aware_utc(prefix.get("start_utc"))
+                            if isinstance(prefix, Mapping)
+                            else None
                         )
-                else:
-                    prefix_start = (
-                        _parse_aware_utc(prefix.get("start_utc"))
-                        if isinstance(prefix, Mapping)
-                        else None
-                    )
-                    prefix_end = (
-                        _parse_aware_utc(prefix.get("end_exclusive_utc"))
-                        if isinstance(prefix, Mapping)
-                        else None
-                    )
-                    if (
-                        not isinstance(prefix, Mapping)
-                        or set(prefix)
-                        != {"start_utc", "end_exclusive_utc", "role"}
-                        or prefix.get("role") != "audit_only_reference"
-                        or prefix_start != interval_start
-                        or prefix_end != strategy_start
-                        or prefix_start is None
-                        or prefix_end is None
-                        or prefix_start >= prefix_end
-                    ):
-                        errors.append(
-                            "NATIVE_UNIVERSE_TIMEFRAME_AUDIT_PREFIX_INVALID:"
-                            f"{timeframe}"
+                        prefix_end = (
+                            _parse_aware_utc(prefix.get("end_exclusive_utc"))
+                            if isinstance(prefix, Mapping)
+                            else None
                         )
+                        if (
+                            not isinstance(prefix, Mapping)
+                            or set(prefix)
+                            != {"start_utc", "end_exclusive_utc", "role"}
+                            or prefix.get("role") != "audit_only_reference"
+                            or prefix_start != interval_start
+                            or prefix_end != strategy_start
+                            or prefix_start is None
+                            or prefix_end is None
+                            or prefix_start >= prefix_end
+                        ):
+                            errors.append(
+                                "NATIVE_UNIVERSE_TIMEFRAME_AUDIT_PREFIX_INVALID:"
+                                f"{timeframe}"
+                            )
+                elif interval_start is not None and strategy_start is not None and (
+                    interval_start > strategy_start
+                ):
+                    errors.append(
+                        "NATIVE_UNIVERSE_TIMEFRAME_SOURCE_UNION_INVALID:"
+                        f"{timeframe}"
+                    )
 
-        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+        if request_map_version == FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
             expected_references = _expected_cross_resolution_reference_map(roster)
             if audit_references != expected_references:
                 errors.append("NATIVE_UNIVERSE_TIMEFRAME_AUDIT_REFERENCE_MAP_INVALID")
@@ -640,6 +701,57 @@ def _validated_calendar_contract(
                         errors.append(
                             "NATIVE_UNIVERSE_TIMEFRAME_AUDIT_DEPTH_INVALID:"
                             f"{target}->{reference}"
+                        )
+        elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            expected_references = {
+                target: list(expected_reference_timeframes(target))
+                for target in NATIVE_PRODUCTION_TIMEFRAMES
+            }
+            if roster != NATIVE_PRODUCTION_TIMEFRAMES:
+                errors.append("NATIVE_UNIVERSE_TIMEFRAME_V5_ROSTER_INVALID")
+            if audit_references != expected_references:
+                errors.append("NATIVE_UNIVERSE_TIMEFRAME_AUDIT_REFERENCE_MAP_INVALID")
+            expected_consumers = {
+                timeframe: [] for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+            }
+            for target, references in expected_references.items():
+                for reference in references:
+                    expected_consumers[reference].append(target)
+            if request.get("timeframe_audit_consumer_map") != expected_consumers:
+                errors.append("NATIVE_UNIVERSE_TIMEFRAME_AUDIT_CONSUMER_MAP_INVALID")
+            if request.get("timeframe_consensus_policy") != (
+                CONSENSUS_POLICY
+            ):
+                errors.append("NATIVE_UNIVERSE_TIMEFRAME_CONSENSUS_POLICY_INVALID")
+            audit_windows = request.get("timeframe_audit_windows")
+            edge_intervals = request.get("timeframe_audit_reference_intervals")
+            audit_only_intervals = request.get("timeframe_audit_only_intervals")
+            for field_name, value in (
+                ("AUDIT_WINDOWS", audit_windows),
+                ("AUDIT_REFERENCE_INTERVALS", edge_intervals),
+                ("AUDIT_ONLY_INTERVALS", audit_only_intervals),
+            ):
+                if not isinstance(value, Mapping) or set(value) != set(roster):
+                    errors.append(
+                        f"NATIVE_UNIVERSE_TIMEFRAME_{field_name}_ROSTER_INVALID"
+                    )
+            if isinstance(audit_windows, Mapping) and isinstance(
+                edge_intervals, Mapping
+            ):
+                for target in roster:
+                    target_windows = audit_windows.get(target)
+                    if not isinstance(target_windows, Mapping) or set(
+                        target_windows
+                    ) != set(REQUIRED_AUDIT_WINDOWS):
+                        errors.append(
+                            f"NATIVE_UNIVERSE_TIMEFRAME_AUDIT_WINDOWS_INVALID:{target}"
+                        )
+                    target_edges = edge_intervals.get(target)
+                    if not isinstance(target_edges, Mapping) or set(
+                        target_edges
+                    ) != set(expected_references.get(target, ())):
+                        errors.append(
+                            f"NATIVE_UNIVERSE_TIMEFRAME_AUDIT_EDGES_INVALID:{target}"
                         )
 
         compatibility_timeframe = (
@@ -698,12 +810,707 @@ def _validated_calendar_contract(
                 "timeframe_audit_reference_map": request.get(
                     "timeframe_audit_reference_map"
                 ),
-                "timeframe_audit_only_prefix_intervals": request.get(
-                    "timeframe_audit_only_prefix_intervals"
-                ),
             }
         )
+        request_map_version = str(
+            request.get("timeframe_request_map_schema_version") or ""
+        )
+        if request_map_version == FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            result["timeframe_audit_only_prefix_intervals"] = request.get(
+                "timeframe_audit_only_prefix_intervals"
+            )
+        elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            for field_name in (
+                "timeframe_audit_consumer_map",
+                "timeframe_audit_windows",
+                "timeframe_audit_reference_intervals",
+                "timeframe_audit_only_intervals",
+                "timeframe_consensus_policy",
+            ):
+                result[field_name] = request.get(field_name)
     return result, []
+
+
+def _v5_interval(value: Any) -> Optional[Tuple[datetime, datetime]]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "start_utc",
+        "end_exclusive_utc",
+    }:
+        return None
+    start = _parse_aware_utc(value.get("start_utc"))
+    end = _parse_aware_utc(value.get("end_exclusive_utc"))
+    if start is None or end is None or start >= end:
+        return None
+    return start, end
+
+
+def _v5_pair_states(report: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    partitions = report.get("partitions")
+    states: Dict[str, Dict[str, Any]] = {}
+    for window in REQUIRED_AUDIT_WINDOWS:
+        detail = partitions.get(window) if isinstance(partitions, Mapping) else None
+        status = str(
+            detail.get("status") if isinstance(detail, Mapping) else ""
+        ).upper()
+        if status == "PASS":
+            integrity, evidence = INTEGRITY_PASS, EVIDENCE_PASS
+        elif status == "FAIL":
+            integrity, evidence = INTEGRITY_PASS, EVIDENCE_SEMANTIC_FAIL
+        elif status == "PENDING":
+            integrity, evidence = INTEGRITY_PASS, EVIDENCE_PENDING
+        else:
+            integrity, evidence = INTEGRITY_ERROR, EVIDENCE_PENDING
+        states[window] = {
+            "integrity_state": integrity,
+            "evidence_state": evidence,
+            "reason_codes": list(
+                detail.get("reason_codes") if isinstance(detail, Mapping) else []
+                or []
+            ),
+        }
+    return states
+
+
+def _v5_terminal_states(reasons: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    return {
+        window: {
+            "integrity_state": INTEGRITY_PASS,
+            "evidence_state": EVIDENCE_TERMINAL_UNAVAILABLE,
+            "reason_codes": list(reasons),
+        }
+        for window in REQUIRED_AUDIT_WINDOWS
+    }
+
+
+def _v5_tolerance(provenance: Mapping[str, Any]) -> Optional[float]:
+    instrument = provenance.get("instrument")
+    try:
+        value = float(
+            instrument.get("parity_tick_tolerance")
+            if isinstance(instrument, Mapping)
+            else None
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0.0 else None
+
+
+def _v5_read_frame(path: Optional[Path]) -> Optional[pd.DataFrame]:
+    if path is None or not path.is_file():
+        return None
+    try:
+        return normalize_ohlc_frame(pd.read_csv(path))
+    except Exception:
+        return None
+
+
+def _v5_expected_coverage(
+    envelope: Mapping[str, Any],
+    pair_reports: Mapping[str, Optional[Mapping[str, Any]]],
+) -> Dict[str, Optional[float]]:
+    result: Dict[str, Optional[float]] = {}
+    for partition in NATIVE_EVIDENCE_PARTITIONS:
+        status = str(
+            ((envelope.get("windows") or {}).get(partition) or {}).get("status")
+            or ""
+        ).upper()
+        candidates: List[float] = []
+        for report in pair_reports.values():
+            detail = (
+                (report.get("partitions") or {}).get(partition)
+                if isinstance(report, Mapping)
+                else None
+            )
+            if not isinstance(detail, Mapping) or str(
+                detail.get("status") or ""
+            ).upper() != "PASS":
+                continue
+            raw = detail.get("bidirectional_coverage") if isinstance(detail, Mapping) else None
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value) and 0.0 <= value <= 1.0:
+                candidates.append(value)
+        result[partition] = (
+            max(candidates)
+            if status == "PASS" and candidates
+            else 0.0
+            if status == "FAIL"
+            else None
+        )
+    return result
+
+
+def _v5_expected_disagreement(envelope: Mapping[str, Any]) -> Dict[str, Any]:
+    per_window: Dict[str, Any] = {}
+    count = 0
+    for window in REQUIRED_AUDIT_WINDOWS:
+        detail = (envelope.get("windows") or {}).get(window) or {}
+        states = detail.get("edge_states") or {}
+        outcomes = {
+            str(reference): {
+                "integrity_state": state.get("integrity_state"),
+                "evidence_state": state.get("evidence_state"),
+            }
+            for reference, state in states.items()
+            if isinstance(state, Mapping)
+        }
+        disagreement = len(
+            {
+                (value["integrity_state"], value["evidence_state"])
+                for value in outcomes.values()
+            }
+        ) > 1
+        count += int(disagreement)
+        per_window[window] = {
+            "consensus_status": detail.get("status"),
+            "disagreement": disagreement,
+            "edge_outcomes": outcomes,
+        }
+    return {
+        "window_disagreement_count": count,
+        "windows_with_disagreement": [
+            window
+            for window in REQUIRED_AUDIT_WINDOWS
+            if per_window[window]["disagreement"]
+        ],
+        "per_window": per_window,
+    }
+
+
+def _verify_v5_activation_cell_evidence(
+    native_root: Path,
+    *,
+    symbol: str,
+    timeframe: str,
+    entry: Any,
+    run_cell: Any,
+    audited_cell: Any,
+    expected_cell_status: str,
+    activation_id: str,
+    run_id: str,
+    run_manifest_relative_path: Any,
+    run_manifest_sha256: Any,
+    run_request: Mapping[str, Any],
+    contract_minimum: float,
+    parity_thresholds: Mapping[str, Any],
+    symbol_run_cells: Mapping[str, Mapping[str, Any]],
+) -> List[str]:
+    """Recompute V5 pair evidence from pinned CSVs; never trust stored PASS."""
+
+    cell_id = f"{symbol}|{timeframe}"
+    errors: List[str] = []
+    if not isinstance(entry, Mapping) or not isinstance(run_cell, Mapping):
+        return [f"NATIVE_V5_CELL_EVIDENCE_MISSING:{cell_id}"]
+    allowed_fields = {
+        "status",
+        "audit_status",
+        "universe_eligibility_status",
+        "symbol",
+        "timeframe",
+        "run_id",
+        "bars_relative_path",
+        "bars_sha256",
+        "run_manifest_sha256",
+        "sidecar_relative_path",
+        "sidecar_sha256",
+        "parity_relative_path",
+        "parity_sha256",
+        "coverage_method",
+        "cross_resolution_reference_timeframes",
+        "cross_resolution_reference_bindings",
+        "consensus_status",
+        "consensus_disagreement_count",
+        "consensus_window_diagnostics",
+        "resolution_status",
+        "resolution_reason_codes",
+        "expected_session_coverage_by_partition",
+        "observed_session_bars_by_partition",
+        "expected_session_bars_by_partition",
+        "reason_codes",
+    }
+    if set(entry) - allowed_fields:
+        errors.append(f"NATIVE_V5_ENTRY_FIELDS_INVALID:{cell_id}")
+    for field_name, expected in (
+        ("symbol", symbol),
+        ("timeframe", timeframe),
+        ("run_id", run_id),
+    ):
+        if str(entry.get(field_name) or "") != expected:
+            errors.append(f"NATIVE_V5_ENTRY_{field_name.upper()}_MISMATCH:{cell_id}")
+    if str(entry.get("run_manifest_sha256") or "").lower() != str(
+        run_manifest_sha256 or ""
+    ).lower():
+        errors.append(f"NATIVE_V5_ENTRY_RUN_MANIFEST_MISMATCH:{cell_id}")
+    classification, coherence_error = classify_native_availability_cell(
+        run_cell.get("status"),
+        run_cell.get("failure_status"),
+        run_cell.get("rows"),
+    )
+    if classification == "invalid":
+        errors.append(
+            f"NATIVE_V5_RUN_AVAILABILITY_INVALID:{cell_id}:{coherence_error or 'unknown'}"
+        )
+    if str(entry.get("bars_sha256") or "").lower() != str(
+        run_cell.get("sha256") or ""
+    ).lower():
+        errors.append(f"NATIVE_V5_RUN_BARS_MISMATCH:{cell_id}")
+
+    sidecar_path, file_errors = _verify_pinned_file(
+        native_root,
+        entry.get("sidecar_relative_path"),
+        entry.get("sidecar_sha256"),
+        error_prefix=f"NATIVE_V5_SIDECAR:{cell_id}",
+    )
+    errors.extend(file_errors)
+    consensus_path, file_errors = _verify_pinned_file(
+        native_root,
+        entry.get("parity_relative_path"),
+        entry.get("parity_sha256"),
+        error_prefix=f"NATIVE_V5_CONSENSUS:{cell_id}",
+    )
+    errors.extend(file_errors)
+    sidecar, object_errors = _read_evidence_object(
+        sidecar_path,
+        error_prefix=f"NATIVE_V5_SIDECAR:{cell_id}",
+    )
+    errors.extend(object_errors)
+    consensus, object_errors = _read_evidence_object(
+        consensus_path,
+        error_prefix=f"NATIVE_V5_CONSENSUS:{cell_id}",
+    )
+    errors.extend(object_errors)
+    if not isinstance(sidecar, Mapping) or not isinstance(consensus, Mapping):
+        return list(dict.fromkeys(errors))
+
+    provenance_relative = sidecar.get("source_provenance_relative_path")
+    provenance_path, file_errors = _verify_pinned_file(
+        native_root,
+        provenance_relative,
+        sidecar.get("source_provenance_sha256"),
+        error_prefix=f"NATIVE_V5_PROVENANCE:{cell_id}",
+    )
+    errors.extend(file_errors)
+    provenance, object_errors = _read_evidence_object(
+        provenance_path,
+        error_prefix=f"NATIVE_V5_PROVENANCE:{cell_id}",
+    )
+    errors.extend(object_errors)
+    if not isinstance(provenance, Mapping):
+        return list(dict.fromkeys(errors))
+    if str(provenance.get("sha256") or "").lower() != str(
+        entry.get("bars_sha256") or ""
+    ).lower():
+        errors.append(f"NATIVE_V5_PROVENANCE_BARS_MISMATCH:{cell_id}")
+    provenance_request = provenance.get("request")
+    for field_name in (
+        "window_contract_version",
+        "timeframe_request_map_schema_version",
+        "timeframe_window_years",
+        "timeframe_calendar_boundaries",
+        "timeframe_calendar_boundaries_sha256",
+        "timeframe_required_evidence_lead_start_utc",
+        "timeframe_source_request_intervals",
+        "timeframe_strategy_evidence_intervals",
+        "timeframe_audit_reference_map",
+        "timeframe_audit_consumer_map",
+        "timeframe_audit_windows",
+        "timeframe_audit_reference_intervals",
+        "timeframe_audit_only_intervals",
+        "timeframe_consensus_policy",
+        "timeframe_request_map_sha256",
+    ):
+        if not isinstance(provenance_request, Mapping) or provenance_request.get(
+            field_name
+        ) != run_request.get(field_name):
+            errors.append(
+                f"NATIVE_V5_PROVENANCE_REQUEST_MISMATCH:{cell_id}:{field_name}"
+            )
+    for leaf_field, map_field in (
+        ("strategy_evidence_interval", "timeframe_strategy_evidence_intervals"),
+        ("audit_reference_timeframes", "timeframe_audit_reference_map"),
+        ("audit_consumer_targets", "timeframe_audit_consumer_map"),
+        ("audit_windows", "timeframe_audit_windows"),
+        ("audit_reference_intervals", "timeframe_audit_reference_intervals"),
+        ("audit_only_intervals", "timeframe_audit_only_intervals"),
+    ):
+        source_map = run_request.get(map_field)
+        expected = source_map.get(timeframe) if isinstance(source_map, Mapping) else None
+        if not isinstance(provenance_request, Mapping) or provenance_request.get(
+            leaf_field
+        ) != expected:
+            errors.append(f"NATIVE_V5_PROVENANCE_LEAF_ROLE_MISMATCH:{cell_id}:{leaf_field}")
+
+    references = expected_reference_timeframes(timeframe)
+    if list(entry.get("cross_resolution_reference_timeframes") or []) != list(
+        references
+    ):
+        errors.append(f"NATIVE_V5_REFERENCE_ORDER_MISMATCH:{cell_id}")
+    if list(consensus.get("reference_timeframes") or []) != list(references):
+        errors.append(f"NATIVE_V5_CONSENSUS_REFERENCE_ORDER_MISMATCH:{cell_id}")
+    for payload, label in ((sidecar, "SIDECAR"), (consensus, "CONSENSUS")):
+        if str(payload.get("activation_id") or "") != activation_id:
+            errors.append(f"NATIVE_V5_{label}_ACTIVATION_MISMATCH:{cell_id}")
+        if str(payload.get("run_id") or "") != run_id:
+            errors.append(f"NATIVE_V5_{label}_RUN_MISMATCH:{cell_id}")
+        if str(payload.get("run_manifest_relative_path") or "").replace(
+            "\\", "/"
+        ) != str(run_manifest_relative_path or "").replace("\\", "/"):
+            errors.append(f"NATIVE_V5_{label}_RUN_MANIFEST_PATH_MISMATCH:{cell_id}")
+        if str(payload.get("run_manifest_sha256") or "").lower() != str(
+            run_manifest_sha256 or ""
+        ).lower():
+            errors.append(f"NATIVE_V5_{label}_RUN_MANIFEST_SHA_MISMATCH:{cell_id}")
+
+    normalized_expected = str(expected_cell_status or "").lower()
+    if normalized_expected == "eligible":
+        normalized_expected = "active"
+    if classification == "unavailable":
+        if normalized_expected != "excluded_no_trade":
+            errors.append(f"NATIVE_V5_UNAVAILABLE_STATUS_MISMATCH:{cell_id}")
+        if consensus.get("source_unavailable") is not True:
+            errors.append(f"NATIVE_V5_UNAVAILABLE_CONSENSUS_INVALID:{cell_id}")
+        return list(dict.fromkeys(errors))
+    if classification != "success":
+        return list(dict.fromkeys(errors))
+
+    bars_path, file_errors = _verify_pinned_file(
+        native_root,
+        entry.get("bars_relative_path"),
+        entry.get("bars_sha256"),
+        error_prefix=f"NATIVE_V5_BARS:{cell_id}",
+    )
+    errors.extend(file_errors)
+    target_frame = _v5_read_frame(bars_path)
+    tolerance = _v5_tolerance(provenance)
+    if target_frame is None or tolerance is None:
+        errors.append(f"NATIVE_V5_TARGET_FRAME_OR_TOLERANCE_INVALID:{cell_id}")
+        return list(dict.fromkeys(errors))
+
+    try:
+        thresholds = ParityThresholds(
+            min_membership_ratio=float(parity_thresholds["min_membership_ratio"]),
+            max_ohlc_mismatch_ratio=float(parity_thresholds["max_ohlc_mismatch_ratio"]),
+            max_unassigned_m5_ratio=float(parity_thresholds["max_unassigned_m5_ratio"]),
+            min_compared_native_bars=int(parity_thresholds["min_compared_native_bars"]),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        errors.append(f"NATIVE_V5_PARITY_THRESHOLDS_INVALID:{cell_id}")
+        return list(dict.fromkeys(errors))
+    raw_windows = (run_request.get("timeframe_audit_windows") or {}).get(timeframe)
+    windows: Dict[str, Tuple[datetime, datetime]] = {}
+    for window in REQUIRED_AUDIT_WINDOWS:
+        parsed = _v5_interval(
+            raw_windows.get(window) if isinstance(raw_windows, Mapping) else None
+        )
+        if parsed is None:
+            errors.append(f"NATIVE_V5_AUDIT_WINDOW_INVALID:{cell_id}:{window}")
+        else:
+            windows[window] = parsed
+    if len(windows) != len(REQUIRED_AUDIT_WINDOWS):
+        return list(dict.fromkeys(errors))
+
+    source_binding = {
+        "availability_state": "AVAILABLE",
+        "bars_sha256": entry.get("bars_sha256"),
+        "provenance_sha256": sidecar.get("source_provenance_sha256"),
+    }
+    expected_reference_bindings: Dict[str, Dict[str, Any]] = {}
+    expected_edges: Dict[str, Dict[str, Any]] = {}
+    pair_reports: Dict[str, Optional[Mapping[str, Any]]] = {}
+    for reference in references:
+        reference_cell = symbol_run_cells.get(reference)
+        reference_class, reference_error = classify_native_availability_cell(
+            reference_cell.get("status") if isinstance(reference_cell, Mapping) else None,
+            reference_cell.get("failure_status") if isinstance(reference_cell, Mapping) else None,
+            reference_cell.get("rows") if isinstance(reference_cell, Mapping) else None,
+        )
+        if reference_class == "unavailable":
+            failure = str(reference_cell.get("failure_status") or "").upper()
+            binding = {
+                "availability_state": EVIDENCE_TERMINAL_UNAVAILABLE,
+                "bars_sha256": None,
+                "provenance_sha256": None,
+            }
+            states = _v5_terminal_states(
+                [f"AUDIT_REFERENCE_UNAVAILABLE:{reference}:{failure or 'UNSPECIFIED'}"]
+            )
+            pair_reports[reference] = None
+        elif reference_class == "success":
+            reference_bars = (
+                native_root / "runs" / run_id / symbol / reference / "bars.csv"
+            )
+            reference_provenance = (
+                native_root / "runs" / run_id / symbol / reference / "provenance.json"
+            )
+            if not reference_bars.is_file() or sha256_file(reference_bars).lower() != str(
+                reference_cell.get("sha256") or ""
+            ).lower():
+                errors.append(f"NATIVE_V5_REFERENCE_BARS_INVALID:{cell_id}:{reference}")
+                continue
+            if not reference_provenance.is_file():
+                errors.append(f"NATIVE_V5_REFERENCE_PROVENANCE_MISSING:{cell_id}:{reference}")
+                continue
+            reference_provenance_sha = sha256_file(reference_provenance)
+            try:
+                reference_provenance_payload = json.loads(
+                    reference_provenance.read_text(encoding="utf-8")
+                )
+            except Exception:
+                errors.append(f"NATIVE_V5_REFERENCE_PROVENANCE_INVALID:{cell_id}:{reference}")
+                continue
+            reference_tolerance = (
+                _v5_tolerance(reference_provenance_payload)
+                if isinstance(reference_provenance_payload, Mapping)
+                else None
+            )
+            reference_frame = _v5_read_frame(reference_bars)
+            if (
+                reference_frame is None
+                or reference_tolerance is None
+            ):
+                errors.append(
+                    f"NATIVE_V5_REFERENCE_FRAME_OR_TOLERANCE_INVALID:{cell_id}:{reference}"
+                )
+                continue
+            binding = {
+                "availability_state": "AVAILABLE",
+                "bars_sha256": reference_cell.get("sha256"),
+                "provenance_sha256": reference_provenance_sha,
+            }
+            if NATIVE_TIMEFRAME_SECONDS[reference] < NATIVE_TIMEFRAME_SECONDS[timeframe]:
+                fine_tf, fine_frame = reference, reference_frame
+                coarse_tf, coarse_frame = timeframe, target_frame
+            else:
+                fine_tf, fine_frame = timeframe, target_frame
+                coarse_tf, coarse_frame = reference, reference_frame
+            raw_report = audit_native_cross_resolution(
+                fine_frame,
+                coarse_frame,
+                symbol=symbol,
+                fine_timeframe=fine_tf,
+                coarse_timeframe=coarse_tf,
+                activation_target_timeframe=timeframe,
+                tick_tolerance=min(tolerance, reference_tolerance),
+                partition_windows=windows,
+                thresholds=thresholds,
+            )
+            raw_report = dict(raw_report)
+            raw_report["reference_timeframe"] = reference
+            pair_reports[reference] = raw_report
+            states = _v5_pair_states(raw_report)
+            del reference_frame
+        else:
+            errors.append(
+                f"NATIVE_V5_REFERENCE_RUN_CELL_INVALID:{cell_id}:{reference}:{reference_error or 'unknown'}"
+            )
+            continue
+        expected_reference_bindings[reference] = binding
+        expected_edges[reference] = build_edge_report(
+            symbol=symbol,
+            target_timeframe=timeframe,
+            reference_timeframe=reference,
+            source_binding=source_binding,
+            reference_binding=binding,
+            window_states=states,
+            pair_reports=(
+                {window: pair_reports[reference] for window in REQUIRED_AUDIT_WINDOWS}
+                if pair_reports[reference] is not None
+                else None
+            ),
+        )
+    if set(expected_edges) != set(references):
+        return list(dict.fromkeys(errors))
+    expected_envelope = build_consensus_envelope(
+        symbol=symbol,
+        target_timeframe=timeframe,
+        source_binding=source_binding,
+        reference_bindings=expected_reference_bindings,
+        edge_reports=expected_edges,
+    )
+    for payload, label in (
+        (entry, "ENTRY"),
+        (sidecar, "SIDECAR"),
+        (audited_cell, "AUDIT"),
+        (consensus, "CONSENSUS"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        if list(payload.get("cross_resolution_reference_timeframes") or []) != list(
+            references
+        ):
+            errors.append(f"NATIVE_V5_{label}_REFERENCE_ORDER_MISMATCH:{cell_id}")
+        if payload.get("cross_resolution_reference_bindings") != (
+            expected_reference_bindings
+        ):
+            errors.append(f"NATIVE_V5_{label}_REFERENCE_BINDINGS_MISMATCH:{cell_id}")
+    errors.extend(
+        f"NATIVE_V5_{value}:{cell_id}"
+        for value in validate_consensus_envelope(
+            consensus,
+            symbol=symbol,
+            target_timeframe=timeframe,
+            source_binding=source_binding,
+            reference_bindings=expected_reference_bindings,
+        )
+    )
+    stored_edges = consensus.get("edges")
+    for reference in references:
+        stored_report = (
+            (stored_edges.get(reference) or {}).get("report")
+            if isinstance(stored_edges, Mapping)
+            else None
+        )
+        if stored_report != expected_edges[reference]:
+            errors.append(
+                f"NATIVE_V5_RAW_PAIR_RECOMPUTATION_MISMATCH:{cell_id}:{reference}"
+            )
+    for field_name in (
+        "status",
+        "reference_timeframes",
+        "reference_graph_sha256",
+        "policy",
+        "policy_sha256",
+        "source_binding",
+        "reference_bindings",
+        "windows",
+    ):
+        if consensus.get(field_name) != expected_envelope.get(field_name):
+            errors.append(f"NATIVE_V5_CONSENSUS_DERIVATION_MISMATCH:{cell_id}:{field_name}")
+
+    expected_disagreement = _v5_expected_disagreement(expected_envelope)
+    consensus_diagnostics = consensus.get("diagnostics")
+    if not isinstance(consensus_diagnostics, Mapping) or consensus_diagnostics.get(
+        "raw_pair_reports_recomputed_from_pinned_bars"
+    ) is not True:
+        errors.append(f"NATIVE_V5_RAW_PAIR_RECOMPUTATION_MARKER_INVALID:{cell_id}")
+    for field_name in (
+        "window_disagreement_count",
+        "windows_with_disagreement",
+        "per_window",
+    ):
+        if not isinstance(consensus_diagnostics, Mapping) or consensus_diagnostics.get(
+            field_name
+        ) != expected_disagreement[field_name]:
+            errors.append(
+                f"NATIVE_V5_CONSENSUS_DISAGREEMENT_MISMATCH:{cell_id}:{field_name}"
+            )
+    for payload, label in (
+        (entry, "ENTRY"),
+        (sidecar, "SIDECAR"),
+        (audited_cell, "AUDIT"),
+    ):
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("consensus_disagreement_count") != expected_disagreement[
+            "window_disagreement_count"
+        ]:
+            errors.append(f"NATIVE_V5_{label}_DISAGREEMENT_COUNT_MISMATCH:{cell_id}")
+        if payload.get("consensus_window_diagnostics") != expected_disagreement[
+            "per_window"
+        ]:
+            errors.append(f"NATIVE_V5_{label}_WINDOW_DIAGNOSTICS_MISMATCH:{cell_id}")
+
+    expected_coverage = _v5_expected_coverage(expected_envelope, pair_reports)
+    if consensus.get("expected_session_coverage_by_partition") != expected_coverage:
+        errors.append(f"NATIVE_V5_CONSENSUS_COVERAGE_MISMATCH:{cell_id}")
+    for payload, label in (
+        (entry, "ENTRY"),
+        (sidecar, "SIDECAR"),
+        (audited_cell, "AUDIT"),
+    ):
+        if isinstance(payload, Mapping) and payload.get(
+            "expected_session_coverage_by_partition"
+        ) != expected_coverage:
+            errors.append(f"NATIVE_V5_{label}_COVERAGE_MISMATCH:{cell_id}")
+
+    # Resolution is independently recomputed before any consensus decision is
+    # allowed to activate the cell. D1 is loaded only for this calculation and
+    # released before returning; pair references were processed sequentially.
+    d1_cell = symbol_run_cells.get("D1")
+    d1_path = native_root / "runs" / run_id / symbol / "D1" / "bars.csv"
+    d1_frame: Optional[pd.DataFrame] = None
+    if isinstance(d1_cell, Mapping) and str(d1_cell.get("status") or "").lower() == "success":
+        if d1_path.is_file() and sha256_file(d1_path).lower() == str(
+            d1_cell.get("sha256") or ""
+        ).lower():
+            d1_frame = target_frame if timeframe == "D1" else _v5_read_frame(d1_path)
+    resolution = audit_native_resolution(
+        target_frame,
+        symbol=symbol,
+        timeframe=timeframe,
+        daily_frame=d1_frame,
+        tick_tolerance=tolerance,
+    ).to_dict()
+    serialized_resolution = json.loads(
+        json.dumps(resolution, sort_keys=True, ensure_ascii=False)
+    )
+    if sidecar.get("resolution_audit") != serialized_resolution:
+        errors.append(f"NATIVE_V5_RESOLUTION_RECOMPUTATION_MISMATCH:{cell_id}")
+    resolution_status = str(resolution.get("status") or "PENDING").upper()
+    history_status, _history_reasons, _normalized = classify_native_session_history(
+        expected_coverage,
+        minimum=contract_minimum,
+    )
+    consensus_status = str(expected_envelope.get("status") or "ERROR").upper()
+    derived = (
+        "active"
+        if consensus_status == "PASS"
+        and history_status == "sufficient"
+        and resolution_status == "PASS"
+        else "excluded_no_trade"
+        if consensus_status == "FAIL"
+        or history_status == "insufficient"
+        or resolution_status == "FAIL"
+        else "invalid"
+    )
+    if derived != normalized_expected:
+        errors.append(
+            f"NATIVE_V5_UNIVERSE_STATUS_MISMATCH:{cell_id}:{derived}!={normalized_expected}"
+        )
+    expected_audit_status = "PASS" if derived == "active" else "FAIL"
+    expected_reasons = [
+        f"RESOLUTION:{value}"
+        for value in (resolution.get("reason_codes") or [])
+        if str(value)
+    ]
+    if consensus_status == "FAIL":
+        expected_reasons.append("CROSS_RESOLUTION_CONSENSUS_FAILED")
+    elif consensus_status == "PENDING":
+        expected_reasons.append("CROSS_RESOLUTION_CONSENSUS_PENDING")
+    elif consensus_status == "ERROR":
+        expected_reasons.append("CROSS_RESOLUTION_CONSENSUS_INTEGRITY_ERROR")
+    elif history_status != "sufficient":
+        expected_reasons.extend(_history_reasons)
+    expected_reasons.extend(
+        f"CONSENSUS_DISAGREEMENT:{window}"
+        for window in expected_disagreement["windows_with_disagreement"]
+    )
+    expected_reasons = list(dict.fromkeys(expected_reasons))
+    if str(entry.get("audit_status") or "").upper() != expected_audit_status:
+        errors.append(f"NATIVE_V5_ENTRY_AUDIT_STATUS_MISMATCH:{cell_id}")
+    if list(entry.get("reason_codes") or []) != expected_reasons:
+        errors.append(f"NATIVE_V5_ENTRY_REASON_DERIVATION_MISMATCH:{cell_id}")
+    if str(sidecar.get("activation_status") or "").upper() != expected_audit_status:
+        errors.append(f"NATIVE_V5_SIDECAR_AUDIT_STATUS_MISMATCH:{cell_id}")
+    if list(sidecar.get("activation_reason_codes") or []) != expected_reasons:
+        errors.append(f"NATIVE_V5_SIDECAR_REASON_DERIVATION_MISMATCH:{cell_id}")
+    if str(consensus.get("cell_activation_status") or "").upper() != (
+        expected_audit_status
+    ):
+        errors.append(f"NATIVE_V5_CONSENSUS_AUDIT_STATUS_MISMATCH:{cell_id}")
+    if list(consensus.get("cell_reason_codes") or []) != expected_reasons:
+        errors.append(f"NATIVE_V5_CONSENSUS_REASON_DERIVATION_MISMATCH:{cell_id}")
+    if sidecar.get("complete") is not (expected_audit_status == "PASS"):
+        errors.append(f"NATIVE_V5_SIDECAR_COMPLETE_MISMATCH:{cell_id}")
+    if str(entry.get("consensus_status") or "").upper() != consensus_status:
+        errors.append(f"NATIVE_V5_ENTRY_CONSENSUS_STATUS_MISMATCH:{cell_id}")
+    if str(sidecar.get("parity_status") or "").upper() != consensus_status:
+        errors.append(f"NATIVE_V5_SIDECAR_CONSENSUS_STATUS_MISMATCH:{cell_id}")
+    if str(entry.get("status") or "").lower() != normalized_expected:
+        errors.append(f"NATIVE_V5_ENTRY_STATUS_MISMATCH:{cell_id}")
+    return list(dict.fromkeys(errors))
 
 
 def _verify_activation_cell_evidence(
@@ -724,6 +1531,8 @@ def _verify_activation_cell_evidence(
     expected_coverage_method: str,
     require_resolution_audit: bool,
     reference_run_cell: Any,
+    parity_thresholds: Optional[Mapping[str, Any]] = None,
+    symbol_run_cells: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> List[str]:
     """Bind one manifest decision to the immutable acquisition/audit bytes.
 
@@ -733,6 +1542,27 @@ def _verify_activation_cell_evidence(
     provenance, audited sidecar and parity report, and requires every copied
     manifest claim to agree with those records.
     """
+
+    if str(run_request.get("timeframe_request_map_schema_version") or "") == (
+        TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+    ):
+        return _verify_v5_activation_cell_evidence(
+            native_root,
+            symbol=symbol,
+            timeframe=timeframe,
+            entry=entry,
+            run_cell=run_cell,
+            audited_cell=audited_cell,
+            expected_cell_status=expected_cell_status,
+            activation_id=activation_id,
+            run_id=run_id,
+            run_manifest_relative_path=run_manifest_relative_path,
+            run_manifest_sha256=run_manifest_sha256,
+            run_request=run_request,
+            contract_minimum=contract_minimum,
+            parity_thresholds=parity_thresholds or {},
+            symbol_run_cells=symbol_run_cells or {},
+        )
 
     cell_id = f"{symbol}|{timeframe}"
     legacy_symbol_excluded = (
@@ -1766,7 +2596,7 @@ def resolve_active_native_universe(
                 or ""
             ) != TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
                 result.errors.append(
-                    "NATIVE_UNIVERSE_PRODUCTION_TIMEFRAME_V4_REQUIRED"
+                    "NATIVE_UNIVERSE_PRODUCTION_TIMEFRAME_V5_REQUIRED"
                 )
             if contract_decision_basis != NATIVE_SOURCE_EVIDENCE_DECISION_BASIS:
                 result.errors.append(
@@ -2040,6 +2870,20 @@ def resolve_active_native_universe(
                     "audited_sidecar_sha256",
                     "parity_sha256",
                 }
+                if str(
+                    verified_run_request.get(
+                        "timeframe_request_map_schema_version"
+                    )
+                    or ""
+                ) == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+                    allowed_audit_fields.update(
+                        {
+                            "cross_resolution_reference_timeframes",
+                            "cross_resolution_reference_bindings",
+                            "consensus_disagreement_count",
+                            "consensus_window_diagnostics",
+                        }
+                    )
                 if set(audit_cell) - allowed_audit_fields:
                     result.errors.append(
                         f"NATIVE_UNIVERSE_EXCLUSION_AUDIT_FIELDS_INVALID:{symbol}|{timeframe}"
@@ -2054,7 +2898,21 @@ def resolve_active_native_universe(
                         result.errors.append(
                             f"NATIVE_UNIVERSE_EXCLUSION_SOURCE_STATUS_INVALID:{symbol}|{timeframe}"
                         )
-                    if parity_status != "NOT_APPLICABLE" or coverage_status != "NOT_APPLICABLE":
+                    unavailable_parity_status = (
+                        "FAIL"
+                        if str(
+                            verified_run_request.get(
+                                "timeframe_request_map_schema_version"
+                            )
+                            or ""
+                        )
+                        == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+                        else "NOT_APPLICABLE"
+                    )
+                    if (
+                        parity_status != unavailable_parity_status
+                        or coverage_status != "NOT_APPLICABLE"
+                    ):
                         result.errors.append(
                             f"NATIVE_UNIVERSE_EXCLUSION_UNAVAILABLE_AUDIT_INVALID:{symbol}|{timeframe}"
                         )
@@ -2493,7 +3351,13 @@ def resolve_active_native_universe(
             elif str(entry.get("status") or "").lower() != "excluded_no_trade":
                 result.errors.append(f"NATIVE_EXCLUDED_AUDIT_CELL_STATUS_INVALID:{cell_id}")
 
-    if result.explicit_contract and verify_exclusion_evidence:
+    # Production resolution may never disable byte-level evidence replay. The
+    # compatibility flag remains available only for non-production forensic
+    # inspection of historical manifests.
+    verify_cell_evidence = bool(
+        verify_exclusion_evidence or production_contract_required
+    )
+    if result.explicit_contract and verify_cell_evidence:
         for symbol in result.requested_symbols:
             symbol_entries = entries.get(symbol) if isinstance(entries.get(symbol), Mapping) else {}
             excluded_record = result.excluded_symbols.get(symbol) or {}
@@ -2552,6 +3416,16 @@ def resolve_active_native_universe(
                                 ).upper(),
                             )
                         ),
+                        parity_thresholds=(
+                            manifest.get("parity_thresholds")
+                            if isinstance(manifest.get("parity_thresholds"), Mapping)
+                            else {}
+                        ),
+                        symbol_run_cells={
+                            candidate_timeframe: candidate_cell
+                            for (candidate_symbol, candidate_timeframe), candidate_cell in run_cells.items()
+                            if candidate_symbol == symbol
+                        },
                     )
                 )
 
@@ -2853,11 +3727,47 @@ def resolve_active_native_artifact(
             data_dir,
             required_timeframes=declared_required or (tf,),
             verify_exclusion_evidence=False,
-            production_contract_required=production_contract_required,
+            # This cell resolver performs the expensive raw-bar replay for the
+            # requested cell below. Asking the universe resolver to replay the
+            # complete symbol grid first would multiply twelve-edge validation
+            # by every artifact load without adding evidence.
+            production_contract_required=False,
         )
         if semantic_universe.errors:
             result.errors.extend(semantic_universe.errors)
             return result
+        if production_contract_required:
+            if semantic_universe.eligibility_schema != UNIVERSE_ELIGIBILITY_SCHEMA:
+                result.errors.append(
+                    "NATIVE_UNIVERSE_PRODUCTION_CURRENT_ELIGIBILITY_SCHEMA_REQUIRED"
+                )
+            if str(universe.get("session_coverage_method") or "") != (
+                NATIVE_SESSION_COVERAGE_METHOD
+            ):
+                result.errors.append(
+                    "NATIVE_UNIVERSE_PRODUCTION_CROSS_RESOLUTION_REQUIRED"
+                )
+            if str(
+                semantic_universe.calendar_contract.get(
+                    "timeframe_request_map_schema_version"
+                )
+                or ""
+            ) != TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+                result.errors.append(
+                    "NATIVE_UNIVERSE_PRODUCTION_TIMEFRAME_V5_REQUIRED"
+                )
+            if semantic_universe.decision_basis != (
+                NATIVE_SOURCE_EVIDENCE_DECISION_BASIS
+            ):
+                result.errors.append(
+                    "NATIVE_UNIVERSE_PRODUCTION_SOURCE_EVIDENCE_BASIS_REQUIRED"
+                )
+            if declared_required != NATIVE_PRODUCTION_TIMEFRAMES:
+                result.errors.append(
+                    "NATIVE_UNIVERSE_PRODUCTION_SIX_TIMEFRAME_ROSTER_REQUIRED"
+                )
+            if result.errors:
+                return result
         if canonical_symbol in semantic_universe.excluded_symbols:
             result.errors.append("NATIVE_ACTIVE_SYMBOL_EXCLUDED_NO_TRADE")
             return result
@@ -2966,6 +3876,12 @@ def resolve_active_native_artifact(
                         == UNIVERSE_ELIGIBILITY_SCHEMA
                     ),
                     reference_run_cell=reference_run_cell,
+                    parity_thresholds=(
+                        manifest.get("parity_thresholds")
+                        if isinstance(manifest.get("parity_thresholds"), Mapping)
+                        else {}
+                    ),
+                    symbol_run_cells=run_cells_for_symbol,
                 )
             )
         if result.errors:

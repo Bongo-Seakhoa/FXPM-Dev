@@ -31,9 +31,8 @@ from tools.acquire_native_history import (  # noqa: E402
     SEGMENTED_SESSION_COVERAGE_METHOD_V2,
     SCHEMA_VERSION,
     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
-    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4,
     TIMEFRAME_SECONDS,
-    cross_resolution_reference_map,
     expected_session_coverage_by_partition,
     segmented_session_coverage_by_partition_v2,
 )
@@ -138,7 +137,11 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
         }
         for timeframe in timeframes
     }
-    references = cross_resolution_reference_map(timeframes)
+    ordered = tuple(sorted(timeframes, key=lambda value: TIMEFRAME_SECONDS[value]))
+    references = {
+        timeframe: (ordered[1] if index == 0 else ordered[index - 1])
+        for index, timeframe in enumerate(ordered)
+    }
     intervals = {
         timeframe: dict(strategy_intervals[timeframe]) for timeframe in timeframes
     }
@@ -179,7 +182,7 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
         "common_calendar_boundaries": serialized[compatibility_timeframe],
         "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
         "timeframe_request_map_schema_version": (
-            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4
         ),
         "timeframe_window_years": timeframe_years,
         "timeframe_calendar_boundaries": serialized,
@@ -191,7 +194,7 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
         "timeframe_audit_only_prefix_intervals": audit_prefixes,
     }
     request_map_payload = {
-        "schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        "schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4,
         "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
         "common_as_of_utc": common_as_of.isoformat(),
         "timeframe_window_years": timeframe_years,
@@ -353,7 +356,10 @@ def _write_source(
     frame = frame.copy()
     duration = {
         "M5": pd.Timedelta(minutes=5),
+        "M15": pd.Timedelta(minutes=15),
+        "M30": pd.Timedelta(minutes=30),
         "H1": pd.Timedelta(hours=1),
+        "H4": pd.Timedelta(hours=4),
         "D1": pd.Timedelta(days=1),
     }[timeframe]
     frame["_BAR_CLOSE_TS"] = frame.index + duration
@@ -1408,6 +1414,9 @@ def test_timeframe_v4_cell_windows_activate_and_resolve_independently():
             production_contract_required=True,
         )
         assert not production.valid
+        assert "NATIVE_UNIVERSE_PRODUCTION_TIMEFRAME_V5_REQUIRED" in (
+            production.errors
+        )
         assert "NATIVE_UNIVERSE_PRODUCTION_SIX_TIMEFRAME_ROSTER_REQUIRED" in (
             production.errors
         )
