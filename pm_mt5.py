@@ -18,7 +18,7 @@ Version: 3.1 (Portfolio Manager)
 import logging
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Mapping, Optional, Any, Tuple
 from enum import Enum
 import time
 import math
@@ -985,10 +985,12 @@ class MT5Connector:
             timeframe: Timeframe string
             start_date: Start date
             end_date: End date
-            sync_retry: When True, retry on an empty result to give the terminal
-                time to download history for a freshly selected symbol. Off by
-                default so the live delta-sync hot path is not slowed by the
-                normal "no new bars" empty case.
+            sync_retry: When True, poll an empty *or boundary-incomplete* result
+                while the terminal downloads/builds the requested timeseries.
+                The widest response seen is retained and polling stops once an
+                incomplete response stabilizes. Off by default so the live
+                delta-sync hot path is not slowed by a normal "no new bars"
+                result.
 
         Returns:
             DataFrame with OHLCV data or None
@@ -1004,32 +1006,127 @@ class MT5Connector:
         if broker_symbol is None:
             return None
 
-        try:
-            rates = mt5.copy_rates_range(broker_symbol, tf, start_date, end_date)
-        except Exception as exc:
-            # MT5/Windows rejects out-of-range dates (e.g. pre-1970) with OSError
-            # Errno 22; never let that crash the fetch.
-            logger.debug(f"copy_rates_range failed for {broker_symbol} ({start_date}..{end_date}): {exc}")
-            rates = None
+        def _copy_range():
+            try:
+                return mt5.copy_rates_range(broker_symbol, tf, start_date, end_date)
+            except Exception as exc:
+                # MT5/Windows rejects out-of-range dates (e.g. pre-1970) with
+                # OSError Errno 22; never let that crash the fetch.
+                logger.debug(
+                    f"copy_rates_range failed for {broker_symbol} "
+                    f"({start_date}..{end_date}): {exc}"
+                )
+                return None
 
-        if (rates is None or len(rates) == 0) and sync_retry:
-            max_attempts = max(0, int(getattr(self.config, "history_sync_max_attempts", 0) or 0))
-            sleep_s = max(0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0))
-            if max_attempts > 0:
+        def _range_extent(candidate) -> Optional[Tuple[int, int, int]]:
+            """Return (rows, first epoch second, last epoch second)."""
+            if candidate is None:
+                return None
+            try:
+                rows = int(len(candidate))
+            except (TypeError, ValueError):
+                return None
+            if rows <= 0:
+                return None
+            try:
+                # MetaTrader's numpy structured array supports the fast column
+                # path; the fallback keeps injected list/dict test connectors
+                # and older package builds compatible.
+                raw_times = candidate["time"]
+            except (TypeError, ValueError, KeyError, IndexError):
                 try:
-                    mt5.symbol_select(broker_symbol, True)
-                except Exception:
-                    pass
-                for _ in range(max_attempts):
-                    if sleep_s > 0:
-                        time.sleep(sleep_s)
-                    try:
-                        rates = mt5.copy_rates_range(broker_symbol, tf, start_date, end_date)
-                    except Exception as exc:
-                        logger.debug(f"copy_rates_range retry failed for {broker_symbol}: {exc}")
-                        rates = None
-                    if rates is not None and len(rates) > 0:
-                        break
+                    raw_times = [
+                        item.get("time") if isinstance(item, Mapping) else getattr(item, "time")
+                        for item in candidate
+                    ]
+                except (TypeError, ValueError, AttributeError):
+                    return None
+            try:
+                values = np.asarray(raw_times, dtype=np.int64)
+                if values.size != rows or not np.isfinite(values.astype(np.float64)).all():
+                    return None
+                return rows, int(values.min()), int(values.max())
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        def _boundary_complete(extent: Optional[Tuple[int, int, int]]) -> bool:
+            if extent is None:
+                return False
+            try:
+                start_epoch = int(start_date.timestamp())
+                end_epoch = int(end_date.timestamp())
+            except (AttributeError, OSError, OverflowError, ValueError):
+                return False
+            tf_seconds = {
+                "M1": 60,
+                "M5": 5 * 60,
+                "M15": 15 * 60,
+                "M30": 30 * 60,
+                "H1": 60 * 60,
+                "H4": 4 * 60 * 60,
+                "D1": 24 * 60 * 60,
+            }.get(str(timeframe).upper(), 5 * 60)
+            # Weekend/holiday and exchange-session gaps are not missing data.
+            # Four calendar days covers normal weekend boundaries; slower bars
+            # receive at least four nominal periods of slack.
+            slack = max(4 * 86400, 4 * int(tf_seconds))
+            _, first_epoch, last_epoch = extent
+            return bool(
+                first_epoch <= start_epoch + slack
+                and last_epoch >= end_epoch - int(tf_seconds) - slack
+            )
+
+        rates = _copy_range()
+
+        if sync_retry:
+            max_attempts = max(
+                1,
+                int(getattr(self.config, "history_sync_max_attempts", 1) or 1),
+            )
+            sleep_s = max(
+                0.0,
+                float(getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0),
+            )
+            try:
+                mt5.symbol_select(broker_symbol, True)
+                if hasattr(mt5, "symbol_info_tick"):
+                    mt5.symbol_info_tick(broker_symbol)
+            except Exception:
+                pass
+
+            best = rates
+            best_extent = _range_extent(best)
+            previous_extent = best_extent
+            attempts = 1
+            # A response spanning both requested boundaries is already usable.
+            # Otherwise MT5 may still be asynchronously extending/building the
+            # series even though the first call returned some rows. Poll until
+            # it becomes complete, stabilizes twice, or exhausts the budget.
+            stable_incomplete = 0
+            while attempts < max_attempts and not _boundary_complete(best_extent):
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                candidate = _copy_range()
+                attempts += 1
+                extent = _range_extent(candidate)
+                if extent is not None:
+                    if best_extent is None:
+                        best, best_extent = candidate, extent
+                    else:
+                        _, best_first, best_last = best_extent
+                        _, first, last = extent
+                        best_span = best_last - best_first
+                        span = last - first
+                        if (span, extent[0]) > (best_span, best_extent[0]):
+                            best, best_extent = candidate, extent
+                if extent is not None and extent == previous_extent:
+                    stable_incomplete += 1
+                else:
+                    stable_incomplete = 0
+                previous_extent = extent
+                if stable_incomplete >= 1:
+                    break
+            rates = best
 
         if rates is None or len(rates) == 0:
             if sync_retry:

@@ -1,7 +1,7 @@
 import unittest
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pm_mt5
@@ -487,6 +487,34 @@ class HistorySyncTests(unittest.TestCase):
         )
         self.assertIsNotNone(ok_bars)
         self.assertEqual(len(ok_bars), 1)
+
+    def test_get_bars_range_sync_retry_waits_for_nonempty_history_to_expand(self):
+        class _GrowingRangeMT5(_SyncingMT5):
+            def copy_rates_range(self, symbol, timeframe, start_date, end_date):
+                self.range_calls += 1
+                recent = int((end_date - timedelta(minutes=5)).timestamp())
+                if self.range_calls == 1:
+                    # MT5 can expose the locally prepared tail before the older
+                    # requested history has finished downloading/building.
+                    return [dict(self._bar(), time=recent)]
+                return [
+                    dict(self._bar(), time=int(start_date.timestamp())),
+                    dict(self._bar(), time=recent),
+                ]
+
+        fake = _GrowingRangeMT5()
+        connector = self._connector(fake)
+        bars = connector.get_bars_range(
+            "PLATINUM",
+            "M5",
+            datetime(2024, 1, 1, tzinfo=timezone.utc),
+            datetime(2024, 1, 10, tzinfo=timezone.utc),
+            sync_retry=True,
+        )
+
+        self.assertIsNotNone(bars)
+        self.assertEqual(len(bars), 2)
+        self.assertGreaterEqual(fake.range_calls, 2)
 
 
 if __name__ == "__main__":
