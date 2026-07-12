@@ -220,7 +220,10 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         # the old JSON count and scope-power knob did not affect DSR/PBO gates.
         self.assertNotIn("false_discovery_symbol_count", pipeline)
         self.assertNotIn("false_discovery_scope_power", pipeline)
-        self.assertEqual(pipeline["optimization_max_workers"], 4)
+        # The 7.36 GB deployment host stays sequential until the calibrated
+        # memory governor is integrated end-to-end. This is a throughput
+        # constraint, not a change to scoring or candidate mathematics.
+        self.assertEqual(pipeline["optimization_max_workers"], 1)
         self.assertNotIn("optimization_min_m5_bars", pipeline)
         self.assertNotIn("historical_fetch_retry_attempts", pipeline)
         self.assertNotIn("historical_fetch_deep_backfill_enabled", pipeline)
