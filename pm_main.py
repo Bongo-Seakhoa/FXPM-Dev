@@ -3460,7 +3460,7 @@ class LiveTrader:
                                       volume: float,
                                       *,
                                       spec: Optional[Any] = None) -> float:
-        """Estimate one-way commission for the proposed volume."""
+        """Estimate configured round-trip commission for the proposed volume."""
         pipeline_config = getattr(self, "pipeline_config", None)
         if not bool(getattr(pipeline_config, "use_commission", False)):
             return 0.0
@@ -3483,6 +3483,130 @@ class LiveTrader:
         if commission_per_lot <= 0.0:
             return 0.0
         return commission_per_lot * volume_value
+
+    def _remaining_exit_commission_amount(self,
+                                          symbol: str,
+                                          volume: float,
+                                          *,
+                                          spec: Optional[Any] = None) -> float:
+        """Return the uncharged exit side of the configured round-trip commission."""
+        return self._commission_amount_for_volume(symbol, volume, spec=spec) * 0.5
+
+    def _estimate_stop_pnl_amount(self,
+                                  order_type: int,
+                                  symbol: str,
+                                  volume: float,
+                                  entry_price: float,
+                                  stop_price: float,
+                                  *,
+                                  accrued_swap: float,
+                                  spec: Optional[Any] = None,
+                                  symbol_info: Optional[Any] = None) -> Tuple[Optional[float], Optional[str]]:
+        """Estimate signed net P&L at an open position's effective stop.
+
+        MT5 contract math is authoritative.  Deterministic tick- and pip-value
+        fallbacks preserve direction instead of applying ``abs``.  The returned
+        amount includes accrued swap and the remaining one-way exit commission;
+        positive values therefore represent capital already locked by the stop.
+        """
+        try:
+            volume_value = float(volume)
+            entry_value = float(entry_price)
+            stop_value = float(stop_price)
+            swap_value = float(accrued_swap)
+        except (TypeError, ValueError, OverflowError):
+            return None, None
+        if (
+            volume_value <= 0.0
+            or entry_value <= 0.0
+            or stop_value <= 0.0
+            or not all(
+                math.isfinite(value)
+                for value in (volume_value, entry_value, stop_value, swap_value)
+            )
+        ):
+            return None, None
+        try:
+            normalized_order_type = int(order_type)
+        except (TypeError, ValueError, OverflowError):
+            return None, None
+        buy_type = int(OrderType.BUY.value)
+        sell_type = int(OrderType.SELL.value)
+        if normalized_order_type not in {buy_type, sell_type}:
+            return None, None
+
+        price_pnl: Optional[float] = None
+        path: Optional[str] = None
+        if self.mt5 is not None:
+            try:
+                raw_pnl = self.mt5.order_calc_profit(
+                    order_type,
+                    symbol,
+                    volume_value,
+                    entry_value,
+                    stop_value,
+                )
+                candidate = float(raw_pnl)
+            except Exception:
+                candidate = float("nan")
+            if math.isfinite(candidate):
+                price_pnl = candidate
+                path = "mt5"
+
+        direction = 1.0 if normalized_order_type == buy_type else -1.0
+        info = symbol_info
+        if price_pnl is None:
+            if info is None and self.mt5 is not None and symbol:
+                try:
+                    info = self.mt5.get_symbol_info(symbol)
+                except Exception:
+                    info = None
+            if info is not None:
+                tick_size = self._safe_finite_float(
+                    getattr(info, "trade_tick_size", None)
+                )
+                tick_value = self._safe_finite_float(
+                    getattr(info, "trade_tick_value", None)
+                )
+                if tick_size and tick_size > 0.0 and tick_value and tick_value > 0.0:
+                    price_pnl = (
+                        ((stop_value - entry_value) * direction / tick_size)
+                        * tick_value
+                        * volume_value
+                    )
+                    path = "tick_value"
+
+        resolved_spec = spec
+        if price_pnl is None:
+            if resolved_spec is None and symbol:
+                try:
+                    resolved_spec = get_instrument_spec(symbol)
+                except Exception:
+                    resolved_spec = None
+            if resolved_spec is not None:
+                pip_size = self._safe_finite_float(
+                    getattr(resolved_spec, "pip_size", None)
+                )
+                pip_value = self._safe_finite_float(
+                    getattr(resolved_spec, "pip_value", None)
+                )
+                if pip_size and pip_size > 0.0 and pip_value and pip_value > 0.0:
+                    price_pnl = (
+                        ((stop_value - entry_value) * direction / pip_size)
+                        * pip_value
+                        * volume_value
+                    )
+                    path = "pip_value"
+
+        if price_pnl is None or not math.isfinite(price_pnl):
+            return None, path
+        exit_commission = self._remaining_exit_commission_amount(
+            symbol,
+            volume_value,
+            spec=resolved_spec,
+        )
+        stop_pnl = price_pnl + swap_value - exit_commission
+        return (float(stop_pnl), path) if math.isfinite(stop_pnl) else (None, path)
 
     def _estimate_stop_loss_amount(self,
                                    order_type: int,
@@ -3900,7 +4024,7 @@ class LiveTrader:
         if equity is None or equity <= 0.0 or balance is None or balance <= 0.0:
             return [], None, "fresh account balance/equity unavailable for gross stop-risk admission"
 
-        measured: List[Tuple[str, str, str, float]] = []
+        measured: List[Tuple[str, str, str, float, float, float]] = []
         for index, position in enumerate(list(positions_snapshot or [])):
             canonical, resolution = self._resolve_live_position_canonical_symbol(
                 position,
@@ -3928,39 +4052,63 @@ class LiveTrader:
                 spec = get_instrument_spec(canonical)
             except Exception as exc:
                 return [], None, f"instrument spec unavailable for {canonical}: {exc}"
-            risk_amount, _path = self._estimate_stop_loss_amount(
+            current_profit = self._safe_finite_float(
+                getattr(position, "profit", None)
+            )
+            accrued_swap = self._safe_finite_float(
+                getattr(position, "swap", None)
+            )
+            if current_profit is None or accrued_swap is None:
+                return [], None, (
+                    f"open position {getattr(position, 'ticket', index)} current MTM "
+                    "profit/swap is unavailable"
+                )
+            stop_pnl, _path = self._estimate_stop_pnl_amount(
                 order_type,
                 broker_symbol,
                 volume,
                 entry_price,
                 stop_price,
+                accrued_swap=accrued_swap,
                 spec=spec,
                 symbol_info=self.mt5.get_symbol_info(broker_symbol),
-                include_commission=True,
             )
-            if risk_amount is None or not math.isfinite(float(risk_amount)) or risk_amount <= 0.0:
+            if stop_pnl is None or not math.isfinite(float(stop_pnl)):
                 return [], None, (
-                    f"open position {getattr(position, 'ticket', index)} stop risk "
+                    f"open position {getattr(position, 'ticket', index)} signed stop P&L "
                     "cannot be measured"
                 )
+            current_mtm = float(current_profit) + float(accrued_swap)
+            gross_stop_loss = max(0.0, -float(stop_pnl))
             measured.append(
                 (
                     canonical,
                     str(getattr(spec, "asset_class", "unknown") or "unknown"),
                     str(getattr(position, "ticket", index) or index),
-                    float(risk_amount),
+                    float(stop_pnl),
+                    current_mtm,
+                    gross_stop_loss,
                 )
             )
 
+        portfolio_stop_equity = equity + sum(
+            stop_pnl - current_mtm
+            for _canonical, _asset_class, _exposure_id, stop_pnl, current_mtm, _gross_loss
+            in measured
+        )
+        gross_open_stop_risk = sum(item[5] for item in measured)
         capital = conservative_risk_capital(
             balance=balance,
             equity=equity,
-            open_stop_risk_amount=sum(item[3] for item in measured),
+            portfolio_stop_equity=portfolio_stop_equity,
+            open_stop_risk_amount=gross_open_stop_risk,
         )
         if not capital.allow:
             return [], None, capital.reason
         exposures: List[StopRiskExposure] = []
-        for canonical, asset_class, exposure_id, risk_amount in measured:
+        for canonical, asset_class, exposure_id, _stop_pnl, _current_mtm, risk_amount in measured:
+            if risk_amount <= 0.0:
+                continue
             exposures.append(
                 StopRiskExposure(
                     symbol=canonical,

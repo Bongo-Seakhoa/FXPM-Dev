@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, Mapping, Tuple
 from pm_symbol import FIAT_CODES, infer_asset_class, normalize_symbol
 
 
-RISK_ADMISSION_SCHEMA_VERSION = "2026-07-11-conservative-risk-capital-v2"
+RISK_ADMISSION_SCHEMA_VERSION = "2026-07-13-signed-portfolio-stop-equity-v3"
 _EPSILON = 1e-10
 
 
@@ -90,7 +90,7 @@ class GrossRiskLimits:
 
 @dataclass(frozen=True)
 class ConservativeRiskCapitalDecision:
-    """Live/replay denominator: min(MTM equity, balance less open stop loss)."""
+    """Live/replay denominator: min(MTM equity, explicit portfolio stop equity)."""
 
     allow: bool
     code: str
@@ -147,16 +147,23 @@ def conservative_risk_capital(
     *,
     balance: Any,
     equity: Any,
+    portfolio_stop_equity: Any,
     open_stop_risk_amount: Any,
 ) -> ConservativeRiskCapitalDecision:
-    """Calculate the exact conservative capital denominator used by replay.
+    """Calculate conservative capital from an explicit stop-equity snapshot.
 
-    Open stop loss is reconstructed in account currency from the same fresh
-    broker position snapshot.  Missing, non-finite or non-positive account
-    values fail closed; a negative open-risk input is never coerced to zero.
+    ``portfolio_stop_equity`` is authoritative and must already incorporate the
+    signed outcome of every open position at its effective stop.  Gross
+    ``open_stop_risk_amount`` remains a non-negative diagnostic used by the
+    allocation layer; it is deliberately not subtracted from balance here
+    because doing so destroys locked-in profits from trailing stops.
     """
     balance_value = _finite_positive(balance)
     equity_value = _finite_positive(equity)
+    try:
+        stop_equity = float(portfolio_stop_equity)
+    except (TypeError, ValueError, OverflowError):
+        stop_equity = float("nan")
     try:
         open_risk = float(open_stop_risk_amount)
     except (TypeError, ValueError, OverflowError):
@@ -164,15 +171,15 @@ def conservative_risk_capital(
     if (
         balance_value is None
         or equity_value is None
+        or not math.isfinite(stop_equity)
         or not math.isfinite(open_risk)
         or open_risk < 0.0
     ):
         return ConservativeRiskCapitalDecision(
             False,
             "RISK_CAPITAL_INPUT_INVALID",
-            "balance, equity and reconstructed open stop risk must be finite and valid",
+            "balance, equity, portfolio stop equity and gross open stop risk must be finite and valid",
         )
-    stop_equity = balance_value - open_risk
     risk_capital = min(equity_value, stop_equity)
     common = {
         "balance": balance_value,
@@ -185,7 +192,7 @@ def conservative_risk_capital(
         return ConservativeRiskCapitalDecision(
             False,
             "NO_POSITIVE_CONSERVATIVE_RISK_CAPITAL",
-            "min(equity, balance - open stop risk) is not positive",
+            "min(equity, portfolio stop equity) is not positive",
             **common,
         )
     return ConservativeRiskCapitalDecision(

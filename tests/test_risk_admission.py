@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from pm_risk_admission import (
     GrossRiskLimits,
     StopRiskExposure,
@@ -123,6 +125,7 @@ def test_conservative_capital_blocks_risk_that_fresh_equity_math_would_admit():
     snapshot = conservative_risk_capital(
         balance=10_000.0,
         equity=10_000.0,
+        portfolio_stop_equity=9_300.0,
         open_stop_risk_amount=700.0,
     )
     assert snapshot.allow
@@ -148,6 +151,7 @@ def test_conservative_capital_missing_balance_or_exhausted_stop_equity_fails_clo
     missing = conservative_risk_capital(
         balance=None,
         equity=10_000.0,
+        portfolio_stop_equity=10_000.0,
         open_stop_risk_amount=0.0,
     )
     assert not missing.allow
@@ -156,10 +160,64 @@ def test_conservative_capital_missing_balance_or_exhausted_stop_equity_fails_clo
     exhausted = conservative_risk_capital(
         balance=1_000.0,
         equity=1_100.0,
+        portfolio_stop_equity=0.0,
         open_stop_risk_amount=1_000.0,
     )
     assert not exhausted.allow
     assert exhausted.code == "NO_POSITIVE_CONSERVATIVE_RISK_CAPITAL"
+
+
+def test_conservative_capital_uses_explicit_stop_equity_not_gross_diagnostic():
+    snapshot = conservative_risk_capital(
+        balance=10_000.0,
+        equity=10_100.0,
+        portfolio_stop_equity=10_050.0,
+        open_stop_risk_amount=0.0,
+    )
+    assert snapshot.allow
+    assert snapshot.stop_equity == 10_050.0
+    assert snapshot.risk_capital == 10_050.0
+
+    mixed = conservative_risk_capital(
+        balance=10_000.0,
+        equity=10_050.0,
+        portfolio_stop_equity=9_950.0,
+        open_stop_risk_amount=100.0,
+    )
+    assert mixed.allow
+    assert mixed.risk_capital == 9_950.0
+    assert mixed.open_stop_risk_amount == 100.0
+
+
+@pytest.mark.parametrize(
+    ("portfolio_stop_equity", "open_stop_risk_amount"),
+    [
+        (math.nan, 0.0),
+        (10_000.0, math.nan),
+        (10_000.0, -1.0),
+    ],
+)
+def test_conservative_capital_rejects_invalid_explicit_inputs(
+    portfolio_stop_equity,
+    open_stop_risk_amount,
+):
+    decision = conservative_risk_capital(
+        balance=10_000.0,
+        equity=10_000.0,
+        portfolio_stop_equity=portfolio_stop_equity,
+        open_stop_risk_amount=open_stop_risk_amount,
+    )
+    assert not decision.allow
+    assert decision.code == "RISK_CAPITAL_INPUT_INVALID"
+
+
+def test_conservative_capital_requires_explicit_portfolio_stop_equity():
+    with pytest.raises(TypeError, match="portfolio_stop_equity"):
+        conservative_risk_capital(
+            balance=10_000.0,
+            equity=10_000.0,
+            open_stop_risk_amount=0.0,
+        )
 
 
 def test_projected_margin_is_separate_and_capped_at_utilization_boundary():

@@ -1420,9 +1420,15 @@ class SynchronizedPortfolioSimulator:
         open_margin = sum(position.open_margin for position in open_positions.values())
         unrealized = sum(position.unrealized_pnl for position in open_positions.values())
         equity = balance + unrealized
+        # Legacy replay candidates currently carry only immutable initial-stop
+        # loss, not the signed path of governance stop updates.  Pass that
+        # existing stop-equity model explicitly so the shared helper no longer
+        # reconstructs it, without claiming live timing/state parity.
+        legacy_portfolio_stop_equity = balance - open_risk
         risk_capital_decision = conservative_risk_capital(
             balance=balance,
             equity=equity,
+            portfolio_stop_equity=legacy_portfolio_stop_equity,
             open_stop_risk_amount=open_risk,
         )
         risk_capital = risk_capital_decision.risk_capital
