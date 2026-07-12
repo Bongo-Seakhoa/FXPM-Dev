@@ -19,7 +19,7 @@ The production design should have four distinct layers:
 3. **Common-clock competition.** Frozen specialists are compared on synchronized daily mark-to-market net returns and capital occupancy. Raw return, raw trade count and native timeframe do not receive an automatic advantage.
 4. **Hierarchical allocation.** Specialists propose trades; symbol controllers coordinate them; the institution allocates the shared balance sheet under empirically calibrated stress, drawdown, margin and concentration constraints.
 
-The current global `5y/2y/2y` contract is a reasonable starting point for M5/M15. It is too short to be the default evidentiary claim for D1 and often H4, particularly after splitting observations into four regimes. The current global trade floors are also too weak to establish comparable precision across cells.
+The current global `5y/2y/2y` contract is a reasonable starting point for M5/M15. Its five-year **training** component is too short for D1 and often H4 after four-way regime partitioning. The recent tuning and final windows should remain concurrent across all specialists so they are compared on the same market history. The current global trade floors are also too weak to establish comparable precision across cells.
 
 ## 2. Requirements versus calibration
 
@@ -125,13 +125,13 @@ The table below is the **initial engineering prior** for planning acquisition. I
 | M5 | 5 years | 2 years | 2 years | 9 years | Many events are available, but microstructure/cost regimes change quickly. More old data is not automatically more relevant. |
 | M15 | 5 years | 2 years | 2 years | 9 years | Similar market-cycle breadth to M5 with fewer overlapping opportunities. |
 | M30 | 6 years | 2 years | 2 years | 10 years | Fewer decisions per regime justify a longer train span. |
-| H1 | 7 years | 3 years | 3 years | 13 years | Requires broader cycle coverage and more validation time. |
-| H4 | 8 years | 3 years | 3 years | 14 years | Sparse regime-event counts become binding before raw bars do. |
-| D1 | 12 years | 4 years | 4 years | 20 years | Daily bars and regime-specific trades accumulate slowly; a ten-year source may be inadequate after four-way regime partitioning. |
+| H1 | 7 years | 2 years | 2 years | 11 years | Requires broader training-cycle coverage while retaining the common recent comparison clock. |
+| H4 | 8 years | 2 years | 2 years | 12 years | Sparse regime-event counts become binding before raw bars do. |
+| D1 | 12 years | 2 years | 2 years | 16 years | Daily bars and regime-specific trades accumulate slowly; a ten-year source may be inadequate after four-way regime partitioning. |
 
-All windows end at one shared UTC information cutoff. Their starts may differ by timeframe. Purge length is `max(label horizon, maximum modeled holding horizon, feature dependency horizon)` rather than an unrelated fixed number of bars.
+All windows end at one shared UTC information cutoff. **Only the training start differs by timeframe.** Tuning and final boundaries are identical for all six timeframes, preserving one concurrent recent comparison. Purge length is `max(label horizon, maximum modeled holding horizon, feature dependency horizon)` rather than an unrelated fixed number of bars.
 
-A two-year synchronized subwindow at the end of the frozen final interval is reserved for the all-cell portfolio replay. Every candidate is frozen before any final observation is evaluated. Longer H1/H4/D1 final evidence produces cell diagnostics and may fail the complete release, but it may not prune the roster, reselect a policy or create a survivors-only portfolio before the common verdict.
+The common two-year frozen final interval is used for both cell verdicts and synchronized all-cell portfolio replay. Every candidate is frozen before any final observation is evaluated. Older timeframe-specific history belongs to training and outer walk-forward diagnostics; it cannot give H1/H4/D1 a different final market period or create a survivors-only portfolio before the common verdict.
 
 ### 4.2 Illustrative expected bars, not hard gates
 
@@ -142,9 +142,9 @@ The values below show why a universal bar floor is inappropriate. They are arith
 | M5 | 5 | 374,400 | 98,280 | 2 | 149,760 | 39,312 |
 | M15 | 5 | 124,800 | 32,760 | 2 | 49,920 | 13,104 |
 | M30 | 6 | 74,880 | 19,656 | 2 | 24,960 | 6,552 |
-| H1 | 7 | 43,680 | 12,348 | 3 | 18,720 | 5,292 |
-| H4 | 8 | 12,480 | 4,032 | 3 | 4,680 | 1,512 |
-| D1 | 12 | 3,120 | 3,024 | 4 | 1,040 | 1,008 |
+| H1 | 7 | 43,680 | 12,348 | 2 | 12,480 | 3,528 |
+| H4 | 8 | 12,480 | 4,032 | 2 | 3,120 | 1,008 |
+| D1 | 12 | 3,120 | 3,024 | 2 | 520 | 504 |
 
 For a cell, record both:
 
@@ -166,7 +166,7 @@ A D1 file containing 2,500 bars is roughly ten years for a weekday market, not 2
 Therefore:
 
 - D1 should preferentially use 15-25 years of trustworthy daily history when provider and instrument longevity allow it.
-- Twelve/four/four years is the acquisition planning minimum, not an automatic pass.
+- Twelve/two/two years is the acquisition planning minimum, not an automatic pass; D1 statistical power may still require an earlier training start or abstention.
 - If instrument inception makes that impossible, compute power from the available span. Do not backfill with synthetic/resampled observations and do not lower the confidence requirement merely to retain the symbol.
 - Cross-symbol hierarchical priors may stabilize estimates, but borrowed strength must not be counted as independent D1 validation trades.
 - The D1 cell abstains when its own final evidence remains underpowered.
@@ -470,9 +470,9 @@ Replace the current global evidence fields with a versioned contract referenced 
         "M5":  {"train_years": 5,  "tuning_years": 2, "final_years": 2},
         "M15": {"train_years": 5,  "tuning_years": 2, "final_years": 2},
         "M30": {"train_years": 6,  "tuning_years": 2, "final_years": 2},
-        "H1":  {"train_years": 7,  "tuning_years": 3, "final_years": 3},
-        "H4":  {"train_years": 8,  "tuning_years": 3, "final_years": 3},
-        "D1":  {"train_years": 12, "tuning_years": 4, "final_years": 4}
+        "H1":  {"train_years": 7,  "tuning_years": 2, "final_years": 2},
+        "H4":  {"train_years": 8,  "tuning_years": 2, "final_years": 2},
+        "D1":  {"train_years": 12, "tuning_years": 2, "final_years": 2}
       },
       "purge_mode": "max_label_feature_holding_horizon",
       "warmup_mode": "feature_graph_exact",
