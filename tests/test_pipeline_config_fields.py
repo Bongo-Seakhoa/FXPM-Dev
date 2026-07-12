@@ -4,13 +4,10 @@ from pm_core import PipelineConfig
 
 
 class PipelineConfigFieldTests(unittest.TestCase):
-    def test_actionable_score_margin_default(self):
-        cfg = PipelineConfig()
-        self.assertAlmostEqual(cfg.actionable_score_margin, 0.92, places=6)
-
-    def test_actionable_score_margin_accepts_config_value(self):
-        cfg = PipelineConfig(actionable_score_margin=0.9)
-        self.assertAlmostEqual(cfg.actionable_score_margin, 0.9, places=6)
+    def test_uncalibrated_cross_timeframe_actionable_margin_is_removed(self):
+        self.assertFalse(hasattr(PipelineConfig(), "actionable_score_margin"))
+        with self.assertRaises(TypeError):
+            PipelineConfig(actionable_score_margin=0.9)
 
     def test_position_timeframe_overrides_default(self):
         cfg = PipelineConfig()
@@ -102,10 +99,36 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(cfg.historical_stress_audit_bars, 50000)
         self.assertEqual(cfg.active_universe_bars, 250000)
         self.assertAlmostEqual(cfg.active_stage2_pct, 50.0, places=6)
-        self.assertEqual(cfg.production_split_mode, "bleeding_edge")
+        self.assertEqual(cfg.production_split_mode, "calendar_lockbox_v2")
+        self.assertEqual(cfg.tuning_validation_bars, 50000)
+        self.assertEqual(cfg.final_lockbox_bars, 50000)
+        self.assertEqual(cfg.split_embargo_bars, 300)
+        self.assertAlmostEqual(cfg.evidence_purge_days, 7.0, places=6)
+        self.assertAlmostEqual(cfg.evidence_warmup_days, 400.0, places=6)
+        self.assertEqual(cfg.evidence_as_of_utc, "")
         self.assertEqual(cfg.walk_forward_validation_bars, 50000)
         self.assertTrue(cfg.walk_forward_audit_enabled)
         self.assertAlmostEqual(cfg.clean_holdout_pct, 0.0, places=6)
+
+    def test_calendar_production_cannot_disable_native_evidence_gates(self):
+        cfg = PipelineConfig(
+            production_split_mode="calendar_lockbox_v2",
+            evidence_sufficiency_enabled=False,
+            evidence_require_native_timeframes=False,
+            evidence_require_native_provenance=False,
+            evidence_require_session_coverage=False,
+        )
+        self.assertTrue(cfg.evidence_sufficiency_enabled)
+        self.assertTrue(cfg.evidence_require_native_timeframes)
+        self.assertTrue(cfg.evidence_require_native_provenance)
+        self.assertTrue(cfg.evidence_require_session_coverage)
+
+        research = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            evidence_sufficiency_enabled=False,
+        )
+        self.assertFalse(research.evidence_sufficiency_enabled)
 
     def test_feature_cache_max_entries_defaults_and_clamps(self):
         self.assertEqual(PipelineConfig().feature_cache_max_entries, 24)
@@ -140,6 +163,7 @@ class PipelineConfigFieldTests(unittest.TestCase):
         default_cfg = PipelineConfig()
         self.assertFalse(default_cfg.screening_atr_anchor_enabled)
         self.assertEqual(default_cfg.screening_atr_anchor_multipliers, [2.0])
+        self.assertEqual(default_cfg.regime_family_probe_trials, 5)
 
         cfg = PipelineConfig(
             screening_atr_anchor_enabled=True,
@@ -147,10 +171,14 @@ class PipelineConfigFieldTests(unittest.TestCase):
         )
         self.assertTrue(cfg.screening_atr_anchor_enabled)
         self.assertEqual(cfg.screening_atr_anchor_multipliers, [1.0, 2.0, 3.0])
+        self.assertEqual(
+            PipelineConfig(regime_family_probe_trials=0).regime_family_probe_trials,
+            1,
+        )
 
     def test_risk_management_optimization_is_enabled_by_default(self):
         cfg = PipelineConfig()
-        self.assertTrue(cfg.risk_management_optimization_enabled)
+        self.assertFalse(cfg.risk_management_optimization_enabled)
         self.assertEqual(cfg.risk_management_selection_stage, "stage3")
 
     def test_live_loop_trigger_defaults_to_bar(self):
@@ -201,13 +229,14 @@ class PipelineConfigFieldTests(unittest.TestCase):
 
     def test_threadspark_controls_default_and_normalize(self):
         default = PipelineConfig()
-        self.assertEqual(default.production_split_mode, "bleeding_edge")
+        self.assertEqual(default.production_split_mode, "calendar_lockbox_v2")
         self.assertEqual(default.threadspark_selection_surface, "validation")
         self.assertTrue(default.threadspark_use_historical_cost_evidence)
         self.assertEqual(default.threadspark_historical_cost_scope, "workflow")
         self.assertEqual(default.threadspark_historical_chunk_count, 5)
 
         cfg = PipelineConfig(
+            research_mode=True,
             production_split_mode="CLEAN_HOLDOUT",
             walk_forward_validation_bars=-5,
             threadspark_selection_surface="VALIDATION",
@@ -223,7 +252,10 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(cfg.threadspark_historical_chunk_count, 12)
 
         self.assertEqual(PipelineConfig(threadspark_selection_surface="future").threadspark_selection_surface, "validation")
-        self.assertEqual(PipelineConfig(production_split_mode="future").production_split_mode, "bleeding_edge")
+        self.assertEqual(
+            PipelineConfig(production_split_mode="future").production_split_mode,
+            "calendar_lockbox_v2",
+        )
         self.assertEqual(PipelineConfig(threadspark_historical_cost_scope="future").threadspark_historical_cost_scope, "workflow")
         self.assertEqual(PipelineConfig(threadspark_historical_chunk_count=0).threadspark_historical_chunk_count, 1)
 
@@ -241,7 +273,7 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(clamped.specialist_spokes_v2_cost_frequency_strength, 1.0)
         self.assertAlmostEqual(clamped.specialist_spokes_v2_max_validation_sharpe, 0.0)
 
-    def test_false_discovery_controls_default_off_and_clamp(self):
+    def test_false_discovery_controls_default_on_and_clamp(self):
         cfg = PipelineConfig(
             false_discovery_min_dsr=2.0,
             false_discovery_confidence_floor=-1.0,
@@ -251,14 +283,57 @@ class PipelineConfigFieldTests(unittest.TestCase):
             false_discovery_holdout_min_trades=-1,
             false_discovery_holdout_min_profit_factor=-2.0,
         )
-        self.assertFalse(cfg.false_discovery_control_enabled)
+        self.assertTrue(cfg.false_discovery_control_enabled)
         self.assertAlmostEqual(cfg.false_discovery_min_dsr, 1.0, places=6)
         self.assertAlmostEqual(cfg.false_discovery_confidence_floor, 0.0, places=6)
         self.assertAlmostEqual(cfg.false_discovery_scope_power, 1.0, places=6)
         self.assertEqual(cfg.false_discovery_symbol_count, 0)
-        self.assertEqual(cfg.false_discovery_holdout_policy, "off")
+        self.assertEqual(cfg.false_discovery_holdout_policy, "block")
         self.assertEqual(cfg.false_discovery_holdout_min_trades, 0)
         self.assertAlmostEqual(cfg.false_discovery_holdout_min_profit_factor, 0.0, places=6)
+
+    def test_lockbox_fields_and_live_statuses_normalize_fail_closed(self):
+        self.assertEqual(
+            PipelineConfig(production_split_mode="lockbox").production_split_mode,
+            "calendar_lockbox_v2",
+        )
+        self.assertEqual(
+            PipelineConfig(production_split_mode="THREE_WAY").production_split_mode,
+            "calendar_lockbox_v2",
+        )
+        self.assertEqual(
+            PipelineConfig(research_mode=True, production_split_mode="bleeding_edge").production_split_mode,
+            "bleeding_edge",
+        )
+        self.assertEqual(
+            PipelineConfig(research_mode=True, production_split_mode="CLEAN_HOLDOUT").production_split_mode,
+            "research_clean_holdout",
+        )
+
+        clamped = PipelineConfig(
+            tuning_validation_bars=0,
+            final_lockbox_bars=-1,
+            split_embargo_bars=-2,
+            false_discovery_holdout_max_drawdown_pct=-1.0,
+            live_allowed_promotion_statuses=[
+                "promote_small", "invalid", "PROMOTED", "promoted"
+            ],
+        )
+        self.assertEqual(clamped.tuning_validation_bars, 1)
+        self.assertEqual(clamped.final_lockbox_bars, 1)
+        self.assertEqual(clamped.split_embargo_bars, 0)
+        self.assertEqual(clamped.false_discovery_holdout_max_drawdown_pct, 0.0)
+        self.assertEqual(clamped.live_allowed_promotion_statuses, ["PROMOTE_SMALL", "PROMOTED"])
+        self.assertEqual(
+            PipelineConfig(false_discovery_holdout_max_drawdown_pct=float("nan"))
+            .false_discovery_holdout_max_drawdown_pct,
+            20.0,
+        )
+        self.assertEqual(
+            PipelineConfig(live_allowed_promotion_statuses=["invalid"])
+            .live_allowed_promotion_statuses,
+            ["PROMOTED"],
+        )
 
     def test_oos_evidence_controls_default_off_and_clamp(self):
         cfg = PipelineConfig(
@@ -280,7 +355,7 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(cfg.oos_embargo_bars, 0)
         self.assertEqual(cfg.oos_min_trades, 0)
         self.assertEqual(cfg.oos_aggregate_policy, "aggregate_with_worst_fold_floor")
-        self.assertFalse(cfg.oos_evidence_export_enabled)
+        self.assertTrue(cfg.oos_evidence_export_enabled)
         self.assertEqual(cfg.oos_evidence_periods, 2)
         self.assertEqual(cfg.oos_evidence_min_periods, 2)
         self.assertEqual(cfg.oos_evidence_dirname, "oos_evidence")
@@ -290,6 +365,7 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(cfg.oos_evidence_execution_cost_max_candidates_per_tf, 0)
 
         purged = PipelineConfig(
+            research_mode=True,
             oos_validation_mode="purged_kfold",
             oos_kfold_splits=5,
             oos_embargo_bars=3,

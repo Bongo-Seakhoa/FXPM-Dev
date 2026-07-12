@@ -366,6 +366,8 @@ class FeatureCacheTests(unittest.TestCase):
             df = self._sample_ohlcv(rows=240).reset_index().rename(columns={"index": "time"})
             df.to_csv(data_dir / "TEST_M5.csv", index=False)
             cfg = PipelineConfig(
+                research_mode=True,
+                production_split_mode="bleeding_edge",
                 data_dir=data_dir,
                 timeframes=["M5"],
                 feature_cache_max_entries=0,

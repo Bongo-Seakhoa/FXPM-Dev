@@ -17,6 +17,7 @@ symbol/timeframe-specific parameters can be loaded and applied.
 Version: 3.1 (Portfolio Manager - Numba optimizations)
 """
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field, asdict
@@ -25,6 +26,7 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 
 import numpy as np
 import pandas as pd
+from pm_evidence import CALENDAR_SPLIT_MODE, EVIDENCE_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +400,288 @@ _REGIME_FALLBACK_RECORD: Dict[Tuple[str, str], str] = {}
 _REGIME_ADX_THRESHOLD_EXPLICIT: Set[Tuple[str, str]] = set()
 
 
+# A regime detector is part of the model-selection surface: changing its
+# parameters changes which trades belong to every regime bucket.  An explicit
+# JSON row is therefore not evidence that the row was fitted without seeing
+# tuning-validation or final-lockbox observations.  The companion provenance
+# artifact below makes that boundary machine-verifiable.
+REGIME_PROVENANCE_SCHEMA_VERSION = "fxpm.regime-detector-fit-provenance/v1"
+REGIME_PROVENANCE_FIT_SCOPE = "optimizer_train"
+_REGIME_SOURCE_DIGEST_CACHE: Dict[Tuple[str, int, int], str] = {}
+
+
+def regime_params_provenance_path(filepath: str = "regime_params.json") -> Path:
+    """Return the deterministic sidecar path for a regime-parameter artifact."""
+    params_path = Path(str(filepath or "regime_params.json"))
+    return params_path.with_name(f"{params_path.stem}.provenance.json")
+
+
+def regime_params_sha256(params: Dict[str, Any]) -> str:
+    """Hash one symbol/timeframe parameter row using canonical JSON."""
+    encoded = json.dumps(
+        params,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _case_insensitive_nested_cell(payload: Any, symbol: str, timeframe: str) -> Any:
+    """Read ``payload[symbol][timeframe]`` without depending on broker-key case."""
+    if not isinstance(payload, dict):
+        return None
+    symbol_key = next(
+        (
+            key for key in payload
+            if str(key or "").strip().upper() == str(symbol or "").strip().upper()
+        ),
+        None,
+    )
+    if symbol_key is None or not isinstance(payload.get(symbol_key), dict):
+        return None
+    tf_map = payload[symbol_key]
+    timeframe_key = next(
+        (
+            key for key in tf_map
+            if str(key or "").strip().upper() == str(timeframe or "").strip().upper()
+        ),
+        None,
+    )
+    return tf_map.get(timeframe_key) if timeframe_key is not None else None
+
+
+def _normalized_timestamp(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    try:
+        return pd.Timestamp(value).isoformat()
+    except Exception:
+        return None
+
+
+def _source_sha256(path: Path) -> str:
+    stat = path.stat()
+    key = (str(path.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _REGIME_SOURCE_DIGEST_CACHE.get(key)
+    if cached:
+        return cached
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    _REGIME_SOURCE_DIGEST_CACHE[key] = value
+    return value
+
+
+def validate_regime_params_provenance(
+    symbol: str,
+    timeframe: str,
+    filepath: str = "regime_params.json",
+    *,
+    provenance_filepath: Optional[str] = None,
+    expected_source: Optional[Dict[str, Any]] = None,
+    expected_train_window: Optional[Dict[str, Any]] = None,
+    expected_split_contract: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fail-closed validation of one detector-fit provenance record.
+
+    ``expected_source`` and ``expected_train_window`` are supplied by the
+    chronological pipeline.  With them, validation proves that the detector
+    was fitted on the exact same M5 optimizer-train partition the strategy
+    optimizer is about to use.  Without them (the lightweight live-readiness
+    check), the function still verifies the fit scope, split geometry,
+    parameter hash, and current source-file hash.
+    """
+    params_path = Path(str(filepath or "regime_params.json"))
+    sidecar_path = (
+        Path(provenance_filepath)
+        if provenance_filepath
+        else regime_params_provenance_path(str(params_path))
+    )
+
+    def reject(reason: str, record: Any = None) -> Dict[str, Any]:
+        return {
+            "valid": False,
+            "reason": reason,
+            "symbol": str(symbol),
+            "timeframe": str(timeframe).upper(),
+            "params_path": str(params_path),
+            "provenance_path": str(sidecar_path),
+            "record": record if isinstance(record, dict) else {},
+        }
+
+    try:
+        params_payload = json.loads(params_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return reject("regime params file is missing")
+    except Exception as exc:
+        return reject(f"regime params file is unreadable: {exc}")
+    params_cell = _case_insensitive_nested_cell(params_payload, symbol, timeframe)
+    if not isinstance(params_cell, dict):
+        return reject("regime params cell is missing")
+
+    try:
+        provenance_payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return reject("regime provenance sidecar is missing")
+    except Exception as exc:
+        return reject(f"regime provenance sidecar is unreadable: {exc}")
+    if not isinstance(provenance_payload, dict):
+        return reject("regime provenance sidecar is not an object")
+    if provenance_payload.get("schema_version") != REGIME_PROVENANCE_SCHEMA_VERSION:
+        return reject("regime provenance schema mismatch")
+
+    record = _case_insensitive_nested_cell(
+        provenance_payload.get("cells", {}), symbol, timeframe
+    )
+    if not isinstance(record, dict):
+        return reject("regime provenance cell is missing")
+    if record.get("schema_version") != REGIME_PROVENANCE_SCHEMA_VERSION:
+        return reject("regime provenance cell schema mismatch", record)
+    if str(record.get("symbol", "")).upper() != str(symbol).upper():
+        return reject("regime provenance symbol mismatch", record)
+    if str(record.get("timeframe", "")).upper() != str(timeframe).upper():
+        return reject("regime provenance timeframe mismatch", record)
+    if str(record.get("fit_scope", "")).strip().lower() != REGIME_PROVENANCE_FIT_SCOPE:
+        return reject("regime detector was not fitted on optimizer_train", record)
+    if str(record.get("status", "")).strip().upper() != "FIT":
+        return reject("regime detector provenance is not a successful fit", record)
+    if record.get("params_sha256") != regime_params_sha256(params_cell):
+        return reject("regime parameter hash mismatch", record)
+
+    source = record.get("source")
+    if not isinstance(source, dict):
+        return reject("regime provenance source metadata is missing", record)
+    source_path_raw = str(source.get("path", "") or "").strip()
+    source_sha = str(source.get("sha256", "") or "").strip().lower()
+    try:
+        source_size = int(source.get("size"))
+    except (TypeError, ValueError):
+        source_size = -1
+    if not source_path_raw or source_size < 0 or len(source_sha) != 64:
+        return reject("regime provenance source fingerprint is incomplete", record)
+    source_path = Path(source_path_raw)
+    try:
+        current_size = int(source_path.stat().st_size)
+    except OSError as exc:
+        return reject(f"regime provenance source is unavailable: {exc}", record)
+    if current_size != source_size:
+        return reject("regime provenance source size mismatch", record)
+
+    if expected_source is not None:
+        expected_path_raw = str(expected_source.get("path", "") or "").strip()
+        expected_sha = str(expected_source.get("sha256", "") or "").strip().lower()
+        try:
+            expected_size = int(expected_source.get("size"))
+        except (TypeError, ValueError):
+            expected_size = -1
+        if not expected_path_raw or expected_size < 0 or len(expected_sha) != 64:
+            return reject("current pipeline source fingerprint is incomplete", record)
+        try:
+            paths_match = source_path.resolve() == Path(expected_path_raw).resolve()
+        except OSError:
+            paths_match = source_path.absolute() == Path(expected_path_raw).absolute()
+        if not paths_match or expected_size != source_size or expected_sha != source_sha:
+            return reject("regime provenance does not match current pipeline source", record)
+    else:
+        try:
+            current_sha = _source_sha256(source_path).lower()
+        except OSError as exc:
+            return reject(f"regime provenance source cannot be hashed: {exc}", record)
+        if current_sha != source_sha:
+            return reject("regime provenance source SHA256 mismatch", record)
+
+    train = record.get("train")
+    split = record.get("split")
+    if not isinstance(train, dict) or not isinstance(split, dict):
+        return reject("regime provenance train/split metadata is missing", record)
+    try:
+        start_index = int(train.get("start_index"))
+        end_index = int(train.get("end_index"))
+        train_rows = int(train.get("rows"))
+    except (TypeError, ValueError):
+        return reject("regime provenance train indices are invalid", record)
+    if start_index < 0 or end_index <= start_index or train_rows != end_index - start_index:
+        return reject("regime provenance train geometry is invalid", record)
+    if not _normalized_timestamp(train.get("start_ts")):
+        return reject("regime provenance train start timestamp is missing", record)
+    if not _normalized_timestamp(train.get("end_ts_inclusive")):
+        return reject("regime provenance train inclusive end timestamp is missing", record)
+    if not _normalized_timestamp(train.get("end_ts_exclusive")):
+        return reject("regime provenance train exclusive end timestamp is missing", record)
+
+    try:
+        split_train = [int(value) for value in split.get("optimizer_train_indices", [])]
+        split_validation = [int(value) for value in split.get("tuning_validation_indices", [])]
+        split_lockbox = [int(value) for value in split.get("final_lockbox_indices", [])]
+    except (TypeError, ValueError):
+        return reject("regime provenance split indices are invalid", record)
+    if split_train != [start_index, end_index]:
+        return reject("regime provenance train indices disagree with split metadata", record)
+    if len(split_validation) != 2 or len(split_lockbox) != 2:
+        return reject("regime provenance validation/lockbox indices are missing", record)
+    if not (
+        end_index <= split_validation[0]
+        < split_validation[1]
+        <= split_lockbox[0]
+        < split_lockbox[1]
+    ):
+        return reject("regime provenance leaks beyond optimizer_train", record)
+    split_mode = str(split.get("production_split_mode", "")).lower()
+    if split_mode not in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
+        return reject("regime provenance was not produced by a lockbox split", record)
+    if split_mode == CALENDAR_SPLIT_MODE:
+        if str(split.get("source_authority", "")).lower() != "broker_native_timeframe":
+            return reject(
+                "calendar regime provenance is not native-timeframe authoritative",
+                record,
+            )
+        if str(source.get("source_kind", "")).lower() != "broker_native":
+            return reject("calendar regime provenance source is not broker-native", record)
+        if split.get("contract_version") != EVIDENCE_CONTRACT_VERSION:
+            return reject("calendar regime provenance contract is stale", record)
+    top_contract = provenance_payload.get("split_contract_version")
+    if top_contract and top_contract != split.get("contract_version"):
+        return reject("regime provenance top-level split contract mismatch", record)
+    if expected_split_contract and split.get("contract_version") != expected_split_contract:
+        return reject("regime provenance split-contract mismatch", record)
+
+    if expected_train_window is not None:
+        expected_values = {
+            "start_index": expected_train_window.get("start_index"),
+            "end_index": expected_train_window.get("end_index"),
+            "rows": expected_train_window.get("rows"),
+        }
+        try:
+            expected_values = {key: int(value) for key, value in expected_values.items()}
+        except (TypeError, ValueError):
+            return reject("current optimizer-train indices are incomplete", record)
+        if expected_values != {
+            "start_index": start_index,
+            "end_index": end_index,
+            "rows": train_rows,
+        }:
+            return reject("regime provenance optimizer-train window mismatch", record)
+        for key in ("start_ts", "end_ts_inclusive", "end_ts_exclusive"):
+            expected_ts = _normalized_timestamp(expected_train_window.get(key))
+            record_ts = _normalized_timestamp(train.get(key))
+            if expected_ts is None or record_ts != expected_ts:
+                return reject(f"regime provenance optimizer-train {key} mismatch", record)
+
+    return {
+        "valid": True,
+        "reason": "ok",
+        "symbol": str(symbol),
+        "timeframe": str(timeframe).upper(),
+        "params_path": str(params_path),
+        "provenance_path": str(sidecar_path),
+        "record": record,
+    }
+
+
 def _ensure_regime_params_loaded(filepath: str = "regime_params.json") -> None:
     """Load tuned regime params once for the requested path without recording fallbacks."""
     global _REGIME_PARAMS_CACHE, _REGIME_PARAMS_LOADED, _REGIME_PARAMS_LOADED_PATH
@@ -454,7 +738,10 @@ def _find_tuned_regime_params(symbol: str, timeframe: str) -> Optional[Tuple[Tup
 
 
 def has_tuned_regime_params(symbol: str, timeframe: str,
-                            filepath: str = "regime_params.json") -> bool:
+                            filepath: str = "regime_params.json",
+                            *,
+                            require_provenance: bool = False,
+                            provenance_filepath: Optional[str] = None) -> bool:
     """
     True only when regime params contain an explicit tuned entry.
 
@@ -462,7 +749,16 @@ def has_tuned_regime_params(symbol: str, timeframe: str,
     readiness must distinguish trained params from research/default fallbacks.
     """
     _ensure_regime_params_loaded(filepath)
-    return _find_tuned_regime_params(symbol, timeframe) is not None
+    if _find_tuned_regime_params(symbol, timeframe) is None:
+        return False
+    if not require_provenance:
+        return True
+    return bool(validate_regime_params_provenance(
+        symbol,
+        timeframe,
+        filepath,
+        provenance_filepath=provenance_filepath,
+    ).get("valid", False))
 
 
 def validated_regime_params_for_timeframe(symbol: str, timeframe: str) -> RegimeParams:
@@ -544,7 +840,7 @@ def _regime_payload_tradeable(payload: Any) -> bool:
     artifact_meta = _object_get(payload, "artifact_meta", {}) or {}
     if isinstance(artifact_meta, dict) and artifact_meta.get("no_trade"):
         return False
-    status = str(_object_get(payload, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+    status = str(_object_get(payload, "promotion_status", "BLOCKED") or "BLOCKED").upper()
     return status not in {"NO_TRADE", "BLOCKED", "PAPER_ONLY"}
 
 
@@ -662,6 +958,7 @@ def clear_regime_params_cache():
     _REGIME_PARAMS_LOADED = False
     _REGIME_PARAMS_LOADED_PATH = None
     _REGIME_ADX_THRESHOLD_EXPLICIT.clear()
+    _REGIME_SOURCE_DIGEST_CACHE.clear()
     clear_regime_fallback_log()
 
 
@@ -1544,6 +1841,11 @@ __all__ = [
     'MarketRegimeDetector',
     'load_regime_params',
     'has_tuned_regime_params',
+    'validate_regime_params_provenance',
+    'regime_params_provenance_path',
+    'regime_params_sha256',
+    'REGIME_PROVENANCE_SCHEMA_VERSION',
+    'REGIME_PROVENANCE_FIT_SCOPE',
     'validated_regime_params_for_timeframe',
     'materialize_regime_params_for_cells',
     'materialize_regime_params_from_symbol_config',

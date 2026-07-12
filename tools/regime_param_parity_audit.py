@@ -43,7 +43,7 @@ def _load_json(path: Path) -> Any:
 def _tradeable(payload: Dict[str, Any]) -> bool:
     name = str(payload.get("strategy_name", "") or "").strip().upper()
     meta = payload.get("artifact_meta") if isinstance(payload.get("artifact_meta"), dict) else {}
-    status = str(payload.get("promotion_status", "PROMOTED") or "PROMOTED").upper()
+    status = str(payload.get("promotion_status", "BLOCKED") or "BLOCKED").upper()
     return bool(
         name
         and name != "NO_TRADE"

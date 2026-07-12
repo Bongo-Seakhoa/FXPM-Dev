@@ -1,14 +1,19 @@
+import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
-from pm_core import PipelineConfig, DataSplitter
+from pm_core import DataLoader, PipelineConfig, DataSplitter
 from pm_pipeline import OptimizationPipeline
 
 
 class DataSplitterTests(unittest.TestCase):
     def test_active_recent_m5_workflow_indices(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="bleeding_edge",
             max_bars=300000,
             historical_stress_audit_bars=50000,
             active_universe_bars=250000,
@@ -36,6 +41,8 @@ class DataSplitterTests(unittest.TestCase):
 
     def test_bleeding_edge_exact_300k_geometry(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="bleeding_edge",
             max_bars=300000,
             historical_stress_audit_bars=50000,
             active_universe_bars=250000,
@@ -55,6 +62,8 @@ class DataSplitterTests(unittest.TestCase):
 
     def test_active_recent_m5_does_not_expand_historical_audit_when_max_bars_is_larger(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="bleeding_edge",
             max_bars=500000,
             historical_stress_audit_bars=50000,
             active_universe_bars=250000,
@@ -73,6 +82,8 @@ class DataSplitterTests(unittest.TestCase):
 
     def test_active_recent_m5_short_history_preserves_newest_active_rows(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="bleeding_edge",
             max_bars=300000,
             historical_stress_audit_bars=50000,
             active_universe_bars=250000,
@@ -91,7 +102,7 @@ class DataSplitterTests(unittest.TestCase):
         self.assertEqual(indices["stage2_selection_with_warmup"], (80000, 200000))
 
     def test_empty_data_returns_zero_windows(self):
-        cfg = PipelineConfig()
+        cfg = PipelineConfig(research_mode=True, production_split_mode="bleeding_edge")
         splitter = DataSplitter(cfg)
         indices = splitter.get_workflow_indices(0)
         for key in (
@@ -113,6 +124,7 @@ class DataSplitterTests(unittest.TestCase):
 
     def test_clean_holdout_reserves_newest_stage2_rows_when_enabled(self):
         cfg = PipelineConfig(
+            research_mode=True,
             max_bars=300000,
             historical_stress_audit_bars=50000,
             active_universe_bars=250000,
@@ -133,6 +145,7 @@ class DataSplitterTests(unittest.TestCase):
 
     def test_purged_kfold_mode_does_not_reserve_fixed_clean_holdout(self):
         cfg = PipelineConfig(
+            research_mode=True,
             max_bars=300000,
             historical_stress_audit_bars=50000,
             active_universe_bars=250000,
@@ -154,6 +167,8 @@ class DataSplitterTests(unittest.TestCase):
 
     def test_pipeline_workflow_meta_carries_optimization_train_window(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="bleeding_edge",
             max_bars=1100,
             historical_stress_audit_bars=100,
             active_universe_bars=1000,
@@ -184,6 +199,126 @@ class DataSplitterTests(unittest.TestCase):
             windows["walk_forward_validation"]["end_index"],
             windows["optimization_train"]["start_index"],
         )
+
+    def test_chronological_lockbox_exact_300k_geometry(self):
+        cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="chronological_lockbox_v1",
+            max_bars=300000,
+            historical_stress_audit_bars=50000,
+            active_universe_bars=250000,
+            tuning_validation_bars=50000,
+            final_lockbox_bars=50000,
+            split_embargo_bars=300,
+            overlap_pct=10.0,
+        )
+
+        windows = DataSplitter(cfg).get_workflow_indices(300000)
+
+        self.assertEqual(windows["historical_stress_audit"], (0, 50000))
+        self.assertEqual(windows["active_universe"], (50000, 300000))
+        self.assertEqual(windows["optimizer_train"], (50000, 199400))
+        self.assertEqual(windows["embargo_train_validation"], (199400, 199700))
+        self.assertEqual(windows["tuning_validation"], (199700, 249700))
+        self.assertEqual(windows["embargo_validation_lockbox"], (249700, 250000))
+        self.assertEqual(windows["final_lockbox"], (250000, 300000))
+        self.assertEqual(windows["tuning_validation_warmup"], (174700, 199700))
+        self.assertEqual(windows["tuning_validation_with_warmup"], (174700, 249700))
+        self.assertEqual(windows["final_lockbox_warmup"], (225000, 250000))
+        self.assertEqual(windows["final_lockbox_with_warmup"], (225000, 300000))
+        self.assertEqual(windows["optimization_train"], windows["optimizer_train"])
+        self.assertEqual(windows["walk_forward_validation"], windows["tuning_validation"])
+        self.assertEqual(windows["clean_holdout"], windows["final_lockbox"])
+
+    def test_chronological_lockbox_uses_latest_workflow_rows(self):
+        cfg = PipelineConfig(research_mode=True, production_split_mode="chronological_lockbox_v1")
+        windows = DataSplitter(cfg).get_workflow_indices(400000)
+
+        self.assertEqual(windows["optimizer_train"], (150000, 299400))
+        self.assertEqual(windows["tuning_validation"], (299700, 349700))
+        self.assertEqual(windows["final_lockbox"], (350000, 400000))
+
+    def test_chronological_lockbox_fails_closed_without_training_row(self):
+        cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="chronological_lockbox_v1",
+            max_bars=1000,
+            active_universe_bars=1000,
+            historical_stress_audit_bars=0,
+            tuning_validation_bars=50,
+            final_lockbox_bars=50,
+            split_embargo_bars=5,
+        )
+        # PipelineConfig clamps active_universe_bars to at least 1000, so use
+        # the requested 110/111-row histories against that active cap.
+        with self.assertRaisesRegex(ValueError, "requires at least one optimizer-train row"):
+            DataSplitter(cfg).get_workflow_indices(110)
+
+        self.assertEqual(DataSplitter(cfg).get_workflow_indices(111)["optimizer_train"], (0, 1))
+
+    def test_resample_tracks_source_bar_bounds_and_excludes_straddlers(self):
+        index = pd.date_range("2026-01-01", periods=24, freq="5min")
+        source = pd.DataFrame(
+            {
+                "Open": 1.0,
+                "High": 1.1,
+                "Low": 0.9,
+                "Close": 1.0,
+                "Volume": 1,
+            },
+            index=index,
+        )
+        resampled = DataLoader(Path("."), cache_resampled=False).resample(source, "H1")
+
+        self.assertEqual(resampled.loc[index[0], "_SOURCE_FIRST_TS"], index[0])
+        self.assertEqual(resampled.loc[index[0], "_SOURCE_LAST_TS"], index[11])
+        straddling = OptimizationPipeline._slice_time_window(
+            resampled, index[0], pd.Timestamp("2026-01-01 00:30")
+        )
+        clean_second_hour = OptimizationPipeline._slice_time_window(
+            resampled,
+            pd.Timestamp("2026-01-01 01:00"),
+            pd.Timestamp("2026-01-01 02:00"),
+        )
+        self.assertTrue(straddling.empty)
+        self.assertEqual(clean_second_hour.index.tolist(), [pd.Timestamp("2026-01-01 01:00")])
+
+    def test_source_content_digest_invalidates_resample_cache_and_provenance_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "TEST_M5.csv"
+            frame = pd.DataFrame(
+                {
+                    "time": pd.date_range("2026-01-01", periods=24, freq="5min"),
+                    "Open": 1.0,
+                    "High": 1.1,
+                    "Low": 0.9,
+                    "Close": 1.0,
+                    "Volume": 1,
+                }
+            )
+            frame.to_csv(path, index=False)
+            loader = DataLoader(root, cache_resampled=True, cache_dir=root / "cache")
+            source = loader.load_symbol("TEST", "M5")
+            self.assertIsNotNone(source)
+            source_meta = loader._source_meta["TEST_M5"]
+            self.assertEqual(source_meta["size"], path.stat().st_size)
+            self.assertEqual(source_meta["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+
+            resampled = loader.resample(source, "H1")
+            loader._save_resample_cache("TEST", "H1", source_meta, resampled)
+            cache_meta = dict(loader._resample_meta["TEST_H1"])
+            self.assertTrue(loader._is_resample_cache_valid(cache_meta, source_meta))
+            altered = dict(source_meta)
+            altered["sha256"] = "0" * 64
+            self.assertFalse(loader._is_resample_cache_valid(cache_meta, altered))
+
+            loader._resample_cache.clear()
+            loader._resample_meta.clear()
+            restored = loader._load_resample_cache("TEST", "H1", source_meta)
+            self.assertIsNotNone(restored)
+            self.assertIn("_SOURCE_FIRST_TS", restored.columns)
+            self.assertIn("_SOURCE_LAST_TS", restored.columns)
 
 
 if __name__ == "__main__":

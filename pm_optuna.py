@@ -394,6 +394,8 @@ class OptunaTPEOptimizer:
     trading strategy optimization where evaluations are expensive.
     """
     
+    REGIME_SEARCH_CONTRACT = "independent_regime_family_train_only_v1"
+
     def __init__(self, 
                  config: OptunaConfig,
                  backtester,
@@ -412,9 +414,134 @@ class OptunaTPEOptimizer:
         self.backtester = backtester
         self.scorer = scorer
         self.strategy_registry = strategy_registry
+        self.last_regime_search_metadata: Dict[str, Any] = {}
         
         if not OPTUNA_AVAILABLE:
             logger.warning("Optuna not available. Install with: pip install optuna")
+
+    @staticmethod
+    def _gate_signals_to_regime(
+        signals: pd.Series,
+        features: pd.DataFrame,
+        regime: str,
+    ) -> pd.Series:
+        """Fail-closed entry gating for an exact regime specialist.
+
+        A post-hoc trade bucket is not equivalent: trades opened in other
+        regimes alter compounding and can occupy the single-position backtester,
+        suppressing entries for the target specialist. Every selection surface
+        must therefore run the same entry gate used by lockbox/live evaluation.
+        """
+        if not isinstance(signals, pd.Series):
+            signals = pd.Series(signals, index=features.index)
+        gated = signals.reindex(features.index).fillna(0).copy()
+        if "REGIME_LIVE" not in features.columns:
+            gated.iloc[:] = 0
+            return gated
+        mask = (
+            features["REGIME_LIVE"]
+            .reindex(gated.index)
+            .astype(str)
+            .str.upper()
+            .eq(str(regime or "").upper())
+            .fillna(False)
+        )
+        gated.loc[~mask] = 0
+        return gated
+
+    def _evaluate_frozen_regime_candidate(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        symbol: str,
+        timeframe: str,
+        strategy_name: str,
+        regime: str,
+        val_features: Optional[pd.DataFrame],
+        val_warmup_bars: int,
+    ) -> int:
+        """Evaluate one frozen train winner on tuning exactly once.
+
+        The result is evidence only: it never changes the parameters selected
+        inside the train-only study. Errors fail closed through empty metrics.
+        """
+        params = dict(candidate.get("params", {}) or {})
+        frozen_strategy = candidate.get("strategy")
+        try:
+            frozen_strategy = self.strategy_registry.get(strategy_name, **params)
+        except Exception as exc:
+            logger.debug(
+                "[%s] [%s] [%s] Could not recreate frozen %s candidate: %s",
+                symbol, timeframe, regime, strategy_name, exc,
+            )
+        candidate["strategy"] = frozen_strategy
+        val_metrics = self._empty_val_metrics()
+        evaluations = 0
+        evaluation_error: Optional[str] = None
+        if val_features is not None and len(val_features) >= 50:
+            evaluations = 1
+            try:
+                if frozen_strategy is None:
+                    raise RuntimeError("frozen strategy unavailable")
+                raw_val_signals = frozen_strategy.generate_signals(val_features, symbol)
+                val_signals = self._gate_signals_to_regime(
+                    raw_val_signals, val_features, regime
+                )
+                val_result = self.backtester.run(
+                    val_features,
+                    val_signals,
+                    symbol,
+                    frozen_strategy,
+                    warmup_bars=int(max(0, val_warmup_bars)),
+                    timeframe=timeframe,
+                )
+                val_metrics = dict(val_result or self._empty_val_metrics())
+            except Exception as exc:
+                evaluation_error = f"{type(exc).__name__}: {exc}"
+                val_metrics = self._empty_val_metrics()
+                val_metrics["evaluation_error"] = evaluation_error
+                logger.debug(
+                    "[%s] [%s] [%s] Frozen tuning evaluation failed for %s: %s",
+                    symbol, timeframe, regime, strategy_name, exc,
+                )
+        candidate["val_regime_metrics"] = {str(regime): val_metrics}
+        candidate["tuning_validation_evaluations"] = int(evaluations)
+        candidate["tuning_validation_evaluation_error"] = evaluation_error
+        candidate["search_contract"] = self.REGIME_SEARCH_CONTRACT
+        return int(evaluations)
+
+    def _record_regime_search_metadata(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        strategy_name: str,
+        method: str,
+        cells: List[Dict[str, Any]],
+    ) -> None:
+        """Publish exact per-family cell/trial counts for multiplicity control."""
+        self.last_regime_search_metadata = {
+            "contract": self.REGIME_SEARCH_CONTRACT,
+            "symbol": str(symbol),
+            "timeframe": str(timeframe),
+            "strategy_family": str(strategy_name),
+            "method": str(method),
+            "cell_count": int(len(cells)),
+            "search_trials_total": int(sum(
+                int(cell.get("search_trials", 0) or 0) for cell in cells
+            )),
+            "completed_trials_total": int(sum(
+                int(cell.get("completed_trials", 0) or 0) for cell in cells
+            )),
+            "eligible_train_trials_total": int(sum(
+                int(cell.get("eligible_train_trials", 0) or 0) for cell in cells
+            )),
+            "tuning_validation_evaluations": int(sum(
+                int(cell.get("tuning_validation_evaluations", 0) or 0)
+                for cell in cells
+            )),
+            "cells": [dict(cell) for cell in cells],
+        }
     
     def optimize(self,
                  symbol: str,
@@ -488,7 +615,8 @@ class OptunaTPEOptimizer:
             logger.info(f"[{symbol}] Optuna TPE optimization for {strategy_name}: "
                        f"search_space={search_space_size}, trials={n_trials}")
         
-        # Track best results
+        # Track the best optimizer-train result. Validation is unavailable to
+        # the objective and is evaluated only once after parameters are frozen.
         best_result = {
             'params': default_params.copy(),
             'score': float('-inf'),
@@ -526,14 +654,12 @@ class OptunaTPEOptimizer:
                 if train_metrics.get('total_trades', 0) < min_trades:
                     return self.config.penalty_no_trades
 
-                # Progressive rejection: relax DD thresholds in early trials
+                # Progressive rejection: relax the train DD threshold in early trials.
                 progress = trial_count[0] / max(n_trials, 1)
                 if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
                     dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
-                    dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
                 else:
                     dd_train_mult = self.config.train_dd_multiplier
-                    dd_val_mult = self.config.val_dd_multiplier
 
                 # EARLY REJECTION 2: Training drawdown
                 train_dd = train_metrics.get('max_drawdown_pct', 100.0)
@@ -541,30 +667,15 @@ class OptunaTPEOptimizer:
                     early_rejections[0] += 1
                     return self.config.penalty_dd_rejection
 
-                # CONDITIONAL VALIDATION: Only run if training passed
-                if val_features is not None and len(val_features) >= 50:
-                    val_signals = strategy.generate_signals(val_features, symbol)
-                    val_metrics = self.backtester.run(
-                        val_features, val_signals, symbol, strategy, timeframe=timeframe
-                    )
-                    
-                    # EARLY REJECTION 3: Validation drawdown
-                    val_dd = val_metrics.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct * dd_val_mult:
-                        early_rejections[0] += 1
-                        return self.config.penalty_dd_rejection
-                else:
-                    val_metrics = self._empty_val_metrics()
+                # Parameter choice is optimizer-train only.
+                score = float(scoring_fn(train_metrics, {}))
                 
-                # Compute score
-                score = scoring_fn(train_metrics, val_metrics)
-                
-                # Update best if improved (only if passes DD check)
+                # Update the frozen train winner.
                 if score > best_result['score']:
                     best_result['score'] = score
                     best_result['params'] = self._clean_params(params)
                     best_result['train_metrics'] = train_metrics
-                    best_result['val_metrics'] = val_metrics
+                    best_result['val_metrics'] = self._empty_val_metrics()
                 
                 # Log progress
                 if trial_count[0] % self.config.log_interval == 0:
@@ -587,7 +698,6 @@ class OptunaTPEOptimizer:
             len(train_features),
             str(train_features.index[0]) if len(train_features) else "",
             str(train_features.index[-1]) if len(train_features) else "",
-            len(val_features) if val_features is not None else 0,
         )
         sampler = TPESampler(
             seed=sampler_seed,
@@ -613,6 +723,31 @@ class OptunaTPEOptimizer:
         # Compile statistics
         elapsed = time.time() - start_time
         stats = self._compile_stats(study, elapsed)
+        stats.early_dd_rejections = int(early_rejections[0])
+
+        # One post-freeze validation evaluation; it cannot change best_params.
+        frozen_val_metrics = self._empty_val_metrics()
+        if best_result['train_metrics'] and val_features is not None and len(val_features) >= 50:
+            try:
+                frozen_strategy = self.strategy_registry.get(
+                    strategy_name, **dict(best_result['params'])
+                )
+                val_signals = frozen_strategy.generate_signals(val_features, symbol)
+                frozen_val_metrics = self.backtester.run(
+                    val_features,
+                    val_signals,
+                    symbol,
+                    frozen_strategy,
+                    timeframe=timeframe,
+                )
+            except Exception as exc:
+                frozen_val_metrics = self._empty_val_metrics()
+                frozen_val_metrics['evaluation_error'] = f"{type(exc).__name__}: {exc}"
+                logger.debug(
+                    "[%s] Frozen single-strategy validation failed for %s: %s",
+                    symbol, strategy_name, exc,
+                )
+        best_result['val_metrics'] = frozen_val_metrics
         
         logger.info(f"[{symbol}] Optimization complete: {stats}")
         
@@ -637,13 +772,12 @@ class OptunaTPEOptimizer:
                              min_train_trades: int = 25,
                              max_drawdown_pct: float = 25.0,
                              val_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
-        """
-        Optimize strategy parameters for multiple regimes simultaneously.
-        
-        This is more efficient than per-regime optimization because:
-        1. Each backtest produces trades for all regimes
-        2. TPE learns parameter-regime relationships
-        3. Early rejection of high-drawdown candidates (saves compute)
+        """Run independent train-only studies for exact regime-family cells.
+
+        Tuning-validation rows are never generated or backtested inside a
+        trial. Each regime gets its own sampler/study/objective. Only after the
+        train-best parameters are frozen is that one candidate evaluated once
+        on tuning validation.
         
         Args:
             symbol: Trading symbol
@@ -653,8 +787,8 @@ class OptunaTPEOptimizer:
             train_features: Training data with REGIME_LIVE column
             val_features: Validation data
             regimes: List of regime names
-            bucket_trades_fn: Function to bucket trades by regime
-            compute_score_fn: Function to compute regime score
+            bucket_trades_fn: Deprecated compatibility argument; not called.
+            compute_score_fn: Train-only score function called as ``fn(train, {})``.
             min_train_trades: Minimum trades per regime
             max_drawdown_pct: Maximum allowed drawdown (early rejection threshold)
             
@@ -669,9 +803,8 @@ class OptunaTPEOptimizer:
                 max_drawdown_pct, val_warmup_bars
             )
         
+        self.last_regime_search_metadata = {}
         start_time = time.time()
-        
-        # Get default params
         base_strategy = self.strategy_registry.get(strategy_name)
         default_params = base_strategy.get_params()
         
@@ -693,190 +826,174 @@ class OptunaTPEOptimizer:
         if budget_mode == "family_aware":
             coverage = (n_trials / search_space_size) if search_space_size else 1.0
             logger.info(
-                f"[{symbol}] Optuna multi-regime optimization for {strategy_name}: "
+                f"[{symbol}] Optuna independent-cell optimization for {strategy_name}: "
                 f"search_space={search_space_size}, trials={n_trials} "
                 f"(family-aware budget: {coverage:.1%} coverage, "
                 f"min={self.config.min_trials_per_strategy}, max={self.config.max_trials_per_strategy})"
             )
 
-        # Track best per regime
-        best_by_regime: Dict[str, Tuple[float, Dict[str, Any]]] = {
-            r: (float('-inf'), None) for r in regimes
-        }
-        
-        # Track early rejections for logging
-        early_rejections = [0]
-        trial_count = [0]
-        
-        def objective(trial: optuna.Trial) -> float:
-            """Multi-regime objective with drawdown-based early rejection."""
-            trial_count[0] += 1
-            params = param_space.suggest(trial)
-            
-            try:
-                strategy = self.strategy_registry.get(strategy_name, **params)
-                
-                # Backtest on training data
-                signals = strategy.generate_signals(train_features, symbol)
+        results: Dict[str, Dict[str, Any]] = {}
+        cell_records: List[Dict[str, Any]] = []
+        for regime in [str(value) for value in regimes]:
+            cell_start = time.time()
+            best_score = [float("-inf")]
+            best_candidate: List[Optional[Dict[str, Any]]] = [None]
+            trial_count = [0]
+            eligible_train_trials = [0]
+            early_rejections = [0]
 
-                # C1: Skip backtest entirely if no signals generated
-                if signals.abs().sum() == 0:
-                    return self.config.penalty_no_trades
-
-                train_result = self.backtester.run(
-                    train_features, signals, symbol, strategy, timeframe=timeframe
-                )
-
-                # ===== EARLY REJECTION 1: Minimum trades =====
-                if train_result.get('total_trades', 0) < min_train_trades // 2:
-                    return self.config.penalty_no_trades
-
-                # Progressive rejection for regime optimizer
-                progress = trial_count[0] / max(n_trials, 1)
-                if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
-                    dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
-                    dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
-                else:
-                    dd_train_mult = self.config.train_dd_multiplier
-                    dd_val_mult = self.config.val_dd_multiplier
-
-                # ===== EARLY REJECTION 2: Training drawdown =====
-                train_dd = train_result.get('max_drawdown_pct', 100.0)
-                if train_dd > max_drawdown_pct * dd_train_mult:
-                    early_rejections[0] += 1
-                    return self.config.penalty_dd_rejection
-
-                # Bucket trades by regime
-                train_trades = train_result.get('trades', [])
+            def objective(trial: optuna.Trial, target_regime: str = regime) -> float:
+                """One exact-regime, optimizer-train-only objective."""
+                trial_count[0] += 1
+                params = param_space.suggest(trial)
+                clean_params = self._clean_params(params)
                 try:
-                    train_regime_metrics = bucket_trades_fn(
-                        train_trades, train_features, timeframe=timeframe
+                    strategy = self.strategy_registry.get(strategy_name, **params)
+                    progress = trial_count[0] / max(n_trials, 1)
+                    if (
+                        self.config.progressive_rejection
+                        and progress < self.config.progressive_warmup_frac
+                    ):
+                        dd_train_mult = (
+                            self.config.train_dd_multiplier
+                            * self.config.progressive_warmup_multiplier
+                        )
+                    else:
+                        dd_train_mult = self.config.train_dd_multiplier
+                    raw_train_signals = strategy.generate_signals(train_features, symbol)
+                    train_signals = self._gate_signals_to_regime(
+                        raw_train_signals, train_features, target_regime
                     )
-                except TypeError:
-                    train_regime_metrics = bucket_trades_fn(train_trades, train_features)
-
-                # ===== CONDITIONAL VALIDATION: Only if training passed DD check =====
-                val_regime_metrics = {}
-                if val_features is not None and len(val_features) >= 50:
-                    val_signals = strategy.generate_signals(val_features, symbol)
-                    val_result = self.backtester.run(
-                        val_features,
-                        val_signals,
+                    if train_signals.abs().sum() == 0:
+                        return float(self.config.penalty_no_trades)
+                    train_result = self.backtester.run(
+                        train_features,
+                        train_signals,
                         symbol,
                         strategy,
-                        warmup_bars=val_warmup_bars,
                         timeframe=timeframe,
                     )
-
-                    # Early rejection if validation DD too high
-                    val_dd = val_result.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct * dd_val_mult:
+                    train_m = dict(train_result or {})
+                    if int(train_m.get("total_trades", 0) or 0) < min_train_trades:
+                        return float(self.config.penalty_no_trades)
+                    if float(train_m.get("max_drawdown_pct", 100.0) or 100.0) > (
+                        max_drawdown_pct * dd_train_mult
+                    ):
                         early_rejections[0] += 1
-                        return self.config.penalty_dd_rejection
-
-                    val_trades = val_result.get('trades', [])
-                    try:
-                        val_regime_metrics = bucket_trades_fn(
-                            val_trades, val_features, timeframe=timeframe
-                        )
-                    except TypeError:
-                        val_regime_metrics = bucket_trades_fn(val_trades, val_features)
-
-                # Score each regime and track best
-                regime_scores = []
-                regime_score_map: Dict[str, float] = {}
-                clean_params = self._clean_params(params)
-
-                for regime in regimes:
-                    train_m = train_regime_metrics.get(regime, {})
-                    val_m = val_regime_metrics.get(regime, {})
-
-                    # ===== EARLY REJECTION 3: Per-regime minimum trades =====
-                    if train_m.get('total_trades', 0) < min_train_trades:
-                        continue
-
-                    # ===== EARLY REJECTION 4: Per-regime drawdown =====
-                    regime_train_dd = train_m.get('max_drawdown_pct', 100.0)
-                    regime_val_dd = val_m.get('max_drawdown_pct', 100.0)
-
-                    if regime_val_dd > max_drawdown_pct * dd_val_mult:
-                        continue
-                    if regime_train_dd > max_drawdown_pct * dd_train_mult:
-                        continue
-                    
-                    score = compute_score_fn(train_m, val_m)
-                    regime_scores.append(score)
-                    regime_score_map[regime] = float(score)
-                    
-                    # Update best for this regime (only if passes DD check)
-                    if score > best_by_regime[regime][0]:
-                        best_by_regime[regime] = (score, {
-                            'strategy': strategy,
-                            'strategy_name': strategy_name,
-                            'params': clean_params,
-                            'train_result': train_result,
-                            'train_regime_metrics': train_regime_metrics,
-                            'val_regime_metrics': val_regime_metrics,
-                            'is_tuned': True,
-                        })
-                
-                if regime_score_map:
+                        return float(self.config.penalty_dd_rejection)
+                    score = float(compute_score_fn(train_m, {}))
+                    if not math.isfinite(score):
+                        return float(self.config.penalty_no_trades)
+                    eligible_train_trials[0] += 1
                     trial.set_user_attr("clean_params", clean_params)
-                    trial.set_user_attr("regime_scores", regime_score_map)
-                # Return the mean score so a single lucky regime cannot dominate the search.
-                return float(np.mean(regime_scores)) if regime_scores else -1000.0
-                
-            except Exception as e:
-                logger.debug(f"[{symbol}] [{timeframe}] Trial failed: {e}")
-                return -1000.0
-        
-        # Create and run study
-        sampler_seed = _stable_seed(
-            self.config.seed,
+                    trial.set_user_attr("regime_scores", {target_regime: score})
+                    if score > best_score[0]:
+                        best_score[0] = score
+                        best_candidate[0] = {
+                            "strategy": strategy,
+                            "strategy_name": strategy_name,
+                            "params": clean_params,
+                            "train_result": train_result,
+                            "train_regime_metrics": {target_regime: train_m},
+                            "val_regime_metrics": {target_regime: {}},
+                            "regime_gated": True,
+                            "evaluation_regime": target_regime,
+                            "is_tuned": True,
+                        }
+                    return score
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] [%s] [%s] Train-only trial failed for %s: %s",
+                        symbol, timeframe, target_regime, strategy_name, exc,
+                    )
+                    return float(self.config.penalty_no_trades)
+
+            sampler_seed = _stable_seed(
+                self.config.seed,
+                symbol,
+                timeframe,
+                regime,
+                strategy_name,
+                "optuna_regime_train_only",
+                len(train_features),
+                str(train_features.index[0]) if len(train_features) else "",
+                str(train_features.index[-1]) if len(train_features) else "",
+            )
+            sampler = TPESampler(
+                seed=sampler_seed,
+                n_startup_trials=min(self.config.n_startup_trials, n_trials // 2),
+                multivariate=self.config.multivariate,
+            )
+            study = optuna.create_study(direction="maximize", sampler=sampler)
+            study.optimize(
+                objective,
+                n_trials=n_trials,
+                timeout=self.config.timeout_seconds,
+                show_progress_bar=False,
+                catch=(Exception,),
+            )
+            stats = self._compile_stats(study, time.time() - cell_start)
+            stats.early_dd_rejections = early_rejections[0]
+            actual_trials = int(len(getattr(study, "trials", []) or []))
+            validation_evaluations = 0
+            candidate = best_candidate[0]
+            if candidate is not None:
+                candidate["search_trials"] = actual_trials
+                candidate["search_completed_trials"] = int(stats.n_completed)
+                candidate["eligible_train_trials"] = int(eligible_train_trials[0])
+                candidate["search_cell_count"] = 1
+                candidate["parameter_stability_evidence"] = (
+                    self._build_parameter_stability_evidence(
+                        study,
+                        regime,
+                        candidate.get("params", {}),
+                        float(best_score[0]),
+                        param_space,
+                    )
+                )
+                validation_evaluations = self._evaluate_frozen_regime_candidate(
+                    candidate,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    strategy_name=strategy_name,
+                    regime=regime,
+                    val_features=val_features,
+                    val_warmup_bars=val_warmup_bars,
+                )
+                results[regime] = candidate
+            cell_records.append({
+                "regime": regime,
+                "strategy_family": str(strategy_name),
+                "search_trials": actual_trials,
+                "completed_trials": int(stats.n_completed),
+                "eligible_train_trials": int(eligible_train_trials[0]),
+                "early_dd_rejections": int(early_rejections[0]),
+                "frozen_candidate": bool(candidate is not None),
+                "tuning_validation_evaluations": int(validation_evaluations),
+                "best_train_score": (
+                    float(best_score[0]) if math.isfinite(best_score[0]) else None
+                ),
+            })
+            logger.debug(
+                "[%s] [%s] [%s] %s independent train-only study: %s",
+                symbol, timeframe, regime, strategy_name, stats,
+            )
+
+        self._record_regime_search_metadata(
+            symbol=symbol,
+            timeframe=timeframe,
+            strategy_name=strategy_name,
+            method="optuna_tpe",
+            cells=cell_records,
+        )
+        logger.debug(
+            "[%s] [%s] %s independent-cell tuning complete in %.1fs: %s",
             symbol,
             timeframe,
             strategy_name,
-            "optuna_regime",
-            len(train_features),
-            str(train_features.index[0]) if len(train_features) else "",
-            str(train_features.index[-1]) if len(train_features) else "",
-            len(val_features) if val_features is not None else 0,
+            time.time() - start_time,
+            self.last_regime_search_metadata,
         )
-        sampler = TPESampler(
-            seed=sampler_seed,
-            n_startup_trials=min(self.config.n_startup_trials, n_trials // 2),
-            multivariate=self.config.multivariate,
-        )
-        
-        study = optuna.create_study(direction='maximize', sampler=sampler)
-        study.optimize(
-            objective,
-            n_trials=n_trials,
-            timeout=self.config.timeout_seconds,
-            show_progress_bar=False,
-            catch=(Exception,),
-        )
-        
-        elapsed = time.time() - start_time
-        stats = self._compile_stats(study, elapsed)
-        stats.early_dd_rejections = early_rejections[0]
-        
-        logger.debug(f"[{symbol}] [{timeframe}] {strategy_name} regime tuning: {stats}")
-        
-        # Return best candidates per regime
-        results = {}
-        for regime, (score, candidate) in best_by_regime.items():
-            if candidate is not None:
-                candidate['search_trials'] = int(n_trials)
-                candidate['parameter_stability_evidence'] = self._build_parameter_stability_evidence(
-                    study,
-                    regime,
-                    candidate.get('params', {}),
-                    float(score),
-                    param_space,
-                )
-                results[regime] = candidate
-        
         return results
 
     @staticmethod
@@ -1022,6 +1139,9 @@ class OptunaTPEOptimizer:
             train_features, signals, symbol, strategy, timeframe=timeframe
         )
         
+        # The only parameter set is frozen after its train evaluation. Score it
+        # on train only, then attach exactly one validation evaluation.
+        score = float(scoring_fn(train_metrics, {}))
         if val_features is not None and len(val_features) >= 50:
             val_signals = strategy.generate_signals(val_features, symbol)
             val_metrics = self.backtester.run(
@@ -1029,8 +1149,6 @@ class OptunaTPEOptimizer:
             )
         else:
             val_metrics = self._empty_val_metrics()
-        
-        score = scoring_fn(train_metrics, val_metrics)
         
         stats = OptimizationStats(
             n_trials=1,
@@ -1083,12 +1201,11 @@ class OptunaTPEOptimizer:
             _seed = _stable_seed(
                 symbol,
                 strategy_name,
-                "grid_fallback",
+                "grid_fallback_train_only",
                 len(train_features),
-                len(val_features) if val_features is not None else 0,
             )
-            np.random.seed(_seed)
-            indices = np.random.choice(len(all_combos), n_trials, replace=False)
+            rng = np.random.default_rng(_seed)
+            indices = rng.choice(len(all_combos), n_trials, replace=False)
             combos = [all_combos[i] for i in indices]
         else:
             combos = all_combos
@@ -1096,7 +1213,7 @@ class OptunaTPEOptimizer:
         best_score = float('-inf')
         best_params = default_params.copy()
         best_train_metrics = {}
-        best_val_metrics = {}
+        best_val_metrics = self._empty_val_metrics()
         completed = 0
         early_rejections = 0
         
@@ -1107,10 +1224,8 @@ class OptunaTPEOptimizer:
             progress = (idx + 1) / max(len(combos), 1)
             if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
                 dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
-                dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
             else:
                 dd_train_mult = self.config.train_dd_multiplier
-                dd_val_mult = self.config.val_dd_multiplier
 
             try:
                 strategy = self.strategy_registry.get(strategy_name, **params)
@@ -1130,29 +1245,13 @@ class OptunaTPEOptimizer:
                     early_rejections += 1
                     continue
 
-                # CONDITIONAL VALIDATION
-                if val_features is not None and len(val_features) >= 50:
-                    val_signals = strategy.generate_signals(val_features, symbol)
-                    val_metrics = self.backtester.run(
-                        val_features, val_signals, symbol, strategy, timeframe=timeframe
-                    )
-
-                    # EARLY REJECTION 3: Validation drawdown
-                    val_dd = val_metrics.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct * dd_val_mult:
-                        early_rejections += 1
-                        continue
-                else:
-                    val_metrics = self._empty_val_metrics()
-                
-                score = scoring_fn(train_metrics, val_metrics)
+                score = float(scoring_fn(train_metrics, {}))
                 completed += 1
                 
                 if score > best_score:
                     best_score = score
                     best_params = self._clean_params(params)
                     best_train_metrics = train_metrics
-                    best_val_metrics = val_metrics
                     
             except Exception:
                 continue
@@ -1161,6 +1260,24 @@ class OptunaTPEOptimizer:
             logger.debug(f"[{symbol}] Random search: {early_rejections} early DD rejections")
         
         elapsed = time.time() - start_time
+
+        # Evaluate only the frozen train winner on validation.
+        if best_train_metrics and val_features is not None and len(val_features) >= 50:
+            try:
+                frozen_strategy = self.strategy_registry.get(
+                    strategy_name, **dict(best_params)
+                )
+                val_signals = frozen_strategy.generate_signals(val_features, symbol)
+                best_val_metrics = self.backtester.run(
+                    val_features,
+                    val_signals,
+                    symbol,
+                    frozen_strategy,
+                    timeframe=timeframe,
+                )
+            except Exception as exc:
+                best_val_metrics = self._empty_val_metrics()
+                best_val_metrics['evaluation_error'] = f"{type(exc).__name__}: {exc}"
         
         stats = OptimizationStats(
             n_trials=len(combos),
@@ -1194,7 +1311,7 @@ class OptunaTPEOptimizer:
                                 min_train_trades: int,
                                 max_drawdown_pct: float = 25.0,
                                 val_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
-        """Fallback regime search when Optuna unavailable (with drawdown-based early rejection)."""
+        """Independent train-only grid cells, each followed by one frozen tuning eval."""
         from itertools import product
         
         base_strategy = self.strategy_registry.get(strategy_name)
@@ -1207,134 +1324,125 @@ class OptunaTPEOptimizer:
         param_values = list(param_grid.values())
         all_combos = list(product(*param_values))
         
+        self.last_regime_search_metadata = {}
         n_trials = min(self.config.n_trials, len(all_combos))
-        if len(all_combos) > n_trials:
-            _seed = _stable_seed(
-                symbol,
-                timeframe,
-                strategy_name,
-                "regime_grid_fallback",
-                len(train_features),
-                len(val_features) if val_features is not None else 0,
-            )
-            np.random.seed(_seed)
-            indices = np.random.choice(len(all_combos), n_trials, replace=False)
-            combos = [all_combos[i] for i in indices]
-        else:
-            combos = all_combos
-
-        best_by_regime = {r: (float('-inf'), None) for r in regimes}
-        early_rejections = 0
-
-        for idx, combo in enumerate(combos):
-            params = {**default_params, **dict(zip(param_names, combo))}
-
-            # Progressive rejection for regime fallback
-            progress = (idx + 1) / max(len(combos), 1)
-            if self.config.progressive_rejection and progress < self.config.progressive_warmup_frac:
-                dd_train_mult = self.config.train_dd_multiplier * self.config.progressive_warmup_multiplier
-                dd_val_mult = self.config.val_dd_multiplier * self.config.progressive_warmup_multiplier
-            else:
-                dd_train_mult = self.config.train_dd_multiplier
-                dd_val_mult = self.config.val_dd_multiplier
-
-            try:
-                strategy = self.strategy_registry.get(strategy_name, **params)
-
-                signals = strategy.generate_signals(train_features, symbol)
-                train_result = self.backtester.run(
-                    train_features, signals, symbol, strategy, timeframe=timeframe
+        results: Dict[str, Dict[str, Any]] = {}
+        cell_records: List[Dict[str, Any]] = []
+        for regime in [str(value) for value in regimes]:
+            if len(all_combos) > n_trials:
+                seed = _stable_seed(
+                    symbol,
+                    timeframe,
+                    regime,
+                    strategy_name,
+                    "regime_grid_train_only",
+                    len(train_features),
                 )
-
-                # EARLY REJECTION 1: Minimum trades
-                if train_result.get('total_trades', 0) < min_train_trades // 2:
-                    continue
-
-                # EARLY REJECTION 2: Training drawdown
-                train_dd = train_result.get('max_drawdown_pct', 100.0)
-                if train_dd > max_drawdown_pct * dd_train_mult:
-                    early_rejections += 1
-                    continue
-
-                train_trades = train_result.get('trades', [])
-                try:
-                    train_regime_metrics = bucket_trades_fn(
-                        train_trades, train_features, timeframe=timeframe
+                rng = np.random.default_rng(seed)
+                indices = rng.choice(len(all_combos), n_trials, replace=False)
+                combos = [all_combos[int(index)] for index in indices]
+            else:
+                combos = list(all_combos)
+            best_score = float("-inf")
+            best_candidate: Optional[Dict[str, Any]] = None
+            completed_trials = 0
+            eligible_train_trials = 0
+            early_rejections = 0
+            for idx, combo in enumerate(combos):
+                params = {**default_params, **dict(zip(param_names, combo))}
+                progress = (idx + 1) / max(len(combos), 1)
+                if (
+                    self.config.progressive_rejection
+                    and progress < self.config.progressive_warmup_frac
+                ):
+                    dd_train_mult = (
+                        self.config.train_dd_multiplier
+                        * self.config.progressive_warmup_multiplier
                     )
-                except TypeError:
-                    train_regime_metrics = bucket_trades_fn(train_trades, train_features)
-
-                # CONDITIONAL VALIDATION: Only if training passed DD check
-                val_regime_metrics = {}
-                if val_features is not None and len(val_features) >= 50:
-                    val_signals = strategy.generate_signals(val_features, symbol)
-                    val_result = self.backtester.run(
-                        val_features,
-                        val_signals,
+                else:
+                    dd_train_mult = self.config.train_dd_multiplier
+                try:
+                    strategy = self.strategy_registry.get(strategy_name, **params)
+                    raw_train_signals = strategy.generate_signals(train_features, symbol)
+                    train_signals = self._gate_signals_to_regime(
+                        raw_train_signals, train_features, regime
+                    )
+                    if train_signals.abs().sum() == 0:
+                        continue
+                    train_result = self.backtester.run(
+                        train_features,
+                        train_signals,
                         symbol,
                         strategy,
-                        warmup_bars=val_warmup_bars,
                         timeframe=timeframe,
                     )
-
-                    # Early rejection if validation DD too high
-                    val_dd = val_result.get('max_drawdown_pct', 100.0)
-                    if val_dd > max_drawdown_pct * dd_val_mult:
+                    completed_trials += 1
+                    train_m = dict(train_result or {})
+                    if int(train_m.get("total_trades", 0) or 0) < min_train_trades:
+                        continue
+                    if float(train_m.get("max_drawdown_pct", 100.0) or 100.0) > (
+                        max_drawdown_pct * dd_train_mult
+                    ):
                         early_rejections += 1
                         continue
-
-                    val_trades = val_result.get('trades', [])
-                    try:
-                        val_regime_metrics = bucket_trades_fn(
-                            val_trades, val_features, timeframe=timeframe
-                        )
-                    except TypeError:
-                        val_regime_metrics = bucket_trades_fn(val_trades, val_features)
-
-                clean_params = self._clean_params(params)
-
-                for regime in regimes:
-                    train_m = train_regime_metrics.get(regime, {})
-                    val_m = val_regime_metrics.get(regime, {})
-
-                    # EARLY REJECTION 3: Per-regime minimum trades
-                    if train_m.get('total_trades', 0) < min_train_trades:
+                    score = float(compute_score_fn(train_m, {}))
+                    if not math.isfinite(score):
                         continue
-
-                    # EARLY REJECTION 4: Per-regime drawdown
-                    regime_train_dd = train_m.get('max_drawdown_pct', 100.0)
-                    regime_val_dd = val_m.get('max_drawdown_pct', 100.0)
-
-                    if regime_val_dd > max_drawdown_pct * dd_val_mult:
-                        continue
-                    if regime_train_dd > max_drawdown_pct * dd_train_mult:
-                        continue
-                    
-                    score = compute_score_fn(train_m, val_m)
-                    
-                    if score > best_by_regime[regime][0]:
-                        best_by_regime[regime] = (score, {
-                            'strategy': strategy,
-                            'strategy_name': strategy_name,
-                            'params': clean_params,
-                            'train_result': train_result,
-                            'train_regime_metrics': train_regime_metrics,
-                            'val_regime_metrics': val_regime_metrics,
-                            'is_tuned': True,
-                            'search_trials': int(len(combos)),
-                        })
-                        
-            except Exception:
-                continue
-        
-        if early_rejections > 0:
-            logger.debug(f"[{symbol}] [{timeframe}] Grid search: {early_rejections} early DD rejections")
-        
-        results = {}
-        for regime, (score, candidate) in best_by_regime.items():
-            if candidate is not None:
-                results[regime] = candidate
-        
+                    eligible_train_trials += 1
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = {
+                            "strategy": strategy,
+                            "strategy_name": strategy_name,
+                            "params": self._clean_params(params),
+                            "train_result": train_result,
+                            "train_regime_metrics": {regime: train_m},
+                            "val_regime_metrics": {regime: {}},
+                            "regime_gated": True,
+                            "evaluation_regime": regime,
+                            "is_tuned": True,
+                        }
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] [%s] [%s] Train-only grid trial failed for %s: %s",
+                        symbol, timeframe, regime, strategy_name, exc,
+                    )
+            validation_evaluations = 0
+            if best_candidate is not None:
+                best_candidate["search_trials"] = int(len(combos))
+                best_candidate["search_completed_trials"] = int(completed_trials)
+                best_candidate["eligible_train_trials"] = int(eligible_train_trials)
+                best_candidate["search_cell_count"] = 1
+                validation_evaluations = self._evaluate_frozen_regime_candidate(
+                    best_candidate,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    strategy_name=strategy_name,
+                    regime=regime,
+                    val_features=val_features,
+                    val_warmup_bars=val_warmup_bars,
+                )
+                results[regime] = best_candidate
+            cell_records.append({
+                "regime": regime,
+                "strategy_family": str(strategy_name),
+                "search_trials": int(len(combos)),
+                "completed_trials": int(completed_trials),
+                "eligible_train_trials": int(eligible_train_trials),
+                "early_dd_rejections": int(early_rejections),
+                "frozen_candidate": bool(best_candidate is not None),
+                "tuning_validation_evaluations": int(validation_evaluations),
+                "best_train_score": (
+                    float(best_score) if math.isfinite(best_score) else None
+                ),
+            })
+        self._record_regime_search_metadata(
+            symbol=symbol,
+            timeframe=timeframe,
+            strategy_name=strategy_name,
+            method="deterministic_grid_fallback",
+            cells=cell_records,
+        )
         return results
     
     def _compile_stats(self, study: 'optuna.Study', elapsed: float) -> OptimizationStats:

@@ -593,6 +593,10 @@ class TestPortfolioRiskCap:
         )
         trader._recent_closing_deals = [{"profit": -150.0, "time": datetime.now()}]
         trader._recent_closing_deals_lookback_hours = 24 * 8
+        # LiveTrader distinguishes a successfully sourced broker snapshot from
+        # an injected/non-authoritative list. Mark this fixture as the former;
+        # production must otherwise refetch or fail closed.
+        trader._recent_closing_deals_available = True
 
         reasons = trader._realized_loss_hard_block_reasons(account)
 

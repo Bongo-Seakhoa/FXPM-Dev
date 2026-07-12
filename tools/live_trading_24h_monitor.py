@@ -135,7 +135,7 @@ def _is_tradeable_cell(cell: Any) -> bool:
     if not isinstance(cell, dict):
         return False
     name = str(cell.get("strategy_name", "") or "").upper()
-    status = str(cell.get("promotion_status", "PROMOTED") or "PROMOTED").upper()
+    status = str(cell.get("promotion_status", "BLOCKED") or "BLOCKED").upper()
     meta = cell.get("artifact_meta") if isinstance(cell.get("artifact_meta"), dict) else {}
     return bool(name and name != "NO_TRADE" and not meta.get("no_trade") and status not in {"NO_TRADE", "BLOCKED", "PAPER_ONLY"})
 

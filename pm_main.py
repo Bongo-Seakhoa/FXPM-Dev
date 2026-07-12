@@ -20,7 +20,8 @@ Usage:
     python pm_main.py --optimize              # Optimize (skip valid configs)
     python pm_main.py --optimize --overwrite  # Force re-optimize all
     python pm_main.py --trade                 # Live trading with existing configs
-    python pm_main.py --trade --paper         # Paper trading mode
+    python pm_main.py --trade --paper         # Demo-only edge-challenger probation
+    python pm_main.py --preflight             # Readiness checks only, no trading loop
     python pm_main.py --status                # Show current status
 
 Version: 3.1 (Portfolio Manager with Stateful Optimization)
@@ -37,13 +38,18 @@ import sys
 import time
 import threading
 import zlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Set
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 
 import pandas as pd
 import numpy as np
+
+ACTIONABLE_SCHEMA_VERSION = "2026-06-18-entry-slippage-v1"
+MARGIN_PROTECTION_STATE_SCHEMA_VERSION = "2026-07-11-margin-protection-v1"
+CHAMPION_EXECUTION_BOOK = "LOCKBOX_CHAMPION"
+EDGE_DEMO_EXECUTION_BOOK = "EDGE_CHALLENGER_DEMO"
 
 # Import PM modules
 
@@ -85,11 +91,264 @@ def load_config_json(path: str) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to load config file '{path}': {e}")
 
 
+def _resolve_config_relative_path(value: Any, config_path: Any) -> Path:
+    """Resolve one runtime path using the selected config file as authority."""
+    path = Path(str(value or ""))
+    if path.is_absolute():
+        return path.resolve()
+    return (Path(config_path).resolve().parent / path).resolve()
+
+
+def _phase_a_optimization_complete(
+    ledger_payload: Any,
+    symbols: List[str],
+) -> Tuple[bool, List[str]]:
+    """Recognize a complete frozen roster without making it live eligible."""
+    try:
+        from pm_two_phase_lockbox import build_frozen_roster
+
+        _roster, errors = build_frozen_roster(ledger_payload, symbols)
+    except Exception as exc:
+        return False, [f"PHASE_A_ROSTER_CHECK_FAILED:{type(exc).__name__}:{exc}"]
+    return not errors, list(errors)
+
+
 def _is_research_discovery_only_config(config_data: Dict[str, Any]) -> bool:
     """Return True when a config is explicitly marked as non-trading research."""
     meta = (config_data or {}).get("_meta") or {}
     scope = str(meta.get("scope", "") or "").strip().lower()
     return scope == "research_discovery_only_not_live_trading"
+
+
+FUNDED_LIVE_CONFIG_SCOPE = "funded_live_v1"
+
+# Versioned, positive configuration surface for funded production.  The
+# research dataclasses intentionally retain historical knobs for reproducible
+# experiments, but those knobs must not silently become funded-live behavior.
+# Adding a new production knob therefore requires an explicit contract review
+# here instead of being admitted merely because somebody added a dataclass
+# field.  These are the keys shipped by config.json after fixed invariants and
+# research-only row split controls are removed.
+FUNDED_PIPELINE_CONFIG_KEYS = frozenset(
+    """
+    allow_d1_plus_lower_tf backtest_spread_mode daily_loss_hard_block_pct
+    data_dir discovery_risk_per_trade_pct evidence_as_of_utc
+    evidence_boundary_tolerance_days evidence_min_expected_session_coverage
+    evidence_min_native_bars evidence_purge_days
+    evidence_require_native_provenance evidence_require_native_timeframes
+    evidence_require_session_coverage evidence_sufficiency_enabled
+    evidence_warmup_days evidence_window_years exceptional_val_profit_factor
+    exceptional_val_return_pct false_discovery_bootstrap_confidence
+    false_discovery_bootstrap_max_dd_upper
+    false_discovery_bootstrap_min_mean_lower
+    false_discovery_bootstrap_min_pf_lower
+    false_discovery_bootstrap_repetitions false_discovery_confidence_floor
+    false_discovery_control_enabled false_discovery_holdout_max_drawdown_pct
+    false_discovery_holdout_min_profit_factor
+    false_discovery_holdout_min_return_pct false_discovery_holdout_min_trades
+    false_discovery_holdout_policy false_discovery_max_pbo
+    false_discovery_min_daily_observations false_discovery_min_dsr
+    false_discovery_min_effective_observations false_discovery_pbo_blocks
+    false_discovery_pbo_min_candidates false_discovery_require_bootstrap
+    feature_cache_max_entries feature_disk_cache_dir feature_disk_cache_enabled
+    feature_disk_cache_max_gb feature_disk_cache_min_free_gb
+    fx_gap_penalty_lambda fx_min_robustness_ratio
+    fx_robustness_boost fx_stability_penalty_k
+    fx_val_max_drawdown fx_val_sharpe_override
+    hard_block_reopen_mode initial_capital
+    live_allow_partial_symbol_ledger live_allowed_promotion_statuses
+    live_artifact_drift_policy live_min_account_equity
+    live_min_account_equity_currency live_outcome_feed_cycle_drift
+    live_outcome_feedback_enabled live_outcome_ledger_path
+    live_outcome_require_position_history live_outcome_state_path
+    live_outcome_volume_tolerance live_require_tuned_regime_params
+    lockbox_access_registry_path lockbox_one_shot_registry_enabled log_dir
+    manual_kill_switch_path manual_new_entries_enabled margin_entry_block_level
+    margin_panic_level margin_recovery_start_level margin_reopen_level
+    max_combined_risk_pct max_new_entries_when_total_open_risk_above_pct
+    max_factor_group_open_risk_pct max_total_open_risk_pct
+    oos_evidence_execution_stress_mode
+    oos_evidence_export_enabled oos_evidence_include_execution_cost_survival
+    oos_evidence_min_periods oos_evidence_periods
+    oos_validation_mode open_drawdown_hard_block_pct
+    open_risk_action optimization_max_workers optuna_family_size_aware_budget
+    optuna_max_trials_per_strategy optuna_min_trials_per_strategy
+    optuna_target_coverage_pct output_dir probation_days probation_enabled
+    probation_min_live_outcomes probation_min_mean_r
+    probation_min_profit_factor probation_risk_multiplier
+    production_prelockbox_roster_path production_prelockbox_roster_sha256
+    production_cap_calibration_path production_cap_calibration_sha256
+    production_portfolio_replay_evidence_path
+    production_portfolio_replay_evidence_required
+    production_portfolio_replay_max_drawdown_pct
+    production_portfolio_replay_min_calendar_days
+    production_portfolio_replay_min_positions
+    production_portfolio_replay_min_profit_factor
+    production_portfolio_replay_min_return_pct
+    production_portfolio_replay_require_mtm
+    production_portfolio_replay_required_starting_balances
+    production_promotion_authorization_max_age_days
+    production_promotion_authorization_path
+    production_promotion_authorization_sha256 production_promotion_gate_mode
+    production_replay_audit_block_unverified production_replay_audit_enabled
+    production_replay_audit_mode production_require_full_symbol_ledger
+    production_require_promotion_gate production_retrain_anchor_date
+    production_retrain_interval_weeks production_retrain_mode
+    production_retrain_time production_retrain_weekday production_split_mode
+    production_symbol_pool_target_count
+    regime_enable_hyperparam_tuning regime_hyperparam_max_combos
+    regime_hyperparam_top_k regime_min_train_trades
+    regime_min_val_profit_factor regime_min_val_return_pct
+    regime_min_val_trades regime_params_file regime_scoring_model
+    regime_timeframe_val_trade_floors
+    regime_timeframe_val_trade_floors_enabled regime_trade_stability_floor
+    scoring_use_consistency scoring_use_continuous_dd scoring_use_sortino_blend
+    scoring_use_tail_risk screening_atr_anchor_enabled
+    screening_atr_anchor_multipliers secondary_trade_max_risk_pct
+    session_loss_hard_block_pct slippage_pips
+    storage_pause_entries_below_free_gb swap_model_enabled
+    swap_model_min_holding_hours swap_model_triple_rollover_day
+    timeframes train_max_drawdown train_min_profit_factor train_min_return_pct
+    walk_forward_audit_windows
+    weekly_loss_hard_block_pct winner_ledger_path
+    """.split()
+)
+
+# Live position policy has one short, reviewed surface.  Trailing-stop,
+# breakeven, time-exit, duplicate cost, stop-widening, minimum-lot clamp, and
+# TP-geometry switches remain available to research objects but cannot be
+# introduced through a funded JSON profile.
+FUNDED_POSITION_CONFIG_KEYS = frozenset(
+    {
+        "risk_per_trade_pct",
+        "max_position_size",
+        "min_position_size",
+        "risk_basis",
+        "max_risk_pct",
+        "risk_tolerance_pct",
+    }
+)
+
+# Evidence-backed funded invariants. Alternate scoring models and purged-kfold
+# workflows remain constructible for research, but all completed honest
+# per-cell comparisons retained frequency-off legacy as the production scorer,
+# and the native two-phase contract requires one fixed final lockbox.
+FUNDED_FIXED_PIPELINE_VALUES = {
+    "regime_scoring_model": "legacy",
+    "oos_validation_mode": "fixed_holdout",
+}
+
+
+def _funded_storage_config_keys() -> Set[str]:
+    """Return only real storage settings, never arbitrary pipeline fields."""
+    pipeline_names = {item.name for item in fields(PipelineConfig)}
+    prefixed = {name for name in pipeline_names if name.startswith("storage_")}
+    natural = {name[len("storage_"):] for name in prefixed}
+    filenames = {"state_filename", "manifest_filename", "ledger_filename"}
+    return prefixed | natural | filenames
+
+
+def _config_scope(config_data: Dict[str, Any]) -> str:
+    meta = (config_data or {}).get("_meta") or {}
+    return str(meta.get("scope", "") or "").strip().lower()
+
+
+def _apply_funded_position_cost_contract(
+    config_data: Dict[str, Any],
+    pipeline_config: "PipelineConfig",
+    position_config: "PositionConfig",
+) -> None:
+    """Bind live position math to the funded backtest cost contract.
+
+    PositionConfig retains its historic cost fields for research compatibility,
+    but funded JSON cannot override them independently.  Copying the resolved
+    production values prevents the backtest and live risk projection from
+    drifting if either dataclass default changes in the future.
+    """
+    if _config_scope(config_data) != FUNDED_LIVE_CONFIG_SCOPE:
+        return
+    position_config.use_spread = bool(getattr(pipeline_config, "use_spread", True))
+    position_config.use_slippage = bool(getattr(pipeline_config, "use_slippage", True))
+    position_config.slippage_pips = float(
+        getattr(pipeline_config, "slippage_pips", 0.0) or 0.0
+    )
+
+
+def _apply_funded_pipeline_contract(
+    config_data: Dict[str, Any],
+    pipeline_config: "PipelineConfig",
+) -> None:
+    """Bind omitted funded invariants to reviewed production values."""
+    if _config_scope(config_data) != FUNDED_LIVE_CONFIG_SCOPE:
+        return
+    for field_name, expected in FUNDED_FIXED_PIPELINE_VALUES.items():
+        setattr(pipeline_config, field_name, expected)
+
+
+def _validate_funded_config_schema(config_data: Dict[str, Any]) -> None:
+    """Reject unknown material keys in the versioned funded-live profile.
+
+    Research configs retain tolerant loading for historical reproducibility. A
+    funded profile must fail loudly when a safety key is misspelled instead of
+    silently falling back to a dataclass default.
+    """
+    if _config_scope(config_data) != FUNDED_LIVE_CONFIG_SCOPE:
+        raise ValueError(
+            f"funded execution requires _meta.scope={FUNDED_LIVE_CONFIG_SCOPE!r}"
+        )
+    allowed_top_level = {
+        "_meta",
+        "pipeline",
+        "broker_specs_path",
+        "instrument_spec_defaults",
+        "instrument_specs",
+        "symbols",
+        "position",
+        "storage",
+        "mt5",
+    }
+    unknown_top = sorted(set(config_data or {}) - allowed_top_level)
+    if unknown_top:
+        raise ValueError(f"unknown funded-live top-level config keys: {unknown_top}")
+
+    checks = (
+        ("pipeline", FUNDED_PIPELINE_CONFIG_KEYS),
+        ("position", FUNDED_POSITION_CONFIG_KEYS),
+        ("mt5", {item.name for item in fields(MT5Config)} | {"terminal_path"}),
+    )
+    for section_name, allowed in checks:
+        payload = (config_data or {}).get(section_name) or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"funded-live config section {section_name!r} must be an object")
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ValueError(
+                f"unsupported funded-live {section_name} config keys: {unknown}. "
+                "Research-only, internal, and fixed-policy dataclass fields are "
+                "not funded-profile overrides."
+            )
+
+    pipeline_payload = (config_data or {}).get("pipeline") or {}
+    for field_name, expected in FUNDED_FIXED_PIPELINE_VALUES.items():
+        if field_name in pipeline_payload and pipeline_payload[field_name] != expected:
+            raise ValueError(
+                f"funded-live pipeline {field_name!r} is fixed to {expected!r}; "
+                f"received {pipeline_payload[field_name]!r}"
+            )
+
+    storage_payload = (config_data or {}).get("storage") or {}
+    if not isinstance(storage_payload, dict):
+        raise ValueError("funded-live config section 'storage' must be an object")
+    allowed_storage = _funded_storage_config_keys()
+    unknown_storage = sorted(
+        key
+        for key in storage_payload
+        if key not in allowed_storage
+    )
+    if unknown_storage:
+        raise ValueError(
+            f"unknown funded-live storage config keys: {unknown_storage}"
+        )
 
 def log_resolved_config_summary(logger: logging.Logger,
                                config_path: str,
@@ -219,6 +478,15 @@ from pm_enhancement_seams import (
 from pm_order_governance import GovernanceContext, evaluate_policy, make_policy, policy_name_from_artifact
 from pm_institutional_supervisor import InstitutionalSupervisor, SupervisorContext
 from pm_cycle_drift import CycleDriftContext, CycleDriftMonitor
+from pm_live_outcomes import LiveOutcomeError, LiveOutcomeLedger
+from pm_model_lifecycle import EDGE_CHALLENGER_ROLE, LOCKBOX_CHAMPION_ROLE
+from pm_risk_admission import (
+    GrossRiskLimits,
+    StopRiskExposure,
+    conservative_risk_capital,
+    evaluate_gross_stop_risk,
+    evaluate_projected_margin,
+)
 from pm_event_context import EventCalendar, observe_event_context
 from pm_live_readiness import log_readiness_report, validate_live_readiness
 from pm_storage import StorageManager
@@ -316,19 +584,33 @@ def classify_lot_normalization_drift(actual_risk_pct: float,
     """Classify the severity of lot-normalization risk drift.
 
     Returns one of:
-      * "ok"    — actual within tolerance of target
-      * "warn"  — actual above tolerance band, still ≤ hard cap
-      * "block" — actual above per-trade hard cap
+      * "ok"    — actual at or below target
+      * "warn"  — actual above target but inside the allowed envelope
+      * "block" — invalid input or actual above the target/tolerance/hard-cap envelope
 
     Inputs are all percentages of basis (balance/equity). `tolerance_pct` is
     interpreted as a percentage of `target_risk_pct` (e.g. tolerance=10.0 →
-    target × 1.10 is the warn boundary). Negative tolerance is clamped to 0.
+    target × 1.10 is the maximum allowed boundary). Negative tolerance is clamped to 0.
     """
-    eps = 1e-9
-    if actual_risk_pct > max_risk_pct + eps:
+    try:
+        actual, target, hard_cap, tolerance = map(
+            float,
+            (actual_risk_pct, target_risk_pct, max_risk_pct, tolerance_pct),
+        )
+    except (TypeError, ValueError, OverflowError):
         return "block"
-    drift_threshold = target_risk_pct * (1.0 + max(0.0, tolerance_pct) / 100.0)
-    if actual_risk_pct > drift_threshold + eps:
+    if (
+        not all(math.isfinite(value) for value in (actual, target, hard_cap, tolerance))
+        or actual <= 0.0
+        or target <= 0.0
+        or hard_cap <= 0.0
+    ):
+        return "block"
+    eps = 1e-9
+    allowed = min(hard_cap, target * (1.0 + max(0.0, tolerance) / 100.0))
+    if actual > allowed + eps:
+        return "block"
+    if actual > target + eps:
         return "warn"
     return "ok"
 
@@ -741,7 +1023,8 @@ class LiveTrader:
                  enable_trading: bool = True,
                  close_on_opposite_signal: bool = False,
                  pipeline_config: 'PipelineConfig' = None,
-                 storage_manager: Optional[StorageManager] = None):
+                 storage_manager: Optional[StorageManager] = None,
+                 execution_book: str = CHAMPION_EXECUTION_BOOK):
         """
         Initialize live trader.
         
@@ -752,6 +1035,7 @@ class LiveTrader:
             enable_trading: Enable actual trade execution
             close_on_opposite_signal: Close positions on opposite signal (default: False)
             pipeline_config: Pipeline configuration (for regime params, etc.)
+            execution_book: Funded champion or demo-only edge challenger book.
         """
         self.mt5 = mt5_connector
         self.pm = portfolio_manager
@@ -760,6 +1044,11 @@ class LiveTrader:
         self.close_on_opposite_signal = close_on_opposite_signal
         self.pipeline_config = pipeline_config
         self.storage_manager = storage_manager
+        normalized_book = str(execution_book or CHAMPION_EXECUTION_BOOK).strip().upper()
+        if normalized_book not in {CHAMPION_EXECUTION_BOOK, EDGE_DEMO_EXECUTION_BOOK}:
+            raise ValueError(f"unsupported execution book: {execution_book!r}")
+        self.execution_book = normalized_book
+        self._is_edge_challenger_demo = normalized_book == EDGE_DEMO_EXECUTION_BOOK
         
         self.position_calc = PositionCalculator(position_config)
         
@@ -772,13 +1061,54 @@ class LiveTrader:
         self._unknown_tf_position_warnings: Set[int] = set()
         self._tf_recovery_cache: Dict[int, Optional[str]] = {}
         self._margin_state: str = "NORMAL"
+        self._margin_reopen_required: bool = False
         self._last_margin_close_ts: Optional[datetime] = None
         self._margin_cooldown_notice_logged_ts: Optional[datetime] = None
+        self._margin_state_persistence_lock = threading.RLock()
+        self._margin_state_persistence_error: str = ""
         
         # Decision throttle – prevents re-evaluation / re-logging of the
         # same decision on the same bar (e.g. risk-cap skips for XAUUSD).
-        self._decision_throttle = DecisionThrottle(log_path="last_trade_log.json")
-        self._actionable_log = ActionableDecisionLog(log_path="last_actionable_log.json")
+        raw_runtime_dir = getattr(self.pipeline_config, "output_dir", "pm_outputs")
+        if not isinstance(raw_runtime_dir, (str, Path)):
+            raw_runtime_dir = "pm_outputs"
+        runtime_state_dir = Path(raw_runtime_dir or "pm_outputs")
+        if not runtime_state_dir.is_absolute():
+            source_config = str(
+                getattr(self.pipeline_config, "_deployment_config_path", "") or ""
+            ).strip()
+            runtime_root = (
+                Path(source_config).resolve().parent
+                if source_config
+                else Path.cwd()
+            )
+            runtime_state_dir = (runtime_root / runtime_state_dir).resolve()
+        if self._is_edge_challenger_demo:
+            runtime_state_dir = runtime_state_dir / "edge_challenger_demo"
+            decision_log_path = runtime_state_dir / "last_trade_log.json"
+            actionable_log_path = runtime_state_dir / "last_actionable_log.json"
+        else:
+            decision_log_path = Path("last_trade_log.json")
+            actionable_log_path = Path("last_actionable_log.json")
+        self._runtime_state_dir = runtime_state_dir
+        self._margin_protection_state_path = (
+            runtime_state_dir / "margin_protection_state.json"
+        )
+        self._margin_state_persistence_enabled = bool(
+            isinstance(self.pipeline_config, PipelineConfig)
+            and (
+                bool(
+                    getattr(
+                        self.pipeline_config,
+                        "_funded_live_execution",
+                        False,
+                    )
+                )
+                or self._is_edge_challenger_demo
+            )
+        )
+        self._decision_throttle = DecisionThrottle(log_path=str(decision_log_path))
+        self._actionable_log = ActionableDecisionLog(log_path=str(actionable_log_path))
         
         # Feature/signal cache – avoids recomputing features and signals 
         # when no new bar has arrived. Cache key: (symbol, timeframe, bar_time)
@@ -792,6 +1122,10 @@ class LiveTrader:
         self._seen_cycle_closure_keys: Set[str] = set()
         self._recent_closing_deals: List[Dict[str, Any]] = []
         self._recent_closing_deals_lookback_hours: int = 0
+        # Distinguish a successful empty broker-history query from transport or
+        # connection failure.  Hard loss breakers must never interpret the
+        # latter as proof of zero realized loss.
+        self._recent_closing_deals_available: bool = False
         self._live_session_started_at = datetime.now()
         
         # Cache statistics for monitoring
@@ -805,17 +1139,58 @@ class LiveTrader:
         self._latest_bar_time_by_tf: Dict[str, pd.Timestamp] = {}
         self._last_bar_probe_times: Dict[str, Tuple[str, pd.Timestamp]] = {}
         self._pending_bar_probe_times: Dict[str, Tuple[str, pd.Timestamp]] = {}
+        # Cross-horizon signals admitted from the same bar are serialized so
+        # the second decision sees the first fill in a fresh broker snapshot.
+        self._pending_specialist_timeframes: Dict[str, Set[str]] = {}
         self._last_governance_bar_times: Dict[str, pd.Timestamp] = {}
         self._daily_advisory_state: Dict[str, str] = {}
         self._last_portfolio_observation: Dict[str, Any] = {}
         self._order_governance_state: Dict[int, Dict[str, Any]] = {}
 
         self.logger = logging.getLogger(__name__)
+        self._restore_margin_protection_state()
 
         # Enhancement seams (risk scalars, spread filter, exit pack)
         self._enhancement_seams = create_default_enhancement_seams(self.pipeline_config)
-        self._institutional_supervisor = InstitutionalSupervisor(self.pipeline_config)
-        self._cycle_drift_monitor = CycleDriftMonitor(self.pipeline_config)
+        supervisor_state_path = None
+        drift_state_path = None
+        if self._is_edge_challenger_demo:
+            supervisor_state_path = runtime_state_dir / "institutional_supervisor_state.json"
+            drift_state_path = runtime_state_dir / "cycle_drift_state.json"
+        self._institutional_supervisor = InstitutionalSupervisor(
+            self.pipeline_config,
+            state_path=supervisor_state_path,
+        )
+        self._cycle_drift_monitor = CycleDriftMonitor(
+            self.pipeline_config,
+            state_path=drift_state_path,
+        )
+        # Only an authoritative resolved PipelineConfig may enable persistent
+        # feedback. Loose mocks/legacy embedding callers keep the prior
+        # observation path and cannot accidentally create production files.
+        self._live_outcome_feedback_initialized = isinstance(
+            self.pipeline_config, PipelineConfig
+        )
+        self._live_outcome_feedback_error = ""
+        self._live_outcome_ledger: Optional[LiveOutcomeLedger] = None
+        if (
+            self._live_outcome_feedback_initialized
+            and bool(getattr(self.pipeline_config, "live_outcome_feedback_enabled", True))
+        ):
+            try:
+                if self._is_edge_challenger_demo:
+                    self._live_outcome_ledger = LiveOutcomeLedger(
+                        self.pipeline_config,
+                        ledger_path=runtime_state_dir / "closed_positions.jsonl",
+                        state_path=runtime_state_dir / "closed_positions.state.json",
+                    )
+                else:
+                    self._live_outcome_ledger = LiveOutcomeLedger(self.pipeline_config)
+            except LiveOutcomeError as exc:
+                # Corrupt accounting evidence is a hard entry blocker. Existing
+                # positions remain manageable, but no new risk may be added.
+                self._live_outcome_feedback_error = str(exc)
+                self.logger.error(f"Live outcome feedback unavailable: {exc}")
         self._event_calendar: Optional[EventCalendar] = None
         if bool(getattr(self.pipeline_config, "event_calendar_enabled", False)):
             try:
@@ -896,6 +1271,7 @@ class LiveTrader:
         self._last_bar_times.clear()
         self._last_bar_probe_times.clear()
         self._pending_bar_probe_times.clear()
+        self._pending_specialist_timeframes.clear()
         self._last_governance_bar_times.clear()
         self._sweep_recent_m5_windows.clear()
         self._get_latest_bar_time_store().clear()
@@ -1264,20 +1640,59 @@ class LiveTrader:
         return bars
 
     def _get_live_configs(self, *, log_rejections: bool = False) -> Dict[str, SymbolConfig]:
-        """Return live-eligible configs, with a legacy fallback for test doubles."""
+        """Return configs for exactly the selected execution book."""
         if not self.pm:
             return {}
-        if hasattr(self.pm, "get_live_eligible_configs"):
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            selector = getattr(self.pm, "get_edge_challenger_configs", None)
+            if not callable(selector):
+                self.logger.error(
+                    "Edge challenger selector unavailable; refusing all new entries"
+                )
+                return {}
             try:
-                configs = self.pm.get_live_eligible_configs(log_rejections=log_rejections)
-            except TypeError:
-                configs = self.pm.get_live_eligible_configs()
-            if isinstance(configs, dict):
-                return configs
-        if hasattr(self.pm, "get_validated_configs"):
-            configs = self.pm.get_validated_configs()
-            return configs if isinstance(configs, dict) else {}
-        return {}
+                configs = selector(log_rejections=log_rejections)
+            except Exception as exc:
+                self.logger.error(
+                    "Edge challenger selector failed closed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                return {}
+            if not isinstance(configs, dict):
+                self.logger.error(
+                    "Edge challenger selector returned a non-mapping result; "
+                    "refusing all new entries"
+                )
+                return {}
+            return configs
+
+        # Funded entry eligibility is an authority boundary.  Never fall back
+        # to get_validated_configs(): that broader management view intentionally
+        # includes expired/frozen configs so existing positions can still be
+        # governed, and is not authority to add risk.
+        selector = getattr(self.pm, "get_live_eligible_configs", None)
+        if not callable(selector):
+            self.logger.error(
+                "Funded live-eligibility selector unavailable; refusing all new entries"
+            )
+            return {}
+        try:
+            configs = selector(log_rejections=log_rejections)
+        except Exception as exc:
+            self.logger.error(
+                "Funded live-eligibility selector failed closed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+        if not isinstance(configs, dict):
+            self.logger.error(
+                "Funded live-eligibility selector returned a non-mapping result; "
+                "refusing all new entries"
+            )
+            return {}
+        return configs
 
     def _get_raw_validated_configs(self) -> Dict[str, SymbolConfig]:
         """Return raw validated configs for management-only surfaces."""
@@ -1294,6 +1709,10 @@ class LiveTrader:
         positions still need margin protection, attribution, and governance even
         if the entry ledger expires before the next retrain is complete.
         """
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            # A demo challenger session must never borrow champion configs for
+            # position attribution or order governance.
+            return self._get_live_configs()
         raw_validated = self._get_raw_validated_configs()
         if raw_validated:
             return raw_validated
@@ -1399,6 +1818,14 @@ class LiveTrader:
                 if self._last_bar_probe_times.get(cache_key) != current:
                     self._pending_bar_probe_times[cache_key] = current
                     changed.setdefault(canonical_symbol, set()).add(timeframe)
+        # A second independent horizon from an already observed bar is a
+        # pending admission, not a new market bar.  Keep it schedulable until
+        # _process_symbol consumes the exact timeframe on the following sweep.
+        for symbol, timeframes in getattr(
+            self, "_pending_specialist_timeframes", {}
+        ).items():
+            if symbol in live_configs and timeframes:
+                changed.setdefault(symbol, set()).update(set(timeframes))
         return changed
 
     def has_new_bar(self, configs: Optional[Dict[str, SymbolConfig]] = None) -> bool:
@@ -1428,6 +1855,21 @@ class LiveTrader:
         due_candidates: List[datetime] = []
 
         validated = self._get_live_configs()
+        # A queued independent horizon is work on an already observed bar, not
+        # an unknown/missing scheduler state.  _process_symbol deliberately
+        # removes that exact timeframe from _last_bar_times when it serializes
+        # D1 + lower-TF admissions; scheduled mode must therefore wake now so
+        # the deferred specialist sees the first fill in a fresh broker
+        # snapshot.  Ordinary missing symbol/timeframe entries remain ignored
+        # below to avoid a permanent stale-retry loop.
+        pending_specialists = getattr(
+            self, "_pending_specialist_timeframes", {}
+        )
+        if isinstance(pending_specialists, dict) and any(
+            symbol in (validated or {}) and bool(timeframes)
+            for symbol, timeframes in pending_specialists.items()
+        ):
+            return probe
         for symbol, config in (validated or {}).items():
             try:
                 if config.has_regime_configs():
@@ -1506,11 +1948,29 @@ class LiveTrader:
             self.logger.warning("Live position snapshot unavailable; skipping this iteration.")
             return False
 
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            position_book_reason = self._edge_demo_position_block_reason(
+                list(positions_snapshot or []),
+                entry_configs,
+            )
+            if position_book_reason:
+                self.logger.error(
+                    f"Edge challenger demo session blocked: {position_book_reason}"
+                )
+                return False
+
         if account_info is None:
             account_info = self.mt5.get_account_info()
         if account_info is None:
             self.logger.warning("Live account snapshot unavailable; skipping this iteration.")
             return False
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            demo_account_reason = self._edge_demo_account_block_reason(account_info)
+            if demo_account_reason:
+                self.logger.error(
+                    f"Edge challenger demo session blocked: {demo_account_reason}"
+                )
+                return False
         live_equity = 0.0
         try:
             live_equity = float(getattr(account_info, "equity", 0.0) or 0.0)
@@ -1555,12 +2015,20 @@ class LiveTrader:
         if not runtime_only:
             try:
                 recent_lookback_hours = 24 * 8
-                recent_deals = list(
-                    self.mt5.get_recent_closing_deals(lookback_hours=recent_lookback_hours) or []
+                broker_deals = self.mt5.get_recent_closing_deals(
+                    lookback_hours=recent_lookback_hours
                 )
-                self._recent_closing_deals_lookback_hours = recent_lookback_hours
+                if broker_deals is None:
+                    self._recent_closing_deals_available = False
+                    self._recent_closing_deals_lookback_hours = 0
+                else:
+                    recent_deals = list(broker_deals)
+                    self._recent_closing_deals_available = True
+                    self._recent_closing_deals_lookback_hours = recent_lookback_hours
             except Exception as exc:
-                self.logger.debug(f"Recent closing deals unavailable: {exc}")
+                self._recent_closing_deals_available = False
+                self._recent_closing_deals_lookback_hours = 0
+                self.logger.warning(f"Recent closing deals unavailable: {exc}")
             self._recent_closing_deals = list(recent_deals or [])
 
         self._run_order_governance_cycle(active_configs, positions_snapshot)
@@ -1572,7 +2040,11 @@ class LiveTrader:
                 f"{'; '.join(hard_loss_reasons)}"
             )
             if not runtime_only:
-                self._sync_drift_monitor(active_configs, recent_deals=recent_deals)
+                self._sync_drift_monitor(
+                    active_configs,
+                    recent_deals=recent_deals,
+                    open_positions_snapshot=positions_snapshot,
+                )
                 self._evaluate_daily_loss_advisory(account_info, recent_deals)
                 self._run_portfolio_observatory(active_configs, positions_snapshot, account_info)
             return False
@@ -1594,7 +2066,11 @@ class LiveTrader:
                 self.logger.error(f"[{symbol}] Error: {e}")
 
         if not runtime_only:
-            self._sync_drift_monitor(active_configs, recent_deals=recent_deals)
+            self._sync_drift_monitor(
+                active_configs,
+                recent_deals=recent_deals,
+                open_positions_snapshot=positions_snapshot,
+            )
             self._evaluate_daily_loss_advisory(account_info, recent_deals)
             self._run_portfolio_observatory(active_configs, positions_snapshot, account_info)
         sweep_duration = time.perf_counter() - sweep_started
@@ -1627,9 +2103,93 @@ class LiveTrader:
                 self.logger.debug(f"Storage sweep hook failed: {exc}")
         return True
 
+    def _resolve_live_outcome_cell(
+        self,
+        context: Dict[str, Any],
+        validated: Dict[str, SymbolConfig],
+    ) -> Dict[str, Any]:
+        """Prove one exact current symbol/timeframe/regime/strategy cell."""
+        from pm_position import TradeTagEncoder
+
+        intent = dict(context.get("entry_intent") or {})
+        decoded = dict(context.get("decoded_comment") or {})
+        broker_symbol = str(context.get("broker_symbol", "") or "")
+        symbol = str(intent.get("symbol") or decoded.get("symbol") or "").upper()
+        if symbol not in validated:
+            symbol = str(self._resolve_symbol_from_broker(broker_symbol, validated) or "").upper()
+        if not symbol or symbol not in validated:
+            return {"cell_match_status": "UNAVAILABLE", "cell_match_reason": "symbol not in live-eligible ledger"}
+
+        symbol_config = validated[symbol]
+        magic = int(context.get("entry_magic", 0) or intent.get("magic", 0) or 0)
+        magic_to_tf, magic_to_regime = self._build_magic_lookup(symbol, symbol_config)
+        timeframe = str(
+            intent.get("timeframe")
+            or magic_to_tf.get(magic, "")
+            or decoded.get("timeframe", "")
+        ).upper()
+        regime = str(intent.get("regime") or magic_to_regime.get(magic, "")).upper()
+
+        if symbol_config.has_regime_configs():
+            if not timeframe or not regime:
+                return {"cell_match_status": "UNAVAILABLE", "cell_match_reason": "timeframe/regime attribution incomplete"}
+            regime_cfg = symbol_config.get_regime_config(timeframe, regime)
+        else:
+            regime_cfg = symbol_config.default_config
+            timeframe = timeframe or str(getattr(symbol_config, "timeframe", "") or "").upper()
+            regime = regime or "LEGACY"
+        if regime_cfg is None or getattr(regime_cfg, "is_no_trade_marker", lambda: False)():
+            return {"cell_match_status": "UNAVAILABLE", "cell_match_reason": "attributed cell is absent or NO_TRADE"}
+
+        strategy_name = str(getattr(regime_cfg, "strategy_name", "") or "")
+        intended_strategy = str(intent.get("strategy_name", "") or "")
+        if intended_strategy and intended_strategy != strategy_name:
+            return {"cell_match_status": "UNAVAILABLE", "cell_match_reason": "entry intent strategy differs from current cell"}
+        strategy_code = str(decoded.get("strategy_code", "") or "")
+        if strategy_code and strategy_code != TradeTagEncoder._strategy_code(strategy_name, max_len=5):
+            return {"cell_match_status": "UNAVAILABLE", "cell_match_reason": "broker comment strategy code mismatch"}
+        expected_role = (
+            EDGE_CHALLENGER_ROLE
+            if bool(getattr(self, "_is_edge_challenger_demo", False))
+            else LOCKBOX_CHAMPION_ROLE
+        )
+        intent_role = str(intent.get("book_role", "") or "").upper()
+        decoded_role = str(decoded.get("book_role", "") or "").upper()
+        current_candidate_id = str(
+            (getattr(regime_cfg, "artifact_meta", {}) or {}).get("candidate_id") or ""
+        )
+        intended_candidate_id = str(intent.get("candidate_id", "") or "")
+        if expected_role == EDGE_CHALLENGER_ROLE:
+            if intent_role != expected_role or decoded_role != expected_role:
+                return {
+                    "cell_match_status": "UNAVAILABLE",
+                    "cell_match_reason": "challenger entry lacks matching durable and broker book tags",
+                }
+            if not current_candidate_id or intended_candidate_id != current_candidate_id:
+                return {
+                    "cell_match_status": "UNAVAILABLE",
+                    "cell_match_reason": "challenger candidate id differs from current edge cell",
+                }
+        elif intent_role == EDGE_CHALLENGER_ROLE or decoded_role == EDGE_CHALLENGER_ROLE:
+            return {
+                "cell_match_status": "UNAVAILABLE",
+                "cell_match_reason": "edge challenger outcome cannot resolve against funded champions",
+            }
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "regime": regime,
+            "strategy_name": strategy_name,
+            "book_role": expected_role,
+            "candidate_id": current_candidate_id if expected_role == EDGE_CHALLENGER_ROLE else "",
+            "cell_match_status": "EXACT",
+            "cell_match_reason": "durable intent/comment/magic matched current cell",
+        }
+
     def _sync_drift_monitor(self,
                             validated_configs: Optional[Dict[str, SymbolConfig]] = None,
-                            recent_deals: Optional[List[Dict[str, Any]]] = None) -> None:
+                            recent_deals: Optional[List[Dict[str, Any]]] = None,
+                            open_positions_snapshot: Optional[List[Any]] = None) -> None:
         """Pull recent closing deals into DriftMonitor and compare against validation metrics."""
         validated = validated_configs or self._get_live_configs()
         if not validated:
@@ -1643,9 +2203,91 @@ class LiveTrader:
                 return
         else:
             deals = list(recent_deals or [])
-        if not deals:
-            return
         if not isinstance(deals, (list, tuple)):
+            return
+
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            # The demo account may contain older champion history even though
+            # its *open* book is dedicated and clean.  Never ingest those
+            # closures into challenger evidence/state.
+            from pm_position import TradeTagEncoder
+
+            edge_magics: Set[int] = set()
+            for edge_symbol, edge_config in (validated or {}).items():
+                for edge_tf, edge_regimes in (edge_config.regime_configs or {}).items():
+                    for edge_regime in (edge_regimes or {}):
+                        edge_magics.add(
+                            self._encode_specialist_magic(
+                                edge_symbol, edge_tf, edge_regime
+                            )
+                        )
+            filtered_deals: List[Dict[str, Any]] = []
+            for deal in deals:
+                magic = int(deal.get("magic", 0) or 0)
+                decoded = TradeTagEncoder.decode_comment(
+                    str(deal.get("comment", "") or "")
+                )
+                if (
+                    magic in edge_magics
+                    or str((decoded or {}).get("book_role", "") or "").upper()
+                    == EDGE_CHALLENGER_ROLE
+                ):
+                    filtered_deals.append(deal)
+            deals = filtered_deals
+
+        outcome_ledger = getattr(self, "_live_outcome_ledger", None)
+        if not deals and outcome_ledger is None:
+            return
+        if outcome_ledger is not None:
+            open_ids: Optional[Set[int]] = None
+            snapshot = open_positions_snapshot
+            if snapshot is None and hasattr(self.mt5, "get_positions"):
+                try:
+                    snapshot = self.mt5.get_positions()
+                except Exception:
+                    snapshot = None
+            if isinstance(snapshot, (list, tuple)):
+                open_ids = {
+                    int(getattr(position, "identifier", 0) or getattr(position, "ticket", 0) or 0)
+                    for position in snapshot
+                    if int(getattr(position, "identifier", 0) or getattr(position, "ticket", 0) or 0) > 0
+                }
+            provider = getattr(self.mt5, "get_position_history", None)
+            sync_result = outcome_ledger.sync(
+                closing_deals=deals,
+                open_position_ids=open_ids,
+                position_history_provider=provider if callable(provider) else None,
+                resolve_cell=lambda ctx: self._resolve_live_outcome_cell(ctx, validated),
+                drift_monitor=self._cycle_drift_monitor,
+            )
+            for record in sync_result.emitted_records:
+                symbol = str(record.get("symbol", "") or "")
+                r_value = record.get("realized_r")
+                self.drift_monitor.record_trade(
+                    symbol=symbol,
+                    pnl_dollars=float(record.get("realized_net_pnl", 0.0) or 0.0),
+                    r_multiple=(float(r_value) if r_value is not None else None),
+                )
+                if symbol in validated:
+                    cfg = validated[symbol]
+                    _tf, _rg, regime_cfg = self._resolve_exact_regime_config(
+                        symbol,
+                        cfg,
+                        record.get("timeframe"),
+                        record.get("regime"),
+                    )
+                    self.drift_monitor.check_drift(
+                        symbol,
+                        getattr(regime_cfg, "val_metrics", None) or cfg.val_metrics,
+                    )
+            if sync_result.fail_closed_reasons:
+                self._live_outcome_feedback_error = "; ".join(sync_result.fail_closed_reasons[:8])
+                self.logger.error(
+                    "Live outcome feedback pending/fail-closed: "
+                    f"{self._live_outcome_feedback_error}"
+                )
+            else:
+                self._live_outcome_feedback_error = ""
             return
 
         from pm_position import TradeTagEncoder
@@ -2248,8 +2890,6 @@ class LiveTrader:
 
     def _build_magic_lookup(self, symbol: str, config: SymbolConfig) -> Tuple[Dict[int, str], Dict[int, str]]:
         """Build magic->timeframe/regime lookup for fast position inference."""
-        from pm_position import TradeTagEncoder
-
         magic_to_tf: Dict[int, str] = {}
         magic_to_regime: Dict[int, str] = {}
 
@@ -2257,11 +2897,11 @@ class LiveTrader:
             if config and config.has_regime_configs():
                 for tf in config.get_available_timeframes():
                     for regime in config.get_regimes_for_timeframe(tf):
-                        magic = TradeTagEncoder.encode_magic(symbol, tf, regime)
+                        magic = self._encode_specialist_magic(symbol, tf, regime)
                         magic_to_tf[magic] = tf
                         magic_to_regime[magic] = regime
             elif config and config.timeframe:
-                magic = TradeTagEncoder.encode_magic(symbol, config.timeframe, "LEGACY")
+                magic = self._encode_specialist_magic(symbol, config.timeframe, "LEGACY")
                 magic_to_tf[magic] = config.timeframe
                 magic_to_regime[magic] = "LEGACY"
         except Exception:
@@ -2429,6 +3069,390 @@ class LiveTrader:
             str(candidate.get("strategy_name", "") or ""),
         ])
         return (selection_score, quality_score, regime_strength, signal_rank, candidate_id)
+
+    def _plan_symbol_specialist_admissions(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        allow_d1_plus_lower: bool,
+        open_position_count: int,
+    ) -> List[Dict[str, Any]]:
+        """Choose the independent specialists that may request entry this sweep.
+
+        The exact-cell specialists remain independent signal generators.  The
+        symbol controller only arbitrates the scarce same-symbol order slots:
+
+        * with no open position and the two-horizon rule enabled, admit the
+          best D1 specialist and the best lower-timeframe specialist;
+        * otherwise admit the single best specialist for the remaining slot.
+
+        Institution, cluster, symbol-risk, margin, and fresh-position checks
+        are deliberately *not* performed here.  Every admitted specialist is
+        still evaluated by the normal immediate-pre-send hard gates.
+        """
+        ranked = sorted(
+            list(candidates or []),
+            key=self._candidate_rank_key,
+            reverse=True,
+        )
+        if not ranked:
+            return []
+        if not allow_d1_plus_lower or int(open_position_count or 0) != 0:
+            return ranked[:1]
+
+        best_d1 = next(
+            (candidate for candidate in ranked
+             if str(candidate.get("timeframe", "") or "").upper() == "D1"),
+            None,
+        )
+        best_lower = next(
+            (candidate for candidate in ranked
+             if str(candidate.get("timeframe", "") or "").upper() != "D1"),
+            None,
+        )
+        admitted = [candidate for candidate in (best_d1, best_lower) if candidate is not None]
+        return sorted(admitted, key=self._candidate_rank_key, reverse=True)
+
+    def _queue_specialist_timeframe(self, symbol: str, timeframe: str) -> None:
+        pending = getattr(self, "_pending_specialist_timeframes", None)
+        if pending is None:
+            pending = {}
+            self._pending_specialist_timeframes = pending
+        normalized_symbol = str(symbol or "")
+        normalized_tf = str(timeframe or "").upper()
+        if normalized_symbol and normalized_tf:
+            pending.setdefault(normalized_symbol, set()).add(normalized_tf)
+
+    def _consume_specialist_timeframes(
+        self,
+        symbol: str,
+        timeframes: Optional[Set[str]],
+    ) -> None:
+        pending = getattr(self, "_pending_specialist_timeframes", None)
+        if not isinstance(pending, dict):
+            return
+        symbol_pending = pending.get(str(symbol or ""))
+        if not symbol_pending:
+            return
+        normalized = {
+            str(timeframe or "").upper()
+            for timeframe in (timeframes or set())
+            if str(timeframe or "").strip()
+        }
+        if normalized:
+            symbol_pending.difference_update(normalized)
+        if not symbol_pending:
+            pending.pop(str(symbol or ""), None)
+
+    @staticmethod
+    def _specialist_rate_limit_key(symbol: str, magic: int) -> str:
+        """Return the exact-cell key used by the order submission limiter."""
+        return f"{str(symbol or '').upper()}|{int(magic)}"
+
+    def _encode_specialist_magic(self, symbol: str, timeframe: str, regime: str) -> int:
+        """Encode an exact-cell magic in the selected book namespace."""
+        from pm_position import TradeTagEncoder
+
+        regime_key = str(regime or "").upper()
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            regime_key = f"EDGE::{regime_key}"
+        return TradeTagEncoder.encode_magic(symbol, timeframe, regime_key)
+
+    @staticmethod
+    def _edge_demo_account_block_reason(account_info: Any) -> Optional[str]:
+        """Require broker-authoritative MT5 DEMO mode for challenger orders."""
+        if account_info is None:
+            return "account snapshot unavailable; challenger execution requires MT5 DEMO mode"
+        try:
+            trade_mode = int(getattr(account_info, "trade_mode"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return "ACCOUNT_TRADE_MODE unavailable; challenger execution fails closed"
+        if trade_mode != 0:
+            label = {1: "CONTEST", 2: "REAL"}.get(trade_mode, f"UNKNOWN({trade_mode})")
+            return f"ACCOUNT_TRADE_MODE={label}; edge challengers may execute only on DEMO (0)"
+        return None
+
+    def _edge_demo_position_block_reason(
+        self,
+        positions: Optional[List[Any]],
+        configs: Dict[str, SymbolConfig],
+    ) -> Optional[str]:
+        """Require a dedicated account containing only attributed edge orders."""
+        if not bool(getattr(self, "_is_edge_challenger_demo", False)):
+            return None
+        if positions is None:
+            return "position snapshot unavailable"
+        from pm_position import TradeTagEncoder
+
+        allowed_magics: Set[int] = set()
+        allowed_broker_symbols: Set[str] = set()
+        for symbol, config in (configs or {}).items():
+            broker_symbol = self._resolve_broker_symbol_for_live(symbol)
+            allowed_broker_symbols.add(str(broker_symbol))
+            for timeframe, regimes in (config.regime_configs or {}).items():
+                for regime in (regimes or {}):
+                    allowed_magics.add(
+                        self._encode_specialist_magic(symbol, timeframe, regime)
+                    )
+        for position in list(positions or []):
+            magic = int(getattr(position, "magic", 0) or 0)
+            comment = str(getattr(position, "comment", "") or "")
+            decoded = TradeTagEncoder.decode_comment(comment) if comment else None
+            comment_role = str((decoded or {}).get("book_role", "") or "").upper()
+            broker_symbol = str(getattr(position, "symbol", "") or "")
+            if (
+                magic not in allowed_magics
+                or broker_symbol not in allowed_broker_symbols
+                or comment_role != EDGE_CHALLENGER_ROLE
+            ):
+                ticket = int(getattr(position, "ticket", 0) or 0)
+                return (
+                    f"position ticket={ticket or '<unknown>'} is not an exactly attributed "
+                    "edge-challenger demo position; use a dedicated clean DEMO account"
+                )
+        return None
+
+    @staticmethod
+    def _multi_position_account_block_reason(account_info: Any) -> Optional[str]:
+        """Require MT5 retail-hedging accounting for a second symbol position."""
+        if account_info is None:
+            return "account mode unavailable for same-symbol multi-position admission"
+        try:
+            margin_mode = int(getattr(account_info, "margin_mode"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return "ACCOUNT_MARGIN_MODE unavailable for same-symbol multi-position admission"
+        if margin_mode != 2:
+            return (
+                f"ACCOUNT_MARGIN_MODE={margin_mode} is netting/exchange; "
+                "independent D1/lower positions require RETAIL_HEDGING (2)"
+            )
+        hedge_allowed = getattr(account_info, "hedge_allowed", None)
+        if hedge_allowed is None:
+            return "ACCOUNT_HEDGE_ALLOWED unavailable for same-symbol multi-position admission"
+        if not bool(hedge_allowed):
+            return "ACCOUNT_HEDGE_ALLOWED is false for same-symbol multi-position admission"
+        return None
+
+    def _promotion_status_is_entry_eligible(self, status: Any) -> bool:
+        """Apply the exact selected-book status contract."""
+        normalized = str(status or "BLOCKED").strip().upper() or "BLOCKED"
+        never_eligible = {"", "BLOCKED", "PAPER_ONLY", "NO_TRADE", "UNKNOWN"}
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            return normalized == "PAPER_ONLY"
+        if not bool(getattr(self, "enable_trading", False)):
+            # Paper mode remains an observability surface for PROMOTE_SMALL.
+            return normalized in {"PROMOTED", "PROMOTE_SMALL"}
+
+        configured = getattr(
+            self.pipeline_config,
+            "live_allowed_promotion_statuses",
+            ["PROMOTED"],
+        )
+        if isinstance(configured, str):
+            configured = configured.split(",")
+        allowed = {
+            str(value or "").strip().upper()
+            for value in (configured or ["PROMOTED"])
+            if str(value or "").strip()
+        }
+        allowed -= never_eligible
+        return normalized in (allowed or {"PROMOTED"})
+
+    def _regime_config_is_entry_eligible(
+        self,
+        regime_config: Any,
+        *,
+        min_pf: float,
+        min_return: float,
+        max_dd: float,
+        min_return_dd_ratio: float,
+    ) -> bool:
+        """Validate a champion or edge cell without crossing book contracts."""
+        if regime_config is None or regime_config.is_no_trade_marker():
+            return False
+        if not bool(getattr(self, "_is_edge_challenger_demo", False)):
+            return bool(
+                regime_config.is_valid_for_live(
+                    min_pf,
+                    min_return,
+                    max_dd,
+                    min_return_dd_ratio,
+                )
+            )
+        temporal = dict(
+            (getattr(regime_config, "validation_evidence", {}) or {}).get(
+                "temporal_lineage", {}
+            )
+            or {}
+        )
+        edge_refit = dict(
+            (getattr(regime_config, "validation_evidence", {}) or {}).get(
+                "edge_refit", {}
+            )
+            or {}
+        )
+        artifact = dict(getattr(regime_config, "artifact_meta", {}) or {})
+        candidate_id = str(
+            artifact.get("candidate_id") or edge_refit.get("candidate_id") or ""
+        ).strip()
+        return bool(
+            str(getattr(regime_config, "promotion_status", "") or "").upper()
+            == "PAPER_ONLY"
+            and artifact.get("edge_challenger") is True
+            and artifact.get("funded_role_eligible") is False
+            and candidate_id
+            and str(temporal.get("book_role", "") or "").upper()
+            == EDGE_CHALLENGER_ROLE
+            and str(temporal.get("contract_status", "") or "").upper()
+            == "PAPER_ONLY"
+            and temporal.get("edge_refit_performed") is True
+            and temporal.get("champion_lockbox_verdict_inherited") is False
+            and temporal.get("requires_future_nonoverlapping_forward_evidence") is True
+            and str(temporal.get("fit_cutoff_utc", "") or "").strip()
+            and int((getattr(regime_config, "train_metrics", {}) or {}).get("total_trades", 0) or 0) > 0
+        )
+
+    def _promotion_authorization_block_reason(
+        self,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+    ) -> Optional[str]:
+        """Fresh exact-cell authority check for the final funded send boundary."""
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            # Edge execution has its own structurally restricted selector and
+            # broker DEMO gate.  It can never consume funded authorization.
+            return None
+        if not bool(getattr(self, "enable_trading", False)):
+            return None
+        gate_required = bool(
+            getattr(self.pipeline_config, "production_require_promotion_gate", True)
+        )
+        gate_mode = str(
+            getattr(self.pipeline_config, "production_promotion_gate_mode", "ledger_status")
+            or ""
+        ).strip().lower()
+        if gate_mode in {"immutable", "authorization", "authorization_exact"}:
+            gate_mode = "immutable_exact"
+        funded_execution = bool(
+            getattr(self.pipeline_config, "_funded_live_execution", False)
+        )
+        if funded_execution and (not gate_required or gate_mode != "immutable_exact"):
+            return (
+                "funded entry requires the immutable_exact promotion gate "
+                f"(required={gate_required}, mode={gate_mode!r})"
+            )
+        if not gate_required or gate_mode != "immutable_exact":
+            return None
+        manager = getattr(self, "pm", None)
+        checker = getattr(manager, "is_exact_cell_authorized_for_live", None)
+        if not callable(checker):
+            return "exact-cell promotion checker unavailable"
+        try:
+            authorized, reason = checker(
+                symbol,
+                timeframe,
+                regime,
+                refresh=True,
+            )
+        except Exception as exc:
+            return f"authorization check raised {type(exc).__name__}: {exc}"
+        return None if authorized else str(reason or "exact cell is not approved")
+
+    def _fresh_entry_account_validation(
+        self,
+        baseline_account: Any,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """Refresh and validate account identity/permissions immediately pre-send."""
+        try:
+            fresh = self.mt5.get_account_info()
+        except Exception as exc:
+            return None, f"fresh account snapshot raised {type(exc).__name__}: {exc}"
+        if fresh is None:
+            return None, "fresh account snapshot unavailable"
+
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            edge_mode_reason = self._edge_demo_account_block_reason(fresh)
+            if edge_mode_reason:
+                return None, edge_mode_reason
+
+        equity = self._safe_finite_float(getattr(fresh, "equity", None))
+        if equity is None or equity <= 0.0:
+            return None, "fresh account equity is missing, non-finite, or non-positive"
+        if not bool(getattr(fresh, "trade_allowed", True)):
+            return None, "fresh account disallows trading"
+        if not bool(getattr(fresh, "trade_expert", True)):
+            return None, "fresh account disallows expert trading"
+
+        minimum_equity = self._safe_finite_float(
+            getattr(self.pipeline_config, "live_min_account_equity", 0.0),
+            0.0,
+        ) or 0.0
+        if minimum_equity > 0.0 and equity < minimum_equity:
+            return None, f"fresh equity {equity:.2f} below live minimum {minimum_equity:.2f}"
+
+        fresh_currency = str(getattr(fresh, "currency", "") or "").strip().upper()
+        minimum_currency = str(
+            getattr(self.pipeline_config, "live_min_account_equity_currency", "") or ""
+        ).strip().upper()
+        if minimum_currency and fresh_currency != minimum_currency:
+            return None, (
+                f"fresh account currency {fresh_currency or '<missing>'} != "
+                f"required {minimum_currency}"
+            )
+
+        connector_config = getattr(self.mt5, "config", None)
+        if self._looks_like_mock(connector_config):
+            connector_config = None
+        expected_login = 0
+        try:
+            expected_login = int(getattr(connector_config, "expected_login", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None, "configured expected_login is invalid"
+        fresh_login = 0
+        try:
+            fresh_login = int(getattr(fresh, "login", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None, "fresh account login is invalid"
+        if expected_login <= 0:
+            return None, "MT5 account identity requires a nonzero expected_login pin"
+        if fresh_login != expected_login:
+            return None, f"fresh account login {fresh_login} != expected {expected_login}"
+
+        fresh_server = str(getattr(fresh, "server", "") or "").strip()
+        expected_server = str(getattr(connector_config, "expected_server", "") or "").strip()
+        if expected_server and fresh_server.casefold() != expected_server.casefold():
+            return None, (
+                f"fresh account server {fresh_server or '<missing>'} != expected {expected_server}"
+            )
+        expected_currency = str(
+            getattr(connector_config, "expected_currency", "") or ""
+        ).strip().upper()
+        if not expected_server:
+            return None, "MT5 account identity requires a nonempty expected_server pin"
+        if not expected_currency:
+            return None, "MT5 account identity requires a nonempty expected_currency pin"
+        if fresh_currency != expected_currency:
+            return None, (
+                f"fresh account currency {fresh_currency or '<missing>'} != "
+                f"expected {expected_currency}"
+            )
+
+        if baseline_account is not None:
+            baseline_login = getattr(baseline_account, "login", 0)
+            try:
+                baseline_login = int(baseline_login or 0)
+            except (TypeError, ValueError, OverflowError):
+                baseline_login = 0
+            if baseline_login > 0 and fresh_login > 0 and baseline_login != fresh_login:
+                return None, f"account login changed during decision: {baseline_login} -> {fresh_login}"
+            for attr, label in (("server", "server"), ("currency", "currency")):
+                before = str(getattr(baseline_account, attr, "") or "").strip().casefold()
+                after = str(getattr(fresh, attr, "") or "").strip().casefold()
+                if before and after and before != after:
+                    return None, f"account {label} changed during decision"
+
+        return fresh, None
 
     def _commission_amount_for_volume(self,
                                       symbol: str,
@@ -2820,6 +3844,132 @@ class LiveTrader:
                 total += max(0.0, float(risk_pct))
         return total
 
+    def _resolve_live_position_canonical_symbol(
+        self,
+        position: Any,
+        *,
+        candidate_symbol: str,
+        candidate_broker_symbol: str,
+    ) -> Tuple[Optional[str], str]:
+        """Resolve one fresh broker position without guessing across symbols."""
+        from pm_position import TradeTagEncoder
+        from pm_symbol import normalize_symbol
+
+        broker_symbol = str(getattr(position, "symbol", "") or "").strip()
+        if not broker_symbol:
+            return None, "open position has no broker symbol"
+        if broker_symbol == str(candidate_broker_symbol or ""):
+            return str(candidate_symbol).upper(), "candidate_broker_match"
+
+        comment = str(getattr(position, "comment", "") or "")
+        decoded = TradeTagEncoder.decode_comment(comment) if comment else None
+        decoded_symbol = str((decoded or {}).get("symbol", "") or "").strip().upper()
+        if decoded_symbol:
+            try:
+                resolved_broker = self.mt5.find_broker_symbol(decoded_symbol)
+            except Exception:
+                resolved_broker = None
+            if resolved_broker == broker_symbol or (
+                normalize_symbol(broker_symbol) == normalize_symbol(decoded_symbol)
+            ):
+                return decoded_symbol, "trade_tag"
+            return None, (
+                f"position tag symbol {decoded_symbol} does not match broker symbol "
+                f"{broker_symbol}"
+            )
+
+        validated = self._get_management_configs()
+        if validated:
+            resolved = self._resolve_symbol_from_broker(broker_symbol, validated)
+            if resolved:
+                return str(resolved).upper(), "validated_broker_map"
+        return None, f"cannot resolve canonical symbol for broker position {broker_symbol}"
+
+    def _build_live_stop_risk_exposures(
+        self,
+        positions_snapshot: List[Any],
+        account_info: Any,
+        *,
+        candidate_symbol: str,
+        candidate_broker_symbol: str,
+    ) -> Tuple[List[StopRiskExposure], Optional[float], str]:
+        """Measure open SL loss against replay-equivalent conservative capital."""
+        equity = self._safe_finite_float(getattr(account_info, "equity", None))
+        balance = self._safe_finite_float(getattr(account_info, "balance", None))
+        if equity is None or equity <= 0.0 or balance is None or balance <= 0.0:
+            return [], None, "fresh account balance/equity unavailable for gross stop-risk admission"
+
+        measured: List[Tuple[str, str, str, float]] = []
+        for index, position in enumerate(list(positions_snapshot or [])):
+            canonical, resolution = self._resolve_live_position_canonical_symbol(
+                position,
+                candidate_symbol=candidate_symbol,
+                candidate_broker_symbol=candidate_broker_symbol,
+            )
+            if not canonical:
+                return [], None, resolution
+            broker_symbol = str(getattr(position, "symbol", "") or "").strip()
+            try:
+                entry_price = float(getattr(position, "price_open", 0.0) or 0.0)
+                stop_price = float(getattr(position, "sl", 0.0) or 0.0)
+                volume = float(getattr(position, "volume", 0.0) or 0.0)
+                raw_position_type = getattr(position, "type", 1)
+                position_type = int(1 if raw_position_type is None else raw_position_type)
+            except (TypeError, ValueError, OverflowError):
+                return [], None, f"open position {index} has invalid SL geometry"
+            if entry_price <= 0.0 or stop_price <= 0.0 or volume <= 0.0:
+                return [], None, (
+                    f"open position {getattr(position, 'ticket', index)} lacks "
+                    "positive entry, stop or volume"
+                )
+            order_type = OrderType.BUY.value if position_type == 0 else OrderType.SELL.value
+            try:
+                spec = get_instrument_spec(canonical)
+            except Exception as exc:
+                return [], None, f"instrument spec unavailable for {canonical}: {exc}"
+            risk_amount, _path = self._estimate_stop_loss_amount(
+                order_type,
+                broker_symbol,
+                volume,
+                entry_price,
+                stop_price,
+                spec=spec,
+                symbol_info=self.mt5.get_symbol_info(broker_symbol),
+                include_commission=True,
+            )
+            if risk_amount is None or not math.isfinite(float(risk_amount)) or risk_amount <= 0.0:
+                return [], None, (
+                    f"open position {getattr(position, 'ticket', index)} stop risk "
+                    "cannot be measured"
+                )
+            measured.append(
+                (
+                    canonical,
+                    str(getattr(spec, "asset_class", "unknown") or "unknown"),
+                    str(getattr(position, "ticket", index) or index),
+                    float(risk_amount),
+                )
+            )
+
+        capital = conservative_risk_capital(
+            balance=balance,
+            equity=equity,
+            open_stop_risk_amount=sum(item[3] for item in measured),
+        )
+        if not capital.allow:
+            return [], None, capital.reason
+        exposures: List[StopRiskExposure] = []
+        for canonical, asset_class, exposure_id, risk_amount in measured:
+            exposures.append(
+                StopRiskExposure(
+                    symbol=canonical,
+                    stop_risk_pct=risk_amount / capital.risk_capital * 100.0,
+                    asset_class=asset_class,
+                    exposure_id=exposure_id,
+                )
+            )
+        return exposures, capital.risk_capital, ""
+
     @staticmethod
     def _estimate_open_drawdown_pct(account_info: Optional[Any]) -> float:
         if account_info is None:
@@ -2852,17 +4002,42 @@ class LiveTrader:
 
         deals = list(getattr(self, "_recent_closing_deals", []) or [])
         cached_lookback_hours = int(getattr(self, "_recent_closing_deals_lookback_hours", 0) or 0)
-        cache_too_short = cached_lookback_hours <= 0 or cached_lookback_hours < lookback_hours
+        cache_available = bool(
+            getattr(
+                self,
+                "_recent_closing_deals_available",
+                # Compatibility for tests/embedded callers that pre-populate a
+                # trustworthy cache without constructing LiveTrader normally.
+                bool(deals) or cached_lookback_hours > 0,
+            )
+        )
+        cache_too_short = (
+            not cache_available
+            or cached_lookback_hours <= 0
+            or cached_lookback_hours < lookback_hours
+        )
         if self.mt5 is not None and hasattr(self.mt5, "get_recent_closing_deals") and (
             not deals or cache_too_short
         ):
             try:
-                deals = list(self.mt5.get_recent_closing_deals(lookback_hours=lookback_hours) or [])
+                broker_deals = self.mt5.get_recent_closing_deals(
+                    lookback_hours=lookback_hours
+                )
+                if broker_deals is None:
+                    self._recent_closing_deals_available = False
+                    self._recent_closing_deals_lookback_hours = 0
+                    return None
+                deals = list(broker_deals)
                 self._recent_closing_deals = list(deals)
                 self._recent_closing_deals_lookback_hours = lookback_hours
+                self._recent_closing_deals_available = True
             except Exception as exc:
+                self._recent_closing_deals_available = False
+                self._recent_closing_deals_lookback_hours = 0
                 self.logger.warning(f"Realized loss snapshot unavailable for {normalized_period}: {exc}")
                 return None
+        elif not cache_available:
+            return None
         if not deals:
             return 0.0
 
@@ -2880,7 +4055,18 @@ class LiveTrader:
             except Exception:
                 continue
             if timestamp >= boundary:
-                realized += float(deal.get("profit", 0.0) or 0.0)
+                net_cash = 0.0
+                for field_name in ("profit", "commission", "swap", "fee"):
+                    component = self._safe_finite_float(deal.get(field_name, 0.0))
+                    if component is None:
+                        self.logger.warning(
+                            "Realized loss snapshot contains invalid %s for deal %s",
+                            field_name,
+                            deal.get("ticket", "<unknown>"),
+                        )
+                        return None
+                    net_cash += component
+                realized += net_cash
         return max(0.0, (-realized / balance) * 100.0)
 
     @staticmethod
@@ -2905,7 +4091,15 @@ class LiveTrader:
             return None
         path = Path(path_raw)
         if not path.is_absolute():
-            path = Path.cwd() / path
+            source_config = str(
+                getattr(self.pipeline_config, "_deployment_config_path", "") or ""
+            ).strip()
+            base = (
+                Path(source_config).resolve().parent
+                if source_config
+                else Path.cwd()
+            )
+            path = (base / path).resolve()
         if not path.exists():
             return None
         try:
@@ -2919,6 +4113,262 @@ class LiveTrader:
     @staticmethod
     def _safe_account_margin_level(account_info: Any) -> Optional[float]:
         return LiveTrader._safe_finite_float(getattr(account_info, "margin_level", None))
+
+    @staticmethod
+    def _margin_utc_now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _normalize_margin_timestamp(value: Any, field_name: str) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                # Backward-compatible in-memory callers historically used
+                # datetime.now(). Durable JSON timestamps remain strictly
+                # offset-aware below.
+                return parsed.astimezone(timezone.utc)
+        else:
+            text = str(value or "").strip()
+            if not text:
+                raise ValueError(f"{field_name} is missing")
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{field_name} must be offset-aware")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _margin_state_digest(payload: Dict[str, Any]) -> str:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _margin_state_payload(self) -> Dict[str, Any]:
+        last_close = getattr(self, "_last_margin_close_ts", None)
+        if last_close is not None:
+            last_close = self._normalize_margin_timestamp(
+                last_close,
+                "last_forced_close_utc",
+            )
+        payload: Dict[str, Any] = {
+            "schema_version": MARGIN_PROTECTION_STATE_SCHEMA_VERSION,
+            "execution_book": self.execution_book,
+            "margin_reopen_required": self._is_margin_reopen_required(),
+            "last_forced_close_utc": (
+                last_close.isoformat().replace("+00:00", "Z")
+                if last_close is not None
+                else None
+            ),
+            "updated_at_utc": self._margin_utc_now()
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        payload["content_sha256"] = self._margin_state_digest(payload)
+        return payload
+
+    def _persist_margin_protection_state(self) -> bool:
+        if not bool(getattr(self, "_margin_state_persistence_enabled", False)):
+            return True
+        path = Path(self._margin_protection_state_path)
+        temp_path: Optional[Path] = None
+        try:
+            with self._margin_state_persistence_lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                payload = self._margin_state_payload()
+                temp_path = path.with_name(
+                    f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+                )
+                serialized = json.dumps(
+                    payload,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                with temp_path.open("x", encoding="utf-8", newline="\n") as handle:
+                    handle.write(serialized)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, path)
+                temp_path = None
+                self._margin_state_persistence_error = ""
+            return True
+        except Exception as exc:
+            self._margin_state_persistence_error = (
+                "margin protection state save failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            self.logger.error(self._margin_state_persistence_error)
+            return False
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _fail_closed_margin_protection_state(self, reason: str) -> None:
+        self._margin_state = "BLOCKED"
+        self._margin_reopen_required = True
+        # A missing/corrupt state could be the only remaining record of a
+        # just-completed forced close. Restart the entire cooldown rather than
+        # allowing deletion or truncation to reopen exposure.
+        self._last_margin_close_ts = self._margin_utc_now()
+        self._margin_state_persistence_error = str(reason or "unknown state error")
+        self.logger.error(
+            "MARGIN PROTECTION STATE FAIL-CLOSED: %s; "
+            "reopen latch armed and cooldown restarted",
+            self._margin_state_persistence_error,
+        )
+        self._persist_margin_protection_state()
+
+    def _restore_margin_protection_state(self) -> None:
+        if not bool(getattr(self, "_margin_state_persistence_enabled", False)):
+            return
+        path = Path(self._margin_protection_state_path)
+        if not path.exists():
+            self._fail_closed_margin_protection_state(
+                f"margin protection state missing at {path}"
+            )
+            return
+        try:
+            if not path.is_file() or path.is_symlink():
+                raise ValueError("state path is not a regular non-symlink file")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("state payload is not an object")
+            expected_fields = {
+                "schema_version",
+                "execution_book",
+                "margin_reopen_required",
+                "last_forced_close_utc",
+                "updated_at_utc",
+                "content_sha256",
+            }
+            if set(payload) != expected_fields:
+                raise ValueError("state fields do not match the durable contract")
+            if payload.get("schema_version") != MARGIN_PROTECTION_STATE_SCHEMA_VERSION:
+                raise ValueError("state schema is unsupported")
+            if str(payload.get("execution_book") or "") != self.execution_book:
+                raise ValueError("state execution book does not match this runtime")
+            reopen_required = payload.get("margin_reopen_required")
+            if not isinstance(reopen_required, bool):
+                raise ValueError("margin_reopen_required is not boolean")
+            declared_digest = str(payload.get("content_sha256") or "").lower()
+            unsigned = dict(payload)
+            unsigned.pop("content_sha256", None)
+            if (
+                len(declared_digest) != 64
+                or declared_digest != self._margin_state_digest(unsigned)
+            ):
+                raise ValueError("state content digest is invalid")
+            updated_at = self._normalize_margin_timestamp(
+                payload.get("updated_at_utc"),
+                "updated_at_utc",
+            )
+            now = self._margin_utc_now()
+            if updated_at > now + timedelta(minutes=5):
+                raise ValueError("state update timestamp is implausibly in the future")
+            last_close_raw = payload.get("last_forced_close_utc")
+            last_close = None
+            if last_close_raw is not None:
+                last_close = self._normalize_margin_timestamp(
+                    last_close_raw,
+                    "last_forced_close_utc",
+                )
+                if last_close > now + timedelta(minutes=5):
+                    raise ValueError(
+                        "last forced-close timestamp is implausibly in the future"
+                    )
+                if last_close > updated_at + timedelta(seconds=1):
+                    raise ValueError("last forced close occurs after the state update")
+            self._margin_reopen_required = reopen_required
+            self._last_margin_close_ts = last_close
+            self._margin_state = "BLOCKED" if reopen_required else "NORMAL"
+            self._margin_state_persistence_error = ""
+            self.logger.info(
+                "Restored margin protection state from %s "
+                "(reopen_required=%s, last_forced_close_utc=%s)",
+                path,
+                reopen_required,
+                (
+                    last_close.isoformat().replace("+00:00", "Z")
+                    if last_close is not None
+                    else "none"
+                ),
+            )
+        except Exception as exc:
+            self._fail_closed_margin_protection_state(
+                "margin protection state load failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _arm_margin_reopen_required(
+        self,
+        *,
+        last_forced_close: Optional[datetime] = None,
+    ) -> bool:
+        changed = not self._is_margin_reopen_required()
+        if last_forced_close is not None:
+            normalized = self._normalize_margin_timestamp(
+                last_forced_close,
+                "last_forced_close_utc",
+            )
+            changed = changed or normalized != self._last_margin_close_ts
+            self._last_margin_close_ts = normalized
+        self._margin_reopen_required = True
+        if changed:
+            return self._persist_margin_protection_state()
+        return self._margin_state_persistence_block_reason() is None
+
+    def _margin_cooldown_remaining_minutes(
+        self,
+        *,
+        now: Optional[datetime] = None,
+    ) -> float:
+        try:
+            cooldown_minutes = float(
+                getattr(
+                    self.pipeline_config,
+                    "margin_reopen_cooldown_minutes",
+                    15.0,
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            cooldown_minutes = 15.0
+        if not math.isfinite(cooldown_minutes) or cooldown_minutes <= 0.0:
+            return 0.0
+        last_close = getattr(self, "_last_margin_close_ts", None)
+        if last_close is None:
+            return 0.0
+        try:
+            normalized_last = self._normalize_margin_timestamp(
+                last_close,
+                "last_forced_close_utc",
+            )
+            normalized_now = self._normalize_margin_timestamp(
+                now or self._margin_utc_now(),
+                "margin_cooldown_now",
+            )
+        except (TypeError, ValueError, OverflowError):
+            # An in-memory timestamp failure cannot be interpreted as an
+            # elapsed cooldown. Hold the full configured interval.
+            return cooldown_minutes
+        elapsed = max(
+            0.0,
+            (normalized_now - normalized_last).total_seconds() / 60.0,
+        )
+        return max(0.0, cooldown_minutes - elapsed)
+
+    def _margin_state_persistence_block_reason(self) -> Optional[str]:
+        error = str(getattr(self, "_margin_state_persistence_error", "") or "")
+        if bool(getattr(self, "_margin_state_persistence_enabled", False)) and error:
+            return error
+        return None
 
     def _classify_margin_state(self, margin_level: float) -> str:
         """Classify account stress state from MT5-native margin level."""
@@ -2946,8 +4396,9 @@ class LiveTrader:
         if margin_level is None:
             return
         reopen_level = float(getattr(self.pipeline_config, "margin_reopen_level", 100.0) or 100.0)
-        if margin_level >= reopen_level:
+        if margin_level >= reopen_level and self._is_margin_reopen_required():
             self._margin_reopen_required = False
+            self._persist_margin_protection_state()
 
     def _run_margin_protection_cycle(self,
                                      account_info: Optional[Any] = None,
@@ -2979,7 +4430,7 @@ class LiveTrader:
 
         state = self._classify_margin_state(margin_level)
         if state != "NORMAL":
-            self._margin_reopen_required = True
+            self._arm_margin_reopen_required()
         elif self._is_margin_reopen_required():
             reopen_level = float(getattr(self.pipeline_config, "margin_reopen_level", 100.0) or 100.0)
             if margin_level < reopen_level:
@@ -3023,6 +4474,21 @@ class LiveTrader:
                 break
             attempts += 1
 
+            # Durably arm both recovery hysteresis and the complete cooldown
+            # before asking the broker to close. If the process terminates
+            # after MT5 accepts the close but before the post-success update,
+            # restart still observes this conservative precommit. A failed
+            # close may therefore impose an unnecessary cooldown; that is the
+            # safe side of the ambiguity.
+            precommit_at = self._margin_utc_now()
+            if not self._arm_margin_reopen_required(
+                last_forced_close=precommit_at,
+            ):
+                self.logger.error(
+                    "MARGIN CLOSE DEFERRED: durable cooldown precommit failed; "
+                    "new entries remain blocked"
+                )
+                break
             result = self.mt5.close_position(pos)
             if not getattr(result, "success", False):
                 self.logger.warning(
@@ -3034,8 +4500,9 @@ class LiveTrader:
                 # a margin cycle cannot immediately re-open the same exposure
                 # once margin_level bounces above the block threshold
                 # Use a short re-open buffer after forced margin closures.
-                self._last_margin_close_ts = datetime.now()
-                self._margin_reopen_required = True
+                self._arm_margin_reopen_required(
+                    last_forced_close=self._margin_utc_now(),
+                )
                 positions_changed = True
 
             account = self.mt5.get_account_info() if self.mt5 else None
@@ -3054,7 +4521,7 @@ class LiveTrader:
 
             state = self._classify_margin_state(margin_level)
             if state != "NORMAL":
-                self._margin_reopen_required = True
+                self._arm_margin_reopen_required()
             elif self._is_margin_reopen_required():
                 reopen_level = float(getattr(self.pipeline_config, "margin_reopen_level", 100.0) or 100.0)
                 if margin_level < reopen_level:
@@ -3115,6 +4582,11 @@ class LiveTrader:
         if account_info is None:
             self.logger.warning(f"[{symbol}] Account snapshot unavailable; skipping this iteration.")
             return
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            edge_mode_reason = self._edge_demo_account_block_reason(account_info)
+            if edge_mode_reason:
+                self.logger.error(f"[{symbol}] Edge challenger blocked: {edge_mode_reason}")
+                return
         if not getattr(account_info, "trade_allowed", True) or not getattr(account_info, "trade_expert", True):
             self.logger.warning(f"[{symbol}] Account is not tradable; skipping this iteration.")
             return
@@ -3125,7 +4597,7 @@ class LiveTrader:
         open_magics = {int(getattr(p, 'magic', 0) or 0) for p in symbol_positions}
         
         # Check if D1+lower-TF mode is enabled
-        allow_d1_plus_lower = getattr(self.pipeline_config, 'allow_d1_plus_lower_tf', True) if self.pipeline_config else True
+        allow_d1_plus_lower = getattr(self.pipeline_config, 'allow_d1_plus_lower_tf', False) if self.pipeline_config else False
         
         # Analyze existing positions
         has_d1_position = False
@@ -3239,6 +4711,12 @@ class LiveTrader:
         if not can_open_trade:
             if block_reason:
                 self.logger.debug(f"[{symbol}] {block_reason}")
+            pending_scope = (
+                set(timeframes_filter or set())
+                if timeframes_filter is not None
+                else set(getattr(self, "_pending_specialist_timeframes", {}).get(symbol, set()))
+            )
+            self._consume_specialist_timeframes(symbol, pending_scope)
             return
 
         # Evaluate candidates across timeframes (winners-only)
@@ -3248,6 +4726,12 @@ class LiveTrader:
             config,
             timeframes_filter=timeframes_filter,
         )
+        pending_scope = (
+            set(timeframes_filter or set())
+            if timeframes_filter is not None
+            else set(getattr(self, "_pending_specialist_timeframes", {}).get(symbol, set()))
+        )
+        self._consume_specialist_timeframes(symbol, pending_scope)
         
         if not candidates:
             if eval_stats:
@@ -3273,7 +4757,9 @@ class LiveTrader:
             original_count = len(candidates)
             candidates = [
                 c for c in candidates
-                if TradeTagEncoder.encode_magic(symbol, c['timeframe'], c['regime']) not in open_magics
+                if self._encode_specialist_magic(
+                    symbol, c['timeframe'], c['regime']
+                ) not in open_magics
             ]
             if len(candidates) < original_count:
                 self.logger.debug(f"[{symbol}] Filtered out candidates matching existing open position magic")
@@ -3282,29 +4768,14 @@ class LiveTrader:
             self.logger.debug(f"[{symbol}] No valid candidates after secondary/open-position constraints")
             return
         
-        # Select the best feasible candidate using an "actionable-within-margin" policy.
+        # Select among independently actionable cells. A stronger non-signalling
+        # cell must not suppress a signal from another timeframe/regime.
         
         #
         
-        # Rationale:
-        
-        # - The single top-ranked candidate can legitimately have signal==0 on a given bar.
-        
-        # - In that case, we should not abort immediately if another high-quality candidate
-        
-        #   has an actionable signal (LONG/SHORT) and is close in score to the best overall.
-        
-        #
-        
-        # Policy:
-        
-        # 1) Compute best_overall_score across all candidates (even if signal==0)
-        
-        # 2) Filter to actionable candidates (signal != 0)
-        
-        # 3) Choose the best actionable candidate with selection_score >= best_overall_score * margin
-        
-        # 4) If none qualify, record a throttled no-trade decision and return
+        # A non-signalling leader is irrelevant to the current admission
+        # decision. Portfolio/risk constraints still arbitrate simultaneous
+        # signals after the independent-cell filter.
         
         best_overall = max(candidates, key=self._candidate_rank_key)
 
@@ -3328,19 +4799,6 @@ class LiveTrader:
             )
             return
 
-        margin = float(self.pipeline_config.actionable_score_margin)
-        
-        # Clamp margin defensively: [0.0, 1.0]
-        
-        if margin < 0.0:
-        
-            margin = 0.0
-        
-        if margin > 1.0:
-        
-            margin = 1.0
-
-        
         actionable = [c for c in candidates if int(c.get('signal', 0)) != 0]
         self.logger.debug(
             f"[{symbol}] Winners-only eval: tfs={eval_stats.get('timeframes_evaluated', 0)}/"
@@ -3368,31 +4826,50 @@ class LiveTrader:
             return
 
         
-        min_score = best_overall_score * margin
+        min_score = 0.0
         
-        eligible = [c for c in actionable if float(c.get('selection_score', 0.0)) >= min_score]
+        eligible = [c for c in actionable if float(c.get('selection_score', 0.0)) > min_score]
         
         if not eligible:
 
-            # There were signals, but none were close enough to the best overall score.
+            # There were signals, but none retained a positive selection score.
             # Use helper to prevent duplicate log spam within same bar.
 
             bar_time_iso = str(best_overall.get('bar_time', ''))
 
             self._log_no_actionable_signal(
                 symbol=symbol,
-                message="NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN (actionable below margin)",
+                message="NO_ACTIONABLE_SIGNAL_WITH_POSITIVE_SCORE",
                 best_candidate=best_overall,
                 bar_time_iso=bar_time_iso,
-                action_type="NO_ACTIONABLE_SIGNAL_WITHIN_MARGIN"
+                action_type="NO_ACTIONABLE_SIGNAL_WITH_POSITIVE_SCORE"
             )
 
             return
 
         
-        # Choose the best actionable candidate (highest selection score) within the margin band.
-        
-        best = max(eligible, key=self._candidate_rank_key)
+        # The symbol controller arbitrates order slots without collapsing D1
+        # and lower-timeframe specialists into one portfolio winner.  If both
+        # horizons are independently actionable while the symbol is flat, the
+        # stronger request is handled now and the other is deliberately left
+        # eligible for the immediately following sweep.  This sequencing lets
+        # _execute_entry re-read the broker's position state before admitting
+        # the second horizon and avoids relying on instantaneous fill visibility.
+        admission_plan = self._plan_symbol_specialist_admissions(
+            eligible,
+            allow_d1_plus_lower=bool(allow_d1_plus_lower),
+            open_position_count=num_positions,
+        )
+        best = admission_plan[0]
+        for deferred in admission_plan[1:]:
+            deferred_tf = str(deferred.get("timeframe", "") or "")
+            self._last_bar_times.pop(f"{symbol}_{deferred_tf}", None)
+            self._queue_specialist_timeframe(symbol, deferred_tf)
+            self.logger.info(
+                f"[{symbol}] Queued independent specialist for next sweep: "
+                f"{deferred.get('strategy_name', 'UNKNOWN')} @ "
+                f"{deferred_tf}/{deferred.get('regime', 'UNKNOWN')}"
+            )
         # ── Throttle check ──────────────────────────────────────────────
         # Build a decision key from the candidate's identifying attributes
         # so that the *same* signal on the *same* bar is only acted on once.
@@ -3415,7 +4892,9 @@ class LiveTrader:
         
         # Create magic number for this specific trade
         # Include timeframe and regime so we can identify the config used
-        magic = TradeTagEncoder.encode_magic(symbol, best['timeframe'], best['regime'])
+        magic = self._encode_specialist_magic(
+            symbol, best['timeframe'], best['regime']
+        )
         signal_bar_index = max(len(best['features']) - 2, 0) if len(best['features']) > 1 else max(len(best['features']) - 1, 0)
         trade_intent = best['strategy'].build_trade_intent(
             best['features'],
@@ -3569,8 +5048,8 @@ class LiveTrader:
             for candidate_cfg in tf_payload.values():
                 if candidate_cfg is None or candidate_cfg.is_no_trade_marker():
                     continue
-                status = str(getattr(candidate_cfg, "promotion_status", "PROMOTED") or "PROMOTED").upper()
-                if status not in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+                status = str(getattr(candidate_cfg, "promotion_status", "BLOCKED") or "BLOCKED").upper()
+                if self._promotion_status_is_entry_eligible(status):
                     return True
             return False
 
@@ -3618,7 +5097,12 @@ class LiveTrader:
             if (
                 live_require_tuned_regime_params
                 and has_tuned_regime_params is not None
-                and not has_tuned_regime_params(symbol, tf, regime_params_file)
+                and not has_tuned_regime_params(
+                    symbol,
+                    tf,
+                    regime_params_file,
+                    require_provenance=True,
+                )
             ):
                 stats["missing_tuned_regime_params"] += 1
                 logged_missing = getattr(self, "_live_missing_regime_params_logged", None)
@@ -3759,8 +5243,8 @@ class LiveTrader:
                     }
                     self._prune_cache()
                     continue
-                promotion_status = str(getattr(regime_config, "promotion_status", "PROMOTED") or "PROMOTED").upper()
-                if promotion_status in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+                promotion_status = str(getattr(regime_config, "promotion_status", "BLOCKED") or "BLOCKED").upper()
+                if not self._promotion_status_is_entry_eligible(promotion_status):
                     stats["winner_failed_gate"] += 1
                     reasons = "; ".join(getattr(regime_config, "promotion_reasons", []) or [])
                     self.logger.debug(
@@ -3777,7 +5261,13 @@ class LiveTrader:
                     }
                     self._prune_cache()
                     continue
-                if not regime_config.is_valid_for_live(min_pf, min_return, max_dd, min_return_dd_ratio):
+                if not self._regime_config_is_entry_eligible(
+                    regime_config,
+                    min_pf=min_pf,
+                    min_return=min_return,
+                    max_dd=max_dd,
+                    min_return_dd_ratio=min_return_dd_ratio,
+                ):
                     val_ret = regime_config.val_metrics.get('total_return_pct', -100)
                     val_dd = regime_config.val_metrics.get('max_drawdown_pct', 100)
                     val_ratio = val_ret / max(val_dd, 0.5)
@@ -3825,8 +5315,8 @@ class LiveTrader:
                 self._prune_cache()  # Prevent unbounded growth
             # ─────────────────────────────────────────────────────────────────
             
-            promotion_status = str(getattr(regime_config, "promotion_status", "PROMOTED") or "PROMOTED").upper()
-            if promotion_status in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+            promotion_status = str(getattr(regime_config, "promotion_status", "BLOCKED") or "BLOCKED").upper()
+            if not self._promotion_status_is_entry_eligible(promotion_status):
                 stats["winner_failed_gate"] += 1
                 continue
 
@@ -3839,9 +5329,35 @@ class LiveTrader:
             selection_score = float(regime_strength) * quality_score * float(freshness)
             eligibility_report = {}
             portfolio_manager = getattr(self, "pm", None)
-            if portfolio_manager is not None and hasattr(portfolio_manager, "live_eligibility_report"):
+            if bool(getattr(self, "_is_edge_challenger_demo", False)):
+                temporal = dict(
+                    (regime_config.validation_evidence or {}).get("temporal_lineage", {})
+                    or {}
+                )
+                eligibility_report = {
+                    "execution_book": EDGE_DEMO_EXECUTION_BOOK,
+                    "book_role": EDGE_CHALLENGER_ROLE,
+                    "paper_only": True,
+                    "candidate_id": str(
+                        (regime_config.artifact_meta or {}).get("candidate_id") or ""
+                    ),
+                    "fit_cutoff_utc": temporal.get("fit_cutoff_utc"),
+                }
+            elif portfolio_manager is not None and hasattr(portfolio_manager, "live_eligibility_report"):
                 eligibility_report = portfolio_manager.live_eligibility_report(symbol, tf, current_regime)
             
+            base_promo_mult = (
+                float(getattr(self.pipeline_config, "promote_small_risk_multiplier", 0.5))
+                if str(getattr(regime_config, "promotion_status", "") or "").upper() == "PROMOTE_SMALL"
+                else 1.0
+            )
+            probation_mult, on_probation = self._probation_multiplier(
+                regime_config,
+                config,
+                symbol=symbol,
+                timeframe=tf,
+                regime=current_regime,
+            )
             candidates.append({
                 'timeframe': tf,
                 'regime': current_regime,
@@ -3855,16 +5371,78 @@ class LiveTrader:
                 'features': features,
                 'regime_config': regime_config,
                 'eligibility_report': eligibility_report,
-                'promotion_status': str(getattr(regime_config, "promotion_status", "PROMOTED") or "PROMOTED"),
-                'promotion_risk_multiplier': float(getattr(self.pipeline_config, "promote_small_risk_multiplier", 0.5))
-                if str(getattr(regime_config, "promotion_status", "") or "").upper() == "PROMOTE_SMALL"
-                else 1.0,
+                'promotion_status': str(getattr(regime_config, "promotion_status", "BLOCKED") or "BLOCKED"),
+                'promotion_risk_multiplier': base_promo_mult * probation_mult,
+                'on_probation': on_probation,
                 'bar_time': str(features.index[-2]) if len(features) > 1 else '',
             })
             stats["winner_candidates"] += 1
         
         return candidates, stats
     
+    def _probation_multiplier(self,
+                              regime_config: Any,
+                              config: Any,
+                              *,
+                              symbol: str = "",
+                              timeframe: str = "",
+                              regime: str = "") -> Tuple[float, bool]:
+        """Probation tier (agent_audit/comms/CHANNEL.md [004]).
+
+        Freshly (re)trained winners have no forward evidence, and stored-window metrics
+        correlate poorly with full-sample profitability (Spearman <= ~0.30), so cells whose
+        training timestamp is within `probation_days` trade at `probation_risk_multiplier`.
+        Graduation requires both the minimum age and durable, exactly attributed
+        live outcomes with positive mean R and profit factor. Missing provenance
+        or missing feedback remains probationary.
+        """
+        cfg = self.pipeline_config
+        if not bool(getattr(cfg, "probation_enabled", True)):
+            return 1.0, False
+        days = int(getattr(cfg, "probation_days", 14) or 0)
+        if days <= 0:
+            return 1.0, False
+        stamp = getattr(regime_config, "trained_at", None) or getattr(config, "optimized_at", None)
+        if isinstance(stamp, str):
+            try:
+                stamp = datetime.fromisoformat(stamp)
+            except ValueError:
+                stamp = None
+        try:
+            mult = float(getattr(cfg, "probation_risk_multiplier", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            mult = 0.5
+        probationary = (max(0.05, min(1.0, mult)), True)
+        if not isinstance(stamp, datetime):
+            return probationary
+        if (datetime.now() - stamp) < timedelta(days=days):
+            return probationary
+        ledger = getattr(self, "_live_outcome_ledger", None)
+        if ledger is None or not all((symbol, timeframe, regime)):
+            return probationary
+        try:
+            summary = ledger.exact_cell_summary(
+                symbol,
+                timeframe,
+                regime,
+                str(getattr(regime_config, "strategy_name", "") or ""),
+            )
+            minimum = max(1, int(getattr(cfg, "probation_min_live_outcomes", 30) or 30))
+            min_mean_r = float(getattr(cfg, "probation_min_mean_r", 0.0) or 0.0)
+            min_pf = float(getattr(cfg, "probation_min_profit_factor", 1.0) or 1.0)
+            mean_r = summary.get("mean_r")
+            if (
+                int(summary.get("exact_closed_positions", 0) or 0) < minimum
+                or int(summary.get("r_observations", 0) or 0) < minimum
+                or mean_r is None
+                or float(mean_r) <= min_mean_r
+                or float(summary.get("profit_factor_r", 0.0) or 0.0) < min_pf
+            ):
+                return probationary
+        except Exception:
+            return probationary
+        return 1.0, False
+
     def _evaluate_legacy_candidate(self,
                                    symbol: str,
                                    broker_symbol: str,
@@ -3891,9 +5469,9 @@ class LiveTrader:
         val_return_dd_ratio = val_return / max(val_dd, 0.5)
         default_config = getattr(config, "default_config", None)
         legacy_status = str(
-            getattr(default_config, "promotion_status", "PROMOTED")
+            getattr(default_config, "promotion_status", "BLOCKED")
             if default_config is not None
-            else "PROMOTED"
+            else "BLOCKED"
         ).upper()
         if legacy_status in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
             reasons = "; ".join(getattr(default_config, "promotion_reasons", []) or []) if default_config else ""
@@ -4035,11 +5613,24 @@ class LiveTrader:
         _tf = best_candidate.get('timeframe', '') if best_candidate else ''
         _regime = best_candidate.get('regime', '') if best_candidate else ''
         _strat_name = best_candidate.get('strategy_name', '') if best_candidate else ''
+        regime_candidate = best_candidate.get("regime_config") if best_candidate else None
+        execution_book_role = (
+            EDGE_CHALLENGER_ROLE
+            if bool(getattr(self, "_is_edge_challenger_demo", False))
+            else LOCKBOX_CHAMPION_ROLE
+        )
+        edge_candidate_id = str(
+            (getattr(regime_candidate, "artifact_meta", {}) or {}).get("candidate_id")
+            or ""
+        )
         
         decision_context = {
             "secondary_trade": bool(is_secondary_trade),
             "secondary_reason": secondary_reason,
             "position_context": position_context,
+            "execution_book": str(getattr(self, "execution_book", CHAMPION_EXECUTION_BOOK)),
+            "book_role": execution_book_role,
+            "candidate_id": edge_candidate_id,
         }
         try:
             event_observation = observe_event_context(
@@ -4137,6 +5728,11 @@ class LiveTrader:
                                volume_value: Optional[float] = None,
                                target_risk_pct_value: Optional[float] = None,
                                actual_risk_pct_value: Optional[float] = None,
+                               expected_entry_price_value: Optional[float] = None,
+                               filled_entry_price_value: Optional[float] = None,
+                               entry_slippage_pips_value: Optional[float] = None,
+                               entry_slippage_r_value: Optional[float] = None,
+                               entry_slippage_direction_value: Optional[str] = None,
                                context: Optional[Dict[str, Any]] = None) -> None:
             """Persist actionable outcomes for dashboard consumption."""
             if not decision_key:
@@ -4152,6 +5748,7 @@ class LiveTrader:
                     "strategy_name": _strat_name,
                     "direction": direction_label,
                     "action": action,
+                    "actionable_schema_version": ACTIONABLE_SCHEMA_VERSION,
                     "action_time": datetime.now().isoformat(),
                     "entry_price": entry_price_value,
                     "stop_loss_price": sl_value,
@@ -4159,6 +5756,11 @@ class LiveTrader:
                     "volume": volume_value,
                     "target_risk_pct": target_risk_pct_value,
                     "actual_risk_pct": actual_risk_pct_value,
+                    "expected_entry_price": expected_entry_price_value,
+                    "filled_entry_price": filled_entry_price_value,
+                    "entry_slippage_pips": entry_slippage_pips_value,
+                    "entry_slippage_r": entry_slippage_r_value,
+                    "entry_slippage_direction": entry_slippage_direction_value,
                     "secondary_trade": bool(is_secondary_trade),
                     "secondary_reason": secondary_reason,
                     "position_context": position_context,
@@ -4166,6 +5768,9 @@ class LiveTrader:
                     "quality": quality_score,
                     "freshness": freshness_score,
                     "regime_strength": regime_strength_score,
+                    "execution_book": str(getattr(self, "execution_book", CHAMPION_EXECUTION_BOOK)),
+                    "book_role": execution_book_role,
+                    "candidate_id": edge_candidate_id,
                 }
                 payload_context: Dict[str, Any] = {}
                 if isinstance(decision_context.get("event_calendar"), dict):
@@ -4182,6 +5787,25 @@ class LiveTrader:
                 self.logger.debug(f"[{symbol}] Actionable log failed: {exc}")
 
         storage_manager = getattr(self, "storage_manager", None)
+        if (
+            bool(getattr(self, "_live_outcome_feedback_initialized", False))
+            and bool(getattr(self.pipeline_config, "live_outcome_feedback_enabled", True))
+            and (
+                getattr(self, "_live_outcome_ledger", None) is None
+                or bool(getattr(self, "_live_outcome_feedback_error", ""))
+            )
+        ):
+            reason = str(
+                getattr(self, "_live_outcome_feedback_error", "")
+                or "durable live outcome ledger unavailable"
+            )
+            self.logger.error(f"[{symbol}] Skipping trade; live outcome feedback is fail-closed: {reason}")
+            _record_throttle("BLOCKED_LIVE_OUTCOME_FEEDBACK")
+            _record_actionable(
+                action="BLOCKED_LIVE_OUTCOME_FEEDBACK",
+                context={"live_outcome_feedback_error": reason},
+            )
+            return
         manual_block_reason = self._manual_new_entries_block_reason()
         if manual_block_reason:
             self.logger.warning(f"[{symbol}] Skipping trade; {manual_block_reason}")
@@ -4218,8 +5842,12 @@ class LiveTrader:
                 return
             ambiguous_blocks.pop(symbol, None)
         
-        # Check rate limit - prevent rapid order submission
-        last_order_time = self._last_order_times.get(symbol)
+        # Rate-limit the exact specialist, not the whole symbol.  The symbol
+        # controller may legitimately admit an independent D1/lower-TF pair;
+        # a symbol-wide timer silently discarded the second specialist even
+        # though fresh position and institution gates explicitly allowed it.
+        rate_limit_key = self._specialist_rate_limit_key(symbol, magic)
+        last_order_time = self._last_order_times.get(rate_limit_key)
         if last_order_time:
             time_since_last = (datetime.now() - last_order_time).total_seconds()
             if time_since_last < self.ORDER_RATE_LIMIT_SECONDS:
@@ -4271,7 +5899,7 @@ class LiveTrader:
             ]
             current_tf = str(_tf or "").upper()
             allow_d1_plus_lower = bool(
-                getattr(self.pipeline_config, 'allow_d1_plus_lower_tf', True)
+                getattr(self.pipeline_config, 'allow_d1_plus_lower_tf', False)
             ) if self.pipeline_config else True
             fresh_open_timeframes: Set[str] = set()
             fresh_has_d1 = False
@@ -4315,6 +5943,13 @@ class LiveTrader:
                     _block_fresh_position_state(
                         "BLOCKED_SYMBOL_POSITION_EXISTS",
                         "additional entries disabled while a same-symbol position is open",
+                    )
+                    return
+                account_mode_reason = self._multi_position_account_block_reason(account_info)
+                if account_mode_reason:
+                    _block_fresh_position_state(
+                        "BLOCKED_ACCOUNT_POSITION_MODE",
+                        account_mode_reason,
                     )
                     return
                 if fresh_has_unknown:
@@ -4401,6 +6036,18 @@ class LiveTrader:
             return
 
         # --- Margin protection entry gate (black-swan guard) ---
+        margin_state_error = self._margin_state_persistence_block_reason()
+        if margin_state_error:
+            self.logger.error(
+                f"[{symbol}] MARGIN STATE UNAVAILABLE: {margin_state_error}; "
+                "entry blocked"
+            )
+            _record_throttle("SKIPPED_MARGIN_STATE_UNAVAILABLE")
+            _record_actionable(
+                action="SKIPPED_MARGIN_STATE_UNAVAILABLE",
+                context={"margin_state_error": margin_state_error},
+            )
+            return
         margin_level = self._safe_account_margin_level(account)
         margin_used = self._account_margin_used(account)
         margin_block = float(getattr(
@@ -4444,24 +6091,32 @@ class LiveTrader:
         # re-arm new entries for `margin_reopen_cooldown_minutes` after the most
         # recent forced close. Prevents the panic-cycle from re-opening the
         # exact exposure that triggered the close in the first place.
-        cooldown_minutes = float(getattr(
-            self.pipeline_config, 'margin_reopen_cooldown_minutes', 15.0) or 0.0)
         last_margin_close_ts = getattr(self, '_last_margin_close_ts', None)
-        if cooldown_minutes > 0 and last_margin_close_ts is not None:
-            elapsed = (datetime.now() - last_margin_close_ts).total_seconds() / 60.0
-            if elapsed < cooldown_minutes:
-                remaining = cooldown_minutes - elapsed
-                last_notice = getattr(self, '_margin_cooldown_notice_logged_ts', None)
-                if (last_notice is None or
-                        (datetime.now() - last_notice).total_seconds() > 60.0):
-                    self.logger.info(
-                        f"[{symbol}] MARGIN COOLDOWN: {remaining:.1f} min remaining "
-                        f"(forced close at {last_margin_close_ts.isoformat(timespec='seconds')}) — entry blocked"
-                    )
-                    self._margin_cooldown_notice_logged_ts = datetime.now()
-                _record_throttle("SKIPPED_MARGIN_COOLDOWN")
-                _record_actionable(action="SKIPPED_MARGIN_COOLDOWN")
-                return
+        remaining = self._margin_cooldown_remaining_minutes()
+        if remaining > 0.0 and last_margin_close_ts is not None:
+            notice_now = self._margin_utc_now()
+            last_notice = getattr(self, '_margin_cooldown_notice_logged_ts', None)
+            notice_due = True
+            if last_notice is not None:
+                try:
+                    notice_due = (
+                        notice_now
+                        - self._normalize_margin_timestamp(
+                            last_notice,
+                            "margin_cooldown_notice_utc",
+                        )
+                    ).total_seconds() > 60.0
+                except (TypeError, ValueError, OverflowError):
+                    notice_due = True
+            if notice_due:
+                self.logger.info(
+                    f"[{symbol}] MARGIN COOLDOWN: {remaining:.1f} min remaining "
+                    f"(forced close at {last_margin_close_ts.isoformat(timespec='seconds')}) — entry blocked"
+                )
+                self._margin_cooldown_notice_logged_ts = notice_now
+            _record_throttle("SKIPPED_MARGIN_COOLDOWN")
+            _record_actionable(action="SKIPPED_MARGIN_COOLDOWN")
+            return
 
         basis_pref = getattr(self.position_config, "risk_basis", "balance")
         basis_value = account.balance if basis_pref == "balance" else account.equity
@@ -4533,12 +6188,27 @@ class LiveTrader:
 
         # Enforce broker minimum stop distance (auto widen SL if too close)
         min_stop_dist = float(symbol_info.trade_stops_level) * float(symbol_info.point) if symbol_info.trade_stops_level else 0.0
-        if min_stop_dist > 0 and abs(entry_price - sl_price) < min_stop_dist and getattr(self.position_config, "auto_widen_sl", True):
+        if min_stop_dist > 0 and abs(entry_price - sl_price) < min_stop_dist:
+            if not bool(getattr(self.position_config, "auto_widen_sl", False)):
+                reason = (
+                    f"frozen stop distance {abs(entry_price - sl_price):.8f} is below "
+                    f"broker minimum {min_stop_dist:.8f}"
+                )
+                self.logger.warning(f"[{symbol}] Skipping trade; {reason}")
+                _record_throttle("SKIPPED_BROKER_STOP_DISTANCE")
+                _record_actionable(
+                    action="SKIPPED_BROKER_STOP_DISTANCE",
+                    entry_price_value=entry_price,
+                    sl_value=sl_price,
+                    tp_value=tp_price,
+                    context={"broker_min_stop_distance": min_stop_dist, "reason": reason},
+                )
+                return
             if is_long:
                 sl_price = entry_price - min_stop_dist
             else:
                 sl_price = entry_price + min_stop_dist
-            # Preserve validated R-multiple: recalculate TP to match original reward:risk
+            # Research/paper compatibility only: preserve the original R ratio.
             if original_r_multiple > 0:
                 new_sl_dist = abs(entry_price - sl_price)
                 new_tp_dist = original_r_multiple * new_sl_dist
@@ -4933,10 +6603,13 @@ class LiveTrader:
         actual_risk_pct = (actual_risk_amount / basis_value) * 100.0 if basis_value > 0 else float('inf')
         max_risk_pct = float(getattr(self.position_config, 'max_risk_pct', 2.0))
         risk_tolerance_pct = float(getattr(self.position_config, 'risk_tolerance_pct', 2.0))
+        allowed_risk_pct = min(
+            max_risk_pct,
+            target_risk_pct * (1.0 + max(0.0, risk_tolerance_pct) / 100.0),
+        )
         # Lot-normalization drift gate:
-        # within tolerance -> debug only
-        # over tolerance but inside cap -> operator-visible warning
-        # over hard cap -> block
+        # at/below target -> OK; inside target tolerance -> WARN;
+        # outside target/tolerance/hard-cap envelope -> BLOCK.
         drift_severity = classify_lot_normalization_drift(
             actual_risk_pct=actual_risk_pct,
             target_risk_pct=target_risk_pct,
@@ -4964,7 +6637,7 @@ class LiveTrader:
             risk_cap_action = "BLOCKED_MIN_LOT_EXCEEDS_CAP" if risk_target_volume < min_vol - 1e-9 else "SKIPPED_RISK_CAP"
             self.logger.warning(
                 f"[{symbol}] Skipping trade; actual risk {actual_risk_pct:.2f}% exceeds "
-                f"per-trade hard cap {max_risk_pct:.2f}% "
+                f"allowed risk envelope {allowed_risk_pct:.2f}% "
                 f"(configured={configured_risk_pct:.2f}%, effective_target={target_risk_pct:.2f}%, "
                 f"vol={volume:.4f}, sl={sl_price:.5f})"
             )
@@ -5132,10 +6805,28 @@ class LiveTrader:
         entry_price = final_entry_price
         sl_price = (entry_price - sl_distance) if is_long else (entry_price + sl_distance)
         tp_price = (entry_price + tp_distance) if is_long else (entry_price - tp_distance)
-        if min_stop_dist > 0 and sl_distance < min_stop_dist and getattr(self.position_config, "auto_widen_sl", True):
+        if min_stop_dist > 0 and sl_distance < min_stop_dist:
+            if not bool(getattr(self.position_config, "auto_widen_sl", False)):
+                _record_throttle("SKIPPED_BROKER_STOP_DISTANCE")
+                _record_actionable(
+                    action="SKIPPED_BROKER_STOP_DISTANCE",
+                    entry_price_value=entry_price,
+                    sl_value=sl_price,
+                    tp_value=tp_price,
+                    volume_value=volume,
+                    target_risk_pct_value=target_risk_pct,
+                    actual_risk_pct_value=actual_risk_pct,
+                    context={
+                        "stage": "final_quote_refresh",
+                        "broker_min_stop_distance": min_stop_dist,
+                        "frozen_stop_distance": sl_distance,
+                    },
+                )
+                return
+            prior_sl_distance = sl_distance
+            final_r_multiple = (tp_distance / prior_sl_distance) if prior_sl_distance > 0.0 else 0.0
             sl_distance = min_stop_dist
             sl_price = (entry_price - sl_distance) if is_long else (entry_price + sl_distance)
-            final_r_multiple = (tp_distance / sl_distance) if sl_distance > 0.0 else 0.0
             if final_r_multiple > 0.0:
                 tp_distance = final_r_multiple * sl_distance
                 tp_price = (entry_price + tp_distance) if is_long else (entry_price - tp_distance)
@@ -5175,7 +6866,7 @@ class LiveTrader:
             risk_cap_action = "BLOCKED_MIN_LOT_EXCEEDS_CAP" if risk_target_volume < min_vol - 1e-9 else "SKIPPED_RISK_CAP"
             self.logger.warning(
                 f"[{symbol}] Skipping trade after final quote refresh; actual risk "
-                f"{actual_risk_pct:.2f}% exceeds per-trade hard cap {max_risk_pct:.2f}% "
+                f"{actual_risk_pct:.2f}% exceeds allowed risk envelope {allowed_risk_pct:.2f}% "
                 f"(vol={volume:.4f}, entry={entry_price:.5f}, sl={sl_price:.5f})"
             )
             _record_throttle("SKIPPED_RISK_CAP")
@@ -5403,7 +7094,8 @@ class LiveTrader:
                 f"{volume:.4f} lots @ {entry_price:.5f} | SL={sl_price:.5f} | TP={tp_price:.5f}"
             )
             self._log_trade(symbol, direction, volume, entry_price,
-                            sl_price, tp_price, magic, "PAPER")
+                            sl_price, tp_price, magic, "PAPER",
+                            candidate_id=edge_candidate_id)
             _record_throttle("PAPER")
             _record_actionable(
                 action="PAPER",
@@ -5416,6 +7108,416 @@ class LiveTrader:
             )
             return
 
+        def _block_pre_send(action: str, reason: str, context: Optional[Dict[str, Any]] = None) -> None:
+            book_label = (
+                "edge-demo" if bool(getattr(self, "_is_edge_challenger_demo", False))
+                else "funded"
+            )
+            self.logger.warning(
+                f"[{symbol}] {book_label} entry blocked immediately pre-send: {reason}"
+            )
+            _record_throttle(action)
+            _record_actionable(
+                action=action,
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+                context={"stage": "immediate_pre_send", "reason": reason, **(context or {})},
+            )
+
+        # Complete the expensive whole-ledger/native authorization before the
+        # final broker snapshot.  Nothing between the subsequent account,
+        # position, stop-risk, margin and loss checks and send may perform a
+        # full artifact-tree walk: otherwise broker state could change while
+        # authorization hashes hundreds of immutable sources.
+        if bool(getattr(self, "_is_edge_challenger_demo", False)) and not edge_candidate_id:
+            _block_pre_send(
+                "BLOCKED_EDGE_CANDIDATE_ID",
+                "edge challenger lacks a durable candidate id",
+            )
+            return
+        promotion_block_reason = self._promotion_authorization_block_reason(
+            symbol,
+            _tf,
+            _regime,
+        )
+        if promotion_block_reason:
+            self.logger.error(
+                f"[{symbol}] Skipping trade; immutable promotion authorization rejected: "
+                f"{promotion_block_reason}"
+            )
+            _record_throttle("BLOCKED_PROMOTION_AUTHORIZATION")
+            _record_actionable(
+                action="BLOCKED_PROMOTION_AUTHORIZATION",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=volume,
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=actual_risk_pct,
+                context={"promotion_authorization_error": promotion_block_reason},
+            )
+            return
+
+        final_manual_block_reason = self._manual_new_entries_block_reason()
+        if final_manual_block_reason:
+            _block_pre_send(
+                "BLOCKED_MANUAL_KILL_SWITCH",
+                final_manual_block_reason,
+            )
+            return
+
+        fresh_account, fresh_account_error = self._fresh_entry_account_validation(account)
+        if fresh_account_error or fresh_account is None:
+            _block_pre_send(
+                "BLOCKED_FRESH_ACCOUNT",
+                fresh_account_error or "fresh account validation failed",
+            )
+            return
+        fresh_basis = self._safe_finite_float(
+            getattr(
+                fresh_account,
+                "balance" if basis_pref == "balance" else "equity",
+                None,
+            )
+        )
+        if fresh_basis is None or fresh_basis <= 0.0:
+            _block_pre_send(
+                "BLOCKED_FRESH_ACCOUNT",
+                f"fresh {basis_pref} risk basis unavailable",
+            )
+            return
+        fresh_actual_risk_pct = float(actual_risk_amount) / fresh_basis * 100.0
+
+        try:
+            fresh_pre_send_positions = self.mt5.get_positions()
+        except Exception as exc:
+            fresh_pre_send_positions = None
+            fresh_positions_error = f"{type(exc).__name__}: {exc}"
+        else:
+            fresh_positions_error = ""
+        if fresh_pre_send_positions is None:
+            _block_pre_send(
+                "BLOCKED_PORTFOLIO_SNAPSHOT_UNAVAILABLE",
+                f"fresh position snapshot unavailable {fresh_positions_error}".strip(),
+            )
+            return
+
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            dedicated_book_reason = self._edge_demo_position_block_reason(
+                list(fresh_pre_send_positions or []),
+                {str(config.symbol): config},
+            )
+            if dedicated_book_reason:
+                _block_pre_send(
+                    "BLOCKED_EDGE_DEMO_POSITION_BOOK",
+                    dedicated_book_reason,
+                )
+                return
+
+        # Re-apply the symbol-controller topology to the final broker snapshot.
+        # On a netting/exchange account, a second order would mutate the first
+        # position rather than create an independently attributable specialist.
+        final_symbol_positions = [
+            position for position in list(fresh_pre_send_positions or [])
+            if getattr(position, "symbol", None) == broker_symbol
+        ]
+        if len(final_symbol_positions) >= 2:
+            _block_pre_send(
+                "BLOCKED_SYMBOL_POSITION_LIMIT",
+                "final snapshot already has 2 same-symbol positions",
+            )
+            return
+        if len(final_symbol_positions) == 1:
+            allow_pair = bool(
+                getattr(self.pipeline_config, "allow_d1_plus_lower_tf", False)
+            ) if self.pipeline_config else False
+            if not allow_pair:
+                _block_pre_send(
+                    "BLOCKED_SYMBOL_POSITION_EXISTS",
+                    "final snapshot has a same-symbol position and pairing is disabled",
+                )
+                return
+            account_mode_reason = self._multi_position_account_block_reason(fresh_account)
+            if account_mode_reason:
+                _block_pre_send(
+                    "BLOCKED_ACCOUNT_POSITION_MODE",
+                    account_mode_reason,
+                )
+                return
+            existing_tf = self._infer_position_timeframe(
+                symbol,
+                config,
+                final_symbol_positions[0],
+            )
+            existing_tf = str(existing_tf or "").upper()
+            current_tf = str(_tf or "").upper()
+            if not existing_tf:
+                _block_pre_send(
+                    "BLOCKED_POSITION_TIMEFRAME_UNKNOWN",
+                    "final same-symbol position timeframe is unknown",
+                )
+                return
+            is_cross_horizon_pair = (
+                (existing_tf == "D1" and current_tf != "D1")
+                or (existing_tf != "D1" and current_tf == "D1")
+            )
+            if not is_cross_horizon_pair:
+                _block_pre_send(
+                    "BLOCKED_SYMBOL_POSITION_LIMIT",
+                    "final same-symbol positions are not a D1/lower-timeframe pair",
+                )
+                return
+
+        # Shared-account hierarchy: every open position and the candidate are
+        # measured from replay-equivalent conservative capital:
+        # min(fresh MTM equity, fresh balance - reconstructed open stop loss).
+        # Gross factor risk is deliberately not direction-netted. Margin is
+        # evaluated separately and is never reported as loss-at-stop risk.
+        if isinstance(self.pipeline_config, PipelineConfig):
+            (
+                open_stop_exposures,
+                conservative_capital,
+                exposure_error,
+            ) = self._build_live_stop_risk_exposures(
+                list(fresh_pre_send_positions or []),
+                fresh_account,
+                candidate_symbol=config.symbol,
+                candidate_broker_symbol=broker_symbol,
+            )
+            if exposure_error:
+                _block_pre_send(
+                    "BLOCKED_GROSS_STOP_RISK_INPUT",
+                    exposure_error,
+                )
+                return
+            if conservative_capital is None or conservative_capital <= 0.0:
+                _block_pre_send(
+                    "BLOCKED_GROSS_STOP_RISK_INPUT",
+                    "positive conservative risk capital unavailable",
+                )
+                return
+
+            # Replay sizes each chronological admission from this same capital.
+            # Funded live may only reduce the already-computed volume at this
+            # last snapshot; it never increases exposure immediately pre-send.
+            final_loss_per_lot = float(actual_risk_amount) / float(volume)
+            conservative_target_amount = (
+                conservative_capital * target_risk_pct / 100.0
+            )
+            conservative_raw_volume = conservative_target_amount / final_loss_per_lot
+            if conservative_raw_volume < min_vol - 1e-12:
+                _block_pre_send(
+                    "BLOCKED_MIN_LOT_EXCEEDS_CAP",
+                    "broker minimum volume exceeds conservative risk-capital target",
+                    {
+                        "conservative_risk_capital": conservative_capital,
+                        "conservative_raw_volume": conservative_raw_volume,
+                        "minimum_volume": min_vol,
+                    },
+                )
+                return
+            conservative_volume = min(
+                float(volume),
+                float(self.mt5.normalize_volume(conservative_raw_volume, symbol_info)),
+            )
+            if conservative_volume < min_vol - 1e-12 or conservative_volume <= 0.0:
+                _block_pre_send(
+                    "BLOCKED_MIN_LOT_EXCEEDS_CAP",
+                    "no positive broker-valid volume fits conservative risk capital",
+                )
+                return
+            if conservative_volume < float(volume) - 1e-12:
+                volume = conservative_volume
+                actual_risk_amount, _actual_risk_path = self._estimate_stop_loss_amount(
+                    order_type.value,
+                    broker_symbol,
+                    volume,
+                    entry_price,
+                    sl_price,
+                    spec=spec,
+                    symbol_info=symbol_info,
+                    include_commission=True,
+                )
+                if (
+                    actual_risk_amount is None
+                    or not math.isfinite(float(actual_risk_amount))
+                    or actual_risk_amount <= 0.0
+                ):
+                    _block_pre_send(
+                        "BLOCKED_GROSS_STOP_RISK_INPUT",
+                        "resized candidate stop risk is unavailable",
+                    )
+                    return
+            candidate_conservative_stop_risk_pct = (
+                float(actual_risk_amount) / conservative_capital * 100.0
+            )
+            conservative_drift = classify_lot_normalization_drift(
+                actual_risk_pct=candidate_conservative_stop_risk_pct,
+                target_risk_pct=target_risk_pct,
+                max_risk_pct=max_risk_pct,
+                tolerance_pct=risk_tolerance_pct,
+            )
+            if conservative_drift == "block":
+                _block_pre_send(
+                    "SKIPPED_RISK_CAP",
+                    (
+                        f"conservative-capital candidate risk "
+                        f"{candidate_conservative_stop_risk_pct:.4f}% exceeds the "
+                        "per-trade envelope"
+                    ),
+                    {"conservative_risk_capital": conservative_capital},
+                )
+                return
+            # From this point all audit percentages and the order volume refer
+            # to the final conservative-capital sizing decision.
+            actual_risk_pct = candidate_conservative_stop_risk_pct
+
+            same_symbol_open_risk_pct = sum(
+                exposure.stop_risk_pct
+                for exposure in open_stop_exposures
+                if str(exposure.symbol).upper() == str(config.symbol).upper()
+            )
+            max_same_symbol_risk_pct = float(
+                getattr(self.pipeline_config, "max_combined_risk_pct", 0.0)
+            )
+            if (
+                max_same_symbol_risk_pct <= 0.0
+                or same_symbol_open_risk_pct + actual_risk_pct
+                > max_same_symbol_risk_pct + 1e-10
+            ):
+                _block_pre_send(
+                    "BLOCKED_SYMBOL_RISK_CAP",
+                    "same-symbol conservative stop risk exceeds the funded cap",
+                    {
+                        "existing_same_symbol_risk_pct": same_symbol_open_risk_pct,
+                        "candidate_risk_pct": actual_risk_pct,
+                        "max_same_symbol_risk_pct": max_same_symbol_risk_pct,
+                    },
+                )
+                return
+            candidate_asset_class = str(
+                getattr(spec, "asset_class", "unknown") or "unknown"
+            )
+            gross_risk_decision = evaluate_gross_stop_risk(
+                open_stop_exposures,
+                StopRiskExposure(
+                    symbol=config.symbol,
+                    stop_risk_pct=actual_risk_pct,
+                    asset_class=candidate_asset_class,
+                    exposure_id=f"candidate:{config.symbol}:{_tf}:{_regime}",
+                ),
+                GrossRiskLimits(
+                    max_total_stop_risk_pct=float(
+                        getattr(self.pipeline_config, "max_total_open_risk_pct", 0.0)
+                    ),
+                    max_factor_group_stop_risk_pct=float(
+                        getattr(self.pipeline_config, "max_factor_group_open_risk_pct", 0.0)
+                    ),
+                ),
+            )
+            decision_context["gross_stop_risk_admission"] = asdict(gross_risk_decision)
+            decision_context["conservative_risk_capital"] = {
+                "risk_capital": conservative_capital,
+                "denominator": "min(fresh_equity, fresh_balance - reconstructed_open_stop_risk)",
+            }
+            if not gross_risk_decision.allow:
+                _block_pre_send(
+                    "BLOCKED_GROSS_STOP_RISK_ADMISSION",
+                    gross_risk_decision.reason,
+                    {"gross_stop_risk_admission": asdict(gross_risk_decision)},
+                )
+                return
+
+            # Volume may have been reduced after the earlier margin estimate.
+            if not hasattr(self.mt5, "calc_margin_required"):
+                _block_pre_send(
+                    "SKIPPED_MARGIN_UNAVAILABLE",
+                    "broker margin calculator unavailable after conservative resizing",
+                )
+                return
+            margin_required_raw = self.mt5.calc_margin_required(
+                order_type.value,
+                broker_symbol,
+                volume,
+                entry_price,
+            )
+            margin_required = self._safe_finite_float(margin_required_raw)
+            if margin_required is None or margin_required <= 0.0:
+                _block_pre_send(
+                    "SKIPPED_MARGIN_UNAVAILABLE",
+                    "fresh required margin unavailable after conservative resizing",
+                )
+                return
+
+        fresh_margin_free = self._safe_finite_float(getattr(fresh_account, "margin_free", None))
+        if isinstance(self.pipeline_config, PipelineConfig):
+            margin_block_level = self._safe_finite_float(
+                getattr(self.pipeline_config, "margin_entry_block_level", None)
+            )
+            max_margin_utilization_pct = (
+                10_000.0 / margin_block_level
+                if margin_block_level is not None and margin_block_level > 0.0
+                else None
+            )
+            projected_margin_decision = evaluate_projected_margin(
+                equity=getattr(fresh_account, "equity", None),
+                current_used_margin=getattr(fresh_account, "margin", None),
+                candidate_required_margin=margin_required,
+                max_margin_utilization_pct=max_margin_utilization_pct,
+            )
+            decision_context["projected_margin_admission"] = asdict(
+                projected_margin_decision
+            )
+            if not projected_margin_decision.allow:
+                _block_pre_send(
+                    "BLOCKED_PROJECTED_MARGIN_ADMISSION",
+                    projected_margin_decision.reason,
+                    {"projected_margin_admission": asdict(projected_margin_decision)},
+                )
+                return
+        if margin_required is not None and margin_required > 0.0:
+            if fresh_margin_free is None:
+                _block_pre_send(
+                    "SKIPPED_MARGIN_UNAVAILABLE",
+                    "fresh free margin unavailable for a margin-requiring order",
+                    {"required_margin": margin_required},
+                )
+                return
+            if margin_required > fresh_margin_free:
+                _block_pre_send(
+                    "SKIPPED_MARGIN_REQUIRED",
+                    (
+                        f"required margin {margin_required:.2f} exceeds fresh free "
+                        f"margin {fresh_margin_free:.2f}"
+                    ),
+                    {"required_margin": margin_required, "fresh_margin_free": fresh_margin_free},
+                )
+                return
+
+        hard_loss_reasons = self._realized_loss_hard_block_reasons(fresh_account)
+        if hard_loss_reasons:
+            _block_pre_send(
+                "BLOCKED_REALIZED_LOSS_LIMIT",
+                "; ".join(hard_loss_reasons),
+            )
+            return
+
+        # From this point onward, audit and any post-fill checks use the exact
+        # account snapshot that authorized the send.
+        account = fresh_account
+        if isinstance(self.pipeline_config, PipelineConfig):
+            basis_value = conservative_capital
+            target_risk_amount = conservative_capital * (target_risk_pct / 100.0)
+        else:
+            basis_value = fresh_basis
+            actual_risk_pct = fresh_actual_risk_pct
+            target_risk_amount = fresh_basis * (target_risk_pct / 100.0)
+        free_margin = fresh_margin_free
+
         # Encode enough metadata for later position attribution.
         trade_comment = TradeTagEncoder.encode_comment(
             symbol=config.symbol,  # Use original symbol, not broker symbol
@@ -5423,7 +7525,104 @@ class LiveTrader:
             strategy_name=_strat_name,
             direction=direction,
             risk_pct=target_risk_pct,
+            book_role=execution_book_role,
         )
+
+        def _entry_slippage_values(fill_price_candidate: Any) -> Dict[str, Any]:
+            values = {
+                "expected_entry_price_value": None,
+                "filled_entry_price_value": None,
+                "entry_slippage_pips_value": None,
+                "entry_slippage_r_value": None,
+                "entry_slippage_direction_value": None,
+            }
+            try:
+                expected_entry = float(entry_price)
+                filled_entry = float(fill_price_candidate)
+                stop_for_r = float(sl_price)
+                pip_size_exec = float(getattr(spec, "pip_size", 0.0) or 0.0)
+            except Exception:
+                return values
+            if (
+                not math.isfinite(expected_entry)
+                or not math.isfinite(filled_entry)
+                or not math.isfinite(stop_for_r)
+                or expected_entry <= 0.0
+                or filled_entry <= 0.0
+                or pip_size_exec <= 0.0
+            ):
+                return values
+
+            adverse_slippage_pips = (
+                (filled_entry - expected_entry) / pip_size_exec
+                if is_long else
+                (expected_entry - filled_entry) / pip_size_exec
+            )
+            entry_stop_pips = abs(filled_entry - stop_for_r) / pip_size_exec
+            slippage_direction = "flat"
+            if adverse_slippage_pips > 1e-9:
+                slippage_direction = "adverse"
+            elif adverse_slippage_pips < -1e-9:
+                slippage_direction = "favorable"
+
+            values.update({
+                "expected_entry_price_value": expected_entry,
+                "filled_entry_price_value": filled_entry,
+                "entry_slippage_pips_value": adverse_slippage_pips,
+                "entry_slippage_r_value": (
+                    adverse_slippage_pips / entry_stop_pips
+                    if entry_stop_pips > 0.0 else None
+                ),
+                "entry_slippage_direction_value": slippage_direction,
+            })
+            return values
+
+        def _record_live_entry_intent(
+            *,
+            position_id: int = 0,
+            deal_ticket: int = 0,
+            order_ticket: int = 0,
+            fill_price: float,
+            fill_volume: float,
+            risk_cash: Optional[float],
+        ) -> None:
+            ledger = getattr(self, "_live_outcome_ledger", None)
+            if ledger is None:
+                return
+            try:
+                ledger.record_entry_intent(
+                    position_id=position_id,
+                    opening_deal_ticket=deal_ticket,
+                    opening_order_ticket=order_ticket,
+                    symbol=symbol,
+                    timeframe=_tf,
+                    regime=_regime,
+                    strategy_name=_strat_name,
+                    magic=magic,
+                    entry_price=fill_price,
+                    volume=fill_volume,
+                    initial_stop=sl_price,
+                    risk_cash=risk_cash,
+                    book_role=execution_book_role,
+                    candidate_id=edge_candidate_id,
+                )
+            except Exception as exc:
+                # The position is already filled, so preserve management but
+                # stop all subsequent entries until durable attribution works.
+                self._live_outcome_feedback_error = (
+                    f"entry intent persistence failed: {type(exc).__name__}: {exc}"
+                )
+                self.logger.error(f"[{symbol}] {self._live_outcome_feedback_error}")
+
+        # Artifact authorization was completed before the final broker-state
+        # transaction above.  Recheck the broker-authoritative DEMO mode from
+        # that final account snapshot, then submit without another heavyweight
+        # filesystem operation reopening the capital/identity race.
+        if bool(getattr(self, "_is_edge_challenger_demo", False)):
+            demo_mode_reason = self._edge_demo_account_block_reason(account)
+            if demo_mode_reason:
+                _block_pre_send("BLOCKED_EDGE_DEMO_ACCOUNT_MODE", demo_mode_reason)
+                return
 
         # Execute order
         result = self.mt5.send_market_order(
@@ -5445,11 +7644,15 @@ class LiveTrader:
                 f"{result.volume} lots @ {result.price:.5f}"
             )
             self._log_trade(symbol, direction, result.volume, result.price,
-                           sl_price, tp_price, magic, "EXECUTED")
+                           sl_price, tp_price, magic, "EXECUTED",
+                           candidate_id=edge_candidate_id)
             # Record order time for rate limiting
-            self._last_order_times[symbol] = datetime.now()
+            order_time = datetime.now()
+            self._last_order_times[rate_limit_key] = order_time
+            self._last_order_times[symbol] = order_time  # diagnostic summary
             _record_throttle("EXECUTED")
             actual_risk_pct_exec = actual_risk_pct
+            risk_exec: Optional[float] = None
             try:
                 risk_exec, _risk_exec_path = self._estimate_stop_loss_amount(
                     order_type.value,
@@ -5465,6 +7668,13 @@ class LiveTrader:
                     actual_risk_pct_exec = (risk_exec / basis_value) * 100.0
             except Exception:
                 pass
+            _record_live_entry_intent(
+                deal_ticket=int(getattr(result, "deal", 0) or 0),
+                order_ticket=int(getattr(result, "order", 0) or 0),
+                fill_price=float(result.price),
+                fill_volume=float(result.volume),
+                risk_cash=risk_exec,
+            )
             _record_actionable(
                 action="EXECUTED",
                 entry_price_value=result.price,
@@ -5473,6 +7683,7 @@ class LiveTrader:
                 volume_value=result.volume,
                 target_risk_pct_value=target_risk_pct,
                 actual_risk_pct_value=actual_risk_pct_exec,
+                **_entry_slippage_values(result.price),
             )
         else:
             if _is_ambiguous_order_result(result):
@@ -5491,8 +7702,41 @@ class LiveTrader:
                         tp_price,
                         magic,
                         "EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND",
+                        candidate_id=edge_candidate_id,
                     )
-                    self._last_order_times[symbol] = datetime.now()
+                    order_time = datetime.now()
+                    self._last_order_times[rate_limit_key] = order_time
+                    self._last_order_times[symbol] = order_time  # diagnostic summary
+                    reconciled_volume = float(
+                        getattr(reconciled_position, "volume", volume) or volume
+                    )
+                    reconciled_price = float(
+                        getattr(reconciled_position, "price_open", entry_price) or entry_price
+                    )
+                    reconciled_risk: Optional[float] = None
+                    try:
+                        reconciled_risk, _ = self._estimate_stop_loss_amount(
+                            order_type.value,
+                            broker_symbol,
+                            reconciled_volume,
+                            reconciled_price,
+                            sl_price,
+                            spec=spec,
+                            symbol_info=symbol_info,
+                            include_commission=True,
+                        )
+                    except Exception:
+                        pass
+                    _record_live_entry_intent(
+                        position_id=int(
+                            getattr(reconciled_position, "identifier", 0)
+                            or getattr(reconciled_position, "ticket", 0)
+                            or 0
+                        ),
+                        fill_price=reconciled_price,
+                        fill_volume=reconciled_volume,
+                        risk_cash=reconciled_risk,
+                    )
                     ambiguous_blocks = getattr(self, "_ambiguous_order_block_until", {})
                     ambiguous_blocks.pop(symbol, None)
                     _record_throttle("EXECUTION_RECONCILED_AFTER_AMBIGUOUS_SEND")
@@ -5504,6 +7748,9 @@ class LiveTrader:
                         volume_value=float(getattr(reconciled_position, "volume", volume) or volume),
                         target_risk_pct_value=target_risk_pct,
                         actual_risk_pct_value=actual_risk_pct,
+                        **_entry_slippage_values(
+                            float(getattr(reconciled_position, "price_open", entry_price) or entry_price)
+                        ),
                         context={
                             "ambiguous_retcode": getattr(result, "retcode", None),
                             "position_ticket": getattr(reconciled_position, "ticket", None),
@@ -5520,7 +7767,9 @@ class LiveTrader:
                     ambiguous_blocks = {}
                     self._ambiguous_order_block_until = ambiguous_blocks
                 ambiguous_blocks[symbol] = datetime.now() + timedelta(seconds=cooldown)
-                self._last_order_times[symbol] = datetime.now()
+                order_time = datetime.now()
+                self._last_order_times[rate_limit_key] = order_time
+                self._last_order_times[symbol] = order_time  # diagnostic summary
                 self.logger.error(
                     f"[{symbol}] Ambiguous order result could not be reconciled; "
                     f"blocking duplicate entries for {cooldown}s "
@@ -5535,6 +7784,7 @@ class LiveTrader:
                     tp_price,
                     magic,
                     f"AMBIGUOUS_UNRECONCILED: {getattr(result, 'retcode_description', '')}",
+                    candidate_id=edge_candidate_id,
                 )
                 _record_throttle("BLOCKED_AMBIGUOUS_ORDER_UNRECONCILED", cooldown=cooldown)
                 _record_actionable(
@@ -5556,7 +7806,8 @@ class LiveTrader:
                 f"[FAIL] [{symbol}] Order failed: {result.retcode} - {result.retcode_description}"
             )
             self._log_trade(symbol, direction, volume, entry_price,
-                           sl_price, tp_price, magic, f"FAILED: {result.retcode_description}")
+                           sl_price, tp_price, magic, f"FAILED: {result.retcode_description}",
+                           candidate_id=edge_candidate_id)
             _record_throttle(f"FAILED_{result.retcode}")
             _record_actionable(
                 action=f"FAILED_{result.retcode}",
@@ -5586,7 +7837,8 @@ class LiveTrader:
             self.logger.warning(f"[FAIL] [{position.symbol}] Close failed: {result.retcode_description}")
     
     def _log_trade(self, symbol: str, direction: str, volume: float,
-                   price: float, sl: float, tp: float, magic: int, status: str):
+                   price: float, sl: float, tp: float, magic: int, status: str,
+                   *, candidate_id: str = ""):
         """Log trade to history."""
         self.trade_log.append({
             'timestamp': datetime.now().isoformat(),
@@ -5597,7 +7849,14 @@ class LiveTrader:
             'sl': sl,
             'tp': tp,
             'magic': magic,
-            'status': status
+            'status': status,
+            'execution_book': str(getattr(self, 'execution_book', CHAMPION_EXECUTION_BOOK)),
+            'book_role': (
+                EDGE_CHALLENGER_ROLE
+                if bool(getattr(self, '_is_edge_challenger_demo', False))
+                else LOCKBOX_CHAMPION_ROLE
+            ),
+            'candidate_id': str(candidate_id or ''),
         })
     
     def save_trade_log(self, filepath: str):
@@ -5788,9 +8047,20 @@ class FXPortfolioManagerApp:
         
         fetch_stats = None
         original_pm_symbols = list(getattr(self.portfolio_manager, "symbols", []) or [])
+        native_calendar_mode = str(
+            getattr(self.pipeline_config, "production_split_mode", "") or ""
+        ).strip().lower() == "calendar_lockbox_v2"
 
-        # Fetch data if MT5 connected
-        if self.mt5 and self.mt5.is_connected():
+        # Calendar production has one authority: the immutable active native
+        # six-timeframe manifest. Do not even invoke the legacy live-MT5 M5
+        # downloader here; its bar-count roster must never pre-empt the
+        # activation's eligible/excluded universe decision.
+        if native_calendar_mode:
+            self.logger.info(
+                "Calendar optimization uses the active immutable six-timeframe native "
+                "universe; bypassing legacy MT5 M5 fetch and readiness filtering."
+            )
+        elif self.mt5 and self.mt5.is_connected():
             fetch_stats = self._fetch_historical_data()
         else:
             self.logger.info("Using existing data files (MT5 not connected)")
@@ -5843,7 +8113,39 @@ class FXPortfolioManagerApp:
         
         # Print summary
         self.portfolio_manager.print_status()
-        
+
+        if str(
+            getattr(self.pipeline_config, "production_split_mode", "") or ""
+        ).strip().lower() == "calendar_lockbox_v2":
+            ledger_path = Path(self.config_file)
+            if not ledger_path.is_absolute():
+                ledger_path = Path.cwd() / ledger_path
+            try:
+                phase_a_ledger = json.loads(
+                    ledger_path.read_text(encoding="utf-8-sig")
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "Phase-A ledger unreadable after optimization: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                return False
+            complete, phase_a_errors = _phase_a_optimization_complete(
+                phase_a_ledger, self.symbols
+            )
+            if complete:
+                self.logger.info(
+                    "Phase-A optimization complete: global train+tuning roster is "
+                    "frozen and intentionally has zero funded-live eligibility"
+                )
+                return True
+            self.logger.error(
+                "Phase-A optimization incomplete: %s",
+                ", ".join(phase_a_errors[:12]),
+            )
+            return False
+
         return len(self.portfolio_manager.get_live_eligible_configs()) > 0
 
     def _check_production_retrain_schedule(self) -> None:
@@ -5967,7 +8269,8 @@ class FXPortfolioManagerApp:
     
     def run_trading(self, 
                     enable_trading: bool = True,
-                    close_on_opposite_signal: bool = False):
+                    close_on_opposite_signal: bool = False,
+                    execution_book: str = CHAMPION_EXECUTION_BOOK):
         """
         Run live trading loop.
         """
@@ -5976,8 +8279,14 @@ class FXPortfolioManagerApp:
             return
         
         self.logger.info("\n" + "=" * 60)
-        self.logger.info("STARTING LIVE TRADING")
+        normalized_book = str(execution_book or CHAMPION_EXECUTION_BOOK).strip().upper()
+        is_edge_demo = normalized_book == EDGE_DEMO_EXECUTION_BOOK
+        self.logger.info(
+            "STARTING EDGE CHALLENGER DEMO FORWARD PROBATION"
+            if is_edge_demo else "STARTING LIVE TRADING"
+        )
         self.logger.info(f"Trading enabled: {enable_trading}")
+        self.logger.info(f"Execution book: {normalized_book}")
         self.logger.info(
             f"Production retrain: {self.pipeline_config.production_retrain_mode} "
             f"({self.pipeline_config.describe_retrain_schedule()})"
@@ -6000,8 +8309,26 @@ class FXPortfolioManagerApp:
         
         # Check entry eligibility. Existing positions may still require PM-side
         # margin/governance management even after the entry ledger has expired.
-        live_eligible_configs = self.portfolio_manager.get_live_eligible_configs(log_rejections=True)
+        if is_edge_demo:
+            account_info = self.mt5.get_account_info()
+            demo_reason = LiveTrader._edge_demo_account_block_reason(account_info)
+            if demo_reason:
+                self.logger.error(f"Refusing edge challenger execution: {demo_reason}")
+                return False
+            selector = getattr(self.portfolio_manager, "get_edge_challenger_configs", None)
+            if not callable(selector):
+                self.logger.error("Refusing edge challenger execution: edge selector unavailable")
+                return False
+            live_eligible_configs = selector(log_rejections=True)
+        else:
+            live_eligible_configs = self.portfolio_manager.get_live_eligible_configs(log_rejections=True)
         if not live_eligible_configs:
+            if is_edge_demo:
+                self.logger.warning(
+                    "No executable edge challengers. Run a calendar-lockbox optimization "
+                    "that generates the separate latest-data challenger book first."
+                )
+                return False
             open_positions = None
             try:
                 open_positions = self.mt5.get_positions()
@@ -6013,8 +8340,11 @@ class FXPortfolioManagerApp:
                     "Starting in management-only mode until live eligibility is restored."
                 )
             else:
-                self.logger.warning("No live-eligible configurations. Run optimization or review live eligibility policy first.")
-                return
+                label = "executable edge challengers" if is_edge_demo else "live-eligible configurations"
+                self.logger.warning(
+                    f"No {label}. Run optimization or review eligibility policy first."
+                )
+                return False
         
         # Create trader
         self.trader = LiveTrader(
@@ -6025,7 +8355,20 @@ class FXPortfolioManagerApp:
             close_on_opposite_signal=close_on_opposite_signal,
             pipeline_config=self.pipeline_config,
             storage_manager=self.storage_manager,
+            execution_book=normalized_book,
         )
+        if is_edge_demo:
+            startup_positions = self.mt5.get_positions()
+            startup_position_reason = self.trader._edge_demo_position_block_reason(
+                startup_positions,
+                live_eligible_configs,
+            )
+            if startup_position_reason:
+                self.logger.error(
+                    f"Refusing edge challenger execution: {startup_position_reason}"
+                )
+                self.trader = None
+                return False
         self.trader._running = True
 
         live_loop_trigger_mode = str(
@@ -6249,6 +8592,16 @@ class FXPortfolioManagerApp:
 
     def _fetch_historical_data(self, symbols: List[str] = None):
         """Fetch historical data from MT5 and save to data directory."""
+        if str(
+            getattr(self.pipeline_config, "production_split_mode", "") or ""
+        ).lower() == "calendar_lockbox_v2":
+            self.logger.info(
+                "Calendar production uses the immutable activated native-timeframe run; "
+                "skipping the legacy M5 count/backfill workflow. Use "
+                "tools/acquire_native_history.py and tools/audit_activate_native_history.py "
+                "to refresh it explicitly."
+            )
+            return None
         if not self.mt5 or not self.mt5.is_connected():
             return
         
@@ -6432,7 +8785,10 @@ class FXPortfolioManagerApp:
             self.trader.stop()
             
             # Save trade log
-            log_path = self.output_dir / f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            trade_log_dir = self.output_dir
+            if bool(getattr(self.trader, "_is_edge_challenger_demo", False)):
+                trade_log_dir = trade_log_dir / "edge_challenger_demo"
+            log_path = trade_log_dir / f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             self.trader.save_trade_log(str(log_path))
         if self.storage_manager:
             self.storage_manager.on_shutdown()
@@ -6502,7 +8858,10 @@ def main():
     parser.add_argument(
         '--paper',
         action='store_true',
-        help='Paper trading mode (no real trades)'
+        help=(
+            'Execute the separate PAPER_ONLY edge-challenger book on a broker-verified '
+            'MT5 DEMO account; REAL/CONTEST/unknown accounts are refused'
+        )
     )
     parser.add_argument(
         '--close-on-opposite-signal',
@@ -6547,18 +8906,31 @@ def main():
         action='store_true',
         help='Print current status and exit'
     )
+    parser.add_argument(
+        '--preflight',
+        action='store_true',
+        help='Run live-readiness checks and exit without starting the trading loop'
+    )
     
     args = parser.parse_args()
 
     # Load runtime configuration before logger setup so config paths remain authoritative.
-    config_data = load_config_json(args.config)
-    os.environ["PM_CONFIG_PATH"] = args.config
+    resolved_config_path = Path(args.config).resolve()
+    config_data = load_config_json(str(resolved_config_path))
+    os.environ["PM_CONFIG_PATH"] = str(resolved_config_path)
     if args.trade and _is_research_discovery_only_config(config_data):
         print(
             f"Refusing --trade with research-only discovery config: {args.config}. "
             "Use this config with --optimize only."
         )
         return 2
+    funded_contract_requested = bool(args.preflight or (args.trade and not args.paper))
+    if funded_contract_requested or _config_scope(config_data) == FUNDED_LIVE_CONFIG_SCOPE:
+        try:
+            _validate_funded_config_schema(config_data)
+        except ValueError as exc:
+            print(f"Refusing funded-live configuration {args.config}: {exc}")
+            return 2
 
     # Prefer symbols from config.json unless CLI overrides
     symbols = args.symbols or config_data.get("symbols") or DEFAULT_SYMBOLS
@@ -6580,6 +8952,30 @@ def main():
     pipeline_config = PipelineConfig(**_filter_dataclass_kwargs(PipelineConfig, pipeline_section))
     position_config = PositionConfig(**_filter_dataclass_kwargs(PositionConfig, config_data.get("position", {})))
     mt5_config = MT5Config(**_filter_dataclass_kwargs(MT5Config, mt5_section))
+    _apply_funded_pipeline_contract(config_data, pipeline_config)
+    _apply_funded_position_cost_contract(config_data, pipeline_config, position_config)
+    # Bind persisted optimization artifacts to the exact funded deployment
+    # surface (broker specs, symbol roster, and PositionConfig). This attribute
+    # is intentionally runtime-only and is consumed by build_artifact_meta.
+    pipeline_config._deployment_config_path = str(resolved_config_path)
+    pipeline_config.data_dir = _resolve_config_relative_path(
+        pipeline_config.data_dir,
+        resolved_config_path,
+    )
+    manual_kill_switch_path = str(
+        getattr(pipeline_config, "manual_kill_switch_path", "") or ""
+    ).strip()
+    if manual_kill_switch_path:
+        pipeline_config.manual_kill_switch_path = str(
+            _resolve_config_relative_path(
+                manual_kill_switch_path,
+                resolved_config_path,
+            )
+        )
+    # Runtime-only authority bit used by the final pre-send gate.  Paper and
+    # research runs remain usable, while a funded entry can never fall back to
+    # a mutable ledger status or the legacy review files.
+    pipeline_config._funded_live_execution = bool(args.trade and not args.paper)
     if (
         bool(getattr(pipeline_config, "false_discovery_control_enabled", False))
         and int(getattr(pipeline_config, "false_discovery_symbol_count", 0) or 0) <= 0
@@ -6594,7 +8990,10 @@ def main():
     )
 
     if args.data_dir:
-        pipeline_config.data_dir = Path(args.data_dir)
+        pipeline_config.data_dir = _resolve_config_relative_path(
+            args.data_dir,
+            resolved_config_path,
+        )
         pipeline_config.data_dir.mkdir(parents=True, exist_ok=True)
     if args.output_dir:
         pipeline_config.output_dir = Path(args.output_dir)
@@ -6613,16 +9012,25 @@ def main():
     # Apply instrument spec config (single source of truth)
     broker_specs_path = config_data.get("broker_specs_path")
     if broker_specs_path:
-        set_broker_specs_path(broker_specs_path)
+        runtime_broker_specs_path = str(
+            _resolve_config_relative_path(
+                broker_specs_path,
+                resolved_config_path,
+            )
+        )
+        set_broker_specs_path(runtime_broker_specs_path)
         specs_loaded = {}
         for attempt in range(1, 4):
             # Force reload on each attempt
-            set_broker_specs_path(broker_specs_path)
-            specs_loaded = load_broker_specs(broker_specs_path)
+            set_broker_specs_path(runtime_broker_specs_path)
+            specs_loaded = load_broker_specs(runtime_broker_specs_path)
             if specs_loaded:
                 break
-        if not specs_loaded and os.path.exists(broker_specs_path):
-            logger.warning(f"Broker specs file found but empty/unreadable after 3 attempts: {broker_specs_path}")
+        if not specs_loaded and os.path.exists(runtime_broker_specs_path):
+            logger.warning(
+                "Broker specs file found but empty/unreadable after 3 attempts: "
+                f"{runtime_broker_specs_path}"
+            )
     set_instrument_specs(
         specs=config_data.get("instrument_specs"),
         defaults=config_data.get("instrument_spec_defaults")
@@ -6650,6 +9058,30 @@ def main():
         if args.status:
             _app_instance.print_status()
             return 0
+
+        if args.preflight:
+            account_info = None
+            try:
+                if _app_instance.mt5 is not None and _app_instance.mt5.is_connected():
+                    account_info = _app_instance.mt5.get_account_info()
+            except Exception as exc:
+                logger.warning(f"Could not fetch MT5 account info for preflight validation: {exc}")
+            readiness = validate_live_readiness(
+                pipeline_config,
+                symbols=symbols,
+                config_path=args.config,
+                winner_ledger_path=getattr(pipeline_config, "winner_ledger_path", None),
+                mt5_config=mt5_config,
+                account_info=account_info,
+                position_config=position_config,
+            )
+            log_readiness_report(logger, readiness)
+            logger.info(
+                "Preflight complete: %d error(s), %d warning(s)",
+                len(readiness.errors),
+                len(readiness.warnings),
+            )
+            return 0 if readiness.ok else 2
         
         # Run optimization
         if args.optimize:
@@ -6658,6 +9090,18 @@ def main():
         
         # Run trading
         if args.trade:
+            if args.close_on_opposite_signal:
+                if args.paper:
+                    logger.error(
+                        "Edge challenger probation refuses --close-on-opposite-signal because "
+                        "it would alter the refit's executable policy and contaminate forward evidence."
+                    )
+                else:
+                    logger.error(
+                        "Funded live refuses --close-on-opposite-signal because that exit "
+                        "was not part of the frozen lockbox contract."
+                    )
+                return 2
             if not args.paper:
                 account_info = None
                 try:
@@ -6678,10 +9122,18 @@ def main():
                 if not readiness.ok:
                     logger.error("Live readiness failed; refusing to start live trading.")
                     return 2
-            _app_instance.run_trading(
-                enable_trading=not args.paper,
-                close_on_opposite_signal=args.close_on_opposite_signal
+            trading_started = _app_instance.run_trading(
+                # --paper is executable demo forward probation, not a log-only
+                # simulator. Broker-reported ACCOUNT_TRADE_MODE==DEMO remains
+                # mandatory at startup, every sweep, and immediately pre-send.
+                enable_trading=True,
+                close_on_opposite_signal=False,
+                execution_book=(
+                    EDGE_DEMO_EXECUTION_BOOK if args.paper else CHAMPION_EXECUTION_BOOK
+                ),
             )
+            if trading_started is False:
+                return 2
         
         # Default: show status
         if not args.optimize and not args.trade:
@@ -6690,7 +9142,8 @@ def main():
             print("  python pm_main.py --optimize              # Run optimization (skip valid)")
             print("  python pm_main.py --optimize --overwrite  # Force re-optimize all")
             print("  python pm_main.py --trade                 # Start live trading")
-            print("  python pm_main.py --trade --paper         # Paper trading")
+            print("  python pm_main.py --trade --paper         # Demo-only edge challenger probation")
+            print("  python pm_main.py --preflight             # Readiness checks only")
             print(f"  production retrain schedule: {pipeline_config.describe_retrain_schedule()}")
         
         return 0

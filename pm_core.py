@@ -34,7 +34,23 @@ from typing import Dict, List, Any, Optional, Tuple, Union, Set
 import numpy as np
 import pandas as pd
 from pm_order_governance import candidate_policy_names, evaluate_policy, make_policy, GovernanceContext
+from pm_metrics import (
+    METRIC_CONTRACT_VERSION,
+    profit_factor_from_gross,
+    return_drawdown_metrics,
+    round_metric,
+    sharpe_sortino_from_returns,
+)
 from pm_symbol import infer_asset_class
+from pm_native_activation import resolve_active_native_artifact
+from pm_evidence import (
+    CALENDAR_SPLIT_MODE,
+    DEFAULT_MIN_NATIVE_BARS,
+    DEFAULT_WINDOW_YEARS,
+    normalize_min_native_bars,
+    normalize_window_years,
+    validate_native_provenance,
+)
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -75,6 +91,11 @@ EXIT_NONE = 0
 EXIT_SL = 1
 EXIT_TP = 2
 EXIT_EOD = 3
+
+# Trade records emitted after this version include per-trade MAE/MFE and
+# underwater timing fields. Older artifacts without this field must not be
+# interpreted as zero-excursion records.
+BACKTEST_TRADE_RECORD_SCHEMA_VERSION = "2026-06-18-mae-mfe-v1"
 
 
 @jit(nopython=True, cache=True)
@@ -177,9 +198,7 @@ def _backtest_loop_numba(
     max_lot: float,
     volume_step: float,
     warmup_bars: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+) -> Tuple:
     """
     Numba JIT-compiled backtest loop for 3-10x speedup.
     
@@ -200,7 +219,8 @@ def _backtest_loop_numba(
         - trade_directions, trade_entry_prices, trade_exit_prices
         - trade_sl_prices, trade_tp_prices, trade_sizes
         - trade_pnl_dollars, trade_pnl_pips, trade_exit_reasons, trade_risk_amounts
-        - final_equity, max_drawdown
+        - equity_curve, final_equity, max_drawdown
+        - MAE/MFE excursion fields appended after the legacy result fields
     """
     n_bars = len(open_arr)
     
@@ -220,6 +240,15 @@ def _backtest_loop_numba(
     trade_pnl_pips = np.zeros(max_trades, dtype=np.float64)
     trade_exit_reasons = np.zeros(max_trades, dtype=np.int32)
     trade_risk_amounts = np.zeros(max_trades, dtype=np.float64)
+    trade_mae_pips = np.zeros(max_trades, dtype=np.float64)
+    trade_mfe_pips = np.zeros(max_trades, dtype=np.float64)
+    trade_mae_r = np.zeros(max_trades, dtype=np.float64)
+    trade_mfe_r = np.zeros(max_trades, dtype=np.float64)
+    trade_time_to_mae_bars = np.zeros(max_trades, dtype=np.int64)
+    trade_time_to_mfe_bars = np.zeros(max_trades, dtype=np.int64)
+    trade_time_underwater_bars = np.zeros(max_trades, dtype=np.int64)
+    trade_entry_to_stop_pips = np.zeros(max_trades, dtype=np.float64)
+    trade_entry_to_target_pips = np.zeros(max_trades, dtype=np.float64)
     
     # Equity curve
     equity_curve = np.zeros(n_bars, dtype=np.float64)
@@ -239,6 +268,13 @@ def _backtest_loop_numba(
     take_profit = 0.0
     position_size = 0.0
     risk_amount_at_entry = 0.0
+    entry_to_stop_pips = 0.0
+    entry_to_target_pips = 0.0
+    mae_pips_current = 0.0
+    mfe_pips_current = 0.0
+    time_to_mae_bars_current = 0
+    time_to_mfe_bars_current = 0
+    time_underwater_bars_current = 0
     
     trade_count = 0
     
@@ -270,6 +306,25 @@ def _backtest_loop_numba(
             ask_close = close_price
         
         if in_position:
+            bars_held_now = i - entry_bar
+            if pip_size > 0.0:
+                if position_direction == 1:
+                    adverse_pips = (entry_price - bid_low) / pip_size
+                    favorable_pips = (bid_high - entry_price) / pip_size
+                    close_mark_pips = (bid_close - entry_price) / pip_size
+                else:
+                    adverse_pips = (ask_high - entry_price) / pip_size
+                    favorable_pips = (entry_price - ask_low) / pip_size
+                    close_mark_pips = (entry_price - ask_close) / pip_size
+                if adverse_pips > mae_pips_current:
+                    mae_pips_current = adverse_pips
+                    time_to_mae_bars_current = bars_held_now
+                if favorable_pips > mfe_pips_current:
+                    mfe_pips_current = favorable_pips
+                    time_to_mfe_bars_current = bars_held_now
+                if close_mark_pips < 0.0:
+                    time_underwater_bars_current += 1
+
             exit_price = -1.0
             exit_reason = EXIT_NONE
 
@@ -314,6 +369,15 @@ def _backtest_loop_numba(
                 trade_pnl_pips[trade_count] = pnl_pips
                 trade_exit_reasons[trade_count] = exit_reason
                 trade_risk_amounts[trade_count] = risk_amount_at_entry
+                trade_mae_pips[trade_count] = mae_pips_current
+                trade_mfe_pips[trade_count] = mfe_pips_current
+                trade_mae_r[trade_count] = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+                trade_mfe_r[trade_count] = mfe_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+                trade_time_to_mae_bars[trade_count] = time_to_mae_bars_current
+                trade_time_to_mfe_bars[trade_count] = time_to_mfe_bars_current
+                trade_time_underwater_bars[trade_count] = time_underwater_bars_current
+                trade_entry_to_stop_pips[trade_count] = entry_to_stop_pips
+                trade_entry_to_target_pips[trade_count] = entry_to_target_pips
                 trade_count += 1
                 in_position = False
 
@@ -373,10 +437,42 @@ def _backtest_loop_numba(
                 entry_price = entry_price_candidate
                 stop_loss = stop_loss_candidate
                 take_profit = take_profit_candidate
+                if pip_size > 0.0:
+                    if direction == 1:
+                        entry_to_stop_pips = (entry_price - stop_loss) / pip_size
+                        entry_to_target_pips = (take_profit - entry_price) / pip_size
+                    else:
+                        entry_to_stop_pips = (stop_loss - entry_price) / pip_size
+                        entry_to_target_pips = (entry_price - take_profit) / pip_size
+                else:
+                    entry_to_stop_pips = 0.0
+                    entry_to_target_pips = 0.0
+                mae_pips_current = 0.0
+                mfe_pips_current = 0.0
+                time_to_mae_bars_current = 0
+                time_to_mfe_bars_current = 0
+                time_underwater_bars_current = 0
                 in_position = True
                 position_direction = direction
                 entry_bar = i
                 signal_bar = signal_bar_index
+                if pip_size > 0.0:
+                    if position_direction == 1:
+                        adverse_pips = (entry_price - bid_low) / pip_size
+                        favorable_pips = (bid_high - entry_price) / pip_size
+                        close_mark_pips = (bid_close - entry_price) / pip_size
+                    else:
+                        adverse_pips = (ask_high - entry_price) / pip_size
+                        favorable_pips = (entry_price - ask_low) / pip_size
+                        close_mark_pips = (entry_price - ask_close) / pip_size
+                    if adverse_pips > mae_pips_current:
+                        mae_pips_current = adverse_pips
+                        time_to_mae_bars_current = 0
+                    if favorable_pips > mfe_pips_current:
+                        mfe_pips_current = favorable_pips
+                        time_to_mfe_bars_current = 0
+                    if close_mark_pips < 0.0:
+                        time_underwater_bars_current += 1
 
                 # Same-bar exit: check gap-through at open FIRST, then intra-bar
                 exit_price = -1.0
@@ -422,6 +518,15 @@ def _backtest_loop_numba(
                     trade_pnl_pips[trade_count] = pnl_pips
                     trade_exit_reasons[trade_count] = exit_reason
                     trade_risk_amounts[trade_count] = risk_amount_at_entry
+                    trade_mae_pips[trade_count] = mae_pips_current
+                    trade_mfe_pips[trade_count] = mfe_pips_current
+                    trade_mae_r[trade_count] = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+                    trade_mfe_r[trade_count] = mfe_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+                    trade_time_to_mae_bars[trade_count] = time_to_mae_bars_current
+                    trade_time_to_mfe_bars[trade_count] = time_to_mfe_bars_current
+                    trade_time_underwater_bars[trade_count] = time_underwater_bars_current
+                    trade_entry_to_stop_pips[trade_count] = entry_to_stop_pips
+                    trade_entry_to_target_pips[trade_count] = entry_to_target_pips
                     trade_count += 1
                     in_position = False
 
@@ -468,6 +573,15 @@ def _backtest_loop_numba(
         trade_pnl_pips[trade_count] = pnl_pips
         trade_exit_reasons[trade_count] = EXIT_EOD
         trade_risk_amounts[trade_count] = risk_amount_at_entry
+        trade_mae_pips[trade_count] = mae_pips_current
+        trade_mfe_pips[trade_count] = mfe_pips_current
+        trade_mae_r[trade_count] = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+        trade_mfe_r[trade_count] = mfe_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+        trade_time_to_mae_bars[trade_count] = time_to_mae_bars_current
+        trade_time_to_mfe_bars[trade_count] = time_to_mfe_bars_current
+        trade_time_underwater_bars[trade_count] = time_underwater_bars_current
+        trade_entry_to_stop_pips[trade_count] = entry_to_stop_pips
+        trade_entry_to_target_pips[trade_count] = entry_to_target_pips
         trade_count += 1
         equity_curve[n_bars - 1] = equity
         if equity > peak_equity:
@@ -494,7 +608,16 @@ def _backtest_loop_numba(
         trade_risk_amounts[:trade_count],
         equity_curve,
         equity,
-        max_drawdown
+        max_drawdown,
+        trade_mae_pips[:trade_count],
+        trade_mfe_pips[:trade_count],
+        trade_mae_r[:trade_count],
+        trade_mfe_r[:trade_count],
+        trade_time_to_mae_bars[:trade_count],
+        trade_time_to_mfe_bars[:trade_count],
+        trade_time_underwater_bars[:trade_count],
+        trade_entry_to_stop_pips[:trade_count],
+        trade_entry_to_target_pips[:trade_count],
     )
 
 
@@ -524,6 +647,10 @@ class PipelineConfig:
     # `historical_stress_audit_bars` as audit-only context, and lets the
     # newest `active_universe_bars` drive production strategy selection.
     # Production split mode:
+    # - calendar_lockbox_v2: common timestamp windows across every native
+    #   timeframe: 5y train -> purge -> 2y tuning -> purge -> 2y lockbox.
+    #   This is the production default.
+    # - chronological_lockbox_v1: legacy fixed-M5-row lockbox geometry.
     # - bleeding_edge: full active universe is used for broad eligibility,
     #   newest `active_stage2_pct` drives optimization up to the live edge,
     #   and the immediately prior `walk_forward_validation_bars` are production
@@ -532,7 +659,36 @@ class PipelineConfig:
     historical_stress_audit_bars: int = 50000
     active_universe_bars: int = 250000
     active_stage2_pct: float = 50.0
-    production_split_mode: str = "bleeding_edge"
+    # Research-only split modes remain available for reproducibility, but they
+    # must be opted into explicitly and can never pass funded-live readiness.
+    research_mode: bool = False
+    production_split_mode: str = CALENDAR_SPLIT_MODE
+    tuning_validation_bars: int = 50000
+    final_lockbox_bars: int = 50000
+    split_embargo_bars: int = 300
+    # Necessary evidence gate, evaluated before feature computation/model search.
+    # Calendar production forces these gates on. Non-calendar research modes
+    # may explicitly disable them, but are outside this funded-live contract.
+    evidence_sufficiency_enabled: bool = True
+    evidence_require_native_timeframes: bool = True
+    evidence_require_native_provenance: bool = True
+    evidence_require_session_coverage: bool = True
+    evidence_min_expected_session_coverage: float = 0.95
+    evidence_boundary_tolerance_days: float = 7.0
+    evidence_purge_days: float = 7.0
+    evidence_warmup_days: float = 400.0
+    # Optional deterministic research/as-of cutoff. Empty means use current
+    # UTC and then cap to the last fully closed native M5 bar.
+    evidence_as_of_utc: str = ""
+    evidence_window_years: Dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_WINDOW_YEARS)
+    )
+    evidence_min_native_bars: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            timeframe: dict(partitions)
+            for timeframe, partitions in DEFAULT_MIN_NATIVE_BARS.items()
+        }
+    )
     walk_forward_validation_bars: int = 50000
     clean_holdout_pct: float = 0.0  # Research-only percent of stage2 reserved as newest unseen holdout.
     overlap_pct: float = 10.0  # Warmup window as a fraction of the active universe size
@@ -550,8 +706,8 @@ class PipelineConfig:
     #   units are trusted.
     # - Commission: per-lot fee (use_commission=True). Set to False for
     #   spread-only accounts where commission is embedded in the spread.
-    # - Slippage: applied only to SL exits (market orders). TP exits are
-    #   limit fills and do not incur slippage (correct by design).
+    # - Slippage: applied adversely to market entry and SL exits. TP exits are
+    #   limit fills and do not incur slippage.
     # - Swap: modeled from InstrumentSpec.swap_long/swap_short when
     #   swap_model_enabled=True. Triple rollover is applied on the configured
     #   broker rollover weekday.
@@ -611,7 +767,10 @@ class PipelineConfig:
     scoring_use_sortino_blend: bool = True
     scoring_use_tail_risk: bool = True
     scoring_use_consistency: bool = True
-    scoring_use_trade_frequency_bonus: bool = True
+    # More trades are not evidence of more edge once costs and dependence are
+    # modeled. Keep the old bonus available to research, but never enable it by
+    # default in the production selector.
+    scoring_use_trade_frequency_bonus: bool = False
     legacy_confidence_bonus_cap: float = 0.08
     regime_scoring_model: str = "legacy"  # legacy|legacy_confidence|specialist_spokes|specialist_spokes_v2|specialist_spokes_asym|specialist_spokes_threadspark
     regime_trade_stability_floor: float = 0.7  # 0.7 legacy; 0.9 is Phase-1 experiment candidate
@@ -620,39 +779,49 @@ class PipelineConfig:
     specialist_spokes_v2_allow_promote_small_default: bool = True
     specialist_spokes_v2_max_validation_sharpe: float = 0.0
 
-    # Global false-discovery controls. These are opt-in for legacy compatibility;
-    # the discovery contract enables them before any broad roster re-optimization.
-    false_discovery_control_enabled: bool = False
-    false_discovery_min_dsr: float = 0.0
+    # Global false-discovery controls are part of the default production
+    # contract. Research runs may disable them explicitly, but live readiness
+    # will reject such artifacts.
+    false_discovery_control_enabled: bool = True
+    false_discovery_min_dsr: float = 0.95
     false_discovery_confidence_floor: float = 0.35
     false_discovery_scope_power: float = 0.25
     false_discovery_symbol_count: int = 0
-    false_discovery_holdout_policy: str = "off"  # off|promote_small|block
+    false_discovery_min_daily_observations: int = 252
+    false_discovery_min_effective_observations: float = 60.0
+    false_discovery_max_pbo: float = 0.50
+    false_discovery_pbo_min_candidates: int = 5
+    false_discovery_pbo_blocks: int = 10
+    false_discovery_require_bootstrap: bool = True
+    false_discovery_bootstrap_repetitions: int = 300
+    false_discovery_bootstrap_confidence: float = 0.95
+    false_discovery_bootstrap_min_mean_lower: float = 0.0
+    false_discovery_bootstrap_min_pf_lower: float = 1.0
+    false_discovery_bootstrap_max_dd_upper: float = 0.20
+    false_discovery_holdout_policy: str = "block"  # off|promote_small|block
     false_discovery_holdout_min_trades: int = 5
     false_discovery_holdout_min_profit_factor: float = 1.0
     false_discovery_holdout_min_return_pct: float = 0.0
+    false_discovery_holdout_max_drawdown_pct: float = 20.0
+    lockbox_one_shot_registry_enabled: bool = True
+    lockbox_access_registry_path: str = ""
     oos_validation_mode: str = "fixed_holdout"  # fixed_holdout|purged_kfold
     oos_kfold_splits: int = 5
     oos_embargo_bars: int = 1
     oos_min_trades: int = 5
     oos_aggregate_policy: str = "aggregate_with_worst_fold_floor"  # all_folds|aggregate_with_worst_fold_floor
-    oos_evidence_export_enabled: bool = False
+    oos_evidence_export_enabled: bool = True
     oos_evidence_periods: int = 64
     oos_evidence_min_periods: int = 8
     oos_evidence_dirname: str = "oos_evidence"
     oos_evidence_trade_path_max_points: int = 256
-    oos_evidence_include_execution_cost_survival: bool = False
+    oos_evidence_include_execution_cost_survival: bool = True
     oos_evidence_execution_stress_mode: str = "stress_p95"
     oos_evidence_execution_cost_max_candidates_per_tf: int = 0  # 0 = no cap when enabled
     threadspark_selection_surface: str = "validation"  # validation|clean_holdout
     threadspark_use_historical_cost_evidence: bool = True
     threadspark_historical_cost_scope: str = "workflow"  # workflow|audit
     threadspark_historical_chunk_count: int = 5
-
-    # Actionable signal threshold (0.0-1.0): minimum composite score for a signal
-    # to be considered actionable in live trading. Signals below this are logged but
-    # not executed. Default 0.95 is strict; lower values (e.g. 0.9) allow more trades.
-    actionable_score_margin: float = 0.92
 
     # Timeframes to evaluate
     timeframes: List[str] = field(default_factory=lambda: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'])
@@ -670,13 +839,47 @@ class PipelineConfig:
     live_config_expiry_grace_minutes: int = 0
     manual_new_entries_enabled: bool = True
     manual_kill_switch_path: str = ""
-    production_require_promotion_gate: bool = False
-    production_promotion_gate_mode: str = "external_review_exact"  # external_review_exact|ledger_status
+    production_require_promotion_gate: bool = True
+    # ``ledger_status`` and the old multi-file review mode remain readable for
+    # historical/research runs.  The shipped funded profile uses
+    # ``immutable_exact`` and live readiness refuses every weaker mode.
+    production_promotion_gate_mode: str = "ledger_status"  # immutable_exact|external_review_exact|ledger_status
+    production_promotion_authorization_path: str = ""
+    production_promotion_authorization_sha256: str = ""
+    production_promotion_authorization_max_age_days: int = 31
     production_promotion_review_path: str = ""
     production_promotion_cell_safety_path: str = ""
     production_completion_marker_path: str = ""
     production_expected_promote_cells: List[str] = field(default_factory=list)
-    production_require_full_symbol_ledger: bool = False
+    live_allowed_promotion_statuses: List[str] = field(default_factory=lambda: ["PROMOTED"])
+    production_replay_audit_enabled: bool = True
+    production_replay_audit_mode: str = "apply"  # report_only|apply
+    production_replay_audit_starting_balance: float = 10000.0
+    production_replay_audit_min_profit_factor: float = 1.05
+    production_replay_audit_max_drawdown_pct: float = 30.0
+    production_replay_audit_min_trades: int = 30
+    production_replay_audit_block_unverified: bool = True
+    production_replay_audit_fail_on_error: bool = True
+    production_replay_audit_out_dir: str = ""
+    # Funded live additionally requires one sealed, content-addressed replay of
+    # every promoted cell through a synchronized shared-capital account.  The
+    # diagnostic per-cell replay above cannot satisfy this portfolio contract.
+    production_prelockbox_roster_path: str = ""
+    production_prelockbox_roster_sha256: str = ""
+    production_cap_calibration_path: str = ""
+    production_cap_calibration_sha256: str = ""
+    production_portfolio_replay_evidence_required: bool = True
+    production_portfolio_replay_evidence_path: str = ""
+    production_portfolio_replay_required_starting_balances: List[float] = field(
+        default_factory=lambda: [1000.0, 10000.0]
+    )
+    production_portfolio_replay_min_calendar_days: int = 730
+    production_portfolio_replay_min_positions: int = 100
+    production_portfolio_replay_min_profit_factor: float = 1.05
+    production_portfolio_replay_min_return_pct: float = 0.0
+    production_portfolio_replay_max_drawdown_pct: float = 20.0
+    production_portfolio_replay_require_mtm: bool = True
+    production_require_full_symbol_ledger: bool = True
     live_allow_partial_symbol_ledger: bool = False
     production_symbol_pool_target_count: int = 0
     live_min_account_equity: float = 0.0
@@ -697,13 +900,15 @@ class PipelineConfig:
     institutional_supervisor_mode: str = "circuit_breaker"  # off|observe|circuit_breaker
     portfolio_control_policy: str = "hard_breakpoints_only"
     max_total_open_risk_pct: float = 8.0
-    max_new_entries_when_total_open_risk_above_pct: float = 6.0
-    open_risk_action: str = "pause_new_entries"  # observe|pause_new_entries|derate
+    # Gross, non-netted factor exposure (currencies/equity beta/metals/etc.).
+    max_factor_group_open_risk_pct: float = 2.0
+    max_new_entries_when_total_open_risk_above_pct: float = 0.0
+    open_risk_action: str = "observe"  # observe|pause_new_entries|derate
     daily_loss_hard_block_pct: float = 0.0
     session_loss_hard_block_pct: float = 0.0
     weekly_loss_hard_block_pct: float = 0.0
     open_drawdown_hard_block_pct: float = 0.0
-    hard_block_reopen_mode: str = "manual_or_next_cycle"
+    hard_block_reopen_mode: str = "when_clear"
     cycle_drift_monitor_enabled: bool = True
     cycle_drift_mode: str = "lightweight"  # off|observe|lightweight
     cycle_drift_min_trades: int = 6
@@ -711,6 +916,15 @@ class PipelineConfig:
     cycle_drift_execution_slippage_mult: float = 2.5
     cycle_drift_spread_degradation_mult: float = 2.0
     cycle_drift_action: str = "pause_context"  # observe|pause_context|derate_context
+    # Durable position-close accounting. This subsystem is observation-only:
+    # it can pause/derate an exact cell through CycleDriftMonitor, but it has no
+    # order placement or automatic-promotion capability.
+    live_outcome_feedback_enabled: bool = True
+    live_outcome_require_position_history: bool = True
+    live_outcome_feed_cycle_drift: bool = True
+    live_outcome_ledger_path: str = ""
+    live_outcome_state_path: str = ""
+    live_outcome_volume_tolerance: float = 1e-8
     walk_forward_audit_enabled: bool = True
     walk_forward_audit_windows: int = 3
     walk_forward_audit_mode: str = "severe_fragility_only"
@@ -719,6 +933,16 @@ class PipelineConfig:
     walk_forward_do_not_displace_latest_surface: bool = True
     # PROMOTE_SMALL winners trade live with a derated risk multiplier (0..1).
     promote_small_risk_multiplier: float = 0.5
+    # Probation tier (agent_audit/comms/CHANNEL.md [004]): stored-window evidence predicts
+    # full-sample profitability poorly (Spearman <= ~0.30), so freshly (re)trained winners
+    # trade at reduced risk until forward evidence accrues. Conservative-only: it can only
+    # lower the live risk multiplier, never raise it.
+    probation_enabled: bool = True
+    probation_days: int = 14
+    probation_risk_multiplier: float = 0.5
+    probation_min_live_outcomes: int = 30
+    probation_min_mean_r: float = 0.0
+    probation_min_profit_factor: float = 1.0
     local_governance_tournament_enabled: bool = False
     local_governance_live_mode: str = "off"
     local_governance_candidate_policies: List[str] = field(
@@ -738,7 +962,11 @@ class PipelineConfig:
     )
     local_governance_require_baseline_improvement: bool = True
     local_governance_min_score_improvement: float = 0.0
-    risk_management_optimization_enabled: bool = True
+    # Governance/risk-policy selection currently runs after the strategy's
+    # one-shot holdout evaluation, so enabling it would deploy a policy that the
+    # lockbox did not test.  Keep it research-only until the entire selected
+    # policy is frozen before lockbox evaluation.
+    risk_management_optimization_enabled: bool = False
     risk_management_selection_stage: str = "stage3"
     historical_audit_min_trades: int = 5
     historical_audit_max_drawdown: float = 35.0
@@ -817,9 +1045,19 @@ class PipelineConfig:
     historical_fetch_deep_backfill_years: int = 18
     
     # Regime-aware optimization settings
-    use_regime_optimization: bool = True
     regime_min_train_trades: int = 25  # Minimum trades per regime bucket in training
     regime_min_val_trades: int = 15    # Minimum trades per regime bucket in validation
+    regime_timeframe_val_trade_floors_enabled: bool = False
+    regime_timeframe_val_trade_floors: Dict[str, int] = field(
+        default_factory=lambda: {
+            "D1": 15,
+            "H4": 25,
+            "H1": 25,
+            "M30": 30,
+            "M15": 30,
+            "M5": 30,
+        }
+    )
     regime_params_file: str = "regime_params.json"  # Path to tuned regime params
     live_require_tuned_regime_params: bool = True  # Live entries require an explicit tuned params row
     # Live-only optional TP overlay. Discovery/backtesting keeps this neutral so
@@ -835,6 +1073,11 @@ class PipelineConfig:
     regime_enable_hyperparam_tuning: bool = True  # Enable hyperparameter tuning in regime optimization
     regime_hyperparam_top_k: int = 3  # Top K strategies to tune per regime (screening phase)
     regime_hyperparam_max_combos: int = 150  # Max param combinations to test per strategy
+    # Equal-budget train-only B0 probe before any family is shortlisted. This
+    # prevents a poor default/ATR anchor from eliminating a family whose tuned
+    # region is strong. Actual per-cell trials are min(grid size, this budget),
+    # with mandatory default/ATR anchors included and deduplicated.
+    regime_family_probe_trials: int = 5
     
     # Validation profitability gates for stored regime winners.
     regime_min_val_profit_factor: float = 1.05   # Minimum validation PF to be stored as winner
@@ -842,10 +1085,10 @@ class PipelineConfig:
     regime_allow_losing_winners: bool = False    # If True, allows PF < 1 (not recommended)
     regime_no_winner_marker: str = "NO_TRADE"    # Strategy name for "no valid winner" state
 
-    # ===== PRE-TUNING ELIGIBILITY GATES =====
-    # Applied BEFORE hyperparameter tuning on DEFAULT-param training results.
-    # Purpose: skip truly catastrophic strategies to save compute.
-    # Must stay lenient because default params are not optimized yet.
+    # ===== POST-B0 / PRE-DEEP-TUNING ELIGIBILITY GATES =====
+    # Applied to each family-regime cell's equal-budget train-only B0 winner.
+    # Purpose: skip truly catastrophic cells before deeper independent studies.
+    # Must stay lenient because B0 is a bounded probe, not exhaustive search.
     train_min_profit_factor: float = 0.5     # Reject only extremely bad PF
     train_min_return_pct: float = -30.0      # Allow moderate losses (tuning may fix)
     train_max_drawdown: float = 60.0         # Reject only catastrophic blowups
@@ -864,10 +1107,10 @@ class PipelineConfig:
     # ===== MARGIN PROTECTION (BLACK SWAN GUARD) =====
     # Cycle-based margin protection layer (thresholds are config-driven).
     # Uses MT5-native margin_level (equity/margin*100). No sleep/cooldown logic.
-    margin_entry_block_level: float = 100.0       # block new entries below this margin level %
-    margin_recovery_start_level: float = 80.0     # start forced closures below this %
-    margin_panic_level: float = 65.0              # aggressive forced closures below this %
-    margin_reopen_level: float = 100.0            # resume entries above this %
+    margin_entry_block_level: float = 200.0       # 50% used-margin ceiling for new entries
+    margin_recovery_start_level: float = 150.0    # start forced closures below this %
+    margin_panic_level: float = 120.0              # aggressive forced closures below this %
+    margin_reopen_level: float = 300.0            # reopen only after recovery to 33.33% use
     margin_recovery_closes_per_cycle: int = 1     # max forced closes per cycle in RECOVERY
     margin_panic_closes_per_cycle: int = 3        # max forced closes per cycle in PANIC
     margin_reopen_cooldown_minutes: float = 15.0  # block all new entries for N minutes after any forced close (flash-crash guard)
@@ -880,10 +1123,10 @@ class PipelineConfig:
     position_timeframe_overrides: Dict[str, str] = field(default_factory=dict)
 
     # Allow up to two concurrent trades per symbol: one D1 + one lower-TF.
-    allow_d1_plus_lower_tf: bool = True          # Enable D1 + lower-TF concurrent trades
+    allow_d1_plus_lower_tf: bool = True          # Exact one-D1 + one-lower topology only
     d1_secondary_risk_multiplier: float = 1.0   # Risk for second trade when D1 is open
-    max_combined_risk_pct: float = 3.0          # Max combined risk per symbol (D1 + lower)
-    secondary_trade_max_risk_pct: float = 0.9  # hard cap for the secondary (non-D1) trade
+    max_combined_risk_pct: float = 1.0          # Max combined risk per symbol (D1 + lower)
+    secondary_trade_max_risk_pct: float = 0.25  # hard cap for the secondary trade
     
     # Compatibility alias for older artifacts/metrics. Production validity now
     # comes from the fixed calendar schedule above.
@@ -897,6 +1140,25 @@ class PipelineConfig:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            margin_reopen = float(self.margin_reopen_level)
+            margin_block = float(self.margin_entry_block_level)
+            margin_recovery = float(self.margin_recovery_start_level)
+            margin_panic = float(self.margin_panic_level)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("margin protection thresholds must be finite numbers") from exc
+        if not all(math.isfinite(value) for value in (
+            margin_reopen, margin_block, margin_recovery, margin_panic
+        )) or not (margin_reopen >= margin_block > margin_recovery > margin_panic > 0.0):
+            raise ValueError(
+                "margin thresholds must satisfy "
+                "margin_reopen_level >= margin_entry_block_level > "
+                "margin_recovery_start_level > margin_panic_level > 0"
+            )
+        self.margin_reopen_level = margin_reopen
+        self.margin_entry_block_level = margin_block
+        self.margin_recovery_start_level = margin_recovery
+        self.margin_panic_level = margin_panic
         # Clamp workers to sane minimum
         try:
             self.optimization_max_workers = max(1, int(self.optimization_max_workers))
@@ -931,6 +1193,10 @@ class PipelineConfig:
         except (TypeError, ValueError, OverflowError):
             self.screening_atr_anchor_multipliers = [2.0]
         self.screening_atr_anchor_enabled = bool(self.screening_atr_anchor_enabled)
+        try:
+            self.regime_family_probe_trials = max(1, int(self.regime_family_probe_trials))
+        except (TypeError, ValueError, OverflowError):
+            self.regime_family_probe_trials = 5
 
         try:
             risk = float(self.discovery_risk_per_trade_pct)
@@ -1169,7 +1435,8 @@ class PipelineConfig:
 
         for _name, _default in {
             "max_total_open_risk_pct": 8.0,
-            "max_new_entries_when_total_open_risk_above_pct": 6.0,
+            "max_factor_group_open_risk_pct": 2.0,
+            "max_new_entries_when_total_open_risk_above_pct": 0.0,
             "daily_loss_hard_block_pct": 0.0,
             "session_loss_hard_block_pct": 0.0,
             "weekly_loss_hard_block_pct": 0.0,
@@ -1191,9 +1458,9 @@ class PipelineConfig:
         if _open_risk_action not in {"observe", "pause_new_entries", "derate"}:
             _open_risk_action = "pause_new_entries"
         self.open_risk_action = _open_risk_action
-        _reopen_mode = str(getattr(self, "hard_block_reopen_mode", "manual_or_next_cycle") or "").strip().lower()
-        if _reopen_mode not in {"manual_or_next_cycle", "manual", "next_cycle"}:
-            _reopen_mode = "manual_or_next_cycle"
+        _reopen_mode = str(getattr(self, "hard_block_reopen_mode", "when_clear") or "").strip().lower()
+        if _reopen_mode not in {"when_clear", "manual_or_next_cycle", "manual", "next_cycle"}:
+            _reopen_mode = "when_clear"
         self.hard_block_reopen_mode = _reopen_mode
         self.cycle_drift_monitor_enabled = bool(self.cycle_drift_monitor_enabled)
         _drift_mode = str(getattr(self, "cycle_drift_mode", "lightweight") or "").strip().lower()
@@ -1277,9 +1544,84 @@ class PipelineConfig:
         except (TypeError, ValueError, OverflowError):
             symbol_count = 0
         self.false_discovery_symbol_count = max(0, symbol_count)
-        policy = str(getattr(self, "false_discovery_holdout_policy", "off") or "off").strip().lower()
+        try:
+            self.false_discovery_min_daily_observations = max(
+                2, int(getattr(self, "false_discovery_min_daily_observations", 252) or 252)
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.false_discovery_min_daily_observations = 252
+        try:
+            effective_observations = float(
+                getattr(self, "false_discovery_min_effective_observations", 60.0)
+                or 60.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            effective_observations = 60.0
+        self.false_discovery_min_effective_observations = (
+            effective_observations
+            if math.isfinite(effective_observations) and effective_observations >= 2.0
+            else 60.0
+        )
+        try:
+            max_pbo = float(getattr(self, "false_discovery_max_pbo", 0.50))
+        except (TypeError, ValueError, OverflowError):
+            max_pbo = 0.50
+        self.false_discovery_max_pbo = (
+            max(0.0, min(1.0, max_pbo)) if math.isfinite(max_pbo) else 0.50
+        )
+        try:
+            self.false_discovery_pbo_min_candidates = max(
+                2, int(getattr(self, "false_discovery_pbo_min_candidates", 5) or 5)
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.false_discovery_pbo_min_candidates = 5
+        try:
+            pbo_blocks = max(2, int(getattr(self, "false_discovery_pbo_blocks", 10) or 10))
+        except (TypeError, ValueError, OverflowError):
+            pbo_blocks = 10
+        self.false_discovery_pbo_blocks = pbo_blocks - (pbo_blocks % 2)
+        self.false_discovery_require_bootstrap = bool(
+            getattr(self, "false_discovery_require_bootstrap", True)
+        )
+        try:
+            self.false_discovery_bootstrap_repetitions = max(
+                100,
+                int(getattr(self, "false_discovery_bootstrap_repetitions", 300) or 300),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.false_discovery_bootstrap_repetitions = 300
+        try:
+            bootstrap_confidence = float(
+                getattr(self, "false_discovery_bootstrap_confidence", 0.95) or 0.95
+            )
+        except (TypeError, ValueError, OverflowError):
+            bootstrap_confidence = 0.95
+        self.false_discovery_bootstrap_confidence = (
+            max(0.50, min(0.999, bootstrap_confidence))
+            if math.isfinite(bootstrap_confidence)
+            else 0.95
+        )
+        for _name, _default in (
+            ("false_discovery_bootstrap_min_mean_lower", 0.0),
+            ("false_discovery_bootstrap_min_pf_lower", 1.0),
+            ("false_discovery_bootstrap_max_dd_upper", 0.20),
+        ):
+            try:
+                _value = float(getattr(self, _name, _default))
+            except (TypeError, ValueError, OverflowError):
+                _value = _default
+            if not math.isfinite(_value):
+                _value = _default
+            setattr(self, _name, max(0.0, _value))
+        self.lockbox_one_shot_registry_enabled = bool(
+            getattr(self, "lockbox_one_shot_registry_enabled", True)
+        )
+        self.lockbox_access_registry_path = str(
+            getattr(self, "lockbox_access_registry_path", "") or ""
+        ).strip()
+        policy = str(getattr(self, "false_discovery_holdout_policy", "block") or "block").strip().lower()
         if policy not in {"off", "promote_small", "block"}:
-            policy = "off"
+            policy = "block"
         self.false_discovery_holdout_policy = policy
         try:
             holdout_min_trades = int(getattr(self, "false_discovery_holdout_min_trades", 5) or 0)
@@ -1296,6 +1638,15 @@ class PipelineConfig:
         except (TypeError, ValueError, OverflowError):
             holdout_min_return = 0.0
         self.false_discovery_holdout_min_return_pct = holdout_min_return
+        try:
+            holdout_max_dd = float(
+                getattr(self, "false_discovery_holdout_max_drawdown_pct", 20.0)
+            )
+            if not math.isfinite(holdout_max_dd):
+                holdout_max_dd = 20.0
+        except (TypeError, ValueError, OverflowError):
+            holdout_max_dd = 20.0
+        self.false_discovery_holdout_max_drawdown_pct = max(0.0, holdout_max_dd)
         oos_mode = str(getattr(self, "oos_validation_mode", "fixed_holdout") or "fixed_holdout").strip().lower()
         if oos_mode not in {"fixed_holdout", "purged_kfold"}:
             oos_mode = "fixed_holdout"
@@ -1387,6 +1738,34 @@ class PipelineConfig:
         except (TypeError, ValueError, OverflowError):
             mult = 0.5
         self.promote_small_risk_multiplier = max(0.0, min(1.0, mult))
+        self.probation_enabled = bool(getattr(self, "probation_enabled", True))
+        try:
+            self.probation_days = max(0, int(getattr(self, "probation_days", 14) or 0))
+        except (TypeError, ValueError, OverflowError):
+            self.probation_days = 14
+        try:
+            probation_mult = float(getattr(self, "probation_risk_multiplier", 0.5) or 0.5)
+        except (TypeError, ValueError, OverflowError):
+            probation_mult = 0.5
+        self.probation_risk_multiplier = max(0.05, min(1.0, probation_mult))
+        try:
+            self.probation_min_live_outcomes = max(
+                1, int(getattr(self, "probation_min_live_outcomes", 30) or 30)
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.probation_min_live_outcomes = 30
+        try:
+            probation_mean_r = float(getattr(self, "probation_min_mean_r", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            probation_mean_r = 0.0
+        self.probation_min_mean_r = probation_mean_r if math.isfinite(probation_mean_r) else 0.0
+        try:
+            probation_pf = float(getattr(self, "probation_min_profit_factor", 1.0) or 1.0)
+        except (TypeError, ValueError, OverflowError):
+            probation_pf = 1.0
+        self.probation_min_profit_factor = (
+            max(0.0, probation_pf) if math.isfinite(probation_pf) else 1.0
+        )
         self.swap_model_enabled = bool(self.swap_model_enabled)
         _spread_mode = str(getattr(self, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
         if _spread_mode not in {
@@ -1479,17 +1858,123 @@ class PipelineConfig:
             self.active_stage2_pct = max(1.0, min(100.0, float(self.active_stage2_pct)))
         except Exception:
             self.active_stage2_pct = 50.0
-        split_mode = str(getattr(self, "production_split_mode", "bleeding_edge") or "bleeding_edge").strip().lower()
+        split_mode = str(
+            getattr(self, "production_split_mode", CALENDAR_SPLIT_MODE)
+            or CALENDAR_SPLIT_MODE
+        ).strip().lower()
         split_aliases = {
+            "calendar": CALENDAR_SPLIT_MODE,
+            "calendar_lockbox": CALENDAR_SPLIT_MODE,
+            "lockbox": CALENDAR_SPLIT_MODE,
+            "three_way": CALENDAR_SPLIT_MODE,
+            "chronological_lockbox": "chronological_lockbox_v1",
             "production": "bleeding_edge",
             "practical": "bleeding_edge",
             "clean_holdout": "research_clean_holdout",
             "legacy_clean_holdout": "research_clean_holdout",
         }
         split_mode = split_aliases.get(split_mode, split_mode)
-        if split_mode not in {"bleeding_edge", "research_clean_holdout"}:
-            split_mode = "bleeding_edge"
+        if split_mode not in {
+            CALENDAR_SPLIT_MODE,
+            "chronological_lockbox_v1",
+            "bleeding_edge",
+            "research_clean_holdout",
+        }:
+            split_mode = CALENDAR_SPLIT_MODE
+        self.research_mode = bool(getattr(self, "research_mode", False))
+        if split_mode != CALENDAR_SPLIT_MODE and not self.research_mode:
+            raise ValueError(
+                f"production_split_mode={split_mode!r} is research-only; "
+                "set research_mode=True explicitly. Funded production requires "
+                f"{CALENDAR_SPLIT_MODE!r}."
+            )
+        if self.oos_validation_mode != "fixed_holdout" and not self.research_mode:
+            raise ValueError(
+                f"oos_validation_mode={self.oos_validation_mode!r} is research-only; "
+                "funded production requires the one-shot fixed final lockbox"
+            )
         self.production_split_mode = split_mode
+        try:
+            self.tuning_validation_bars = max(1, int(self.tuning_validation_bars))
+        except Exception:
+            self.tuning_validation_bars = 50000
+        try:
+            self.final_lockbox_bars = max(1, int(self.final_lockbox_bars))
+        except Exception:
+            self.final_lockbox_bars = 50000
+        try:
+            self.split_embargo_bars = max(0, int(self.split_embargo_bars))
+        except Exception:
+            self.split_embargo_bars = 300
+        self.evidence_sufficiency_enabled = bool(
+            getattr(self, "evidence_sufficiency_enabled", True)
+        )
+        self.evidence_require_native_timeframes = bool(
+            getattr(self, "evidence_require_native_timeframes", True)
+        )
+        self.evidence_require_native_provenance = bool(
+            getattr(self, "evidence_require_native_provenance", True)
+        )
+        self.evidence_require_session_coverage = bool(
+            getattr(self, "evidence_require_session_coverage", True)
+        )
+        if self.production_split_mode == CALENDAR_SPLIT_MODE:
+            # Calendar lockbox is the funded-production contract. Its native
+            # source, immutable provenance, and session-coverage gates cannot
+            # be disabled by a stale or research-oriented JSON override.
+            self.evidence_sufficiency_enabled = True
+            self.evidence_require_native_timeframes = True
+            self.evidence_require_native_provenance = True
+            self.evidence_require_session_coverage = True
+        try:
+            evidence_coverage = float(
+                getattr(self, "evidence_min_expected_session_coverage", 0.95)
+            )
+            self.evidence_min_expected_session_coverage = (
+                evidence_coverage
+                if math.isfinite(evidence_coverage) and 0.0 <= evidence_coverage <= 1.0
+                else 0.95
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.evidence_min_expected_session_coverage = 0.95
+        if self.production_split_mode == CALENDAR_SPLIT_MODE:
+            # The activation universe and every later funded evidence stage
+            # share one ex-ante threshold. Raising it after acquisition could
+            # prune cells using final-window availability metadata; lowering
+            # it would weaken sufficiency. Research modes may still explore.
+            self.evidence_min_expected_session_coverage = 0.95
+        try:
+            tolerance_days = float(getattr(self, "evidence_boundary_tolerance_days", 7.0))
+            self.evidence_boundary_tolerance_days = (
+                tolerance_days
+                if math.isfinite(tolerance_days) and tolerance_days >= 0.0
+                else 7.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.evidence_boundary_tolerance_days = 7.0
+        try:
+            purge_days = float(getattr(self, "evidence_purge_days", 7.0))
+            self.evidence_purge_days = (
+                purge_days if math.isfinite(purge_days) and purge_days >= 0.0 else 7.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.evidence_purge_days = 7.0
+        try:
+            warmup_days = float(getattr(self, "evidence_warmup_days", 400.0))
+            self.evidence_warmup_days = (
+                warmup_days if math.isfinite(warmup_days) and warmup_days >= 0.0 else 400.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.evidence_warmup_days = 400.0
+        self.evidence_as_of_utc = str(
+            getattr(self, "evidence_as_of_utc", "") or ""
+        ).strip()
+        self.evidence_window_years = normalize_window_years(
+            getattr(self, "evidence_window_years", None)
+        )
+        self.evidence_min_native_bars = normalize_min_native_bars(
+            getattr(self, "evidence_min_native_bars", None)
+        )
         try:
             self.walk_forward_validation_bars = max(0, int(self.walk_forward_validation_bars))
         except Exception:
@@ -1578,6 +2063,9 @@ class PipelineConfig:
         )
         gate_mode = str(getattr(self, "production_promotion_gate_mode", "external_review_exact") or "").strip().lower()
         gate_mode_aliases = {
+            "immutable": "immutable_exact",
+            "authorization": "immutable_exact",
+            "authorization_exact": "immutable_exact",
             "external": "external_review_exact",
             "exact": "external_review_exact",
             "review_exact": "external_review_exact",
@@ -1587,13 +2075,26 @@ class PipelineConfig:
             "ledger_authoritative": "ledger_status",
         }
         gate_mode = gate_mode_aliases.get(gate_mode, gate_mode)
-        if gate_mode not in {"external_review_exact", "ledger_status"}:
+        if gate_mode not in {"immutable_exact", "external_review_exact", "ledger_status"}:
             logger.warning(
                 "Invalid production_promotion_gate_mode=%r; falling back to 'external_review_exact'.",
                 getattr(self, "production_promotion_gate_mode", None),
             )
             gate_mode = "external_review_exact"
         self.production_promotion_gate_mode = gate_mode
+        self.production_promotion_authorization_path = str(
+            getattr(self, "production_promotion_authorization_path", "") or ""
+        ).strip()
+        self.production_promotion_authorization_sha256 = str(
+            getattr(self, "production_promotion_authorization_sha256", "") or ""
+        ).strip().lower()
+        try:
+            self.production_promotion_authorization_max_age_days = max(
+                1,
+                int(getattr(self, "production_promotion_authorization_max_age_days", 31) or 31),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.production_promotion_authorization_max_age_days = 31
         self.production_promotion_review_path = str(
             getattr(self, "production_promotion_review_path", "") or ""
         ).strip()
@@ -1611,6 +2112,17 @@ class PipelineConfig:
             for cell in raw_cells
             if str(cell or "").strip()
         ]
+        raw_live_statuses = getattr(self, "live_allowed_promotion_statuses", ["PROMOTED"])
+        if isinstance(raw_live_statuses, str):
+            raw_live_statuses = [
+                item.strip() for item in raw_live_statuses.split(",") if item.strip()
+            ]
+        normalized_live_statuses: List[str] = []
+        for raw_status in raw_live_statuses or []:
+            status = str(raw_status or "").strip().upper()
+            if status in {"PROMOTED", "PROMOTE_SMALL"} and status not in normalized_live_statuses:
+                normalized_live_statuses.append(status)
+        self.live_allowed_promotion_statuses = normalized_live_statuses or ["PROMOTED"]
         try:
             self.storage_warn_free_gb = max(0.0, float(self.storage_warn_free_gb))
         except Exception:
@@ -2412,6 +2924,29 @@ def _normalize_symbol(symbol: str) -> str:
     return symbol.split('.')[0].split('#')[0].upper()
 
 
+def _lookup_broker_spec(symbol: str, broker_specs: Dict[str, Dict[str, Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Find broker spec by exact key, normalized key, or recorded MT5 aliases."""
+    if not symbol or not broker_specs:
+        return None
+
+    normalized = _normalize_symbol(str(symbol))
+    candidates = [str(symbol), normalized]
+    for candidate in candidates:
+        payload = broker_specs.get(candidate)
+        if isinstance(payload, dict):
+            return candidate, payload
+
+    for key, payload in broker_specs.items():
+        if not isinstance(payload, dict):
+            continue
+        if _normalize_symbol(str(key)) == normalized:
+            return str(key), payload
+        for alias in (payload.get("symbol"), payload.get("broker_symbol")):
+            if alias and _normalize_symbol(str(alias)) == normalized:
+                return str(key), payload
+    return None
+
+
 def _maybe_load_config_specs(config_path: Optional[str] = None) -> None:
     """Lazy-load instrument specs from config.json for child processes."""
     global _CONFIG_SPECS_LOADED, _CONFIG_SPECS_LOADED_PATH
@@ -2473,8 +3008,9 @@ def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
         parent_spec = _CONFIG_INSTRUMENT_SPECS.get(parent_key)
         if parent_spec is None:
             broker_specs = load_broker_specs()
-            if parent_key in broker_specs:
-                parent_spec = _create_spec_from_broker_data(parent_key, broker_specs[parent_key])
+            broker_match = _lookup_broker_spec(parent_key, broker_specs)
+            if broker_match is not None:
+                parent_spec = _create_spec_from_broker_data(parent_key, broker_match[1])
             elif parent_key in INSTRUMENT_SPECS:
                 parent_spec = INSTRUMENT_SPECS[parent_key]
         if parent_spec is not None:
@@ -2743,11 +3279,9 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
 
     # 1) Broker specs are the source of truth for point/digits/tick/spread.
     broker_specs = load_broker_specs()
-    if symbol in broker_specs:
-        return _create_spec_from_broker_data(symbol, broker_specs[symbol], base_spec=config_spec)
-    
-    if symbol_key in broker_specs:
-        return _create_spec_from_broker_data(symbol, broker_specs[symbol_key], base_spec=config_spec)
+    broker_match = _lookup_broker_spec(symbol, broker_specs)
+    if broker_match is not None:
+        return _create_spec_from_broker_data(symbol, broker_match[1], base_spec=config_spec)
 
     # 2) Config-provided overrides
     if config_spec is not None:
@@ -2816,7 +3350,7 @@ class DataLoader:
         'H4': 2000,    # ~6 months of H4 data minimum  
         'D1': 500,     # ~2 years of D1 data minimum
     }
-    RESAMPLE_CACHE_SCHEMA_VERSION = 2
+    RESAMPLE_CACHE_SCHEMA_VERSION = 3
     
     def __init__(self, data_dir: Path, cache_resampled: bool = True, cache_dir: Optional[Path] = None):
         """
@@ -2830,6 +3364,11 @@ class DataLoader:
         self._resample_cache: Dict[str, pd.DataFrame] = {}
         self._resample_meta: Dict[str, Dict[str, Any]] = {}
         self._source_meta: Dict[str, Dict[str, Any]] = {}
+        self._source_sha256_cache: Dict[Tuple[str, int, int], str] = {}
+        # One DataLoader instance is one immutable native evidence snapshot.
+        # An ACTIVE pointer change requires a new loader/run; mixing activations
+        # across symbols or timeframes would invalidate a portfolio experiment.
+        self._native_activation_pin: Optional[Tuple[str, str]] = None
         self._resample_cache_stats: Dict[str, Any] = {
             "memory_hits": 0,
             "disk_hits": 0,
@@ -2881,6 +3420,22 @@ class DataLoader:
             )
         return None
 
+    def _file_sha256(self, path: Path) -> str:
+        """Content fingerprint cached by immutable filesystem identity."""
+        resolved = Path(path).resolve()
+        stat = resolved.stat()
+        key = (str(resolved), int(stat.st_mtime_ns), int(stat.st_size))
+        cached = self._source_sha256_cache.get(key)
+        if cached:
+            return cached
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        value = digest.hexdigest()
+        self._source_sha256_cache[key] = value
+        return value
+
     def load_symbol(self, symbol: str, base_timeframe: str = 'M5') -> Optional[pd.DataFrame]:
         """
         Load data for a symbol from CSV.
@@ -2925,6 +3480,9 @@ class DataLoader:
                 self._source_meta[cache_key] = {
                     "path": str(data_file),
                     "mtime": stat.st_mtime,
+                    "mtime_ns": int(stat.st_mtime_ns),
+                    "size": int(stat.st_size),
+                    "sha256": self._file_sha256(data_file),
                     "rows": len(df),
                     "last_index": df.index[-1].isoformat() if len(df) else None,
                 }
@@ -2932,6 +3490,9 @@ class DataLoader:
                 self._source_meta[cache_key] = {
                     "path": str(data_file),
                     "mtime": None,
+                    "mtime_ns": None,
+                    "size": None,
+                    "sha256": None,
                     "rows": len(df),
                     "last_index": df.index[-1].isoformat() if len(df) else None,
                 }
@@ -2942,6 +3503,202 @@ class DataLoader:
         except Exception as e:
             logger.error(f"Error loading {symbol}: {e}")
             return None
+
+    def _native_timeframe_candidates(self, symbol: str, timeframe: str) -> List[Path]:
+        """Return deterministic native-file candidates without using resample caches."""
+        tf = str(timeframe or "").upper()
+        names = [
+            f"{symbol}_{tf}.csv",
+            f"{str(symbol).upper()}_{tf}.csv",
+            f"{str(symbol).lower()}_{tf}.csv",
+        ]
+        candidates: List[Path] = []
+        seen: Set[str] = set()
+        for directory in (self.data_dir / "native", self.data_dir):
+            for name in names:
+                path = directory / name
+                key = str(path.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(path)
+        return candidates
+
+    @staticmethod
+    def _native_sidecar_candidates(data_file: Path) -> List[Path]:
+        return [
+            data_file.with_name(f"{data_file.name}.meta.json"),
+            data_file.with_suffix(".meta.json"),
+            data_file.with_suffix(".json"),
+        ]
+
+    def load_native_timeframe(
+        self,
+        symbol: str,
+        timeframe: str,
+    ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+        """Load one hash-pinned active broker-native timeframe artifact.
+
+        Resolution is fail-closed through ``data/native/ACTIVE.json`` and its
+        immutable activation manifest. An invalid activation never falls back
+        to a flat file. Once file resolution succeeds, a readable frame may be
+        returned with provenance errors for diagnostics; production evidence
+        must still require ``provenance_valid``.
+        """
+        tf = str(timeframe or "").strip().upper()
+        # Native production data is resolved only through one atomic,
+        # hash-pinned activation. Never scan flat files and never silently
+        # substitute an M5-derived artifact here.
+        activation = resolve_active_native_artifact(self.data_dir, symbol, tf)
+        if not activation.valid:
+            return None, {
+                "source_kind": "missing",
+                "symbol": str(symbol),
+                "timeframe": tf,
+                "provenance_valid": False,
+                "provenance_errors": list(
+                    activation.errors or ["NATIVE_ACTIVE_CELL_UNRESOLVED"]
+                ),
+                "activation_id": activation.activation_id,
+                "activation_manifest_path": (
+                    str(activation.activation_manifest_path)
+                    if activation.activation_manifest_path is not None
+                    else None
+                ),
+                "activation_manifest_sha256": activation.activation_manifest_sha256,
+            }
+        activation_identity = (
+            str(activation.activation_id or ""),
+            str(activation.activation_manifest_sha256 or ""),
+        )
+        if self._native_activation_pin is None:
+            self._native_activation_pin = activation_identity
+        elif self._native_activation_pin != activation_identity:
+            return None, {
+                "source_kind": "missing",
+                "symbol": str(symbol),
+                "timeframe": tf,
+                "provenance_valid": False,
+                "provenance_errors": ["NATIVE_ACTIVATION_CHANGED_DURING_LOADER_LIFETIME"],
+                "activation_id": activation.activation_id,
+                "activation_manifest_sha256": activation.activation_manifest_sha256,
+                "pinned_activation_id": self._native_activation_pin[0],
+                "pinned_activation_manifest_sha256": self._native_activation_pin[1],
+            }
+        cache_key = (
+            f"native::{activation.activation_id}:{activation.activation_manifest_sha256}:"
+            f"{symbol}_{tf}"
+        )
+        if cache_key in self._cache:
+            meta = dict(self._source_meta.get(cache_key, {}) or {})
+            return self._cache[cache_key].copy(), meta
+
+        data_file = activation.data_path
+
+        try:
+            raw = pd.read_csv(data_file)
+            frame = self._standardize_columns(raw)
+            frame = self._parse_datetime_index(frame)
+            provenance_errors: List[str] = []
+            if frame.index.has_duplicates:
+                provenance_errors.append("DUPLICATE_TIMESTAMPS")
+            if not frame.index.is_monotonic_increasing:
+                provenance_errors.append("NON_MONOTONIC_TIMESTAMPS")
+            if not self._validate_data(frame, symbol):
+                provenance_errors.append("OHLC_VALIDATION_FAILED")
+            if "_BAR_CLOSE_TS" not in frame.columns:
+                provenance_errors.append("BAR_CLOSE_TS_MISSING")
+            else:
+                declared_closes = pd.DatetimeIndex(
+                    pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+                )
+                frame_opens = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True))
+                if declared_closes.isna().any() or not bool((declared_closes > frame_opens).all()):
+                    provenance_errors.append("BAR_CLOSE_TS_INVALID")
+
+            stat = data_file.stat()
+            digest = self._file_sha256(data_file)
+            sidecar_path = activation.sidecar_path
+            sidecar: Optional[Dict[str, Any]] = None
+            if sidecar_path is not None:
+                try:
+                    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                    sidecar = payload if isinstance(payload, dict) else None
+                    if sidecar is None:
+                        provenance_errors.append("SIDECAR_JSON_NOT_OBJECT")
+                except Exception:
+                    provenance_errors.append("SIDECAR_JSON_INVALID")
+
+            first_ts = frame.index[0] if len(frame) else None
+            last_ts = frame.index[-1] if len(frame) else None
+            provenance_errors.extend(
+                validate_native_provenance(
+                    sidecar,
+                    symbol=symbol,
+                    timeframe=tf,
+                    sha256=digest,
+                    rows=len(frame),
+                    first_ts=first_ts,
+                    last_ts=last_ts,
+                )
+            )
+            # Preserve insertion order while de-duplicating reason codes.
+            provenance_errors = list(dict.fromkeys(provenance_errors))
+            meta: Dict[str, Any] = {
+                "source_kind": "broker_native",
+                "symbol": str(symbol),
+                "timeframe": tf,
+                "path": str(data_file.resolve()),
+                "mtime": stat.st_mtime,
+                "mtime_ns": int(stat.st_mtime_ns),
+                "size": int(stat.st_size),
+                "sha256": digest,
+                "rows": int(len(frame)),
+                "first_index": first_ts.isoformat() if first_ts is not None else None,
+                "last_index": last_ts.isoformat() if last_ts is not None else None,
+                "sidecar_path": str(sidecar_path.resolve()) if sidecar_path is not None else None,
+                "provenance_valid": not provenance_errors,
+                "provenance_errors": provenance_errors,
+                "activation_id": activation.activation_id,
+                "activation_manifest_path": str(activation.activation_manifest_path),
+                "activation_manifest_sha256": activation.activation_manifest_sha256,
+                "activation_entry": dict(activation.entry or {}),
+            }
+            if isinstance(sidecar, dict):
+                if "expected_session_coverage" in sidecar:
+                    meta["expected_session_coverage"] = sidecar.get("expected_session_coverage")
+                if "expected_session_coverage_by_partition" in sidecar:
+                    meta["expected_session_coverage_by_partition"] = sidecar.get(
+                        "expected_session_coverage_by_partition"
+                    )
+                if "observed_session_bars_by_partition" in sidecar:
+                    meta["observed_session_bars_by_partition"] = sidecar.get(
+                        "observed_session_bars_by_partition"
+                    )
+                if "expected_session_bars_by_partition" in sidecar:
+                    meta["expected_session_bars_by_partition"] = sidecar.get(
+                        "expected_session_bars_by_partition"
+                    )
+                if "timestamp_semantics" in sidecar:
+                    meta["timestamp_semantics"] = sidecar.get("timestamp_semantics")
+                if "common_calendar_boundaries" in sidecar:
+                    meta["common_calendar_boundaries"] = sidecar.get(
+                        "common_calendar_boundaries"
+                    )
+                meta["sidecar_schema_version"] = sidecar.get("schema_version")
+
+            self._cache[cache_key] = frame.copy()
+            self._source_meta[cache_key] = dict(meta)
+            return frame.copy(), dict(meta)
+        except Exception as exc:
+            logger.warning(f"{symbol} {tf}: native timeframe load failed: {exc}")
+            return None, {
+                "source_kind": "broker_native",
+                "symbol": str(symbol),
+                "timeframe": tf,
+                "path": str(data_file),
+                "provenance_valid": False,
+                "provenance_errors": [f"NATIVE_LOAD_FAILED:{type(exc).__name__}"],
+            }
 
     def estimate_source_rows(self,
                              timeframe: str,
@@ -3064,6 +3821,10 @@ class DataLoader:
         if 'RealVolume' in df.columns:
             agg_map['RealVolume'] = 'sum'
         resampled = df.resample(resample_rule).agg(agg_map).dropna()
+        source_ts = pd.Series(pd.DatetimeIndex(df.index), index=df.index)
+        source_groups = source_ts.resample(resample_rule)
+        resampled['_SOURCE_FIRST_TS'] = source_groups.first().reindex(resampled.index)
+        resampled['_SOURCE_LAST_TS'] = source_groups.last().reindex(resampled.index)
         
         # Handle Spread if present
         if 'Spread' in df.columns:
@@ -3090,6 +3851,9 @@ class DataLoader:
         return (
             meta.get("schema_version") == self.RESAMPLE_CACHE_SCHEMA_VERSION and
             meta.get("source_mtime") == source_meta.get("mtime") and
+            meta.get("source_mtime_ns") == source_meta.get("mtime_ns") and
+            meta.get("source_size") == source_meta.get("size") and
+            meta.get("source_sha256") == source_meta.get("sha256") and
             meta.get("source_rows") == source_meta.get("rows") and
             meta.get("source_last_index") == source_meta.get("last_index")
         )
@@ -3147,6 +3911,9 @@ class DataLoader:
         meta = {
             "schema_version": self.RESAMPLE_CACHE_SCHEMA_VERSION,
             "source_mtime": source_meta.get("mtime"),
+            "source_mtime_ns": source_meta.get("mtime_ns"),
+            "source_size": source_meta.get("size"),
+            "source_sha256": source_meta.get("sha256"),
             "source_rows": source_meta.get("rows"),
             "source_last_index": source_meta.get("last_index"),
         }
@@ -4634,7 +5401,7 @@ class DataSplitter:
 
     The overlap window is warmup-only and is never scored.
     """
-    SPLIT_CONTRACT_VERSION = "2026-06-09-bleeding-edge-production-split"
+    SPLIT_CONTRACT_VERSION = "2026-07-10-chronological-lockbox-v1"
     
     def __init__(self, config: PipelineConfig):
         """
@@ -4656,13 +5423,33 @@ class DataSplitter:
         selection uses the newest `active_stage2_pct` percent of the active
         universe with warmup context.
         """
+        split_mode = str(
+            getattr(self.config, "production_split_mode", CALENDAR_SPLIT_MODE)
+            or CALENDAR_SPLIT_MODE
+        ).lower()
+        if split_mode == CALENDAR_SPLIT_MODE:
+            raise ValueError(
+                "calendar_lockbox_v2 requires timestamp boundaries; "
+                "use build_calendar_boundaries instead of integer M5 geometry"
+            )
         n = max(0, int(n))
         if n <= 0:
-            return {
+            zero_keys = {
                 "workflow_window": (0, 0),
                 "historical_stress_audit": (0, 0),
                 "active_universe": (0, 0),
                 "base_selection": (0, 0),
+                "optimizer_train": (0, 0),
+                "optimizer_train_warmup": (0, 0),
+                "optimizer_train_with_warmup": (0, 0),
+                "embargo_train_validation": (0, 0),
+                "tuning_validation": (0, 0),
+                "tuning_validation_warmup": (0, 0),
+                "tuning_validation_with_warmup": (0, 0),
+                "embargo_validation_lockbox": (0, 0),
+                "final_lockbox": (0, 0),
+                "final_lockbox_warmup": (0, 0),
+                "final_lockbox_with_warmup": (0, 0),
                 "walk_forward_validation": (0, 0),
                 "optimization_train": (0, 0),
                 "optimization_train_with_warmup": (0, 0),
@@ -4673,6 +5460,7 @@ class DataSplitter:
                 "clean_holdout": (0, 0),
                 "clean_holdout_with_warmup": (0, 0),
             }
+            return zero_keys
 
         max_bars = max(1, int(getattr(self.config, "max_bars", 300000)))
         active_bars = max(1, int(getattr(self.config, "active_universe_bars", 250000)))
@@ -4700,7 +5488,57 @@ class DataSplitter:
 
         warmup_bars = int(active_size * (float(getattr(self.config, "overlap_pct", 0.0)) / 100.0))
         stage2_warmup_start = max(active_start, stage2_start - max(0, warmup_bars))
-        split_mode = str(getattr(self.config, "production_split_mode", "bleeding_edge") or "bleeding_edge").lower()
+        split_mode = str(
+            getattr(self.config, "production_split_mode", "chronological_lockbox_v1")
+            or "chronological_lockbox_v1"
+        ).lower()
+        if split_mode == "chronological_lockbox_v1":
+            tuning_bars = max(1, int(getattr(self.config, "tuning_validation_bars", 50000) or 50000))
+            lockbox_bars = max(1, int(getattr(self.config, "final_lockbox_bars", 50000) or 50000))
+            split_embargo = max(0, int(getattr(self.config, "split_embargo_bars", 300) or 0))
+
+            lockbox_end = active_end
+            lockbox_start = lockbox_end - lockbox_bars
+            validation_end = lockbox_start - split_embargo
+            validation_start = validation_end - tuning_bars
+            optimizer_train_end = validation_start - split_embargo
+            if optimizer_train_end <= active_start:
+                required = tuning_bars + lockbox_bars + (2 * split_embargo) + 1
+                raise ValueError(
+                    "chronological_lockbox_v1 requires at least one optimizer-train row: "
+                    f"active_size={active_size}, required={required} "
+                    f"(tuning={tuning_bars}, lockbox={lockbox_bars}, embargo={split_embargo})"
+                )
+
+            validation_warmup_start = max(active_start, validation_start - max(0, warmup_bars))
+            lockbox_warmup_start = max(active_start, lockbox_start - max(0, warmup_bars))
+            return {
+                "workflow_window": (workflow_start, workflow_end),
+                "historical_stress_audit": (audit_start, audit_end),
+                "active_universe": (active_start, active_end),
+                "base_selection": (active_start, active_end),
+                "optimizer_train": (active_start, optimizer_train_end),
+                "optimizer_train_warmup": (active_start, active_start),
+                "optimizer_train_with_warmup": (active_start, optimizer_train_end),
+                "embargo_train_validation": (optimizer_train_end, validation_start),
+                "tuning_validation": (validation_start, validation_end),
+                "tuning_validation_warmup": (validation_warmup_start, validation_start),
+                "tuning_validation_with_warmup": (validation_warmup_start, validation_end),
+                "embargo_validation_lockbox": (validation_end, lockbox_start),
+                "final_lockbox": (lockbox_start, lockbox_end),
+                "final_lockbox_warmup": (lockbox_warmup_start, lockbox_start),
+                "final_lockbox_with_warmup": (lockbox_warmup_start, lockbox_end),
+                # Compatibility aliases. New code should use the canonical keys.
+                "optimization_train": (active_start, optimizer_train_end),
+                "optimization_train_with_warmup": (active_start, optimizer_train_end),
+                "walk_forward_validation": (validation_start, validation_end),
+                "stage2_selection": (validation_start, validation_end),
+                "stage2_selection_with_warmup": (validation_warmup_start, validation_end),
+                "stage2_training_selection": (validation_start, validation_end),
+                "stage2_training_selection_with_warmup": (validation_warmup_start, validation_end),
+                "clean_holdout": (lockbox_start, lockbox_end),
+                "clean_holdout_with_warmup": (lockbox_warmup_start, lockbox_end),
+            }
         if split_mode == "bleeding_edge":
             walk_forward_bars = max(0, int(getattr(self.config, "walk_forward_validation_bars", 50000) or 0))
             walk_forward_end = max(active_start, stage2_start - embargo_bars)
@@ -4710,6 +5548,14 @@ class DataSplitter:
                 "historical_stress_audit": (audit_start, audit_end),
                 "active_universe": (active_start, active_end),
                 "base_selection": (active_start, active_end),
+                "optimizer_train": (stage2_start, stage2_end),
+                "optimizer_train_with_warmup": (stage2_warmup_start, stage2_end),
+                "tuning_validation": (walk_forward_start, walk_forward_end),
+                "tuning_validation_with_warmup": (walk_forward_start, walk_forward_end),
+                "final_lockbox": (stage2_end, stage2_end),
+                "final_lockbox_with_warmup": (stage2_end, stage2_end),
+                "embargo_train_validation": (walk_forward_end, stage2_start),
+                "embargo_validation_lockbox": (stage2_end, stage2_end),
                 "walk_forward_validation": (walk_forward_start, walk_forward_end),
                 "optimization_train": (stage2_start, stage2_end),
                 "optimization_train_with_warmup": (stage2_warmup_start, stage2_end),
@@ -4746,6 +5592,21 @@ class DataSplitter:
             "historical_stress_audit": (audit_start, audit_end),
             "active_universe": (active_start, active_end),
             "base_selection": (active_start, active_end),
+            "optimizer_train": (active_start, optimization_train_end),
+            "optimizer_train_with_warmup": (active_start, optimization_train_end),
+            "tuning_validation": (stage2_start, stage2_train_end),
+            "tuning_validation_with_warmup": (stage2_warmup_start, stage2_train_end),
+            "final_lockbox": (
+                (clean_holdout_start, stage2_end) if clean_holdout_size > 0 else (stage2_end, stage2_end)
+            ),
+            "final_lockbox_with_warmup": (
+                (clean_holdout_warmup_start, stage2_end) if clean_holdout_size > 0 else (stage2_end, stage2_end)
+            ),
+            "embargo_train_validation": (stage2_train_end, stage2_train_end),
+            "embargo_validation_lockbox": (
+                (stage2_train_end, clean_holdout_start) if clean_holdout_size > 0
+                else (stage2_end, stage2_end)
+            ),
             "walk_forward_validation": (stage2_start, stage2_train_end),
             "optimization_train": (active_start, optimization_train_end),
             "optimization_train_with_warmup": (active_start, optimization_train_end),
@@ -5146,13 +6007,20 @@ class Backtester:
                             f"sl={sl_pips}, tp={tp_pips}"
                         )
 
-                    # Entry price: Open of ENTRY bar (i) + spread
+                    # Entry price: Open of ENTRY bar (i), plus spread and an
+                    # adverse market-entry slippage allowance.
                     open_price = open_arr[i]
                     entry_half_spread = entry_half_spread_arr[i] if i < len(entry_half_spread_arr) else 0.0
                     if self.config.use_spread:
                         entry_price = open_price + entry_half_spread if is_long else open_price - entry_half_spread
                     else:
                         entry_price = open_price
+                    if self.config.use_slippage:
+                        entry_price = (
+                            entry_price + slippage_price
+                            if is_long
+                            else entry_price - slippage_price
+                        )
 
                     # Set SL/TP prices
                     if direction == 1:
@@ -5178,7 +6046,11 @@ class Backtester:
                 trade_directions, trade_entry_prices, trade_exit_prices,
                 trade_sl_prices, trade_tp_prices, trade_sizes,
                 trade_pnl_dollars, trade_pnl_pips, trade_exit_reasons,
-                trade_risk_amounts, equity_curve, final_equity, max_drawdown
+                trade_risk_amounts, equity_curve, final_equity, max_drawdown,
+                trade_mae_pips, trade_mfe_pips, trade_mae_r, trade_mfe_r,
+                trade_time_to_mae_bars, trade_time_to_mfe_bars,
+                trade_time_underwater_bars, trade_entry_to_stop_pips,
+                trade_entry_to_target_pips
             ) = _backtest_loop_numba(
                 open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
@@ -5222,6 +6094,16 @@ class Backtester:
                     'exit_reason': exit_reason_map.get(trade_exit_reasons[j], "unknown"),
                     'risk_amount': round(trade_risk_amounts[j], 2),
                     'r_multiple': round(r_multiple, 3),
+                    'trade_record_schema_version': BACKTEST_TRADE_RECORD_SCHEMA_VERSION,
+                    'mae_pips': round(float(trade_mae_pips[j]), 2),
+                    'mfe_pips': round(float(trade_mfe_pips[j]), 2),
+                    'mae_r': round(float(trade_mae_r[j]), 3),
+                    'mfe_r': round(float(trade_mfe_r[j]), 3),
+                    'time_to_mae_bars': int(trade_time_to_mae_bars[j]),
+                    'time_to_mfe_bars': int(trade_time_to_mfe_bars[j]),
+                    'time_underwater_bars': int(trade_time_underwater_bars[j]),
+                    'entry_to_stop_pips': round(float(trade_entry_to_stop_pips[j]), 2),
+                    'entry_to_target_pips': round(float(trade_entry_to_target_pips[j]), 2),
                 })
             
             equity_curve = equity_curve.tolist()
@@ -5288,25 +6170,38 @@ class Backtester:
     def _swap_rollover_units(self,
                              trade: Dict[str, Any],
                              features: Optional[pd.DataFrame],
-                             timeframe: str = "") -> int:
+                             timeframe: str = "",
+                             spec: Optional[InstrumentSpec] = None) -> int:
         """Count broker rollover units for one closed trade."""
         try:
             entry_time = pd.Timestamp(trade.get("entry_time"))
             exit_time = pd.Timestamp(trade.get("exit_time"))
             if pd.notna(entry_time) and pd.notna(exit_time) and exit_time > entry_time:
-                holding_hours = (exit_time - entry_time).total_seconds() / 3600.0
-                min_hours = float(getattr(self.config, "swap_model_min_holding_hours", 20.0) or 0.0)
-                if holding_hours < min_hours:
-                    return 0
                 rollover_day = _WEEKDAY_NAME_TO_INDEX.get(
                     str(getattr(self.config, "swap_model_triple_rollover_day", "wednesday")).lower(),
                     2,
                 )
+                if spec is not None:
+                    try:
+                        mt5_rollover_day = int(
+                            getattr(spec, "swap_rollover3days", -1)
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        mt5_rollover_day = -1
+                    if 0 <= mt5_rollover_day <= 6:
+                        # MT5: Sunday=0 ... Saturday=6. pandas/Python:
+                        # Monday=0 ... Sunday=6.
+                        rollover_day = (mt5_rollover_day - 1) % 7
                 units = 0
+                # A short trade can still incur swap when it crosses a broker
+                # rollover boundary. Count observed calendar crossings instead
+                # of suppressing every holding shorter than an arbitrary floor.
                 cursor = (entry_time.normalize() + pd.Timedelta(days=1))
                 end_day = exit_time.normalize()
                 while cursor <= end_day:
-                    units += 3 if int(cursor.weekday()) == rollover_day else 1
+                    weekday = int(cursor.weekday())
+                    if weekday < 5:
+                        units += 3 if weekday == rollover_day else 1
                     cursor += pd.Timedelta(days=1)
                 return max(0, units)
         except Exception as exc:
@@ -5337,7 +6232,12 @@ class Backtester:
         return max(0, int(math.floor(bars_held / max(1, bars_per_day))))
 
     @staticmethod
-    def _swap_value_per_lot_dollars(spec: InstrumentSpec, raw_swap: float) -> float:
+    def _swap_value_per_lot_dollars(
+        spec: InstrumentSpec,
+        raw_swap: float,
+        *,
+        entry_price: Optional[float] = None,
+    ) -> float:
         """Convert configured/MT5 swap value to account-currency dollars per lot."""
         try:
             swap_value = float(raw_swap or 0.0)
@@ -5357,7 +6257,27 @@ class Backtester:
             point = float(getattr(spec, "point", 0.0) or 0.0)
             if tick_size > 0.0 and tick_value > 0.0 and point > 0.0:
                 return swap_value * (point / tick_size) * tick_value
+            if swap_value:
+                raise ValueError("swap mode 1 requires positive point/tick geometry")
             return 0.0
+        if mode == 6:
+            # SYMBOL_SWAP_MODE_INTEREST_OPEN: annual percentage of the
+            # position's opening notional on a 360-day bank year.
+            try:
+                price = float(entry_price)
+                contract_size = float(getattr(spec, "contract_size", 0.0) or 0.0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("swap mode 6 requires entry price and contract size") from exc
+            if not (
+                math.isfinite(price)
+                and price > 0.0
+                and math.isfinite(contract_size)
+                and contract_size > 0.0
+            ):
+                raise ValueError("swap mode 6 requires entry price and contract size")
+            return price * contract_size * (swap_value / 100.0) / 360.0
+        if swap_value:
+            raise ValueError(f"unsupported nonzero MT5 swap mode {mode}")
         return 0.0
 
     def _apply_swap_model(self,
@@ -5378,17 +6298,23 @@ class Backtester:
         adjustments_by_exit_bar: Dict[int, float] = {}
         total_swap = 0.0
         for trade in trades:
-            units = self._swap_rollover_units(trade, features, timeframe=timeframe)
+            units = self._swap_rollover_units(
+                trade, features, timeframe=timeframe, spec=spec
+            )
             if units <= 0:
                 trade["swap_rollover_units"] = 0
                 trade["swap_dollars"] = 0.0
                 continue
             volume = float(trade.get("position_size", trade.get("size", 0.0)) or 0.0)
             raw_daily_swap = float(spec.swap_long if self._trade_is_long(trade) else spec.swap_short)
-            daily_swap = self._swap_value_per_lot_dollars(spec, raw_daily_swap)
+            daily_swap = self._swap_value_per_lot_dollars(
+                spec,
+                raw_daily_swap,
+                entry_price=trade.get("entry_price"),
+            )
             swap_dollars = daily_swap * volume * units
             if not math.isfinite(swap_dollars):
-                swap_dollars = 0.0
+                raise ValueError("nonfinite modeled swap cashflow")
             gross_pnl = float(trade.get("pnl_dollars", 0.0) or 0.0)
             trade.setdefault("gross_pnl_dollars", round(gross_pnl, 2))
             trade["swap_rollover_units"] = int(units)
@@ -5458,6 +6384,13 @@ class Backtester:
         initial_take_profit = 0.0
         highest_since_entry = 0.0
         lowest_since_entry = 0.0
+        entry_to_stop_pips = 0.0
+        entry_to_target_pips = 0.0
+        mae_pips_current = 0.0
+        mfe_pips_current = 0.0
+        time_to_mae_bars_current = 0
+        time_to_mfe_bars_current = 0
+        time_underwater_bars_current = 0
         governance_tp_released = False
         governance_partial_taken = False
         entry_regime_label = ""
@@ -5465,6 +6398,51 @@ class Backtester:
             governance_policy.get("name", "control_fixed")
             if isinstance(governance_policy, dict) else "control_fixed"
         )
+        pip_size_value = float(getattr(spec, "pip_size", 0.0) or 0.0)
+
+        def _update_excursion(direction: int,
+                              entry: float,
+                              bars_held: int,
+                              mae_pips: float,
+                              mfe_pips: float,
+                              time_to_mae: int,
+                              time_to_mfe: int,
+                              underwater_bars: int) -> Tuple[float, float, int, int, int]:
+            if pip_size_value <= 0.0:
+                return mae_pips, mfe_pips, time_to_mae, time_to_mfe, underwater_bars
+            if direction == 1:
+                adverse_pips = (entry - bid_low) / pip_size_value
+                favorable_pips = (bid_high - entry) / pip_size_value
+                close_mark_pips = (bid_close - entry) / pip_size_value
+            else:
+                adverse_pips = (ask_high - entry) / pip_size_value
+                favorable_pips = (entry - ask_low) / pip_size_value
+                close_mark_pips = (entry - ask_close) / pip_size_value
+            if adverse_pips > mae_pips:
+                mae_pips = adverse_pips
+                time_to_mae = bars_held
+            if favorable_pips > mfe_pips:
+                mfe_pips = favorable_pips
+                time_to_mfe = bars_held
+            if close_mark_pips < 0.0:
+                underwater_bars += 1
+            return mae_pips, mfe_pips, time_to_mae, time_to_mfe, underwater_bars
+
+        def _excursion_payload() -> Dict[str, Any]:
+            mae_r = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+            mfe_r = mfe_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
+            return {
+                'trade_record_schema_version': BACKTEST_TRADE_RECORD_SCHEMA_VERSION,
+                'mae_pips': round(float(mae_pips_current), 2),
+                'mfe_pips': round(float(mfe_pips_current), 2),
+                'mae_r': round(float(mae_r), 3),
+                'mfe_r': round(float(mfe_r), 3),
+                'time_to_mae_bars': int(time_to_mae_bars_current),
+                'time_to_mfe_bars': int(time_to_mfe_bars_current),
+                'time_underwater_bars': int(time_underwater_bars_current),
+                'entry_to_stop_pips': round(float(entry_to_stop_pips), 2),
+                'entry_to_target_pips': round(float(entry_to_target_pips), 2),
+            }
 
         n_bars = len(features)
         
@@ -5600,6 +6578,7 @@ class Backtester:
                                     'exit_reason': 'governance_partial',
                                     'risk_amount': round(partial_risk, 2),
                                     'r_multiple': round(partial_pnl / partial_risk, 3) if partial_risk > 0 else 0.0,
+                                    **_excursion_payload(),
                                     'governance_policy': active_governance_name,
                                     'tp_released': governance_tp_released,
                                 })
@@ -5616,6 +6595,24 @@ class Backtester:
                             governance_exit_reason = 'governance_exit'
                 exit_price = governance_exit_price
                 exit_reason = governance_exit_reason
+
+                if exit_price is None:
+                    (
+                        mae_pips_current,
+                        mfe_pips_current,
+                        time_to_mae_bars_current,
+                        time_to_mfe_bars_current,
+                        time_underwater_bars_current,
+                    ) = _update_excursion(
+                        position_direction,
+                        entry_price,
+                        max(0, i - entry_bar),
+                        mae_pips_current,
+                        mfe_pips_current,
+                        time_to_mae_bars_current,
+                        time_to_mfe_bars_current,
+                        time_underwater_bars_current,
+                    )
                 
                 if exit_price is None and position_direction == 1:  # Long position
                     if bid_open <= stop_loss:
@@ -5679,6 +6676,7 @@ class Backtester:
                         'exit_reason': exit_reason,
                         'risk_amount': round(risk_amount_at_entry, 2),
                         'r_multiple': round(r_multiple, 3),
+                        **_excursion_payload(),
                         'governance_policy': active_governance_name,
                         'tp_released': governance_tp_released,
                     })
@@ -5722,6 +6720,17 @@ class Backtester:
                             initial_take_profit = take_profit_candidate
                             highest_since_entry = float(high_price)
                             lowest_since_entry = float(low_price)
+                            if pip_size_value > 0.0:
+                                entry_to_stop_pips = abs(entry_price - stop_loss) / pip_size_value
+                                entry_to_target_pips = abs(take_profit - entry_price) / pip_size_value
+                            else:
+                                entry_to_stop_pips = 0.0
+                                entry_to_target_pips = 0.0
+                            mae_pips_current = 0.0
+                            mfe_pips_current = 0.0
+                            time_to_mae_bars_current = 0
+                            time_to_mfe_bars_current = 0
+                            time_underwater_bars_current = 0
                             governance_tp_released = False
                             governance_partial_taken = False
                             entry_regime_label = ""
@@ -5740,6 +6749,23 @@ class Backtester:
                                     entry_regime_label = str(features[regime_col].iat[signal_bar])
                                 except Exception:
                                     entry_regime_label = ""
+
+                            (
+                                mae_pips_current,
+                                mfe_pips_current,
+                                time_to_mae_bars_current,
+                                time_to_mfe_bars_current,
+                                time_underwater_bars_current,
+                            ) = _update_excursion(
+                                position_direction,
+                                entry_price,
+                                0,
+                                mae_pips_current,
+                                mfe_pips_current,
+                                time_to_mae_bars_current,
+                                time_to_mfe_bars_current,
+                                time_underwater_bars_current,
+                            )
 
                             # Same-bar exit: check gap-through at open FIRST, then intra-bar
                             exit_price = None
@@ -5795,6 +6821,7 @@ class Backtester:
                                     'exit_reason': exit_reason,
                                     'risk_amount': round(risk_amount_at_entry, 2),
                                     'r_multiple': round(r_multiple, 3),
+                                    **_excursion_payload(),
                                     'governance_policy': active_governance_name,
                                     'tp_released': governance_tp_released,
                                 })
@@ -5858,6 +6885,7 @@ class Backtester:
                 'exit_reason': TradeStatus.CLOSED_EOD.value,
                 'risk_amount': round(risk_amount_at_entry, 2),
                 'r_multiple': round(r_multiple, 3),
+                **_excursion_payload(),
                 'governance_policy': active_governance_name,
                 'tp_released': governance_tp_released,
             })
@@ -5921,7 +6949,7 @@ class Backtester:
         win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
         
         # Profit factor
-        profit_factor = win_pnl / loss_pnl if loss_pnl > 0 else (float('inf') if win_pnl > 0 else 0.0)
+        profit_factor = profit_factor_from_gross(win_pnl, loss_pnl)
         
         # Average trade metrics
         avg_win_pips = sum(t['pnl_pips'] for t in wins) / len(wins) if wins else 0
@@ -5944,6 +6972,8 @@ class Backtester:
         # ================================================================
         sharpe = 0.0
         sortino = 0.0
+        bars_per_year = self._TF_BARS_PER_YEAR.get(timeframe, 0)
+        risk_return_periods = 0
         std_weekly_return = 0.0  # findings.html §C4: variance/stability penalty input
 
         # Need at least 3 equity points to get 2 returns for meaningful std calculation
@@ -5955,6 +6985,7 @@ class Backtester:
                 equity_arr = equity_arr[risk_start:]
             # Per-bar returns (percentage)
             bar_returns = np.diff(equity_arr) / np.where(equity_arr[:-1] != 0, equity_arr[:-1], 1.0)
+            risk_return_periods = int(len(bar_returns))
             
             # Determine annualization factor based on timeframe
             # Priority: explicit timeframe string → data inference → H1 default
@@ -6000,6 +7031,9 @@ class Backtester:
 
             # Weekly-return std for stability penalty (findings.html §C4).
             # Sample equity at ~weekly intervals; need ≥3 weekly samples for ddof=1 std.
+            if len(bar_returns) >= 2:
+                sharpe, sortino = sharpe_sortino_from_returns(bar_returns, bars_per_year)
+
             bars_per_week = max(1, int(round(bars_per_year / 52.0)))
             if len(equity_arr) >= 3 * bars_per_week:
                 weekly_idxs = np.arange(0, len(equity_arr), bars_per_week)
@@ -6056,9 +7090,14 @@ class Backtester:
             std_r = se_r = edge_t_stat_r = 0.0
             r_downside_deviation = r_block_downside_deviation = r_block_cvar = 0.0
         
-        # Calmar ratio
-        total_return_pct = (final_equity - self.config.initial_capital) / self.config.initial_capital * 100
-        calmar = total_return_pct / max_dd if max_dd > 0 else 0
+        drawdown_metrics = return_drawdown_metrics(
+            initial_equity=self.config.initial_capital,
+            final_equity=final_equity,
+            max_drawdown_pct=max_dd,
+            periods=risk_return_periods,
+            periods_per_year=bars_per_year,
+        )
+        total_return_pct = drawdown_metrics["total_return_pct"]
         
         # Consecutive wins/losses
         max_consec_wins = self._max_consecutive(trades, win=True)
@@ -6099,7 +7138,7 @@ class Backtester:
             'total_return_pct': round(total_return_pct, 2),
             'gross_profit': round(win_pnl, 2),
             'gross_loss': round(loss_pnl, 2),
-            'profit_factor': round(profit_factor, 2) if math.isfinite(profit_factor) else profit_factor,
+            'profit_factor': round_metric(profit_factor, 2),
             
             # Average trade metrics
             'avg_win_pips': round(avg_win_pips, 2),
@@ -6113,8 +7152,13 @@ class Backtester:
             'max_drawdown_pct': round(max_dd, 2),
             'expectancy_pips': round(expectancy, 2),
             'sharpe_ratio': round(sharpe, 2),
-            'sortino_ratio': round(sortino, 2) if math.isfinite(sortino) else sortino,
-            'calmar_ratio': round(calmar, 2),
+            'sortino_ratio': round_metric(sortino, 2),
+            'calmar_ratio': round_metric(drawdown_metrics["calmar_ratio"], 2),
+            'return_drawdown_ratio': round_metric(drawdown_metrics["return_drawdown_ratio"], 2),
+            'calmar_ratio_annualized': round_metric(drawdown_metrics["calmar_ratio_annualized"], 2),
+            'annualized_return_pct': round_metric(drawdown_metrics["annualized_return_pct"], 2),
+            'calmar_ratio_basis': drawdown_metrics["calmar_ratio_basis"],
+            'metric_contract_version': METRIC_CONTRACT_VERSION,
             'std_weekly_return': round(std_weekly_return, 6),
             
             # R-Multiple metrics (risk-normalized)
@@ -6260,6 +7304,11 @@ class Backtester:
             'sharpe_ratio': 0,
             'sortino_ratio': 0,
             'calmar_ratio': 0,
+            'return_drawdown_ratio': 0,
+            'calmar_ratio_annualized': 0,
+            'annualized_return_pct': 0,
+            'calmar_ratio_basis': "cumulative_return_pct_over_max_drawdown_pct",
+            'metric_contract_version': METRIC_CONTRACT_VERSION,
             'std_weekly_return': 0.0,
             'r_count': 0,
             'mean_r': 0,

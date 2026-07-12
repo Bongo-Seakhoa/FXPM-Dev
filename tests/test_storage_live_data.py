@@ -277,6 +277,8 @@ class StorageLiveDataTests(unittest.TestCase):
         delta = self._make_bars(start="2026-01-01 00:35:00", periods=6, freq="5min", price_start=1.2000)
 
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="bleeding_edge",
             data_dir=self.data_dir,
             output_dir=self.output_dir,
             log_dir=self.log_dir,

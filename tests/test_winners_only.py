@@ -57,6 +57,12 @@ def make_features():
     )
 
 
+def promoted_regime_config(**kwargs):
+    """Create an explicitly funded-eligible cell for live-selection unit tests."""
+    kwargs["promotion_status"] = "PROMOTED"
+    return RegimeConfig(**kwargs)
+
+
 class WinnersOnlyTests(unittest.TestCase):
     @patch("pm_main.FeatureComputer.compute_all")
     @patch("pm_strategies.StrategyRegistry.get")
@@ -64,7 +70,7 @@ class WinnersOnlyTests(unittest.TestCase):
         mock_get.return_value = DummyStrategy()
         mock_compute.return_value = make_features()
 
-        valid_cfg = RegimeConfig(
+        valid_cfg = promoted_regime_config(
             strategy_name="TrendStrategy",
             parameters={},
             quality_score=0.8,
@@ -94,14 +100,14 @@ class WinnersOnlyTests(unittest.TestCase):
         mock_get.return_value = DummyStrategy()
         mock_compute.return_value = make_features()
 
-        bad_cfg = RegimeConfig(
+        bad_cfg = promoted_regime_config(
             strategy_name="BadStrategy",
             parameters={},
             quality_score=0.5,
             train_metrics={},
             val_metrics={"profit_factor": 0.5, "total_return_pct": -5.0, "max_drawdown_pct": 50.0},
         )
-        default_cfg = RegimeConfig(
+        default_cfg = promoted_regime_config(
             strategy_name="DefaultStrategy",
             parameters={},
             quality_score=0.9,
@@ -125,7 +131,7 @@ class WinnersOnlyTests(unittest.TestCase):
     @patch("pm_main.FeatureComputer.compute_all")
     @patch("pm_strategies.StrategyRegistry.get")
     def test_winners_only_skips_stale_timeframe_before_bar_load(self, mock_get, mock_compute):
-        valid_cfg = RegimeConfig(
+        valid_cfg = promoted_regime_config(
             strategy_name="TrendStrategy",
             parameters={},
             quality_score=0.8,
@@ -157,7 +163,7 @@ class WinnersOnlyTests(unittest.TestCase):
         mock_get.return_value = DummyStrategy()
         mock_compute.return_value = make_features()
 
-        valid_cfg = RegimeConfig(
+        valid_cfg = promoted_regime_config(
             strategy_name="TrendStrategy",
             parameters={},
             quality_score=0.0,
@@ -184,7 +190,7 @@ class WinnersOnlyTests(unittest.TestCase):
         mock_get.return_value = DummyStrategy()
         mock_compute.return_value = make_features()
 
-        valid_cfg = RegimeConfig(
+        valid_cfg = promoted_regime_config(
             strategy_name="TrendStrategy",
             parameters={},
             quality_score=0.8,
@@ -227,7 +233,7 @@ class WinnersOnlyTests(unittest.TestCase):
     @patch("pm_main.FeatureComputer.compute_all")
     @patch("pm_strategies.StrategyRegistry.get")
     def test_live_strict_regime_params_turn_missing_detector_row_into_no_trade(self, mock_get, mock_compute):
-        valid_cfg = RegimeConfig(
+        valid_cfg = promoted_regime_config(
             strategy_name="TrendStrategy",
             parameters={},
             quality_score=0.8,

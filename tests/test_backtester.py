@@ -156,6 +156,103 @@ class BacktesterTests(unittest.TestCase):
         self.assertEqual(max_dd, 0.0)
         self.assertTrue(np.all(equity_curve == 10000.0))
 
+    def test_trade_excursion_fields_match_python_and_numba(self):
+        cfg = PipelineConfig(
+            initial_capital=10000.0,
+            use_spread=False,
+            use_slippage=False,
+            use_commission=False,
+        )
+        bt = Backtester(cfg)
+        index = pd.date_range("2024-01-01", periods=5, freq="h")
+        features = pd.DataFrame({
+            "Open": [1.1000, 1.1000, 1.1000, 1.1000, 1.1010],
+            "High": [1.1000, 1.1005, 1.1008, 1.1010, 1.1010],
+            "Low": [1.1000, 1.0996, 1.0997, 1.1000, 1.1010],
+            "Close": [1.1000, 1.0998, 1.1002, 1.1010, 1.1010],
+            "Volume": [100] * 5,
+        }, index=index)
+        open_arr = features["Open"].to_numpy(dtype=np.float64)
+        high_arr = features["High"].to_numpy(dtype=np.float64)
+        low_arr = features["Low"].to_numpy(dtype=np.float64)
+        close_arr = features["Close"].to_numpy(dtype=np.float64)
+        sig_arr = np.zeros(5, dtype=np.int32)
+        sig_arr[0] = 1
+        entry_prices = np.full(5, np.nan, dtype=np.float64)
+        sl_prices = np.full(5, np.nan, dtype=np.float64)
+        tp_prices = np.full(5, np.nan, dtype=np.float64)
+        entry_prices[1] = 1.1000
+        sl_prices[1] = 1.0990
+        tp_prices[1] = 1.1010
+        spec = InstrumentSpec(symbol="EURUSD", pip_position=4, pip_value=10.0, spread_avg=0.0)
+
+        trades, *_ = bt._run_python_loop(
+            features,
+            open_arr,
+            high_arr,
+            low_arr,
+            close_arr,
+            sig_arr,
+            sl_prices,
+            tp_prices,
+            entry_prices,
+            np.zeros(5, dtype=np.float64),
+            0.0,
+            spec,
+        )
+
+        self.assertEqual(len(trades), 1)
+        py_trade = trades[0]
+        self.assertEqual(py_trade["trade_record_schema_version"], pm_core.BACKTEST_TRADE_RECORD_SCHEMA_VERSION)
+        self.assertAlmostEqual(py_trade["mae_pips"], 4.0, places=2)
+        self.assertAlmostEqual(py_trade["mfe_pips"], 10.0, places=2)
+        self.assertAlmostEqual(py_trade["mae_r"], 0.4, places=3)
+        self.assertAlmostEqual(py_trade["mfe_r"], 1.0, places=3)
+        self.assertEqual(py_trade["time_to_mae_bars"], 0)
+        self.assertEqual(py_trade["time_to_mfe_bars"], 2)
+        self.assertEqual(py_trade["time_underwater_bars"], 1)
+        self.assertAlmostEqual(py_trade["entry_to_stop_pips"], 10.0, places=2)
+        self.assertAlmostEqual(py_trade["entry_to_target_pips"], 10.0, places=2)
+
+        if not pm_core.NUMBA_AVAILABLE:
+            return
+        result = pm_core._backtest_loop_numba(
+            open_arr,
+            high_arr,
+            low_arr,
+            close_arr,
+            sig_arr,
+            sl_prices,
+            tp_prices,
+            entry_prices,
+            10000.0,
+            1.0,
+            np.zeros(5, dtype=np.float64),
+            0.0,
+            False,
+            False,
+            False,
+            0.0,
+            0.00001,
+            1.0,
+            0.0001,
+            10.0,
+            0.01,
+            100.0,
+            0.01,
+            0,
+        )
+        self.assertEqual(len(result[0]), 1)
+        self.assertAlmostEqual(float(result[16][0]), 4.0, places=2)
+        self.assertAlmostEqual(float(result[17][0]), 10.0, places=2)
+        self.assertAlmostEqual(float(result[18][0]), 0.4, places=3)
+        self.assertAlmostEqual(float(result[19][0]), 1.0, places=3)
+        self.assertEqual(int(result[20][0]), 0)
+        self.assertEqual(int(result[21][0]), 2)
+        self.assertEqual(int(result[22][0]), 1)
+        self.assertAlmostEqual(float(result[23][0]), 10.0, places=2)
+        self.assertAlmostEqual(float(result[24][0]), 10.0, places=2)
+
     def test_warmup_prefix_is_excluded_from_bar_return_risk_metrics(self):
         cfg = PipelineConfig(initial_capital=100.0)
         bt = Backtester(cfg)
@@ -288,6 +385,7 @@ class BacktesterTests(unittest.TestCase):
         t0 = trades[0]
         self.assertEqual(t0["signal_bar"], 0)
         self.assertEqual(t0["entry_bar"], 1)
+        self.assertEqual(t0["trade_record_schema_version"], pm_core.BACKTEST_TRADE_RECORD_SCHEMA_VERSION)
         # Ensure entry_time is after signal_time
         self.assertTrue(t0["entry_time"] > t0["signal_time"])
 

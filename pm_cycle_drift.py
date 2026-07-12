@@ -39,6 +39,7 @@ class _ContextState:
     last_spread_degradation_mult: float = 0.0
     max_spread_degradation_mult: float = 0.0
     last_evaluated_at: str = ""
+    processed_event_ids: List[str] = field(default_factory=list)
 
 
 class CycleDriftMonitor:
@@ -54,6 +55,7 @@ class CycleDriftMonitor:
                 log_dir = Path("logs")
             state_path = log_dir / "cycle_drift_state.json"
         self.state_path = Path(state_path)
+        self._persistence_error = ""
         self._state: Dict[Tuple[str, str, str, str], _ContextState] = self._load_state()
 
     @staticmethod
@@ -93,10 +95,14 @@ class CycleDriftMonitor:
                                 raw_state.get("max_spread_degradation_mult", 0.0) or 0.0
                             ),
                             last_evaluated_at=str(raw_state.get("last_evaluated_at", "") or ""),
+                            processed_event_ids=[
+                                str(value) for value in raw_state.get("processed_event_ids", []) or []
+                                if str(value)
+                            ][-10000:],
                         )
                     return state
-        except Exception:
-            pass
+        except Exception as exc:
+            self._persistence_error = f"cycle drift state load failed: {type(exc).__name__}: {exc}"
         return {}
 
     def _save_state(self) -> None:
@@ -112,12 +118,16 @@ class CycleDriftMonitor:
                     "last_spread_degradation_mult": value.last_spread_degradation_mult,
                     "max_spread_degradation_mult": value.max_spread_degradation_mult,
                     "last_evaluated_at": value.last_evaluated_at,
+                    "processed_event_ids": list(value.processed_event_ids[-10000:]),
                 }
                 for key, value in self._state.items()
             }
-            self.state_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        except Exception:
-            pass
+            temp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            temp_path.replace(self.state_path)
+            self._persistence_error = ""
+        except Exception as exc:
+            self._persistence_error = f"cycle drift state save failed: {type(exc).__name__}: {exc}"
 
     @staticmethod
     def _key(symbol: str, timeframe: str, regime: str, strategy_name: str) -> Tuple[str, str, str, str]:
@@ -142,12 +152,16 @@ class CycleDriftMonitor:
                      pnl_dollars: float,
                      *,
                      execution_slippage_mult: float = 0.0,
-                     spread_degradation_mult: float = 0.0) -> None:
+                     spread_degradation_mult: float = 0.0,
+                     event_id: str = "") -> None:
         """Record a closed trade. Optional execution-quality observations widen
         the running max so the sentinel can pause a context whose live execution
         has degraded materially against expectations."""
         key = self._key(symbol, timeframe, regime, strategy_name)
         state = self._state.setdefault(key, _ContextState())
+        normalized_event_id = str(event_id or "").strip()
+        if normalized_event_id and normalized_event_id in state.processed_event_ids:
+            return
         state.trades += 1
         state.last_pnl = float(pnl_dollars or 0.0)
         if state.last_pnl < 0.0:
@@ -163,6 +177,10 @@ class CycleDriftMonitor:
             state.last_spread_degradation_mult = value
             state.max_spread_degradation_mult = max(state.max_spread_degradation_mult, value)
         state.last_evaluated_at = datetime.now().isoformat()
+        if normalized_event_id:
+            state.processed_event_ids.append(normalized_event_id)
+            if len(state.processed_event_ids) > 10000:
+                state.processed_event_ids = state.processed_event_ids[-10000:]
         self._save_state()
 
     def reset_context(self,
@@ -185,9 +203,17 @@ class CycleDriftMonitor:
             "last_spread_degradation_mult": state.last_spread_degradation_mult,
             "max_spread_degradation_mult": state.max_spread_degradation_mult,
             "last_evaluated_at": state.last_evaluated_at,
+            "processed_event_count": len(state.processed_event_ids),
         }
 
     def evaluate(self, context: CycleDriftContext) -> CycleDriftDecision:
+        if self._persistence_error:
+            return CycleDriftDecision(
+                allow_trade=False,
+                action="pause_state_persistence",
+                risk_multiplier=0.0,
+                reasons=[self._persistence_error],
+            )
         mode = self._mode()
         if mode == "off":
             return CycleDriftDecision(action="disabled")
@@ -208,6 +234,13 @@ class CycleDriftMonitor:
         if state_changed:
             state.last_evaluated_at = datetime.now().isoformat()
             self._save_state()
+            if self._persistence_error:
+                return CycleDriftDecision(
+                    allow_trade=False,
+                    action="pause_state_persistence",
+                    risk_multiplier=0.0,
+                    reasons=[self._persistence_error],
+                )
         min_trades = max(1, int(getattr(self.config, "cycle_drift_min_trades", 6) or 6))
         loss_threshold = max(1, int(getattr(self.config, "cycle_drift_consecutive_losses", 5) or 5))
         slippage_threshold = float(getattr(self.config, "cycle_drift_execution_slippage_mult", 2.5) or 2.5)

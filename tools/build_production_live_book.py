@@ -164,7 +164,7 @@ def build_live_ledger(source: Dict[str, Any],
             raise SystemExit(
                 f"strategy mismatch for {cell}: review={row_strategy}, ledger={cell_payload.get('strategy_name')}"
             )
-        status = str(cell_payload.get("promotion_status", "PROMOTED") or "PROMOTED").upper()
+        status = str(cell_payload.get("promotion_status", "BLOCKED") or "BLOCKED").upper()
         if status not in {"PROMOTED", "PROMOTE"}:
             raise SystemExit(f"promoted cell {cell} has non-live ledger status {status}")
 

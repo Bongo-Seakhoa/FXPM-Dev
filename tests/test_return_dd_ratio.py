@@ -18,6 +18,8 @@ from pm_pipeline import RegimeOptimizer
 
 def _make_optimizer(**overrides):
     cfg = PipelineConfig(
+        research_mode=True,
+        false_discovery_control_enabled=False,
         regime_enable_hyperparam_tuning=False,
         **overrides,
     )

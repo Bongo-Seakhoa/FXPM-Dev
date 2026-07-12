@@ -231,6 +231,39 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(spec.stops_level, 12)
         self.assertEqual(spec.commission_per_lot, 0.0)
 
+    def test_broker_spec_lookup_accepts_case_variant_aliases(self):
+        broker_path = self._tmpdir / "broker_specs.json"
+        broker_path.write_text(
+            """{
+              "Palladium": {
+                "symbol": "Palladium",
+                "broker_symbol": "Palladium",
+                "asset_class": "metal",
+                "digits": 2,
+                "point": 0.01,
+                "tick_size": 0.01,
+                "tick_value": 1.0,
+                "contract_size": 100.0,
+                "volume_min": 0.01,
+                "volume_max": 50.0,
+                "volume_step": 0.01,
+                "spread": 647
+              }
+            }""",
+            encoding="utf-8",
+        )
+        set_broker_specs_path(str(broker_path))
+
+        spec = get_instrument_spec("PALLADIUM")
+
+        self.assertEqual(spec.symbol, "PALLADIUM")
+        self.assertEqual(spec.digits, 2)
+        self.assertAlmostEqual(spec.point, 0.01, places=8)
+        self.assertAlmostEqual(spec.tick_value, 1.0, places=8)
+        self.assertAlmostEqual(spec.contract_size, 100.0, places=8)
+        self.assertAlmostEqual(spec.spread_avg, 647.0, places=8)
+        self.assertEqual(spec.asset_class, "metal")
+
     def test_offline_specs_infer_symbol_class_points(self):
         eurusd = get_instrument_spec("EURUSD")
         usdjpy = get_instrument_spec("USDJPY")

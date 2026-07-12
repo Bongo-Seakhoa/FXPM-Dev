@@ -14,6 +14,7 @@ runtime/
 data/.cache/
 data/.live/
 data/*.csv
+data/native/
 last_actionable_log.json
 last_trade_log.json
 last_trade_log.json.tmp.*
@@ -38,6 +39,7 @@ config.*.local.json
 
 # Disposable analysis scratch (prospect screens, PBO runs, ad-hoc benchmarks)
 pm_outputs/experiments/
+.tmp_pytest*/
 
 # Large static reference docs (kept locally, not in git history)
 *.pdf

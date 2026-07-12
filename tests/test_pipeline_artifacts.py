@@ -26,13 +26,15 @@ class PipelineArtifactTests(unittest.TestCase):
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             cfg = PipelineConfig(
+                research_mode=True,
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
+                oos_evidence_export_enabled=False,
             )
             artifact_meta = build_artifact_meta(cfg)
             self.assertEqual(artifact_meta["max_bars"], 300000)
             self.assertEqual(artifact_meta["discovery_risk_per_trade_pct"], 1.0)
-            self.assertTrue(artifact_meta["risk_management_optimization_enabled"])
+            self.assertFalse(artifact_meta["risk_management_optimization_enabled"])
             self.assertEqual(artifact_meta["risk_management_selection_stage"], "stage3")
             ledger_path = tmp / "pm_configs.json"
             ledger = ConfigLedger(str(ledger_path))
@@ -143,6 +145,7 @@ class PipelineArtifactTests(unittest.TestCase):
         try:
             regime_path = tmp / "regime_params.json"
             cfg = PipelineConfig(
+                research_mode=True,
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
                 log_dir=tmp / "logs",
@@ -226,14 +229,15 @@ class PipelineArtifactTests(unittest.TestCase):
         self.assertEqual(current["false_discovery_holdout_min_trades"], 5)
         self.assertAlmostEqual(current["false_discovery_holdout_min_profit_factor"], 1.0)
         self.assertAlmostEqual(current["false_discovery_holdout_min_return_pct"], 0.0)
-        self.assertEqual(current["production_split_mode"], "bleeding_edge")
+        self.assertEqual(current["production_split_mode"], "calendar_lockbox_v2")
+        self.assertAlmostEqual(current["false_discovery_holdout_max_drawdown_pct"], 20.0)
         self.assertEqual(current["walk_forward_validation_bars"], 50000)
         self.assertEqual(current["oos_validation_mode"], "fixed_holdout")
         self.assertEqual(current["oos_kfold_splits"], 5)
         self.assertEqual(current["oos_embargo_bars"], 1)
         self.assertEqual(current["oos_min_trades"], 5)
         self.assertEqual(current["oos_aggregate_policy"], "aggregate_with_worst_fold_floor")
-        self.assertFalse(current["oos_evidence_export_enabled"])
+        self.assertTrue(current["oos_evidence_export_enabled"])
         self.assertEqual(current["oos_evidence_periods"], 64)
         self.assertEqual(current["oos_evidence_min_periods"], 8)
         self.assertEqual(current["oos_evidence_dirname"], "oos_evidence")
@@ -243,7 +247,7 @@ class PipelineArtifactTests(unittest.TestCase):
         self.assertFalse(artifact_contract_matches(current, changed))
 
         changed = dict(current)
-        changed["oos_evidence_export_enabled"] = True
+        changed["oos_evidence_export_enabled"] = False
         self.assertFalse(artifact_contract_matches(current, changed))
 
         changed = dict(current)
@@ -286,6 +290,7 @@ class PipelineArtifactTests(unittest.TestCase):
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             cfg = PipelineConfig(
+                research_mode=True,
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
                 false_discovery_control_enabled=True,
@@ -306,7 +311,12 @@ class PipelineArtifactTests(unittest.TestCase):
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True, exist_ok=True)
         try:
-            cfg = PipelineConfig(data_dir=tmp / "data", output_dir=tmp / "out")
+            cfg = PipelineConfig(
+                research_mode=True,
+                data_dir=tmp / "data",
+                output_dir=tmp / "out",
+                false_discovery_control_enabled=False,
+            )
             manager = PortfolioManager(
                 cfg,
                 ["EURUSD", "GBPUSD", "USDJPY"],
@@ -486,9 +496,11 @@ class PipelineArtifactTests(unittest.TestCase):
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             cfg = PipelineConfig(
+                research_mode=True,
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
                 live_artifact_drift_policy="block",
+                production_split_mode="bleeding_edge",
             )
             artifact_meta = build_artifact_meta(cfg)
             manager = PortfolioManager(cfg, ["EURUSD", "GBPUSD", "USDJPY"], config_file=str(tmp / "pm_configs.json"))
@@ -537,9 +549,11 @@ class PipelineArtifactTests(unittest.TestCase):
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             cfg = PipelineConfig(
+                research_mode=True,
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
                 live_artifact_drift_policy="warn",
+                production_split_mode="bleeding_edge",
             )
             artifact_meta = build_artifact_meta(cfg)
             drifted_meta = dict(artifact_meta)
@@ -570,8 +584,10 @@ class PipelineArtifactTests(unittest.TestCase):
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             cfg = PipelineConfig(
+                research_mode=True,
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
+                oos_evidence_export_enabled=False,
             )
             artifact_meta = build_artifact_meta(cfg)
             manager = PortfolioManager(cfg, ["EURUSD"], config_file=str(tmp / "pm_configs.json"))
@@ -606,8 +622,12 @@ class PipelineArtifactTests(unittest.TestCase):
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             cfg = PipelineConfig(
+                research_mode=True,
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
+                oos_evidence_export_enabled=False,
+                production_require_promotion_gate=False,
+                production_split_mode="bleeding_edge",
             )
             artifact_meta = build_artifact_meta(cfg)
             ledger_path = tmp / "pm_configs.json"

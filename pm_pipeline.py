@@ -13,13 +13,16 @@ Main pipeline for the Portfolio Manager that handles:
 Version: 3.1 (Portfolio Manager with Optuna TPE Optimization)
 """
 
+import csv
 import json
 import hashlib
+import inspect
 import logging
 import math
 import os
+import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -41,6 +44,18 @@ from pm_core import (
     get_instrument_spec,
     InstrumentSpec
 )
+from pm_evidence import (
+    CALENDAR_SPLIT_MODE,
+    EVIDENCE_CONTRACT_VERSION,
+    EvidenceVerdict,
+    build_calendar_boundaries,
+    calendar_window_meta,
+    derive_purge_duration,
+    ensure_utc_index,
+    latest_closed_bar_end,
+    trim_to_closed_bars,
+    validate_timeframe_evidence,
+)
 from pm_enhancement_seams import EnhancementSeams, create_default_enhancement_seams
 from pm_strategies import (
     StrategyRegistry,
@@ -51,11 +66,34 @@ from pm_position import PositionConfig, PositionManager
 from pm_regime import (
     load_regime_params,
     materialize_regime_params_from_symbol_config,
+    regime_params_provenance_path,
+    validate_regime_params_provenance,
     validated_regime_params_for_timeframe,
 )
 from pm_order_governance import candidate_policy_names, make_policy, policy_name_from_artifact
 from pm_fairness_audit import build_fairness_evidence, build_fairness_report
 from pm_regime_audit import audit_regime_profitability
+from pm_statistics import (
+    LockboxAccessRegistry,
+    STATISTICS_CONTRACT_VERSION,
+    aligned_cell_pbo,
+    block_bootstrap_evidence,
+    deflated_sharpe_evidence,
+)
+from pm_model_lifecycle import (
+    EDGE_CHALLENGER_ROLE,
+    build_edge_challenger_lineage,
+    build_empty_edge_challenger_book,
+    build_lockbox_champion_lineage,
+    build_prelockbox_champion_lineage,
+    temporal_role_block_reason,
+)
+from pm_two_phase_lockbox import FROZEN_PRELOCKBOX_STATUS
+from pm_native_activation import (
+    NATIVE_PRODUCTION_TIMEFRAMES,
+    resolve_active_native_universe,
+    validate_native_exclusion_no_trade_grid,
+)
 
 # Import Optuna TPE optimizer
 try:
@@ -90,7 +128,7 @@ except ImportError:
 
 # Configure module logger
 logger = logging.getLogger(__name__)
-PIPELINE_ARTIFACT_VERSION = "2026-04-29-neutral-discovery-exit-surface"
+PIPELINE_ARTIFACT_VERSION = "2026-07-11-two-book-nonoverlap-deployment-v5"
 
 
 def _stable_seed(*parts: Any) -> int:
@@ -106,6 +144,58 @@ def _stable_hash(payload: Any) -> str:
     return hashlib.sha1(encoded).hexdigest()
 
 
+def _deployment_contract_fingerprint(config: PipelineConfig) -> Dict[str, Any]:
+    """Hash broker execution specs and the funded position/deployment surface.
+
+    Direct unit/research construction has no source config and receives a stable
+    unbound token. Runs created through ``pm_main`` bind the exact funded JSON,
+    broker-spec bytes, symbol roster, and PositionConfig payload without ever
+    including MT5 credentials.
+    """
+    source_raw = str(getattr(config, "_deployment_config_path", "") or "").strip()
+    if not source_raw:
+        return {"contract": "unbound_research_deployment_v1"}
+    source_path = Path(source_raw)
+    try:
+        payload = json.loads(source_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        return {
+            "contract": "funded_live_deployment_v1",
+            "status": "UNAVAILABLE",
+            "reason": f"config unreadable: {type(exc).__name__}",
+        }
+    broker_raw = str(payload.get("broker_specs_path", "") or "").strip()
+    broker_path = Path(broker_raw) if broker_raw else None
+    if broker_path is not None and not broker_path.is_absolute():
+        broker_path = source_path.resolve().parent / broker_path
+    broker_sha = None
+    broker_size = None
+    if broker_path is not None:
+        try:
+            broker_bytes = broker_path.read_bytes()
+            broker_sha = hashlib.sha256(broker_bytes).hexdigest()
+            broker_size = len(broker_bytes)
+        except Exception:
+            broker_sha = None
+    contract_payload = {
+        "scope": str((payload.get("_meta") or {}).get("scope", "") or ""),
+        "symbols": [str(value) for value in (payload.get("symbols") or [])],
+        "position": dict(payload.get("position") or {}),
+        "instrument_spec_defaults": dict(payload.get("instrument_spec_defaults") or {}),
+        "instrument_specs": dict(payload.get("instrument_specs") or {}),
+        "broker_specs_path": broker_raw,
+        "broker_specs_sha256": broker_sha,
+        "broker_specs_size": broker_size,
+    }
+    return {
+        "contract": "funded_live_deployment_v1",
+        "status": "PASS" if broker_sha else "UNAVAILABLE",
+        "sha1": _stable_hash(contract_payload),
+        "broker_specs_sha256": broker_sha,
+        "broker_specs_size": broker_size,
+    }
+
+
 def _regime_params_fingerprint(filepath: str) -> Dict[str, Any]:
     try:
         path = Path(filepath)
@@ -114,9 +204,25 @@ def _regime_params_fingerprint(filepath: str) -> Dict[str, Any]:
             "path": str(path.resolve()),
             "mtime_ns": stat.st_mtime_ns,
             "size": stat.st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
     except Exception:
-        return {"path": str(filepath), "mtime_ns": None, "size": None}
+        return {"path": str(filepath), "mtime_ns": None, "size": None, "sha256": None}
+
+
+def _regime_provenance_fingerprint(params_filepath: str) -> Dict[str, Any]:
+    """Fingerprint the train-only detector-fit sidecar independently."""
+    path = regime_params_provenance_path(params_filepath)
+    try:
+        stat = path.stat()
+        return {
+            "path": str(path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    except Exception:
+        return {"path": str(path), "mtime_ns": None, "size": None, "sha256": None}
 
 
 def _scheduled_valid_until(config: PipelineConfig, from_dt: Optional[datetime] = None) -> datetime:
@@ -124,38 +230,150 @@ def _scheduled_valid_until(config: PipelineConfig, from_dt: Optional[datetime] =
     return config.get_next_retrain_at(from_dt or datetime.now())
 
 
+_DEFAULT_STRATEGY_SURFACE_HASH: Optional[str] = None
+
+
 def _strategy_surface_fingerprint(strategies: Optional[List[BaseStrategy]] = None) -> str:
+    """Hash the discoverable strategy surface once per process.
+
+    Enumerating every strategy, parameter grid, and class source is intentionally
+    comprehensive but expensive.  The default registry cannot change safely
+    inside a running optimization/live process, so recomputing its hash on every
+    ledger/readiness check adds latency without detecting any additional drift.
+    Explicit strategy lists remain uncached for tests and bounded research runs.
+    """
+    global _DEFAULT_STRATEGY_SURFACE_HASH
+    if strategies is None and _DEFAULT_STRATEGY_SURFACE_HASH is not None:
+        return _DEFAULT_STRATEGY_SURFACE_HASH
+
     strategy_list = strategies if strategies is not None else StrategyRegistry.get_all_instances()
+    module_file_hashes: Dict[str, str] = {}
     surface = []
     for strategy in strategy_list:
         try:
+            try:
+                source_file = inspect.getsourcefile(strategy.__class__)
+                if source_file:
+                    source_key = str(Path(source_file).resolve())
+                    file_hash = module_file_hashes.get(source_key)
+                    if file_hash is None:
+                        file_hash = hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
+                        module_file_hashes[source_key] = file_hash
+                    # Hash a module once, then bind each class identity to those
+                    # exact bytes.  This is stricter (a sibling implementation
+                    # change invalidates the whole strategy surface) and avoids
+                    # 100 repeated, very slow inspect.getsource calls on Windows.
+                    implementation = (
+                        f"file_sha256={file_hash};"
+                        f"class={strategy.__class__.__module__}."
+                        f"{strategy.__class__.__qualname__}"
+                    )
+                else:
+                    implementation = inspect.getsource(strategy.__class__)
+            except (OSError, TypeError):
+                implementation = (
+                    f"{strategy.__class__.__module__}."
+                    f"{strategy.__class__.__qualname__}"
+                )
             surface.append({
                 "name": strategy.name,
                 "params": strategy.get_params(),
                 "grid": strategy.get_param_grid(),
+                "implementation_sha256": hashlib.sha256(
+                    implementation.encode("utf-8", errors="replace")
+                ).hexdigest(),
             })
         except Exception:
             surface.append({"name": getattr(strategy, "name", strategy.__class__.__name__)})
     surface.sort(key=lambda item: item["name"])
-    return _stable_hash(surface)
+    fingerprint = _stable_hash(surface)
+    if strategies is None:
+        _DEFAULT_STRATEGY_SURFACE_HASH = fingerprint
+    return fingerprint
 
 
 def build_artifact_meta(config: PipelineConfig,
                         strategies: Optional[List[BaseStrategy]] = None) -> Dict[str, Any]:
     """Build a semantic fingerprint for persisted optimization artifacts."""
+    split_mode = str(
+        getattr(config, "production_split_mode", CALENDAR_SPLIT_MODE)
+        or CALENDAR_SPLIT_MODE
+    ).strip().lower()
     return {
         "artifact_version": PIPELINE_ARTIFACT_VERSION,
+        "research_mode": bool(getattr(config, "research_mode", False)),
+        "deployment_contract": _deployment_contract_fingerprint(config),
         "feature_cache_version": FeatureComputer.FEATURE_CACHE_VERSION,
-        "split_contract_version": DataSplitter.SPLIT_CONTRACT_VERSION,
+        "split_contract_version": (
+            EVIDENCE_CONTRACT_VERSION
+            if split_mode == CALENDAR_SPLIT_MODE
+            else DataSplitter.SPLIT_CONTRACT_VERSION
+        ),
         "max_bars": int(getattr(config, "max_bars", 300000)),
+        "max_bars_applied": split_mode != CALENDAR_SPLIT_MODE,
         "screening_atr_anchor_enabled": bool(getattr(config, "screening_atr_anchor_enabled", False)),
         "screening_atr_anchor_multipliers": [
             float(value) for value in (getattr(config, "screening_atr_anchor_multipliers", [2.0]) or [2.0])
         ],
+        "regime_family_probe_trials": int(
+            getattr(config, "regime_family_probe_trials", 5) or 5
+        ),
+        "regime_hyperparam_top_k": int(
+            getattr(config, "regime_hyperparam_top_k", 3) or 3
+        ),
+        "regime_hyperparam_max_combos": int(
+            getattr(config, "regime_hyperparam_max_combos", 150) or 150
+        ),
+        "optuna_family_size_aware_budget": bool(
+            getattr(config, "optuna_family_size_aware_budget", False)
+        ),
+        "optuna_min_trials_per_strategy": int(
+            getattr(config, "optuna_min_trials_per_strategy", 50) or 50
+        ),
+        "optuna_max_trials_per_strategy": int(
+            getattr(config, "optuna_max_trials_per_strategy", 5000) or 5000
+        ),
+        "optuna_target_coverage_pct": float(
+            getattr(config, "optuna_target_coverage_pct", 0.10) or 0.10
+        ),
         "historical_stress_audit_bars": int(getattr(config, "historical_stress_audit_bars", 50000)),
         "active_universe_bars": int(getattr(config, "active_universe_bars", 250000)),
         "active_stage2_pct": float(getattr(config, "active_stage2_pct", 50.0)),
-        "production_split_mode": str(getattr(config, "production_split_mode", "bleeding_edge") or "bleeding_edge"),
+        "production_split_mode": str(
+            getattr(config, "production_split_mode", CALENDAR_SPLIT_MODE)
+            or CALENDAR_SPLIT_MODE
+        ),
+        "tuning_validation_bars": int(getattr(config, "tuning_validation_bars", 50000) or 0),
+        "final_lockbox_bars": int(getattr(config, "final_lockbox_bars", 50000) or 0),
+        "split_embargo_bars": int(getattr(config, "split_embargo_bars", 300) or 0),
+        "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
+        "evidence_sufficiency_enabled": bool(
+            getattr(config, "evidence_sufficiency_enabled", True)
+        ),
+        "evidence_require_native_timeframes": bool(
+            getattr(config, "evidence_require_native_timeframes", True)
+        ),
+        "evidence_require_native_provenance": bool(
+            getattr(config, "evidence_require_native_provenance", True)
+        ),
+        "evidence_require_session_coverage": bool(
+            getattr(config, "evidence_require_session_coverage", True)
+        ),
+        "evidence_min_expected_session_coverage": float(
+            getattr(config, "evidence_min_expected_session_coverage", 0.95)
+        ),
+        "evidence_boundary_tolerance_days": float(
+            getattr(config, "evidence_boundary_tolerance_days", 7.0)
+        ),
+        "evidence_purge_days": float(getattr(config, "evidence_purge_days", 7.0)),
+        "evidence_warmup_days": float(getattr(config, "evidence_warmup_days", 400.0)),
+        "evidence_as_of_utc": str(getattr(config, "evidence_as_of_utc", "") or ""),
+        "evidence_window_years": dict(
+            getattr(config, "evidence_window_years", {}) or {}
+        ),
+        "evidence_min_native_bars": dict(
+            getattr(config, "evidence_min_native_bars", {}) or {}
+        ),
         "walk_forward_validation_bars": int(getattr(config, "walk_forward_validation_bars", 50000) or 0),
         "clean_holdout_pct": float(getattr(config, "clean_holdout_pct", 0.0)),
         "overlap_pct": float(config.overlap_pct),
@@ -183,6 +401,34 @@ def build_artifact_meta(config: PipelineConfig,
             getattr(config, "false_discovery_scope_power", 0.25) or 0.0
         ),
         "false_discovery_symbol_count": int(getattr(config, "false_discovery_symbol_count", 0) or 0),
+        "statistics_contract_version": STATISTICS_CONTRACT_VERSION,
+        "false_discovery_min_daily_observations": int(
+            getattr(config, "false_discovery_min_daily_observations", 252) or 252
+        ),
+        "false_discovery_min_effective_observations": float(
+            getattr(config, "false_discovery_min_effective_observations", 60.0) or 60.0
+        ),
+        "false_discovery_max_pbo": float(
+            getattr(config, "false_discovery_max_pbo", 0.50) or 0.50
+        ),
+        "false_discovery_pbo_min_candidates": int(
+            getattr(config, "false_discovery_pbo_min_candidates", 5) or 5
+        ),
+        "false_discovery_pbo_blocks": int(
+            getattr(config, "false_discovery_pbo_blocks", 10) or 10
+        ),
+        "false_discovery_require_bootstrap": bool(
+            getattr(config, "false_discovery_require_bootstrap", True)
+        ),
+        "false_discovery_bootstrap_repetitions": int(
+            getattr(config, "false_discovery_bootstrap_repetitions", 300) or 300
+        ),
+        "false_discovery_bootstrap_confidence": float(
+            getattr(config, "false_discovery_bootstrap_confidence", 0.95) or 0.95
+        ),
+        "lockbox_one_shot_registry_enabled": bool(
+            getattr(config, "lockbox_one_shot_registry_enabled", True)
+        ),
         "false_discovery_holdout_policy": str(
             getattr(config, "false_discovery_holdout_policy", "off") or "off"
         ).lower(),
@@ -194,6 +440,9 @@ def build_artifact_meta(config: PipelineConfig,
         ),
         "false_discovery_holdout_min_return_pct": float(
             getattr(config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0
+        ),
+        "false_discovery_holdout_max_drawdown_pct": float(
+            getattr(config, "false_discovery_holdout_max_drawdown_pct", 20.0) or 0.0
         ),
         "oos_validation_mode": str(getattr(config, "oos_validation_mode", "fixed_holdout") or "fixed_holdout"),
         "oos_kfold_splits": int(getattr(config, "oos_kfold_splits", 5) or 5),
@@ -232,10 +481,6 @@ def build_artifact_meta(config: PipelineConfig,
         "threadspark_historical_chunk_count": int(
             getattr(config, "threadspark_historical_chunk_count", 5) or 5
         ),
-        "optuna_family_size_aware_budget": bool(getattr(config, "optuna_family_size_aware_budget", False)),
-        "optuna_min_trials_per_strategy": int(getattr(config, "optuna_min_trials_per_strategy", 0) or 0),
-        "optuna_max_trials_per_strategy": int(getattr(config, "optuna_max_trials_per_strategy", 0) or 0),
-        "optuna_target_coverage_pct": float(getattr(config, "optuna_target_coverage_pct", 0.0) or 0.0),
         "scoring_use_consistency": bool(getattr(config, "scoring_use_consistency", False)),
         "scoring_use_continuous_dd": bool(getattr(config, "scoring_use_continuous_dd", False)),
         "scoring_use_sortino_blend": bool(getattr(config, "scoring_use_sortino_blend", False)),
@@ -267,13 +512,16 @@ def build_artifact_meta(config: PipelineConfig,
             getattr(config, "local_governance_min_score_improvement", 0.0) or 0.0
         ),
         "risk_management_optimization_enabled": bool(
-            getattr(config, "risk_management_optimization_enabled", True)
+            getattr(config, "risk_management_optimization_enabled", False)
         ),
         "risk_management_selection_stage": str(
             getattr(config, "risk_management_selection_stage", "stage3")
         ),
         "exit_surface_contract": "neutral_discovery_sl_tp_v1",
         "regime_params": _regime_params_fingerprint(getattr(config, "regime_params_file", "regime_params.json")),
+        "regime_provenance": _regime_provenance_fingerprint(
+            getattr(config, "regime_params_file", "regime_params.json")
+        ),
         "strategy_surface_hash": _strategy_surface_fingerprint(strategies),
         "metric_contract": "net_dollar_mtm_equity_v1",
     }
@@ -385,6 +633,22 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
     if regime_config is None or regime_config.is_no_trade_marker():
         return "NO_TRADE", ["no trade marker"]
 
+    temporal_evidence = dict(
+        (getattr(regime_config, "validation_evidence", {}) or {}).get(
+            "temporal_lineage", {}
+        ) or {}
+    )
+    temporal_role = str(temporal_evidence.get("book_role", "") or "").upper()
+    if temporal_role == EDGE_CHALLENGER_ROLE:
+        return "PAPER_ONLY", [
+            "latest-data edge challenger requires future non-overlapping forward evidence"
+        ]
+    temporal_block = temporal_role_block_reason(
+        getattr(regime_config, "validation_evidence", {}) or {}
+    )
+    if temporal_block:
+        reasons.append(temporal_block)
+
     scoring_model = str(getattr(config, "regime_scoring_model", "legacy") or "legacy").lower()
     historical = dict(getattr(regime_config, "historical_audit_metrics", {}) or {})
     historical_severe_reasons: List[str] = []
@@ -448,23 +712,57 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
     holdout_trades = int(holdout.get("total_trades", 0) or 0)
     holdout_return = float(holdout.get("total_return_pct", 0.0) or 0.0)
     false_discovery_enabled = bool(getattr(config, "false_discovery_control_enabled", False))
+    split_mode = str(
+        getattr(config, "production_split_mode", CALENDAR_SPLIT_MODE)
+        or CALENDAR_SPLIT_MODE
+    ).lower()
+    false_discovery_reasons: List[str] = []
     if false_discovery_enabled:
         evidence = dict(getattr(regime_config, "validation_evidence", {}) or {})
         false_discovery = dict(evidence.get("false_discovery", {}) or {})
-        min_dsr = float(getattr(config, "false_discovery_min_dsr", 0.0) or 0.0)
-        if false_discovery and min_dsr > 0.0:
-            dsr = float(false_discovery.get("deflated_sharpe", 1.0) or 0.0)
+        min_dsr = float(getattr(config, "false_discovery_min_dsr", 0.95) or 0.95)
+        if split_mode == CALENDAR_SPLIT_MODE:
+            if not false_discovery:
+                false_discovery_reasons.append("false-discovery evidence unavailable")
+            else:
+                dsr = float(false_discovery.get("deflated_sharpe", 0.0) or 0.0)
+                dsr_status = str(
+                    (false_discovery.get("dsr_evidence") or {}).get("status", "UNAVAILABLE")
+                ).upper()
+                if dsr_status != "PASS" or dsr < min_dsr:
+                    false_discovery_reasons.append(
+                        f"false-discovery daily-return DSR {dsr_status} {dsr:.4f} < {min_dsr:.4f}"
+                    )
+                pbo_status = str(false_discovery.get("pbo_status", "unavailable")).upper()
+                if pbo_status != "PASS":
+                    false_discovery_reasons.append(
+                        f"aligned exact-cell PBO {pbo_status}: {false_discovery.get('pbo')}"
+                    )
+                if bool(getattr(config, "false_discovery_require_bootstrap", True)):
+                    bootstrap_status = str(
+                        (false_discovery.get("bootstrap_evidence") or {}).get(
+                            "status", "UNAVAILABLE"
+                        )
+                    ).upper()
+                    if bootstrap_status != "PASS":
+                        false_discovery_reasons.append(
+                            f"validation block bootstrap {bootstrap_status}"
+                        )
+        elif false_discovery and min_dsr > 0.0:
+            dsr = float(false_discovery.get("deflated_sharpe", 0.0) or 0.0)
             if dsr < min_dsr:
-                return "BLOCKED", [
+                false_discovery_reasons.append(
                     f"false-discovery DSR {dsr:.4f} < {min_dsr:.4f}"
-                ]
-
-    holdout_gate_enabled = false_discovery_enabled or scoring_model == "specialist_spokes_v2"
+                )
+    holdout_gate_enabled = (
+        false_discovery_enabled
+        or scoring_model == "specialist_spokes_v2"
+        or split_mode in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}
+    )
     if holdout_gate_enabled:
         holdout_policy = str(
             getattr(config, "false_discovery_holdout_policy", "off") or "off"
         ).lower()
-        split_mode = str(getattr(config, "production_split_mode", "bleeding_edge") or "bleeding_edge").lower()
         if (
             split_mode == "bleeding_edge"
             and not holdout
@@ -473,7 +771,13 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
         ):
             holdout_policy = "off"
         if holdout_policy != "off":
-            min_holdout_trades = int(getattr(config, "false_discovery_holdout_min_trades", 5) or 0)
+            min_holdout_trades = int(
+                holdout.get(
+                    "min_trades_required",
+                    getattr(config, "false_discovery_holdout_min_trades", 5),
+                )
+                or 0
+            )
             if str(holdout.get("validation_mode", "") or "").lower() == "purged_kfold":
                 min_holdout_trades = int(getattr(config, "oos_min_trades", min_holdout_trades) or 0)
             if 0 < min_holdout_trades and holdout_trades < min_holdout_trades:
@@ -506,6 +810,10 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                 min_holdout_return = float(
                     getattr(config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0
                 )
+                max_holdout_drawdown = float(
+                    getattr(config, "false_discovery_holdout_max_drawdown_pct", 20.0) or 0.0
+                )
+                holdout_drawdown = float(holdout.get("max_drawdown_pct", 100.0) or 0.0)
                 holdout_reasons = []
                 if holdout_pf < min_holdout_pf:
                     holdout_reasons.append(
@@ -514,6 +822,10 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                 if holdout_return < min_holdout_return:
                     holdout_reasons.append(
                         f"holdout return {holdout_return:.1f}% < {min_holdout_return:.1f}%"
+                    )
+                if max_holdout_drawdown > 0.0 and holdout_drawdown > max_holdout_drawdown:
+                    holdout_reasons.append(
+                        f"holdout max DD {holdout_drawdown:.1f}% > {max_holdout_drawdown:.1f}%"
                     )
                 if holdout_reasons:
                     if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
@@ -525,6 +837,9 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                     if holdout_policy == "block":
                         return "BLOCKED", holdout_reasons
                     return "PROMOTE_SMALL", holdout_reasons
+
+    if false_discovery_reasons:
+        return "BLOCKED", false_discovery_reasons
 
     if holdout_trades > 0 and holdout_return <= 0.0:
         if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
@@ -1034,7 +1349,9 @@ class RegimeConfig:
     live_observability: Dict[str, Any] = field(default_factory=_default_live_observability)
     governance_policy: Dict[str, Any] = field(default_factory=_default_governance_policy)
     walk_forward_audit: Dict[str, Any] = field(default_factory=_default_walk_forward_audit)
-    promotion_status: str = "PROMOTED"
+    # A candidate becomes live-eligible only after the promotion pipeline writes
+    # an explicit verdict. Missing/legacy status is never treated as approval.
+    promotion_status: str = "BLOCKED"
     promotion_reasons: List[str] = field(default_factory=list)
     
     def is_no_trade_marker(self) -> bool:
@@ -1073,6 +1390,8 @@ class RegimeConfig:
         """
         if self.is_no_trade_marker():
             return False
+        if temporal_role_block_reason(self.validation_evidence or {}):
+            return False
         
         val_pf = self.val_metrics.get('profit_factor', 0.0)
         val_return = self.val_metrics.get('total_return_pct', -100.0)
@@ -1098,7 +1417,7 @@ class RegimeConfig:
             'valid_until': self.valid_until.isoformat() if self.valid_until else None,
             'is_validated': (
                 not self.is_no_trade_marker()
-                and str(self.promotion_status or "PROMOTED").upper() in {"PROMOTED", "PROMOTE_SMALL"}
+                and str(self.promotion_status or "BLOCKED").upper() in {"PROMOTED", "PROMOTE_SMALL"}
             ),
             'train_metrics': {k: v for k, v in self.train_metrics.items() 
                             if k not in ['equity_curve', 'trades']},
@@ -1115,7 +1434,7 @@ class RegimeConfig:
             'live_observability': dict(self.live_observability or _default_live_observability()),
             'governance_policy': dict(self.governance_policy or _default_governance_policy()),
             'walk_forward_audit': dict(self.walk_forward_audit or _default_walk_forward_audit()),
-            'promotion_status': str(self.promotion_status or "PROMOTED"),
+            'promotion_status': str(self.promotion_status or "BLOCKED"),
             'promotion_reasons': list(self.promotion_reasons or []),
         }
     
@@ -1141,7 +1460,7 @@ class RegimeConfig:
             live_observability=data.get('live_observability') or _default_live_observability(),
             governance_policy=data.get('governance_policy') or _default_governance_policy(),
             walk_forward_audit=data.get('walk_forward_audit') or _default_walk_forward_audit(),
-            promotion_status=data.get('promotion_status', 'PROMOTED'),
+            promotion_status=data.get('promotion_status', 'BLOCKED'),
             promotion_reasons=list(data.get('promotion_reasons', []) or []),
         )
         
@@ -1183,6 +1502,9 @@ class SymbolConfig:
     holdout_metrics: Dict[str, Any] = field(default_factory=dict)
     historical_audit_metrics: Dict[str, Any] = field(default_factory=_default_historical_audit)
     data_window_meta: Dict[str, Any] = field(default_factory=dict)
+    # A physically separate, non-funded book for a latest-data refit.  It must
+    # never replace regime_configs, which is the lockbox-validated champion.
+    edge_challenger_book: Dict[str, Any] = field(default_factory=dict)
     composite_score: float = 0.0
     robustness_ratio: float = 0.0
     
@@ -1231,7 +1553,7 @@ class SymbolConfig:
             if (
                 cfg is not None
                 and not cfg.is_no_trade_marker()
-                and str(getattr(cfg, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+                and str(getattr(cfg, "promotion_status", "BLOCKED") or "BLOCKED").upper()
                 not in non_live_statuses
             )
         )
@@ -1270,12 +1592,13 @@ class SymbolConfig:
                 if k not in ['equity_curve', 'trades']
             },
             'data_window_meta': dict(self.data_window_meta or {}),
+            'edge_challenger_book': dict(self.edge_challenger_book or {}),
             'artifact_meta': self.artifact_meta,
             'live_observability': dict(self.live_observability or _default_live_observability()),
             'walk_forward_audit': dict(self.walk_forward_audit or _default_walk_forward_audit()),
         }
         if self.default_config:
-            result['promotion_status'] = str(self.default_config.promotion_status or "PROMOTED")
+            result['promotion_status'] = str(self.default_config.promotion_status or "BLOCKED")
             result['promotion_reasons'] = list(self.default_config.promotion_reasons or [])
 
         if self.regime_detection_version:
@@ -1316,6 +1639,7 @@ class SymbolConfig:
             holdout_metrics=data.get('holdout_metrics', {}),
             historical_audit_metrics=data.get('historical_audit_metrics') or _default_historical_audit(),
             data_window_meta=data.get('data_window_meta', {}),
+            edge_challenger_book=data.get('edge_challenger_book', {}),
             artifact_meta=data.get('artifact_meta', {}),
             live_observability=data.get('live_observability') or _default_live_observability(),
             walk_forward_audit=data.get('walk_forward_audit') or _default_walk_forward_audit(),
@@ -1973,8 +2297,8 @@ class RegimeOptimizer:
     All strategies compete for all regimes - winners are selected per (tf, regime).
     
     Flow:
-    1. Quick screening with default params to identify top-K strategies per regime
-    2. Hyperparameter tuning using Optuna TPE (simultaneous multi-regime optimization)
+    1. Equal-budget train-only B0 family probe per exact regime cell
+    2. Independent train-only Optuna/grid study for shortlisted family-regime cells
     3. Final selection: pick best tuned config per regime
     4. Validation: apply fx_backtester validation rules to each winner
     
@@ -1997,6 +2321,10 @@ class RegimeOptimizer:
         self.enable_hyperparam_tuning = getattr(config, 'regime_enable_hyperparam_tuning', True)
         self.hyperparam_top_k = getattr(config, 'regime_hyperparam_top_k', 3)  # Top K strategies to tune per regime
         self.hyperparam_max_combos = getattr(config, 'regime_hyperparam_max_combos', 30)  # Max param combos per strategy
+        self.family_probe_trials = max(
+            1, int(getattr(config, 'regime_family_probe_trials', 5) or 5)
+        )
+        self._last_tuning_search_meta: Dict[str, Any] = {}
         
         # Validation thresholds (from fx_backtester config)
         self.val_max_drawdown = getattr(config, 'fx_val_max_drawdown', 20.0)
@@ -2045,6 +2373,28 @@ class RegimeOptimizer:
                     "falling back to grid search (reduced search quality). "
                     "Install optuna to restore TPE optimization."
                 )
+
+    def _min_val_trades_for_timeframe(self, timeframe: Optional[str] = None) -> int:
+        """Return the validation trade floor for a timeframe."""
+        base = max(0, int(self.min_val_trades or 0))
+        if not bool(getattr(self.config, "regime_timeframe_val_trade_floors_enabled", False)):
+            return base
+        tf = str(timeframe or "").strip().upper()
+        floors = getattr(self.config, "regime_timeframe_val_trade_floors", {}) or {}
+        floor = floors.get(tf)
+        if floor is None:
+            if tf == "D1":
+                floor = 15
+            elif tf in {"H1", "H4"}:
+                floor = 25
+            elif tf in {"M1", "M5", "M15", "M30"}:
+                floor = 30
+            else:
+                floor = base
+        try:
+            return max(base, int(floor))
+        except (TypeError, ValueError, OverflowError):
+            return base
 
     def _make_no_trade_marker(self, reason: str, now: Optional[datetime] = None) -> RegimeConfig:
         """Create an explicit non-tradeable marker for a regime slot with no validated winner."""
@@ -2246,6 +2596,21 @@ class RegimeOptimizer:
                 value = float(value)
             clean[str(key)] = value
         return clean
+
+    @staticmethod
+    def _candidate_evaluation_regime(candidate: Dict[str, Any]) -> str:
+        """Resolve the one regime cell represented by a frozen candidate."""
+        for field_name in ("evaluation_regime", "tuned_for_regime"):
+            value = str(candidate.get(field_name, "") or "").strip().upper()
+            if value:
+                return value
+        metric_regimes = {
+            str(value).strip().upper()
+            for surface_name in ("train_regime_metrics", "val_regime_metrics")
+            for value in (candidate.get(surface_name) or {}).keys()
+            if str(value).strip()
+        }
+        return next(iter(metric_regimes)) if len(metric_regimes) == 1 else ""
 
     @staticmethod
     def _compact_backtest_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2518,9 +2883,11 @@ class RegimeOptimizer:
             return None
         params = self._clean_candidate_params(candidate.get("params", {}))
         strategy_name = str(candidate.get("strategy_name", "Unknown"))
+        evaluation_regime = self._candidate_evaluation_regime(candidate)
         candidate_key = {
             "symbol": symbol,
             "timeframe": timeframe,
+            "regime": evaluation_regime,
             "strategy_name": strategy_name,
             "parameters": params,
         }
@@ -2555,12 +2922,27 @@ class RegimeOptimizer:
             "candidate_id": candidate_id,
             "symbol": symbol,
             "timeframe": timeframe,
+            "regime": evaluation_regime,
             "strategy_name": strategy_name,
             "parameters": params,
             "is_tuned": bool(candidate.get("is_tuned", False)),
             "tuned_for_regime": candidate.get("tuned_for_regime"),
             "search_trials": int(candidate.get("search_trials", 1) or 1),
             "local_search_trials_total": int(candidate.get("local_search_trials_total", 0) or 0),
+            "local_search_cells_total": int(candidate.get("local_search_cells_total", 0) or 0),
+            "family_probe_search_trials_total": int(
+                candidate.get("family_probe_search_trials_total", 0) or 0
+            ),
+            "family_probe_search_cells_total": int(
+                candidate.get("family_probe_search_cells_total", 0) or 0
+            ),
+            "tuning_search_trials_total": int(
+                candidate.get("tuning_search_trials_total", 0) or 0
+            ),
+            "tuning_search_cells_total": int(
+                candidate.get("tuning_search_cells_total", 0) or 0
+            ),
+            "multiplicity_scope": candidate.get("multiplicity_scope"),
             "strategy_roster_count": int(candidate.get("strategy_roster_count", 0) or 0),
             "oos_surface": "stage3_selection",
             "return_index": "relative_equal_blocks",
@@ -2630,10 +3012,22 @@ class RegimeOptimizer:
                 stress_enabled = False
         for cand in candidates:
             try:
+                evaluation_regime = self._candidate_evaluation_regime(cand)
+                if not evaluation_regime:
+                    logger.debug(
+                        f"[{symbol}] [{timeframe}] OOS evidence skipped for "
+                        f"{cand.get('strategy_name', 'Unknown')}: candidate has no exact regime identity"
+                    )
+                    continue
                 strategy = cand.get("strategy")
                 if strategy is None:
                     strategy = StrategyRegistry.get(cand.get("strategy_name", ""), **(cand.get("params", {}) or {}))
-                signals = strategy.generate_signals(val_features, symbol)
+                raw_signals = strategy.generate_signals(val_features, symbol)
+                signals = self._gate_signals_to_exact_regime(
+                    raw_signals,
+                    val_features,
+                    evaluation_regime,
+                )
                 val_result = self.backtester.run(
                     val_features,
                     signals,
@@ -2774,6 +3168,9 @@ class RegimeOptimizer:
                     "requested_clean_holdout_unavailable_or_too_thin"
                 )
             try:
+                evaluation_regime = self._candidate_evaluation_regime(cand)
+                if not evaluation_regime:
+                    raise ValueError("candidate has no exact regime identity")
                 strategy = cand.get("strategy")
                 if strategy is None:
                     strategy = StrategyRegistry.get(cand.get("strategy_name", ""), **(cand.get("params", {}) or {}))
@@ -2786,7 +3183,12 @@ class RegimeOptimizer:
 
             if has_selection:
                 try:
-                    signals = strategy.generate_signals(selection_features, symbol)
+                    raw_signals = strategy.generate_signals(selection_features, symbol)
+                    signals = self._gate_signals_to_exact_regime(
+                        raw_signals,
+                        selection_features,
+                        evaluation_regime,
+                    )
                     result = self.backtester.run(
                         selection_features,
                         signals,
@@ -2795,11 +3197,12 @@ class RegimeOptimizer:
                         timeframe=timeframe,
                         warmup_bars=selection_warmup_bars,
                     )
-                    cand["threadspark_selection_regime_metrics"] = self._bucket_trades_by_regime(
-                        result.get("trades", []),
-                        selection_features,
-                        timeframe=timeframe,
-                    )
+                    cand["threadspark_selection_regime_metrics"] = {
+                        evaluation_regime: self._compact_exact_regime_result(
+                            result,
+                            evaluation_regime,
+                        )
+                    }
                     cand["threadspark_selection_surface"] = surface_name
                     cand["threadspark_selection_missing"] = False
                     record = self._build_oos_evidence_record(
@@ -2821,7 +3224,12 @@ class RegimeOptimizer:
 
             if has_historical:
                 try:
-                    hist_signals = strategy.generate_signals(historical_features, symbol)
+                    raw_hist_signals = strategy.generate_signals(historical_features, symbol)
+                    hist_signals = self._gate_signals_to_exact_regime(
+                        raw_hist_signals,
+                        historical_features,
+                        evaluation_regime,
+                    )
                     hist_result = self.backtester.run(
                         historical_features,
                         hist_signals,
@@ -2830,11 +3238,12 @@ class RegimeOptimizer:
                         timeframe=timeframe,
                     )
                     hist_trades = hist_result.get("trades", [])
-                    cand["threadspark_historical_regime_metrics"] = self._bucket_trades_by_regime(
-                        hist_trades,
-                        historical_features,
-                        timeframe=timeframe,
-                    )
+                    cand["threadspark_historical_regime_metrics"] = {
+                        evaluation_regime: self._compact_exact_regime_result(
+                            hist_result,
+                            evaluation_regime,
+                        )
+                    }
                     historical_chunks = _historical_chunk_buckets(hist_trades, historical_features)
                     if historical_chunks:
                         cand["threadspark_historical_chunk_regime_metrics"] = historical_chunks
@@ -2856,7 +3265,7 @@ class RegimeOptimizer:
         This is applied BEFORE hyperparameter tuning to save compute on losing strategies.
         Thresholds must be LENIENT since strategies run with default (untuned) params.
 
-        Checks (applied to broad eligibility backtest when available, NOT regime buckets):
+        Checks (applied only to the frozen optimizer-train B0 candidate):
         - train_min_profit_factor: Default 0.5 (reject only catastrophic)
         - train_min_return_pct: Default -30.0% (allow moderate losses)
         - train_max_drawdown: Default 60.0% (reject only blowups)
@@ -2880,10 +3289,10 @@ class RegimeOptimizer:
         train_dd_ceiling = float(self.config.train_max_drawdown)
 
         for cand in candidates:
-            # Use the full active-universe eligibility surface as the primary
-            # broad gate when present. Stored train metrics stay on the
-            # bleeding-edge optimization surface.
-            train_result = cand.get('eligibility_result') or cand.get('train_result', {})
+            # Candidate admission is model selection and therefore may inspect
+            # optimizer-train only. Compatibility eligibility fields must not
+            # override the frozen train result.
+            train_result = cand.get('train_result', {})
 
             train_pf = float(train_result.get('profit_factor', 0))
             train_return = float(train_result.get('total_return_pct', 0))
@@ -2908,7 +3317,7 @@ class RegimeOptimizer:
             else:
                 # Regime-local rescue: preserve strategies that are strong in at
                 # least one regime even if full-sample is weak (regime specialists)
-                regime_metrics = cand.get('eligibility_regime_metrics') or cand.get('train_regime_metrics', {})
+                regime_metrics = cand.get('train_regime_metrics', {})
                 rescued = False
                 for _rname, rm in regime_metrics.items():
                     regime_pf = float(rm.get('profit_factor', 0))
@@ -2970,6 +3379,389 @@ class RegimeOptimizer:
                 )
         return variants or [(strategy, None)]
 
+    @staticmethod
+    def _gate_signals_to_exact_regime(
+        signals: pd.Series,
+        features: pd.DataFrame,
+        regime: str,
+    ) -> pd.Series:
+        """Mask entries outside one regime, matching optimizer/lockbox/live."""
+        if not isinstance(signals, pd.Series):
+            signals = pd.Series(signals, index=features.index)
+        gated = signals.reindex(features.index).fillna(0).copy()
+        if "REGIME_LIVE" not in features.columns:
+            gated.iloc[:] = 0
+            return gated
+        mask = (
+            features["REGIME_LIVE"]
+            .reindex(gated.index)
+            .astype(str)
+            .str.upper()
+            .eq(str(regime or "").upper())
+            .fillna(False)
+        )
+        gated.loc[~mask] = 0
+        return gated
+
+    @staticmethod
+    def _compact_exact_regime_result(
+        result: Optional[Dict[str, Any]],
+        regime: str,
+    ) -> Dict[str, Any]:
+        """Compact direct backtest metrics while preserving bucket aliases."""
+        compact = RegimeOptimizer._compact_backtest_result(result)
+        if "sharpe_approx" not in compact and "sharpe_ratio" in compact:
+            compact["sharpe_approx"] = compact["sharpe_ratio"]
+        if "sortino_approx" not in compact and "sortino_ratio" in compact:
+            compact["sortino_approx"] = compact["sortino_ratio"]
+        if "avg_win" not in compact and "avg_win_dollars" in compact:
+            compact["avg_win"] = compact["avg_win_dollars"]
+        if "avg_loss" not in compact and "avg_loss_dollars" in compact:
+            compact["avg_loss"] = compact["avg_loss_dollars"]
+        compact["regime_gated"] = True
+        compact["evaluation_regime"] = str(regime)
+        return compact
+
+    def _run_one_exact_regime(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        features: pd.DataFrame,
+        strategy: BaseStrategy,
+        regime: str,
+        warmup_bars: int = 0,
+        run_zero_signal_path: bool = False,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Run one exact-regime cell and report whether Backtester.run executed."""
+        raw_signals = strategy.generate_signals(features, symbol)
+        gated = self._gate_signals_to_exact_regime(raw_signals, features, regime)
+        if gated.abs().sum() == 0 and not run_zero_signal_path:
+            return {
+                "total_trades": 0,
+                "regime_gated": True,
+                "evaluation_regime": str(regime),
+            }, False
+        result = self.backtester.run(
+            features,
+            gated,
+            symbol,
+            strategy,
+            warmup_bars=int(max(0, warmup_bars)),
+            timeframe=timeframe,
+        )
+        return self._compact_exact_regime_result(result, regime), True
+
+    def _run_exact_regime_screening(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        features: Optional[pd.DataFrame],
+        strategy: BaseStrategy,
+        warmup_bars: int = 0,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """Return raw and compact direct backtests for each exact regime."""
+        if (
+            features is None
+            or len(features) < 2
+            or "REGIME_LIVE" not in features.columns
+        ):
+            return {}, {}
+        raw_signals = strategy.generate_signals(features, symbol)
+        raw_results: Dict[str, Dict[str, Any]] = {}
+        compact_results: Dict[str, Dict[str, Any]] = {}
+        for regime in self.REGIMES:
+            gated = self._gate_signals_to_exact_regime(raw_signals, features, regime)
+            if gated.abs().sum() == 0:
+                compact_results[regime] = {
+                    "total_trades": 0,
+                    "regime_gated": True,
+                    "evaluation_regime": str(regime),
+                }
+                continue
+            result = self.backtester.run(
+                features,
+                gated,
+                symbol,
+                strategy,
+                warmup_bars=int(max(0, warmup_bars)),
+                timeframe=timeframe,
+            )
+            raw_results[regime] = result
+            compact_results[regime] = self._compact_exact_regime_result(
+                result, regime
+            )
+        return raw_results, compact_results
+
+    def _family_probe_param_specs(
+        self,
+        strategy: BaseStrategy,
+        *,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+    ) -> List[Tuple[Dict[str, Any], Optional[float]]]:
+        """Equal-budget deterministic B0 design for one family-regime cell.
+
+        Mandatory default/ATR anchors are seeded first. Remaining points walk
+        the cartesian grid by a deterministic coprime mixed-radix cycle, which
+        gives bounded uniform coverage without materializing a large grid.
+        """
+        specs: List[Tuple[Dict[str, Any], Optional[float]]] = []
+        seen: set = set()
+
+        def add(params: Dict[str, Any], anchor: Optional[float]) -> None:
+            clean = self._clean_candidate_params(params)
+            identity = json.dumps(clean, sort_keys=True, separators=(",", ":"), default=str)
+            if identity in seen:
+                return
+            seen.add(identity)
+            specs.append((clean, anchor))
+
+        for seeded_strategy, anchor in self._screening_variants_for_strategy(strategy):
+            add(dict(seeded_strategy.get_params() or {}), anchor)
+        base_params = dict(strategy.get_params() or {})
+        add(base_params, None)
+        target_budget = max(int(self.family_probe_trials), len(specs), 1)
+        param_grid = dict(strategy.get_param_grid() or {})
+        param_names = list(param_grid.keys())
+        choices_by_name = [list(param_grid[name] or []) for name in param_names]
+        if not param_names or any(not choices for choices in choices_by_name):
+            return specs
+        total_space = int(math.prod(len(choices) for choices in choices_by_name))
+        if total_space <= 0:
+            return specs
+        seed = _stable_seed(
+            symbol,
+            timeframe,
+            regime,
+            strategy.name,
+            "family_probe_b0",
+            total_space,
+        )
+        start = int(seed % total_space)
+        step = int((seed // max(total_space, 1)) % total_space) or 1
+        while math.gcd(step, total_space) != 1:
+            step = (step + 1) % total_space or 1
+        for offset in range(total_space):
+            if len(specs) >= target_budget:
+                break
+            encoded = int((start + offset * step) % total_space)
+            decoded = dict(base_params)
+            remainder = encoded
+            for name, choices in reversed(list(zip(param_names, choices_by_name))):
+                decoded[name] = choices[remainder % len(choices)]
+                remainder //= len(choices)
+            add(decoded, None)
+        return specs
+
+    def _collect_family_probe_candidates(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        train_features: pd.DataFrame,
+        strategies: List[BaseStrategy],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Freeze the train-best B0 candidate independently for every cell."""
+        candidates: List[Dict[str, Any]] = []
+        cell_records: List[Dict[str, Any]] = []
+        for base_strategy in strategies:
+            for regime in self.REGIMES:
+                specs = self._family_probe_param_specs(
+                    base_strategy,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                )
+                best_score = float("-inf")
+                best_candidate: Optional[Dict[str, Any]] = None
+                completed_trials = 0
+                eligible_train_trials = 0
+                for params, atr_anchor in specs:
+                    try:
+                        probe_strategy = StrategyRegistry.get(base_strategy.name, **params)
+                        metrics, ran = self._run_one_exact_regime(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            features=train_features,
+                            strategy=probe_strategy,
+                            regime=regime,
+                        )
+                        completed_trials += int(ran)
+                        if int(metrics.get("total_trades", 0) or 0) <= 0:
+                            continue
+                        score = float(self._compute_train_regime_score(metrics, {}))
+                        if not math.isfinite(score):
+                            continue
+                        eligible_train_trials += 1
+                        if score > best_score:
+                            best_score = score
+                            clean_params = self._clean_candidate_params(
+                                probe_strategy.get_params()
+                            )
+                            best_candidate = {
+                                "strategy": probe_strategy,
+                                "strategy_name": probe_strategy.name,
+                                "params": clean_params,
+                                "train_result": dict(metrics),
+                                "train_regime_metrics": {regime: dict(metrics)},
+                                "eligibility_result": dict(metrics),
+                                "eligibility_regime_metrics": {regime: dict(metrics)},
+                                "val_regime_metrics": {regime: {}},
+                                "is_tuned": True,
+                                "is_family_probe": True,
+                                "tuned_for_regime": str(regime),
+                                "evaluation_regime": str(regime),
+                                "screening_atr_anchor_mult": atr_anchor,
+                                "search_trials": int(len(specs)),
+                                "search_completed_trials": int(completed_trials),
+                                "eligible_train_trials": int(eligible_train_trials),
+                                "search_cell_count": 1,
+                                "search_phase": "family_probe_b0",
+                                "search_contract": "independent_regime_family_train_only_v1",
+                                "regime_gated": True,
+                                "family_probe_budget": int(self.family_probe_trials),
+                            }
+                    except Exception as exc:
+                        logger.debug(
+                            "[%s] [%s] [%s] B0 probe failed for %s: %s",
+                            symbol, timeframe, regime, base_strategy.name, exc,
+                        )
+                if best_candidate is not None:
+                    best_candidate["search_completed_trials"] = int(completed_trials)
+                    best_candidate["eligible_train_trials"] = int(eligible_train_trials)
+                    candidates.append(best_candidate)
+                cell_records.append({
+                    "phase": "family_probe_b0",
+                    "strategy_family": str(base_strategy.name),
+                    "regime": str(regime),
+                    "search_trials": int(len(specs)),
+                    "completed_trials": int(completed_trials),
+                    "eligible_train_trials": int(eligible_train_trials),
+                    "frozen_candidate": bool(best_candidate is not None),
+                    "tuning_validation_evaluations": 0,
+                    "best_train_score": (
+                        float(best_score) if math.isfinite(best_score) else None
+                    ),
+                })
+        return candidates, cell_records
+
+    def _attach_frozen_probe_validation(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        val_features: Optional[pd.DataFrame],
+        val_warmup_bars: int,
+        candidates: List[Dict[str, Any]],
+        cell_records: List[Dict[str, Any]],
+    ) -> None:
+        """Evaluate each train-frozen B0 cell once on tuning validation."""
+        records = {
+            (str(record.get("strategy_family")), str(record.get("regime"))): record
+            for record in cell_records
+        }
+        for candidate in candidates:
+            regime = str(candidate.get("evaluation_regime", ""))
+            family = str(candidate.get("strategy_name", ""))
+            evaluations = 0
+            error: Optional[str] = None
+            metrics: Dict[str, Any] = {"total_trades": 0}
+            if val_features is not None and len(val_features) >= 50:
+                evaluations = 1
+                try:
+                    frozen_strategy = StrategyRegistry.get(
+                        family, **dict(candidate.get("params", {}) or {})
+                    )
+                    candidate["strategy"] = frozen_strategy
+                    metrics, _ = self._run_one_exact_regime(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        features=val_features,
+                        strategy=frozen_strategy,
+                        regime=regime,
+                        warmup_bars=val_warmup_bars,
+                        run_zero_signal_path=True,
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    metrics = {"total_trades": 0, "evaluation_error": error}
+            candidate["val_regime_metrics"] = {regime: metrics}
+            candidate["tuning_validation_evaluations"] = int(evaluations)
+            candidate["tuning_validation_evaluation_error"] = error
+            record = records.get((family, regime))
+            if record is not None:
+                record["tuning_validation_evaluations"] = int(evaluations)
+                record["tuning_validation_evaluation_error"] = error
+
+    @staticmethod
+    def _attach_local_search_multiplicity(
+        candidates: List[Dict[str, Any]],
+        *,
+        probe_cells: List[Dict[str, Any]],
+        tuning_summaries: List[Dict[str, Any]],
+        roster_count: int,
+    ) -> None:
+        """Attach exact attempted cell/trial totals used by DSR."""
+        probe_trials = int(sum(
+            int(cell.get("search_trials", 0) or 0) for cell in probe_cells
+        ))
+        tuning_trials = int(sum(
+            int(summary.get("search_trials_total", 0) or 0)
+            for summary in tuning_summaries
+        ))
+        probe_cell_count = int(len(probe_cells))
+        tuning_cell_count = int(sum(
+            int(summary.get("cell_count", 0) or 0)
+            for summary in tuning_summaries
+        ))
+        validation_evaluations = int(
+            sum(int(cell.get("tuning_validation_evaluations", 0) or 0) for cell in probe_cells)
+            + sum(
+                int(summary.get("tuning_validation_evaluations", 0) or 0)
+                for summary in tuning_summaries
+            )
+        )
+        for candidate in candidates:
+            candidate["strategy_roster_count"] = int(roster_count)
+            candidate["family_probe_search_trials_total"] = probe_trials
+            candidate["family_probe_search_cells_total"] = probe_cell_count
+            candidate["tuning_search_trials_total"] = tuning_trials
+            candidate["tuning_search_cells_total"] = tuning_cell_count
+            candidate["local_search_trials_total"] = int(probe_trials + tuning_trials)
+            candidate["local_search_cells_total"] = int(probe_cell_count + tuning_cell_count)
+            candidate["local_search_trial_count_exact"] = True
+            candidate["multiplicity_scope"] = "symbol_timeframe_all_regime_cells"
+            candidate["frozen_tuning_validation_evaluations_total"] = validation_evaluations
+
+    @staticmethod
+    def _representative_exact_regime_result(
+        metrics_by_regime: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Compatibility summary chosen only from direct regime-gated metrics."""
+        populated = [
+            (regime, dict(metrics or {}))
+            for regime, metrics in (metrics_by_regime or {}).items()
+            if int((metrics or {}).get("total_trades", 0) or 0) > 0
+        ]
+        if not populated:
+            return {"total_trades": 0, "regime_gated": True}
+        regime, metrics = max(
+            populated,
+            key=lambda item: (
+                int(item[1].get("total_trades", 0) or 0),
+                float(item[1].get("total_return_pct", -1e12) or -1e12),
+                float(item[1].get("profit_factor", 0.0) or 0.0),
+                -float(item[1].get("max_drawdown_pct", 100.0) or 100.0),
+                str(item[0]),
+            ),
+        )
+        metrics["representative_regime"] = str(regime)
+        metrics["regime_gated"] = True
+        return metrics
+
     def _collect_candidates(self,
                             symbol: str,
                             timeframe: str,
@@ -2985,86 +3777,21 @@ class RegimeOptimizer:
         """
         Collect all strategy candidates with per-regime metrics.
         
-        Phase 1 (Screening): Run all strategies with configured first-pass variants, bucket by regime.
-        Phase 2 (Tuning): For top-K strategies per regime, run hyperparameter optimization.
+        Phase B0: give every family-regime cell the same bounded train-only probe.
+        Phase B1: run independent deeper train-only studies for B0 top-K cells.
         
-        Returns list of candidate dicts with bucketed metrics (including tuned variants).
+        Each frozen train winner is evaluated once on tuning validation only
+        after its parameters are fixed. Returns exact-regime candidate mappings.
         """
-        eligibility_features = (
-            eligibility_features
-            if eligibility_features is not None and len(eligibility_features) >= 200
-            else train_features
+        # ``eligibility_features`` remains accepted for API compatibility, but
+        # no family gate or shortlist may inspect rows outside optimizer train.
+        _ = eligibility_features
+        screening_candidates, probe_cells = self._collect_family_probe_candidates(
+            symbol=symbol,
+            timeframe=timeframe,
+            train_features=train_features,
+            strategies=strategies,
         )
-        # Phase 1: Quick screening with default params
-        screening_candidates = []
-        screening_trials_evaluated = 0
-        
-        for strategy in strategies:
-            for screening_strategy, atr_anchor in self._screening_variants_for_strategy(strategy):
-                screening_trials_evaluated += 1
-                try:
-                    # Broad eligibility uses the full active universe. Final train metrics
-                    # remain on the bleeding-edge optimization window.
-                    eligibility_signals = screening_strategy.generate_signals(eligibility_features, symbol)
-                    eligibility_result = self.backtester.run(
-                        eligibility_features, eligibility_signals, symbol, screening_strategy
-                    )
-
-                    # Skip if no broad active-universe evidence exists.
-                    if eligibility_result.get('total_trades', 0) == 0:
-                        continue
-
-                    eligibility_trades = eligibility_result.get('trades', [])
-                    eligibility_regime_metrics = self._bucket_trades_by_regime(
-                        eligibility_trades, eligibility_features, timeframe=timeframe
-                    )
-
-                    if eligibility_features is train_features:
-                        train_result = eligibility_result
-                        train_regime_metrics = eligibility_regime_metrics
-                    else:
-                        signals = screening_strategy.generate_signals(train_features, symbol)
-                        train_result = self.backtester.run(
-                            train_features, signals, symbol, screening_strategy
-                        )
-                        train_trades = train_result.get('trades', [])
-                        train_regime_metrics = self._bucket_trades_by_regime(
-                            train_trades, train_features, timeframe=timeframe
-                        )
-
-                    train_trades = train_result.get('trades', [])
-                    compact_train_result = self._compact_backtest_result(train_result)
-                    compact_eligibility_result = self._compact_backtest_result(eligibility_result)
-
-                    # Run validation if available
-                    val_regime_metrics = {}
-                    if val_features is not None and len(val_features) >= 50:
-                        val_signals = screening_strategy.generate_signals(val_features, symbol)
-                        val_result = self.backtester.run(
-                            val_features, val_signals, symbol, screening_strategy, warmup_bars=val_warmup_bars
-                        )
-                        val_trades = val_result.get('trades', [])
-                        val_regime_metrics = self._bucket_trades_by_regime(
-                            val_trades, val_features, timeframe=timeframe
-                        )
-
-                    screening_candidates.append({
-                        'strategy': screening_strategy,
-                        'strategy_name': screening_strategy.name,
-                        'params': screening_strategy.get_params(),
-                        'train_result': compact_train_result,
-                        'train_regime_metrics': train_regime_metrics,
-                        'eligibility_result': compact_eligibility_result,
-                        'eligibility_regime_metrics': eligibility_regime_metrics,
-                        'val_regime_metrics': val_regime_metrics,
-                        'is_tuned': False,
-                        'screening_atr_anchor_mult': atr_anchor,
-                        'search_trials': 1,
-                    })
-
-                except Exception as e:
-                    logger.debug(f"[{symbol}] [{timeframe}] {screening_strategy.name} failed: {e}")
-                    continue
 
         # ===== NEW: Apply training eligibility gates =====
         # Filter out strategies that are "obviously bad" on training data
@@ -3080,11 +3807,23 @@ class RegimeOptimizer:
             )
             return []  # Return empty list - no candidates to optimize
 
+        # Validation is touched only after the B0 train winner in each cell is frozen.
+        self._attach_frozen_probe_validation(
+            symbol=symbol,
+            timeframe=timeframe,
+            val_features=val_features,
+            val_warmup_bars=val_warmup_bars,
+            candidates=eligible_candidates,
+            cell_records=probe_cells,
+        )
+
         if not self.enable_hyperparam_tuning:
-            local_trials = max(screening_trials_evaluated, len(screening_candidates))
-            for cand in eligible_candidates:
-                cand['local_search_trials_total'] = int(local_trials)
-                cand['strategy_roster_count'] = int(len(strategies))
+            self._attach_local_search_multiplicity(
+                eligible_candidates,
+                probe_cells=probe_cells,
+                tuning_summaries=[],
+                roster_count=len(strategies),
+            )
             self._attach_oos_evidence_to_candidates(
                 symbol,
                 timeframe,
@@ -3092,15 +3831,16 @@ class RegimeOptimizer:
                 val_warmup_bars,
                 eligible_candidates,
             )
-            self._attach_threadspark_selection_evidence_to_candidates(
-                symbol,
-                timeframe,
-                selection_features,
-                selection_warmup_bars,
-                historical_features,
-                eligible_candidates,
-                selection_surface=selection_surface,
-            )
+            if self._uses_threadspark_selector():
+                self._attach_threadspark_selection_evidence_to_candidates(
+                    symbol,
+                    timeframe,
+                    selection_features,
+                    selection_warmup_bars,
+                    historical_features,
+                    eligible_candidates,
+                    selection_surface=selection_surface,
+                )
             return eligible_candidates
 
         # Phase 2: Hyperparameter tuning for top-K strategies per regime
@@ -3110,17 +3850,22 @@ class RegimeOptimizer:
             eligible_candidates, top_k=self.hyperparam_top_k
         )
         
-        # Collect all unique strategies that need tuning
-        strategies_to_tune = set()
+        # Preserve the exact shortlisted family-regime cells. Taking only the
+        # family union would silently tune a shortlisted family in regimes where
+        # it did not earn a train-only top-K place.
+        strategy_regimes_to_tune: Dict[str, set] = {}
         for regime, strategy_names in regime_top_strategies.items():
-            strategies_to_tune.update(strategy_names)
+            for strategy_name in strategy_names:
+                strategy_regimes_to_tune.setdefault(strategy_name, set()).add(regime)
         
-        if not strategies_to_tune:
+        if not strategy_regimes_to_tune:
             logger.debug(f"[{symbol}] [{timeframe}] No strategies eligible for hyperparameter tuning")
-            local_trials = max(screening_trials_evaluated, len(screening_candidates))
-            for cand in eligible_candidates:
-                cand['local_search_trials_total'] = int(local_trials)
-                cand['strategy_roster_count'] = int(len(strategies))
+            self._attach_local_search_multiplicity(
+                eligible_candidates,
+                probe_cells=probe_cells,
+                tuning_summaries=[],
+                roster_count=len(strategies),
+            )
             self._attach_oos_evidence_to_candidates(
                 symbol,
                 timeframe,
@@ -3128,22 +3873,32 @@ class RegimeOptimizer:
                 val_warmup_bars,
                 eligible_candidates,
             )
-            self._attach_threadspark_selection_evidence_to_candidates(
-                symbol,
-                timeframe,
-                selection_features,
-                selection_warmup_bars,
-                historical_features,
-                eligible_candidates,
-                selection_surface=selection_surface,
-            )
+            if self._uses_threadspark_selector():
+                self._attach_threadspark_selection_evidence_to_candidates(
+                    symbol,
+                    timeframe,
+                    selection_features,
+                    selection_warmup_bars,
+                    historical_features,
+                    eligible_candidates,
+                    selection_surface=selection_surface,
+                )
             return eligible_candidates
 
-        logger.info(f"[{symbol}] [{timeframe}] Hyperparameter tuning {len(strategies_to_tune)} strategies")
+        logger.info(
+            f"[{symbol}] [{timeframe}] Hyperparameter tuning "
+            f"{len(strategy_regimes_to_tune)} families across "
+            f"{sum(len(values) for values in strategy_regimes_to_tune.values())} independent cells"
+        )
 
         # Run hyperparameter tuning for each strategy
         tuned_candidates = []
-        for strategy_name in strategies_to_tune:
+        tuning_summaries: List[Dict[str, Any]] = []
+        for strategy_name in sorted(strategy_regimes_to_tune):
+            target_regimes = [
+                regime for regime in self.REGIMES
+                if regime in strategy_regimes_to_tune[strategy_name]
+            ]
             # Find the original strategy from eligible candidates (post-gates)
             original_cand = next((c for c in eligible_candidates if c['strategy_name'] == strategy_name), None)
             if original_cand is None:
@@ -3158,19 +3913,23 @@ class RegimeOptimizer:
             # Run grid search
             tuned_results = self._tune_strategy_params(
                 symbol, timeframe, strategy_name, param_grid,
-                train_features, val_features, val_warmup_bars
+                train_features, val_features, val_warmup_bars,
+                regimes=target_regimes,
             )
 
             tuned_candidates.extend(tuned_results)
+            if self._last_tuning_search_meta:
+                tuning_summaries.append(dict(self._last_tuning_search_meta))
 
         # Combine eligible candidates with tuned candidates
         # The tuned candidates may replace or augment the defaults
         all_candidates = eligible_candidates + tuned_candidates
-        tuned_trials = sum(max(int(cand.get('search_trials', 1) or 1), 1) for cand in tuned_candidates)
-        local_trials = int(max(screening_trials_evaluated, len(screening_candidates)) + tuned_trials)
-        for cand in all_candidates:
-            cand['local_search_trials_total'] = local_trials
-            cand['strategy_roster_count'] = int(len(strategies))
+        self._attach_local_search_multiplicity(
+            all_candidates,
+            probe_cells=probe_cells,
+            tuning_summaries=tuning_summaries,
+            roster_count=len(strategies),
+        )
         self._attach_oos_evidence_to_candidates(
             symbol,
             timeframe,
@@ -3178,17 +3937,32 @@ class RegimeOptimizer:
             val_warmup_bars,
             all_candidates,
         )
-        self._attach_threadspark_selection_evidence_to_candidates(
-            symbol,
-            timeframe,
-            selection_features,
-            selection_warmup_bars,
-            historical_features,
-            all_candidates,
-            selection_surface=selection_surface,
-        )
+        if self._uses_threadspark_selector():
+            self._attach_threadspark_selection_evidence_to_candidates(
+                symbol,
+                timeframe,
+                selection_features,
+                selection_warmup_bars,
+                historical_features,
+                all_candidates,
+                selection_surface=selection_surface,
+            )
 
         return all_candidates
+
+    def _uses_threadspark_selector(self) -> bool:
+        """Return whether candidate ranking consumes ThreadSpark evidence.
+
+        Building ThreadSpark evidence replays every candidate on an additional
+        selection surface and optional historical chunks.  Those computations
+        have no decision effect for the other scoring models, so production
+        must not pay their runtime and memory cost unless ThreadSpark is the
+        configured selector.  The research model remains fully supported.
+        """
+        scoring_model = str(
+            getattr(self.config, "regime_scoring_model", "legacy") or "legacy"
+        ).strip().lower()
+        return scoring_model == "specialist_spokes_threadspark"
     
     def _identify_top_strategies_per_regime(self,
                                             candidates: List[Dict[str, Any]],
@@ -3199,21 +3973,19 @@ class RegimeOptimizer:
         Returns dict mapping regime -> list of strategy names to tune.
         """
         regime_scores: Dict[str, Dict[str, float]] = {r: {} for r in self.REGIMES}
+        screening_trade_floor = max(1, int(self.min_train_trades or 0) // 2)
         
         for cand in candidates:
             for regime in self.REGIMES:
-                train_metrics = (
-                    cand.get('eligibility_regime_metrics')
-                    or cand.get('train_regime_metrics', {})
-                ).get(regime, {})
+                train_metrics = cand.get('train_regime_metrics', {}).get(regime, {})
                 
                 train_trades = train_metrics.get('total_trades', 0)
                 
                 # Only consider strategies with enough trades in this regime
-                if train_trades < self.min_train_trades // 2:  # Relaxed threshold for screening
+                if train_trades < screening_trade_floor:  # Relaxed, but never admits an empty cell.
                     continue
                 
-                score = self._compute_regime_score(train_metrics, {})
+                score = self._compute_train_regime_score(train_metrics, {})
                 strategy_name = cand['strategy_name']
                 previous_score = regime_scores[regime].get(strategy_name)
                 if previous_score is None or score > previous_score:
@@ -3237,7 +4009,8 @@ class RegimeOptimizer:
                               param_grid: Dict[str, List],
                               train_features: pd.DataFrame,
                               val_features: Optional[pd.DataFrame],
-                              val_warmup_bars: int = 0) -> List[Dict[str, Any]]:
+                              val_warmup_bars: int = 0,
+                              regimes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Tune hyperparameters for a strategy using Optuna TPE.
         
@@ -3246,6 +4019,14 @@ class RegimeOptimizer:
         
         Returns list of tuned candidate dicts with regime metrics.
         """
+        target_regimes = [
+            regime for regime in self.REGIMES
+            if regime in set(regimes or self.REGIMES)
+        ]
+        self._last_tuning_search_meta = {}
+        if not target_regimes:
+            return []
+
         # Use Optuna if available
         if self.optuna_optimizer is not None:
             regime_results = self.optuna_optimizer.optimize_for_regimes(
@@ -3255,9 +4036,9 @@ class RegimeOptimizer:
                 param_grid=param_grid,
                 train_features=train_features,
                 val_features=val_features,
-                regimes=self.REGIMES,
+                regimes=target_regimes,
                 bucket_trades_fn=self._bucket_trades_by_regime,
-                compute_score_fn=self._compute_regime_score,
+                compute_score_fn=self._compute_train_regime_score,
                 min_train_trades=self.min_train_trades,
                 max_drawdown_pct=self.val_max_drawdown,  # Pass DD threshold for early rejection
                 val_warmup_bars=val_warmup_bars,
@@ -3265,10 +4046,16 @@ class RegimeOptimizer:
             
             # Convert to candidate list format
             tuned_candidates = []
+            self._last_tuning_search_meta = dict(
+                getattr(self.optuna_optimizer, "last_regime_search_metadata", {}) or {}
+            )
             for regime, candidate in regime_results.items():
                 candidate['tuned_for_regime'] = regime
                 candidate['train_result'] = self._compact_backtest_result(
                     candidate.get('train_result')
+                )
+                candidate['family_search_metadata'] = dict(
+                    self._last_tuning_search_meta
                 )
                 tuned_candidates.append(candidate)
             
@@ -3280,7 +4067,14 @@ class RegimeOptimizer:
         
         # Fallback to grid search
         return self._tune_strategy_params_grid(
-            symbol, timeframe, strategy_name, param_grid, train_features, val_features, val_warmup_bars
+            symbol,
+            timeframe,
+            strategy_name,
+            param_grid,
+            train_features,
+            val_features,
+            val_warmup_bars,
+            regimes=target_regimes,
         )
     
     def _tune_strategy_params_grid(self,
@@ -3290,7 +4084,8 @@ class RegimeOptimizer:
                                    param_grid: Dict[str, List],
                                    train_features: pd.DataFrame,
                                    val_features: Optional[pd.DataFrame],
-                                   val_warmup_bars: int = 0) -> List[Dict[str, Any]]:
+                                   val_warmup_bars: int = 0,
+                                   regimes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Fallback grid search for hyperparameter tuning.
         
@@ -3303,106 +4098,172 @@ class RegimeOptimizer:
         param_values = list(param_grid.values())
         all_combos = list(product(*param_values))
         
-        # Limit combinations with context-derived seed (X2)
-        if len(all_combos) > self.hyperparam_max_combos:
-            _seed = _stable_seed(
-                symbol,
-                timeframe,
-                strategy_name,
-                "regime_grid",
-                len(train_features),
-                len(val_features) if val_features is not None else 0,
-            )
-            np.random.seed(_seed)
-            indices = np.random.choice(len(all_combos), self.hyperparam_max_combos, replace=False)
-            all_combos = [all_combos[i] for i in indices]
-        
         # Get default params as base
         base_strategy = StrategyRegistry.get(strategy_name)
         default_params = base_strategy.get_params()
-        
-        tuned_candidates = []
-        best_scores_by_regime: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-        
-        for combo in all_combos:
-            params = {**default_params, **dict(zip(param_names, combo))}
-            
-            try:
-                # Create strategy with these params
-                test_strategy = StrategyRegistry.get(strategy_name, **params)
-                
-                # Run backtest
-                signals = test_strategy.generate_signals(train_features, symbol)
-                train_result = self.backtester.run(
-                    train_features, signals, symbol, test_strategy
+        target_regimes = [
+            regime for regime in self.REGIMES
+            if regime in set(regimes or self.REGIMES)
+        ]
+        tuned_candidates: List[Dict[str, Any]] = []
+        cell_records: List[Dict[str, Any]] = []
+        for regime in target_regimes:
+            if len(all_combos) > self.hyperparam_max_combos:
+                seed = _stable_seed(
+                    symbol,
+                    timeframe,
+                    regime,
+                    strategy_name,
+                    "regime_grid_train_only",
+                    len(train_features),
                 )
-                
-                if train_result.get('total_trades', 0) < self.config.min_trades // 2:
-                    continue
-                
-                # Bucket by regime
-                train_trades = train_result.get('trades', [])
-                train_regime_metrics = self._bucket_trades_by_regime(
-                    train_trades, train_features, timeframe=timeframe
+                rng = np.random.default_rng(seed)
+                indices = rng.choice(
+                    len(all_combos), self.hyperparam_max_combos, replace=False
                 )
-                compact_train_result = self._compact_backtest_result(train_result)
-                
-                # Validation
-                val_regime_metrics = {}
-                if val_features is not None and len(val_features) >= 50:
-                    val_signals = test_strategy.generate_signals(val_features, symbol)
-                    val_result = self.backtester.run(
-                        val_features, val_signals, symbol, test_strategy, warmup_bars=val_warmup_bars
+                combos = [all_combos[int(index)] for index in indices]
+            else:
+                combos = list(all_combos)
+            best_score = float("-inf")
+            best_candidate: Optional[Dict[str, Any]] = None
+            completed_trials = 0
+            eligible_train_trials = 0
+            early_dd_rejections = 0
+            for combo in combos:
+                params = {**default_params, **dict(zip(param_names, combo))}
+                try:
+                    test_strategy = StrategyRegistry.get(strategy_name, **params)
+                    train_m, ran = self._run_one_exact_regime(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        features=train_features,
+                        strategy=test_strategy,
+                        regime=regime,
                     )
-                    val_trades = val_result.get('trades', [])
-                    val_regime_metrics = self._bucket_trades_by_regime(
-                        val_trades, val_features, timeframe=timeframe
-                    )
-                
-                # Score per regime and track best
-                for regime in self.REGIMES:
-                    train_m = train_regime_metrics.get(regime, {})
-                    val_m = val_regime_metrics.get(regime, {})
-                    
-                    if train_m.get('total_trades', 0) < self.min_train_trades:
+                    completed_trials += int(ran)
+                    if int(train_m.get("total_trades", 0) or 0) < self.min_train_trades:
                         continue
-                    
-                    score = self._compute_regime_score(train_m, val_m)
-                    
-                    if regime not in best_scores_by_regime or score > best_scores_by_regime[regime][0]:
-                        # Clean params for JSON serialization
-                        clean_params = {}
-                        for k, v in params.items():
-                            if hasattr(v, "item"):
-                                v = v.item()
-                            elif isinstance(v, (np.integer, np.floating)):
-                                v = float(v) if isinstance(v, np.floating) else int(v)
-                            clean_params[k] = v
-                        
-                        best_scores_by_regime[regime] = (score, {
-                            'strategy': test_strategy,
-                            'strategy_name': strategy_name,
-                            'params': clean_params,
-                            'train_result': compact_train_result,
-                            'train_regime_metrics': train_regime_metrics,
-                            'val_regime_metrics': val_regime_metrics,
-                            'is_tuned': True,
-                            'tuned_for_regime': regime,
-                            'search_trials': int(len(all_combos)),
-                        })
-                
-            except Exception as e:
-                logger.debug(f"[{symbol}] [{timeframe}] {strategy_name} param combo failed: {e}")
-                continue
-        
-        # Collect best tuned candidates (one per regime this strategy is good for)
-        for regime, (score, candidate) in best_scores_by_regime.items():
-            tuned_candidates.append(candidate)
-        
+                    if float(train_m.get("max_drawdown_pct", 100.0) or 100.0) > (
+                        self.val_max_drawdown * 1.25
+                    ):
+                        early_dd_rejections += 1
+                        continue
+                    score = float(self._compute_train_regime_score(train_m, {}))
+                    if not math.isfinite(score):
+                        continue
+                    eligible_train_trials += 1
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = {
+                            "strategy": test_strategy,
+                            "strategy_name": strategy_name,
+                            "params": self._clean_candidate_params(
+                                test_strategy.get_params()
+                            ),
+                            "train_result": dict(train_m),
+                            "train_regime_metrics": {regime: dict(train_m)},
+                            "val_regime_metrics": {regime: {}},
+                            "is_tuned": True,
+                            "tuned_for_regime": str(regime),
+                            "search_trials": int(len(combos)),
+                            "search_completed_trials": int(completed_trials),
+                            "eligible_train_trials": int(eligible_train_trials),
+                            "search_cell_count": 1,
+                            "search_phase": "deep_grid",
+                            "search_contract": "independent_regime_family_train_only_v1",
+                            "regime_gated": True,
+                            "evaluation_regime": str(regime),
+                            "parameter_stability_evidence": {
+                                "status": "not_available",
+                                "reason": "deterministic_grid_fallback",
+                            },
+                        }
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] [%s] [%s] %s train-only grid trial failed: %s",
+                        symbol, timeframe, regime, strategy_name, exc,
+                    )
+            evaluations = 0
+            evaluation_error: Optional[str] = None
+            if best_candidate is not None:
+                best_candidate["search_completed_trials"] = int(completed_trials)
+                best_candidate["eligible_train_trials"] = int(eligible_train_trials)
+                val_m: Dict[str, Any] = {"total_trades": 0}
+                if val_features is not None and len(val_features) >= 50:
+                    evaluations = 1
+                    try:
+                        frozen_strategy = StrategyRegistry.get(
+                            strategy_name, **dict(best_candidate["params"])
+                        )
+                        best_candidate["strategy"] = frozen_strategy
+                        val_m, _ = self._run_one_exact_regime(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            features=val_features,
+                            strategy=frozen_strategy,
+                            regime=regime,
+                            warmup_bars=val_warmup_bars,
+                            run_zero_signal_path=True,
+                        )
+                    except Exception as exc:
+                        evaluation_error = f"{type(exc).__name__}: {exc}"
+                        val_m = {
+                            "total_trades": 0,
+                            "evaluation_error": evaluation_error,
+                        }
+                best_candidate["val_regime_metrics"] = {regime: val_m}
+                best_candidate["tuning_validation_evaluations"] = int(evaluations)
+                best_candidate["tuning_validation_evaluation_error"] = evaluation_error
+                tuned_candidates.append(best_candidate)
+            cell_records.append({
+                "phase": "deep_grid",
+                "strategy_family": str(strategy_name),
+                "regime": str(regime),
+                "search_trials": int(len(combos)),
+                "completed_trials": int(completed_trials),
+                "eligible_train_trials": int(eligible_train_trials),
+                "early_dd_rejections": int(early_dd_rejections),
+                "frozen_candidate": bool(best_candidate is not None),
+                "tuning_validation_evaluations": int(evaluations),
+                "best_train_score": (
+                    float(best_score) if math.isfinite(best_score) else None
+                ),
+            })
+        self._last_tuning_search_meta = {
+            "contract": "independent_regime_family_train_only_v1",
+            "symbol": str(symbol),
+            "timeframe": str(timeframe),
+            "strategy_family": str(strategy_name),
+            "method": "deterministic_grid_fallback",
+            "cell_count": int(len(cell_records)),
+            "search_trials_total": int(sum(
+                int(cell.get("search_trials", 0) or 0) for cell in cell_records
+            )),
+            "completed_trials_total": int(sum(
+                int(cell.get("completed_trials", 0) or 0) for cell in cell_records
+            )),
+            "eligible_train_trials_total": int(sum(
+                int(cell.get("eligible_train_trials", 0) or 0) for cell in cell_records
+            )),
+            "tuning_validation_evaluations": int(sum(
+                int(cell.get("tuning_validation_evaluations", 0) or 0)
+                for cell in cell_records
+            )),
+            "cells": [dict(cell) for cell in cell_records],
+        }
+        for candidate in tuned_candidates:
+            candidate["family_search_metadata"] = dict(
+                self._last_tuning_search_meta
+            )
         if tuned_candidates:
-            logger.debug(f"[{symbol}] [{timeframe}] {strategy_name}: "
-                        f"{len(tuned_candidates)} tuned variants (grid search)")
-        
+            logger.debug(
+                "[%s] [%s] %s: %d frozen variants from %d train-only grid cells",
+                symbol,
+                timeframe,
+                strategy_name,
+                len(tuned_candidates),
+                len(cell_records),
+            )
         return tuned_candidates
     
     def _bucket_trades_by_regime(self,
@@ -3464,16 +4325,69 @@ class RegimeOptimizer:
             Dict with comprehensive metrics including max_drawdown_pct
         """
         if not trades:
-            return {'total_trades': 0, 'max_drawdown_pct': 0.0, 'total_return_pct': 0.0}
+            return {
+                'total_trades': 0,
+                'max_drawdown_pct': 0.0,
+                'total_return_pct': 0.0,
+                'return_drawdown_ratio': 0.0,
+                'calmar_ratio_annualized': 0.0,
+                'annualized_return_pct': 0.0,
+                'calmar_ratio_basis': "cumulative_return_pct_over_max_drawdown_pct",
+            }
         
         if initial_capital is None:
             initial_capital = getattr(self.config, 'initial_capital', 10000.0)
         sorted_trades = sorted(trades, key=lambda t: t.get('entry_bar', t.get('signal_bar', 0)))
-        equity = initial_capital
-        equity_curve = [equity]
-        for trade in sorted_trades:
-            equity += trade.get('pnl_dollars', 0.0)
-            equity_curve.append(equity)
+
+        # Bucket metrics historically supplied one equity observation per trade
+        # to a routine that annualized those observations as timeframe bars. A
+        # 16-trade H1 bucket was therefore treated like 16 hourly returns and
+        # could report Sharpe values in the hundreds. Reconstruct a dated daily
+        # realized-equity series instead so every timeframe has the same metric
+        # clock. Exact-regime selection now uses direct gated backtests; this
+        # reconstruction remains for diagnostics and legacy evidence only.
+        metric_features = features
+        metric_timeframe = "D1"
+        daily_realized_returns: List[float] = []
+        daily_return_dates: List[str] = []
+        if features is not None and len(features) > 0 and isinstance(features.index, pd.DatetimeIndex):
+            active_days = pd.DatetimeIndex(features.index.normalize().unique()).sort_values()
+            pnl_by_day = pd.Series(0.0, index=active_days, dtype=float)
+            for trade in sorted_trades:
+                exit_time = trade.get("exit_time")
+                if exit_time is None:
+                    try:
+                        exit_bar = int(trade.get("exit_bar", trade.get("entry_bar", 0)) or 0)
+                        exit_bar = max(0, min(exit_bar, len(features) - 1))
+                        exit_time = features.index[exit_bar]
+                    except (TypeError, ValueError, IndexError):
+                        exit_time = active_days[-1]
+                exit_day = pd.Timestamp(exit_time).normalize()
+                if exit_day not in pnl_by_day.index:
+                    eligible_days = active_days[active_days <= exit_day]
+                    exit_day = eligible_days[-1] if len(eligible_days) else active_days[0]
+                pnl_by_day.loc[exit_day] += float(trade.get('pnl_dollars', 0.0) or 0.0)
+            daily_equity = float(initial_capital) + pnl_by_day.cumsum()
+            prior_equity = pd.Series(
+                [float(initial_capital), *daily_equity.iloc[:-1].astype(float).tolist()],
+                index=daily_equity.index,
+                dtype=float,
+            )
+            daily_returns_series = (daily_equity.astype(float) - prior_equity) / prior_equity.replace(0.0, np.nan)
+            daily_returns_series = daily_returns_series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            daily_realized_returns = [float(value) for value in daily_returns_series.tolist()]
+            daily_return_dates = [pd.Timestamp(value).isoformat() for value in daily_returns_series.index]
+            equity_curve = [float(initial_capital), *daily_equity.astype(float).tolist()]
+            metric_features = pd.DataFrame(index=pd.DatetimeIndex([
+                active_days[0] - pd.Timedelta(days=1), *active_days.tolist()
+            ]))
+            equity = float(equity_curve[-1])
+        else:
+            equity = float(initial_capital)
+            equity_curve = [equity]
+            for trade in sorted_trades:
+                equity += float(trade.get('pnl_dollars', 0.0) or 0.0)
+                equity_curve.append(equity)
 
         peak = initial_capital
         max_drawdown_pct = 0.0
@@ -3488,8 +4402,8 @@ class RegimeOptimizer:
             equity,
             equity_curve,
             max_drawdown_pct,
-            features=features,
-            timeframe=timeframe,
+            features=metric_features,
+            timeframe=metric_timeframe,
         )
         return {
             'bars': int(len(features)) if features is not None else 0,
@@ -3504,6 +4418,15 @@ class RegimeOptimizer:
             'sharpe_approx': metrics.get('sharpe_ratio', 0.0),
             'sortino_approx': metrics.get('sortino_ratio', 0.0),
             'calmar_ratio': metrics.get('calmar_ratio', 0.0),
+            'return_drawdown_ratio': metrics.get('return_drawdown_ratio', metrics.get('calmar_ratio', 0.0)),
+            'calmar_ratio_annualized': metrics.get('calmar_ratio_annualized', 0.0),
+            'annualized_return_pct': metrics.get('annualized_return_pct', 0.0),
+            'calmar_ratio_basis': metrics.get('calmar_ratio_basis', "cumulative_return_pct_over_max_drawdown_pct"),
+            'metric_contract_version': metrics.get('metric_contract_version'),
+            'risk_return_frequency': 'daily_realized',
+            'daily_realized_returns': daily_realized_returns,
+            'daily_return_dates': daily_return_dates,
+            'daily_return_observations': int(len(daily_realized_returns)),
             'std_weekly_return': metrics.get('std_weekly_return', 0.0),
             'r_count': metrics.get('r_count', 0),
             'mean_r': metrics.get('mean_r', 0.0),
@@ -3854,7 +4777,7 @@ class RegimeOptimizer:
             total += max(int(cand.get('search_trials', 1) or 1), 1)
         return max(total, 1)
 
-    def _false_discovery_scope_multiplier(self) -> int:
+    def _false_discovery_scope_multiplier(self, *, local_includes_regimes: bool = False) -> int:
         symbol_count = int(getattr(self.config, 'false_discovery_symbol_count', 0) or 0)
         symbol_count = max(1, symbol_count)
         try:
@@ -3862,34 +4785,118 @@ class RegimeOptimizer:
         except Exception:
             timeframe_count = 1
         timeframe_count = max(1, timeframe_count)
-        return max(1, symbol_count * timeframe_count * len(self.REGIMES))
+        regime_count = 1 if local_includes_regimes else len(self.REGIMES)
+        return max(1, symbol_count * timeframe_count * regime_count)
 
     def _build_false_discovery_evidence(self,
                                         val_metrics: Dict[str, Any],
                                         candidates: List[Dict[str, Any]],
-                                        candidate: Dict[str, Any]) -> Dict[str, Any]:
+                                        candidate: Dict[str, Any],
+                                        regime: str = "",
+                                        pbo_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         enabled = bool(getattr(self.config, 'false_discovery_control_enabled', False))
         local_trials = self._effective_search_trials(candidates)
-        scope_multiplier = self._false_discovery_scope_multiplier()
-        try:
-            scope_power = float(getattr(self.config, 'false_discovery_scope_power', 0.25) or 0.0)
-        except Exception:
-            scope_power = 0.25
-        scope_power = max(0.0, min(1.0, scope_power))
-        if enabled:
-            effective_trials = int(math.ceil(local_trials * (scope_multiplier ** scope_power)))
-        else:
-            effective_trials = local_trials
-        candidate_trials = max(int(candidate.get('search_trials', 1) or 1), 1)
-        effective_trials = max(effective_trials, candidate_trials, 1)
-
-        val_sharpe = float(val_metrics.get('sharpe_approx', val_metrics.get('sharpe_ratio', 0.0)) or 0.0)
-        val_trades = int(val_metrics.get('total_trades', 0) or 0)
-        dsr = self._deflated_sharpe_ratio(
-            sharpe=val_sharpe,
-            n_trades=val_trades,
-            n_trials=effective_trials,
+        local_includes_regimes = any(
+            str(cand.get("multiplicity_scope", ""))
+            == "symbol_timeframe_all_regime_cells"
+            for cand in candidates
         )
+        scope_multiplier = self._false_discovery_scope_multiplier(
+            local_includes_regimes=local_includes_regimes
+        )
+        local_cells = max(
+            [int(cand.get("local_search_cells_total", 0) or 0) for cand in candidates]
+            or [0]
+        )
+        candidate_trials = max(int(candidate.get('search_trials', 1) or 1), 1)
+        # Multiplicity is the actual attempted train-only trial count persisted
+        # by the optimizer. Estimated symbol/timeframe multipliers are reported
+        # separately but are never presented as observations that did not run.
+        effective_trials = max(local_trials, candidate_trials, 1)
+        min_daily = int(
+            getattr(self.config, "false_discovery_min_daily_observations", 252) or 252
+        )
+        min_effective = float(
+            getattr(self.config, "false_discovery_min_effective_observations", 60.0)
+            or 60.0
+        )
+        min_dsr = float(getattr(self.config, 'false_discovery_min_dsr', 0.95) or 0.95)
+        daily_returns = list(val_metrics.get("daily_realized_returns", []) or [])
+        dsr_evidence = deflated_sharpe_evidence(
+            daily_returns,
+            attempted_trials=effective_trials,
+            min_observations=min_daily,
+            min_effective_observations=min_effective,
+            min_dsr=min_dsr,
+        )
+        if pbo_evidence is None:
+            pbo_evidence = aligned_cell_pbo(
+                candidates,
+                regime,
+                min_candidates=int(
+                    getattr(self.config, "false_discovery_pbo_min_candidates", 5) or 5
+                ),
+                min_observations=min_daily,
+                max_pbo=float(getattr(self.config, "false_discovery_max_pbo", 0.50) or 0.50),
+                blocks=int(getattr(self.config, "false_discovery_pbo_blocks", 10) or 10),
+            )
+        pbo_evidence = dict(pbo_evidence or {})
+        candidate_pbo_id = str(
+            (candidate.get("oos_evidence") or {}).get("candidate_id")
+            or candidate.get("candidate_id")
+            or ""
+        )
+        pbo_candidate_ids = [
+            str(value) for value in (pbo_evidence.get("candidate_ids") or [])
+        ]
+        pbo_membership_required = (
+            str(pbo_evidence.get("alignment", ""))
+            == "exact_regime_identical_daily_axis"
+        )
+        pbo_candidate_included = (
+            bool(candidate_pbo_id and candidate_pbo_id in pbo_candidate_ids)
+            if pbo_membership_required
+            else None
+        )
+        if pbo_membership_required and not pbo_candidate_included:
+            pbo_evidence.update({
+                "status": "UNAVAILABLE",
+                "passed": False,
+                "reason": "evaluated candidate is absent from the exact PBO matrix",
+            })
+        pbo_evidence["evaluated_candidate_id"] = candidate_pbo_id or None
+        pbo_evidence["evaluated_candidate_included"] = pbo_candidate_included
+        bootstrap = block_bootstrap_evidence(
+            daily_returns,
+            repetitions=int(
+                getattr(self.config, "false_discovery_bootstrap_repetitions", 300) or 300
+            ),
+            confidence=float(
+                getattr(self.config, "false_discovery_bootstrap_confidence", 0.95) or 0.95
+            ),
+            seed=_stable_seed(
+                candidate.get("strategy_name", ""),
+                candidate.get("params", {}),
+                regime,
+            ),
+            min_observations=min_daily,
+            min_effective_observations=min_effective,
+            min_mean_lower=float(
+                getattr(self.config, "false_discovery_bootstrap_min_mean_lower", 0.0)
+                or 0.0
+            ),
+            min_profit_factor_lower=float(
+                getattr(self.config, "false_discovery_bootstrap_min_pf_lower", 1.0)
+                or 1.0
+            ),
+            max_drawdown_upper=float(
+                getattr(self.config, "false_discovery_bootstrap_max_dd_upper", 0.20)
+                or 0.20
+            ),
+        )
+        dsr = float(dsr_evidence.get("deflated_sharpe", 0.0) or 0.0)
+        val_sharpe = float(dsr_evidence.get("sharpe_annualized", 0.0) or 0.0)
+        val_trades = int(val_metrics.get('total_trades', 0) or 0)
         try:
             confidence_floor = float(getattr(self.config, 'false_discovery_confidence_floor', 0.35) or 0.0)
         except Exception:
@@ -3902,18 +4909,25 @@ class RegimeOptimizer:
         )
         return {
             "enabled": enabled,
-            "pbo_status": "not_available",
+            "statistics_contract_version": dsr_evidence.get("contract_version"),
+            "pbo_status": str(pbo_evidence.get("status", "UNAVAILABLE")).lower(),
+            "pbo": pbo_evidence.get("pbo"),
+            "pbo_evidence": dict(pbo_evidence),
+            "pbo_candidate_included": pbo_candidate_included,
+            "bootstrap_evidence": dict(bootstrap),
+            "dsr_evidence": dict(dsr_evidence),
             "val_sharpe": val_sharpe,
             "val_trades": val_trades,
             "local_trials": int(local_trials),
+            "local_search_cells": int(local_cells),
+            "local_scope_includes_regimes": bool(local_includes_regimes),
             "candidate_trials": int(candidate_trials),
             "scope_multiplier": int(scope_multiplier),
-            "scope_power": float(scope_power),
             "effective_trials": int(effective_trials),
             "deflated_sharpe": round(float(dsr), 6),
             "confidence_floor": float(confidence_floor),
             "confidence_multiplier": round(float(confidence_multiplier), 6),
-            "min_dsr": float(getattr(self.config, 'false_discovery_min_dsr', 0.0) or 0.0),
+            "min_dsr": min_dsr,
         }
 
     def _call_regime_score(self,
@@ -3956,6 +4970,35 @@ class RegimeOptimizer:
             "multiplier": round(multiplier, 6),
         }
 
+    @staticmethod
+    def _selection_surface_failure(
+        metrics: Dict[str, Any],
+        *,
+        label: str,
+    ) -> Optional[str]:
+        """Return a fail-closed reason for a malformed core metric surface."""
+        try:
+            trades_raw = float(metrics.get("total_trades"))
+            total_return = float(metrics.get("total_return_pct"))
+            drawdown = float(metrics.get("max_drawdown_pct"))
+            profit_factor = float(metrics.get("profit_factor"))
+            win_rate = float(metrics.get("win_rate", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            return f"{label} core metrics are missing or non-numeric"
+        if not math.isfinite(trades_raw) or trades_raw < 0.0 or not trades_raw.is_integer():
+            return f"{label} total_trades is invalid"
+        if not math.isfinite(total_return):
+            return f"{label} total_return_pct is non-finite"
+        if not math.isfinite(drawdown) or drawdown < 0.0:
+            return f"{label} max_drawdown_pct is invalid"
+        # Positive infinity is a valid PF when a sufficiently populated sample
+        # has no losing trades; NaN, negative values, and -inf are not.
+        if math.isnan(profit_factor) or profit_factor < 0.0:
+            return f"{label} profit_factor is invalid"
+        if not math.isfinite(win_rate) or not 0.0 <= win_rate <= 100.0:
+            return f"{label} win_rate is outside [0, 100]"
+        return None
+
     def _select_best_for_regime(self,
                                  symbol: str,
                                  timeframe: str,
@@ -3974,10 +5017,51 @@ class RegimeOptimizer:
         rejection_reasons = []  # Track why candidates were rejected at gate level
         best_score = -float('inf')
         best_candidate = None
+        min_val_trades = self._min_val_trades_for_timeframe(timeframe)
+        false_discovery_enabled = bool(
+            getattr(self.config, "false_discovery_control_enabled", False)
+        )
+        cell_pbo_evidence = (
+            aligned_cell_pbo(
+                candidates,
+                regime,
+                min_candidates=int(
+                    getattr(self.config, "false_discovery_pbo_min_candidates", 5) or 5
+                ),
+                min_observations=int(
+                    getattr(self.config, "false_discovery_min_daily_observations", 252)
+                    or 252
+                ),
+                max_pbo=float(
+                    getattr(self.config, "false_discovery_max_pbo", 0.50) or 0.50
+                ),
+                blocks=int(
+                    getattr(self.config, "false_discovery_pbo_blocks", 10) or 10
+                ),
+            )
+            if false_discovery_enabled
+            else {"status": "DISABLED", "passed": True, "pbo": None}
+        )
 
         for cand in candidates:
-            train_metrics = cand['train_regime_metrics'].get(regime, {})
-            val_metrics = cand['val_regime_metrics'].get(regime, {})
+            train_metrics = dict(
+                (cand.get('train_regime_metrics') or {}).get(regime, {}) or {}
+            )
+            val_metrics = dict(
+                (cand.get('val_regime_metrics') or {}).get(regime, {}) or {}
+            )
+            surface_failure = self._selection_surface_failure(
+                train_metrics,
+                label="train",
+            ) or self._selection_surface_failure(
+                val_metrics,
+                label="validation",
+            )
+            if surface_failure:
+                rejection_reasons.append(
+                    f"{cand.get('strategy_name', 'Unknown')}: {surface_failure}"
+                )
+                continue
 
             train_trades = train_metrics.get('total_trades', 0)
             val_trades = val_metrics.get('total_trades', 0)
@@ -3985,7 +5069,7 @@ class RegimeOptimizer:
             # Check minimum trades
             if train_trades < self.min_train_trades:
                 continue
-            if val_trades < self.min_val_trades:
+            if val_trades < min_val_trades:
                 continue
 
             # ===== EARLY REJECTION: Check drawdown before scoring =====
@@ -4030,20 +5114,42 @@ class RegimeOptimizer:
                 val_metrics,
                 candidates,
                 cand,
+                regime=regime,
+                pbo_evidence=cell_pbo_evidence,
             )
             min_dsr = float(false_discovery.get("min_dsr", 0.0) or 0.0)
             dsr = float(false_discovery.get("deflated_sharpe", 0.0) or 0.0)
-            if (
-                bool(false_discovery.get("enabled", False))
-                and min_dsr > 0.0
-                and float(val_sharpe or 0.0) > 0.0
-                and dsr < min_dsr
-            ):
-                rejection_reasons.append(
-                    f"{cand['strategy_name']}: false-discovery DSR={dsr:.4f} < {min_dsr:.4f} "
-                    f"(trials={false_discovery.get('effective_trials')})"
-                )
-                continue
+            if bool(false_discovery.get("enabled", False)):
+                dsr_status = str(
+                    (false_discovery.get("dsr_evidence") or {}).get("status", "UNAVAILABLE")
+                ).upper()
+                if dsr_status != "PASS" or dsr < min_dsr:
+                    rejection_reasons.append(
+                        f"{cand['strategy_name']}: daily-return DSR {dsr_status} "
+                        f"value={dsr:.4f} threshold={min_dsr:.4f} "
+                        f"(actual_trials={false_discovery.get('effective_trials')})"
+                    )
+                    continue
+                pbo_status = str(false_discovery.get("pbo_status", "unavailable")).upper()
+                if pbo_status != "PASS":
+                    rejection_reasons.append(
+                        f"{cand['strategy_name']}: aligned cell PBO {pbo_status} "
+                        f"value={false_discovery.get('pbo')}"
+                    )
+                    continue
+                if bool(
+                    getattr(self.config, "false_discovery_require_bootstrap", True)
+                ):
+                    bootstrap_status = str(
+                        (false_discovery.get("bootstrap_evidence") or {}).get(
+                            "status", "UNAVAILABLE"
+                        )
+                    ).upper()
+                    if bootstrap_status != "PASS":
+                        rejection_reasons.append(
+                            f"{cand['strategy_name']}: block bootstrap {bootstrap_status}"
+                        )
+                        continue
 
             scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
             if scoring_model == "specialist_spokes_threadspark":
@@ -4066,6 +5172,11 @@ class RegimeOptimizer:
                 score *= float(legacy_confidence.get("multiplier", 1.0) or 1.0)
             if bool(false_discovery.get("enabled", False)):
                 score *= float(false_discovery.get("confidence_multiplier", 1.0) or 1.0)
+            if not math.isfinite(float(score)):
+                rejection_reasons.append(
+                    f"{cand.get('strategy_name', 'Unknown')}: selection score is non-finite"
+                )
+                continue
             scored_candidates.append((score, cand, false_discovery, legacy_confidence))
 
             if score > best_score:
@@ -4088,6 +5199,7 @@ class RegimeOptimizer:
                     -float(item[1].get("_threadspark_l1_base_score", item[0]) or 0.0),
                     int(item[1].get('search_trials', 1) or 1),
                     str(item[1].get('strategy_name', '')),
+                    _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
                 )
             )
             l1_top_k = min(self.regime_validation_top_k, len(scored_candidates))
@@ -4098,6 +5210,7 @@ class RegimeOptimizer:
                     -float(item[1].get("_threadspark_l1_base_score", item[0]) or 0.0),
                     int(item[1].get('search_trials', 1) or 1),
                     str(item[1].get('strategy_name', '')),
+                    _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
                 ),
             )
         else:
@@ -4107,27 +5220,41 @@ class RegimeOptimizer:
                     -int(item[1]['train_regime_metrics'].get(regime, {}).get('total_trades', 0) or 0),
                     int(item[1].get('search_trials', 1) or 1),
                     str(item[1].get('strategy_name', '')),
+                    _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
                 )
             )
 
-        # Cap the number of validation attempts
-        top_k = min(self.regime_validation_top_k, len(scored_candidates))
+        # Every candidate in this list already paid the cost of frozen tuning
+        # validation and metric scoring.  Truncating descent here saved no
+        # compute and could manufacture NO_TRADE when rank K+1 was the first
+        # candidate to pass the final generalization gates.  Descend the full
+        # scored list.  ThreadSpark's research-only L1 shortlist, when used,
+        # has already been applied above and remains a distinct model choice.
+        descent_count = len(scored_candidates)
 
         logger.debug(
             f"[{symbol}] [{timeframe}] [{regime}] Candidate descent: "
-            f"{len(scored_candidates)} gate-passed, validating top-{top_k}"
+            f"validating all {descent_count} already-scored, gate-passed candidates"
         )
 
-        # Iterate top-K candidates, return first that passes validation
+        # Return the highest-scored candidate that passes every final gate.
         validation_failures = []
-        for rank, (score, cand, false_discovery, legacy_confidence) in enumerate(scored_candidates[:top_k], start=1):
+        for rank, (score, cand, false_discovery, legacy_confidence) in enumerate(
+            scored_candidates,
+            start=1,
+        ):
             train_metrics = cand['train_regime_metrics'].get(regime, {})
             val_metrics = cand['val_regime_metrics'].get(regime, {})
             strategy_name = cand.get('strategy_name', 'Unknown')
 
-            is_validated, validation_reason = self._validate_regime_winner(
-                train_metrics, val_metrics, regime, strategy_name
-            )
+            if bool(getattr(self.config, "regime_timeframe_val_trade_floors_enabled", False)):
+                is_validated, validation_reason = self._validate_regime_winner(
+                    train_metrics, val_metrics, regime, strategy_name, timeframe=timeframe
+                )
+            else:
+                is_validated, validation_reason = self._validate_regime_winner(
+                    train_metrics, val_metrics, regime, strategy_name
+                )
 
             if is_validated:
                 if rank > 1:
@@ -4181,15 +5308,20 @@ class RegimeOptimizer:
                     f"rank #{rank} {strategy_name} FAILED: {validation_reason}"
                 )
 
-        # All top-K candidates failed validation - return the best one as unvalidated
+        # Every scored candidate failed validation - return the best one as unvalidated
         best_score, best_candidate, false_discovery, legacy_confidence = scored_candidates[0]
         train_metrics = best_candidate['train_regime_metrics'].get(regime, {})
         val_metrics = best_candidate['val_regime_metrics'].get(regime, {})
         
         # Validate the winner using fx_backtester rules
-        is_validated, validation_reason = self._validate_regime_winner(
-            train_metrics, val_metrics, regime, best_candidate['strategy_name']
-        )
+        if bool(getattr(self.config, "regime_timeframe_val_trade_floors_enabled", False)):
+            is_validated, validation_reason = self._validate_regime_winner(
+                train_metrics, val_metrics, regime, best_candidate['strategy_name'], timeframe=timeframe
+            )
+        else:
+            is_validated, validation_reason = self._validate_regime_winner(
+                train_metrics, val_metrics, regime, best_candidate['strategy_name']
+            )
         
         # Normalize quality score to 0-1 using sigmoid mapping
         quality_score = self._normalize_score(best_score)
@@ -4230,7 +5362,7 @@ class RegimeOptimizer:
         )
         logger.info(
             f"[{symbol}] [{timeframe}] [{regime}] Descent exhausted: "
-            f"{len(validation_failures)}/{top_k} candidates failed validation"
+            f"{len(validation_failures)}/{descent_count} candidates failed validation"
         )
 
         return config, False, final_reason
@@ -4239,7 +5371,8 @@ class RegimeOptimizer:
                                  train_metrics: Dict[str, Any],
                                  val_metrics: Dict[str, Any],
                                  regime: str,
-                                 candidate_name: str = "Unknown") -> Tuple[bool, str]:
+                                 candidate_name: str = "Unknown",
+                                 timeframe: Optional[str] = None) -> Tuple[bool, str]:
         """
         Validate a regime winner against fx_backtester thresholds.
 
@@ -4276,10 +5409,11 @@ class RegimeOptimizer:
 
         train_pf = train_metrics.get('profit_factor', 0.0)
         train_return = train_metrics.get('total_return_pct', -100.0)
+        min_val_trades = self._min_val_trades_for_timeframe(timeframe)
 
         # Check minimum validation trades
-        if val_trades < self.min_val_trades:
-            return False, f"Insufficient val trades: {val_trades} < {self.min_val_trades}"
+        if val_trades < min_val_trades:
+            return False, f"Insufficient val trades: {val_trades} < {min_val_trades}"
 
         # Enforce drawdown limits before winner validation.
         if val_drawdown > self.val_max_drawdown:
@@ -4304,7 +5438,7 @@ class RegimeOptimizer:
             #   * val_win_rate > 50% — edge must come from hit-rate, not lucky tail
             exceptional_val_pf = float(self.config.exceptional_val_profit_factor)
             exceptional_val_return = float(self.config.exceptional_val_return_pct)
-            exceptional_val_min_trades = max(self.min_val_trades * 2, 50)
+            exceptional_val_min_trades = max(min_val_trades * 2, 50)
             exceptional_val_min_sharpe = 0.5
             exceptional_val_min_win_rate = 50.0
             val_win_rate = float(val_metrics.get('win_rate', 0.0) or 0.0)
@@ -4417,6 +5551,10 @@ class RegimeOptimizer:
             except Exception:
                 strategy = None
             evidence["fairness_evidence"] = build_fairness_evidence(candidate, strategy=strategy)
+            oos_evidence = dict(candidate.get("oos_evidence") or {})
+            if oos_evidence.get("candidate_id"):
+                evidence["candidate_id"] = str(oos_evidence["candidate_id"])
+            evidence["evaluation_regime"] = self._candidate_evaluation_regime(candidate)
         if isinstance(false_discovery_evidence, dict):
             evidence["false_discovery"] = dict(false_discovery_evidence)
         if isinstance(legacy_confidence_evidence, dict):
@@ -5361,6 +6499,27 @@ class RegimeOptimizer:
             )["score"]
         )
 
+    def _compute_train_regime_score(
+        self,
+        train_metrics: Dict[str, Any],
+        _unused_validation_metrics: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """One-surface score for B0, shortlist, and train-only studies.
+
+        Final configured scoring models may use tuning/generalization spokes;
+        those are intentionally unavailable before parameters are frozen.
+        """
+        train_full = self._bucket_to_full_metrics(train_metrics or {})
+        base_score = float(self.scorer.score(train_full, purpose="selection"))
+        trades = int((train_metrics or {}).get("total_trades", 0) or 0)
+        target = max(1, int(self.min_train_trades or 0) * 2)
+        stability = min(1.0, math.log1p(trades) / math.log1p(target))
+        floor = max(
+            0.0,
+            min(1.0, float(getattr(self.config, "regime_trade_stability_floor", 0.7))),
+        )
+        return base_score * (floor + (1.0 - floor) * stability)
+
     def _compute_regime_score(self,
                                train_metrics: Dict[str, Any],
                                val_metrics: Dict[str, Any],
@@ -5437,14 +6596,21 @@ class RegimeOptimizer:
             'win_rate': bucket_metrics.get('win_rate', 0),
             'profit_factor': bucket_metrics.get('profit_factor', 0),
             'total_return_pct': total_return,  # FIX: Use properly computed value
-            'sharpe_ratio': bucket_metrics.get('sharpe_approx', 0),
+            'sharpe_ratio': bucket_metrics.get(
+                'sharpe_ratio', bucket_metrics.get('sharpe_approx', 0)
+            ),
             'max_drawdown_pct': max_dd,  # FIX: Use properly computed value (default worst-case)
             'gross_profit': bucket_metrics.get('gross_profit', 0),
             'gross_loss': bucket_metrics.get('gross_loss', 0),
             'total_pnl': bucket_metrics.get('total_pnl', 0),
-            'expectancy_pips': bucket_metrics.get('avg_win', 0) * bucket_metrics.get('win_rate', 0) / 100
-                             - bucket_metrics.get('avg_loss', 0) * (1 - bucket_metrics.get('win_rate', 0) / 100),
-            'sortino_ratio': bucket_metrics.get('sortino_approx', 0),
+            'expectancy_pips': bucket_metrics.get(
+                'expectancy_pips',
+                bucket_metrics.get('avg_win_pips', 0) * bucket_metrics.get('win_rate', 0) / 100
+                - bucket_metrics.get('avg_loss_pips', 0) * (1 - bucket_metrics.get('win_rate', 0) / 100),
+            ),
+            'sortino_ratio': bucket_metrics.get(
+                'sortino_ratio', bucket_metrics.get('sortino_approx', 0)
+            ),
             'calmar_ratio': bucket_metrics.get('calmar_ratio', 0),
             'std_weekly_return': bucket_metrics.get('std_weekly_return', 0.0),
             'r_count': bucket_metrics.get('r_count', bucket_metrics.get('total_trades', 0)),
@@ -5469,10 +6635,16 @@ class RegimeOptimizer:
         Calibrated for the continuous-DD scoring distribution where
         typical scores land in the 25-55 range.
         """
+        try:
+            score = float(score)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(score):
+            return 0.0
+
         # Sigmoid centered at 45 with scale 30
         # score=15 -> ~0.27, score=30 -> ~0.38, score=45 -> 0.5,
         # score=60 -> ~0.62, score=80 -> ~0.76
-        import math
         try:
             normalized = 1.0 / (1.0 + math.exp(-(score - 45) / 30))
         except OverflowError:
@@ -5517,6 +6689,12 @@ class OptimizationPipeline:
 
         # Regime-aware optimizer (sole production path)
         self.regime_optimizer = RegimeOptimizer(config)
+        registry_path = str(
+            getattr(config, "lockbox_access_registry_path", "") or ""
+        ).strip()
+        if not registry_path:
+            registry_path = str(Path(config.output_dir) / "lockbox_access_registry.json")
+        self.lockbox_access_registry = LockboxAccessRegistry(Path(registry_path))
 
     @staticmethod
     def _locate_default_origin(default_config: Optional[RegimeConfig],
@@ -5553,38 +6731,282 @@ class OptimizationPipeline:
     def _slice_time_window(df: pd.DataFrame,
                            start_ts: Optional[pd.Timestamp],
                            end_ts: Optional[pd.Timestamp]) -> pd.DataFrame:
-        """Slice by half-open timestamp window [start_ts, end_ts)."""
+        """Slice by a source-bar-clean half-open window ``[start_ts, end_ts)``.
+
+        Higher-timeframe candles carry the first and last M5 source timestamps
+        used to build them.  Requiring the complete source interval to fall in
+        the requested partition prevents a candle from leaking observations
+        across train/validation/lockbox boundaries.
+        """
         if df is None or len(df) == 0:
             return pd.DataFrame()
         mask = pd.Series(True, index=df.index)
+        first_source = (
+            pd.to_datetime(df["_SOURCE_FIRST_TS"], errors="coerce")
+            if "_SOURCE_FIRST_TS" in df.columns else pd.Series(df.index, index=df.index)
+        )
+        last_source = (
+            pd.to_datetime(df["_SOURCE_LAST_TS"], errors="coerce")
+            if "_SOURCE_LAST_TS" in df.columns else pd.Series(df.index, index=df.index)
+        )
         if start_ts is not None:
-            mask &= df.index >= start_ts
+            mask &= first_source >= start_ts
         if end_ts is not None:
-            mask &= df.index < end_ts
+            mask &= last_source < end_ts
         return df.loc[mask].copy()
 
-    def _build_m5_workflow_meta(self, base_m5: pd.DataFrame) -> Dict[str, Any]:
+    @classmethod
+    def _selection_feature_input(
+        cls,
+        data: pd.DataFrame,
+        *,
+        split_mode: str,
+        final_lockbox_start: Optional[pd.Timestamp],
+    ) -> pd.DataFrame:
+        """Return data on which Phase-A features are legally computable."""
+        if (
+            str(split_mode or "").lower() == CALENDAR_SPLIT_MODE
+            and final_lockbox_start is not None
+        ):
+            return cls._slice_time_window(data, None, final_lockbox_start)
+        return data
+
+    @staticmethod
+    def _candidate_eligibility_bounds(
+        split_mode: str,
+        base_start: Optional[pd.Timestamp],
+        base_end: Optional[pd.Timestamp],
+        optimizer_train_start: Optional[pd.Timestamp],
+        optimizer_train_end: Optional[pd.Timestamp],
+    ) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+        """Return the only time range candidate screening may inspect."""
+        if str(split_mode or "").lower() in {
+            "chronological_lockbox_v1",
+            CALENDAR_SPLIT_MODE,
+        }:
+            return optimizer_train_start, optimizer_train_end
+        return base_start, base_end
+
+    def _timeframe_evidence_verdict(
+        self,
+        timeframe: str,
+        partition_frames: Dict[str, pd.DataFrame],
+        data_window_meta: Dict[str, Any],
+    ) -> EvidenceVerdict:
+        """Return the necessary pre-search evidence verdict for one timeframe."""
+        source_meta = dict(
+            (data_window_meta.get("timeframe_sources", {}) or {}).get(timeframe, {}) or {}
+        )
+        windows = dict(data_window_meta.get("windows", {}) or {})
+        partition_bounds: Dict[str, Tuple[Any, Any]] = {}
+        for partition in ("optimizer_train", "tuning_validation", "final_lockbox"):
+            meta = dict(windows.get(partition, {}) or {})
+            start = meta.get("start_ts")
+            end = meta.get("end_ts") or meta.get("end_ts_exclusive")
+            if start not in (None, "") and end not in (None, ""):
+                partition_bounds[partition] = (start, end)
+        return validate_timeframe_evidence(
+            timeframe,
+            partition_frames,
+            source_meta=source_meta,
+            window_years=getattr(self.config, "evidence_window_years", None),
+            min_native_bars=getattr(self.config, "evidence_min_native_bars", None),
+            partition_bounds=partition_bounds,
+            require_native=bool(
+                getattr(self.config, "evidence_require_native_timeframes", True)
+            ),
+            require_provenance=bool(
+                getattr(self.config, "evidence_require_native_provenance", True)
+            ),
+            require_session_coverage=bool(
+                getattr(self.config, "evidence_require_session_coverage", True)
+            ),
+            min_expected_session_coverage=float(
+                getattr(self.config, "evidence_min_expected_session_coverage", 0.95)
+            ),
+            boundary_tolerance_days=float(
+                getattr(self.config, "evidence_boundary_tolerance_days", 7.0)
+            ),
+        )
+
+    def _evidence_no_trade_markers(self, verdict: EvidenceVerdict) -> Dict[str, RegimeConfig]:
+        """Create an explicit NO_TRADE slot for every regime without optimizing."""
+        reason = verdict.concise_reason()
+        now = datetime.now()
+        regimes = tuple(getattr(self.regime_optimizer, "REGIMES", ()) or ())
+        if not regimes:
+            regimes = ("TREND", "RANGE", "BREAKOUT", "CHOP")
+        return {
+            regime: self.regime_optimizer._make_no_trade_marker(reason, now=now)
+            for regime in regimes
+        }
+
+    def _build_calendar_workflow_meta(
+        self,
+        base_m5: pd.DataFrame,
+        *,
+        as_of_utc: Any,
+    ) -> Dict[str, Any]:
+        """Build common timestamp windows without fixed-M5-row truncation."""
+        ordered = ensure_utc_index(base_m5)
+        if ordered.empty:
+            return {}
+        as_of = pd.Timestamp(as_of_utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.tz_localize("UTC")
+        else:
+            as_of = as_of.tz_convert("UTC")
+        purge = derive_purge_duration(
+            configured_days=getattr(self.config, "evidence_purge_days", 7.0),
+            split_embargo_bars=getattr(self.config, "split_embargo_bars", 0),
+        )
+        boundaries = build_calendar_boundaries(
+            as_of,
+            window_years=getattr(self.config, "evidence_window_years", None),
+            embargo=purge,
+        )
+        train_start, train_end = boundaries.windows["optimizer_train"]
+        validation_start, validation_end = boundaries.windows["tuning_validation"]
+        lockbox_start, lockbox_end = boundaries.windows["final_lockbox"]
+        first_ts = pd.Timestamp(ordered.index[0])
+        warmup = pd.Timedelta(
+            days=max(0.0, float(getattr(self.config, "evidence_warmup_days", 400.0)))
+        )
+
+        def _clip_start(value: pd.Timestamp) -> pd.Timestamp:
+            return max(first_ts, pd.Timestamp(value))
+
+        optimizer_warm_start = _clip_start(train_start - warmup)
+        validation_warm_start = _clip_start(validation_start - warmup)
+        lockbox_warm_start = _clip_start(lockbox_start - warmup)
+
+        intervals: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {
+            "workflow_window": (first_ts, as_of),
+            "historical_stress_audit": (first_ts, train_start),
+            "active_universe": (train_start, as_of),
+            "base_selection": (train_start, as_of),
+            "optimizer_train": (train_start, train_end),
+            "optimizer_train_warmup": (optimizer_warm_start, train_start),
+            "optimizer_train_with_warmup": (optimizer_warm_start, train_end),
+            "embargo_train_validation": (train_end, validation_start),
+            "tuning_validation": (validation_start, validation_end),
+            "tuning_validation_warmup": (validation_warm_start, validation_start),
+            "tuning_validation_with_warmup": (validation_warm_start, validation_end),
+            "embargo_validation_lockbox": (validation_end, lockbox_start),
+            "final_lockbox": (lockbox_start, lockbox_end),
+            "final_lockbox_warmup": (lockbox_warm_start, lockbox_start),
+            "final_lockbox_with_warmup": (lockbox_warm_start, lockbox_end),
+            # Compatibility aliases retained for downstream consumers.
+            "optimization_train": (train_start, train_end),
+            "optimization_train_with_warmup": (optimizer_warm_start, train_end),
+            "walk_forward_validation": (validation_start, validation_end),
+            "stage2_selection": (validation_start, validation_end),
+            "stage2_selection_with_warmup": (validation_warm_start, validation_end),
+            "stage2_training_selection": (validation_start, validation_end),
+            "stage2_training_selection_with_warmup": (validation_warm_start, validation_end),
+            "clean_holdout": (lockbox_start, lockbox_end),
+            "clean_holdout_with_warmup": (lockbox_warm_start, lockbox_end),
+        }
+        # A short or newly activated file can begin after one or more calendar
+        # boundaries.  Those missing periods are evidence failures, not
+        # metadata-construction exceptions.  Represent a wholly pre-history
+        # interval as an explicit empty half-open window and let the native
+        # evidence gate report the missing span/bar count.
+        intervals = {
+            name: ((end, end) if end < start else (start, end))
+            for name, (start, end) in intervals.items()
+        }
+        windows = {
+            name: calendar_window_meta(ordered, start, end)
+            for name, (start, end) in intervals.items()
+        }
+        return {
+            "base_timeframe": "M5",
+            "production_split_mode": CALENDAR_SPLIT_MODE,
+            "split_contract_version": EVIDENCE_CONTRACT_VERSION,
+            "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
+            "as_of_utc": as_of.isoformat(),
+            "max_bars": int(getattr(self.config, "max_bars", 300000)),
+            "max_bars_applied": False,
+            "workflow_rows": int(len(ordered)),
+            "historical_stress_audit_bars": int(
+                getattr(self.config, "historical_stress_audit_bars", 50000)
+            ),
+            "active_universe_bars": int(getattr(self.config, "active_universe_bars", 250000)),
+            "evidence_purge_days": float(purge.total_seconds() / 86_400.0),
+            "evidence_purge_seconds": float(purge.total_seconds()),
+            "evidence_warmup_days": float(
+                getattr(self.config, "evidence_warmup_days", 400.0)
+            ),
+            "evidence_window_years": dict(
+                getattr(self.config, "evidence_window_years", {}) or {}
+            ),
+            "calendar_boundaries": boundaries.to_dict(),
+            "windows": windows,
+        }
+
+    def _build_m5_workflow_meta(
+        self,
+        base_m5: pd.DataFrame,
+        *,
+        as_of_utc: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Build per-symbol workflow metadata from the base M5 data window."""
+        split_mode = str(
+            getattr(self.config, "production_split_mode", CALENDAR_SPLIT_MODE)
+            or CALENDAR_SPLIT_MODE
+        ).strip().lower()
+        if split_mode == CALENDAR_SPLIT_MODE:
+            cutoff = as_of_utc
+            if cutoff in (None, ""):
+                configured = str(getattr(self.config, "evidence_as_of_utc", "") or "").strip()
+                not_after = configured or datetime.now(timezone.utc)
+                cutoff = latest_closed_bar_end(
+                    base_m5,
+                    "M5",
+                    not_after_utc=not_after,
+                )
+            if cutoff is None:
+                return {}
+            return self._build_calendar_workflow_meta(base_m5, as_of_utc=cutoff)
+
         indices = self.splitter.get_workflow_indices(len(base_m5))
 
         def _meta(name: str) -> Dict[str, Any]:
             start, end = indices[name]
             frame = base_m5.iloc[start:end]
+            end_exclusive = (
+                base_m5.index[int(end)].isoformat()
+                if 0 <= int(end) < len(base_m5)
+                else None
+            )
             return {
                 "start_index": int(start),
                 "end_index": int(end),
                 "rows": int(max(0, end - start)),
                 "start_ts": frame.index[0].isoformat() if len(frame) else None,
-                "end_ts": frame.index[-1].isoformat() if len(frame) else None,
+                # `end_ts` remains the compatibility field, but is now truly
+                # exclusive to match _slice_time_window's contract.
+                "end_ts": end_exclusive,
+                "end_ts_exclusive": end_exclusive,
+                "end_ts_inclusive": frame.index[-1].isoformat() if len(frame) else None,
             }
 
         return {
             "base_timeframe": "M5",
+            "split_contract_version": DataSplitter.SPLIT_CONTRACT_VERSION,
+            "max_bars_applied": True,
             "max_bars": int(getattr(self.config, "max_bars", 300000)),
             "historical_stress_audit_bars": int(getattr(self.config, "historical_stress_audit_bars", 50000)),
             "active_universe_bars": int(getattr(self.config, "active_universe_bars", 250000)),
             "active_stage2_pct": float(getattr(self.config, "active_stage2_pct", 50.0)),
-            "production_split_mode": str(getattr(self.config, "production_split_mode", "bleeding_edge") or "bleeding_edge"),
+            "production_split_mode": str(
+                getattr(self.config, "production_split_mode", CALENDAR_SPLIT_MODE)
+                or CALENDAR_SPLIT_MODE
+            ),
+            "tuning_validation_bars": int(getattr(self.config, "tuning_validation_bars", 50000) or 0),
+            "final_lockbox_bars": int(getattr(self.config, "final_lockbox_bars", 50000) or 0),
+            "split_embargo_bars": int(getattr(self.config, "split_embargo_bars", 300) or 0),
             "walk_forward_validation_bars": int(getattr(self.config, "walk_forward_validation_bars", 50000) or 0),
             "clean_holdout_pct": float(getattr(self.config, "clean_holdout_pct", 0.0)),
             "effective_clean_holdout_pct": (
@@ -5600,6 +7022,10 @@ class OptimizationPipeline:
                 "active_universe": _meta("active_universe"),
                 "base_selection": _meta("base_selection"),
                 "walk_forward_validation": _meta("walk_forward_validation"),
+                "tuning_validation": _meta("tuning_validation"),
+                "tuning_validation_with_warmup": _meta("tuning_validation_with_warmup"),
+                "optimizer_train": _meta("optimizer_train"),
+                "optimizer_train_with_warmup": _meta("optimizer_train_with_warmup"),
                 "optimization_train": _meta("optimization_train"),
                 "optimization_train_with_warmup": _meta("optimization_train_with_warmup"),
                 "stage2_selection": _meta("stage2_selection"),
@@ -5608,49 +7034,246 @@ class OptimizationPipeline:
                 "stage2_training_selection_with_warmup": _meta("stage2_training_selection_with_warmup"),
                 "clean_holdout": _meta("clean_holdout"),
                 "clean_holdout_with_warmup": _meta("clean_holdout_with_warmup"),
+                "final_lockbox": _meta("final_lockbox"),
+                "final_lockbox_with_warmup": _meta("final_lockbox_with_warmup"),
+                "embargo_train_validation": _meta("embargo_train_validation"),
+                "embargo_validation_lockbox": _meta("embargo_validation_lockbox"),
             },
         }
 
     def _load_symbol_timeframe_data(self, symbol: str) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         """
-        Load the latest base-M5 workflow window and derive higher timeframes
-        from the same timestamp-bounded source.
+        Load the base-M5 workflow plus broker-native signal timeframes.
+
+        Calendar-lockbox production is strictly broker-native: all configured
+        signal timeframes are resolved and provenance-checked before a legacy
+        M5 file, resampler, feature computation, or optimizer can run.  Older
+        research modes retain the explicit legacy/resampled diagnostic path.
         """
-        base_m5 = self.data_loader.get_data(symbol, "M5")
+        split_mode = str(
+            getattr(self.config, "production_split_mode", CALENDAR_SPLIT_MODE)
+            or CALENDAR_SPLIT_MODE
+        ).strip().lower()
+        configured_timeframes = tuple(
+            dict.fromkeys(
+                str(value or "").strip().upper()
+                for value in (getattr(self.config, "timeframes", []) or [])
+                if str(value or "").strip()
+            )
+        )
+        strict_native = split_mode == CALENDAR_SPLIT_MODE
+        preloaded_native: Dict[str, pd.DataFrame] = {}
+        preloaded_meta: Dict[str, Dict[str, Any]] = {}
+        native_gate_errors: Dict[str, List[str]] = {}
+
+        if strict_native:
+            if "M5" not in configured_timeframes:
+                native_gate_errors["M5"] = ["NATIVE_M5_TIMEFRAME_REQUIRED"]
+            for tf_name in configured_timeframes:
+                try:
+                    native_data, native_meta = self.data_loader.load_native_timeframe(
+                        symbol, tf_name
+                    )
+                except Exception as exc:
+                    native_data = None
+                    native_meta = {
+                        "source_kind": "error",
+                        "symbol": symbol,
+                        "timeframe": tf_name,
+                        "provenance_valid": False,
+                        "provenance_errors": [
+                            f"NATIVE_LOAD_RAISED:{type(exc).__name__}"
+                        ],
+                    }
+                timeframe_meta = dict(native_meta or {})
+                preloaded_meta[tf_name] = timeframe_meta
+                reasons: List[str] = []
+                if native_data is None or len(native_data) == 0:
+                    reasons.append("NATIVE_FRAME_MISSING_OR_EMPTY")
+                if str(timeframe_meta.get("source_kind") or "").lower() != "broker_native":
+                    reasons.append("NATIVE_SOURCE_KIND_REQUIRED")
+                if not bool(timeframe_meta.get("provenance_valid", False)):
+                    reasons.extend(
+                        str(value)
+                        for value in (
+                            timeframe_meta.get("provenance_errors")
+                            or ["NATIVE_PROVENANCE_REQUIRED"]
+                        )
+                    )
+                if reasons:
+                    native_gate_errors[tf_name] = list(dict.fromkeys(reasons))
+                else:
+                    preloaded_native[tf_name] = native_data.copy()
+
+            if native_gate_errors:
+                logger.error(
+                    "[%s] Calendar native source gate failed before legacy data/search: %s",
+                    symbol,
+                    "; ".join(
+                        f"{tf}: {', '.join(reasons)}"
+                        for tf, reasons in sorted(native_gate_errors.items())
+                    ),
+                )
+                return {}, {
+                    "production_split_mode": split_mode,
+                    "native_source_gate": {
+                        "passed": False,
+                        "strict_no_fallback": True,
+                        "errors_by_timeframe": native_gate_errors,
+                    },
+                    "timeframe_sources": preloaded_meta,
+                }
+            base_m5 = preloaded_native["M5"].copy()
+            base_source_meta = dict(preloaded_meta.get("M5") or {})
+        else:
+            base_m5, base_source_meta = self.data_loader.load_native_timeframe(
+                symbol, "M5"
+            )
+            if base_m5 is None:
+                base_m5 = self.data_loader.get_data(symbol, "M5")
+                legacy_meta = dict(
+                    getattr(self.data_loader, "_source_meta", {}).get(
+                        f"{symbol}_M5", {}
+                    ) or {}
+                )
+                base_source_meta = {
+                    **legacy_meta,
+                    "source_kind": "legacy_m5_csv",
+                    "provenance_valid": False,
+                    "provenance_errors": ["NATIVE_M5_PROVENANCE_MISSING"],
+                }
+
+        base_source_meta = dict(base_source_meta or {})
+
         if base_m5 is None or len(base_m5) < 200:
-            return {}, {}
-        base_m5 = base_m5.sort_index()
+            return {}, {
+                "production_split_mode": split_mode,
+                "native_source_gate": {
+                    "passed": False,
+                    "strict_no_fallback": strict_native,
+                    "errors_by_timeframe": {
+                        "M5": ["M5_WORKFLOW_REQUIRES_AT_LEAST_200_BARS"]
+                    },
+                },
+                "timeframe_sources": preloaded_meta,
+            }
+        as_of_utc: Optional[pd.Timestamp] = None
+        if strict_native:
+            base_m5 = ensure_utc_index(base_m5)
+            configured_cutoff = str(
+                getattr(self.config, "evidence_as_of_utc", "") or ""
+            ).strip()
+            as_of_utc = latest_closed_bar_end(
+                base_m5,
+                "M5",
+                not_after_utc=configured_cutoff or datetime.now(timezone.utc),
+            )
+            if as_of_utc is None:
+                logger.warning(f"[{symbol}] No fully closed native M5 bar at evidence cutoff")
+                return {}, {}
+            base_m5 = trim_to_closed_bars(base_m5, "M5", as_of_utc=as_of_utc)
+        else:
+            base_m5 = base_m5.sort_index()
         max_bars = int(getattr(self.config, "max_bars", 300000) or 300000)
-        if max_bars > 0 and len(base_m5) > max_bars:
+        if (
+            split_mode != CALENDAR_SPLIT_MODE
+            and max_bars > 0
+            and len(base_m5) > max_bars
+        ):
             base_m5 = base_m5.tail(max_bars).copy()
 
-        workflow_meta = self._build_m5_workflow_meta(base_m5)
-        source_meta = dict(getattr(self.data_loader, "_source_meta", {}).get(f"{symbol}_M5", {}) or {})
+        workflow_meta = self._build_m5_workflow_meta(base_m5, as_of_utc=as_of_utc)
+        if not workflow_meta:
+            return {}, {}
         workflow_window = (workflow_meta.get("windows", {}) or {}).get("workflow_window", {})
         workflow_meta["source"] = {
-            "path": source_meta.get("path"),
-            "mtime": source_meta.get("mtime"),
-            "rows": source_meta.get("rows"),
-            "last_index": source_meta.get("last_index"),
+            "path": base_source_meta.get("path"),
+            "mtime": base_source_meta.get("mtime"),
+            "size": base_source_meta.get("size"),
+            "rows": base_source_meta.get("rows"),
+            "last_index": base_source_meta.get("last_index"),
+            "sha256": base_source_meta.get("sha256"),
+            "source_kind": base_source_meta.get("source_kind"),
+            "provenance_valid": bool(base_source_meta.get("provenance_valid", False)),
+            "provenance_errors": list(base_source_meta.get("provenance_errors", []) or []),
         }
-        workflow_meta["data_window_fingerprint"] = _stable_hash({
-            "symbol": symbol,
-            "source": workflow_meta["source"],
-            "workflow_window": workflow_window,
-            "windows": workflow_meta.get("windows", {}),
-        })
         data_by_tf: Dict[str, pd.DataFrame] = {}
-        for tf in self.config.timeframes:
-            tf_name = str(tf).upper()
+        timeframe_sources: Dict[str, Dict[str, Any]] = {}
+        for tf_name in configured_timeframes:
             try:
                 if tf_name == "M5":
                     data = base_m5.copy()
+                    timeframe_meta = dict(base_source_meta or {})
+                elif strict_native:
+                    data = preloaded_native[tf_name].copy()
+                    timeframe_meta = dict(preloaded_meta.get(tf_name) or {})
                 else:
-                    data = self.data_loader.resample(base_m5, tf_name)
-                if data is not None and len(data) >= 200:
+                    native_data, native_meta = self.data_loader.load_native_timeframe(symbol, tf_name)
+                    if native_data is not None and len(native_data) > 0:
+                        data = native_data
+                        timeframe_meta = dict(native_meta or {})
+                    else:
+                        data = self.data_loader.resample(base_m5, tf_name)
+                        timeframe_meta = {
+                            "source_kind": "m5_resampled",
+                            "symbol": symbol,
+                            "timeframe": tf_name,
+                            "path": base_source_meta.get("path"),
+                            "sha256": base_source_meta.get("sha256"),
+                            "provenance_valid": False,
+                            "provenance_errors": list(
+                                (native_meta or {}).get("provenance_errors", [])
+                                or ["NATIVE_TIMEFRAME_FILE_MISSING"]
+                            ),
+                            "parent_m5_sha256": base_source_meta.get("sha256"),
+                        }
+                if split_mode == CALENDAR_SPLIT_MODE:
+                    data = trim_to_closed_bars(data, tf_name, as_of_utc=as_of_utc)
+                timeframe_meta["workflow_rows"] = int(len(data)) if data is not None else 0
+                timeframe_meta["as_of_utc"] = (
+                    as_of_utc.isoformat() if as_of_utc is not None else None
+                )
+                timeframe_sources[tf_name] = timeframe_meta
+                if data is not None and len(data) > 0:
                     data_by_tf[tf_name] = data.copy()
             except Exception as exc:
                 logger.warning(f"[{symbol}] [{tf_name}] Data preparation failed: {exc}")
+                timeframe_sources[tf_name] = {
+                    "source_kind": "error",
+                    "symbol": symbol,
+                    "timeframe": tf_name,
+                    "provenance_valid": False,
+                    "provenance_errors": [f"DATA_PREPARATION_FAILED:{type(exc).__name__}"],
+                }
+        if strict_native:
+            empty_after_cutoff = sorted(set(configured_timeframes) - set(data_by_tf))
+            if empty_after_cutoff:
+                for tf_name in empty_after_cutoff:
+                    native_gate_errors[tf_name] = [
+                        "NATIVE_CLOSED_WORKFLOW_EMPTY_OR_PREPARATION_FAILED"
+                    ]
+                workflow_meta["timeframe_sources"] = timeframe_sources
+                workflow_meta["native_source_gate"] = {
+                    "passed": False,
+                    "strict_no_fallback": True,
+                    "errors_by_timeframe": native_gate_errors,
+                }
+                return {}, workflow_meta
+            workflow_meta["native_source_gate"] = {
+                "passed": True,
+                "strict_no_fallback": True,
+                "timeframes": list(configured_timeframes),
+            }
+        workflow_meta["timeframe_sources"] = timeframe_sources
+        workflow_meta["evidence_contract_version"] = EVIDENCE_CONTRACT_VERSION
+        workflow_meta["data_window_fingerprint"] = _stable_hash({
+            "symbol": symbol,
+            "source": workflow_meta["source"],
+            "timeframe_sources": timeframe_sources,
+            "workflow_window": workflow_window,
+            "as_of_utc": workflow_meta.get("as_of_utc"),
+            "windows": workflow_meta.get("windows", {}),
+        })
         return data_by_tf, workflow_meta
 
     def precompute_feature_cache(self, symbols: List[str]) -> Dict[str, Any]:
@@ -5692,12 +7315,197 @@ class OptimizationPipeline:
         stats["feature_cache"] = FeatureComputer.get_cache_stats(reset=True)
         return stats
 
+    def _build_edge_challengers_for_timeframe(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        champion_configs: Dict[str, RegimeConfig],
+        full_features: pd.DataFrame,
+        fit_start: pd.Timestamp,
+        fit_end: pd.Timestamp,
+        champion_temporal_lineage: Dict[str, Any],
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+        """Refit only champion families on a latest trailing in-sample window.
+
+        The output is deliberately serialized into the separate paper-only
+        challenger book.  It has no validation metrics, cannot inherit the
+        champion lockbox verdict, and requires observations strictly after the
+        fit cutoff before any later promotion process may consider it.
+        """
+        failures: List[str] = []
+        output: Dict[str, Dict[str, Any]] = {}
+        edge_features = self._slice_time_window(full_features, fit_start, fit_end)
+        if edge_features is None or len(edge_features) < 200:
+            return {}, [
+                f"{timeframe}:edge fit rows {0 if edge_features is None else len(edge_features)} < 200"
+            ]
+
+        family_regimes: Dict[str, List[str]] = {}
+        eligible_champions: Dict[str, RegimeConfig] = {}
+        for regime, champion in (champion_configs or {}).items():
+            if champion is None or champion.is_no_trade_marker():
+                continue
+            status, reasons = classify_promotion_status(champion, self.config)
+            if status not in {"PROMOTED", "PROMOTE_SMALL"}:
+                failures.append(
+                    f"{timeframe}|{regime}:champion_not_promotion_eligible:{status}:"
+                    f"{'; '.join(reasons[:2])}"
+                )
+                continue
+            family = str(champion.strategy_name or "")
+            if not family:
+                continue
+            eligible_champions[str(regime).upper()] = champion
+            family_regimes.setdefault(family, []).append(str(regime).upper())
+
+        for family, regimes in sorted(family_regimes.items()):
+            family_candidates: Dict[str, Dict[str, Any]] = {}
+            try:
+                reference = next(
+                    eligible_champions[regime]
+                    for regime in regimes
+                    if regime in eligible_champions
+                )
+                strategy = StrategyRegistry.get(family, **dict(reference.parameters or {}))
+                param_grid = strategy.get_param_grid()
+                if param_grid:
+                    tuned = self.regime_optimizer._tune_strategy_params(
+                        symbol,
+                        timeframe,
+                        family,
+                        param_grid,
+                        edge_features,
+                        None,
+                        0,
+                        regimes=regimes,
+                    )
+                    family_candidates = {
+                        str(candidate.get("tuned_for_regime", "") or "").upper(): candidate
+                        for candidate in tuned
+                        if str(candidate.get("tuned_for_regime", "") or "").strip()
+                    }
+                else:
+                    # There is nothing to estimate for a parameterless family;
+                    # still reassess its frozen rule on the latest fit window.
+                    for regime in regimes:
+                        champion = eligible_champions[regime]
+                        fixed = StrategyRegistry.get(
+                            family, **dict(champion.parameters or {})
+                        )
+                        metrics, ran = self.regime_optimizer._run_one_exact_regime(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            features=edge_features,
+                            strategy=fixed,
+                            regime=regime,
+                        )
+                        if not ran:
+                            continue
+                        family_candidates[regime] = {
+                            "strategy_name": family,
+                            "params": self.regime_optimizer._clean_candidate_params(
+                                fixed.get_params()
+                            ),
+                            "train_regime_metrics": {regime: dict(metrics)},
+                            "tuned_for_regime": regime,
+                            "is_tuned": False,
+                            "search_trials": 1,
+                            "search_phase": "latest_fixed_family_reassessment",
+                        }
+            except Exception as exc:
+                failures.append(
+                    f"{timeframe}|{family}:edge_refit_failed:{type(exc).__name__}:{exc}"
+                )
+                continue
+
+            for regime in regimes:
+                candidate = family_candidates.get(regime)
+                if not isinstance(candidate, dict):
+                    failures.append(f"{timeframe}|{regime}|{family}:no_edge_candidate")
+                    continue
+                train_metrics = dict(
+                    (candidate.get("train_regime_metrics") or {}).get(regime, {}) or {}
+                )
+                if int(train_metrics.get("total_trades", 0) or 0) < int(
+                    self.regime_optimizer.min_train_trades
+                ):
+                    failures.append(f"{timeframe}|{regime}|{family}:insufficient_edge_trades")
+                    continue
+                try:
+                    train_score = float(
+                        self.regime_optimizer._compute_train_regime_score(
+                            train_metrics, {}
+                        )
+                    )
+                except Exception:
+                    train_score = 0.0
+                temporal = build_edge_challenger_lineage(
+                    fit_start_utc=fit_start,
+                    fit_end_utc=fit_end,
+                    parent_champion=champion_temporal_lineage,
+                )
+                champion = eligible_champions[regime]
+                challenger_parameters = dict(candidate.get("params", {}) or {})
+                candidate_id = _stable_hash({
+                    "book_role": EDGE_CHALLENGER_ROLE,
+                    "symbol": str(symbol).upper(),
+                    "timeframe": str(timeframe).upper(),
+                    "regime": str(regime).upper(),
+                    "strategy_name": family,
+                    "parameters": challenger_parameters,
+                    "fit_cutoff_utc": temporal.get("fit_cutoff_utc"),
+                })
+                challenger = RegimeConfig(
+                    strategy_name=family,
+                    parameters=challenger_parameters,
+                    quality_score=self.regime_optimizer._normalize_score(train_score),
+                    train_metrics=train_metrics,
+                    val_metrics={},
+                    holdout_metrics={},
+                    regime_train_trades=int(train_metrics.get("total_trades", 0) or 0),
+                    regime_val_trades=0,
+                    trained_at=datetime.now(),
+                    valid_until=None,
+                    artifact_meta={
+                        "edge_challenger": True,
+                        "funded_role_eligible": False,
+                        "candidate_id": candidate_id,
+                    },
+                    validation_evidence={
+                        "temporal_lineage": temporal,
+                        "edge_refit": {
+                            "selection_surface": "latest_trailing_5y_in_sample_refit",
+                            "family_fixed_from_champion": family,
+                            "champion_parameters": dict(champion.parameters or {}),
+                            "search_trials": int(candidate.get("search_trials", 0) or 0),
+                            "search_phase": str(candidate.get("search_phase", "") or ""),
+                            "fit_rows": int(len(edge_features)),
+                            "forward_evidence_status": "NOT_STARTED",
+                            "candidate_id": candidate_id,
+                        },
+                    },
+                    promotion_status="PAPER_ONLY",
+                    promotion_reasons=[
+                        "latest-data refit has no observations after its fit cutoff",
+                        "champion lockbox verdict is not inherited",
+                    ],
+                )
+                output[regime] = challenger.to_dict()
+        return output, failures
+
     def _attach_holdout_metrics(self,
                                 symbol: str,
                                 regime_configs: Dict[str, Dict[str, RegimeConfig]],
                                 holdout_features_by_tf: Dict[str, pd.DataFrame],
-                                holdout_warmup_by_tf: Dict[str, int]) -> None:
-        """Evaluate validated winners on the freshest holdout window."""
+                                holdout_warmup_by_tf: Dict[str, int],
+                                data_window_meta: Optional[Dict[str, Any]] = None) -> None:
+        """Evaluate each frozen winner on its exact final-lockbox regime cell.
+
+        Signals outside the promoted regime are zeroed before the backtest. This
+        matches live entry eligibility and avoids contaminating a cell's equity
+        path with trades that live execution assigns to other specialists.
+        """
         for tf, regimes in regime_configs.items():
             holdout_features = holdout_features_by_tf.get(tf)
             holdout_warmup = int(holdout_warmup_by_tf.get(tf, 0) or 0)
@@ -5708,23 +7516,170 @@ class OptimizationPipeline:
             for regime, cfg in regimes.items():
                 if cfg.is_no_trade_marker():
                     continue
+                lockbox_access: Dict[str, Any] = {"status": "NOT_REQUIRED"}
+                if (
+                    bool(getattr(self.config, "lockbox_one_shot_registry_enabled", True))
+                    and data_window_meta is not None
+                ):
+                    timeframe_source = dict(
+                        (data_window_meta.get("timeframe_sources") or {}).get(tf, {}) or {}
+                    )
+                    lockbox_window = dict(
+                        (data_window_meta.get("windows") or {}).get("final_lockbox", {}) or {}
+                    )
+                    lineage = {
+                        "source_sha256": timeframe_source.get("sha256"),
+                        "source_kind": timeframe_source.get("source_kind"),
+                        "window_start": lockbox_window.get("start_ts"),
+                        "window_end": lockbox_window.get("end_ts"),
+                        "data_window_fingerprint": data_window_meta.get("data_window_fingerprint"),
+                        "evidence_contract_version": data_window_meta.get("evidence_contract_version"),
+                    }
+                    if not all(
+                        lineage.get(key)
+                        for key in (
+                            "source_sha256",
+                            "window_start",
+                            "window_end",
+                            "data_window_fingerprint",
+                        )
+                    ):
+                        cfg.holdout_metrics = {
+                            "validation_mode": "final_lockbox_regime_gated",
+                            "timeframe": str(tf).upper(),
+                            "target_regime": str(regime).upper(),
+                            "total_trades": 0,
+                            "policy_status": "FAIL",
+                            "policy_reason": "one-shot lockbox lineage incomplete",
+                            "lockbox_access": {"status": "UNAVAILABLE", "lineage": lineage},
+                        }
+                        continue
+                    try:
+                        decision = self.lockbox_access_registry.consume(
+                            cell={
+                                "symbol": symbol,
+                                "timeframe": str(tf).upper(),
+                                "regime": str(regime).upper(),
+                            },
+                            lineage=lineage,
+                        )
+                    except Exception as exc:
+                        cfg.holdout_metrics = {
+                            "validation_mode": "final_lockbox_regime_gated",
+                            "timeframe": str(tf).upper(),
+                            "target_regime": str(regime).upper(),
+                            "total_trades": 0,
+                            "policy_status": "FAIL",
+                            "policy_reason": f"lockbox registry unavailable: {type(exc).__name__}: {exc}",
+                            "lockbox_access": {"status": "ERROR"},
+                        }
+                        continue
+                    lockbox_access = {
+                        "status": "CONSUMED" if decision.allowed else "REUSED_BLOCKED",
+                        "access_id": decision.access_id,
+                        "reason": decision.reason,
+                        "conflict": dict(decision.metadata or {}),
+                    }
+                    if not decision.allowed:
+                        cfg.holdout_metrics = {
+                            "validation_mode": "final_lockbox_regime_gated",
+                            "timeframe": str(tf).upper(),
+                            "target_regime": str(regime).upper(),
+                            "total_trades": 0,
+                            "policy_status": "FAIL",
+                            "policy_reason": "final lockbox already consumed for this lineage/cell",
+                            "lockbox_access": lockbox_access,
+                        }
+                        continue
                 try:
                     strategy = StrategyRegistry.get(cfg.strategy_name, **cfg.parameters)
                     signals = strategy.generate_signals(holdout_features, symbol)
+                    regime_mask = (
+                        holdout_features["REGIME_LIVE"]
+                        .reindex(signals.index)
+                        .astype(str)
+                        .str.upper()
+                        .eq(str(regime).upper())
+                        .fillna(False)
+                    )
+                    signals = signals.copy()
+                    signals.loc[~regime_mask] = 0
                     holdout_result = self.regime_optimizer.backtester.run(
                         holdout_features,
                         signals,
                         symbol,
                         strategy,
                         warmup_bars=holdout_warmup,
-                    )
-                    holdout_bucket = self.regime_optimizer._bucket_trades_by_regime(
-                        holdout_result.get('trades', []),
-                        holdout_features,
                         timeframe=tf,
                     )
-                    cfg.holdout_metrics = holdout_bucket.get(regime, {'total_trades': 0})
+                    compact = self.regime_optimizer._compact_backtest_result(holdout_result)
+                    compact.update({
+                        "validation_mode": "final_lockbox_regime_gated",
+                        "timeframe": str(tf).upper(),
+                        "target_regime": str(regime).upper(),
+                        "regime_gated": True,
+                        "regime_matching_bars": int(regime_mask.sum()),
+                        "min_trades_required": int(
+                            self.regime_optimizer._min_val_trades_for_timeframe(tf)
+                        ),
+                        "lockbox_access": lockbox_access,
+                    })
+                    bucket_metrics = self.regime_optimizer._compute_bucket_metrics(
+                        list(holdout_result.get("trades", []) or []),
+                        features=holdout_features.iloc[holdout_warmup:].copy(),
+                        timeframe=tf,
+                    )
+                    lockbox_bootstrap = block_bootstrap_evidence(
+                        bucket_metrics.get("daily_realized_returns", []) or [],
+                        repetitions=int(
+                            getattr(self.config, "false_discovery_bootstrap_repetitions", 300)
+                            or 300
+                        ),
+                        confidence=float(
+                            getattr(self.config, "false_discovery_bootstrap_confidence", 0.95)
+                            or 0.95
+                        ),
+                        seed=_stable_seed(symbol, tf, regime, cfg.strategy_name, cfg.parameters, "lockbox"),
+                        min_observations=int(
+                            getattr(self.config, "false_discovery_min_daily_observations", 252)
+                            or 252
+                        ),
+                        min_effective_observations=float(
+                            getattr(self.config, "false_discovery_min_effective_observations", 60.0)
+                            or 60.0
+                        ),
+                        min_mean_lower=float(
+                            getattr(self.config, "false_discovery_bootstrap_min_mean_lower", 0.0)
+                            or 0.0
+                        ),
+                        min_profit_factor_lower=float(
+                            getattr(self.config, "false_discovery_bootstrap_min_pf_lower", 1.0)
+                            or 1.0
+                        ),
+                        max_drawdown_upper=float(
+                            getattr(self.config, "false_discovery_bootstrap_max_dd_upper", 0.20)
+                            or 0.20
+                        ),
+                    )
+                    compact["lockbox_bootstrap_evidence"] = lockbox_bootstrap
+                    if str(lockbox_bootstrap.get("status", "UNAVAILABLE")).upper() != "PASS":
+                        compact["policy_status"] = "FAIL"
+                        compact["policy_reason"] = (
+                            "final-lockbox block bootstrap did not establish positive edge"
+                        )
+                    cfg.holdout_metrics = compact
                 except Exception as exc:
+                    cfg.holdout_metrics = {
+                        "validation_mode": "final_lockbox_regime_gated",
+                        "timeframe": str(tf).upper(),
+                        "target_regime": str(regime).upper(),
+                        "regime_gated": True,
+                        "total_trades": 0,
+                        "min_trades_required": int(
+                            self.regime_optimizer._min_val_trades_for_timeframe(tf)
+                        ),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                     logger.warning(f"[{symbol}] [{tf}] [{regime}] Holdout evaluation failed: {exc}")
 
     def _attach_purged_kfold_oos_metrics(self,
@@ -5970,7 +7925,7 @@ class OptimizationPipeline:
                                   evaluation_warmup: int,
                                   *,
                                   selection_surface: str = "stage3_selection") -> Dict[str, Any]:
-        risk_opt_enabled = bool(getattr(self.config, "risk_management_optimization_enabled", True))
+        risk_opt_enabled = bool(getattr(self.config, "risk_management_optimization_enabled", False))
         tournament_enabled = bool(getattr(self.config, "local_governance_tournament_enabled", False))
         if cfg.is_no_trade_marker():
             payload = _default_governance_policy()
@@ -6334,7 +8289,7 @@ class OptimizationPipeline:
         if cfg is None or cfg.is_no_trade_marker():
             return ["no trade marker"]
         reasons: List[str] = []
-        status = str(getattr(cfg, "promotion_status", "PROMOTED") or "PROMOTED").upper()
+        status = str(getattr(cfg, "promotion_status", "BLOCKED") or "BLOCKED").upper()
         allow_small = (
             bool(getattr(self.config, "specialist_spokes_v2_allow_promote_small_default", True))
             if allow_promote_small is None else bool(allow_promote_small)
@@ -6389,7 +8344,7 @@ class OptimizationPipeline:
                 "tf": tf,
                 "regime": regime,
                 "strategy": cfg.strategy_name,
-                "promotion_status": str(getattr(cfg, "promotion_status", "PROMOTED") or "PROMOTED"),
+                "promotion_status": str(getattr(cfg, "promotion_status", "BLOCKED") or "BLOCKED"),
                 "quality_score": float(cfg.quality_score or 0.0),
                 "reasons": reasons,
             }
@@ -6468,7 +8423,21 @@ class OptimizationPipeline:
             result.data_window_meta = dict(data_window_meta or {})
             
             if not data_by_tf:
-                result.error_message = "No valid data available"
+                native_gate = (
+                    data_window_meta.get("native_source_gate")
+                    if isinstance(data_window_meta, dict)
+                    and isinstance(data_window_meta.get("native_source_gate"), dict)
+                    else {}
+                )
+                gate_errors = native_gate.get("errors_by_timeframe") or {}
+                if gate_errors:
+                    detail = "; ".join(
+                        f"{tf}: {', '.join(str(value) for value in reasons)}"
+                        for tf, reasons in sorted(gate_errors.items())
+                    )
+                    result.error_message = f"Native source gate failed before search: {detail}"
+                else:
+                    result.error_message = "No valid data available"
                 return result
             
             result.timeframes_tested = len(data_by_tf)
@@ -6487,6 +8456,8 @@ class OptimizationPipeline:
             validated_count = 0
             unvalidated_count = 0
             oos_evidence_records: List[Dict[str, Any]] = []
+            edge_challenger_configs: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            edge_challenger_failures: List[str] = []
             
             regime_params_file = getattr(self.config, 'regime_params_file', 'regime_params.json')
 
@@ -6501,15 +8472,21 @@ class OptimizationPipeline:
             hist_meta = windows.get("historical_stress_audit", {})
             active_meta = windows.get("active_universe", {})
             base_meta = windows.get("base_selection", active_meta)
-            wf_meta = windows.get("walk_forward_validation", {})
-            opt_train_meta = windows.get("optimization_train", active_meta)
-            opt_train_warm_meta = windows.get("optimization_train_with_warmup", opt_train_meta)
+            wf_meta = windows.get("tuning_validation", windows.get("walk_forward_validation", {}))
+            opt_train_meta = windows.get("optimizer_train", windows.get("optimization_train", active_meta))
+            opt_train_warm_meta = windows.get(
+                "optimizer_train_with_warmup",
+                windows.get("optimization_train_with_warmup", opt_train_meta),
+            )
             stage2_meta = windows.get("stage2_selection", {})
             stage2_warm_meta = windows.get("stage2_selection_with_warmup", {})
             stage2_train_meta = windows.get("stage2_training_selection", stage2_meta)
             stage2_train_warm_meta = windows.get("stage2_training_selection_with_warmup", stage2_warm_meta)
-            holdout_meta = windows.get("clean_holdout", {})
-            holdout_warm_meta = windows.get("clean_holdout_with_warmup", {})
+            holdout_meta = windows.get("final_lockbox", windows.get("clean_holdout", {}))
+            holdout_warm_meta = windows.get(
+                "final_lockbox_with_warmup",
+                windows.get("clean_holdout_with_warmup", {}),
+            )
 
             hist_start = pd.Timestamp(hist_meta["start_ts"]) if hist_meta.get("start_ts") else None
             hist_end = pd.Timestamp(active_meta["start_ts"]) if active_meta.get("start_ts") else None
@@ -6526,6 +8503,7 @@ class OptimizationPipeline:
                 if opt_train_warm_meta.get("start_ts") else opt_train_start
             )
             holdout_start = pd.Timestamp(holdout_meta["start_ts"]) if holdout_meta.get("start_ts") else None
+            holdout_end = pd.Timestamp(holdout_meta["end_ts"]) if holdout_meta.get("end_ts") else active_end
             stage2_start = pd.Timestamp(stage2_meta["start_ts"]) if stage2_meta.get("start_ts") else active_start
             stage2_warm_start = (
                 pd.Timestamp(stage2_warm_meta["start_ts"])
@@ -6548,21 +8526,136 @@ class OptimizationPipeline:
                 pd.Timestamp(holdout_warm_meta["start_ts"])
                 if holdout_warm_meta.get("start_ts") else holdout_start
             )
+            split_mode = str(
+                getattr(self.config, "production_split_mode", CALENDAR_SPLIT_MODE)
+                or CALENDAR_SPLIT_MODE
+            ).lower()
+
+            # Regime labels determine every specialist bucket and are therefore
+            # part of model selection.  In chronological-lockbox mode, reject
+            # the symbol before computing a feature or ranking a candidate when
+            # the detector parameters cannot be proven to come from this exact
+            # optimizer-train source/window. Calendar v2 is native-timeframe
+            # authoritative; legacy v1 remains M5-derived.
+            if split_mode in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
+                provenance_checks: Dict[str, Dict[str, Any]] = {}
+                current_source = dict(data_window_meta.get("source", {}) or {})
+                timeframe_sources = dict(data_window_meta.get("timeframe_sources", {}) or {})
+                expected_contract = (
+                    EVIDENCE_CONTRACT_VERSION
+                    if split_mode == CALENDAR_SPLIT_MODE
+                    else DataSplitter.SPLIT_CONTRACT_VERSION
+                )
+                for tf, tf_data in data_by_tf.items():
+                    if split_mode == CALENDAR_SPLIT_MODE:
+                        expected_source = dict(timeframe_sources.get(tf, {}) or {})
+                        expected_train_window = calendar_window_meta(
+                            tf_data,
+                            opt_train_start,
+                            opt_train_end,
+                        )
+                    else:
+                        expected_source = current_source
+                        expected_train_window = opt_train_meta
+                    check = validate_regime_params_provenance(
+                        symbol,
+                        tf,
+                        regime_params_file,
+                        expected_source=expected_source,
+                        expected_train_window=expected_train_window,
+                        expected_split_contract=expected_contract,
+                    )
+                    provenance_checks[str(tf).upper()] = {
+                        "valid": bool(check.get("valid", False)),
+                        "reason": str(check.get("reason", "unknown")),
+                        "provenance_path": check.get("provenance_path"),
+                    }
+                data_window_meta = dict(data_window_meta or {})
+                data_window_meta["regime_provenance_gate"] = provenance_checks
+                result.data_window_meta = dict(data_window_meta)
+                failed = {
+                    tf: check for tf, check in provenance_checks.items()
+                    if not check["valid"]
+                }
+                if failed:
+                    reasons = "; ".join(
+                        f"{tf}: {check['reason']}" for tf, check in sorted(failed.items())
+                    )
+                    result.error_message = f"Regime detector provenance gate failed: {reasons}"
+                    logger.error(f"[{symbol}] {result.error_message}")
+                    return result
 
             import gc
 
             for tf, data in data_by_tf.items():
-                full_features = FeatureComputer.compute_all(
-                    data, symbol=symbol, timeframe=tf,
-                    regime_params_file=regime_params_file
-                )
-                eligibility_features = self._slice_time_window(full_features, base_start, base_end)
-                active_features = self._slice_time_window(full_features, opt_train_start, opt_train_end)
                 validation_start = wf_start if wf_start is not None else stage2_train_start
                 validation_end = wf_end if wf_end is not None else stage2_train_end
+                if bool(getattr(self.config, "evidence_sufficiency_enabled", True)):
+                    evidence_frames = {
+                        "optimizer_train": self._slice_time_window(
+                            data, opt_train_start, opt_train_end
+                        ),
+                        "tuning_validation": self._slice_time_window(
+                            data, validation_start, validation_end
+                        ),
+                        "final_lockbox": (
+                            self._slice_time_window(data, holdout_start, holdout_end)
+                            if holdout_start is not None
+                            else pd.DataFrame()
+                        ),
+                    }
+                    evidence_verdict = self._timeframe_evidence_verdict(
+                        tf, evidence_frames, data_window_meta
+                    )
+                    data_window_meta.setdefault("timeframe_evidence", {})[tf] = (
+                        evidence_verdict.to_dict()
+                    )
+                    result.data_window_meta = dict(data_window_meta)
+                    if not evidence_verdict.passed:
+                        markers = self._evidence_no_trade_markers(evidence_verdict)
+                        regime_configs[tf] = markers
+                        unvalidated_count += len(markers)
+                        logger.warning(
+                            f"[{symbol}] [{tf}] Evidence gate failed before feature/search: "
+                            f"{evidence_verdict.concise_reason()}"
+                        )
+                        continue
+
+                # Phase A never computes features on final-lockbox prices.
+                # This is stronger than relying on every current feature to be
+                # causal and prevents a future whole-series transform from
+                # leaking holdout outcomes into selection.  Raw final rows are
+                # used above only for provenance/count sufficiency metadata.
+                feature_input = self._selection_feature_input(
+                    data,
+                    split_mode=split_mode,
+                    final_lockbox_start=holdout_start,
+                )
+                full_features = FeatureComputer.compute_all(
+                    feature_input, symbol=symbol, timeframe=tf,
+                    regime_params_file=regime_params_file
+                )
+                # Candidate eligibility is part of model selection. In lockbox
+                # mode it may only see optimizer-train data; exposing validation
+                # or final-lockbox rows here would contaminate the candidate pool
+                # before strategy/parameter selection even begins.
+                eligibility_start, eligibility_end = self._candidate_eligibility_bounds(
+                    split_mode,
+                    base_start,
+                    base_end,
+                    opt_train_start,
+                    opt_train_end,
+                )
+                eligibility_features = self._slice_time_window(
+                    full_features, eligibility_start, eligibility_end
+                )
+                active_features = self._slice_time_window(full_features, opt_train_start, opt_train_end)
                 stage2_features = self._slice_time_window(full_features, validation_start, validation_end)
                 historical_features = self._slice_time_window(full_features, hist_start, hist_end)
-                holdout_features = self._slice_time_window(full_features, holdout_warm_start, None) if holdout_start is not None else pd.DataFrame()
+                holdout_features = (
+                    self._slice_time_window(full_features, holdout_warm_start, holdout_end)
+                    if holdout_start is not None else pd.DataFrame()
+                )
 
                 if len(active_features) < 200:
                     logger.debug(f"[{symbol}] [{tf}] Skipping - insufficient active data")
@@ -6582,12 +8675,20 @@ class OptimizationPipeline:
                 threadspark_surface = str(
                     getattr(self.config, "threadspark_selection_surface", "validation") or "validation"
                 ).lower()
+                # A final lockbox is a one-shot verdict surface. It must never be
+                # exposed to a candidate-ranking model such as ThreadSpark.
+                if split_mode in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
+                    threadspark_surface = "validation"
                 threadspark_history_scope = str(
                     getattr(self.config, "threadspark_historical_cost_scope", "workflow") or "workflow"
                 ).lower()
                 threadspark_historical_features = (
                     full_features
-                    if scoring_model == "specialist_spokes_threadspark" and threadspark_history_scope == "workflow"
+                    if (
+                        split_mode not in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}
+                        and scoring_model == "specialist_spokes_threadspark"
+                        and threadspark_history_scope == "workflow"
+                    )
                     else historical_features
                 )
                 if len(stage2_features) >= 50:
@@ -6647,12 +8748,17 @@ class OptimizationPipeline:
                             val_features_by_tf,
                             val_warmup_by_tf,
                         )
-                    elif holdout_start is not None and len(holdout_features) >= 50:
+                    elif (
+                        split_mode != CALENDAR_SPLIT_MODE
+                        and holdout_start is not None
+                        and len(holdout_features) >= 50
+                    ):
                         self._attach_holdout_metrics(
                             symbol,
                             tf_regime_configs,
                             {tf: holdout_features},
                             {tf: int((holdout_features.index < holdout_start).sum())},
+                            data_window_meta=data_window_meta,
                         )
                     if len(historical_features) >= 50:
                         self._attach_historical_stress_audit(
@@ -6684,6 +8790,13 @@ class OptimizationPipeline:
                         governance_warmup_by_tf,
                         selection_surface=governance_surface,
                     )
+
+                    # A calendar-lockbox production run is Phase A only.  It
+                    # must not read final outcomes or create a latest-data
+                    # refit.  Phase B is the sole synchronized one-shot access
+                    # to that partition and can only accept/reject this roster.
+                    # A later latest-data challenger is built only after the
+                    # joint verdict and remains a physically separate demo book.
 
                 self._log_regime_coverage(symbol, train_features_by_tf, val_features_by_tf)
                 del train_features_by_tf, val_features_by_tf, val_warmup_by_tf
@@ -6726,10 +8839,54 @@ class OptimizationPipeline:
                 default_config.live_observability = dict(matched_cfg.live_observability)
                 default_config.walk_forward_audit = dict(matched_cfg.walk_forward_audit)
                 default_config.governance_policy = dict(matched_cfg.governance_policy)
-                default_config.promotion_status = str(matched_cfg.promotion_status or "PROMOTED")
+                default_config.promotion_status = str(matched_cfg.promotion_status or "BLOCKED")
                 default_config.promotion_reasons = list(matched_cfg.promotion_reasons or [])
 
-            self._apply_promotion_statuses(regime_configs, default_config)
+            # Calendar production stops at a globally frozen Phase-A book.
+            # Only the synchronized Phase-B command may observe final-lockbox
+            # outcomes.  Other modes preserve the historical single-run
+            # lineage for research compatibility.
+            champion_temporal_lineage = (
+                build_prelockbox_champion_lineage(data_window_meta or {})
+                if split_mode == CALENDAR_SPLIT_MODE
+                else build_lockbox_champion_lineage(data_window_meta or {})
+            )
+            for regimes in regime_configs.values():
+                for cfg in regimes.values():
+                    cfg.validation_evidence = {
+                        **dict(cfg.validation_evidence or {}),
+                        "temporal_lineage": dict(champion_temporal_lineage),
+                    }
+            if default_config is not None:
+                default_config.validation_evidence = {
+                    **dict(default_config.validation_evidence or {}),
+                    "temporal_lineage": dict(champion_temporal_lineage),
+                }
+
+            if split_mode == CALENDAR_SPLIT_MODE:
+                freeze_reason = (
+                    "Phase-A winner frozen before final lockbox; awaiting the "
+                    "complete joint roster verdict"
+                )
+                for regimes in regime_configs.values():
+                    for cfg in regimes.values():
+                        if cfg.is_no_trade_marker():
+                            cfg.promotion_status = "NO_TRADE"
+                            if not cfg.promotion_reasons:
+                                cfg.promotion_reasons = ["training/tuning produced no eligible specialist"]
+                        else:
+                            cfg.holdout_metrics = {}
+                            cfg.promotion_status = FROZEN_PRELOCKBOX_STATUS
+                            cfg.promotion_reasons = [freeze_reason]
+                if default_config is not None:
+                    if default_config.is_no_trade_marker():
+                        default_config.promotion_status = "NO_TRADE"
+                    else:
+                        default_config.holdout_metrics = {}
+                        default_config.promotion_status = FROZEN_PRELOCKBOX_STATUS
+                        default_config.promotion_reasons = [freeze_reason]
+            else:
+                self._apply_promotion_statuses(regime_configs, default_config)
 
             scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
             default_selection_evidence: Dict[str, Any] = {}
@@ -6761,9 +8918,25 @@ class OptimizationPipeline:
 
             for regimes in regime_configs.values():
                 for cfg in regimes.values():
-                    cfg.artifact_meta = {**artifact_meta, **dict(cfg.artifact_meta or {})}
+                    cfg.artifact_meta = {
+                        **artifact_meta,
+                        **dict(cfg.artifact_meta or {}),
+                        "optimization_lifecycle_phase": (
+                            "PRELOCKBOX_SELECTION_FROZEN"
+                            if split_mode == CALENDAR_SPLIT_MODE
+                            else "LEGACY_SINGLE_RUN"
+                        ),
+                    }
             if default_config is not None:
-                default_config.artifact_meta = {**artifact_meta, **dict(default_config.artifact_meta or {})}
+                default_config.artifact_meta = {
+                    **artifact_meta,
+                    **dict(default_config.artifact_meta or {}),
+                    "optimization_lifecycle_phase": (
+                        "PRELOCKBOX_SELECTION_FROZEN"
+                        if split_mode == CALENDAR_SPLIT_MODE
+                        else "LEGACY_SINGLE_RUN"
+                    ),
+                }
 
             default_validation_evidence = (
                 dict(getattr(default_config, "validation_evidence", {}) or {})
@@ -6783,6 +8956,23 @@ class OptimizationPipeline:
             retrain_days = int(getattr(self.config, 'fixed_retrain_days', getattr(self.config, 'optimization_valid_days', 14)))
             now = datetime.now()
             valid_until = _scheduled_valid_until(self.config, now)
+            edge_challenger_book = build_empty_edge_challenger_book(
+                data_window_meta or {}
+            )
+            edge_challenger_book.update({
+                "generation_status": (
+                    "COMPLETE"
+                    if edge_challenger_configs and not edge_challenger_failures
+                    else "PARTIAL"
+                    if edge_challenger_configs
+                    else "NO_ELIGIBLE_CHALLENGER"
+                ),
+                "funded_role_eligible": False,
+                "paper_only": True,
+                "regime_configs": edge_challenger_configs,
+                "generated_cells": int(sum(len(v) for v in edge_challenger_configs.values())),
+                "generation_failures": list(edge_challenger_failures),
+            })
             config = SymbolConfig(
                 symbol=symbol,
                 regime_configs=regime_configs,
@@ -6797,6 +8987,7 @@ class OptimizationPipeline:
                 holdout_metrics=default_config.holdout_metrics if default_config else {},
                 historical_audit_metrics=default_config.historical_audit_metrics if default_config else _default_historical_audit(),
                 data_window_meta=data_window_meta,
+                edge_challenger_book=edge_challenger_book,
                 composite_score=default_config.quality_score * 100 if default_config else 0.0,
                 robustness_ratio=selected_robustness,
                 is_validated=total_winners > 0,
@@ -7017,15 +9208,91 @@ class PortfolioManager:
             logger.warning(f"Could not load configs: {e}")
             self.symbol_configs = {}
 
+    def verify_live_promotion_authorization(self):
+        """Re-read and verify the detached funded-live authorization.
+
+        This intentionally performs fresh file/hash/native-activation checks on
+        every call.  Startup uses it once for the whole ledger and the order
+        path calls it again immediately before a funded entry.
+        """
+        from pm_promotion_authorization import (
+            PromotionAuthorizationResult,
+            verify_promotion_authorization,
+        )
+
+        mode = str(
+            getattr(self.config, "production_promotion_gate_mode", "ledger_status") or ""
+        ).strip().lower()
+        if mode in {"immutable", "authorization", "authorization_exact"}:
+            mode = "immutable_exact"
+        if mode != "immutable_exact":
+            result = PromotionAuthorizationResult(
+                valid=False,
+                errors=[f"PROMOTION_GATE_MODE_NOT_IMMUTABLE_EXACT:{mode or 'missing'}"],
+            )
+            self._last_promotion_authorization = result
+            return result
+
+        self.symbol_configs = self.ledger.get_all_configs()
+        source_config = str(getattr(self.config, "_deployment_config_path", "") or "").strip()
+        result = verify_promotion_authorization(
+            self.config,
+            self.symbol_configs,
+            ledger_path=self.ledger.filepath,
+            config_path=Path(source_config) if source_config else None,
+            verify_active_native=True,
+        )
+        self._last_promotion_authorization = result
+        return result
+
+    def is_exact_cell_authorized_for_live(
+        self,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        *,
+        refresh: bool = True,
+    ) -> Tuple[bool, str]:
+        """Return funded entry authority for exactly one independent cell."""
+        if not bool(getattr(self.config, "production_require_promotion_gate", True)):
+            if bool(getattr(self.config, "_funded_live_execution", False)):
+                return False, "funded execution cannot disable the promotion gate"
+            return True, "promotion gate disabled for research"
+        mode = str(
+            getattr(self.config, "production_promotion_gate_mode", "ledger_status") or ""
+        ).strip().lower()
+        if mode in {"immutable", "authorization", "authorization_exact"}:
+            mode = "immutable_exact"
+        if mode != "immutable_exact":
+            if bool(getattr(self.config, "_funded_live_execution", False)):
+                return False, f"funded execution rejects weak promotion gate mode {mode!r}"
+            return True, f"legacy promotion mode {mode!r} retained for research"
+        verification = None if refresh else getattr(self, "_last_promotion_authorization", None)
+        if verification is None:
+            try:
+                verification = self.verify_live_promotion_authorization()
+            except Exception as exc:
+                return False, f"promotion authorization verification raised {type(exc).__name__}: {exc}"
+        if not verification.valid:
+            return False, verification.concise_reason()
+        if not verification.authorizes(symbol, timeframe, regime):
+            cell_id = "|".join(
+                str(value or "").strip().upper()
+                for value in (symbol, timeframe, regime)
+            )
+            return False, f"exact cell {cell_id} is not approved"
+        return True, f"authorized by {verification.authorization_id}"
+
     def _build_ledger_status(self) -> Dict[str, Any]:
         """Build operator-facing completion metadata for the active winner ledger."""
         configured_symbols = [str(symbol) for symbol in (self.symbols or [])]
         optimized_symbols = sorted(str(symbol) for symbol in self.symbol_configs.keys())
         artifact_contract_counts: Dict[str, int] = {}
         artifact_contract_symbols: Dict[str, set] = {}
+        current_artifact_meta = build_artifact_meta(self.config)
         current_artifact_key = "|".join([
-            PIPELINE_ARTIFACT_VERSION,
-            DataSplitter.SPLIT_CONTRACT_VERSION,
+            str(current_artifact_meta["artifact_version"]),
+            str(current_artifact_meta["split_contract_version"]),
         ])
         for symbol, cfg in self.symbol_configs.items():
             artifact = getattr(cfg, "artifact_meta", {}) or {}
@@ -7094,32 +9361,59 @@ class PortfolioManager:
         *,
         failure_kind: str,
         data_window_meta: Optional[Dict[str, Any]] = None,
+        native_exclusion_binding: Optional[Dict[str, Any]] = None,
     ) -> SymbolConfig:
         """Persist an explicit NO_TRADE config for symbols that cannot be safely traded."""
         now = datetime.now()
         regime_optimizer = self.pipeline.regime_optimizer
         failure_kind = str(failure_kind or "optimization_failure")
         regime_configs: Dict[str, Dict[str, RegimeConfig]] = {}
+        exclusion_binding = dict(native_exclusion_binding or {})
         for timeframe in list(getattr(self.config, "timeframes", []) or []):
             regime_configs[timeframe] = {}
             for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP"):
-                regime_configs[timeframe][regime] = regime_optimizer._make_no_trade_marker(reason, now=now)
+                marker = regime_optimizer._make_no_trade_marker(reason, now=now)
+                if exclusion_binding:
+                    marker.artifact_meta = {
+                        **dict(marker.artifact_meta or {}),
+                        "native_exclusion_binding": exclusion_binding,
+                    }
+                    marker.validation_evidence = {
+                        **dict(marker.validation_evidence or {}),
+                        "native_exclusion_binding": exclusion_binding,
+                    }
+                regime_configs[timeframe][regime] = marker
 
         default_config = regime_optimizer._make_no_trade_marker(reason, now=now)
+        if exclusion_binding:
+            default_config.artifact_meta = {
+                **dict(default_config.artifact_meta or {}),
+                "native_exclusion_binding": exclusion_binding,
+            }
+            default_config.validation_evidence = {
+                **dict(default_config.validation_evidence or {}),
+                "native_exclusion_binding": exclusion_binding,
+            }
         validation_evidence = {
             "validation_reason": reason,
             "tradeable": False,
             "no_trade": True,
             failure_kind: True,
         }
+        if exclusion_binding:
+            validation_evidence["native_exclusion_binding"] = exclusion_binding
         artifact_meta = {
             **build_artifact_meta(self.config),
             "no_trade": True,
             "reason": reason,
             failure_kind: True,
         }
+        if exclusion_binding:
+            artifact_meta["native_exclusion_binding"] = exclusion_binding
         marker_data_window_meta = dict(data_window_meta or {})
         marker_data_window_meta.update({failure_kind: True, "reason": reason})
+        if exclusion_binding:
+            marker_data_window_meta["native_exclusion_binding"] = exclusion_binding
         config = SymbolConfig(
             symbol=symbol,
             regime_configs=regime_configs,
@@ -7150,6 +9444,25 @@ class PortfolioManager:
         """Persist an explicit NO_TRADE config for symbols with insufficient historical data."""
         return self._save_no_trade_config(symbol, reason, failure_kind="data_failure")
 
+    def save_native_exclusion_no_trade_config(
+        self,
+        symbol: str,
+        native_exclusion_binding: Dict[str, Any],
+    ) -> SymbolConfig:
+        """Persist a full 6x4 NO_TRADE grid pinned to one activation decision."""
+        reasons = list((native_exclusion_binding or {}).get("reason_codes") or [])
+        reason = (
+            "Native history is structurally unavailable for the full production calendar: "
+            + (", ".join(str(value) for value in reasons) or "availability evidence missing")
+            + ". The symbol is excluded before model search; no performance result was used."
+        )
+        return self._save_no_trade_config(
+            symbol,
+            reason,
+            failure_kind="native_availability_exclusion",
+            native_exclusion_binding=native_exclusion_binding,
+        )
+
     def save_optimization_no_trade_config(
         self,
         symbol: str,
@@ -7162,6 +9475,70 @@ class PortfolioManager:
             reason,
             failure_kind="optimization_failure",
             data_window_meta=data_window_meta,
+        )
+
+    def _native_universe_for_optimization(self):
+        """Resolve the production availability roster before any model search."""
+        data_dir = Path(getattr(self.config, "data_dir", "data"))
+        source_config = str(
+            getattr(self.config, "_deployment_config_path", "") or ""
+        ).strip()
+        if not data_dir.is_absolute() and source_config:
+            data_dir = Path(source_config).resolve().parent / data_dir
+        active_pointer = data_dir / "native" / "ACTIVE.json"
+        production_native = bool(source_config) and bool(
+            getattr(self.config, "evidence_require_native_timeframes", True)
+        )
+        configured_timeframes = tuple(
+            str(value or "").strip().upper()
+            for value in (getattr(self.config, "timeframes", []) or [])
+            if str(value or "").strip()
+        )
+        if production_native and configured_timeframes != NATIVE_PRODUCTION_TIMEFRAMES:
+            raise RuntimeError(
+                "NATIVE_PRODUCTION_TIMEFRAME_ROSTER_INVALID: calendar production requires "
+                f"exactly {list(NATIVE_PRODUCTION_TIMEFRAMES)!r}, got "
+                f"{list(configured_timeframes)!r}"
+            )
+        if not active_pointer.exists():
+            if production_native:
+                raise RuntimeError(
+                    "NATIVE_UNIVERSE_ACTIVATION_REQUIRED: acquire and activate the immutable "
+                    "six-timeframe roster before production optimization"
+                )
+            return None
+        universe = resolve_active_native_universe(
+            data_dir,
+            self.symbols,
+            required_timeframes=configured_timeframes,
+        )
+        if universe.errors:
+            raise RuntimeError(
+                "NATIVE_UNIVERSE_ACTIVATION_INVALID: "
+                + "; ".join(universe.errors[:20])
+            )
+        if production_native and not universe.explicit_contract:
+            raise RuntimeError(
+                "NATIVE_UNIVERSE_ELIGIBILITY_CONTRACT_MISSING: production optimization "
+                "requires an immutable availability-only eligible/excluded roster"
+            )
+        return universe
+
+    def _has_exact_native_exclusion_grid(
+        self,
+        config: Optional[SymbolConfig],
+        binding: Dict[str, Any],
+    ) -> bool:
+        if config is None:
+            return False
+        return not validate_native_exclusion_no_trade_grid(
+            config.to_dict(),
+            binding,
+            required_timeframes=tuple(
+                str(value or "").strip().upper()
+                for value in (getattr(self.config, "timeframes", []) or [])
+                if str(value or "").strip()
+            ),
         )
     
     def needs_retraining(self, symbol: str) -> bool:
@@ -7189,6 +9566,34 @@ class PortfolioManager:
         Returns:
             True if successful
         """
+        # Scheduled/manual retraining is an optimization entry point too.  It
+        # must honor the current immutable availability roster before checking
+        # ledger age or invoking the optimizer; otherwise an expired exclusion
+        # could enter the legacy data path, and a newly eligible symbol could
+        # remain stuck behind its still-valid old NO_TRADE artifact.
+        universe = self._native_universe_for_optimization()
+        if universe is not None and universe.explicit_contract:
+            canonical = str(symbol or "").strip().upper()
+            existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
+            if canonical in set(universe.excluded_symbols):
+                binding = universe.exclusion_binding(canonical)
+                if not self._has_exact_native_exclusion_grid(existing, binding):
+                    self.save_native_exclusion_no_trade_config(symbol, binding)
+                logger.info(
+                    "SKIP %s: immutable native availability exclusion %s",
+                    symbol,
+                    universe.activation_id,
+                )
+                return True
+            if canonical not in set(universe.eligible_symbols):
+                raise RuntimeError(
+                    f"NATIVE_UNIVERSE_SYMBOL_UNBOUND:{canonical}"
+                )
+            if existing is not None and bool(
+                (existing.artifact_meta or {}).get("native_exclusion_binding")
+            ):
+                force = True
+
         # Check if we should skip
         if not force:
             artifact_meta = build_artifact_meta(self.config)
@@ -7325,6 +9730,195 @@ class PortfolioManager:
         ):
             logger.warning(f"Feature disk cache precompute had cache-level issues: {summary['feature_cache']}")
         return summary
+
+    def _run_production_replay_audit(self) -> Dict[str, Any]:
+        """Run the post-optimization full-sample replay gate against the winner ledger."""
+        if str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower() == CALENDAR_SPLIT_MODE:
+            # Phase A must remain frozen.  Per-cell full-history/replay gates
+            # cannot prune it; only the one-shot synchronized Phase B verdict
+            # may release or reject the complete roster.
+            return {
+                "enabled": False,
+                "reason": "two_phase_calendar_lockbox_uses_joint_replay_only",
+            }
+        enabled = bool(getattr(self.config, "production_replay_audit_enabled", True))
+        if not enabled:
+            return {"enabled": False, "reason": "disabled"}
+
+        mode = str(getattr(self.config, "production_replay_audit_mode", "apply") or "apply").strip().lower()
+        if mode in {"report", "report-only", "report_only", "dry_run", "dry-run"}:
+            mode = "report_only"
+        elif mode in {"apply", "block", "enforce"}:
+            mode = "apply"
+        else:
+            message = f"invalid production_replay_audit_mode={mode!r}; expected report_only or apply"
+            if bool(getattr(self.config, "production_replay_audit_fail_on_error", True)):
+                raise RuntimeError(message)
+            logger.warning(message)
+            return {"enabled": True, "ok": False, "error": message}
+
+        try:
+            from agent_audit.performance.scripts import run_promoted_cell_replay as replay_tools
+            from tools import promotion_replay_audit as replay_audit
+        except Exception as exc:
+            message = f"production replay audit tools unavailable: {type(exc).__name__}: {exc}"
+            if bool(getattr(self.config, "production_replay_audit_fail_on_error", True)):
+                raise RuntimeError(message) from exc
+            logger.warning(message)
+            return {"enabled": True, "ok": False, "error": message}
+
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            message = f"production replay audit could not read ledger {ledger_path}: {type(exc).__name__}: {exc}"
+            if bool(getattr(self.config, "production_replay_audit_fail_on_error", True)):
+                raise RuntimeError(message) from exc
+            logger.warning(message)
+            return {"enabled": True, "ok": False, "error": message}
+
+        cells = list(replay_tools.iter_promoted_cells(ledger))
+        if not cells:
+            logger.info("Production replay audit skipped: no logical promoted cells")
+            return {"enabled": True, "ok": True, "cells": 0, "mode": mode}
+
+        starting_balance = float(getattr(self.config, "production_replay_audit_starting_balance", 10000.0) or 10000.0)
+        min_pf = float(getattr(self.config, "production_replay_audit_min_profit_factor", 1.05) or 0.0)
+        max_dd_pct = float(getattr(self.config, "production_replay_audit_max_drawdown_pct", 30.0) or 0.0)
+        min_trades = int(getattr(self.config, "production_replay_audit_min_trades", 30) or 0)
+        block_unverified = bool(getattr(self.config, "production_replay_audit_block_unverified", False))
+        thresholds = {
+            "min_pf": min_pf,
+            "max_dd_pct": max_dd_pct,
+            "min_trades": min_trades,
+            "starting_balance": starting_balance,
+        }
+
+        audit_config = replace(self.config, initial_capital=starting_balance)
+        loader = DataLoader(audit_config.data_dir)
+        results: List[Dict[str, Any]] = []
+        logger.info(
+            "Production replay audit starting: "
+            f"cells={len(cells)}, mode={mode}, min_pf={min_pf:.2f}, "
+            f"max_dd={max_dd_pct:.1f}%, min_trades={min_trades}"
+        )
+        for idx, cell in enumerate(cells, start=1):
+            row = replay_tools.replay_cell(audit_config, loader, cell)
+            verdict, reasons = replay_audit.evaluate_gates(
+                row,
+                min_pf=min_pf,
+                max_dd_pct=max_dd_pct,
+                min_trades=min_trades,
+            )
+            evidence = replay_audit._audit_evidence(row, verdict, reasons, thresholds)
+            results.append(
+                {
+                    "cell": cell,
+                    "row": row,
+                    "verdict": verdict,
+                    "reasons": reasons,
+                    "evidence": evidence,
+                }
+            )
+            logger.info(
+                "Production replay audit [%s/%s] %s %s %s %s -> %s%s",
+                idx,
+                len(cells),
+                cell.get("symbol"),
+                cell.get("timeframe"),
+                cell.get("regime"),
+                cell.get("strategy_name"),
+                verdict,
+                f" ({'; '.join(reasons)})" if reasons else "",
+            )
+
+        out_dir_raw = str(getattr(self.config, "production_replay_audit_out_dir", "") or "").strip()
+        if out_dir_raw:
+            out_dir = Path(out_dir_raw)
+            if not out_dir.is_absolute():
+                out_dir = Path.cwd() / out_dir
+        else:
+            out_dir = Path(self.config.output_dir) / "replay_audit"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = out_dir / f"production_replay_audit_{stamp}.csv"
+        with report_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "symbol",
+                    "timeframe",
+                    "regime",
+                    "strategy",
+                    "promotion_status",
+                    "verdict",
+                    "reasons",
+                    "net_profit",
+                    "return_pct",
+                    "profit_factor",
+                    "max_drawdown_pct",
+                    "total_trades",
+                    "expectancy_pips",
+                ]
+            )
+            for result in results:
+                cell = result["cell"]
+                row = result["row"]
+                writer.writerow(
+                    [
+                        cell.get("symbol"),
+                        cell.get("timeframe"),
+                        cell.get("regime"),
+                        cell.get("strategy_name"),
+                        cell.get("promotion_status"),
+                        result["verdict"],
+                        "; ".join(result["reasons"]),
+                        row.get("net_profit"),
+                        row.get("return_pct"),
+                        row.get("profit_factor"),
+                        row.get("max_drawdown_pct"),
+                        row.get("total_trades"),
+                        row.get("expectancy_pips"),
+                    ]
+                )
+
+        summary: Dict[str, Any] = {
+            "enabled": True,
+            "ok": True,
+            "mode": mode,
+            "cells": len(results),
+            "pass": sum(1 for item in results if item["verdict"] == "PASS"),
+            "fail": sum(1 for item in results if item["verdict"] == "FAIL"),
+            "unverified": sum(1 for item in results if item["verdict"] == "UNVERIFIED"),
+            "report_path": str(report_path),
+        }
+
+        if mode == "apply":
+            backup = ledger_path.with_name(f"{ledger_path.stem}.backup_replay_audit_{stamp}{ledger_path.suffix}")
+            shutil.copy2(ledger_path, backup)
+            counters = replay_audit.apply_audit(
+                ledger,
+                results,
+                block_unverified=block_unverified,
+            )
+            tmp_path = ledger_path.with_suffix(f"{ledger_path.suffix}.tmp_replay_audit")
+            tmp_path.write_text(json.dumps(ledger, indent=2, default=str), encoding="utf-8")
+            tmp_path.replace(ledger_path)
+            self.ledger.load()
+            self.symbol_configs = self.ledger.get_all_configs()
+            summary["backup_path"] = str(backup)
+            summary["counters"] = counters
+
+        logger.info(
+            "Production replay audit complete: "
+            f"PASS={summary['pass']} FAIL={summary['fail']} UNVERIFIED={summary['unverified']} "
+            f"mode={mode} report={report_path}"
+        )
+        return summary
     
     def initial_optimization(self, overwrite: bool = False) -> Dict[str, PipelineResult]:
         """
@@ -7345,17 +9939,56 @@ class PortfolioManager:
         
         total_start = time.time()
         
-        # Determine which symbols to optimize
+        # Freeze the availability-only universe before model search. Excluded
+        # symbols receive a complete, manifest-bound NO_TRADE grid and never
+        # enter scoring/optimization. A prior exclusion that becomes eligible
+        # under a later activation is forced back through optimization.
+        universe = self._native_universe_for_optimization()
+        optimization_symbols = list(self.symbols)
+        stale_exclusions_now_eligible: List[str] = []
+        excluded_now: List[str] = []
+        if universe is not None and universe.explicit_contract:
+            eligible_set = set(universe.eligible_symbols)
+            excluded_set = set(universe.excluded_symbols)
+            optimization_symbols = [
+                symbol for symbol in self.symbols if str(symbol).upper() in eligible_set
+            ]
+            for symbol in self.symbols:
+                canonical = str(symbol).upper()
+                existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
+                if canonical in excluded_set:
+                    excluded_now.append(symbol)
+                    binding = universe.exclusion_binding(canonical)
+                    if not self._has_exact_native_exclusion_grid(existing, binding):
+                        self.save_native_exclusion_no_trade_config(symbol, binding)
+                elif existing is not None and bool(
+                    (existing.artifact_meta or {}).get("native_exclusion_binding")
+                ):
+                    stale_exclusions_now_eligible.append(symbol)
+
+        # Determine which eligible symbols to optimize.
         artifact_meta = build_artifact_meta(self.config)
         to_optimize, to_skip = self.ledger.get_symbols_to_optimize(
-            self.symbols,
+            optimization_symbols,
             overwrite=overwrite,
             current_artifact_meta=artifact_meta,
         )
+        for symbol in stale_exclusions_now_eligible:
+            if symbol not in to_optimize:
+                to_optimize.append(symbol)
+            if symbol in to_skip:
+                to_skip.remove(symbol)
+        to_skip.extend(symbol for symbol in excluded_now if symbol not in to_skip)
         
         logger.info(f"\n{'#'*60}")
         logger.info(f"PORTFOLIO MANAGER - STATEFUL OPTIMIZATION")
         logger.info(f"Total symbols: {len(self.symbols)}")
+        if excluded_now:
+            logger.info(
+                "Availability-excluded before model search: %d (%s)",
+                len(excluded_now),
+                ", ".join(str(value) for value in excluded_now[:12]),
+            )
         logger.info(f"To optimize: {len(to_optimize)}")
         logger.info(f"Skipping: {len(to_skip)} (valid configs)")
         if overwrite:
@@ -7366,6 +9999,7 @@ class PortfolioManager:
         
         if not to_optimize:
             logger.info("All symbols have valid configs. Nothing to optimize.")
+            self._run_production_replay_audit()
             return results
         
         max_workers = int(getattr(self.config, "optimization_max_workers", 1) or 1)
@@ -7482,6 +10116,8 @@ class PortfolioManager:
         logger.info(f"Total validated: {total_validated}/{len(self.symbols)}")
         logger.info(f"Live eligible: {total_live_eligible}/{len(self.symbols)}")
         logger.info(f"{'#'*60}")
+
+        self._run_production_replay_audit()
         
         return results
     
@@ -7494,6 +10130,171 @@ class PortfolioManager:
             for s, c in self.symbol_configs.items()
             if c.is_validated or c.has_tradeable_regime_winners()
         }
+
+    def get_edge_challenger_configs(
+        self,
+        *,
+        log_rejections: bool = False,
+    ) -> Dict[str, SymbolConfig]:
+        """Return the executable demo-probation view of the edge book.
+
+        This selector deliberately does *not* reuse funded-live eligibility.
+        An edge refit has no validation/lockbox verdict to inherit, so its only
+        legal execution surface is the separately authorized demo path.  The
+        returned ``SymbolConfig`` objects contain only structurally complete
+        PAPER_ONLY challenger cells; funded champions are never copied into
+        this view and the persisted ledger is never mutated.
+        """
+        self.symbol_configs = self.ledger.get_all_configs()
+        selected: Dict[str, SymbolConfig] = {}
+        rejections: Dict[str, str] = {}
+
+        for symbol, champion_book in self.symbol_configs.items():
+            book = dict(getattr(champion_book, "edge_challenger_book", {}) or {})
+            book_role = str(book.get("book_role", "") or "").strip().upper()
+            if book_role != EDGE_CHALLENGER_ROLE:
+                rejections[symbol] = "edge challenger book role missing or invalid"
+                continue
+            if not bool(book.get("paper_only", False)):
+                rejections[symbol] = "edge challenger book is not explicitly paper-only"
+                continue
+            if bool(book.get("funded_role_eligible", True)):
+                rejections[symbol] = "edge challenger book claims funded eligibility"
+                continue
+
+            raw_timeframes = book.get("regime_configs") or {}
+            if not isinstance(raw_timeframes, dict):
+                rejections[symbol] = "edge challenger regime_configs is not an object"
+                continue
+            parsed_timeframes: Dict[str, Dict[str, RegimeConfig]] = {}
+            invalid_cells: List[str] = []
+            for timeframe, raw_regimes in raw_timeframes.items():
+                if not isinstance(raw_regimes, dict):
+                    invalid_cells.append(f"{timeframe}:regime map invalid")
+                    continue
+                parsed_regimes: Dict[str, RegimeConfig] = {}
+                for regime, raw_candidate in raw_regimes.items():
+                    try:
+                        candidate = (
+                            RegimeConfig.from_dict(raw_candidate)
+                            if isinstance(raw_candidate, dict)
+                            else RegimeConfig.from_dict(raw_candidate.to_dict())
+                        )
+                    except Exception as exc:
+                        invalid_cells.append(
+                            f"{timeframe}|{regime}:deserialize:{type(exc).__name__}"
+                        )
+                        continue
+                    temporal = dict(
+                        (candidate.validation_evidence or {}).get("temporal_lineage", {})
+                        or {}
+                    )
+                    edge_refit = dict(
+                        (candidate.validation_evidence or {}).get("edge_refit", {})
+                        or {}
+                    )
+                    candidate_id = str(
+                        (candidate.artifact_meta or {}).get("candidate_id")
+                        or edge_refit.get("candidate_id")
+                        or ""
+                    ).strip()
+                    fit_cutoff_raw = str(temporal.get("fit_cutoff_utc", "") or "").strip()
+                    errors: List[str] = []
+                    if candidate.is_no_trade_marker():
+                        errors.append("NO_TRADE")
+                    if str(candidate.promotion_status or "").upper() != "PAPER_ONLY":
+                        errors.append("status is not PAPER_ONLY")
+                    if not bool((candidate.artifact_meta or {}).get("edge_challenger", False)):
+                        errors.append("edge artifact flag missing")
+                    if bool((candidate.artifact_meta or {}).get("funded_role_eligible", True)):
+                        errors.append("candidate claims funded eligibility")
+                    if str(temporal.get("book_role", "") or "").upper() != EDGE_CHALLENGER_ROLE:
+                        errors.append("temporal role mismatch")
+                    if str(temporal.get("contract_status", "") or "").upper() != "PAPER_ONLY":
+                        errors.append("temporal contract is not PAPER_ONLY")
+                    if not bool(temporal.get("edge_refit_performed", False)):
+                        errors.append("latest-data refit not proven")
+                    if bool(temporal.get("champion_lockbox_verdict_inherited", True)):
+                        errors.append("champion verdict inheritance is not prohibited")
+                    if not fit_cutoff_raw:
+                        errors.append("fit cutoff missing")
+                    else:
+                        try:
+                            fit_cutoff = datetime.fromisoformat(
+                                fit_cutoff_raw.replace("Z", "+00:00")
+                            )
+                            if fit_cutoff.tzinfo is None:
+                                fit_cutoff = fit_cutoff.replace(tzinfo=timezone.utc)
+                            fit_cutoff = fit_cutoff.astimezone(timezone.utc)
+                        except (TypeError, ValueError, OverflowError):
+                            errors.append("fit cutoff is invalid")
+                        else:
+                            if fit_cutoff > datetime.now(timezone.utc):
+                                errors.append("fit cutoff is in the future")
+                            if str(
+                                temporal.get("requires_forward_evidence_strictly_after_utc", "")
+                                or ""
+                            ).strip() != fit_cutoff_raw:
+                                errors.append("forward evidence boundary differs from fit cutoff")
+                    if not bool(temporal.get("requires_future_nonoverlapping_forward_evidence", False)):
+                        errors.append("future evidence contract missing")
+                    if list(temporal.get("contract_errors", []) or []):
+                        errors.append("temporal contract carries errors")
+                    if not candidate_id:
+                        errors.append("candidate id missing")
+                    else:
+                        expected_candidate_id = _stable_hash({
+                            "book_role": EDGE_CHALLENGER_ROLE,
+                            "symbol": str(symbol).upper(),
+                            "timeframe": str(timeframe).upper(),
+                            "regime": str(regime).upper(),
+                            "strategy_name": str(candidate.strategy_name or ""),
+                            "parameters": dict(candidate.parameters or {}),
+                            "fit_cutoff_utc": fit_cutoff_raw or None,
+                        })
+                        if candidate_id != expected_candidate_id:
+                            errors.append("candidate id does not match cell payload")
+                    if int((candidate.train_metrics or {}).get("total_trades", 0) or 0) <= 0:
+                        errors.append("latest-data fit has no trades")
+                    if errors:
+                        invalid_cells.append(
+                            f"{timeframe}|{regime}:" + ", ".join(errors)
+                        )
+                        continue
+                    parsed_regimes[str(regime).upper()] = candidate
+                if parsed_regimes:
+                    parsed_timeframes[str(timeframe).upper()] = parsed_regimes
+
+            if not parsed_timeframes:
+                reason = "no executable edge challenger cells"
+                if invalid_cells:
+                    reason += f" ({'; '.join(invalid_cells[:4])})"
+                rejections[symbol] = reason
+                continue
+
+            selected[symbol] = SymbolConfig(
+                symbol=symbol,
+                regime_configs=parsed_timeframes,
+                default_config=None,
+                is_validated=False,
+                validation_reason="demo-only latest-data edge challenger",
+                data_window_meta=dict(champion_book.data_window_meta or {}),
+                edge_challenger_book=book,
+                artifact_meta={
+                    "book_role": EDGE_CHALLENGER_ROLE,
+                    "funded_role_eligible": False,
+                    "paper_only": True,
+                },
+                regime_detection_version=champion_book.regime_detection_version,
+                optimized_at=champion_book.optimized_at,
+                valid_until=None,
+            )
+
+        self._last_edge_challenger_rejections = dict(rejections)
+        if log_rejections:
+            for symbol, reason in sorted(rejections.items()):
+                logger.warning(f"EDGE DEMO BLOCK {symbol}: {reason}")
+        return selected
 
     def _live_eligibility_reason(self,
                                  symbol: str,
@@ -7523,6 +10324,45 @@ class PortfolioManager:
                 return False, "symbol config is NO_TRADE"
             if not config.strategy_name and default_cfg is None:
                 return False, "no strategy"
+
+        live_split_mode = str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower()
+        if live_split_mode in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
+            required_timeframes = {
+                str(timeframe).upper()
+                for timeframe, regime_map in (config.regime_configs or {}).items()
+                if isinstance(regime_map, dict)
+                and any(
+                    candidate is not None and not candidate.is_no_trade_marker()
+                    for candidate in regime_map.values()
+                )
+            }
+            if not required_timeframes and str(config.timeframe or "").strip():
+                required_timeframes.add(str(config.timeframe).strip().upper())
+            if not required_timeframes:
+                return False, "no detector timeframe for provenance validation"
+            params_file = str(
+                getattr(self.config, "regime_params_file", "regime_params.json")
+                or "regime_params.json"
+            )
+            expected_contract = (
+                EVIDENCE_CONTRACT_VERSION
+                if live_split_mode == CALENDAR_SPLIT_MODE
+                else DataSplitter.SPLIT_CONTRACT_VERSION
+            )
+            for timeframe in sorted(required_timeframes):
+                provenance = validate_regime_params_provenance(
+                    symbol,
+                    timeframe,
+                    params_file,
+                    expected_split_contract=expected_contract,
+                )
+                if not provenance.get("valid", False):
+                    return False, (
+                        f"regime detector provenance invalid for {timeframe}: "
+                        f"{provenance.get('reason', 'unknown')}"
+                    )
 
         if current_artifact_meta and artifact_policy == "block":
             stored_artifact = getattr(config, "artifact_meta", {}) or {}
@@ -7555,6 +10395,32 @@ class PortfolioManager:
         eligible: Dict[str, SymbolConfig] = {}
         rejections: Dict[str, str] = {}
         drift_warnings: Dict[str, str] = {}
+
+        gate_mode = str(
+            getattr(self.config, "production_promotion_gate_mode", "ledger_status") or ""
+        ).strip().lower()
+        if gate_mode in {"immutable", "authorization", "authorization_exact"}:
+            gate_mode = "immutable_exact"
+        if bool(getattr(self.config, "production_require_promotion_gate", True)) and gate_mode == "immutable_exact":
+            try:
+                authorization = self.verify_live_promotion_authorization()
+            except Exception as exc:
+                authorization = None
+                authorization_reason = (
+                    f"promotion authorization verification raised {type(exc).__name__}: {exc}"
+                )
+            else:
+                authorization_reason = authorization.concise_reason()
+            if authorization is None or not authorization.valid:
+                for symbol in self.symbol_configs:
+                    rejections[symbol] = f"immutable promotion authorization rejected: {authorization_reason}"
+                self._last_live_eligibility_rejections = dict(rejections)
+                self._last_live_eligibility_warnings = {}
+                if log_rejections:
+                    for symbol, reason in sorted(rejections.items()):
+                        logger.warning(f"LIVE BLOCK {symbol}: {reason}")
+                return {}
+
         for symbol, config in self.symbol_configs.items():
             ok, reason = self._live_eligibility_reason(
                 symbol,

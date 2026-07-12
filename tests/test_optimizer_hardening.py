@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -131,6 +132,8 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_regime_selection_accounts_for_search_trial_breadth(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_min_train_trades=1,
             regime_min_val_trades=1,
             regime_min_val_profit_factor=0.0,
@@ -190,7 +193,66 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertIsNotNone(best_config)
         self.assertEqual(best_config.strategy_name, "LowTrialStrategy")
 
-    def test_global_false_discovery_scales_trials_and_penalizes_score(self):
+    def test_candidate_descent_reaches_rank_six_after_top_five_fail(self):
+        cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
+            regime_validation_top_k=5,
+            regime_min_train_trades=1,
+            regime_min_val_trades=1,
+            regime_min_val_profit_factor=0.0,
+            regime_min_val_return_pct=-100.0,
+            regime_min_val_return_dd_ratio=0.0,
+            fx_val_max_drawdown=100.0,
+        )
+        optimizer = RegimeOptimizer(cfg)
+        checked = []
+        optimizer._compute_regime_score = (
+            lambda train, val, candidate=None: float(candidate["rank_score"])
+        )
+
+        def validate(_train, _val, _regime, candidate_name, timeframe=None):
+            checked.append(candidate_name)
+            if candidate_name == "Rank6Passes":
+                return True, "Validated rank six"
+            return False, "deliberate final-gate failure"
+
+        optimizer._validate_regime_winner = validate
+        shared_metrics = {
+            "total_trades": 30,
+            "profit_factor": 1.5,
+            "total_return_pct": 10.0,
+            "max_drawdown_pct": 2.0,
+            "sharpe_approx": 1.0,
+            "avg_win": 2.0,
+            "avg_loss": -1.0,
+        }
+        candidates = []
+        for rank in range(1, 7):
+            name = "Rank6Passes" if rank == 6 else f"Rank{rank}Fails"
+            candidates.append(
+                {
+                    "strategy_name": name,
+                    "params": {},
+                    "rank_score": float(7 - rank),
+                    "search_trials": 1,
+                    "train_regime_metrics": {"TREND": dict(shared_metrics)},
+                    "val_regime_metrics": {"TREND": dict(shared_metrics)},
+                }
+            )
+
+        winner, validated, reason = optimizer._select_best_for_regime(
+            "EURUSD",
+            "H1",
+            "TREND",
+            candidates,
+        )
+
+        self.assertTrue(validated, reason)
+        self.assertEqual(winner.strategy_name, "Rank6Passes")
+        self.assertEqual(len(checked), 6)
+
+    def test_false_discovery_reports_actual_trials_without_invented_scope_trials(self):
         cfg = PipelineConfig(
             regime_min_train_trades=1,
             regime_min_val_trades=1,
@@ -227,20 +289,31 @@ class OptimizerHardeningTests(unittest.TestCase):
             "val_regime_metrics": {"TREND": val},
         }]
 
-        best_config, is_valid, _ = optimizer._select_best_for_regime(
-            "EURUSD",
-            "H1",
-            "TREND",
-            candidates,
-        )
+        with patch(
+            "pm_pipeline.deflated_sharpe_evidence",
+            return_value={
+                "contract_version": "test",
+                "status": "PASS",
+                "deflated_sharpe": 0.99,
+                "sharpe_annualized": 2.0,
+            },
+        ), patch(
+            "pm_pipeline.block_bootstrap_evidence",
+            return_value={"status": "PASS", "passed": True},
+        ):
+            evidence = optimizer._build_false_discovery_evidence(
+                val,
+                candidates,
+                candidates[0],
+                regime="TREND",
+                pbo_evidence={"status": "PASS", "passed": True, "pbo": 0.1},
+            )
 
-        self.assertTrue(is_valid)
-        evidence = best_config.validation_evidence["false_discovery"]
         self.assertTrue(evidence["enabled"])
         self.assertEqual(evidence["local_trials"], 100)
         self.assertEqual(evidence["scope_multiplier"], 50 * 6 * 4)
-        self.assertGreater(evidence["effective_trials"], evidence["local_trials"])
-        self.assertLess(best_config.validation_evidence["selection_score_raw"], 100.0)
+        self.assertEqual(evidence["effective_trials"], evidence["local_trials"])
+        self.assertLess(evidence["confidence_multiplier"], 1.0)
 
     def test_false_discovery_confidence_does_not_mutate_val_metric_surface(self):
         cfg = PipelineConfig(
@@ -287,12 +360,27 @@ class OptimizerHardeningTests(unittest.TestCase):
             "val_regime_metrics": {"TREND": val},
         }]
 
-        best_config, is_valid, _ = optimizer._select_best_for_regime(
-            "EURUSD",
-            "H1",
-            "TREND",
-            candidates,
-        )
+        with patch(
+            "pm_pipeline.aligned_cell_pbo",
+            return_value={"status": "PASS", "passed": True, "pbo": 0.1},
+        ), patch(
+            "pm_pipeline.deflated_sharpe_evidence",
+            return_value={
+                "contract_version": "test",
+                "status": "PASS",
+                "deflated_sharpe": 0.99,
+                "sharpe_annualized": 0.2,
+            },
+        ), patch(
+            "pm_pipeline.block_bootstrap_evidence",
+            return_value={"status": "PASS", "passed": True},
+        ):
+            best_config, is_valid, _ = optimizer._select_best_for_regime(
+                "EURUSD",
+                "H1",
+                "TREND",
+                candidates,
+            )
 
         self.assertTrue(is_valid)
         self.assertAlmostEqual(seen["sharpe_approx"], 0.2)
@@ -342,9 +430,9 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         self.assertFalse(is_valid)
         self.assertIsNone(best_config)
-        self.assertIn("false-discovery DSR", reason)
+        self.assertIn("daily-return DSR UNAVAILABLE", reason)
 
-    def test_false_discovery_rejects_flashy_noise_and_selects_next_candidate(self):
+    def test_false_discovery_rejects_candidates_without_daily_aligned_evidence(self):
         cfg = PipelineConfig(
             regime_min_train_trades=1,
             regime_min_val_trades=1,
@@ -392,14 +480,12 @@ class OptimizerHardeningTests(unittest.TestCase):
             ],
         )
 
-        self.assertTrue(is_valid)
-        self.assertEqual(best_config.strategy_name, "DefensibleStrategy")
-        evidence = best_config.validation_evidence["false_discovery"]
-        self.assertGreaterEqual(evidence["deflated_sharpe"], 0.5)
-        self.assertEqual(evidence["pbo_status"], "not_available")
+        self.assertFalse(is_valid)
+        self.assertIsNone(best_config)
 
     def test_false_discovery_promotion_blocks_low_dsr(self):
         cfg = PipelineConfig(
+            research_mode=True,
             false_discovery_control_enabled=True,
             false_discovery_min_dsr=0.10,
         )
@@ -407,16 +493,26 @@ class OptimizerHardeningTests(unittest.TestCase):
             strategy_name="SomeStrategy",
             parameters={},
             quality_score=0.5,
+            holdout_metrics={
+                "total_trades": 5,
+                "profit_factor": 1.5,
+                "total_return_pct": 1.0,
+                "max_drawdown_pct": 1.0,
+            },
             validation_evidence={"false_discovery": {"deflated_sharpe": 0.01}},
         )
 
         status, reasons = classify_promotion_status(winner, cfg)
 
         self.assertEqual(status, "BLOCKED")
-        self.assertIn("false-discovery DSR", reasons[0])
+        self.assertTrue(
+            any("false-discovery daily-return DSR" in reason for reason in reasons),
+            reasons,
+        )
 
     def test_false_discovery_holdout_policy_blocks_failed_holdout(self):
         cfg = PipelineConfig(
+            research_mode=True,
             false_discovery_control_enabled=True,
             false_discovery_holdout_policy="block",
             false_discovery_holdout_min_trades=5,
@@ -441,6 +537,7 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_false_discovery_holdout_block_policy_blocks_insufficient_holdout(self):
         cfg = PipelineConfig(
+            research_mode=True,
             false_discovery_control_enabled=True,
             false_discovery_holdout_policy="block",
             production_split_mode="research_clean_holdout",
@@ -464,6 +561,7 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_bleeding_edge_split_does_not_require_clean_holdout_metrics(self):
         cfg = PipelineConfig(
+            research_mode=True,
             false_discovery_control_enabled=True,
             false_discovery_holdout_policy="block",
             production_split_mode="bleeding_edge",
@@ -504,7 +602,7 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(status, "PROMOTE_SMALL")
         self.assertEqual(reasons, ["holdout trades 0 < 5"])
 
-    def test_broad_eligibility_surface_controls_screening_before_latest_half_train(self):
+    def test_optimizer_train_controls_screening_even_if_broad_surface_looks_better(self):
         cfg = PipelineConfig(
             train_min_profit_factor=1.0,
             train_min_return_pct=0.0,
@@ -540,11 +638,17 @@ class OptimizerHardeningTests(unittest.TestCase):
         eligible = optimizer._apply_training_eligibility_gates([candidate], "EURUSD", "M5")
         top = optimizer._identify_top_strategies_per_regime(eligible, top_k=1)
 
-        self.assertEqual(eligible, [candidate])
-        self.assertEqual(top["TREND"], ["BroadActiveWinner"])
+        self.assertEqual(eligible, [])
+        self.assertEqual(top["TREND"], [])
 
     def test_walk_forward_observe_only_does_not_block_live_promotion(self):
-        cfg = PipelineConfig(walk_forward_promotion_policy="observe_only")
+        cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            false_discovery_control_enabled=False,
+            false_discovery_holdout_policy="off",
+            walk_forward_promotion_policy="observe_only",
+        )
         winner = RegimeConfig(
             strategy_name="SomeStrategy",
             parameters={},
@@ -565,6 +669,10 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_walk_forward_block_policy_remains_available_for_research(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            false_discovery_control_enabled=False,
+            false_discovery_holdout_policy="off",
             walk_forward_promotion_policy="block_severe_only",
             walk_forward_live_blocking_enabled=True,
         )
@@ -588,6 +696,10 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_walk_forward_block_policy_without_live_opt_in_is_research_only(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            false_discovery_control_enabled=False,
+            false_discovery_holdout_policy="off",
             walk_forward_promotion_policy="block_severe_only",
             walk_forward_live_blocking_enabled=False,
         )
@@ -610,7 +722,12 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(reasons, [])
 
     def test_walk_forward_promotion_gate_promotes_clean_evidence(self):
-        cfg = PipelineConfig()
+        cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            false_discovery_control_enabled=False,
+            false_discovery_holdout_policy="off",
+        )
         winner = RegimeConfig(
             strategy_name="SomeStrategy",
             parameters={},
@@ -624,7 +741,12 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(reasons, [])
 
     def test_walk_forward_promotion_gate_derates_missing_evidence(self):
-        cfg = PipelineConfig()
+        cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            false_discovery_control_enabled=False,
+            false_discovery_holdout_policy="off",
+        )
         winner = RegimeConfig(
             strategy_name="SomeStrategy",
             parameters={},
@@ -642,7 +764,12 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertTrue(any("insufficient promotion evidence" in reason for reason in reasons))
 
     def test_walk_forward_promotion_gate_derates_weak_evidence(self):
-        cfg = PipelineConfig()
+        cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            false_discovery_control_enabled=False,
+            false_discovery_holdout_policy="off",
+        )
         winner = RegimeConfig(
             strategy_name="SomeStrategy",
             parameters={},
@@ -656,7 +783,12 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertTrue(any("walk_forward" in reason for reason in reasons))
 
     def test_walk_forward_promotion_gate_blocks_severe_evidence(self):
-        cfg = PipelineConfig()
+        cfg = PipelineConfig(
+            research_mode=True,
+            production_split_mode="research_clean_holdout",
+            false_discovery_control_enabled=False,
+            false_discovery_holdout_policy="off",
+        )
         winner = RegimeConfig(
             strategy_name="SomeStrategy",
             parameters={},
@@ -764,7 +896,7 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(status, "PROMOTE_SMALL")
         self.assertIn("holdout trades 2 < 5", reasons)
 
-    def test_default_holdout_policy_off_does_not_gate_missing_production_holdout(self):
+    def test_funded_default_blocks_missing_production_holdout_even_when_false_discovery_disabled(self):
         cfg = PipelineConfig(
             regime_scoring_model="specialist_spokes_v2",
             false_discovery_control_enabled=False,
@@ -779,8 +911,8 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         status, reasons = classify_promotion_status(winner, cfg)
 
-        self.assertEqual(status, "PROMOTED")
-        self.assertEqual(reasons, [])
+        self.assertEqual(status, "BLOCKED")
+        self.assertIn("holdout trades 0 < 5", reasons)
 
     def test_specialist_spokes_v2_uses_promote_small_only_after_clean_pool_exhausted(self):
         cfg = PipelineConfig(
@@ -851,7 +983,12 @@ class OptimizerHardeningTests(unittest.TestCase):
             parameters={},
             quality_score=0.8,
             promotion_status="PROMOTED",
-            holdout_metrics={"total_trades": 8, "profit_factor": 1.4, "total_return_pct": 1.0},
+            holdout_metrics={
+                "total_trades": 8,
+                "profit_factor": 1.4,
+                "total_return_pct": 1.0,
+                "max_drawdown_pct": 5.0,
+            },
             historical_audit_metrics={
                 "regime_profitability_audit": {
                     "severe_failure": True,
@@ -864,7 +1001,12 @@ class OptimizerHardeningTests(unittest.TestCase):
             parameters={},
             quality_score=0.9,
             promotion_status="PROMOTE_SMALL",
-            holdout_metrics={"total_trades": 8, "profit_factor": 0.7, "total_return_pct": -1.0},
+            holdout_metrics={
+                "total_trades": 8,
+                "profit_factor": 0.7,
+                "total_return_pct": -1.0,
+                "max_drawdown_pct": 5.0,
+            },
             historical_audit_metrics={
                 "regime_profitability_audit": {
                     "severe_failure": True,
@@ -879,6 +1021,8 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_specialist_spokes_v2_classification_confirms_historical_severe_with_holdout(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_scoring_model="specialist_spokes_v2",
             false_discovery_holdout_policy="promote_small",
             false_discovery_holdout_min_trades=5,
@@ -888,7 +1032,12 @@ class OptimizerHardeningTests(unittest.TestCase):
             strategy_name="HistoricalSevereButCleanHoldout",
             parameters={},
             quality_score=0.8,
-            holdout_metrics={"total_trades": 8, "profit_factor": 1.4, "total_return_pct": 1.0},
+            holdout_metrics={
+                "total_trades": 8,
+                "profit_factor": 1.4,
+                "total_return_pct": 1.0,
+                "max_drawdown_pct": 5.0,
+            },
             walk_forward_audit=self._walk_forward_audit([0.4, 0.6, 0.5]),
             historical_audit_metrics={
                 "severe_failure": True,
@@ -899,7 +1048,12 @@ class OptimizerHardeningTests(unittest.TestCase):
             strategy_name="HistoricalSevereAndBadHoldout",
             parameters={},
             quality_score=0.9,
-            holdout_metrics={"total_trades": 8, "profit_factor": 0.7, "total_return_pct": -1.0},
+            holdout_metrics={
+                "total_trades": 8,
+                "profit_factor": 0.7,
+                "total_return_pct": -1.0,
+                "max_drawdown_pct": 5.0,
+            },
             walk_forward_audit=self._walk_forward_audit([0.4, 0.6, 0.5]),
             historical_audit_metrics={
                 "severe_failure": True,
@@ -1039,9 +1193,19 @@ class OptimizerHardeningTests(unittest.TestCase):
             features,
             val_warmup_bars=1,
         )
+        other_regime = optimizer._build_oos_evidence_record(
+            "EURUSD",
+            "H1",
+            {**candidate, "tuned_for_regime": "RANGE"},
+            val_result,
+            features,
+            val_warmup_bars=1,
+        )
 
         self.assertEqual(first["format_version"], "oos_candidate_returns_v3")
         self.assertEqual(first["candidate_id"], second["candidate_id"])
+        self.assertNotEqual(first["candidate_id"], other_regime["candidate_id"])
+        self.assertEqual(first["regime"], "TREND")
         self.assertEqual(first["return_index"], "relative_equal_blocks")
         self.assertEqual(first["period_count"], 4)
         self.assertEqual(len(first["period_returns"]), 4)
@@ -1179,7 +1343,11 @@ class OptimizerHardeningTests(unittest.TestCase):
                 return pd.Series([1] * len(features), index=features.index)
 
         class FakeBacktester:
+            def __init__(self):
+                self.signal_vectors = []
+
             def run(self, features, signals, symbol, strategy, timeframe=None, warmup_bars=0):
+                self.signal_vectors.append(signals.astype(int).tolist())
                 return {
                     "equity_curve": [100.0, 101.0, 100.5, 102.0, 101.5, 103.0],
                     "total_trades": 4,
@@ -1190,14 +1358,20 @@ class OptimizerHardeningTests(unittest.TestCase):
                 }
 
         cfg = PipelineConfig(
+            research_mode=True,
             oos_evidence_export_enabled=True,
             oos_evidence_periods=5,
             oos_evidence_min_periods=2,
+            oos_evidence_include_execution_cost_survival=False,
         )
         optimizer = RegimeOptimizer(cfg)
-        optimizer.backtester = FakeBacktester()
+        backtester = FakeBacktester()
+        optimizer.backtester = backtester
         features = pd.DataFrame(
-            {"Close": [1, 2, 3, 4, 5, 6]},
+            {
+                "Close": [1, 2, 3, 4, 5, 6],
+                "REGIME_LIVE": ["TREND"] * 3 + ["RANGE"] * 3,
+            },
             index=pd.date_range("2026-01-01", periods=6, freq="h"),
         )
         candidate = {
@@ -1205,6 +1379,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             "strategy_name": "FakeEvidenceStrategy",
             "params": {"p": 1},
             "search_trials": 1,
+            "evaluation_regime": "TREND",
         }
 
         optimizer._attach_oos_evidence_to_candidates(
@@ -1221,6 +1396,8 @@ class OptimizerHardeningTests(unittest.TestCase):
         records = optimizer.consume_oos_candidate_evidence()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["strategy_name"], "FakeEvidenceStrategy")
+        self.assertEqual(records[0]["regime"], "TREND")
+        self.assertEqual(backtester.signal_vectors, [[1, 1, 1, 0, 0, 0]])
 
     def test_purged_kfold_ranges_exclude_test_from_train_segments(self):
         ranges = RegimeOptimizer._build_purged_kfold_ranges(
@@ -1330,6 +1507,7 @@ class OptimizerHardeningTests(unittest.TestCase):
         StrategyRegistry._strategies[strategy_name] = KFoldUnitTestStrategy
         try:
             cfg = PipelineConfig(
+                research_mode=True,
                 oos_validation_mode="purged_kfold",
                 oos_kfold_splits=3,
                 oos_embargo_bars=1,
@@ -1372,6 +1550,7 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_purged_kfold_policy_status_blocks_promotion(self):
         cfg = PipelineConfig(
+            research_mode=True,
             false_discovery_control_enabled=True,
             false_discovery_holdout_policy="block",
             oos_validation_mode="purged_kfold",
@@ -1398,6 +1577,8 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_regime_selection_tie_breaks_on_trade_count(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_min_train_trades=1,
             regime_min_val_trades=1,
             regime_min_val_profit_factor=0.0,
@@ -1794,17 +1975,21 @@ class OptimizerHardeningTests(unittest.TestCase):
                 self.params = {}
 
             def generate_signals(self, features, symbol):
-                return pd.Series([0] * len(features), index=features.index)
+                return pd.Series([1] * len(features), index=features.index)
 
             def get_params(self):
                 return {}
 
         class FakeBacktester:
             def run(self, features, signals, symbol, strategy, **kwargs):
+                trades = [
+                    {"signal_bar": 10, "entry_bar": 11, "exit_bar": 12, "pnl_dollars": 120.0},
+                    {"signal_bar": 60, "entry_bar": 61, "exit_bar": 62, "pnl_dollars": -40.0},
+                ]
                 return {
                     "trades": [
-                        {"signal_bar": 10, "entry_bar": 11, "exit_bar": 12, "pnl_dollars": 120.0},
-                        {"signal_bar": 60, "entry_bar": 61, "exit_bar": 62, "pnl_dollars": -40.0},
+                        trade for trade in trades
+                        if int(signals.iloc[int(trade["signal_bar"])]) != 0
                     ]
                 }
 
@@ -1856,6 +2041,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             "strategy": FakeStrategy(),
             "strategy_name": "Fake",
             "params": {},
+            "evaluation_regime": "TREND",
         }
 
         optimizer._attach_threadspark_selection_evidence_to_candidates(
@@ -1869,13 +2055,15 @@ class OptimizerHardeningTests(unittest.TestCase):
         )
 
         chunks = candidate.get("threadspark_historical_chunk_regime_metrics")
-        self.assertEqual(candidate.get("threadspark_historical_chunk_count"), 2)
-        self.assertEqual(len(chunks), 2)
+        self.assertEqual(candidate.get("threadspark_historical_chunk_count"), 1)
+        self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0]["TREND"]["total_trades"], 1)
-        self.assertEqual(chunks[1]["RANGE"]["total_trades"], 1)
+        self.assertNotIn("RANGE", candidate["threadspark_historical_regime_metrics"])
 
     def test_threadspark_selector_reranks_only_l1_shortlist(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_scoring_model="specialist_spokes_threadspark",
             regime_validation_top_k=2,
             regime_min_train_trades=10,
@@ -1940,6 +2128,8 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_threadspark_tie_break_does_not_prefer_more_trades(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_scoring_model="specialist_spokes_threadspark",
             regime_validation_top_k=2,
             regime_min_train_trades=10,
@@ -2279,6 +2469,8 @@ class OptimizerHardeningTests(unittest.TestCase):
 
     def test_specialist_spoke_selection_prefers_stable_parameter_plateau(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_scoring_model="specialist_spokes",
             regime_min_train_trades=20,
             regime_min_val_trades=15,
@@ -2800,6 +2992,33 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertGreater(metrics["r_downside_deviation"], 0.0)
         self.assertGreater(metrics["r_block_cvar"], 0.0)
 
+    def test_bucket_sharpe_uses_dated_daily_returns_not_timeframe_label(self):
+        cfg = PipelineConfig(initial_capital=10000.0)
+        optimizer = RegimeOptimizer(cfg)
+        features = pd.DataFrame(index=pd.date_range("2025-01-01", periods=24 * 90, freq="h"))
+        pnls = [120.0, -80.0, 100.0, -70.0, 130.0, -60.0, 90.0, -50.0]
+        trades = []
+        for idx, pnl in enumerate(pnls):
+            entry_bar = 24 * (5 + idx * 10)
+            trades.append({
+                "signal_bar": entry_bar - 1,
+                "entry_bar": entry_bar,
+                "exit_bar": entry_bar + 2,
+                "pnl_dollars": pnl,
+                "pnl_pips": pnl / 10.0,
+                "r_multiple": pnl / 100.0,
+                "risk_amount": 100.0,
+                "exit_reason": "test",
+                "direction": "LONG",
+            })
+
+        as_h1 = optimizer._compute_bucket_metrics(trades, features=features, timeframe="H1")
+        as_m5 = optimizer._compute_bucket_metrics(trades, features=features, timeframe="M5")
+
+        self.assertEqual(as_h1["risk_return_frequency"], "daily_realized")
+        self.assertEqual(as_h1["sharpe_approx"], as_m5["sharpe_approx"])
+        self.assertEqual(as_h1["sortino_approx"], as_m5["sortino_approx"])
+
     def test_asym_tail_risk_uses_block_downside_metrics(self):
         cfg = PipelineConfig(regime_scoring_model="specialist_spokes_asym")
         optimizer = RegimeOptimizer(cfg)
@@ -2911,6 +3130,7 @@ class OptimizerHardeningTests(unittest.TestCase):
                 regime_enable_hyperparam_tuning=False,
                 screening_atr_anchor_enabled=True,
                 screening_atr_anchor_multipliers=[1.0, 2.0, 3.0],
+                regime_family_probe_trials=3,
                 regime_min_train_trades=1,
                 train_min_profit_factor=1.0,
                 train_min_return_pct=-100.0,
@@ -2935,7 +3155,12 @@ class OptimizerHardeningTests(unittest.TestCase):
 
             optimizer._bucket_trades_by_regime = bucket_by_anchor
             features = pd.DataFrame(
-                {"Close": range(80)},
+                {
+                    "Close": range(80),
+                    "REGIME_LIVE": [
+                        optimizer.REGIMES[i % len(optimizer.REGIMES)] for i in range(80)
+                    ],
+                },
                 index=pd.date_range("2026-01-01", periods=80, freq="h"),
             )
 
@@ -2952,16 +3177,67 @@ class OptimizerHardeningTests(unittest.TestCase):
             else:
                 StrategyRegistry._strategies["AnchorSensitiveStrategy"] = previous
 
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["screening_atr_anchor_mult"], 3.0)
-        self.assertEqual(candidates[0]["params"]["sl_atr_mult"], 3.0)
-        self.assertEqual(candidates[0]["params"]["tp_atr_mult"], 3.0)
-        self.assertEqual(candidates[0]["local_search_trials_total"], 3)
+        self.assertEqual(len(candidates), 4)
+        self.assertTrue(all(c["screening_atr_anchor_mult"] == 3.0 for c in candidates))
+        self.assertTrue(all(c["params"]["sl_atr_mult"] == 3.0 for c in candidates))
+        self.assertTrue(all(c["params"]["tp_atr_mult"] == 3.0 for c in candidates))
+        self.assertTrue(all(c["local_search_trials_total"] == 12 for c in candidates))
+        self.assertTrue(all(c["local_search_cells_total"] == 4 for c in candidates))
+
+    def test_threadspark_evidence_runs_only_when_selector_consumes_it(self):
+        def exercise(scoring_model):
+            optimizer = RegimeOptimizer(
+                PipelineConfig(
+                    regime_scoring_model=scoring_model,
+                    regime_enable_hyperparam_tuning=False,
+                )
+            )
+            candidate = {
+                "strategy_name": "ProbeStrategy",
+                "train_regime_metrics": {},
+                "val_regime_metrics": {},
+            }
+            optimizer._collect_family_probe_candidates = (
+                lambda **kwargs: ([candidate], [])
+            )
+            optimizer._apply_training_eligibility_gates = (
+                lambda candidates, symbol, timeframe: candidates
+            )
+            optimizer._attach_frozen_probe_validation = lambda **kwargs: None
+            optimizer._attach_local_search_multiplicity = (
+                lambda candidates, **kwargs: None
+            )
+            optimizer._attach_oos_evidence_to_candidates = (
+                lambda *args, **kwargs: None
+            )
+            calls = []
+            optimizer._attach_threadspark_selection_evidence_to_candidates = (
+                lambda *args, **kwargs: calls.append((args, kwargs))
+            )
+
+            result = optimizer._collect_candidates(
+                "EURUSD",
+                "H1",
+                pd.DataFrame({"Close": [1.0]}),
+                None,
+                [],
+            )
+            return result, calls
+
+        legacy_result, legacy_calls = exercise("legacy")
+        threadspark_result, threadspark_calls = exercise(
+            "specialist_spokes_threadspark"
+        )
+
+        self.assertEqual(len(legacy_result), 1)
+        self.assertEqual(legacy_calls, [])
+        self.assertEqual(len(threadspark_result), 1)
+        self.assertEqual(len(threadspark_calls), 1)
 
     def test_screening_shortlist_dedupes_atr_anchor_variants_by_strategy(self):
         cfg = PipelineConfig(regime_min_train_trades=2)
         optimizer = RegimeOptimizer(cfg)
-        optimizer._compute_regime_score = lambda train, val: float(train["_score"])
+        optimizer._compute_train_regime_score = lambda train, val: float(train["_score"])
 
         def candidate(name, score):
             return {
@@ -2990,6 +3266,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             strategy_name="SomeStrategy",
             parameters={},
             quality_score=0.9,
+            promotion_status="PROMOTED",
             val_metrics={"profit_factor": 2.0, "total_return_pct": 10.0, "max_drawdown_pct": 4.0},
         )
         marker = RegimeConfig(
@@ -3004,7 +3281,7 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         self.assertEqual(cfg.count_regime_winners(), 1)
 
-    def test_regime_grid_fallback_objective_uses_validation_metrics(self):
+    def test_regime_grid_fallback_freezes_train_best_before_one_validation(self):
         class FakeStrategy:
             def __init__(self, p=0):
                 self.p = p
@@ -3021,8 +3298,12 @@ class OptimizerHardeningTests(unittest.TestCase):
                 return FakeStrategy(**params)
 
         class FakeBacktester:
+            def __init__(self):
+                self.events = []
+
             def run(self, features, signals, symbol, strategy, warmup_bars=0, **kwargs):
                 is_val = bool(features.attrs.get("is_val"))
+                self.events.append(("validation" if is_val else "train", strategy.p))
                 if strategy.p == 0:
                     score = 10.0 if not is_val else 100.0
                 else:
@@ -3030,6 +3311,7 @@ class OptimizerHardeningTests(unittest.TestCase):
                 return {
                     "total_trades": 20,
                     "max_drawdown_pct": 2.0,
+                    "score": score,
                     "trades": [{"score": score}],
                 }
 
@@ -3042,13 +3324,14 @@ class OptimizerHardeningTests(unittest.TestCase):
                 }
             }
 
-        train = pd.DataFrame({"Close": range(60)})
-        val = pd.DataFrame({"Close": range(60)})
+        train = pd.DataFrame({"Close": range(60), "REGIME_LIVE": ["TREND"] * 60})
+        val = pd.DataFrame({"Close": range(60), "REGIME_LIVE": ["TREND"] * 60})
         val.attrs["is_val"] = True
 
+        backtester = FakeBacktester()
         optimizer = OptunaTPEOptimizer(
             OptunaConfig(n_trials=2),
-            backtester=FakeBacktester(),
+            backtester=backtester,
             scorer=None,
             strategy_registry=FakeRegistry(),
         )
@@ -3061,12 +3344,16 @@ class OptimizerHardeningTests(unittest.TestCase):
             val_features=val,
             regimes=["TREND"],
             bucket_trades_fn=bucket_trades,
-            compute_score_fn=lambda train_m, val_m: float(val_m.get("score", -999.0)),
+            compute_score_fn=lambda train_m, val_m: float(train_m.get("score", -999.0)),
             min_train_trades=10,
             max_drawdown_pct=10.0,
         )
 
-        self.assertEqual(result["TREND"]["params"]["p"], 0)
+        self.assertEqual(result["TREND"]["params"]["p"], 1)
+        self.assertEqual(result["TREND"]["val_regime_metrics"]["TREND"]["score"], -100.0)
+        self.assertEqual(backtester.events, [("train", 0), ("train", 1), ("validation", 1)])
+        self.assertEqual(result["TREND"]["search_trials"], 2)
+        self.assertEqual(result["TREND"]["tuning_validation_evaluations"], 1)
 
     @unittest.skipIf(TrialState is None, "optuna not available")
     def test_optuna_regime_objective_passes_timeframe_to_backtester(self):
@@ -3199,6 +3486,66 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(backtester.calls), 2)
         self.assertTrue(all(call.get("timeframe") == "H4" for call in backtester.calls))
+
+    @unittest.skipIf(TrialState is None, "optuna not available")
+    def test_single_strategy_trials_are_train_only_then_validate_frozen_best_once(self):
+        class Strategy:
+            name = "Fake"
+
+            def __init__(self, p=1):
+                self.p = int(p)
+
+            def get_params(self):
+                return {"p": self.p}
+
+            def generate_signals(self, features, symbol):
+                return pd.Series(1, index=features.index, dtype=int)
+
+        class Registry:
+            @staticmethod
+            def get(name, **params):
+                return Strategy(**params)
+
+        class Backtester:
+            def __init__(self):
+                self.events = []
+
+            def run(self, features, signals, symbol, strategy, **kwargs):
+                surface = features.attrs["surface"]
+                self.events.append((surface, strategy.p))
+                score = float(strategy.p if surface == "train" else -strategy.p)
+                return {
+                    "total_trades": 20,
+                    "max_drawdown_pct": 1.0,
+                    "score": score,
+                }
+
+        train = pd.DataFrame({"Close": range(80)})
+        val = pd.DataFrame({"Close": range(80)})
+        train.attrs["surface"] = "train"
+        val.attrs["surface"] = "validation"
+        backtester = Backtester()
+        optimizer = OptunaTPEOptimizer(
+            OptunaConfig(n_trials=2, n_startup_trials=2, progressive_rejection=False),
+            backtester=backtester,
+            scorer=None,
+            strategy_registry=Registry(),
+        )
+        result = optimizer.optimize(
+            symbol="EURUSD",
+            timeframe="H1",
+            strategy_name="Fake",
+            param_grid={"p": [0, 1]},
+            train_features=train,
+            val_features=val,
+            scoring_fn=lambda train_m, _val_m: float(train_m["score"]),
+            min_trades=1,
+            max_drawdown_pct=10.0,
+        )
+
+        self.assertEqual(sum(surface == "validation" for surface, _p in backtester.events), 1)
+        self.assertEqual(backtester.events[-1][0], "validation")
+        self.assertEqual(result.val_metrics["score"], -result.best_params["p"])
 
 
 if __name__ == "__main__":

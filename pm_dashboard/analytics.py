@@ -15,6 +15,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
+from pm_metrics import (
+    METRIC_CONTRACT_VERSION,
+    profit_factor_from_gross,
+    return_drawdown_metrics,
+    round_metric,
+    trade_sharpe_sortino_from_pnl,
+)
+
 from .utils import (
     build_entry_id,
     load_instrument_specs,
@@ -582,6 +590,11 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
             "sharpe_ratio": 0.0,
             "sortino_ratio": 0.0,
             "calmar_ratio": 0.0,
+            "return_drawdown_ratio": 0.0,
+            "calmar_ratio_annualized": 0.0,
+            "annualized_return_pct": 0.0,
+            "calmar_ratio_basis": "cumulative_return_pct_over_max_drawdown_pct",
+            "metric_contract_version": METRIC_CONTRACT_VERSION,
             "recovery_factor": 0.0,
             "expectancy": 0.0,
             "max_consecutive_wins": 0,
@@ -623,7 +636,7 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
 
     gross_profit = sum(wins) if wins else 0.0
     gross_loss = abs(sum(losses)) if losses else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+    profit_factor = profit_factor_from_gross(gross_profit, gross_loss)
 
     equity_curve = compute_equity_curve(realized_trades, initial_capital)
     drawdown_curve = compute_drawdown_curve(equity_curve)
@@ -636,26 +649,16 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
 
     avg_trade_pnl = (total_pnl / total_trades) if total_trades > 0 else 0.0
 
-    import math
+    sharpe_ratio, sortino_ratio = trade_sharpe_sortino_from_pnl(pnls, periods_per_year=252.0)
 
-    if len(pnls) > 1:
-        pnl_mean = sum(pnls) / len(pnls)
-        pnl_std = math.sqrt(sum((p - pnl_mean) ** 2 for p in pnls) / len(pnls))
-        sharpe_ratio = (pnl_mean / pnl_std * math.sqrt(252)) if pnl_std > 0 else 0.0
-    else:
-        sharpe_ratio = 0.0
-
-    # Sortino ratio (downside deviation only)
-    if len(pnls) > 1:
-        pnl_mean = sum(pnls) / len(pnls)
-        downside = [min(0.0, p - pnl_mean) ** 2 for p in pnls]
-        downside_dev = math.sqrt(sum(downside) / len(downside))
-        sortino_ratio = (pnl_mean / downside_dev * math.sqrt(252)) if downside_dev > 1e-8 else 0.0
-    else:
-        sortino_ratio = 0.0
-
-    # Calmar ratio (annualized return / max drawdown)
-    calmar_ratio = (total_return_pct / max_dd_pct) if max_dd_pct > 0 else 0.0
+    drawdown_metrics = return_drawdown_metrics(
+        initial_equity=initial_capital,
+        final_equity=final_equity,
+        max_drawdown_pct=max_dd_pct,
+        periods=max(0, len(equity_curve) - 1),
+        periods_per_year=252.0,
+    )
+    total_return_pct = drawdown_metrics["total_return_pct"]
 
     # Recovery factor (net profit / max drawdown $)
     recovery_factor = (total_pnl / max_dd_abs) if max_dd_abs > 0 else 0.0
@@ -698,8 +701,8 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
     long_losses = abs(sum(_get_pnl(t) for t in realized_trades if _is_long(t) and _get_pnl(t) < 0))
     short_wins = sum(_get_pnl(t) for t in realized_trades if _is_short(t) and _get_pnl(t) > 0)
     short_losses = abs(sum(_get_pnl(t) for t in realized_trades if _is_short(t) and _get_pnl(t) < 0))
-    long_pf = (long_wins / long_losses) if long_losses > 0 else 0.0
-    short_pf = (short_wins / short_losses) if short_losses > 0 else 0.0
+    long_pf = profit_factor_from_gross(long_wins, long_losses)
+    short_pf = profit_factor_from_gross(short_wins, short_losses)
 
     # Extract equity as plain floats for extended risk metrics
     _equity_floats = [p["equity"] for p in equity_curve] if equity_curve else [initial_capital]
@@ -712,18 +715,23 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], initial_capital: f
         "total_pnl": round(total_pnl, 2),
         "avg_win": round(avg_win, 2),
         "avg_loss": round(avg_loss, 2),
-        "profit_factor": round(profit_factor, 2),
+        "profit_factor": round_metric(profit_factor, 2),
         "max_drawdown_pct": round(max_dd_pct, 2),
         "max_drawdown_abs": round(max_dd_abs, 2),
-        "sharpe_ratio": round(sharpe_ratio, 2),
-        "sortino_ratio": round(sortino_ratio, 2),
-        "calmar_ratio": round(calmar_ratio, 2),
+        "sharpe_ratio": round_metric(sharpe_ratio, 2),
+        "sortino_ratio": round_metric(sortino_ratio, 2),
+        "calmar_ratio": round_metric(drawdown_metrics["calmar_ratio"], 2),
+        "return_drawdown_ratio": round_metric(drawdown_metrics["return_drawdown_ratio"], 2),
+        "calmar_ratio_annualized": round_metric(drawdown_metrics["calmar_ratio_annualized"], 2),
+        "annualized_return_pct": round_metric(drawdown_metrics["annualized_return_pct"], 2),
+        "calmar_ratio_basis": drawdown_metrics["calmar_ratio_basis"],
+        "metric_contract_version": METRIC_CONTRACT_VERSION,
         "recovery_factor": round(recovery_factor, 2),
         "expectancy": round(expectancy, 2),
         "max_consecutive_wins": max_consec_wins,
         "max_consecutive_losses": max_consec_losses,
-        "long_profit_factor": round(long_pf, 2),
-        "short_profit_factor": round(short_pf, 2),
+        "long_profit_factor": round_metric(long_pf, 2),
+        "short_profit_factor": round_metric(short_pf, 2),
         "total_return_pct": round(total_return_pct, 2),
         "avg_trade_pnl": round(avg_trade_pnl, 2),
         "best_trade": round(max(pnls, default=0.0), 2),

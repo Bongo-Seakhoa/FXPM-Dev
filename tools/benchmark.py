@@ -22,6 +22,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from pm_core import PipelineConfig, DataLoader, FeatureComputer, Backtester, get_instrument_spec
+from pm_metrics import return_drawdown_metrics, round_metric
 from pm_strategies import StrategyRegistry
 from pm_symbol import is_fiat_fx_symbol
 
@@ -62,9 +63,11 @@ def path_dependent_dd(equity):
     eq = np.asarray(equity, dtype=np.float64)
     if eq.size < 2:
         return {"ulcer_index": 0.0, "time_underwater_pct": 0.0,
-                "max_dd_duration": 0, "avg_dd_duration": 0.0, "recovery_factor": 0.0}
+                "max_dd_duration": 0, "avg_dd_duration": 0.0, "recovery_factor": 0.0,
+                "return_drawdown_ratio": 0.0, "calmar_ratio_basis": "cumulative_return_pct_over_max_drawdown_pct"}
     peak = np.maximum.accumulate(eq)
     dd = np.where(peak > 0, (peak - eq) / peak, 0.0)
+    dd_abs = np.maximum(peak - eq, 0.0)
     underwater = dd > 1e-9
     ulcer = float(np.sqrt(np.mean((dd * 100.0) ** 2)))
     tuw = float(underwater.mean() * 100.0)
@@ -77,13 +80,24 @@ def path_dependent_dd(equity):
     if run:
         durations.append(run)
     max_dd = float(dd.max() * 100.0)
-    total_ret = (eq[-1] - eq[0]) / eq[0] * 100.0 if eq[0] else 0.0
+    max_dd_currency = float(dd_abs.max())
+    net_pnl = float(eq[-1] - eq[0])
+    drawdown_metrics = return_drawdown_metrics(
+        initial_equity=float(eq[0]),
+        final_equity=float(eq[-1]),
+        max_drawdown_pct=max_dd,
+        periods=max(0, int(eq.size) - 1),
+        periods_per_year=252.0,
+    )
     return {
         "ulcer_index": round(ulcer, 3),
         "time_underwater_pct": round(tuw, 2),
         "max_dd_duration": int(max(durations) if durations else 0),
         "avg_dd_duration": round(float(np.mean(durations)) if durations else 0.0, 1),
-        "recovery_factor": round(total_ret / max_dd, 3) if max_dd > 0 else 0.0,
+        "recovery_factor": round(net_pnl / max_dd_currency, 3) if max_dd_currency > 0 else 0.0,
+        "return_drawdown_ratio": round_metric(drawdown_metrics["return_drawdown_ratio"], 3),
+        "calmar_ratio_annualized": round_metric(drawdown_metrics["calmar_ratio_annualized"], 3),
+        "calmar_ratio_basis": drawdown_metrics["calmar_ratio_basis"],
     }
 
 

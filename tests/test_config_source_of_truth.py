@@ -1,4 +1,6 @@
 import unittest
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -6,16 +8,58 @@ import pandas as pd
 
 from pm_core import PipelineConfig
 from pm_main import (
+    ACTIONABLE_SCHEMA_VERSION,
+    FUNDED_FIXED_PIPELINE_VALUES,
+    FUNDED_PIPELINE_CONFIG_KEYS,
+    FUNDED_POSITION_CONFIG_KEYS,
     FXPortfolioManagerApp,
     LiveTrader,
+    _apply_funded_pipeline_contract,
+    _apply_funded_position_cost_contract,
     _filter_dataclass_kwargs,
     _is_research_discovery_only_config,
     _normalize_storage_section_for_pipeline,
+    _resolve_config_relative_path,
+    _validate_funded_config_schema,
 )
 from pm_position import PositionConfig, TradeTagEncoder
 
 
 class ConfigSourceOfTruthTests(unittest.TestCase):
+    def test_runtime_authority_paths_are_rooted_at_selected_config(self):
+        config_path = Path("C:/approved/deployment/config.live.json")
+
+        self.assertEqual(
+            _resolve_config_relative_path("broker_specs.json", config_path),
+            Path("C:/approved/deployment/broker_specs.json"),
+        )
+        self.assertEqual(
+            _resolve_config_relative_path("data", config_path),
+            Path("C:/approved/deployment/data"),
+        )
+
+    def test_runtime_manual_kill_switch_uses_selected_config_directory(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            deployment = Path(tmp) / "approved"
+            config_path = deployment / "config.live.json"
+            flag = deployment / "runtime" / "entries.flag"
+            flag.parent.mkdir(parents=True)
+            config_path.write_text("{}", encoding="utf-8")
+            flag.write_text("blocked", encoding="utf-8")
+
+            trader = LiveTrader.__new__(LiveTrader)
+            trader.pipeline_config = SimpleNamespace(
+                manual_new_entries_enabled=True,
+                manual_kill_switch_path="runtime/entries.flag",
+                _deployment_config_path=str(config_path),
+            )
+
+            reason = trader._manual_new_entries_block_reason()
+            self.assertIsNotNone(reason)
+            self.assertIn(str(flag.resolve()), reason)
+
     def _resolve_configs(self, config_data):
         pipeline_config = PipelineConfig(
             **_filter_dataclass_kwargs(PipelineConfig, config_data.get("pipeline", {}))
@@ -62,6 +106,82 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
 
         self.assertAlmostEqual(position_config.max_risk_pct, 1.0, places=6)
 
+    def test_fixed_funded_safety_defaults_survive_omitted_json_switches(self):
+        """Removing fixed switches from JSON must not weaken resolved policy."""
+        config_path = Path(__file__).resolve().parents[1] / "config.json"
+        pipeline_payload = dict(
+            json.loads(config_path.read_text(encoding="utf-8"))["pipeline"]
+        )
+        fixed_switches = {
+            "use_spread",
+            "use_commission",
+            "use_slippage",
+            "scoring_use_trade_frequency_bonus",
+            "local_governance_tournament_enabled",
+            "local_governance_live_mode",
+            "risk_management_optimization_enabled",
+            "walk_forward_audit_enabled",
+            "walk_forward_promotion_policy",
+            "walk_forward_live_blocking_enabled",
+        }
+        for key in fixed_switches:
+            pipeline_payload.pop(key, None)
+
+        resolved = PipelineConfig(
+            **_filter_dataclass_kwargs(PipelineConfig, pipeline_payload)
+        )
+
+        self.assertTrue(resolved.use_spread)
+        self.assertTrue(resolved.use_commission)
+        self.assertTrue(resolved.use_slippage)
+        live_position_defaults = PositionConfig()
+        self.assertTrue(live_position_defaults.use_spread)
+        self.assertTrue(live_position_defaults.use_slippage)
+        self.assertEqual(live_position_defaults.slippage_pips, resolved.slippage_pips)
+        self.assertFalse(live_position_defaults.auto_widen_sl)
+        self.assertFalse(live_position_defaults.allow_min_lot_risk_clamp)
+        self.assertTrue(
+            all(
+                value == 1.0
+                for value in live_position_defaults.regime_tp_multipliers.values()
+            )
+        )
+        self.assertFalse(resolved.scoring_use_trade_frequency_bonus)
+        self.assertFalse(resolved.local_governance_tournament_enabled)
+        self.assertEqual(resolved.local_governance_live_mode, "off")
+        self.assertFalse(resolved.risk_management_optimization_enabled)
+        self.assertTrue(resolved.walk_forward_audit_enabled)
+        self.assertEqual(resolved.walk_forward_promotion_policy, "promotion_gate")
+        self.assertTrue(resolved.walk_forward_live_blocking_enabled)
+
+    def test_funded_position_cost_math_is_bound_to_backtest_contract(self):
+        pipeline = PipelineConfig(slippage_pips=0.75)
+        position = PositionConfig(use_spread=False, use_slippage=False, slippage_pips=9.0)
+
+        _apply_funded_position_cost_contract(
+            {"_meta": {"scope": "funded_live_v1"}},
+            pipeline,
+            position,
+        )
+
+        self.assertTrue(position.use_spread)
+        self.assertTrue(position.use_slippage)
+        self.assertEqual(position.slippage_pips, 0.75)
+
+        research_position = PositionConfig(
+            use_spread=False,
+            use_slippage=False,
+            slippage_pips=9.0,
+        )
+        _apply_funded_position_cost_contract(
+            {"_meta": {"scope": "research_discovery_only_not_live_trading"}},
+            pipeline,
+            research_position,
+        )
+        self.assertFalse(research_position.use_spread)
+        self.assertFalse(research_position.use_slippage)
+        self.assertEqual(research_position.slippage_pips, 9.0)
+
     def test_nested_storage_section_accepts_natural_keys(self):
         normalized = _normalize_storage_section_for_pipeline(
             {
@@ -74,6 +194,166 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertFalse(normalized["storage_observe_only"])
         self.assertEqual(normalized["storage_live_sync_bars"], 123)
         self.assertEqual(normalized["state_filename"], "custom_state.json")
+
+    def test_shipped_funded_profile_matches_positive_schema(self):
+        config_path = Path(__file__).resolve().parents[1] / "config.json"
+        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+
+        _validate_funded_config_schema(config_data)
+
+        self.assertEqual(set(config_data["pipeline"]), FUNDED_PIPELINE_CONFIG_KEYS)
+        self.assertEqual(set(config_data["position"]), FUNDED_POSITION_CONFIG_KEYS)
+        self.assertEqual(len(FUNDED_POSITION_CONFIG_KEYS), 6)
+        self.assertTrue(
+            FUNDED_PIPELINE_CONFIG_KEYS.issubset(PipelineConfig.__dataclass_fields__)
+        )
+        self.assertEqual(len(FUNDED_PIPELINE_CONFIG_KEYS), 156)
+        self.assertLess(len(FUNDED_PIPELINE_CONFIG_KEYS), len(PipelineConfig.__dataclass_fields__))
+
+    def test_funded_schema_rejects_fixed_and_research_only_pipeline_knobs(self):
+        for key, value in (
+            ("research_mode", True),
+            ("max_bars", 1234),
+            ("use_spread", False),
+            ("scoring_use_trade_frequency_bonus", True),
+            ("walk_forward_audit_mode", "off"),
+            ("local_governance_tournament_enabled", True),
+            ("regime_validation_top_k", 1),
+            ("false_discovery_scope_power", 1.0),
+            ("false_discovery_symbol_count", 100),
+            ("walk_forward_do_not_displace_latest_surface", False),
+            ("walk_forward_audit_enabled", False),
+            ("walk_forward_promotion_policy", "observe_only"),
+            ("walk_forward_live_blocking_enabled", False),
+            ("tuning_validation_bars", 10),
+            ("final_lockbox_bars", 10),
+            ("split_embargo_bars", 0),
+            ("oos_kfold_splits", 3),
+            ("oos_embargo_bars", 2),
+            ("oos_aggregate_policy", "all_folds"),
+            ("max_param_combos", 10),
+            ("min_trades", 1),
+            ("fx_opt_min_trades", 1),
+            ("fx_val_min_trades", 1),
+            ("fx_selection_top_k", 1),
+            ("fx_opt_top_k", 1),
+            ("oos_min_trades", 1),
+            ("legacy_confidence_bonus_cap", 0.5),
+            ("threadspark_selection_surface", "clean_holdout"),
+            ("threadspark_use_historical_cost_evidence", False),
+            ("threadspark_historical_cost_scope", "workflow"),
+            ("threadspark_historical_chunk_count", 2),
+            ("promote_small_risk_multiplier", 0.5),
+        ):
+            payload = {
+                "_meta": {"scope": "funded_live_v1"},
+                "pipeline": {key: value},
+            }
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ValueError, "unsupported funded-live pipeline"
+            ):
+                _validate_funded_config_schema(payload)
+
+        # The same fields remain constructor-compatible for historical and
+        # research reproduction outside the funded profile.
+        research = PipelineConfig(
+            research_mode=True,
+            production_split_mode="bleeding_edge",
+            max_bars=1234,
+            use_spread=False,
+            scoring_use_trade_frequency_bonus=True,
+            tuning_validation_bars=123,
+            final_lockbox_bars=456,
+            split_embargo_bars=7,
+            oos_validation_mode="purged_kfold",
+            oos_kfold_splits=3,
+            oos_embargo_bars=2,
+            oos_aggregate_policy="all_folds",
+        )
+        self.assertTrue(research.research_mode)
+        self.assertEqual(research.max_bars, 1234)
+        self.assertFalse(research.use_spread)
+        self.assertEqual(research.tuning_validation_bars, 123)
+        self.assertEqual(research.final_lockbox_bars, 456)
+        self.assertEqual(research.split_embargo_bars, 7)
+        self.assertEqual(research.oos_kfold_splits, 3)
+        self.assertEqual(research.oos_embargo_bars, 2)
+        self.assertEqual(research.oos_aggregate_policy, "all_folds")
+
+    def test_funded_scoring_and_oos_models_are_fixed_but_research_remains_open(self):
+        self.assertEqual(
+            FUNDED_FIXED_PIPELINE_VALUES,
+            {
+                "regime_scoring_model": "legacy",
+                "oos_validation_mode": "fixed_holdout",
+            },
+        )
+        for key, bad_value in (
+            ("regime_scoring_model", "specialist_spokes_threadspark"),
+            ("oos_validation_mode", "purged_kfold"),
+        ):
+            payload = {
+                "_meta": {"scope": "funded_live_v1"},
+                "pipeline": {key: bad_value},
+            }
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ValueError,
+                "is fixed to",
+            ):
+                _validate_funded_config_schema(payload)
+
+        funded = PipelineConfig(
+            research_mode=True,
+            regime_scoring_model="specialist_spokes_threadspark",
+            oos_validation_mode="purged_kfold",
+        )
+        _apply_funded_pipeline_contract(
+            {"_meta": {"scope": "funded_live_v1"}},
+            funded,
+        )
+        self.assertEqual(funded.regime_scoring_model, "legacy")
+        self.assertEqual(funded.oos_validation_mode, "fixed_holdout")
+        research = PipelineConfig(
+            research_mode=True,
+            regime_scoring_model="specialist_spokes_threadspark",
+            oos_validation_mode="purged_kfold",
+        )
+        self.assertEqual(research.regime_scoring_model, "specialist_spokes_threadspark")
+        self.assertEqual(research.oos_validation_mode, "purged_kfold")
+
+    def test_funded_schema_rejects_dormant_position_management_branches(self):
+        for key, value in (
+            ("use_trailing_stop", True),
+            ("use_breakeven_stop", True),
+            ("max_trade_duration_bars", 10),
+            ("use_slippage", False),
+            ("auto_widen_sl", True),
+            ("allow_min_lot_risk_clamp", True),
+            ("regime_tp_multipliers", {"TREND": 1.5}),
+        ):
+            payload = {
+                "_meta": {"scope": "funded_live_v1"},
+                "position": {key: value},
+            }
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ValueError, "unsupported funded-live position"
+            ):
+                _validate_funded_config_schema(payload)
+
+    def test_funded_storage_section_cannot_override_pipeline_policy(self):
+        payload = {
+            "_meta": {"scope": "funded_live_v1"},
+            "storage": {"risk_per_trade_pct": 25.0},
+        }
+        with self.assertRaisesRegex(ValueError, "unknown funded-live storage"):
+            _validate_funded_config_schema(payload)
+
+        _validate_funded_config_schema(
+            {
+                "_meta": {"scope": "funded_live_v1"},
+                "storage": {"observe_only": True, "live_sync_bars": 500},
+            }
+        )
 
     def test_app_defaults_to_pipeline_winner_ledger_path(self):
         pipeline_config = PipelineConfig(winner_ledger_path="custom_pm_configs.json")
@@ -112,6 +392,8 @@ class LiveRiskIntentTests(unittest.TestCase):
             margin_entry_block_level=100.0,
             target_annual_vol=0.10,
             use_commission=False,
+            live_min_account_equity=0.0,
+            live_min_account_equity_currency="",
         )
         trader.position_calc = MagicMock()
         trader.position_calc.calculate_stop_prices.return_value = (1.1900, 1.2200)
@@ -149,9 +431,25 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         trader.mt5.calc_loss_amount.side_effect = _calc_loss_amount
         trader.mt5.calc_margin_required.return_value = None
+        trader.mt5.config = SimpleNamespace(
+            expected_login=123,
+            expected_server="Broker-Live",
+            expected_currency="USD",
+        )
+        trader.mt5.get_account_info.return_value = SimpleNamespace(
+            login=123,
+            server="Broker-Live",
+            currency="USD",
+            balance=10000.0,
+            equity=10000.0,
+            margin_level=0.0,
+            margin_free=10000.0,
+            trade_allowed=True,
+            trade_expert=True,
+        )
         return trader
 
-    def test_execute_entry_uses_hard_cap_not_target_risk(self):
+    def test_execute_entry_enforces_target_tolerance_below_hard_cap(self):
         trader = self._make_trader(
             SimpleNamespace(
                 risk_per_trade_pct=0.05,
@@ -188,16 +486,15 @@ class LiveRiskIntentTests(unittest.TestCase):
             account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0),
         )
 
-        self.assertGreaterEqual(trader._check_symbol_combined_risk_cap.call_count, 1)
         actionable_payload = trader._actionable_log.record.call_args[0][1]
-        self.assertEqual(actionable_payload["action"], "PAPER")
+        self.assertEqual(actionable_payload["action"], "BLOCKED_MIN_LOT_EXCEEDS_CAP")
         self.assertAlmostEqual(actionable_payload["target_risk_pct"], 0.05, places=6)
         self.assertAlmostEqual(actionable_payload["actual_risk_pct"], 0.10, places=6)
 
     def test_execute_entry_uses_fresh_symbol_positions_for_combined_risk(self):
         trader = self._make_trader(
             SimpleNamespace(
-                risk_per_trade_pct=0.05,
+                risk_per_trade_pct=0.10,
                 max_risk_pct=1.0,
                 min_position_size=0.01,
                 max_position_size=0.0,
@@ -205,6 +502,7 @@ class LiveRiskIntentTests(unittest.TestCase):
                 auto_widen_sl=True,
             )
         )
+        trader.pipeline_config.allow_d1_plus_lower_tf = True
         trader.mt5.get_position_by_symbol_magic.return_value = None
         fresh_positions = [
             SimpleNamespace(
@@ -239,7 +537,13 @@ class LiveRiskIntentTests(unittest.TestCase):
             },
             trade_intent=SimpleNamespace(stop_loss_pips=10.0, take_profit_pips=20.0),
             positions_snapshot=[],
-            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0),
+            account_info=SimpleNamespace(
+                balance=10000.0,
+                equity=10000.0,
+                margin_level=0.0,
+                margin_mode=2,
+                hedge_allowed=True,
+            ),
         )
 
         self.assertGreaterEqual(trader._check_symbol_combined_risk_cap.call_count, 1)
@@ -250,11 +554,10 @@ class LiveRiskIntentTests(unittest.TestCase):
                 for call in trader._check_symbol_combined_risk_cap.call_args_list
             )
         )
-
     def test_execute_entry_blocks_fresh_same_timeframe_pairing(self):
         trader = self._make_trader(
             SimpleNamespace(
-                risk_per_trade_pct=0.05,
+                risk_per_trade_pct=0.10,
                 max_risk_pct=1.0,
                 min_position_size=0.01,
                 max_position_size=0.0,
@@ -262,6 +565,7 @@ class LiveRiskIntentTests(unittest.TestCase):
                 auto_widen_sl=True,
             )
         )
+        trader.pipeline_config.allow_d1_plus_lower_tf = True
         trader.mt5.get_position_by_symbol_magic.return_value = None
         trader.mt5.get_positions.return_value = [
             SimpleNamespace(
@@ -294,14 +598,79 @@ class LiveRiskIntentTests(unittest.TestCase):
             },
             trade_intent=SimpleNamespace(stop_loss_pips=10.0, take_profit_pips=20.0),
             positions_snapshot=[],
-            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0),
+            account_info=SimpleNamespace(
+                balance=10000.0,
+                equity=10000.0,
+                margin_level=0.0,
+                margin_mode=2,
+                hedge_allowed=True,
+            ),
         )
 
         actionable_payload = trader._actionable_log.record.call_args[0][1]
         self.assertEqual(actionable_payload["action"], "BLOCKED_SYMBOL_POSITION_LIMIT")
         self.assertEqual(actionable_payload["position_context"]["fresh_open_positions_total"], 1)
 
-    def test_execute_entry_respects_dataclass_backup_hard_cap(self):
+    def test_execute_entry_blocks_cross_horizon_pair_on_netting_account(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.10,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.pipeline_config.allow_d1_plus_lower_tf = True
+        trader.mt5.get_position_by_symbol_magic.return_value = None
+        trader.mt5.get_positions.return_value = [
+            SimpleNamespace(
+                symbol="XAUUSD",
+                magic=TradeTagEncoder.encode_magic("XAUUSD", "D1", "TREND"),
+                ticket=42,
+                comment=TradeTagEncoder.encode_comment(
+                    "XAUUSD", "D1", "MomentumBurstStrategy", "LONG", risk_pct=0.05
+                ),
+            )
+        ]
+        features = pd.DataFrame(
+            {"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]}
+        )
+
+        trader._execute_entry(
+            symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
+            magic=12345,
+            config=SimpleNamespace(symbol="XAUUSD"),
+            decision_key="netting-pair-block",
+            bar_time_iso="2026-04-02T15:15:52",
+            best_candidate={
+                "timeframe": "M15",
+                "regime": "CHOP",
+                "strategy_name": "MomentumBurstStrategy",
+                "signal": 1,
+            },
+            trade_intent=SimpleNamespace(stop_loss_pips=10.0, take_profit_pips=20.0),
+            positions_snapshot=[],
+            account_info=SimpleNamespace(
+                balance=10000.0,
+                equity=10000.0,
+                margin_level=0.0,
+                margin_mode=0,
+                hedge_allowed=False,
+            ),
+        )
+
+        actionable_payload = trader._actionable_log.record.call_args[0][1]
+        self.assertEqual(actionable_payload["action"], "BLOCKED_ACCOUNT_POSITION_MODE")
+        trader.mt5.send_market_order.assert_not_called()
+
+    def test_execute_entry_backup_hard_cap_does_not_override_target_envelope(self):
         trader = self._make_trader(
             SimpleNamespace(
                 risk_per_trade_pct=0.05,
@@ -334,11 +703,17 @@ class LiveRiskIntentTests(unittest.TestCase):
                 "signal": 1,
             },
             positions_snapshot=[],
-            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0),
+            account_info=SimpleNamespace(
+                balance=10000.0,
+                equity=10000.0,
+                margin_level=0.0,
+                margin_mode=2,
+                hedge_allowed=True,
+            ),
         )
 
         actionable_payload = trader._actionable_log.record.call_args[0][1]
-        self.assertEqual(actionable_payload["action"], "PAPER")
+        self.assertEqual(actionable_payload["action"], "BLOCKED_MIN_LOT_EXCEEDS_CAP")
         self.assertAlmostEqual(actionable_payload["actual_risk_pct"], 0.10, places=6)
 
     def test_execute_entry_blocks_when_commission_pushes_min_lot_over_hard_cap(self):
@@ -618,6 +993,14 @@ class LiveRiskIntentTests(unittest.TestCase):
         self.assertAlmostEqual(kwargs["sl"], 1.1950, places=6)
         self.assertAlmostEqual(kwargs["tp"], 1.2250, places=6)
         self.assertIs(kwargs["symbol_info"], trader.mt5.get_symbol_info.return_value)
+        actionable_payload = trader._actionable_log.record.call_args[0][1]
+        self.assertEqual(actionable_payload["action"], "EXECUTED")
+        self.assertEqual(actionable_payload["actionable_schema_version"], ACTIONABLE_SCHEMA_VERSION)
+        self.assertAlmostEqual(actionable_payload["expected_entry_price"], 1.2050, places=6)
+        self.assertAlmostEqual(actionable_payload["filled_entry_price"], 1.2050, places=6)
+        self.assertAlmostEqual(actionable_payload["entry_slippage_pips"], 0.0, places=6)
+        self.assertAlmostEqual(actionable_payload["entry_slippage_r"], 0.0, places=6)
+        self.assertEqual(actionable_payload["entry_slippage_direction"], "flat")
 
     def test_execute_entry_reconciles_ambiguous_timeout_to_open_position(self):
         trader = self._make_trader(

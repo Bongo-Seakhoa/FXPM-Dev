@@ -179,10 +179,14 @@ class LiveLoopIntegrationTests(unittest.TestCase):
 
         mock_pm = Mock()
         mock_pm.symbols = ["EURUSD", "GBPUSD"]
-        mock_pm.get_validated_configs.return_value = {
+        exact_live_configs = {
             "EURUSD": Mock(),
             "GBPUSD": Mock(),
         }
+        # Entry evaluation must be authorized by the exact funded-live
+        # selector.  get_validated_configs() is deliberately management-only.
+        mock_pm.get_live_eligible_configs.return_value = exact_live_configs
+        mock_pm.get_validated_configs.return_value = exact_live_configs
 
         trader = LiveTrader(
             mt5_connector=mock_mt5,
@@ -248,9 +252,11 @@ class LiveLoopIntegrationTests(unittest.TestCase):
 
         mock_pm = Mock()
         mock_pm.symbols = ["EURUSD"]
-        mock_pm.get_validated_configs.return_value = {
+        exact_live_configs = {
             "EURUSD": Mock(val_metrics={"win_rate": 50.0, "mean_r": 0.5})
         }
+        mock_pm.get_live_eligible_configs.return_value = exact_live_configs
+        mock_pm.get_validated_configs.return_value = exact_live_configs
 
         trader = LiveTrader(
             mt5_connector=mock_mt5,
@@ -284,12 +290,14 @@ class LiveLoopIntegrationTests(unittest.TestCase):
 
         mock_pm = Mock()
         mock_pm.symbols = ["EURUSD"]
-        mock_pm.get_validated_configs.return_value = {
+        exact_live_configs = {
             "EURUSD": Mock(
                 has_regime_configs=Mock(return_value=False),
                 timeframe="H1",
             )
         }
+        mock_pm.get_live_eligible_configs.return_value = exact_live_configs
+        mock_pm.get_validated_configs.return_value = exact_live_configs
         mock_pipeline = Mock()
         mock_pipeline.actionable_score_margin = 1.0
         mock_pipeline.allow_d1_plus_lower_tf = True
@@ -341,12 +349,14 @@ class LiveLoopIntegrationTests(unittest.TestCase):
 
         mock_pm = Mock()
         mock_pm.symbols = ["EURUSD"]
-        mock_pm.get_validated_configs.return_value = {
+        exact_live_configs = {
             "EURUSD": Mock(
                 has_regime_configs=Mock(return_value=False),
                 timeframe="H1",
             )
         }
+        mock_pm.get_live_eligible_configs.return_value = exact_live_configs
+        mock_pm.get_validated_configs.return_value = exact_live_configs
 
         mock_pipeline = Mock()
         mock_pipeline.actionable_score_margin = 1.0
@@ -595,6 +605,7 @@ class LiveLoopIntegrationTests(unittest.TestCase):
                 "M5": {
                     "TREND": RegimeConfig(
                         strategy_name="FakeLiveStrategy",
+                        promotion_status="PROMOTED",
                         parameters={},
                         quality_score=0.8,
                         val_metrics={
@@ -605,6 +616,7 @@ class LiveLoopIntegrationTests(unittest.TestCase):
                     ),
                     "RANGE": RegimeConfig(
                         strategy_name="ShouldNotUse",
+                        promotion_status="PROMOTED",
                         parameters={},
                         quality_score=0.8,
                         val_metrics={
@@ -662,6 +674,7 @@ class LiveLoopIntegrationTests(unittest.TestCase):
                 "M5": {
                     "TREND": RegimeConfig(
                         strategy_name="ShouldNotTrade",
+                        promotion_status="PROMOTED",
                         parameters={},
                         quality_score=0.8,
                         val_metrics={

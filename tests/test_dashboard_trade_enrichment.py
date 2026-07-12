@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import shutil
 import unittest
@@ -277,6 +278,15 @@ class DashboardTradeEnrichmentTests(unittest.TestCase):
 
         metrics = compute_performance_metrics(trades, initial_capital=10000.0)
         self.assertAlmostEqual(metrics["expectancy"], metrics["avg_trade_pnl"], places=2)
+
+    def test_compute_metrics_all_winners_profit_factor_is_infinite(self) -> None:
+        trades = [
+            {"timestamp": "2026-02-09T03:00:00", "status": "CLOSED", "pnl": 15.0},
+            {"timestamp": "2026-02-09T04:00:00", "status": "CLOSED", "pnl": 5.0},
+        ]
+
+        metrics = compute_performance_metrics(trades, initial_capital=10000.0)
+        self.assertTrue(math.isinf(metrics["profit_factor"]))
 
     def test_reconstruct_trade_outcomes_uses_root_instrument_specs_for_pip_value(self) -> None:
         self._write_root_config(

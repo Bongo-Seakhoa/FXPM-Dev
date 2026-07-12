@@ -20,10 +20,15 @@ class LiveSchedulerTests(unittest.TestCase):
         )
         mock_pm = Mock()
         mock_pm.symbols = []
-        mock_pm.get_validated_configs.return_value = {
+        live_configs = {
             "EURUSD": config,
             "GBPUSD": config,
         }
+        # Entry scheduling consumes only the strict live-eligibility view.
+        # get_validated_configs is management-only and must never be its
+        # compatibility fallback.
+        mock_pm.get_live_eligible_configs.return_value = live_configs
+        mock_pm.get_validated_configs.return_value = live_configs
 
         pipeline_config = SimpleNamespace(
             live_bar_settle_seconds=5,
@@ -66,6 +71,23 @@ class LiveSchedulerTests(unittest.TestCase):
         due_at = trader.get_next_sweep_due(["H1"], now=probe)
 
         self.assertEqual(due_at, datetime(2026, 4, 3, 11, 0, 5))
+
+    def test_next_sweep_due_wakes_immediately_for_queued_exact_cell(self):
+        trader = self._make_trader()
+        probe = datetime(2026, 4, 3, 10, 30, 0)
+        config = SimpleNamespace(
+            has_regime_configs=lambda: True,
+            get_available_timeframes=lambda: ["M5", "D1"],
+        )
+        trader.pm.get_live_eligible_configs.return_value = {"EURUSD": config}
+        trader._last_bar_times["EURUSD_D1"] = pd.Timestamp(
+            datetime(2026, 4, 3, 0, 0, 0)
+        )
+        trader._pending_specialist_timeframes["EURUSD"] = {"M5"}
+
+        due_at = trader.get_next_sweep_due(["M5", "D1"], now=probe)
+
+        self.assertEqual(due_at, probe)
 
     def test_bar_trigger_tracks_bar_timestamps_per_symbol_timeframe(self):
         trader = self._make_trader()

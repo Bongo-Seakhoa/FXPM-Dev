@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -40,10 +40,10 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.allow_trade)
-        self.assertEqual(decision.action, "block_new_entry")
+        self.assertEqual(decision.action, "block_new_entry_transient")
         self.assertTrue(any("total_open_risk" in reason for reason in decision.reasons))
 
-    def test_institutional_supervisor_latches_until_next_cycle(self):
+    def test_institutional_supervisor_capacity_block_does_not_latch(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = PipelineConfig(max_total_open_risk_pct=1.0, hard_block_reopen_mode="manual_or_next_cycle")
             supervisor = InstitutionalSupervisor(cfg, state_path=Path(tmp) / "supervisor.json")
@@ -62,8 +62,33 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 SupervisorContext(symbol="EURUSD", metadata={"cycle_id": "cycle-b"})
             )
             self.assertFalse(blocked.allow_trade)
-            self.assertFalse(latched.allow_trade)
+            self.assertEqual(blocked.action, "block_new_entry_transient")
+            self.assertTrue(latched.allow_trade)
             self.assertTrue(reopened.allow_trade)
+
+    def test_account_breaker_latches_until_clear_in_production_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = PipelineConfig(
+                daily_loss_hard_block_pct=2.0,
+                max_new_entries_when_total_open_risk_above_pct=0.0,
+                hard_block_reopen_mode="when_clear",
+            )
+            supervisor = InstitutionalSupervisor(cfg, state_path=Path(tmp) / "supervisor.json")
+            blocked = supervisor.evaluate(
+                SupervisorContext(symbol="EURUSD", daily_loss_pct=2.1)
+            )
+            still_blocked = supervisor.evaluate(
+                SupervisorContext(symbol="GBPUSD", daily_loss_pct=2.1)
+            )
+            reopened = supervisor.evaluate(
+                SupervisorContext(symbol="GBPUSD", daily_loss_pct=0.0)
+            )
+            self.assertFalse(blocked.allow_trade)
+            self.assertEqual(blocked.action, "block_new_entry")
+            self.assertFalse(still_blocked.allow_trade)
+            self.assertEqual(still_blocked.action, "block_latched")
+            self.assertTrue(reopened.allow_trade)
+            self.assertFalse(supervisor._state.get("active_block"))
 
     def test_cycle_drift_pauses_after_severe_local_loss_cluster(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -96,6 +121,59 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(loss_pct, 2.5, places=6)
+
+    def test_realized_loss_pct_includes_all_closing_deal_cash_costs(self):
+        trader = LiveTrader.__new__(LiveTrader)
+        trader.mt5 = None
+        trader.logger = SimpleNamespace(
+            debug=lambda *_args, **_kwargs: None,
+            warning=lambda *_args, **_kwargs: None,
+        )
+        now = datetime.now()
+        trader._live_session_started_at = now - timedelta(hours=2)
+        trader._recent_closing_deals = [
+            {
+                "ticket": 42,
+                "time": now - timedelta(hours=1),
+                "profit": -100.0,
+                "commission": -7.0,
+                "swap": -3.0,
+                "fee": -2.0,
+            }
+        ]
+
+        loss_pct = trader._estimate_realized_loss_pct(
+            "session",
+            SimpleNamespace(balance=10000.0),
+        )
+
+        self.assertAlmostEqual(loss_pct, 1.12, places=6)
+
+    def test_realized_loss_pct_distinguishes_history_failure_from_empty_history(self):
+        trader = LiveTrader.__new__(LiveTrader)
+        trader._recent_closing_deals = []
+        trader._recent_closing_deals_lookback_hours = 0
+        trader._recent_closing_deals_available = False
+        trader._live_session_started_at = datetime.now() - timedelta(hours=1)
+        trader.logger = SimpleNamespace(
+            debug=lambda *_args, **_kwargs: None,
+            warning=lambda *_args, **_kwargs: None,
+        )
+        trader.mt5 = Mock()
+        trader.mt5.get_recent_closing_deals.return_value = None
+
+        unavailable = trader._estimate_realized_loss_pct(
+            "daily",
+            SimpleNamespace(balance=10000.0),
+        )
+        self.assertIsNone(unavailable)
+
+        trader.mt5.get_recent_closing_deals.return_value = []
+        empty = trader._estimate_realized_loss_pct(
+            "daily",
+            SimpleNamespace(balance=10000.0),
+        )
+        self.assertEqual(empty, 0.0)
 
     def test_weekly_realized_loss_refetches_beyond_recent_cache(self):
         trader = LiveTrader.__new__(LiveTrader)
@@ -197,7 +275,17 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                         "EURUSD": {
                             "symbol": "EURUSD",
                             "strategy_name": "EMACrossoverStrategy",
+                            "valid_until": (datetime.now() + timedelta(days=2)).isoformat(),
                             "artifact_meta": stale_artifact,
+                            "regime_configs": {
+                                "H1": {
+                                    "TREND": {
+                                        "strategy_name": "EMACrossoverStrategy",
+                                        "parameters": {},
+                                        "promotion_status": "PROMOTED",
+                                    }
+                                }
+                            },
                         }
                     }
                 ),
@@ -243,7 +331,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(item.code == "production_symbol_ledger_incomplete" for item in report.errors))
 
-    def test_live_readiness_warns_optional_symbol_ledger_gap(self):
+    def test_live_readiness_blocks_optional_symbol_ledger_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Path(tmp) / "pm_configs.json"
             cfg = PipelineConfig(
@@ -274,10 +362,11 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 config_path=str(Path(tmp) / "config.json"),
             )
 
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "full_symbol_ledger_required" for item in report.errors))
             self.assertTrue(any(item.code == "symbols_missing_from_ledger" for item in report.warnings))
 
-    def test_live_readiness_allows_partial_ledger_when_live_partial_mode_enabled(self):
+    def test_live_readiness_blocks_partial_ledger_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Path(tmp) / "pm_configs.json"
             cfg = PipelineConfig(
@@ -309,7 +398,8 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 config_path=str(Path(tmp) / "config.json"),
             )
 
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "partial_symbol_ledger_not_live" for item in report.errors))
             self.assertTrue(any(item.code == "symbols_missing_from_ledger" for item in report.warnings))
             self.assertFalse(any(item.code == "production_symbol_ledger_incomplete" for item in report.errors))
 
@@ -340,6 +430,151 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
         self.assertFalse(report.ok)
         self.assertTrue(any(item.code == "risk_pct_exceeds_hard_cap" for item in report.errors))
+
+    def test_live_readiness_blocks_when_min_lot_exceeds_target_risk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.0001,
+                            "tick_value": 1.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "valid_until": (datetime.now() + timedelta(days=2)).isoformat(),
+                            "regime_configs": {
+                                "H1": {
+                                    "TREND": {
+                                        "strategy_name": "EMACrossoverStrategy",
+                                        "parameters": {"sl_pips": 50.0},
+                                        "promotion_status": "PROMOTED",
+                                    }
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+
+            report = validate_live_readiness(
+                cfg,
+                symbols=["EURUSD"],
+                config_path=str(root / "config.json"),
+                account_info=SimpleNamespace(equity=22.0, currency="USD"),
+                position_config=SimpleNamespace(risk_per_trade_pct=0.5, max_risk_pct=25.0),
+            )
+
+            self.assertTrue(any(item.code == "min_lot_risk_exceeds_target" for item in report.errors))
+            self.assertFalse(any(item.code == "min_lot_risk_exceeds_hard_cap" for item in report.errors))
+
+    def test_live_readiness_rejects_weakened_walk_forward_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = PipelineConfig(
+                walk_forward_audit_enabled=True,
+                walk_forward_promotion_policy="observe_only",
+                walk_forward_live_blocking_enabled=False,
+                winner_ledger_path=str(Path(tmp) / "missing-ledger.json"),
+                regime_params_file="",
+                log_dir=str(Path(tmp) / "logs"),
+            )
+
+            report = validate_live_readiness(
+                cfg,
+                symbols=[],
+                config_path=str(Path(tmp) / "missing-config.json"),
+            )
+
+        codes = {item.code for item in report.errors}
+        self.assertIn("walk_forward_promotion_policy_weakened", codes)
+        self.assertIn("walk_forward_live_blocking_disabled", codes)
+
+    def test_live_readiness_blocks_when_min_lot_exceeds_hard_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"broker_specs_path": "broker_specs.json"}), encoding="utf-8")
+            (root / "broker_specs.json").write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "digits": 5,
+                            "point": 0.00001,
+                            "tick_size": 0.0001,
+                            "tick_value": 1.0,
+                            "contract_size": 100000.0,
+                            "volume_min": 0.01,
+                            "volume_max": 100.0,
+                            "volume_step": 0.01,
+                            "spread": 20,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = root / "pm_configs.json"
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "EURUSD": {
+                            "symbol": "EURUSD",
+                            "valid_until": (datetime.now() + timedelta(days=2)).isoformat(),
+                            "regime_configs": {
+                                "H1": {
+                                    "TREND": {
+                                        "strategy_name": "EMACrossoverStrategy",
+                                        "parameters": {"sl_pips": 50.0},
+                                        "promotion_status": "PROMOTED",
+                                    }
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = PipelineConfig(
+                live_artifact_drift_policy="block",
+                winner_ledger_path=str(ledger),
+                regime_params_file="",
+                walk_forward_audit_enabled=True,
+                log_dir=str(root / "logs"),
+            )
+
+            report = validate_live_readiness(
+                cfg,
+                symbols=["EURUSD"],
+                config_path=str(root / "config.json"),
+                account_info=SimpleNamespace(equity=22.0, currency="USD"),
+                position_config=SimpleNamespace(risk_per_trade_pct=0.5, max_risk_pct=1.0),
+            )
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "min_lot_risk_exceeds_hard_cap" for item in report.errors))
 
     def test_live_readiness_rejects_paper_only_winners(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -462,6 +697,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                         "EURUSD": {
                             "symbol": "EURUSD",
                             "strategy_name": "EMACrossoverStrategy",
+                            "promotion_status": "PROMOTED",
                             "valid_until": (datetime.now() - timedelta(minutes=1)).isoformat(),
                             "artifact_meta": build_artifact_meta(cfg),
                         }
@@ -501,7 +737,8 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
 
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "supervisor_disabled" for item in report.errors))
             self.assertTrue(
                 any(item.code == "storage_free_space_below_advisory_floor" for item in report.warnings)
             )
@@ -531,7 +768,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
 
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
             self.assertFalse(any(item.code == "regime_params_missing" for item in report.warnings))
 
     def test_live_readiness_blocks_promoted_regime_cell_without_explicit_detector_row(self):
@@ -585,6 +822,46 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertTrue(any(item.code == "mt5_account_identity_not_pinned" for item in report.errors))
 
+    def test_live_readiness_rejects_each_partial_mt5_identity_pin(self):
+        cfg = PipelineConfig(regime_params_file="")
+        partial_pins = (
+            SimpleNamespace(
+                expected_login=0,
+                expected_server="Broker-Live",
+                expected_currency="USD",
+            ),
+            SimpleNamespace(
+                expected_login=123,
+                expected_server="",
+                expected_currency="USD",
+            ),
+            SimpleNamespace(
+                expected_login=123,
+                expected_server="Broker-Live",
+                expected_currency="",
+            ),
+        )
+
+        for mt5_config in partial_pins:
+            with self.subTest(mt5_config=mt5_config):
+                report = validate_live_readiness(
+                    cfg,
+                    symbols=[],
+                    config_path="config.json",
+                    mt5_config=mt5_config,
+                    account_info=SimpleNamespace(
+                        login=123,
+                        server="Broker-Live",
+                        currency="USD",
+                    ),
+                )
+                self.assertTrue(
+                    any(
+                        item.code == "mt5_account_identity_not_pinned"
+                        for item in report.errors
+                    )
+                )
+
     def test_live_readiness_blocks_mt5_identity_mismatch(self):
         cfg = PipelineConfig(regime_params_file="")
 
@@ -613,6 +890,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 winner_ledger_path=str(ledger),
                 regime_params_file="",
                 production_require_promotion_gate=True,
+                production_promotion_gate_mode="external_review_exact",
                 production_promotion_review_path=str(review),
                 production_promotion_cell_safety_path=str(safety),
                 production_completion_marker_path=str(marker),
@@ -687,7 +965,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 any(item.code == "production_winner_ledger_promotion_mismatch" for item in report.errors)
             )
 
-    def test_live_readiness_ledger_status_gate_ignores_stale_external_review_mismatch(self):
+    def test_live_readiness_blocks_legacy_ledger_status_gate_for_funded_use(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ledger = root / "pm_configs.json"
@@ -750,7 +1028,13 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(root / "config.json"))
 
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(
+                    item.code == "production_promotion_gate_not_immutable_exact"
+                    for item in report.errors
+                )
+            )
             self.assertFalse(
                 any(item.code == "production_winner_ledger_promotion_mismatch" for item in report.errors)
             )
@@ -766,6 +1050,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 winner_ledger_path=str(ledger),
                 regime_params_file="",
                 production_require_promotion_gate=True,
+                production_promotion_gate_mode="external_review_exact",
                 production_promotion_review_path=str(review),
                 production_promotion_cell_safety_path=str(safety),
                 production_completion_marker_path=str(marker),
@@ -973,7 +1258,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             report = validate_live_readiness(cfg, symbols=["EURUSD.a"], config_path=str(root / "config.json"))
 
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
             self.assertFalse(any(item.code == "broker_specs_missing_symbols" for item in report.errors))
 
     def test_event_calendar_matches_symbol_currencies_and_minutes(self):
@@ -1311,7 +1596,170 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(item.code == "supervisor_latched_from_previous_run" for item in report.errors))
 
-    def test_live_readiness_allows_supervisor_latch_from_previous_cycle(self):
+    def test_live_readiness_fails_closed_when_supervisor_state_check_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_dir = root / "logs"
+            log_dir.mkdir()
+            (log_dir / "institutional_supervisor_state.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            cfg = PipelineConfig(log_dir=str(log_dir))
+            def _state_only_failure(path):
+                if Path(path).name == "institutional_supervisor_state.json":
+                    raise RuntimeError("state read failed")
+                return None
+            with patch(
+                "pm_live_readiness._load_json_file",
+                side_effect=_state_only_failure,
+            ):
+                report = validate_live_readiness(
+                    cfg,
+                    symbols=["EURUSD"],
+                    config_path=str(root / "config.json"),
+                )
+            self.assertTrue(
+                any(
+                    item.code == "supervisor_state_check_failed"
+                    for item in report.errors
+                )
+            )
+
+    def test_live_readiness_accepts_aligned_tuning_cap_within_gap_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = PipelineConfig(
+                max_total_open_risk_pct=7.25,
+                max_factor_group_open_risk_pct=2.0,
+            )
+            report = validate_live_readiness(
+                cfg,
+                symbols=["EURUSD"],
+                config_path=str(Path(tmp) / "config.json"),
+            )
+            self.assertFalse(
+                any(
+                    item.code == "total_stop_risk_cap_contract_mismatch"
+                    for item in report.errors
+                )
+            )
+
+            above_gap_budget = PipelineConfig(
+                max_total_open_risk_pct=8.25,
+                max_factor_group_open_risk_pct=2.0,
+            )
+            rejected = validate_live_readiness(
+                above_gap_budget,
+                symbols=["EURUSD"],
+                config_path=str(Path(tmp) / "config.json"),
+            )
+            self.assertTrue(
+                any(
+                    item.code == "total_stop_risk_cap_contract_mismatch"
+                    for item in rejected.errors
+                )
+            )
+
+    def test_live_readiness_rejects_non_enforcing_supervisor_modes(self):
+        funded_breakers = {
+            "session_loss_hard_block_pct": 1.5,
+            "daily_loss_hard_block_pct": 2.0,
+            "weekly_loss_hard_block_pct": 5.0,
+            "open_drawdown_hard_block_pct": 3.0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for mode in ("off", "observe"):
+                with self.subTest(mode=mode):
+                    cfg = PipelineConfig(
+                        institutional_supervisor_mode=mode,
+                        portfolio_control_policy="hard_breakpoints_only",
+                        **funded_breakers,
+                    )
+                    report = validate_live_readiness(
+                        cfg,
+                        symbols=["EURUSD"],
+                        config_path=str(Path(tmp) / "config.json"),
+                    )
+                    self.assertTrue(
+                        any(
+                            item.code == "supervisor_mode_not_circuit_breaker"
+                            for item in report.errors
+                        )
+                    )
+
+    def test_live_readiness_rejects_disabled_breakpoint_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = PipelineConfig(
+                institutional_supervisor_mode="circuit_breaker",
+                portfolio_control_policy="off",
+                session_loss_hard_block_pct=1.5,
+                daily_loss_hard_block_pct=2.0,
+                weekly_loss_hard_block_pct=5.0,
+                open_drawdown_hard_block_pct=3.0,
+            )
+            report = validate_live_readiness(
+                cfg,
+                symbols=["EURUSD"],
+                config_path=str(Path(tmp) / "config.json"),
+            )
+            self.assertTrue(
+                any(
+                    item.code == "portfolio_control_policy_not_hard_breakpoints"
+                    for item in report.errors
+                )
+            )
+
+    def test_live_readiness_rejects_each_wrong_breaker_threshold(self):
+        funded_breakers = {
+            "session_loss_hard_block_pct": 1.5,
+            "daily_loss_hard_block_pct": 2.0,
+            "weekly_loss_hard_block_pct": 5.0,
+            "open_drawdown_hard_block_pct": 3.0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for field_name, expected in funded_breakers.items():
+                with self.subTest(field_name=field_name):
+                    thresholds = dict(funded_breakers)
+                    thresholds[field_name] = expected + 0.25
+                    cfg = PipelineConfig(
+                        institutional_supervisor_mode="circuit_breaker",
+                        portfolio_control_policy="hard_breakpoints_only",
+                        **thresholds,
+                    )
+                    report = validate_live_readiness(
+                        cfg,
+                        symbols=["EURUSD"],
+                        config_path=str(Path(tmp) / "config.json"),
+                    )
+                    self.assertTrue(
+                        any(
+                            item.code == "account_breaker_threshold_contract_mismatch"
+                            for item in report.errors
+                        )
+                    )
+
+    def test_shipped_config_passes_funded_breaker_contract(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        payload = json.loads((repo_root / "config.json").read_text(encoding="utf-8"))
+        cfg = PipelineConfig(**payload["pipeline"])
+
+        report = validate_live_readiness(
+            cfg,
+            symbols=payload["symbols"],
+            config_path=str(repo_root / "config.json"),
+        )
+
+        breaker_contract_codes = {
+            "supervisor_disabled",
+            "supervisor_mode_not_circuit_breaker",
+            "portfolio_control_policy_not_hard_breakpoints",
+            "account_breaker_threshold_contract_mismatch",
+            "automatic_safety_reopen_not_live",
+        }
+        self.assertFalse(
+            breaker_contract_codes.intersection(item.code for item in report.errors)
+        )
+
+    def test_live_readiness_blocks_automatic_supervisor_reopen_even_on_new_cycle(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_dir = Path(tmp) / "logs"
             log_dir.mkdir()
@@ -1365,7 +1813,8 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 encoding="utf-8",
             )
             report = validate_live_readiness(cfg, symbols=["EURUSD"], config_path=str(Path(tmp) / "config.json"))
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
+            self.assertTrue(any(item.code == "automatic_safety_reopen_not_live" for item in report.errors))
             self.assertTrue(any(item.code == "supervisor_latch_from_previous_cycle" for item in report.warnings))
 
     def test_cycle_drift_record_trade_captures_execution_quality(self):

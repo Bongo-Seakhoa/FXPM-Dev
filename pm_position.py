@@ -79,6 +79,10 @@ class TradeTagEncoder:
     COMMENT_PREFIX_V1 = "PM:"
     COMMENT_PREFIX_V2 = "PM2:"
     COMMENT_PREFIX_V3 = "PM3:"
+    # Latest-data challengers use a distinct broker-visible namespace.  This
+    # prevents a demo forward-probation order from being mistaken for a funded
+    # champion when positions/deals are recovered after a restart.
+    COMMENT_PREFIX_EDGE_V1 = "PME:"
 
     @staticmethod
     def _base36(n: int) -> str:
@@ -112,7 +116,8 @@ class TradeTagEncoder:
                        timeframe: str,
                        strategy_name: str,
                        direction: str,
-                       risk_pct: float = None) -> str:
+                       risk_pct: float = None,
+                       book_role: str = "") -> str:
         """
         Encode trade metadata into MT5 comment string.
 
@@ -125,6 +130,11 @@ class TradeTagEncoder:
         if risk_pct is not None:
             scode = TradeTagEncoder._strategy_code(strategy_name, max_len=5)
             risk_tenths = int(round(float(risk_pct) * 10.0))
+            if str(book_role or "").strip().upper() == "LATEST_DATA_EDGE_CHALLENGER":
+                return (
+                    f"{TradeTagEncoder.COMMENT_PREFIX_EDGE_V1}"
+                    f"{symbol}:{timeframe}:{scode}:{dir_short}:{risk_tenths}"
+                )
             return f"{TradeTagEncoder.COMMENT_PREFIX_V3}{symbol}:{timeframe}:{scode}:{dir_short}:{risk_tenths}"
 
         # Legacy v1
@@ -155,6 +165,26 @@ class TradeTagEncoder:
             return None
 
         try:
+            # Edge challenger: PME:symbol:tf:scode:dir:risk_tenths.  The
+            # explicit book role is durable even if the entry-intent state has
+            # to be reconstructed from broker history.
+            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_EDGE_V1):
+                parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_EDGE_V1):].split(':')
+                if len(parts) >= 3:
+                    result = {
+                        "symbol": parts[0],
+                        "timeframe": parts[1],
+                        "strategy_code": parts[2],
+                        "book_role": "LATEST_DATA_EDGE_CHALLENGER",
+                    }
+                    if len(parts) >= 4:
+                        direction = TradeTagEncoder._normalize_direction(parts[3])
+                        if direction:
+                            result["direction"] = direction
+                    if len(parts) >= 5:
+                        result["risk_pct"] = float(int(parts[4])) / 10.0
+                    return result
+
             # v3: PM3:symbol:tf:scode:dir:risk_tenths (winners-only, no tier)
             if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_V3):
                 parts = comment[len(TradeTagEncoder.COMMENT_PREFIX_V3):].split(':')
@@ -261,8 +291,10 @@ class PositionConfig:
     risk_basis: str = "balance"  # "balance" or "equity"
     max_risk_pct: float = 2.0  # hard safety cap (skip if exceeded)
     risk_tolerance_pct: float = 2.0  # allowed deviation vs target before logging/adjustment
-    auto_widen_sl: bool = True  # widen SL only to satisfy broker min stop distance / constraints
-    allow_min_lot_risk_clamp: bool = False  # only clamp up to min_lot when the hard cap still permits it
+    # Research-only compatibility. Funded-live blocks broker-incompatible stops
+    # instead of changing the frozen strategy's stop/target geometry.
+    auto_widen_sl: bool = False
+    allow_min_lot_risk_clamp: bool = False  # only clamp within target+tolerance and the hard cap
 
     # Stop management
     use_trailing_stop: bool = False
@@ -272,11 +304,6 @@ class PositionConfig:
     use_breakeven_stop: bool = False
     breakeven_trigger_pips: float = 0.0
     breakeven_offset_pips: float = 1.0
-    
-    # Scaling
-    allow_scaling: bool = False
-    max_scale_ins: int = 3
-    scale_in_pct: float = 50.0
     
     # Time-based exits
     max_trade_duration_bars: int = 0  # 0 = no limit
@@ -410,11 +437,36 @@ class PositionCalculator:
         Returns:
             PositionSizeResult with calculated volume and details
         """
+        try:
+            equity = float(equity)
+            sl_pips = float(sl_pips)
+            target_risk_pct = float(self.config.risk_per_trade_pct)
+            pip_value = float(spec.pip_value)
+        except (TypeError, ValueError, OverflowError):
+            return PositionSizeResult(
+                volume=0.0, risk_amount=0.0, sl_pips=0.0,
+                pip_value=0.0, equity=0.0, details="Invalid position-sizing input; skipped",
+            )
+        if (
+            not all(math.isfinite(value) for value in (equity, sl_pips, target_risk_pct, pip_value))
+            or equity <= 0.0
+            or sl_pips <= 0.0
+            or target_risk_pct <= 0.0
+        ):
+            return PositionSizeResult(
+                volume=0.0, risk_amount=0.0, sl_pips=sl_pips,
+                pip_value=pip_value, equity=equity, details="Non-finite/non-positive sizing input; skipped",
+            )
+
         # Calculate risk amount
-        risk_amount = equity * (self.config.risk_per_trade_pct / 100.0)
+        risk_amount = equity * (target_risk_pct / 100.0)
+        if not math.isfinite(risk_amount) or risk_amount <= 0.0:
+            return PositionSizeResult(
+                volume=0.0, risk_amount=0.0, sl_pips=sl_pips,
+                pip_value=pip_value, equity=equity, details="Invalid risk amount; skipped",
+            )
         
         # Get pip value
-        pip_value = spec.pip_value
         loss_per_lot = 0.0
 
         # Calculate lot size using tick-based math if available, else pip-based
@@ -429,29 +481,66 @@ class PositionCalculator:
                 volume = self.config.min_position_size
         elif pip_value > 0 and sl_pips > 0:
             # Fallback to pip-based sizing
-            volume = risk_amount / (sl_pips * pip_value)
+            loss_per_lot = sl_pips * pip_value
+            volume = risk_amount / loss_per_lot
         else:
-            volume = self.config.min_position_size
+            volume = 0.0
+
+        if (
+            not math.isfinite(loss_per_lot)
+            or loss_per_lot <= 0.0
+            or not math.isfinite(volume)
+            or volume <= 0.0
+        ):
+            return PositionSizeResult(
+                volume=0.0, risk_amount=risk_amount, sl_pips=sl_pips,
+                pip_value=pip_value, equity=equity, details="Invalid loss/volume calculation; skipped",
+            )
 
         allow_min_lot_clamp = bool(getattr(self.config, "allow_min_lot_risk_clamp", False))
-        min_lot_volume = max(spec.min_lot, self.config.min_position_size)
+        try:
+            min_lot_volume = max(float(spec.min_lot), float(self.config.min_position_size))
+        except (TypeError, ValueError, OverflowError):
+            min_lot_volume = 0.0
+        if not math.isfinite(min_lot_volume) or min_lot_volume <= 0.0:
+            return PositionSizeResult(
+                volume=0.0, risk_amount=risk_amount, sl_pips=sl_pips,
+                pip_value=pip_value, equity=equity, details="Invalid minimum lot; skipped",
+            )
+
+        def _min_lot_risk_envelope() -> tuple[float, float, bool]:
+            try:
+                actual = float(loss_per_lot * min_lot_volume / equity * 100.0)
+                hard_cap = float(getattr(self.config, "max_risk_pct", 0.0))
+                tolerance = float(getattr(self.config, "risk_tolerance_pct", 0.0))
+                target = float(target_risk_pct)
+            except (TypeError, ValueError, OverflowError):
+                return float("nan"), 0.0, False
+            if (
+                not all(math.isfinite(value) for value in (actual, hard_cap, tolerance, target))
+                or actual <= 0.0
+                or hard_cap <= 0.0
+                or target <= 0.0
+            ):
+                return actual, 0.0, False
+            allowed = min(hard_cap, target * (1.0 + max(0.0, tolerance) / 100.0))
+            return actual, allowed, actual <= allowed + 1e-9
 
         if volume < spec.min_lot:
             if allow_min_lot_clamp and loss_per_lot > 0 and equity > 0:
-                actual_risk_amount = loss_per_lot * min_lot_volume
-                actual_risk_pct = (actual_risk_amount / equity) * 100.0
-                hard_cap = float(getattr(self.config, "max_risk_pct", 0.0) or 0.0)
-                if hard_cap <= 0.0 or actual_risk_pct <= hard_cap + 1e-9:
+                actual_risk_pct, allowed_risk_pct, within_envelope = _min_lot_risk_envelope()
+                if within_envelope:
                     logger.info(
                         f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot}; "
-                        f"clamping to min_lot {min_lot_volume:.4f} within hard cap "
-                        f"{hard_cap:.2f}% (actual_risk={actual_risk_pct:.2f}%)"
+                        f"clamping to min_lot {min_lot_volume:.4f} within allowed risk "
+                        f"envelope {allowed_risk_pct:.2f}% (actual_risk={actual_risk_pct:.2f}%)"
                     )
                     volume = min_lot_volume
                 else:
                     logger.warning(
                         f"Risk-based volume {volume:.8f} below min_lot {spec.min_lot} "
-                        f"and min_lot risk {actual_risk_pct:.2f}% exceeds hard cap {hard_cap:.2f}% "
+                        f"and min_lot risk {actual_risk_pct:.2f}% exceeds allowed envelope "
+                        f"{allowed_risk_pct:.2f}% "
                         f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
                     )
                     return PositionSizeResult(
@@ -462,7 +551,7 @@ class PositionCalculator:
                         equity=equity,
                         details=(
                             f"Equity: {equity:.2f}, Risk: {risk_amount:.2f}, "
-                            f"SL: {sl_pips:.1f} pips - min_lot exceeds hard cap, skipped"
+                            f"SL: {sl_pips:.1f} pips - min_lot exceeds allowed risk envelope, skipped"
                         ),
                     )
             else:
@@ -501,19 +590,19 @@ class PositionCalculator:
         # hard cap or reject the trade.
         if volume < spec.min_lot:
             if allow_min_lot_clamp and loss_per_lot > 0 and equity > 0:
-                actual_risk_amount = loss_per_lot * min_lot_volume
-                actual_risk_pct = (actual_risk_amount / equity) * 100.0
-                hard_cap = float(getattr(self.config, "max_risk_pct", 0.0) or 0.0)
-                if hard_cap <= 0.0 or actual_risk_pct <= hard_cap + 1e-9:
+                actual_risk_pct, allowed_risk_pct, within_envelope = _min_lot_risk_envelope()
+                if within_envelope:
                     logger.info(
                         f"Rounded volume fell below min_lot; clamping to {min_lot_volume:.4f} "
-                        f"within hard cap {hard_cap:.2f}% (actual_risk={actual_risk_pct:.2f}%)"
+                        f"within allowed risk envelope {allowed_risk_pct:.2f}% "
+                        f"(actual_risk={actual_risk_pct:.2f}%)"
                     )
                     volume = round(min_lot_volume, 8)
                 else:
                     logger.warning(
                         f"Volume {volume:.8f} below min_lot {spec.min_lot} after rounding "
-                        f"and min_lot risk {actual_risk_pct:.2f}% exceeds hard cap {hard_cap:.2f}% "
+                        f"and min_lot risk {actual_risk_pct:.2f}% exceeds allowed envelope "
+                        f"{allowed_risk_pct:.2f}% "
                         f"(equity={equity:.2f}, sl_pips={sl_pips:.1f}); skipping trade"
                     )
                     volume = 0.0

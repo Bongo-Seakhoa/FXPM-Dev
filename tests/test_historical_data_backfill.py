@@ -39,6 +39,26 @@ class _FakeMT5:
         return self.range_bars.copy()
 
 
+class _OptimizationPortfolio:
+    def __init__(self, symbols):
+        self.symbols = list(symbols)
+        self.optimization_rosters = []
+        self.saved_no_trade = []
+
+    def initial_optimization(self, overwrite=False):
+        self.optimization_rosters.append(list(self.symbols))
+        return {}
+
+    def save_data_no_trade_config(self, symbol, reason):
+        self.saved_no_trade.append((symbol, reason))
+
+    def print_status(self):
+        return None
+
+    def get_live_eligible_configs(self):
+        return {"EURUSD": object()}
+
+
 def _bars(n):
     idx = pd.date_range("2026-01-01", periods=n, freq="5min")
     return pd.DataFrame(
@@ -51,6 +71,60 @@ def _bars(n):
         },
         index=idx,
     )
+
+
+def test_run_optimization_calendar_mode_never_invokes_legacy_m5_roster_filter(
+    tmp_path: Path,
+    monkeypatch,
+):
+    app = FXPortfolioManagerApp.__new__(FXPortfolioManagerApp)
+    app.logger = _Logger()
+    app.pipeline_config = SimpleNamespace(production_split_mode="calendar_lockbox_v2")
+    app.mt5 = SimpleNamespace(is_connected=lambda: True)
+    app.symbols = ["EURUSD", "SOLUSD"]
+    app.portfolio_manager = _OptimizationPortfolio(["EURUSD", "SOLUSD"])
+    app.config_file = str(tmp_path / "pm_configs.json")
+    (tmp_path / "pm_configs.json").write_text("{}", encoding="utf-8")
+    app.storage_manager = None
+    app._save_results = lambda _results: None
+    app._fetch_historical_data = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("legacy M5 fetch must not run in calendar production")
+    )
+    monkeypatch.setattr(
+        "pm_main._phase_a_optimization_complete",
+        lambda _ledger, _symbols: (True, []),
+    )
+
+    assert app.run_optimization()
+    assert app.portfolio_manager.optimization_rosters == [["EURUSD", "SOLUSD"]]
+    assert app.portfolio_manager.symbols == ["EURUSD", "SOLUSD"]
+    assert app.portfolio_manager.saved_no_trade == []
+
+
+def test_run_optimization_legacy_mode_retains_m5_readiness_filter():
+    app = FXPortfolioManagerApp.__new__(FXPortfolioManagerApp)
+    app.logger = _Logger()
+    app.pipeline_config = SimpleNamespace(
+        production_split_mode="chronological_lockbox_v1",
+        historical_fetch_retry_attempts=1,
+        optimization_min_m5_bars=5,
+        optimization_min_m5_bars_fraction=0.0,
+        max_bars=5,
+    )
+    app.mt5 = SimpleNamespace(is_connected=lambda: True)
+    app.portfolio_manager = _OptimizationPortfolio(["EURUSD", "SOLUSD"])
+    app.storage_manager = None
+    app._save_results = lambda _results: None
+    app._fetch_historical_data = lambda *_args, **_kwargs: {
+        "ready_symbols": ["EURUSD"],
+        "incomplete_symbols": {"SOLUSD": 2},
+        "no_data_symbols": [],
+    }
+
+    assert app.run_optimization()
+    assert app.portfolio_manager.optimization_rosters == [["EURUSD"]]
+    assert app.portfolio_manager.symbols == ["EURUSD", "SOLUSD"]
+    assert [row[0] for row in app.portfolio_manager.saved_no_trade] == ["SOLUSD"]
 
 
 def test_fetch_historical_data_backfills_when_existing_file_below_target(tmp_path: Path):

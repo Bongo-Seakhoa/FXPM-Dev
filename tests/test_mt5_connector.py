@@ -100,6 +100,24 @@ class _FakeMT5:
     def last_error(self):
         return (0, "ok")
 
+    def account_info(self):
+        return SimpleNamespace(
+            login=123,
+            server="Demo",
+            company="Broker",
+            balance=10000.0,
+            equity=10000.0,
+            margin=0.0,
+            margin_free=10000.0,
+            margin_level=0.0,
+            profit=0.0,
+            leverage=100,
+            currency="USD",
+            trade_allowed=True,
+            trade_expert=True,
+            margin_mode=2,
+        )
+
 
 class MT5ConnectorTests(unittest.TestCase):
     def setUp(self):
@@ -208,6 +226,18 @@ class MT5ConnectorTests(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertTrue(info.visible)
         self.assertEqual(info.trade_mode, 2)
+
+    def test_get_account_info_preserves_hedging_account_mode(self):
+        connector = MT5Connector(MT5Config())
+        connector._connected = True
+
+        info = connector.get_account_info()
+
+        self.assertIsNotNone(info)
+        self.assertEqual(info.margin_mode, 2)
+        # Python's account_info tuple may omit ACCOUNT_HEDGE_ALLOWED; retail
+        # hedging mode is then the authoritative permission source.
+        self.assertTrue(info.hedge_allowed)
 
     def test_missing_symbol_get_bars_is_not_terminal_noise(self):
         connector = MT5Connector(MT5Config())

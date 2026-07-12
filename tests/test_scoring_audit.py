@@ -13,6 +13,7 @@ Covers:
 
 import math
 import unittest
+from unittest.mock import patch
 
 from pm_core import PipelineConfig, StrategyScorer
 from pm_pipeline import RegimeOptimizer
@@ -236,7 +237,7 @@ class TestDDHardGateInvariants(unittest.TestCase):
         self.assertTrue(cfg.scoring_use_sortino_blend)
         self.assertTrue(cfg.scoring_use_tail_risk)
         self.assertTrue(cfg.scoring_use_consistency)
-        self.assertTrue(cfg.scoring_use_trade_frequency_bonus)
+        self.assertFalse(cfg.scoring_use_trade_frequency_bonus)
         self.assertAlmostEqual(cfg.legacy_confidence_bonus_cap, 0.08)
 
 
@@ -451,6 +452,8 @@ class TestCandidateDescentSelection(unittest.TestCase):
 
     def test_rank1_fail_rank2_pass_selects_rank2(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_enable_hyperparam_tuning=False,
             regime_validation_top_k=5,
         )
@@ -479,16 +482,22 @@ class TestCandidateDescentSelection(unittest.TestCase):
         self.assertEqual(cfg_out.strategy_name, "S2")
         self.assertIn("pass", reason)
 
-    def test_top_k_cap_limits_validation_attempts(self):
+    def test_already_scored_descent_does_not_stop_at_legacy_top_k_cap(self):
         cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
             regime_enable_hyperparam_tuning=False,
             regime_validation_top_k=1,
         )
         opt = RegimeOptimizer(cfg)
         opt._compute_regime_score = lambda train_m, val_m: float(val_m.get('_score', 0.0))
 
-        # Only S2 would pass, but top_k=1 means only S1 is attempted.
+        # Both candidates already have validation metrics and scores, so the
+        # legacy top_k must not manufacture NO_TRADE after S1 fails.
+        attempted = []
+
         def fake_validate(train_m, val_m, regime, candidate_name="Unknown"):
+            attempted.append(candidate_name)
             return (candidate_name == "S2"), ("pass" if candidate_name == "S2" else "fail")
 
         opt._validate_regime_winner = fake_validate
@@ -499,13 +508,62 @@ class TestCandidateDescentSelection(unittest.TestCase):
         ]
 
         cfg_out, is_valid, reason = opt._select_best_for_regime("SYM", "H1", "TREND", candidates)
-        self.assertFalse(is_valid)
+        self.assertTrue(is_valid)
         self.assertIsNotNone(cfg_out)
-        self.assertEqual(cfg_out.strategy_name, "S1")
-        self.assertIn("failed validation", reason)
+        self.assertEqual(cfg_out.strategy_name, "S2")
+        self.assertEqual(attempted, ["S1", "S2"])
+        self.assertIn("pass", reason)
+
+    def test_non_finite_score_cannot_sort_ahead_of_a_finite_winner(self):
+        cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
+            regime_enable_hyperparam_tuning=False,
+        )
+        opt = RegimeOptimizer(cfg)
+        opt._compute_regime_score = lambda _train, val: float(val["_score"])
+        validated = []
+
+        def validate(_train, _val, _regime, candidate_name="Unknown"):
+            validated.append(candidate_name)
+            return True, "pass"
+
+        opt._validate_regime_winner = validate
+        poisoned = self._candidate("PoisonedNaN", float("nan"))
+        finite = self._candidate("Finite", 10.0)
+
+        cfg_out, is_valid, _reason = opt._select_best_for_regime(
+            "SYM", "H1", "TREND", [poisoned, finite]
+        )
+
+        self.assertTrue(is_valid)
+        self.assertEqual(cfg_out.strategy_name, "Finite")
+        self.assertEqual(validated, ["Finite"])
+        self.assertEqual(opt._normalize_score(float("nan")), 0.0)
+
+    def test_invalid_core_metric_surface_fails_closed_before_ranking(self):
+        cfg = PipelineConfig(
+            research_mode=True,
+            false_discovery_control_enabled=False,
+            regime_enable_hyperparam_tuning=False,
+        )
+        opt = RegimeOptimizer(cfg)
+        opt._compute_regime_score = lambda _train, val: float(val["_score"])
+        invalid = self._candidate("NegativeDrawdown", 1000.0)
+        invalid["val_regime_metrics"]["TREND"]["max_drawdown_pct"] = -1.0
+        finite = self._candidate("Finite", 10.0)
+        opt._validate_regime_winner = lambda *_args, **_kwargs: (True, "pass")
+
+        cfg_out, is_valid, _reason = opt._select_best_for_regime(
+            "SYM", "H1", "TREND", [invalid, finite]
+        )
+
+        self.assertTrue(is_valid)
+        self.assertEqual(cfg_out.strategy_name, "Finite")
 
     def test_false_discovery_rejection_happens_before_descent_validation(self):
         cfg = PipelineConfig(
+            research_mode=True,
             regime_enable_hyperparam_tuning=False,
             regime_validation_top_k=5,
             regime_min_train_trades=1,
@@ -542,7 +600,25 @@ class TestCandidateDescentSelection(unittest.TestCase):
         c2["train_regime_metrics"]["TREND"]["sharpe_approx"] = 6.0
         c2["val_regime_metrics"]["TREND"]["sharpe_approx"] = 6.0
 
-        cfg_out, is_valid, _ = opt._select_best_for_regime("SYM", "H1", "TREND", [c1, c2])
+        def false_discovery_evidence(_val, _candidates, candidate, **_kwargs):
+            passed = candidate["strategy_name"] == "C3Passed"
+            return {
+                "enabled": True,
+                "min_dsr": 0.5,
+                "deflated_sharpe": 0.9 if passed else 0.1,
+                "dsr_evidence": {"status": "PASS"},
+                "pbo_status": "PASS",
+                "bootstrap_evidence": {"status": "PASS"},
+                "confidence_multiplier": 1.0,
+                "effective_trials": 100,
+            }
+
+        with patch.object(
+            opt,
+            "_build_false_discovery_evidence",
+            side_effect=false_discovery_evidence,
+        ):
+            cfg_out, is_valid, _ = opt._select_best_for_regime("SYM", "H1", "TREND", [c1, c2])
 
         self.assertTrue(is_valid)
         self.assertEqual(cfg_out.strategy_name, "C3Passed")

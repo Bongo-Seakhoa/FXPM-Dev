@@ -212,6 +212,10 @@ class MT5AccountInfo:
     currency: str
     trade_allowed: bool
     trade_expert: bool
+    # MT5 ACCOUNT_MARGIN_MODE_RETAIL_HEDGING == 2.  Only that accounting
+    # mode permits multiple independently attributed positions per symbol.
+    margin_mode: int = -1
+    hedge_allowed: Optional[bool] = None
 
 
 @dataclass
@@ -446,6 +450,23 @@ class MT5Connector:
         if info is None:
             return None
         
+        margin_mode_raw = getattr(info, "margin_mode", None)
+        try:
+            margin_mode = int(margin_mode_raw)
+        except (TypeError, ValueError, OverflowError):
+            margin_mode = -1
+        hedge_allowed_raw = getattr(info, "hedge_allowed", None)
+        # MetaTrader5.account_info() exposes margin_mode but some package
+        # versions omit the separate MQL5 ACCOUNT_HEDGE_ALLOWED property.
+        # In that case the official accounting-mode contract is authoritative:
+        # RETAIL_HEDGING permits independent same-symbol positions; netting and
+        # exchange modes do not.
+        hedge_allowed = (
+            bool(hedge_allowed_raw)
+            if hedge_allowed_raw is not None
+            else (True if margin_mode == 2 else False if margin_mode in {0, 1} else None)
+        )
+
         return MT5AccountInfo(
             login=info.login,
             server=info.server,
@@ -459,7 +480,9 @@ class MT5Connector:
             leverage=info.leverage,
             currency=info.currency,
             trade_allowed=info.trade_allowed,
-            trade_expert=info.trade_expert
+            trade_expert=info.trade_expert,
+            margin_mode=margin_mode,
+            hedge_allowed=hedge_allowed,
         )
     
     def get_equity(self) -> float:
@@ -1547,21 +1570,98 @@ class MT5Connector:
 
         return None
 
-    def get_recent_closing_deals(self, lookback_hours: int = 48) -> List[Dict[str, Any]]:
-        """Fetch recent closing deals for drift-monitor integration."""
-        if not self._check_connection():
-            return []
+    def get_position_history(self, position_identifier: int) -> Optional[Dict[str, Any]]:
+        """Return complete broker deals/orders for one stable MT5 position id.
 
-        from_time = datetime.now() - timedelta(hours=max(1, int(lookback_hours)))
-        to_time = datetime.now()
+        This is read-only accounting evidence. ``history_complete`` is true
+        only when both MT5 history queries succeeded; downstream close
+        accounting must otherwise retain the position in its pending outbox.
+        """
+        identifier = int(position_identifier or 0)
+        if identifier <= 0 or not self._check_connection():
+            return None
+        try:
+            raw_deals = mt5.history_deals_get(position=identifier)
+            raw_orders = mt5.history_orders_get(position=identifier)
+        except Exception:
+            return None
+        if raw_deals is None or raw_orders is None:
+            return {
+                "history_complete": False,
+                "position_id": identifier,
+                "deals": [],
+                "orders": [],
+            }
+
+        deals: List[Dict[str, Any]] = []
+        for deal in raw_deals:
+            deals.append({
+                "ticket": int(getattr(deal, "ticket", 0) or 0),
+                "order_ticket": int(getattr(deal, "order", 0) or 0),
+                "position_id": int(getattr(deal, "position_id", identifier) or identifier),
+                "symbol": str(getattr(deal, "symbol", "") or ""),
+                "entry": getattr(deal, "entry", None),
+                "type": getattr(deal, "type", None),
+                "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+                "price": float(getattr(deal, "price", 0.0) or 0.0),
+                "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+                "commission": float(getattr(deal, "commission", 0.0) or 0.0),
+                "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+                "fee": float(getattr(deal, "fee", 0.0) or 0.0),
+                "magic": int(getattr(deal, "magic", 0) or 0),
+                "comment": str(getattr(deal, "comment", "") or ""),
+                "reason": getattr(deal, "reason", None),
+                "time_msc": getattr(deal, "time_msc", None),
+                "time": getattr(deal, "time", None),
+            })
+
+        orders: List[Dict[str, Any]] = []
+        for order in raw_orders:
+            orders.append({
+                "ticket": int(getattr(order, "ticket", 0) or 0),
+                "position_id": int(
+                    getattr(order, "position_id", 0)
+                    or getattr(order, "position_by_id", 0)
+                    or identifier
+                ),
+                "time_setup_msc": getattr(order, "time_setup_msc", None),
+                "time_setup": getattr(order, "time_setup", None),
+                "price_open": float(getattr(order, "price_open", 0.0) or 0.0),
+                "volume_initial": float(getattr(order, "volume_initial", 0.0) or 0.0),
+                "initial_stop": float(getattr(order, "sl", 0.0) or 0.0),
+                "initial_take_profit": float(getattr(order, "tp", 0.0) or 0.0),
+                "magic": int(getattr(order, "magic", 0) or 0),
+                "comment": str(getattr(order, "comment", "") or ""),
+                "type": getattr(order, "type", None),
+            })
+        return {
+            "history_complete": True,
+            "position_id": identifier,
+            "deals": deals,
+            "orders": orders,
+        }
+
+    def get_recent_closing_deals(self, lookback_hours: int = 48) -> Optional[List[Dict[str, Any]]]:
+        """Fetch recent closing deals with full accounting fields.
+
+        ``None`` means broker history could not be obtained; an empty list means
+        the query succeeded and found no closing deals.  Risk controls rely on
+        that distinction and must not translate a transport failure into zero
+        realized loss.
+        """
+        if not self._check_connection():
+            return None
+
+        to_time = datetime.now(timezone.utc)
+        from_time = to_time - timedelta(hours=max(1, int(lookback_hours)))
 
         try:
             deals = mt5.history_deals_get(from_time, to_time)
         except Exception:
-            return []
+            return None
 
         if deals is None:
-            return []
+            return None
 
         result: List[Dict[str, Any]] = []
         exit_entries = {
@@ -1575,12 +1675,27 @@ class MT5Connector:
             deal_time = getattr(deal, 'time', None)
             result.append({
                 'ticket': int(getattr(deal, 'ticket', 0) or 0),
+                'order_ticket': int(getattr(deal, 'order', 0) or 0),
                 'position_id': int(getattr(deal, 'position_id', 0) or 0),
                 'symbol': getattr(deal, 'symbol', ''),
                 'profit': float(getattr(deal, 'profit', 0.0) or 0.0),
+                'commission': float(getattr(deal, 'commission', 0.0) or 0.0),
+                'swap': float(getattr(deal, 'swap', 0.0) or 0.0),
+                'fee': float(getattr(deal, 'fee', 0.0) or 0.0),
+                'volume': float(getattr(deal, 'volume', 0.0) or 0.0),
+                'price': float(getattr(deal, 'price', 0.0) or 0.0),
+                'entry': entry_type,
+                'entry_kind': (
+                    'OUT_BY'
+                    if entry_type == getattr(mt5, 'DEAL_ENTRY_OUT_BY', 3)
+                    else 'OUT'
+                ),
+                'type': getattr(deal, 'type', None),
                 'comment': getattr(deal, 'comment', '') or '',
                 'magic': int(getattr(deal, 'magic', 0) or 0),
-                'time': datetime.fromtimestamp(deal_time) if deal_time else to_time,
+                'reason': getattr(deal, 'reason', None),
+                'time_msc': getattr(deal, 'time_msc', None),
+                'time': datetime.fromtimestamp(deal_time, tz=timezone.utc) if deal_time else to_time,
             })
         return result
     

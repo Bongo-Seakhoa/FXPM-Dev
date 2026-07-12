@@ -12,9 +12,13 @@ Validates:
   - Config fields propagate from PipelineConfig
 """
 
+import json
+import os
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, call, patch
 
 
@@ -100,6 +104,44 @@ def _make_trader(margin_level=0.0, positions=None, close_success=True, **cfg_ove
         portfolio_manager=pm,
         position_config=PositionConfig(),
         pipeline_config=pipeline_config,
+        enable_trading=False,
+    )
+    return trader
+
+
+def _make_persistent_trader(
+    root: Path,
+    *,
+    margin_level: float = 500.0,
+    positions=None,
+):
+    """Build the funded runtime path that owns durable margin state."""
+    from pm_core import PipelineConfig
+    from pm_main import LiveTrader
+    from pm_position import PositionConfig
+
+    mt5 = Mock()
+    mt5.is_connected.return_value = False
+    mt5.get_account_info.return_value = MockAccountInfo(
+        margin_level=margin_level,
+    )
+    mt5.get_positions.return_value = list(positions or [])
+    mt5.close_position.return_value = MockOrderResult(success=True)
+
+    pm = Mock()
+    pm.symbols = []
+    config = PipelineConfig(
+        output_dir=Path("runtime"),
+        log_dir=root / "logs",
+        live_outcome_feedback_enabled=False,
+    )
+    config._deployment_config_path = str(root / "config.json")
+    config._funded_live_execution = True
+    trader = LiveTrader(
+        mt5_connector=mt5,
+        portfolio_manager=pm,
+        position_config=PositionConfig(),
+        pipeline_config=config,
         enable_trading=False,
     )
     return trader
@@ -376,10 +418,10 @@ class TestConfigFieldsExist(unittest.TestCase):
     def test_pipeline_config_defaults(self):
         from pm_core import PipelineConfig
         cfg = PipelineConfig()
-        self.assertEqual(cfg.margin_entry_block_level, 100.0)
-        self.assertEqual(cfg.margin_recovery_start_level, 80.0)
-        self.assertEqual(cfg.margin_panic_level, 65.0)
-        self.assertEqual(cfg.margin_reopen_level, 100.0)
+        self.assertEqual(cfg.margin_entry_block_level, 200.0)
+        self.assertEqual(cfg.margin_recovery_start_level, 150.0)
+        self.assertEqual(cfg.margin_panic_level, 120.0)
+        self.assertEqual(cfg.margin_reopen_level, 300.0)
         self.assertEqual(cfg.margin_recovery_closes_per_cycle, 1)
         self.assertEqual(cfg.margin_panic_closes_per_cycle, 3)
         self.assertEqual(cfg.margin_reopen_cooldown_minutes, 15.0)
@@ -389,16 +431,16 @@ class TestEntryGateIntegration(unittest.TestCase):
     """Verify the entry gate blocks when margin_level is below threshold."""
 
     def test_margin_level_below_block_returns_early(self):
-        """Simulate a call context where margin_level < 100 should block."""
-        trader = _make_trader(margin_level=95.0)
+        """Simulate a call context where margin_level < 200 should block."""
+        trader = _make_trader(margin_level=195.0)
 
         # The entry gate is inside _execute_entry which has many dependencies.
         # Instead, test via the cycle state approach: _margin_state is set
         # by the cycle, and we can verify the entry gate logic independently.
 
         # Direct unit test of the gate condition:
-        margin_level = 95.0
-        margin_block = 100.0
+        margin_level = 195.0
+        margin_block = 200.0
         blocked = margin_level > 0 and margin_level < margin_block
         self.assertTrue(blocked)
 
@@ -477,11 +519,12 @@ class TestMarginReopenCooldown(unittest.TestCase):
         trader._run_margin_protection_cycle()
         self.assertIsNotNone(trader._last_margin_close_ts)
 
-    def test_failed_close_does_not_stamp_cooldown(self):
+    def test_failed_close_keeps_conservative_precommitted_cooldown(self):
         positions = [MockPosition(ticket=1, symbol="A", profit=-100.0, volume=0.10)]
         trader = _make_trader(margin_level=50.0, positions=positions, close_success=False)
         trader._run_margin_protection_cycle()
-        self.assertIsNone(trader._last_margin_close_ts)
+        self.assertIsNotNone(trader._last_margin_close_ts)
+        self.assertGreater(trader._margin_cooldown_remaining_minutes(), 14.0)
 
     def test_cooldown_blocks_within_window(self):
         trader = _make_trader(margin_level=500.0)
@@ -535,6 +578,210 @@ class TestMarginReopenCooldown(unittest.TestCase):
         trader._run_margin_protection_cycle()
         self.assertEqual(trader._margin_state, "NORMAL")
         self.assertFalse(getattr(trader, "_margin_reopen_required", False))
+
+
+class TestDurableMarginProtectionState(unittest.TestCase):
+    """The funded recovery latch and forced-close cooldown survive restart."""
+
+    def test_precommit_survives_post_close_save_failure_and_restart(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            positions = [
+                MockPosition(
+                    ticket=1,
+                    symbol="EURUSD",
+                    profit=-100.0,
+                    volume=0.10,
+                )
+            ]
+            trader = _make_persistent_trader(
+                root,
+                margin_level=50.0,
+                positions=positions,
+            )
+            # Start from a valid, already-latched record so the first replace
+            # inside the protection cycle is the pre-close timestamp commit.
+            trader._margin_reopen_required = True
+            trader._last_margin_close_ts = (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            )
+            self.assertTrue(trader._persist_margin_protection_state())
+            real_replace = os.replace
+            replace_calls = 0
+
+            def fail_post_close_replace(source, destination):
+                nonlocal replace_calls
+                replace_calls += 1
+                if replace_calls == 1:
+                    return real_replace(source, destination)
+                raise OSError("post-close state write interrupted")
+
+            close_started = datetime.now(timezone.utc)
+            with patch("pm_main.os.replace", side_effect=fail_post_close_replace):
+                changed = trader._run_margin_protection_cycle(
+                    account_info=MockAccountInfo(margin_level=50.0),
+                    positions_snapshot=positions,
+                )
+
+            self.assertTrue(changed)
+            trader.mt5.close_position.assert_called_once_with(positions[0])
+            self.assertEqual(replace_calls, 2)
+            self.assertIsNotNone(trader._margin_state_persistence_block_reason())
+
+            # The failed second save emulates termination immediately after a
+            # successful broker close. A clean process must still restore the
+            # first, pre-close commit rather than the old one-hour timestamp.
+            restarted = _make_persistent_trader(root)
+            self.assertTrue(restarted._is_margin_reopen_required())
+            self.assertGreaterEqual(
+                restarted._last_margin_close_ts.timestamp(),
+                close_started.timestamp(),
+            )
+            self.assertGreater(
+                restarted._margin_cooldown_remaining_minutes(),
+                14.0,
+            )
+
+    def test_successful_forced_close_is_durable_across_restart(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            positions = [
+                MockPosition(
+                    ticket=1,
+                    symbol="EURUSD",
+                    profit=-100.0,
+                    volume=0.10,
+                )
+            ]
+            trader = _make_persistent_trader(
+                root,
+                margin_level=50.0,
+                positions=positions,
+            )
+            trader._margin_reopen_required = False
+            trader._last_margin_close_ts = (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            )
+            self.assertTrue(trader._persist_margin_protection_state())
+            close_started = datetime.now(timezone.utc)
+
+            changed = trader._run_margin_protection_cycle(
+                account_info=MockAccountInfo(margin_level=50.0),
+                positions_snapshot=positions,
+            )
+
+            self.assertTrue(changed)
+            trader.mt5.close_position.assert_called_once_with(positions[0])
+            forced_close = trader._last_margin_close_ts
+            self.assertGreaterEqual(forced_close, close_started)
+
+            restarted = _make_persistent_trader(root)
+            self.assertTrue(restarted._is_margin_reopen_required())
+            self.assertAlmostEqual(
+                restarted._last_margin_close_ts.timestamp(),
+                forced_close.timestamp(),
+                delta=0.01,
+            )
+            self.assertGreater(
+                restarted._margin_cooldown_remaining_minutes(),
+                14.0,
+            )
+
+    def test_restart_restores_reopen_latch_and_forced_close_cooldown(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = _make_persistent_trader(root)
+            close_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+
+            # This is the same atomic state transition used by a successful
+            # forced margin close.
+            first._margin_reopen_required = False
+            first._last_margin_close_ts = None
+            first._arm_margin_reopen_required(last_forced_close=close_at)
+
+            state_path = root / "runtime" / "margin_protection_state.json"
+            self.assertEqual(first._margin_protection_state_path, state_path)
+            self.assertTrue(state_path.is_file())
+
+            restarted = _make_persistent_trader(root)
+            self.assertTrue(restarted._is_margin_reopen_required())
+            self.assertAlmostEqual(
+                restarted._last_margin_close_ts.timestamp(),
+                close_at.timestamp(),
+                delta=1.0,
+            )
+            self.assertGreater(
+                restarted._margin_cooldown_remaining_minutes(),
+                12.0,
+            )
+
+            # Reaching the 300% reopen threshold clears only the latch. The
+            # independently required 15-minute post-close cooldown survives.
+            restarted._clear_margin_reopen_if_recovered(300.0)
+            after_clear_restart = _make_persistent_trader(root)
+            self.assertFalse(after_clear_restart._is_margin_reopen_required())
+            self.assertGreater(
+                after_clear_restart._margin_cooldown_remaining_minutes(),
+                12.0,
+            )
+
+    def test_missing_state_bootstraps_a_durable_fail_closed_window(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            trader = _make_persistent_trader(root)
+
+            self.assertTrue(trader._is_margin_reopen_required())
+            self.assertEqual(trader._margin_state, "BLOCKED")
+            self.assertGreater(
+                trader._margin_cooldown_remaining_minutes(),
+                14.0,
+            )
+            self.assertEqual(trader._margin_state_persistence_error, "")
+            payload = json.loads(
+                trader._margin_protection_state_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                payload["schema_version"],
+                "2026-07-11-margin-protection-v1",
+            )
+            self.assertTrue(payload["margin_reopen_required"])
+            self.assertTrue(payload["last_forced_close_utc"].endswith("Z"))
+
+    def test_corrupt_state_is_replaced_with_fail_closed_state(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            initial = _make_persistent_trader(root)
+            state_path = initial._margin_protection_state_path
+            state_path.write_text("{not-json", encoding="utf-8")
+
+            restarted = _make_persistent_trader(root)
+
+            self.assertTrue(restarted._is_margin_reopen_required())
+            self.assertEqual(restarted._margin_state, "BLOCKED")
+            self.assertGreater(
+                restarted._margin_cooldown_remaining_minutes(),
+                14.0,
+            )
+            self.assertEqual(restarted._margin_state_persistence_error, "")
+            repaired = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(repaired["margin_reopen_required"])
+            self.assertIn("content_sha256", repaired)
+
+    def test_state_save_failure_blocks_entries_fail_closed(self):
+        with TemporaryDirectory() as temp_dir:
+            trader = _make_persistent_trader(Path(temp_dir))
+            trader._margin_reopen_required = False
+            trader._last_margin_close_ts = None
+
+            with patch("pm_main.os.replace", side_effect=OSError("disk unavailable")):
+                trader._arm_margin_reopen_required(
+                    last_forced_close=datetime.now(timezone.utc),
+                )
+
+            reason = trader._margin_state_persistence_block_reason()
+            self.assertIsNotNone(reason)
+            self.assertIn("state save failed", reason)
+            self.assertTrue(trader._is_margin_reopen_required())
 
 
 if __name__ == '__main__':
