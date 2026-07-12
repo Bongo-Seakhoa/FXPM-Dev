@@ -516,6 +516,59 @@ class HistorySyncTests(unittest.TestCase):
         self.assertEqual(len(bars), 2)
         self.assertGreaterEqual(fake.range_calls, 2)
 
+    def test_get_bars_range_does_not_trust_repeated_incomplete_cache_extent(self):
+        class _DelayedExpansionMT5(_SyncingMT5):
+            def copy_rates_range(self, symbol, timeframe, start_date, end_date):
+                self.range_calls += 1
+                recent = int((end_date - timedelta(minutes=5)).timestamp())
+                if self.range_calls < 4:
+                    return [dict(self._bar(), time=recent)]
+                return [
+                    dict(self._bar(), time=int(start_date.timestamp())),
+                    dict(self._bar(), time=recent),
+                ]
+
+        fake = _DelayedExpansionMT5()
+        connector = self._connector(fake)
+        bars = connector.get_bars_range(
+            "PLATINUM",
+            "M5",
+            datetime(2024, 1, 1, tzinfo=timezone.utc),
+            datetime(2024, 1, 10, tzinfo=timezone.utc),
+            sync_retry=True,
+        )
+
+        self.assertIsNotNone(bars)
+        self.assertEqual(len(bars), 2)
+        self.assertEqual(fake.range_calls, 4)
+        diagnostics = connector.get_last_history_range_diagnostics()
+        self.assertEqual(diagnostics["copy_rates_range_attempts"], 4)
+        self.assertTrue(diagnostics["boundary_complete"])
+        self.assertEqual(
+            bars.attrs["mt5_history_range_diagnostics"],
+            diagnostics,
+        )
+
+    def test_range_diagnostics_do_not_break_get_bars_and_reset_on_early_return(self):
+        connector = self._connector(_ImmediateMT5())
+        self.assertIsNotNone(connector.get_bars("PLATINUM", "M5", count=1))
+        connector._last_history_range_diagnostics = {
+            "copy_rates_range_attempts": 99
+        }
+
+        result = connector.get_bars_range(
+            "PLATINUM",
+            "UNKNOWN",
+            datetime(2024, 1, 1, tzinfo=timezone.utc),
+            datetime(2024, 1, 2, tzinfo=timezone.utc),
+            sync_retry=True,
+        )
+
+        self.assertIsNone(result)
+        diagnostics = connector.get_last_history_range_diagnostics()
+        self.assertEqual(diagnostics["copy_rates_range_attempts"], 0)
+        self.assertFalse(diagnostics["boundary_complete"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,8 +7,7 @@ import pytest
 
 from pm_core import PipelineConfig
 from pm_native_activation import (
-    ACTIVATION_MANIFEST_SCHEMA,
-    ACTIVE_POINTER_SCHEMA,
+    ActiveNativeUniverse,
     NATIVE_PRODUCTION_TIMEFRAMES,
     resolve_active_native_artifact,
     resolve_active_native_universe,
@@ -20,8 +19,12 @@ from tools.acquire_native_history import (
     ACQUISITION_CONTRACT_VERSION,
     DEFAULT_PAGE_DAYS,
     MANIFEST_SCHEMA_VERSION,
+    PAGINATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     TIMEFRAME_SECONDS,
+    cross_resolution_reference_map,
 )
 from tools.audit_activate_native_history import audit_and_activate
 
@@ -66,18 +69,132 @@ def _availability_request_contract(boundaries):
     }
 
 
+def _canonical_json_sha256(value) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _availability_v4_request_contract(boundaries):
+    timeframes = tuple(NATIVE_PRODUCTION_TIMEFRAMES)
+    common_start = pd.Timestamp(boundaries["optimizer_train"]["start_ts"])
+    common_as_of = pd.Timestamp(boundaries["final_lockbox"]["end_ts"])
+    serialized = {
+        timeframe: json.loads(json.dumps(boundaries)) for timeframe in timeframes
+    }
+    years = {
+        timeframe: {
+            "optimizer_train": 5,
+            "tuning_validation": 2,
+            "final_lockbox": 2,
+        }
+        for timeframe in timeframes
+    }
+    leads = {timeframe: common_start.isoformat() for timeframe in timeframes}
+    strategy_intervals = {}
+    for timeframe in timeframes:
+        seconds = TIMEFRAME_SECONDS[timeframe]
+        if timeframe in {"H4", "D1"}:
+            start = common_start - pd.Timedelta(seconds=seconds)
+            end = common_as_of + pd.Timedelta(seconds=1)
+        else:
+            start = common_start.floor(f"{seconds}s")
+            end = common_as_of.floor(f"{seconds}s")
+        strategy_intervals[timeframe] = {
+            "start_utc": start.isoformat(),
+            "end_exclusive_utc": end.isoformat(),
+        }
+    references = cross_resolution_reference_map(timeframes)
+    source_intervals = {
+        timeframe: dict(strategy_intervals[timeframe]) for timeframe in timeframes
+    }
+    for target, reference in references.items():
+        source_intervals[reference]["start_utc"] = min(
+            pd.Timestamp(source_intervals[reference]["start_utc"]),
+            pd.Timestamp(strategy_intervals[target]["start_utc"]),
+        ).isoformat()
+    audit_prefixes = {
+        timeframe: (
+            {
+                "start_utc": source_intervals[timeframe]["start_utc"],
+                "end_exclusive_utc": strategy_intervals[timeframe]["start_utc"],
+                "role": "audit_only_reference",
+            }
+            if source_intervals[timeframe]["start_utc"]
+            != strategy_intervals[timeframe]["start_utc"]
+            else None
+        )
+        for timeframe in timeframes
+    }
+    contract = {
+        **_availability_request_contract(boundaries),
+        "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        "timeframe_request_map_schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        "timeframe_window_years": years,
+        "timeframe_calendar_boundaries": serialized,
+        "timeframe_calendar_boundaries_sha256": _canonical_json_sha256(serialized),
+        "timeframe_required_evidence_lead_start_utc": leads,
+        "timeframe_source_request_intervals": source_intervals,
+        "timeframe_strategy_evidence_intervals": strategy_intervals,
+        "timeframe_audit_reference_map": references,
+        "timeframe_audit_only_prefix_intervals": audit_prefixes,
+    }
+    request_map_payload = {
+        "schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        "common_as_of_utc": common_as_of.isoformat(),
+        "timeframe_window_years": years,
+        "timeframe_calendar_boundaries": serialized,
+        "timeframe_required_evidence_lead_start_utc": leads,
+        "timeframe_source_request_intervals": source_intervals,
+        "timeframe_strategy_evidence_intervals": strategy_intervals,
+        "timeframe_audit_reference_map": references,
+        "timeframe_audit_only_prefix_intervals": audit_prefixes,
+    }
+    contract["timeframe_request_map_sha256"] = _canonical_json_sha256(
+        request_map_payload
+    )
+    leaves = {
+        timeframe: {
+            **contract,
+            "window_years": years[timeframe],
+            "common_calendar_boundaries": serialized[timeframe],
+            "cell_timeframe": timeframe,
+            "cell_timeframe_window_years": years[timeframe],
+            "cell_calendar_boundaries": serialized[timeframe],
+            "cell_required_evidence_lead_start_utc": leads[timeframe],
+            "source_request_interval": source_intervals[timeframe],
+            "strategy_evidence_interval": strategy_intervals[timeframe],
+            "audit_only_prefix_interval": audit_prefixes[timeframe],
+            "audit_reference_timeframe": references.get(timeframe),
+        }
+        for timeframe in timeframes
+    }
+    return contract, leaves
+
+
 def _availability_pagination(timeframe, request_contract, *, has_data):
     seconds = TIMEFRAME_SECONDS[timeframe]
     common_start = pd.Timestamp(request_contract["common_requested_start_utc"])
     common_as_of = pd.Timestamp(request_contract["common_as_of_utc"])
-    if timeframe in {"H4", "D1"}:
+    source_interval = request_contract.get("source_request_interval")
+    if isinstance(source_interval, dict):
+        fetch_start = pd.Timestamp(source_interval["start_utc"])
+        fetch_end = pd.Timestamp(source_interval["end_exclusive_utc"])
+    elif timeframe in {"H4", "D1"}:
         fetch_start = common_start - pd.Timedelta(seconds=seconds)
         fetch_end = common_as_of + pd.Timedelta(seconds=1)
-        alignment_mode = "broker_observed_successor_or_nominal_close_v1"
-        sentinel_slack = 1
     else:
         fetch_start = common_start.ceil(f"{seconds}s")
         fetch_end = common_as_of.floor(f"{seconds}s")
+    if timeframe in {"H4", "D1"}:
+        alignment_mode = "broker_observed_successor_or_nominal_close_v1"
+        sentinel_slack = 1
+    else:
         alignment_mode = "fixed_utc_native_boundary_v1"
         sentinel_slack = 0
     configured_slots = max(1, DEFAULT_PAGE_DAYS[timeframe] * 86400 // seconds)
@@ -108,6 +225,18 @@ def _availability_pagination(timeframe, request_contract, *, has_data):
         if index != data_index
     ]
     pages_with_data = 1 if data_index is not None else 0
+    page_attempts = []
+    for index, (start, end) in enumerate(intervals):
+        attempts = 1 if index == data_index else 3
+        page_attempts.append(
+            {
+                "start_utc": start.isoformat(),
+                "end_exclusive_utc": end.isoformat(),
+                "attempts": attempts,
+                "copy_rates_range_attempts": attempts,
+            }
+        )
+    attempts_total = sum(item["attempts"] for item in page_attempts)
     request = {
         **request_contract,
         "native_fetch_start_utc": fetch_start.isoformat(),
@@ -116,13 +245,16 @@ def _availability_pagination(timeframe, request_contract, *, has_data):
         "successor_sentinel_fetch_slack_seconds": sentinel_slack,
     }
     pagination = {
+        "contract_version": PAGINATION_CONTRACT_VERSION,
         "page_span_seconds": page_span_seconds,
         "pages_requested": len(intervals),
         "pages_with_data": pages_with_data,
         "empty_pages": empty_pages,
         "failed_pages": [],
         "truncated_pages": [],
-        "attempts_total": len(empty_pages) * 3 + pages_with_data,
+        "attempts_total": attempts_total,
+        "copy_rates_range_attempts_total": attempts_total,
+        "page_attempts": page_attempts,
         "retries_per_page": 3,
     }
     return request, pagination
@@ -134,6 +266,7 @@ def _write_unavailable_run(
     *,
     symbol: str = "SOLUSD",
     failure_status: str = "no_history",
+    production_v4: bool = False,
 ) -> None:
     run_root = native_root / "runs" / run_id
     run_root.mkdir(parents=True)
@@ -151,7 +284,16 @@ def _write_unavailable_run(
             "end_ts": "2026-01-15T00:00:00Z",
         },
     }
-    request_contract = _availability_request_contract(boundaries)
+    if production_v4:
+        request_contract, leaf_contracts = _availability_v4_request_contract(
+            boundaries
+        )
+    else:
+        request_contract = _availability_request_contract(boundaries)
+        leaf_contracts = {
+            timeframe: request_contract
+            for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+        }
     seconds = {
         "M5": 300,
         "M15": 900,
@@ -167,7 +309,7 @@ def _write_unavailable_run(
         status = "partial" if failure_status == "partial_history" else "failed"
         provenance_request, pagination = _availability_pagination(
             timeframe,
-            request_contract,
+            leaf_contracts[timeframe],
             has_data=failure_status in {"partial_history", "no_fully_closed_history"},
         )
         provenance = {
@@ -286,6 +428,7 @@ def test_short_history_symbol_is_immutable_excluded_no_trade_not_activation_fail
         native_root,
         "short-sol",
         failure_status="partial_history",
+        production_v4=True,
     )
 
     result = audit_and_activate(
@@ -366,6 +509,55 @@ def test_partial_history_corrupt_bars_are_activation_failure(tmp_path: Path) -> 
 
     assert result["status"] == "failed"
     assert not result["active_pointer_updated"]
+
+
+def test_internal_history_gap_is_technical_failure_not_no_trade(tmp_path: Path) -> None:
+    native_root = tmp_path / "data" / "native"
+    native_root.mkdir(parents=True)
+    run_id = "technical-gap"
+    _write_unavailable_run(
+        native_root,
+        run_id,
+        failure_status="partial_history",
+        production_v4=True,
+    )
+    provenance_path = (
+        native_root / "runs" / run_id / "SOLUSD" / "M5" / "provenance.json"
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["failure_status"] = "technical_history_gap"
+    provenance_path.write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = native_root / "runs" / run_id / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cell = next(
+        item
+        for item in manifest["results"]
+        if item["symbol"] == "SOLUSD" and item["timeframe"] == "M5"
+    )
+    cell["failure_status"] = "technical_history_gap"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    result = audit_and_activate(
+        native_root,
+        run_id=run_id,
+        symbols=["SOLUSD"],
+        timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+        activation_id="technical-gap-activation",
+    )
+
+    assert result["status"] == "failed"
+    assert not result["active_pointer_updated"]
+    assert result["entries"]["SOLUSD"]["M5"]["status"] == "failed"
+    assert any(
+        "NON_AVAILABILITY_FAILURE:technical_history_gap" in reason
+        for reason in result["entries"]["SOLUSD"]["M5"]["reason_codes"]
+    )
 
 
 def test_no_history_provenance_failure_status_must_match_manifest(tmp_path: Path) -> None:
@@ -622,7 +814,12 @@ def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
     data_dir = tmp_path / "data"
     native_root = data_dir / "native"
     native_root.mkdir(parents=True)
-    _write_unavailable_run(native_root, "new-ton", symbol="TONUSD")
+    _write_unavailable_run(
+        native_root,
+        "new-ton",
+        symbol="TONUSD",
+        production_v4=True,
+    )
     audit_and_activate(
         native_root,
         run_id="new-ton",
@@ -751,54 +948,6 @@ def test_calendar_loader_fails_before_legacy_m5_or_resampling(tmp_path: Path, mo
     )
 
 
-def _activate_manifest_only_eligible_symbol(
-    native_root: Path,
-    symbol: str,
-    activation_id: str,
-) -> None:
-    entries = {
-        symbol: {
-            timeframe: {
-                "status": "active",
-                "audit_status": "PASS",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "coverage_method": "train_only_robust_weekly_session_rate_v1",
-                "expected_session_coverage_by_partition": {
-                    "optimizer_train": 0.99,
-                    "tuning_validation": 0.99,
-                    "final_lockbox": 0.99,
-                },
-            }
-            for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
-        }
-    }
-    manifest = {
-        "schema_version": ACTIVATION_MANIFEST_SCHEMA,
-        "activation_id": activation_id,
-        "status": "active",
-        "entries": entries,
-    }
-    manifest_path = native_root / "activations" / f"{activation_id}.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    pointer = {
-        "schema_version": ACTIVE_POINTER_SCHEMA,
-        "activation_id": activation_id,
-        "manifest_relative_path": str(manifest_path.relative_to(native_root)).replace(
-            "\\", "/"
-        ),
-        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-    }
-    (native_root / "ACTIVE.json").write_text(
-        json.dumps(pointer, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-
 def test_later_eligibility_forces_old_exclusion_back_into_retraining(
     tmp_path: Path,
     monkeypatch,
@@ -806,7 +955,12 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
     data_dir = tmp_path / "data"
     native_root = data_dir / "native"
     native_root.mkdir(parents=True)
-    _write_unavailable_run(native_root, "old-unavailable", symbol="TONUSD")
+    _write_unavailable_run(
+        native_root,
+        "old-unavailable",
+        symbol="TONUSD",
+        production_v4=True,
+    )
     audit_and_activate(
         native_root,
         run_id="old-unavailable",
@@ -828,7 +982,31 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
     monkeypatch.setattr(manager, "_run_production_replay_audit", lambda: {})
     assert manager.initial_optimization() == {}
 
-    _activate_manifest_only_eligible_symbol(native_root, "TONUSD", "now-eligible")
+    authenticated_eligible = ActiveNativeUniverse(
+        activation_id="now-eligible",
+        activation_manifest_sha256="b" * 64,
+        requested_symbols=("TONUSD",),
+        required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+        eligible_symbols=("TONUSD",),
+        cell_statuses={
+            "TONUSD": {
+                timeframe: "active"
+                for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+            }
+        },
+        symbols_with_active_cells=("TONUSD",),
+        explicit_contract=True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_native_universe_for_optimization",
+        lambda: authenticated_eligible,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_preflight_active_regime_provenance",
+        lambda *_args, **_kwargs: None,
+    )
     calls = []
 
     def run_for_symbol(symbol: str) -> PipelineResult:

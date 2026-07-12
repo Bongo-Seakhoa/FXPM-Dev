@@ -1145,6 +1145,7 @@ def validate_live_readiness(config: Any,
                 native_data_dir,
                 requested_symbols,
                 required_timeframes=required_timeframes,
+                production_contract_required=True,
             )
         except Exception as exc:
             native_universe = None
@@ -1727,7 +1728,10 @@ def validate_live_readiness(config: Any,
                 }
                 for symbol, timeframe in sorted(tradeable_sources):
                     resolution = resolve_active_native_artifact(
-                        data_dir, symbol, timeframe
+                        data_dir,
+                        symbol,
+                        timeframe,
+                        production_contract_required=True,
                     )
                     if not resolution.valid:
                         reasons = ",".join(resolution.errors) or "unresolved"

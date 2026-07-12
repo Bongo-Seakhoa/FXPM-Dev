@@ -17,7 +17,7 @@ Version: 3.1 (Portfolio Manager)
 
 import logging
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Any, Tuple
 from enum import Enum
 import time
@@ -350,6 +350,12 @@ class MT5Connector:
         self._connected = False
         self._symbol_cache: Dict[str, MT5SymbolInfo] = {}
         self._broker_symbol_cache: Dict[str, str] = {}
+        self._last_history_range_diagnostics: Dict[str, Any] = {}
+
+    def get_last_history_range_diagnostics(self) -> Dict[str, Any]:
+        """Return a copy of the most recent range-fetch synchronization facts."""
+
+        return dict(self._last_history_range_diagnostics)
     
     # =========================================================================
     # Connection Management
@@ -704,9 +710,6 @@ class MT5Connector:
                 logger.debug(f"copy_rates fetch failed for {broker_symbol}: {exc}")
                 return None
 
-        # A UTC anchor "now" is identical in epoch to a naive local now, but using
-        # tz-aware UTC keeps fixed historical anchors (deep backfill) correct too.
-        utc_now = datetime.now(timezone.utc)
         rates = _rates(from_date)
         best = rates
         best_len = _len(rates)
@@ -987,14 +990,25 @@ class MT5Connector:
             end_date: End date
             sync_retry: When True, poll an empty *or boundary-incomplete* result
                 while the terminal downloads/builds the requested timeseries.
-                The widest response seen is retained and polling stops once an
-                incomplete response stabilizes. Off by default so the live
+                The widest response seen is retained and polling uses the full
+                bounded budget unless both requested boundaries are covered.
+                Off by default so the live
                 delta-sync hot path is not slowed by a normal "no new bars"
                 result.
 
         Returns:
             DataFrame with OHLCV data or None
         """
+        self._last_history_range_diagnostics = {
+            "symbol": str(symbol),
+            "broker_symbol": None,
+            "timeframe": str(timeframe).upper(),
+            "sync_retry": bool(sync_retry),
+            "copy_rates_range_attempts": 0,
+            "copy_rates_range_max_attempts": 0,
+            "boundary_complete": False,
+            "best_extent": None,
+        }
         if not self._check_connection():
             return None
 
@@ -1077,6 +1091,8 @@ class MT5Connector:
             )
 
         rates = _copy_range()
+        attempts = 1
+        max_attempts = 1
 
         if sync_retry:
             max_attempts = max(
@@ -1096,13 +1112,11 @@ class MT5Connector:
 
             best = rates
             best_extent = _range_extent(best)
-            previous_extent = best_extent
-            attempts = 1
             # A response spanning both requested boundaries is already usable.
             # Otherwise MT5 may still be asynchronously extending/building the
-            # series even though the first call returned some rows. Poll until
-            # it becomes complete, stabilizes twice, or exhausts the budget.
-            stable_incomplete = 0
+            # series even though repeated calls return the same cached tail.
+            # Only boundary completion or the explicit attempt budget may stop
+            # synchronization; one repeated incomplete extent proves nothing.
             while attempts < max_attempts and not _boundary_complete(best_extent):
                 if sleep_s > 0:
                     time.sleep(sleep_s)
@@ -1119,14 +1133,27 @@ class MT5Connector:
                         span = last - first
                         if (span, extent[0]) > (best_span, best_extent[0]):
                             best, best_extent = candidate, extent
-                if extent is not None and extent == previous_extent:
-                    stable_incomplete += 1
-                else:
-                    stable_incomplete = 0
-                previous_extent = extent
-                if stable_incomplete >= 1:
-                    break
             rates = best
+
+        final_extent = _range_extent(rates)
+        self._last_history_range_diagnostics = {
+            "symbol": str(symbol),
+            "broker_symbol": str(broker_symbol),
+            "timeframe": str(timeframe).upper(),
+            "sync_retry": bool(sync_retry),
+            "copy_rates_range_attempts": int(attempts),
+            "copy_rates_range_max_attempts": int(max_attempts),
+            "boundary_complete": bool(_boundary_complete(final_extent)),
+            "best_extent": (
+                {
+                    "rows": int(final_extent[0]),
+                    "first_epoch_second": int(final_extent[1]),
+                    "last_epoch_second": int(final_extent[2]),
+                }
+                if final_extent is not None
+                else None
+            ),
+        }
 
         if rates is None or len(rates) == 0:
             if sync_retry:
@@ -1145,6 +1172,9 @@ class MT5Connector:
             'spread': 'Spread',
             'real_volume': 'RealVolume'
         })
+        df.attrs["mt5_history_range_diagnostics"] = dict(
+            self._last_history_range_diagnostics
+        )
         
         return df
     

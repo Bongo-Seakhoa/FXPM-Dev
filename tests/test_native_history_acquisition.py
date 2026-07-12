@@ -18,9 +18,12 @@ if str(PATCH_ROOT) not in sys.path:
     sys.path.insert(0, str(PATCH_ROOT))
 
 from tools.acquire_native_history import (  # noqa: E402
+    ACQUISITION_CONTRACT_VERSION,
     DEFAULT_TIMEFRAMES,
     LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
+    SEGMENTED_SESSION_COVERAGE_METHOD_V2,
     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     ConcurrentWriterError,
     NativeHistoryAcquirer,
     NativeHistoryRunLock,
@@ -29,6 +32,7 @@ from tools.acquire_native_history import (  # noqa: E402
     NativeHistoryStore,
     TIMEFRAME_SECONDS,
     build_common_partition_windows,
+    cross_resolution_reference_map,
     expected_session_coverage_by_partition,
     load_native_history_resume_contract,
     main,
@@ -95,7 +99,7 @@ def _scheduled_hourly_index(kind):
 def _minimal_provenance(run_id, symbol="EURUSD", timeframe="M5"):
     return {
         "schema_version": "fxpm-native-bars-v1",
-        "acquisition_contract_version": "2026-07-10-native-calendar-acquisition-v1",
+        "acquisition_contract_version": ACQUISITION_CONTRACT_VERSION,
         "immutable_record": True,
         "run_id": run_id,
         "status": "success",
@@ -268,12 +272,94 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 (store.run_root / "NEWCFD" / "M5" / "provenance.json").read_text(encoding="utf-8")
             )
             self.assertEqual(sidecar["status"], "partial")
-            self.assertEqual(sidecar["failure_status"], "partial_history")
+            self.assertEqual(
+                sidecar["failure_status"],
+                "boundary_history_shortfall",
+            )
             self.assertFalse(sidecar["eligible_for_optimization"])
             self.assertEqual(sidecar["coverage"]["status"], "partial_requested_span")
             self.assertGreater(sidecar["coverage"]["start_delay_seconds"], 300 * 86400)
+            self.assertEqual(
+                sidecar["coverage"]["technical_integrity_status"],
+                "complete_page_ledger",
+            )
+            self.assertEqual(sidecar["coverage"]["internal_empty_page_count"], 0)
+            self.assertEqual(sidecar["coverage"]["internal_truncated_page_count"], 0)
             self.assertFalse(sidecar["coverage"]["market_calendar_completeness_assessed"])
             self.assertTrue((store.run_root / "NEWCFD" / "M5" / "bars.csv").exists())
+
+    def test_outer_retry_continues_after_internal_sync_budget_returns_partial_tail(self):
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        end = datetime(2024, 1, 10, tzinfo=UTC)
+
+        class _DelayedBoundaryConnector:
+            def __init__(self):
+                self.calls = 0
+
+            def get_bars_range(
+                self,
+                symbol,
+                timeframe,
+                start_date,
+                end_date,
+                sync_retry=False,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    frame = _bar_frame([end_date - timedelta(minutes=5)])
+                    attempts = 6
+                    complete = False
+                else:
+                    frame = _bar_frame(
+                        [start_date, end_date - timedelta(minutes=5)]
+                    )
+                    attempts = 1
+                    complete = True
+                frame.attrs["mt5_history_range_diagnostics"] = {
+                    "copy_rates_range_attempts": attempts,
+                    "boundary_complete": complete,
+                    "best_extent": {
+                        "rows": len(frame),
+                        "first_epoch_second": int(frame.index[0].timestamp()),
+                        "last_epoch_second": int(frame.index[-1].timestamp()),
+                    },
+                }
+                return frame
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            store = NativeHistoryStore(native_root, "outer-sync-retry")
+            request = NativeHistoryRequest(
+                symbols=("EURUSD",),
+                timeframes=("M5",),
+                horizon_years=1,
+                as_of_utc=end,
+                retries=3,
+                retry_sleep_seconds=0.0,
+                enforce_evidence_horizon=False,
+            )
+            connector = _DelayedBoundaryConnector()
+            acquirer = NativeHistoryAcquirer(
+                connector,
+                store,
+                request,
+                now_fn=lambda: end,
+                runtime_metadata={},
+            )
+
+            frame, outcome = acquirer._fetch_page(
+                "EURUSD",
+                "M5",
+                start,
+                end,
+            )
+
+            self.assertIsNotNone(frame)
+            self.assertEqual(len(frame), 2)
+            self.assertEqual(connector.calls, 2)
+            self.assertEqual(outcome["attempts"], 2)
+            self.assertEqual(outcome["copy_rates_range_attempts"], 7)
+            store.close()
 
     def test_csv_write_failure_exposes_no_partial_artifact_or_canonical_change(self):
         as_of = datetime(2026, 1, 10, 12, 2, tzinfo=UTC)
@@ -387,6 +473,12 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             self.assertEqual(sidecar["coverage"]["start_delay_seconds"], 0.0)
             self.assertEqual(sidecar["coverage"]["end_lag_seconds"], 0.0)
             self.assertEqual(sidecar["coverage"]["truncated_page_count"], 1)
+            self.assertEqual(sidecar["failure_status"], "technical_history_gap")
+            self.assertEqual(sidecar["coverage"]["internal_truncated_page_count"], 1)
+            self.assertEqual(
+                sidecar["coverage"]["technical_integrity_status"],
+                "internal_gap_detected",
+            )
             self.assertEqual(len(sidecar["pagination"]["truncated_pages"]), 1)
             self.assertFalse(sidecar["eligible_for_optimization"])
 
@@ -682,6 +774,48 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_nonaligned_partition_counts_match_pipeline_full_bar_containment(self):
+        from pm_pipeline import OptimizationPipeline
+
+        index = pd.date_range(
+            "2019-12-31T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            freq="h",
+            inclusive="left",
+        )
+        frame = _bar_frame(index)
+        frame["_BAR_CLOSE_TS"] = frame.index + pd.Timedelta(hours=1)
+        windows = {
+            "optimizer_train": (
+                datetime(2020, 1, 1, 0, 7, tzinfo=UTC),
+                datetime(2022, 1, 1, 0, 7, tzinfo=UTC),
+            ),
+            "tuning_validation": (
+                datetime(2022, 1, 1, 0, 7, tzinfo=UTC),
+                datetime(2024, 1, 1, 0, 7, tzinfo=UTC),
+            ),
+            "final_lockbox": (
+                datetime(2024, 1, 1, 0, 7, tzinfo=UTC),
+                datetime(2026, 1, 1, 0, 7, tzinfo=UTC),
+            ),
+        }
+
+        _coverage, details = segmented_session_coverage_by_partition_v2(
+            frame,
+            windows,
+        )
+
+        for partition, (start, end) in windows.items():
+            sliced = OptimizationPipeline._slice_time_window(
+                frame,
+                pd.Timestamp(start),
+                pd.Timestamp(end),
+            )
+            self.assertEqual(
+                details["partitions"][partition]["observed_rows"],
+                len(sliced),
+            )
+
     def test_effective_acquisition_start_precedes_train_by_warmup_safety_and_close_slack(self):
         as_of = datetime(2026, 1, 1, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as tmp:
@@ -717,11 +851,11 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             )
             store.close()
 
-    def test_timeframe_v3_fetches_d1_earlier_without_expanding_m5(self):
+    def test_timeframe_v4_extends_only_adjacent_audit_references(self):
         as_of = datetime(2026, 1, 5, tzinfo=UTC)
         request = NativeHistoryRequest(
             symbols=("EURUSD",),
-            timeframes=("M5", "D1"),
+            timeframes=DEFAULT_TIMEFRAMES,
             as_of_utc=as_of,
             retries=1,
             retry_sleep_seconds=0.0,
@@ -754,6 +888,35 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             d1_source_start = acquirer.timeframe_source_request_intervals["D1"][0]
             self.assertLess(d1_source_start, m5_source_start - timedelta(days=6 * 365))
             self.assertGreater(m5_source_start, datetime(2016, 1, 1, tzinfo=UTC))
+            self.assertEqual(
+                acquirer.timeframe_audit_reference_map,
+                {
+                    "M5": "M15",
+                    "M15": "M5",
+                    "M30": "M15",
+                    "H1": "M30",
+                    "H4": "H1",
+                    "D1": "H4",
+                },
+            )
+            self.assertEqual(
+                acquirer.timeframe_audit_reference_map,
+                cross_resolution_reference_map(DEFAULT_TIMEFRAMES),
+            )
+            m5_audit_prefix = acquirer.timeframe_audit_only_prefix_intervals["M5"]
+            self.assertIsNotNone(m5_audit_prefix)
+            self.assertLessEqual(
+                m5_audit_prefix[1] - m5_audit_prefix[0],
+                timedelta(minutes=15),
+            )
+            self.assertIsNotNone(
+                acquirer.timeframe_audit_only_prefix_intervals["H4"]
+            )
+            d1_train_start = acquirer.timeframe_partition_windows["D1"][
+                "optimizer_train"
+            ][0]
+            h4_audit_start = acquirer.timeframe_source_request_intervals["H4"][0]
+            self.assertLessEqual(h4_audit_start, d1_train_start)
 
             manifest = acquirer.acquire()
             self.assertTrue(manifest["complete"])
@@ -769,11 +932,31 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             )
             for timeframe, sidecar in (("M5", m5_sidecar), ("D1", d1_sidecar)):
                 sidecar_request = sidecar["request"]
+                pagination = sidecar["pagination"]
+                self.assertGreaterEqual(
+                    pagination["copy_rates_range_attempts_total"],
+                    pagination["attempts_total"],
+                )
+                self.assertEqual(
+                    len(pagination["page_attempts"]),
+                    pagination["pages_requested"],
+                )
+                self.assertEqual(
+                    sum(
+                        page["copy_rates_range_attempts"]
+                        for page in pagination["page_attempts"]
+                    ),
+                    pagination["copy_rates_range_attempts_total"],
+                )
                 self.assertEqual(
                     sidecar_request["window_contract_version"],
                     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
                 )
                 self.assertEqual(sidecar_request["cell_timeframe"], timeframe)
+                self.assertEqual(
+                    sidecar_request["timeframe_request_map_schema_version"],
+                    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+                )
                 self.assertEqual(
                     sidecar_request["cell_calendar_boundaries"],
                     sidecar_request["timeframe_calendar_boundaries"][timeframe],
@@ -790,7 +973,19 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                     sidecar["expected_session_coverage_details_by_partition"][
                         "method"
                     ],
-                    "timestamp_segmented_weekly_session_rate_v2",
+                    SEGMENTED_SESSION_COVERAGE_METHOD_V2,
+                )
+                self.assertEqual(
+                    sidecar_request["strategy_evidence_interval"],
+                    sidecar_request["timeframe_strategy_evidence_intervals"][timeframe],
+                )
+                self.assertEqual(
+                    sidecar_request["audit_only_prefix_interval"],
+                    sidecar_request["timeframe_audit_only_prefix_intervals"][timeframe],
+                )
+                self.assertEqual(
+                    sidecar_request["audit_reference_timeframe"],
+                    sidecar_request["timeframe_audit_reference_map"][timeframe],
                 )
                 self.assertEqual(
                     len(sidecar_request["timeframe_calendar_boundaries_sha256"]),
@@ -808,6 +1003,61 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 manifest["request"]["timeframe_calendar_boundaries"],
                 m5_sidecar["request"]["timeframe_calendar_boundaries"],
             )
+            store.close()
+
+    def test_timeframe_v4_reference_depth_covers_non_aligned_real_cutoff(self):
+        as_of = datetime(2026, 7, 12, 17, 33, 41, tzinfo=UTC)
+        request = NativeHistoryRequest(
+            symbols=("EURUSD",),
+            timeframes=DEFAULT_TIMEFRAMES,
+            as_of_utc=as_of,
+            retries=1,
+            retry_sleep_seconds=0.0,
+            timeframe_window_years={},
+            window_contract_version=TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            store = NativeHistoryStore(native_root, "timeframe-v4-nonaligned")
+            acquirer = NativeHistoryAcquirer(
+                _RangeConnector(),
+                store,
+                request,
+                now_fn=lambda: as_of,
+            )
+
+            for target, reference in acquirer.timeframe_audit_reference_map.items():
+                reference_start = acquirer.timeframe_source_request_intervals[
+                    reference
+                ][0]
+                target_lead = acquirer.timeframe_required_evidence_lead_start_utc[
+                    target
+                ]
+                self.assertIsNotNone(target_lead)
+                self.assertLessEqual(
+                    reference_start,
+                    target_lead,
+                    f"{target}->{reference} omits its containing reference bar",
+                )
+
+            self.assertEqual(acquirer.as_of_utc.minute, 30)
+            self.assertEqual(
+                acquirer.timeframe_required_evidence_lead_start_utc["H4"].minute,
+                30,
+            )
+            self.assertEqual(
+                acquirer.timeframe_source_request_intervals["H1"][0].minute,
+                0,
+            )
+            resume_contract = acquirer._common_request_contract()
+            self.assertEqual(
+                resume_contract["timeframe_request_map_schema_version"],
+                TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+            )
+            self.assertIn("timeframe_strategy_evidence_intervals", resume_contract)
+            self.assertIn("timeframe_audit_reference_map", resume_contract)
+            self.assertIn("timeframe_audit_only_prefix_intervals", resume_contract)
+            store.close()
 
     def test_legacy_flat_window_request_remains_reproducible(self):
         as_of = datetime(2026, 1, 5, tzinfo=UTC)

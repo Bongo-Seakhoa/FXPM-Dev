@@ -11,12 +11,15 @@ from pm_core import PipelineConfig
 from pm_evidence import (
     CALENDAR_SPLIT_MODE,
     EVIDENCE_CONTRACT_VERSION,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     build_calendar_boundaries,
+    build_timeframe_calendar_boundaries,
     calendar_window_meta,
     latest_closed_bar_end,
     trim_to_closed_bars,
     validate_timeframe_evidence,
 )
+from pm_native_activation import ActiveNativeUniverse, NATIVE_PRODUCTION_TIMEFRAMES
 from pm_pipeline import OptimizationPipeline
 from pm_regime import (
     REGIME_PROVENANCE_FIT_SCOPE,
@@ -148,11 +151,42 @@ def test_calendar_tuner_fits_requested_native_timeframe_and_records_authority():
             evidence_as_of_utc="2026-01-01T00:00:00Z",
         )
         tuner = RegimeParamTuner(root, config=cfg)
+        as_of = pd.Timestamp(cfg.evidence_as_of_utc)
+        timeframe_boundaries = {
+            timeframe: build_timeframe_calendar_boundaries(
+                as_of,
+                timeframe,
+                timeframe_window_years=cfg.evidence_timeframe_window_years,
+                embargo=pd.Timedelta(days=cfg.evidence_purge_days),
+            ).to_dict()["windows"]
+            for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+        }
+        active_universe = ActiveNativeUniverse(
+            activation_id="activation-v4-test",
+            activation_manifest_sha256="c" * 64,
+            requested_symbols=("EURUSD",),
+            required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+            eligible_symbols=("EURUSD",),
+            cell_statuses={
+                "EURUSD": {
+                    timeframe: "active"
+                    for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+                }
+            },
+            symbols_with_active_cells=("EURUSD",),
+            calendar_contract={
+                "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+                "common_as_of_utc": as_of.isoformat(),
+                "timeframe_window_years": cfg.evidence_timeframe_window_years,
+                "timeframe_calendar_boundaries": timeframe_boundaries,
+            },
+            explicit_contract=True,
+        )
         m5_index = pd.date_range("2016-01-01T00:00:00Z", "2025-12-31T00:00:00Z", freq="D")
         m5_index = m5_index.append(pd.DatetimeIndex([pd.Timestamp("2025-12-31T23:55:00Z")]))
         m5 = _ohlc(m5_index)
         h4 = _business_h4(
-            pd.Timestamp("2016-01-01T00:00:00Z"),
+            pd.Timestamp("2013-01-01T00:00:00Z"),
             pd.Timestamp("2026-01-01T00:00:00Z"),
         )
         m5_meta = _source_meta(str(root / "native" / "EURUSD_M5.csv"))
@@ -162,7 +196,10 @@ def test_calendar_tuner_fits_requested_native_timeframe_and_records_authority():
         def load_native(_symbol, timeframe):
             return (m5.copy(), dict(m5_meta)) if timeframe == "M5" else (h4.copy(), dict(h4_meta))
 
-        with mock.patch.object(
+        with mock.patch(
+            "pm_regime_tuner.resolve_active_native_universe",
+            return_value=active_universe,
+        ) as resolve_universe, mock.patch.object(
             tuner.native_data_loader,
             "load_native_timeframe",
             side_effect=load_native,
@@ -171,11 +208,19 @@ def test_calendar_tuner_fits_requested_native_timeframe_and_records_authority():
                 "EURUSD", "H4"
             )
 
+        resolve_universe.assert_called_once_with(
+            root,
+            required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+            production_contract_required=True,
+        )
         assert not selected.empty
         assert selected_source["sha256"] == "b" * 64
         assert fit_meta["split"]["source_authority"] == "broker_native_timeframe"
-        assert fit_meta["split"]["contract_version"] == EVIDENCE_CONTRACT_VERSION
-        assert fit_meta["train"]["start_ts"] == "2016-12-18T00:00:00+00:00"
+        assert (
+            fit_meta["split"]["contract_version"]
+            == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+        )
+        assert fit_meta["train"]["start_ts"] == "2013-12-18T00:00:00+00:00"
         assert fit_meta["train"]["end_ts_exclusive"] == "2021-12-18T00:00:00+00:00"
 
 

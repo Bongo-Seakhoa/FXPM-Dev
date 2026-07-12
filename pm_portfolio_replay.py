@@ -639,6 +639,7 @@ def active_native_portfolio_contract(
         requested_symbols,
         required_timeframes=requested_timeframes,
         verify_exclusion_evidence=verify_exclusion_evidence,
+        production_contract_required=True,
     )
     errors.extend(universe.errors)
     eligible_symbols = set(universe.eligible_symbols)

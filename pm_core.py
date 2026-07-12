@@ -3598,7 +3598,12 @@ class DataLoader:
         # Native production data is resolved only through one atomic,
         # hash-pinned activation. Never scan flat files and never silently
         # substitute an M5-derived artifact here.
-        activation = resolve_active_native_artifact(self.data_dir, symbol, tf)
+        activation = resolve_active_native_artifact(
+            self.data_dir,
+            symbol,
+            tf,
+            production_contract_required=True,
+        )
         if not activation.valid:
             return None, {
                 "source_kind": "missing",

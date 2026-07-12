@@ -239,7 +239,7 @@ def test_calendar_trim_prefers_audited_broker_close_over_nominal_d1_utc_close():
     assert latest == pd.Timestamp("2025-03-30T21:00:00Z")
 
 
-def test_native_loader_requires_hash_pinned_active_manifest_and_sidecar():
+def test_native_loader_rejects_legacy_active_manifest_without_production_contract():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         native = root / "native"
@@ -304,48 +304,21 @@ def test_native_loader_requires_hash_pinned_active_manifest_and_sidecar():
 
         loader = DataLoader(root, cache_resampled=False)
         loaded, meta = loader.load_native_timeframe("EURUSD", "H4")
-        assert loaded is not None
-        assert meta["source_kind"] == "broker_native"
-        assert meta["provenance_valid"]
-        assert meta["sha256"] == digest
-
-        manifest_2 = json.loads(json.dumps(manifest))
-        manifest_2["activation_id"] = "activation-2"
-        manifest_2_path = native / "activations" / "activation-2.json"
-        manifest_2_path.write_text(json.dumps(manifest_2), encoding="utf-8")
-        pointer_2 = {
-            "schema_version": ACTIVE_POINTER_SCHEMA,
-            "activation_id": "activation-2",
-            "manifest_relative_path": manifest_2_path.relative_to(native).as_posix(),
-            "manifest_sha256": sha256_file(manifest_2_path),
-        }
-        (native / "ACTIVE.json").write_text(json.dumps(pointer_2), encoding="utf-8")
-        mixed, mixed_meta = loader.load_native_timeframe("EURUSD", "H4")
-        assert mixed is None
-        assert "NATIVE_ACTIVATION_CHANGED_DURING_LOADER_LIFETIME" in mixed_meta[
+        assert loaded is None
+        assert not meta["provenance_valid"]
+        assert "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED" in meta[
             "provenance_errors"
         ]
 
-        # Restore the first activation before testing tamper detection with a
-        # fresh loader instance.
-        (native / "ACTIVE.json").write_text(json.dumps(pointer), encoding="utf-8")
-
-        sidecar["sha256"] = "0" * 64
-        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
-        reloaded, bad_meta = DataLoader(root, cache_resampled=False).load_native_timeframe(
-            "EURUSD", "H4"
-        )
-        assert reloaded is None
-        assert not bad_meta["provenance_valid"]
-        assert "NATIVE_ACTIVE_SIDECAR_SHA256_MISMATCH" in bad_meta["provenance_errors"]
-
-        # A flat file is never a fallback when the active audited cell is invalid.
+        # A flat file is never a fallback when the production contract is absent.
         (native / "EURUSD_H4.csv").write_text("time,Open,High,Low,Close\n", encoding="utf-8")
         still_missing, strict_meta = DataLoader(root, cache_resampled=False).load_native_timeframe(
             "EURUSD", "H4"
         )
         assert still_missing is None
-        assert "NATIVE_ACTIVE_SIDECAR_SHA256_MISMATCH" in strict_meta["provenance_errors"]
+        assert "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED" in strict_meta[
+            "provenance_errors"
+        ]
 
 
 def test_pipeline_evidence_failure_emits_four_markers_before_features_or_optimizer():

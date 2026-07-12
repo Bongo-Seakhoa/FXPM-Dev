@@ -21,16 +21,19 @@ from pm_native_activation import (  # noqa: E402
 )
 from pm_native_parity import (  # noqa: E402
     ParityThresholds,
+    audit_native_cross_resolution,
     audit_native_vs_session_m5,
 )
 from tools.acquire_native_history import (  # noqa: E402
     ACQUISITION_CONTRACT_VERSION,
     DEFAULT_PAGE_DAYS,
+    PAGINATION_CONTRACT_VERSION,
     SEGMENTED_SESSION_COVERAGE_METHOD_V2,
     SCHEMA_VERSION,
     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     TIMEFRAME_SECONDS,
+    cross_resolution_reference_map,
     expected_session_coverage_by_partition,
     segmented_session_coverage_by_partition_v2,
 )
@@ -126,13 +129,35 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
         ).isoformat()
         for timeframe in timeframes
     }
-    intervals = {
+    strategy_intervals = {
         timeframe: {
             "start_utc": pd.Timestamp(
                 timeframe_windows[timeframe]["optimizer_train"][0]
             ).isoformat(),
             "end_exclusive_utc": common_as_of.isoformat(),
         }
+        for timeframe in timeframes
+    }
+    references = cross_resolution_reference_map(timeframes)
+    intervals = {
+        timeframe: dict(strategy_intervals[timeframe]) for timeframe in timeframes
+    }
+    for target, reference in references.items():
+        intervals[reference]["start_utc"] = min(
+            pd.Timestamp(intervals[reference]["start_utc"]),
+            pd.Timestamp(strategy_intervals[target]["start_utc"]),
+        ).isoformat()
+    audit_prefixes = {
+        timeframe: (
+            {
+                "start_utc": intervals[timeframe]["start_utc"],
+                "end_exclusive_utc": strategy_intervals[timeframe]["start_utc"],
+                "role": "audit_only_reference",
+            }
+            if intervals[timeframe]["start_utc"]
+            != strategy_intervals[timeframe]["start_utc"]
+            else None
+        )
         for timeframe in timeframes
     }
     compatibility_timeframe = "M5" if "M5" in timeframes else timeframes[0]
@@ -161,6 +186,9 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
         "timeframe_calendar_boundaries_sha256": _canonical_json_sha256(serialized),
         "timeframe_required_evidence_lead_start_utc": leads,
         "timeframe_source_request_intervals": intervals,
+        "timeframe_strategy_evidence_intervals": strategy_intervals,
+        "timeframe_audit_reference_map": references,
+        "timeframe_audit_only_prefix_intervals": audit_prefixes,
     }
     request_map_payload = {
         "schema_version": TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
@@ -170,6 +198,9 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
         "timeframe_calendar_boundaries": serialized,
         "timeframe_required_evidence_lead_start_utc": leads,
         "timeframe_source_request_intervals": intervals,
+        "timeframe_strategy_evidence_intervals": strategy_intervals,
+        "timeframe_audit_reference_map": references,
+        "timeframe_audit_only_prefix_intervals": audit_prefixes,
     }
     contract["timeframe_request_map_sha256"] = _canonical_json_sha256(
         request_map_payload
@@ -184,6 +215,9 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
             "cell_calendar_boundaries": serialized[timeframe],
             "cell_required_evidence_lead_start_utc": leads[timeframe],
             "source_request_interval": intervals[timeframe],
+            "strategy_evidence_interval": strategy_intervals[timeframe],
+            "audit_only_prefix_interval": audit_prefixes[timeframe],
+            "audit_reference_timeframe": references.get(timeframe),
         }
         for timeframe in timeframes
     }
@@ -215,6 +249,22 @@ def _pagination_contract(timeframe, request_contract, source_interval=None):
     pages_requested = int(
         np.ceil((fetch_end - fetch_start).total_seconds() / page_span_seconds)
     )
+    page_attempts = []
+    cursor = fetch_start
+    while cursor < fetch_end:
+        page_end = min(
+            cursor + pd.Timedelta(seconds=page_span_seconds),
+            fetch_end,
+        )
+        page_attempts.append(
+            {
+                "start_utc": cursor.isoformat(),
+                "end_exclusive_utc": page_end.isoformat(),
+                "attempts": 1,
+                "copy_rates_range_attempts": 1,
+            }
+        )
+        cursor = page_end
     request = {
         **request_contract,
         "native_fetch_start_utc": fetch_start.isoformat(),
@@ -223,6 +273,7 @@ def _pagination_contract(timeframe, request_contract, source_interval=None):
         "successor_sentinel_fetch_slack_seconds": sentinel_slack,
     }
     pagination = {
+        "contract_version": PAGINATION_CONTRACT_VERSION,
         "page_span_seconds": page_span_seconds,
         "pages_requested": pages_requested,
         "pages_with_data": pages_requested,
@@ -230,6 +281,8 @@ def _pagination_contract(timeframe, request_contract, source_interval=None):
         "failed_pages": [],
         "truncated_pages": [],
         "attempts_total": pages_requested,
+        "copy_rates_range_attempts_total": pages_requested,
+        "page_attempts": page_attempts,
         "retries_per_page": 3,
     }
     return request, pagination
@@ -456,7 +509,7 @@ def _write_run(
     return m5, h1
 
 
-def _write_timeframe_v3_run(native_root, run_id):
+def _write_timeframe_v4_run(native_root, run_id):
     origin = pd.Timestamp("2025-01-06", tz="UTC")
     active_windows = {
         "tuning_validation": (
@@ -488,14 +541,13 @@ def _write_timeframe_v3_run(native_root, run_id):
         timeframe_windows,
         ("M5", "H1"),
     )
-    m5 = _weekly_m5_history(start=origin.strftime("%Y-%m-%d"), weeks=50)
-    h1_early_source = _weekly_m5_history(
+    m5_strategy = _weekly_m5_history(start=origin.strftime("%Y-%m-%d"), weeks=50)
+    m5_audit_prefix = _weekly_m5_history(
         start=(origin - pd.Timedelta(weeks=10)).strftime("%Y-%m-%d"),
         weeks=10,
     )
-    h1 = pd.concat(
-        [_resample(h1_early_source, "1h"), _resample(m5, "1h")]
-    ).sort_index()
+    m5 = pd.concat([m5_audit_prefix, m5_strategy]).sort_index()
+    h1 = _resample(m5, "1h")
     frames = {"M5": m5, "H1": h1}
     results = []
     for timeframe in ("M5", "H1"):
@@ -582,6 +634,7 @@ def _rewrite_m5_as_no_history(native_root, run_id):
                 "start_utc": cursor.isoformat(),
                 "end_exclusive_utc": page_end.isoformat(),
                 "attempts": 3,
+                "copy_rates_range_attempts": 3,
             }
         )
         cursor = page_end
@@ -593,6 +646,8 @@ def _rewrite_m5_as_no_history(native_root, run_id):
             "failed_pages": [],
             "truncated_pages": [],
             "attempts_total": len(empty_pages) * 3,
+            "copy_rates_range_attempts_total": len(empty_pages) * 3,
+            "page_attempts": [dict(page) for page in empty_pages],
             "retries_per_page": 3,
         }
     )
@@ -717,6 +772,39 @@ def _rewrite_source_frame(
             },
         }
     )
+    if failure_status == "boundary_history_shortfall":
+        requested_start = pd.Timestamp(
+            provenance["request"]["native_fetch_start_utc"]
+        )
+        requested_end = pd.Timestamp(
+            provenance["request"]["native_fetch_end_exclusive_utc"]
+        )
+        actual_last_close = pd.Timestamp(frame["_BAR_CLOSE_TS"].iloc[-1])
+        provenance["coverage"] = {
+            "status": "partial_requested_span",
+            "actual_first_open_utc": frame.index[0].isoformat(),
+            "actual_last_open_utc": frame.index[-1].isoformat(),
+            "actual_last_close_utc": actual_last_close.isoformat(),
+            "start_delay_seconds": max(
+                0.0,
+                float((frame.index[0] - requested_start).total_seconds()),
+            ),
+            "end_lag_seconds": max(
+                0.0,
+                float((requested_end - actual_last_close).total_seconds()),
+            ),
+            "calendar_span_coverage_ratio": float(
+                (actual_last_close - frame.index[0]).total_seconds()
+                / (requested_end - requested_start).total_seconds()
+            ),
+            "internal_empty_page_count": 0,
+            "truncated_page_count": 0,
+            "internal_truncated_page_count": 0,
+            "boundary_truncated_page_count": 0,
+            "failed_page_count": 0,
+            "technical_integrity_status": "complete_page_ledger",
+            "market_calendar_completeness_assessed": False,
+        }
     provenance_path.write_text(
         json.dumps(provenance, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -760,6 +848,332 @@ def test_exact_native_m5_parity_passes_with_membership_and_ohlc():
     assert report["metrics"]["bar_membership_ratio"] == 1.0
     assert report["metrics"]["ohlc_mismatch_bars"] == 0
     assert report["metrics"]["unassigned_m5_rows"] == 0
+
+
+def _three_partition_windows(start):
+    start = pd.Timestamp(start)
+    return {
+        "optimizer_train": (start, start + pd.Timedelta(days=2)),
+        "tuning_validation": (
+            start + pd.Timedelta(days=2),
+            start + pd.Timedelta(days=4),
+        ),
+        "final_lockbox": (
+            start + pd.Timedelta(days=4),
+            start + pd.Timedelta(days=6),
+        ),
+    }
+
+
+def _resample_with_real_volume(frame, rule="15min"):
+    return frame.resample(rule).agg(
+        {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+            "RealVolume": "sum",
+        }
+    ).dropna()
+
+
+def test_cross_resolution_reconciliation_is_exact_and_partition_scoped():
+    fine = _m5_history(days=6)
+    fine["RealVolume"] = 2
+    coarse = _resample_with_real_volume(fine)
+    windows = _three_partition_windows(fine.index[0])
+
+    report = audit_native_cross_resolution(
+        fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M15",
+        tick_tolerance=0.0001,
+        partition_windows=windows,
+        thresholds=ParityThresholds(min_compared_native_bars=20),
+    )
+
+    assert report["status"] == "PASS", report["reason_codes"]
+    assert report["metrics"]["partitions_passed"] == 3
+    for partition in windows:
+        evidence = report["partitions"][partition]
+        assert evidence["status"] == "PASS"
+        assert evidence["bidirectional_coverage"] == 1.0
+        assert evidence["tick_volume_mismatch_coarse_bars"] == 0
+        assert evidence["real_volume_mismatch_coarse_bars"] == 0
+
+
+def test_cross_resolution_missing_fine_bar_is_caught_by_exact_volume():
+    complete_fine = _m5_history(days=6)
+    complete_fine["RealVolume"] = 2
+    coarse = _resample_with_real_volume(complete_fine)
+    # The middle member does not determine the M15 open/close/high/low in this
+    # monotonic fixture. Exact volume must still expose the missing M5 bar.
+    missing_ts = complete_fine.index[1]
+    incomplete_fine = complete_fine.drop(index=missing_ts)
+
+    report = audit_native_cross_resolution(
+        incomplete_fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M15",
+        tick_tolerance=0.0001,
+        partition_windows=_three_partition_windows(complete_fine.index[0]),
+        thresholds=ParityThresholds(min_compared_native_bars=20),
+    )
+
+    assert report["status"] == "FAIL"
+    assert any(
+        reason.startswith("TICK_VOLUME_MISMATCH:optimizer_train:")
+        for reason in report["reason_codes"]
+    )
+    assert any(
+        reason.startswith("REAL_VOLUME_MISMATCH:optimizer_train:")
+        for reason in report["reason_codes"]
+    )
+    assert report["partitions"]["tuning_validation"]["status"] == "PASS"
+    assert report["partitions"]["final_lockbox"]["status"] == "PASS"
+
+
+def test_cross_resolution_missing_coarse_bar_leaves_fine_rows_unassigned():
+    fine = _m5_history(days=6)
+    fine["RealVolume"] = 0
+    coarse = _resample_with_real_volume(fine)
+    coarse = coarse.drop(index=coarse.index[4])
+
+    report = audit_native_cross_resolution(
+        fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M15",
+        tick_tolerance=0.0001,
+        partition_windows=_three_partition_windows(fine.index[0]),
+        thresholds=ParityThresholds(
+            max_unassigned_m5_ratio=0.0,
+            min_compared_native_bars=20,
+        ),
+    )
+
+    assert report["status"] == "FAIL"
+    train = report["partitions"]["optimizer_train"]
+    assert train["unassigned_fine_rows"] == 3
+    assert any(
+        reason.startswith("UNASSIGNED_FINE_RATIO_HIGH:optimizer_train:")
+        for reason in report["reason_codes"]
+    )
+
+
+def test_cross_resolution_final_defect_is_not_diluted_by_training_history():
+    complete_fine = _m5_history(days=6)
+    complete_fine["RealVolume"] = 0
+    coarse = _resample_with_real_volume(complete_fine)
+    final_start = complete_fine.index[0] + pd.Timedelta(days=4)
+    incomplete_fine = complete_fine.drop(index=final_start + pd.Timedelta(minutes=5))
+
+    report = audit_native_cross_resolution(
+        incomplete_fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M15",
+        tick_tolerance=0.0001,
+        partition_windows=_three_partition_windows(complete_fine.index[0]),
+        thresholds=ParityThresholds(min_compared_native_bars=20),
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["partitions"]["optimizer_train"]["status"] == "PASS"
+    assert report["partitions"]["tuning_validation"]["status"] == "PASS"
+    assert report["partitions"]["final_lockbox"]["status"] == "FAIL"
+    boundary = report["partitions"]["final_lockbox"]["boundaries"]
+    assert boundary["requested_start_utc"] == final_start.isoformat()
+
+
+def test_cross_resolution_nonaligned_boundaries_follow_target_bar_containment():
+    fine = _m5_history(days=1).iloc[:73].copy()
+    coarse = _resample(fine, "15min")
+    origin = fine.index[0]
+    windows = {
+        "optimizer_train": (
+            origin + pd.Timedelta(minutes=7),
+            origin + pd.Timedelta(hours=2, minutes=7),
+        ),
+        "tuning_validation": (
+            origin + pd.Timedelta(hours=2, minutes=7),
+            origin + pd.Timedelta(hours=4, minutes=7),
+        ),
+        "final_lockbox": (
+            origin + pd.Timedelta(hours=4, minutes=7),
+            origin + pd.Timedelta(hours=6, minutes=7),
+        ),
+    }
+
+    corrupt_fine = fine.copy()
+    corrupt_fine.loc[
+        origin + pd.Timedelta(minutes=10),
+        ["Open", "High", "Low", "Close"],
+    ] += 10.0
+    fine_target = audit_native_cross_resolution(
+        corrupt_fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M5",
+        tick_tolerance=0.0001,
+        partition_windows=windows,
+        thresholds=ParityThresholds(min_compared_native_bars=1),
+    )
+    assert fine_target["status"] == "FAIL"
+    assert any(
+        reason.startswith("OHLC_MISMATCH_RATIO_HIGH:optimizer_train:")
+        for reason in fine_target["reason_codes"]
+    )
+
+    corrupt_coarse = coarse.copy()
+    corrupt_coarse.loc[
+        origin + pd.Timedelta(hours=2),
+        ["Open", "High", "Low", "Close"],
+    ] += 10.0
+    coarse_target = audit_native_cross_resolution(
+        fine,
+        corrupt_coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M15",
+        tick_tolerance=0.0001,
+        partition_windows=windows,
+        thresholds=ParityThresholds(min_compared_native_bars=1),
+    )
+    assert coarse_target["status"] == "PASS", coarse_target["reason_codes"]
+
+
+def test_cross_resolution_fine_target_detects_wholly_missing_fine_group():
+    complete_fine = _m5_history(days=6)
+    coarse = _resample(complete_fine, "15min")
+    missing_open = complete_fine.index[0] + pd.Timedelta(hours=3)
+    incomplete_fine = complete_fine.drop(
+        index=pd.date_range(missing_open, periods=3, freq="5min")
+    )
+
+    report = audit_native_cross_resolution(
+        incomplete_fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M5",
+        tick_tolerance=0.0001,
+        partition_windows=_three_partition_windows(complete_fine.index[0]),
+        thresholds=ParityThresholds(min_compared_native_bars=20),
+    )
+
+    assert report["status"] == "FAIL"
+    train = report["partitions"]["optimizer_train"]
+    assert train["missing_coarse_membership_bars"] >= 1
+    assert any(
+        reason.startswith("MISSING_COARSE_MEMBERSHIP:optimizer_train:")
+        for reason in report["reason_codes"]
+    )
+
+
+def test_cross_resolution_fixed_coarse_target_detects_missing_edge_bars():
+    fine = _m5_history(days=1)
+    complete_coarse = _resample(fine, "1h")
+    origin = fine.index[0]
+    windows = {
+        "optimizer_train": (origin, origin + pd.Timedelta(hours=8)),
+        "tuning_validation": (
+            origin + pd.Timedelta(hours=8),
+            origin + pd.Timedelta(hours=16),
+        ),
+        "final_lockbox": (
+            origin + pd.Timedelta(hours=16),
+            origin + pd.Timedelta(hours=24),
+        ),
+    }
+
+    for missing_open in (origin, origin + pd.Timedelta(hours=7)):
+        report = audit_native_cross_resolution(
+            fine,
+            complete_coarse.drop(index=missing_open),
+            symbol="EURUSD",
+            fine_timeframe="M5",
+            coarse_timeframe="H1",
+            activation_target_timeframe="H1",
+            tick_tolerance=0.0001,
+            partition_windows=windows,
+            thresholds=ParityThresholds(min_compared_native_bars=1),
+        )
+        assert report["status"] == "FAIL"
+        assert report["partitions"]["optimizer_train"][
+            "unassigned_fine_rows"
+        ] >= 12
+
+
+def test_cross_resolution_broker_aligned_h4_detects_bracketed_edge_gaps():
+    m5 = _m5_history(start="2024-12-31", days=5)
+    fine = _resample(m5, "1h")
+    coarse = (
+        fine.resample(
+            "4h",
+            origin="epoch",
+            offset="2h",
+            label="left",
+            closed="left",
+        )
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        .dropna()
+    )
+    origin = pd.Timestamp("2025-01-01T00:00:00Z")
+    windows = {
+        "optimizer_train": (origin, origin + pd.Timedelta(days=1)),
+        "tuning_validation": (
+            origin + pd.Timedelta(days=1),
+            origin + pd.Timedelta(days=2),
+        ),
+        "final_lockbox": (
+            origin + pd.Timedelta(days=2),
+            origin + pd.Timedelta(days=3),
+        ),
+    }
+
+    for missing_open in (
+        origin + pd.Timedelta(hours=2),
+        origin + pd.Timedelta(hours=18),
+    ):
+        report = audit_native_cross_resolution(
+            fine,
+            coarse.drop(index=missing_open),
+            symbol="EURUSD",
+            fine_timeframe="H1",
+            coarse_timeframe="H4",
+            activation_target_timeframe="H4",
+            tick_tolerance=0.0001,
+            partition_windows=windows,
+            thresholds=ParityThresholds(min_compared_native_bars=1),
+        )
+        assert report["status"] == "FAIL"
+        assert report["partitions"]["optimizer_train"][
+            "unassigned_fine_rows"
+        ] >= 4
 
 
 def test_missing_tick_tolerance_is_explicitly_pending():
@@ -951,14 +1365,24 @@ def test_segmented_v2_coverage_is_recomputed_and_authenticated():
             required_timeframes=("M5", "H1"),
         )
         assert universe.valid, universe.errors
+        production = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+            production_contract_required=True,
+        )
+        assert not production.valid
+        assert "NATIVE_UNIVERSE_PRODUCTION_CROSS_RESOLUTION_REQUIRED" in (
+            production.errors
+        )
 
 
-def test_timeframe_v3_cell_windows_activate_and_resolve_independently():
+def test_timeframe_v4_cell_windows_activate_and_resolve_independently():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "data"
         native_root = data_dir / "native"
         native_root.mkdir(parents=True)
-        _write_timeframe_v3_run(native_root, "run-timeframe-v3")
+        _write_timeframe_v4_run(native_root, "run-timeframe-v3")
 
         result = audit_and_activate(
             native_root,
@@ -977,6 +1401,16 @@ def test_timeframe_v3_cell_windows_activate_and_resolve_independently():
             required_timeframes=("M5", "H1"),
         )
         assert universe.valid, universe.errors
+        production = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+            production_contract_required=True,
+        )
+        assert not production.valid
+        assert "NATIVE_UNIVERSE_PRODUCTION_SIX_TIMEFRAME_ROSTER_REQUIRED" in (
+            production.errors
+        )
         calendar = universe.calendar_contract
         assert calendar["window_contract_version"] == (
             TIMEFRAME_EVIDENCE_CONTRACT_VERSION
@@ -987,11 +1421,241 @@ def test_timeframe_v3_cell_windows_activate_and_resolve_independently():
         assert resolve_active_native_artifact(data_dir, "EURUSD", "H1").valid
 
 
-def test_timeframe_v3_request_map_tamper_blocks_activation():
+def test_timeframe_v4_high_coverage_integrity_failure_is_resolvable_exclusion():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        native_root = data_dir / "native"
+        native_root.mkdir(parents=True)
+        run_id = "run-timeframe-v4-integrity-fail"
+        _write_timeframe_v4_run(native_root, run_id)
+
+        bars_path = native_root / "runs" / run_id / "EURUSD" / "M5" / "bars.csv"
+        frame = pd.read_csv(bars_path)
+        frame.index = pd.to_datetime(frame.pop("time"), utc=True)
+        audit_prefix = frame.index < pd.Timestamp("2025-01-06T00:00:00Z")
+        changed_timestamp = frame.index[audit_prefix][0]
+        frame.loc[changed_timestamp, "Volume"] += 1
+        _rewrite_source_frame(
+            native_root,
+            run_id,
+            "M5",
+            frame,
+            status="success",
+            failure_status=None,
+        )
+
+        result = audit_and_activate(
+            native_root,
+            run_id=run_id,
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-timeframe-v4-integrity-fail",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+        )
+
+        assert result["status"] == "active", result
+        assert result["active_pointer_updated"]
+        assert result["entries"]["EURUSD"]["M5"]["status"] == "active"
+        h1_entry = result["entries"]["EURUSD"]["H1"]
+        assert h1_entry["status"] == "excluded_no_trade"
+        assert all(
+            value >= 0.95
+            for value in h1_entry["expected_session_coverage_by_partition"].values()
+        )
+        assert any("VOLUME" in reason for reason in h1_entry["reason_codes"])
+
+        universe = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+        )
+        assert universe.valid, universe.errors
+        assert universe.active_timeframes("EURUSD") == ("M5",)
+        assert universe.excluded_timeframes("EURUSD") == ("H1",)
+
+
+def test_timeframe_v4_all_semantic_failures_form_valid_full_exclusion():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        native_root = data_dir / "native"
+        native_root.mkdir(parents=True)
+        run_id = "run-timeframe-v4-all-integrity-fail"
+        _write_timeframe_v4_run(native_root, run_id)
+
+        bars_path = native_root / "runs" / run_id / "EURUSD" / "M5" / "bars.csv"
+        frame = pd.read_csv(bars_path)
+        frame.index = pd.to_datetime(frame.pop("time"), utc=True)
+        shared_strategy = frame.index >= pd.Timestamp("2025-01-06T00:00:00Z")
+        changed_timestamp = frame.index[shared_strategy][0]
+        frame.loc[changed_timestamp, "Volume"] += 1
+        _rewrite_source_frame(
+            native_root,
+            run_id,
+            "M5",
+            frame,
+            status="success",
+            failure_status=None,
+        )
+
+        result = audit_and_activate(
+            native_root,
+            run_id=run_id,
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-timeframe-v4-all-integrity-fail",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+        )
+
+        assert result["status"] == "active", result
+        assert result["active_pointer_updated"]
+        assert result["universe_eligibility"]["eligible_symbols"] == []
+        exclusion = result["universe_eligibility"]["excluded_symbols"]["EURUSD"]
+        assert exclusion["reason_codes"]
+        assert all(
+            entry["status"] == "excluded_no_trade"
+            for entry in result["entries"]["EURUSD"].values()
+        )
+
+        universe = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+        )
+        assert universe.valid, universe.errors
+        assert universe.symbol_status("EURUSD") == "excluded_no_trade"
+        assert universe.active_timeframes("EURUSD") == ()
+
+
+def test_timeframe_v4_single_ohlc_corruption_is_not_diluted_by_horizon():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        native_root = data_dir / "native"
+        native_root.mkdir(parents=True)
+        run_id = "run-timeframe-v4-ohlc-corruption"
+        _write_timeframe_v4_run(native_root, run_id)
+
+        bars_path = native_root / "runs" / run_id / "EURUSD" / "H1" / "bars.csv"
+        frame = pd.read_csv(bars_path)
+        frame.index = pd.to_datetime(frame.pop("time"), utc=True)
+        strategy_rows = frame.index >= pd.Timestamp("2025-01-06T00:00:00Z")
+        changed_timestamp = frame.index[strategy_rows][0]
+        frame.loc[
+            changed_timestamp,
+            ["Open", "High", "Low", "Close"],
+        ] += 10.0
+        _rewrite_source_frame(
+            native_root,
+            run_id,
+            "H1",
+            frame,
+            status="success",
+            failure_status=None,
+        )
+
+        result = audit_and_activate(
+            native_root,
+            run_id=run_id,
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-timeframe-v4-ohlc-corruption",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+        )
+
+        assert result["status"] == "active", result
+        assert result["active_pointer_updated"]
+        assert all(
+            entry["status"] == "excluded_no_trade"
+            for entry in result["entries"]["EURUSD"].values()
+        )
+        assert all(
+            any("OHLC_MISMATCH_RATIO_HIGH" in reason for reason in entry["reason_codes"])
+            for entry in result["entries"]["EURUSD"].values()
+        )
+        universe = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+        )
+        assert universe.valid, universe.errors
+        assert universe.active_timeframes("EURUSD") == ()
+
+
+def test_timeframe_v4_tick_tolerance_override_cannot_weaken_source_contract():
     with tempfile.TemporaryDirectory() as tmp:
         native_root = Path(tmp) / "data" / "native"
         native_root.mkdir(parents=True)
-        _write_timeframe_v3_run(native_root, "run-timeframe-v3-tamper")
+        run_id = "run-timeframe-v4-tolerance-override"
+        _write_timeframe_v4_run(native_root, run_id)
+
+        result = audit_and_activate(
+            native_root,
+            run_id=run_id,
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-timeframe-v4-tolerance-override",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+            tick_tolerance_overrides={"EURUSD": 1.0},
+        )
+
+        assert result["status"] == "failed"
+        assert not result["active_pointer_updated"]
+        assert all(
+            any(
+                "TICK_TOLERANCE_OVERRIDE_WEAKENS_AUTHENTICATED_BASE" in reason
+                for reason in entry["reason_codes"]
+            )
+            for entry in result["entries"]["EURUSD"].values()
+        )
+
+
+def test_timeframe_v4_unavailable_reference_forms_valid_full_exclusion():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        native_root = data_dir / "native"
+        native_root.mkdir(parents=True)
+        run_id = "run-timeframe-v4-reference-unavailable"
+        _write_timeframe_v4_run(native_root, run_id)
+        _rewrite_m5_as_no_history(native_root, run_id)
+
+        result = audit_and_activate(
+            native_root,
+            run_id=run_id,
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-timeframe-v4-reference-unavailable",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+        )
+
+        assert result["status"] == "active", result
+        assert result["active_pointer_updated"]
+        assert result["entries"]["EURUSD"]["M5"]["status"] == (
+            "excluded_no_trade"
+        )
+        assert result["entries"]["EURUSD"]["H1"]["status"] == (
+            "excluded_no_trade"
+        )
+        exclusion = result["universe_eligibility"]["excluded_symbols"]["EURUSD"]
+        assert "M5:NO_HISTORY" in exclusion["reason_codes"]
+        assert any(
+            reason.startswith("H1:AUDIT_REFERENCE_UNAVAILABLE:M5:NO_HISTORY")
+            for reason in exclusion["reason_codes"]
+        )
+
+        universe = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+        )
+        assert universe.valid, universe.errors
+        assert universe.symbol_status("EURUSD") == "excluded_no_trade"
+        assert universe.active_timeframes("EURUSD") == ()
+
+
+def test_timeframe_v4_request_map_tamper_blocks_activation():
+    with tempfile.TemporaryDirectory() as tmp:
+        native_root = Path(tmp) / "data" / "native"
+        native_root.mkdir(parents=True)
+        _write_timeframe_v4_run(native_root, "run-timeframe-v3-tamper")
         provenance_path = (
             native_root
             / "runs"
@@ -1024,6 +1688,47 @@ def test_timeframe_v3_request_map_tamper_blocks_activation():
         assert any(
             "SOURCE_REQUEST_CONTRACT_INVALID" in reason
             for reason in result["entries"]["EURUSD"]["H1"]["reason_codes"]
+        )
+
+
+def test_timeframe_v4_repin_cannot_flip_parity_target_orientation():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        native_root = data_dir / "native"
+        native_root.mkdir(parents=True)
+        run_id = "run-timeframe-v4-orientation-repin"
+        _write_timeframe_v4_run(native_root, run_id)
+        activated = audit_and_activate(
+            native_root,
+            run_id=run_id,
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-timeframe-v4-orientation-repin",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+        )
+        manifest_path = Path(activated["manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = manifest["entries"]["EURUSD"]["H1"]
+        parity_path = native_root / entry["parity_relative_path"]
+        parity = json.loads(parity_path.read_text(encoding="utf-8"))
+        parity["activation_target_timeframe"] = "M5"
+        parity_path.write_text(
+            json.dumps(parity, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        entry["parity_sha256"] = sha256_file(parity_path)
+        _rewrite_activation_and_repin(native_root, activated, manifest)
+
+        universe = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+        )
+
+        assert not universe.valid
+        assert any(
+            "PARITY_TARGET_TIMEFRAME_MISMATCH" in error
+            for error in universe.errors
         )
 
 
@@ -1230,6 +1935,52 @@ def test_one_partial_cell_excludes_only_that_cell_and_preserves_sibling():
         assert resolve_active_native_artifact(data_dir, "EURUSD", "M5").valid
         excluded = resolve_active_native_artifact(data_dir, "EURUSD", "H1")
         assert "NATIVE_ACTIVE_CELL_EXCLUDED_NO_TRADE" in excluded.errors
+
+
+def test_v4_leading_audit_prefix_shortfall_does_not_veto_covered_target_cell():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        native_root = data_dir / "native"
+        native_root.mkdir(parents=True)
+        run_id = "run-v4-leading-shortfall"
+        _write_timeframe_v4_run(native_root, run_id)
+        bars_path = native_root / "runs" / run_id / "EURUSD" / "M5" / "bars.csv"
+        frame = pd.read_csv(bars_path)
+        frame.index = pd.to_datetime(frame.pop("time"), utc=True)
+        own_train_start = pd.Timestamp("2025-01-06T00:00:00Z")
+        # Remove only the oldest week of the H1-reference prefix. M5's own
+        # train/tuning/lockbox strategy envelope remains byte-for-byte covered.
+        frame = frame.loc[
+            frame.index >= own_train_start - pd.Timedelta(weeks=9)
+        ]
+        _rewrite_source_frame(
+            native_root,
+            run_id,
+            "M5",
+            frame,
+            status="partial",
+            failure_status="boundary_history_shortfall",
+        )
+
+        result = audit_and_activate(
+            native_root,
+            run_id=run_id,
+            symbols=["EURUSD"],
+            timeframes=["M5", "H1"],
+            activation_id="activation-v4-leading-shortfall",
+            thresholds=ParityThresholds(min_compared_native_bars=20),
+        )
+
+        assert result["status"] == "active", result
+        assert result["entries"]["EURUSD"]["M5"]["status"] == "active"
+        universe = resolve_active_native_universe(
+            data_dir,
+            ["EURUSD"],
+            required_timeframes=("M5", "H1"),
+        )
+        assert universe.valid, universe.errors
+        assert "M5" in universe.active_timeframes("EURUSD")
+        assert resolve_active_native_artifact(data_dir, "EURUSD", "M5").valid
 
 
 def test_one_low_coverage_cell_excludes_only_that_cell_with_sufficient_sibling():

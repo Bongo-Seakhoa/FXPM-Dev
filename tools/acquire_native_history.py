@@ -53,11 +53,15 @@ from pm_evidence import (  # noqa: E402
 
 LOGGER = logging.getLogger("fxpm.native_history")
 SCHEMA_VERSION = "fxpm-native-bars-v1"
-ACQUISITION_CONTRACT_VERSION = "2026-07-10-native-calendar-acquisition-v1"
+ACQUISITION_CONTRACT_VERSION = "2026-07-12-native-calendar-acquisition-v3"
+PAGINATION_CONTRACT_VERSION = "fxpm.native_history.pagination.v2"
 MANIFEST_SCHEMA_VERSION = "fxpm.native_history_run_manifest.v1"
 RESUME_CONTRACT_VERSION = "fxpm.native_history_resume.v1"
 LEGACY_FLAT_WINDOW_CONTRACT_VERSION = "fxpm.native_history.flat_windows.v1"
-TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v3"
+LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = (
+    "fxpm.native_history.timeframe_request_map.v3"
+)
+TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v4"
 PARTITIONS: Tuple[str, ...] = (
     "optimizer_train",
     "tuning_validation",
@@ -86,6 +90,37 @@ _SESSION_V2_MIN_EVIDENCE_WEEKS = 26
 _SESSION_V2_MIN_SEGMENT_WEEKS = 26
 _SESSION_V2_CHANGE_WINDOW_WEEKS = 26
 _SESSION_V2_MIN_CHANGE_FRACTION = 0.10
+
+
+def cross_resolution_reference_map(
+    timeframes: Sequence[str],
+) -> Dict[str, str]:
+    """Return the deterministic native audit counterpart for every timeframe.
+
+    A target above the finest requested timeframe is reconciled against the
+    closest requested finer native series.  The finest target is reconciled in
+    the reverse direction against the closest coarser series.  In the standard
+    six-timeframe roster this produces M5<->M15, M30<-M15, H1<-M30,
+    H4<-H1, and D1<-H4.  Both inputs remain broker-native; neither is a
+    resampled strategy authority.
+    """
+
+    normalized = tuple(
+        dict.fromkeys(str(value or "").strip().upper() for value in timeframes)
+    )
+    if any(value not in TIMEFRAME_SECONDS for value in normalized):
+        unknown = sorted(value for value in normalized if value not in TIMEFRAME_SECONDS)
+        raise ValueError(f"unsupported timeframe(s) for cross-resolution audit: {unknown}")
+    ordered = tuple(sorted(normalized, key=lambda value: TIMEFRAME_SECONDS[value]))
+    if len(ordered) < 2:
+        # Acquisition remains usable for a one-cell diagnostic. Activation is
+        # responsible for refusing to certify that cell without an independent
+        # counterpart.
+        return {}
+    references: Dict[str, str] = {}
+    for index, timeframe in enumerate(ordered):
+        references[timeframe] = ordered[1] if index == 0 else ordered[index - 1]
+    return references
 
 # At a 10,000-bar terminal cap these spans remain below the cap even for a
 # continuously traded market.  The span is reduced dynamically when MT5
@@ -296,9 +331,11 @@ def _higher_quantile(values: np.ndarray, quantile: float) -> float:
     return float(np.partition(np.asarray(values, dtype="float64"), position)[position])
 
 
-def segmented_session_coverage_by_partition_v2(
+def _segmented_session_coverage_by_partition(
     frame: pd.DataFrame,
     partition_windows: Mapping[str, Tuple[datetime, datetime]],
+    *,
+    method: str,
 ) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
     """Estimate timestamp completeness under sustained session-schedule changes.
 
@@ -321,7 +358,7 @@ def segmented_session_coverage_by_partition_v2(
 
     def _failure(status: str, **extra: Any):
         return dict(empty_coverage), {
-            "method": SEGMENTED_SESSION_COVERAGE_METHOD_V2,
+            "method": method,
             "status": status,
             "performance_inputs_used": False,
             "timestamp_only": True,
@@ -346,13 +383,52 @@ def segmented_session_coverage_by_partition_v2(
     if any(start >= end for start, end in windows.values()):
         return _failure("invalid_partition_windows")
 
-    index = pd.DatetimeIndex(
+    raw_index = pd.DatetimeIndex(
         pd.to_datetime(frame.index, utc=True, errors="coerce")
-    ).dropna()
-    index = index[~index.duplicated()].sort_values()
+    )
+    has_authenticated_closes = "_BAR_CLOSE_TS" in frame.columns
+    raw_closes = (
+        pd.DatetimeIndex(
+            pd.to_datetime(
+                frame["_BAR_CLOSE_TS"],
+                utc=True,
+                errors="coerce",
+            )
+        )
+        if has_authenticated_closes
+        else pd.DatetimeIndex([pd.NaT] * len(raw_index), tz="UTC")
+    )
+    normalized_bars = pd.DataFrame(
+        {"open": raw_index, "close": raw_closes}
+    ).dropna(subset=["open"])
+    normalized_bars = (
+        normalized_bars.drop_duplicates(subset=["open"], keep="last")
+        .sort_values("open")
+        .reset_index(drop=True)
+    )
+    if has_authenticated_closes:
+        normalized_bars["close"] = normalized_bars["close"].fillna(
+            normalized_bars["open"] + pd.Timedelta(nanoseconds=1)
+        )
+    else:
+        open_values = pd.DatetimeIndex(normalized_bars["open"])
+        positive_deltas = np.diff(open_values.asi8)
+        positive_deltas = positive_deltas[positive_deltas > 0]
+        inferred_ns = (
+            int(np.median(positive_deltas))
+            if positive_deltas.size
+            else 1
+        )
+        normalized_bars["close"] = normalized_bars["open"] + pd.Timedelta(
+            nanoseconds=max(1, inferred_ns)
+        )
+    index = pd.DatetimeIndex(normalized_bars["open"])
+    close_index = pd.DatetimeIndex(normalized_bars["close"])
     envelope_start = min(start for start, _ in windows.values())
     envelope_end = max(end for _, end in windows.values())
-    index = index[(index >= envelope_start) & (index < envelope_end)]
+    envelope_mask = (index >= envelope_start) & (index < envelope_end)
+    index = index[envelope_mask]
+    close_index = close_index[envelope_mask]
     if index.empty:
         return _failure("requested_calendar_empty")
 
@@ -496,16 +572,17 @@ def segmented_session_coverage_by_partition_v2(
         counts = weekly_counts[start_pos:end_pos]
         positive = counts[counts > 0]
         nominal = _higher_quantile(positive, 0.75)
-        empirical_upper = float(np.max(positive))
+        empirical_max = float(np.max(positive))
         nonempty_fraction = float(positive.size / max(1, counts.size))
         healthy_fraction = float(
             np.mean((counts >= 0.80 * nominal) & (counts <= 1.20 * nominal))
         )
+        upper_schedule = empirical_max
         bound_defensible = bool(
             counts.size >= _SESSION_V2_MIN_EVIDENCE_WEEKS
             and positive.size >= 20
             and nonempty_fraction >= 0.75
-            and empirical_upper <= 1.15 * nominal
+            and empirical_max <= 1.15 * nominal
         )
         lower_bound_available = lower_bound_available and bound_defensible
 
@@ -529,7 +606,7 @@ def segmented_session_coverage_by_partition_v2(
             "start": segment_start,
             "end": segment_end,
             "nominal": float(nominal),
-            "upper": empirical_upper,
+            "upper": float(upper_schedule),
             "bound_defensible": bound_defensible,
             "recurring_max_gap": (
                 float(recurring_max_gap) if recurring_max_gap is not None else None
@@ -545,7 +622,11 @@ def segmented_session_coverage_by_partition_v2(
                 "nonempty_weeks": int(positive.size),
                 "zero_count_weeks": int((counts == 0).sum()),
                 "nominal_bars_per_week_q75": float(nominal),
-                "empirical_schedule_envelope_bars_per_week": empirical_upper,
+                "empirical_schedule_envelope_bars_per_week": float(upper_schedule),
+                "empirical_max_bars_per_week": empirical_max,
+                "upper_mean_bound_method": "segment_max_v2",
+                "upper_mean_bound_family_alpha": None,
+                "upper_mean_bound_radius": None,
                 "nonempty_week_fraction": nonempty_fraction,
                 "healthy_week_fraction": healthy_fraction,
                 "conservative_lower_bound_defensible": bound_defensible,
@@ -601,7 +682,13 @@ def segmented_session_coverage_by_partition_v2(
     week_duration_seconds = 7.0 * 86400.0
     for partition in PARTITIONS:
         start, end = windows[partition]
-        observed_index = index[(index >= start) & (index < end)]
+        observed_mask = (
+            (index >= start)
+            & (index < end)
+            & (close_index > index)
+            & (close_index <= end)
+        )
+        observed_index = index[observed_mask]
         observed = int(len(observed_index))
         expected_point = 0.0
         expected_upper = 0.0
@@ -689,11 +776,13 @@ def segmented_session_coverage_by_partition_v2(
         )
     )
     details: Dict[str, Any] = {
-        "method": SEGMENTED_SESSION_COVERAGE_METHOD_V2,
+        "method": method,
         "status": "estimated",
         "performance_inputs_used": False,
         "timestamp_only": True,
         "schedule_source": "all_requested_calendar_weeks_timestamp_only",
+        "conservative_bound_method": "segment_empirical_max_v2",
+        "conservative_bound_family_alpha": None,
         "complete_calendar_weeks": int(len(week_starts)),
         "complete_train_weeks": complete_train_weeks,
         "schedule_segments": segment_records,
@@ -709,6 +798,18 @@ def segmented_session_coverage_by_partition_v2(
         ),
     }
     return coverage, details
+
+
+def segmented_session_coverage_by_partition_v2(
+    frame: pd.DataFrame,
+    partition_windows: Mapping[str, Tuple[datetime, datetime]],
+) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
+    """Reproduce the immutable v2 maximum-week coverage contract."""
+    return _segmented_session_coverage_by_partition(
+        frame,
+        partition_windows,
+        method=SEGMENTED_SESSION_COVERAGE_METHOD_V2,
+    )
 
 
 def _safe_name(value: str, label: str) -> str:
@@ -924,6 +1025,13 @@ _V3_RESUME_REQUEST_KEYS: Tuple[str, ...] = (
     "timeframe_required_evidence_lead_start_utc",
     "timeframe_source_request_intervals",
     "timeframe_request_map_sha256",
+)
+
+_V4_RESUME_REQUEST_KEYS: Tuple[str, ...] = (
+    *_V3_RESUME_REQUEST_KEYS,
+    "timeframe_strategy_evidence_intervals",
+    "timeframe_audit_reference_map",
+    "timeframe_audit_only_prefix_intervals",
 )
 
 _SOURCE_IDENTITY_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -1203,7 +1311,7 @@ def _load_json_object(path: Path) -> Dict[str, Any]:
 
 
 def _timeframe_request_hash_payload(request: Mapping[str, Any]) -> Dict[str, Any]:
-    return {
+    payload = {
         "schema_version": request.get("timeframe_request_map_schema_version"),
         "window_contract_version": request.get("window_contract_version"),
         "common_as_of_utc": request.get("common_as_of_utc"),
@@ -1218,6 +1326,23 @@ def _timeframe_request_hash_payload(request: Mapping[str, Any]) -> Dict[str, Any
             "timeframe_source_request_intervals"
         ),
     }
+    if str(request.get("timeframe_request_map_schema_version") or "") == (
+        TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+    ):
+        payload.update(
+            {
+                "timeframe_strategy_evidence_intervals": request.get(
+                    "timeframe_strategy_evidence_intervals"
+                ),
+                "timeframe_audit_reference_map": request.get(
+                    "timeframe_audit_reference_map"
+                ),
+                "timeframe_audit_only_prefix_intervals": request.get(
+                    "timeframe_audit_only_prefix_intervals"
+                ),
+            }
+        )
+    return payload
 
 
 def _resume_request_contract(record: Mapping[str, Any], path: Path) -> Dict[str, Any]:
@@ -1231,7 +1356,17 @@ def _resume_request_contract(record: Mapping[str, Any], path: Path) -> Dict[str,
     if version == LEGACY_FLAT_WINDOW_CONTRACT_VERSION:
         keys = _LEGACY_RESUME_REQUEST_KEYS
     elif version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
-        keys = _V3_RESUME_REQUEST_KEYS
+        request_map_version = str(
+            request.get("timeframe_request_map_schema_version") or ""
+        )
+        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            keys = _V4_RESUME_REQUEST_KEYS
+        elif request_map_version == LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            keys = _V3_RESUME_REQUEST_KEYS
+        else:
+            raise ResumeValidationError(
+                f"unsupported timeframe request map {request_map_version!r}: {path}"
+            )
     else:
         raise ResumeValidationError(
             f"unsupported native window contract {version!r}: {path}"
@@ -1293,8 +1428,27 @@ def _validate_v3_cell_request(
         "source_request_interval": expected_interval,
         "cell_required_evidence_lead_start_utc": expected_lead,
     }
+    if str(common.get("timeframe_request_map_schema_version") or "") == (
+        TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+    ):
+        checks.update(
+            {
+                "strategy_evidence_interval": (
+                    common.get("timeframe_strategy_evidence_intervals") or {}
+                ).get(tf),
+                "audit_only_prefix_interval": (
+                    common.get("timeframe_audit_only_prefix_intervals") or {}
+                ).get(tf),
+                "audit_reference_timeframe": (
+                    common.get("timeframe_audit_reference_map") or {}
+                ).get(tf),
+            }
+        )
     for field_name, expected in checks.items():
-        if expected is None or _json_safe(request.get(field_name)) != _json_safe(expected):
+        if (
+            field_name not in request
+            or _json_safe(request.get(field_name)) != _json_safe(expected)
+        ):
             raise ResumeValidationError(
                 f"v3 cell request field {field_name!r} does not match the "
                 f"hash-bound timeframe map: {path}"
@@ -1598,9 +1752,11 @@ class NativeHistoryStore:
             raise ResumeValidationError(f"concurrent final leaf is not immutable: {sidecar}")
         expected_request = expected.get("request")
         if isinstance(expected_request, Mapping):
-            if _resume_request_contract(record, sidecar) != {
-                key: _json_safe(expected_request[key]) for key in _RESUME_REQUEST_KEYS
-            }:
+            expected_contract = _resume_request_contract(
+                {"request": expected_request},
+                sidecar,
+            )
+            if _resume_request_contract(record, sidecar) != expected_contract:
                 raise ResumeValidationError(
                     f"concurrent final leaf request differs from this writer: {sidecar}"
                 )
@@ -2052,13 +2208,60 @@ class NativeHistoryAcquirer:
                 self.timeframe_requested_start_utc[timeframe] = self.common_start_utc
         self.requested_horizon_start_utc = requested_start
         self.required_evidence_lead_start_utc = evidence_lead_start
-        self.timeframe_source_request_intervals = {
+        self.timeframe_strategy_evidence_intervals = {
             timeframe: self._source_request_interval(
                 timeframe,
                 self.timeframe_requested_start_utc[timeframe],
+                include_containing_start=(
+                    self.window_contract_version
+                    == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                ),
             )
             for timeframe in request.timeframes
         }
+        self.timeframe_audit_reference_map = (
+            cross_resolution_reference_map(request.timeframes)
+            if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+            else {}
+        )
+        audit_requested_starts = dict(self.timeframe_requested_start_utc)
+        for target, reference in self.timeframe_audit_reference_map.items():
+            # The comparator must contain the native bar that spans the target's
+            # evidence lead.  Passing a non-aligned target lead through the
+            # normal fixed-timeframe request path would ceil it and silently
+            # omit that containing bar (for example H4 13:30 -> H1 14:00).
+            reference_start = floor_utc_boundary(
+                self.timeframe_requested_start_utc[target],
+                TIMEFRAME_SECONDS[reference],
+            )
+            audit_requested_starts[reference] = min(
+                audit_requested_starts[reference],
+                reference_start,
+            )
+        self.timeframe_source_request_intervals = {
+            timeframe: self._source_request_interval(
+                timeframe,
+                audit_requested_starts[timeframe],
+                include_containing_start=(
+                    self.window_contract_version
+                    == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                ),
+            )
+            for timeframe in request.timeframes
+        }
+        self.timeframe_audit_only_prefix_intervals: Dict[
+            str, Optional[Tuple[datetime, datetime]]
+        ] = {}
+        for timeframe in request.timeframes:
+            source_start, _source_end = self.timeframe_source_request_intervals[
+                timeframe
+            ]
+            strategy_start, _strategy_end = self.timeframe_strategy_evidence_intervals[
+                timeframe
+            ]
+            self.timeframe_audit_only_prefix_intervals[timeframe] = (
+                (source_start, strategy_start) if source_start < strategy_start else None
+            )
         self.runtime_metadata = dict(runtime_metadata or self._read_runtime_metadata())
         self.terminal_max_bars = self._extract_terminal_max_bars(self.runtime_metadata)
         self.resume_contract = store.resume_contract
@@ -2084,6 +2287,8 @@ class NativeHistoryAcquirer:
         self,
         timeframe: str,
         requested_start: datetime,
+        *,
+        include_containing_start: bool = False,
     ) -> Tuple[datetime, datetime]:
         seconds = TIMEFRAME_SECONDS[timeframe]
         if timeframe in {"H4", "D1"}:
@@ -2092,7 +2297,11 @@ class NativeHistoryAcquirer:
                 self.as_of_utc + timedelta(seconds=1),
             )
         return (
-            ceil_utc_boundary(requested_start, seconds),
+            (
+                floor_utc_boundary(requested_start, seconds)
+                if include_containing_start
+                else ceil_utc_boundary(requested_start, seconds)
+            ),
             floor_utc_boundary(self.as_of_utc, seconds),
         )
 
@@ -2114,9 +2323,40 @@ class NativeHistoryAcquirer:
             for timeframe, (start, end) in self.timeframe_source_request_intervals.items()
         }
 
+    def _serialized_strategy_evidence_intervals(self) -> Dict[str, Dict[str, str]]:
+        return {
+            timeframe: {
+                "start_utc": _iso(start),
+                "end_exclusive_utc": _iso(end),
+            }
+            for timeframe, (start, end) in (
+                self.timeframe_strategy_evidence_intervals.items()
+            )
+        }
+
+    def _serialized_audit_only_prefix_intervals(
+        self,
+    ) -> Dict[str, Optional[Dict[str, str]]]:
+        return {
+            timeframe: (
+                {
+                    "start_utc": _iso(interval[0]),
+                    "end_exclusive_utc": _iso(interval[1]),
+                    "role": "audit_only_reference",
+                }
+                if interval is not None
+                else None
+            )
+            for timeframe, interval in (
+                self.timeframe_audit_only_prefix_intervals.items()
+            )
+        }
+
     def _v3_request_fields(self) -> Dict[str, Any]:
         boundaries = self._serialized_timeframe_boundaries()
         intervals = self._serialized_timeframe_intervals()
+        strategy_intervals = self._serialized_strategy_evidence_intervals()
+        audit_only_prefixes = self._serialized_audit_only_prefix_intervals()
         leads = {
             timeframe: _iso(value)
             for timeframe, value in self.timeframe_required_evidence_lead_start_utc.items()
@@ -2137,6 +2377,11 @@ class NativeHistoryAcquirer:
             ),
             "timeframe_required_evidence_lead_start_utc": leads,
             "timeframe_source_request_intervals": intervals,
+            "timeframe_strategy_evidence_intervals": strategy_intervals,
+            "timeframe_audit_reference_map": dict(
+                self.timeframe_audit_reference_map
+            ),
+            "timeframe_audit_only_prefix_intervals": audit_only_prefixes,
         }
         fields["timeframe_request_map_sha256"] = _canonical_json_sha256(
             _timeframe_request_hash_payload(
@@ -2175,7 +2420,7 @@ class NativeHistoryAcquirer:
         }
         if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
             request.update(self._v3_request_fields())
-            return {key: _json_safe(request[key]) for key in _V3_RESUME_REQUEST_KEYS}
+            return {key: _json_safe(request[key]) for key in _V4_RESUME_REQUEST_KEYS}
         return {
             key: _json_safe(request[key]) for key in _LEGACY_RESUME_REQUEST_KEYS
         }
@@ -2363,6 +2608,10 @@ class NativeHistoryAcquirer:
         end_utc: datetime,
     ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
         errors: List[Dict[str, Any]] = []
+        copy_attempts_total = 0
+        best_incomplete_frame: Optional[pd.DataFrame] = None
+        best_incomplete_diagnostics: Dict[str, Any] = {}
+        best_incomplete_rank = (-1, -1)
         for attempt in range(1, int(self.request.retries) + 1):
             try:
                 frame = self.connector.get_bars_range(
@@ -2372,12 +2621,58 @@ class NativeHistoryAcquirer:
                     end_utc,
                     sync_retry=True,
                 )
+                diagnostics: Mapping[str, Any] = {}
+                if frame is not None and isinstance(
+                    getattr(frame, "attrs", None), Mapping
+                ):
+                    candidate_diagnostics = frame.attrs.get(
+                        "mt5_history_range_diagnostics"
+                    )
+                    if isinstance(candidate_diagnostics, Mapping):
+                        diagnostics = candidate_diagnostics
+                if not diagnostics:
+                    reader = getattr(
+                        self.connector,
+                        "get_last_history_range_diagnostics",
+                        None,
+                    )
+                    if callable(reader):
+                        try:
+                            candidate_diagnostics = reader()
+                        except Exception:
+                            candidate_diagnostics = None
+                        if isinstance(candidate_diagnostics, Mapping):
+                            diagnostics = candidate_diagnostics
+                try:
+                    connector_attempts = int(
+                        diagnostics.get("copy_rates_range_attempts", 1) or 1
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    connector_attempts = 1
+                copy_attempts_total += max(1, connector_attempts)
                 if frame is not None and len(frame) > 0:
-                    return frame, {
-                        "outcome": "data",
-                        "attempts": attempt,
-                        "errors": errors,
-                    }
+                    boundary_complete = diagnostics.get("boundary_complete")
+                    if boundary_complete is False:
+                        extent = diagnostics.get("best_extent")
+                        try:
+                            first = int(extent.get("first_epoch_second"))
+                            last = int(extent.get("last_epoch_second"))
+                            rows = int(extent.get("rows"))
+                            rank = (last - first, rows)
+                        except (AttributeError, TypeError, ValueError, OverflowError):
+                            rank = (0, int(len(frame)))
+                        if rank > best_incomplete_rank:
+                            best_incomplete_frame = frame
+                            best_incomplete_diagnostics = dict(diagnostics)
+                            best_incomplete_rank = rank
+                    else:
+                        return frame, {
+                            "outcome": "data",
+                            "attempts": attempt,
+                            "copy_rates_range_attempts": copy_attempts_total,
+                            "connector_diagnostics": _json_safe(dict(diagnostics)),
+                            "errors": errors,
+                        }
                 last_error = self._last_error(self.connector)
                 if self._is_hard_last_error(last_error):
                     errors.append(
@@ -2397,9 +2692,20 @@ class NativeHistoryAcquirer:
                 )
             if attempt < int(self.request.retries) and float(self.request.retry_sleep_seconds) > 0.0:
                 self.sleep_fn(float(self.request.retry_sleep_seconds))
+        if best_incomplete_frame is not None:
+            return best_incomplete_frame, {
+                "outcome": "data",
+                "attempts": int(self.request.retries),
+                "copy_rates_range_attempts": copy_attempts_total,
+                "connector_diagnostics": _json_safe(
+                    best_incomplete_diagnostics
+                ),
+                "errors": errors,
+            }
         return None, {
             "outcome": "error" if errors else "empty",
             "attempts": int(self.request.retries),
+            "copy_rates_range_attempts": copy_attempts_total,
             "errors": errors,
         }
 
@@ -2461,6 +2767,8 @@ class NativeHistoryAcquirer:
         page_count = 0
         pages_with_data = 0
         attempts_total = 0
+        copy_rates_range_attempts_total = 0
+        page_attempts: List[Dict[str, Any]] = []
         empty_pages: List[Dict[str, Any]] = []
         failed_pages: List[Dict[str, Any]] = []
         truncated_pages: List[Dict[str, Any]] = []
@@ -2470,11 +2778,18 @@ class NativeHistoryAcquirer:
             frame, outcome = self._fetch_page(symbol, timeframe, cursor, page_end)
             page_count += 1
             attempts_total += int(outcome["attempts"])
+            copy_rates_range_attempts_total += int(
+                outcome.get("copy_rates_range_attempts", outcome["attempts"])
+            )
             page_identity = {
                 "start_utc": _iso(cursor),
                 "end_exclusive_utc": _iso(page_end),
                 "attempts": int(outcome["attempts"]),
+                "copy_rates_range_attempts": int(
+                    outcome.get("copy_rates_range_attempts", outcome["attempts"])
+                ),
             }
+            page_attempts.append(page_identity)
             if outcome["outcome"] == "data" and frame is not None:
                 normalized, page_raw_rows = self._normalize_page(frame, cursor, page_end)
                 raw_rows += page_raw_rows
@@ -2566,6 +2881,15 @@ class NativeHistoryAcquirer:
                         "start_utc": _iso(native_start),
                         "end_exclusive_utc": _iso(fetch_end_exclusive),
                     },
+                    "strategy_evidence_interval": (
+                        self._serialized_strategy_evidence_intervals()[timeframe]
+                    ),
+                    "audit_only_prefix_interval": (
+                        self._serialized_audit_only_prefix_intervals()[timeframe]
+                    ),
+                    "audit_reference_timeframe": (
+                        self.timeframe_audit_reference_map.get(timeframe)
+                    ),
                 }
             )
 
@@ -2592,6 +2916,7 @@ class NativeHistoryAcquirer:
             "acquisition_started_utc": _iso(started_utc),
             "acquisition_completed_utc": _iso(_utc(self.now_fn())),
             "pagination": {
+                "contract_version": PAGINATION_CONTRACT_VERSION,
                 "page_span_seconds": int(page_span.total_seconds()),
                 "pages_requested": page_count,
                 "pages_with_data": pages_with_data,
@@ -2599,6 +2924,10 @@ class NativeHistoryAcquirer:
                 "failed_pages": failed_pages,
                 "truncated_pages": truncated_pages,
                 "attempts_total": attempts_total,
+                "copy_rates_range_attempts_total": (
+                    copy_rates_range_attempts_total
+                ),
+                "page_attempts": page_attempts,
                 "retries_per_page": int(self.request.retries),
             },
         }
@@ -2729,10 +3058,35 @@ class NativeHistoryAcquirer:
             if parse_utc_datetime(item["start_utc"]) >= actual_first
             and parse_utc_datetime(item["end_exclusive_utc"]) <= actual_last
         ]
+        internal_truncated_pages: List[Dict[str, Any]] = []
+        boundary_truncated_pages: List[Dict[str, Any]] = []
+        tolerance_seconds = float(tolerance.total_seconds())
+        for item in truncated_pages:
+            try:
+                page_start = parse_utc_datetime(item["start_utc"])
+                page_end = parse_utc_datetime(item["end_exclusive_utc"])
+                page_start_delay = float(item.get("start_delay_seconds", 0.0) or 0.0)
+                page_end_lag = float(item.get("end_lag_seconds", 0.0) or 0.0)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                internal_truncated_pages.append(item)
+                continue
+            contains_first = page_start <= actual_first < page_end
+            contains_last = page_start <= actual_last < page_end
+            internal_defect = (
+                (page_start_delay > tolerance_seconds and not contains_first)
+                or (page_end_lag > tolerance_seconds and not contains_last)
+            )
+            if internal_defect:
+                internal_truncated_pages.append(item)
+            else:
+                boundary_truncated_pages.append(item)
+        technical_internal_gap = bool(
+            failed_pages or internal_empty_pages or internal_truncated_pages
+        )
         full_span = (
             start_delay <= tolerance
             and end_lag <= tolerance
-            and not internal_empty_pages
+            and not technical_internal_gap
             and not truncated_pages
         )
         span_seconds = max(1.0, (coverage_end - coverage_start).total_seconds())
@@ -2753,12 +3107,23 @@ class NativeHistoryAcquirer:
             "calendar_span_coverage_ratio": float(min(1.0, observed_span_seconds / span_seconds)),
             "internal_empty_page_count": len(internal_empty_pages),
             "truncated_page_count": len(truncated_pages),
+            "internal_truncated_page_count": len(internal_truncated_pages),
+            "boundary_truncated_page_count": len(boundary_truncated_pages),
+            "failed_page_count": len(failed_pages),
+            "technical_integrity_status": (
+                "internal_gap_detected"
+                if technical_internal_gap
+                else "complete_page_ledger"
+            ),
             "market_calendar_completeness_assessed": False,
             "caveat": (
                 "Continuous-calendar slot density and cadence gaps include weekends, holidays, "
                 "and exchange closures; they are diagnostics, not a trading-calendar completeness claim."
             ),
         }
+        # Timestamp-only v2 remains an explicit diagnostic, not eligibility
+        # authority. Production completeness is established later by the
+        # independently acquired cross-resolution audit counterpart.
         session_coverage, session_coverage_details = segmented_session_coverage_by_partition_v2(
             combined,
             cell_partition_windows,
@@ -2794,10 +3159,17 @@ class NativeHistoryAcquirer:
             for partition in PARTITIONS
         }
         status = "success" if full_span else "partial"
+        failure_status = None
+        if not full_span:
+            failure_status = (
+                "technical_history_gap"
+                if technical_internal_gap
+                else "boundary_history_shortfall"
+            )
         base_record.update(
             {
                 "status": status,
-                "failure_status": None if full_span else "partial_history",
+                "failure_status": failure_status,
                 # Acquisition proves source/data integrity, not statistical
                 # sufficiency.  A separate validator must promote this artifact
                 # before an optimizer is allowed to consume it.

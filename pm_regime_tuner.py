@@ -393,6 +393,7 @@ class RegimeParamTuner:
             universe = resolve_active_native_universe(
                 self.data_dir,
                 required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+                production_contract_required=True,
             )
             if not universe.valid:
                 reasons = ",".join(universe.errors[:12]) or "unknown"
@@ -1093,7 +1094,7 @@ def main():
         logger.error("No symbols found. Check --data-dir path.")
         return 1
     
-    logger.info(f"Tuning regime parameters")
+    logger.info("Tuning regime parameters")
     logger.info(f"  Symbols: {len(symbols)}")
     logger.info(f"  Timeframes: {args.timeframes}")
     logger.info(f"  Output: {output_path}")

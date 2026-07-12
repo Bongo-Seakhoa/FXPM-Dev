@@ -48,8 +48,11 @@ DEFAULT_TIMEFRAME_WINDOW_YEARS: Dict[str, Dict[str, int]] = {
 # sessions. Calendar duration and expected broker-session coverage are
 # mandatory companions; these row counts are never sufficient on their own.
 DEFAULT_MIN_NATIVE_BARS: Dict[str, Dict[str, int]] = {
-    "M5": {"optimizer_train": 100_000, "tuning_validation": 40_000, "final_lockbox": 40_000},
-    "M15": {"optimizer_train": 30_000, "tuning_validation": 13_000, "final_lockbox": 13_000},
+    # A standard 6.5-hour equity session contributes about 98,280 M5 and
+    # 32,760 M15 bars over five 252-session years (39,312/13,104 over two).
+    # Floors retain a modest holiday/outage buffer without privileging 24x5 FX.
+    "M5": {"optimizer_train": 90_000, "tuning_validation": 36_000, "final_lockbox": 36_000},
+    "M15": {"optimizer_train": 30_000, "tuning_validation": 12_000, "final_lockbox": 12_000},
     "M30": {"optimizer_train": 15_000, "tuning_validation": 6_500, "final_lockbox": 6_500},
     "H1": {"optimizer_train": 7_500, "tuning_validation": 3_500, "final_lockbox": 3_500},
     "H4": {"optimizer_train": 2_500, "tuning_validation": 1_000, "final_lockbox": 1_000},
@@ -522,13 +525,14 @@ def validate_timeframe_evidence(
                 expected_count = candidate_expected if candidate_expected > 0 else None
             except (TypeError, ValueError, OverflowError):
                 expected_count = None
-        # Once an immutable activation supplies a learned, partition-specific
-        # session schedule, that schedule is fairer than a cross-asset static
-        # floor (e.g. five complete equity years can contain just under 1,260
-        # D1 sessions). The static matrix remains the fail-closed fallback when
-        # schedule evidence is absent.
+        # Same-series schedule evidence may strengthen a requirement, but can
+        # never weaken the cross-asset floor. Otherwise a stable broker outage
+        # or schedule-estimator error can certify its own missing observations.
         if expected_count is not None:
-            required = max(1, int(math.ceil(expected_count * minimum_coverage)))
+            required = max(
+                int(required_rows[partition]),
+                int(math.ceil(expected_count * minimum_coverage)),
+            )
             required_rows[partition] = required
         else:
             required = int(required_rows[partition])

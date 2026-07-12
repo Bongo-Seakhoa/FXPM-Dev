@@ -6747,14 +6747,27 @@ class OptimizationPipeline:
             pd.to_datetime(df["_SOURCE_FIRST_TS"], errors="coerce")
             if "_SOURCE_FIRST_TS" in df.columns else pd.Series(df.index, index=df.index)
         )
-        last_source = (
-            pd.to_datetime(df["_SOURCE_LAST_TS"], errors="coerce")
-            if "_SOURCE_LAST_TS" in df.columns else pd.Series(df.index, index=df.index)
+        source_last_is_open = "_SOURCE_LAST_TS" in df.columns
+        native_close_is_boundary = (
+            not source_last_is_open and "_BAR_CLOSE_TS" in df.columns
         )
+        if source_last_is_open:
+            last_source = pd.to_datetime(
+                df["_SOURCE_LAST_TS"], errors="coerce"
+            )
+        elif native_close_is_boundary:
+            last_source = pd.to_datetime(
+                df["_BAR_CLOSE_TS"], errors="coerce", utc=True
+            )
+        else:
+            last_source = pd.Series(df.index, index=df.index)
         if start_ts is not None:
             mask &= first_source >= start_ts
         if end_ts is not None:
-            mask &= last_source < end_ts
+            if native_close_is_boundary:
+                mask &= last_source <= end_ts
+            else:
+                mask &= last_source < end_ts
         return df.loc[mask].copy()
 
     @classmethod
@@ -7207,6 +7220,7 @@ class OptimizationPipeline:
                 universe = resolve_active_native_universe(
                     Path(self.data_loader.data_dir),
                     required_timeframes=configured_timeframes,
+                    production_contract_required=True,
                 )
                 if universe.errors:
                     return {}, {
@@ -10085,6 +10099,7 @@ class PortfolioManager:
             data_dir,
             self.symbols,
             required_timeframes=configured_timeframes,
+            production_contract_required=True,
         )
         if universe.errors:
             raise RuntimeError(

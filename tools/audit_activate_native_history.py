@@ -36,6 +36,7 @@ from pm_native_activation import (  # noqa: E402
     NATIVE_EVIDENCE_PARTITIONS,
     NATIVE_MINIMUM_SESSION_COVERAGE,
     NATIVE_SESSION_COVERAGE_METHOD,
+    NATIVE_SOURCE_EVIDENCE_DECISION_BASIS,
     SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS,
     UNIVERSE_ELIGIBILITY_SCHEMA,
     classify_native_availability_cell,
@@ -43,8 +44,10 @@ from pm_native_activation import (  # noqa: E402
     sha256_file,
 )
 from pm_native_parity import (  # noqa: E402
+    CROSS_RESOLUTION_PARITY_SCHEMA_VERSION,
     PARITY_SCHEMA_VERSION,
     ParityThresholds,
+    audit_native_cross_resolution,
     audit_native_vs_session_m5,
     normalize_ohlc_frame,
 )
@@ -55,12 +58,16 @@ from tools.acquire_native_history import (  # noqa: E402
     DEFAULT_PAGE_DAYS,
     DEFAULT_TIMEFRAMES,
     MANIFEST_SCHEMA_VERSION,
+    PAGINATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
+    LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     TIMEFRAME_SECONDS,
     ceil_utc_boundary,
+    cross_resolution_reference_map,
     expected_session_coverage_by_partition,
     floor_utc_boundary,
+    SEGMENTED_SESSION_COVERAGE_METHOD_V2,
     segmented_session_coverage_by_partition_v2,
 )
 
@@ -92,6 +99,11 @@ _V3_REQUEST_CONTRACT_FIELDS: Tuple[str, ...] = (
     "timeframe_required_evidence_lead_start_utc",
     "timeframe_source_request_intervals",
     "timeframe_request_map_sha256",
+)
+_V4_REQUEST_CONTRACT_FIELDS: Tuple[str, ...] = (
+    "timeframe_strategy_evidence_intervals",
+    "timeframe_audit_reference_map",
+    "timeframe_audit_only_prefix_intervals",
 )
 _SOURCE_IDENTITY_FIELDS: Mapping[str, Tuple[str, ...]] = {
     "account": ("login", "server", "company", "currency"),
@@ -239,11 +251,17 @@ def _request_contract(value: Any) -> Optional[Dict[str, Any]]:
     version = str(value.get("window_contract_version") or "")
     fields = _REQUEST_CONTRACT_FIELDS
     if version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
-        if str(value.get("timeframe_request_map_schema_version") or "") != (
-            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
-        ):
+        request_map_version = str(
+            value.get("timeframe_request_map_schema_version") or ""
+        )
+        if request_map_version not in {
+            LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+        }:
             return None
         fields = (*fields, *_V3_REQUEST_CONTRACT_FIELDS)
+        if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            fields = (*fields, *_V4_REQUEST_CONTRACT_FIELDS)
     elif version:
         return None
     if any(field_name not in value for field_name in fields):
@@ -270,6 +288,22 @@ def _request_contract(value: Any) -> Optional[Dict[str, Any]]:
                 "timeframe_source_request_intervals"
             ),
         }
+        if str(contract.get("timeframe_request_map_schema_version") or "") == (
+            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+        ):
+            request_map_payload.update(
+                {
+                    "timeframe_strategy_evidence_intervals": contract.get(
+                        "timeframe_strategy_evidence_intervals"
+                    ),
+                    "timeframe_audit_reference_map": contract.get(
+                        "timeframe_audit_reference_map"
+                    ),
+                    "timeframe_audit_only_prefix_intervals": contract.get(
+                        "timeframe_audit_only_prefix_intervals"
+                    ),
+                }
+            )
         if str(contract.get("timeframe_request_map_sha256") or "") != (
             _canonical_json_sha256(request_map_payload)
         ):
@@ -412,6 +446,10 @@ def _pagination_contract_errors(
     pages_requested = _strict_int(pagination.get("pages_requested"))
     pages_with_data = _strict_int(pagination.get("pages_with_data"))
     attempts_total = _strict_int(pagination.get("attempts_total"))
+    copy_attempts_total = _strict_int(
+        pagination.get("copy_rates_range_attempts_total")
+    )
+    page_attempts = pagination.get("page_attempts")
     retries_per_page = _strict_int(pagination.get("retries_per_page"))
     manifest_retries = _strict_int(manifest_request.get("retries"))
     empty_pages = pagination.get("empty_pages")
@@ -448,6 +486,59 @@ def _pagination_contract_errors(
     ):
         errors.append("SOURCE_PAGINATION_ATTEMPT_COUNT_INVALID")
 
+    require_copy_attempt_ledger = str(
+        manifest_request.get("timeframe_request_map_schema_version") or ""
+    ) == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+    if require_copy_attempt_ledger:
+        if str(pagination.get("contract_version") or "") != (
+            PAGINATION_CONTRACT_VERSION
+        ):
+            errors.append("SOURCE_PAGINATION_CONTRACT_VERSION_INVALID")
+        if not isinstance(page_attempts, list) or len(page_attempts) != len(
+            expected_intervals
+        ):
+            errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_LEDGER_INVALID")
+            page_attempts = []
+        ledger_keys: set[Tuple[int, int]] = set()
+        ledger_outer_total = 0
+        ledger_copy_total = 0
+        for page in page_attempts:
+            if not isinstance(page, Mapping):
+                errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_RECORD_INVALID")
+                continue
+            try:
+                page_start = _utc_timestamp(page.get("start_utc"))
+                page_end = _utc_timestamp(page.get("end_exclusive_utc"))
+                key = (int(page_start.value), int(page_end.value))
+            except Exception:
+                errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_BOUNDARY_INVALID")
+                continue
+            if key not in expected_interval_keys or key in ledger_keys:
+                errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_INTERVAL_INVALID")
+            ledger_keys.add(key)
+            outer_attempts = _strict_int(page.get("attempts"))
+            copy_attempts = _strict_int(page.get("copy_rates_range_attempts"))
+            if (
+                outer_attempts is None
+                or outer_attempts <= 0
+                or copy_attempts is None
+                or copy_attempts < outer_attempts
+            ):
+                errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_COUNT_INVALID")
+                continue
+            ledger_outer_total += outer_attempts
+            ledger_copy_total += copy_attempts
+        if ledger_keys != expected_interval_keys:
+            errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_COVERAGE_INVALID")
+        if attempts_total != ledger_outer_total:
+            errors.append("SOURCE_PAGINATION_OUTER_ATTEMPT_TOTAL_MISMATCH")
+        if copy_attempts_total != ledger_copy_total:
+            errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_TOTAL_MISMATCH")
+        if copy_attempts_total is None or copy_attempts_total < int(
+            attempts_total or 0
+        ):
+            errors.append("SOURCE_PAGINATION_COPY_ATTEMPT_TOTAL_INVALID")
+
     observed_page_keys: set[Tuple[int, int]] = set()
     for page in [*empty_pages, *failed_pages]:
         if not isinstance(page, Mapping):
@@ -482,6 +573,97 @@ def _pagination_contract_errors(
     elif availability_class in {"success", "unavailable"}:
         if pages_with_data is None or pages_with_data <= 0:
             errors.append("SOURCE_PUBLISHED_HISTORY_DATA_PAGE_PROOF_MISSING")
+    return list(dict.fromkeys(errors))
+
+
+def _boundary_shortfall_integrity_errors(
+    provenance: Mapping[str, Any],
+    frame: Optional[pd.DataFrame],
+) -> list[str]:
+    """Recompute that an auditable shortfall has no internal page defect."""
+
+    if frame is None or frame.empty:
+        return ["SOURCE_BOUNDARY_SHORTFALL_FRAME_MISSING"]
+    pagination = provenance.get("pagination")
+    coverage = provenance.get("coverage")
+    request = provenance.get("request")
+    if not all(isinstance(value, Mapping) for value in (pagination, coverage, request)):
+        return ["SOURCE_BOUNDARY_SHORTFALL_DIAGNOSTICS_MISSING"]
+    assert isinstance(pagination, Mapping)
+    assert isinstance(coverage, Mapping)
+    assert isinstance(request, Mapping)
+    errors: list[str] = []
+    failed_pages = pagination.get("failed_pages")
+    empty_pages = pagination.get("empty_pages")
+    truncated_pages = pagination.get("truncated_pages")
+    if not all(isinstance(value, list) for value in (failed_pages, empty_pages, truncated_pages)):
+        return ["SOURCE_BOUNDARY_SHORTFALL_PAGE_LEDGER_INVALID"]
+    assert isinstance(failed_pages, list)
+    assert isinstance(empty_pages, list)
+    assert isinstance(truncated_pages, list)
+    if failed_pages:
+        errors.append("SOURCE_BOUNDARY_SHORTFALL_FAILED_PAGE_PRESENT")
+    actual_first = pd.Timestamp(frame.index[0]).tz_convert("UTC")
+    actual_last = pd.Timestamp(frame.index[-1]).tz_convert("UTC")
+    internal_empty = 0
+    for page in empty_pages:
+        if not isinstance(page, Mapping):
+            errors.append("SOURCE_BOUNDARY_SHORTFALL_EMPTY_PAGE_INVALID")
+            continue
+        try:
+            page_start = _utc_timestamp(page.get("start_utc"))
+            page_end = _utc_timestamp(page.get("end_exclusive_utc"))
+        except Exception:
+            errors.append("SOURCE_BOUNDARY_SHORTFALL_EMPTY_PAGE_INVALID")
+            continue
+        if page_start >= actual_first and page_end <= actual_last:
+            internal_empty += 1
+
+    tolerance_days = _strict_finite_number(request.get("boundary_tolerance_days"))
+    tolerance_seconds = max(0.0, float(tolerance_days or 0.0) * 86_400.0)
+    internal_truncated = 0
+    boundary_truncated = 0
+    for page in truncated_pages:
+        if not isinstance(page, Mapping):
+            errors.append("SOURCE_BOUNDARY_SHORTFALL_TRUNCATED_PAGE_INVALID")
+            internal_truncated += 1
+            continue
+        try:
+            page_start = _utc_timestamp(page.get("start_utc"))
+            page_end = _utc_timestamp(page.get("end_exclusive_utc"))
+            start_delay = float(page.get("start_delay_seconds", 0.0) or 0.0)
+            end_lag = float(page.get("end_lag_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            errors.append("SOURCE_BOUNDARY_SHORTFALL_TRUNCATED_PAGE_INVALID")
+            internal_truncated += 1
+            continue
+        contains_first = page_start <= actual_first < page_end
+        contains_last = page_start <= actual_last < page_end
+        if (
+            (start_delay > tolerance_seconds and not contains_first)
+            or (end_lag > tolerance_seconds and not contains_last)
+        ):
+            internal_truncated += 1
+        else:
+            boundary_truncated += 1
+
+    declared_counts = {
+        "internal_empty_page_count": internal_empty,
+        "internal_truncated_page_count": internal_truncated,
+        "boundary_truncated_page_count": boundary_truncated,
+        "failed_page_count": len(failed_pages),
+    }
+    for field_name, expected in declared_counts.items():
+        if _strict_int(coverage.get(field_name)) != expected:
+            errors.append(
+                f"SOURCE_BOUNDARY_SHORTFALL_{field_name.upper()}_MISMATCH"
+            )
+    if internal_empty or internal_truncated or failed_pages:
+        errors.append("SOURCE_BOUNDARY_SHORTFALL_INTERNAL_GAP_PRESENT")
+    if str(coverage.get("technical_integrity_status") or "") != (
+        "complete_page_ledger"
+    ):
+        errors.append("SOURCE_BOUNDARY_SHORTFALL_INTEGRITY_STATUS_INVALID")
     return list(dict.fromkeys(errors))
 
 
@@ -692,10 +874,34 @@ def _source_leaf(
                 or {}
             ).get(timeframe),
         }
+        if str(
+            source_request_contract.get("timeframe_request_map_schema_version") or ""
+        ) == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            expected_projection.update(
+                {
+                    "strategy_evidence_interval": (
+                        source_request_contract.get(
+                            "timeframe_strategy_evidence_intervals"
+                        )
+                        or {}
+                    ).get(timeframe),
+                    "audit_only_prefix_interval": (
+                        source_request_contract.get(
+                            "timeframe_audit_only_prefix_intervals"
+                        )
+                        or {}
+                    ).get(timeframe),
+                    "audit_reference_timeframe": (
+                        source_request_contract.get("timeframe_audit_reference_map")
+                        or {}
+                    ).get(timeframe),
+                }
+            )
         for field_name, expected_value in expected_projection.items():
-            if expected_value is None or provenance.get("request", {}).get(
-                field_name
-            ) != expected_value:
+            if (
+                field_name not in provenance.get("request", {})
+                or provenance.get("request", {}).get(field_name) != expected_value
+            ):
                 errors.append(
                     f"SOURCE_TIMEFRAME_REQUEST_PROJECTION_MISMATCH:{field_name}"
                 )
@@ -719,10 +925,31 @@ def _source_leaf(
         errors.append("SOURCE_MANIFEST_PUBLISHED_ROWS_MISMATCH")
 
     if availability_class == "success":
-        if provenance_status != _SUCCESS_SOURCE_STATUS or provenance_failure:
-            errors.append("SOURCE_ACQUISITION_SUCCESS_INVALID")
-        if provenance.get("complete") is not True:
-            errors.append("SOURCE_INCOMPLETE")
+        if manifest_failure == "boundary_history_shortfall":
+            # A leading/trailing requested-span shortfall is statistical
+            # evidence, not source absence.  Preserve the writer's immutable
+            # partial marker while allowing the exact timeframe cell to reach
+            # the partition, bar-floor, resolution, and parity gates below.
+            if (
+                provenance_status != "partial"
+                or provenance_failure != "boundary_history_shortfall"
+                or frame is None
+                or provenance.get("complete") is not False
+            ):
+                errors.append("SOURCE_BOUNDARY_HISTORY_SHORTFALL_INVALID")
+            if (
+                provenance.get("eligible_for_downstream_validation") is not False
+                or provenance.get("eligible_for_optimization") is not False
+            ):
+                errors.append("SOURCE_BOUNDARY_HISTORY_SHORTFALL_SELF_PROMOTED")
+            errors.extend(
+                _boundary_shortfall_integrity_errors(provenance, frame)
+            )
+        else:
+            if provenance_status != _SUCCESS_SOURCE_STATUS or provenance_failure:
+                errors.append("SOURCE_ACQUISITION_SUCCESS_INVALID")
+            if provenance.get("complete") is not True:
+                errors.append("SOURCE_INCOMPLETE")
     elif availability_class == "unavailable":
         if provenance.get("complete") is not False:
             errors.append("SOURCE_UNAVAILABLE_MARKED_COMPLETE")
@@ -906,7 +1133,7 @@ def _coverage_verdict(
             ["SESSION_COVERAGE_METHOD_OR_STATUS_INVALID"],
             {partition: None for partition in NATIVE_EVIDENCE_PARTITIONS},
         )
-    if declared_method == NATIVE_SESSION_COVERAGE_METHOD:
+    if declared_method == SEGMENTED_SESSION_COVERAGE_METHOD_V2:
         recomputed, recomputed_details = segmented_session_coverage_by_partition_v2(
             frame,
             partition_windows,
@@ -934,7 +1161,7 @@ def _coverage_verdict(
         else None
     )
     errors: list[str] = []
-    if declared_method == NATIVE_SESSION_COVERAGE_METHOD and dict(details) != dict(
+    if declared_method == SEGMENTED_SESSION_COVERAGE_METHOD_V2 and dict(details) != dict(
         recomputed_details
     ):
         errors.append("SESSION_COVERAGE_SEGMENTED_DETAILS_MISMATCH")
@@ -1043,7 +1270,9 @@ def _coverage_verdict(
                 errors.append(f"{code}:{partition}")
     if errors:
         return "ERROR", list(dict.fromkeys(errors)), dict(recomputed)
-    if declared_method == NATIVE_SESSION_COVERAGE_METHOD:
+    if declared_method in {
+        SEGMENTED_SESSION_COVERAGE_METHOD_V2,
+    }:
         if recomputed_details.get("conservative_lower_bound_available") is not True:
             return (
                 "ERROR",
@@ -1091,6 +1320,87 @@ def _coverage_verdict(
                 )
     history_status, reasons, normalized = classify_native_session_history(
         recomputed,
+        minimum=minimum,
+    )
+    if history_status == "insufficient":
+        return "FAIL", reasons, normalized
+    if history_status == "invalid":
+        return "ERROR", reasons, normalized
+    return "PASS", [], normalized
+
+
+def _cross_resolution_coverage_verdict(
+    report: Mapping[str, Any],
+    minimum: float,
+) -> Tuple[str, list[str], Dict[str, Optional[float]]]:
+    """Classify an independently reconciled native timeframe pair.
+
+    Unlike the legacy timestamp diagnostic, this map is computed from another
+    broker-native resolution and is evaluated separately for train, tuning,
+    and final partitions. Deterministic source inconsistencies are a cell-level
+    insufficiency; malformed or incomplete audit evidence is technical.
+    """
+
+    empty = {partition: None for partition in NATIVE_EVIDENCE_PARTITIONS}
+    if not isinstance(report, Mapping) or str(report.get("schema_version") or "") != (
+        CROSS_RESOLUTION_PARITY_SCHEMA_VERSION
+    ):
+        return "ERROR", ["CROSS_RESOLUTION_REPORT_INVALID"], empty
+    partitions = report.get("partitions")
+    if not isinstance(partitions, Mapping) or set(partitions) != set(
+        NATIVE_EVIDENCE_PARTITIONS
+    ):
+        return "ERROR", ["CROSS_RESOLUTION_PARTITION_MAP_INVALID"], empty
+
+    coverage: Dict[str, Optional[float]] = {}
+    errors: list[str] = []
+    for partition in NATIVE_EVIDENCE_PARTITIONS:
+        detail = partitions.get(partition)
+        if not isinstance(detail, Mapping):
+            coverage[partition] = None
+            errors.append(f"CROSS_RESOLUTION_PARTITION_INVALID:{partition}")
+            continue
+        partition_status = str(detail.get("status") or "").upper()
+        value = _strict_finite_number(detail.get("bidirectional_coverage"))
+        try:
+            compared_coarse = int(detail.get("coarse_bars", 0) or 0)
+            compared_fine = int(detail.get("fine_rows", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            compared_coarse = compared_fine = -1
+        no_comparable_evidence = compared_coarse == 0 or compared_fine == 0
+        if value is None and (
+            partition_status == "FAIL"
+            or (
+                partition_status == "PENDING"
+                and no_comparable_evidence
+            )
+        ):
+            # A completed comparison with no usable overlap is decisive zero
+            # evidence, not a malformed ratio. This keeps genuinely short
+            # histories as immutable cell exclusions instead of turning the
+            # entire activation into a technical failure.
+            value = 0.0
+        coverage[partition] = value
+        if value is None or not 0.0 <= value <= 1.0:
+            errors.append(f"CROSS_RESOLUTION_COVERAGE_INVALID:{partition}")
+        if partition_status not in {"PASS", "FAIL", "PENDING"}:
+            errors.append(f"CROSS_RESOLUTION_PARTITION_STATUS_INVALID:{partition}")
+    if errors:
+        return "ERROR", list(dict.fromkeys(errors)), coverage
+
+    report_status = str(report.get("status") or "").upper()
+    if report_status == "PENDING":
+        report_reasons = [
+            f"CROSS_RESOLUTION:{reason}"
+            for reason in (report.get("reason_codes") or [])
+            if str(reason)
+        ]
+        return "PENDING", report_reasons or ["CROSS_RESOLUTION_PENDING"], coverage
+    if report_status not in {"PASS", "FAIL"}:
+        return "ERROR", ["CROSS_RESOLUTION_STATUS_INVALID"], coverage
+
+    history_status, reasons, normalized = classify_native_session_history(
+        coverage,
         minimum=minimum,
     )
     if history_status == "insufficient":
@@ -1184,7 +1494,7 @@ def _symbol_availability_decision(
     return {
         "symbol": symbol,
         "status": status,
-        "decision_basis": "source_availability_only",
+        "decision_basis": NATIVE_SOURCE_EVIDENCE_DECISION_BASIS,
         "reason_codes": list(dict.fromkeys(availability_reasons or blocking_reasons)),
         "availability_cells": cells,
     }
@@ -1235,8 +1545,16 @@ def audit_and_activate(
         )
     if not 0.0 <= float(thresholds.min_membership_ratio) <= 1.0:
         raise ValueError("min_membership_ratio must be between 0 and 1")
-    if not 0.0 <= float(thresholds.max_ohlc_mismatch_ratio) <= 1.0:
-        raise ValueError("max_ohlc_mismatch_ratio must be between 0 and 1")
+    if not math.isclose(
+        float(thresholds.max_ohlc_mismatch_ratio),
+        0.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "production max_ohlc_mismatch_ratio is pinned at 0.0; "
+            "tick tolerance already handles legitimate price precision"
+        )
     if not 0.0 <= float(thresholds.max_unassigned_m5_ratio) <= 1.0:
         raise ValueError("max_unassigned_m5_ratio must be between 0 and 1")
     if int(thresholds.min_compared_native_bars) <= 0:
@@ -1394,6 +1712,23 @@ def audit_and_activate(
         else:
             run_manifest_errors.append("RUN_MANIFEST_RESULT_NOT_OBJECT")
 
+    cross_resolution_mode = str(
+        run_request.get("timeframe_request_map_schema_version") or ""
+    ) == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+    audit_reference_map: Dict[str, str] = {}
+    if cross_resolution_mode:
+        declared_references = run_request.get("timeframe_audit_reference_map")
+        try:
+            expected_references = cross_resolution_reference_map(canonical_timeframes)
+        except ValueError:
+            expected_references = {}
+        if not isinstance(declared_references, Mapping) or dict(
+            declared_references
+        ) != expected_references:
+            run_manifest_errors.append("RUN_MANIFEST_AUDIT_REFERENCE_MAP_INVALID")
+        else:
+            audit_reference_map = dict(expected_references)
+
     entries: Dict[str, Dict[str, Any]] = {}
     activation_blocking_statuses: list[str] = []
     declared_coverage_methods: set[str] = set()
@@ -1451,16 +1786,31 @@ def audit_and_activate(
             provenance = source.get("provenance", {}) or {}
             frame = source.get("frame")
             source_errors = list(source.get("errors", []) or [])
-            tolerance = overrides.get(symbol)
-            if tolerance is None:
-                instrument = provenance.get("instrument")
-                if isinstance(instrument, Mapping):
-                    try:
-                        candidate = float(instrument.get("parity_tick_tolerance"))
-                    except (TypeError, ValueError, OverflowError):
-                        candidate = float("nan")
-                    if math.isfinite(candidate) and candidate > 0.0:
-                        tolerance = candidate
+            authenticated_tolerance: Optional[float] = None
+            instrument = provenance.get("instrument")
+            if isinstance(instrument, Mapping):
+                try:
+                    candidate = float(instrument.get("parity_tick_tolerance"))
+                except (TypeError, ValueError, OverflowError):
+                    candidate = float("nan")
+                if math.isfinite(candidate) and candidate > 0.0:
+                    authenticated_tolerance = candidate
+            tolerance = authenticated_tolerance
+            override_tolerance = overrides.get(symbol)
+            if override_tolerance is not None:
+                if authenticated_tolerance is None:
+                    if cross_resolution_mode:
+                        source_errors.append(
+                            "TICK_TOLERANCE_OVERRIDE_WITHOUT_AUTHENTICATED_BASE"
+                        )
+                    else:
+                        tolerance = override_tolerance
+                elif override_tolerance > authenticated_tolerance + 1e-12:
+                    source_errors.append(
+                        "TICK_TOLERANCE_OVERRIDE_WEAKENS_AUTHENTICATED_BASE"
+                    )
+                else:
+                    tolerance = override_tolerance
             resolution_audit = audit_native_resolution(
                 frame,
                 symbol=symbol,
@@ -1479,66 +1829,212 @@ def audit_and_activate(
             source_availability_class = str(
                 source.get("availability_class") or ""
             )
+            reference_source: Mapping[str, Any] = {}
+            reference_timeframe = audit_reference_map.get(timeframe)
             if source_availability_class == "unavailable" and not source_errors:
                 parity = {
-                    "schema_version": PARITY_SCHEMA_VERSION,
+                    "schema_version": (
+                        CROSS_RESOLUTION_PARITY_SCHEMA_VERSION
+                        if cross_resolution_mode
+                        else PARITY_SCHEMA_VERSION
+                    ),
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "status": "NOT_APPLICABLE",
                     "reason_codes": ["CELL_ACQUISITION_UNAVAILABLE"],
                     "native_is_signal_authority": True,
-                    "m5_role": "read_only_session_membership_audit_comparator",
                     "metrics": {},
+                    "partitions": {},
                     "diagnostics": {},
                 }
-            elif (
-                timeframe != "M5"
-                and m5_availability_class == "unavailable"
-                and not m5_errors
-            ):
-                parity = {
-                    "schema_version": PARITY_SCHEMA_VERSION,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "status": "NOT_APPLICABLE",
-                    "reason_codes": [
-                        "M5_ACQUISITION_UNAVAILABLE:"
-                        f"{m5_failure or 'UNSPECIFIED'}"
-                    ],
-                    "native_is_signal_authority": True,
-                    "m5_role": "read_only_session_membership_audit_comparator",
-                    "metrics": {},
-                    "diagnostics": {},
+                coverage_status = "FAIL"
+                coverage_reasons = ["CELL_ACQUISITION_UNAVAILABLE"]
+                coverage = {
+                    partition: 0.0 for partition in NATIVE_EVIDENCE_PARTITIONS
                 }
-            elif frame is None or m5_frame is None or m5_errors:
-                parity = {
-                    "schema_version": PARITY_SCHEMA_VERSION,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "status": "PENDING",
-                    "reason_codes": ["SOURCE_FRAME_UNAVAILABLE_FOR_PARITY"] + [
-                        f"M5:{reason}" for reason in m5_errors
-                    ],
-                    "native_is_signal_authority": True,
-                    "m5_role": "read_only_session_membership_audit_comparator",
-                    "metrics": {},
-                    "diagnostics": {},
-                }
-            else:
-                parity = audit_native_vs_session_m5(
-                    m5_frame,
-                    frame,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    tick_tolerance=tolerance,
-                    thresholds=thresholds,
+            elif cross_resolution_mode:
+                reference_source = sources.get(reference_timeframe, {})
+                reference_frame = (
+                    reference_source.get("frame")
+                    if isinstance(reference_source, Mapping)
+                    else None
                 )
-            coverage_status, coverage_reasons, coverage = _coverage_verdict(
-                provenance,
-                frame,
-                float(minimum_session_coverage),
-                partition_windows_by_timeframe.get(timeframe, {}),
-            )
+                reference_errors = (
+                    list(reference_source.get("errors", []) or [])
+                    if isinstance(reference_source, Mapping)
+                    else ["REFERENCE_SOURCE_MISSING"]
+                )
+                reference_class = (
+                    str(reference_source.get("availability_class") or "")
+                    if isinstance(reference_source, Mapping)
+                    else ""
+                )
+                reference_failure = str(
+                    (
+                        (reference_source.get("provenance") or {}).get(
+                            "failure_status"
+                        )
+                        if isinstance(reference_source, Mapping)
+                        and isinstance(reference_source.get("provenance"), Mapping)
+                        else ""
+                    )
+                    or ""
+                ).strip().upper()
+                if not reference_timeframe:
+                    parity = {
+                        "schema_version": CROSS_RESOLUTION_PARITY_SCHEMA_VERSION,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "status": "PENDING",
+                        "reason_codes": ["AUDIT_REFERENCE_TIMEFRAME_MISSING"],
+                        "native_is_signal_authority": True,
+                        "metrics": {},
+                        "partitions": {},
+                        "diagnostics": {},
+                    }
+                    coverage_status = "ERROR"
+                    coverage_reasons = ["AUDIT_REFERENCE_TIMEFRAME_MISSING"]
+                    coverage = dict.fromkeys(NATIVE_EVIDENCE_PARTITIONS)
+                elif reference_class == "unavailable" and not reference_errors:
+                    reason = (
+                        f"AUDIT_REFERENCE_UNAVAILABLE:{reference_timeframe}:"
+                        f"{reference_failure or 'UNSPECIFIED'}"
+                    )
+                    parity = {
+                        "schema_version": CROSS_RESOLUTION_PARITY_SCHEMA_VERSION,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "status": "NOT_APPLICABLE",
+                        "reason_codes": [reason],
+                        "native_is_signal_authority": True,
+                        "reference_timeframe": reference_timeframe,
+                        "metrics": {},
+                        "partitions": {},
+                        "diagnostics": {},
+                    }
+                    coverage = {
+                        partition: 0.0 for partition in NATIVE_EVIDENCE_PARTITIONS
+                    }
+                    _history_status, coverage_reasons, coverage = (
+                        classify_native_session_history(
+                            coverage,
+                            minimum=float(minimum_session_coverage),
+                        )
+                    )
+                    coverage_status = "FAIL"
+                elif frame is None or reference_frame is None or reference_errors:
+                    reasons_pending = ["SOURCE_FRAME_UNAVAILABLE_FOR_CROSS_RESOLUTION"]
+                    reasons_pending.extend(
+                        f"{reference_timeframe}:{reason}"
+                        for reason in reference_errors
+                    )
+                    parity = {
+                        "schema_version": CROSS_RESOLUTION_PARITY_SCHEMA_VERSION,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "status": "PENDING",
+                        "reason_codes": reasons_pending,
+                        "native_is_signal_authority": True,
+                        "reference_timeframe": reference_timeframe,
+                        "metrics": {},
+                        "partitions": {},
+                        "diagnostics": {},
+                    }
+                    coverage_status = "PENDING"
+                    coverage_reasons = reasons_pending
+                    coverage = dict.fromkeys(NATIVE_EVIDENCE_PARTITIONS)
+                else:
+                    if TIMEFRAME_SECONDS[reference_timeframe] < TIMEFRAME_SECONDS[timeframe]:
+                        fine_timeframe, fine_frame = reference_timeframe, reference_frame
+                        coarse_timeframe, coarse_frame = timeframe, frame
+                    else:
+                        fine_timeframe, fine_frame = timeframe, frame
+                        coarse_timeframe, coarse_frame = (
+                            reference_timeframe,
+                            reference_frame,
+                        )
+                    parity = audit_native_cross_resolution(
+                        fine_frame,
+                        coarse_frame,
+                        symbol=symbol,
+                        fine_timeframe=fine_timeframe,
+                        coarse_timeframe=coarse_timeframe,
+                        activation_target_timeframe=timeframe,
+                        tick_tolerance=tolerance,
+                        partition_windows=partition_windows_by_timeframe.get(
+                            timeframe,
+                            {},
+                        ),
+                        thresholds=thresholds,
+                    )
+                    parity = dict(parity)
+                    parity.update(
+                        {
+                            "timeframe": timeframe,
+                            "activation_target_timeframe": timeframe,
+                            "reference_timeframe": reference_timeframe,
+                            "reference_bars_sha256": reference_source.get(
+                                "bars_sha256"
+                            ),
+                            "reference_provenance_sha256": reference_source.get(
+                                "provenance_sha256"
+                            ),
+                        }
+                    )
+                    coverage_status, coverage_reasons, coverage = (
+                        _cross_resolution_coverage_verdict(
+                            parity,
+                            float(minimum_session_coverage),
+                        )
+                    )
+            else:
+                if (
+                    timeframe != "M5"
+                    and m5_availability_class == "unavailable"
+                    and not m5_errors
+                ):
+                    parity = {
+                        "schema_version": PARITY_SCHEMA_VERSION,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "status": "NOT_APPLICABLE",
+                        "reason_codes": [
+                            "M5_ACQUISITION_UNAVAILABLE:"
+                            f"{m5_failure or 'UNSPECIFIED'}"
+                        ],
+                        "native_is_signal_authority": True,
+                        "m5_role": "read_only_session_membership_audit_comparator",
+                        "metrics": {},
+                        "diagnostics": {},
+                    }
+                elif frame is None or m5_frame is None or m5_errors:
+                    parity = {
+                        "schema_version": PARITY_SCHEMA_VERSION,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "status": "PENDING",
+                        "reason_codes": ["SOURCE_FRAME_UNAVAILABLE_FOR_PARITY"]
+                        + [f"M5:{reason}" for reason in m5_errors],
+                        "native_is_signal_authority": True,
+                        "m5_role": "read_only_session_membership_audit_comparator",
+                        "metrics": {},
+                        "diagnostics": {},
+                    }
+                else:
+                    parity = audit_native_vs_session_m5(
+                        m5_frame,
+                        frame,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        tick_tolerance=tolerance,
+                        thresholds=thresholds,
+                    )
+                coverage_status, coverage_reasons, coverage = _coverage_verdict(
+                    provenance,
+                    frame,
+                    float(minimum_session_coverage),
+                    partition_windows_by_timeframe.get(timeframe, {}),
+                )
             cell_status, reasons = _merge_cell_status(
                 source_errors,
                 parity,
@@ -1570,9 +2066,9 @@ def audit_and_activate(
                     final_cell_status = "excluded_no_trade"
                     cell_universe_status = "excluded_no_trade"
             elif availability_class == "success":
-                # Low but valid coverage is a deterministic cell abstention.
-                # Invalid coverage, source, and parity evidence still blocks
-                # the entire activation rather than becoming NO_TRADE.
+                # Deterministic cross-resolution inconsistency is a cell-level
+                # source abstention. Malformed/hash/pagination evidence and an
+                # unfinished audit remain activation-blocking technical states.
                 if resolution_status != "PASS":
                     cell_status = "FAIL"
                     reasons = list(
@@ -1596,9 +2092,27 @@ def audit_and_activate(
                     if coverage_status in {"ERROR", "PENDING"}
                     else []
                 )
+                semantic_cross_resolution_failure = bool(
+                    cross_resolution_mode
+                    and str(parity.get("schema_version") or "")
+                    == CROSS_RESOLUTION_PARITY_SCHEMA_VERSION
+                    and str(parity.get("status") or "").upper() == "FAIL"
+                )
+                if semantic_cross_resolution_failure and coverage_status == "ERROR":
+                    # A deterministic parity FAIL can make the derived coverage
+                    # ratio unavailable (for example, too little overlap). That
+                    # is a cell-level evidence abstention, not a broken audit
+                    # transaction. Malformed source/hash/pagination evidence is
+                    # already carried independently in ``source_errors``.
+                    technical_coverage_status = "PASS"
+                    technical_coverage_reasons = []
+                technical_parity = dict(parity)
+                if semantic_cross_resolution_failure:
+                    technical_parity["status"] = "PASS"
+                    technical_parity["reason_codes"] = []
                 technical_status, _technical_reasons = _merge_cell_status(
                     source_errors,
-                    parity,
+                    technical_parity,
                     technical_coverage_status,
                     technical_coverage_reasons,
                 )
@@ -1607,7 +2121,11 @@ def audit_and_activate(
                     final_cell_status = (
                         "failed" if technical_status == "FAIL" else "pending"
                     )
-                elif coverage_status == "FAIL" or resolution_status != "PASS":
+                elif (
+                    coverage_status == "FAIL"
+                    or resolution_status != "PASS"
+                    or semantic_cross_resolution_failure
+                ):
                     final_cell_status = "excluded_no_trade"
                     cell_universe_status = "excluded_no_trade"
                 elif cell_status == "PASS":
@@ -1622,17 +2140,73 @@ def audit_and_activate(
                     f"{availability_error or 'unknown'}"
                 ]
                 activation_blocking_statuses.append("FAIL")
+            coverage_details = provenance.get(
+                "expected_session_coverage_details_by_partition"
+            )
+            source_timestamp_coverage_method = (
+                str(coverage_details.get("method") or "")
+                if isinstance(coverage_details, Mapping)
+                else ""
+            )
+            coverage_method = (
+                NATIVE_SESSION_COVERAGE_METHOD
+                if cross_resolution_mode
+                else (
+                    source_timestamp_coverage_method
+                    or LEGACY_NATIVE_SESSION_COVERAGE_METHOD
+                )
+            )
+            if coverage_method:
+                declared_coverage_methods.add(coverage_method)
             parity = dict(parity)
+            if cross_resolution_mode and reference_timeframe:
+                if (
+                    TIMEFRAME_SECONDS[reference_timeframe]
+                    < TIMEFRAME_SECONDS[timeframe]
+                ):
+                    bound_fine_timeframe = reference_timeframe
+                    bound_coarse_timeframe = timeframe
+                else:
+                    bound_fine_timeframe = timeframe
+                    bound_coarse_timeframe = reference_timeframe
+            else:
+                bound_fine_timeframe = None
+                bound_coarse_timeframe = None
             parity.update(
                 {
                     "activation_id": activation_id,
                     "run_id": run_id,
+                    "activation_target_timeframe": (
+                        timeframe if cross_resolution_mode else None
+                    ),
+                    "fine_timeframe": bound_fine_timeframe,
+                    "coarse_timeframe": bound_coarse_timeframe,
+                    "reference_timeframe": (
+                        reference_timeframe if cross_resolution_mode else None
+                    ),
                     "cell_activation_status": cell_status,
                     "cell_reason_codes": reasons,
                     "expected_session_coverage_by_partition": coverage,
+                    "coverage_method": coverage_method,
+                    "source_timestamp_coverage_method": (
+                        source_timestamp_coverage_method
+                    ),
                     "minimum_session_coverage": float(minimum_session_coverage),
                     "source_bars_sha256": source.get("bars_sha256"),
                     "source_provenance_sha256": source.get("provenance_sha256"),
+                    "cross_resolution_reference_timeframe": (
+                        reference_timeframe if cross_resolution_mode else None
+                    ),
+                    "cross_resolution_reference_bars_sha256": (
+                        reference_source.get("bars_sha256")
+                        if isinstance(reference_source, Mapping)
+                        else None
+                    ),
+                    "cross_resolution_reference_provenance_sha256": (
+                        reference_source.get("provenance_sha256")
+                        if isinstance(reference_source, Mapping)
+                        else None
+                    ),
                     "run_manifest_relative_path": str(
                         run_manifest_path.relative_to(native_root)
                     ).replace("\\", "/"),
@@ -1656,7 +2230,14 @@ def audit_and_activate(
                 "end_ts": frame.index[-1].isoformat() if frame is not None and len(frame) else None,
                 "complete": cell_status == "PASS",
                 "resolution_audit": resolution_audit,
+                "coverage_method": coverage_method,
                 "expected_session_coverage_by_partition": coverage,
+                "source_timestamp_coverage_method": (
+                    source_timestamp_coverage_method
+                ),
+                "source_timestamp_coverage_by_partition": provenance.get(
+                    "expected_session_coverage_by_partition"
+                ),
                 "observed_session_bars_by_partition": provenance.get(
                     "observed_session_bars_by_partition"
                 ),
@@ -1699,6 +2280,19 @@ def audit_and_activate(
                     Path(source["provenance_path"]).resolve().relative_to(native_root)
                 ).replace("\\", "/"),
                 "source_provenance_sha256": source.get("provenance_sha256"),
+                "cross_resolution_reference_timeframe": (
+                    reference_timeframe if cross_resolution_mode else None
+                ),
+                "cross_resolution_reference_bars_sha256": (
+                    reference_source.get("bars_sha256")
+                    if isinstance(reference_source, Mapping)
+                    else None
+                ),
+                "cross_resolution_reference_provenance_sha256": (
+                    reference_source.get("provenance_sha256")
+                    if isinstance(reference_source, Mapping)
+                    else None
+                ),
                 "run_manifest_relative_path": str(
                     run_manifest_path.relative_to(native_root)
                 ).replace("\\", "/"),
@@ -1714,16 +2308,6 @@ def audit_and_activate(
             )
             parity_sha = sha256_file(parity_path)
             sidecar_sha = sha256_file(sidecar_path)
-            coverage_details = provenance.get(
-                "expected_session_coverage_details_by_partition"
-            )
-            coverage_method = (
-                str(coverage_details.get("method") or "")
-                if isinstance(coverage_details, Mapping)
-                else ""
-            )
-            if coverage_method:
-                declared_coverage_methods.add(coverage_method)
             if availability_class == "unavailable":
                 source_validation_status = (
                     "ACQUISITION_UNAVAILABLE" if not source_errors else "FAIL"
@@ -1754,6 +2338,19 @@ def audit_and_activate(
                 ),
                 "coverage_method": coverage_method,
                 "source_provenance_sha256": source.get("provenance_sha256"),
+                "cross_resolution_reference_timeframe": (
+                    reference_timeframe if cross_resolution_mode else None
+                ),
+                "cross_resolution_reference_bars_sha256": (
+                    reference_source.get("bars_sha256")
+                    if isinstance(reference_source, Mapping)
+                    else None
+                ),
+                "cross_resolution_reference_provenance_sha256": (
+                    reference_source.get("provenance_sha256")
+                    if isinstance(reference_source, Mapping)
+                    else None
+                ),
                 "audited_sidecar_sha256": sidecar_sha,
                 "parity_sha256": parity_sha,
             }
@@ -1774,6 +2371,19 @@ def audit_and_activate(
                 "parity_relative_path": str(parity_path.relative_to(native_root)).replace("\\", "/"),
                 "parity_sha256": parity_sha,
                 "coverage_method": coverage_method,
+                "cross_resolution_reference_timeframe": (
+                    reference_timeframe if cross_resolution_mode else None
+                ),
+                "cross_resolution_reference_bars_sha256": (
+                    reference_source.get("bars_sha256")
+                    if isinstance(reference_source, Mapping)
+                    else None
+                ),
+                "cross_resolution_reference_provenance_sha256": (
+                    reference_source.get("provenance_sha256")
+                    if isinstance(reference_source, Mapping)
+                    else None
+                ),
                 "resolution_status": resolution_status,
                 "resolution_reason_codes": resolution_reasons,
                 "expected_session_coverage_by_partition": coverage,
@@ -1839,11 +2449,17 @@ def audit_and_activate(
                 coverage_reason_codes.extend(
                     f"{timeframe}:{reason}"
                     for reason in entries[symbol][timeframe].get("reason_codes") or []
-                    if str(reason).startswith(("SESSION_COVERAGE_", "RESOLUTION:"))
+                    if str(reason)
+                    and (
+                        cross_resolution_mode
+                        or str(reason).startswith(
+                            ("SESSION_COVERAGE_", "RESOLUTION:")
+                        )
+                    )
                 )
         excluded_symbols[symbol] = {
             "status": "excluded_no_trade",
-            "decision_basis": "source_availability_only",
+            "decision_basis": NATIVE_SOURCE_EVIDENCE_DECISION_BASIS,
             "reason_codes": list(
                 dict.fromkeys(
                     [*acquisition_reason_codes, *coverage_reason_codes]
@@ -1860,7 +2476,11 @@ def audit_and_activate(
     activation_coverage_method = (
         next(iter(declared_coverage_methods))
         if len(declared_coverage_methods) == 1
-        else NATIVE_SESSION_COVERAGE_METHOD
+        else (
+            NATIVE_SESSION_COVERAGE_METHOD
+            if cross_resolution_mode
+            else LEGACY_NATIVE_SESSION_COVERAGE_METHOD
+        )
     )
     if "FAIL" in activation_blocking_statuses:
         manifest_status = "failed"
@@ -1870,7 +2490,7 @@ def audit_and_activate(
         manifest_status = "active"
     universe_eligibility = {
         "schema_version": UNIVERSE_ELIGIBILITY_SCHEMA,
-        "decision_basis": "source_availability_only",
+        "decision_basis": NATIVE_SOURCE_EVIDENCE_DECISION_BASIS,
         "performance_inputs_used": False,
         "minimum_session_coverage": NATIVE_MINIMUM_SESSION_COVERAGE,
         "session_coverage_method": activation_coverage_method,
@@ -1996,10 +2616,6 @@ def _parser() -> argparse.ArgumentParser:
         default=NATIVE_MINIMUM_SESSION_COVERAGE,
         help="pinned production policy; values other than 0.95 are rejected",
     )
-    parser.add_argument("--min-membership-ratio", type=float, default=0.99)
-    parser.add_argument("--max-ohlc-mismatch-ratio", type=float, default=0.005)
-    parser.add_argument("--max-unassigned-m5-ratio", type=float, default=0.01)
-    parser.add_argument("--min-compared-native-bars", type=int, default=20)
     parser.add_argument("--tick-tolerance", action="append", default=[])
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
@@ -2046,6 +2662,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise ValueError(
             "--timeframes must equal the immutable acquisition run's requested timeframe roster"
         )
+    production_contract = bool(
+        str(request.get("timeframe_request_map_schema_version") or "")
+        == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+        and tuple(manifest_timeframes) == tuple(DEFAULT_TIMEFRAMES)
+    )
+    if args.execute and not args.audit_only and not production_contract:
+        raise ValueError(
+            "production activation requires the V4 cross-resolution request map "
+            "and the exact six-timeframe roster; legacy/subset runs are audit-only"
+        )
+    if args.execute and not args.audit_only and args.tick_tolerance:
+        raise ValueError(
+            "production activation forbids tick-tolerance overrides; the immutable "
+            "instrument point/tick size is authoritative"
+        )
     plan = {
         "mode": (
             "audit_only" if args.execute and args.audit_only
@@ -2066,12 +2697,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         symbols=symbols,
         timeframes=args.timeframes,
         activation_id=args.activation_id,
-        thresholds=ParityThresholds(
-            min_membership_ratio=args.min_membership_ratio,
-            max_ohlc_mismatch_ratio=args.max_ohlc_mismatch_ratio,
-            max_unassigned_m5_ratio=args.max_unassigned_m5_ratio,
-            min_compared_native_bars=args.min_compared_native_bars,
-        ),
+        thresholds=ParityThresholds(),
         minimum_session_coverage=args.minimum_session_coverage,
         tick_tolerance_overrides=_parse_tolerances(args.tick_tolerance),
         update_active_pointer=not bool(args.audit_only),

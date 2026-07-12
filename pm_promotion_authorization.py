@@ -530,6 +530,7 @@ def verify_promotion_authorization(
                     active_data_dir,
                     expected_contract["symbol"],
                     expected_contract["timeframe"],
+                    production_contract_required=True,
                 )
             except Exception as exc:
                 result.errors.append(f"PROMOTION_AUTHORIZATION_NATIVE_RESOLUTION_FAILED:{cell_id}:{type(exc).__name__}")
