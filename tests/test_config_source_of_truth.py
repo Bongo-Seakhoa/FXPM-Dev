@@ -207,7 +207,7 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertTrue(
             FUNDED_PIPELINE_CONFIG_KEYS.issubset(PipelineConfig.__dataclass_fields__)
         )
-        self.assertEqual(len(FUNDED_PIPELINE_CONFIG_KEYS), 156)
+        self.assertEqual(len(FUNDED_PIPELINE_CONFIG_KEYS), 158)
         self.assertLess(len(FUNDED_PIPELINE_CONFIG_KEYS), len(PipelineConfig.__dataclass_fields__))
 
     def test_funded_schema_rejects_fixed_and_research_only_pipeline_knobs(self):

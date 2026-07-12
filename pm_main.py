@@ -137,7 +137,8 @@ FUNDED_PIPELINE_CONFIG_KEYS = frozenset(
     evidence_min_native_bars evidence_purge_days
     evidence_require_native_provenance evidence_require_native_timeframes
     evidence_require_session_coverage evidence_sufficiency_enabled
-    evidence_warmup_days evidence_window_years exceptional_val_profit_factor
+    evidence_timeframe_window_years evidence_warmup_days evidence_window_years
+    native_history_window_contract exceptional_val_profit_factor
     exceptional_val_return_pct false_discovery_bootstrap_confidence
     false_discovery_bootstrap_max_dd_upper
     false_discovery_bootstrap_min_mean_lower

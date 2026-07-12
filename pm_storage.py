@@ -7,14 +7,66 @@ and discovers MetaQuotes cleanup candidates under explicit config control.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
+
+
+_PROCESS_FILE_LOCK = threading.RLock()
+
+
+@contextmanager
+def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
+    """Serialize a file transaction across threads and OS processes.
+
+    POSIX advisory locks are process-scoped, so the process-local RLock is
+    required as well as the OS lock.  The one-byte lock file is persistent and
+    bounded; the kernel releases its lock automatically if a writer exits.
+    """
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # A single process-local lock is intentionally constant-space.  Per-path
+    # lock registries grow forever as monthly ledgers roll over.
+    with _PROCESS_FILE_LOCK:
+        with open(lock_path, "a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.01)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _now() -> datetime:
@@ -137,7 +189,6 @@ class SignalLedger:
         self.output_dir = Path(output_dir)
         self.enabled = bool(enabled)
         self.filename = str(filename or "signal_ledger.jsonl").strip() or "signal_ledger.jsonl"
-        self._lock = threading.Lock()
 
     def _ledger_path(self, when: datetime) -> Path:
         stem = Path(self.filename).stem or "signal_ledger"
@@ -151,7 +202,9 @@ class SignalLedger:
         payload = dict(record)
         payload.setdefault("ledger_recorded_at", timestamp.isoformat())
         path = self._ledger_path(timestamp)
-        with self._lock:
+        stem = Path(self.filename).stem or "signal_ledger"
+        lock_path = self.output_dir / f".{stem}.append.lock"
+        with _exclusive_file_lock(lock_path):
             _append_jsonl(path, payload)
         return path
 
@@ -179,6 +232,9 @@ class StorageManager:
         ledger_filename = str(getattr(self.config, "ledger_filename", "signal_ledger.jsonl") or "signal_ledger.jsonl").strip()
         self.state_path = self.output_dir / state_filename
         self.manifest_path = self.output_dir / manifest_filename
+        self._manifest_lock_path = self.manifest_path.with_name(
+            f"{self.manifest_path.name}.lock"
+        )
         self.signal_ledger = SignalLedger(
             self.output_dir,
             enabled=bool(getattr(self.config, "storage_signal_ledger_enabled", True)),
@@ -567,6 +623,122 @@ class StorageManager:
         except Exception as exc:
             self.logger.debug(f"Storage state save failed: {exc}")
 
+    # Non-terminal journal results may repeat every sweep in observe-only
+    # mode; terminal outcomes (deleted/failed) must always be journaled.
+    _MANIFEST_DEDUPE_RESULTS = frozenset({"candidate", "protected_recent_write", "missing"})
+    _MANIFEST_DEFAULT_MAX_MB = 16.0
+    _MANIFEST_ABSOLUTE_MAX_MB = 1024.0
+    _MANIFEST_MAX_ROTATIONS = 16
+    _MANIFEST_MAX_DEDUPE_HOURS = 24.0 * 365.0
+
+    def _manifest_limits(self) -> tuple[int, int]:
+        max_mb = _safe_float(
+            getattr(self.config, "storage_manifest_max_mb", self._MANIFEST_DEFAULT_MAX_MB),
+            self._MANIFEST_DEFAULT_MAX_MB,
+        )
+        if not math.isfinite(max_mb) or max_mb <= 0:
+            max_mb = self._MANIFEST_DEFAULT_MAX_MB
+        max_mb = min(self._MANIFEST_ABSOLUTE_MAX_MB, max_mb)
+        keep = _safe_int(getattr(self.config, "storage_manifest_keep_rotations", 2), 2)
+        keep = min(self._MANIFEST_MAX_ROTATIONS, max(0, keep))
+        return max(1, int(max_mb * 1024 * 1024)), keep
+
+    def _remove_excess_manifest_rotations(self, keep: int) -> None:
+        prefix = f"{self.manifest_path.name}."
+        for candidate in self.manifest_path.parent.glob(f"{self.manifest_path.name}.*"):
+            token = candidate.name[len(prefix):]
+            if token.isdigit() and int(token) > keep:
+                candidate.unlink(missing_ok=True)
+
+    def _rotate_manifest_if_needed_locked(self, incoming_bytes: int = 0) -> None:
+        cap_bytes, keep = self._manifest_limits()
+        self._remove_excess_manifest_rotations(keep)
+        current_size = _safe_size(self.manifest_path)
+        if current_size <= 0 or current_size + max(0, int(incoming_bytes)) <= cap_bytes:
+            return
+        if keep == 0:
+            self.manifest_path.unlink(missing_ok=True)
+            return
+        oldest = self.manifest_path.with_name(f"{self.manifest_path.name}.{keep}")
+        oldest.unlink(missing_ok=True)
+        for index in range(keep - 1, 0, -1):
+            source = self.manifest_path.with_name(f"{self.manifest_path.name}.{index}")
+            if source.exists():
+                os.replace(
+                    source,
+                    self.manifest_path.with_name(f"{self.manifest_path.name}.{index + 1}"),
+                )
+        os.replace(
+            self.manifest_path,
+            self.manifest_path.with_name(f"{self.manifest_path.name}.1"),
+        )
+        self._remove_excess_manifest_rotations(keep)
+
+    def _rotate_manifest_if_needed(self, incoming_bytes: int = 0) -> None:
+        """Rotate under the same cross-process lock used by manifest append."""
+        with _exclusive_file_lock(self._manifest_lock_path):
+            self._rotate_manifest_if_needed_locked(incoming_bytes=incoming_bytes)
+
+    def _should_journal(
+        self,
+        path: Path,
+        result: str,
+        size_bytes: int,
+        now: datetime,
+        *,
+        trigger: str = "",
+        action: str = "",
+        reason: str = "",
+    ) -> bool:
+        if result not in self._MANIFEST_DEDUPE_RESULTS:
+            return True
+        window_hours = _safe_float(getattr(self.config, "storage_manifest_dedupe_hours", 24.0), 24.0)
+        if not math.isfinite(window_hours):
+            window_hours = 24.0
+        window_hours = min(self._MANIFEST_MAX_DEDUPE_HOURS, window_hours)
+        if window_hours <= 0:
+            return True
+        bucket = self._state.get("manifest_dedupe")
+        if not isinstance(bucket, dict):
+            bucket = {}
+            self._state["manifest_dedupe"] = bucket
+        key = str(path)
+        prior = bucket.get(key)
+        if isinstance(prior, dict):
+            prior_at = _dt_from_iso(prior.get("at"))
+            try:
+                within_window = bool(
+                    prior_at is not None
+                    and prior_at >= now - timedelta(hours=window_hours)
+                )
+            except (TypeError, OverflowError, ValueError):
+                within_window = False
+            if (
+                str(prior.get("result")) == str(result)
+                and _safe_int(prior.get("size_bytes"), -1) == int(size_bytes)
+                and str(prior.get("trigger") or "") == str(trigger)
+                and str(prior.get("action") or "") == str(action)
+                and str(prior.get("reason") or "") == str(reason)
+                and within_window
+            ):
+                return False
+        bucket[key] = {
+            "result": str(result),
+            "size_bytes": int(size_bytes),
+            "trigger": str(trigger),
+            "action": str(action),
+            "reason": str(reason),
+            "at": now.isoformat(),
+        }
+        if len(bucket) > 512:
+            ordered = sorted(
+                bucket.items(),
+                key=lambda item: str((item[1] or {}).get("at") or ""),
+            )
+            for stale_key, _payload in ordered[: len(bucket) - 512]:
+                bucket.pop(stale_key, None)
+        return True
+
     def _append_manifest(
         self,
         *,
@@ -587,10 +759,30 @@ class StorageManager:
             "size_bytes": int(size_bytes),
             "result": result,
         }
-        try:
-            _append_jsonl(self.manifest_path, payload)
-        except Exception as exc:
-            self.logger.debug(f"Storage manifest append failed: {exc}")
+        encoded_size = len(
+            (json.dumps(payload, ensure_ascii=True, default=str) + "\n").encode("utf-8")
+        )
+        with _exclusive_file_lock(self._manifest_lock_path):
+            if not self._should_journal(
+                path,
+                result,
+                int(size_bytes),
+                now,
+                trigger=trigger,
+                action=action,
+                reason=reason,
+            ):
+                return
+            try:
+                self._rotate_manifest_if_needed_locked(incoming_bytes=encoded_size)
+            except Exception as exc:
+                # Rotation is housekeeping.  A rotation failure must never
+                # suppress the event it was meant to make room for.
+                self.logger.debug(f"Storage manifest rotation failed: {exc}")
+            try:
+                _append_jsonl(self.manifest_path, payload)
+            except Exception as exc:
+                self.logger.debug(f"Storage manifest append failed: {exc}")
 
     def _is_due(self, key: str, now: datetime, interval_seconds: int) -> bool:
         interval = max(1, int(interval_seconds))
@@ -678,9 +870,16 @@ class StorageManager:
         candidates.extend(self._trade_snapshot_cleanup_candidates(now))
         candidates.extend(self._cache_cleanup_candidates(now))
         candidates.extend(self._live_cache_cleanup_candidates(now))
+        # signal_ledger_YYYYMM.jsonl is never age-deleted.  Closed months are
+        # losslessly archived to .jsonl.gz only after the compressed payload
+        # decompresses sha256-identical, and every dashboard/audit reader
+        # consumes the archive transparently, so canonical history survives
+        # while storage stays bounded.
+        candidates.extend(self._signal_ledger_compaction_candidates(now))
 
         reclaimed_bytes = 0
         deleted = 0
+        compressed = 0
         skipped = 0
         protect_minutes = _safe_int(getattr(self.config, "storage_write_protect_minutes", 5), 5)
 
@@ -726,16 +925,22 @@ class StorageManager:
                 reclaimed_bytes += size_bytes
                 continue
             try:
-                _delete_path(path)
-                reclaimed_bytes += size_bytes
-                deleted += 1
+                if action == "compress_signal_ledger_month":
+                    reclaimed_bytes += self._compress_ledger_month(path)
+                    compressed += 1
+                    result = "compressed"
+                else:
+                    _delete_path(path)
+                    reclaimed_bytes += size_bytes
+                    deleted += 1
+                    result = "deleted"
                 self._append_manifest(
                     trigger=trigger,
                     action=action,
                     path=path,
                     reason=reason,
                     size_bytes=size_bytes,
-                    result="deleted",
+                    result=result,
                     now=now,
                 )
             except Exception as exc:
@@ -753,6 +958,7 @@ class StorageManager:
         return {
             "candidates": len(candidates),
             "deleted": deleted,
+            "compressed": compressed,
             "skipped": skipped,
             "reclaimable_bytes": int(reclaimed_bytes),
         }
@@ -863,6 +1069,94 @@ class StorageManager:
                 if overflow <= 0:
                     break
         return candidates
+
+    def _ledger_stem_suffix(self) -> tuple[str, str]:
+        stem = Path(self.signal_ledger.filename).stem or "signal_ledger"
+        suffix = Path(self.signal_ledger.filename).suffix or ".jsonl"
+        return stem, suffix
+
+    def _signal_ledger_compaction_candidates(self, now: datetime) -> List[Dict[str, Any]]:
+        """Nominate closed ledger months for lossless gzip archiving.
+
+        Only whole months older than the configured window qualify; the
+        current and recent months always stay raw for hot readers/monitors.
+        A month whose raw file reappeared after archiving (late append) is
+        re-nominated so the merge path folds it into the existing archive.
+        """
+        compress_after = _safe_int(
+            getattr(self.config, "storage_signal_ledger_compress_after_months", 2), 2
+        )
+        if compress_after <= 0:
+            return []
+        compress_after = min(compress_after, 120)
+        stem, suffix = self._ledger_stem_suffix()
+        candidates: List[Dict[str, Any]] = []
+        for path in sorted(self.output_dir.glob(f"{stem}_*{suffix}")):
+            token = path.stem[len(stem) + 1:]
+            if len(token) != 6 or not token.isdigit():
+                continue
+            year, month = int(token[:4]), int(token[4:6])
+            if not 1 <= month <= 12:
+                continue
+            age_months = (now.year - year) * 12 + (now.month - month)
+            if age_months < compress_after:
+                continue
+            candidates.append(
+                {
+                    "path": path,
+                    "size_bytes": _safe_size(path),
+                    "reason": f"signal_ledger_lossless_archive>{compress_after}m",
+                    "action": "compress_signal_ledger_month",
+                }
+            )
+        return candidates
+
+    def _compress_ledger_month(self, path: Path) -> int:
+        """Losslessly archive one closed ledger month; return bytes reclaimed.
+
+        The raw file is removed only after the fully written archive
+        decompresses to a sha256-identical payload. If an archive already
+        exists (a late append recreated the raw file), the raw records are
+        merged after the archived ones so no canonical event is ever lost.
+        Runs under the same OS lock as ledger appends.
+        """
+        stem, _suffix = self._ledger_stem_suffix()
+        lock_path = self.output_dir / f".{stem}.append.lock"
+        with _exclusive_file_lock(lock_path):
+            raw_bytes = path.read_bytes()
+            gz_path = path.with_name(f"{path.name}.gz")
+            prior_gz_size = _safe_size(gz_path)
+            prior_bytes = b""
+            if gz_path.exists():
+                prior_bytes = gzip.decompress(gz_path.read_bytes())
+            combined = prior_bytes + raw_bytes
+            expected_sha = hashlib.sha256(combined).hexdigest()
+            tmp_path = gz_path.with_name(
+                f"{gz_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                with open(tmp_path, "wb") as handle:
+                    # mtime=0 keeps the archive byte-deterministic for audits.
+                    with gzip.GzipFile(
+                        fileobj=handle, mode="wb", filename="", mtime=0
+                    ) as gz_handle:
+                        gz_handle.write(combined)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                verified = gzip.decompress(tmp_path.read_bytes())
+                if hashlib.sha256(verified).hexdigest() != expected_sha:
+                    raise RuntimeError(
+                        "ledger archive roundtrip does not match canonical bytes"
+                    )
+                os.replace(tmp_path, gz_path)
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+            path.unlink()
+            return max(0, len(raw_bytes) + prior_gz_size - _safe_size(gz_path))
 
     def _live_cache_cleanup_candidates(self, now: datetime) -> List[Dict[str, Any]]:
         live_dir = self.data_dir / ".live"

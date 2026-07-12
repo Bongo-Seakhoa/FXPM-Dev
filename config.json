@@ -4,7 +4,7 @@
     "scope": "funded_live_v1",
     "strategy_roster_count": 100,
     "holdout_unit": "native-timeframe common-calendar final lockbox never visible to search or ranking",
-    "data_depth_note": "Each native timeframe uses the same UTC calendar boundaries: 5y optimizer train, 7d purge, 2y tuning validation, 7d purge, and a 2y one-shot final lockbox.",
+    "data_depth_note": "Each native timeframe is acquired independently. Tuning validation and the one-shot final lockbox share one concurrent 2y/2y UTC clock; optimizer-train depth is timeframe-specific (M5/M15 5y, M30 6y, H1 7y, H4 8y, D1 12y).",
     "run_label": "institutional_native_calendar_lockbox_v3_20260710",
     "worker_note": "Optimization uses a 4-worker pool; funded live trading is disabled while the new evidence book is rebuilt.",
     "symbol_pool_count": 100,
@@ -36,6 +36,15 @@
       "optimizer_train": 5,
       "tuning_validation": 2,
       "final_lockbox": 2
+    },
+    "native_history_window_contract": "fxpm-timeframe-evidence-v3",
+    "evidence_timeframe_window_years": {
+      "M5": {"optimizer_train": 5, "tuning_validation": 2, "final_lockbox": 2},
+      "M15": {"optimizer_train": 5, "tuning_validation": 2, "final_lockbox": 2},
+      "M30": {"optimizer_train": 6, "tuning_validation": 2, "final_lockbox": 2},
+      "H1": {"optimizer_train": 7, "tuning_validation": 2, "final_lockbox": 2},
+      "H4": {"optimizer_train": 8, "tuning_validation": 2, "final_lockbox": 2},
+      "D1": {"optimizer_train": 12, "tuning_validation": 2, "final_lockbox": 2}
     },
     "evidence_min_native_bars": {
       "M5": {"optimizer_train": 100000, "tuning_validation": 40000, "final_lockbox": 40000},

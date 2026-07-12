@@ -46,8 +46,10 @@ from pm_native_activation import resolve_active_native_artifact
 from pm_evidence import (
     CALENDAR_SPLIT_MODE,
     DEFAULT_MIN_NATIVE_BARS,
+    DEFAULT_TIMEFRAME_WINDOW_YEARS,
     DEFAULT_WINDOW_YEARS,
     normalize_min_native_bars,
+    normalize_timeframe_window_years,
     normalize_window_years,
     validate_native_provenance,
 )
@@ -683,6 +685,16 @@ class PipelineConfig:
     evidence_window_years: Dict[str, int] = field(
         default_factory=lambda: dict(DEFAULT_WINDOW_YEARS)
     )
+    # V3 acquisition and model-selection geometry: every timeframe is sourced
+    # independently; tuning/final remain on one concurrent clock while only
+    # optimizer-train depth may differ by specialist timeframe.
+    evidence_timeframe_window_years: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            timeframe: dict(partitions)
+            for timeframe, partitions in DEFAULT_TIMEFRAME_WINDOW_YEARS.items()
+        }
+    )
+    native_history_window_contract: str = "fxpm-timeframe-evidence-v3"
     evidence_min_native_bars: Dict[str, Dict[str, int]] = field(
         default_factory=lambda: {
             timeframe: dict(partitions)
@@ -1015,6 +1027,9 @@ class PipelineConfig:
     storage_metaquotes_active_root_allowlist: List[str] = field(default_factory=list)
     storage_metaquotes_demo_servers: List[str] = field(default_factory=lambda: ["FBS-Demo", "MetaQuotes-Demo"])
     storage_metaquotes_stale_tester_days: int = 14
+    storage_manifest_max_mb: float = 16.0
+    storage_manifest_keep_rotations: int = 2
+    storage_manifest_dedupe_hours: float = 24.0
     state_filename: str = "storage_state.json"
     manifest_filename: str = "storage_manifest.jsonl"
     ledger_filename: str = "signal_ledger.jsonl"
@@ -1972,6 +1987,17 @@ class PipelineConfig:
         self.evidence_window_years = normalize_window_years(
             getattr(self, "evidence_window_years", None)
         )
+        self.evidence_timeframe_window_years = normalize_timeframe_window_years(
+            getattr(self, "evidence_timeframe_window_years", None)
+        )
+        self.native_history_window_contract = str(
+            getattr(
+                self,
+                "native_history_window_contract",
+                "fxpm-timeframe-evidence-v3",
+            )
+            or "fxpm-timeframe-evidence-v3"
+        ).strip()
         self.evidence_min_native_bars = normalize_min_native_bars(
             getattr(self, "evidence_min_native_bars", None)
         )
@@ -2196,6 +2222,30 @@ class PipelineConfig:
             self.storage_metaquotes_stale_tester_days = max(1, int(self.storage_metaquotes_stale_tester_days))
         except Exception:
             self.storage_metaquotes_stale_tester_days = 14
+        try:
+            manifest_max_mb = float(self.storage_manifest_max_mb)
+            if not math.isfinite(manifest_max_mb) or manifest_max_mb <= 0:
+                raise ValueError("manifest cap must be finite and positive")
+            self.storage_manifest_max_mb = min(1024.0, manifest_max_mb)
+        except Exception:
+            self.storage_manifest_max_mb = 16.0
+        try:
+            self.storage_manifest_keep_rotations = min(
+                16,
+                max(0, int(self.storage_manifest_keep_rotations)),
+            )
+        except Exception:
+            self.storage_manifest_keep_rotations = 2
+        try:
+            manifest_dedupe_hours = float(self.storage_manifest_dedupe_hours)
+            if not math.isfinite(manifest_dedupe_hours):
+                raise ValueError("manifest dedupe window must be finite")
+            self.storage_manifest_dedupe_hours = min(
+                24.0 * 365.0,
+                max(0.0, manifest_dedupe_hours),
+            )
+        except Exception:
+            self.storage_manifest_dedupe_hours = 24.0
         self.storage_metaquotes_root = str(self.storage_metaquotes_root or "").strip()
         self.storage_metaquotes_active_root_allowlist = [
             str(item).strip() for item in (self.storage_metaquotes_active_root_allowlist or []) if str(item).strip()

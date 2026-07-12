@@ -8,6 +8,12 @@ _test_tmp/
 .tmp_test/
 *.tmp.*
 .pm_configs.json.*.tmp
+
+# Local bounded Claude/Codex coordination ledger runtime. The protocol and
+# CLI are tracked; hash-chain segments/locks are host-local operational state.
+coordination/events*.jsonl
+coordination/events*.json
+coordination/events*.lock
 .claude/
 logs/
 runtime/
