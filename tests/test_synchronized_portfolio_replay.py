@@ -507,6 +507,69 @@ def test_mark_to_market_drawdown_is_not_hidden_by_realized_balance():
     assert result["summary"]["mtm_candidate_coverage_pct"] == 100.0
 
 
+def test_common_m5_mark_is_applied_before_same_time_admission():
+    first_with_m5 = candidate(
+        "first-m5",
+        symbol="EURUSD",
+        exit="2025-01-04",
+        marks=(
+            MarkPoint(
+                "2025-01-02",
+                -6_000.0,
+                observation_time="2025-01-02",
+            ),
+        ),
+    )
+    first_with_stale_h4 = replace(
+        first_with_m5,
+        candidate_id="first-h4-stale",
+        marks=(),
+    )
+    second = candidate(
+        "second",
+        symbol="XAUUSD",
+        asset_class="metal",
+        entry="2025-01-02",
+        exit="2025-01-03",
+    )
+    replay_policy = policy(
+        max_open_risk_pct=2.1,
+        max_factor_group_open_risk_pct=2.1,
+        max_same_symbol_open_risk_pct=2.1,
+        enforce_pair_correlation=False,
+    )
+
+    stale = SynchronizedPortfolioSimulator(replay_policy).run(
+        [first_with_stale_h4, second]
+    )
+    causal = SynchronizedPortfolioSimulator(replay_policy).run(
+        [first_with_m5, second]
+    )
+
+    assert stale["summary"]["accepted_positions"] == 2
+    assert causal["summary"]["accepted_positions"] == 1
+    assert causal["summary"]["blocked_by_reason"] == {
+        "EXISTING_TOTAL_STOP_RISK_CAP": 1
+    }
+    assert causal["summary"]["valuation_event_order"] == (
+        "close_existing_then_mark_existing_then_admit"
+    )
+
+
+def test_future_observation_cannot_be_backstamped_as_causal_mark():
+    with pytest.raises(ValueError, match="observation time cannot be after"):
+        candidate(
+            "future-mark",
+            marks=(
+                MarkPoint(
+                    "2025-01-02T10:00:00",
+                    -100.0,
+                    observation_time="2025-01-02T10:05:00",
+                ),
+            ),
+        ).normalized()
+
+
 def test_promotion_status_fails_closed_by_live_allowlist():
     paper = candidate("paper", status="PROMOTE_SMALL")
     result = SynchronizedPortfolioSimulator(policy()).run([paper])
@@ -673,6 +736,43 @@ def test_mtm_marks_accrue_swap_causally_with_broker_triple_day():
     )
 
     assert [mark.pnl_per_current_lot for mark in marks] == [0.0, -5.0, -20.0, -25.0]
+
+
+def test_m5_valuation_uses_observable_open_not_future_close():
+    index = pd.date_range("2026-04-06", periods=2, freq="5min")
+    valuation = pd.DataFrame(
+        {
+            "Open": [100.0, 90.0],
+            # The second close is not observable at its bar-open timestamp and
+            # must never enter the decision-time mark.
+            "Close": [100.0, 1_000.0],
+        },
+        index=index,
+    )
+    backtester = Backtester(PipelineConfig(swap_model_enabled=False))
+    spec = InstrumentSpec("TEST", pip_position=2, commission_per_lot=0.0)
+    spec.calculate_tick_profit = (
+        lambda entry, exit_price, volume, direction: (exit_price - entry)
+        * volume
+        * direction
+    )
+
+    marks = _marks_for_position(
+        valuation,
+        np.zeros(len(valuation)),
+        spec,
+        index[0],
+        index[-1],
+        100.0,
+        1,
+        0.0,
+        backtester,
+        "M5",
+        valuation_price_field="Open",
+    )
+
+    assert [mark.pnl_per_current_lot for mark in marks] == [0.0, -10.0]
+    assert all(mark.observation_time == mark.time for mark in marks)
 
 
 def test_swap_interest_open_mode_uses_open_notional_and_360_day_year():

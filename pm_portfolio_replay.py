@@ -34,16 +34,17 @@ from pm_risk_admission import (
 )
 
 
-PORTFOLIO_REPLAY_SCHEMA_VERSION = "2026-07-11-synchronized-shared-capital-v6"
-PORTFOLIO_REPLAY_EVIDENCE_SCHEMA_VERSION = "2026-07-11-funded-portfolio-evidence-v6"
+PORTFOLIO_REPLAY_SCHEMA_VERSION = "2026-07-13-synchronized-shared-capital-v7"
+PORTFOLIO_REPLAY_EVIDENCE_SCHEMA_VERSION = "2026-07-13-funded-portfolio-evidence-v7"
 PORTFOLIO_REPLAY_EVIDENCE_SEAL_ALGORITHM = "sha256-canonical-json-v1"
 PORTFOLIO_REPLAY_CANDIDATE_SCHEMA_VERSION = (
-    "2026-07-11-native-final-lockbox-exact-regime-position-v4"
+    "2026-07-13-native-final-lockbox-exact-regime-position-v5"
 )
 PORTFOLIO_REPLAY_REQUIRED_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
 PORTFOLIO_REPLAY_REQUIRED_REGIMES = ("TREND", "RANGE", "BREAKOUT", "CHOP")
 MINIMUM_BOOTSTRAP_DAILY_RETURN_OBSERVATIONS = 500
-MTM_MARK_COST_CONTRACT_VERSION = "causal-calendar-rollover-accrual-v1"
+MTM_MARK_COST_CONTRACT_VERSION = "causal-common-valuation-tape-v1"
+MTM_SWAP_ACCRUAL_CONTRACT_VERSION = "causal-calendar-rollover-accrual-v2"
 CorrelationLookup = Callable[[str, str, pd.Timestamp], Optional[float]]
 
 
@@ -235,6 +236,32 @@ def portfolio_cost_contract(config_payload: Mapping[str, Any]) -> Dict[str, Any]
     }
 
 
+def portfolio_mark_cost_contract(
+    cost_contract: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return the exact funded causal valuation/mark contract.
+
+    A single code-owned builder prevents the evidence writer and validator from
+    drifting on the economically important price, clock and event-order rules.
+    """
+    return {
+        "valuation_tape_contract": MTM_MARK_COST_CONTRACT_VERSION,
+        "valuation_timeframe": "M5",
+        "valuation_price_field": "Open",
+        "valuation_timestamp_semantics": "bar_open_utc",
+        "observation_time_rule": "observation_time_lte_effective_time",
+        "event_order": "close_existing_then_mark_existing_then_admit",
+        "spread_at_mark": bool(cost_contract.get("use_spread")),
+        "round_trip_commission_at_mark": bool(
+            cost_contract.get("use_commission")
+        ),
+        "swap_accrued_through_mark": bool(
+            cost_contract.get("swap_model_enabled")
+        ),
+        "swap_accrual_model": MTM_SWAP_ACCRUAL_CONTRACT_VERSION,
+    }
+
+
 def portfolio_policy_from_config_payload(
     config_payload: Mapping[str, Any],
     starting_balance: float,
@@ -413,17 +440,35 @@ class ExitLeg:
 
 @dataclass(frozen=True)
 class MarkPoint:
-    """Unrealized net P&L for one currently-open lot at a bar close."""
+    """One causal unrealized-P&L observation for a currently-open lot.
+
+    ``time`` is the effective portfolio decision timestamp.  The optional
+    ``observation_time`` keeps older two-argument constructors source-compatible,
+    but normalizes them to an observation made at the effective timestamp.  A
+    future observation can never be back-stamped onto an earlier decision.
+    """
 
     time: Any
     pnl_per_current_lot: float
+    observation_time: Any = None
 
     def normalized(self) -> "MarkPoint":
+        effective_time = _timestamp(self.time)
+        observation_time = (
+            effective_time
+            if self.observation_time is None
+            else _timestamp(self.observation_time)
+        )
+        if observation_time > effective_time:
+            raise ValueError(
+                "mark observation time cannot be after its effective decision time"
+            )
         return MarkPoint(
-            time=_timestamp(self.time),
+            time=effective_time,
             pnl_per_current_lot=_required_finite(
                 self.pnl_per_current_lot, "mark P&L"
             ),
+            observation_time=observation_time,
         )
 
 
@@ -807,16 +852,9 @@ def validate_funded_portfolio_replay_evidence(
         for key in ("use_spread", "use_commission", "use_slippage", "swap_model_enabled")
     ):
         errors.append("PORTFOLIO_EVIDENCE_CURRENT_COST_CONTRACT_DISABLED")
-    expected_mark_cost_contract = {
-        "spread_at_mark": bool(expected_cost_contract.get("use_spread")),
-        "round_trip_commission_at_mark": bool(
-            expected_cost_contract.get("use_commission")
-        ),
-        "swap_accrued_through_mark": bool(
-            expected_cost_contract.get("swap_model_enabled")
-        ),
-        "swap_accrual_model": MTM_MARK_COST_CONTRACT_VERSION,
-    }
+    expected_mark_cost_contract = portfolio_mark_cost_contract(
+        expected_cost_contract
+    )
     if replay.get("mark_cost_contract") != expected_mark_cost_contract:
         errors.append("PORTFOLIO_EVIDENCE_MARK_COST_CONTRACT_MISMATCH")
 
@@ -870,6 +908,70 @@ def validate_funded_portfolio_replay_evidence(
             errors.append(f"PORTFOLIO_EVIDENCE_NATIVE_BARS_HASH_MISMATCH:{cell_id}")
         if source.get("sidecar_sha256") != expected_sidecar_sha:
             errors.append(f"PORTFOLIO_EVIDENCE_NATIVE_SIDECAR_HASH_MISMATCH:{cell_id}")
+
+    valuation_sources = replay.get("valuation_sources")
+    if not isinstance(valuation_sources, Mapping):
+        valuation_sources = {}
+    bars_by_source = expected_lineage.get("native_bars_sha256_by_source")
+    sidecars_by_source = expected_lineage.get("native_sidecar_sha256_by_source")
+    valuation_symbols = sorted({
+        str(cell_id).split("|", 1)[0].upper()
+        for cell_id in (expected_roster.get("tradeable_cell_ids") or [])
+        if str(cell_id).strip()
+    })
+    for symbol in valuation_symbols:
+        canonical_symbol = str(symbol).upper()
+        source_id = f"{canonical_symbol}|M5"
+        source = valuation_sources.get(canonical_symbol)
+        if not isinstance(source, Mapping):
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_SOURCE_MISSING:{canonical_symbol}"
+            )
+            continue
+        if (
+            str(source.get("source_kind") or "").lower() != "broker_native"
+            or str(source.get("symbol") or "").upper() != canonical_symbol
+            or str(source.get("timeframe") or "").upper() != "M5"
+        ):
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_SOURCE_INVALID:{canonical_symbol}"
+            )
+        if not bool(source.get("provenance_valid")):
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_PROVENANCE_INVALID:{canonical_symbol}"
+            )
+        if str(source.get("timestamp_semantics") or "").lower() != "bar_open_utc":
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_TIMESTAMP_INVALID:{canonical_symbol}"
+            )
+        if source.get("activation_id") != expected_lineage.get("native_activation_id"):
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_ACTIVATION_MISMATCH:{canonical_symbol}"
+            )
+        if source.get("activation_manifest_sha256") != expected_lineage.get(
+            "native_activation_manifest_sha256"
+        ):
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_MANIFEST_MISMATCH:{canonical_symbol}"
+            )
+        expected_bars_sha = (
+            bars_by_source.get(source_id)
+            if isinstance(bars_by_source, Mapping)
+            else None
+        )
+        expected_sidecar_sha = (
+            sidecars_by_source.get(source_id)
+            if isinstance(sidecars_by_source, Mapping)
+            else None
+        )
+        if source.get("source_sha256") != expected_bars_sha:
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_BARS_HASH_MISMATCH:{canonical_symbol}"
+            )
+        if source.get("sidecar_sha256") != expected_sidecar_sha:
+            errors.append(
+                f"PORTFOLIO_EVIDENCE_VALUATION_SIDECAR_HASH_MISMATCH:{canonical_symbol}"
+            )
 
     scenarios = replay.get("scenarios") if isinstance(replay.get("scenarios"), list) else []
     scenario_balances = [
@@ -1099,7 +1201,7 @@ class SynchronizedPortfolioSimulator:
         allowed = {str(status).upper() for status in self.policy.allowed_promotion_statuses}
         entry_events: Dict[pd.Timestamp, List[CandidateTrade]] = defaultdict(list)
         leg_events: Dict[pd.Timestamp, List[Tuple[str, int]]] = defaultdict(list)
-        mark_events: Dict[pd.Timestamp, List[Tuple[str, float]]] = defaultdict(list)
+        mark_events: Dict[pd.Timestamp, List[Tuple[str, MarkPoint]]] = defaultdict(list)
         blocked: List[Dict[str, Any]] = []
         for candidate in candidates:
             if candidate.promotion_status not in allowed:
@@ -1109,7 +1211,7 @@ class SynchronizedPortfolioSimulator:
             for leg_index, leg in enumerate(candidate.legs):
                 leg_events[leg.exit_time].append((candidate.candidate_id, leg_index))
             for mark in candidate.marks:
-                mark_events[mark.time].append((candidate.candidate_id, mark.pnl_per_current_lot))
+                mark_events[mark.time].append((candidate.candidate_id, mark))
 
         timeline = sorted(set(entry_events) | set(leg_events) | set(mark_events))
         open_positions: Dict[str, _OpenPosition] = {}
@@ -1185,6 +1287,25 @@ class SynchronizedPortfolioSimulator:
                 if candidate_id in open_positions and open_positions[candidate_id].candidate.entry_time < stamp:
                     close_leg(candidate_id, leg_index, stamp)
 
+            # Apply the common causal valuation tape before sizing/admission.
+            # Only positions already open before this decision timestamp may
+            # consume the observation. A new same-t entry must wait for the next
+            # M5 observation rather than inheriting a mark from before it existed.
+            for candidate_id, mark in mark_events.get(stamp, []):
+                if mark.observation_time > stamp:
+                    raise ValueError(
+                        "mark observation time cannot be after portfolio decision time"
+                    )
+                position = open_positions.get(candidate_id)
+                if (
+                    position is not None
+                    and position.candidate.entry_time < stamp
+                ):
+                    position.last_mark_per_current_lot = (
+                        mark.pnl_per_current_lot
+                    )
+                    mark_updates += 1
+
             batch = sorted(
                 entry_events.get(stamp, []),
                 key=lambda candidate: (-candidate.priority_score, candidate.cell_id, candidate.candidate_id),
@@ -1247,13 +1368,6 @@ class SynchronizedPortfolioSimulator:
                     initial_margin=margin,
                 )
                 accepted_ids.add(candidate.candidate_id)
-
-            # Marks at the entry bar close are applied after admission.
-            for candidate_id, pnl_per_lot in mark_events.get(stamp, []):
-                position = open_positions.get(candidate_id)
-                if position is not None:
-                    position.last_mark_per_current_lot = pnl_per_lot
-                    mark_updates += 1
 
             # Same-bar exits are admitted and then settled at the same timestamp.
             for candidate_id, leg_index in leg_events.get(stamp, []):
@@ -1320,6 +1434,11 @@ class SynchronizedPortfolioSimulator:
             "schema_version": PORTFOLIO_REPLAY_SCHEMA_VERSION,
             "capital_model": "one_shared_compounding_account",
             "portfolio_return_aggregation": "chronological_cashflows_not_summed_cell_returns",
+            "valuation_tape_contract": MTM_MARK_COST_CONTRACT_VERSION,
+            "valuation_event_order": "close_existing_then_mark_existing_then_admit",
+            "valuation_timeframe": "M5",
+            "valuation_price_field": "Open",
+            "stop_equity_contract": "legacy_immutable_initial_stop_risk_v1",
             "starting_balance": self.policy.starting_balance,
             "final_balance": round(balance, 8),
             "final_mtm_equity": round(float(final_equity), 8),
@@ -1374,8 +1493,8 @@ class SynchronizedPortfolioSimulator:
             "limitations": [
                 "candidate strategies and parameters remain selection-contaminated unless generated solely from an untouched lockbox",
                 "offline margin is an approximation unless broker historical margin-per-lot is supplied",
-                "mark-to-market uses candidate timeframe bar closes; intrabar portfolio equity can be worse",
-                "initial-stop stress retains original risk until a leg closes and is conservative for trailing-stop policies",
+                "mark-to-market uses the independently loaded native M5 Open observable at each bar-open timestamp; intrabar portfolio equity can be worse",
+                "replay stop-equity remains the legacy immutable initial-stop model until the separate causal stop-state lane is implemented",
                 "spread and slippage are embedded in price P&L and are not separately identifiable from the current trade schema",
                 "bootstrap ruin is a conditional sequence stress test, not a forecast or profitability guarantee",
             ],

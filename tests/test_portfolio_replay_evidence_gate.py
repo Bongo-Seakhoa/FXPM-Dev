@@ -14,9 +14,7 @@ from agent_audit.performance.scripts.run_synchronized_portfolio_replay import (
 )
 from pm_core import PipelineConfig
 from pm_live_readiness import validate_live_readiness
-from pm_native_activation import ACTIVE_POINTER_SCHEMA, ACTIVATION_MANIFEST_SCHEMA
 from pm_portfolio_replay import (
-    MTM_MARK_COST_CONTRACT_VERSION,
     PORTFOLIO_REPLAY_CANDIDATE_SCHEMA_VERSION,
     PORTFOLIO_REPLAY_REQUIRED_REGIMES,
     PORTFOLIO_REPLAY_REQUIRED_TIMEFRAMES,
@@ -25,9 +23,11 @@ from pm_portfolio_replay import (
     active_native_portfolio_contract,
     build_ledger_cell_roster,
     seal_portfolio_replay_evidence,
+    portfolio_mark_cost_contract,
     validate_funded_portfolio_replay_evidence,
     write_immutable_portfolio_replay_evidence,
 )
+from tests.native_v5_support import activate_v5_run, write_v5_run
 from pm_two_phase_lockbox import (
     build_prelockbox_roster_artifact,
     consume_global_final_lockbox_once,
@@ -70,8 +70,14 @@ def _valid_evidence() -> tuple[dict, dict, dict, dict]:
         "native_activation_id": "activation-test",
         "native_activation_manifest_sha256": "e" * 64,
         "native_activation_roster_sha256": "f" * 64,
-        "native_bars_sha256_by_source": {"EURUSD|H1": "1" * 64},
-        "native_sidecar_sha256_by_source": {"EURUSD|H1": "2" * 64},
+        "native_bars_sha256_by_source": {
+            "EURUSD|H1": "1" * 64,
+            "EURUSD|M5": "3" * 64,
+        },
+        "native_sidecar_sha256_by_source": {
+            "EURUSD|H1": "2" * 64,
+            "EURUSD|M5": "4" * 64,
+        },
     }
     costs = {
         "use_spread": True,
@@ -126,17 +132,25 @@ def _valid_evidence() -> tuple[dict, dict, dict, dict]:
             "global_lockbox_access_id": "access-test",
             "replayed_cell_ids": [cell_id],
             "cost_contract": costs,
-            "mark_cost_contract": {
-                "spread_at_mark": True,
-                "round_trip_commission_at_mark": True,
-                "swap_accrued_through_mark": True,
-                "swap_accrual_model": MTM_MARK_COST_CONTRACT_VERSION,
-            },
+            "mark_cost_contract": portfolio_mark_cost_contract(costs),
             "native_sources": {
                 cell_id: {
                     "source_kind": "broker_native",
                     "source_sha256": "1" * 64,
                     "sidecar_sha256": "2" * 64,
+                    "provenance_valid": True,
+                    "timestamp_semantics": "bar_open_utc",
+                    "activation_id": "activation-test",
+                    "activation_manifest_sha256": "e" * 64,
+                }
+            },
+            "valuation_sources": {
+                "EURUSD": {
+                    "symbol": "EURUSD",
+                    "timeframe": "M5",
+                    "source_kind": "broker_native",
+                    "source_sha256": "3" * 64,
+                    "sidecar_sha256": "4" * 64,
                     "provenance_valid": True,
                     "timestamp_semantics": "bar_open_utc",
                     "activation_id": "activation-test",
@@ -210,6 +224,20 @@ def test_mtm_mark_cost_contract_requires_causal_swap_accrual() -> None:
     evidence = seal_portfolio_replay_evidence(evidence)
     errors = _validate(evidence, lineage, roster, costs)
     assert "PORTFOLIO_EVIDENCE_MARK_COST_CONTRACT_MISMATCH" in errors
+
+
+def test_funded_evidence_requires_authenticated_native_m5_valuation_source() -> None:
+    evidence, lineage, roster, costs = _valid_evidence()
+    evidence["replay"]["valuation_sources"]["EURUSD"]["source_sha256"] = (
+        "0" * 64
+    )
+    evidence = seal_portfolio_replay_evidence(evidence)
+
+    errors = _validate(evidence, lineage, roster, costs)
+
+    assert (
+        "PORTFOLIO_EVIDENCE_VALUATION_BARS_HASH_MISMATCH:EURUSD" in errors
+    )
 
 
 def test_changed_native_or_ledger_lineage_makes_evidence_stale() -> None:
@@ -455,40 +483,35 @@ def test_global_final_lockbox_access_is_burned_before_rerun(tmp_path: Path) -> N
 def test_active_native_contract_requires_every_symbol_timeframe(tmp_path: Path) -> None:
     native = tmp_path / "data" / "native"
     native.mkdir(parents=True)
-    entries = {"EURUSD": {}}
-    for timeframe in PORTFOLIO_REPLAY_REQUIRED_TIMEFRAMES:
-        entries["EURUSD"][timeframe] = {
-            "status": "active",
-            "symbol": "EURUSD",
-            "timeframe": timeframe,
-            "bars_sha256": "a" * 64,
-            "sidecar_sha256": "b" * 64,
-        }
-    manifest = {
-        "schema_version": ACTIVATION_MANIFEST_SCHEMA,
-        "status": "active",
-        "activation_id": "native-test",
-        "entries": entries,
-    }
-    manifest_path = native / "activation.json"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    write_v5_run(native, "portfolio-contract-v5")
+    activation = activate_v5_run(
+        native,
+        "portfolio-contract-v5",
+        "native-test-v5",
+    )
+    assert activation["status"] == "active"
+    assert activation["active_pointer_updated"] is True
+
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    (native / "ACTIVE.json").write_text(json.dumps({
-        "schema_version": ACTIVE_POINTER_SCHEMA,
-        "activation_id": "native-test",
-        "manifest_relative_path": "activation.json",
-        "manifest_sha256": digest,
-    }), encoding="utf-8")
 
     contract, errors = active_native_portfolio_contract(tmp_path / "data", ["EURUSD"])
     assert errors == []
     assert contract["activation_manifest_sha256"] == digest
     del manifest["entries"]["EURUSD"]["D1"]
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     new_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    pointer = json.loads((native / "ACTIVE.json").read_text(encoding="utf-8"))
     pointer["manifest_sha256"] = new_digest
-    (native / "ACTIVE.json").write_text(json.dumps(pointer), encoding="utf-8")
+    pointer_path.write_text(
+        json.dumps(pointer, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     _, errors = active_native_portfolio_contract(tmp_path / "data", ["EURUSD"])
     assert "NATIVE_ACTIVE_CELL_MISSING:EURUSD|D1" in errors
 
