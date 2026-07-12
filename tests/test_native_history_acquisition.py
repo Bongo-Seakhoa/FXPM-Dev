@@ -20,10 +20,13 @@ if str(PATCH_ROOT) not in sys.path:
 from tools.acquire_native_history import (  # noqa: E402
     ACQUISITION_CONTRACT_VERSION,
     DEFAULT_TIMEFRAMES,
+    FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
     SEGMENTED_SESSION_COVERAGE_METHOD_V2,
     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V3,
+    TWO_REFERENCE_CONSENSUS_POLICY,
     ConcurrentWriterError,
     NativeHistoryAcquirer,
     NativeHistoryRunLock,
@@ -38,6 +41,8 @@ from tools.acquire_native_history import (  # noqa: E402
     main,
     segmented_session_coverage_by_partition_v2,
     snapshot_read_only_runtime_metadata,
+    _canonical_json_sha256,
+    _timeframe_request_hash_payload,
 )
 
 
@@ -851,7 +856,7 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             )
             store.close()
 
-    def test_timeframe_v4_extends_only_adjacent_audit_references(self):
+    def test_timeframe_v5_hash_binds_two_references_and_source_unions(self):
         as_of = datetime(2026, 1, 5, tzinfo=UTC)
         request = NativeHistoryRequest(
             symbols=("EURUSD",),
@@ -867,7 +872,7 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _, native_root = self._paths(tmp)
             connector = _RangeConnector()
-            store = NativeHistoryStore(native_root, "timeframe-v3-ranges")
+            store = NativeHistoryStore(native_root, "timeframe-v5-ranges")
             acquirer = NativeHistoryAcquirer(
                 connector,
                 store,
@@ -891,35 +896,62 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             self.assertEqual(
                 acquirer.timeframe_audit_reference_map,
                 {
-                    "M5": "M15",
-                    "M15": "M5",
-                    "M30": "M15",
-                    "H1": "M30",
-                    "H4": "H1",
-                    "D1": "H4",
+                    "M5": ["M15", "M30"],
+                    "M15": ["M5", "M30"],
+                    "M30": ["M15", "H1"],
+                    "H1": ["M30", "H4"],
+                    "H4": ["H1", "D1"],
+                    "D1": ["H4", "H1"],
                 },
             )
             self.assertEqual(
                 acquirer.timeframe_audit_reference_map,
                 cross_resolution_reference_map(DEFAULT_TIMEFRAMES),
             )
-            m5_audit_prefix = acquirer.timeframe_audit_only_prefix_intervals["M5"]
-            self.assertIsNotNone(m5_audit_prefix)
-            self.assertLessEqual(
-                m5_audit_prefix[1] - m5_audit_prefix[0],
-                timedelta(minutes=15),
+            self.assertEqual(
+                acquirer.timeframe_audit_consumer_map,
+                {
+                    "M5": ["M15"],
+                    "M15": ["M5", "M30"],
+                    "M30": ["M5", "M15", "H1"],
+                    "H1": ["M30", "H4", "D1"],
+                    "H4": ["H1", "D1"],
+                    "D1": ["H4"],
+                },
             )
-            self.assertIsNotNone(
-                acquirer.timeframe_audit_only_prefix_intervals["H4"]
+            self.assertEqual(
+                acquirer.timeframe_consensus_policy,
+                TWO_REFERENCE_CONSENSUS_POLICY,
             )
-            d1_train_start = acquirer.timeframe_partition_windows["D1"][
-                "optimizer_train"
-            ][0]
-            h4_audit_start = acquirer.timeframe_source_request_intervals["H4"][0]
-            self.assertLessEqual(h4_audit_start, d1_train_start)
+            for source in DEFAULT_TIMEFRAMES:
+                interval_parts = [
+                    acquirer.timeframe_strategy_evidence_intervals[source]
+                ]
+                for target in acquirer.timeframe_audit_consumer_map[source]:
+                    interval_parts.extend(
+                        acquirer.timeframe_audit_reference_intervals[target][
+                            source
+                        ].values()
+                    )
+                self.assertEqual(
+                    acquirer.timeframe_source_request_intervals[source],
+                    (
+                        min(interval[0] for interval in interval_parts),
+                        max(interval[1] for interval in interval_parts),
+                    ),
+                )
 
             manifest = acquirer.acquire()
             self.assertTrue(manifest["complete"])
+            self.assertEqual(len(manifest["results"]), len(DEFAULT_TIMEFRAMES))
+            self.assertEqual(
+                sorted(
+                    path.name
+                    for path in (store.run_root / "EURUSD").iterdir()
+                    if path.is_dir()
+                ),
+                sorted(DEFAULT_TIMEFRAMES),
+            )
             m5_sidecar = json.loads(
                 (store.run_root / "EURUSD" / "M5" / "provenance.json").read_text(
                     encoding="utf-8"
@@ -980,13 +1012,27 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                     sidecar_request["timeframe_strategy_evidence_intervals"][timeframe],
                 )
                 self.assertEqual(
-                    sidecar_request["audit_only_prefix_interval"],
-                    sidecar_request["timeframe_audit_only_prefix_intervals"][timeframe],
-                )
-                self.assertEqual(
-                    sidecar_request["audit_reference_timeframe"],
+                    sidecar_request["audit_reference_timeframes"],
                     sidecar_request["timeframe_audit_reference_map"][timeframe],
                 )
+                self.assertEqual(
+                    sidecar_request["audit_consumer_targets"],
+                    sidecar_request["timeframe_audit_consumer_map"][timeframe],
+                )
+                self.assertEqual(
+                    sidecar_request["audit_windows"],
+                    sidecar_request["timeframe_audit_windows"][timeframe],
+                )
+                self.assertEqual(
+                    sidecar_request["audit_reference_intervals"],
+                    sidecar_request["timeframe_audit_reference_intervals"][timeframe],
+                )
+                self.assertEqual(
+                    sidecar_request["audit_only_intervals"],
+                    sidecar_request["timeframe_audit_only_intervals"][timeframe],
+                )
+                self.assertNotIn("audit_reference_timeframe", sidecar_request)
+                self.assertNotIn("audit_only_prefix_interval", sidecar_request)
                 self.assertEqual(
                     len(sidecar_request["timeframe_calendar_boundaries_sha256"]),
                     64,
@@ -1003,9 +1049,13 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 manifest["request"]["timeframe_calendar_boundaries"],
                 m5_sidecar["request"]["timeframe_calendar_boundaries"],
             )
+            self.assertEqual(
+                manifest["request"]["timeframe_consensus_policy"],
+                TWO_REFERENCE_CONSENSUS_POLICY,
+            )
             store.close()
 
-    def test_timeframe_v4_reference_depth_covers_non_aligned_real_cutoff(self):
+    def test_timeframe_v5_nonaligned_edges_transform_each_start_once(self):
         as_of = datetime(2026, 7, 12, 17, 33, 41, tzinfo=UTC)
         request = NativeHistoryRequest(
             symbols=("EURUSD",),
@@ -1018,7 +1068,7 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             _, native_root = self._paths(tmp)
-            store = NativeHistoryStore(native_root, "timeframe-v4-nonaligned")
+            store = NativeHistoryStore(native_root, "timeframe-v5-nonaligned")
             acquirer = NativeHistoryAcquirer(
                 _RangeConnector(),
                 store,
@@ -1026,28 +1076,47 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 now_fn=lambda: as_of,
             )
 
-            for target, reference in acquirer.timeframe_audit_reference_map.items():
-                reference_start = acquirer.timeframe_source_request_intervals[
-                    reference
-                ][0]
-                target_lead = acquirer.timeframe_required_evidence_lead_start_utc[
-                    target
-                ]
-                self.assertIsNotNone(target_lead)
-                self.assertLessEqual(
-                    reference_start,
-                    target_lead,
-                    f"{target}->{reference} omits its containing reference bar",
-                )
+            for target, references in acquirer.timeframe_audit_reference_map.items():
+                target_start = acquirer.timeframe_requested_start_utc[target]
+                for reference in references:
+                    edge_start = acquirer.timeframe_audit_reference_intervals[
+                        target
+                    ][reference]["strategy_full_context"][0]
+                    self.assertLessEqual(
+                        edge_start,
+                        target_start,
+                        f"{target}->{reference} omits its containing reference bar",
+                    )
+                    self.assertLessEqual(
+                        acquirer.timeframe_source_request_intervals[reference][0],
+                        edge_start,
+                    )
 
             self.assertEqual(acquirer.as_of_utc.minute, 30)
             self.assertEqual(
                 acquirer.timeframe_required_evidence_lead_start_utc["H4"].minute,
                 30,
             )
+            h4_target_start = acquirer.timeframe_requested_start_utc["H4"]
+            h4_h1_edge_start = acquirer.timeframe_audit_reference_intervals["H4"][
+                "H1"
+            ]["strategy_full_context"][0]
             self.assertEqual(
-                acquirer.timeframe_source_request_intervals["H1"][0].minute,
-                0,
+                h4_h1_edge_start,
+                pd.Timestamp(h4_target_start).floor("h").to_pydatetime(),
+            )
+            self.assertGreater(
+                h4_h1_edge_start,
+                acquirer.timeframe_strategy_evidence_intervals["H4"][0],
+            )
+            d1_target_start = acquirer.timeframe_requested_start_utc["D1"]
+            d1_h4_edge_start = acquirer.timeframe_audit_reference_intervals["D1"][
+                "H4"
+            ]["strategy_full_context"][0]
+            self.assertEqual(d1_h4_edge_start, d1_target_start - timedelta(hours=4))
+            self.assertGreater(
+                d1_h4_edge_start,
+                acquirer.timeframe_strategy_evidence_intervals["D1"][0],
             )
             resume_contract = acquirer._common_request_contract()
             self.assertEqual(
@@ -1056,8 +1125,51 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             )
             self.assertIn("timeframe_strategy_evidence_intervals", resume_contract)
             self.assertIn("timeframe_audit_reference_map", resume_contract)
-            self.assertIn("timeframe_audit_only_prefix_intervals", resume_contract)
+            self.assertIn("timeframe_audit_consumer_map", resume_contract)
+            self.assertIn("timeframe_audit_windows", resume_contract)
+            self.assertIn("timeframe_audit_reference_intervals", resume_contract)
+            self.assertIn("timeframe_audit_only_intervals", resume_contract)
+            self.assertIn("timeframe_consensus_policy", resume_contract)
             store.close()
+
+    def test_timeframe_v5_contract_is_canonical_under_reordered_roster(self):
+        as_of = datetime(2026, 7, 12, 17, 33, 41, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            stores = (
+                NativeHistoryStore(native_root, "v5-canonical-order"),
+                NativeHistoryStore(native_root, "v5-reversed-order"),
+            )
+            try:
+                contracts = []
+                for store, timeframes in zip(
+                    stores,
+                    (DEFAULT_TIMEFRAMES, tuple(reversed(DEFAULT_TIMEFRAMES))),
+                    strict=True,
+                ):
+                    acquirer = NativeHistoryAcquirer(
+                        _RangeConnector(),
+                        store,
+                        NativeHistoryRequest(
+                            symbols=("EURUSD",),
+                            timeframes=timeframes,
+                            as_of_utc=as_of,
+                            timeframe_window_years={},
+                            window_contract_version=(
+                                TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                            ),
+                        ),
+                        now_fn=lambda: as_of,
+                    )
+                    contracts.append(acquirer._common_request_contract())
+                self.assertEqual(contracts[0], contracts[1])
+                self.assertEqual(
+                    contracts[0]["timeframe_request_map_sha256"],
+                    contracts[1]["timeframe_request_map_sha256"],
+                )
+            finally:
+                for store in stores:
+                    store.close()
 
     def test_legacy_flat_window_request_remains_reproducible(self):
         as_of = datetime(2026, 1, 5, tzinfo=UTC)
@@ -1114,11 +1226,11 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             implicit_store.close()
             explicit_store.close()
 
-    def test_v3_resume_rejects_boundary_map_hash_tampering(self):
+    def test_v5_resume_hash_binds_graph_edges_consumers_windows_and_policy(self):
         as_of = datetime(2026, 1, 5, tzinfo=UTC)
         request = NativeHistoryRequest(
             symbols=("EURUSD",),
-            timeframes=("M5", "D1"),
+            timeframes=DEFAULT_TIMEFRAMES,
             as_of_utc=as_of,
             retries=1,
             retry_sleep_seconds=0.0,
@@ -1129,7 +1241,7 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             _, native_root = self._paths(tmp)
-            store = NativeHistoryStore(native_root, "v3-hash-resume")
+            store = NativeHistoryStore(native_root, "v5-hash-resume")
             NativeHistoryAcquirer(
                 _RangeConnector(),
                 store,
@@ -1137,32 +1249,226 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 now_fn=lambda: as_of,
                 sleep_fn=lambda _: None,
             ).acquire(max_new_cells=1)
+            store.close()
 
             recovered = load_native_history_resume_contract(
                 native_root,
-                "v3-hash-resume",
+                "v5-hash-resume",
             )
             self.assertEqual(
                 recovered.request["window_contract_version"],
                 TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
             )
+            resumed_store = NativeHistoryStore(
+                native_root,
+                "v5-hash-resume",
+                resume=True,
+            )
+            try:
+                resumed = NativeHistoryAcquirer(
+                    _RangeConnector(),
+                    resumed_store,
+                    request,
+                    now_fn=lambda: as_of,
+                    sleep_fn=lambda _: None,
+                )
+                self.assertEqual(
+                    resumed._common_request_contract(),
+                    dict(recovered.request),
+                )
+            finally:
+                resumed_store.close()
+
             sidecar_path = store.run_root / "EURUSD" / "M5" / "provenance.json"
+            original = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            mutations = (
+                lambda value: value["request"]["timeframe_audit_reference_map"][
+                    "M5"
+                ].reverse(),
+                lambda value: value["request"]["timeframe_audit_consumer_map"][
+                    "M15"
+                ].pop(),
+                lambda value: value["request"]["timeframe_audit_windows"]["H4"][
+                    "optimizer_train"
+                ].update({"start_utc": "2010-01-01T00:00:00Z"}),
+                lambda value: value["request"][
+                    "timeframe_audit_reference_intervals"
+                ]["D1"]["H4"]["strategy_full_context"].update(
+                    {"start_utc": "2010-01-01T00:00:00Z"}
+                ),
+                lambda value: value["request"]["timeframe_consensus_policy"].update(
+                    {"activation_rule": "both_edges_pass"}
+                ),
+            )
+            for mutate in mutations:
+                with self.subTest(mutate=mutate):
+                    sidecar = json.loads(json.dumps(original))
+                    mutate(sidecar)
+                    sidecar_path.write_text(
+                        json.dumps(sidecar, indent=2, sort_keys=True),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        ResumeValidationError,
+                        "request map hash mismatch",
+                    ):
+                        load_native_history_resume_contract(
+                            native_root,
+                            "v5-hash-resume",
+                        )
+            sidecar_path.write_text(
+                json.dumps(original, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+
+    def test_v4_forensic_contract_loads_but_cannot_resume_as_v5(self):
+        as_of = datetime(2026, 1, 5, tzinfo=UTC)
+        request = NativeHistoryRequest(
+            symbols=("EURUSD",),
+            timeframes=DEFAULT_TIMEFRAMES,
+            as_of_utc=as_of,
+            retries=1,
+            retry_sleep_seconds=0.0,
+            timeframe_window_years={},
+            window_contract_version=TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            warmup_days=0.0,
+            safety_days=0.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            store = NativeHistoryStore(native_root, "v4-forensic-resume")
+            NativeHistoryAcquirer(
+                _RangeConnector(),
+                store,
+                request,
+                now_fn=lambda: as_of,
+                sleep_fn=lambda _: None,
+            ).acquire(max_new_cells=1)
+            sidecar_path = store.run_root / "EURUSD" / "M5" / "provenance.json"
+            store.close()
+
             sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-            sidecar["request"]["timeframe_calendar_boundaries"]["D1"][
-                "optimizer_train"
-            ]["start_ts"] = "2010-01-01T00:00:00Z"
+            sidecar_request = sidecar["request"]
+            v4_graph = {
+                "M5": "M15",
+                "M15": "M5",
+                "M30": "M15",
+                "H1": "M30",
+                "H4": "H1",
+                "D1": "H4",
+            }
+            v4_prefixes = {}
+            for timeframe in DEFAULT_TIMEFRAMES:
+                source_interval = sidecar_request[
+                    "timeframe_source_request_intervals"
+                ][timeframe]
+                strategy_interval = sidecar_request[
+                    "timeframe_strategy_evidence_intervals"
+                ][timeframe]
+                v4_prefixes[timeframe] = (
+                    {
+                        "start_utc": source_interval["start_utc"],
+                        "end_exclusive_utc": strategy_interval["start_utc"],
+                        "role": "audit_only_reference",
+                    }
+                    if source_interval["start_utc"]
+                    < strategy_interval["start_utc"]
+                    else None
+                )
+            for field in (
+                "timeframe_audit_consumer_map",
+                "timeframe_audit_windows",
+                "timeframe_audit_reference_intervals",
+                "timeframe_audit_only_intervals",
+                "timeframe_consensus_policy",
+                "audit_reference_timeframes",
+                "audit_consumer_targets",
+                "audit_windows",
+                "audit_reference_intervals",
+                "audit_only_intervals",
+            ):
+                sidecar_request.pop(field, None)
+            sidecar_request.update(
+                {
+                    "timeframe_request_map_schema_version": (
+                        FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+                    ),
+                    "timeframe_audit_reference_map": v4_graph,
+                    "timeframe_audit_only_prefix_intervals": v4_prefixes,
+                    "audit_reference_timeframe": v4_graph["M5"],
+                    "audit_only_prefix_interval": v4_prefixes["M5"],
+                }
+            )
+            sidecar_request["timeframe_request_map_sha256"] = (
+                _canonical_json_sha256(
+                    _timeframe_request_hash_payload(sidecar_request)
+                )
+            )
             sidecar_path.write_text(
                 json.dumps(sidecar, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(
-                ResumeValidationError,
-                "boundary hash mismatch",
-            ):
-                load_native_history_resume_contract(native_root, "v3-hash-resume")
+            recovered = load_native_history_resume_contract(
+                native_root,
+                "v4-forensic-resume",
+            )
+            self.assertEqual(
+                recovered.request["timeframe_request_map_schema_version"],
+                FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
+            )
 
-    def test_cli_defaults_to_v3_and_extracts_nested_config(self):
+            resumed_store = NativeHistoryStore(
+                native_root,
+                "v4-forensic-resume",
+                resume=True,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    ResumeValidationError,
+                    "resume request does not exactly match",
+                ):
+                    NativeHistoryAcquirer(
+                        _RangeConnector(),
+                        resumed_store,
+                        request,
+                        now_fn=lambda: as_of,
+                        sleep_fn=lambda _: None,
+                    )
+            finally:
+                resumed_store.close()
+
+            for field in (
+                "timeframe_strategy_evidence_intervals",
+                "timeframe_audit_reference_map",
+                "timeframe_audit_only_prefix_intervals",
+                "strategy_evidence_interval",
+                "audit_reference_timeframe",
+                "audit_only_prefix_interval",
+            ):
+                sidecar_request.pop(field, None)
+            sidecar_request["timeframe_request_map_schema_version"] = (
+                TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V3
+            )
+            sidecar_request["timeframe_request_map_sha256"] = (
+                _canonical_json_sha256(
+                    _timeframe_request_hash_payload(sidecar_request)
+                )
+            )
+            sidecar_path.write_text(
+                json.dumps(sidecar, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            recovered_v3 = load_native_history_resume_contract(
+                native_root,
+                "v4-forensic-resume",
+            )
+            self.assertEqual(
+                recovered_v3.request["timeframe_request_map_schema_version"],
+                TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V3,
+            )
+
+    def test_cli_defaults_to_v5_six_timeframes_and_extracts_nested_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, native_root = self._paths(tmp)
             config = root / "config.json"
@@ -1187,9 +1493,6 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                         str(config),
                         "--output-root",
                         str(native_root),
-                        "--timeframes",
-                        "M5",
-                        "D1",
                         "--as-of",
                         "2026-01-05T00:00:00Z",
                     ]
@@ -1200,6 +1503,7 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 plan["window_contract_version"],
                 TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
             )
+            self.assertEqual(plan["timeframes"], list(DEFAULT_TIMEFRAMES))
             self.assertEqual(
                 plan["timeframe_window_years"]["M5"]["optimizer_train"],
                 5,
@@ -1237,6 +1541,15 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
             )
             self.assertIsNone(legacy_plan["timeframe_window_years"])
+
+    def test_v5_request_refuses_a_partial_reference_roster(self):
+        with self.assertRaisesRegex(ValueError, "exact six-timeframe roster"):
+            NativeHistoryRequest(
+                symbols=("EURUSD",),
+                timeframes=("M5", "M15"),
+                timeframe_window_years={},
+                window_contract_version=TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            )
 
     def test_bounded_run_resumes_without_overwriting_valid_leaf(self):
         as_of = datetime(2026, 1, 10, 12, 2, 17, tzinfo=UTC)

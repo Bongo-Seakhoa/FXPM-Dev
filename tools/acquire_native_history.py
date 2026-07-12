@@ -58,10 +58,21 @@ PAGINATION_CONTRACT_VERSION = "fxpm.native_history.pagination.v2"
 MANIFEST_SCHEMA_VERSION = "fxpm.native_history_run_manifest.v1"
 RESUME_CONTRACT_VERSION = "fxpm.native_history_resume.v1"
 LEGACY_FLAT_WINDOW_CONTRACT_VERSION = "fxpm.native_history.flat_windows.v1"
-LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = (
+TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V3 = (
     "fxpm.native_history.timeframe_request_map.v3"
 )
-TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v4"
+TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4 = (
+    "fxpm.native_history.timeframe_request_map.v4"
+)
+# Retain the old public name because immutable V3 artifacts and downstream
+# forensic readers import it.  It is never the schema emitted by a new run.
+LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = (
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V3
+)
+FORENSIC_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = (
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4
+)
+TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v5"
 PARTITIONS: Tuple[str, ...] = (
     "optimizer_train",
     "tuning_validation",
@@ -83,6 +94,23 @@ TIMEFRAME_SECONDS: Dict[str, int] = {
 DEFAULT_TIMEFRAMES: Tuple[str, ...] = tuple(TIMEFRAME_SECONDS)
 SEGMENTED_SESSION_COVERAGE_METHOD_V2 = "timestamp_segmented_weekly_session_rate_v2"
 
+TWO_REFERENCE_AUDIT_GRAPH: Dict[str, Tuple[str, str]] = {
+    "M5": ("M15", "M30"),
+    "M15": ("M5", "M30"),
+    "M30": ("M15", "H1"),
+    "H1": ("M30", "H4"),
+    "H4": ("H1", "D1"),
+    "D1": ("H4", "H1"),
+}
+TWO_REFERENCE_CONSENSUS_POLICY: Dict[str, Any] = {
+    "schema_version": "fxpm.native_history.two_reference_consensus.v1",
+    "evaluate_all_edges": True,
+    "references_required_per_target": 2,
+    "activation_rule": "at_least_one_exact_edge_pass",
+    "exclusion_rule": "both_terminal_edges_fail",
+    "pending_rule": "no_pass_and_any_edge_technical_pending",
+}
+
 # The coverage estimator deliberately reasons in complete UTC calendar weeks.
 # Twenty-six weeks is long enough to distinguish a sustained schedule from a
 # transient outage/holiday cluster without imposing an instrument calendar.
@@ -94,33 +122,30 @@ _SESSION_V2_MIN_CHANGE_FRACTION = 0.10
 
 def cross_resolution_reference_map(
     timeframes: Sequence[str],
-) -> Dict[str, str]:
-    """Return the deterministic native audit counterpart for every timeframe.
+) -> Dict[str, List[str]]:
+    """Return the exact ordered two-reference graph for the six native cells.
 
-    A target above the finest requested timeframe is reconciled against the
-    closest requested finer native series.  The finest target is reconciled in
-    the reverse direction against the closest coarser series.  In the standard
-    six-timeframe roster this produces M5<->M15, M30<-M15, H1<-M30,
-    H4<-H1, and D1<-H4.  Both inputs remain broker-native; neither is a
-    resampled strategy authority.
+    V5 deliberately refuses to invent a weaker graph for a diagnostic subset.
+    All six broker-native sources are required so every target has two
+    independently acquired references and a single bad intermediate series
+    cannot veto its otherwise valid neighbours.
     """
 
-    normalized = tuple(
-        dict.fromkeys(str(value or "").strip().upper() for value in timeframes)
-    )
+    normalized = tuple(str(value or "").strip().upper() for value in timeframes)
     if any(value not in TIMEFRAME_SECONDS for value in normalized):
         unknown = sorted(value for value in normalized if value not in TIMEFRAME_SECONDS)
         raise ValueError(f"unsupported timeframe(s) for cross-resolution audit: {unknown}")
-    ordered = tuple(sorted(normalized, key=lambda value: TIMEFRAME_SECONDS[value]))
-    if len(ordered) < 2:
-        # Acquisition remains usable for a one-cell diagnostic. Activation is
-        # responsible for refusing to certify that cell without an independent
-        # counterpart.
-        return {}
-    references: Dict[str, str] = {}
-    for index, timeframe in enumerate(ordered):
-        references[timeframe] = ordered[1] if index == 0 else ordered[index - 1]
-    return references
+    if set(normalized) != set(DEFAULT_TIMEFRAMES) or len(normalized) != len(
+        DEFAULT_TIMEFRAMES
+    ):
+        raise ValueError(
+            "the V5 cross-resolution contract requires the exact six-timeframe "
+            f"roster {list(DEFAULT_TIMEFRAMES)!r}"
+        )
+    return {
+        timeframe: list(TWO_REFERENCE_AUDIT_GRAPH[timeframe])
+        for timeframe in DEFAULT_TIMEFRAMES
+    }
 
 # At a 10,000-bar terminal cap these spans remain below the cap even for a
 # continuously traded market.  The span is reduced dynamically when MT5
@@ -960,6 +985,13 @@ class NativeHistoryRequest:
             )
         normalized_timeframe_years: Optional[Dict[str, Dict[str, int]]] = None
         if requested_contract == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            if set(normalized_timeframes) != set(DEFAULT_TIMEFRAMES) or len(
+                normalized_timeframes
+            ) != len(DEFAULT_TIMEFRAMES):
+                raise ValueError(
+                    "the V5 timeframe evidence contract requires the exact "
+                    f"six-timeframe roster {list(DEFAULT_TIMEFRAMES)!r}"
+                )
             normalized_all = normalize_timeframe_window_years(
                 self.timeframe_window_years
             )
@@ -1032,6 +1064,17 @@ _V4_RESUME_REQUEST_KEYS: Tuple[str, ...] = (
     "timeframe_strategy_evidence_intervals",
     "timeframe_audit_reference_map",
     "timeframe_audit_only_prefix_intervals",
+)
+
+_V5_RESUME_REQUEST_KEYS: Tuple[str, ...] = (
+    *_V3_RESUME_REQUEST_KEYS,
+    "timeframe_strategy_evidence_intervals",
+    "timeframe_audit_reference_map",
+    "timeframe_audit_consumer_map",
+    "timeframe_audit_windows",
+    "timeframe_audit_reference_intervals",
+    "timeframe_audit_only_intervals",
+    "timeframe_consensus_policy",
 )
 
 _SOURCE_IDENTITY_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -1326,9 +1369,10 @@ def _timeframe_request_hash_payload(request: Mapping[str, Any]) -> Dict[str, Any
             "timeframe_source_request_intervals"
         ),
     }
-    if str(request.get("timeframe_request_map_schema_version") or "") == (
-        TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
-    ):
+    request_map_version = str(
+        request.get("timeframe_request_map_schema_version") or ""
+    )
+    if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4:
         payload.update(
             {
                 "timeframe_strategy_evidence_intervals": request.get(
@@ -1339,6 +1383,32 @@ def _timeframe_request_hash_payload(request: Mapping[str, Any]) -> Dict[str, Any
                 ),
                 "timeframe_audit_only_prefix_intervals": request.get(
                     "timeframe_audit_only_prefix_intervals"
+                ),
+            }
+        )
+    elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+        payload.update(
+            {
+                "timeframe_strategy_evidence_intervals": request.get(
+                    "timeframe_strategy_evidence_intervals"
+                ),
+                "timeframe_audit_reference_map": request.get(
+                    "timeframe_audit_reference_map"
+                ),
+                "timeframe_audit_consumer_map": request.get(
+                    "timeframe_audit_consumer_map"
+                ),
+                "timeframe_audit_windows": request.get(
+                    "timeframe_audit_windows"
+                ),
+                "timeframe_audit_reference_intervals": request.get(
+                    "timeframe_audit_reference_intervals"
+                ),
+                "timeframe_audit_only_intervals": request.get(
+                    "timeframe_audit_only_intervals"
+                ),
+                "timeframe_consensus_policy": request.get(
+                    "timeframe_consensus_policy"
                 ),
             }
         )
@@ -1360,6 +1430,8 @@ def _resume_request_contract(record: Mapping[str, Any], path: Path) -> Dict[str,
             request.get("timeframe_request_map_schema_version") or ""
         )
         if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+            keys = _V5_RESUME_REQUEST_KEYS
+        elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4:
             keys = _V4_RESUME_REQUEST_KEYS
         elif request_map_version == LEGACY_TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
             keys = _V3_RESUME_REQUEST_KEYS
@@ -1398,12 +1470,12 @@ def _resume_request_contract(record: Mapping[str, Any], path: Path) -> Dict[str,
     return contract
 
 
-def _validate_v3_cell_request(
+def _validate_timeframe_cell_request(
     record: Mapping[str, Any],
     timeframe: str,
     path: Path,
 ) -> None:
-    """Authenticate a leaf's cell projection against its hash-bound v3 map."""
+    """Authenticate a leaf projection against its hash-bound timeframe map."""
 
     request = record.get("request")
     if not isinstance(request, Mapping):
@@ -1428,9 +1500,10 @@ def _validate_v3_cell_request(
         "source_request_interval": expected_interval,
         "cell_required_evidence_lead_start_utc": expected_lead,
     }
-    if str(common.get("timeframe_request_map_schema_version") or "") == (
-        TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
-    ):
+    request_map_version = str(
+        common.get("timeframe_request_map_schema_version") or ""
+    )
+    if request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION_V4:
         checks.update(
             {
                 "strategy_evidence_interval": (
@@ -1444,13 +1517,36 @@ def _validate_v3_cell_request(
                 ).get(tf),
             }
         )
+    elif request_map_version == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION:
+        checks.update(
+            {
+                "strategy_evidence_interval": (
+                    common.get("timeframe_strategy_evidence_intervals") or {}
+                ).get(tf),
+                "audit_reference_timeframes": (
+                    common.get("timeframe_audit_reference_map") or {}
+                ).get(tf),
+                "audit_consumer_targets": (
+                    common.get("timeframe_audit_consumer_map") or {}
+                ).get(tf),
+                "audit_windows": (
+                    common.get("timeframe_audit_windows") or {}
+                ).get(tf),
+                "audit_reference_intervals": (
+                    common.get("timeframe_audit_reference_intervals") or {}
+                ).get(tf),
+                "audit_only_intervals": (
+                    common.get("timeframe_audit_only_intervals") or {}
+                ).get(tf),
+            }
+        )
     for field_name, expected in checks.items():
         if (
             field_name not in request
             or _json_safe(request.get(field_name)) != _json_safe(expected)
         ):
             raise ResumeValidationError(
-                f"v3 cell request field {field_name!r} does not match the "
+                f"timeframe cell request field {field_name!r} does not match the "
                 f"hash-bound timeframe map: {path}"
             )
 
@@ -1542,7 +1638,7 @@ def load_native_history_resume_contract(
         if str(record.get("timeframe", "")).upper() != timeframe:
             raise ResumeValidationError(f"timeframe mismatch in {sidecar}")
         request = _resume_request_contract(record, sidecar)
-        _validate_v3_cell_request(record, timeframe, sidecar)
+        _validate_timeframe_cell_request(record, timeframe, sidecar)
         identity = _source_identity(record.get("source_environment"))
         if not identity:
             raise ResumeValidationError(f"source identity is absent in {sidecar}")
@@ -2224,44 +2320,99 @@ class NativeHistoryAcquirer:
             if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
             else {}
         )
-        audit_requested_starts = dict(self.timeframe_requested_start_utc)
-        for target, reference in self.timeframe_audit_reference_map.items():
-            # The comparator must contain the native bar that spans the target's
-            # evidence lead.  Passing a non-aligned target lead through the
-            # normal fixed-timeframe request path would ceil it and silently
-            # omit that containing bar (for example H4 13:30 -> H1 14:00).
-            reference_start = floor_utc_boundary(
-                self.timeframe_requested_start_utc[target],
-                TIMEFRAME_SECONDS[reference],
-            )
-            audit_requested_starts[reference] = min(
-                audit_requested_starts[reference],
-                reference_start,
-            )
-        self.timeframe_source_request_intervals = {
-            timeframe: self._source_request_interval(
-                timeframe,
-                audit_requested_starts[timeframe],
-                include_containing_start=(
-                    self.window_contract_version
-                    == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
-                ),
-            )
+        audit_roster = (
+            DEFAULT_TIMEFRAMES
+            if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+            else request.timeframes
+        )
+        self.timeframe_audit_consumer_map: Dict[str, List[str]] = {
+            timeframe: [] for timeframe in audit_roster
+        }
+        for target in audit_roster:
+            for reference in self.timeframe_audit_reference_map.get(target, []):
+                self.timeframe_audit_consumer_map[reference].append(target)
+
+        # These are semantic target-clock windows.  A source-boundary transform
+        # is applied exactly once per target/reference edge below.  In
+        # particular, a broker-aligned H4/D1 strategy interval (which already
+        # includes its own predecessor sentinel) must not become the starting
+        # point for a second reference transform.
+        self.timeframe_audit_windows: Dict[
+            str, Dict[str, Tuple[datetime, datetime]]
+        ] = {}
+        for target in request.timeframes:
+            target_windows: Dict[str, Tuple[datetime, datetime]] = {
+                "strategy_full_context": (
+                    self.timeframe_requested_start_utc[target],
+                    self.as_of_utc,
+                )
+            }
+            target_windows.update(self.timeframe_partition_windows[target])
+            self.timeframe_audit_windows[target] = target_windows
+
+        self.timeframe_audit_reference_intervals: Dict[
+            str, Dict[str, Dict[str, Tuple[datetime, datetime]]]
+        ] = {}
+        for target in request.timeframes:
+            edge_intervals: Dict[str, Dict[str, Tuple[datetime, datetime]]] = {}
+            for reference in self.timeframe_audit_reference_map.get(target, []):
+                edge_intervals[reference] = {
+                    role: self._bounded_source_interval(reference, start, end)
+                    for role, (start, end) in self.timeframe_audit_windows[
+                        target
+                    ].items()
+                }
+            self.timeframe_audit_reference_intervals[target] = edge_intervals
+
+        # There remains exactly one immutable artifact per source timeframe.
+        # Its fetch interval is the union of its own strategy evidence and every
+        # edge for which that source is a comparator.  Metadata stays bounded by
+        # the fixed six-node/twelve-edge graph rather than growing with bars.
+        source_interval_parts: Dict[str, List[Tuple[datetime, datetime]]] = {
+            timeframe: [self.timeframe_strategy_evidence_intervals[timeframe]]
             for timeframe in request.timeframes
         }
-        self.timeframe_audit_only_prefix_intervals: Dict[
-            str, Optional[Tuple[datetime, datetime]]
-        ] = {}
-        for timeframe in request.timeframes:
-            source_start, _source_end = self.timeframe_source_request_intervals[
-                timeframe
-            ]
-            strategy_start, _strategy_end = self.timeframe_strategy_evidence_intervals[
-                timeframe
-            ]
-            self.timeframe_audit_only_prefix_intervals[timeframe] = (
-                (source_start, strategy_start) if source_start < strategy_start else None
+        for target, references in self.timeframe_audit_reference_intervals.items():
+            for reference, audit_intervals in references.items():
+                source_interval_parts[reference].extend(audit_intervals.values())
+        self.timeframe_source_request_intervals = {
+            timeframe: (
+                min(interval[0] for interval in intervals),
+                max(interval[1] for interval in intervals),
             )
+            for timeframe, intervals in source_interval_parts.items()
+        }
+
+        self.timeframe_audit_only_intervals: Dict[
+            str, List[Dict[str, Any]]
+        ] = {timeframe: [] for timeframe in request.timeframes}
+        for source, consumers in self.timeframe_audit_consumer_map.items():
+            own_start, own_end = self.timeframe_strategy_evidence_intervals[source]
+            for target in consumers:
+                edge_start, edge_end = self.timeframe_audit_reference_intervals[
+                    target
+                ][source]["strategy_full_context"]
+                if edge_start < own_start:
+                    self.timeframe_audit_only_intervals[source].append(
+                        {
+                            "consumer_target_timeframe": target,
+                            "audit_window": "strategy_full_context",
+                            "start_utc": edge_start,
+                            "end_exclusive_utc": min(edge_end, own_start),
+                            "role": "audit_only_reference",
+                        }
+                    )
+                if edge_end > own_end:
+                    self.timeframe_audit_only_intervals[source].append(
+                        {
+                            "consumer_target_timeframe": target,
+                            "audit_window": "strategy_full_context",
+                            "start_utc": max(edge_start, own_end),
+                            "end_exclusive_utc": edge_end,
+                            "role": "audit_only_reference",
+                        }
+                    )
+        self.timeframe_consensus_policy = dict(TWO_REFERENCE_CONSENSUS_POLICY)
         self.runtime_metadata = dict(runtime_metadata or self._read_runtime_metadata())
         self.terminal_max_bars = self._extract_terminal_max_bars(self.runtime_metadata)
         self.resume_contract = store.resume_contract
@@ -2291,18 +2442,39 @@ class NativeHistoryAcquirer:
         include_containing_start: bool = False,
     ) -> Tuple[datetime, datetime]:
         seconds = TIMEFRAME_SECONDS[timeframe]
+        if include_containing_start:
+            return self._bounded_source_interval(
+                timeframe,
+                requested_start,
+                self.as_of_utc,
+            )
         if timeframe in {"H4", "D1"}:
             return (
                 requested_start - timedelta(seconds=seconds),
                 self.as_of_utc + timedelta(seconds=1),
             )
         return (
-            (
-                floor_utc_boundary(requested_start, seconds)
-                if include_containing_start
-                else ceil_utc_boundary(requested_start, seconds)
-            ),
+            ceil_utc_boundary(requested_start, seconds),
             floor_utc_boundary(self.as_of_utc, seconds),
+        )
+
+    @staticmethod
+    def _bounded_source_interval(
+        timeframe: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> Tuple[datetime, datetime]:
+        """Expand one semantic window to the source's native fetch boundaries."""
+
+        seconds = TIMEFRAME_SECONDS[timeframe]
+        if timeframe in {"H4", "D1"}:
+            return (
+                _utc(window_start) - timedelta(seconds=seconds),
+                _utc(window_end) + timedelta(seconds=1),
+            )
+        return (
+            floor_utc_boundary(window_start, seconds),
+            floor_utc_boundary(window_end, seconds),
         )
 
     def _serialized_timeframe_boundaries(self) -> Dict[str, Dict[str, Dict[str, str]]]:
@@ -2334,29 +2506,66 @@ class NativeHistoryAcquirer:
             )
         }
 
-    def _serialized_audit_only_prefix_intervals(
-        self,
-    ) -> Dict[str, Optional[Dict[str, str]]]:
+    @staticmethod
+    def _serialized_interval(
+        interval: Tuple[datetime, datetime],
+    ) -> Dict[str, str]:
         return {
-            timeframe: (
-                {
-                    "start_utc": _iso(interval[0]),
-                    "end_exclusive_utc": _iso(interval[1]),
-                    "role": "audit_only_reference",
+            "start_utc": str(_iso(interval[0])),
+            "end_exclusive_utc": str(_iso(interval[1])),
+        }
+
+    def _serialized_audit_windows(
+        self,
+    ) -> Dict[str, Dict[str, Dict[str, str]]]:
+        return {
+            target: {
+                role: self._serialized_interval(interval)
+                for role, interval in windows.items()
+            }
+            for target, windows in self.timeframe_audit_windows.items()
+        }
+
+    def _serialized_audit_reference_intervals(
+        self,
+    ) -> Dict[str, Dict[str, Dict[str, Dict[str, str]]]]:
+        return {
+            target: {
+                reference: {
+                    role: self._serialized_interval(interval)
+                    for role, interval in windows.items()
                 }
-                if interval is not None
-                else None
-            )
-            for timeframe, interval in (
-                self.timeframe_audit_only_prefix_intervals.items()
+                for reference, windows in references.items()
+            }
+            for target, references in (
+                self.timeframe_audit_reference_intervals.items()
             )
         }
 
-    def _v3_request_fields(self) -> Dict[str, Any]:
+    def _serialized_audit_only_intervals(self) -> Dict[str, List[Dict[str, Any]]]:
+        return {
+            source: [
+                {
+                    **{
+                        key: value
+                        for key, value in interval.items()
+                        if key not in {"start_utc", "end_exclusive_utc"}
+                    },
+                    "start_utc": _iso(interval["start_utc"]),
+                    "end_exclusive_utc": _iso(interval["end_exclusive_utc"]),
+                }
+                for interval in intervals
+            ]
+            for source, intervals in self.timeframe_audit_only_intervals.items()
+        }
+
+    def _timeframe_request_fields(self) -> Dict[str, Any]:
         boundaries = self._serialized_timeframe_boundaries()
         intervals = self._serialized_timeframe_intervals()
         strategy_intervals = self._serialized_strategy_evidence_intervals()
-        audit_only_prefixes = self._serialized_audit_only_prefix_intervals()
+        audit_windows = self._serialized_audit_windows()
+        audit_reference_intervals = self._serialized_audit_reference_intervals()
+        audit_only_intervals = self._serialized_audit_only_intervals()
         leads = {
             timeframe: _iso(value)
             for timeframe, value in self.timeframe_required_evidence_lead_start_utc.items()
@@ -2378,10 +2587,18 @@ class NativeHistoryAcquirer:
             "timeframe_required_evidence_lead_start_utc": leads,
             "timeframe_source_request_intervals": intervals,
             "timeframe_strategy_evidence_intervals": strategy_intervals,
-            "timeframe_audit_reference_map": dict(
-                self.timeframe_audit_reference_map
-            ),
-            "timeframe_audit_only_prefix_intervals": audit_only_prefixes,
+            "timeframe_audit_reference_map": {
+                target: list(references)
+                for target, references in self.timeframe_audit_reference_map.items()
+            },
+            "timeframe_audit_consumer_map": {
+                source: list(consumers)
+                for source, consumers in self.timeframe_audit_consumer_map.items()
+            },
+            "timeframe_audit_windows": audit_windows,
+            "timeframe_audit_reference_intervals": audit_reference_intervals,
+            "timeframe_audit_only_intervals": audit_only_intervals,
+            "timeframe_consensus_policy": dict(self.timeframe_consensus_policy),
         }
         fields["timeframe_request_map_sha256"] = _canonical_json_sha256(
             _timeframe_request_hash_payload(
@@ -2419,8 +2636,8 @@ class NativeHistoryAcquirer:
             },
         }
         if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
-            request.update(self._v3_request_fields())
-            return {key: _json_safe(request[key]) for key in _V4_RESUME_REQUEST_KEYS}
+            request.update(self._timeframe_request_fields())
+            return {key: _json_safe(request[key]) for key in _V5_RESUME_REQUEST_KEYS}
         return {
             key: _json_safe(request[key]) for key in _LEGACY_RESUME_REQUEST_KEYS
         }
@@ -2470,7 +2687,7 @@ class NativeHistoryAcquirer:
             )
         if _resume_request_contract(record, sidecar) != self._common_request_contract():
             raise ResumeValidationError(f"reusable request mismatch in {sidecar}")
-        _validate_v3_cell_request(record, timeframe, sidecar)
+        _validate_timeframe_cell_request(record, timeframe, sidecar)
         if _source_identity(record.get("source_environment")) != _source_identity(
             self.runtime_metadata
         ):
@@ -2851,7 +3068,7 @@ class NativeHistoryAcquirer:
                 else dict(self.request.window_years or {})
             ),
             "embargo_days": float(self.request.embargo_days),
-            # For v3 leaves this compatibility projection is deliberately the
+            # For timeframe-window leaves this compatibility projection is the
             # current cell's exact boundary map, not a fictitious common train
             # window. The hash-bound full map below authenticates it.
             "common_calendar_boundaries": {
@@ -2860,7 +3077,7 @@ class NativeHistoryAcquirer:
             },
         }
         if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
-            request_record.update(self._v3_request_fields())
+            request_record.update(self._timeframe_request_fields())
             request_record.update(
                 {
                     "cell_timeframe": timeframe,
@@ -2884,11 +3101,20 @@ class NativeHistoryAcquirer:
                     "strategy_evidence_interval": (
                         self._serialized_strategy_evidence_intervals()[timeframe]
                     ),
-                    "audit_only_prefix_interval": (
-                        self._serialized_audit_only_prefix_intervals()[timeframe]
+                    "audit_reference_timeframes": list(
+                        self.timeframe_audit_reference_map.get(timeframe, [])
                     ),
-                    "audit_reference_timeframe": (
-                        self.timeframe_audit_reference_map.get(timeframe)
+                    "audit_consumer_targets": list(
+                        self.timeframe_audit_consumer_map.get(timeframe, [])
+                    ),
+                    "audit_windows": (
+                        self._serialized_audit_windows()[timeframe]
+                    ),
+                    "audit_reference_intervals": (
+                        self._serialized_audit_reference_intervals()[timeframe]
+                    ),
+                    "audit_only_intervals": (
+                        self._serialized_audit_only_intervals()[timeframe]
                     ),
                 }
             )
@@ -3499,7 +3725,7 @@ class NativeHistoryAcquirer:
             },
         }
         if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
-            manifest_request.update(self._v3_request_fields())
+            manifest_request.update(self._timeframe_request_fields())
         manifest: Dict[str, Any] = {
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "immutable_record": True,
@@ -3570,7 +3796,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--timeframe-window-years-json",
         help=(
             "Nested timeframe/partition year map as inline JSON or a JSON file. "
-            "Defaults new runs to the non-weakenable v3 timeframe matrix."
+            "Defaults new runs to the non-weakenable V5 timeframe matrix."
         ),
     )
     parser.add_argument(
@@ -3726,7 +3952,7 @@ def _main_with_args(
             and (args.legacy_flat_windows or flat_cli_supplied)
         ):
             raise ResumeValidationError(
-                "legacy flat-window options cannot resume a v3 timeframe-window run"
+                "legacy flat-window options cannot resume a timeframe-window run"
             )
         if (
             window_contract_version == LEGACY_FLAT_WINDOW_CONTRACT_VERSION
@@ -3792,7 +4018,7 @@ def _main_with_args(
             locked_timeframe_years = locked.get("timeframe_window_years")
             if not isinstance(locked_timeframe_years, Mapping):
                 raise ResumeValidationError(
-                    "v3 resume contract has no timeframe window matrix"
+                    "timeframe resume contract has no timeframe window matrix"
                 )
             timeframe_window_years = {
                 str(timeframe): dict(years)
@@ -3809,7 +4035,7 @@ def _main_with_args(
                 }
                 if supplied_active != timeframe_window_years:
                     raise ResumeValidationError(
-                        "--timeframe-window-years-json differs from the original v3 map"
+                        "--timeframe-window-years-json differs from the original map"
                     )
             window_years = dict(DEFAULT_WINDOW_YEARS)
         else:
@@ -3873,7 +4099,7 @@ def _main_with_args(
                 if nested_cli_windows is not None
                 else configured_timeframe_windows
             )
-            # Retained only as a compatibility projection in v3 artifacts.
+            # Retained only as a compatibility projection in timeframe artifacts.
             window_years = dict(DEFAULT_WINDOW_YEARS)
         if args.embargo_days is not None:
             embargo_days = args.embargo_days
