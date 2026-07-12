@@ -30,6 +30,7 @@ from tools.acquire_native_history import (  # noqa: E402
     expected_session_coverage_by_partition,
     load_native_history_resume_contract,
     main,
+    segmented_session_coverage_by_partition_v2,
     snapshot_read_only_runtime_metadata,
 )
 
@@ -51,6 +52,42 @@ def _bar_frame(timestamps):
         },
         index=index,
     )
+
+
+def _segmented_coverage_windows():
+    return {
+        "optimizer_train": (
+            datetime(2020, 1, 6, tzinfo=UTC),
+            datetime(2022, 1, 3, tzinfo=UTC),
+        ),
+        "tuning_validation": (
+            datetime(2022, 1, 3, tzinfo=UTC),
+            datetime(2024, 1, 1, tzinfo=UTC),
+        ),
+        "final_lockbox": (
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 5, tzinfo=UTC),
+        ),
+    }
+
+
+def _scheduled_hourly_index(kind):
+    index = pd.date_range(
+        "2020-01-06",
+        "2026-01-05",
+        freq="h",
+        inclusive="left",
+        tz="UTC",
+    )
+    if kind == "fx":
+        return index[index.weekday < 5]
+    if kind == "equity":
+        return index[(index.weekday < 5) & (index.hour >= 14) & (index.hour < 20)]
+    if kind == "24x7":
+        return index
+    if kind == "d1":
+        return index[(index.weekday < 5) & (index.hour == 21)]
+    raise AssertionError(f"unsupported test schedule {kind!r}")
 
 
 def _minimal_provenance(run_id, symbol="EURUSD", timeframe="M5"):
@@ -523,6 +560,125 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 details["partitions"][partition]["start_ts"],
                 pd.Timestamp(windows[partition][0]).isoformat(),
             )
+
+    def test_segmented_session_coverage_v2_handles_stable_market_schedules(self):
+        windows = _segmented_coverage_windows()
+
+        for market_kind in ("fx", "equity", "24x7", "d1"):
+            with self.subTest(market_kind=market_kind):
+                frame = _bar_frame(_scheduled_hourly_index(market_kind))
+                coverage, details = segmented_session_coverage_by_partition_v2(
+                    frame,
+                    windows,
+                )
+
+                self.assertEqual(details["status"], "estimated")
+                self.assertTrue(details["timestamp_only"])
+                self.assertFalse(details["performance_inputs_used"])
+                self.assertEqual(len(details["schedule_segments"]), 1)
+                self.assertEqual(details["change_points"], [])
+                for partition, value in coverage.items():
+                    self.assertIsNotNone(value, partition)
+                    self.assertGreaterEqual(value, 0.99, partition)
+                    partition_detail = details["partitions"][partition]
+                    self.assertEqual(partition_detail["missing_calendar_weeks"], 0)
+                    self.assertIsNotNone(
+                        partition_detail["conservative_coverage_lower_bound"]
+                    )
+
+    def test_segmented_session_coverage_v2_accepts_sustained_schedule_change(self):
+        windows = _segmented_coverage_windows()
+        old_schedule = _scheduled_hourly_index("fx")
+        change = pd.Timestamp("2023-01-02", tz="UTC")
+        old_schedule = old_schedule[old_schedule < change]
+        new_schedule = _scheduled_hourly_index("fx")
+        new_schedule = new_schedule[(new_schedule >= change) & (new_schedule.hour < 8)]
+        frame = _bar_frame(old_schedule.append(new_schedule))
+
+        legacy_coverage, _ = expected_session_coverage_by_partition(frame, windows)
+        coverage, details = segmented_session_coverage_by_partition_v2(frame, windows)
+
+        self.assertLess(legacy_coverage["final_lockbox"], 0.50)
+        self.assertGreaterEqual(coverage["final_lockbox"], 0.99)
+        self.assertEqual(len(details["schedule_segments"]), 2)
+        self.assertEqual(len(details["change_points"]), 1)
+        self.assertEqual(
+            details["change_points"][0]["effective_week_start_utc"],
+            change.isoformat(),
+        )
+        self.assertEqual(
+            details["schedule_segments"][0]["nominal_bars_per_week_q75"],
+            120.0,
+        )
+        self.assertEqual(
+            details["schedule_segments"][1]["nominal_bars_per_week_q75"],
+            40.0,
+        )
+
+    def test_segmented_session_coverage_v2_keeps_missing_weeks_expected(self):
+        windows = _segmented_coverage_windows()
+        index = _scheduled_hourly_index("fx")
+        missing_start = pd.Timestamp("2024-06-03", tz="UTC")
+        missing_end = missing_start + pd.Timedelta(weeks=4)
+        frame = _bar_frame(index[(index < missing_start) | (index >= missing_end)])
+
+        coverage, details = segmented_session_coverage_by_partition_v2(frame, windows)
+
+        final = details["partitions"]["final_lockbox"]
+        self.assertEqual(final["missing_calendar_weeks"], 4)
+        self.assertEqual(final["weeks_below_half_expected_schedule"], 4)
+        self.assertLess(coverage["final_lockbox"], 0.98)
+        self.assertGreater(coverage["final_lockbox"], 0.90)
+        self.assertIsNotNone(final["largest_unexplained_gap"])
+        self.assertGreater(final["largest_unexplained_gap"]["seconds"], 0.0)
+        self.assertEqual(details["change_points"], [])
+
+    def test_segmented_session_coverage_v2_fails_closed_on_short_history(self):
+        start = datetime(2025, 1, 6, tzinfo=UTC)
+        windows = {
+            "optimizer_train": (start, start + timedelta(weeks=4)),
+            "tuning_validation": (
+                start + timedelta(weeks=4),
+                start + timedelta(weeks=8),
+            ),
+            "final_lockbox": (
+                start + timedelta(weeks=8),
+                start + timedelta(weeks=12),
+            ),
+        }
+        frame = _bar_frame(
+            pd.date_range(
+                start,
+                start + timedelta(weeks=12),
+                freq="h",
+                inclusive="left",
+                tz="UTC",
+            )
+        )
+
+        coverage, details = segmented_session_coverage_by_partition_v2(frame, windows)
+
+        self.assertTrue(all(value is None for value in coverage.values()))
+        self.assertEqual(
+            details["status"],
+            "fewer_than_26_complete_calendar_weeks",
+        )
+
+    def test_segmented_session_coverage_v2_never_reads_bar_values(self):
+        windows = _segmented_coverage_windows()
+        frame = _bar_frame(_scheduled_hourly_index("d1"))
+        changed = frame.copy()
+        changed["Open"] = range(len(changed))
+        changed["High"] = -1.0
+        changed["Low"] = float("nan")
+        changed["Close"] = float("inf")
+        changed["Volume"] = 0
+        changed["Spread"] = 999999
+
+        first = segmented_session_coverage_by_partition_v2(frame, windows)
+        second = segmented_session_coverage_by_partition_v2(changed, windows)
+
+        self.assertEqual(first, second)
 
     def test_effective_acquisition_start_precedes_train_by_warmup_safety_and_close_slack(self):
         as_of = datetime(2026, 1, 1, tzinfo=UTC)

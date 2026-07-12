@@ -69,6 +69,15 @@ TIMEFRAME_SECONDS: Dict[str, int] = {
     "D1": 24 * 60 * 60,
 }
 DEFAULT_TIMEFRAMES: Tuple[str, ...] = tuple(TIMEFRAME_SECONDS)
+SEGMENTED_SESSION_COVERAGE_METHOD_V2 = "timestamp_segmented_weekly_session_rate_v2"
+
+# The coverage estimator deliberately reasons in complete UTC calendar weeks.
+# Twenty-six weeks is long enough to distinguish a sustained schedule from a
+# transient outage/holiday cluster without imposing an instrument calendar.
+_SESSION_V2_MIN_EVIDENCE_WEEKS = 26
+_SESSION_V2_MIN_SEGMENT_WEEKS = 26
+_SESSION_V2_CHANGE_WINDOW_WEEKS = 26
+_SESSION_V2_MIN_CHANGE_FRACTION = 0.10
 
 # At a 10,000-bar terminal cap these spans remain below the cap even for a
 # continuously traded market.  The span is reduced dynamically when MT5
@@ -256,6 +265,441 @@ def expected_session_coverage_by_partition(
             "expected_rows_from_train_session_rate": float(expected),
             "coverage": coverage[partition],
         }
+    return coverage, details
+
+
+def _monday_floor_utc(value: pd.Timestamp) -> pd.Timestamp:
+    """Return the Monday 00:00 UTC boundary containing ``value``."""
+
+    value = pd.Timestamp(value)
+    if value.tzinfo is None:
+        value = value.tz_localize("UTC")
+    else:
+        value = value.tz_convert("UTC")
+    return value.normalize() - pd.Timedelta(days=int(value.weekday()))
+
+
+def _higher_quantile(values: np.ndarray, quantile: float) -> float:
+    """Deterministic discrete quantile used for count/envelope estimates."""
+
+    if values.size == 0:
+        return float("nan")
+    position = int(math.ceil(float(quantile) * (int(values.size) - 1)))
+    return float(np.partition(np.asarray(values, dtype="float64"), position)[position])
+
+
+def segmented_session_coverage_by_partition_v2(
+    frame: pd.DataFrame,
+    partition_windows: Mapping[str, Tuple[datetime, datetime]],
+) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
+    """Estimate timestamp completeness under sustained session-schedule changes.
+
+    Version 2 is intentionally timestamp-only: OHLCV, spread, returns, strategy
+    output, and performance labels are never read.  It constructs an explicit
+    zero-filled UTC-week grid, detects only sustained level changes with at
+    least 26 weeks of evidence on each side, and estimates each resulting
+    schedule segment independently.  Consequently, absent calendar weeks stay
+    in the denominator while a durable broker-session change does not make all
+    later partitions look incomplete under an obsolete train-period rate.
+
+    This is a broker-history completeness diagnostic, not an exchange-calendar
+    certification.  A stable, systematic data omission is observationally
+    indistinguishable from a real schedule reduction when timestamps are the
+    only permitted input; the returned diagnostics make that limitation and
+    every accepted change point explicit.
+    """
+
+    empty_coverage = {partition: None for partition in PARTITIONS}
+
+    def _failure(status: str, **extra: Any):
+        return dict(empty_coverage), {
+            "method": SEGMENTED_SESSION_COVERAGE_METHOD_V2,
+            "status": status,
+            "performance_inputs_used": False,
+            "timestamp_only": True,
+            **extra,
+        }
+
+    if frame is None or frame.empty:
+        return _failure("insufficient_data")
+    if set(partition_windows) != set(PARTITIONS):
+        return _failure("invalid_partition_windows")
+
+    try:
+        windows = {
+            partition: (
+                pd.Timestamp(_utc(start)),
+                pd.Timestamp(_utc(end)),
+            )
+            for partition, (start, end) in partition_windows.items()
+        }
+    except (TypeError, ValueError, KeyError):
+        return _failure("invalid_partition_windows")
+    if any(start >= end for start, end in windows.values()):
+        return _failure("invalid_partition_windows")
+
+    index = pd.DatetimeIndex(
+        pd.to_datetime(frame.index, utc=True, errors="coerce")
+    ).dropna()
+    index = index[~index.duplicated()].sort_values()
+    envelope_start = min(start for start, _ in windows.values())
+    envelope_end = max(end for _, end in windows.values())
+    index = index[(index >= envelope_start) & (index < envelope_end)]
+    if index.empty:
+        return _failure("requested_calendar_empty")
+
+    first_full_week = _monday_floor_utc(envelope_start)
+    if first_full_week < envelope_start:
+        first_full_week += pd.Timedelta(days=7)
+    last_full_week = _monday_floor_utc(envelope_end)
+    if last_full_week + pd.Timedelta(days=7) > envelope_end:
+        last_full_week -= pd.Timedelta(days=7)
+    if last_full_week < first_full_week:
+        return _failure(
+            "fewer_than_26_complete_calendar_weeks",
+            complete_calendar_weeks=0,
+        )
+    week_starts = pd.DatetimeIndex(
+        pd.date_range(first_full_week, last_full_week, freq="7D", tz="UTC")
+    )
+    if len(week_starts) < _SESSION_V2_MIN_EVIDENCE_WEEKS:
+        return _failure(
+            "fewer_than_26_complete_calendar_weeks",
+            complete_calendar_weeks=int(len(week_starts)),
+        )
+
+    index_ns = index.asi8
+    week_ns = week_starts.asi8
+    week_end_ns = (week_starts + pd.Timedelta(days=7)).asi8
+    weekly_counts = (
+        np.searchsorted(index_ns, week_end_ns, side="left")
+        - np.searchsorted(index_ns, week_ns, side="left")
+    ).astype("int64")
+    positive_weeks = int((weekly_counts > 0).sum())
+    if positive_weeks < _SESSION_V2_MIN_EVIDENCE_WEEKS:
+        return _failure(
+            "fewer_than_26_nonempty_calendar_weeks",
+            complete_calendar_weeks=int(len(week_starts)),
+            nonempty_calendar_weeks=positive_weeks,
+        )
+
+    def _window_nominal(values: np.ndarray) -> Optional[Tuple[float, float]]:
+        positive = values[values > 0]
+        minimum_support = max(13, int(math.ceil(0.60 * len(values))))
+        if positive.size < minimum_support:
+            return None
+        nominal = _higher_quantile(positive, 0.75)
+        if not math.isfinite(nominal) or nominal <= 0.0:
+            return None
+        consistent = float(
+            np.mean((positive >= 0.80 * nominal) & (positive <= 1.20 * nominal))
+        )
+        if consistent < 0.65:
+            return None
+        return nominal, consistent
+
+    # Deterministic binary segmentation.  Zeros remain in the week grid but do
+    # not define a new schedule.  Each accepted child retains >=26 weeks, and
+    # the local windows on both sides must independently show a stable level.
+    accepted_changes: Dict[int, Dict[str, Any]] = {}
+
+    def _split_segment(start_pos: int, end_pos: int) -> List[Tuple[int, int]]:
+        if end_pos - start_pos < 2 * _SESSION_V2_MIN_SEGMENT_WEEKS:
+            return [(start_pos, end_pos)]
+        best: Optional[Tuple[float, int, float, float, float, float]] = None
+        for split_pos in range(
+            start_pos + _SESSION_V2_MIN_SEGMENT_WEEKS,
+            end_pos - _SESSION_V2_MIN_SEGMENT_WEEKS + 1,
+        ):
+            left = weekly_counts[
+                max(start_pos, split_pos - _SESSION_V2_CHANGE_WINDOW_WEEKS) : split_pos
+            ]
+            right = weekly_counts[
+                split_pos : min(end_pos, split_pos + _SESSION_V2_CHANGE_WINDOW_WEEKS)
+            ]
+            left_estimate = _window_nominal(left)
+            right_estimate = _window_nominal(right)
+            if left_estimate is None or right_estimate is None:
+                continue
+            left_nominal, left_consistency = left_estimate
+            right_nominal, right_consistency = right_estimate
+            relative_change = abs(left_nominal - right_nominal) / max(
+                left_nominal,
+                right_nominal,
+            )
+            if (
+                abs(left_nominal - right_nominal) < 1.0
+                or relative_change < _SESSION_V2_MIN_CHANGE_FRACTION
+            ):
+                continue
+            support = min(
+                float(np.mean(left > 0)),
+                float(np.mean(right > 0)),
+                left_consistency,
+                right_consistency,
+            )
+            score = relative_change * support
+            candidate = (
+                score,
+                split_pos,
+                left_nominal,
+                right_nominal,
+                relative_change,
+                support,
+            )
+            if best is None or score > best[0] + 1e-12 or (
+                math.isclose(score, best[0], rel_tol=0.0, abs_tol=1e-12)
+                and split_pos < best[1]
+            ):
+                best = candidate
+        if best is None:
+            return [(start_pos, end_pos)]
+        _, split_pos, left_nominal, right_nominal, relative_change, support = best
+        accepted_changes[split_pos] = {
+            "effective_week_start_utc": week_starts[split_pos].isoformat(),
+            "left_nominal_bars_per_week": float(left_nominal),
+            "right_nominal_bars_per_week": float(right_nominal),
+            "relative_change": float(relative_change),
+            "minimum_local_support": float(support),
+            "local_window_weeks": _SESSION_V2_CHANGE_WINDOW_WEEKS,
+        }
+        return _split_segment(start_pos, split_pos) + _split_segment(split_pos, end_pos)
+
+    segment_bounds = _split_segment(0, len(week_starts))
+
+    # Gap baselines use each healthy week's maximum timestamp gap, assigning a
+    # weekend/closure gap to the week containing its right-hand bar.
+    all_gap_seconds = np.diff(index.asi8).astype("float64") / 1_000_000_000.0
+    all_gap_right_weeks = index[1:].normalize() - pd.to_timedelta(
+        index[1:].weekday,
+        unit="D",
+    )
+    weekly_gap_max_by_key: Dict[int, float] = {}
+    for right_week, gap_seconds in zip(all_gap_right_weeks.asi8, all_gap_seconds):
+        week_key = int(right_week)
+        weekly_gap_max_by_key[week_key] = max(
+            weekly_gap_max_by_key.get(week_key, 0.0),
+            float(gap_seconds),
+        )
+    segment_records: List[Dict[str, Any]] = []
+    segment_models: List[Dict[str, Any]] = []
+    lower_bound_available = True
+    for segment_id, (start_pos, end_pos) in enumerate(segment_bounds):
+        counts = weekly_counts[start_pos:end_pos]
+        positive = counts[counts > 0]
+        nominal = _higher_quantile(positive, 0.75)
+        empirical_upper = float(np.max(positive))
+        nonempty_fraction = float(positive.size / max(1, counts.size))
+        healthy_fraction = float(
+            np.mean((counts >= 0.80 * nominal) & (counts <= 1.20 * nominal))
+        )
+        bound_defensible = bool(
+            counts.size >= _SESSION_V2_MIN_EVIDENCE_WEEKS
+            and positive.size >= 20
+            and nonempty_fraction >= 0.75
+            and empirical_upper <= 1.15 * nominal
+        )
+        lower_bound_available = lower_bound_available and bound_defensible
+
+        healthy_week_set = set(
+            week_starts[start_pos:end_pos][counts >= 0.80 * nominal].asi8.tolist()
+        )
+        weekly_gap_maxima = [
+            weekly_gap_max_by_key[week_key]
+            for week_key in healthy_week_set
+            if week_key in weekly_gap_max_by_key
+        ]
+        recurring_max_gap = (
+            _higher_quantile(np.asarray(weekly_gap_maxima, dtype="float64"), 0.90)
+            if len(weekly_gap_maxima) >= 13
+            else None
+        )
+        segment_start = week_starts[start_pos]
+        segment_end = week_starts[end_pos - 1] + pd.Timedelta(days=7)
+        model = {
+            "segment_id": segment_id,
+            "start": segment_start,
+            "end": segment_end,
+            "nominal": float(nominal),
+            "upper": empirical_upper,
+            "bound_defensible": bound_defensible,
+            "recurring_max_gap": (
+                float(recurring_max_gap) if recurring_max_gap is not None else None
+            ),
+        }
+        segment_models.append(model)
+        segment_records.append(
+            {
+                "segment_id": segment_id,
+                "start_week_utc": segment_start.isoformat(),
+                "end_week_exclusive_utc": segment_end.isoformat(),
+                "calendar_weeks": int(counts.size),
+                "nonempty_weeks": int(positive.size),
+                "zero_count_weeks": int((counts == 0).sum()),
+                "nominal_bars_per_week_q75": float(nominal),
+                "empirical_schedule_envelope_bars_per_week": empirical_upper,
+                "nonempty_week_fraction": nonempty_fraction,
+                "healthy_week_fraction": healthy_fraction,
+                "conservative_lower_bound_defensible": bound_defensible,
+                "recurring_max_gap_seconds_q90": (
+                    float(recurring_max_gap) if recurring_max_gap is not None else None
+                ),
+            }
+        )
+
+    def _segment_for_week(week_start: pd.Timestamp) -> Dict[str, Any]:
+        for model in segment_models:
+            if model["start"] <= week_start < model["end"]:
+                return model
+        return segment_models[0] if week_start < segment_models[0]["start"] else segment_models[-1]
+
+    def _partition_gap_diagnostic(
+        partition_index: pd.DatetimeIndex,
+    ) -> Optional[Dict[str, Any]]:
+        if len(partition_index) < 2:
+            return None
+        gaps = np.diff(partition_index.asi8).astype("float64") / 1_000_000_000.0
+        best: Optional[Tuple[float, int, float, float]] = None
+        for gap_pos, gap_seconds in enumerate(gaps):
+            right_week = _monday_floor_utc(partition_index[gap_pos + 1])
+            baseline = _segment_for_week(right_week).get("recurring_max_gap")
+            if baseline is None:
+                continue
+            unexplained = max(0.0, float(gap_seconds) - float(baseline))
+            if best is None or unexplained > best[0] or (
+                math.isclose(unexplained, best[0], rel_tol=0.0, abs_tol=1e-9)
+                and float(gap_seconds) > best[3]
+            ):
+                best = (
+                    unexplained,
+                    gap_pos,
+                    float(baseline),
+                    float(gap_seconds),
+                )
+        if best is None:
+            return None
+        unexplained, gap_pos, baseline, observed_gap = best
+        return {
+            "seconds": float(unexplained),
+            "gap_start_utc": partition_index[gap_pos].isoformat(),
+            "gap_end_utc": partition_index[gap_pos + 1].isoformat(),
+            "observed_gap_seconds": observed_gap,
+            "recurring_schedule_gap_seconds": baseline,
+        }
+
+    coverage: Dict[str, Optional[float]] = {}
+    partition_details: Dict[str, Any] = {}
+    global_gap: Optional[Dict[str, Any]] = None
+    week_duration_seconds = 7.0 * 86400.0
+    for partition in PARTITIONS:
+        start, end = windows[partition]
+        observed_index = index[(index >= start) & (index < end)]
+        observed = int(len(observed_index))
+        expected_point = 0.0
+        expected_upper = 0.0
+        bound_is_available = True
+        week_start = _monday_floor_utc(start)
+        while week_start < end:
+            week_end = week_start + pd.Timedelta(days=7)
+            overlap_start = max(start, week_start)
+            overlap_end = min(end, week_end)
+            overlap_fraction = max(
+                0.0,
+                (overlap_end - overlap_start).total_seconds() / week_duration_seconds,
+            )
+            model = _segment_for_week(week_start)
+            expected_point += float(model["nominal"]) * overlap_fraction
+            if model["bound_defensible"]:
+                expected_upper += float(model["upper"]) * overlap_fraction
+            else:
+                bound_is_available = False
+            week_start = week_end
+        point = min(1.0, observed / expected_point) if expected_point > 0.0 else None
+        lower_bound = (
+            min(1.0, observed / expected_upper)
+            if bound_is_available and expected_upper > 0.0
+            else None
+        )
+        coverage[partition] = float(point) if point is not None else None
+
+        first_partition_full_week = _monday_floor_utc(start)
+        if first_partition_full_week < start:
+            first_partition_full_week += pd.Timedelta(days=7)
+        full_partition_weeks: List[pd.Timestamp] = []
+        cursor = first_partition_full_week
+        while cursor + pd.Timedelta(days=7) <= end:
+            full_partition_weeks.append(cursor)
+            cursor += pd.Timedelta(days=7)
+        missing_weeks = 0
+        low_coverage_weeks = 0
+        for full_week in full_partition_weeks:
+            start_pos = int(np.searchsorted(index_ns, full_week.value, side="left"))
+            end_pos = int(
+                np.searchsorted(
+                    index_ns,
+                    (full_week + pd.Timedelta(days=7)).value,
+                    side="left",
+                )
+            )
+            count = end_pos - start_pos
+            nominal = float(_segment_for_week(full_week)["nominal"])
+            if count == 0:
+                missing_weeks += 1
+            if count < 0.50 * nominal:
+                low_coverage_weeks += 1
+        gap_diagnostic = _partition_gap_diagnostic(observed_index)
+        if gap_diagnostic is not None and (
+            global_gap is None
+            or float(gap_diagnostic["seconds"]) > float(global_gap["seconds"])
+        ):
+            global_gap = {"partition": partition, **gap_diagnostic}
+        partition_details[partition] = {
+            "start_ts": start.isoformat(),
+            "end_ts": end.isoformat(),
+            "observed_rows": observed,
+            "expected_rows_from_segmented_session_schedule": float(expected_point),
+            # Compatibility alias consumed by v1 provenance readers.  The v2
+            # method field prevents this from being mistaken for a train-only
+            # estimate when artifacts are authenticated.
+            "expected_rows_from_train_session_rate": float(expected_point),
+            "coverage": coverage[partition],
+            "conservative_coverage_lower_bound": (
+                float(lower_bound) if lower_bound is not None else None
+            ),
+            "complete_calendar_weeks": int(len(full_partition_weeks)),
+            "missing_calendar_weeks": int(missing_weeks),
+            "weeks_below_half_expected_schedule": int(low_coverage_weeks),
+            "largest_unexplained_gap": gap_diagnostic,
+        }
+
+    train_start, train_end = windows["optimizer_train"]
+    complete_train_weeks = int(
+        sum(
+            1
+            for week in week_starts
+            if week >= train_start and week + pd.Timedelta(days=7) <= train_end
+        )
+    )
+    details: Dict[str, Any] = {
+        "method": SEGMENTED_SESSION_COVERAGE_METHOD_V2,
+        "status": "estimated",
+        "performance_inputs_used": False,
+        "timestamp_only": True,
+        "schedule_source": "all_requested_calendar_weeks_timestamp_only",
+        "complete_calendar_weeks": int(len(week_starts)),
+        "complete_train_weeks": complete_train_weeks,
+        "schedule_segments": segment_records,
+        "change_points": [accepted_changes[key] for key in sorted(accepted_changes)],
+        "conservative_lower_bound_available": bool(lower_bound_available),
+        "largest_unexplained_gap": global_gap,
+        "partitions": partition_details,
+        "caveat": (
+            "Expected sessions are inferred only from recurring broker timestamps. "
+            "Missing weeks remain expected. A stable systematic omission cannot be "
+            "distinguished from a genuine schedule reduction without an authenticated "
+            "exchange or broker calendar."
+        ),
+    }
     return coverage, details
 
 
@@ -1963,7 +2407,7 @@ class NativeHistoryAcquirer:
                 "and exchange closures; they are diagnostics, not a trading-calendar completeness claim."
             ),
         }
-        session_coverage, session_coverage_details = expected_session_coverage_by_partition(
+        session_coverage, session_coverage_details = segmented_session_coverage_by_partition_v2(
             combined,
             self.partition_windows,
         )
