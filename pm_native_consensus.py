@@ -129,8 +129,14 @@ def validate_reference_graph(
     graph: Mapping[str, Sequence[str]],
 ) -> list[str]:
     errors: list[str] = []
-    if tuple(graph) != PRODUCTION_TIMEFRAMES:
-        errors.append("CONSENSUS_REFERENCE_GRAPH_TARGET_ORDER_INVALID")
+    # JSON objects are unordered by contract and every persisted FXPM artifact
+    # is written with ``sort_keys=True``.  Target order therefore cannot be an
+    # authenticated property of this mapping.  The ordered reference *arrays*
+    # below are semantic; the mapping itself must contain the exact target set.
+    if len(graph) != len(PRODUCTION_TIMEFRAMES) or set(graph) != set(
+        PRODUCTION_TIMEFRAMES
+    ):
+        errors.append("CONSENSUS_REFERENCE_GRAPH_TARGET_ROSTER_INVALID")
     for target in PRODUCTION_TIMEFRAMES:
         raw = graph.get(target)
         references = tuple(str(value or "").strip().upper() for value in (raw or ()))
@@ -352,8 +358,13 @@ def build_consensus_envelope(
 ) -> Dict[str, Any]:
     target = str(target_timeframe or "").strip().upper()
     references = expected_reference_timeframes(target)
-    if tuple(reference_bindings) != references or tuple(edge_reports) != references:
-        raise ValueError("consensus references must match the exact ordered graph")
+    if (
+        len(reference_bindings) != len(references)
+        or set(reference_bindings) != set(references)
+        or len(edge_reports) != len(references)
+        or set(edge_reports) != set(references)
+    ):
+        raise ValueError("consensus references must match the exact graph roster")
     errors: list[str] = []
     for reference in references:
         errors.extend(
@@ -455,8 +466,10 @@ def validate_consensus_envelope(
     if envelope.get("reference_bindings") != reference_bindings:
         errors.append("CONSENSUS_REFERENCE_BINDINGS_MISMATCH")
     errors.extend(_binding_errors(source_binding, "SOURCE"))
-    if tuple(reference_bindings) != references:
-        errors.append("CONSENSUS_REFERENCE_BINDING_ORDER_INVALID")
+    if len(reference_bindings) != len(references) or set(reference_bindings) != set(
+        references
+    ):
+        errors.append("CONSENSUS_REFERENCE_BINDING_ROSTER_INVALID")
     for reference in references:
         errors.extend(
             _binding_errors(
@@ -466,7 +479,11 @@ def validate_consensus_envelope(
             )
         )
     edges = envelope.get("edges")
-    if not isinstance(edges, Mapping) or tuple(edges) != references:
+    if (
+        not isinstance(edges, Mapping)
+        or len(edges) != len(references)
+        or set(edges) != set(references)
+    ):
         errors.append("CONSENSUS_EDGE_ROSTER_INVALID")
         return list(dict.fromkeys(errors))
     edge_reports: Dict[str, Mapping[str, Any]] = {}

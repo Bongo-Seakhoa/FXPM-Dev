@@ -1,5 +1,6 @@
 import copy
 import itertools
+import json
 
 import pytest
 
@@ -118,6 +119,48 @@ def test_reference_graph_is_exact_integral_and_deterministic():
     assert REFERENCE_GRAPH_SHA256 == canonical_sha256(
         {target: list(REFERENCE_GRAPH[target]) for target in PRODUCTION_TIMEFRAMES}
     )
+    persisted = json.loads(json.dumps(REFERENCE_GRAPH, sort_keys=True))
+    assert tuple(persisted) != PRODUCTION_TIMEFRAMES
+    assert validate_reference_graph(persisted) == []
+
+
+@pytest.mark.parametrize("target", PRODUCTION_TIMEFRAMES)
+def test_all_targets_survive_sorted_json_roundtrip(target):
+    envelope, source, references = _envelope(target=target)
+    persisted_envelope = json.loads(json.dumps(envelope, sort_keys=True))
+    persisted_references = json.loads(json.dumps(references, sort_keys=True))
+
+    # Mapping insertion order is not evidence.  The explicit array remains the
+    # only ordered authority and every target/reference orientation is
+    # re-derived by the validator after persistence.
+    assert persisted_envelope["reference_timeframes"] == list(
+        expected_reference_timeframes(target)
+    )
+    assert validate_consensus_envelope(
+        persisted_envelope,
+        symbol="EURUSD",
+        target_timeframe=target,
+        source_binding=source,
+        reference_bindings=persisted_references,
+    ) == []
+
+    rebuilt = build_consensus_envelope(
+        symbol="EURUSD",
+        target_timeframe=target,
+        source_binding=source,
+        reference_bindings=persisted_references,
+        edge_reports={
+            reference: persisted_envelope["edges"][reference]["report"]
+            for reference in sorted(persisted_envelope["edges"])
+        },
+    )
+    assert validate_consensus_envelope(
+        json.loads(json.dumps(rebuilt, sort_keys=True)),
+        symbol="EURUSD",
+        target_timeframe=target,
+        source_binding=source,
+        reference_bindings=persisted_references,
+    ) == []
 
 
 @pytest.mark.parametrize(
