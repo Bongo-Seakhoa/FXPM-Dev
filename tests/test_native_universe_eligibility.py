@@ -13,7 +13,12 @@ from pm_native_activation import (
     resolve_active_native_universe,
     validate_native_cell_exclusion_no_trade,
 )
-from pm_pipeline import OptimizationPipeline, PipelineResult, PortfolioManager
+from pm_pipeline import (
+    OptimizationGenerationOutcome,
+    OptimizationPipeline,
+    PipelineResult,
+    PortfolioManager,
+)
 from pm_portfolio_replay import active_native_portfolio_contract
 from tools.acquire_native_history import (
     ACQUISITION_CONTRACT_VERSION,
@@ -1177,15 +1182,35 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
         "_preflight_active_regime_provenance",
         lambda *_args, **_kwargs: None,
     )
-    calls = []
+    requests = []
 
-    def run_for_symbol(symbol: str) -> PipelineResult:
-        calls.append(symbol)
-        return PipelineResult(symbol=symbol, success=False, error_message="test stop")
+    def governed(request):
+        requests.append(request)
+        return OptimizationGenerationOutcome(
+            generation_id="test",
+            status="FAILED_TECHNICAL",
+            requested_symbols=tuple(request.target_symbols),
+            effective_symbols=tuple(request.target_symbols),
+            retained_symbols=(),
+            excluded_symbols=(),
+            results={
+                "TONUSD": PipelineResult(
+                    symbol="TONUSD",
+                    success=False,
+                    error_message="test stop",
+                )
+            },
+        )
 
-    monkeypatch.setattr(manager.pipeline, "run_for_symbol", run_for_symbol)
+    monkeypatch.setattr(manager, "_run_governed_symbol_generation", governed)
+    monkeypatch.setattr(
+        manager.pipeline,
+        "run_for_symbol",
+        lambda _symbol: pytest.fail("parent-process optimizer bypassed governor"),
+    )
     assert manager.retrain_symbol("TONUSD") is False
-    assert calls == ["TONUSD"]
+    assert len(requests) == 1
+    assert requests[0].target_symbols == ("TONUSD",)
 
 
 def test_performance_tamper_invalidates_universe_contract(tmp_path: Path) -> None:

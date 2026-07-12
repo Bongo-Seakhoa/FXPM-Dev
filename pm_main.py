@@ -8327,13 +8327,35 @@ class FXPortfolioManagerApp:
             f"Production retrain due since {due_str}; refreshing {len(symbols_to_retrain)} symbols "
             f"on the fixed schedule ({self.pipeline_config.describe_retrain_schedule()})"
         )
-        self._fetch_historical_data(symbols_to_retrain)
-        self.portfolio_manager.retrain_all_needed()
+        production_native = bool(
+            str(getattr(self.pipeline_config, "_deployment_config_path", "") or "").strip()
+        ) and str(
+            getattr(self.pipeline_config, "production_split_mode", "") or ""
+        ).strip().lower() == "calendar_lockbox_v2"
+        if production_native:
+            self.logger.info(
+                "Scheduled native retraining will use only a newly activated immutable "
+                "six-timeframe source; legacy M5 refresh is intentionally skipped"
+            )
+        else:
+            self._fetch_historical_data(symbols_to_retrain)
+        retrain_results = self.portfolio_manager.retrain_all_needed()
         self._last_retrain_schedule_notice = due_str
-        if self.trader:
-            self.trader.invalidate_runtime_caches()
-        if self.storage_manager:
-            self.storage_manager.on_optimization_complete()
+        outcome = getattr(
+            self.portfolio_manager,
+            "last_optimization_generation",
+            None,
+        )
+        if outcome is not None and bool(getattr(outcome, "ledger_changed", False)):
+            if self.trader:
+                self.trader.invalidate_runtime_caches()
+            if self.storage_manager:
+                self.storage_manager.on_optimization_complete()
+        elif retrain_results:
+            self.logger.warning(
+                "Scheduled retraining did not promote a new ledger generation; "
+                "runtime caches and storage completion hooks were left untouched"
+            )
 
     def _get_active_live_timeframes(self) -> List[str]:
         """Return the unique active timeframes from the current validated configs."""

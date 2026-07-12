@@ -2,6 +2,8 @@ import shutil
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from pm_core import PipelineConfig
 from pm_main import FXPortfolioManagerApp
@@ -70,6 +72,46 @@ class RetrainScheduleTests(unittest.TestCase):
         self.assertEqual(app.output_dir, override_output)
         self.assertEqual(cfg.data_dir, override_data)
         self.assertEqual(cfg.output_dir, override_output)
+
+    def _scheduled_native_app(self, *, ledger_changed: bool):
+        cfg = PipelineConfig(
+            data_dir=self.tmp / "scheduled_data",
+            output_dir=self.tmp / "scheduled_out",
+        )
+        cfg.production_retrain_mode = "auto"
+        cfg.production_split_mode = "calendar_lockbox_v2"
+        cfg._deployment_config_path = "config.json"
+        app = FXPortfolioManagerApp(pipeline_config=cfg)
+        app.portfolio_manager = MagicMock()
+        app.portfolio_manager.get_symbols_needing_retrain.return_value = ["EURUSD"]
+        app.portfolio_manager.retrain_all_needed.return_value = {
+            "EURUSD": bool(ledger_changed)
+        }
+        app.portfolio_manager.last_optimization_generation = SimpleNamespace(
+            ledger_changed=bool(ledger_changed)
+        )
+        app.trader = MagicMock()
+        app.storage_manager = MagicMock()
+        app._fetch_historical_data = MagicMock()
+        return app
+
+    def test_failed_native_generation_leaves_runtime_side_effects_untouched(self):
+        app = self._scheduled_native_app(ledger_changed=False)
+
+        app._check_production_retrain_schedule()
+
+        app._fetch_historical_data.assert_not_called()
+        app.trader.invalidate_runtime_caches.assert_not_called()
+        app.storage_manager.on_optimization_complete.assert_not_called()
+
+    def test_promoted_native_generation_invalidates_runtime_once(self):
+        app = self._scheduled_native_app(ledger_changed=True)
+
+        app._check_production_retrain_schedule()
+
+        app._fetch_historical_data.assert_not_called()
+        app.trader.invalidate_runtime_caches.assert_called_once_with()
+        app.storage_manager.on_optimization_complete.assert_called_once_with()
 
 
 if __name__ == "__main__":

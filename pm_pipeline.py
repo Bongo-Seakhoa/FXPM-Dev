@@ -2043,6 +2043,36 @@ class PipelineResult:
     data_window_meta: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class OptimizationGenerationRequest:
+    """Code-owned target set for one governed, atomic ledger generation."""
+
+    kind: str
+    target_symbols: Tuple[str, ...]
+    overwrite_targets: bool = False
+    require_fresh_native_activation: bool = False
+
+
+@dataclass
+class OptimizationGenerationOutcome:
+    """Bounded operator result for an optimization generation."""
+
+    generation_id: str
+    status: str
+    requested_symbols: Tuple[str, ...]
+    effective_symbols: Tuple[str, ...]
+    retained_symbols: Tuple[str, ...]
+    excluded_symbols: Tuple[str, ...]
+    results: Dict[str, PipelineResult] = field(default_factory=dict)
+    technical_failures: Dict[str, str] = field(default_factory=dict)
+    promoted: bool = False
+    ledger_changed: bool = False
+    base_ledger_sha256: str = ""
+    promoted_ledger_sha256: str = ""
+    manifest_path: str = ""
+    replay_evidence: Dict[str, Any] = field(default_factory=dict)
+
+
 # =============================================================================
 # PIPELINE STAGES
 # =============================================================================
@@ -9990,64 +10020,23 @@ class OptimizationPipeline:
                 logger.debug(f"[{symbol}/{tf}] regime coverage report skipped: {exc}")
 
     def run_for_all(self, symbols: List[str]) -> Dict[str, PipelineResult]:
+        """Reject the obsolete parent-process batch optimizer.
+
+        Production and research batches must enter through ``PortfolioManager``
+        so every symbol runs in a fresh governed child and every ledger mutation
+        is receipt-verified, full-roster staged, replayed and CAS-promoted.
         """
-        Run optimization for all symbols.
-        
-        Args:
-            symbols: List of symbols to optimize
-            
-        Returns:
-            Dict mapping symbol to PipelineResult
-        """
-        results = {}
-        if (
-            bool(getattr(self.config, "false_discovery_control_enabled", False))
-            and int(getattr(self.config, "false_discovery_symbol_count", 0) or 0) <= 0
-        ):
-            self.config.false_discovery_symbol_count = len(symbols or [])
-        
-        total_start = time.time()
-        
-        logger.info(f"\n{'#'*60}")
-        logger.info(f"PORTFOLIO MANAGER - OPTIMIZATION PIPELINE")
-        logger.info(f"Symbols: {len(symbols)}")
-        logger.info(f"Strategies: {StrategyRegistry.count()}")
-        logger.info(f"Timeframes: {self.config.timeframes}")
-        logger.info(f"{'#'*60}")
-        
-        for i, symbol in enumerate(symbols):
-            logger.info(f"\nProgress: {i+1}/{len(symbols)}")
-            result = self.run_for_symbol(symbol)
-            results[symbol] = result
-            
-            # Clear data cache after each symbol to prevent memory leaks during long runs
-            self.data_loader.clear_cache()
-        
-        # Summary
-        total_time = time.time() - total_start
-        successful = sum(1 for r in results.values() if r.success)
-        validated = sum(1 for r in results.values() if r.config and r.config.is_validated)
-        
-        logger.info(f"\n{'#'*60}")
-        logger.info(f"OPTIMIZATION COMPLETE")
-        logger.info(f"Total time: {total_time:.1f}s")
-        logger.info(f"Successful: {successful}/{len(symbols)}")
-        logger.info(f"Validated:  {validated}/{len(symbols)}")
-        logger.info(f"{'#'*60}")
-        
-        return results
+        del symbols
+        raise RuntimeError(
+            "UNSAFE_UNGOVERNED_BATCH_API_DISABLED_USE_PORTFOLIO_MANAGER"
+        )
     
     def save_configs(self, results: Dict[str, PipelineResult], filepath: str):
-        """Save validated configurations to JSON file."""
-        configs = {}
-        for symbol, result in results.items():
-            if result.success and result.config:
-                configs[symbol] = result.config.to_dict()
-        
-        with open(filepath, 'w') as f:
-            json.dump(configs, f, indent=2)
-        
-        logger.info(f"Saved {len(configs)} configurations to {filepath}")
+        """Reject direct config writes that bypass generation/CAS validation."""
+        del results, filepath
+        raise RuntimeError(
+            "UNSAFE_DIRECT_CONFIG_SAVE_DISABLED_USE_PORTFOLIO_MANAGER"
+        )
     
     def load_configs(self, filepath: str) -> Dict[str, SymbolConfig]:
         """Load configurations from JSON file."""
@@ -10113,6 +10102,7 @@ class PortfolioManager:
         
         # Active configurations (loaded from ledger)
         self.symbol_configs: Dict[str, SymbolConfig] = {}
+        self.last_optimization_generation: Optional[OptimizationGenerationOutcome] = None
         
         # Load existing configs via ledger
         self._load_configs()
@@ -10758,78 +10748,38 @@ class PortfolioManager:
         return should_optimize
     
     def get_symbols_needing_retrain(self) -> List[str]:
-        """Get list of symbols that need retraining."""
-        return [s for s in self.symbols if self.needs_retraining(s)]
-    
-    def retrain_symbol(self, symbol: str, force: bool = False) -> bool:
-        """
-        Retrain a single symbol.
-        
-        Args:
-            symbol: Symbol to retrain
-            force: If True, retrain even if config is valid
-            
-        Returns:
-            True if successful
-        """
-        # Scheduled/manual retraining is an optimization entry point too.  It
-        # must honor the current immutable availability roster before checking
-        # ledger age or invoking the optimizer; otherwise an expired exclusion
-        # could enter the legacy data path, and a newly eligible symbol could
-        # remain stuck behind its still-valid old NO_TRADE artifact.
+        """Get ledger-expired or active-native-contract-stale symbols."""
+        due = [symbol for symbol in self.symbols if self.needs_retraining(symbol)]
         universe = self._native_universe_for_optimization()
         if universe is not None and universe.explicit_contract:
-            canonical = str(symbol or "").strip().upper()
-            self._preflight_active_regime_provenance(universe, [canonical])
-            existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
-            fully_excluded = set(
-                getattr(universe, "fully_excluded_symbols", ())
-                or universe.excluded_symbols
-            )
-            symbols_with_active = set(
-                getattr(universe, "symbols_with_active_cells", ())
-                or universe.eligible_symbols
-            )
-            if canonical in fully_excluded:
-                if not self._has_exact_native_cell_grid(
-                    canonical, existing, universe
+            for symbol in self.symbols:
+                canonical = str(symbol).upper()
+                existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(
+                    canonical
+                )
+                if (
+                    not self._has_exact_native_cell_grid(canonical, existing, universe)
+                    and symbol not in due
                 ):
-                    self.save_fully_excluded_native_config(symbol, universe)
-                logger.info(
-                    "SKIP %s: all native timeframe cells excluded by activation %s",
-                    symbol,
-                    universe.activation_id,
-                )
-                return True
-            if canonical not in symbols_with_active:
-                raise RuntimeError(
-                    f"NATIVE_UNIVERSE_SYMBOL_UNBOUND:{canonical}"
-                )
-            if existing is not None and not self._has_exact_native_cell_grid(
-                canonical, existing, universe
-            ):
-                force = True
+                    due.append(symbol)
+        return due
 
-        # Check if we should skip
-        if not force:
-            artifact_meta = build_artifact_meta(self.config)
-            should_optimize, reason = self.ledger.should_optimize(symbol, current_artifact_meta=artifact_meta)
-            if not should_optimize:
-                logger.info(f"SKIP {symbol}: {reason}")
-                return True  # Already valid
-        
-        logger.info(f"RETRAIN {symbol}: running optimization...")
-        
-        result = self.pipeline.run_for_symbol(symbol)
-        
-        if result.success and result.config:
-            self._save_symbol_config(symbol, result.config)
-            logger.info(f"SAVED {symbol}: optimization complete")
+    def retrain_symbol(self, symbol: str, force: bool = False) -> bool:
+        """Run one manual target through the governed atomic generation path."""
+        outcome = self._run_governed_symbol_generation(
+            OptimizationGenerationRequest(
+                kind="MANUAL_RETRAIN",
+                target_symbols=(str(symbol),),
+                overwrite_targets=bool(force),
+                require_fresh_native_activation=False,
+            )
+        )
+        if outcome.status == "NOOP":
             return True
-        else:
-            # Keep existing config on failure
-            logger.warning(f"FAILED {symbol}: keeping existing config")
-            return False
+        result = outcome.results.get(str(symbol)) or outcome.results.get(
+            str(symbol).upper()
+        )
+        return bool(outcome.promoted and (result is None or result.success))
     
     def retrain_all_needed(self) -> Dict[str, bool]:
         """
@@ -10845,12 +10795,26 @@ class PortfolioManager:
             logger.info("No symbols need retraining")
             return results
         
-        logger.info(f"Retraining {len(symbols_to_retrain)} symbols...")
-        
-        for i, symbol in enumerate(symbols_to_retrain):
-            logger.info(f"Progress: {i+1}/{len(symbols_to_retrain)}")
-            results[symbol] = self.retrain_symbol(symbol)
-        
+        logger.info(f"Retraining {len(symbols_to_retrain)} symbols atomically...")
+        production_native = bool(
+            str(getattr(self.config, "_deployment_config_path", "") or "").strip()
+        ) and str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower() == CALENDAR_SPLIT_MODE
+        outcome = self._run_governed_symbol_generation(
+            OptimizationGenerationRequest(
+                kind="SCHEDULED_RETRAIN",
+                target_symbols=tuple(symbols_to_retrain),
+                overwrite_targets=False,
+                require_fresh_native_activation=production_native,
+            )
+        )
+        for symbol in symbols_to_retrain:
+            result = outcome.results.get(symbol)
+            results[symbol] = bool(
+                outcome.status == "NOOP"
+                or (outcome.promoted and (result is None or result.success))
+            )
         return results
 
     def _precompute_feature_cache_for_symbols(
@@ -10993,8 +10957,17 @@ class PortfolioManager:
             logger.warning(f"Feature disk cache precompute had cache-level issues: {summary['feature_cache']}")
         return summary
 
-    def _run_production_replay_audit(self) -> Dict[str, Any]:
-        """Run the post-optimization full-sample replay gate against the winner ledger."""
+    def _run_production_replay_audit(
+        self,
+        ledger_override: Optional[Path] = None,
+        *,
+        mutate_manager: bool = True,
+    ) -> Dict[str, Any]:
+        """Run the full-roster replay gate against live or staged ledger bytes."""
+        staged_override = getattr(self, "_staged_replay_ledger_override", None)
+        if ledger_override is None and staged_override is not None:
+            ledger_override = Path(staged_override)
+            mutate_manager = False
         if str(
             getattr(self.config, "production_split_mode", "") or ""
         ).strip().lower() == CALENDAR_SPLIT_MODE:
@@ -11031,7 +11004,7 @@ class PortfolioManager:
             logger.warning(message)
             return {"enabled": True, "ok": False, "error": message}
 
-        ledger_path = Path(self.config_file)
+        ledger_path = Path(ledger_override) if ledger_override is not None else Path(self.config_file)
         if not ledger_path.is_absolute():
             ledger_path = Path.cwd() / ledger_path
         try:
@@ -11160,8 +11133,12 @@ class PortfolioManager:
         }
 
         if mode == "apply":
-            backup = ledger_path.with_name(f"{ledger_path.stem}.backup_replay_audit_{stamp}{ledger_path.suffix}")
-            shutil.copy2(ledger_path, backup)
+            backup = None
+            if ledger_override is None:
+                backup = ledger_path.with_name(
+                    f"{ledger_path.stem}.backup_replay_audit_{stamp}{ledger_path.suffix}"
+                )
+                shutil.copy2(ledger_path, backup)
             counters = replay_audit.apply_audit(
                 ledger,
                 results,
@@ -11170,9 +11147,11 @@ class PortfolioManager:
             tmp_path = ledger_path.with_suffix(f"{ledger_path.suffix}.tmp_replay_audit")
             tmp_path.write_text(json.dumps(ledger, indent=2, default=str), encoding="utf-8")
             tmp_path.replace(ledger_path)
-            self.ledger.load()
-            self.symbol_configs = self.ledger.get_all_configs()
-            summary["backup_path"] = str(backup)
+            if mutate_manager and ledger_override is None:
+                self.ledger.load()
+                self.symbol_configs = self.ledger.get_all_configs()
+            if backup is not None:
+                summary["backup_path"] = str(backup)
             summary["counters"] = counters
 
         logger.info(
@@ -11320,6 +11299,10 @@ class PortfolioManager:
                 "OPTIMIZATION_GENERATION_LIVE_LEDGER_CHANGED_DURING_RUN"
             )
         os.replace(stage_path, ledger_path)
+        # A detached funded-live authorization is bound to the pre-CAS ledger
+        # hash. Never allow refresh=False entry checks to reuse it after the
+        # winner book changes.
+        self._last_promotion_authorization = None
         promoted_manifest = {
             **dict(manifest),
             "generation_status": "PROMOTED",
@@ -11331,23 +11314,58 @@ class PortfolioManager:
         self.ledger.load()
         self.symbol_configs = self.ledger.get_all_configs()
     
-    def initial_optimization(self, overwrite: bool = False) -> Dict[str, PipelineResult]:
-        """
-        Run initial optimization for all symbols with skip/resume support.
-        
-        This is the main entry point for optimization that:
-        - Skips symbols with valid configs (unless overwrite=True)
-        - Saves progress after each symbol (incremental persistence)
-        - Never loses existing configs on failure
-        
-        Args:
-            overwrite: If True, re-optimize all symbols ignoring validity
-            
-        Returns:
-            Dict of pipeline results (only for symbols that were optimized)
-        """
+    def _run_governed_symbol_generation(
+        self,
+        request: OptimizationGenerationRequest,
+    ) -> OptimizationGenerationOutcome:
+        """Run one receipt-verified, full-roster, atomic ledger generation."""
         results = {}
-        
+
+        request_kind = str(request.kind or "").strip().upper()
+        allowed_kinds = {"INITIAL", "MANUAL_RETRAIN", "SCHEDULED_RETRAIN"}
+        if request_kind not in allowed_kinds:
+            raise ValueError(
+                f"OPTIMIZATION_GENERATION_KIND_UNKNOWN:{request_kind or 'EMPTY'}"
+            )
+        production_native_context = bool(
+            str(getattr(self.config, "_deployment_config_path", "") or "").strip()
+        ) and str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower() == CALENDAR_SPLIT_MODE
+        if request_kind == "SCHEDULED_RETRAIN" and request.overwrite_targets:
+            raise ValueError("SCHEDULED_RETRAIN_OVERWRITE_FORBIDDEN")
+        if (
+            request_kind != "SCHEDULED_RETRAIN"
+            and request.require_fresh_native_activation
+        ):
+            raise ValueError(
+                "FRESH_NATIVE_ACTIVATION_POLICY_ONLY_APPLIES_TO_SCHEDULED_RETRAIN"
+            )
+        if (
+            request_kind == "SCHEDULED_RETRAIN"
+            and request.require_fresh_native_activation
+            and not production_native_context
+        ):
+            raise ValueError(
+                "FRESH_NATIVE_ACTIVATION_POLICY_REQUIRES_PRODUCTION_CALENDAR_CONTEXT"
+            )
+        require_fresh_native_activation = bool(
+            request_kind == "SCHEDULED_RETRAIN" and production_native_context
+        )
+
+        configured_by_canonical = {
+            str(symbol).strip().upper(): str(symbol)
+            for symbol in self.symbols
+        }
+        requested: List[str] = []
+        for raw_symbol in request.target_symbols:
+            canonical = str(raw_symbol or "").strip().upper()
+            if canonical not in configured_by_canonical:
+                raise ValueError(f"OPTIMIZATION_GENERATION_TARGET_UNKNOWN:{canonical}")
+            configured = configured_by_canonical[canonical]
+            if configured not in requested:
+                requested.append(configured)
+
         total_start = time.time()
         
         # Freeze the availability-only universe before model search. Excluded
@@ -11355,7 +11373,6 @@ class PortfolioManager:
         # enter scoring/optimization. A prior exclusion that becomes eligible
         # under a later activation is forced back through optimization.
         universe = self._native_universe_for_optimization()
-        self._preflight_active_regime_provenance(universe)
         ledger_path = Path(self.config_file)
         if not ledger_path.is_absolute():
             ledger_path = Path.cwd() / ledger_path
@@ -11374,7 +11391,7 @@ class PortfolioManager:
                 )
         generation_started_at = datetime.now(timezone.utc).isoformat()
         generation_id = _stable_hash({
-            "schema": "fxpm.optimization-generation.v1",
+            "schema": "fxpm.optimization-generation.v2",
             "started_at": generation_started_at,
             "pid": os.getpid(),
             "base_ledger_sha256": base_ledger_sha256,
@@ -11382,27 +11399,124 @@ class PortfolioManager:
             "activation_manifest_sha256": getattr(
                 universe, "activation_manifest_sha256", None
             ),
-            "overwrite": bool(overwrite),
+            "kind": request_kind,
+            "requested_symbols": requested,
+            "overwrite": bool(request.overwrite_targets),
         })
         generation_manifest: Dict[str, Any] = {
-            "schema_version": "fxpm.optimization-generation.v1",
+            "schema_version": "fxpm.optimization-generation.v2",
             "generation_id": generation_id,
             "generation_status": "RUNNING",
             "started_at": generation_started_at,
             "base_ledger_sha256": base_ledger_sha256,
             "configured_symbols": [str(symbol) for symbol in self.symbols],
+            "generation_kind": request_kind,
+            "requested_symbols": list(requested),
             "activation_id": getattr(universe, "activation_id", None),
             "activation_manifest_sha256": getattr(
                 universe, "activation_manifest_sha256", None
             ),
-            "overwrite": bool(overwrite),
+            "overwrite": bool(request.overwrite_targets),
+            "fresh_native_activation_required": require_fresh_native_activation,
             "completed_symbols": [],
             "technical_failures": {},
         }
+
+        effective_symbols = list(requested)
+        if universe is not None and universe.explicit_contract:
+            for symbol in self.symbols:
+                canonical = str(symbol).upper()
+                existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
+                if existing is not None and not self._has_exact_native_cell_grid(
+                    canonical, existing, universe
+                ) and symbol not in effective_symbols:
+                    effective_symbols.append(symbol)
+        self._preflight_active_regime_provenance(universe, effective_symbols)
+        generation_manifest["effective_symbols"] = list(effective_symbols)
+
+        def _outcome(
+            status: str,
+            *,
+            promoted: bool = False,
+            ledger_changed: bool = False,
+            promoted_sha: str = "",
+            replay_evidence: Optional[Dict[str, Any]] = None,
+            manifest_path_override: Optional[Path] = None,
+        ) -> OptimizationGenerationOutcome:
+            _stage, stage_manifest, active_manifest = self._optimization_generation_paths()
+            manifest_path = (
+                Path(manifest_path_override)
+                if manifest_path_override is not None
+                else active_manifest if promoted else stage_manifest
+            )
+            outcome = OptimizationGenerationOutcome(
+                generation_id=generation_id,
+                status=str(status),
+                requested_symbols=tuple(requested),
+                effective_symbols=tuple(effective_symbols),
+                retained_symbols=tuple(
+                    symbol for symbol in self.symbols if symbol not in effective_symbols
+                ),
+                excluded_symbols=tuple(excluded_now),
+                results=dict(results),
+                technical_failures=dict(
+                    generation_manifest.get("technical_failures", {}) or {}
+                ),
+                promoted=bool(promoted),
+                ledger_changed=bool(ledger_changed),
+                base_ledger_sha256=base_ledger_sha256,
+                promoted_ledger_sha256=str(promoted_sha or ""),
+                manifest_path=str(manifest_path),
+                replay_evidence=dict(replay_evidence or {}),
+            )
+            self.last_optimization_generation = outcome
+            return outcome
+
         generation_dirty = False
-        optimization_symbols = list(self.symbols)
+        optimization_symbols = list(effective_symbols)
         stale_exclusions_now_eligible: List[str] = []
         excluded_now: List[str] = []
+        if require_fresh_native_activation:
+            current_activation_id = str(
+                getattr(universe, "activation_id", None) or ""
+            )
+            stale_source_symbols: List[str] = []
+            if not current_activation_id:
+                stale_source_symbols = list(requested)
+            else:
+                for symbol in requested:
+                    existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(
+                        str(symbol).upper()
+                    )
+                    eligibility = dict(
+                        (getattr(existing, "data_window_meta", {}) or {}).get(
+                            "native_cell_eligibility", {}
+                        )
+                        if existing is not None
+                        else {}
+                    )
+                    if str(eligibility.get("activation_id") or "") == current_activation_id:
+                        stale_source_symbols.append(symbol)
+            if stale_source_symbols:
+                for symbol in stale_source_symbols:
+                    results[symbol] = PipelineResult(
+                        symbol=symbol,
+                        success=False,
+                        error_message=(
+                            "BLOCKED_STALE_NATIVE_ACTIVATION: scheduled production "
+                            "retraining requires a newly activated native source"
+                        ),
+                    )
+                generation_manifest["generation_status"] = "BLOCKED_STALE_SOURCE"
+                generation_manifest["blocking_failures"] = {
+                    symbol: results[symbol].error_message
+                    for symbol in stale_source_symbols
+                }
+                self._stage_optimization_generation(
+                    staged_configs,
+                    generation_manifest,
+                )
+                return _outcome("BLOCKED_STALE_SOURCE")
         if universe is not None and universe.explicit_contract:
             eligible_set = set(
                 getattr(universe, "symbols_with_active_cells", ())
@@ -11413,9 +11527,9 @@ class PortfolioManager:
                 or universe.excluded_symbols
             )
             optimization_symbols = [
-                symbol for symbol in self.symbols if str(symbol).upper() in eligible_set
+                symbol for symbol in effective_symbols if str(symbol).upper() in eligible_set
             ]
-            for symbol in self.symbols:
+            for symbol in effective_symbols:
                 canonical = str(symbol).upper()
                 existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
                 if canonical in excluded_set:
@@ -11437,7 +11551,7 @@ class PortfolioManager:
         artifact_meta = build_artifact_meta(self.config)
         to_optimize, to_skip = self.ledger.get_symbols_to_optimize(
             optimization_symbols,
-            overwrite=overwrite,
+            overwrite=request.overwrite_targets,
             current_artifact_meta=artifact_meta,
         )
         for symbol in stale_exclusions_now_eligible:
@@ -11460,7 +11574,7 @@ class PortfolioManager:
         valid_skip_count = len([symbol for symbol in to_skip if symbol not in excluded_now])
         logger.info(f"Skipping valid configs: {valid_skip_count}")
         logger.info(f"Skipping fully excluded symbols: {len(excluded_now)}")
-        if overwrite:
+        if request.overwrite_targets:
             logger.info(f"OVERWRITE MODE: ignoring validity checks")
         logger.info(f"Strategies: {StrategyRegistry.count()}")
         logger.info(f"Timeframes: {self.config.timeframes}")
@@ -11468,8 +11582,10 @@ class PortfolioManager:
         
         if not to_optimize and not generation_dirty:
             logger.info("All symbols have valid configs. Nothing to optimize.")
-            self._run_production_replay_audit()
-            return results
+            generation_manifest["generation_status"] = "NOOP"
+            generation_manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+            self._stage_optimization_generation(staged_configs, generation_manifest)
+            return _outcome("NOOP")
         
         max_workers = int(getattr(self.config, "optimization_max_workers", 1) or 1)
         precompute_failed = False
@@ -11667,7 +11783,7 @@ class PortfolioManager:
                 generation_id,
                 len(technical_failures),
             )
-            return results
+            return _outcome("FAILED_TECHNICAL")
 
         expected_symbol_set = {str(symbol) for symbol in self.symbols}
         missing_staged = sorted(expected_symbol_set - set(staged_configs))
@@ -11684,7 +11800,7 @@ class PortfolioManager:
                 "Optimization generation %s incomplete; live ledger unchanged",
                 generation_id,
             )
-            return results
+            return _outcome("FAILED_INCOMPLETE_ROSTER")
 
         ledger_status = self._build_ledger_status(staged_configs)
         if not bool(ledger_status.get("complete_current_contract_universe", False)):
@@ -11700,12 +11816,15 @@ class PortfolioManager:
                 "live ledger unchanged",
                 generation_id,
             )
-            return results
+            return _outcome("FAILED_ARTIFACT_CONTRACT")
 
         generation_binding = {
-            "schema_version": "fxpm.optimization-generation.v1",
+            "schema_version": "fxpm.optimization-generation.v2",
             "generation_id": generation_id,
             "generation_status": "COMPLETE",
+            "generation_kind": request_kind,
+            "requested_symbols": list(requested),
+            "effective_symbols": list(effective_symbols),
             "activation_id": getattr(universe, "activation_id", None),
             "activation_manifest_sha256": getattr(
                 universe, "activation_manifest_sha256", None
@@ -11738,11 +11857,132 @@ class PortfolioManager:
             "ledger_staging_path": str(stage_path),
         })
         self._validate_staged_generation(stage_path, staged_configs, universe)
-        self._promote_staged_generation(
-            stage_path,
-            stage_manifest_path,
+
+        # Replay the complete resulting roster before the compare-and-swap.
+        # Apply-mode audit mutations are confined to staging, then parsed,
+        # revalidated and rehashed before promotion.
+        try:
+            self._staged_replay_ledger_override = stage_path
+            try:
+                replay_evidence = self._run_production_replay_audit()
+            finally:
+                self._staged_replay_ledger_override = None
+        except Exception as exc:
+            detail = f"STAGED_REPLAY_TECHNICAL:{type(exc).__name__}:{exc}"
+            generation_manifest["generation_status"] = "FAILED_REPLAY_TECHNICAL"
+            generation_manifest["technical_failures"] = {"__REPLAY__": detail}
+            self._stage_optimization_generation(staged_configs, generation_manifest)
+            return _outcome("FAILED_REPLAY_TECHNICAL")
+        if replay_evidence.get("ok") is False:
+            detail = str(replay_evidence.get("error") or "staged replay incomplete")
+            generation_manifest["generation_status"] = "FAILED_REPLAY_TECHNICAL"
+            generation_manifest["technical_failures"] = {"__REPLAY__": detail}
+            self._stage_optimization_generation(staged_configs, generation_manifest)
+            return _outcome(
+                "FAILED_REPLAY_TECHNICAL",
+                replay_evidence=replay_evidence,
+            )
+
+        try:
+            audited_payload = json.loads(stage_path.read_text(encoding="utf-8"))
+            staged_configs = {
+                symbol: SymbolConfig.from_dict(payload)
+                for symbol, payload in audited_payload.items()
+            }
+        except Exception as exc:
+            generation_manifest["generation_status"] = "FAILED_REPLAY_ARTIFACT"
+            generation_manifest["technical_failures"] = {
+                "__REPLAY__": f"STAGED_REPLAY_ARTIFACT_INVALID:{type(exc).__name__}:{exc}"
+            }
+            self._stage_optimization_generation(staged_configs, generation_manifest)
+            return _outcome("FAILED_REPLAY_ARTIFACT", replay_evidence=replay_evidence)
+
+        ledger_status = self._build_ledger_status(staged_configs)
+        stage_path, stage_manifest_path, ledger_sha = self._stage_optimization_generation(
+            staged_configs,
             generation_manifest,
         )
+        generation_manifest["ledger_sha256"] = ledger_sha
+        generation_manifest["ledger_status"] = ledger_status
+        generation_manifest["replay_evidence"] = replay_evidence
+        self._atomic_write_json(stage_manifest_path, {
+            **generation_manifest,
+            "ledger_staging_path": str(stage_path),
+        })
+        self._validate_staged_generation(stage_path, staged_configs, universe)
+        try:
+            self._promote_staged_generation(
+                stage_path,
+                stage_manifest_path,
+                generation_manifest,
+            )
+        except Exception as exc:
+            detail = f"PROMOTION_TECHNICAL:{type(exc).__name__}:{exc}"
+            live_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+            live_sha = hashlib.sha256(live_bytes).hexdigest()
+            cas_applied = live_sha == ledger_sha
+            external_change_preserved = (
+                live_sha != base_ledger_sha256 and not cas_applied
+            )
+            recovery_status = (
+                "PROMOTED_RECOVERY_REQUIRED"
+                if cas_applied
+                else "FAILED_PROMOTION_TECHNICAL"
+            )
+            reconciled = False
+            reconciliation_error = ""
+            if cas_applied:
+                # The target bytes are already live. This is a promoted ledger,
+                # regardless of a later manifest/load failure. Never roll it
+                # back; invalidate old authorization and reconcile memory.
+                self._last_promotion_authorization = None
+                try:
+                    self.ledger.load()
+                    self.symbol_configs = self.ledger.get_all_configs()
+                    reconciled = True
+                except Exception as reconcile_exc:
+                    reconciliation_error = (
+                        f"{type(reconcile_exc).__name__}:{reconcile_exc}"
+                    )
+            generation_manifest["generation_status"] = recovery_status
+            generation_manifest["technical_failures"] = {
+                "__PROMOTION__": detail
+            }
+            generation_manifest["promotion_failure_evidence"] = {
+                "cas_applied": bool(cas_applied),
+                "external_ledger_change_preserved": bool(
+                    external_change_preserved
+                ),
+                "observed_live_ledger_sha256": live_sha,
+                "target_ledger_sha256": ledger_sha,
+                "manager_reconciled": bool(reconciled),
+                "manager_reconciliation_error": reconciliation_error,
+            }
+            # Persist only the detached generation manifest. If os.replace()
+            # already completed, never attempt to reconstruct or roll back the
+            # live ledger; operator evidence records that state explicitly.
+            try:
+                self._atomic_write_json(
+                    stage_manifest_path,
+                    {
+                        **generation_manifest,
+                        "ledger_staging_path": str(stage_path),
+                    },
+                )
+            except Exception as manifest_exc:
+                logger.error(
+                    "Could not persist promotion recovery manifest for %s: %s",
+                    generation_id,
+                    manifest_exc,
+                )
+            return _outcome(
+                recovery_status,
+                promoted=cas_applied,
+                ledger_changed=cas_applied,
+                promoted_sha=ledger_sha if cas_applied else "",
+                replay_evidence=replay_evidence,
+                manifest_path_override=stage_manifest_path,
+            )
         logger.info(
             "PROMOTED complete optimization generation %s (%d symbols) atomically",
             generation_id,
@@ -11752,7 +11992,6 @@ class PortfolioManager:
         # Summary
         total_time = time.time() - total_start
         successful = sum(1 for r in results.values() if r.success)
-        validated = sum(1 for r in results.values() if r.config and r.config.is_validated)
         
         # Include skipped symbols in final counts
         total_validated = len(self.get_validated_configs())
@@ -11768,9 +12007,28 @@ class PortfolioManager:
         logger.info(f"Live eligible: {total_live_eligible}/{len(self.symbols)}")
         logger.info(f"{'#'*60}")
 
-        self._run_production_replay_audit()
-        
-        return results
+        return _outcome(
+            "PROMOTED",
+            promoted=True,
+            ledger_changed=True,
+            promoted_sha=ledger_sha,
+            replay_evidence=replay_evidence,
+        )
+
+    def initial_optimization(
+        self,
+        overwrite: bool = False,
+    ) -> Dict[str, PipelineResult]:
+        """Compatibility wrapper over the sole governed generation engine."""
+        outcome = self._run_governed_symbol_generation(
+            OptimizationGenerationRequest(
+                kind="INITIAL",
+                target_symbols=tuple(str(symbol) for symbol in self.symbols),
+                overwrite_targets=bool(overwrite),
+                require_fresh_native_activation=False,
+            )
+        )
+        return dict(outcome.results)
     
     def get_validated_configs(self) -> Dict[str, SymbolConfig]:
         """Get only validated configurations."""
