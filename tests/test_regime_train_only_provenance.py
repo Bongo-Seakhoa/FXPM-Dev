@@ -9,6 +9,11 @@ import numpy as np
 import pandas as pd
 
 from pm_core import DataSplitter, PipelineConfig
+from pm_evidence import (
+    CALENDAR_SPLIT_MODE,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+    build_timeframe_calendar_boundaries,
+)
 from pm_regime import (
     REGIME_PROVENANCE_FIT_SCOPE,
     REGIME_PROVENANCE_SCHEMA_VERSION,
@@ -18,7 +23,7 @@ from pm_regime import (
     regime_params_sha256,
     validate_regime_params_provenance,
 )
-from pm_regime_tuner import RegimeParamTuner
+from pm_regime_tuner import RegimeParamTuner, RegimeTuningIncompleteError
 
 
 def _config(data_dir: Path) -> PipelineConfig:
@@ -132,6 +137,107 @@ class RegimeTrainOnlyTunerTests(unittest.TestCase):
                 "newest_20pct_within_optimizer_train",
             )
 
+    def test_native_timeframe_uses_activation_cutoff_without_loading_m5(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = PipelineConfig(
+                research_mode=True,
+                data_dir=root,
+                output_dir=root / "out",
+                timeframes=["M5", "M15", "M30", "H1", "H4", "D1"],
+                production_split_mode=CALENDAR_SPLIT_MODE,
+                evidence_purge_days=7.0,
+                regime_params_file=str(root / "regime_params.json"),
+            )
+            as_of = pd.Timestamp("2026-01-01T00:00:00Z")
+            boundaries = build_timeframe_calendar_boundaries(
+                as_of,
+                "D1",
+                timeframe_window_years=config.evidence_timeframe_window_years,
+                embargo=pd.Timedelta(days=7),
+            )
+            frame = _bars(6000)
+            frame.index = pd.date_range(
+                "2009-01-01", periods=len(frame), freq="1D", tz="UTC"
+            )
+
+            class Universe:
+                activation_id = "activation-1"
+                activation_manifest_sha256 = "a" * 64
+                calendar_contract = {
+                    "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+                    "common_as_of_utc": as_of.isoformat(),
+                    "timeframe_window_years": config.evidence_timeframe_window_years,
+                    "timeframe_calendar_boundaries": {
+                        "D1": boundaries.to_dict()["windows"]
+                    },
+                }
+
+                @staticmethod
+                def cell_status(symbol, timeframe):
+                    return "active" if (symbol, timeframe) == ("EURUSD", "D1") else "excluded_no_trade"
+
+            tuner = RegimeParamTuner(root, config=config)
+            tuner._active_native_universe = Universe()
+
+            def load_native(symbol, timeframe):
+                self.assertEqual(timeframe, "D1", "M5 must not be used as a cutoff spine")
+                return frame, {
+                    "source_kind": "broker_native",
+                    "provenance_valid": True,
+                    "provenance_errors": [],
+                    "path": str(root / "native_d1.csv"),
+                    "size": 123,
+                    "sha256": "b" * 64,
+                }
+
+            tuner.native_data_loader.load_native_timeframe = load_native
+            selected, fit_meta, _source = tuner._optimizer_train_native_timeframe(
+                "EURUSD", "D1"
+            )
+
+            self.assertGreater(len(selected), 2500)
+            self.assertEqual(
+                fit_meta["split"]["contract_version"],
+                TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            )
+            self.assertEqual(
+                pd.Timestamp(fit_meta["train"]["start_ts"]),
+                boundaries.windows["optimizer_train"][0],
+            )
+
+    def test_incomplete_generation_never_overwrites_promoted_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config(root)
+            params_path = Path(config.regime_params_file)
+            sidecar_path = regime_params_provenance_path(str(params_path))
+            params_path.write_text('{"LAST_GOOD": {}}', encoding="utf-8")
+            sidecar_path.write_text('{"last": "good"}', encoding="utf-8")
+            tuner = RegimeParamTuner(root, config=config)
+            tuner.tune_symbol_timeframe = mock.Mock(
+                return_value=(RegimeParams(), {})
+            )
+
+            with self.assertRaises(RegimeTuningIncompleteError):
+                tuner.tune_all(
+                    ["EURUSD"],
+                    ["M5"],
+                    str(params_path),
+                )
+
+            self.assertEqual(
+                params_path.read_text(encoding="utf-8"), '{"LAST_GOOD": {}}'
+            )
+            self.assertEqual(
+                sidecar_path.read_text(encoding="utf-8"), '{"last": "good"}'
+            )
+            staged = json.loads(
+                Path(str(sidecar_path) + ".staging").read_text(encoding="utf-8")
+            )
+            self.assertEqual(staged["generation_status"], "INCOMPLETE")
+            self.assertEqual(staged["fitted_active_cell_count"], 0)
+
 
 class RegimeProvenanceValidatorTests(unittest.TestCase):
     def _write_valid_artifacts(self, root: Path):
@@ -239,6 +345,54 @@ class RegimeProvenanceValidatorTests(unittest.TestCase):
             check = validate_regime_params_provenance("EURUSD", "M5", str(params_path))
             self.assertFalse(check["valid"])
             self.assertIn("sidecar is missing", check["reason"])
+
+    def test_complete_v3_generation_binds_activation_and_whole_params_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _config_obj, _frame, _source, params_path, sidecar, payload, _fit_meta = (
+                self._write_valid_artifacts(root)
+            )
+            record = payload["cells"]["EURUSD"]["M5"]
+            record["source"]["source_kind"] = "broker_native"
+            record["split"].update({
+                "production_split_mode": CALENDAR_SPLIT_MODE,
+                "source_authority": "broker_native_timeframe",
+                "contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            })
+            payload.update({
+                "generation_status": "COMPLETE",
+                "params_file_sha256": hashlib.sha256(params_path.read_bytes()).hexdigest(),
+                "activation_id": "activation-v3",
+                "activation_manifest_sha256": "c" * 64,
+                "split_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+                "required_active_cells": ["EURUSD|M5"],
+                "required_active_cell_count": 1,
+                "fitted_active_cell_count": 1,
+            })
+            sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+            check = validate_regime_params_provenance(
+                "EURUSD",
+                "M5",
+                str(params_path),
+                expected_split_contract=TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+                expected_activation_id="activation-v3",
+                expected_activation_manifest_sha256="c" * 64,
+                require_complete_generation=True,
+            )
+            self.assertTrue(check["valid"], check["reason"])
+
+            changed = json.loads(params_path.read_text(encoding="utf-8"))
+            changed["UNRELATED"] = {}
+            params_path.write_text(json.dumps(changed), encoding="utf-8")
+            check = validate_regime_params_provenance(
+                "EURUSD",
+                "M5",
+                str(params_path),
+                require_complete_generation=True,
+            )
+            self.assertFalse(check["valid"])
+            self.assertIn("artifact hash mismatch", check["reason"])
 
 
 if __name__ == "__main__":

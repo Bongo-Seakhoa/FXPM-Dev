@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -8,12 +9,17 @@ import pandas as pd
 import pytest
 
 from pm_core import PipelineConfig
+from pm_evidence import (
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+    build_timeframe_calendar_boundaries,
+)
 from pm_pipeline import (
     OptimizationPipeline,
     PipelineResult,
     PortfolioManager,
     RegimeConfig,
     SymbolConfig,
+    build_artifact_meta,
 )
 
 
@@ -153,6 +159,60 @@ def test_calendar_loader_uses_active_h1_when_m5_is_manifest_excluded(
     assert eligibility["active_timeframes"] == ["H1"]
     assert eligibility["excluded_timeframes"] == ["M5"]
     assert eligibility["excluded_bindings"]["M5"]["timeframe"] == "M5"
+
+
+def test_v3_training_starts_are_per_timeframe_but_active_windows_are_concurrent(
+    tmp_path: Path,
+) -> None:
+    cfg = PipelineConfig(
+        data_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        timeframes=["M5", "H1"],
+        production_split_mode="calendar_lockbox_v2",
+        evidence_purge_days=7.0,
+    )
+    pipeline = OptimizationPipeline(cfg)
+    as_of = pd.Timestamp("2026-01-01T00:00:00Z")
+    boundaries = {
+        timeframe: build_timeframe_calendar_boundaries(
+            as_of,
+            timeframe,
+            timeframe_window_years=cfg.evidence_timeframe_window_years,
+            embargo=pd.Timedelta(days=7),
+        ).to_dict()["windows"]
+        for timeframe in ("M5", "H1")
+    }
+    contract = {
+        "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        "common_as_of_utc": as_of.isoformat(),
+        "timeframe_window_years": cfg.evidence_timeframe_window_years,
+        "timeframe_calendar_boundaries": boundaries,
+        "common_calendar_boundaries": boundaries["M5"],
+    }
+    frame = _native_frame()
+
+    m5_meta = pipeline._build_calendar_workflow_meta(
+        frame,
+        as_of_utc=as_of,
+        base_timeframe="M5",
+        calendar_contract=contract,
+    )
+    h1_meta = pipeline._build_calendar_workflow_meta(
+        frame,
+        as_of_utc=as_of,
+        base_timeframe="H1",
+        calendar_contract=contract,
+    )
+
+    assert m5_meta["split_contract_version"] == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+    assert h1_meta["split_contract_version"] == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+    assert (
+        m5_meta["windows"]["optimizer_train"]["start_ts"]
+        != h1_meta["windows"]["optimizer_train"]["start_ts"]
+    )
+    for partition in ("tuning_validation", "final_lockbox"):
+        assert m5_meta["windows"][partition]["start_ts"] == h1_meta["windows"][partition]["start_ts"]
+        assert m5_meta["windows"][partition]["end_ts"] == h1_meta["windows"][partition]["end_ts"]
 
 
 def test_native_exclusion_markers_bind_all_four_regimes_to_exact_cell(tmp_path: Path) -> None:
@@ -313,6 +373,157 @@ def test_optimizer_infrastructure_failure_does_not_mutate_existing_ledger(
 
     assert not results["EURUSD"].success
     assert ledger_path.read_bytes() == before
+
+
+def test_successful_symbol_is_not_persisted_when_sibling_fails_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path = tmp_path / "pm_configs.json"
+    cfg = PipelineConfig(
+        research_mode=True,
+        data_dir=tmp_path / "data",
+        output_dir=tmp_path / "out",
+        log_dir=tmp_path / "logs",
+        timeframes=["M5"],
+        production_split_mode="bleeding_edge",
+        optimization_max_workers=1,
+        feature_disk_cache_enabled=False,
+    )
+    manager = PortfolioManager(
+        cfg, ["EURUSD", "GBPUSD"], config_file=str(ledger_path)
+    )
+
+    def make_config(symbol: str, strategy: str) -> SymbolConfig:
+        winner = RegimeConfig(
+            strategy_name=strategy,
+            parameters={"period": 10},
+            quality_score=0.5,
+            promotion_status="PROMOTED",
+            trained_at=datetime.now(),
+            valid_until=datetime.now() + timedelta(days=7),
+        )
+        return SymbolConfig(
+            symbol=symbol,
+            regime_configs={"M5": {"TREND": winner}},
+            default_config=winner,
+            strategy_name=strategy,
+            timeframe="M5",
+            parameters={"period": 10},
+            is_validated=True,
+            artifact_meta=build_artifact_meta(cfg),
+            optimized_at=datetime.now(),
+            valid_until=datetime.now() + timedelta(days=7),
+        )
+
+    assert manager.ledger.update_symbol("EURUSD", make_config("EURUSD", "OLD_EUR"))
+    assert manager.ledger.update_symbol("GBPUSD", make_config("GBPUSD", "OLD_GBP"))
+    manager._load_configs()
+    before = ledger_path.read_bytes()
+
+    monkeypatch.setattr(manager, "_native_universe_for_optimization", lambda: None)
+    monkeypatch.setattr(manager, "_run_production_replay_audit", lambda: {})
+
+    def run(symbol: str) -> PipelineResult:
+        if symbol == "EURUSD":
+            return PipelineResult(
+                symbol=symbol,
+                success=True,
+                config=make_config(symbol, "NEW_EUR"),
+            )
+        return PipelineResult(
+            symbol=symbol,
+            success=False,
+            error_message="simulated worker OOM",
+        )
+
+    monkeypatch.setattr(manager.pipeline, "run_for_symbol", run)
+    results = manager.initial_optimization(overwrite=True)
+
+    assert results["EURUSD"].success
+    assert not results["GBPUSD"].success
+    assert ledger_path.read_bytes() == before
+    stage_path, stage_manifest, _active_manifest = manager._optimization_generation_paths()
+    assert stage_path.exists()
+    staged_payload = json.loads(stage_path.read_text(encoding="utf-8"))
+    assert staged_payload["EURUSD"]["strategy_name"] == "NEW_EUR"
+    assert json.loads(stage_manifest.read_text(encoding="utf-8"))[
+        "generation_status"
+    ] == "FAILED_TECHNICAL"
+
+
+def test_complete_generation_promotes_whole_ledger_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger_path = tmp_path / "pm_configs.json"
+    cfg = PipelineConfig(
+        research_mode=True,
+        data_dir=tmp_path / "data",
+        output_dir=tmp_path / "out",
+        log_dir=tmp_path / "logs",
+        timeframes=["M5"],
+        production_split_mode="bleeding_edge",
+        optimization_max_workers=1,
+        feature_disk_cache_enabled=False,
+    )
+    manager = PortfolioManager(
+        cfg, ["EURUSD", "GBPUSD"], config_file=str(ledger_path)
+    )
+
+    def make_config(symbol: str) -> SymbolConfig:
+        strategy = f"NEW_{symbol}"
+        winner = RegimeConfig(
+            strategy_name=strategy,
+            parameters={},
+            quality_score=0.6,
+            promotion_status="PROMOTED",
+            trained_at=datetime.now(),
+            valid_until=datetime.now() + timedelta(days=7),
+        )
+        return SymbolConfig(
+            symbol=symbol,
+            regime_configs={"M5": {"TREND": winner}},
+            default_config=winner,
+            strategy_name=strategy,
+            timeframe="M5",
+            parameters={},
+            is_validated=True,
+            artifact_meta=build_artifact_meta(cfg),
+            optimized_at=datetime.now(),
+            valid_until=datetime.now() + timedelta(days=7),
+        )
+
+    monkeypatch.setattr(manager, "_native_universe_for_optimization", lambda: None)
+    monkeypatch.setattr(manager, "_run_production_replay_audit", lambda: {})
+    monkeypatch.setattr(
+        manager.pipeline,
+        "run_for_symbol",
+        lambda symbol: PipelineResult(
+            symbol=symbol,
+            success=True,
+            config=make_config(symbol),
+        ),
+    )
+
+    results = manager.initial_optimization(overwrite=True)
+
+    assert all(result.success for result in results.values())
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert set(payload) == {"EURUSD", "GBPUSD"}
+    assert payload["EURUSD"]["strategy_name"] == "NEW_EURUSD"
+    assert payload["GBPUSD"]["strategy_name"] == "NEW_GBPUSD"
+    generation_ids = {
+        value["artifact_meta"]["optimization_generation"]["generation_id"]
+        for value in payload.values()
+    }
+    assert len(generation_ids) == 1
+    stage_path, stage_manifest, active_manifest = manager._optimization_generation_paths()
+    assert not stage_path.exists()
+    assert not stage_manifest.exists()
+    assert json.loads(active_manifest.read_text(encoding="utf-8"))[
+        "generation_status"
+    ] == "PROMOTED"
 
 
 def test_regime_preflight_checks_active_cells_only(

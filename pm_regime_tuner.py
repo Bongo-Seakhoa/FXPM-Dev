@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,11 +41,16 @@ from pm_core import DataLoader, DataSplitter, PipelineConfig
 from pm_evidence import (
     CALENDAR_SPLIT_MODE,
     EVIDENCE_CONTRACT_VERSION,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     build_calendar_boundaries,
+    build_timeframe_calendar_boundaries,
     calendar_window_meta,
     derive_purge_duration,
-    latest_closed_bar_end,
     trim_to_closed_bars,
+)
+from pm_native_activation import (
+    NATIVE_PRODUCTION_TIMEFRAMES,
+    resolve_active_native_universe,
 )
 from pm_regime import (
     RegimeParams, 
@@ -55,10 +61,13 @@ from pm_regime import (
     REGIME_PROVENANCE_SCHEMA_VERSION,
     regime_params_provenance_path,
     regime_params_sha256,
-    save_regime_params,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class RegimeTuningIncompleteError(RuntimeError):
+    """Raised when any required active specialist cell fails detector fitting."""
 
 
 # =============================================================================
@@ -362,6 +371,7 @@ class RegimeParamTuner:
     """
     
     def __init__(self, data_dir: Path, config: Optional[PipelineConfig] = None):
+        self.data_dir = Path(data_dir)
         self.data_loader = TunerDataLoader(data_dir)
         self.native_data_loader = DataLoader(Path(data_dir), cache_resampled=False)
         self.config = config or PipelineConfig(data_dir=Path(data_dir))
@@ -375,6 +385,22 @@ class RegimeParamTuner:
             )
         self.split_mode = split_mode
         self.splitter = DataSplitter(self.config)
+        self._active_native_universe = None
+
+    def _native_universe(self):
+        """Resolve and cache the single authenticated production activation."""
+        if self._active_native_universe is None:
+            universe = resolve_active_native_universe(
+                self.data_dir,
+                required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+            )
+            if not universe.valid:
+                reasons = ",".join(universe.errors[:12]) or "unknown"
+                raise ValueError(f"active native universe is invalid: {reasons}")
+            if not universe.explicit_contract:
+                raise ValueError("active native universe lacks an explicit cell contract")
+            self._active_native_universe = universe
+        return self._active_native_universe
 
     @staticmethod
     def _window_meta(df: pd.DataFrame, start: int, end: int) -> Dict[str, Any]:
@@ -441,28 +467,42 @@ class RegimeParamTuner:
         symbol: str,
         timeframe: str,
     ) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
-        """Return the native-TF optimizer-train slice for calendar lockbox v2.
+        """Return one active native cell's authenticated optimizer-train slice.
 
-        M5 supplies only the common information cutoff. The detector being
-        tuned is fitted directly on the requested broker-native timeframe and
-        its provenance record fingerprints that native file.
+        The activation manifest, not M5, supplies the common information
+        cutoff. Under the v3 contract each specialist has its own training
+        start while tuning and final windows remain concurrent. This permits a
+        valid H1/H4/D1 cell to be tuned even when that symbol's M5 cell is an
+        authenticated availability exclusion.
         """
-        base_m5, base_meta = self.native_data_loader.load_native_timeframe(symbol, "M5")
-        if base_m5 is None or base_m5.empty:
-            raise ValueError("native M5 source is missing")
-        if not bool((base_meta or {}).get("provenance_valid", False)):
-            errors = ",".join((base_meta or {}).get("provenance_errors", []) or [])
-            raise ValueError(f"native M5 provenance is invalid: {errors or 'unknown'}")
+        timeframe = str(timeframe or "").strip().upper()
+        symbol = str(symbol or "").strip().upper()
+        universe = self._native_universe()
+        if universe.cell_status(symbol, timeframe) != "active":
+            raise ValueError(
+                f"native cell is not active in activation: {symbol}|{timeframe}"
+            )
+        contract = dict(universe.calendar_contract or {})
+        as_of_raw = str(contract.get("common_as_of_utc") or "").strip()
+        if not as_of_raw:
+            raise ValueError("authenticated native activation has no information cutoff")
+        as_of = pd.Timestamp(as_of_raw)
+        as_of = as_of.tz_localize("UTC") if as_of.tzinfo is None else as_of.tz_convert("UTC")
+
         configured_cutoff = str(
             getattr(self.config, "evidence_as_of_utc", "") or ""
         ).strip()
-        as_of = latest_closed_bar_end(
-            base_m5,
-            "M5",
-            not_after_utc=configured_cutoff or datetime.now(timezone.utc),
-        )
-        if as_of is None:
-            raise ValueError("native M5 has no fully closed bar at the evidence cutoff")
+        if configured_cutoff:
+            configured_as_of = pd.Timestamp(configured_cutoff)
+            configured_as_of = (
+                configured_as_of.tz_localize("UTC")
+                if configured_as_of.tzinfo is None
+                else configured_as_of.tz_convert("UTC")
+            )
+            if configured_as_of != as_of:
+                raise ValueError(
+                    "configured evidence cutoff does not match authenticated activation"
+                )
 
         native, source_meta = self.native_data_loader.load_native_timeframe(
             symbol,
@@ -483,14 +523,56 @@ class RegimeParamTuner:
             configured_days=getattr(self.config, "evidence_purge_days", 7.0),
             split_embargo_bars=getattr(self.config, "split_embargo_bars", 0),
         )
-        boundaries = build_calendar_boundaries(
-            as_of,
-            window_years=getattr(self.config, "evidence_window_years", None),
-            embargo=purge,
-        )
-        train_start, train_end = boundaries.windows["optimizer_train"]
-        validation_start, validation_end = boundaries.windows["tuning_validation"]
-        lockbox_start, lockbox_end = boundaries.windows["final_lockbox"]
+        contract_version = str(contract.get("window_contract_version") or "").strip()
+        timeframe_boundaries = contract.get("timeframe_calendar_boundaries")
+        if contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            if not isinstance(timeframe_boundaries, dict):
+                raise ValueError("authenticated v3 timeframe boundaries are missing")
+            raw_boundaries = timeframe_boundaries.get(timeframe)
+            if not isinstance(raw_boundaries, dict):
+                raise ValueError(
+                    f"authenticated v3 boundaries are missing for {timeframe}"
+                )
+            # Independently derive the expected v3 geometry from the pinned
+            # policy and reject a locally edited/semantically inconsistent map.
+            expected = build_timeframe_calendar_boundaries(
+                as_of,
+                timeframe,
+                timeframe_window_years=contract.get("timeframe_window_years"),
+                embargo=purge,
+            )
+        else:
+            raw_boundaries = contract.get("common_calendar_boundaries")
+            expected = build_calendar_boundaries(
+                as_of,
+                window_years=getattr(self.config, "evidence_window_years", None),
+                embargo=purge,
+            )
+            contract_version = EVIDENCE_CONTRACT_VERSION
+        if not isinstance(raw_boundaries, dict):
+            raise ValueError("authenticated calendar boundaries are missing")
+
+        parsed_windows: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+        for partition in ("optimizer_train", "tuning_validation", "final_lockbox"):
+            raw = raw_boundaries.get(partition)
+            if not isinstance(raw, dict):
+                raise ValueError(f"authenticated calendar boundary is missing: {partition}")
+            start = pd.Timestamp(raw.get("start_ts"))
+            end = pd.Timestamp(raw.get("end_ts"))
+            start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+            end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+            if end <= start:
+                raise ValueError(f"authenticated calendar boundary is invalid: {partition}")
+            expected_start, expected_end = expected.windows[partition]
+            if start != expected_start or end != expected_end:
+                raise ValueError(
+                    f"authenticated {timeframe} {partition} boundary disagrees with policy"
+                )
+            parsed_windows[partition] = (start, end)
+
+        train_start, train_end = parsed_windows["optimizer_train"]
+        validation_start, validation_end = parsed_windows["tuning_validation"]
+        lockbox_start, lockbox_end = parsed_windows["final_lockbox"]
         train_meta = calendar_window_meta(workflow, train_start, train_end)
         validation_meta = calendar_window_meta(
             workflow, validation_start, validation_end
@@ -502,11 +584,13 @@ class RegimeParamTuner:
         fit_meta = {
             "train": train_meta,
             "split": {
-                "contract_version": EVIDENCE_CONTRACT_VERSION,
+                "contract_version": contract_version,
                 "production_split_mode": CALENDAR_SPLIT_MODE,
                 "source_authority": "broker_native_timeframe",
-                "base_cutoff_timeframe": "M5",
+                "cutoff_authority": "authenticated_native_activation",
                 "as_of_utc": pd.Timestamp(as_of).isoformat(),
+                "activation_id": universe.activation_id,
+                "activation_manifest_sha256": universe.activation_manifest_sha256,
                 "workflow_rows": int(len(workflow)),
                 "workflow_source_start_index": 0,
                 "optimizer_train_indices": [
@@ -526,10 +610,24 @@ class RegimeParamTuner:
                     int(lockbox_meta["end_index"]),
                 ],
                 "evidence_purge_seconds": float(purge.total_seconds()),
-                "evidence_window_years": dict(
-                    getattr(self.config, "evidence_window_years", {}) or {}
+                "evidence_window_years": (
+                    dict((contract.get("timeframe_window_years") or {}).get(timeframe) or {})
+                    if contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                    else dict(getattr(self.config, "evidence_window_years", {}) or {})
                 ),
-                "calendar_boundaries": boundaries.to_dict(),
+                "calendar_boundaries": {
+                    "contract_version": contract_version,
+                    "as_of_utc": as_of.isoformat(),
+                    "embargo_seconds": float(purge.total_seconds()),
+                    "windows": {
+                        name: {
+                            "start_ts": start.isoformat(),
+                            "end_ts": end.isoformat(),
+                        }
+                        for name, (start, end) in parsed_windows.items()
+                    },
+                    "source": "authenticated_native_activation",
+                },
             },
         }
         start_index = int(train_meta["start_index"])
@@ -709,84 +807,191 @@ class RegimeParamTuner:
                  output_path: str = "regime_params.json",
                  provenance_output_path: Optional[str] = None
                  ) -> Dict[str, Dict[str, RegimeParams]]:
+        """Tune and atomically promote one complete active-cell generation.
+
+        Availability-excluded cells are deliberately absent. Any active cell
+        that cannot produce a successful train-only fit makes the generation
+        incomplete: fixed-size staging artifacts are retained for diagnosis,
+        while the last promoted parameter/provenance pair remains untouched.
         """
-        Tune parameters for all symbol/timeframe combinations.
-        
-        Args:
-            symbols: List of symbols
-            timeframes: List of timeframes
-            output_path: Path to save results
-            
-        Returns:
-            Dict with all tuned parameters
-        """
+        normalized_symbols = list(dict.fromkeys(
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        ))
+        normalized_timeframes = list(dict.fromkeys(
+            str(timeframe or "").strip().upper()
+            for timeframe in timeframes
+            if str(timeframe or "").strip()
+        ))
+        activation_meta: Dict[str, Any] = {}
+        if self.split_mode == CALENDAR_SPLIT_MODE:
+            universe = self._native_universe()
+            if set(normalized_symbols) != set(universe.requested_symbols):
+                missing = sorted(set(universe.requested_symbols) - set(normalized_symbols))
+                extra = sorted(set(normalized_symbols) - set(universe.requested_symbols))
+                raise RegimeTuningIncompleteError(
+                    "production regime generation must cover the complete activated symbol "
+                    f"roster (missing={missing[:12]}, extra={extra[:12]})"
+                )
+            if set(normalized_timeframes) != set(universe.required_timeframes):
+                raise RegimeTuningIncompleteError(
+                    "production regime generation must cover the complete activated timeframe roster"
+                )
+            unknown_symbols = sorted(
+                set(normalized_symbols) - set(universe.requested_symbols)
+            )
+            if unknown_symbols:
+                raise RegimeTuningIncompleteError(
+                    "requested symbols are unbound from the active native universe: "
+                    + ",".join(unknown_symbols)
+                )
+            unknown_timeframes = sorted(
+                set(normalized_timeframes) - set(universe.required_timeframes)
+            )
+            if unknown_timeframes:
+                raise RegimeTuningIncompleteError(
+                    "requested timeframes are unbound from the active native universe: "
+                    + ",".join(unknown_timeframes)
+                )
+            required_cells = [
+                (symbol, timeframe)
+                for symbol in normalized_symbols
+                for timeframe in normalized_timeframes
+                if universe.cell_status(symbol, timeframe) == "active"
+            ]
+            activation_meta = {
+                "activation_id": universe.activation_id,
+                "activation_manifest_sha256": universe.activation_manifest_sha256,
+                "window_contract_version": str(
+                    (universe.calendar_contract or {}).get("window_contract_version")
+                    or EVIDENCE_CONTRACT_VERSION
+                ),
+            }
+        else:
+            required_cells = [
+                (symbol, timeframe)
+                for symbol in normalized_symbols
+                for timeframe in normalized_timeframes
+            ]
+        if not required_cells:
+            raise RegimeTuningIncompleteError("no active regime cells were selected")
+
         all_params: Dict[str, Dict[str, RegimeParams]] = {}
         provenance_cells: Dict[str, Dict[str, Dict[str, Any]]] = {}
         failures: List[Dict[str, str]] = []
-        
-        total = len(symbols) * len(timeframes)
-        current = 0
-        
-        for symbol in symbols:
-            all_params[symbol] = {}
-            
-            for tf in timeframes:
-                current += 1
-                logger.info(f"Progress: {current}/{total}")
-                tf_key = str(tf or "").strip().upper()
+
+        total = len(required_cells)
+        for current, (symbol, tf_key) in enumerate(required_cells, start=1):
+            logger.info(f"Progress: {current}/{total} active cells")
+            try:
                 best_params, tuning_result = self.tune_symbol_timeframe(symbol, tf_key)
-                all_params[symbol][tf_key] = best_params
+            except Exception as exc:
+                logger.exception("%s %s regime fitting raised", symbol, tf_key)
+                best_params, tuning_result = None, {}
+                failures.append({
+                    "symbol": symbol,
+                    "timeframe": tf_key,
+                    "reason": f"fit raised {type(exc).__name__}: {exc}",
+                })
+            else:
                 provenance = dict(tuning_result.get("provenance", {}) or {})
-                if provenance:
+                if provenance and best_params is not None:
                     # Hash the exact row that will be serialized below.
                     provenance["params_sha256"] = regime_params_sha256(best_params.to_dict())
+                    all_params.setdefault(symbol, {})[tf_key] = best_params
                     provenance_cells.setdefault(symbol, {})[tf_key] = provenance
                 else:
                     failures.append({
-                        "symbol": str(symbol),
+                        "symbol": symbol,
                         "timeframe": tf_key,
                         "reason": "no successful optimizer_train-only fit",
                     })
-            
-            # Clear cache after each symbol to manage memory
-            self.data_loader.clear_cache()
-            self.native_data_loader.clear_cache()
-        
-        # Save to file
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        save_regime_params(all_params, output_path)
+
+            next_symbol = (
+                required_cells[current][0] if current < total else None
+            )
+            if next_symbol != symbol:
+                # One symbol is the bounded memory lifecycle. No frame or
+                # resample cache survives into the next symbol.
+                self.data_loader.clear_cache()
+                self.native_data_loader.clear_cache()
+        params_path = Path(output_path)
+        params_path.parent.mkdir(parents=True, exist_ok=True)
         sidecar_path = (
             Path(provenance_output_path)
             if provenance_output_path
             else regime_params_provenance_path(output_path)
         )
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        params_stage = params_path.with_name(params_path.name + ".staging")
+        sidecar_stage = sidecar_path.with_name(sidecar_path.name + ".staging")
+        serialized_params = {
+            symbol: {
+                timeframe: params.to_dict()
+                for timeframe, params in sorted(tf_map.items())
+            }
+            for symbol, tf_map in sorted(all_params.items())
+            if tf_map
+        }
+        params_bytes = json.dumps(
+            serialized_params,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        params_stage.write_bytes(params_bytes)
+        params_sha256 = hashlib.sha256(params_bytes).hexdigest()
+        required_cell_ids = [
+            f"{symbol}|{timeframe}" for symbol, timeframe in required_cells
+        ]
         sidecar_payload = {
             "schema_version": REGIME_PROVENANCE_SCHEMA_VERSION,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "params_path": str(Path(output_path).resolve()),
+            "params_file_sha256": params_sha256,
             "fit_scope": REGIME_PROVENANCE_FIT_SCOPE,
+            "generation_status": "INCOMPLETE" if failures else "COMPLETE",
+            "required_active_cells": required_cell_ids,
+            "required_active_cell_count": len(required_cell_ids),
+            "fitted_active_cell_count": sum(
+                len(tf_map) for tf_map in provenance_cells.values()
+            ),
+            **activation_meta,
             "split_contract_version": (
-                EVIDENCE_CONTRACT_VERSION
+                activation_meta.get("window_contract_version", EVIDENCE_CONTRACT_VERSION)
                 if self.split_mode == CALENDAR_SPLIT_MODE
                 else DataSplitter.SPLIT_CONTRACT_VERSION
             ),
             "cells": provenance_cells,
             "failures": failures,
         }
-        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_sidecar = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
-        temp_sidecar.write_text(
+        sidecar_stage.write_text(
             json.dumps(sidecar_payload, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        temp_sidecar.replace(sidecar_path)
         logger.info(
-            "Saved regime fit provenance for %d cells to %s (%d failed cells)",
+            "Staged regime fit provenance for %d cells at %s (%d failed cells)",
             sum(len(tf_map) for tf_map in provenance_cells.values()),
-            sidecar_path,
+            sidecar_stage,
             len(failures),
         )
-        
+
+        if failures:
+            raise RegimeTuningIncompleteError(
+                f"regime generation incomplete: {len(failures)}/{total} active cells failed; "
+                f"last promoted artifacts were not changed; diagnostics: {sidecar_stage}"
+            )
+
+        # Both staged artifacts are fully written before either promoted path
+        # changes. Readers validate the pair hash and therefore fail closed in
+        # the tiny two-replace interval; an incomplete run never reaches here.
+        os.replace(sidecar_stage, sidecar_path)
+        os.replace(params_stage, params_path)
+        logger.info(
+            "Promoted complete regime generation: %d active cells -> %s",
+            total,
+            params_path,
+        )
         return all_params
 
 
@@ -866,11 +1071,21 @@ def main():
         logger.error(f"Data directory not found: {data_dir}")
         return 1
     
-    # Discover symbols if not specified
+    # Calendar production tunes the configured institutional roster, then the
+    # authenticated activation narrows it to active symbol/timeframe cells.
+    # Filesystem globbing is a legacy fallback only; it silently missed native
+    # run layouts and was one cause of incomplete detector books.
     if args.symbols is None:
-        csv_files = list(data_dir.glob("*_M5*.csv"))
-        symbols = list(set(f.name.split('_')[0].upper() for f in csv_files))
-        symbols = sorted(symbols)
+        configured_symbols = config_payload.get("symbols")
+        if isinstance(configured_symbols, list) and configured_symbols:
+            symbols = list(dict.fromkeys(
+                str(symbol or "").strip().upper()
+                for symbol in configured_symbols
+                if str(symbol or "").strip()
+            ))
+        else:
+            csv_files = list(data_dir.glob("*_M5*.csv"))
+            symbols = sorted(set(f.name.split('_')[0].upper() for f in csv_files))
     else:
         symbols = [s.upper() for s in args.symbols]
     
@@ -889,12 +1104,21 @@ def main():
     except ValueError as exc:
         logger.error(str(exc))
         return 2
-    tuner.tune_all(
-        symbols,
-        args.timeframes,
-        str(output_path),
-        provenance_output_path=args.provenance_output,
-    )
+    provenance_output = Path(args.provenance_output) if args.provenance_output else None
+    if provenance_output is not None and not provenance_output.is_absolute():
+        provenance_output = config_path.parent / provenance_output
+    try:
+        tuner.tune_all(
+            symbols,
+            args.timeframes,
+            str(output_path),
+            provenance_output_path=(
+                str(provenance_output) if provenance_output is not None else None
+            ),
+        )
+    except RegimeTuningIncompleteError as exc:
+        logger.error(str(exc))
+        return 3
     
     logger.info("Tuning complete!")
     

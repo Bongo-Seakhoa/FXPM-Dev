@@ -47,6 +47,7 @@ from pm_core import (
 from pm_evidence import (
     CALENDAR_SPLIT_MODE,
     EVIDENCE_CONTRACT_VERSION,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     EvidenceVerdict,
     build_calendar_boundaries,
     calendar_window_meta,
@@ -6798,7 +6799,17 @@ class OptimizationPipeline:
         source_meta = dict(
             (data_window_meta.get("timeframe_sources", {}) or {}).get(timeframe, {}) or {}
         )
-        windows = dict(data_window_meta.get("windows", {}) or {})
+        tf_window_payload = dict(
+            (data_window_meta.get("timeframe_windows", {}) or {}).get(
+                str(timeframe).upper(), {}
+            )
+            or {}
+        )
+        windows = dict(
+            tf_window_payload.get("windows")
+            or data_window_meta.get("windows", {})
+            or {}
+        )
         partition_bounds: Dict[str, Tuple[Any, Any]] = {}
         for partition in ("optimizer_train", "tuning_validation", "final_lockbox"):
             meta = dict(windows.get(partition, {}) or {})
@@ -6806,11 +6817,27 @@ class OptimizationPipeline:
             end = meta.get("end_ts") or meta.get("end_ts_exclusive")
             if start not in (None, "") and end not in (None, ""):
                 partition_bounds[partition] = (start, end)
+        calendar_contract = dict(
+            data_window_meta.get("native_calendar_contract", {}) or {}
+        )
+        is_v3 = str(
+            tf_window_payload.get("split_contract_version")
+            or calendar_contract.get("window_contract_version")
+            or ""
+        ) == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
         return validate_timeframe_evidence(
             timeframe,
             partition_frames,
             source_meta=source_meta,
-            window_years=getattr(self.config, "evidence_window_years", None),
+            window_years=(
+                None if is_v3 else getattr(self.config, "evidence_window_years", None)
+            ),
+            timeframe_window_years=(
+                calendar_contract.get("timeframe_window_years")
+                or getattr(self.config, "evidence_timeframe_window_years", None)
+                if is_v3
+                else None
+            ),
             min_native_bars=getattr(self.config, "evidence_min_native_bars", None),
             partition_bounds=partition_bounds,
             require_native=bool(
@@ -6904,7 +6931,22 @@ class OptimizationPipeline:
             configured_days=getattr(self.config, "evidence_purge_days", 7.0),
             split_embargo_bars=getattr(self.config, "split_embargo_bars", 0),
         )
-        raw_boundaries = contract.get("common_calendar_boundaries")
+        contract_version = str(
+            contract.get("window_contract_version") or EVIDENCE_CONTRACT_VERSION
+        ).strip()
+        timeframe_boundary_map = contract.get("timeframe_calendar_boundaries")
+        if contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            if not isinstance(timeframe_boundary_map, dict):
+                raise ValueError("authenticated v3 timeframe boundary map is missing")
+            raw_boundaries = timeframe_boundary_map.get(
+                str(base_timeframe or "M5").upper()
+            )
+            if not isinstance(raw_boundaries, dict):
+                raise ValueError(
+                    f"authenticated timeframe boundary missing: {base_timeframe}"
+                )
+        else:
+            raw_boundaries = contract.get("common_calendar_boundaries")
         if isinstance(raw_boundaries, dict):
             parsed_boundaries: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
             for partition in ("optimizer_train", "tuning_validation", "final_lockbox"):
@@ -6922,7 +6964,7 @@ class OptimizationPipeline:
             validation_start, validation_end = parsed_boundaries["tuning_validation"]
             lockbox_start, lockbox_end = parsed_boundaries["final_lockbox"]
             boundaries_payload: Dict[str, Any] = {
-                "contract_version": EVIDENCE_CONTRACT_VERSION,
+                "contract_version": contract_version,
                 "as_of_utc": as_of.isoformat(),
                 "embargo_seconds": float(purge.total_seconds()),
                 "windows": {
@@ -6999,8 +7041,8 @@ class OptimizationPipeline:
         return {
             "base_timeframe": str(base_timeframe or "M5").upper(),
             "production_split_mode": CALENDAR_SPLIT_MODE,
-            "split_contract_version": EVIDENCE_CONTRACT_VERSION,
-            "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
+            "split_contract_version": contract_version,
+            "evidence_contract_version": contract_version,
             "as_of_utc": as_of.isoformat(),
             "max_bars": int(getattr(self.config, "max_bars", 300000)),
             "max_bars_applied": False,
@@ -7014,8 +7056,15 @@ class OptimizationPipeline:
             "evidence_warmup_days": float(
                 getattr(self.config, "evidence_warmup_days", 400.0)
             ),
-            "evidence_window_years": dict(
-                getattr(self.config, "evidence_window_years", {}) or {}
+            "evidence_window_years": (
+                dict(
+                    (contract.get("timeframe_window_years") or {}).get(
+                        str(base_timeframe or "M5").upper()
+                    )
+                    or {}
+                )
+                if contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                else dict(getattr(self.config, "evidence_window_years", {}) or {})
             ),
             "calendar_boundaries": boundaries_payload,
             "native_calendar_contract": contract,
@@ -7141,6 +7190,7 @@ class OptimizationPipeline:
         strict_native = split_mode == CALENDAR_SPLIT_MODE
         preloaded_native: Dict[str, pd.DataFrame] = {}
         preloaded_meta: Dict[str, Dict[str, Any]] = {}
+        timeframe_window_meta: Dict[str, Dict[str, Any]] = {}
         native_gate_errors: Dict[str, List[str]] = {}
         active_timeframes = set(configured_timeframes)
         excluded_timeframes: set[str] = set()
@@ -7355,6 +7405,24 @@ class OptimizationPipeline:
                     timeframe_meta["as_of_utc"] = as_of_utc.isoformat()
                     timeframe_sources[tf_name] = timeframe_meta
                     data_by_tf[tf_name] = data
+                    tf_workflow_meta = self._build_calendar_workflow_meta(
+                        data,
+                        as_of_utc=as_of_utc,
+                        base_timeframe=tf_name,
+                        calendar_contract=calendar_contract,
+                    )
+                    timeframe_window_meta[tf_name] = {
+                        "split_contract_version": tf_workflow_meta.get(
+                            "split_contract_version"
+                        ),
+                        "evidence_contract_version": tf_workflow_meta.get(
+                            "evidence_contract_version"
+                        ),
+                        "calendar_boundaries": tf_workflow_meta.get(
+                            "calendar_boundaries", {}
+                        ),
+                        "windows": tf_workflow_meta.get("windows", {}),
+                    }
                 except Exception as exc:
                     native_gate_errors[tf_name] = [
                         f"NATIVE_CLOSED_WORKFLOW_PREPARATION_FAILED:{type(exc).__name__}"
@@ -7467,7 +7535,11 @@ class OptimizationPipeline:
                 ),
             }
         workflow_meta["timeframe_sources"] = timeframe_sources
-        workflow_meta["evidence_contract_version"] = EVIDENCE_CONTRACT_VERSION
+        if timeframe_window_meta:
+            workflow_meta["timeframe_windows"] = timeframe_window_meta
+        workflow_meta["evidence_contract_version"] = workflow_meta.get(
+            "split_contract_version", EVIDENCE_CONTRACT_VERSION
+        )
         workflow_meta["data_window_fingerprint"] = _stable_hash({
             "symbol": symbol,
             "source": workflow_meta["source"],
@@ -7476,6 +7548,7 @@ class OptimizationPipeline:
             "workflow_window": workflow_window,
             "as_of_utc": workflow_meta.get("as_of_utc"),
             "windows": workflow_meta.get("windows", {}),
+            "timeframe_windows": workflow_meta.get("timeframe_windows", {}),
         })
         return data_by_tf, workflow_meta
 
@@ -8745,6 +8818,81 @@ class OptimizationPipeline:
                 or CALENDAR_SPLIT_MODE
             ).lower()
 
+            per_timeframe_windows = dict(
+                data_window_meta.get("timeframe_windows", {}) or {}
+            )
+
+            def _timeframe_geometry(timeframe: str) -> Dict[str, Optional[pd.Timestamp]]:
+                tf_payload = dict(per_timeframe_windows.get(str(timeframe).upper()) or {})
+                tf_windows = dict(tf_payload.get("windows") or windows)
+
+                def _meta(primary: str, fallback: Optional[str] = None) -> Dict[str, Any]:
+                    value = tf_windows.get(primary)
+                    if not isinstance(value, dict) and fallback:
+                        value = tf_windows.get(fallback)
+                    return dict(value or {}) if isinstance(value, dict) else {}
+
+                def _ts(meta: Dict[str, Any], key: str) -> Optional[pd.Timestamp]:
+                    value = meta.get(key)
+                    return pd.Timestamp(value) if value not in (None, "") else None
+
+                tf_active = _meta("active_universe")
+                tf_base = _meta("base_selection") or tf_active
+                tf_validation = _meta("tuning_validation", "walk_forward_validation")
+                tf_train = _meta("optimizer_train", "optimization_train") or tf_active
+                tf_train_warm = (
+                    _meta("optimizer_train_with_warmup", "optimization_train_with_warmup")
+                    or tf_train
+                )
+                tf_stage2 = _meta("stage2_selection") or tf_validation
+                tf_stage2_warm = _meta("stage2_selection_with_warmup") or tf_stage2
+                tf_stage2_train = _meta("stage2_training_selection") or tf_stage2
+                tf_stage2_train_warm = (
+                    _meta("stage2_training_selection_with_warmup") or tf_stage2_warm
+                )
+                tf_holdout = _meta("final_lockbox", "clean_holdout")
+                tf_holdout_warm = _meta(
+                    "final_lockbox_with_warmup", "clean_holdout_with_warmup"
+                )
+                tf_hist = _meta("historical_stress_audit")
+                return {
+                    "hist_start": _ts(tf_hist, "start_ts"),
+                    "hist_end": _ts(tf_active, "start_ts"),
+                    "active_start": _ts(tf_active, "start_ts"),
+                    "active_end": _ts(tf_active, "end_ts"),
+                    "base_start": _ts(tf_base, "start_ts"),
+                    "base_end": _ts(tf_base, "end_ts"),
+                    "validation_start": _ts(tf_validation, "start_ts"),
+                    "validation_end": _ts(tf_validation, "end_ts"),
+                    "opt_train_start": _ts(tf_train, "start_ts"),
+                    "opt_train_end": _ts(tf_train, "end_ts"),
+                    "opt_train_warm_start": (
+                        _ts(tf_train_warm, "start_ts") or _ts(tf_train, "start_ts")
+                    ),
+                    "stage2_start": _ts(tf_stage2, "start_ts"),
+                    "stage2_warm_start": (
+                        _ts(tf_stage2_warm, "start_ts") or _ts(tf_stage2, "start_ts")
+                    ),
+                    "stage2_train_start": (
+                        _ts(tf_stage2_train, "start_ts") or _ts(tf_stage2, "start_ts")
+                    ),
+                    "stage2_train_end": (
+                        _ts(tf_stage2_train, "end_ts") or _ts(tf_holdout, "start_ts")
+                    ),
+                    "stage2_train_warm_start": (
+                        _ts(tf_stage2_train_warm, "start_ts")
+                        or _ts(tf_stage2_warm, "start_ts")
+                    ),
+                    "holdout_start": _ts(tf_holdout, "start_ts"),
+                    "holdout_end": (
+                        _ts(tf_holdout, "end_ts") or _ts(tf_active, "end_ts")
+                    ),
+                    "holdout_warm_start": (
+                        _ts(tf_holdout_warm, "start_ts")
+                        or _ts(tf_holdout, "start_ts")
+                    ),
+                }
+
             # Regime labels determine every specialist bucket and are therefore
             # part of model selection.  In chronological-lockbox mode, reject
             # the symbol before computing a feature or ranking a candidate when
@@ -8755,22 +8903,26 @@ class OptimizationPipeline:
                 provenance_checks: Dict[str, Dict[str, Any]] = {}
                 current_source = dict(data_window_meta.get("source", {}) or {})
                 timeframe_sources = dict(data_window_meta.get("timeframe_sources", {}) or {})
-                expected_contract = (
-                    EVIDENCE_CONTRACT_VERSION
-                    if split_mode == CALENDAR_SPLIT_MODE
-                    else DataSplitter.SPLIT_CONTRACT_VERSION
-                )
                 for tf, tf_data in data_by_tf.items():
                     if split_mode == CALENDAR_SPLIT_MODE:
+                        geometry = _timeframe_geometry(tf)
                         expected_source = dict(timeframe_sources.get(tf, {}) or {})
                         expected_train_window = calendar_window_meta(
                             tf_data,
-                            opt_train_start,
-                            opt_train_end,
+                            geometry["opt_train_start"],
+                            geometry["opt_train_end"],
+                        )
+                        expected_contract = str(
+                            (
+                                per_timeframe_windows.get(str(tf).upper(), {}) or {}
+                            ).get("split_contract_version")
+                            or data_window_meta.get("split_contract_version")
+                            or EVIDENCE_CONTRACT_VERSION
                         )
                     else:
                         expected_source = current_source
                         expected_train_window = opt_train_meta
+                        expected_contract = DataSplitter.SPLIT_CONTRACT_VERSION
                     check = validate_regime_params_provenance(
                         symbol,
                         tf,
@@ -8778,6 +8930,21 @@ class OptimizationPipeline:
                         expected_source=expected_source,
                         expected_train_window=expected_train_window,
                         expected_split_contract=expected_contract,
+                        expected_activation_id=(
+                            native_cell_eligibility.get("activation_id")
+                            if split_mode == CALENDAR_SPLIT_MODE
+                            else None
+                        ),
+                        expected_activation_manifest_sha256=(
+                            native_cell_eligibility.get(
+                                "activation_manifest_sha256"
+                            )
+                            if split_mode == CALENDAR_SPLIT_MODE
+                            else None
+                        ),
+                        require_complete_generation=(
+                            split_mode == CALENDAR_SPLIT_MODE
+                        ),
                     )
                     provenance_checks[str(tf).upper()] = {
                         "valid": bool(check.get("valid", False)),
@@ -8802,8 +8969,36 @@ class OptimizationPipeline:
             import gc
 
             for tf, data in data_by_tf.items():
-                validation_start = wf_start if wf_start is not None else stage2_train_start
-                validation_end = wf_end if wf_end is not None else stage2_train_end
+                geometry = _timeframe_geometry(tf)
+                hist_start = geometry["hist_start"]
+                hist_end = geometry["hist_end"]
+                active_start = geometry["active_start"]
+                active_end = geometry["active_end"]
+                base_start = geometry["base_start"] or active_start
+                base_end = geometry["base_end"] or active_end
+                opt_train_start = geometry["opt_train_start"] or active_start
+                opt_train_end = geometry["opt_train_end"]
+                opt_train_warm_start = (
+                    geometry["opt_train_warm_start"] or opt_train_start
+                )
+                stage2_start = geometry["stage2_start"]
+                stage2_warm_start = geometry["stage2_warm_start"] or stage2_start
+                stage2_train_start = (
+                    geometry["stage2_train_start"] or stage2_start
+                )
+                stage2_train_end = geometry["stage2_train_end"]
+                stage2_train_warm_start = (
+                    geometry["stage2_train_warm_start"] or stage2_warm_start
+                )
+                holdout_start = geometry["holdout_start"]
+                holdout_end = geometry["holdout_end"] or active_end
+                holdout_warm_start = (
+                    geometry["holdout_warm_start"] or holdout_start
+                )
+                validation_start = (
+                    geometry["validation_start"] or stage2_train_start
+                )
+                validation_end = geometry["validation_end"] or stage2_train_end
                 if bool(getattr(self.config, "evidence_sufficiency_enabled", True)):
                     evidence_frames = {
                         "optimizer_train": self._slice_time_window(
@@ -9531,10 +9726,14 @@ class PortfolioManager:
             return False, f"exact cell {cell_id} is not approved"
         return True, f"authorized by {verification.authorization_id}"
 
-    def _build_ledger_status(self) -> Dict[str, Any]:
+    def _build_ledger_status(
+        self,
+        configs: Optional[Dict[str, SymbolConfig]] = None,
+    ) -> Dict[str, Any]:
         """Build operator-facing completion metadata for the active winner ledger."""
+        source_configs = self.symbol_configs if configs is None else configs
         configured_symbols = [str(symbol) for symbol in (self.symbols or [])]
-        optimized_symbols = sorted(str(symbol) for symbol in self.symbol_configs.keys())
+        optimized_symbols = sorted(str(symbol) for symbol in source_configs.keys())
         artifact_contract_counts: Dict[str, int] = {}
         artifact_contract_symbols: Dict[str, set] = {}
         current_artifact_meta = build_artifact_meta(self.config)
@@ -9542,7 +9741,7 @@ class PortfolioManager:
             str(current_artifact_meta["artifact_version"]),
             str(current_artifact_meta["split_contract_version"]),
         ])
-        for symbol, cfg in self.symbol_configs.items():
+        for symbol, cfg in source_configs.items():
             artifact = getattr(cfg, "artifact_meta", {}) or {}
             key = "|".join([
                 str(artifact.get("artifact_version", "missing")),
@@ -9762,8 +9961,12 @@ class PortfolioManager:
             },
         }
 
-    def save_fully_excluded_native_config(self, symbol: str, universe: Any) -> SymbolConfig:
-        """Persist 24 exact cell-bound markers without launching model search."""
+    def _build_fully_excluded_native_config(
+        self,
+        symbol: str,
+        universe: Any,
+    ) -> SymbolConfig:
+        """Build 24 exact cell-bound markers without mutating the ledger."""
         now = datetime.now()
         regime_configs: Dict[str, Dict[str, RegimeConfig]] = {}
         bindings: Dict[str, Dict[str, Any]] = {}
@@ -9822,6 +10025,11 @@ class PortfolioManager:
             optimized_at=now,
             valid_until=_scheduled_valid_until(self.config, now),
         )
+        return config
+
+    def save_fully_excluded_native_config(self, symbol: str, universe: Any) -> SymbolConfig:
+        """Persist 24 exact cell-bound markers without launching model search."""
+        config = self._build_fully_excluded_native_config(symbol, universe)
         self._save_symbol_config(symbol, config)
         logger.info(
             "SAVED %s: 24 manifest-bound native cell exclusions (no search)",
@@ -9904,7 +10112,12 @@ class PortfolioManager:
         if split_mode not in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
             return
         expected_contract = (
-            EVIDENCE_CONTRACT_VERSION
+            str(
+                (getattr(universe, "calendar_contract", {}) or {}).get(
+                    "window_contract_version"
+                )
+                or EVIDENCE_CONTRACT_VERSION
+            )
             if split_mode == CALENDAR_SPLIT_MODE
             else DataSplitter.SPLIT_CONTRACT_VERSION
         )
@@ -9913,7 +10126,50 @@ class PortfolioManager:
             or "regime_params.json"
         )
         failures: List[str] = []
-        for symbol in (symbols if symbols is not None else self.symbols):
+        target_symbols = list(symbols if symbols is not None else self.symbols)
+        target_active_cells = [
+            (str(symbol or "").strip().upper(), str(timeframe).upper())
+            for symbol in target_symbols
+            for timeframe in universe.active_timeframes(
+                str(symbol or "").strip().upper()
+            )
+        ]
+        # Availability-only NO_TRADE materialization has no detector input and
+        # must remain possible even when no regime generation exists yet.
+        if not target_active_cells:
+            return
+        if split_mode == CALENDAR_SPLIT_MODE:
+            expected_cells = sorted(
+                f"{str(symbol).upper()}|{str(timeframe).upper()}"
+                for symbol in (
+                    getattr(universe, "requested_symbols", ()) or self.symbols
+                )
+                for timeframe in universe.active_timeframes(symbol)
+            )
+            sidecar_path = regime_params_provenance_path(params_file)
+            try:
+                sidecar_payload = json.loads(
+                    sidecar_path.read_text(encoding="utf-8")
+                )
+            except Exception as exc:
+                sidecar_payload = {}
+                failures.append(f"GENERATION:sidecar unreadable: {exc}")
+            declared_cells = sidecar_payload.get("required_active_cells")
+            if not isinstance(declared_cells, list) or sorted(
+                str(value) for value in declared_cells
+            ) != expected_cells:
+                failures.append(
+                    "GENERATION:required active-cell roster does not match activation"
+                )
+            if int(sidecar_payload.get("required_active_cell_count") or -1) != len(
+                expected_cells
+            ):
+                failures.append("GENERATION:required active-cell count mismatch")
+            if int(sidecar_payload.get("fitted_active_cell_count") or -1) != len(
+                expected_cells
+            ):
+                failures.append("GENERATION:fitted active-cell count mismatch")
+        for symbol in target_symbols:
             canonical = str(symbol or "").strip().upper()
             for timeframe in universe.active_timeframes(canonical):
                 check = validate_regime_params_provenance(
@@ -9921,6 +10177,13 @@ class PortfolioManager:
                     str(timeframe).upper(),
                     params_file,
                     expected_split_contract=expected_contract,
+                    expected_activation_id=getattr(universe, "activation_id", None),
+                    expected_activation_manifest_sha256=(
+                        getattr(universe, "activation_manifest_sha256", None)
+                    ),
+                    require_complete_generation=(
+                        split_mode == CALENDAR_SPLIT_MODE
+                    ),
                 )
                 if not check.get("valid", False):
                     failures.append(
@@ -10392,6 +10655,155 @@ class PortfolioManager:
             f"mode={mode} report={report_path}"
         )
         return summary
+
+    def _optimization_generation_paths(self) -> Tuple[Path, Path, Path]:
+        """Return fixed-size staging and active-manifest paths for the ledger."""
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        ledger_path = ledger_path.resolve()
+        stage_path = ledger_path.with_name(f".{ledger_path.name}.generation.staging")
+        stage_manifest = ledger_path.with_name(
+            f".{ledger_path.name}.generation.staging.manifest.json"
+        )
+        active_manifest = ledger_path.with_name(
+            f"{ledger_path.stem}.generation.json"
+        )
+        return stage_path, stage_manifest, active_manifest
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(
+            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        try:
+            with temp.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _stage_optimization_generation(
+        self,
+        configs: Dict[str, SymbolConfig],
+        manifest: Dict[str, Any],
+    ) -> Tuple[Path, Path, str]:
+        """Write one bounded, non-live generation checkpoint atomically."""
+        stage_path, stage_manifest, _active_manifest = (
+            self._optimization_generation_paths()
+        )
+        payload = {
+            symbol: config.to_dict()
+            for symbol, config in sorted(configs.items())
+        }
+        encoded = json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        temp = stage_path.with_name(
+            f".{stage_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        stage_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with temp.open("wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, stage_path)
+        finally:
+            temp.unlink(missing_ok=True)
+        ledger_sha = hashlib.sha256(encoded).hexdigest()
+        staged_manifest = {
+            **dict(manifest or {}),
+            "ledger_staging_path": str(stage_path),
+            "ledger_sha256": ledger_sha,
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._atomic_write_json(stage_manifest, staged_manifest)
+        return stage_path, stage_manifest, ledger_sha
+
+    def _validate_staged_generation(
+        self,
+        stage_path: Path,
+        expected_configs: Dict[str, SymbolConfig],
+        universe: Any,
+    ) -> None:
+        """Deserialize and prove the complete staged roster before promotion."""
+        try:
+            raw = json.loads(Path(stage_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"OPTIMIZATION_GENERATION_STAGE_UNREADABLE:{type(exc).__name__}:{exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError("OPTIMIZATION_GENERATION_STAGE_NOT_OBJECT")
+        expected_symbols = [str(symbol) for symbol in self.symbols]
+        if set(raw) != set(expected_symbols):
+            missing = sorted(set(expected_symbols) - set(raw))
+            extra = sorted(set(raw) - set(expected_symbols))
+            raise RuntimeError(
+                f"OPTIMIZATION_GENERATION_ROSTER_MISMATCH:missing={missing}:extra={extra}"
+            )
+        parsed: Dict[str, SymbolConfig] = {}
+        for symbol in expected_symbols:
+            try:
+                parsed[symbol] = SymbolConfig.from_dict(raw[symbol])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"OPTIMIZATION_GENERATION_CELL_UNREADABLE:{symbol}:{type(exc).__name__}"
+                ) from exc
+        if universe is not None and getattr(universe, "explicit_contract", False):
+            invalid = [
+                symbol
+                for symbol, config in parsed.items()
+                if not self._has_exact_native_cell_grid(symbol, config, universe)
+            ]
+            if invalid:
+                raise RuntimeError(
+                    "OPTIMIZATION_GENERATION_CELL_GRID_INVALID:" + ",".join(invalid)
+                )
+        if set(expected_configs) != set(parsed):
+            raise RuntimeError("OPTIMIZATION_GENERATION_IN_MEMORY_ROSTER_MISMATCH")
+
+    def _promote_staged_generation(
+        self,
+        stage_path: Path,
+        stage_manifest_path: Path,
+        manifest: Dict[str, Any],
+    ) -> None:
+        """Atomically replace the live ledger once the entire generation passes."""
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        ledger_path = ledger_path.resolve()
+        _stage, _stage_manifest, active_manifest = self._optimization_generation_paths()
+        expected_sha = str(manifest.get("ledger_sha256") or "").lower()
+        observed_sha = hashlib.sha256(Path(stage_path).read_bytes()).hexdigest()
+        if not expected_sha or observed_sha != expected_sha:
+            raise RuntimeError("OPTIMIZATION_GENERATION_STAGE_HASH_MISMATCH")
+        expected_base_sha = str(manifest.get("base_ledger_sha256") or "").lower()
+        current_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+        if hashlib.sha256(current_bytes).hexdigest() != expected_base_sha:
+            raise RuntimeError(
+                "OPTIMIZATION_GENERATION_LIVE_LEDGER_CHANGED_DURING_RUN"
+            )
+        os.replace(stage_path, ledger_path)
+        promoted_manifest = {
+            **dict(manifest),
+            "generation_status": "PROMOTED",
+            "promoted_at": datetime.now(timezone.utc).isoformat(),
+            "ledger_path": str(ledger_path),
+        }
+        self._atomic_write_json(active_manifest, promoted_manifest)
+        Path(stage_manifest_path).unlink(missing_ok=True)
+        self.ledger.load()
+        self.symbol_configs = self.ledger.get_all_configs()
     
     def initial_optimization(self, overwrite: bool = False) -> Dict[str, PipelineResult]:
         """
@@ -10418,6 +10830,50 @@ class PortfolioManager:
         # under a later activation is forced back through optimization.
         universe = self._native_universe_for_optimization()
         self._preflight_active_regime_provenance(universe)
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        base_ledger_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+        base_ledger_sha256 = hashlib.sha256(base_ledger_bytes).hexdigest()
+        staged_configs: Dict[str, SymbolConfig] = {}
+        for configured_symbol in self.symbols:
+            canonical = str(configured_symbol).upper()
+            existing = (
+                self.symbol_configs.get(configured_symbol)
+                or self.symbol_configs.get(canonical)
+            )
+            if existing is not None:
+                staged_configs[configured_symbol] = SymbolConfig.from_dict(
+                    existing.to_dict()
+                )
+        generation_started_at = datetime.now(timezone.utc).isoformat()
+        generation_id = _stable_hash({
+            "schema": "fxpm.optimization-generation.v1",
+            "started_at": generation_started_at,
+            "pid": os.getpid(),
+            "base_ledger_sha256": base_ledger_sha256,
+            "activation_id": getattr(universe, "activation_id", None),
+            "activation_manifest_sha256": getattr(
+                universe, "activation_manifest_sha256", None
+            ),
+            "overwrite": bool(overwrite),
+        })
+        generation_manifest: Dict[str, Any] = {
+            "schema_version": "fxpm.optimization-generation.v1",
+            "generation_id": generation_id,
+            "generation_status": "RUNNING",
+            "started_at": generation_started_at,
+            "base_ledger_sha256": base_ledger_sha256,
+            "configured_symbols": [str(symbol) for symbol in self.symbols],
+            "activation_id": getattr(universe, "activation_id", None),
+            "activation_manifest_sha256": getattr(
+                universe, "activation_manifest_sha256", None
+            ),
+            "overwrite": bool(overwrite),
+            "completed_symbols": [],
+            "technical_failures": {},
+        }
+        generation_dirty = False
         optimization_symbols = list(self.symbols)
         stale_exclusions_now_eligible: List[str] = []
         excluded_now: List[str] = []
@@ -10441,7 +10897,11 @@ class PortfolioManager:
                     if not self._has_exact_native_cell_grid(
                         canonical, existing, universe
                     ):
-                        self.save_fully_excluded_native_config(symbol, universe)
+                        staged_configs[symbol] = (
+                            self._build_fully_excluded_native_config(symbol, universe)
+                        )
+                        generation_manifest["completed_symbols"].append(symbol)
+                        generation_dirty = True
                 elif existing is not None and not self._has_exact_native_cell_grid(
                     canonical, existing, universe
                 ):
@@ -10480,7 +10940,7 @@ class PortfolioManager:
         logger.info(f"Timeframes: {self.config.timeframes}")
         logger.info(f"{'#'*60}")
         
-        if not to_optimize:
+        if not to_optimize and not generation_dirty:
             logger.info("All symbols have valid configs. Nothing to optimize.")
             self._run_production_replay_audit()
             return results
@@ -10520,13 +10980,30 @@ class PortfolioManager:
                         results[symbol] = PipelineResult(symbol=symbol, success=False, error_message=str(e))
                         symbol_for_save = symbol
 
-                    # Incremental persistence: save immediately after each symbol
+                    # Checkpoint into the non-live generation. The production
+                    # ledger remains byte-identical until the full roster passes.
                     result = results.get(symbol_for_save)
                     if result and result.success and result.config:
-                        self._save_symbol_config(symbol_for_save, result.config)
-                        logger.info(f"SAVED {symbol_for_save} to {self.config_file} (atomic)")
+                        staged_configs[symbol_for_save] = result.config
+                        generation_dirty = True
+                        if symbol_for_save not in generation_manifest["completed_symbols"]:
+                            generation_manifest["completed_symbols"].append(symbol_for_save)
+                        self._stage_optimization_generation(
+                            staged_configs,
+                            generation_manifest,
+                        )
+                        logger.info(
+                            "STAGED %s in generation %s (live ledger unchanged)",
+                            symbol_for_save,
+                            generation_id,
+                        )
                     else:
                         detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
+                        generation_manifest["technical_failures"][symbol_for_save] = detail
+                        self._stage_optimization_generation(
+                            staged_configs,
+                            generation_manifest,
+                        )
                         logger.error(
                             "FAILED %s: %s; ledger left unchanged because technical "
                             "failures are not trading verdicts",
@@ -10548,12 +11025,29 @@ class PortfolioManager:
                     result = self.pipeline.run_for_symbol(symbol)
                     results[symbol] = result
                     
-                    # Incremental persistence: save immediately after each symbol
+                    # Checkpoint successful semantic verdicts into the
+                    # non-live generation; never incrementally mutate live.
                     if result.success and result.config:
-                        self._save_symbol_config(symbol, result.config)
-                        logger.info(f"SAVED {symbol} to {self.config_file} (atomic)")
+                        staged_configs[symbol] = result.config
+                        generation_dirty = True
+                        if symbol not in generation_manifest["completed_symbols"]:
+                            generation_manifest["completed_symbols"].append(symbol)
+                        self._stage_optimization_generation(
+                            staged_configs,
+                            generation_manifest,
+                        )
+                        logger.info(
+                            "STAGED %s in generation %s (live ledger unchanged)",
+                            symbol,
+                            generation_id,
+                        )
                     else:
                         detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
+                        generation_manifest["technical_failures"][symbol] = detail
+                        self._stage_optimization_generation(
+                            staged_configs,
+                            generation_manifest,
+                        )
                         logger.error(
                             "FAILED %s: %s; ledger left unchanged because technical "
                             "failures are not trading verdicts",
@@ -10568,6 +11062,11 @@ class PortfolioManager:
                         success=False,
                         error_message=str(e),
                     )
+                    generation_manifest["technical_failures"][symbol] = str(e)
+                    self._stage_optimization_generation(
+                        staged_configs,
+                        generation_manifest,
+                    )
                     logger.error(
                         "[%s] Ledger left unchanged after optimizer exception",
                         symbol,
@@ -10576,7 +11075,118 @@ class PortfolioManager:
                 # Clear data cache after each symbol to prevent memory leaks
                 self.pipeline.data_loader.clear_cache()
                 FeatureComputer.clear_cache()
-        
+
+        technical_failures = dict(
+            generation_manifest.get("technical_failures", {}) or {}
+        )
+        missing_results = [
+            symbol for symbol in to_optimize
+            if symbol not in results
+        ]
+        for symbol in missing_results:
+            technical_failures[symbol] = "optimizer produced no terminal result"
+        generation_manifest["technical_failures"] = technical_failures
+
+        if technical_failures:
+            generation_manifest["generation_status"] = "FAILED_TECHNICAL"
+            generation_manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+            self._stage_optimization_generation(
+                staged_configs,
+                generation_manifest,
+            )
+            current_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+            if hashlib.sha256(current_bytes).hexdigest() != base_ledger_sha256:
+                raise RuntimeError(
+                    "OPTIMIZATION_GENERATION_ABORT_FOUND_EXTERNAL_LEDGER_CHANGE"
+                )
+            logger.error(
+                "Optimization generation %s aborted: %d technical failure(s); "
+                "production ledger remained unchanged",
+                generation_id,
+                len(technical_failures),
+            )
+            return results
+
+        expected_symbol_set = {str(symbol) for symbol in self.symbols}
+        missing_staged = sorted(expected_symbol_set - set(staged_configs))
+        extra_staged = sorted(set(staged_configs) - expected_symbol_set)
+        if missing_staged or extra_staged:
+            generation_manifest["generation_status"] = "FAILED_INCOMPLETE_ROSTER"
+            generation_manifest["technical_failures"] = {
+                "__GENERATION__": (
+                    f"missing={missing_staged};extra={extra_staged}"
+                )
+            }
+            self._stage_optimization_generation(staged_configs, generation_manifest)
+            logger.error(
+                "Optimization generation %s incomplete; live ledger unchanged",
+                generation_id,
+            )
+            return results
+
+        ledger_status = self._build_ledger_status(staged_configs)
+        if not bool(ledger_status.get("complete_current_contract_universe", False)):
+            generation_manifest["generation_status"] = "FAILED_ARTIFACT_CONTRACT"
+            generation_manifest["technical_failures"] = {
+                "__GENERATION__": (
+                    "staged roster is not complete under the current artifact contract"
+                )
+            }
+            self._stage_optimization_generation(staged_configs, generation_manifest)
+            logger.error(
+                "Optimization generation %s has an incomplete artifact contract; "
+                "live ledger unchanged",
+                generation_id,
+            )
+            return results
+
+        generation_binding = {
+            "schema_version": "fxpm.optimization-generation.v1",
+            "generation_id": generation_id,
+            "generation_status": "COMPLETE",
+            "activation_id": getattr(universe, "activation_id", None),
+            "activation_manifest_sha256": getattr(
+                universe, "activation_manifest_sha256", None
+            ),
+            "configured_symbol_count": len(self.symbols),
+            "configured_cell_count": len(self.symbols)
+            * len(getattr(self.config, "timeframes", []) or [])
+            * 4,
+        }
+        for config in staged_configs.values():
+            config.artifact_meta = {
+                **dict(config.artifact_meta or {}),
+                "ledger_status": ledger_status,
+                "optimization_generation": generation_binding,
+            }
+
+        generation_manifest["generation_status"] = "COMPLETE"
+        generation_manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        generation_manifest["completed_symbols"] = sorted(expected_symbol_set)
+        stage_path, stage_manifest_path, ledger_sha = (
+            self._stage_optimization_generation(
+                staged_configs,
+                generation_manifest,
+            )
+        )
+        generation_manifest["ledger_sha256"] = ledger_sha
+        generation_manifest["ledger_status"] = ledger_status
+        self._atomic_write_json(stage_manifest_path, {
+            **generation_manifest,
+            "ledger_staging_path": str(stage_path),
+        })
+        self._validate_staged_generation(stage_path, staged_configs, universe)
+        self._promote_staged_generation(
+            stage_path,
+            stage_manifest_path,
+            generation_manifest,
+        )
+        logger.info(
+            "PROMOTED complete optimization generation %s (%d symbols) atomically",
+            generation_id,
+            len(staged_configs),
+        )
+
         # Summary
         total_time = time.time() - total_start
         successful = sum(1 for r in results.values() if r.success)

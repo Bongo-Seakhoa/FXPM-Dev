@@ -26,7 +26,11 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 
 import numpy as np
 import pandas as pd
-from pm_evidence import CALENDAR_SPLIT_MODE, EVIDENCE_CONTRACT_VERSION
+from pm_evidence import (
+    CALENDAR_SPLIT_MODE,
+    EVIDENCE_CONTRACT_VERSION,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -485,6 +489,9 @@ def validate_regime_params_provenance(
     expected_source: Optional[Dict[str, Any]] = None,
     expected_train_window: Optional[Dict[str, Any]] = None,
     expected_split_contract: Optional[str] = None,
+    expected_activation_id: Optional[str] = None,
+    expected_activation_manifest_sha256: Optional[str] = None,
+    require_complete_generation: bool = False,
 ) -> Dict[str, Any]:
     """Fail-closed validation of one detector-fit provenance record.
 
@@ -533,6 +540,32 @@ def validate_regime_params_provenance(
         return reject("regime provenance sidecar is not an object")
     if provenance_payload.get("schema_version") != REGIME_PROVENANCE_SCHEMA_VERSION:
         return reject("regime provenance schema mismatch")
+    if require_complete_generation and str(
+        provenance_payload.get("generation_status") or ""
+    ).upper() != "COMPLETE":
+        return reject("regime provenance generation is not complete")
+    declared_params_sha = str(
+        provenance_payload.get("params_file_sha256") or ""
+    ).strip().lower()
+    if declared_params_sha:
+        if len(declared_params_sha) != 64:
+            return reject("regime params artifact hash is invalid")
+        try:
+            current_params_sha = _source_sha256(params_path).lower()
+        except OSError as exc:
+            return reject(f"regime params artifact cannot be hashed: {exc}")
+        if current_params_sha != declared_params_sha:
+            return reject("regime params artifact hash mismatch")
+    elif require_complete_generation:
+        return reject("regime params artifact hash is missing")
+    if expected_activation_id is not None and str(
+        provenance_payload.get("activation_id") or ""
+    ) != str(expected_activation_id):
+        return reject("regime provenance activation id mismatch")
+    if expected_activation_manifest_sha256 is not None and str(
+        provenance_payload.get("activation_manifest_sha256") or ""
+    ).lower() != str(expected_activation_manifest_sha256).lower():
+        return reject("regime provenance activation manifest mismatch")
 
     record = _case_insensitive_nested_cell(
         provenance_payload.get("cells", {}), symbol, timeframe
@@ -641,7 +674,10 @@ def validate_regime_params_provenance(
             )
         if str(source.get("source_kind", "")).lower() != "broker_native":
             return reject("calendar regime provenance source is not broker-native", record)
-        if split.get("contract_version") != EVIDENCE_CONTRACT_VERSION:
+        if split.get("contract_version") not in {
+            EVIDENCE_CONTRACT_VERSION,
+            TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        }:
             return reject("calendar regime provenance contract is stale", record)
     top_contract = provenance_payload.get("split_contract_version")
     if top_contract and top_contract != split.get("contract_version"):
