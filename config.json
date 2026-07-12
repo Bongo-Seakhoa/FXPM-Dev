@@ -54,12 +54,12 @@
       "H4": {"optimizer_train": 2500, "tuning_validation": 1000, "final_lockbox": 1000},
       "D1": {"optimizer_train": 1260, "tuning_validation": 500, "final_lockbox": 500}
     },
-    "optimization_max_workers": 4,
+    "optimization_max_workers": 1,
     "feature_cache_max_entries": 0,
     "feature_disk_cache_enabled": true,
     "feature_disk_cache_dir": "./pm_outputs/production_live/feature_cache",
-    "feature_disk_cache_max_gb": 20.0,
-    "feature_disk_cache_min_free_gb": 4.0,
+    "feature_disk_cache_max_gb": 8.0,
+    "feature_disk_cache_min_free_gb": 12.0,
     "screening_atr_anchor_enabled": true,
     "screening_atr_anchor_multipliers": [
       1.0,
