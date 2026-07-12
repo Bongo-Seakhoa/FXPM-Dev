@@ -60,12 +60,18 @@ def _utc_timestamp(value: Any) -> pd.Timestamp:
     return timestamp.tz_convert("UTC")
 
 
-def ensure_utc_index(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return a timestamp-sorted copy whose index is explicitly UTC."""
+def ensure_utc_index(frame: pd.DataFrame, *, copy: bool = True) -> pd.DataFrame:
+    """Return a timestamp-sorted frame whose index is explicitly UTC.
+
+    The default preserves the historical isolation contract.  Read-only hot
+    paths may pass ``copy=False``; an already valid UTC/sorted frame is then
+    borrowed without duplicating its column blocks.  Any repair that could
+    mutate the caller's index still detaches the frame first.
+    """
     if frame is None:
         return pd.DataFrame()
-    result = frame.copy()
-    index = pd.DatetimeIndex(pd.to_datetime(result.index, errors="coerce"))
+    result = frame.copy() if copy else frame
+    index = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
     valid = ~index.isna()
     if not bool(valid.all()):
         result = result.loc[valid].copy()
@@ -74,8 +80,15 @@ def ensure_utc_index(frame: pd.DataFrame) -> pd.DataFrame:
         index = index.tz_localize("UTC")
     else:
         index = index.tz_convert("UTC")
-    result.index = index
-    return result.sort_index()
+    if not result.index.equals(index):
+        if result is frame:
+            # A shallow frame copy owns its index/manager while continuing to
+            # share immutable column blocks with the read-only caller.
+            result = result.copy(deep=False)
+        result.index = index
+    if not result.index.is_monotonic_increasing:
+        result = result.sort_index()
+    return result
 
 
 def latest_closed_bar_end(

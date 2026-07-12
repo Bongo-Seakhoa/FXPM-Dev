@@ -16,6 +16,7 @@ from pm_native_activation import (
 from pm_evidence import (
     DEFAULT_MIN_NATIVE_BARS,
     build_calendar_boundaries,
+    ensure_utc_index,
     latest_closed_bar_end,
     trim_to_closed_bars,
     validate_native_provenance,
@@ -36,6 +37,16 @@ def _ohlc(index: pd.DatetimeIndex) -> pd.DataFrame:
         },
         index=index,
     )
+
+
+def test_ensure_utc_index_read_only_fast_path_avoids_full_frame_copy():
+    frame = _ohlc(pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC"))
+
+    borrowed = ensure_utc_index(frame, copy=False)
+    isolated = ensure_utc_index(frame)
+
+    assert borrowed is frame
+    assert isolated is not frame
 
 
 def test_calendar_boundaries_are_common_half_open_and_disjoint():
