@@ -39,9 +39,9 @@ DEFAULT_TIMEFRAME_WINDOW_YEARS: Dict[str, Dict[str, int]] = {
     "M5": {"optimizer_train": 5, "tuning_validation": 2, "final_lockbox": 2},
     "M15": {"optimizer_train": 5, "tuning_validation": 2, "final_lockbox": 2},
     "M30": {"optimizer_train": 6, "tuning_validation": 2, "final_lockbox": 2},
-    "H1": {"optimizer_train": 7, "tuning_validation": 3, "final_lockbox": 3},
-    "H4": {"optimizer_train": 8, "tuning_validation": 3, "final_lockbox": 3},
-    "D1": {"optimizer_train": 12, "tuning_validation": 4, "final_lockbox": 4},
+    "H1": {"optimizer_train": 7, "tuning_validation": 2, "final_lockbox": 2},
+    "H4": {"optimizer_train": 8, "tuning_validation": 2, "final_lockbox": 2},
+    "D1": {"optimizer_train": 12, "tuning_validation": 2, "final_lockbox": 2},
 }
 
 # Absolute fallbacks for instruments with comparatively short regular trading
@@ -197,6 +197,12 @@ def normalize_timeframe_window_years(value: Any) -> Dict[str, Dict[str, int]]:
         normalized[timeframe] = {}
         for partition in PARTITIONS:
             safe = DEFAULT_TIMEFRAME_WINDOW_YEARS[timeframe][partition]
+            if partition != "optimizer_train":
+                # Tuning and final are the common active/comparison clock.
+                # They cannot drift by timeframe; a future institution-wide
+                # change requires a new contract, not six local overrides.
+                normalized[timeframe][partition] = safe
+                continue
             raw = tf_source.get(partition, safe)
             try:
                 years = int(raw)

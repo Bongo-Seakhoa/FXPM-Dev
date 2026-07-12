@@ -86,7 +86,8 @@ def test_v3_timeframe_windows_lengthen_without_changing_information_cutoff():
     assert d1.contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
     assert m5.as_of_utc == d1.as_of_utc == pd.Timestamp(as_of)
     assert m5.windows["final_lockbox"][0] == pd.Timestamp("2024-01-01T00:00:00Z")
-    assert d1.windows["final_lockbox"][0] == pd.Timestamp("2022-01-01T00:00:00Z")
+    assert d1.windows["final_lockbox"] == m5.windows["final_lockbox"]
+    assert d1.windows["tuning_validation"] == m5.windows["tuning_validation"]
     assert d1.windows["optimizer_train"][0] < m5.windows["optimizer_train"][0]
     assert earliest_timeframe_evidence_start(as_of, embargo="7d") == d1.windows["optimizer_train"][0]
 
@@ -109,10 +110,12 @@ def test_v3_timeframe_window_config_may_tighten_but_not_weaken_priors():
 
     assert (m5.windows["optimizer_train"][1].year - m5.windows["optimizer_train"][0].year) == 5
     assert (d1.windows["optimizer_train"][1].year - d1.windows["optimizer_train"][0].year) == 15
+    assert d1.windows["tuning_validation"] == m5.windows["tuning_validation"]
+    assert d1.windows["final_lockbox"] == m5.windows["final_lockbox"]
     assert DEFAULT_TIMEFRAME_WINDOW_YEARS["D1"] == {
         "optimizer_train": 12,
-        "tuning_validation": 4,
-        "final_lockbox": 4,
+        "tuning_validation": 2,
+        "final_lockbox": 2,
     }
 
 
