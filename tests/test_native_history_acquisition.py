@@ -19,6 +19,8 @@ if str(PATCH_ROOT) not in sys.path:
 
 from tools.acquire_native_history import (  # noqa: E402
     DEFAULT_TIMEFRAMES,
+    LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     ConcurrentWriterError,
     NativeHistoryAcquirer,
     NativeHistoryRunLock,
@@ -714,6 +716,277 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 required_latest_start,
             )
             store.close()
+
+    def test_timeframe_v3_fetches_d1_earlier_without_expanding_m5(self):
+        as_of = datetime(2026, 1, 5, tzinfo=UTC)
+        request = NativeHistoryRequest(
+            symbols=("EURUSD",),
+            timeframes=("M5", "D1"),
+            as_of_utc=as_of,
+            retries=1,
+            retry_sleep_seconds=0.0,
+            timeframe_window_years={},
+            window_contract_version=TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            warmup_days=0.0,
+            safety_days=0.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            connector = _RangeConnector()
+            store = NativeHistoryStore(native_root, "timeframe-v3-ranges")
+            acquirer = NativeHistoryAcquirer(
+                connector,
+                store,
+                request,
+                now_fn=lambda: as_of,
+                sleep_fn=lambda _: None,
+            )
+
+            m5_windows = acquirer.timeframe_partition_windows["M5"]
+            d1_windows = acquirer.timeframe_partition_windows["D1"]
+            self.assertLess(
+                d1_windows["optimizer_train"][0],
+                m5_windows["optimizer_train"][0],
+            )
+            for partition in ("tuning_validation", "final_lockbox"):
+                self.assertEqual(d1_windows[partition], m5_windows[partition])
+            m5_source_start = acquirer.timeframe_source_request_intervals["M5"][0]
+            d1_source_start = acquirer.timeframe_source_request_intervals["D1"][0]
+            self.assertLess(d1_source_start, m5_source_start - timedelta(days=6 * 365))
+            self.assertGreater(m5_source_start, datetime(2016, 1, 1, tzinfo=UTC))
+
+            manifest = acquirer.acquire()
+            self.assertTrue(manifest["complete"])
+            m5_sidecar = json.loads(
+                (store.run_root / "EURUSD" / "M5" / "provenance.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            d1_sidecar = json.loads(
+                (store.run_root / "EURUSD" / "D1" / "provenance.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for timeframe, sidecar in (("M5", m5_sidecar), ("D1", d1_sidecar)):
+                sidecar_request = sidecar["request"]
+                self.assertEqual(
+                    sidecar_request["window_contract_version"],
+                    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+                )
+                self.assertEqual(sidecar_request["cell_timeframe"], timeframe)
+                self.assertEqual(
+                    sidecar_request["cell_calendar_boundaries"],
+                    sidecar_request["timeframe_calendar_boundaries"][timeframe],
+                )
+                self.assertEqual(
+                    sidecar_request["source_request_interval"]["start_utc"],
+                    sidecar_request["native_fetch_start_utc"],
+                )
+                self.assertEqual(
+                    sidecar_request["source_request_interval"]["end_exclusive_utc"],
+                    sidecar_request["native_fetch_end_exclusive_utc"],
+                )
+                self.assertEqual(
+                    sidecar["expected_session_coverage_details_by_partition"][
+                        "method"
+                    ],
+                    "timestamp_segmented_weekly_session_rate_v2",
+                )
+                self.assertEqual(
+                    len(sidecar_request["timeframe_calendar_boundaries_sha256"]),
+                    64,
+                )
+                self.assertEqual(
+                    len(sidecar_request["timeframe_request_map_sha256"]),
+                    64,
+                )
+            self.assertEqual(
+                m5_sidecar["request"]["timeframe_calendar_boundaries"],
+                d1_sidecar["request"]["timeframe_calendar_boundaries"],
+            )
+            self.assertEqual(
+                manifest["request"]["timeframe_calendar_boundaries"],
+                m5_sidecar["request"]["timeframe_calendar_boundaries"],
+            )
+
+    def test_legacy_flat_window_request_remains_reproducible(self):
+        as_of = datetime(2026, 1, 5, tzinfo=UTC)
+        request_values = {
+            "symbols": ("EURUSD",),
+            "timeframes": ("M5", "D1"),
+            "horizon_years": 10,
+            "as_of_utc": as_of,
+            "window_years": {
+                "optimizer_train": 5,
+                "tuning_validation": 2,
+                "final_lockbox": 2,
+            },
+            "embargo_days": 7,
+            "warmup_days": 400,
+            "safety_days": 14,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            implicit_store = NativeHistoryStore(native_root, "legacy-implicit")
+            implicit = NativeHistoryAcquirer(
+                _RangeConnector(),
+                implicit_store,
+                NativeHistoryRequest(**request_values),
+                now_fn=lambda: as_of,
+            )
+            explicit_store = NativeHistoryStore(native_root, "legacy-explicit")
+            explicit = NativeHistoryAcquirer(
+                _RangeConnector(),
+                explicit_store,
+                NativeHistoryRequest(
+                    **request_values,
+                    window_contract_version=LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
+                ),
+                now_fn=lambda: as_of,
+            )
+
+            self.assertEqual(
+                implicit._common_request_contract(),
+                explicit._common_request_contract(),
+            )
+            self.assertNotIn(
+                "window_contract_version",
+                implicit._common_request_contract(),
+            )
+            self.assertEqual(
+                implicit.timeframe_partition_windows["M5"],
+                implicit.timeframe_partition_windows["D1"],
+            )
+            self.assertEqual(
+                implicit.timeframe_requested_start_utc["M5"],
+                implicit.timeframe_requested_start_utc["D1"],
+            )
+            implicit_store.close()
+            explicit_store.close()
+
+    def test_v3_resume_rejects_boundary_map_hash_tampering(self):
+        as_of = datetime(2026, 1, 5, tzinfo=UTC)
+        request = NativeHistoryRequest(
+            symbols=("EURUSD",),
+            timeframes=("M5", "D1"),
+            as_of_utc=as_of,
+            retries=1,
+            retry_sleep_seconds=0.0,
+            timeframe_window_years={},
+            window_contract_version=TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            warmup_days=0.0,
+            safety_days=0.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            store = NativeHistoryStore(native_root, "v3-hash-resume")
+            NativeHistoryAcquirer(
+                _RangeConnector(),
+                store,
+                request,
+                now_fn=lambda: as_of,
+                sleep_fn=lambda _: None,
+            ).acquire(max_new_cells=1)
+
+            recovered = load_native_history_resume_contract(
+                native_root,
+                "v3-hash-resume",
+            )
+            self.assertEqual(
+                recovered.request["window_contract_version"],
+                TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            )
+            sidecar_path = store.run_root / "EURUSD" / "M5" / "provenance.json"
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar["request"]["timeframe_calendar_boundaries"]["D1"][
+                "optimizer_train"
+            ]["start_ts"] = "2010-01-01T00:00:00Z"
+            sidecar_path.write_text(
+                json.dumps(sidecar, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ResumeValidationError,
+                "boundary hash mismatch",
+            ):
+                load_native_history_resume_contract(native_root, "v3-hash-resume")
+
+    def test_cli_defaults_to_v3_and_extracts_nested_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, native_root = self._paths(tmp)
+            config = root / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "symbols": ["EURUSD"],
+                        "pipeline": {
+                            "evidence_timeframe_window_years": {
+                                "D1": {"optimizer_train": 15}
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = main(
+                    [
+                        "--config",
+                        str(config),
+                        "--output-root",
+                        str(native_root),
+                        "--timeframes",
+                        "M5",
+                        "D1",
+                        "--as-of",
+                        "2026-01-05T00:00:00Z",
+                    ]
+                )
+            self.assertEqual(result, 0)
+            plan = json.loads(stdout.getvalue())
+            self.assertEqual(
+                plan["window_contract_version"],
+                TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            )
+            self.assertEqual(
+                plan["timeframe_window_years"]["M5"]["optimizer_train"],
+                5,
+            )
+            self.assertEqual(
+                plan["timeframe_window_years"]["D1"]["optimizer_train"],
+                15,
+            )
+            self.assertEqual(
+                plan["timeframe_window_years"]["M5"]["final_lockbox"],
+                plan["timeframe_window_years"]["D1"]["final_lockbox"],
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = main(
+                    [
+                        "--config",
+                        str(config),
+                        "--output-root",
+                        str(native_root),
+                        "--timeframes",
+                        "M5",
+                        "D1",
+                        "--as-of",
+                        "2026-01-05T00:00:00Z",
+                        "--train-years",
+                        "5",
+                    ]
+                )
+            self.assertEqual(result, 0)
+            legacy_plan = json.loads(stdout.getvalue())
+            self.assertEqual(
+                legacy_plan["window_contract_version"],
+                LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
+            )
+            self.assertIsNone(legacy_plan["timeframe_window_years"])
 
     def test_bounded_run_resumes_without_overwriting_valid_leaf(self):
         as_of = datetime(2026, 1, 10, 12, 2, 17, tzinfo=UTC)

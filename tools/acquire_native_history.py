@@ -44,12 +44,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from pm_evidence import (  # noqa: E402
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+    build_timeframe_calendar_boundaries,
+    normalize_timeframe_window_years,
+)
+
 
 LOGGER = logging.getLogger("fxpm.native_history")
 SCHEMA_VERSION = "fxpm-native-bars-v1"
 ACQUISITION_CONTRACT_VERSION = "2026-07-10-native-calendar-acquisition-v1"
 MANIFEST_SCHEMA_VERSION = "fxpm.native_history_run_manifest.v1"
 RESUME_CONTRACT_VERSION = "fxpm.native_history_resume.v1"
+LEGACY_FLAT_WINDOW_CONTRACT_VERSION = "fxpm.native_history.flat_windows.v1"
+TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v3"
 PARTITIONS: Tuple[str, ...] = (
     "optimizer_train",
     "tuning_validation",
@@ -730,6 +738,18 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    """Hash one JSON-safe contract without platform/formatting ambiguity."""
+
+    payload = json.dumps(
+        _json_safe(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -773,6 +793,8 @@ class NativeHistoryRequest:
     retry_sleep_seconds: float = 0.5
     boundary_tolerance_days: float = 3.0
     window_years: Optional[Mapping[str, int]] = None
+    timeframe_window_years: Optional[Mapping[str, Mapping[str, int]]] = None
+    window_contract_version: Optional[str] = None
     embargo_days: float = 7.0
     warmup_days: float = 400.0
     safety_days: float = 14.0
@@ -815,14 +837,58 @@ class NativeHistoryRequest:
             if isinstance(raw, bool) or years <= 0:
                 years = DEFAULT_WINDOW_YEARS[partition]
             normalized_years[partition] = years
+        requested_contract = str(self.window_contract_version or "").strip()
+        has_timeframe_matrix = isinstance(self.timeframe_window_years, Mapping)
+        if not requested_contract:
+            requested_contract = (
+                TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                if has_timeframe_matrix
+                else LEGACY_FLAT_WINDOW_CONTRACT_VERSION
+            )
+        if requested_contract not in {
+            LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
+            TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        }:
+            raise ValueError(f"unsupported native window contract: {requested_contract!r}")
+        if (
+            requested_contract == LEGACY_FLAT_WINDOW_CONTRACT_VERSION
+            and has_timeframe_matrix
+        ):
+            raise ValueError(
+                "legacy flat-window requests cannot include timeframe_window_years"
+            )
+        normalized_timeframe_years: Optional[Dict[str, Dict[str, int]]] = None
+        if requested_contract == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            normalized_all = normalize_timeframe_window_years(
+                self.timeframe_window_years
+            )
+            normalized_timeframe_years = {
+                timeframe: dict(normalized_all[timeframe])
+                for timeframe in normalized_timeframes
+            }
+            # Active tuning and final evaluation periods are deliberately
+            # concurrent. Different training depth must not move the live
+            # comparison windows for one timeframe relative to another.
+            for partition in ("tuning_validation", "final_lockbox"):
+                values = {
+                    normalized_timeframe_years[timeframe][partition]
+                    for timeframe in normalized_timeframes
+                }
+                if len(values) != 1:
+                    raise ValueError(
+                        f"timeframe {partition} years must be identical across "
+                        "all requested timeframes"
+                    )
         object.__setattr__(self, "symbols", normalized_symbols)
         object.__setattr__(self, "timeframes", normalized_timeframes)
         object.__setattr__(self, "window_years", normalized_years)
+        object.__setattr__(self, "timeframe_window_years", normalized_timeframe_years)
+        object.__setattr__(self, "window_contract_version", requested_contract)
         if self.as_of_utc is not None:
             object.__setattr__(self, "as_of_utc", _utc(self.as_of_utc))
 
 
-_RESUME_REQUEST_KEYS: Tuple[str, ...] = (
+_LEGACY_RESUME_REQUEST_KEYS: Tuple[str, ...] = (
     "horizon_years",
     "requested_information_cutoff_utc",
     "requested_horizon_start_utc",
@@ -836,6 +902,28 @@ _RESUME_REQUEST_KEYS: Tuple[str, ...] = (
     "window_years",
     "embargo_days",
     "common_calendar_boundaries",
+)
+
+_V3_RESUME_REQUEST_KEYS: Tuple[str, ...] = (
+    "window_contract_version",
+    "timeframe_request_map_schema_version",
+    "horizon_years",
+    "requested_information_cutoff_utc",
+    "requested_horizon_start_utc",
+    "common_requested_start_utc",
+    "required_evidence_lead_start_utc",
+    "warmup_days",
+    "safety_days",
+    "closed_bar_slack_seconds",
+    "common_as_of_utc",
+    "boundary_tolerance_days",
+    "embargo_days",
+    "timeframe_window_years",
+    "timeframe_calendar_boundaries",
+    "timeframe_calendar_boundaries_sha256",
+    "timeframe_required_evidence_lead_start_utc",
+    "timeframe_source_request_intervals",
+    "timeframe_request_map_sha256",
 )
 
 _SOURCE_IDENTITY_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -1114,16 +1202,103 @@ def _load_json_object(path: Path) -> Dict[str, Any]:
     return value
 
 
+def _timeframe_request_hash_payload(request: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema_version": request.get("timeframe_request_map_schema_version"),
+        "window_contract_version": request.get("window_contract_version"),
+        "common_as_of_utc": request.get("common_as_of_utc"),
+        "timeframe_window_years": request.get("timeframe_window_years"),
+        "timeframe_calendar_boundaries": request.get(
+            "timeframe_calendar_boundaries"
+        ),
+        "timeframe_required_evidence_lead_start_utc": request.get(
+            "timeframe_required_evidence_lead_start_utc"
+        ),
+        "timeframe_source_request_intervals": request.get(
+            "timeframe_source_request_intervals"
+        ),
+    }
+
+
 def _resume_request_contract(record: Mapping[str, Any], path: Path) -> Dict[str, Any]:
     request = record.get("request")
     if not isinstance(request, Mapping):
         raise ResumeValidationError(f"resume provenance has no request object: {path}")
-    missing = [key for key in _RESUME_REQUEST_KEYS if key not in request]
+    version = str(
+        request.get("window_contract_version")
+        or LEGACY_FLAT_WINDOW_CONTRACT_VERSION
+    )
+    if version == LEGACY_FLAT_WINDOW_CONTRACT_VERSION:
+        keys = _LEGACY_RESUME_REQUEST_KEYS
+    elif version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        keys = _V3_RESUME_REQUEST_KEYS
+    else:
+        raise ResumeValidationError(
+            f"unsupported native window contract {version!r}: {path}"
+        )
+    missing = [key for key in keys if key not in request]
     if missing:
         raise ResumeValidationError(
             f"resume provenance lacks immutable request fields {missing}: {path}"
         )
-    return {key: _json_safe(request[key]) for key in _RESUME_REQUEST_KEYS}
+    contract = {key: _json_safe(request[key]) for key in keys}
+    if version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        boundaries = contract.get("timeframe_calendar_boundaries")
+        if not isinstance(boundaries, Mapping) or not boundaries:
+            raise ResumeValidationError(
+                f"timeframe calendar boundary map is invalid: {path}"
+            )
+        declared_boundary_hash = str(
+            contract.get("timeframe_calendar_boundaries_sha256") or ""
+        )
+        if declared_boundary_hash != _canonical_json_sha256(boundaries):
+            raise ResumeValidationError(
+                f"timeframe calendar boundary hash mismatch: {path}"
+            )
+        declared_request_hash = str(contract.get("timeframe_request_map_sha256") or "")
+        if declared_request_hash != _canonical_json_sha256(
+            _timeframe_request_hash_payload(contract)
+        ):
+            raise ResumeValidationError(f"timeframe request map hash mismatch: {path}")
+    return contract
+
+
+def _validate_v3_cell_request(
+    record: Mapping[str, Any],
+    timeframe: str,
+    path: Path,
+) -> None:
+    """Authenticate a leaf's cell projection against its hash-bound v3 map."""
+
+    request = record.get("request")
+    if not isinstance(request, Mapping):
+        raise ResumeValidationError(f"resume provenance has no request object: {path}")
+    if (
+        str(request.get("window_contract_version") or "")
+        != TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+    ):
+        return
+    common = _resume_request_contract(record, path)
+    tf = str(timeframe).upper()
+    expected_years = (common.get("timeframe_window_years") or {}).get(tf)
+    expected_boundaries = (common.get("timeframe_calendar_boundaries") or {}).get(tf)
+    expected_interval = (common.get("timeframe_source_request_intervals") or {}).get(tf)
+    expected_lead = (
+        common.get("timeframe_required_evidence_lead_start_utc") or {}
+    ).get(tf)
+    checks = {
+        "cell_timeframe": tf,
+        "cell_timeframe_window_years": expected_years,
+        "cell_calendar_boundaries": expected_boundaries,
+        "source_request_interval": expected_interval,
+        "cell_required_evidence_lead_start_utc": expected_lead,
+    }
+    for field_name, expected in checks.items():
+        if expected is None or _json_safe(request.get(field_name)) != _json_safe(expected):
+            raise ResumeValidationError(
+                f"v3 cell request field {field_name!r} does not match the "
+                f"hash-bound timeframe map: {path}"
+            )
 
 
 def _source_identity(source_environment: Any) -> Dict[str, Any]:
@@ -1213,6 +1388,7 @@ def load_native_history_resume_contract(
         if str(record.get("timeframe", "")).upper() != timeframe:
             raise ResumeValidationError(f"timeframe mismatch in {sidecar}")
         request = _resume_request_contract(record, sidecar)
+        _validate_v3_cell_request(record, timeframe, sidecar)
         identity = _source_identity(record.get("source_environment"))
         if not identity:
             raise ResumeValidationError(f"source identity is absent in {sidecar}")
@@ -1794,25 +1970,95 @@ class NativeHistoryAcquirer:
             self.requested_information_cutoff_utc,
             TIMEFRAME_SECONDS["M5"],
         )
-        self.partition_windows = build_common_partition_windows(
-            self.as_of_utc,
-            request.window_years or DEFAULT_WINDOW_YEARS,
-            request.embargo_days,
-        )
         requested_start = subtract_calendar_years(self.as_of_utc, request.horizon_years)
-        if request.enforce_evidence_horizon:
-            train_start = self.partition_windows["optimizer_train"][0]
-            closed_bar_slack = max(TIMEFRAME_SECONDS[tf] for tf in request.timeframes)
-            evidence_lead_start = train_start - timedelta(
-                days=float(request.warmup_days) + float(request.safety_days),
-                seconds=closed_bar_slack,
+        self.window_contract_version = str(request.window_contract_version)
+        self.timeframe_partition_windows: Dict[
+            str, Dict[str, Tuple[datetime, datetime]]
+        ] = {}
+        self.timeframe_required_evidence_lead_start_utc: Dict[
+            str, Optional[datetime]
+        ] = {}
+        self.timeframe_requested_start_utc: Dict[str, datetime] = {}
+        if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            assert request.timeframe_window_years is not None
+            for timeframe in request.timeframes:
+                boundaries = build_timeframe_calendar_boundaries(
+                    self.as_of_utc,
+                    timeframe,
+                    timeframe_window_years=request.timeframe_window_years,
+                    embargo=pd.Timedelta(days=float(request.embargo_days)),
+                )
+                cell_windows = {
+                    partition: (
+                        start.to_pydatetime(),
+                        end.to_pydatetime(),
+                    )
+                    for partition, (start, end) in boundaries.windows.items()
+                }
+                self.timeframe_partition_windows[timeframe] = cell_windows
+                if request.enforce_evidence_horizon:
+                    train_start = cell_windows["optimizer_train"][0]
+                    evidence_lead_start = train_start - timedelta(
+                        days=float(request.warmup_days) + float(request.safety_days),
+                        seconds=TIMEFRAME_SECONDS[timeframe],
+                    )
+                    cell_start = evidence_lead_start
+                else:
+                    evidence_lead_start = None
+                    cell_start = requested_start
+                self.timeframe_required_evidence_lead_start_utc[
+                    timeframe
+                ] = evidence_lead_start
+                self.timeframe_requested_start_utc[timeframe] = cell_start
+            compatibility_timeframe = (
+                "M5" if "M5" in request.timeframes else request.timeframes[0]
             )
-            self.common_start_utc = min(requested_start, evidence_lead_start)
+            self.partition_windows = self.timeframe_partition_windows[
+                compatibility_timeframe
+            ]
+            self.common_start_utc = min(self.timeframe_requested_start_utc.values())
+            evidence_starts = [
+                value
+                for value in self.timeframe_required_evidence_lead_start_utc.values()
+                if value is not None
+            ]
+            evidence_lead_start = min(evidence_starts) if evidence_starts else None
         else:
-            evidence_lead_start = None
-            self.common_start_utc = requested_start
+            self.partition_windows = build_common_partition_windows(
+                self.as_of_utc,
+                request.window_years or DEFAULT_WINDOW_YEARS,
+                request.embargo_days,
+            )
+            if request.enforce_evidence_horizon:
+                train_start = self.partition_windows["optimizer_train"][0]
+                closed_bar_slack = max(
+                    TIMEFRAME_SECONDS[tf] for tf in request.timeframes
+                )
+                evidence_lead_start = train_start - timedelta(
+                    days=float(request.warmup_days) + float(request.safety_days),
+                    seconds=closed_bar_slack,
+                )
+                self.common_start_utc = min(requested_start, evidence_lead_start)
+            else:
+                evidence_lead_start = None
+                self.common_start_utc = requested_start
+            for timeframe in request.timeframes:
+                self.timeframe_partition_windows[timeframe] = dict(
+                    self.partition_windows
+                )
+                self.timeframe_required_evidence_lead_start_utc[
+                    timeframe
+                ] = evidence_lead_start
+                self.timeframe_requested_start_utc[timeframe] = self.common_start_utc
         self.requested_horizon_start_utc = requested_start
         self.required_evidence_lead_start_utc = evidence_lead_start
+        self.timeframe_source_request_intervals = {
+            timeframe: self._source_request_interval(
+                timeframe,
+                self.timeframe_requested_start_utc[timeframe],
+            )
+            for timeframe in request.timeframes
+        }
         self.runtime_metadata = dict(runtime_metadata or self._read_runtime_metadata())
         self.terminal_max_bars = self._extract_terminal_max_bars(self.runtime_metadata)
         self.resume_contract = store.resume_contract
@@ -1834,8 +2080,76 @@ class NativeHistoryAcquirer:
     def _read_runtime_metadata(self) -> Dict[str, Any]:
         return snapshot_read_only_runtime_metadata(self.connector)
 
+    def _source_request_interval(
+        self,
+        timeframe: str,
+        requested_start: datetime,
+    ) -> Tuple[datetime, datetime]:
+        seconds = TIMEFRAME_SECONDS[timeframe]
+        if timeframe in {"H4", "D1"}:
+            return (
+                requested_start - timedelta(seconds=seconds),
+                self.as_of_utc + timedelta(seconds=1),
+            )
+        return (
+            ceil_utc_boundary(requested_start, seconds),
+            floor_utc_boundary(self.as_of_utc, seconds),
+        )
+
+    def _serialized_timeframe_boundaries(self) -> Dict[str, Dict[str, Dict[str, str]]]:
+        return {
+            timeframe: {
+                partition: {"start_ts": _iso(start), "end_ts": _iso(end)}
+                for partition, (start, end) in windows.items()
+            }
+            for timeframe, windows in self.timeframe_partition_windows.items()
+        }
+
+    def _serialized_timeframe_intervals(self) -> Dict[str, Dict[str, str]]:
+        return {
+            timeframe: {
+                "start_utc": _iso(start),
+                "end_exclusive_utc": _iso(end),
+            }
+            for timeframe, (start, end) in self.timeframe_source_request_intervals.items()
+        }
+
+    def _v3_request_fields(self) -> Dict[str, Any]:
+        boundaries = self._serialized_timeframe_boundaries()
+        intervals = self._serialized_timeframe_intervals()
+        leads = {
+            timeframe: _iso(value)
+            for timeframe, value in self.timeframe_required_evidence_lead_start_utc.items()
+        }
+        years = {
+            timeframe: dict((self.request.timeframe_window_years or {})[timeframe])
+            for timeframe in self.request.timeframes
+        }
+        fields: Dict[str, Any] = {
+            "window_contract_version": TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+            "timeframe_request_map_schema_version": (
+                TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+            ),
+            "timeframe_window_years": years,
+            "timeframe_calendar_boundaries": boundaries,
+            "timeframe_calendar_boundaries_sha256": _canonical_json_sha256(
+                boundaries
+            ),
+            "timeframe_required_evidence_lead_start_utc": leads,
+            "timeframe_source_request_intervals": intervals,
+        }
+        fields["timeframe_request_map_sha256"] = _canonical_json_sha256(
+            _timeframe_request_hash_payload(
+                {
+                    **fields,
+                    "common_as_of_utc": _iso(self.as_of_utc),
+                }
+            )
+        )
+        return fields
+
     def _common_request_contract(self) -> Dict[str, Any]:
-        request = {
+        request: Dict[str, Any] = {
             "horizon_years": int(self.request.horizon_years),
             "requested_information_cutoff_utc": _iso(
                 self.requested_information_cutoff_utc
@@ -1859,7 +2173,12 @@ class NativeHistoryAcquirer:
                 for partition, (start, end) in self.partition_windows.items()
             },
         }
-        return {key: _json_safe(request[key]) for key in _RESUME_REQUEST_KEYS}
+        if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            request.update(self._v3_request_fields())
+            return {key: _json_safe(request[key]) for key in _V3_RESUME_REQUEST_KEYS}
+        return {
+            key: _json_safe(request[key]) for key in _LEGACY_RESUME_REQUEST_KEYS
+        }
 
     def _validate_reusable_leaf(
         self,
@@ -1906,6 +2225,7 @@ class NativeHistoryAcquirer:
             )
         if _resume_request_contract(record, sidecar) != self._common_request_contract():
             raise ResumeValidationError(f"reusable request mismatch in {sidecar}")
+        _validate_v3_cell_request(record, timeframe, sidecar)
         if _source_identity(record.get("source_environment")) != _source_identity(
             self.runtime_metadata
         ):
@@ -2115,21 +2435,22 @@ class NativeHistoryAcquirer:
     ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
         seconds = TIMEFRAME_SECONDS[timeframe]
         broker_session_aligned = timeframe in {"H4", "D1"}
+        cell_requested_start = self.timeframe_requested_start_utc[timeframe]
+        cell_partition_windows = self.timeframe_partition_windows[timeframe]
+        native_start, fetch_end_exclusive = self.timeframe_source_request_intervals[
+            timeframe
+        ]
         if broker_session_aligned:
             # Broker H4/D1 opens can be 21:00/22:00 UTC and move at DST. Fetch
             # through the information cutoff and classify closure from observed
             # successor bars (or nominal close for the final/gapped bar), never
             # from Unix-epoch UTC modulo arithmetic.
-            native_start = self.common_start_utc - timedelta(seconds=seconds)
             # One second beyond the cutoff is a read-only sentinel window: MT5
             # bar timestamps are second-granular, so a successor opening exactly
             # at ``as_of`` must be visible to prove the preceding DST-shifted bar
             # closed. The successor itself is removed by close<=as_of below.
-            fetch_end_exclusive = self.as_of_utc + timedelta(seconds=1)
             alignment_mode = "broker_observed_successor_or_nominal_close_v1"
         else:
-            native_start = ceil_utc_boundary(self.common_start_utc, seconds)
-            fetch_end_exclusive = floor_utc_boundary(self.as_of_utc, seconds)
             alignment_mode = "fixed_utc_native_boundary_v1"
         if fetch_end_exclusive <= native_start:
             raise ValueError("calendar horizon contains no fully closed native bar")
@@ -2184,6 +2505,70 @@ class NativeHistoryAcquirer:
                 empty_pages.append(page_identity)
             cursor = page_end
 
+        request_record: Dict[str, Any] = {
+            "horizon_years": int(self.request.horizon_years),
+            "requested_information_cutoff_utc": _iso(
+                self.requested_information_cutoff_utc
+            ),
+            "requested_horizon_start_utc": _iso(self.requested_horizon_start_utc),
+            "common_requested_start_utc": _iso(self.common_start_utc),
+            "required_evidence_lead_start_utc": _iso(
+                self.required_evidence_lead_start_utc
+            ),
+            "warmup_days": float(self.request.warmup_days),
+            "safety_days": float(self.request.safety_days),
+            "closed_bar_slack_seconds": max(
+                TIMEFRAME_SECONDS[tf] for tf in self.request.timeframes
+            ),
+            "common_as_of_utc": _iso(self.as_of_utc),
+            "native_fetch_start_utc": _iso(native_start),
+            "native_fetch_end_exclusive_utc": _iso(fetch_end_exclusive),
+            "last_fully_closed_bar_open_utc": None,
+            "alignment_mode": alignment_mode,
+            "successor_sentinel_fetch_slack_seconds": (
+                1 if broker_session_aligned else 0
+            ),
+            "boundary_tolerance_days": float(self.request.boundary_tolerance_days),
+            "window_years": (
+                dict((self.request.timeframe_window_years or {})[timeframe])
+                if self.window_contract_version
+                == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                else dict(self.request.window_years or {})
+            ),
+            "embargo_days": float(self.request.embargo_days),
+            # For v3 leaves this compatibility projection is deliberately the
+            # current cell's exact boundary map, not a fictitious common train
+            # window. The hash-bound full map below authenticates it.
+            "common_calendar_boundaries": {
+                partition: {"start_ts": _iso(start), "end_ts": _iso(end)}
+                for partition, (start, end) in cell_partition_windows.items()
+            },
+        }
+        if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            request_record.update(self._v3_request_fields())
+            request_record.update(
+                {
+                    "cell_timeframe": timeframe,
+                    "cell_timeframe_window_years": dict(
+                        (self.request.timeframe_window_years or {})[timeframe]
+                    ),
+                    "cell_calendar_boundaries": {
+                        partition: {
+                            "start_ts": _iso(start),
+                            "end_ts": _iso(end),
+                        }
+                        for partition, (start, end) in cell_partition_windows.items()
+                    },
+                    "cell_required_evidence_lead_start_utc": _iso(
+                        self.timeframe_required_evidence_lead_start_utc[timeframe]
+                    ),
+                    "source_request_interval": {
+                        "start_utc": _iso(native_start),
+                        "end_exclusive_utc": _iso(fetch_end_exclusive),
+                    },
+                }
+            )
+
         base_record: Dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "acquisition_contract_version": ACQUISITION_CONTRACT_VERSION,
@@ -2201,40 +2586,7 @@ class NativeHistoryAcquirer:
             "source_kind": "broker_native",
             "timezone": "UTC",
             "timeframe_seconds": seconds,
-            "request": {
-                "horizon_years": int(self.request.horizon_years),
-                "requested_information_cutoff_utc": _iso(
-                    self.requested_information_cutoff_utc
-                ),
-                "requested_horizon_start_utc": _iso(self.requested_horizon_start_utc),
-                "common_requested_start_utc": _iso(self.common_start_utc),
-                "required_evidence_lead_start_utc": _iso(
-                    self.required_evidence_lead_start_utc
-                ),
-                "warmup_days": float(self.request.warmup_days),
-                "safety_days": float(self.request.safety_days),
-                "closed_bar_slack_seconds": max(
-                    TIMEFRAME_SECONDS[tf] for tf in self.request.timeframes
-                ),
-                "common_as_of_utc": _iso(self.as_of_utc),
-                "native_fetch_start_utc": _iso(native_start),
-                "native_fetch_end_exclusive_utc": _iso(fetch_end_exclusive),
-                "last_fully_closed_bar_open_utc": None,
-                "alignment_mode": alignment_mode,
-                "successor_sentinel_fetch_slack_seconds": (
-                    1 if broker_session_aligned else 0
-                ),
-                "boundary_tolerance_days": float(self.request.boundary_tolerance_days),
-                "window_years": dict(self.request.window_years or {}),
-                "embargo_days": float(self.request.embargo_days),
-                "common_calendar_boundaries": {
-                    partition: {
-                        "start_ts": _iso(start),
-                        "end_ts": _iso(end),
-                    }
-                    for partition, (start, end) in self.partition_windows.items()
-                },
-            },
+            "request": request_record,
             "source_environment": _json_safe(self.runtime_metadata),
             "instrument": _json_safe(dict(instrument_metadata or {})),
             "acquisition_started_utc": _iso(started_utc),
@@ -2298,7 +2650,7 @@ class NativeHistoryAcquirer:
             )
             as_of_ns = pd.Timestamp(self.as_of_utc).value
             in_range = (
-                (combined.index >= pd.Timestamp(self.common_start_utc))
+                (combined.index >= pd.Timestamp(cell_requested_start))
                 & (close_ns <= as_of_ns)
             )
             combined = combined.loc[in_range].copy()
@@ -2367,7 +2719,7 @@ class NativeHistoryAcquirer:
         actual_last_close = pd.Timestamp(combined["_BAR_CLOSE_TS"].iloc[-1]).to_pydatetime()
         base_record["request"]["last_fully_closed_bar_open_utc"] = _iso(actual_last)
         tolerance = boundary_tolerance
-        coverage_start = self.common_start_utc if broker_session_aligned else native_start
+        coverage_start = cell_requested_start if broker_session_aligned else native_start
         coverage_end = self.as_of_utc if broker_session_aligned else fetch_end_exclusive
         start_delay = max(timedelta(0), actual_first - coverage_start)
         end_lag = max(timedelta(0), coverage_end - actual_last_close)
@@ -2409,7 +2761,7 @@ class NativeHistoryAcquirer:
         }
         session_coverage, session_coverage_details = segmented_session_coverage_by_partition_v2(
             combined,
-            self.partition_windows,
+            cell_partition_windows,
         )
         coverage_partitions = (
             session_coverage_details.get("partitions", {})
@@ -2733,6 +3085,49 @@ class NativeHistoryAcquirer:
             }
 
         completed = _utc(self.now_fn())
+        compatibility_timeframe = (
+            "M5" if "M5" in self.request.timeframes else self.request.timeframes[0]
+        )
+        manifest_request: Dict[str, Any] = {
+            "symbols": list(self.request.symbols),
+            "timeframes": list(self.request.timeframes),
+            "horizon_years": int(self.request.horizon_years),
+            "requested_information_cutoff_utc": _iso(
+                self.requested_information_cutoff_utc
+            ),
+            "requested_horizon_start_utc": _iso(self.requested_horizon_start_utc),
+            "common_requested_start_utc": _iso(self.common_start_utc),
+            "required_evidence_lead_start_utc": _iso(
+                self.required_evidence_lead_start_utc
+            ),
+            "warmup_days": float(self.request.warmup_days),
+            "safety_days": float(self.request.safety_days),
+            "closed_bar_slack_seconds": max(
+                TIMEFRAME_SECONDS[tf] for tf in self.request.timeframes
+            ),
+            "common_as_of_utc": _iso(self.as_of_utc),
+            "retries": int(self.request.retries),
+            "boundary_tolerance_days": float(self.request.boundary_tolerance_days),
+            "window_years": (
+                dict(
+                    (self.request.timeframe_window_years or {})[
+                        compatibility_timeframe
+                    ]
+                )
+                if self.window_contract_version
+                == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+                else dict(self.request.window_years or {})
+            ),
+            "embargo_days": float(self.request.embargo_days),
+            "common_calendar_boundaries": {
+                partition: {"start_ts": _iso(start), "end_ts": _iso(end)}
+                for partition, (start, end) in self.timeframe_partition_windows[
+                    compatibility_timeframe
+                ].items()
+            },
+        }
+        if self.window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            manifest_request.update(self._v3_request_fields())
         manifest: Dict[str, Any] = {
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "immutable_record": True,
@@ -2740,35 +3135,7 @@ class NativeHistoryAcquirer:
             "run_id": self.store.run_id,
             "acquisition_started_utc": _iso(started),
             "acquisition_completed_utc": _iso(completed),
-            "request": {
-                "symbols": list(self.request.symbols),
-                "timeframes": list(self.request.timeframes),
-                "horizon_years": int(self.request.horizon_years),
-                "requested_information_cutoff_utc": _iso(
-                    self.requested_information_cutoff_utc
-                ),
-                "requested_horizon_start_utc": _iso(self.requested_horizon_start_utc),
-                "common_requested_start_utc": _iso(self.common_start_utc),
-                "required_evidence_lead_start_utc": _iso(
-                    self.required_evidence_lead_start_utc
-                ),
-                "warmup_days": float(self.request.warmup_days),
-                "safety_days": float(self.request.safety_days),
-                "closed_bar_slack_seconds": max(
-                    TIMEFRAME_SECONDS[tf] for tf in self.request.timeframes
-                ),
-                "common_as_of_utc": _iso(self.as_of_utc),
-                "retries": int(self.request.retries),
-                "boundary_tolerance_days": float(
-                    self.request.boundary_tolerance_days
-                ),
-                "window_years": dict(self.request.window_years or {}),
-                "embargo_days": float(self.request.embargo_days),
-                "common_calendar_boundaries": {
-                    partition: {"start_ts": _iso(start), "end_ts": _iso(end)}
-                    for partition, (start, end) in self.partition_windows.items()
-                },
-            },
+            "request": manifest_request,
             "source_environment": _json_safe(self.runtime_metadata),
             "results": results,
             "counts": status_counts,
@@ -2827,6 +3194,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-years", type=int)
     parser.add_argument("--tuning-years", type=int)
     parser.add_argument("--lockbox-years", type=int)
+    parser.add_argument(
+        "--timeframe-window-years-json",
+        help=(
+            "Nested timeframe/partition year map as inline JSON or a JSON file. "
+            "Defaults new runs to the non-weakenable v3 timeframe matrix."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-flat-windows",
+        action="store_true",
+        help=(
+            "Explicitly reproduce the legacy flat window contract. Supplying "
+            "--years/--train-years/--tuning-years/--lockbox-years also selects it."
+        ),
+    )
     parser.add_argument("--embargo-days", type=float)
     parser.add_argument("--warmup-days", type=float)
     parser.add_argument("--safety-days", type=float)
@@ -2863,6 +3245,28 @@ def _build_parser() -> argparse.ArgumentParser:
 def _filtered_dataclass_kwargs(dataclass_type: Any, values: Mapping[str, Any]) -> Dict[str, Any]:
     allowed = {item.name for item in fields(dataclass_type)}
     return {key: value for key, value in dict(values or {}).items() if key in allowed}
+
+
+def _load_nested_window_option(
+    value: Optional[str],
+    *,
+    config_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        raise ValueError("--timeframe-window-years-json cannot be empty")
+    if text.startswith("{"):
+        parsed = json.loads(text)
+    else:
+        path = Path(text)
+        if not path.is_absolute():
+            path = config_dir / path
+        parsed = _load_config(path.resolve())
+    if not isinstance(parsed, dict):
+        raise ValueError("timeframe window years JSON must be an object")
+    return parsed
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2913,10 +3317,52 @@ def _main_with_args(
         if isinstance(pipeline_config.get("evidence_window_years"), Mapping)
         else {}
     )
+    configured_timeframe_windows = (
+        pipeline_config.get("evidence_timeframe_window_years")
+        if isinstance(
+            pipeline_config.get("evidence_timeframe_window_years"), Mapping
+        )
+        else None
+    )
+    nested_cli_windows = _load_nested_window_option(
+        args.timeframe_window_years_json,
+        config_dir=config_path.parent,
+    )
+    flat_cli_supplied = any(
+        value is not None
+        for value in (
+            args.years,
+            args.train_years,
+            args.tuning_years,
+            args.lockbox_years,
+        )
+    )
+    if nested_cli_windows is not None and (args.legacy_flat_windows or flat_cli_supplied):
+        raise ValueError(
+            "nested timeframe windows cannot be combined with legacy flat-window options"
+        )
     resume_contract: Optional[NativeHistoryResumeContract] = None
     if args.resume:
         resume_contract = load_native_history_resume_contract(output_root, args.run_id)
         locked = dict(resume_contract.request)
+        window_contract_version = str(
+            locked.get("window_contract_version")
+            or LEGACY_FLAT_WINDOW_CONTRACT_VERSION
+        )
+        if (
+            window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+            and (args.legacy_flat_windows or flat_cli_supplied)
+        ):
+            raise ResumeValidationError(
+                "legacy flat-window options cannot resume a v3 timeframe-window run"
+            )
+        if (
+            window_contract_version == LEGACY_FLAT_WINDOW_CONTRACT_VERSION
+            and nested_cli_windows is not None
+        ):
+            raise ResumeValidationError(
+                "nested timeframe windows cannot resume a legacy flat-window run"
+            )
         original_cutoff = parse_utc_datetime(
             str(locked["requested_information_cutoff_utc"])
         )
@@ -2924,20 +3370,8 @@ def _main_with_args(
             raise ResumeValidationError(
                 "--as-of must exactly equal the original requested information cutoff"
             )
-        explicit_checks = {
+        explicit_checks: Dict[str, Tuple[Any, Any]] = {
             "--years": (args.years, int(locked["horizon_years"])),
-            "--train-years": (
-                args.train_years,
-                int(locked["window_years"]["optimizer_train"]),
-            ),
-            "--tuning-years": (
-                args.tuning_years,
-                int(locked["window_years"]["tuning_validation"]),
-            ),
-            "--lockbox-years": (
-                args.lockbox_years,
-                int(locked["window_years"]["final_lockbox"]),
-            ),
             "--embargo-days": (args.embargo_days, float(locked["embargo_days"])),
             "--warmup-days": (args.warmup_days, float(locked["warmup_days"])),
             "--safety-days": (args.safety_days, float(locked["safety_days"])),
@@ -2946,6 +3380,23 @@ def _main_with_args(
                 float(locked["boundary_tolerance_days"]),
             ),
         }
+        if window_contract_version == LEGACY_FLAT_WINDOW_CONTRACT_VERSION:
+            explicit_checks.update(
+                {
+                    "--train-years": (
+                        args.train_years,
+                        int(locked["window_years"]["optimizer_train"]),
+                    ),
+                    "--tuning-years": (
+                        args.tuning_years,
+                        int(locked["window_years"]["tuning_validation"]),
+                    ),
+                    "--lockbox-years": (
+                        args.lockbox_years,
+                        int(locked["window_years"]["final_lockbox"]),
+                    ),
+                }
+            )
         for option, (supplied, expected) in explicit_checks.items():
             if supplied is not None and supplied != expected:
                 raise ResumeValidationError(
@@ -2965,7 +3416,33 @@ def _main_with_args(
             )
         as_of = original_cutoff
         horizon_years = int(locked["horizon_years"])
-        window_years = dict(locked["window_years"])
+        if window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            locked_timeframe_years = locked.get("timeframe_window_years")
+            if not isinstance(locked_timeframe_years, Mapping):
+                raise ResumeValidationError(
+                    "v3 resume contract has no timeframe window matrix"
+                )
+            timeframe_window_years = {
+                str(timeframe): dict(years)
+                for timeframe, years in locked_timeframe_years.items()
+                if isinstance(years, Mapping)
+            }
+            if nested_cli_windows is not None:
+                normalized_supplied = normalize_timeframe_window_years(
+                    nested_cli_windows
+                )
+                supplied_active = {
+                    timeframe.upper(): dict(normalized_supplied[timeframe.upper()])
+                    for timeframe in timeframes
+                }
+                if supplied_active != timeframe_window_years:
+                    raise ResumeValidationError(
+                        "--timeframe-window-years-json differs from the original v3 map"
+                    )
+            window_years = dict(DEFAULT_WINDOW_YEARS)
+        else:
+            timeframe_window_years = None
+            window_years = dict(locked["window_years"])
         embargo_days = float(locked["embargo_days"])
         warmup_days = float(locked["warmup_days"])
         safety_days = float(locked["safety_days"])
@@ -2974,29 +3451,58 @@ def _main_with_args(
     else:
         as_of = parse_utc_datetime(args.as_of) if args.as_of else datetime.now(timezone.utc)
         horizon_years = args.years if args.years is not None else 10
-        window_years = {
-            "optimizer_train": (
-                args.train_years
-                if args.train_years is not None
-                else configured_windows.get(
-                    "optimizer_train", DEFAULT_WINDOW_YEARS["optimizer_train"]
-                )
-            ),
-            "tuning_validation": (
-                args.tuning_years
-                if args.tuning_years is not None
-                else configured_windows.get(
-                    "tuning_validation", DEFAULT_WINDOW_YEARS["tuning_validation"]
-                )
-            ),
-            "final_lockbox": (
-                args.lockbox_years
-                if args.lockbox_years is not None
-                else configured_windows.get(
-                    "final_lockbox", DEFAULT_WINDOW_YEARS["final_lockbox"]
-                )
-            ),
-        }
+        configured_contract = str(
+            pipeline_config.get("native_history_window_contract") or ""
+        ).strip()
+        legacy_flat = bool(
+            args.legacy_flat_windows
+            or flat_cli_supplied
+            or configured_contract == LEGACY_FLAT_WINDOW_CONTRACT_VERSION
+        )
+        if configured_contract and configured_contract not in {
+            LEGACY_FLAT_WINDOW_CONTRACT_VERSION,
+            TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        }:
+            raise ValueError(
+                "pipeline.native_history_window_contract must be "
+                f"{LEGACY_FLAT_WINDOW_CONTRACT_VERSION!r} or "
+                f"{TIMEFRAME_EVIDENCE_CONTRACT_VERSION!r}"
+            )
+        if legacy_flat:
+            window_contract_version = LEGACY_FLAT_WINDOW_CONTRACT_VERSION
+            timeframe_window_years = None
+            window_years = {
+                "optimizer_train": (
+                    args.train_years
+                    if args.train_years is not None
+                    else configured_windows.get(
+                        "optimizer_train", DEFAULT_WINDOW_YEARS["optimizer_train"]
+                    )
+                ),
+                "tuning_validation": (
+                    args.tuning_years
+                    if args.tuning_years is not None
+                    else configured_windows.get(
+                        "tuning_validation", DEFAULT_WINDOW_YEARS["tuning_validation"]
+                    )
+                ),
+                "final_lockbox": (
+                    args.lockbox_years
+                    if args.lockbox_years is not None
+                    else configured_windows.get(
+                        "final_lockbox", DEFAULT_WINDOW_YEARS["final_lockbox"]
+                    )
+                ),
+            }
+        else:
+            window_contract_version = TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+            timeframe_window_years = (
+                nested_cli_windows
+                if nested_cli_windows is not None
+                else configured_timeframe_windows
+            )
+            # Retained only as a compatibility projection in v3 artifacts.
+            window_years = dict(DEFAULT_WINDOW_YEARS)
         if args.embargo_days is not None:
             embargo_days = args.embargo_days
         else:
@@ -3038,6 +3544,8 @@ def _main_with_args(
         retries=args.retries,
         retry_sleep_seconds=args.retry_sleep_seconds,
         window_years=window_years,
+        timeframe_window_years=timeframe_window_years,
+        window_contract_version=window_contract_version,
         embargo_days=embargo_days,
         warmup_days=warmup_days,
         safety_days=safety_days,
@@ -3051,6 +3559,15 @@ def _main_with_args(
         "timeframes": list(request.timeframes),
         "horizon_years": request.horizon_years,
         "window_years": dict(request.window_years or {}),
+        "window_contract_version": request.window_contract_version,
+        "timeframe_window_years": (
+            {
+                timeframe: dict(years)
+                for timeframe, years in (request.timeframe_window_years or {}).items()
+            }
+            if request.timeframe_window_years is not None
+            else None
+        ),
         "embargo_days": float(request.embargo_days),
         "warmup_days": float(request.warmup_days),
         "safety_days": float(request.safety_days),
