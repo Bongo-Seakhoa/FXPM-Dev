@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import pm_pipeline
 from pm_core import PipelineConfig
 from pm_evidence import (
     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
@@ -21,6 +22,74 @@ from pm_pipeline import (
     SymbolConfig,
     build_artifact_meta,
 )
+from pm_memory_governor import TaskOutcome
+
+
+def _install_fake_governor(
+    monkeypatch: pytest.MonkeyPatch,
+    run_symbol,
+) -> None:
+    """Drive the parent integration contract without bypassing its worker seam."""
+
+    class FakeMemoryGovernor:
+        def __init__(self, **_kwargs):
+            pass
+
+        def iter_completed(self, worker, tasks):
+            assert worker is pm_pipeline._governed_optimize_symbol_worker
+            for task in tasks:
+                (
+                    _config_dict,
+                    _runtime_bindings,
+                    symbol,
+                    generation_id,
+                    receipt_value,
+                ) = task.args
+                result = run_symbol(symbol)
+                if not result.success or result.config is None:
+                    detail = str(result.error_message or "injected technical failure")
+                    memory = pm_pipeline.is_memory_failure(detail)
+                    yield TaskOutcome(
+                        task_key=symbol,
+                        status="FAILED_MEMORY" if memory else "FAILED_TECHNICAL",
+                        error_type="InjectedMemoryError" if memory else "InjectedError",
+                        error_message=detail,
+                        technical_failure=True,
+                        memory_failure=memory,
+                    )
+                    continue
+                receipt = {
+                    "schema_version": pm_pipeline.OPTIMIZER_RECEIPT_SCHEMA,
+                    "generation_id": generation_id,
+                    "symbol": symbol,
+                    "config": result.config.to_dict(),
+                    "counters": {
+                        "duration_seconds": float(result.duration_seconds),
+                        "strategies_tested": int(result.strategies_tested),
+                        "timeframes_tested": int(result.timeframes_tested),
+                        "param_combos_tested": int(result.param_combos_tested),
+                        "regime_winners": int(result.regime_winners),
+                    },
+                }
+                receipt_path = Path(receipt_value)
+                digest, byte_count = pm_pipeline._atomic_write_optimizer_receipt(
+                    receipt_path,
+                    receipt,
+                )
+                yield TaskOutcome(
+                    task_key=symbol,
+                    status="COMPLETED",
+                    value={
+                        "schema_version": pm_pipeline.OPTIMIZER_RECEIPT_POINTER_SCHEMA,
+                        "generation_id": generation_id,
+                        "symbol": symbol,
+                        "path": str(receipt_path.resolve()),
+                        "sha256": digest,
+                        "bytes": byte_count,
+                    },
+                )
+
+    monkeypatch.setattr(pm_pipeline, "MemoryGovernor", FakeMemoryGovernor)
 
 
 class _MixedUniverse:
@@ -362,6 +431,10 @@ def test_optimizer_infrastructure_failure_does_not_mutate_existing_ledger(
     monkeypatch.setattr(
         manager.pipeline,
         "run_for_symbol",
+        lambda _symbol: pytest.fail("parent pipeline.run_for_symbol bypassed governor"),
+    )
+    _install_fake_governor(
+        monkeypatch,
         lambda symbol: PipelineResult(
             symbol=symbol,
             success=False,
@@ -437,7 +510,12 @@ def test_successful_symbol_is_not_persisted_when_sibling_fails_generation(
             error_message="simulated worker OOM",
         )
 
-    monkeypatch.setattr(manager.pipeline, "run_for_symbol", run)
+    monkeypatch.setattr(
+        manager.pipeline,
+        "run_for_symbol",
+        lambda _symbol: pytest.fail("parent pipeline.run_for_symbol bypassed governor"),
+    )
+    _install_fake_governor(monkeypatch, run)
     results = manager.initial_optimization(overwrite=True)
 
     assert results["EURUSD"].success
@@ -499,6 +577,10 @@ def test_complete_generation_promotes_whole_ledger_once(
     monkeypatch.setattr(
         manager.pipeline,
         "run_for_symbol",
+        lambda _symbol: pytest.fail("parent pipeline.run_for_symbol bypassed governor"),
+    )
+    _install_fake_governor(
+        monkeypatch,
         lambda symbol: PipelineResult(
             symbol=symbol,
             success=True,

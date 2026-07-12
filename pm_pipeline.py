@@ -24,8 +24,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Callable
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, List, Any, Optional, Tuple, Iterable, Mapping
 from itertools import product
 from dataclasses import dataclass, field, fields, replace
 
@@ -96,6 +95,11 @@ from pm_native_activation import (
     validate_native_cell_exclusion_no_trade,
     validate_native_exclusion_no_trade_grid,
 )
+from pm_memory_governor import (
+    MemoryGovernor,
+    MemoryTask,
+    is_memory_failure,
+)
 
 # Import Optuna TPE optimizer
 try:
@@ -131,6 +135,21 @@ except ImportError:
 # Configure module logger
 logger = logging.getLogger(__name__)
 PIPELINE_ARTIFACT_VERSION = "2026-07-11-two-book-nonoverlap-deployment-v5"
+
+# Runtime-only optimizer resource contract.  These values control scheduling
+# and failure isolation only; they never alter bars, features, trials, scoring,
+# or promotion decisions and are intentionally absent from PipelineConfig.
+OPTIMIZER_RECEIPT_SCHEMA = "fxpm.optimizer-symbol-receipt.v1"
+OPTIMIZER_RECEIPT_POINTER_SCHEMA = "fxpm.optimizer-symbol-receipt-pointer.v1"
+FEATURE_PRECOMPUTE_RESULT_SCHEMA = "fxpm.feature-precompute-result.v1"
+OPTIMIZER_MEMORY_RESERVE_BYTES = 1 * 1024 * 1024 * 1024
+OPTIMIZER_TASK_TIMEOUT_SECONDS = 4 * 60 * 60
+OPTIMIZER_WORKER_START_TIMEOUT_SECONDS = 180.0
+OPTIMIZER_ADMISSION_TIMEOUT_SECONDS = 60.0
+OPTIMIZER_TERMINATION_GRACE_SECONDS = 5.0
+OPTIMIZER_ESTIMATE_BASE_BYTES = 512 * 1024 * 1024
+OPTIMIZER_ESTIMATE_FALLBACK_BYTES = 1 * 1024 * 1024 * 1024
+OPTIMIZER_NATIVE_INPUT_MULTIPLIER = 16
 
 
 def _stable_seed(*parts: Any) -> int:
@@ -869,34 +888,373 @@ def _pipeline_config_to_dict(config: PipelineConfig) -> Dict[str, Any]:
     return cfg
 
 
-def _optimize_symbol_worker(config_dict: Dict[str, Any], symbol: str) -> Tuple[str, 'PipelineResult']:
-    """Worker for parallel optimization."""
+def _pipeline_runtime_bindings(config: PipelineConfig) -> Dict[str, Any]:
+    """Serialize the only non-dataclass deployment bindings children require."""
+
+    return {
+        "deployment_config_path": str(
+            getattr(config, "_deployment_config_path", "") or ""
+        ),
+        "funded_live_execution": bool(
+            getattr(config, "_funded_live_execution", False)
+        ),
+    }
+
+
+def _restore_pipeline_runtime_bindings(
+    config: PipelineConfig,
+    bindings: Mapping[str, Any],
+) -> None:
+    """Restore an exact allowlist; arbitrary parent attributes never cross spawn."""
+
+    expected = {"deployment_config_path", "funded_live_execution"}
+    if not isinstance(bindings, Mapping) or set(bindings) != expected:
+        raise RuntimeError("OPTIMIZER_RUNTIME_BINDINGS_INVALID")
+    config._deployment_config_path = str(bindings["deployment_config_path"] or "")
+    config._funded_live_execution = bool(bindings["funded_live_execution"])
+
+
+def _native_artifact_input_bytes(
+    config: PipelineConfig,
+    symbol: str,
+    universe: Any = None,
+) -> int:
+    """Return authenticated active-native input bytes without loading a frame."""
+
+    if universe is None or not bool(getattr(universe, "explicit_contract", False)):
+        return 0
+    canonical = str(symbol or "").strip().upper()
+    entries = getattr(universe, "entries", {}) or {}
+    symbol_entries = entries.get(canonical) if isinstance(entries, Mapping) else None
+    if not isinstance(symbol_entries, Mapping):
+        return 0
+    try:
+        active_timeframes = tuple(universe.active_timeframes(canonical))
+    except Exception:
+        active_timeframes = tuple(
+            str(tf).upper()
+            for tf, entry in symbol_entries.items()
+            if isinstance(entry, Mapping)
+            and str(entry.get("status") or "").strip().lower() == "active"
+        )
+    native_root = (Path(config.data_dir) / "native").resolve()
+    total = 0
+    for timeframe in active_timeframes:
+        entry = symbol_entries.get(str(timeframe).upper())
+        if not isinstance(entry, Mapping):
+            continue
+        relative = entry.get("bars_relative_path")
+        if not relative:
+            continue
+        try:
+            path = (native_root / str(relative)).resolve(strict=True)
+            path.relative_to(native_root)
+            if path.is_file() and not path.is_symlink():
+                total += max(0, int(path.stat().st_size))
+        except (OSError, ValueError):
+            continue
+    return int(total)
+
+
+def _optimizer_peak_estimate_bytes(
+    config: PipelineConfig,
+    symbol: str,
+    universe: Any = None,
+) -> int:
+    """Conservative, monotone bootstrap estimate from native artifact bytes."""
+
+    source_bytes = _native_artifact_input_bytes(config, symbol, universe)
+    if source_bytes <= 0:
+        return OPTIMIZER_ESTIMATE_FALLBACK_BYTES
+    return (
+        OPTIMIZER_ESTIMATE_BASE_BYTES
+        + OPTIMIZER_NATIVE_INPUT_MULTIPLIER * int(source_bytes)
+    )
+
+
+def _ordered_optimizer_memory_work(
+    config: PipelineConfig,
+    symbols: Iterable[str],
+    universe: Any = None,
+) -> List[Tuple[str, int]]:
+    """Schedule the largest authenticated inputs first to calibrate safely."""
+
+    work = [
+        (str(symbol), _optimizer_peak_estimate_bytes(config, str(symbol), universe))
+        for symbol in symbols
+    ]
+    return sorted(work, key=lambda item: (-int(item[1]), item[0]))
+
+
+def _new_optimizer_memory_governor(requested_workers: int) -> MemoryGovernor:
+    """Construct the mandatory runtime governor from code-owned safety policy."""
+
+    return MemoryGovernor(
+        requested_workers=max(1, int(requested_workers)),
+        reserve_bytes=OPTIMIZER_MEMORY_RESERVE_BYTES,
+        task_timeout_seconds=OPTIMIZER_TASK_TIMEOUT_SECONDS,
+        worker_start_timeout_seconds=OPTIMIZER_WORKER_START_TIMEOUT_SECONDS,
+        admission_timeout_seconds=OPTIMIZER_ADMISSION_TIMEOUT_SECONDS,
+        termination_grace_seconds=OPTIMIZER_TERMINATION_GRACE_SECONDS,
+    )
+
+
+def _optimizer_receipt_base(config_file: Path) -> Path:
+    ledger_path = Path(config_file)
+    if not ledger_path.is_absolute():
+        ledger_path = Path.cwd() / ledger_path
+    ledger_path = ledger_path.resolve()
+    return ledger_path.with_name(f".{ledger_path.name}.optimizer-receipts")
+
+
+def _optimizer_receipt_root(config_file: Path, generation_id: str) -> Path:
+    generation_digest = hashlib.sha256(
+        str(generation_id).encode("utf-8", errors="strict")
+    ).hexdigest()[:24]
+    return _optimizer_receipt_base(config_file) / generation_digest
+
+
+def _optimizer_receipt_path(
+    config_file: Path,
+    generation_id: str,
+    symbol: str,
+) -> Path:
+    symbol_digest = hashlib.sha256(
+        str(symbol).encode("utf-8", errors="strict")
+    ).hexdigest()[:24]
+    return (
+        _optimizer_receipt_root(config_file, generation_id)
+        / f"{symbol_digest}.receipt.json"
+    )
+
+
+def _optimizer_receipt_temp_path(receipt_path: Path) -> Path:
+    return Path(receipt_path).with_name(f".{Path(receipt_path).name}.tmp")
+
+
+def _cleanup_optimizer_receipts(paths: Iterable[Path]) -> None:
+    """Remove only the exact fixed files allocated by this optimization run."""
+
+    roots = set()
+    for candidate in paths:
+        path = Path(candidate)
+        roots.add(path.parent)
+        for exact in (path, _optimizer_receipt_temp_path(path)):
+            try:
+                exact.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove optimizer receipt scratch file %s", exact)
+    for root in roots:
+        try:
+            root.rmdir()
+        except OSError:
+            # A non-empty directory may contain a receipt owned by another run
+            # or an unrelated file.  Never recurse or delete it.
+            pass
+        try:
+            root.parent.rmdir()
+        except OSError:
+            pass
+
+
+def _atomic_write_optimizer_receipt(path: Path, payload: Mapping[str, Any]) -> Tuple[str, int]:
+    """Write one fixed receipt atomically and return its content identity."""
+
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = _optimizer_receipt_temp_path(target)
+    encoded = json.dumps(
+        dict(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    try:
+        with temp.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, target)
+    finally:
+        temp.unlink(missing_ok=True)
+    return hashlib.sha256(encoded).hexdigest(), len(encoded)
+
+
+def _raise_worker_failure(message: str) -> None:
+    detail = str(message or "optimizer returned an unsuccessful result")
+    if is_memory_failure(detail):
+        raise MemoryError(detail)
+    raise RuntimeError(detail)
+
+
+def _governed_optimize_symbol_worker(
+    config_dict: Dict[str, Any],
+    runtime_bindings: Mapping[str, Any],
+    symbol: str,
+    generation_id: str,
+    receipt_path: str,
+) -> Dict[str, Any]:
+    """Spawn-safe complete-symbol worker returning only a compact receipt pointer."""
+
     try:
         cfg = PipelineConfig(**config_dict)
+        _restore_pipeline_runtime_bindings(cfg, runtime_bindings)
         pipeline = OptimizationPipeline(cfg)
         result = pipeline.run_for_symbol(symbol)
-        return symbol, result
+        if not result.success or result.config is None:
+            _raise_worker_failure(result.error_message)
+        counters = {
+            "duration_seconds": float(result.duration_seconds),
+            "strategies_tested": int(result.strategies_tested),
+            "timeframes_tested": int(result.timeframes_tested),
+            "param_combos_tested": int(result.param_combos_tested),
+            "regime_winners": int(result.regime_winners),
+        }
+        receipt = {
+            "schema_version": OPTIMIZER_RECEIPT_SCHEMA,
+            "generation_id": str(generation_id),
+            "symbol": str(symbol),
+            "config": result.config.to_dict(),
+            "counters": counters,
+        }
+        resolved_receipt = Path(receipt_path).resolve()
+        digest, byte_count = _atomic_write_optimizer_receipt(
+            resolved_receipt,
+            receipt,
+        )
+        return {
+            "schema_version": OPTIMIZER_RECEIPT_POINTER_SCHEMA,
+            "generation_id": str(generation_id),
+            "symbol": str(symbol),
+            "path": str(resolved_receipt),
+            "sha256": digest,
+            "bytes": int(byte_count),
+        }
     except Exception as exc:
-        return symbol, PipelineResult(symbol=symbol, success=False, error_message=str(exc))
+        if isinstance(exc, MemoryError):
+            raise
+        if is_memory_failure(type(exc).__name__) or is_memory_failure(str(exc)):
+            raise MemoryError(str(exc)) from exc
+        raise
     finally:
         FeatureComputer.clear_cache()
 
 
-def _precompute_feature_cache_worker(config_dict: Dict[str, Any], symbol: str) -> Tuple[str, Dict[str, Any]]:
-    """Worker for disk-backed feature-cache precompute."""
+def _governed_precompute_feature_cache_worker(
+    config_dict: Dict[str, Any],
+    runtime_bindings: Mapping[str, Any],
+    symbol: str,
+) -> Dict[str, Any]:
+    """Spawn-safe feature precompute worker with explicit technical failures."""
+
     try:
         cfg = PipelineConfig(**config_dict)
+        _restore_pipeline_runtime_bindings(cfg, runtime_bindings)
         pipeline = OptimizationPipeline(cfg)
         stats = pipeline.precompute_feature_cache([symbol])
-        return symbol, stats
-    except Exception as exc:
-        return symbol, {
-            "symbols_requested": 1,
-            "symbols_failed": 1,
-            "errors": {symbol: str(exc)},
+        errors = dict(stats.get("errors", {}) or {})
+        if int(stats.get("symbols_failed", 0) or 0) or errors:
+            detail = str(errors.get(symbol) or next(iter(errors.values()), "feature precompute failed"))
+            _raise_worker_failure(detail)
+        return {
+            "schema_version": FEATURE_PRECOMPUTE_RESULT_SCHEMA,
+            "symbol": str(symbol),
+            "symbols_completed": int(stats.get("symbols_completed", 0) or 0),
+            "timeframes_computed_or_retrieved": int(
+                stats.get("timeframes_computed_or_retrieved", 0) or 0
+            ),
+            "feature_cache": dict(stats.get("feature_cache", {}) or {}),
         }
+    except Exception as exc:
+        if isinstance(exc, MemoryError):
+            raise
+        if is_memory_failure(type(exc).__name__) or is_memory_failure(str(exc)):
+            raise MemoryError(str(exc)) from exc
+        raise
     finally:
         FeatureComputer.clear_cache()
+
+
+def _consume_optimizer_receipt(
+    pointer: Any,
+    *,
+    expected_generation_id: str,
+    expected_symbol: str,
+    expected_path: Path,
+) -> 'PipelineResult':
+    """Verify, deserialize, and immediately unlink one child receipt."""
+
+    path = Path(expected_path).resolve()
+    try:
+        if not isinstance(pointer, Mapping):
+            raise RuntimeError("OPTIMIZER_RECEIPT_POINTER_NOT_OBJECT")
+        expected_pointer_keys = {
+            "schema_version", "generation_id", "symbol", "path", "sha256", "bytes"
+        }
+        if set(pointer) != expected_pointer_keys:
+            raise RuntimeError("OPTIMIZER_RECEIPT_POINTER_FIELDS_INVALID")
+        if str(pointer.get("schema_version")) != OPTIMIZER_RECEIPT_POINTER_SCHEMA:
+            raise RuntimeError("OPTIMIZER_RECEIPT_POINTER_SCHEMA_INVALID")
+        if str(pointer.get("generation_id")) != str(expected_generation_id):
+            raise RuntimeError("OPTIMIZER_RECEIPT_POINTER_GENERATION_MISMATCH")
+        if str(pointer.get("symbol")) != str(expected_symbol):
+            raise RuntimeError("OPTIMIZER_RECEIPT_POINTER_SYMBOL_MISMATCH")
+        try:
+            observed_pointer_path = Path(str(pointer.get("path"))).resolve()
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("OPTIMIZER_RECEIPT_POINTER_PATH_INVALID") from exc
+        if observed_pointer_path != path:
+            raise RuntimeError("OPTIMIZER_RECEIPT_POINTER_PATH_MISMATCH")
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("OPTIMIZER_RECEIPT_FILE_MISSING_OR_UNSAFE")
+        encoded = path.read_bytes()
+        if int(pointer.get("bytes", -1)) != len(encoded):
+            raise RuntimeError("OPTIMIZER_RECEIPT_SIZE_MISMATCH")
+        if hashlib.sha256(encoded).hexdigest() != str(pointer.get("sha256") or "").lower():
+            raise RuntimeError("OPTIMIZER_RECEIPT_HASH_MISMATCH")
+        try:
+            receipt = json.loads(encoded.decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError("OPTIMIZER_RECEIPT_JSON_INVALID") from exc
+        expected_receipt_keys = {
+            "schema_version", "generation_id", "symbol", "config", "counters"
+        }
+        if not isinstance(receipt, dict) or set(receipt) != expected_receipt_keys:
+            raise RuntimeError("OPTIMIZER_RECEIPT_FIELDS_INVALID")
+        if str(receipt.get("schema_version")) != OPTIMIZER_RECEIPT_SCHEMA:
+            raise RuntimeError("OPTIMIZER_RECEIPT_SCHEMA_INVALID")
+        if str(receipt.get("generation_id")) != str(expected_generation_id):
+            raise RuntimeError("OPTIMIZER_RECEIPT_GENERATION_MISMATCH")
+        if str(receipt.get("symbol")) != str(expected_symbol):
+            raise RuntimeError("OPTIMIZER_RECEIPT_SYMBOL_MISMATCH")
+        config_payload = receipt.get("config")
+        if not isinstance(config_payload, dict):
+            raise RuntimeError("OPTIMIZER_RECEIPT_CONFIG_INVALID")
+        config = SymbolConfig.from_dict(config_payload)
+        if str(config.symbol) != str(expected_symbol):
+            raise RuntimeError("OPTIMIZER_RECEIPT_CONFIG_SYMBOL_MISMATCH")
+        counters = receipt.get("counters")
+        expected_counter_keys = {
+            "duration_seconds", "strategies_tested", "timeframes_tested",
+            "param_combos_tested", "regime_winners",
+        }
+        if not isinstance(counters, dict) or set(counters) != expected_counter_keys:
+            raise RuntimeError("OPTIMIZER_RECEIPT_COUNTERS_INVALID")
+        return PipelineResult(
+            symbol=str(expected_symbol),
+            success=True,
+            config=config,
+            duration_seconds=float(counters["duration_seconds"]),
+            strategies_tested=int(counters["strategies_tested"]),
+            timeframes_tested=int(counters["timeframes_tested"]),
+            param_combos_tested=int(counters["param_combos_tested"]),
+            regime_winners=int(counters["regime_winners"]),
+            data_window_meta=dict(config.data_window_meta or {}),
+        )
+    finally:
+        path.unlink(missing_ok=True)
+        _optimizer_receipt_temp_path(path).unlink(missing_ok=True)
 
 
 # =============================================================================
@@ -10495,7 +10853,11 @@ class PortfolioManager:
         
         return results
 
-    def _precompute_feature_cache_for_symbols(self, symbols: List[str]) -> Dict[str, Any]:
+    def _precompute_feature_cache_for_symbols(
+        self,
+        symbols: List[str],
+        universe: Any = None,
+    ) -> Dict[str, Any]:
         """Precompute disk feature frames before strategy optimization starts."""
         if not symbols:
             return {}
@@ -10536,36 +10898,78 @@ class PortfolioManager:
             f"(workers={workers}, dir={getattr(self.config, 'feature_disk_cache_dir', '')})"
         )
 
-        if workers > 1 and len(symbols) > 1:
-            cfg_dict = _pipeline_config_to_dict(self.config)
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                future_map = {
-                    executor.submit(_precompute_feature_cache_worker, cfg_dict, symbol): symbol
-                    for symbol in symbols
-                }
-                future_iter = tqdm(as_completed(future_map), total=len(future_map), desc="Feature cache", unit="sym") if _TQDM else as_completed(future_map)
-                for future in future_iter:
-                    symbol = future_map[future]
-                    try:
-                        _sym, stats = future.result()
-                    except Exception as exc:
-                        stats = {"symbols_failed": 1, "errors": {symbol: str(exc)}}
-                    summary["symbols_completed"] += int(stats.get("symbols_completed", 0) or 0)
-                    summary["symbols_failed"] += int(stats.get("symbols_failed", 0) or 0)
-                    summary["timeframes_computed_or_retrieved"] += int(
-                        stats.get("timeframes_computed_or_retrieved", 0) or 0
+        cfg_dict = _pipeline_config_to_dict(self.config)
+        runtime_bindings = _pipeline_runtime_bindings(self.config)
+        work = _ordered_optimizer_memory_work(self.config, symbols, universe)
+        governor = _new_optimizer_memory_governor(workers)
+
+        def _tasks() -> Iterable[MemoryTask]:
+            for symbol, estimate in work:
+                yield MemoryTask(
+                    key=symbol,
+                    args=(cfg_dict, runtime_bindings, symbol),
+                    estimated_peak_bytes=estimate,
+                )
+
+        outcomes = governor.iter_completed(
+            _governed_precompute_feature_cache_worker,
+            _tasks(),
+        )
+        outcome_iter = (
+            tqdm(outcomes, total=len(work), desc="Feature cache", unit="sym")
+            if _TQDM else outcomes
+        )
+        requested_symbols = {symbol for symbol, _estimate in work}
+        terminal_symbols = set()
+        precompute_aborted = False
+        try:
+            for outcome in outcome_iter:
+                symbol = str(outcome.task_key)
+                if symbol not in requested_symbols:
+                    summary["errors"]["__GOVERNOR__"] = (
+                        "GOVERNOR_RETURNED_UNKNOWN_PRECOMPUTE_TASK_KEY"
                     )
-                    summary["errors"].update(dict(stats.get("errors", {}) or {}))
-                    _merge_feature_cache_stats(stats)
-        else:
-            stats = self.pipeline.precompute_feature_cache(symbols)
-            summary["symbols_completed"] += int(stats.get("symbols_completed", 0) or 0)
-            summary["symbols_failed"] += int(stats.get("symbols_failed", 0) or 0)
-            summary["timeframes_computed_or_retrieved"] += int(
-                stats.get("timeframes_computed_or_retrieved", 0) or 0
-            )
-            summary["errors"].update(dict(stats.get("errors", {}) or {}))
-            _merge_feature_cache_stats(stats)
+                    precompute_aborted = True
+                    break
+                terminal_symbols.add(symbol)
+                if outcome.status != "COMPLETED":
+                    summary["symbols_failed"] += 1
+                    summary["errors"][symbol] = (
+                        f"{outcome.status}:{outcome.error_type}:{outcome.error_message}"
+                    )
+                    precompute_aborted = True
+                    break
+                value = outcome.value
+                if (
+                    not isinstance(value, Mapping)
+                    or str(value.get("schema_version")) != FEATURE_PRECOMPUTE_RESULT_SCHEMA
+                    or str(value.get("symbol")) != str(symbol)
+                ):
+                    summary["symbols_failed"] += 1
+                    summary["errors"][symbol] = "INVALID_FEATURE_PRECOMPUTE_RESULT"
+                    precompute_aborted = True
+                    break
+                stats = dict(value)
+                summary["symbols_completed"] += int(
+                    stats.get("symbols_completed", 0) or 0
+                )
+                summary["timeframes_computed_or_retrieved"] += int(
+                    stats.get("timeframes_computed_or_retrieved", 0) or 0
+                )
+                _merge_feature_cache_stats(stats)
+        finally:
+            if hasattr(outcomes, "close"):
+                outcomes.close()
+
+        if precompute_aborted:
+            for symbol, _estimate in work:
+                if symbol in terminal_symbols:
+                    continue
+                summary["symbols_failed"] += 1
+                summary["errors"][symbol] = (
+                    "technical_not_run: feature precompute stopped after first "
+                    "technical failure"
+                )
 
         summary["duration_seconds"] = time.time() - started
         logger.info(
@@ -11068,88 +11472,123 @@ class PortfolioManager:
             return results
         
         max_workers = int(getattr(self.config, "optimization_max_workers", 1) or 1)
+        precompute_failed = False
         if (
             bool(getattr(self.config, "feature_disk_cache_enabled", False))
             and bool(getattr(self.config, "feature_disk_cache_precompute_enabled", False))
         ):
-            precompute_stats = self._precompute_feature_cache_for_symbols(to_optimize)
+            precompute_stats = self._precompute_feature_cache_for_symbols(
+                to_optimize,
+                universe,
+            )
             logger.info(f"Feature cache precompute summary: {precompute_stats}")
+            for symbol, detail in dict(precompute_stats.get("errors", {}) or {}).items():
+                precompute_failed = True
+                message = f"FEATURE_PRECOMPUTE_TECHNICAL:{detail}"
+                generation_manifest["technical_failures"][str(symbol)] = message
+                results[str(symbol)] = PipelineResult(
+                    symbol=str(symbol),
+                    success=False,
+                    error_message=message,
+                )
 
-        if max_workers > 1 and len(to_optimize) > 1:
-            cfg_dict = _pipeline_config_to_dict(self.config)
-            logger.info(f"Parallel optimization enabled: workers={max_workers}")
+        cfg_dict = _pipeline_config_to_dict(self.config)
+        runtime_bindings = _pipeline_runtime_bindings(self.config)
+        work = _ordered_optimizer_memory_work(self.config, to_optimize, universe)
+        receipt_paths = {
+            symbol: _optimizer_receipt_path(
+                self.config_file,
+                generation_id,
+                symbol,
+            )
+            for symbol, _estimate in work
+        }
+        _cleanup_optimizer_receipts(receipt_paths.values())
+        outcome_stream = None
+        optimization_aborted = bool(precompute_failed)
+        try:
+            if not precompute_failed:
+                logger.info(
+                    "Memory-governed optimization enabled: requested_workers=%d, "
+                    "reserve_bytes=%d",
+                    max_workers,
+                    OPTIMIZER_MEMORY_RESERVE_BYTES,
+                )
+                governor = _new_optimizer_memory_governor(max_workers)
 
-            completed = 0
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {
-                    executor.submit(_optimize_symbol_worker, cfg_dict, symbol): symbol
-                    for symbol in to_optimize
-                }
+                def _tasks() -> Iterable[MemoryTask]:
+                    for symbol, estimate in work:
+                        yield MemoryTask(
+                            key=symbol,
+                            args=(
+                                cfg_dict,
+                                runtime_bindings,
+                                symbol,
+                                generation_id,
+                                str(receipt_paths[symbol].resolve()),
+                            ),
+                            estimated_peak_bytes=estimate,
+                        )
 
-                future_iter = tqdm(as_completed(future_map), total=len(future_map), desc="Optimizing", unit="sym") if _TQDM else as_completed(future_map)
-                for future in future_iter:
-                    symbol = future_map[future]
+                outcome_stream = governor.iter_completed(
+                    _governed_optimize_symbol_worker,
+                    _tasks(),
+                )
+                outcome_iter = (
+                    tqdm(
+                        outcome_stream,
+                        total=len(work),
+                        desc="Optimizing",
+                        unit="sym",
+                    )
+                    if _TQDM else outcome_stream
+                )
+                completed = 0
+                for outcome in outcome_iter:
+                    symbol = str(outcome.task_key)
                     completed += 1
                     if not _TQDM:
-                        logger.info(f"\nProgress: {completed}/{len(to_optimize)}")
-
-                    try:
-                        sym, result = future.result()
-                        results[sym] = result
-                        symbol_for_save = sym
-                    except Exception as e:
-                        logger.exception(f"[{symbol}] Optimization error: {e}")
-                        results[symbol] = PipelineResult(symbol=symbol, success=False, error_message=str(e))
-                        symbol_for_save = symbol
+                        logger.info(f"\nProgress: {completed}/{len(work)}")
+                    if symbol not in receipt_paths:
+                        generation_manifest["technical_failures"]["__GOVERNOR__"] = (
+                            "GOVERNOR_RETURNED_UNKNOWN_TASK_KEY"
+                        )
+                        self._stage_optimization_generation(
+                            staged_configs,
+                            generation_manifest,
+                        )
+                        optimization_aborted = True
+                        break
+                    if outcome.status != "COMPLETED":
+                        detail = (
+                            f"{outcome.status}:{outcome.error_type}:"
+                            f"{outcome.error_message}"
+                        )
+                        result = PipelineResult(
+                            symbol=symbol,
+                            success=False,
+                            error_message=detail,
+                        )
+                    else:
+                        try:
+                            result = _consume_optimizer_receipt(
+                                outcome.value,
+                                expected_generation_id=generation_id,
+                                expected_symbol=symbol,
+                                expected_path=receipt_paths[symbol],
+                            )
+                        except Exception as exc:
+                            detail = f"INVALID_OPTIMIZER_RECEIPT:{type(exc).__name__}:{exc}"
+                            result = PipelineResult(
+                                symbol=symbol,
+                                success=False,
+                                error_message=detail,
+                            )
+                    results[symbol] = result
 
                     # Checkpoint into the non-live generation. The production
                     # ledger remains byte-identical until the full roster passes.
-                    result = results.get(symbol_for_save)
-                    if result and result.success and result.config:
-                        staged_configs[symbol_for_save] = result.config
-                        generation_dirty = True
-                        if symbol_for_save not in generation_manifest["completed_symbols"]:
-                            generation_manifest["completed_symbols"].append(symbol_for_save)
-                        self._stage_optimization_generation(
-                            staged_configs,
-                            generation_manifest,
-                        )
-                        logger.info(
-                            "STAGED %s in generation %s (live ledger unchanged)",
-                            symbol_for_save,
-                            generation_id,
-                        )
-                    else:
-                        detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
-                        generation_manifest["technical_failures"][symbol_for_save] = detail
-                        self._stage_optimization_generation(
-                            staged_configs,
-                            generation_manifest,
-                        )
-                        logger.error(
-                            "FAILED %s: %s; ledger left unchanged because technical "
-                            "failures are not trading verdicts",
-                            symbol_for_save,
-                            detail,
-                        )
-
-            # Clear any in-process cache after parallel run
-            self.pipeline.data_loader.clear_cache()
-            FeatureComputer.clear_cache()
-        else:
-            # Process symbols needing optimization sequentially
-            symbol_iter = tqdm(to_optimize, desc="Optimizing", unit="sym") if _TQDM else to_optimize
-            for i, symbol in enumerate(symbol_iter):
-                if not _TQDM:
-                    logger.info(f"\nProgress: {i+1}/{len(to_optimize)}")
-                
-                try:
-                    result = self.pipeline.run_for_symbol(symbol)
-                    results[symbol] = result
-                    
-                    # Checkpoint successful semantic verdicts into the
-                    # non-live generation; never incrementally mutate live.
-                    if result.success and result.config:
+                    if result.success and result.config is not None:
                         staged_configs[symbol] = result.config
                         generation_dirty = True
                         if symbol not in generation_manifest["completed_symbols"]:
@@ -11164,7 +11603,10 @@ class PortfolioManager:
                             generation_id,
                         )
                     else:
-                        detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
+                        detail = str(
+                            result.error_message
+                            or "no validated strategy config produced"
+                        )
                         generation_manifest["technical_failures"][symbol] = detail
                         self._stage_optimization_generation(
                             staged_configs,
@@ -11176,27 +11618,14 @@ class PortfolioManager:
                             symbol,
                             detail,
                         )
-                    
-                except Exception as e:
-                    logger.exception(f"[{symbol}] Optimization error: {e}")
-                    results[symbol] = PipelineResult(
-                        symbol=symbol,
-                        success=False,
-                        error_message=str(e),
-                    )
-                    generation_manifest["technical_failures"][symbol] = str(e)
-                    self._stage_optimization_generation(
-                        staged_configs,
-                        generation_manifest,
-                    )
-                    logger.error(
-                        "[%s] Ledger left unchanged after optimizer exception",
-                        symbol,
-                    )
-                
-                # Clear data cache after each symbol to prevent memory leaks
-                self.pipeline.data_loader.clear_cache()
-                FeatureComputer.clear_cache()
+                        optimization_aborted = True
+                        break
+        finally:
+            if outcome_stream is not None and hasattr(outcome_stream, "close"):
+                outcome_stream.close()
+            _cleanup_optimizer_receipts(receipt_paths.values())
+            self.pipeline.data_loader.clear_cache()
+            FeatureComputer.clear_cache()
 
         technical_failures = dict(
             generation_manifest.get("technical_failures", {}) or {}
@@ -11206,7 +11635,18 @@ class PortfolioManager:
             if symbol not in results
         ]
         for symbol in missing_results:
-            technical_failures[symbol] = "optimizer produced no terminal result"
+            detail = (
+                "technical_not_run: optimizer generation stopped after first "
+                "technical failure"
+                if optimization_aborted
+                else "optimizer produced no terminal result"
+            )
+            technical_failures[symbol] = detail
+            results[symbol] = PipelineResult(
+                symbol=symbol,
+                success=False,
+                error_message=detail,
+            )
         generation_manifest["technical_failures"] = technical_failures
 
         if technical_failures:
