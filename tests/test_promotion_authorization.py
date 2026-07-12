@@ -5,11 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from pm_core import PipelineConfig
-from pm_native_activation import (
-    ACTIVATION_MANIFEST_SCHEMA,
-    ACTIVE_POINTER_SCHEMA,
-    sha256_file,
-)
+from pm_native_activation import sha256_file
 from pm_live_readiness import validate_live_readiness
 from pm_main import LiveTrader
 from pm_pipeline import PortfolioManager, RegimeConfig, SymbolConfig
@@ -22,52 +18,26 @@ from pm_promotion_authorization import (
     cell_contract_sha256,
     verify_promotion_authorization,
 )
+from tests.native_v5_support import activate_v5_run, write_v5_run
 
 
 def _activate_native(data_dir: Path, *, activation_id: str, close_value: float) -> dict:
     native_root = data_dir / "native"
-    artifact_root = native_root / "activations" / activation_id
-    artifact_root.mkdir(parents=True, exist_ok=True)
-    bars = artifact_root / "EURUSD_H1.csv"
-    bars.write_text(
-        "time,open,high,low,close,tick_volume,_BAR_CLOSE_TS\n"
-        f"2026-01-01T00:00:00Z,1,2,0.5,{close_value},10,2026-01-01T01:00:00Z\n",
-        encoding="utf-8",
+    run_id = f"{activation_id}-run"
+    write_v5_run(
+        native_root,
+        run_id,
+        price_offset=float(close_value),
     )
-    sidecar = artifact_root / "EURUSD_H1.meta.json"
-    sidecar.write_text(json.dumps({"schema_version": "test-native-sidecar-v1"}), encoding="utf-8")
-    bars_sha = sha256_file(bars)
-    sidecar_sha = sha256_file(sidecar)
-    entry = {
-        "status": "active",
-        "symbol": "EURUSD",
-        "timeframe": "H1",
-        "bars_relative_path": str(bars.relative_to(native_root)).replace("\\", "/"),
-        "sidecar_relative_path": str(sidecar.relative_to(native_root)).replace("\\", "/"),
-        "bars_sha256": bars_sha,
-        "sidecar_sha256": sidecar_sha,
-    }
-    manifest = {
-        "schema_version": ACTIVATION_MANIFEST_SCHEMA,
-        "status": "active",
-        "activation_id": activation_id,
-        "entries": {"EURUSD": {"H1": entry}},
-    }
-    manifest_path = artifact_root / "activation.json"
-    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-    manifest_sha = sha256_file(manifest_path)
-    pointer = {
-        "schema_version": ACTIVE_POINTER_SCHEMA,
-        "activation_id": activation_id,
-        "manifest_relative_path": str(manifest_path.relative_to(native_root)).replace("\\", "/"),
-        "manifest_sha256": manifest_sha,
-    }
-    (native_root / "ACTIVE.json").write_text(json.dumps(pointer, sort_keys=True), encoding="utf-8")
+    activated = activate_v5_run(native_root, run_id, activation_id)
+    assert activated["status"] == "active", activated
+    assert activated["active_pointer_updated"]
+    entry = activated["entries"]["EURUSD"]["H1"]
     return {
         "activation_id": activation_id,
-        "activation_manifest_sha256": manifest_sha,
-        "bars_sha256": bars_sha,
-        "sidecar_sha256": sidecar_sha,
+        "activation_manifest_sha256": activated["manifest_sha256"],
+        "bars_sha256": entry["bars_sha256"],
+        "sidecar_sha256": entry["sidecar_sha256"],
         "entry": entry,
     }
 
