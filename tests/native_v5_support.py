@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from pm_native_activation import sha256_file
+from pm_native_intervals import native_source_interval
 from pm_native_parity import ParityThresholds
 from tools.acquire_native_history import (
     ACQUISITION_CONTRACT_VERSION,
@@ -102,12 +103,6 @@ def _v5_contract(origin: pd.Timestamp, end: pd.Timestamp):
     for target, references in graph.items():
         for reference in references:
             consumers[reference].append(target)
-    strategy = {
-        timeframe: _interval(origin, end) for timeframe in DEFAULT_TIMEFRAMES
-    }
-    source = {
-        timeframe: dict(strategy[timeframe]) for timeframe in DEFAULT_TIMEFRAMES
-    }
     windows = {
         timeframe: {
             "strategy_full_context": _interval(origin, end),
@@ -118,15 +113,54 @@ def _v5_contract(origin: pd.Timestamp, end: pd.Timestamp):
         }
         for timeframe in DEFAULT_TIMEFRAMES
     }
-    reference_intervals = {
+    strategy_ranges = {
+        timeframe: native_source_interval(
+            timeframe,
+            origin.to_pydatetime(),
+            end.to_pydatetime(),
+        )
+        for timeframe in DEFAULT_TIMEFRAMES
+    }
+    strategy = {
+        timeframe: _interval(*strategy_ranges[timeframe])
+        for timeframe in DEFAULT_TIMEFRAMES
+    }
+    reference_ranges = {
         target: {
             reference: {
-                window: dict(interval)
+                window: native_source_interval(
+                    reference,
+                    pd.Timestamp(interval["start_utc"]).to_pydatetime(),
+                    pd.Timestamp(interval["end_exclusive_utc"]).to_pydatetime(),
+                )
                 for window, interval in windows[target].items()
             }
             for reference in graph[target]
         }
         for target in DEFAULT_TIMEFRAMES
+    }
+    reference_intervals = {
+        target: {
+            reference: {
+                window: _interval(*interval)
+                for window, interval in reference_ranges[target][reference].items()
+            }
+            for reference in graph[target]
+        }
+        for target in DEFAULT_TIMEFRAMES
+    }
+    source_parts = {
+        timeframe: [strategy_ranges[timeframe]] for timeframe in DEFAULT_TIMEFRAMES
+    }
+    for target, references in reference_ranges.items():
+        for reference, intervals in references.items():
+            source_parts[reference].extend(intervals.values())
+    source = {
+        timeframe: _interval(
+            min(interval[0] for interval in intervals),
+            max(interval[1] for interval in intervals),
+        )
+        for timeframe, intervals in source_parts.items()
     }
     audit_only = {timeframe: [] for timeframe in DEFAULT_TIMEFRAMES}
     leads = {timeframe: origin.isoformat() for timeframe in DEFAULT_TIMEFRAMES}
