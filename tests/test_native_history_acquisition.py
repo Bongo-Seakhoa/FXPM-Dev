@@ -17,6 +17,7 @@ PATCH_ROOT = Path(__file__).resolve().parents[1]
 if str(PATCH_ROOT) not in sys.path:
     sys.path.insert(0, str(PATCH_ROOT))
 
+from pm_native_consensus import CONSENSUS_POLICY, REFERENCE_GRAPH  # noqa: E402
 from tools.acquire_native_history import (  # noqa: E402
     ACQUISITION_CONTRACT_VERSION,
     DEFAULT_TIMEFRAMES,
@@ -177,6 +178,16 @@ class _RangeConnector:
 
 
 class NativeHistoryAcquisitionTests(unittest.TestCase):
+    def test_timeframe_v5_uses_consensus_module_as_single_authority(self):
+        self.assertEqual(TWO_REFERENCE_CONSENSUS_POLICY, CONSENSUS_POLICY)
+        self.assertEqual(
+            cross_resolution_reference_map(DEFAULT_TIMEFRAMES),
+            {
+                timeframe: list(REFERENCE_GRAPH[timeframe])
+                for timeframe in DEFAULT_TIMEFRAMES
+            },
+        )
+
     def _paths(self, temp_dir):
         root = Path(temp_dir)
         native_root = root / "data" / "native"

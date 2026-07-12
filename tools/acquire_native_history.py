@@ -49,6 +49,11 @@ from pm_evidence import (  # noqa: E402
     build_timeframe_calendar_boundaries,
     normalize_timeframe_window_years,
 )
+from pm_native_consensus import (  # noqa: E402
+    CONSENSUS_POLICY as NATIVE_CONSENSUS_POLICY,
+    PRODUCTION_TIMEFRAMES as NATIVE_PRODUCTION_TIMEFRAMES,
+    REFERENCE_GRAPH as NATIVE_REFERENCE_GRAPH,
+)
 
 
 LOGGER = logging.getLogger("fxpm.native_history")
@@ -91,25 +96,18 @@ TIMEFRAME_SECONDS: Dict[str, int] = {
     "H4": 4 * 60 * 60,
     "D1": 24 * 60 * 60,
 }
-DEFAULT_TIMEFRAMES: Tuple[str, ...] = tuple(TIMEFRAME_SECONDS)
+DEFAULT_TIMEFRAMES: Tuple[str, ...] = tuple(NATIVE_PRODUCTION_TIMEFRAMES)
+if set(DEFAULT_TIMEFRAMES) != set(TIMEFRAME_SECONDS):
+    raise RuntimeError("native acquisition/consensus timeframe authorities diverged")
 SEGMENTED_SESSION_COVERAGE_METHOD_V2 = "timestamp_segmented_weekly_session_rate_v2"
 
 TWO_REFERENCE_AUDIT_GRAPH: Dict[str, Tuple[str, str]] = {
-    "M5": ("M15", "M30"),
-    "M15": ("M5", "M30"),
-    "M30": ("M15", "H1"),
-    "H1": ("M30", "H4"),
-    "H4": ("H1", "D1"),
-    "D1": ("H4", "H1"),
+    timeframe: tuple(NATIVE_REFERENCE_GRAPH[timeframe])
+    for timeframe in DEFAULT_TIMEFRAMES
 }
-TWO_REFERENCE_CONSENSUS_POLICY: Dict[str, Any] = {
-    "schema_version": "fxpm.native_history.two_reference_consensus.v1",
-    "evaluate_all_edges": True,
-    "references_required_per_target": 2,
-    "activation_rule": "at_least_one_exact_edge_pass",
-    "exclusion_rule": "both_terminal_edges_fail",
-    "pending_rule": "no_pass_and_any_edge_technical_pending",
-}
+TWO_REFERENCE_CONSENSUS_POLICY: Dict[str, Any] = json.loads(
+    json.dumps(NATIVE_CONSENSUS_POLICY, sort_keys=True)
+)
 
 # The coverage estimator deliberately reasons in complete UTC calendar weeks.
 # Twenty-six weeks is long enough to distinguish a sustained schedule from a
