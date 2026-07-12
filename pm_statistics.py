@@ -20,6 +20,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from pm_sample_dependence import effective_sample_evidence
+
 
 STATISTICS_CONTRACT_VERSION = "2026-07-10-institutional-promotion-statistics-v1"
 LOCKBOX_REGISTRY_VERSION = "2026-07-11-nonoverlapping-lockbox-v2"
@@ -49,24 +51,22 @@ def _finite_returns(values: Iterable[Any]) -> np.ndarray:
 
 
 def effective_sample_size(values: Sequence[float], max_lag: Optional[int] = None) -> float:
-    """Autocorrelation-adjusted observation count using the initial positive sequence."""
+    """Conservative ACF/HAC-adjusted observation count.
+
+    The compatibility scalar now delegates to FxPM's versioned dependence
+    contract.  Promotion callers needing diagnostics should persist the full
+    :func:`pm_sample_dependence.effective_sample_evidence` result.
+    """
     array = _finite_returns(values)
     count = int(array.size)
     if count < 3:
         return float(count)
-    centered = array - float(array.mean())
-    variance = float(np.dot(centered, centered) / count)
-    if variance <= 1e-18:
-        return 0.0
-    lag_cap = min(count - 1, int(max_lag or max(1, round(math.sqrt(count)))))
-    positive_sum = 0.0
-    for lag in range(1, lag_cap + 1):
-        covariance = float(np.dot(centered[:-lag], centered[lag:]) / (count - lag))
-        rho = covariance / variance
-        if not math.isfinite(rho) or rho <= 0.0:
-            break
-        positive_sum += rho
-    return float(max(1.0, min(count, count / (1.0 + 2.0 * positive_sum))))
+    evidence = effective_sample_evidence(
+        array,
+        max_acf_lag=max_lag,
+        minimum_observations=3,
+    )
+    return float(evidence.effective_observations if evidence.passed else 0.0)
 
 
 def return_moments(values: Sequence[float]) -> Dict[str, float]:
