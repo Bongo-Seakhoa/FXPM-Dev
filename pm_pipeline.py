@@ -92,6 +92,7 @@ from pm_two_phase_lockbox import FROZEN_PRELOCKBOX_STATUS
 from pm_native_activation import (
     NATIVE_PRODUCTION_TIMEFRAMES,
     resolve_active_native_universe,
+    validate_native_cell_exclusion_no_trade,
     validate_native_exclusion_no_trade_grid,
 )
 
@@ -6841,17 +6842,60 @@ class OptimizationPipeline:
             for regime in regimes
         }
 
+    def _native_cell_exclusion_markers(
+        self,
+        binding: Dict[str, Any],
+    ) -> Dict[str, RegimeConfig]:
+        """Create four immutable, activation-bound NO_TRADE regime leaves.
+
+        Native availability is a (symbol, timeframe) decision.  Binding the
+        decision to each regime leaf keeps the ledger's complete 6x4 shape
+        without pretending that an unavailable timeframe entered model search.
+        """
+        exact_binding = dict(binding or {})
+        reasons = [str(value) for value in exact_binding.get("reason_codes", []) or []]
+        reason = (
+            "Native timeframe excluded before model search: "
+            + (", ".join(reasons) or "manifest-bound source insufficiency")
+        )
+        now = datetime.now()
+        regimes = tuple(getattr(self.regime_optimizer, "REGIMES", ()) or ())
+        if not regimes:
+            regimes = ("TREND", "RANGE", "BREAKOUT", "CHOP")
+        markers: Dict[str, RegimeConfig] = {}
+        for regime in regimes:
+            marker = self.regime_optimizer._make_no_trade_marker(reason, now=now)
+            marker.artifact_meta = {
+                **dict(marker.artifact_meta or {}),
+                "native_cell_exclusion_binding": exact_binding,
+            }
+            marker.validation_evidence = {
+                **dict(marker.validation_evidence or {}),
+                "native_cell_exclusion_binding": exact_binding,
+            }
+            markers[str(regime).upper()] = marker
+        return markers
+
     def _build_calendar_workflow_meta(
         self,
         base_m5: pd.DataFrame,
         *,
         as_of_utc: Any,
+        base_timeframe: str = "M5",
+        calendar_contract: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Build common timestamp windows without fixed-M5-row truncation."""
-        ordered = ensure_utc_index(base_m5)
+        """Build common timestamp windows without fixed-M5-row truncation.
+
+        When an authenticated activation calendar is supplied it is the time
+        authority.  The reference frame may then be any active native
+        timeframe; M5 is not required merely to recover the common cutoff.
+        """
+        ordered = ensure_utc_index(base_m5, copy=False)
         if ordered.empty:
             return {}
-        as_of = pd.Timestamp(as_of_utc)
+        contract = dict(calendar_contract or {})
+        contract_as_of = contract.get("common_as_of_utc")
+        as_of = pd.Timestamp(contract_as_of if contract_as_of not in (None, "") else as_of_utc)
         if as_of.tzinfo is None:
             as_of = as_of.tz_localize("UTC")
         else:
@@ -6860,14 +6904,46 @@ class OptimizationPipeline:
             configured_days=getattr(self.config, "evidence_purge_days", 7.0),
             split_embargo_bars=getattr(self.config, "split_embargo_bars", 0),
         )
-        boundaries = build_calendar_boundaries(
-            as_of,
-            window_years=getattr(self.config, "evidence_window_years", None),
-            embargo=purge,
-        )
-        train_start, train_end = boundaries.windows["optimizer_train"]
-        validation_start, validation_end = boundaries.windows["tuning_validation"]
-        lockbox_start, lockbox_end = boundaries.windows["final_lockbox"]
+        raw_boundaries = contract.get("common_calendar_boundaries")
+        if isinstance(raw_boundaries, dict):
+            parsed_boundaries: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+            for partition in ("optimizer_train", "tuning_validation", "final_lockbox"):
+                raw = raw_boundaries.get(partition)
+                if not isinstance(raw, dict):
+                    raise ValueError(f"authenticated calendar boundary missing: {partition}")
+                start = pd.Timestamp(raw.get("start_ts"))
+                end = pd.Timestamp(raw.get("end_ts"))
+                start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+                end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+                if end <= start:
+                    raise ValueError(f"authenticated calendar boundary is non-positive: {partition}")
+                parsed_boundaries[partition] = (start, end)
+            train_start, train_end = parsed_boundaries["optimizer_train"]
+            validation_start, validation_end = parsed_boundaries["tuning_validation"]
+            lockbox_start, lockbox_end = parsed_boundaries["final_lockbox"]
+            boundaries_payload: Dict[str, Any] = {
+                "contract_version": EVIDENCE_CONTRACT_VERSION,
+                "as_of_utc": as_of.isoformat(),
+                "embargo_seconds": float(purge.total_seconds()),
+                "windows": {
+                    name: {
+                        "start_ts": start.isoformat(),
+                        "end_ts": end.isoformat(),
+                    }
+                    for name, (start, end) in parsed_boundaries.items()
+                },
+                "source": "authenticated_native_activation",
+            }
+        else:
+            boundaries = build_calendar_boundaries(
+                as_of,
+                window_years=getattr(self.config, "evidence_window_years", None),
+                embargo=purge,
+            )
+            train_start, train_end = boundaries.windows["optimizer_train"]
+            validation_start, validation_end = boundaries.windows["tuning_validation"]
+            lockbox_start, lockbox_end = boundaries.windows["final_lockbox"]
+            boundaries_payload = boundaries.to_dict()
         first_ts = pd.Timestamp(ordered.index[0])
         warmup = pd.Timedelta(
             days=max(0.0, float(getattr(self.config, "evidence_warmup_days", 400.0)))
@@ -6921,7 +6997,7 @@ class OptimizationPipeline:
             for name, (start, end) in intervals.items()
         }
         return {
-            "base_timeframe": "M5",
+            "base_timeframe": str(base_timeframe or "M5").upper(),
             "production_split_mode": CALENDAR_SPLIT_MODE,
             "split_contract_version": EVIDENCE_CONTRACT_VERSION,
             "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
@@ -6941,7 +7017,8 @@ class OptimizationPipeline:
             "evidence_window_years": dict(
                 getattr(self.config, "evidence_window_years", {}) or {}
             ),
-            "calendar_boundaries": boundaries.to_dict(),
+            "calendar_boundaries": boundaries_payload,
+            "native_calendar_contract": contract,
             "windows": windows,
         }
 
@@ -7065,11 +7142,62 @@ class OptimizationPipeline:
         preloaded_native: Dict[str, pd.DataFrame] = {}
         preloaded_meta: Dict[str, Dict[str, Any]] = {}
         native_gate_errors: Dict[str, List[str]] = {}
+        active_timeframes = set(configured_timeframes)
+        excluded_timeframes: set[str] = set()
+        excluded_bindings: Dict[str, Dict[str, Any]] = {}
+        calendar_contract: Dict[str, Any] = {}
+        universe = None
 
+        # A production activation partitions cells, not symbols.  Research
+        # tests without an ACTIVE pointer retain the explicit legacy behavior,
+        # while any present pointer must validate completely and fail closed.
         if strict_native:
-            if "M5" not in configured_timeframes:
-                native_gate_errors["M5"] = ["NATIVE_M5_TIMEFRAME_REQUIRED"]
+            native_root = Path(self.data_loader.data_dir) / "native"
+            if (native_root / "ACTIVE.json").exists():
+                universe = resolve_active_native_universe(
+                    Path(self.data_loader.data_dir),
+                    required_timeframes=configured_timeframes,
+                )
+                if universe.errors:
+                    return {}, {
+                        "production_split_mode": split_mode,
+                        "native_source_gate": {
+                            "passed": False,
+                            "strict_no_fallback": True,
+                            "errors_by_timeframe": {
+                                "__ACTIVATION__": list(universe.errors)
+                            },
+                        },
+                    }
+                if universe.explicit_contract:
+                    active_timeframes = {
+                        str(tf).upper() for tf in universe.active_timeframes(symbol)
+                    }
+                    excluded_timeframes = {
+                        str(tf).upper() for tf in universe.excluded_timeframes(symbol)
+                    }
+                    if active_timeframes | excluded_timeframes != set(configured_timeframes):
+                        return {}, {
+                            "production_split_mode": split_mode,
+                            "native_source_gate": {
+                                "passed": False,
+                                "strict_no_fallback": True,
+                                "errors_by_timeframe": {
+                                    "__ACTIVATION__": ["NATIVE_CELL_PARTITION_INCOMPLETE"]
+                                },
+                            },
+                        }
+                    excluded_bindings = {
+                        tf: dict(universe.cell_exclusion_binding(symbol, tf) or {})
+                        for tf in sorted(excluded_timeframes)
+                    }
+                    calendar_contract = dict(
+                        getattr(universe, "calendar_contract", {}) or {}
+                    )
+
             for tf_name in configured_timeframes:
+                if tf_name not in active_timeframes:
+                    continue
                 try:
                     native_data, native_meta = self.data_loader.load_native_timeframe(
                         symbol, tf_name
@@ -7081,9 +7209,7 @@ class OptimizationPipeline:
                         "symbol": symbol,
                         "timeframe": tf_name,
                         "provenance_valid": False,
-                        "provenance_errors": [
-                            f"NATIVE_LOAD_RAISED:{type(exc).__name__}"
-                        ],
+                        "provenance_errors": [f"NATIVE_LOAD_RAISED:{type(exc).__name__}"],
                     }
                 timeframe_meta = dict(native_meta or {})
                 preloaded_meta[tf_name] = timeframe_meta
@@ -7103,11 +7229,11 @@ class OptimizationPipeline:
                 if reasons:
                     native_gate_errors[tf_name] = list(dict.fromkeys(reasons))
                 else:
-                    preloaded_native[tf_name] = native_data.copy()
+                    preloaded_native[tf_name] = native_data
 
             if native_gate_errors:
                 logger.error(
-                    "[%s] Calendar native source gate failed before legacy data/search: %s",
+                    "[%s] Active native-cell source gate failed: %s",
                     symbol,
                     "; ".join(
                         f"{tf}: {', '.join(reasons)}"
@@ -7121,11 +7247,129 @@ class OptimizationPipeline:
                         "strict_no_fallback": True,
                         "errors_by_timeframe": native_gate_errors,
                     },
+                    "native_cell_eligibility": {
+                        "active_timeframes": sorted(active_timeframes),
+                        "excluded_timeframes": sorted(excluded_timeframes),
+                        "excluded_bindings": excluded_bindings,
+                    },
                     "timeframe_sources": preloaded_meta,
                 }
-            base_m5 = preloaded_native["M5"].copy()
-            base_source_meta = dict(preloaded_meta.get("M5") or {})
+
+            if not active_timeframes:
+                return {}, {
+                    "production_split_mode": split_mode,
+                    "native_source_gate": {
+                        "passed": True,
+                        "strict_no_fallback": True,
+                        "timeframes": [],
+                    },
+                    "native_cell_eligibility": {
+                        "active_timeframes": [],
+                        "excluded_timeframes": sorted(excluded_timeframes),
+                        "excluded_bindings": excluded_bindings,
+                        "all_cells_excluded": True,
+                    },
+                    "native_calendar_contract": calendar_contract,
+                    "timeframe_sources": {},
+                }
+
+            reference_tf = (
+                "M5" if "M5" in active_timeframes else
+                next(tf for tf in configured_timeframes if tf in active_timeframes)
+            )
+            reference_data = ensure_utc_index(
+                preloaded_native[reference_tf], copy=False
+            )
+            if calendar_contract:
+                try:
+                    as_of_utc = pd.Timestamp(calendar_contract["common_as_of_utc"])
+                    as_of_utc = (
+                        as_of_utc.tz_localize("UTC")
+                        if as_of_utc.tzinfo is None else as_of_utc.tz_convert("UTC")
+                    )
+                except Exception:
+                    return {}, {
+                        "production_split_mode": split_mode,
+                        "native_source_gate": {
+                            "passed": False,
+                            "strict_no_fallback": True,
+                            "errors_by_timeframe": {
+                                "__ACTIVATION__": ["NATIVE_AUTHENTICATED_CALENDAR_INVALID"]
+                            },
+                        },
+                    }
+            else:
+                configured_cutoff = str(
+                    getattr(self.config, "evidence_as_of_utc", "") or ""
+                ).strip()
+                as_of_utc = latest_closed_bar_end(
+                    reference_data,
+                    reference_tf,
+                    not_after_utc=configured_cutoff or datetime.now(timezone.utc),
+                )
+            if as_of_utc is None:
+                return {}, {
+                    "production_split_mode": split_mode,
+                    "native_source_gate": {
+                        "passed": False,
+                        "strict_no_fallback": True,
+                        "errors_by_timeframe": {
+                            reference_tf: ["NATIVE_REFERENCE_HAS_NO_CLOSED_BAR"]
+                        },
+                    },
+                }
+            reference_data = trim_to_closed_bars(
+                reference_data, reference_tf, as_of_utc=as_of_utc
+            )
+            if reference_data is None or len(reference_data) == 0:
+                return {}, {
+                    "production_split_mode": split_mode,
+                    "native_source_gate": {
+                        "passed": False,
+                        "strict_no_fallback": True,
+                        "errors_by_timeframe": {
+                            reference_tf: ["NATIVE_REFERENCE_EMPTY_AFTER_CUTOFF"]
+                        },
+                    },
+                }
+            workflow_meta = self._build_calendar_workflow_meta(
+                reference_data,
+                as_of_utc=as_of_utc,
+                base_timeframe=reference_tf,
+                calendar_contract=calendar_contract,
+            )
+            base_source_meta = dict(preloaded_meta.get(reference_tf) or {})
+            data_by_tf: Dict[str, pd.DataFrame] = {}
+            timeframe_sources: Dict[str, Dict[str, Any]] = {}
+            for tf_name in configured_timeframes:
+                if tf_name not in active_timeframes:
+                    continue
+                try:
+                    data = trim_to_closed_bars(
+                        preloaded_native[tf_name], tf_name, as_of_utc=as_of_utc
+                    )
+                    if data is None or len(data) == 0:
+                        raise ValueError("closed native workflow is empty")
+                    timeframe_meta = dict(preloaded_meta.get(tf_name) or {})
+                    timeframe_meta["workflow_rows"] = int(len(data))
+                    timeframe_meta["as_of_utc"] = as_of_utc.isoformat()
+                    timeframe_sources[tf_name] = timeframe_meta
+                    data_by_tf[tf_name] = data
+                except Exception as exc:
+                    native_gate_errors[tf_name] = [
+                        f"NATIVE_CLOSED_WORKFLOW_PREPARATION_FAILED:{type(exc).__name__}"
+                    ]
+            if native_gate_errors:
+                workflow_meta["timeframe_sources"] = timeframe_sources
+                workflow_meta["native_source_gate"] = {
+                    "passed": False,
+                    "strict_no_fallback": True,
+                    "errors_by_timeframe": native_gate_errors,
+                }
+                return {}, workflow_meta
         else:
+            # Research compatibility path. Production calendar mode above never
+            # scans legacy data or resamples an excluded/failed native cell.
             base_m5, base_source_meta = self.data_loader.load_native_timeframe(
                 symbol, "M5"
             )
@@ -7142,73 +7386,33 @@ class OptimizationPipeline:
                     "provenance_valid": False,
                     "provenance_errors": ["NATIVE_M5_PROVENANCE_MISSING"],
                 }
-
-        base_source_meta = dict(base_source_meta or {})
-
-        if base_m5 is None or len(base_m5) < 200:
-            return {}, {
-                "production_split_mode": split_mode,
-                "native_source_gate": {
-                    "passed": False,
-                    "strict_no_fallback": strict_native,
-                    "errors_by_timeframe": {
-                        "M5": ["M5_WORKFLOW_REQUIRES_AT_LEAST_200_BARS"]
+            base_source_meta = dict(base_source_meta or {})
+            if base_m5 is None or len(base_m5) < 200:
+                return {}, {
+                    "production_split_mode": split_mode,
+                    "native_source_gate": {
+                        "passed": False,
+                        "strict_no_fallback": False,
+                        "errors_by_timeframe": {
+                            "M5": ["M5_WORKFLOW_REQUIRES_AT_LEAST_200_BARS"]
+                        },
                     },
-                },
-                "timeframe_sources": preloaded_meta,
-            }
-        as_of_utc: Optional[pd.Timestamp] = None
-        if strict_native:
-            base_m5 = ensure_utc_index(base_m5)
-            configured_cutoff = str(
-                getattr(self.config, "evidence_as_of_utc", "") or ""
-            ).strip()
-            as_of_utc = latest_closed_bar_end(
-                base_m5,
-                "M5",
-                not_after_utc=configured_cutoff or datetime.now(timezone.utc),
-            )
-            if as_of_utc is None:
-                logger.warning(f"[{symbol}] No fully closed native M5 bar at evidence cutoff")
-                return {}, {}
-            base_m5 = trim_to_closed_bars(base_m5, "M5", as_of_utc=as_of_utc)
-        else:
+                }
             base_m5 = base_m5.sort_index()
-        max_bars = int(getattr(self.config, "max_bars", 300000) or 300000)
-        if (
-            split_mode != CALENDAR_SPLIT_MODE
-            and max_bars > 0
-            and len(base_m5) > max_bars
-        ):
-            base_m5 = base_m5.tail(max_bars).copy()
-
-        workflow_meta = self._build_m5_workflow_meta(base_m5, as_of_utc=as_of_utc)
-        if not workflow_meta:
-            return {}, {}
-        workflow_window = (workflow_meta.get("windows", {}) or {}).get("workflow_window", {})
-        workflow_meta["source"] = {
-            "path": base_source_meta.get("path"),
-            "mtime": base_source_meta.get("mtime"),
-            "size": base_source_meta.get("size"),
-            "rows": base_source_meta.get("rows"),
-            "last_index": base_source_meta.get("last_index"),
-            "sha256": base_source_meta.get("sha256"),
-            "source_kind": base_source_meta.get("source_kind"),
-            "provenance_valid": bool(base_source_meta.get("provenance_valid", False)),
-            "provenance_errors": list(base_source_meta.get("provenance_errors", []) or []),
-        }
-        data_by_tf: Dict[str, pd.DataFrame] = {}
-        timeframe_sources: Dict[str, Dict[str, Any]] = {}
-        for tf_name in configured_timeframes:
-            try:
+            max_bars = int(getattr(self.config, "max_bars", 300000) or 300000)
+            if max_bars > 0 and len(base_m5) > max_bars:
+                base_m5 = base_m5.tail(max_bars).copy()
+            workflow_meta = self._build_m5_workflow_meta(base_m5)
+            data_by_tf = {}
+            timeframe_sources = {}
+            for tf_name in configured_timeframes:
                 if tf_name == "M5":
-                    data = base_m5.copy()
-                    timeframe_meta = dict(base_source_meta or {})
-                elif strict_native:
-                    data = preloaded_native[tf_name].copy()
-                    timeframe_meta = dict(preloaded_meta.get(tf_name) or {})
+                    data = base_m5
+                    timeframe_meta = dict(base_source_meta)
                 else:
-                    native_data, native_meta = self.data_loader.load_native_timeframe(symbol, tf_name)
+                    native_data, native_meta = self.data_loader.load_native_timeframe(
+                        symbol, tf_name
+                    )
                     if native_data is not None and len(native_data) > 0:
                         data = native_data
                         timeframe_meta = dict(native_meta or {})
@@ -7227,42 +7431,40 @@ class OptimizationPipeline:
                             ),
                             "parent_m5_sha256": base_source_meta.get("sha256"),
                         }
-                if split_mode == CALENDAR_SPLIT_MODE:
-                    data = trim_to_closed_bars(data, tf_name, as_of_utc=as_of_utc)
                 timeframe_meta["workflow_rows"] = int(len(data)) if data is not None else 0
-                timeframe_meta["as_of_utc"] = (
-                    as_of_utc.isoformat() if as_of_utc is not None else None
-                )
                 timeframe_sources[tf_name] = timeframe_meta
                 if data is not None and len(data) > 0:
                     data_by_tf[tf_name] = data.copy()
-            except Exception as exc:
-                logger.warning(f"[{symbol}] [{tf_name}] Data preparation failed: {exc}")
-                timeframe_sources[tf_name] = {
-                    "source_kind": "error",
-                    "symbol": symbol,
-                    "timeframe": tf_name,
-                    "provenance_valid": False,
-                    "provenance_errors": [f"DATA_PREPARATION_FAILED:{type(exc).__name__}"],
-                }
+
+        if not workflow_meta:
+            return {}, {}
+        workflow_window = (workflow_meta.get("windows", {}) or {}).get("workflow_window", {})
+        workflow_meta["source"] = {
+            "path": base_source_meta.get("path"),
+            "mtime": base_source_meta.get("mtime"),
+            "size": base_source_meta.get("size"),
+            "rows": base_source_meta.get("rows"),
+            "last_index": base_source_meta.get("last_index"),
+            "sha256": base_source_meta.get("sha256"),
+            "source_kind": base_source_meta.get("source_kind"),
+            "provenance_valid": bool(base_source_meta.get("provenance_valid", False)),
+            "provenance_errors": list(base_source_meta.get("provenance_errors", []) or []),
+        }
         if strict_native:
-            empty_after_cutoff = sorted(set(configured_timeframes) - set(data_by_tf))
-            if empty_after_cutoff:
-                for tf_name in empty_after_cutoff:
-                    native_gate_errors[tf_name] = [
-                        "NATIVE_CLOSED_WORKFLOW_EMPTY_OR_PREPARATION_FAILED"
-                    ]
-                workflow_meta["timeframe_sources"] = timeframe_sources
-                workflow_meta["native_source_gate"] = {
-                    "passed": False,
-                    "strict_no_fallback": True,
-                    "errors_by_timeframe": native_gate_errors,
-                }
-                return {}, workflow_meta
             workflow_meta["native_source_gate"] = {
                 "passed": True,
                 "strict_no_fallback": True,
-                "timeframes": list(configured_timeframes),
+                "timeframes": sorted(active_timeframes),
+                "excluded_timeframes": sorted(excluded_timeframes),
+            }
+            workflow_meta["native_cell_eligibility"] = {
+                "active_timeframes": sorted(active_timeframes),
+                "excluded_timeframes": sorted(excluded_timeframes),
+                "excluded_bindings": excluded_bindings,
+                "activation_id": getattr(universe, "activation_id", None),
+                "activation_manifest_sha256": getattr(
+                    universe, "activation_manifest_sha256", None
+                ),
             }
         workflow_meta["timeframe_sources"] = timeframe_sources
         workflow_meta["evidence_contract_version"] = EVIDENCE_CONTRACT_VERSION
@@ -7270,6 +7472,7 @@ class OptimizationPipeline:
             "symbol": symbol,
             "source": workflow_meta["source"],
             "timeframe_sources": timeframe_sources,
+            "native_cell_eligibility": workflow_meta.get("native_cell_eligibility", {}),
             "workflow_window": workflow_window,
             "as_of_utc": workflow_meta.get("as_of_utc"),
             "windows": workflow_meta.get("windows", {}),
@@ -8468,6 +8671,17 @@ class OptimizationPipeline:
                 result.error_message = "Empty workflow window"
                 return result
 
+            native_cell_eligibility = dict(
+                data_window_meta.get("native_cell_eligibility", {}) or {}
+            )
+            excluded_bindings = dict(
+                native_cell_eligibility.get("excluded_bindings", {}) or {}
+            )
+            for tf, binding in excluded_bindings.items():
+                regime_configs[str(tf).upper()] = self._native_cell_exclusion_markers(
+                    dict(binding or {})
+                )
+
             windows = data_window_meta.get("windows", {})
             hist_meta = windows.get("historical_stress_audit", {})
             active_meta = windows.get("active_universe", {})
@@ -8658,7 +8872,16 @@ class OptimizationPipeline:
                 )
 
                 if len(active_features) < 200:
-                    logger.debug(f"[{symbol}] [{tf}] Skipping - insufficient active data")
+                    reason = (
+                        f"Active native timeframe has only {len(active_features)} "
+                        "optimizer-train feature rows; at least 200 are required"
+                    )
+                    regime_configs[tf] = {
+                        regime: self.regime_optimizer._make_no_trade_marker(reason)
+                        for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
+                    }
+                    unvalidated_count += 4
+                    logger.warning(f"[{symbol}] [{tf}] {reason}; stored explicit NO_TRADE cells")
                     del full_features, eligibility_features, active_features, stage2_features, historical_features, holdout_features
                     FeatureComputer.clear_cache()
                     gc.collect()
@@ -8823,13 +9046,38 @@ class OptimizationPipeline:
                 if cfg is not None and not cfg.is_no_trade_marker()
             )
             result.regime_winners = total_winners
-            
-            if total_winners == 0 and default_config is None:
-                if unvalidated_count > 0:
-                    result.error_message = f"No validated regime winners ({unvalidated_count} candidates failed validation)"
-                else:
-                    result.error_message = "No valid regime winners found"
+
+            configured_grid = tuple(
+                str(value or "").strip().upper()
+                for value in (getattr(self.config, "timeframes", []) or [])
+                if str(value or "").strip()
+            )
+            expected_regimes = {"TREND", "RANGE", "BREAKOUT", "CHOP"}
+            missing_timeframes = sorted(set(configured_grid) - set(regime_configs))
+            malformed_timeframes = sorted(
+                tf
+                for tf in set(configured_grid) & set(regime_configs)
+                if set(regime_configs.get(tf, {})) != expected_regimes
+            )
+            if missing_timeframes or malformed_timeframes:
+                result.error_message = (
+                    "Independent-cell grid incomplete after optimization: "
+                    f"missing_timeframes={missing_timeframes}, "
+                    f"malformed_timeframes={malformed_timeframes}"
+                )
+                logger.error(f"[{symbol}] {result.error_message}")
                 return result
+
+            # A complete search that honestly finds no carrier is a semantic
+            # all-NO_TRADE result, not an optimizer/infrastructure failure.
+            if total_winners == 0 and default_config is None:
+                no_winner_reason = (
+                    f"No validated regime winners after complete cell evaluation "
+                    f"({unvalidated_count} rejected/abstained cells)"
+                )
+                default_config = self.regime_optimizer._make_no_trade_marker(
+                    no_winner_reason
+                )
             
             best_overall_tf, best_overall_regime = self._locate_default_origin(default_config, regime_configs)
             if best_overall_tf and best_overall_regime and default_config is not None:
@@ -9463,6 +9711,124 @@ class PortfolioManager:
             native_exclusion_binding=native_exclusion_binding,
         )
 
+    @staticmethod
+    def _native_calendar_marker_meta(calendar_contract: Dict[str, Any]) -> Dict[str, Any]:
+        """Materialize common windows for a symbol with zero loadable cells."""
+        contract = dict(calendar_contract or {})
+        boundaries = contract.get("common_calendar_boundaries")
+        if not isinstance(boundaries, dict):
+            return {"native_calendar_contract": contract, "windows": {}}
+
+        def _leaf(name: str) -> Dict[str, Any]:
+            raw = boundaries.get(name)
+            if not isinstance(raw, dict):
+                return {}
+            return {
+                "start_index": 0,
+                "end_index": 0,
+                "rows": 0,
+                "start_ts": raw.get("start_ts"),
+                "end_ts": raw.get("end_ts"),
+                "end_ts_exclusive": raw.get("end_ts"),
+                "end_ts_inclusive": None,
+                "first_observed_ts": None,
+                "last_observed_ts": None,
+            }
+
+        train = _leaf("optimizer_train")
+        tuning = _leaf("tuning_validation")
+        final = _leaf("final_lockbox")
+        return {
+            "production_split_mode": CALENDAR_SPLIT_MODE,
+            "split_contract_version": EVIDENCE_CONTRACT_VERSION,
+            "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
+            "as_of_utc": contract.get("common_as_of_utc"),
+            "native_calendar_contract": contract,
+            "windows": {
+                "optimizer_train": dict(train),
+                "optimization_train": dict(train),
+                "optimizer_train_with_warmup": dict(train),
+                "optimization_train_with_warmup": dict(train),
+                "tuning_validation": dict(tuning),
+                "walk_forward_validation": dict(tuning),
+                "stage2_selection": dict(tuning),
+                "stage2_selection_with_warmup": dict(tuning),
+                "stage2_training_selection": dict(tuning),
+                "stage2_training_selection_with_warmup": dict(tuning),
+                "final_lockbox": dict(final),
+                "final_lockbox_with_warmup": dict(final),
+                "clean_holdout": dict(final),
+                "clean_holdout_with_warmup": dict(final),
+            },
+        }
+
+    def save_fully_excluded_native_config(self, symbol: str, universe: Any) -> SymbolConfig:
+        """Persist 24 exact cell-bound markers without launching model search."""
+        now = datetime.now()
+        regime_configs: Dict[str, Dict[str, RegimeConfig]] = {}
+        bindings: Dict[str, Dict[str, Any]] = {}
+        for raw_timeframe in list(getattr(self.config, "timeframes", []) or []):
+            timeframe = str(raw_timeframe or "").strip().upper()
+            binding = dict(universe.cell_exclusion_binding(symbol, timeframe) or {})
+            if not binding:
+                raise RuntimeError(
+                    f"NATIVE_CELL_EXCLUSION_BINDING_MISSING:{str(symbol).upper()}|{timeframe}"
+                )
+            bindings[timeframe] = binding
+            regime_configs[timeframe] = self.pipeline._native_cell_exclusion_markers(binding)
+        reason = "Every configured native timeframe is manifest-excluded before model search"
+        default_config = self.pipeline.regime_optimizer._make_no_trade_marker(reason, now=now)
+        data_window_meta = self._native_calendar_marker_meta(
+            dict(getattr(universe, "calendar_contract", {}) or {})
+        )
+        data_window_meta["native_cell_eligibility"] = {
+            "active_timeframes": [],
+            "excluded_timeframes": sorted(bindings),
+            "excluded_bindings": bindings,
+            "all_cells_excluded": True,
+            "activation_id": getattr(universe, "activation_id", None),
+            "activation_manifest_sha256": getattr(
+                universe, "activation_manifest_sha256", None
+            ),
+        }
+        config = SymbolConfig(
+            symbol=symbol,
+            regime_configs=regime_configs,
+            default_config=default_config,
+            strategy_name="NO_TRADE",
+            timeframe="",
+            parameters={},
+            retrain_days=int(getattr(self.config, "fixed_retrain_days", 14) or 14),
+            train_metrics={"total_trades": 0},
+            val_metrics={"total_trades": 0, "validation_status": "no_trade", "reason": reason},
+            holdout_metrics={},
+            historical_audit_metrics=_default_historical_audit(),
+            data_window_meta=data_window_meta,
+            composite_score=0.0,
+            robustness_ratio=0.0,
+            is_validated=False,
+            validation_reason=reason,
+            validation_evidence={
+                "validation_reason": reason,
+                "tradeable": False,
+                "no_trade": True,
+                "native_cell_exclusions": bindings,
+            },
+            artifact_meta={
+                **build_artifact_meta(self.config),
+                "no_trade": True,
+                "native_cell_exclusions": bindings,
+            },
+            optimized_at=now,
+            valid_until=_scheduled_valid_until(self.config, now),
+        )
+        self._save_symbol_config(symbol, config)
+        logger.info(
+            "SAVED %s: 24 manifest-bound native cell exclusions (no search)",
+            symbol,
+        )
+        return config
+
     def save_optimization_no_trade_config(
         self,
         symbol: str,
@@ -9524,6 +9890,51 @@ class PortfolioManager:
             )
         return universe
 
+    def _preflight_active_regime_provenance(
+        self,
+        universe: Any,
+        symbols: Optional[List[str]] = None,
+    ) -> None:
+        """Fail before workers or ledger writes when active detector inputs are absent."""
+        if universe is None or not getattr(universe, "explicit_contract", False):
+            return
+        split_mode = str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower()
+        if split_mode not in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
+            return
+        expected_contract = (
+            EVIDENCE_CONTRACT_VERSION
+            if split_mode == CALENDAR_SPLIT_MODE
+            else DataSplitter.SPLIT_CONTRACT_VERSION
+        )
+        params_file = str(
+            getattr(self.config, "regime_params_file", "regime_params.json")
+            or "regime_params.json"
+        )
+        failures: List[str] = []
+        for symbol in (symbols if symbols is not None else self.symbols):
+            canonical = str(symbol or "").strip().upper()
+            for timeframe in universe.active_timeframes(canonical):
+                check = validate_regime_params_provenance(
+                    canonical,
+                    str(timeframe).upper(),
+                    params_file,
+                    expected_split_contract=expected_contract,
+                )
+                if not check.get("valid", False):
+                    failures.append(
+                        f"{canonical}|{str(timeframe).upper()}:"
+                        f"{check.get('reason', 'unknown')}"
+                    )
+        if failures:
+            preview = "; ".join(failures[:20])
+            if len(failures) > 20:
+                preview += f"; +{len(failures) - 20} more"
+            raise RuntimeError(
+                "ACTIVE_REGIME_PROVENANCE_PREFLIGHT_FAILED: " + preview
+            )
+
     def _has_exact_native_exclusion_grid(
         self,
         config: Optional[SymbolConfig],
@@ -9540,6 +9951,58 @@ class PortfolioManager:
                 if str(value or "").strip()
             ),
         )
+
+    def _has_exact_native_cell_grid(
+        self,
+        symbol: str,
+        config: Optional[SymbolConfig],
+        universe: Any,
+    ) -> bool:
+        """Check active/excluded cell bindings without trusting symbol summary flags."""
+        if config is None:
+            return False
+        stored_eligibility = dict(
+            (config.data_window_meta or {}).get("native_cell_eligibility", {}) or {}
+        )
+        if str(stored_eligibility.get("activation_id") or "") != str(
+            getattr(universe, "activation_id", None) or ""
+        ):
+            return False
+        if str(stored_eligibility.get("activation_manifest_sha256") or "") != str(
+            getattr(universe, "activation_manifest_sha256", None) or ""
+        ):
+            return False
+        grid = config.regime_configs or {}
+        for raw_timeframe in list(getattr(self.config, "timeframes", []) or []):
+            timeframe = str(raw_timeframe or "").strip().upper()
+            regimes = grid.get(timeframe)
+            if not isinstance(regimes, dict) or set(regimes) != {
+                "TREND", "RANGE", "BREAKOUT", "CHOP"
+            }:
+                return False
+            status = str(universe.cell_status(symbol, timeframe) or "").lower()
+            if status == "excluded_no_trade":
+                expected = dict(universe.cell_exclusion_binding(symbol, timeframe) or {})
+                if not expected:
+                    return False
+                serialized = {
+                    regime: cell.to_dict() if cell is not None else None
+                    for regime, cell in regimes.items()
+                }
+                if validate_native_cell_exclusion_no_trade(serialized, expected):
+                    return False
+            elif status == "active":
+                for cell in regimes.values():
+                    if cell is not None and (
+                        (cell.artifact_meta or {}).get("native_cell_exclusion_binding")
+                        or (cell.validation_evidence or {}).get(
+                            "native_cell_exclusion_binding"
+                        )
+                    ):
+                        return False
+            else:
+                return False
+        return True
     
     def needs_retraining(self, symbol: str) -> bool:
         """
@@ -9574,23 +10037,33 @@ class PortfolioManager:
         universe = self._native_universe_for_optimization()
         if universe is not None and universe.explicit_contract:
             canonical = str(symbol or "").strip().upper()
+            self._preflight_active_regime_provenance(universe, [canonical])
             existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
-            if canonical in set(universe.excluded_symbols):
-                binding = universe.exclusion_binding(canonical)
-                if not self._has_exact_native_exclusion_grid(existing, binding):
-                    self.save_native_exclusion_no_trade_config(symbol, binding)
+            fully_excluded = set(
+                getattr(universe, "fully_excluded_symbols", ())
+                or universe.excluded_symbols
+            )
+            symbols_with_active = set(
+                getattr(universe, "symbols_with_active_cells", ())
+                or universe.eligible_symbols
+            )
+            if canonical in fully_excluded:
+                if not self._has_exact_native_cell_grid(
+                    canonical, existing, universe
+                ):
+                    self.save_fully_excluded_native_config(symbol, universe)
                 logger.info(
-                    "SKIP %s: immutable native availability exclusion %s",
+                    "SKIP %s: all native timeframe cells excluded by activation %s",
                     symbol,
                     universe.activation_id,
                 )
                 return True
-            if canonical not in set(universe.eligible_symbols):
+            if canonical not in symbols_with_active:
                 raise RuntimeError(
                     f"NATIVE_UNIVERSE_SYMBOL_UNBOUND:{canonical}"
                 )
-            if existing is not None and bool(
-                (existing.artifact_meta or {}).get("native_exclusion_binding")
+            if existing is not None and not self._has_exact_native_cell_grid(
+                canonical, existing, universe
             ):
                 force = True
 
@@ -9944,12 +10417,19 @@ class PortfolioManager:
         # enter scoring/optimization. A prior exclusion that becomes eligible
         # under a later activation is forced back through optimization.
         universe = self._native_universe_for_optimization()
+        self._preflight_active_regime_provenance(universe)
         optimization_symbols = list(self.symbols)
         stale_exclusions_now_eligible: List[str] = []
         excluded_now: List[str] = []
         if universe is not None and universe.explicit_contract:
-            eligible_set = set(universe.eligible_symbols)
-            excluded_set = set(universe.excluded_symbols)
+            eligible_set = set(
+                getattr(universe, "symbols_with_active_cells", ())
+                or universe.eligible_symbols
+            )
+            excluded_set = set(
+                getattr(universe, "fully_excluded_symbols", ())
+                or universe.excluded_symbols
+            )
             optimization_symbols = [
                 symbol for symbol in self.symbols if str(symbol).upper() in eligible_set
             ]
@@ -9958,11 +10438,12 @@ class PortfolioManager:
                 existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
                 if canonical in excluded_set:
                     excluded_now.append(symbol)
-                    binding = universe.exclusion_binding(canonical)
-                    if not self._has_exact_native_exclusion_grid(existing, binding):
-                        self.save_native_exclusion_no_trade_config(symbol, binding)
-                elif existing is not None and bool(
-                    (existing.artifact_meta or {}).get("native_exclusion_binding")
+                    if not self._has_exact_native_cell_grid(
+                        canonical, existing, universe
+                    ):
+                        self.save_fully_excluded_native_config(symbol, universe)
+                elif existing is not None and not self._has_exact_native_cell_grid(
+                    canonical, existing, universe
                 ):
                     stale_exclusions_now_eligible.append(symbol)
 
@@ -9990,7 +10471,9 @@ class PortfolioManager:
                 ", ".join(str(value) for value in excluded_now[:12]),
             )
         logger.info(f"To optimize: {len(to_optimize)}")
-        logger.info(f"Skipping: {len(to_skip)} (valid configs)")
+        valid_skip_count = len([symbol for symbol in to_skip if symbol not in excluded_now])
+        logger.info(f"Skipping valid configs: {valid_skip_count}")
+        logger.info(f"Skipping fully excluded symbols: {len(excluded_now)}")
         if overwrite:
             logger.info(f"OVERWRITE MODE: ignoring validity checks")
         logger.info(f"Strategies: {StrategyRegistry.count()}")
@@ -10044,16 +10527,12 @@ class PortfolioManager:
                         logger.info(f"SAVED {symbol_for_save} to {self.config_file} (atomic)")
                     else:
                         detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
-                        reason = (
-                            f"Optimization failed or produced no live-safe winner: {detail}. "
-                            "Live trading disabled for this symbol."
-                        )
-                        self.save_optimization_no_trade_config(
+                        logger.error(
+                            "FAILED %s: %s; ledger left unchanged because technical "
+                            "failures are not trading verdicts",
                             symbol_for_save,
-                            reason,
-                            data_window_meta=getattr(result, "data_window_meta", None),
+                            detail,
                         )
-                        logger.warning(f"FAILED {symbol_for_save}: saved NO_TRADE optimization-failure marker")
 
             # Clear any in-process cache after parallel run
             self.pipeline.data_loader.clear_cache()
@@ -10075,25 +10554,24 @@ class PortfolioManager:
                         logger.info(f"SAVED {symbol} to {self.config_file} (atomic)")
                     else:
                         detail = str(getattr(result, "error_message", "") or "no validated strategy config produced")
-                        reason = (
-                            f"Optimization failed or produced no live-safe winner: {detail}. "
-                            "Live trading disabled for this symbol."
-                        )
-                        self.save_optimization_no_trade_config(
+                        logger.error(
+                            "FAILED %s: %s; ledger left unchanged because technical "
+                            "failures are not trading verdicts",
                             symbol,
-                            reason,
-                            data_window_meta=getattr(result, "data_window_meta", None),
+                            detail,
                         )
-                        logger.warning(f"FAILED {symbol}: saved NO_TRADE optimization-failure marker")
                     
                 except Exception as e:
                     logger.exception(f"[{symbol}] Optimization error: {e}")
-                    results[symbol] = PipelineResult(symbol=symbol, error_message=str(e))
-                    reason = (
-                        f"Optimization raised an exception: {e}. "
-                        "Live trading disabled for this symbol."
+                    results[symbol] = PipelineResult(
+                        symbol=symbol,
+                        success=False,
+                        error_message=str(e),
                     )
-                    self.save_optimization_no_trade_config(symbol, reason)
+                    logger.error(
+                        "[%s] Ledger left unchanged after optimizer exception",
+                        symbol,
+                    )
                 
                 # Clear data cache after each symbol to prevent memory leaks
                 self.pipeline.data_loader.clear_cache()
@@ -10112,7 +10590,8 @@ class PortfolioManager:
         logger.info(f"OPTIMIZATION COMPLETE")
         logger.info(f"Total time: {total_time:.1f}s")
         logger.info(f"Optimized: {successful}/{len(to_optimize)}")
-        logger.info(f"Skipped: {len(to_skip)} (already valid)")
+        logger.info(f"Skipped valid configs: {valid_skip_count}")
+        logger.info(f"Fully excluded without search: {len(excluded_now)}")
         logger.info(f"Total validated: {total_validated}/{len(self.symbols)}")
         logger.info(f"Live eligible: {total_live_eligible}/{len(self.symbols)}")
         logger.info(f"{'#'*60}")
