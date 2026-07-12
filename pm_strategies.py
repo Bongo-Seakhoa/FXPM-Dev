@@ -3206,7 +3206,8 @@ class InsideBarBreakoutStrategy(BaseStrategy):
         return StrategyCategory.BREAKOUT_MOMENTUM
 
     def get_default_params(self) -> Dict[str, Any]:
-        return {'min_inside_bars': 1, 'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
+        return {'min_inside_bars': 1, 'setup_max_age_bars': 20,
+                'sl_atr_mult': 2.0, 'tp_atr_mult': 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -3214,16 +3215,29 @@ class InsideBarBreakoutStrategy(BaseStrategy):
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         min_ib = int(self.params.get('min_inside_bars', 1))
-        h, l, c = features['High'], features['Low'], features['Close']
+        max_age = max(1, int(self.params.get('setup_max_age_bars', 20)))
+        high, low, close = features['High'], features['Low'], features['Close']
         signals = pd.Series(0, index=features.index, dtype=int)
 
         inside_streak = 0
         pending = False
+        setup_bar = -1
         mother_h = np.nan
         mother_l = np.nan
 
         for i in range(1, len(features)):
-            is_inside = (h.iloc[i] < h.iloc[i - 1]) and (l.iloc[i] > l.iloc[i - 1])
+            # Age is the number of completed bars since the setup was confirmed.
+            # A setup may trigger through ``max_age`` and is discarded before
+            # evaluating bar ``max_age + 1``.
+            if pending and i - setup_bar > max_age:
+                pending = False
+                setup_bar = -1
+                inside_streak = 0
+                mother_h = np.nan
+                mother_l = np.nan
+
+            is_inside = ((high.iloc[i] < high.iloc[i - 1])
+                         and (low.iloc[i] > low.iloc[i - 1]))
 
             if is_inside:
                 inside_streak += 1
@@ -3231,21 +3245,24 @@ class InsideBarBreakoutStrategy(BaseStrategy):
                     mother_idx = i - min_ib
                     if mother_idx >= 0:
                         pending = True
-                        mother_h = h.iloc[mother_idx]
-                        mother_l = l.iloc[mother_idx]
+                        setup_bar = i
+                        mother_h = high.iloc[mother_idx]
+                        mother_l = low.iloc[mother_idx]
                 continue
 
             if pending:
-                if c.iloc[i] > mother_h:
+                if close.iloc[i] > mother_h:
                     signals.iloc[i] = 1
                     pending = False
+                    setup_bar = -1
                     inside_streak = 0
                     mother_h = np.nan
                     mother_l = np.nan
                     continue
-                if c.iloc[i] < mother_l:
+                if close.iloc[i] < mother_l:
                     signals.iloc[i] = -1
                     pending = False
+                    setup_bar = -1
                     inside_streak = 0
                     mother_h = np.nan
                     mother_l = np.nan
@@ -3255,7 +3272,8 @@ class InsideBarBreakoutStrategy(BaseStrategy):
         return signals
 
     def get_param_grid(self) -> Dict[str, List]:
-        return {'min_inside_bars': [1, 2, 3], **self._base_sl_tp_grid(),
+        return {'min_inside_bars': [1, 2, 3], 'setup_max_age_bars': [5, 10, 20, 40],
+                **self._base_sl_tp_grid(),
                 **self._structural_sl_grid()}
 
 
@@ -6457,16 +6475,17 @@ class FractalChannelBreakoutStrategy(BaseStrategy):
         return StrategyCategory.BREAKOUT_MOMENTUM
 
     def get_default_params(self) -> Dict[str, Any]:
-        return {"wing_bars": 2, "atr_buffer": 0.1, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0,
+        return {"wing_bars": 2, "atr_buffer": 0.1, "pivot_max_age_bars": 100,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0,
                 **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
-        ema_p = max(2, int(self.params.get("ema_period", 100)))
-        return {"ATR_14", f"EMA_{ema_p}"}
+        return {"ATR_14"}
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         wing = max(1, int(self.params.get("wing_bars", 2)))
         buf = float(self.params.get("atr_buffer", 0.1))
+        max_age = max(1, int(self.params.get("pivot_max_age_bars", 100)))
         high, low, close = features["High"], features["Low"], features["Close"]
         atr = _get_atr(features, 14)
 
@@ -6477,8 +6496,12 @@ class FractalChannelBreakoutStrategy(BaseStrategy):
         right_high = high.shift(1).rolling(wing, min_periods=wing).max()
         right_low = low.shift(1).rolling(wing, min_periods=wing).min()
 
-        fractal_high = center_high.where((center_high > left_high) & (center_high >= right_high)).ffill()
-        fractal_low = center_low.where((center_low < left_low) & (center_low <= right_low)).ffill()
+        fractal_high = center_high.where(
+            (center_high > left_high) & (center_high >= right_high)
+        ).ffill(limit=max_age)
+        fractal_low = center_low.where(
+            (center_low < left_low) & (center_low <= right_low)
+        ).ffill(limit=max_age)
         upper = fractal_high + buf * atr
         lower = fractal_low - buf * atr
 
@@ -6489,6 +6512,7 @@ class FractalChannelBreakoutStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {"wing_bars": [2, 3, 5], "atr_buffer": [0.0, 0.1, 0.25],
+                "pivot_max_age_bars": [50, 100, 200],
                 **self._base_sl_tp_grid(), **self._structural_sl_grid()}
 
 
@@ -6590,8 +6614,7 @@ class VolumeClimaxReversalStrategy(BaseStrategy):
                 "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
 
     def get_required_features(self) -> Set[str]:
-        ema_p = max(2, int(self.params.get("ema_period", 100)))
-        return {"ATR_14", f"EMA_{ema_p}"}
+        return {"ATR_14"}
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         lb = max(5, int(self.params.get("vol_lookback", 30)))
@@ -7087,6 +7110,7 @@ class HeadAndShouldersNecklineBreakStrategy(BaseStrategy):
 
     def get_default_params(self) -> Dict[str, Any]:
         return {"wing_bars": 2, "shoulder_tolerance_atr": 1.5, "neckline_buffer_atr": 0.1,
+                "pattern_max_age_bars": 100,
                 "sl_atr_mult": 2.0, "tp_atr_mult": 2.0, **self._structural_sl_defaults()}
 
     def get_required_features(self) -> Set[str]:
@@ -7096,8 +7120,9 @@ class HeadAndShouldersNecklineBreakStrategy(BaseStrategy):
         wing = max(1, int(self.params.get("wing_bars", 2)))
         shoulder_tol = float(self.params.get("shoulder_tolerance_atr", 1.5))
         buf = float(self.params.get("neckline_buffer_atr", 0.1))
+        max_age = max(1, int(self.params.get("pattern_max_age_bars", 100)))
         high, low, close = features["High"], features["Low"], features["Close"]
-        atr = _get_atr(features, 14).ffill()
+        atr = _get_atr(features, 14).ffill(limit=max_age)
         n = len(features)
 
         center_high = high.shift(wing + 1)
@@ -7111,10 +7136,12 @@ class HeadAndShouldersNecklineBreakStrategy(BaseStrategy):
 
         short_level = np.full(n, np.nan, dtype=float)
         short_pid = np.full(n, np.nan, dtype=float)
+        short_origin = np.full(n, np.nan, dtype=float)
         long_level = np.full(n, np.nan, dtype=float)
         long_pid = np.full(n, np.nan, dtype=float)
-        piv_hi: List[Tuple[int, float]] = []
-        piv_lo: List[Tuple[int, float]] = []
+        long_origin = np.full(n, np.nan, dtype=float)
+        piv_hi: List[Tuple[int, int, float]] = []
+        piv_lo: List[Tuple[int, int, float]] = []
         short_pattern_id = 0
         long_pattern_id = 0
 
@@ -7122,38 +7149,47 @@ class HeadAndShouldersNecklineBreakStrategy(BaseStrategy):
             center_pos = pos - wing - 1
             if center_pos < 0:
                 continue
-            piv_hi.append((center_pos, float(pivot_high.iat[pos])))
+            piv_hi = [pivot for pivot in piv_hi if pos - pivot[0] <= max_age]
+            piv_hi.append((pos, center_pos, float(pivot_high.iat[pos])))
             piv_hi = piv_hi[-6:]
             if len(piv_hi) < 3:
                 continue
-            (a_i, a), (b_i, b), (c_i, c_hi) = piv_hi[-3:]
+            (a_confirm, a_i, a), (_, b_i, b), (_, c_i, c_hi) = piv_hi[-3:]
             atr_now = float(atr.iat[pos]) if pd.notna(atr.iat[pos]) else 0.0
             tol = shoulder_tol * atr_now
             if a_i < b_i < c_i and b > a and b > c_hi and abs(a - c_hi) <= tol:
                 short_pattern_id += 1
                 short_level[pos] = float(low.iloc[a_i:c_i + 1].min())
                 short_pid[pos] = float(short_pattern_id)
+                short_origin[pos] = float(a_confirm)
 
         for pos in np.flatnonzero(pivot_low.notna().to_numpy()):
             center_pos = pos - wing - 1
             if center_pos < 0:
                 continue
-            piv_lo.append((center_pos, float(pivot_low.iat[pos])))
+            piv_lo = [pivot for pivot in piv_lo if pos - pivot[0] <= max_age]
+            piv_lo.append((pos, center_pos, float(pivot_low.iat[pos])))
             piv_lo = piv_lo[-6:]
             if len(piv_lo) < 3:
                 continue
-            (a_i, a), (b_i, b), (c_i, c_lo) = piv_lo[-3:]
+            (a_confirm, a_i, a), (_, b_i, b), (_, c_i, c_lo) = piv_lo[-3:]
             atr_now = float(atr.iat[pos]) if pd.notna(atr.iat[pos]) else 0.0
             tol = shoulder_tol * atr_now
             if a_i < b_i < c_i and b < a and b < c_lo and abs(a - c_lo) <= tol:
                 long_pattern_id += 1
                 long_level[pos] = float(high.iloc[a_i:c_i + 1].max())
                 long_pid[pos] = float(long_pattern_id)
+                long_origin[pos] = float(a_confirm)
 
-        short_level_s = pd.Series(short_level, index=features.index).ffill()
-        long_level_s = pd.Series(long_level, index=features.index).ffill()
-        short_pid_s = pd.Series(short_pid, index=features.index).ffill()
-        long_pid_s = pd.Series(long_pid, index=features.index).ffill()
+        positions = pd.Series(np.arange(n, dtype=float), index=features.index)
+        short_origin_s = pd.Series(short_origin, index=features.index).ffill(limit=max_age)
+        long_origin_s = pd.Series(long_origin, index=features.index).ffill(limit=max_age)
+        short_valid = short_origin_s.notna() & (positions - short_origin_s <= max_age)
+        long_valid = long_origin_s.notna() & (positions - long_origin_s <= max_age)
+        short_level_s = pd.Series(short_level, index=features.index).ffill(limit=max_age).where(short_valid)
+        long_level_s = pd.Series(long_level, index=features.index).ffill(limit=max_age).where(long_valid)
+        short_pid_s = pd.Series(short_pid, index=features.index).ffill(limit=max_age).where(short_valid)
+        long_pid_s = pd.Series(long_pid, index=features.index).ffill(limit=max_age).where(long_valid)
         short_break = (short_pid_s.notna() & (close < short_level_s - buf * atr)
                        & (close.shift(1) >= short_level_s.shift(1) - buf * atr.shift(1)))
         long_break = (long_pid_s.notna() & (close > long_level_s + buf * atr)
@@ -7167,7 +7203,8 @@ class HeadAndShouldersNecklineBreakStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {"wing_bars": [1, 2, 3], "shoulder_tolerance_atr": [1.0, 1.5, 2.5],
-                "neckline_buffer_atr": [0.0, 0.1, 0.25], **self._base_sl_tp_grid(),
+                "neckline_buffer_atr": [0.0, 0.1, 0.25],
+                "pattern_max_age_bars": [50, 100, 200], **self._base_sl_tp_grid(),
                 **self._structural_sl_grid()}
 
 
