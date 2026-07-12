@@ -2432,6 +2432,7 @@ class RegimeOptimizer:
                         val_features_by_tf: Dict[str, pd.DataFrame],
                         strategies: List[BaseStrategy],
                         val_warmup_by_tf: Optional[Dict[str, int]] = None,
+                        train_warmup_by_tf: Optional[Dict[str, int]] = None,
                         eligibility_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
                         selection_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
                         selection_warmup_by_tf: Optional[Dict[str, int]] = None,
@@ -2473,6 +2474,10 @@ class RegimeOptimizer:
             eligibility_features = (
                 None if eligibility_features_by_tf is None else eligibility_features_by_tf.get(tf)
             )
+            train_warmup_bars = (
+                0 if train_warmup_by_tf is None
+                else int(train_warmup_by_tf.get(tf, 0) or 0)
+            )
             val_warmup_bars = 0 if val_warmup_by_tf is None else int(val_warmup_by_tf.get(tf, 0) or 0)
             selection_features = None if selection_features_by_tf is None else selection_features_by_tf.get(tf)
             selection_warmup_bars = (
@@ -2483,7 +2488,10 @@ class RegimeOptimizer:
             )
             historical_features = None if historical_features_by_tf is None else historical_features_by_tf.get(tf)
             
-            if train_features is None or len(train_features) < 200:
+            if (
+                train_features is None
+                or max(0, len(train_features) - train_warmup_bars) < 200
+            ):
                 logger.debug(f"[{symbol}] [{tf}] Skipping - insufficient data")
                 continue
             
@@ -2501,6 +2509,7 @@ class RegimeOptimizer:
                 train_features,
                 val_features,
                 strategies,
+                train_warmup_bars=train_warmup_bars,
                 val_warmup_bars=val_warmup_bars,
                 eligibility_features=eligibility_features,
                 selection_features=selection_features,
@@ -3438,7 +3447,9 @@ class RegimeOptimizer:
         """Run one exact-regime cell and report whether Backtester.run executed."""
         raw_signals = strategy.generate_signals(features, symbol)
         gated = self._gate_signals_to_exact_regime(raw_signals, features, regime)
-        if gated.abs().sum() == 0 and not run_zero_signal_path:
+        warmup = min(len(gated), max(0, int(warmup_bars or 0)))
+        signal_start = max(0, warmup - 1)
+        if gated.iloc[signal_start:].abs().sum() == 0 and not run_zero_signal_path:
             return {
                 "total_trades": 0,
                 "regime_gated": True,
@@ -3449,7 +3460,7 @@ class RegimeOptimizer:
             gated,
             symbol,
             strategy,
-            warmup_bars=int(max(0, warmup_bars)),
+            warmup_bars=warmup,
             timeframe=timeframe,
         )
         return self._compact_exact_regime_result(result, regime), True
@@ -3475,7 +3486,9 @@ class RegimeOptimizer:
         compact_results: Dict[str, Dict[str, Any]] = {}
         for regime in self.REGIMES:
             gated = self._gate_signals_to_exact_regime(raw_signals, features, regime)
-            if gated.abs().sum() == 0:
+            warmup = min(len(gated), max(0, int(warmup_bars or 0)))
+            signal_start = max(0, warmup - 1)
+            if gated.iloc[signal_start:].abs().sum() == 0:
                 compact_results[regime] = {
                     "total_trades": 0,
                     "regime_gated": True,
@@ -3487,7 +3500,7 @@ class RegimeOptimizer:
                 gated,
                 symbol,
                 strategy,
-                warmup_bars=int(max(0, warmup_bars)),
+                warmup_bars=warmup,
                 timeframe=timeframe,
             )
             raw_results[regime] = result
@@ -3565,6 +3578,7 @@ class RegimeOptimizer:
         timeframe: str,
         train_features: pd.DataFrame,
         strategies: List[BaseStrategy],
+        train_warmup_bars: int = 0,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Freeze the train-best B0 candidate independently for every cell."""
         candidates: List[Dict[str, Any]] = []
@@ -3590,6 +3604,7 @@ class RegimeOptimizer:
                             features=train_features,
                             strategy=probe_strategy,
                             regime=regime,
+                            warmup_bars=train_warmup_bars,
                         )
                         completed_trials += int(ran)
                         if int(metrics.get("total_trades", 0) or 0) <= 0:
@@ -3671,7 +3686,10 @@ class RegimeOptimizer:
             evaluations = 0
             error: Optional[str] = None
             metrics: Dict[str, Any] = {"total_trades": 0}
-            if val_features is not None and len(val_features) >= 50:
+            if (
+                val_features is not None
+                and max(0, len(val_features) - int(val_warmup_bars or 0)) >= 50
+            ):
                 evaluations = 1
                 try:
                     frozen_strategy = StrategyRegistry.get(
@@ -3771,6 +3789,7 @@ class RegimeOptimizer:
                             val_features: Optional[pd.DataFrame],
                             strategies: List[BaseStrategy],
                             val_warmup_bars: int = 0,
+                            train_warmup_bars: int = 0,
                             eligibility_features: Optional[pd.DataFrame] = None,
                             selection_features: Optional[pd.DataFrame] = None,
                             selection_warmup_bars: int = 0,
@@ -3786,13 +3805,15 @@ class RegimeOptimizer:
         after its parameters are fixed. Returns exact-regime candidate mappings.
         """
         # ``eligibility_features`` remains accepted for API compatibility, but
-        # no family gate or shortlist may inspect rows outside optimizer train.
+        # no family gate or shortlist may score rows outside optimizer train.
+        # Authenticated prefix rows may initialize causal strategy state only.
         _ = eligibility_features
         screening_candidates, probe_cells = self._collect_family_probe_candidates(
             symbol=symbol,
             timeframe=timeframe,
             train_features=train_features,
             strategies=strategies,
+            train_warmup_bars=train_warmup_bars,
         )
 
         # ===== NEW: Apply training eligibility gates =====
@@ -3915,7 +3936,9 @@ class RegimeOptimizer:
             # Run grid search
             tuned_results = self._tune_strategy_params(
                 symbol, timeframe, strategy_name, param_grid,
-                train_features, val_features, val_warmup_bars,
+                train_features, val_features,
+                val_warmup_bars=val_warmup_bars,
+                train_warmup_bars=train_warmup_bars,
                 regimes=target_regimes,
             )
 
@@ -4012,6 +4035,7 @@ class RegimeOptimizer:
                               train_features: pd.DataFrame,
                               val_features: Optional[pd.DataFrame],
                               val_warmup_bars: int = 0,
+                              train_warmup_bars: int = 0,
                               regimes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Tune hyperparameters for a strategy using Optuna TPE.
@@ -4043,6 +4067,7 @@ class RegimeOptimizer:
                 compute_score_fn=self._compute_train_regime_score,
                 min_train_trades=self.min_train_trades,
                 max_drawdown_pct=self.val_max_drawdown,  # Pass DD threshold for early rejection
+                train_warmup_bars=train_warmup_bars,
                 val_warmup_bars=val_warmup_bars,
             )
             
@@ -4075,7 +4100,8 @@ class RegimeOptimizer:
             param_grid,
             train_features,
             val_features,
-            val_warmup_bars,
+            val_warmup_bars=val_warmup_bars,
+            train_warmup_bars=train_warmup_bars,
             regimes=target_regimes,
         )
     
@@ -4087,6 +4113,7 @@ class RegimeOptimizer:
                                    train_features: pd.DataFrame,
                                    val_features: Optional[pd.DataFrame],
                                    val_warmup_bars: int = 0,
+                                   train_warmup_bars: int = 0,
                                    regimes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Fallback grid search for hyperparameter tuning.
@@ -4141,6 +4168,7 @@ class RegimeOptimizer:
                         features=train_features,
                         strategy=test_strategy,
                         regime=regime,
+                        warmup_bars=train_warmup_bars,
                     )
                     completed_trials += int(ran)
                     if int(train_m.get("total_trades", 0) or 0) < self.min_train_trades:
@@ -4191,7 +4219,10 @@ class RegimeOptimizer:
                 best_candidate["search_completed_trials"] = int(completed_trials)
                 best_candidate["eligible_train_trials"] = int(eligible_train_trials)
                 val_m: Dict[str, Any] = {"total_trades": 0}
-                if val_features is not None and len(val_features) >= 50:
+                if (
+                    val_features is not None
+                    and max(0, len(val_features) - int(val_warmup_bars or 0)) >= 50
+                ):
                     evaluations = 1
                     try:
                         frozen_strategy = StrategyRegistry.get(
@@ -6771,6 +6802,34 @@ class OptimizationPipeline:
         return df.loc[mask].copy()
 
     @classmethod
+    def _strategy_evaluation_context(
+        cls,
+        df: pd.DataFrame,
+        *,
+        context_start: Optional[pd.Timestamp],
+        evaluation_start: Optional[pd.Timestamp],
+        evaluation_end: Optional[pd.Timestamp],
+    ) -> Tuple[pd.DataFrame, int]:
+        """Return causal prefix plus a non-scoring evaluation boundary.
+
+        Parameterized strategies must see authenticated rows preceding a scored
+        partition so recursive/discrete state matches a full-prefix run.  The
+        returned warm-up count is passed unchanged to ``Backtester.run``; rows
+        before ``evaluation_start`` may initialize state but cannot open trades.
+        """
+        start = context_start if context_start is not None else evaluation_start
+        if start is not None and evaluation_start is not None:
+            if pd.Timestamp(start) > pd.Timestamp(evaluation_start):
+                raise ValueError("strategy context cannot start after evaluation")
+        frame = cls._slice_time_window(df, start, evaluation_end)
+        if frame.empty or evaluation_start is None:
+            return frame, 0
+        warmup_bars = int(
+            (pd.DatetimeIndex(frame.index) < pd.Timestamp(evaluation_start)).sum()
+        )
+        return frame, warmup_bars
+
+    @classmethod
     def _selection_feature_input(
         cls,
         data: pd.DataFrame,
@@ -9069,20 +9128,50 @@ class OptimizationPipeline:
                     opt_train_start,
                     opt_train_end,
                 )
-                eligibility_features = self._slice_time_window(
-                    full_features, eligibility_start, eligibility_end
+                eligibility_context_start = eligibility_start
+                if (
+                    opt_train_warm_start is not None
+                    and (
+                        eligibility_context_start is None
+                        or opt_train_warm_start < eligibility_context_start
+                    )
+                ):
+                    eligibility_context_start = opt_train_warm_start
+                eligibility_features, eligibility_warmup_bars = (
+                    self._strategy_evaluation_context(
+                        full_features,
+                        context_start=eligibility_context_start,
+                        evaluation_start=eligibility_start,
+                        evaluation_end=eligibility_end,
+                    )
                 )
-                active_features = self._slice_time_window(full_features, opt_train_start, opt_train_end)
-                stage2_features = self._slice_time_window(full_features, validation_start, validation_end)
+                active_features, train_warmup_bars = self._strategy_evaluation_context(
+                    full_features,
+                    context_start=opt_train_warm_start,
+                    evaluation_start=opt_train_start,
+                    evaluation_end=opt_train_end,
+                )
+                validation_context_start = (
+                    stage2_train_warm_start or stage2_warm_start
+                )
+                stage2_features, validation_warmup_bars = (
+                    self._strategy_evaluation_context(
+                        full_features,
+                        context_start=validation_context_start,
+                        evaluation_start=validation_start,
+                        evaluation_end=validation_end,
+                    )
+                )
                 historical_features = self._slice_time_window(full_features, hist_start, hist_end)
                 holdout_features = (
                     self._slice_time_window(full_features, holdout_warm_start, holdout_end)
                     if holdout_start is not None else pd.DataFrame()
                 )
 
-                if len(active_features) < 200:
+                scored_train_rows = max(0, len(active_features) - train_warmup_bars)
+                if scored_train_rows < 200:
                     reason = (
-                        f"Active native timeframe has only {len(active_features)} "
+                        f"Active native timeframe has only {scored_train_rows} "
                         "optimizer-train feature rows; at least 200 are required"
                     )
                     regime_configs[tf] = {
@@ -9097,7 +9186,14 @@ class OptimizationPipeline:
                     continue
 
                 train_features_by_tf = {tf: active_features}
-                eligibility_features_by_tf = {tf: eligibility_features} if len(eligibility_features) >= 200 else {}
+                train_warmup_by_tf = {tf: train_warmup_bars}
+                scored_eligibility_rows = max(
+                    0, len(eligibility_features) - eligibility_warmup_bars
+                )
+                eligibility_features_by_tf = (
+                    {tf: eligibility_features}
+                    if scored_eligibility_rows >= 200 else {}
+                )
                 val_features_by_tf: Dict[str, pd.DataFrame] = {}
                 val_warmup_by_tf: Dict[str, int] = {}
                 selection_features_by_tf: Dict[str, pd.DataFrame] = {}
@@ -9123,9 +9219,12 @@ class OptimizationPipeline:
                     )
                     else historical_features
                 )
-                if len(stage2_features) >= 50:
+                scored_validation_rows = max(
+                    0, len(stage2_features) - validation_warmup_bars
+                )
+                if scored_validation_rows >= 50:
                     val_features_by_tf[tf] = stage2_features
-                    val_warmup_by_tf[tf] = int((stage2_features.index < validation_start).sum()) if validation_start is not None else 0
+                    val_warmup_by_tf[tf] = validation_warmup_bars
                     if not (
                         scoring_model == "specialist_spokes_threadspark"
                         and threadspark_surface == "clean_holdout"
@@ -9154,6 +9253,7 @@ class OptimizationPipeline:
                         train_features_by_tf,
                         val_features_by_tf,
                         strategies,
+                        train_warmup_by_tf=train_warmup_by_tf,
                         val_warmup_by_tf=val_warmup_by_tf,
                         eligibility_features_by_tf=eligibility_features_by_tf,
                         selection_features_by_tf=selection_features_by_tf,
@@ -9209,11 +9309,17 @@ class OptimizationPipeline:
                     ).lower()
                     if risk_selection_stage == "stage2":
                         governance_features_by_tf = eligibility_features_by_tf or train_features_by_tf
-                        governance_warmup_by_tf = {tf: 0}
+                        governance_warmup_by_tf = {
+                            tf: (
+                                eligibility_warmup_bars
+                                if eligibility_features_by_tf
+                                else train_warmup_bars
+                            )
+                        }
                         governance_surface = "stage2_active_universe"
                     else:
                         governance_features_by_tf = train_features_by_tf
-                        governance_warmup_by_tf = {tf: 0}
+                        governance_warmup_by_tf = {tf: train_warmup_bars}
                         governance_surface = "bleeding_edge_optimization"
                     self._attach_governance_policies(
                         symbol,
@@ -9231,7 +9337,8 @@ class OptimizationPipeline:
                     # joint verdict and remains a physically separate demo book.
 
                 self._log_regime_coverage(symbol, train_features_by_tf, val_features_by_tf)
-                del train_features_by_tf, val_features_by_tf, val_warmup_by_tf
+                del train_features_by_tf, train_warmup_by_tf
+                del val_features_by_tf, val_warmup_by_tf
                 del eligibility_features_by_tf
                 del full_features, eligibility_features, active_features, stage2_features, historical_features, holdout_features
                 FeatureComputer.clear_cache()

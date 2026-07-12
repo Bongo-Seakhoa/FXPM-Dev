@@ -68,6 +68,27 @@ def _stable_seed(*parts: Any) -> int:
     return int.from_bytes(digest, "big") & 0x7FFFFFFF
 
 
+def _bounded_warmup(features: Optional[pd.DataFrame], warmup_bars: int) -> int:
+    """Normalize an authenticated non-scoring prefix for one feature frame."""
+    length = 0 if features is None else len(features)
+    return min(length, max(0, int(warmup_bars or 0)))
+
+
+def _has_scored_signal(signals: pd.Series, warmup_bars: int) -> bool:
+    """Return whether a signal can enter at or after the evaluation boundary."""
+    warmup = min(len(signals), max(0, int(warmup_bars or 0)))
+    # Backtester enters on the bar after a signal. The final context-bar signal
+    # is therefore a legal first-boundary entry, not a warm-up trade.
+    signal_start = max(0, warmup - 1)
+    return bool(signals.iloc[signal_start:].abs().sum() > 0)
+
+
+def _scored_rows(features: Optional[pd.DataFrame], warmup_bars: int) -> int:
+    """Return rows legally available to metrics after the context prefix."""
+    length = 0 if features is None else len(features)
+    return max(0, length - _bounded_warmup(features, warmup_bars))
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -478,7 +499,7 @@ class OptunaTPEOptimizer:
         val_metrics = self._empty_val_metrics()
         evaluations = 0
         evaluation_error: Optional[str] = None
-        if val_features is not None and len(val_features) >= 50:
+        if _scored_rows(val_features, val_warmup_bars) >= 50:
             evaluations = 1
             try:
                 if frozen_strategy is None:
@@ -492,7 +513,9 @@ class OptunaTPEOptimizer:
                     val_signals,
                     symbol,
                     frozen_strategy,
-                    warmup_bars=int(max(0, val_warmup_bars)),
+                    warmup_bars=_bounded_warmup(
+                        val_features, val_warmup_bars
+                    ),
                     timeframe=timeframe,
                 )
                 val_metrics = dict(val_result or self._empty_val_metrics())
@@ -552,7 +575,9 @@ class OptunaTPEOptimizer:
                  val_features: Optional[pd.DataFrame],
                  scoring_fn: Callable[[Dict, Dict], float],
                  min_trades: int = 10,
-                 max_drawdown_pct: float = 30.0) -> OptimizationResult:
+                 max_drawdown_pct: float = 30.0,
+                 train_warmup_bars: int = 0,
+                 val_warmup_bars: int = 0) -> OptimizationResult:
         """
         Optimize strategy parameters using Optuna TPE with early rejection.
         
@@ -574,6 +599,8 @@ class OptunaTPEOptimizer:
                 symbol, strategy_name, param_grid, train_features, 
                 val_features, scoring_fn, min_trades, max_drawdown_pct,
                 timeframe=timeframe,
+                train_warmup_bars=train_warmup_bars,
+                val_warmup_bars=val_warmup_bars,
             )
         
         start_time = time.time()
@@ -588,6 +615,8 @@ class OptunaTPEOptimizer:
                 symbol, strategy_name, default_params,
                 train_features, val_features, scoring_fn,
                 timeframe=timeframe,
+                train_warmup_bars=train_warmup_bars,
+                val_warmup_bars=val_warmup_bars,
             )
         
         # Create parameter space
@@ -643,11 +672,15 @@ class OptunaTPEOptimizer:
                 signals = strategy.generate_signals(train_features, symbol)
 
                 # C1: Skip backtest entirely if no signals generated
-                if signals.abs().sum() == 0:
+                if not _has_scored_signal(signals, train_warmup_bars):
                     return self.config.penalty_no_trades
 
                 train_metrics = self.backtester.run(
-                    train_features, signals, symbol, strategy, timeframe=timeframe
+                    train_features, signals, symbol, strategy,
+                    timeframe=timeframe,
+                    warmup_bars=_bounded_warmup(
+                        train_features, train_warmup_bars
+                    ),
                 )
 
                 # EARLY REJECTION 1: Minimum trades
@@ -727,7 +760,10 @@ class OptunaTPEOptimizer:
 
         # One post-freeze validation evaluation; it cannot change best_params.
         frozen_val_metrics = self._empty_val_metrics()
-        if best_result['train_metrics'] and val_features is not None and len(val_features) >= 50:
+        if (
+            best_result['train_metrics']
+            and _scored_rows(val_features, val_warmup_bars) >= 50
+        ):
             try:
                 frozen_strategy = self.strategy_registry.get(
                     strategy_name, **dict(best_result['params'])
@@ -739,6 +775,9 @@ class OptunaTPEOptimizer:
                     symbol,
                     frozen_strategy,
                     timeframe=timeframe,
+                    warmup_bars=_bounded_warmup(
+                        val_features, val_warmup_bars
+                    ),
                 )
             except Exception as exc:
                 frozen_val_metrics = self._empty_val_metrics()
@@ -771,7 +810,8 @@ class OptunaTPEOptimizer:
                              compute_score_fn: Callable,
                              min_train_trades: int = 25,
                              max_drawdown_pct: float = 25.0,
-                             val_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
+                             val_warmup_bars: int = 0,
+                             train_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
         """Run independent train-only studies for exact regime-family cells.
 
         Tuning-validation rows are never generated or backtested inside a
@@ -800,7 +840,7 @@ class OptunaTPEOptimizer:
                 symbol, timeframe, strategy_name, param_grid,
                 train_features, val_features, regimes,
                 bucket_trades_fn, compute_score_fn, min_train_trades,
-                max_drawdown_pct, val_warmup_bars
+                max_drawdown_pct, val_warmup_bars, train_warmup_bars
             )
         
         self.last_regime_search_metadata = {}
@@ -864,7 +904,9 @@ class OptunaTPEOptimizer:
                     train_signals = self._gate_signals_to_regime(
                         raw_train_signals, train_features, target_regime
                     )
-                    if train_signals.abs().sum() == 0:
+                    if not _has_scored_signal(
+                        train_signals, train_warmup_bars
+                    ):
                         return float(self.config.penalty_no_trades)
                     train_result = self.backtester.run(
                         train_features,
@@ -872,6 +914,9 @@ class OptunaTPEOptimizer:
                         symbol,
                         strategy,
                         timeframe=timeframe,
+                        warmup_bars=_bounded_warmup(
+                            train_features, train_warmup_bars
+                        ),
                     )
                     train_m = dict(train_result or {})
                     if int(train_m.get("total_trades", 0) or 0) < min_train_trades:
@@ -1128,7 +1173,9 @@ class OptunaTPEOptimizer:
                                train_features: pd.DataFrame,
                                val_features: Optional[pd.DataFrame],
                                scoring_fn: Callable,
-                               timeframe: str) -> OptimizationResult:
+                               timeframe: str,
+                               train_warmup_bars: int = 0,
+                               val_warmup_bars: int = 0) -> OptimizationResult:
         """Evaluate strategy with default parameters only."""
         start_time = time.time()
         
@@ -1136,16 +1183,20 @@ class OptunaTPEOptimizer:
         
         signals = strategy.generate_signals(train_features, symbol)
         train_metrics = self.backtester.run(
-            train_features, signals, symbol, strategy, timeframe=timeframe
+            train_features, signals, symbol, strategy,
+            timeframe=timeframe,
+            warmup_bars=_bounded_warmup(train_features, train_warmup_bars),
         )
         
         # The only parameter set is frozen after its train evaluation. Score it
         # on train only, then attach exactly one validation evaluation.
         score = float(scoring_fn(train_metrics, {}))
-        if val_features is not None and len(val_features) >= 50:
+        if _scored_rows(val_features, val_warmup_bars) >= 50:
             val_signals = strategy.generate_signals(val_features, symbol)
             val_metrics = self.backtester.run(
-                val_features, val_signals, symbol, strategy, timeframe=timeframe
+                val_features, val_signals, symbol, strategy,
+                timeframe=timeframe,
+                warmup_bars=_bounded_warmup(val_features, val_warmup_bars),
             )
         else:
             val_metrics = self._empty_val_metrics()
@@ -1175,7 +1226,9 @@ class OptunaTPEOptimizer:
                                 scoring_fn: Callable,
                                 min_trades: int,
                                 max_drawdown_pct: float = 30.0,
-                                timeframe: str = "") -> OptimizationResult:
+                                timeframe: str = "",
+                                train_warmup_bars: int = 0,
+                                val_warmup_bars: int = 0) -> OptimizationResult:
         """Fallback to random search when Optuna unavailable (with drawdown early rejection)."""
         from itertools import product
         
@@ -1189,6 +1242,8 @@ class OptunaTPEOptimizer:
                 symbol, strategy_name, default_params,
                 train_features, val_features, scoring_fn,
                 timeframe=timeframe,
+                train_warmup_bars=train_warmup_bars,
+                val_warmup_bars=val_warmup_bars,
             )
         
         # Generate combinations with Latin Hypercube sampling
@@ -1232,7 +1287,11 @@ class OptunaTPEOptimizer:
 
                 signals = strategy.generate_signals(train_features, symbol)
                 train_metrics = self.backtester.run(
-                    train_features, signals, symbol, strategy, timeframe=timeframe
+                    train_features, signals, symbol, strategy,
+                    timeframe=timeframe,
+                    warmup_bars=_bounded_warmup(
+                        train_features, train_warmup_bars
+                    ),
                 )
 
                 # EARLY REJECTION 1: Minimum trades
@@ -1262,7 +1321,10 @@ class OptunaTPEOptimizer:
         elapsed = time.time() - start_time
 
         # Evaluate only the frozen train winner on validation.
-        if best_train_metrics and val_features is not None and len(val_features) >= 50:
+        if (
+            best_train_metrics
+            and _scored_rows(val_features, val_warmup_bars) >= 50
+        ):
             try:
                 frozen_strategy = self.strategy_registry.get(
                     strategy_name, **dict(best_params)
@@ -1274,6 +1336,9 @@ class OptunaTPEOptimizer:
                     symbol,
                     frozen_strategy,
                     timeframe=timeframe,
+                    warmup_bars=_bounded_warmup(
+                        val_features, val_warmup_bars
+                    ),
                 )
             except Exception as exc:
                 best_val_metrics = self._empty_val_metrics()
@@ -1310,7 +1375,8 @@ class OptunaTPEOptimizer:
                                 compute_score_fn: Callable,
                                 min_train_trades: int,
                                 max_drawdown_pct: float = 25.0,
-                                val_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
+                                val_warmup_bars: int = 0,
+                                train_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
         """Independent train-only grid cells, each followed by one frozen tuning eval."""
         from itertools import product
         
@@ -1367,7 +1433,9 @@ class OptunaTPEOptimizer:
                     train_signals = self._gate_signals_to_regime(
                         raw_train_signals, train_features, regime
                     )
-                    if train_signals.abs().sum() == 0:
+                    if not _has_scored_signal(
+                        train_signals, train_warmup_bars
+                    ):
                         continue
                     train_result = self.backtester.run(
                         train_features,
@@ -1375,6 +1443,9 @@ class OptunaTPEOptimizer:
                         symbol,
                         strategy,
                         timeframe=timeframe,
+                        warmup_bars=_bounded_warmup(
+                            train_features, train_warmup_bars
+                        ),
                     )
                     completed_trials += 1
                     train_m = dict(train_result or {})
