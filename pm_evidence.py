@@ -16,6 +16,7 @@ import pandas as pd
 
 
 EVIDENCE_CONTRACT_VERSION = "2026-07-10-calendar-lockbox-v2"
+TIMEFRAME_EVIDENCE_CONTRACT_VERSION = "fxpm-timeframe-evidence-v3"
 CALENDAR_SPLIT_MODE = "calendar_lockbox_v2"
 NATIVE_SOURCE_KIND = "broker_native"
 PARTITIONS: Tuple[str, ...] = (
@@ -29,6 +30,18 @@ DEFAULT_WINDOW_YEARS: Dict[str, int] = {
     "optimizer_train": 5,
     "tuning_validation": 2,
     "final_lockbox": 2,
+}
+
+# Acquisition/evidence planning priors.  These are necessary calendar-span
+# floors, not sufficient profitability evidence; effective-sample and
+# power-derived trade gates remain independent and binding.
+DEFAULT_TIMEFRAME_WINDOW_YEARS: Dict[str, Dict[str, int]] = {
+    "M5": {"optimizer_train": 5, "tuning_validation": 2, "final_lockbox": 2},
+    "M15": {"optimizer_train": 5, "tuning_validation": 2, "final_lockbox": 2},
+    "M30": {"optimizer_train": 6, "tuning_validation": 2, "final_lockbox": 2},
+    "H1": {"optimizer_train": 7, "tuning_validation": 3, "final_lockbox": 3},
+    "H4": {"optimizer_train": 8, "tuning_validation": 3, "final_lockbox": 3},
+    "D1": {"optimizer_train": 12, "tuning_validation": 4, "final_lockbox": 4},
 }
 
 # Absolute fallbacks for instruments with comparatively short regular trading
@@ -173,6 +186,30 @@ def normalize_window_years(value: Any) -> Dict[str, int]:
     return normalized
 
 
+def normalize_timeframe_window_years(value: Any) -> Dict[str, Dict[str, int]]:
+    """Return a complete, non-weakenable per-timeframe calendar contract."""
+    source = value if isinstance(value, Mapping) else {}
+    normalized: Dict[str, Dict[str, int]] = {}
+    for timeframe in SUPPORTED_TIMEFRAMES:
+        tf_source = source.get(timeframe, {})
+        if not isinstance(tf_source, Mapping):
+            tf_source = {}
+        normalized[timeframe] = {}
+        for partition in PARTITIONS:
+            safe = DEFAULT_TIMEFRAME_WINDOW_YEARS[timeframe][partition]
+            raw = tf_source.get(partition, safe)
+            try:
+                years = int(raw)
+            except (TypeError, ValueError, OverflowError):
+                years = safe
+            if isinstance(raw, bool) or years <= 0:
+                years = safe
+            # A production config may acquire more history, but cannot silently
+            # weaken the planning prior without a new contract version.
+            normalized[timeframe][partition] = max(safe, years)
+    return normalized
+
+
 def normalize_min_native_bars(value: Any) -> Dict[str, Dict[str, int]]:
     """Return the complete fail-closed timeframe/partition floor matrix."""
     source = value if isinstance(value, Mapping) else {}
@@ -249,6 +286,53 @@ def build_calendar_boundaries(
             "final_lockbox": (lockbox_start, lockbox_end),
         },
     )
+
+
+def build_timeframe_calendar_boundaries(
+    as_of_utc: Any,
+    timeframe: str,
+    *,
+    timeframe_window_years: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    embargo: Any = pd.Timedelta(0),
+) -> CalendarBoundaries:
+    """Build the v3 chronological windows for one independently sourced TF."""
+    tf = str(timeframe or "").strip().upper()
+    if tf not in SUPPORTED_TIMEFRAMES:
+        raise ValueError(f"unsupported timeframe: {timeframe!r}")
+    matrix = normalize_timeframe_window_years(timeframe_window_years)
+    boundaries = build_calendar_boundaries(
+        as_of_utc,
+        window_years=matrix[tf],
+        embargo=embargo,
+    )
+    return CalendarBoundaries(
+        as_of_utc=boundaries.as_of_utc,
+        windows=boundaries.windows,
+        embargo=boundaries.embargo,
+        contract_version=TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+    )
+
+
+def earliest_timeframe_evidence_start(
+    as_of_utc: Any,
+    *,
+    timeframes: Sequence[str] = SUPPORTED_TIMEFRAMES,
+    timeframe_window_years: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    embargo: Any = pd.Timedelta(0),
+) -> pd.Timestamp:
+    """Return the earliest train start required by a multi-timeframe run."""
+    starts = [
+        build_timeframe_calendar_boundaries(
+            as_of_utc,
+            timeframe,
+            timeframe_window_years=timeframe_window_years,
+            embargo=embargo,
+        ).windows["optimizer_train"][0]
+        for timeframe in timeframes
+    ]
+    if not starts:
+        raise ValueError("at least one timeframe is required")
+    return min(starts)
 
 
 def calendar_window_meta(
@@ -364,6 +448,7 @@ def validate_timeframe_evidence(
     *,
     source_meta: Optional[Mapping[str, Any]] = None,
     window_years: Optional[Mapping[str, Any]] = None,
+    timeframe_window_years: Optional[Mapping[str, Mapping[str, Any]]] = None,
     min_native_bars: Optional[Mapping[str, Mapping[str, Any]]] = None,
     partition_bounds: Optional[Mapping[str, Tuple[Any, Any]]] = None,
     require_native: bool = True,
@@ -380,7 +465,11 @@ def validate_timeframe_evidence(
     tf = str(timeframe or "").strip().upper()
     meta: Mapping[str, Any] = source_meta if isinstance(source_meta, Mapping) else {}
     source_kind = str(meta.get("source_kind", "unknown") or "unknown").strip().lower()
-    years = normalize_window_years(window_years)
+    years = (
+        normalize_timeframe_window_years(timeframe_window_years).get(tf, {})
+        if timeframe_window_years is not None
+        else normalize_window_years(window_years)
+    )
     floors = normalize_min_native_bars(min_native_bars)
     reasons: list[str] = []
 

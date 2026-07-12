@@ -15,7 +15,11 @@ from pm_native_activation import (
 )
 from pm_evidence import (
     DEFAULT_MIN_NATIVE_BARS,
+    DEFAULT_TIMEFRAME_WINDOW_YEARS,
+    TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     build_calendar_boundaries,
+    build_timeframe_calendar_boundaries,
+    earliest_timeframe_evidence_start,
     ensure_utc_index,
     latest_closed_bar_end,
     trim_to_closed_bars,
@@ -71,6 +75,45 @@ def test_calendar_boundaries_are_common_half_open_and_disjoint():
         pd.Timestamp("2026-01-01T00:00:00Z"),
     )
     assert train[1] < tuning[0] < tuning[1] < lockbox[0] < lockbox[1]
+
+
+def test_v3_timeframe_windows_lengthen_without_changing_information_cutoff():
+    as_of = "2026-01-01T00:00:00Z"
+    m5 = build_timeframe_calendar_boundaries(as_of, "M5", embargo="7d")
+    d1 = build_timeframe_calendar_boundaries(as_of, "D1", embargo="7d")
+
+    assert m5.contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+    assert d1.contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+    assert m5.as_of_utc == d1.as_of_utc == pd.Timestamp(as_of)
+    assert m5.windows["final_lockbox"][0] == pd.Timestamp("2024-01-01T00:00:00Z")
+    assert d1.windows["final_lockbox"][0] == pd.Timestamp("2022-01-01T00:00:00Z")
+    assert d1.windows["optimizer_train"][0] < m5.windows["optimizer_train"][0]
+    assert earliest_timeframe_evidence_start(as_of, embargo="7d") == d1.windows["optimizer_train"][0]
+
+
+def test_v3_timeframe_window_config_may_tighten_but_not_weaken_priors():
+    attempted = {
+        "M5": {"optimizer_train": 1, "tuning_validation": 1, "final_lockbox": 1},
+        "D1": {"optimizer_train": 15, "tuning_validation": 5, "final_lockbox": 5},
+    }
+    m5 = build_timeframe_calendar_boundaries(
+        "2026-01-01T00:00:00Z",
+        "M5",
+        timeframe_window_years=attempted,
+    )
+    d1 = build_timeframe_calendar_boundaries(
+        "2026-01-01T00:00:00Z",
+        "D1",
+        timeframe_window_years=attempted,
+    )
+
+    assert (m5.windows["optimizer_train"][1].year - m5.windows["optimizer_train"][0].year) == 5
+    assert (d1.windows["optimizer_train"][1].year - d1.windows["optimizer_train"][0].year) == 15
+    assert DEFAULT_TIMEFRAME_WINDOW_YEARS["D1"] == {
+        "optimizer_train": 12,
+        "tuning_validation": 4,
+        "final_lockbox": 4,
+    }
 
 
 def test_five_two_two_year_d1_native_evidence_passes_necessary_gate():
@@ -361,7 +404,13 @@ def test_pipeline_evidence_failure_emits_four_markers_before_features_or_optimiz
         ):
             result = pipeline.run_for_symbol("EURUSD")
 
-        assert not result.success
+        # A fully evaluated cell that honestly abstains is a completed semantic
+        # result, not an optimizer/infrastructure failure.  It must therefore
+        # be persistable as an explicit NO_TRADE grid.
+        assert result.success
+        assert result.config is not None
+        assert not result.config.is_validated
+        assert result.config.strategy_name == "NO_TRADE"
         assert len(captured) == 4
         assert set(captured) == {"TREND", "RANGE", "BREAKOUT", "CHOP"}
         assert all(marker.is_no_trade_marker() for marker in captured.values())
