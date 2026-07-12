@@ -13,8 +13,12 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from pm_evidence import TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+from pm_native_resolution import RESOLUTION_AUDIT_SCHEMA_VERSION
 
 
 ACTIVE_POINTER_SCHEMA = "fxpm-native-active-pointer-v1"
@@ -24,9 +28,15 @@ NATIVE_BARS_SCHEMA = "fxpm-native-bars-v1"
 NATIVE_PARITY_SCHEMA = "fxpm-native-m5-parity-v1"
 NATIVE_ACQUISITION_CONTRACT = "2026-07-10-native-calendar-acquisition-v1"
 AUDITED_SIDECAR_CONTRACT = "2026-07-10-native-audited-sidecar-v1"
-UNIVERSE_ELIGIBILITY_SCHEMA = "fxpm-native-universe-eligibility-v2"
+UNIVERSE_ELIGIBILITY_SCHEMA = "fxpm-native-universe-eligibility-v3"
+LEGACY_UNIVERSE_ELIGIBILITY_SCHEMA = "fxpm-native-universe-eligibility-v2"
 NATIVE_MINIMUM_SESSION_COVERAGE = 0.95
-NATIVE_SESSION_COVERAGE_METHOD = "train_only_robust_weekly_session_rate_v1"
+LEGACY_NATIVE_SESSION_COVERAGE_METHOD = "train_only_robust_weekly_session_rate_v1"
+NATIVE_SESSION_COVERAGE_METHOD = "timestamp_segmented_weekly_session_rate_v2"
+SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS = frozenset(
+    {LEGACY_NATIVE_SESSION_COVERAGE_METHOD, NATIVE_SESSION_COVERAGE_METHOD}
+)
+TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION = "fxpm.native_history.timeframe_request_map.v3"
 NATIVE_EVIDENCE_PARTITIONS: Tuple[str, ...] = (
     "optimizer_train",
     "tuning_validation",
@@ -219,6 +229,290 @@ def _read_evidence_object(
     return payload, []
 
 
+def _parse_aware_utc(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_partition_boundaries(
+    raw_boundaries: Any,
+    *,
+    error_prefix: str,
+    as_of_ts: Optional[datetime],
+    requested_start_ts: Optional[datetime],
+) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    errors: List[str] = []
+    boundaries: Dict[str, Dict[str, str]] = {}
+    if not isinstance(raw_boundaries, Mapping) or set(raw_boundaries) != set(
+        NATIVE_EVIDENCE_PARTITIONS
+    ):
+        return {}, [f"{error_prefix}_BOUNDARIES_INVALID"]
+    previous_end: Optional[datetime] = None
+    for partition in NATIVE_EVIDENCE_PARTITIONS:
+        raw_window = raw_boundaries.get(partition)
+        if not isinstance(raw_window, Mapping) or set(raw_window) != {
+            "start_ts",
+            "end_ts",
+        }:
+            errors.append(f"{error_prefix}_WINDOW_INVALID:{partition}")
+            continue
+        raw_window_start = str(raw_window.get("start_ts") or "").strip()
+        raw_window_end = str(raw_window.get("end_ts") or "").strip()
+        window_start = _parse_aware_utc(raw_window_start)
+        window_end = _parse_aware_utc(raw_window_end)
+        if (
+            window_start is None
+            or window_end is None
+            or window_start >= window_end
+            or (previous_end is not None and window_start < previous_end)
+        ):
+            errors.append(f"{error_prefix}_WINDOW_INVALID:{partition}")
+            continue
+        boundaries[partition] = {
+            "start_ts": raw_window_start,
+            "end_ts": raw_window_end,
+        }
+        previous_end = window_end
+    final_end = (
+        _parse_aware_utc(boundaries.get("final_lockbox", {}).get("end_ts"))
+        if boundaries
+        else None
+    )
+    if as_of_ts is not None and final_end != as_of_ts:
+        errors.append(f"{error_prefix}_AS_OF_BOUNDARY_MISMATCH")
+    optimizer_start = (
+        _parse_aware_utc(boundaries.get("optimizer_train", {}).get("start_ts"))
+        if boundaries
+        else None
+    )
+    if (
+        requested_start_ts is not None
+        and optimizer_start is not None
+        and requested_start_ts > optimizer_start
+    ):
+        errors.append(f"{error_prefix}_WARMUP_RANGE_INVALID")
+    return boundaries, errors
+
+
+def _validated_calendar_contract(
+    request: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Authenticate legacy flat or v3 timeframe-specific calendar windows."""
+    errors: List[str] = []
+    common_as_of = str(request.get("common_as_of_utc") or "").strip()
+    common_start = str(request.get("common_requested_start_utc") or "").strip()
+    as_of_ts = _parse_aware_utc(common_as_of)
+    start_ts = _parse_aware_utc(common_start)
+    if as_of_ts is None:
+        errors.append("NATIVE_UNIVERSE_CALENDAR_AS_OF_INVALID")
+    if start_ts is None:
+        errors.append("NATIVE_UNIVERSE_CALENDAR_REQUESTED_START_INVALID")
+    elif as_of_ts is not None and start_ts >= as_of_ts:
+        errors.append("NATIVE_UNIVERSE_CALENDAR_REQUESTED_RANGE_INVALID")
+
+    boundaries, boundary_errors = _validated_partition_boundaries(
+        request.get("common_calendar_boundaries"),
+        error_prefix="NATIVE_UNIVERSE_CALENDAR",
+        as_of_ts=as_of_ts,
+        requested_start_ts=start_ts,
+    )
+    errors.extend(boundary_errors)
+
+    version = str(request.get("window_contract_version") or "").strip()
+    timeframe_boundaries: Dict[str, Dict[str, Dict[str, str]]] = {}
+    if version and version != TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        errors.append("NATIVE_UNIVERSE_TIMEFRAME_CALENDAR_VERSION_INVALID")
+    elif version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        raw_timeframes = [
+            str(value or "").strip()
+            for value in (request.get("timeframes") or [])
+            if str(value or "").strip()
+        ]
+        if (
+            not raw_timeframes
+            or raw_timeframes != [value.upper() for value in raw_timeframes]
+            or len(raw_timeframes) != len(set(raw_timeframes))
+        ):
+            errors.append("NATIVE_UNIVERSE_TIMEFRAME_CALENDAR_ROSTER_INVALID")
+        roster = tuple(raw_timeframes)
+        raw_map = request.get("timeframe_calendar_boundaries")
+        if not isinstance(raw_map, Mapping) or set(raw_map) != set(roster):
+            errors.append("NATIVE_UNIVERSE_TIMEFRAME_CALENDAR_MAP_INVALID")
+            raw_map = {}
+        for timeframe in roster:
+            normalized, cell_errors = _validated_partition_boundaries(
+                raw_map.get(timeframe),
+                error_prefix=f"NATIVE_UNIVERSE_TIMEFRAME_CALENDAR:{timeframe}",
+                as_of_ts=as_of_ts,
+                requested_start_ts=start_ts,
+            )
+            timeframe_boundaries[timeframe] = normalized
+            errors.extend(cell_errors)
+
+        if str(request.get("timeframe_request_map_schema_version") or "") != (
+            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+        ):
+            errors.append("NATIVE_UNIVERSE_TIMEFRAME_REQUEST_MAP_SCHEMA_INVALID")
+        if str(request.get("timeframe_calendar_boundaries_sha256") or "") != (
+            _canonical_json_sha256(raw_map)
+        ):
+            errors.append("NATIVE_UNIVERSE_TIMEFRAME_CALENDAR_HASH_INVALID")
+
+        request_map_fields = {
+            "schema_version": request.get("timeframe_request_map_schema_version"),
+            "window_contract_version": version,
+            "common_as_of_utc": common_as_of,
+            "timeframe_window_years": request.get("timeframe_window_years"),
+            "timeframe_calendar_boundaries": raw_map,
+            "timeframe_required_evidence_lead_start_utc": request.get(
+                "timeframe_required_evidence_lead_start_utc"
+            ),
+            "timeframe_source_request_intervals": request.get(
+                "timeframe_source_request_intervals"
+            ),
+        }
+        if str(request.get("timeframe_request_map_sha256") or "") != (
+            _canonical_json_sha256(request_map_fields)
+        ):
+            errors.append("NATIVE_UNIVERSE_TIMEFRAME_REQUEST_MAP_HASH_INVALID")
+
+        for field_name in (
+            "timeframe_window_years",
+            "timeframe_required_evidence_lead_start_utc",
+            "timeframe_source_request_intervals",
+        ):
+            raw_value = request.get(field_name)
+            if not isinstance(raw_value, Mapping) or set(raw_value) != set(roster):
+                errors.append(
+                    f"NATIVE_UNIVERSE_{field_name.upper()}_ROSTER_INVALID"
+                )
+        years_map = request.get("timeframe_window_years")
+        if isinstance(years_map, Mapping):
+            for timeframe in roster:
+                years = years_map.get(timeframe)
+                if not isinstance(years, Mapping) or set(years) != set(
+                    NATIVE_EVIDENCE_PARTITIONS
+                ):
+                    errors.append(
+                        f"NATIVE_UNIVERSE_TIMEFRAME_WINDOW_YEARS_INVALID:{timeframe}"
+                    )
+                    continue
+                for value in years.values():
+                    if isinstance(value, bool):
+                        errors.append(
+                            f"NATIVE_UNIVERSE_TIMEFRAME_WINDOW_YEARS_INVALID:{timeframe}"
+                        )
+                        break
+                    try:
+                        numeric = float(value)
+                    except (TypeError, ValueError, OverflowError):
+                        numeric = float("nan")
+                    if not math.isfinite(numeric) or numeric <= 0.0:
+                        errors.append(
+                            f"NATIVE_UNIVERSE_TIMEFRAME_WINDOW_YEARS_INVALID:{timeframe}"
+                        )
+                        break
+
+        leads = request.get("timeframe_required_evidence_lead_start_utc")
+        intervals = request.get("timeframe_source_request_intervals")
+        for timeframe in roster:
+            lead = leads.get(timeframe) if isinstance(leads, Mapping) else None
+            if _parse_aware_utc(lead) is None:
+                errors.append(
+                    f"NATIVE_UNIVERSE_TIMEFRAME_EVIDENCE_LEAD_INVALID:{timeframe}"
+                )
+            interval = intervals.get(timeframe) if isinstance(intervals, Mapping) else None
+            interval_start = (
+                _parse_aware_utc(interval.get("start_utc"))
+                if isinstance(interval, Mapping)
+                else None
+            )
+            interval_end = (
+                _parse_aware_utc(interval.get("end_exclusive_utc"))
+                if isinstance(interval, Mapping)
+                else None
+            )
+            if (
+                not isinstance(interval, Mapping)
+                or set(interval) != {"start_utc", "end_exclusive_utc"}
+                or interval_start is None
+                or interval_end is None
+                or interval_start >= interval_end
+            ):
+                errors.append(
+                    f"NATIVE_UNIVERSE_TIMEFRAME_SOURCE_INTERVAL_INVALID:{timeframe}"
+                )
+
+        compatibility_timeframe = (
+            "M5" if "M5" in roster else (roster[0] if roster else "")
+        )
+        if compatibility_timeframe:
+            if boundaries != timeframe_boundaries.get(compatibility_timeframe):
+                errors.append(
+                    "NATIVE_UNIVERSE_TIMEFRAME_COMMON_PROJECTION_MISMATCH"
+                )
+            if isinstance(years_map, Mapping) and request.get("window_years") != (
+                years_map.get(compatibility_timeframe)
+            ):
+                errors.append(
+                    "NATIVE_UNIVERSE_TIMEFRAME_WINDOW_PROJECTION_MISMATCH"
+                )
+
+        reference_active: Optional[Dict[str, str]] = None
+        for timeframe in roster:
+            cell = timeframe_boundaries.get(timeframe) or {}
+            active_projection = {
+                partition: json.dumps(cell.get(partition), sort_keys=True)
+                for partition in ("tuning_validation", "final_lockbox")
+            }
+            if reference_active is None:
+                reference_active = active_projection
+            elif active_projection != reference_active:
+                errors.append(
+                    "NATIVE_UNIVERSE_TIMEFRAME_ACTIVE_WINDOWS_NOT_CONCURRENT"
+                )
+                break
+    if errors:
+        return {}, list(dict.fromkeys(errors))
+    result = {
+        "common_as_of_utc": common_as_of,
+        "common_requested_start_utc": common_start,
+        "common_calendar_boundaries": boundaries,
+    }
+    if version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        result.update(
+            {
+                "window_contract_version": version,
+                "timeframe_calendar_boundaries": timeframe_boundaries,
+                "timeframe_calendar_boundaries_sha256": request.get(
+                    "timeframe_calendar_boundaries_sha256"
+                ),
+                "timeframe_request_map_sha256": request.get(
+                    "timeframe_request_map_sha256"
+                ),
+            }
+        )
+    return result, []
+
+
 def _verify_activation_cell_evidence(
     native_root: Path,
     *,
@@ -227,13 +521,16 @@ def _verify_activation_cell_evidence(
     entry: Any,
     run_cell: Any,
     audited_cell: Any,
-    expected_symbol_status: str,
+    expected_cell_status: str,
     activation_id: str,
     run_id: str,
     run_manifest_relative_path: Any,
     run_manifest_sha256: Any,
     run_request: Mapping[str, Any],
     contract_minimum: float,
+    expected_coverage_method: str,
+    require_resolution_audit: bool,
+    m5_run_cell: Any,
 ) -> List[str]:
     """Bind one manifest decision to the immutable acquisition/audit bytes.
 
@@ -245,6 +542,10 @@ def _verify_activation_cell_evidence(
     """
 
     cell_id = f"{symbol}|{timeframe}"
+    legacy_symbol_excluded = (
+        str(expected_cell_status or "").strip().lower()
+        == "legacy_excluded_no_trade"
+    )
     errors: List[str] = []
     if not isinstance(entry, Mapping):
         return [f"NATIVE_CELL_EVIDENCE_ENTRY_MISSING:{cell_id}"]
@@ -266,6 +567,8 @@ def _verify_activation_cell_evidence(
         "parity_relative_path",
         "parity_sha256",
         "coverage_method",
+        "resolution_status",
+        "resolution_reason_codes",
         "expected_session_coverage_by_partition",
         "observed_session_bars_by_partition",
         "expected_session_bars_by_partition",
@@ -467,7 +770,62 @@ def _verify_activation_cell_evidence(
     provenance_request = (
         provenance.get("request") if isinstance(provenance.get("request"), Mapping) else {}
     )
+    window_contract_version = str(
+        run_request.get("window_contract_version") or ""
+    )
     expected_boundaries = run_request.get("common_calendar_boundaries")
+    if window_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        timeframe_boundaries = run_request.get("timeframe_calendar_boundaries")
+        expected_boundaries = (
+            timeframe_boundaries.get(timeframe)
+            if isinstance(timeframe_boundaries, Mapping)
+            else None
+        )
+        for field_name in (
+            "window_contract_version",
+            "timeframe_request_map_schema_version",
+            "timeframe_window_years",
+            "timeframe_calendar_boundaries",
+            "timeframe_calendar_boundaries_sha256",
+            "timeframe_required_evidence_lead_start_utc",
+            "timeframe_source_request_intervals",
+            "timeframe_request_map_sha256",
+        ):
+            if provenance_request.get(field_name) != run_request.get(field_name):
+                errors.append(
+                    f"NATIVE_CELL_EVIDENCE_PROVENANCE_TIMEFRAME_REQUEST_MISMATCH:{cell_id}:{field_name}"
+                )
+        expected_years = (
+            (run_request.get("timeframe_window_years") or {}).get(timeframe)
+            if isinstance(run_request.get("timeframe_window_years"), Mapping)
+            else None
+        )
+        if provenance_request.get("cell_timeframe") != timeframe:
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_PROVENANCE_CELL_TIMEFRAME_MISMATCH:{cell_id}"
+            )
+        if provenance_request.get("cell_timeframe_window_years") != expected_years:
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_PROVENANCE_CELL_WINDOW_MISMATCH:{cell_id}"
+            )
+        if provenance_request.get("window_years") != expected_years:
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_PROVENANCE_WINDOW_PROJECTION_MISMATCH:{cell_id}"
+            )
+        if provenance_request.get("cell_calendar_boundaries") != expected_boundaries:
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_PROVENANCE_CELL_BOUNDARIES_MISMATCH:{cell_id}"
+            )
+        if sidecar.get("cell_calendar_boundaries") != expected_boundaries:
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_SIDECAR_CELL_BOUNDARIES_MISMATCH:{cell_id}"
+            )
+        if str(sidecar.get("timeframe_calendar_boundaries_sha256") or "") != str(
+            run_request.get("timeframe_calendar_boundaries_sha256") or ""
+        ):
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_SIDECAR_TIMEFRAME_CALENDAR_HASH_MISMATCH:{cell_id}"
+            )
     if provenance_request.get("common_calendar_boundaries") != expected_boundaries:
         errors.append(f"NATIVE_CELL_EVIDENCE_PROVENANCE_BOUNDARIES_MISMATCH:{cell_id}")
     if sidecar.get("common_calendar_boundaries") != expected_boundaries:
@@ -479,6 +837,14 @@ def _verify_activation_cell_evidence(
         if isinstance(coverage_details, Mapping)
         else ""
     )
+    if classification == "success" and coverage_method not in (
+        SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS
+    ):
+        errors.append(f"NATIVE_CELL_EVIDENCE_COVERAGE_METHOD_INVALID:{cell_id}")
+    if classification == "success" and coverage_method != expected_coverage_method:
+        errors.append(
+            f"NATIVE_CELL_EVIDENCE_COVERAGE_METHOD_CONTRACT_MISMATCH:{cell_id}"
+        )
     if str(entry.get("coverage_method") or "") != coverage_method:
         errors.append(f"NATIVE_CELL_EVIDENCE_ENTRY_COVERAGE_METHOD_MISMATCH:{cell_id}")
     if isinstance(audited_cell, Mapping) and str(
@@ -503,6 +869,74 @@ def _verify_activation_cell_evidence(
     ).upper():
         errors.append(f"NATIVE_CELL_EVIDENCE_PARITY_SIDECAR_MISMATCH:{cell_id}")
 
+    resolution_status = "PASS"
+    resolution_reasons: List[str] = []
+    if require_resolution_audit:
+        resolution_audit = sidecar.get("resolution_audit")
+        if not isinstance(resolution_audit, Mapping):
+            errors.append(f"NATIVE_CELL_EVIDENCE_RESOLUTION_AUDIT_MISSING:{cell_id}")
+            resolution_status = "INVALID"
+        else:
+            resolution_status = str(
+                resolution_audit.get("status") or ""
+            ).strip().upper()
+            resolution_reasons = [
+                str(value)
+                for value in (resolution_audit.get("reason_codes") or [])
+                if str(value)
+            ]
+            if str(resolution_audit.get("schema_version") or "") != (
+                RESOLUTION_AUDIT_SCHEMA_VERSION
+            ):
+                errors.append(
+                    f"NATIVE_CELL_EVIDENCE_RESOLUTION_SCHEMA_INVALID:{cell_id}"
+                )
+            if str(resolution_audit.get("symbol") or "") != symbol or str(
+                resolution_audit.get("timeframe") or ""
+            ) != timeframe:
+                errors.append(
+                    f"NATIVE_CELL_EVIDENCE_RESOLUTION_CELL_MISMATCH:{cell_id}"
+                )
+            if resolution_status not in {"PASS", "FAIL", "PENDING"}:
+                errors.append(
+                    f"NATIVE_CELL_EVIDENCE_RESOLUTION_STATUS_INVALID:{cell_id}"
+                )
+        if str(entry.get("resolution_status") or "").upper() != resolution_status:
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_ENTRY_RESOLUTION_STATUS_MISMATCH:{cell_id}"
+            )
+        if list(entry.get("resolution_reason_codes") or []) != resolution_reasons:
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_ENTRY_RESOLUTION_REASON_MISMATCH:{cell_id}"
+            )
+        if isinstance(audited_cell, Mapping):
+            if str(audited_cell.get("resolution_status") or "").upper() != (
+                resolution_status
+            ):
+                errors.append(
+                    f"NATIVE_CELL_EVIDENCE_AUDIT_RESOLUTION_STATUS_MISMATCH:{cell_id}"
+                )
+            if list(audited_cell.get("resolution_reason_codes") or []) != (
+                resolution_reasons
+            ):
+                errors.append(
+                    f"NATIVE_CELL_EVIDENCE_AUDIT_RESOLUTION_REASON_MISMATCH:{cell_id}"
+                )
+        recorded_resolution_reasons = {
+            str(value)
+            for value in entry_reasons
+            if str(value).startswith("RESOLUTION:")
+        }
+        expected_resolution_reasons = {
+            f"RESOLUTION:{value}" for value in resolution_reasons
+        }
+        if classification == "success" and (
+            recorded_resolution_reasons != expected_resolution_reasons
+        ):
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_RESOLUTION_REASON_BINDING_MISMATCH:{cell_id}"
+            )
+
     history_status, history_reasons, _normalized = classify_native_session_history(
         expected_coverage,
         minimum=contract_minimum,
@@ -510,30 +944,83 @@ def _verify_activation_cell_evidence(
     derived_status = "invalid"
     if classification == "unavailable":
         derived_status = "excluded_no_trade"
-    elif classification == "success" and history_status == "sufficient":
-        derived_status = "eligible"
-    elif classification == "success" and history_status == "insufficient":
+    elif (
+        classification == "success"
+        and history_status == "sufficient"
+        and resolution_status == "PASS"
+    ):
+        derived_status = "active"
+    elif classification == "success" and (
+        history_status == "insufficient"
+        or resolution_status in {"FAIL", "PENDING"}
+    ):
         derived_status = "excluded_no_trade"
-    if expected_symbol_status == "eligible" and derived_status != "eligible":
+    normalized_expected = str(expected_cell_status or "").strip().lower()
+    if legacy_symbol_excluded:
+        normalized_expected = "excluded_no_trade"
+    if normalized_expected == "eligible":  # v2 whole-symbol compatibility
+        normalized_expected = "active"
+    if legacy_symbol_excluded:
+        if derived_status == "invalid":
+            errors.append(
+                f"NATIVE_CELL_EVIDENCE_UNIVERSE_STATUS_INVALID:{cell_id}:{derived_status}"
+            )
+    elif derived_status != normalized_expected:
         errors.append(
-            f"NATIVE_CELL_EVIDENCE_UNIVERSE_STATUS_MISMATCH:{cell_id}:{derived_status}!={expected_symbol_status}"
+            f"NATIVE_CELL_EVIDENCE_UNIVERSE_STATUS_MISMATCH:{cell_id}:{derived_status}!={normalized_expected}"
         )
-    elif expected_symbol_status == "excluded_no_trade" and derived_status == "invalid":
-        errors.append(
-            f"NATIVE_CELL_EVIDENCE_UNIVERSE_STATUS_INVALID:{cell_id}:{derived_status}"
-        )
-    expected_entry_status = "active" if expected_symbol_status == "eligible" else "excluded_no_trade"
-    if str(entry.get("status") or "").lower() != expected_entry_status:
+    if str(entry.get("status") or "").lower() != normalized_expected:
         errors.append(f"NATIVE_CELL_EVIDENCE_ENTRY_STATUS_MISMATCH:{cell_id}")
-    if str(entry.get("universe_eligibility_status") or "").lower() != expected_symbol_status:
+    expected_universe_status = (
+        "eligible" if normalized_expected == "active" else normalized_expected
+    )
+    if str(entry.get("universe_eligibility_status") or "").lower() != expected_universe_status:
         errors.append(f"NATIVE_CELL_EVIDENCE_ENTRY_UNIVERSE_STATUS_MISMATCH:{cell_id}")
 
     if classification == "success":
-        if str(parity.get("status") or "").upper() != "PASS":
+        parity_status = str(parity.get("status") or "").upper()
+        if parity_status == "NOT_APPLICABLE":
+            m5_classification, _m5_error = classify_native_availability_cell(
+                m5_run_cell.get("status") if isinstance(m5_run_cell, Mapping) else None,
+                (
+                    m5_run_cell.get("failure_status")
+                    if isinstance(m5_run_cell, Mapping)
+                    else None
+                ),
+                m5_run_cell.get("rows") if isinstance(m5_run_cell, Mapping) else None,
+            )
+            m5_failure = str(
+                (
+                    m5_run_cell.get("failure_status")
+                    if isinstance(m5_run_cell, Mapping)
+                    else ""
+                )
+                or ""
+            ).strip().upper()
+            expected_reason = f"M5_ACQUISITION_UNAVAILABLE:{m5_failure}"
+            if (
+                timeframe == "M5"
+                or m5_classification != "unavailable"
+                or list(parity.get("reason_codes") or []) != [expected_reason]
+            ):
+                errors.append(
+                    f"NATIVE_CELL_EVIDENCE_PARITY_NOT_APPLICABLE_INVALID:{cell_id}"
+                )
+        elif parity_status != "PASS":
             errors.append(f"NATIVE_CELL_EVIDENCE_PARITY_NOT_PASS:{cell_id}")
-        expected_audit_status = "PASS" if history_status == "sufficient" else "FAIL"
+        expected_audit_status = (
+            "PASS"
+            if history_status == "sufficient" and resolution_status == "PASS"
+            else "FAIL"
+        )
         if entry_audit_status != expected_audit_status:
             errors.append(f"NATIVE_CELL_EVIDENCE_AUDIT_STATUS_DERIVATION_MISMATCH:{cell_id}")
+    elif classification == "unavailable" and not legacy_symbol_excluded:
+        expected_reason = f"ACQUISITION_UNAVAILABLE:{failure.upper()}"
+        if entry_audit_status != "FAIL":
+            errors.append(f"NATIVE_CELL_EVIDENCE_AUDIT_STATUS_DERIVATION_MISMATCH:{cell_id}")
+        if entry_reasons != [expected_reason]:
+            errors.append(f"NATIVE_CELL_EVIDENCE_UNAVAILABLE_REASON_MISMATCH:{cell_id}")
     if isinstance(audited_cell, Mapping):
         if classification == "unavailable":
             expected_source = "ACQUISITION_UNAVAILABLE"
@@ -578,12 +1065,13 @@ class ActiveNativeResolution:
 
 @dataclass
 class ActiveNativeUniverse:
-    """Hash-pinned availability-only universe decision from one activation.
+    """Hash-pinned cell eligibility decision from one activation.
 
-    ``eligible_symbols`` may consume native bars. ``excluded_symbols`` are
-    whole-symbol NO_TRADE decisions caused only by immutable source
-    availability facts.  The activation manifest hash pins both sets, so a
-    performance outcome cannot silently change the optimization universe.
+    The authoritative decision is the exact ``symbol x timeframe`` partition
+    in ``cell_statuses``.  ``eligible_symbols`` and ``excluded_symbols`` remain
+    compatibility projections: eligible means at least one active timeframe,
+    while excluded contains only symbols whose complete timeframe grid is
+    excluded.  A sparse cell therefore cannot suppress a valid sibling.
     """
 
     activation_id: Optional[str] = None
@@ -593,7 +1081,12 @@ class ActiveNativeUniverse:
     required_timeframes: Tuple[str, ...] = ()
     eligible_symbols: Tuple[str, ...] = ()
     excluded_symbols: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    cell_statuses: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    symbols_with_active_cells: Tuple[str, ...] = ()
+    fully_excluded_symbols: Tuple[str, ...] = ()
+    calendar_contract: Dict[str, Any] = field(default_factory=dict)
     entries: Dict[str, Any] = field(default_factory=dict)
+    eligibility_schema: str = ""
     explicit_contract: bool = False
     errors: List[str] = field(default_factory=list)
 
@@ -603,11 +1096,58 @@ class ActiveNativeUniverse:
 
     def symbol_status(self, symbol: str) -> str:
         canonical = str(symbol or "").strip().upper()
-        if canonical in self.excluded_symbols:
+        if canonical in self.fully_excluded_symbols or canonical in self.excluded_symbols:
             return "excluded_no_trade"
-        if canonical in self.eligible_symbols:
+        if canonical in self.symbols_with_active_cells or canonical in self.eligible_symbols:
             return "eligible"
         return "unbound"
+
+    def cell_status(self, symbol: str, timeframe: str) -> str:
+        canonical = str(symbol or "").strip().upper()
+        tf = str(timeframe or "").strip().upper()
+        return str((self.cell_statuses.get(canonical) or {}).get(tf) or "unbound")
+
+    def active_timeframes(self, symbol: str) -> Tuple[str, ...]:
+        canonical = str(symbol or "").strip().upper()
+        statuses = self.cell_statuses.get(canonical) or {}
+        return tuple(
+            timeframe
+            for timeframe in self.required_timeframes
+            if statuses.get(timeframe) == "active"
+        )
+
+    def excluded_timeframes(self, symbol: str) -> Tuple[str, ...]:
+        canonical = str(symbol or "").strip().upper()
+        statuses = self.cell_statuses.get(canonical) or {}
+        return tuple(
+            timeframe
+            for timeframe in self.required_timeframes
+            if statuses.get(timeframe) == "excluded_no_trade"
+        )
+
+    def cell_exclusion_binding(self, symbol: str, timeframe: str) -> Dict[str, Any]:
+        """Return the immutable binding for one excluded specialist cell."""
+        canonical = str(symbol or "").strip().upper()
+        tf = str(timeframe or "").strip().upper()
+        if self.cell_status(canonical, tf) != "excluded_no_trade":
+            return {}
+        entry = (
+            (self.entries.get(canonical) or {}).get(tf)
+            if isinstance(self.entries.get(canonical), Mapping)
+            else None
+        )
+        if not isinstance(entry, Mapping):
+            return {}
+        return {
+            "schema_version": self.eligibility_schema or UNIVERSE_ELIGIBILITY_SCHEMA,
+            "decision_basis": "source_availability_only",
+            "activation_id": self.activation_id,
+            "activation_manifest_sha256": self.activation_manifest_sha256,
+            "symbol": canonical,
+            "timeframe": tf,
+            "status": "excluded_no_trade",
+            "reason_codes": list(entry.get("reason_codes") or []),
+        }
 
     def exclusion_binding(self, symbol: str) -> Dict[str, Any]:
         """Return the exact marker payload a ledger NO_TRADE row must carry."""
@@ -616,7 +1156,7 @@ class ActiveNativeUniverse:
         if not record:
             return {}
         return {
-            "schema_version": UNIVERSE_ELIGIBILITY_SCHEMA,
+            "schema_version": self.eligibility_schema or UNIVERSE_ELIGIBILITY_SCHEMA,
             "decision_basis": "source_availability_only",
             "activation_id": self.activation_id,
             "activation_manifest_sha256": self.activation_manifest_sha256,
@@ -735,6 +1275,11 @@ def resolve_active_native_universe(
                 if isinstance(run_manifest.get("request"), Mapping)
                 else {}
             )
+            calendar_contract, calendar_errors = _validated_calendar_contract(
+                verified_run_request
+            )
+            result.calendar_contract = calendar_contract
+            result.errors.extend(calendar_errors)
     result.activation_id = str(manifest.get("activation_id") or "") or None
     entries = manifest.get("entries") if isinstance(manifest.get("entries"), Mapping) else {}
     result.entries = dict(entries)
@@ -764,7 +1309,13 @@ def resolve_active_native_universe(
     contract = manifest.get("universe_eligibility")
     if isinstance(contract, Mapping):
         result.explicit_contract = True
-        if str(contract.get("schema_version") or "") != UNIVERSE_ELIGIBILITY_SCHEMA:
+        contract_schema = str(contract.get("schema_version") or "")
+        result.eligibility_schema = contract_schema
+        cell_contract = contract_schema == UNIVERSE_ELIGIBILITY_SCHEMA
+        if contract_schema not in {
+            UNIVERSE_ELIGIBILITY_SCHEMA,
+            LEGACY_UNIVERSE_ELIGIBILITY_SCHEMA,
+        }:
             result.errors.append("NATIVE_UNIVERSE_ELIGIBILITY_SCHEMA_INVALID")
         if str(contract.get("decision_basis") or "") != "source_availability_only":
             result.errors.append("NATIVE_UNIVERSE_ELIGIBILITY_BASIS_INVALID")
@@ -794,7 +1345,14 @@ def resolve_active_native_universe(
             abs_tol=1e-12,
         ):
             result.errors.append("NATIVE_UNIVERSE_SESSION_COVERAGE_POLICY_MISMATCH")
-        if str(contract.get("session_coverage_method") or "") != NATIVE_SESSION_COVERAGE_METHOD:
+        contract_method = str(contract.get("session_coverage_method") or "")
+        if (
+            contract_method not in SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS
+            or (
+                not cell_contract
+                and contract_method != LEGACY_NATIVE_SESSION_COVERAGE_METHOD
+            )
+        ):
             result.errors.append("NATIVE_UNIVERSE_SESSION_COVERAGE_METHOD_INVALID")
         declared_partitions = tuple(
             str(value or "").strip()
@@ -1021,6 +1579,8 @@ def resolve_active_native_universe(
                     "parity_status",
                     "coverage_status",
                     "coverage_reason_codes",
+                    "resolution_status",
+                    "resolution_reason_codes",
                     "expected_session_coverage_by_partition",
                     "observed_session_bars_by_partition",
                     "expected_session_bars_by_partition",
@@ -1052,11 +1612,24 @@ def resolve_active_native_universe(
                     result.errors.append(
                         f"NATIVE_UNIVERSE_EXCLUSION_SOURCE_STATUS_INVALID:{symbol}|{timeframe}"
                     )
-                if parity_status != "PASS":
+                parity_status_valid = parity_status == "PASS"
+                if parity_status == "NOT_APPLICABLE" and timeframe != "M5":
+                    m5_cell = run_cells.get((symbol, "M5"))
+                    m5_classification, _m5_error = classify_native_availability_cell(
+                        m5_cell.get("status") if isinstance(m5_cell, Mapping) else None,
+                        (
+                            m5_cell.get("failure_status")
+                            if isinstance(m5_cell, Mapping)
+                            else None
+                        ),
+                        m5_cell.get("rows") if isinstance(m5_cell, Mapping) else None,
+                    )
+                    parity_status_valid = m5_classification == "unavailable"
+                if not parity_status_valid:
                     result.errors.append(
                         f"NATIVE_UNIVERSE_EXCLUSION_PARITY_STATUS_INVALID:{symbol}|{timeframe}"
                     )
-                if str(audit_cell.get("coverage_method") or "") != NATIVE_SESSION_COVERAGE_METHOD:
+                if str(audit_cell.get("coverage_method") or "") != contract_method:
                     result.errors.append(
                         f"NATIVE_UNIVERSE_EXCLUSION_COVERAGE_METHOD_INVALID:{symbol}|{timeframe}"
                     )
@@ -1089,6 +1662,27 @@ def resolve_active_native_universe(
                     expected_coverage_reason_codes.extend(
                         f"{timeframe}:{reason}" for reason in history_reasons
                     )
+                if cell_contract:
+                    resolution_status = str(
+                        audit_cell.get("resolution_status") or ""
+                    ).upper()
+                    resolution_reasons = [
+                        str(value)
+                        for value in (
+                            audit_cell.get("resolution_reason_codes") or []
+                        )
+                        if str(value)
+                    ]
+                    if resolution_status not in {"PASS", "FAIL", "PENDING"}:
+                        result.errors.append(
+                            f"NATIVE_UNIVERSE_EXCLUSION_RESOLUTION_STATUS_INVALID:{symbol}|{timeframe}"
+                        )
+                    elif resolution_status != "PASS":
+                        unavailable_count += 1
+                        expected_coverage_reason_codes.extend(
+                            f"{timeframe}:RESOLUTION:{reason}"
+                            for reason in resolution_reasons
+                        )
                 for field_name in (
                     "observed_session_bars_by_partition",
                     "expected_session_bars_by_partition",
@@ -1162,6 +1756,139 @@ def resolve_active_native_universe(
             excluded[symbol] = record
 
         requested_set = set(requested)
+        if cell_contract:
+            raw_cell_statuses = contract.get("cell_statuses")
+            parsed_cell_statuses: Dict[str, Dict[str, str]] = {}
+            if not isinstance(raw_cell_statuses, Mapping):
+                result.errors.append("NATIVE_UNIVERSE_CELL_STATUSES_MISSING")
+                raw_cell_statuses = {}
+            raw_cell_symbols = [str(value or "").strip() for value in raw_cell_statuses]
+            if (
+                raw_cell_symbols != [value.upper() for value in raw_cell_symbols]
+                or len(raw_cell_symbols) != len(set(raw_cell_symbols))
+                or set(raw_cell_symbols) != requested_set
+            ):
+                result.errors.append("NATIVE_UNIVERSE_CELL_SYMBOL_GRID_INVALID")
+            expected_timeframes = tuple(declared_required or required)
+            for symbol in requested:
+                raw_grid = raw_cell_statuses.get(symbol)
+                if not isinstance(raw_grid, Mapping):
+                    result.errors.append(
+                        f"NATIVE_UNIVERSE_CELL_TIMEFRAME_GRID_MISSING:{symbol}"
+                    )
+                    raw_grid = {}
+                raw_keys = [str(value or "").strip() for value in raw_grid]
+                if (
+                    raw_keys != [value.upper() for value in raw_keys]
+                    or len(raw_keys) != len(set(raw_keys))
+                    or set(raw_keys) != set(expected_timeframes)
+                ):
+                    result.errors.append(
+                        f"NATIVE_UNIVERSE_CELL_TIMEFRAME_GRID_INVALID:{symbol}"
+                    )
+                grid: Dict[str, str] = {}
+                symbol_entries = (
+                    entries.get(symbol)
+                    if isinstance(entries.get(symbol), Mapping)
+                    else {}
+                )
+                for timeframe in expected_timeframes:
+                    status = str(raw_grid.get(timeframe) or "").strip().lower()
+                    if status not in {"active", "excluded_no_trade"}:
+                        result.errors.append(
+                            f"NATIVE_UNIVERSE_CELL_STATUS_INVALID:{symbol}|{timeframe}"
+                        )
+                    grid[timeframe] = status
+                    entry = (
+                        symbol_entries.get(timeframe)
+                        if isinstance(symbol_entries, Mapping)
+                        else None
+                    )
+                    if not isinstance(entry, Mapping) or str(
+                        entry.get("status") or ""
+                    ).strip().lower() != status:
+                        result.errors.append(
+                            f"NATIVE_UNIVERSE_CELL_ENTRY_STATUS_MISMATCH:{symbol}|{timeframe}"
+                        )
+                parsed_cell_statuses[symbol] = grid
+
+            derived_active = tuple(
+                sorted(
+                    symbol
+                    for symbol, grid in parsed_cell_statuses.items()
+                    if any(status == "active" for status in grid.values())
+                )
+            )
+            derived_fully_excluded = tuple(
+                sorted(
+                    symbol
+                    for symbol, grid in parsed_cell_statuses.items()
+                    if grid
+                    and all(status == "excluded_no_trade" for status in grid.values())
+                )
+            )
+
+            def _canonical_declared_list(field_name: str) -> Tuple[str, ...]:
+                raw_values = [
+                    str(value or "").strip()
+                    for value in (contract.get(field_name) or [])
+                    if str(value or "").strip()
+                ]
+                canonical = [value.upper() for value in raw_values]
+                if raw_values != canonical or len(canonical) != len(set(canonical)):
+                    result.errors.append(
+                        f"NATIVE_UNIVERSE_{field_name.upper()}_NOT_CANONICAL_UNIQUE"
+                    )
+                return tuple(sorted(set(canonical)))
+
+            declared_active = _canonical_declared_list("symbols_with_active_cells")
+            declared_fully_excluded = _canonical_declared_list(
+                "fully_excluded_symbols"
+            )
+            if declared_active != derived_active:
+                result.errors.append(
+                    "NATIVE_UNIVERSE_SYMBOLS_WITH_ACTIVE_CELLS_DERIVATION_MISMATCH"
+                )
+            if declared_fully_excluded != derived_fully_excluded:
+                result.errors.append(
+                    "NATIVE_UNIVERSE_FULLY_EXCLUDED_SYMBOLS_DERIVATION_MISMATCH"
+                )
+            if tuple(sorted(set(eligible))) != derived_active:
+                result.errors.append("NATIVE_UNIVERSE_ELIGIBLE_PROJECTION_MISMATCH")
+            if set(excluded) != set(derived_fully_excluded):
+                result.errors.append("NATIVE_UNIVERSE_EXCLUDED_PROJECTION_MISMATCH")
+
+            for field_name, target_status in (
+                ("active_timeframes_by_symbol", "active"),
+                ("excluded_timeframes_by_symbol", "excluded_no_trade"),
+            ):
+                raw_projection = contract.get(field_name)
+                if not isinstance(raw_projection, Mapping) or set(raw_projection) != requested_set:
+                    result.errors.append(
+                        f"NATIVE_UNIVERSE_{field_name.upper()}_GRID_INVALID"
+                    )
+                    raw_projection = {}
+                for symbol in requested:
+                    raw_values = [
+                        str(value or "").strip()
+                        for value in (raw_projection.get(symbol) or [])
+                        if str(value or "").strip()
+                    ]
+                    expected_values = [
+                        timeframe
+                        for timeframe in expected_timeframes
+                        if parsed_cell_statuses.get(symbol, {}).get(timeframe)
+                        == target_status
+                    ]
+                    if raw_values != expected_values:
+                        result.errors.append(
+                            f"NATIVE_UNIVERSE_{field_name.upper()}_MISMATCH:{symbol}"
+                        )
+            eligible = derived_active
+            result.cell_statuses = parsed_cell_statuses
+            result.symbols_with_active_cells = derived_active
+            result.fully_excluded_symbols = derived_fully_excluded
+
         eligible_set = set(eligible)
         excluded_set = set(excluded)
         if not requested_set:
@@ -1188,6 +1915,42 @@ def resolve_active_native_universe(
         result.requested_symbols = tuple(sorted(str(key).upper() for key in entries))
         result.eligible_symbols = result.requested_symbols
         result.excluded_symbols = {}
+
+    if not result.cell_statuses:
+        # Legacy/manifest-only compatibility projection. New v3 activations
+        # always authenticate an explicit exact cell grid above.
+        projected: Dict[str, Dict[str, str]] = {}
+        for symbol in result.requested_symbols:
+            symbol_entries = (
+                entries.get(symbol) if isinstance(entries.get(symbol), Mapping) else {}
+            )
+            projected[symbol] = {
+                timeframe: str(
+                    (
+                        symbol_entries.get(timeframe)
+                        if isinstance(symbol_entries.get(timeframe), Mapping)
+                        else {}
+                    ).get("status")
+                    or ""
+                ).strip().lower()
+                for timeframe in result.required_timeframes
+            }
+        result.cell_statuses = projected
+        result.symbols_with_active_cells = tuple(
+            sorted(
+                symbol
+                for symbol, grid in projected.items()
+                if any(status == "active" for status in grid.values())
+            )
+        )
+        result.fully_excluded_symbols = tuple(
+            sorted(
+                symbol
+                for symbol, grid in projected.items()
+                if grid
+                and all(status == "excluded_no_trade" for status in grid.values())
+            )
+        )
 
     if configured:
         missing = sorted(set(configured) - set(result.requested_symbols))
@@ -1221,7 +1984,10 @@ def resolve_active_native_universe(
         for timeframe in result.required_timeframes:
             entry = symbol_entries.get(timeframe) if isinstance(symbol_entries, Mapping) else None
             cell_id = f"{symbol}|{timeframe}"
-            if result.explicit_contract:
+            expected_status = result.cell_status(symbol, timeframe)
+            if result.explicit_contract and (
+                not cell_contract or expected_status == "active"
+            ):
                 run_cell = run_cells.get((symbol, timeframe))
                 if (
                     not isinstance(run_cell, Mapping)
@@ -1231,16 +1997,18 @@ def resolve_active_native_universe(
                     result.errors.append(f"NATIVE_ACTIVE_RUN_CELL_NOT_SUCCESS:{cell_id}")
             if not isinstance(entry, Mapping):
                 result.errors.append(f"NATIVE_ACTIVE_CELL_MISSING:{cell_id}")
-            elif str(entry.get("status") or "").lower() != "active":
-                result.errors.append(f"NATIVE_ACTIVE_CELL_NOT_ACTIVE:{cell_id}")
-            elif result.explicit_contract:
+            elif str(entry.get("status") or "").lower() != expected_status:
+                result.errors.append(f"NATIVE_ACTIVE_CELL_STATUS_MISMATCH:{cell_id}")
+            elif result.explicit_contract and (
+                not cell_contract or expected_status == "active"
+            ):
                 if str(entry.get("bars_sha256") or "").lower() != str(
                     run_cell.get("sha256") if isinstance(run_cell, Mapping) else ""
                 ).lower():
                     result.errors.append(f"NATIVE_ACTIVE_RUN_BARS_BINDING_MISMATCH:{cell_id}")
                 if str(entry.get("audit_status") or "").upper() != "PASS":
                     result.errors.append(f"NATIVE_ACTIVE_CELL_AUDIT_NOT_PASS:{cell_id}")
-                if str(entry.get("coverage_method") or "") != NATIVE_SESSION_COVERAGE_METHOD:
+                if str(entry.get("coverage_method") or "") != contract_method:
                     result.errors.append(f"NATIVE_ACTIVE_CELL_COVERAGE_METHOD_INVALID:{cell_id}")
                 history_status, _history_reasons, _normalized = classify_native_session_history(
                     entry.get("expected_session_coverage_by_partition"),
@@ -1275,9 +2043,6 @@ def resolve_active_native_universe(
 
     if result.explicit_contract and verify_exclusion_evidence:
         for symbol in result.requested_symbols:
-            expected_symbol_status = (
-                "eligible" if symbol in set(result.eligible_symbols) else "excluded_no_trade"
-            )
             symbol_entries = entries.get(symbol) if isinstance(entries.get(symbol), Mapping) else {}
             excluded_record = result.excluded_symbols.get(symbol) or {}
             audited_cells = (
@@ -1302,7 +2067,15 @@ def resolve_active_native_universe(
                             if isinstance(audited_cells, Mapping)
                             else None
                         ),
-                        expected_symbol_status=expected_symbol_status,
+                        expected_cell_status=(
+                            result.cell_status(symbol, timeframe)
+                            if cell_contract
+                            else (
+                                "eligible"
+                                if symbol in set(result.eligible_symbols)
+                                else "legacy_excluded_no_trade"
+                            )
+                        ),
                         activation_id=str(result.activation_id or ""),
                         run_id=str(manifest.get("run_id") or ""),
                         run_manifest_relative_path=manifest.get(
@@ -1311,6 +2084,9 @@ def resolve_active_native_universe(
                         run_manifest_sha256=manifest.get("run_manifest_sha256"),
                         run_request=verified_run_request,
                         contract_minimum=contract_minimum,
+                        expected_coverage_method=contract_method,
+                        require_resolution_audit=cell_contract,
+                        m5_run_cell=run_cells.get((symbol, "M5")),
                     )
                 )
 
@@ -1348,6 +2124,17 @@ def resolve_active_native_universe(
                 "eligible_symbols": len(result.eligible_symbols),
                 "excluded_symbols": len(result.excluded_symbols),
             }
+            if cell_contract:
+                expected_counts.update(
+                    {
+                        "symbols_with_active_cells": len(
+                            result.symbols_with_active_cells
+                        ),
+                        "fully_excluded_symbols": len(
+                            result.fully_excluded_symbols
+                        ),
+                    }
+                )
             for field_name, expected_value in expected_counts.items():
                 raw_value = raw_counts.get(field_name)
                 if isinstance(raw_value, bool) or raw_value != expected_value:
@@ -1479,6 +2266,58 @@ def validate_native_exclusion_no_trade_grid(
     return errors
 
 
+def validate_native_cell_exclusion_no_trade(
+    timeframe_payload: Any,
+    expected_binding: Mapping[str, Any],
+    *,
+    required_regimes: Sequence[str] = ("TREND", "RANGE", "BREAKOUT", "CHOP"),
+) -> List[str]:
+    """Verify one excluded timeframe is an exact four-regime NO_TRADE grid."""
+    symbol = str((expected_binding or {}).get("symbol") or "").strip().upper()
+    timeframe = str((expected_binding or {}).get("timeframe") or "").strip().upper()
+    prefix = f"{symbol or 'UNKNOWN'}|{timeframe or 'UNKNOWN'}"
+    if not isinstance(timeframe_payload, Mapping):
+        return [f"NATIVE_EXCLUDED_CELL_TIMEFRAME_MISSING:{prefix}"]
+    errors: List[str] = []
+    regimes = tuple(str(value or "").strip().upper() for value in required_regimes)
+    if set(timeframe_payload) != set(regimes) or any(
+        str(key) != str(key).upper() for key in timeframe_payload
+    ):
+        errors.append(f"NATIVE_EXCLUDED_CELL_REGIME_GRID_NOT_EXACT:{prefix}")
+        return errors
+    for regime in regimes:
+        cell_id = f"{prefix}|{regime}"
+        cell = timeframe_payload.get(regime)
+        if not isinstance(cell, Mapping):
+            errors.append(f"NATIVE_EXCLUDED_CELL_MISSING:{cell_id}")
+            continue
+        if str(cell.get("strategy_name") or "").upper() != "NO_TRADE":
+            errors.append(f"NATIVE_EXCLUDED_CELL_TRADEABLE:{cell_id}")
+        if str(cell.get("promotion_status") or "").upper() != "NO_TRADE":
+            errors.append(f"NATIVE_EXCLUDED_CELL_STATUS_INVALID:{cell_id}")
+        artifact = (
+            cell.get("artifact_meta")
+            if isinstance(cell.get("artifact_meta"), Mapping)
+            else {}
+        )
+        if dict(artifact.get("native_cell_exclusion_binding") or {}) != dict(
+            expected_binding or {}
+        ):
+            errors.append(f"NATIVE_EXCLUDED_CELL_BINDING_MISMATCH:{cell_id}")
+        validation = (
+            cell.get("validation_evidence")
+            if isinstance(cell.get("validation_evidence"), Mapping)
+            else {}
+        )
+        if dict(validation.get("native_cell_exclusion_binding") or {}) != dict(
+            expected_binding or {}
+        ):
+            errors.append(
+                f"NATIVE_EXCLUDED_CELL_VALIDATION_BINDING_MISMATCH:{cell_id}"
+            )
+    return errors
+
+
 def resolve_active_native_artifact(
     data_dir: Path,
     symbol: str,
@@ -1557,6 +2396,12 @@ def resolve_active_native_artifact(
         if canonical_symbol not in set(semantic_universe.eligible_symbols):
             result.errors.append("NATIVE_ACTIVE_SYMBOL_NOT_ELIGIBLE")
             return result
+        if semantic_universe.cell_status(canonical_symbol, tf) == "excluded_no_trade":
+            result.errors.append("NATIVE_ACTIVE_CELL_EXCLUDED_NO_TRADE")
+            return result
+        if semantic_universe.cell_status(canonical_symbol, tf) != "active":
+            result.errors.append("NATIVE_ACTIVE_CELL_NOT_ELIGIBLE")
+            return result
 
     symbols = manifest.get("entries")
     symbol_entries = symbols.get(canonical_symbol) if isinstance(symbols, Mapping) else None
@@ -1586,6 +2431,7 @@ def resolve_active_native_artifact(
         )
         result.errors.extend(evidence_errors)
         run_cell = None
+        m5_run_cell = None
         run_request: Mapping[str, Any] = {}
         if isinstance(run_manifest, Mapping):
             run_request = (
@@ -1596,6 +2442,12 @@ def resolve_active_native_artifact(
             for candidate in run_manifest.get("results") or []:
                 if not isinstance(candidate, Mapping):
                     continue
+                if str(candidate.get("symbol") or "") == canonical_symbol and str(
+                    candidate.get("timeframe") or ""
+                ) == "M5":
+                    if m5_run_cell is not None:
+                        result.errors.append("NATIVE_ACTIVE_RUN_DUPLICATE_M5_CELL")
+                    m5_run_cell = candidate
                 if str(candidate.get("symbol") or "") == canonical_symbol and str(
                     candidate.get("timeframe") or ""
                 ) == tf:
@@ -1617,7 +2469,7 @@ def resolve_active_native_artifact(
                     entry=entry,
                     run_cell=run_cell,
                     audited_cell=None,
-                    expected_symbol_status="eligible",
+                    expected_cell_status="active",
                     activation_id=str(result.activation_id or ""),
                     run_id=str(manifest.get("run_id") or ""),
                     run_manifest_relative_path=manifest.get(
@@ -1626,6 +2478,14 @@ def resolve_active_native_artifact(
                     run_manifest_sha256=manifest.get("run_manifest_sha256"),
                     run_request=run_request,
                     contract_minimum=contract_minimum,
+                    expected_coverage_method=str(
+                        universe.get("session_coverage_method") or ""
+                    ),
+                    require_resolution_audit=(
+                        str(universe.get("schema_version") or "")
+                        == UNIVERSE_ELIGIBILITY_SCHEMA
+                    ),
+                    m5_run_cell=m5_run_cell,
                 )
             )
         if result.errors:

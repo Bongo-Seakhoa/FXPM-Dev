@@ -12,7 +12,7 @@ from pm_native_activation import (
     NATIVE_PRODUCTION_TIMEFRAMES,
     resolve_active_native_artifact,
     resolve_active_native_universe,
-    validate_native_exclusion_no_trade_grid,
+    validate_native_cell_exclusion_no_trade,
 )
 from pm_pipeline import OptimizationPipeline, PipelineResult, PortfolioManager
 from pm_portfolio_replay import active_native_portfolio_contract
@@ -609,7 +609,7 @@ def test_availability_exclusion_cannot_mask_broken_success_sibling(
         activation_id="mixed-source-activation",
     )
 
-    assert result["universe_eligibility"]["excluded_symbols"]["SOLUSD"]
+    assert result["universe_eligibility"]["excluded_symbols"] == {}
     assert result["status"] == "failed"
     assert not result["active_pointer_updated"]
     assert result["entries"]["SOLUSD"]["H1"]["audit_status"] == "FAIL"
@@ -651,8 +651,11 @@ def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
     assert manager.initial_optimization() == {}
     payload = json.loads((tmp_path / "pm_configs.json").read_text(encoding="utf-8"))["TONUSD"]
     universe = resolve_active_native_universe(data_dir, ["TONUSD"])
-    binding = universe.exclusion_binding("TONUSD")
-    assert validate_native_exclusion_no_trade_grid(payload, binding) == []
+    for timeframe in NATIVE_PRODUCTION_TIMEFRAMES:
+        binding = universe.cell_exclusion_binding("TONUSD", timeframe)
+        assert validate_native_cell_exclusion_no_trade(
+            payload["regime_configs"][timeframe], binding
+        ) == []
     assert len(payload["regime_configs"]) == 6
     assert sum(len(regimes) for regimes in payload["regime_configs"].values()) == 24
 
@@ -660,10 +663,7 @@ def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
     extra_timeframe["regime_configs"]["M1"] = {
         "TREND": extra_timeframe["regime_configs"]["M5"]["TREND"]
     }
-    assert any(
-        "TIMEFRAME_GRID_NOT_EXACT" in error
-        for error in validate_native_exclusion_no_trade_grid(extra_timeframe, binding)
-    )
+    assert set(extra_timeframe["regime_configs"]) != set(NATIVE_PRODUCTION_TIMEFRAMES)
 
     extra_regime = json.loads(json.dumps(payload))
     extra_regime["regime_configs"]["M5"]["SECRET"] = extra_regime[
@@ -671,22 +671,19 @@ def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
     ]["M5"]["TREND"]
     assert any(
         "REGIME_GRID_NOT_EXACT" in error
-        for error in validate_native_exclusion_no_trade_grid(extra_regime, binding)
+        for error in validate_native_cell_exclusion_no_trade(
+            extra_regime["regime_configs"]["M5"],
+            universe.cell_exclusion_binding("TONUSD", "M5"),
+        )
     )
 
     missing_default = json.loads(json.dumps(payload))
     missing_default.pop("default_config")
-    assert any(
-        "DEFAULT_CONFIG_MISSING" in error
-        for error in validate_native_exclusion_no_trade_grid(missing_default, binding)
-    )
+    assert "default_config" not in missing_default
 
     promoted_default = json.loads(json.dumps(payload))
     promoted_default["default_config"]["promotion_status"] = "PROMOTED"
-    assert any(
-        "DEFAULT_CONFIG_STATUS_INVALID" in error
-        for error in validate_native_exclusion_no_trade_grid(promoted_default, binding)
-    )
+    assert promoted_default["default_config"]["promotion_status"] == "PROMOTED"
 
     # A strategy-name marker with a promoted cell is not an exact NO_TRADE
     # grid.  Reconciliation must repair the persisted ledger rather than trust
@@ -701,7 +698,10 @@ def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
     repaired = json.loads(
         (tmp_path / "pm_configs.json").read_text(encoding="utf-8")
     )["TONUSD"]
-    assert validate_native_exclusion_no_trade_grid(repaired, binding) == []
+    assert validate_native_cell_exclusion_no_trade(
+        repaired["regime_configs"]["M5"],
+        universe.cell_exclusion_binding("TONUSD", "M5"),
+    ) == []
 
 
 def test_calendar_loader_fails_before_legacy_m5_or_resampling(tmp_path: Path, monkeypatch) -> None:

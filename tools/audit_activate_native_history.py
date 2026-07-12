@@ -2,16 +2,16 @@
 
 This command is offline: it never imports or connects to MetaTrader.  It reads
 an acquisition run, audits every requested cell, and freezes an availability-
-only universe before model search. Complete six-timeframe symbols must pass
-source integrity, partition-specific session coverage, and native-vs-M5
-parity. A symbol with proven insufficient/no history is instead frozen as a
-whole-symbol NO_TRADE exclusion. Fetch, mapping, write, and data-quality errors
-still block activation.
+only specialist-cell universe before model search. Each symbol/timeframe is
+independently active or hash-bound NO_TRADE. A sparse cell cannot veto a valid
+sibling, while fetch, mapping, write, parity, and invalid-coverage errors still
+block activation.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -32,9 +32,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from pm_native_activation import (  # noqa: E402
     ACTIVATION_MANIFEST_SCHEMA,
     ACTIVE_POINTER_SCHEMA,
+    LEGACY_NATIVE_SESSION_COVERAGE_METHOD,
     NATIVE_EVIDENCE_PARTITIONS,
     NATIVE_MINIMUM_SESSION_COVERAGE,
     NATIVE_SESSION_COVERAGE_METHOD,
+    SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS,
     UNIVERSE_ELIGIBILITY_SCHEMA,
     classify_native_availability_cell,
     classify_native_session_history,
@@ -46,16 +48,20 @@ from pm_native_parity import (  # noqa: E402
     audit_native_vs_session_m5,
     normalize_ohlc_frame,
 )
+from pm_native_resolution import audit_native_resolution  # noqa: E402
+from pm_evidence import TIMEFRAME_EVIDENCE_CONTRACT_VERSION  # noqa: E402
 from tools.acquire_native_history import (  # noqa: E402
     ACQUISITION_CONTRACT_VERSION,
     DEFAULT_PAGE_DAYS,
     DEFAULT_TIMEFRAMES,
     MANIFEST_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     TIMEFRAME_SECONDS,
     ceil_utc_boundary,
     expected_session_coverage_by_partition,
     floor_utc_boundary,
+    segmented_session_coverage_by_partition_v2,
 )
 
 
@@ -76,6 +82,16 @@ _REQUEST_CONTRACT_FIELDS: Tuple[str, ...] = (
     "window_years",
     "embargo_days",
     "common_calendar_boundaries",
+)
+_V3_REQUEST_CONTRACT_FIELDS: Tuple[str, ...] = (
+    "window_contract_version",
+    "timeframe_request_map_schema_version",
+    "timeframe_window_years",
+    "timeframe_calendar_boundaries",
+    "timeframe_calendar_boundaries_sha256",
+    "timeframe_required_evidence_lead_start_utc",
+    "timeframe_source_request_intervals",
+    "timeframe_request_map_sha256",
 )
 _SOURCE_IDENTITY_FIELDS: Mapping[str, Tuple[str, ...]] = {
     "account": ("login", "server", "company", "currency"),
@@ -207,12 +223,58 @@ def _strict_int(value: Any) -> Optional[int]:
     return value if type(value) is int else None
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _request_contract(value: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(value, Mapping) or any(
-        field_name not in value for field_name in _REQUEST_CONTRACT_FIELDS
-    ):
+    if not isinstance(value, Mapping):
         return None
-    return {field_name: value[field_name] for field_name in _REQUEST_CONTRACT_FIELDS}
+    version = str(value.get("window_contract_version") or "")
+    fields = _REQUEST_CONTRACT_FIELDS
+    if version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        if str(value.get("timeframe_request_map_schema_version") or "") != (
+            TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+        ):
+            return None
+        fields = (*fields, *_V3_REQUEST_CONTRACT_FIELDS)
+    elif version:
+        return None
+    if any(field_name not in value for field_name in fields):
+        return None
+    contract = {field_name: value[field_name] for field_name in fields}
+    if version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+        boundaries = contract.get("timeframe_calendar_boundaries")
+        if not isinstance(boundaries, Mapping) or not boundaries:
+            return None
+        if str(contract.get("timeframe_calendar_boundaries_sha256") or "") != (
+            _canonical_json_sha256(boundaries)
+        ):
+            return None
+        request_map_payload = {
+            "schema_version": contract.get("timeframe_request_map_schema_version"),
+            "window_contract_version": contract.get("window_contract_version"),
+            "common_as_of_utc": contract.get("common_as_of_utc"),
+            "timeframe_window_years": contract.get("timeframe_window_years"),
+            "timeframe_calendar_boundaries": boundaries,
+            "timeframe_required_evidence_lead_start_utc": contract.get(
+                "timeframe_required_evidence_lead_start_utc"
+            ),
+            "timeframe_source_request_intervals": contract.get(
+                "timeframe_source_request_intervals"
+            ),
+        }
+        if str(contract.get("timeframe_request_map_sha256") or "") != (
+            _canonical_json_sha256(request_map_payload)
+        ):
+            return None
+    return contract
 
 
 def _source_identity(value: Any) -> Dict[str, Any]:
@@ -266,11 +328,36 @@ def _pagination_contract_errors(
         fetch_end = _utc_timestamp(request.get("native_fetch_end_exclusive_utc"))
     except Exception:
         return ["SOURCE_FETCH_BOUNDARY_INVALID"]
-    if timeframe in {"H4", "D1"}:
+    if (
+        str(manifest_request.get("window_contract_version") or "")
+        == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+    ):
+        timeframe_intervals = manifest_request.get(
+            "timeframe_source_request_intervals"
+        )
+        raw_interval = (
+            timeframe_intervals.get(timeframe)
+            if isinstance(timeframe_intervals, Mapping)
+            else None
+        )
+        try:
+            expected_start = _utc_timestamp(
+                raw_interval.get("start_utc")
+                if isinstance(raw_interval, Mapping)
+                else None
+            )
+            expected_end = _utc_timestamp(
+                raw_interval.get("end_exclusive_utc")
+                if isinstance(raw_interval, Mapping)
+                else None
+            )
+        except Exception:
+            return ["SOURCE_TIMEFRAME_FETCH_INTERVAL_INVALID"]
+        if request.get("source_request_interval") != raw_interval:
+            errors.append("SOURCE_TIMEFRAME_FETCH_INTERVAL_PROJECTION_MISMATCH")
+    elif timeframe in {"H4", "D1"}:
         expected_start = common_start - pd.Timedelta(seconds=seconds)
         expected_end = common_as_of + pd.Timedelta(seconds=1)
-        expected_alignment = "broker_observed_successor_or_nominal_close_v1"
-        expected_slack = 1
     else:
         expected_start = pd.Timestamp(
             ceil_utc_boundary(common_start.to_pydatetime(), seconds)
@@ -278,6 +365,11 @@ def _pagination_contract_errors(
         expected_end = pd.Timestamp(
             floor_utc_boundary(common_as_of.to_pydatetime(), seconds)
         )
+
+    if timeframe in {"H4", "D1"}:
+        expected_alignment = "broker_observed_successor_or_nominal_close_v1"
+        expected_slack = 1
+    else:
         expected_alignment = "fixed_utc_native_boundary_v1"
         expected_slack = 0
     if fetch_start != expected_start or fetch_end != expected_end or fetch_end <= fetch_start:
@@ -513,12 +605,100 @@ def _source_leaf(
         errors.append("SOURCE_REQUEST_CONTRACT_INVALID")
     if manifest_request_contract is None:
         errors.append("RUN_MANIFEST_REQUEST_CONTRACT_INVALID")
+    if source_request_contract is not None and manifest_request_contract is not None:
+        source_contract_version = str(
+            source_request_contract.get("window_contract_version") or ""
+        )
+        manifest_contract_version = str(
+            manifest_request_contract.get("window_contract_version") or ""
+        )
+        if source_contract_version != manifest_contract_version:
+            errors.append("SOURCE_MANIFEST_REQUEST_CONTRACT_MISMATCH")
+        elif source_contract_version == TIMEFRAME_EVIDENCE_CONTRACT_VERSION:
+            # V3 deliberately gives each timeframe its own train start.  The
+            # run manifest's legacy compatibility projection is M5 (or the
+            # first requested timeframe), whereas each leaf projects its own
+            # exact cell window.  Compare the authenticated full request map
+            # and invariant fields, then validate the leaf projection below;
+            # never compare a D1/H4/H1 leaf to the M5 projection.
+            projection_fields = {"window_years", "common_calendar_boundaries"}
+            source_shared = {
+                key: value
+                for key, value in source_request_contract.items()
+                if key not in projection_fields
+            }
+            manifest_shared = {
+                key: value
+                for key, value in manifest_request_contract.items()
+                if key not in projection_fields
+            }
+            if source_shared != manifest_shared:
+                errors.append("SOURCE_MANIFEST_REQUEST_CONTRACT_MISMATCH")
+
+            timeframe_years = (
+                source_request_contract.get("timeframe_window_years") or {}
+            )
+            timeframe_boundaries = (
+                source_request_contract.get("timeframe_calendar_boundaries") or {}
+            )
+            expected_years = (
+                timeframe_years.get(timeframe)
+                if isinstance(timeframe_years, Mapping)
+                else None
+            )
+            expected_boundaries = (
+                timeframe_boundaries.get(timeframe)
+                if isinstance(timeframe_boundaries, Mapping)
+                else None
+            )
+            if (
+                expected_years is None
+                or source_request_contract.get("window_years") != expected_years
+            ):
+                errors.append(
+                    "SOURCE_TIMEFRAME_REQUEST_PROJECTION_MISMATCH:window_years"
+                )
+            if (
+                expected_boundaries is None
+                or source_request_contract.get("common_calendar_boundaries")
+                != expected_boundaries
+            ):
+                errors.append(
+                    "SOURCE_TIMEFRAME_REQUEST_PROJECTION_MISMATCH:common_calendar_boundaries"
+                )
+        elif source_request_contract != manifest_request_contract:
+            errors.append("SOURCE_MANIFEST_REQUEST_CONTRACT_MISMATCH")
     if (
         source_request_contract is not None
-        and manifest_request_contract is not None
-        and source_request_contract != manifest_request_contract
+        and str(source_request_contract.get("window_contract_version") or "")
+        == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
     ):
-        errors.append("SOURCE_MANIFEST_REQUEST_CONTRACT_MISMATCH")
+        expected_projection = {
+            "cell_timeframe": timeframe,
+            "cell_timeframe_window_years": (
+                source_request_contract.get("timeframe_window_years") or {}
+            ).get(timeframe),
+            "cell_calendar_boundaries": (
+                source_request_contract.get("timeframe_calendar_boundaries") or {}
+            ).get(timeframe),
+            "cell_required_evidence_lead_start_utc": (
+                source_request_contract.get(
+                    "timeframe_required_evidence_lead_start_utc"
+                )
+                or {}
+            ).get(timeframe),
+            "source_request_interval": (
+                source_request_contract.get("timeframe_source_request_intervals")
+                or {}
+            ).get(timeframe),
+        }
+        for field_name, expected_value in expected_projection.items():
+            if expected_value is None or provenance.get("request", {}).get(
+                field_name
+            ) != expected_value:
+                errors.append(
+                    f"SOURCE_TIMEFRAME_REQUEST_PROJECTION_MISMATCH:{field_name}"
+                )
     source_identity = _source_identity(provenance.get("source_environment"))
     manifest_source_identity = _source_identity(run_source_environment)
     if not source_identity:
@@ -653,8 +833,19 @@ def _source_leaf(
 
 def _partition_windows(
     request: Mapping[str, Any],
+    timeframe: Optional[str] = None,
 ) -> Tuple[Dict[str, Tuple[datetime, datetime]], list[str]]:
     raw = request.get("common_calendar_boundaries")
+    if (
+        str(request.get("window_contract_version") or "")
+        == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+    ):
+        raw_map = request.get("timeframe_calendar_boundaries")
+        raw = (
+            raw_map.get(str(timeframe or "").upper())
+            if isinstance(raw_map, Mapping)
+            else None
+        )
     windows: Dict[str, Tuple[datetime, datetime]] = {}
     errors: list[str] = []
     for partition in NATIVE_EVIDENCE_PARTITIONS:
@@ -702,9 +893,12 @@ def _coverage_verdict(
             {partition: None for partition in NATIVE_EVIDENCE_PARTITIONS},
         )
     details = provenance.get("expected_session_coverage_details_by_partition")
+    declared_method = (
+        str(details.get("method") or "") if isinstance(details, Mapping) else ""
+    )
     if (
         not isinstance(details, Mapping)
-        or str(details.get("method") or "") != NATIVE_SESSION_COVERAGE_METHOD
+        or declared_method not in SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS
         or str(details.get("status") or "") != "estimated"
     ):
         return (
@@ -712,10 +906,16 @@ def _coverage_verdict(
             ["SESSION_COVERAGE_METHOD_OR_STATUS_INVALID"],
             {partition: None for partition in NATIVE_EVIDENCE_PARTITIONS},
         )
-    recomputed, recomputed_details = expected_session_coverage_by_partition(
-        frame,
-        partition_windows,
-    )
+    if declared_method == NATIVE_SESSION_COVERAGE_METHOD:
+        recomputed, recomputed_details = segmented_session_coverage_by_partition_v2(
+            frame,
+            partition_windows,
+        )
+    else:
+        recomputed, recomputed_details = expected_session_coverage_by_partition(
+            frame,
+            partition_windows,
+        )
     if str(recomputed_details.get("status") or "") != "estimated":
         return (
             "ERROR",
@@ -728,11 +928,16 @@ def _coverage_verdict(
     declared_partitions = details.get("partitions")
     provenance_request = provenance.get("request")
     provenance_boundaries = (
-        provenance_request.get("common_calendar_boundaries")
+        provenance_request.get("cell_calendar_boundaries")
+        or provenance_request.get("common_calendar_boundaries")
         if isinstance(provenance_request, Mapping)
         else None
     )
     errors: list[str] = []
+    if declared_method == NATIVE_SESSION_COVERAGE_METHOD and dict(details) != dict(
+        recomputed_details
+    ):
+        errors.append("SESSION_COVERAGE_SEGMENTED_DETAILS_MISMATCH")
     for mapping, code in (
         (declared_coverage, "SESSION_COVERAGE_MAP_INVALID"),
         (declared_observed, "SESSION_OBSERVED_MAP_INVALID"),
@@ -744,21 +949,22 @@ def _coverage_verdict(
             NATIVE_EVIDENCE_PARTITIONS
         ):
             errors.append(code)
-    for field_name in (
-        "complete_train_weeks",
-        "nominal_bars_per_week_q75",
-    ):
-        declared_value = _strict_finite_number(details.get(field_name))
-        recomputed_value = _strict_finite_number(recomputed_details.get(field_name))
-        if declared_value is None or recomputed_value is None or not math.isclose(
-            declared_value,
-            recomputed_value,
-            rel_tol=0.0,
-            abs_tol=1e-9,
+    if declared_method == LEGACY_NATIVE_SESSION_COVERAGE_METHOD:
+        for field_name in (
+            "complete_train_weeks",
+            "nominal_bars_per_week_q75",
         ):
-            errors.append(f"SESSION_COVERAGE_{field_name.upper()}_MISMATCH")
-    if str(details.get("schedule_source_partition") or "") != "optimizer_train":
-        errors.append("SESSION_COVERAGE_SCHEDULE_SOURCE_INVALID")
+            declared_value = _strict_finite_number(details.get(field_name))
+            recomputed_value = _strict_finite_number(recomputed_details.get(field_name))
+            if declared_value is None or recomputed_value is None or not math.isclose(
+                declared_value,
+                recomputed_value,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                errors.append(f"SESSION_COVERAGE_{field_name.upper()}_MISMATCH")
+        if str(details.get("schedule_source_partition") or "") != "optimizer_train":
+            errors.append("SESSION_COVERAGE_SCHEDULE_SOURCE_INVALID")
     for partition in NATIVE_EVIDENCE_PARTITIONS:
         recomputed_value = _strict_finite_number(recomputed.get(partition))
         declared_value = (
@@ -837,6 +1043,52 @@ def _coverage_verdict(
                 errors.append(f"{code}:{partition}")
     if errors:
         return "ERROR", list(dict.fromkeys(errors)), dict(recomputed)
+    if declared_method == NATIVE_SESSION_COVERAGE_METHOD:
+        if recomputed_details.get("conservative_lower_bound_available") is not True:
+            return (
+                "ERROR",
+                ["SESSION_COVERAGE_CONSERVATIVE_BOUND_UNAVAILABLE"],
+                dict(recomputed),
+            )
+        for partition in NATIVE_EVIDENCE_PARTITIONS:
+            detail = (recomputed_details.get("partitions") or {}).get(partition) or {}
+            lower_bound = _strict_finite_number(
+                detail.get("conservative_coverage_lower_bound")
+            )
+            point = _strict_finite_number(recomputed.get(partition))
+            if (
+                lower_bound is None
+                or point is None
+                or not 0.0 <= lower_bound <= point + 1e-12 <= 1.0 + 1e-12
+            ):
+                return (
+                    "ERROR",
+                    [f"SESSION_COVERAGE_LOWER_BOUND_INVALID:{partition}"],
+                    dict(recomputed),
+                )
+            missing_weeks = int(detail.get("missing_calendar_weeks", 0) or 0)
+            thin_weeks = int(
+                detail.get("weeks_below_half_expected_schedule", 0) or 0
+            )
+            gap = detail.get("largest_unexplained_gap")
+            if gap is not None:
+                gap_seconds = (
+                    _strict_finite_number(gap.get("seconds"))
+                    if isinstance(gap, Mapping)
+                    else None
+                )
+                if gap_seconds is None or gap_seconds < 0.0:
+                    return (
+                        "ERROR",
+                        [f"SESSION_COVERAGE_GAP_DIAGNOSTIC_INVALID:{partition}"],
+                        dict(recomputed),
+                    )
+            if (missing_weeks > 0 or thin_weeks > 0) and not isinstance(gap, Mapping):
+                return (
+                    "ERROR",
+                    [f"SESSION_COVERAGE_GAP_DIAGNOSTIC_MISSING:{partition}"],
+                    dict(recomputed),
+                )
     history_status, reasons, normalized = classify_native_session_history(
         recomputed,
         minimum=minimum,
@@ -858,9 +1110,16 @@ def _merge_cell_status(
     reasons.extend(str(reason) for reason in parity.get("reason_codes", []) or [])
     reasons.extend(str(reason) for reason in coverage_reasons)
     parity_status = str(parity.get("status", "PENDING")).upper()
-    if source_errors or parity_status == "FAIL" or coverage_status == "FAIL":
+    normalized_coverage = str(coverage_status or "").strip().upper()
+    if (
+        source_errors
+        or parity_status == "FAIL"
+        or parity_status not in {"PASS", "FAIL", "PENDING", "NOT_APPLICABLE"}
+        or normalized_coverage in {"FAIL", "ERROR"}
+        or normalized_coverage not in {"PASS", "PENDING"}
+    ):
         return "FAIL", list(dict.fromkeys(reasons))
-    if parity_status == "PENDING" or coverage_status == "PENDING":
+    if parity_status == "PENDING" or normalized_coverage == "PENDING":
         return "PENDING", list(dict.fromkeys(reasons))
     return "PASS", list(dict.fromkeys(reasons))
 
@@ -1018,6 +1277,72 @@ def audit_and_activate(
         run_request = dict(request)
         if _request_contract(run_request) is None:
             run_manifest_errors.append("RUN_MANIFEST_REQUEST_CONTRACT_INVALID")
+        if (
+            str(run_request.get("window_contract_version") or "")
+            == TIMEFRAME_EVIDENCE_CONTRACT_VERSION
+        ):
+            expected_timeframe_set = set(canonical_timeframes)
+            timeframe_boundaries = run_request.get(
+                "timeframe_calendar_boundaries"
+            )
+            timeframe_years = run_request.get("timeframe_window_years")
+            timeframe_leads = run_request.get(
+                "timeframe_required_evidence_lead_start_utc"
+            )
+            timeframe_intervals = run_request.get(
+                "timeframe_source_request_intervals"
+            )
+            for field_name, value in (
+                ("BOUNDARIES", timeframe_boundaries),
+                ("WINDOW_YEARS", timeframe_years),
+                ("EVIDENCE_LEADS", timeframe_leads),
+                ("SOURCE_INTERVALS", timeframe_intervals),
+            ):
+                if not isinstance(value, Mapping) or set(value) != (
+                    expected_timeframe_set
+                ):
+                    run_manifest_errors.append(
+                        f"RUN_MANIFEST_TIMEFRAME_{field_name}_ROSTER_INVALID"
+                    )
+            compatibility_timeframe = (
+                "M5" if "M5" in canonical_timeframes else canonical_timeframes[0]
+            )
+            if isinstance(timeframe_boundaries, Mapping) and (
+                run_request.get("common_calendar_boundaries")
+                != timeframe_boundaries.get(compatibility_timeframe)
+            ):
+                run_manifest_errors.append(
+                    "RUN_MANIFEST_TIMEFRAME_COMMON_PROJECTION_MISMATCH"
+                )
+            if isinstance(timeframe_years, Mapping) and (
+                run_request.get("window_years")
+                != timeframe_years.get(compatibility_timeframe)
+            ):
+                run_manifest_errors.append(
+                    "RUN_MANIFEST_TIMEFRAME_WINDOW_PROJECTION_MISMATCH"
+                )
+            if isinstance(timeframe_boundaries, Mapping):
+                reference_active = None
+                for timeframe in canonical_timeframes:
+                    cell_windows = timeframe_boundaries.get(timeframe)
+                    active_windows = (
+                        {
+                            partition: cell_windows.get(partition)
+                            for partition in (
+                                "tuning_validation",
+                                "final_lockbox",
+                            )
+                        }
+                        if isinstance(cell_windows, Mapping)
+                        else None
+                    )
+                    if reference_active is None:
+                        reference_active = active_windows
+                    elif active_windows != reference_active:
+                        run_manifest_errors.append(
+                            "RUN_MANIFEST_TIMEFRAME_ACTIVE_WINDOWS_NOT_CONCURRENT"
+                        )
+                        break
         source_environment = run_manifest.get("source_environment")
         if isinstance(source_environment, Mapping):
             run_source_environment = dict(source_environment)
@@ -1037,8 +1362,18 @@ def audit_and_activate(
             run_manifest_errors.append("RUN_MANIFEST_SYMBOL_ROSTER_MISMATCH")
         if manifest_timeframes != set(canonical_timeframes):
             run_manifest_errors.append("RUN_MANIFEST_TIMEFRAME_ROSTER_MISMATCH")
-    partition_windows, partition_window_errors = _partition_windows(run_request)
-    run_manifest_errors.extend(partition_window_errors)
+    partition_windows_by_timeframe: Dict[
+        str, Dict[str, Tuple[datetime, datetime]]
+    ] = {}
+    for timeframe in canonical_timeframes:
+        timeframe_windows, partition_window_errors = _partition_windows(
+            run_request,
+            timeframe,
+        )
+        partition_windows_by_timeframe[timeframe] = timeframe_windows
+        run_manifest_errors.extend(
+            f"{timeframe}:{reason}" for reason in partition_window_errors
+        )
     run_manifest_sha = sha256_file(run_manifest_path) if run_manifest_path.exists() else None
     run_manifest_cells: Dict[Tuple[str, str], Mapping[str, Any]] = {}
     results = run_manifest.get("results", []) if isinstance(run_manifest, Mapping) else []
@@ -1060,11 +1395,8 @@ def audit_and_activate(
 
     entries: Dict[str, Dict[str, Any]] = {}
     activation_blocking_statuses: list[str] = []
-    eligible_symbols: list[str] = []
-    excluded_symbols: Dict[str, Dict[str, Any]] = {}
+    declared_coverage_methods: set[str] = set()
     audited_sufficiency_cells: Dict[str, Dict[str, Any]] = {}
-    coverage_exclusion_reasons: Dict[str, list[str]] = {}
-    symbol_technical_statuses: Dict[str, list[str]] = {}
     availability_decisions = {
         symbol: _symbol_availability_decision(
             symbol,
@@ -1077,15 +1409,9 @@ def audit_and_activate(
     for symbol in canonical_symbols:
         entries[symbol] = {}
         audited_sufficiency_cells[symbol] = {}
-        coverage_exclusion_reasons[symbol] = []
-        symbol_technical_statuses[symbol] = []
         availability = availability_decisions[symbol]
         availability_status = str(availability.get("status") or "invalid")
-        if availability_status == "eligible":
-            eligible_symbols.append(symbol)
-        elif availability_status == "excluded_no_trade":
-            excluded_symbols[symbol] = dict(availability)
-        else:
+        if availability_status == "invalid":
             activation_blocking_statuses.append("FAIL")
         sources = {
             timeframe: _source_leaf(
@@ -1103,6 +1429,22 @@ def audit_and_activate(
         m5_source = sources.get("M5")
         m5_frame = m5_source.get("frame") if isinstance(m5_source, Mapping) else None
         m5_errors = list(m5_source.get("errors", [])) if isinstance(m5_source, Mapping) else ["M5_SOURCE_MISSING"]
+        d1_source = sources.get("D1")
+        d1_frame = d1_source.get("frame") if isinstance(d1_source, Mapping) else None
+        m5_availability_class = (
+            str(m5_source.get("availability_class") or "")
+            if isinstance(m5_source, Mapping)
+            else ""
+        )
+        m5_failure = str(
+            (
+                (m5_source.get("provenance") or {}).get("failure_status")
+                if isinstance(m5_source, Mapping)
+                and isinstance(m5_source.get("provenance"), Mapping)
+                else ""
+            )
+            or ""
+        ).strip().upper()
         for timeframe in canonical_timeframes:
             source = sources[timeframe]
             provenance = source.get("provenance", {}) or {}
@@ -1118,7 +1460,56 @@ def audit_and_activate(
                         candidate = float("nan")
                     if math.isfinite(candidate) and candidate > 0.0:
                         tolerance = candidate
-            if frame is None or m5_frame is None or m5_errors:
+            resolution_audit = audit_native_resolution(
+                frame,
+                symbol=symbol,
+                timeframe=timeframe,
+                daily_frame=d1_frame,
+                tick_tolerance=tolerance,
+            ).to_dict()
+            resolution_status = str(
+                resolution_audit.get("status") or "PENDING"
+            ).upper()
+            resolution_reasons = [
+                str(reason)
+                for reason in resolution_audit.get("reason_codes") or []
+                if str(reason)
+            ]
+            source_availability_class = str(
+                source.get("availability_class") or ""
+            )
+            if source_availability_class == "unavailable" and not source_errors:
+                parity = {
+                    "schema_version": PARITY_SCHEMA_VERSION,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "status": "NOT_APPLICABLE",
+                    "reason_codes": ["CELL_ACQUISITION_UNAVAILABLE"],
+                    "native_is_signal_authority": True,
+                    "m5_role": "read_only_session_membership_audit_comparator",
+                    "metrics": {},
+                    "diagnostics": {},
+                }
+            elif (
+                timeframe != "M5"
+                and m5_availability_class == "unavailable"
+                and not m5_errors
+            ):
+                parity = {
+                    "schema_version": PARITY_SCHEMA_VERSION,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "status": "NOT_APPLICABLE",
+                    "reason_codes": [
+                        "M5_ACQUISITION_UNAVAILABLE:"
+                        f"{m5_failure or 'UNSPECIFIED'}"
+                    ],
+                    "native_is_signal_authority": True,
+                    "m5_role": "read_only_session_membership_audit_comparator",
+                    "metrics": {},
+                    "diagnostics": {},
+                }
+            elif frame is None or m5_frame is None or m5_errors:
                 parity = {
                     "schema_version": PARITY_SCHEMA_VERSION,
                     "symbol": symbol,
@@ -1145,7 +1536,7 @@ def audit_and_activate(
                 provenance,
                 frame,
                 float(minimum_session_coverage),
-                partition_windows,
+                partition_windows_by_timeframe.get(timeframe, {}),
             )
             cell_status, reasons = _merge_cell_status(
                 source_errors,
@@ -1158,23 +1549,42 @@ def audit_and_activate(
                 if isinstance(availability.get("availability_cells"), Mapping)
                 else {}
             )
-            availability_class, _availability_error = classify_native_availability_cell(
+            availability_class, availability_error = classify_native_availability_cell(
                 availability_cell.get("status"),
                 availability_cell.get("failure_status"),
                 availability_cell.get("rows"),
             )
-            # Coverage-only insufficiency is a deterministic whole-symbol
-            # abstention input, not a technical failure. Every fetched leaf
-            # must still pass source integrity and parity; missing/non-finite
-            # coverage remains blocking rather than becoming an exclusion.
+            final_cell_status = "failed"
+            cell_universe_status = "invalid"
             if availability_class == "unavailable":
-                unavailable_source_status = "FAIL" if source_errors else "PASS"
-                activation_blocking_statuses.append(unavailable_source_status)
-                symbol_technical_statuses[symbol].append(unavailable_source_status)
-            elif availability_status == "eligible" or (
-                availability_status == "excluded_no_trade"
-                and availability_class != "unavailable"
-            ):
+                failure = str(
+                    availability_cell.get("failure_status") or ""
+                ).strip().upper()
+                cell_status = "FAIL"
+                reasons = [f"ACQUISITION_UNAVAILABLE:{failure}"]
+                if source_errors:
+                    reasons = [f"SOURCE:{reason}" for reason in source_errors]
+                    activation_blocking_statuses.append("FAIL")
+                else:
+                    final_cell_status = "excluded_no_trade"
+                    cell_universe_status = "excluded_no_trade"
+            elif availability_class == "success":
+                # Low but valid coverage is a deterministic cell abstention.
+                # Invalid coverage, source, and parity evidence still blocks
+                # the entire activation rather than becoming NO_TRADE.
+                if resolution_status != "PASS":
+                    cell_status = "FAIL"
+                    reasons = list(
+                        dict.fromkeys(
+                            [
+                                *reasons,
+                                *(
+                                    f"RESOLUTION:{reason}"
+                                    for reason in resolution_reasons
+                                ),
+                            ]
+                        )
+                    )
                 technical_coverage_status = (
                     "FAIL"
                     if coverage_status == "ERROR"
@@ -1191,12 +1601,26 @@ def audit_and_activate(
                     technical_coverage_status,
                     technical_coverage_reasons,
                 )
-                activation_blocking_statuses.append(technical_status)
-                symbol_technical_statuses[symbol].append(technical_status)
-                if coverage_status == "FAIL":
-                    coverage_exclusion_reasons[symbol].extend(
-                        f"{timeframe}:{reason}" for reason in coverage_reasons
+                if technical_status in {"FAIL", "PENDING"}:
+                    activation_blocking_statuses.append(technical_status)
+                    final_cell_status = (
+                        "failed" if technical_status == "FAIL" else "pending"
                     )
+                elif coverage_status == "FAIL" or resolution_status != "PASS":
+                    final_cell_status = "excluded_no_trade"
+                    cell_universe_status = "excluded_no_trade"
+                elif cell_status == "PASS":
+                    final_cell_status = "active"
+                    cell_universe_status = "eligible"
+                else:
+                    activation_blocking_statuses.append("FAIL")
+            else:
+                cell_status = "FAIL"
+                reasons = [
+                    "SOURCE_AVAILABILITY_INVALID:"
+                    f"{availability_error or 'unknown'}"
+                ]
+                activation_blocking_statuses.append("FAIL")
             parity = dict(parity)
             parity.update(
                 {
@@ -1230,6 +1654,7 @@ def audit_and_activate(
                 "start_ts": frame.index[0].isoformat() if frame is not None and len(frame) else None,
                 "end_ts": frame.index[-1].isoformat() if frame is not None and len(frame) else None,
                 "complete": cell_status == "PASS",
+                "resolution_audit": resolution_audit,
                 "expected_session_coverage_by_partition": coverage,
                 "observed_session_bars_by_partition": provenance.get(
                     "observed_session_bars_by_partition"
@@ -1238,7 +1663,29 @@ def audit_and_activate(
                     "expected_session_bars_by_partition"
                 ),
                 "common_calendar_boundaries": (
-                    (provenance.get("request") or {}).get("common_calendar_boundaries")
+                    (provenance.get("request") or {}).get(
+                        "cell_calendar_boundaries"
+                    )
+                    or (provenance.get("request") or {}).get(
+                        "common_calendar_boundaries"
+                    )
+                    if isinstance(provenance.get("request"), Mapping)
+                    else None
+                ),
+                "cell_calendar_boundaries": (
+                    (provenance.get("request") or {}).get(
+                        "cell_calendar_boundaries"
+                    )
+                    or (provenance.get("request") or {}).get(
+                        "common_calendar_boundaries"
+                    )
+                    if isinstance(provenance.get("request"), Mapping)
+                    else None
+                ),
+                "timeframe_calendar_boundaries_sha256": (
+                    (provenance.get("request") or {}).get(
+                        "timeframe_calendar_boundaries_sha256"
+                    )
                     if isinstance(provenance.get("request"), Mapping)
                     else None
                 ),
@@ -1274,6 +1721,8 @@ def audit_and_activate(
                 if isinstance(coverage_details, Mapping)
                 else ""
             )
+            if coverage_method:
+                declared_coverage_methods.add(coverage_method)
             if availability_class == "unavailable":
                 source_validation_status = (
                     "ACQUISITION_UNAVAILABLE" if not source_errors else "FAIL"
@@ -1293,6 +1742,8 @@ def audit_and_activate(
                 "parity_status": audited_parity_status,
                 "coverage_status": audited_coverage_status,
                 "coverage_reason_codes": audited_coverage_reasons,
+                "resolution_status": resolution_status,
+                "resolution_reason_codes": resolution_reasons,
                 "expected_session_coverage_by_partition": coverage,
                 "observed_session_bars_by_partition": provenance.get(
                     "observed_session_bars_by_partition"
@@ -1305,15 +1756,10 @@ def audit_and_activate(
                 "audited_sidecar_sha256": sidecar_sha,
                 "parity_sha256": parity_sha,
             }
-            entry_status = (
-                "excluded_no_trade"
-                if availability_status == "excluded_no_trade"
-                else ("active" if cell_status == "PASS" else cell_status.lower())
-            )
             entries[symbol][timeframe] = {
-                "status": entry_status,
+                "status": final_cell_status,
                 "audit_status": cell_status,
-                "universe_eligibility_status": availability_status,
+                "universe_eligibility_status": cell_universe_status,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "run_id": run_id,
@@ -1327,6 +1773,8 @@ def audit_and_activate(
                 "parity_relative_path": str(parity_path.relative_to(native_root)).replace("\\", "/"),
                 "parity_sha256": parity_sha,
                 "coverage_method": coverage_method,
+                "resolution_status": resolution_status,
+                "resolution_reason_codes": resolution_reasons,
                 "expected_session_coverage_by_partition": coverage,
                 "observed_session_bars_by_partition": provenance.get(
                     "observed_session_bars_by_partition"
@@ -1337,37 +1785,82 @@ def audit_and_activate(
                 "reason_codes": reasons,
             }
 
-    # Coverage-only exclusions are finalized only after every successful leaf
-    # has passed source/hash/parity checks. This keeps the acquisition roster
-    # complete while preventing one sparse broker archive from vetoing every
-    # otherwise valid symbol in the production universe.
-    for symbol in canonical_symbols:
-        coverage_reasons = list(dict.fromkeys(coverage_exclusion_reasons[symbol]))
-        technical_statuses = symbol_technical_statuses[symbol]
-        if coverage_reasons and not any(
-            status in {"FAIL", "PENDING"} for status in technical_statuses
-        ):
-            if symbol in eligible_symbols:
-                eligible_symbols.remove(symbol)
-            base = dict(availability_decisions[symbol])
-            base["status"] = "excluded_no_trade"
-            base["reason_codes"] = list(
-                dict.fromkeys([*(base.get("reason_codes") or []), *coverage_reasons])
+    cell_statuses = {
+        symbol: {
+            timeframe: str(entries[symbol][timeframe].get("status") or "")
+            for timeframe in canonical_timeframes
+        }
+        for symbol in canonical_symbols
+    }
+    active_timeframes_by_symbol = {
+        symbol: [
+            timeframe
+            for timeframe in canonical_timeframes
+            if cell_statuses[symbol][timeframe] == "active"
+        ]
+        for symbol in canonical_symbols
+    }
+    excluded_timeframes_by_symbol = {
+        symbol: [
+            timeframe
+            for timeframe in canonical_timeframes
+            if cell_statuses[symbol][timeframe] == "excluded_no_trade"
+        ]
+        for symbol in canonical_symbols
+    }
+    symbols_with_active_cells = sorted(
+        symbol for symbol in canonical_symbols if active_timeframes_by_symbol[symbol]
+    )
+    fully_excluded_symbols = sorted(
+        symbol
+        for symbol in canonical_symbols
+        if len(excluded_timeframes_by_symbol[symbol]) == len(canonical_timeframes)
+    )
+    excluded_symbols: Dict[str, Dict[str, Any]] = {}
+    for symbol in fully_excluded_symbols:
+        availability = availability_decisions[symbol]
+        availability_cells = dict(availability.get("availability_cells") or {})
+        acquisition_reason_codes: list[str] = []
+        coverage_reason_codes: list[str] = []
+        for timeframe in canonical_timeframes:
+            acquisition = availability_cells.get(timeframe) or {}
+            classification, _coherence_error = classify_native_availability_cell(
+                acquisition.get("status"),
+                acquisition.get("failure_status"),
+                acquisition.get("rows"),
             )
-            excluded_symbols[symbol] = base
-            for entry in entries[symbol].values():
-                entry["status"] = "excluded_no_trade"
-                entry["universe_eligibility_status"] = "excluded_no_trade"
-        elif symbol in excluded_symbols and coverage_reasons:
-            excluded_symbols[symbol]["reason_codes"] = list(
-                dict.fromkeys(
-                    [
-                        *(excluded_symbols[symbol].get("reason_codes") or []),
-                        *coverage_reasons,
-                    ]
+            if classification == "unavailable":
+                acquisition_reason_codes.append(
+                    f"{timeframe}:"
+                    f"{str(acquisition.get('failure_status') or '').upper()}"
                 )
-            )
+            else:
+                coverage_reason_codes.extend(
+                    f"{timeframe}:{reason}"
+                    for reason in entries[symbol][timeframe].get("reason_codes") or []
+                    if str(reason).startswith(("SESSION_COVERAGE_", "RESOLUTION:"))
+                )
+        excluded_symbols[symbol] = {
+            "status": "excluded_no_trade",
+            "decision_basis": "source_availability_only",
+            "reason_codes": list(
+                dict.fromkeys(
+                    [*acquisition_reason_codes, *coverage_reason_codes]
+                )
+            ),
+            "availability_cells": availability_cells,
+            "audited_sufficiency_cells": dict(
+                audited_sufficiency_cells.get(symbol) or {}
+            ),
+        }
 
+    if len(declared_coverage_methods) > 1:
+        activation_blocking_statuses.append("FAIL")
+    activation_coverage_method = (
+        next(iter(declared_coverage_methods))
+        if len(declared_coverage_methods) == 1
+        else NATIVE_SESSION_COVERAGE_METHOD
+    )
     if "FAIL" in activation_blocking_statuses:
         manifest_status = "failed"
     elif "PENDING" in activation_blocking_statuses:
@@ -1379,23 +1872,19 @@ def audit_and_activate(
         "decision_basis": "source_availability_only",
         "performance_inputs_used": False,
         "minimum_session_coverage": NATIVE_MINIMUM_SESSION_COVERAGE,
-        "session_coverage_method": NATIVE_SESSION_COVERAGE_METHOD,
+        "session_coverage_method": activation_coverage_method,
         "session_coverage_partitions": list(NATIVE_EVIDENCE_PARTITIONS),
         "requested_symbols": list(canonical_symbols),
         "required_timeframes": list(canonical_timeframes),
-        "eligible_symbols": sorted(eligible_symbols),
-        "excluded_symbols": {
-            symbol: {
-                "status": "excluded_no_trade",
-                "decision_basis": "source_availability_only",
-                "reason_codes": list(record.get("reason_codes") or []),
-                "availability_cells": dict(record.get("availability_cells") or {}),
-                "audited_sufficiency_cells": dict(
-                    audited_sufficiency_cells.get(symbol) or {}
-                ),
-            }
-            for symbol, record in sorted(excluded_symbols.items())
-        },
+        "cell_statuses": cell_statuses,
+        "active_timeframes_by_symbol": active_timeframes_by_symbol,
+        "excluded_timeframes_by_symbol": excluded_timeframes_by_symbol,
+        "symbols_with_active_cells": symbols_with_active_cells,
+        "fully_excluded_symbols": fully_excluded_symbols,
+        # Compatibility projections. These are authenticated against the
+        # exact cell grid by the resolver and are never independently trusted.
+        "eligible_symbols": symbols_with_active_cells,
+        "excluded_symbols": excluded_symbols,
         "invalid_symbols": {
             symbol: dict(record)
             for symbol, record in sorted(availability_decisions.items())
@@ -1435,11 +1924,21 @@ def audit_and_activate(
                 for symbol_entries in entries.values()
                 for entry in symbol_entries.values()
             ),
-            "pending": sum(status == "PENDING" for status in activation_blocking_statuses),
-            "failed": sum(status == "FAIL" for status in activation_blocking_statuses),
+            "pending": sum(
+                str(entry.get("status") or "") == "pending"
+                for symbol_entries in entries.values()
+                for entry in symbol_entries.values()
+            ),
+            "failed": sum(
+                str(entry.get("status") or "") == "failed"
+                for symbol_entries in entries.values()
+                for entry in symbol_entries.values()
+            ),
             "total": len(canonical_symbols) * len(canonical_timeframes),
-            "eligible_symbols": len(eligible_symbols),
+            "eligible_symbols": len(symbols_with_active_cells),
             "excluded_symbols": len(excluded_symbols),
+            "symbols_with_active_cells": len(symbols_with_active_cells),
+            "fully_excluded_symbols": len(fully_excluded_symbols),
         },
     }
     manifest_path = native_root / "activations" / f"{activation_id}.json"
