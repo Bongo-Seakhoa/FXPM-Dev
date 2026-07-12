@@ -319,7 +319,11 @@ def test_task_deadline_terminates_hung_child_in_bounded_time() -> None:
     assert outcomes[0].technical_failure
     assert outcomes[1].value == "next"
     assert governor.stats.timeout_failures == 1
-    assert elapsed < 5.0
+    # The scheduler's semantic deadline is asserted above by the explicit
+    # FAILED_TIMEOUT outcome.  Leave enough wall-clock allowance for two fresh
+    # Windows ``spawn`` operations on a CPU-loaded full-suite runner; this still
+    # proves the 30-second child was terminated rather than awaited.
+    assert elapsed < 15.0
 
 
 @MULTIPROCESS
