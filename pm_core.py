@@ -98,6 +98,8 @@ EXIT_EOD = 3
 # underwater timing fields. Older artifacts without this field must not be
 # interpreted as zero-excursion records.
 BACKTEST_TRADE_RECORD_SCHEMA_VERSION = "2026-06-18-mae-mfe-v1"
+BACKTEST_EXECUTION_COST_CONTRACT_VERSION = "entry_slippage_parity_v1"
+BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION = "causal_swap_accrual_v1"
 
 
 @jit(nopython=True, cache=True)
@@ -118,11 +120,21 @@ def _round_volume_numba(volume: float, min_lot: float, max_lot: float, step: flo
     """
     if step <= 0.0:
         step = 0.01
-    # Floor to step (risk-safe - never round up)
-    rounded = np.floor(volume / step) * step
-    # Clamp to min/max
+    # Floor to step (risk-safe - never round up).  Calculations that are
+    # mathematically on a broker step can arrive a few ULPs below it (for
+    # example 0.49999999999999956 instead of 0.500).  Snap only that tiny
+    # representation error to the grid before flooring; genuinely sub-step
+    # volumes retain the conservative floor.
+    scaled = volume / step
+    nearest_step = np.round(scaled)
+    tolerance = 1e-10 * max(1.0, abs(scaled))
+    if abs(scaled - nearest_step) <= tolerance:
+        scaled = nearest_step
+    rounded = np.floor(scaled) * step
+    # A risk-sized value below the broker minimum is not tradable.  Never
+    # clamp it upward: that can multiply the intended stop risk arbitrarily.
     if rounded < min_lot:
-        rounded = min_lot
+        return 0.0
     if rounded > max_lot:
         rounded = max_lot
     # Stabilize float noise
@@ -200,6 +212,13 @@ def _backtest_loop_numba(
     max_lot: float,
     volume_step: float,
     warmup_bars: int,
+    # Optional causal-carry inputs are appended so the long-standing direct
+    # kernel call contract remains backward compatible.
+    rollover_units_arr=None,
+    swap_long_per_lot_arr=None,
+    swap_short_per_lot_arr=None,
+    causal_swap_enabled: bool = False,
+    pre_open_rollover_units_arr=None,
 ) -> Tuple:
     """
     Numba JIT-compiled backtest loop for 3-10x speedup.
@@ -225,6 +244,14 @@ def _backtest_loop_numba(
         - MAE/MFE excursion fields appended after the legacy result fields
     """
     n_bars = len(open_arr)
+    if rollover_units_arr is None:
+        rollover_units_arr = np.zeros(n_bars, dtype=np.int32)
+    if pre_open_rollover_units_arr is None:
+        pre_open_rollover_units_arr = np.zeros(n_bars, dtype=np.int32)
+    if swap_long_per_lot_arr is None:
+        swap_long_per_lot_arr = np.zeros(n_bars, dtype=np.float64)
+    if swap_short_per_lot_arr is None:
+        swap_short_per_lot_arr = np.zeros(n_bars, dtype=np.float64)
     
     # Pre-allocate trade arrays (max possible = n_bars trades)
     # We'll return only the filled portion
@@ -238,10 +265,13 @@ def _backtest_loop_numba(
     trade_sl_prices = np.zeros(max_trades, dtype=np.float64)
     trade_tp_prices = np.zeros(max_trades, dtype=np.float64)
     trade_sizes = np.zeros(max_trades, dtype=np.float64)
+    trade_gross_pnl_dollars = np.zeros(max_trades, dtype=np.float64)
     trade_pnl_dollars = np.zeros(max_trades, dtype=np.float64)
     trade_pnl_pips = np.zeros(max_trades, dtype=np.float64)
     trade_exit_reasons = np.zeros(max_trades, dtype=np.int32)
     trade_risk_amounts = np.zeros(max_trades, dtype=np.float64)
+    trade_swap_rollover_units = np.zeros(max_trades, dtype=np.int64)
+    trade_swap_dollars = np.zeros(max_trades, dtype=np.float64)
     trade_mae_pips = np.zeros(max_trades, dtype=np.float64)
     trade_mfe_pips = np.zeros(max_trades, dtype=np.float64)
     trade_mae_r = np.zeros(max_trades, dtype=np.float64)
@@ -270,6 +300,9 @@ def _backtest_loop_numba(
     take_profit = 0.0
     position_size = 0.0
     risk_amount_at_entry = 0.0
+    daily_swap_per_lot_current = 0.0
+    accrued_swap_units_current = 0
+    accrued_swap_dollars_current = 0.0
     entry_to_stop_pips = 0.0
     entry_to_target_pips = 0.0
     mae_pips_current = 0.0
@@ -306,6 +339,25 @@ def _backtest_loop_numba(
             ask_low = low_price
             bid_close = close_price
             ask_close = close_price
+
+        # Rollover events inside an archive/session gap belong only to a
+        # position carried across that gap.  Book them before gap-open exits
+        # and before a new bar-open position can be sized.
+        if in_position and causal_swap_enabled:
+            pre_open_units = (
+                int(pre_open_rollover_units_arr[i])
+                if i < len(pre_open_rollover_units_arr)
+                else 0
+            )
+            if pre_open_units > 0:
+                swap_cashflow = (
+                    daily_swap_per_lot_current
+                    * position_size
+                    * pre_open_units
+                )
+                equity += swap_cashflow
+                accrued_swap_units_current += pre_open_units
+                accrued_swap_dollars_current += swap_cashflow
         
         if in_position:
             bars_held_now = i - entry_bar
@@ -352,12 +404,13 @@ def _backtest_loop_numba(
                     exit_reason = EXIT_TP
             
             if exit_reason != EXIT_NONE:
-                pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
+                gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
                     entry_price, exit_price, position_direction, position_size,
                     tick_size, tick_value, pip_size, pip_value,
                     use_commission, commission_per_lot
                 )
-                equity += pnl_dollars
+                equity += gross_pnl_dollars
+                net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
                 trade_signal_bars[trade_count] = signal_bar
                 trade_entry_bars[trade_count] = entry_bar
                 trade_exit_bars[trade_count] = i
@@ -367,10 +420,13 @@ def _backtest_loop_numba(
                 trade_sl_prices[trade_count] = stop_loss
                 trade_tp_prices[trade_count] = take_profit
                 trade_sizes[trade_count] = position_size
-                trade_pnl_dollars[trade_count] = pnl_dollars
+                trade_gross_pnl_dollars[trade_count] = gross_pnl_dollars
+                trade_pnl_dollars[trade_count] = net_pnl_dollars
                 trade_pnl_pips[trade_count] = pnl_pips
                 trade_exit_reasons[trade_count] = exit_reason
                 trade_risk_amounts[trade_count] = risk_amount_at_entry
+                trade_swap_rollover_units[trade_count] = accrued_swap_units_current
+                trade_swap_dollars[trade_count] = accrued_swap_dollars_current
                 trade_mae_pips[trade_count] = mae_pips_current
                 trade_mfe_pips[trade_count] = mfe_pips_current
                 trade_mae_r[trade_count] = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
@@ -414,6 +470,8 @@ def _backtest_loop_numba(
                 elif pip_size > 0.0 and pip_value > 0.0:
                     pips = dist / pip_size
                     loss_per_lot = pips * pip_value
+                if use_commission:
+                    loss_per_lot += commission_per_lot
                 if loss_per_lot <= 0.0:
                     equity_curve[i] = equity
                     if equity > peak_equity:
@@ -458,6 +516,13 @@ def _backtest_loop_numba(
                 position_direction = direction
                 entry_bar = i
                 signal_bar = signal_bar_index
+                daily_swap_per_lot_current = (
+                    swap_long_per_lot_arr[i]
+                    if position_direction == 1
+                    else swap_short_per_lot_arr[i]
+                )
+                accrued_swap_units_current = 0
+                accrued_swap_dollars_current = 0.0
                 if pip_size > 0.0:
                     if position_direction == 1:
                         adverse_pips = (entry_price - bid_low) / pip_size
@@ -501,12 +566,13 @@ def _backtest_loop_numba(
                         exit_reason = EXIT_TP
 
                 if exit_reason != EXIT_NONE:
-                    pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
+                    gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
                         entry_price, exit_price, position_direction, position_size,
                         tick_size, tick_value, pip_size, pip_value,
                         use_commission, commission_per_lot
                     )
-                    equity += pnl_dollars
+                    equity += gross_pnl_dollars
+                    net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
                     trade_signal_bars[trade_count] = signal_bar
                     trade_entry_bars[trade_count] = entry_bar
                     trade_exit_bars[trade_count] = i
@@ -516,10 +582,13 @@ def _backtest_loop_numba(
                     trade_sl_prices[trade_count] = stop_loss
                     trade_tp_prices[trade_count] = take_profit
                     trade_sizes[trade_count] = position_size
-                    trade_pnl_dollars[trade_count] = pnl_dollars
+                    trade_gross_pnl_dollars[trade_count] = gross_pnl_dollars
+                    trade_pnl_dollars[trade_count] = net_pnl_dollars
                     trade_pnl_pips[trade_count] = pnl_pips
                     trade_exit_reasons[trade_count] = exit_reason
                     trade_risk_amounts[trade_count] = risk_amount_at_entry
+                    trade_swap_rollover_units[trade_count] = accrued_swap_units_current
+                    trade_swap_dollars[trade_count] = accrued_swap_dollars_current
                     trade_mae_pips[trade_count] = mae_pips_current
                     trade_mfe_pips[trade_count] = mfe_pips_current
                     trade_mae_r[trade_count] = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
@@ -531,6 +600,22 @@ def _backtest_loop_numba(
                     trade_entry_to_target_pips[trade_count] = entry_to_target_pips
                     trade_count += 1
                     in_position = False
+
+        if in_position and causal_swap_enabled:
+            rollover_units = (
+                int(rollover_units_arr[i])
+                if i < len(rollover_units_arr)
+                else 0
+            )
+            if rollover_units > 0:
+                swap_cashflow = (
+                    daily_swap_per_lot_current
+                    * position_size
+                    * rollover_units
+                )
+                equity += swap_cashflow
+                accrued_swap_units_current += rollover_units
+                accrued_swap_dollars_current += swap_cashflow
 
         current_equity = equity
         if in_position:
@@ -556,12 +641,13 @@ def _backtest_loop_numba(
             exit_price = close_arr[n_bars - 1] - half_spread if position_direction == 1 else close_arr[n_bars - 1] + half_spread
         else:
             exit_price = close_arr[n_bars - 1]
-        pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
+        gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
             entry_price, exit_price, position_direction, position_size,
             tick_size, tick_value, pip_size, pip_value,
             use_commission, commission_per_lot
         )
-        equity += pnl_dollars
+        equity += gross_pnl_dollars
+        net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
         trade_signal_bars[trade_count] = signal_bar
         trade_entry_bars[trade_count] = entry_bar
         trade_exit_bars[trade_count] = n_bars - 1
@@ -571,10 +657,13 @@ def _backtest_loop_numba(
         trade_sl_prices[trade_count] = stop_loss
         trade_tp_prices[trade_count] = take_profit
         trade_sizes[trade_count] = position_size
-        trade_pnl_dollars[trade_count] = pnl_dollars
+        trade_gross_pnl_dollars[trade_count] = gross_pnl_dollars
+        trade_pnl_dollars[trade_count] = net_pnl_dollars
         trade_pnl_pips[trade_count] = pnl_pips
         trade_exit_reasons[trade_count] = EXIT_EOD
         trade_risk_amounts[trade_count] = risk_amount_at_entry
+        trade_swap_rollover_units[trade_count] = accrued_swap_units_current
+        trade_swap_dollars[trade_count] = accrued_swap_dollars_current
         trade_mae_pips[trade_count] = mae_pips_current
         trade_mfe_pips[trade_count] = mfe_pips_current
         trade_mae_r[trade_count] = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
@@ -620,6 +709,11 @@ def _backtest_loop_numba(
         trade_time_underwater_bars[:trade_count],
         trade_entry_to_stop_pips[:trade_count],
         trade_entry_to_target_pips[:trade_count],
+        # Cost attribution fields are appended after every legacy result field
+        # so direct consumers retain stable positional indexes.
+        trade_gross_pnl_dollars[:trade_count],
+        trade_swap_rollover_units[:trade_count],
+        trade_swap_dollars[:trade_count],
     )
 
 
@@ -1030,6 +1124,7 @@ class PipelineConfig:
     storage_manifest_max_mb: float = 16.0
     storage_manifest_keep_rotations: int = 2
     storage_manifest_dedupe_hours: float = 24.0
+    storage_signal_ledger_compress_after_months: int = 2
     state_filename: str = "storage_state.json"
     manifest_filename: str = "storage_manifest.jsonl"
     ledger_filename: str = "signal_ledger.jsonl"
@@ -2246,6 +2341,13 @@ class PipelineConfig:
             )
         except Exception:
             self.storage_manifest_dedupe_hours = 24.0
+        try:
+            self.storage_signal_ledger_compress_after_months = min(
+                120,
+                max(0, int(self.storage_signal_ledger_compress_after_months)),
+            )
+        except Exception:
+            self.storage_signal_ledger_compress_after_months = 2
         self.storage_metaquotes_root = str(self.storage_metaquotes_root or "").strip()
         self.storage_metaquotes_active_root_allowlist = [
             str(item).strip() for item in (self.storage_metaquotes_active_root_allowlist or []) if str(item).strip()
@@ -2700,13 +2802,23 @@ class InstrumentSpec:
             volume: Raw volume to round
             
         Returns:
-            Volume rounded to volume_step, clamped to min/max
+            Volume rounded down to volume_step and max_lot, or zero when the
+            risk-sized result cannot meet the broker minimum.
         """
         step = self.volume_step if self.volume_step > 0 else 0.01
-        # Floor to step (risk-safe)
-        rounded = math.floor(volume / step) * step
-        # Clamp to min/max
-        rounded = max(self.min_lot, min(self.max_lot, rounded))
+        # Correct only floating-point representation noise at an exact broker
+        # grid boundary, then conservatively floor genuinely sub-step values.
+        scaled = volume / step
+        nearest_step = round(scaled)
+        tolerance = 1e-10 * max(1.0, abs(scaled))
+        if abs(scaled - nearest_step) <= tolerance:
+            scaled = float(nearest_step)
+        rounded = math.floor(scaled) * step
+        # A sub-minimum risk-sized order is not executable without increasing
+        # exposure above the model's budget, so fail closed to no trade.
+        if rounded < self.min_lot:
+            return 0.0
+        rounded = min(self.max_lot, rounded)
         # Round to avoid floating point issues
         return round(rounded, 8)
     
@@ -5855,6 +5967,151 @@ class Backtester:
         except Exception as exc:
             logger.debug("Spread provenance metadata enrichment failed for %s: %s", spec.symbol, exc)
         return entry_arr.astype(np.float64), bar_arr.astype(np.float64), meta
+
+    @staticmethod
+    def _resolved_triple_rollover_weekday(spec: Optional[InstrumentSpec], config: Any) -> int:
+        rollover_day = _WEEKDAY_NAME_TO_INDEX.get(
+            str(
+                getattr(config, "swap_model_triple_rollover_day", "wednesday")
+                or "wednesday"
+            ).lower(),
+            2,
+        )
+        if spec is not None:
+            try:
+                mt5_rollover_day = int(getattr(spec, "swap_rollover3days", -1))
+            except (TypeError, ValueError, OverflowError):
+                mt5_rollover_day = -1
+            if 0 <= mt5_rollover_day <= 6:
+                # MT5: Sunday=0 ... Saturday=6. pandas/Python:
+                # Monday=0 ... Sunday=6.
+                rollover_day = (mt5_rollover_day - 1) % 7
+        return int(rollover_day)
+
+    def _build_causal_swap_inputs(
+        self,
+        features: pd.DataFrame,
+        spec: InstrumentSpec,
+        entry_prices: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, Dict[str, Any]]:
+        """Build observable per-close rollover and per-entry swap arrays."""
+        count = int(len(features))
+        pre_open_rollover_units = np.zeros(count, dtype=np.int32)
+        rollover_units = np.zeros(count, dtype=np.int32)
+        long_per_lot = np.zeros(count, dtype=np.float64)
+        short_per_lot = np.zeros(count, dtype=np.float64)
+        contract: Dict[str, Any] = {
+            "contract_version": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
+            "status": "UNAVAILABLE",
+            "mode": "noncausal_post_loop_fallback",
+            "timestamp_source": None,
+            "triple_rollover_weekday": int(
+                self._resolved_triple_rollover_weekday(spec, self.config)
+            ),
+            "execution_state_compounding": False,
+            "timestamp_evidence_level": "unavailable",
+            "source_provenance_authenticated": False,
+            "reason": "observable bar-close timestamps unavailable",
+        }
+        if not bool(getattr(self.config, "swap_model_enabled", True)):
+            contract.update({
+                "status": "DISABLED",
+                "mode": "disabled",
+                "execution_state_compounding": True,
+                "reason": "swap model disabled",
+            })
+            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+        if count <= 0 or "_BAR_CLOSE_TS" not in features.columns:
+            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+        try:
+            closes = pd.DatetimeIndex(
+                pd.to_datetime(features["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+            )
+        except Exception as exc:
+            contract["reason"] = f"bar-close conversion failed: {type(exc).__name__}"
+            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+        if (
+            len(closes) != count
+            or closes.isna().any()
+            or closes.has_duplicates
+            or not closes.is_monotonic_increasing
+        ):
+            contract["reason"] = "bar-close axis is incomplete, duplicated, or non-monotonic"
+            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+        try:
+            opens = pd.DatetimeIndex(
+                pd.to_datetime(features.index, utc=True, errors="coerce")
+            )
+            if len(opens) != count or opens.isna().any() or not bool((closes > opens).all()):
+                contract["reason"] = "bar-close timestamps are not after bar opens"
+                return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+        except Exception as exc:
+            contract["reason"] = f"bar-open validation failed: {type(exc).__name__}"
+            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+
+        triple_day = self._resolved_triple_rollover_weekday(spec, self.config)
+        first_day = pd.Timestamp(closes[0]).normalize()
+        last_day = pd.Timestamp(closes[-1]).normalize()
+        cursor = first_day
+        while cursor <= last_day:
+            # MT5 weekday multipliers name the trading day being rolled
+            # forward (for example Wednesday -> Thursday).  ``cursor`` is the
+            # rollover boundary itself, so its charge weekday is the preceding
+            # calendar day.
+            charge_weekday = int((cursor - pd.Timedelta(days=1)).weekday())
+            if charge_weekday < 5:
+                located = int(closes.searchsorted(cursor, side="left"))
+                # A close after an event is not enough: after archive/session
+                # gaps, the first later bar may begin after the rollover.  Only
+                # attach an event to the interval that actually contains it.
+                if (
+                    located < count
+                    and opens[located] < cursor <= closes[located]
+                ):
+                    rollover_units[located] += (
+                        3 if charge_weekday == triple_day else 1
+                    )
+                elif located < count and cursor <= opens[located]:
+                    pre_open_rollover_units[located] += (
+                        3 if charge_weekday == triple_day else 1
+                    )
+            cursor += pd.Timedelta(days=1)
+
+        raw_long = float(getattr(spec, "swap_long", 0.0) or 0.0)
+        raw_short = float(getattr(spec, "swap_short", 0.0) or 0.0)
+        for index in np.flatnonzero(np.isfinite(entry_prices)):
+            entry_price = float(entry_prices[int(index)])
+            long_per_lot[int(index)] = self._swap_value_per_lot_dollars(
+                spec,
+                raw_long,
+                entry_price=entry_price,
+            )
+            short_per_lot[int(index)] = self._swap_value_per_lot_dollars(
+                spec,
+                raw_short,
+                entry_price=entry_price,
+            )
+        contract.update({
+            "status": "AVAILABLE",
+            "mode": "explicit_observable_bar_close",
+            "timestamp_source": "_BAR_CLOSE_TS",
+            "timestamp_evidence_level": "observable_validated_column",
+            "source_provenance_authenticated": False,
+            "execution_state_compounding": True,
+            "reason": "causal rollover cashflows enter live equity at observable closes",
+            "rollover_event_bars": int(np.count_nonzero(
+                pre_open_rollover_units.astype(np.int64)
+                + rollover_units.astype(np.int64)
+            )),
+            "pre_open_rollover_event_bars": int(
+                np.count_nonzero(pre_open_rollover_units)
+            ),
+            "close_rollover_event_bars": int(np.count_nonzero(rollover_units)),
+            "rollover_units_on_axis": int(
+                pre_open_rollover_units.sum() + rollover_units.sum()
+            ),
+        })
+        return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, True, contract
      
     def run(self,
             features: pd.DataFrame,
@@ -5913,6 +6170,38 @@ class Backtester:
                 f"Signal series contains invalid values for {strategy_name} on {symbol}: {invalid_values}"
             )
         signal_numeric = signal_numeric.astype(np.int32)
+
+        n_bars = len(features)
+        if n_bars == 0:
+            # Never enter the Numba kernel with zero rows: its preallocated
+            # equity curve writes index zero and bounds checks are disabled.
+            # Preserve the normal empty-result and cost-attestation schema.
+            (
+                _pre_open_units,
+                _close_units,
+                _swap_long,
+                _swap_short,
+                _causal_swap,
+                swap_accrual_contract,
+            ) = self._build_causal_swap_inputs(
+                features,
+                spec,
+                np.empty(0, dtype=np.float64),
+            )
+            metrics = self._empty_result()
+            metrics["spread_model"] = {
+                "source": "unavailable_empty_input",
+                "spread_provenance_status": "unavailable",
+            }
+            metrics["execution_cost_contract"] = (
+                BACKTEST_EXECUTION_COST_CONTRACT_VERSION
+            )
+            metrics["swap_accrual_contract"] = swap_accrual_contract
+            metrics["execution_cost_timing_contract"] = {
+                "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
+                "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
+            }
+            return metrics
         
         # ----------------------------------------------------------------
         # Pre-extract arrays for performance (avoid repeated .iloc calls)
@@ -5929,7 +6218,6 @@ class Backtester:
         entry_half_spread_arr, half_spread_arr, spread_meta = self._build_half_spread_arrays(features, spec)
         slippage_price = spec.pips_to_price(self.config.slippage_pips) if self.config.use_slippage else 0.0
         
-        n_bars = len(features)
         if 'ATR_14' in features.columns:
             atr_arr = pd.to_numeric(features['ATR_14'], errors='coerce').to_numpy().astype(np.float64)
         else:
@@ -5993,6 +6281,12 @@ class Backtester:
                     )
                 else:
                     entry_px = open_arr[entry_idx]
+                if self.config.use_slippage:
+                    entry_px = np.where(
+                        directions == 1,
+                        entry_px + slippage_price,
+                        entry_px - slippage_price,
+                    )
 
                 sl_delta = sl_pips_arr * float(spec.pip_size)
                 tp_delta = tp_pips_arr * float(spec.pip_size)
@@ -6094,18 +6388,29 @@ class Backtester:
         # RUN BACKTEST LOOP (Numba JIT or Pure Python)
         # ----------------------------------------------------------------
         discovery_risk_per_trade_pct = self._discovery_risk_per_trade_pct()
+        (
+            pre_open_rollover_units_arr,
+            rollover_units_arr,
+            swap_long_per_lot_arr,
+            swap_short_per_lot_arr,
+            causal_swap_enabled,
+            swap_accrual_contract,
+        ) = self._build_causal_swap_inputs(features, spec, entry_prices)
         if NUMBA_AVAILABLE and normalized_governance is None:
             # Use Numba JIT-compiled kernel with live-equity sizing
             (
                 trade_signal_bars, trade_entry_bars, trade_exit_bars,
                 trade_directions, trade_entry_prices, trade_exit_prices,
                 trade_sl_prices, trade_tp_prices, trade_sizes,
-                trade_pnl_dollars, trade_pnl_pips, trade_exit_reasons,
-                trade_risk_amounts, equity_curve, final_equity, max_drawdown,
+                trade_pnl_dollars, trade_pnl_pips,
+                trade_exit_reasons, trade_risk_amounts,
+                equity_curve, final_equity, max_drawdown,
                 trade_mae_pips, trade_mfe_pips, trade_mae_r, trade_mfe_r,
                 trade_time_to_mae_bars, trade_time_to_mfe_bars,
                 trade_time_underwater_bars, trade_entry_to_stop_pips,
-                trade_entry_to_target_pips
+                trade_entry_to_target_pips,
+                trade_gross_pnl_dollars,
+                trade_swap_rollover_units, trade_swap_dollars,
             ) = _backtest_loop_numba(
                 open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
@@ -6117,6 +6422,11 @@ class Backtester:
                 spec.tick_size, spec.tick_value, spec.pip_size, spec.pip_value,
                 spec.min_lot, spec.max_lot, spec.volume_step,
                 warmup_bars,
+                rollover_units_arr,
+                swap_long_per_lot_arr,
+                swap_short_per_lot_arr,
+                causal_swap_enabled,
+                pre_open_rollover_units_arr,
             )
             
             # Convert JIT results to trade dicts
@@ -6145,6 +6455,9 @@ class Backtester:
                     'take_profit': trade_tp_prices[j],
                     'position_size': trade_sizes[j],
                     'pnl_pips': round(trade_pnl_pips[j], 2),
+                    'gross_pnl_dollars': round(trade_gross_pnl_dollars[j], 2),
+                    'swap_rollover_units': int(trade_swap_rollover_units[j]),
+                    'swap_dollars': round(trade_swap_dollars[j], 2),
                     'pnl_dollars': round(trade_pnl_dollars[j], 2),
                     'exit_reason': exit_reason_map.get(trade_exit_reasons[j], "unknown"),
                     'risk_amount': round(trade_risk_amounts[j], 2),
@@ -6159,6 +6472,8 @@ class Backtester:
                     'time_underwater_bars': int(trade_time_underwater_bars[j]),
                     'entry_to_stop_pips': round(float(trade_entry_to_stop_pips[j]), 2),
                     'entry_to_target_pips': round(float(trade_entry_to_target_pips[j]), 2),
+                    'governance_policy': 'control_fixed',
+                    'tp_released': False,
                 })
             
             equity_curve = equity_curve.tolist()
@@ -6171,17 +6486,23 @@ class Backtester:
                 atr_arr=atr_arr,
                 governance_policy=normalized_governance,
                 discovery_risk_per_trade_pct=discovery_risk_per_trade_pct,
+                rollover_units_arr=rollover_units_arr,
+                swap_long_per_lot_arr=swap_long_per_lot_arr,
+                swap_short_per_lot_arr=swap_short_per_lot_arr,
+                causal_swap_enabled=causal_swap_enabled,
+                pre_open_rollover_units_arr=pre_open_rollover_units_arr,
             )
         
-        trades, final_equity, max_drawdown, equity_curve = self._apply_swap_model(
-            trades,
-            final_equity,
-            equity_curve,
-            max_drawdown,
-            features,
-            spec,
-            timeframe=timeframe,
-        )
+        if bool(getattr(self.config, "swap_model_enabled", True)) and not causal_swap_enabled:
+            trades, final_equity, max_drawdown, equity_curve = self._apply_swap_model(
+                trades,
+                final_equity,
+                equity_curve,
+                max_drawdown,
+                features,
+                spec,
+                timeframe=timeframe,
+            )
 
         metrics = self._calculate_metrics(
             trades,
@@ -6193,6 +6514,12 @@ class Backtester:
             warmup_bars=warmup_bars,
         )
         metrics["spread_model"] = spread_meta
+        metrics["execution_cost_contract"] = BACKTEST_EXECUTION_COST_CONTRACT_VERSION
+        metrics["swap_accrual_contract"] = swap_accrual_contract
+        metrics["execution_cost_timing_contract"] = {
+            "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
+            "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
+        }
         return metrics
 
     @staticmethod
@@ -6222,45 +6549,73 @@ class Backtester:
         except (TypeError, ValueError):
             return True
 
+    def _calendar_swap_rollover_schedule(
+        self,
+        trade: Dict[str, Any],
+        spec: Optional[InstrumentSpec] = None,
+    ) -> Optional[List[Tuple[pd.Timestamp, int]]]:
+        """Return modeled calendar rollover instants and their unit weights.
+
+        ``None`` means timestamp evidence was unusable and the caller must use
+        the legacy bar-duration fallback.  An empty list is a valid timestamped
+        holding with no modeled rollover crossing.
+        """
+        try:
+            entry_time = pd.Timestamp(trade.get("entry_time"))
+            exit_time = pd.Timestamp(trade.get("exit_time"))
+        except Exception:
+            return None
+        if (
+            pd.isna(entry_time)
+            or pd.isna(exit_time)
+            or exit_time <= entry_time
+        ):
+            return None
+
+        rollover_day = _WEEKDAY_NAME_TO_INDEX.get(
+            str(
+                getattr(
+                    self.config,
+                    "swap_model_triple_rollover_day",
+                    "wednesday",
+                )
+            ).lower(),
+            2,
+        )
+        if spec is not None:
+            try:
+                mt5_rollover_day = int(getattr(spec, "swap_rollover3days", -1))
+            except (TypeError, ValueError, OverflowError):
+                mt5_rollover_day = -1
+            if 0 <= mt5_rollover_day <= 6:
+                # MT5: Sunday=0 ... Saturday=6. pandas/Python:
+                # Monday=0 ... Sunday=6.
+                rollover_day = (mt5_rollover_day - 1) % 7
+
+        schedule: List[Tuple[pd.Timestamp, int]] = []
+        cursor = entry_time.normalize() + pd.Timedelta(days=1)
+        end_day = exit_time.normalize()
+        while cursor <= end_day:
+            charge_weekday = int((cursor - pd.Timedelta(days=1)).weekday())
+            if charge_weekday < 5:
+                schedule.append(
+                    (
+                        pd.Timestamp(cursor),
+                        3 if charge_weekday == rollover_day else 1,
+                    )
+                )
+            cursor += pd.Timedelta(days=1)
+        return schedule
+
     def _swap_rollover_units(self,
                              trade: Dict[str, Any],
                              features: Optional[pd.DataFrame],
                              timeframe: str = "",
                              spec: Optional[InstrumentSpec] = None) -> int:
         """Count broker rollover units for one closed trade."""
-        try:
-            entry_time = pd.Timestamp(trade.get("entry_time"))
-            exit_time = pd.Timestamp(trade.get("exit_time"))
-            if pd.notna(entry_time) and pd.notna(exit_time) and exit_time > entry_time:
-                rollover_day = _WEEKDAY_NAME_TO_INDEX.get(
-                    str(getattr(self.config, "swap_model_triple_rollover_day", "wednesday")).lower(),
-                    2,
-                )
-                if spec is not None:
-                    try:
-                        mt5_rollover_day = int(
-                            getattr(spec, "swap_rollover3days", -1)
-                        )
-                    except (TypeError, ValueError, OverflowError):
-                        mt5_rollover_day = -1
-                    if 0 <= mt5_rollover_day <= 6:
-                        # MT5: Sunday=0 ... Saturday=6. pandas/Python:
-                        # Monday=0 ... Sunday=6.
-                        rollover_day = (mt5_rollover_day - 1) % 7
-                units = 0
-                # A short trade can still incur swap when it crosses a broker
-                # rollover boundary. Count observed calendar crossings instead
-                # of suppressing every holding shorter than an arbitrary floor.
-                cursor = (entry_time.normalize() + pd.Timedelta(days=1))
-                end_day = exit_time.normalize()
-                while cursor <= end_day:
-                    weekday = int(cursor.weekday())
-                    if weekday < 5:
-                        units += 3 if weekday == rollover_day else 1
-                    cursor += pd.Timedelta(days=1)
-                return max(0, units)
-        except Exception as exc:
-            logger.debug("Swap calendar holding-day estimate failed; falling back to bar estimate: %s", exc)
+        schedule = self._calendar_swap_rollover_schedule(trade, spec=spec)
+        if schedule is not None:
+            return max(0, sum(int(units) for _timestamp, units in schedule))
 
         try:
             entry_bar = int(trade.get("entry_bar", 0) or 0)
@@ -6335,6 +6690,60 @@ class Backtester:
             raise ValueError(f"unsupported nonzero MT5 swap mode {mode}")
         return 0.0
 
+    @staticmethod
+    def _swap_accrual_bar_index(
+        rollover_time: pd.Timestamp,
+        features: Optional[pd.DataFrame],
+        *,
+        exit_bar: int,
+        curve_length: int,
+    ) -> int:
+        """Map one modeled rollover to the first available closing equity mark.
+
+        A valid close column makes bar-close timing observable.  No feature-
+        index fallback is allowed to claim causal timing or source provenance.
+        The result is bounded by the trade exit and the available equity path
+        so terminal swap stays identical even on an incomplete timestamp axis.
+        """
+        terminal = max(0, min(int(exit_bar), max(0, int(curve_length) - 1)))
+        if features is None or len(features) == 0 or curve_length <= 0:
+            return terminal
+        if "_BAR_CLOSE_TS" not in features.columns:
+            return terminal
+        try:
+            raw_axis = features["_BAR_CLOSE_TS"]
+            mark_axis = pd.DatetimeIndex(
+                pd.to_datetime(raw_axis, utc=True, errors="coerce")
+            )
+            if (
+                len(mark_axis) != len(features)
+                or mark_axis.isna().any()
+                or mark_axis.has_duplicates
+                or not mark_axis.is_monotonic_increasing
+            ):
+                return terminal
+            event = pd.Timestamp(rollover_time)
+            event = (
+                event.tz_localize("UTC")
+                if event.tzinfo is None
+                else event.tz_convert("UTC")
+            )
+            located = int(mark_axis.searchsorted(event, side="left"))
+            if located >= len(mark_axis):
+                return terminal
+            open_axis = pd.DatetimeIndex(
+                pd.to_datetime(features.index, utc=True, errors="coerce")
+            )
+            if (
+                len(open_axis) != len(mark_axis)
+                or open_axis.isna().any()
+                or not (open_axis[located] < event <= mark_axis[located])
+            ):
+                return terminal
+            return max(0, min(located, terminal, int(curve_length) - 1))
+        except Exception:
+            return terminal
+
     def _apply_swap_model(self,
                           trades: List[Dict[str, Any]],
                           final_equity: float,
@@ -6350,11 +6759,17 @@ class Backtester:
         if not trades:
             return trades, final_equity, max_drawdown, equity_curve
 
-        adjustments_by_exit_bar: Dict[int, float] = {}
+        curve_length = len(equity_curve or [])
+        adjustments_by_effective_bar: Dict[int, float] = {}
         total_swap = 0.0
         for trade in trades:
-            units = self._swap_rollover_units(
-                trade, features, timeframe=timeframe, spec=spec
+            schedule = self._calendar_swap_rollover_schedule(trade, spec=spec)
+            units = (
+                sum(int(weight) for _timestamp, weight in schedule)
+                if schedule is not None
+                else self._swap_rollover_units(
+                    trade, features, timeframe=timeframe, spec=spec
+                )
             )
             if units <= 0:
                 trade["swap_rollover_units"] = 0
@@ -6381,24 +6796,55 @@ class Backtester:
             total_swap += swap_dollars
             try:
                 exit_bar = int(trade.get("exit_bar", 0) or 0)
-                adjustments_by_exit_bar[exit_bar] = adjustments_by_exit_bar.get(exit_bar, 0.0) + swap_dollars
+                if schedule:
+                    for rollover_time, rollover_units in schedule:
+                        effective_bar = self._swap_accrual_bar_index(
+                            rollover_time,
+                            features,
+                            exit_bar=exit_bar,
+                            curve_length=curve_length,
+                        )
+                        amount = daily_swap * volume * int(rollover_units)
+                        adjustments_by_effective_bar[effective_bar] = (
+                            adjustments_by_effective_bar.get(effective_bar, 0.0)
+                            + amount
+                        )
+                else:
+                    # Timestamp-free compatibility fallback: retain the old
+                    # exit booking because no causal rollover instant is known.
+                    effective_bar = max(
+                        0,
+                        min(exit_bar, max(0, curve_length - 1)),
+                    )
+                    adjustments_by_effective_bar[effective_bar] = (
+                        adjustments_by_effective_bar.get(effective_bar, 0.0)
+                        + swap_dollars
+                    )
             except Exception:
-                pass
+                effective_bar = max(0, min(
+                    int(trade.get("exit_bar", 0) or 0),
+                    max(0, curve_length - 1),
+                ))
+                adjustments_by_effective_bar[effective_bar] = (
+                    adjustments_by_effective_bar.get(effective_bar, 0.0)
+                    + swap_dollars
+                )
 
-        if not adjustments_by_exit_bar and abs(total_swap) <= 1e-12:
+        if not adjustments_by_effective_bar and abs(total_swap) <= 1e-12:
             return trades, final_equity, max_drawdown, equity_curve
 
         adjusted_curve = list(equity_curve or [])
         if adjusted_curve:
             cumulative = 0.0
             for idx in range(len(adjusted_curve)):
-                cumulative += adjustments_by_exit_bar.get(idx, 0.0)
+                cumulative += adjustments_by_effective_bar.get(idx, 0.0)
                 if cumulative:
                     adjusted_curve[idx] = float(adjusted_curve[idx]) + cumulative
             last_adjusted_idx = len(adjusted_curve) - 1
             trailing = sum(
-                amount for exit_bar, amount in adjustments_by_exit_bar.items()
-                if int(exit_bar) > last_adjusted_idx
+                amount
+                for effective_bar, amount in adjustments_by_effective_bar.items()
+                if int(effective_bar) > last_adjusted_idx
             )
             if trailing:
                 adjusted_curve[-1] = float(adjusted_curve[-1]) + trailing
@@ -6412,7 +6858,12 @@ class Backtester:
                          warmup_bars: int = 0,
                          atr_arr: Optional[np.ndarray] = None,
                          governance_policy: Optional[Dict[str, Any]] = None,
-                         discovery_risk_per_trade_pct: float = 1.0) -> Tuple[List[Dict], float, float, List[float]]:
+                         discovery_risk_per_trade_pct: float = 1.0,
+                         rollover_units_arr: Optional[np.ndarray] = None,
+                         swap_long_per_lot_arr: Optional[np.ndarray] = None,
+                         swap_short_per_lot_arr: Optional[np.ndarray] = None,
+                         causal_swap_enabled: bool = False,
+                         pre_open_rollover_units_arr: Optional[np.ndarray] = None) -> Tuple[List[Dict], float, float, List[float]]:
         """
         Pure Python backtest loop (fallback when Numba not available).
         
@@ -6435,6 +6886,9 @@ class Backtester:
         take_profit = 0.0
         position_size = 0.0
         risk_amount_at_entry = 0.0
+        daily_swap_per_lot_current = 0.0
+        accrued_swap_units_current = 0
+        accrued_swap_dollars_current = 0.0
         initial_stop_loss = 0.0
         initial_take_profit = 0.0
         highest_since_entry = 0.0
@@ -6483,6 +6937,32 @@ class Backtester:
                 underwater_bars += 1
             return mae_pips, mfe_pips, time_to_mae, time_to_mfe, underwater_bars
 
+        def _update_open_excursion(direction: int,
+                                   entry: float,
+                                   bars_held: int,
+                                   mae_pips: float,
+                                   mfe_pips: float,
+                                   time_to_mae: int,
+                                   time_to_mfe: int) -> Tuple[float, float, int, int]:
+            """Mark only the causally executable current open for governance."""
+            if pip_size_value <= 0.0:
+                return mae_pips, mfe_pips, time_to_mae, time_to_mfe
+            if direction == 1:
+                open_mark = bid_open
+                adverse_pips = (entry - open_mark) / pip_size_value
+                favorable_pips = (open_mark - entry) / pip_size_value
+            else:
+                open_mark = ask_open
+                adverse_pips = (open_mark - entry) / pip_size_value
+                favorable_pips = (entry - open_mark) / pip_size_value
+            if adverse_pips > mae_pips:
+                mae_pips = adverse_pips
+                time_to_mae = bars_held
+            if favorable_pips > mfe_pips:
+                mfe_pips = favorable_pips
+                time_to_mfe = bars_held
+            return mae_pips, mfe_pips, time_to_mae, time_to_mfe
+
         def _excursion_payload() -> Dict[str, Any]:
             mae_r = mae_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
             mfe_r = mfe_pips_current / entry_to_stop_pips if entry_to_stop_pips > 0.0 else 0.0
@@ -6526,11 +7006,34 @@ class Backtester:
                 ask_low = low_price
                 bid_close = close_price
                 ask_close = close_price
+
+            # Apply rollovers crossed during a gap only to a position that was
+            # already open before the gap.  This precedes gap-open exits and
+            # any replacement/new entry sizing on the current bar.
+            if in_position and causal_swap_enabled:
+                pre_open_units = (
+                    int(pre_open_rollover_units_arr[i])
+                    if (
+                        pre_open_rollover_units_arr is not None
+                        and i < len(pre_open_rollover_units_arr)
+                    )
+                    else 0
+                )
+                if pre_open_units > 0:
+                    swap_cashflow = (
+                        daily_swap_per_lot_current
+                        * position_size
+                        * pre_open_units
+                    )
+                    equity += swap_cashflow
+                    accrued_swap_units_current += pre_open_units
+                    accrued_swap_dollars_current += swap_cashflow
             
             # CHECK EXITS FOR OPEN POSITIONS
             if in_position:
                 governance_exit_price = None
                 governance_exit_reason = None
+                governance_open_excursion_updated = False
                 if governance_policy:
                     prev_bar = i - 1
                     if prev_bar >= entry_bar:
@@ -6600,45 +7103,95 @@ class Backtester:
                         )
                         decision = evaluate_policy(governance_policy, context)
                         if decision.partial_close_pct > 0 and not governance_partial_taken and position_size > 0:
-                            partial_fraction = max(0.0, min(1.0, float(decision.partial_close_pct) / 100.0))
-                            partial_size = position_size * partial_fraction
-                            if partial_size > 0 and partial_fraction < 1.0:
-                                partial_pnl = spec.calculate_tick_profit(
-                                    entry_price, prev_price, partial_size, position_direction
+                            requested_partial_fraction = max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    float(decision.partial_close_pct) / 100.0,
+                                ),
+                            )
+                            raw_partial_size = (
+                                position_size * requested_partial_fraction
+                            )
+                            partial_size = spec.round_volume(raw_partial_size)
+                            remaining_size = round(
+                                position_size - partial_size,
+                                8,
+                            )
+                            if (
+                                partial_size > 0.0
+                                and partial_size < position_size
+                                and remaining_size + 1e-10 >= spec.min_lot
+                            ):
+                                # Allocate risk and already-booked carry by the
+                                # broker-executable fraction, not by the raw
+                                # policy percentage.
+                                partial_fraction = partial_size / position_size
+                                (
+                                    mae_pips_current,
+                                    mfe_pips_current,
+                                    time_to_mae_bars_current,
+                                    time_to_mfe_bars_current,
+                                ) = _update_open_excursion(
+                                    position_direction,
+                                    entry_price,
+                                    max(0, i - entry_bar),
+                                    mae_pips_current,
+                                    mfe_pips_current,
+                                    time_to_mae_bars_current,
+                                    time_to_mfe_bars_current,
+                                )
+                                governance_open_excursion_updated = True
+                                partial_exit_price = (
+                                    bid_open
+                                    if position_direction == 1
+                                    else ask_open
+                                )
+                                partial_gross_pnl = spec.calculate_tick_profit(
+                                    entry_price,
+                                    partial_exit_price,
+                                    partial_size,
+                                    position_direction,
                                 )
                                 if self.config.use_commission:
-                                    partial_pnl -= spec.commission_per_lot * partial_size
+                                    partial_gross_pnl -= spec.commission_per_lot * partial_size
                                 partial_risk = risk_amount_at_entry * partial_fraction
-                                equity += partial_pnl
+                                partial_swap = accrued_swap_dollars_current * partial_fraction
+                                partial_net_pnl = partial_gross_pnl + partial_swap
+                                equity += partial_gross_pnl
                                 trades.append({
                                     'signal_bar': signal_bar,
                                     'entry_bar': entry_bar,
-                                    'exit_bar': prev_bar,
+                                    'exit_bar': i,
                                     'signal_time': features.index[signal_bar],
                                     'entry_time': features.index[entry_bar],
-                                    'exit_time': features.index[prev_bar],
+                                    'exit_time': features.index[i],
                                     'direction': 'LONG' if position_direction == 1 else 'SHORT',
                                     'entry_price': entry_price,
-                                    'exit_price': prev_price,
+                                    'exit_price': partial_exit_price,
                                     'stop_loss': stop_loss,
                                     'take_profit': take_profit,
                                     'position_size': partial_size,
                                     'pnl_pips': round(
-                                        spec.price_to_pips(prev_price - entry_price)
+                                        spec.price_to_pips(partial_exit_price - entry_price)
                                         if position_direction == 1
-                                        else spec.price_to_pips(entry_price - prev_price),
+                                        else spec.price_to_pips(entry_price - partial_exit_price),
                                         2,
                                     ),
-                                    'pnl_dollars': round(partial_pnl, 2),
+                                    'gross_pnl_dollars': round(partial_gross_pnl, 2),
+                                    'swap_rollover_units': int(accrued_swap_units_current),
+                                    'swap_dollars': round(partial_swap, 2),
+                                    'pnl_dollars': round(partial_net_pnl, 2),
                                     'exit_reason': 'governance_partial',
                                     'risk_amount': round(partial_risk, 2),
-                                    'r_multiple': round(partial_pnl / partial_risk, 3) if partial_risk > 0 else 0.0,
+                                    'r_multiple': round(partial_net_pnl / partial_risk, 3) if partial_risk > 0 else 0.0,
                                     **_excursion_payload(),
                                     'governance_policy': active_governance_name,
                                     'tp_released': governance_tp_released,
                                 })
-                                position_size = max(0.0, position_size - partial_size)
+                                position_size = remaining_size
                                 risk_amount_at_entry = max(0.0, risk_amount_at_entry - partial_risk)
+                                accrued_swap_dollars_current -= partial_swap
                                 governance_partial_taken = True
                         if decision.stop_loss is not None:
                             stop_loss = float(decision.stop_loss)
@@ -6646,7 +7199,26 @@ class Backtester:
                             take_profit = float(decision.take_profit)
                         governance_tp_released = governance_tp_released or bool(decision.tp_released)
                         if decision.exit_now:
-                            governance_exit_price = prev_price
+                            if not governance_open_excursion_updated:
+                                (
+                                    mae_pips_current,
+                                    mfe_pips_current,
+                                    time_to_mae_bars_current,
+                                    time_to_mfe_bars_current,
+                                ) = _update_open_excursion(
+                                    position_direction,
+                                    entry_price,
+                                    max(0, i - entry_bar),
+                                    mae_pips_current,
+                                    mfe_pips_current,
+                                    time_to_mae_bars_current,
+                                    time_to_mfe_bars_current,
+                                )
+                            governance_exit_price = (
+                                bid_open
+                                if position_direction == 1
+                                else ask_open
+                            )
                             governance_exit_reason = 'governance_exit'
                 exit_price = governance_exit_price
                 exit_reason = governance_exit_reason
@@ -6693,7 +7265,7 @@ class Backtester:
                 
                 if exit_price is not None:
                     # Calculate P&L using tick-based math
-                    pnl_dollars = spec.calculate_tick_profit(
+                    gross_pnl_dollars = spec.calculate_tick_profit(
                         entry_price, exit_price, position_size, position_direction
                     )
                     
@@ -6705,12 +7277,13 @@ class Backtester:
                     
                     # Deduct commission
                     if self.config.use_commission:
-                        pnl_dollars -= spec.commission_per_lot * position_size
+                        gross_pnl_dollars -= spec.commission_per_lot * position_size
+                    net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
                     
                     # Calculate R-multiple
-                    r_multiple = pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
+                    r_multiple = net_pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
                     
-                    equity += pnl_dollars
+                    equity += gross_pnl_dollars
                     
                     # Record trade
                     trades.append({
@@ -6727,7 +7300,10 @@ class Backtester:
                         'take_profit': take_profit,
                         'position_size': position_size,
                         'pnl_pips': round(pnl_pips, 2),
-                        'pnl_dollars': round(pnl_dollars, 2),
+                        'gross_pnl_dollars': round(gross_pnl_dollars, 2),
+                        'swap_rollover_units': int(accrued_swap_units_current),
+                        'swap_dollars': round(accrued_swap_dollars_current, 2),
+                        'pnl_dollars': round(net_pnl_dollars, 2),
                         'exit_reason': exit_reason,
                         'risk_amount': round(risk_amount_at_entry, 2),
                         'r_multiple': round(r_multiple, 3),
@@ -6760,6 +7336,8 @@ class Backtester:
                         loss_per_lot = spec.calculate_loss_at_stop(
                             entry_price_candidate, stop_loss_candidate, 1.0, direction
                         )
+                        if self.config.use_commission:
+                            loss_per_lot += spec.commission_per_lot
                         
                         if loss_per_lot > 0:
                             raw_size = risk_amount_at_entry / loss_per_lot
@@ -6794,6 +7372,23 @@ class Backtester:
                             position_direction = direction
                             entry_bar = i
                             signal_bar = i - 1
+                            daily_swap_per_lot_current = (
+                                float(swap_long_per_lot_arr[i])
+                                if (
+                                    position_direction == 1
+                                    and swap_long_per_lot_arr is not None
+                                    and i < len(swap_long_per_lot_arr)
+                                )
+                                else float(swap_short_per_lot_arr[i])
+                                if (
+                                    position_direction == -1
+                                    and swap_short_per_lot_arr is not None
+                                    and i < len(swap_short_per_lot_arr)
+                                )
+                                else 0.0
+                            )
+                            accrued_swap_units_current = 0
+                            accrued_swap_dollars_current = 0.0
                             regime_col = (
                                 "REGIME_LIVE" if "REGIME_LIVE" in features.columns
                                 else "REGIME" if "REGIME" in features.columns
@@ -6847,7 +7442,7 @@ class Backtester:
                                     exit_reason = TradeStatus.CLOSED_TP.value
 
                             if exit_price is not None:
-                                pnl_dollars = spec.calculate_tick_profit(
+                                gross_pnl_dollars = spec.calculate_tick_profit(
                                     entry_price, exit_price, position_size, position_direction
                                 )
                                 if position_direction == 1:
@@ -6855,9 +7450,10 @@ class Backtester:
                                 else:
                                     pnl_pips = spec.price_to_pips(entry_price - exit_price)
                                 if self.config.use_commission:
-                                    pnl_dollars -= spec.commission_per_lot * position_size
-                                r_multiple = pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
-                                equity += pnl_dollars
+                                    gross_pnl_dollars -= spec.commission_per_lot * position_size
+                                net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
+                                r_multiple = net_pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
+                                equity += gross_pnl_dollars
                                 trades.append({
                                     'signal_bar': signal_bar,
                                     'entry_bar': entry_bar,
@@ -6872,7 +7468,10 @@ class Backtester:
                                     'take_profit': take_profit,
                                     'position_size': position_size,
                                     'pnl_pips': round(pnl_pips, 2),
-                                    'pnl_dollars': round(pnl_dollars, 2),
+                                    'gross_pnl_dollars': round(gross_pnl_dollars, 2),
+                                    'swap_rollover_units': int(accrued_swap_units_current),
+                                    'swap_dollars': round(accrued_swap_dollars_current, 2),
+                                    'pnl_dollars': round(net_pnl_dollars, 2),
                                     'exit_reason': exit_reason,
                                     'risk_amount': round(risk_amount_at_entry, 2),
                                     'r_multiple': round(r_multiple, 3),
@@ -6882,6 +7481,22 @@ class Backtester:
                                 })
                                 in_position = False
             
+            if in_position and causal_swap_enabled:
+                rollover_units = (
+                    int(rollover_units_arr[i])
+                    if rollover_units_arr is not None and i < len(rollover_units_arr)
+                    else 0
+                )
+                if rollover_units > 0:
+                    swap_cashflow = (
+                        daily_swap_per_lot_current
+                        * position_size
+                        * rollover_units
+                    )
+                    equity += swap_cashflow
+                    accrued_swap_units_current += rollover_units
+                    accrued_swap_dollars_current += swap_cashflow
+
             current_equity = equity
             if in_position:
                 mark_exit_price = bid_close if position_direction == 1 else ask_close
@@ -6906,7 +7521,7 @@ class Backtester:
             else:
                 exit_price = close_arr[-1]
             
-            pnl_dollars = spec.calculate_tick_profit(
+            gross_pnl_dollars = spec.calculate_tick_profit(
                 entry_price, exit_price, position_size, position_direction
             )
             
@@ -6916,11 +7531,12 @@ class Backtester:
                 pnl_pips = spec.price_to_pips(entry_price - exit_price)
             
             if self.config.use_commission:
-                pnl_dollars -= spec.commission_per_lot * position_size
+                gross_pnl_dollars -= spec.commission_per_lot * position_size
+            net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
             
-            r_multiple = pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
+            r_multiple = net_pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
             
-            equity += pnl_dollars
+            equity += gross_pnl_dollars
             
             trades.append({
                 'signal_bar': signal_bar,
@@ -6936,7 +7552,10 @@ class Backtester:
                 'take_profit': take_profit,
                 'position_size': position_size,
                 'pnl_pips': round(pnl_pips, 2),
-                'pnl_dollars': round(pnl_dollars, 2),
+                'gross_pnl_dollars': round(gross_pnl_dollars, 2),
+                'swap_rollover_units': int(accrued_swap_units_current),
+                'swap_dollars': round(accrued_swap_dollars_current, 2),
+                'pnl_dollars': round(net_pnl_dollars, 2),
                 'exit_reason': TradeStatus.CLOSED_EOD.value,
                 'risk_amount': round(risk_amount_at_entry, 2),
                 'r_multiple': round(r_multiple, 3),

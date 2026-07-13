@@ -735,7 +735,10 @@ def test_mtm_marks_accrue_swap_causally_with_broker_triple_day():
         "D1",
     )
 
-    assert [mark.pnl_per_current_lot for mark in marks] == [0.0, -5.0, -20.0, -25.0]
+    # MetaQuotes defines SYMBOL_SWAP_WEDNESDAY as the multiplier for a
+    # position rolled FROM Wednesday TO Thursday.  The triple therefore
+    # appears at Thursday's boundary, not Wednesday's.
+    assert [mark.pnl_per_current_lot for mark in marks] == [0.0, -5.0, -10.0, -25.0]
 
 
 def test_m5_valuation_uses_observable_open_not_future_close():
@@ -820,5 +823,5 @@ def test_swap_rollovers_skip_weekends_and_honor_broker_friday_triple():
         timeframe="D1",
         spec=spec,
     )
-    # Tue/Wed/Thu=3, Friday triple=3, weekend=0, Monday=1.
+    # Mon-Thu singles=4, Friday triple=3, weekend=0.
     assert units == 7
