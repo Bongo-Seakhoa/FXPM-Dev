@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,6 +11,7 @@ import pytest
 import pm_core
 from pm_core import Backtester, InstrumentSpec, PipelineConfig, StrategyCategory
 from pm_strategies import BaseStrategy
+from pm_trade_power import build_numerical_execution_cost_attestation
 
 
 class _OneShotAtrStrategy(BaseStrategy):
@@ -200,10 +203,206 @@ def test_empty_frame_returns_attested_result_without_entering_kernel(monkeypatch
         }
         assert result["swap_accrual_contract"]["status"] == "UNAVAILABLE"
         assert result["swap_accrual_contract"]["execution_state_compounding"] is False
+        attestation = result["numerical_execution_cost_attestation"]
+        assert attestation["schema_version"] == (
+            "fxpm-numerical-execution-cost-v1"
+        )
+        assert len(attestation["policy_sha256"]) == 64
+        assert len(attestation["attestation_sha256"]) == 64
+        assert attestation["spread_values_sha256"] == (
+            Backtester._spread_arrays_sha256(
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+            )
+        )
         results.append(result)
 
     if original_numba:
         assert results[0] == results[1]
+
+
+def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
+    monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
+    frame = _flat_daily_frame(rows=4)
+    frame["SpreadOpen"] = [2.0, 3.0, 4.0, 5.0]
+    frame["SpreadMax"] = [4.0, 5.0, 6.0, 7.0]
+    strategy = _OneShotAtrStrategy(1)
+    config = PipelineConfig(
+        research_mode=True,
+        use_spread=True,
+        use_slippage=True,
+        use_commission=True,
+        slippage_pips=0.75,
+        backtest_spread_mode="conservative_max",
+        swap_model_enabled=False,
+    )
+    spec = _fx_spec(
+        spread_avg=1.0,
+        commission_per_lot=7.0,
+        point=0.0001,
+    )
+    backtester = Backtester(config)
+    result = backtester.run(
+        frame,
+        strategy.generate_signals(frame, "ZZZUSD"),
+        "ZZZUSD",
+        strategy,
+        spec=spec,
+        timeframe="D1",
+    )
+    entry_half_spread, intrabar_half_spread, _ = (
+        backtester._build_half_spread_arrays(frame, spec)
+    )
+    attestation = result["numerical_execution_cost_attestation"]
+
+    assert attestation["use_spread"] is True
+    assert attestation["use_slippage"] is True
+    assert attestation["use_commission"] is True
+    assert float.fromhex(attestation["slippage_pips_hex"]) == 0.75
+    assert float.fromhex(attestation["slippage_price_hex"]) == pytest.approx(
+        spec.pips_to_price(0.75)
+    )
+    assert attestation["spread_values_sha256"] == (
+        Backtester._spread_arrays_sha256(
+            entry_half_spread,
+            intrabar_half_spread,
+        )
+    )
+    spread_policy = json.loads(attestation["spread_mode"])
+    assert spread_policy["mode"] == "conservative_max"
+    assert spread_policy["entry_column"] == "SpreadOpen"
+    assert spread_policy["bar_column"] == "SpreadMax"
+    expected = build_numerical_execution_cost_attestation(
+        use_spread=True,
+        use_slippage=True,
+        use_commission=True,
+        spread_mode=attestation["spread_mode"],
+        spread_values_sha256=attestation["spread_values_sha256"],
+        commission_inputs_sha256=attestation["commission_inputs_sha256"],
+        instrument_spec_sha256=attestation["instrument_spec_sha256"],
+        slippage_pips=float.fromhex(attestation["slippage_pips_hex"]),
+        slippage_price=float.fromhex(attestation["slippage_price_hex"]),
+    )
+    assert attestation == expected
+
+
+def test_cost_policy_is_stable_but_exact_spread_attestation_is_slice_local(
+    monkeypatch,
+):
+    monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
+    frame = _flat_daily_frame(rows=8)
+    frame["SpreadOpen"] = np.arange(1.0, 9.0)
+    frame["SpreadMax"] = np.arange(2.0, 10.0)
+    config = PipelineConfig(
+        research_mode=True,
+        use_spread=True,
+        use_slippage=True,
+        use_commission=True,
+        backtest_spread_mode="conservative_max",
+        swap_model_enabled=False,
+    )
+    spec = _fx_spec(spread_avg=1.0, commission_per_lot=7.0)
+    attestations = []
+    for subset in (frame.iloc[:4].copy(), frame.iloc[4:].copy()):
+        strategy = _OneShotAtrStrategy(1)
+        result = Backtester(config).run(
+            subset,
+            strategy.generate_signals(subset, "ZZZUSD"),
+            "ZZZUSD",
+            strategy,
+            spec=spec,
+            timeframe="D1",
+        )
+        attestations.append(result["numerical_execution_cost_attestation"])
+
+    first, second = attestations
+    assert first["policy_sha256"] == second["policy_sha256"]
+    assert first["spread_values_sha256"] != second["spread_values_sha256"]
+    assert first["attestation_sha256"] != second["attestation_sha256"]
+
+
+def test_cost_policy_binds_slippage_commission_and_instrument_spec(monkeypatch):
+    monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
+    frame = _flat_daily_frame(rows=3)
+    strategy = _OneShotAtrStrategy(1)
+
+    def attestation(*, slippage_pips, commission_per_lot, tick_value):
+        config = PipelineConfig(
+            research_mode=True,
+            use_spread=True,
+            use_slippage=True,
+            use_commission=True,
+            slippage_pips=slippage_pips,
+            swap_model_enabled=False,
+        )
+        spec = _fx_spec(
+            spread_avg=1.0,
+            commission_per_lot=commission_per_lot,
+            tick_value=tick_value,
+        )
+        return Backtester(config).run(
+            frame,
+            strategy.generate_signals(frame, "ZZZUSD"),
+            "ZZZUSD",
+            strategy,
+            spec=spec,
+            timeframe="D1",
+        )["numerical_execution_cost_attestation"]
+
+    baseline = attestation(
+        slippage_pips=0.5,
+        commission_per_lot=7.0,
+        tick_value=10.0,
+    )
+    changed_slippage = attestation(
+        slippage_pips=0.75,
+        commission_per_lot=7.0,
+        tick_value=10.0,
+    )
+    changed_commission = attestation(
+        slippage_pips=0.5,
+        commission_per_lot=8.0,
+        tick_value=10.0,
+    )
+    changed_spec = attestation(
+        slippage_pips=0.5,
+        commission_per_lot=7.0,
+        tick_value=11.0,
+    )
+
+    assert len({
+        baseline["policy_sha256"],
+        changed_slippage["policy_sha256"],
+        changed_commission["policy_sha256"],
+        changed_spec["policy_sha256"],
+    }) == 4
+
+
+def test_disabled_research_costs_are_attested_honestly(monkeypatch):
+    monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
+    frame = _flat_daily_frame(rows=3)
+    strategy = _OneShotAtrStrategy(1)
+    config = PipelineConfig(
+        research_mode=True,
+        use_spread=False,
+        use_slippage=False,
+        use_commission=False,
+        swap_model_enabled=False,
+    )
+    result = Backtester(config).run(
+        frame,
+        strategy.generate_signals(frame, "ZZZUSD"),
+        "ZZZUSD",
+        strategy,
+        spec=_fx_spec(),
+        timeframe="D1",
+    )
+    attestation = result["numerical_execution_cost_attestation"]
+
+    assert attestation["use_spread"] is False
+    assert attestation["use_slippage"] is False
+    assert attestation["use_commission"] is False
+    assert float.fromhex(attestation["slippage_price_hex"]) == 0.0
 
 
 def test_governance_partial_close_uses_broker_executable_volumes(monkeypatch):

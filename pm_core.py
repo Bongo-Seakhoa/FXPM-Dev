@@ -59,6 +59,7 @@ from pm_evidence import (
     normalize_window_years,
     validate_native_provenance,
 )
+from pm_trade_power import build_numerical_execution_cost_attestation
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -5917,6 +5918,124 @@ class Backtester:
             return 1.0
 
     @staticmethod
+    def _cost_attestation_json_value(value: Any) -> Any:
+        """Canonicalize exact numerical inputs without JSON float ambiguity."""
+
+        if isinstance(value, (np.bool_, bool)):
+            return bool(value)
+        if isinstance(value, (np.integer, int)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            return {"float64_hex": float(value).hex().lower()}
+        if value is None or isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): Backtester._cost_attestation_json_value(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                Backtester._cost_attestation_json_value(item)
+                for item in value
+            ]
+        raise TypeError(
+            f"unsupported execution-cost attestation value: {type(value).__name__}"
+        )
+
+    @classmethod
+    def _cost_attestation_json_sha256(cls, payload: Dict[str, Any]) -> str:
+        canonical = cls._cost_attestation_json_value(payload)
+        encoded = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8", errors="strict")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _spread_arrays_sha256(
+        entry_half_spread: np.ndarray,
+        intrabar_half_spread: np.ndarray,
+    ) -> str:
+        """Hash the exact two float64 spread arrays consumed by the engine."""
+
+        digest = hashlib.sha256()
+        digest.update(b"fxpm-backtester-spread-arrays-v1\x00")
+        for label, raw in (
+            ("entry_half_spread", entry_half_spread),
+            ("intrabar_half_spread", intrabar_half_spread),
+        ):
+            array = np.asarray(raw, dtype=np.float64)
+            if array.ndim != 1:
+                raise ValueError(f"{label} must be a one-dimensional array")
+            # Normalize byte order only; do not round, fill, or otherwise
+            # transform values after the Backtester selected them.
+            exact = np.ascontiguousarray(array.astype("<f8", copy=False))
+            digest.update(label.encode("ascii"))
+            digest.update(b"\x00<f8\x00")
+            digest.update(int(exact.size).to_bytes(8, "big", signed=False))
+            digest.update(exact.tobytes(order="C"))
+        return digest.hexdigest()
+
+    def _numerical_execution_cost_attestation(
+        self,
+        *,
+        entry_half_spread: np.ndarray,
+        intrabar_half_spread: np.ndarray,
+        spread_meta: Dict[str, Any],
+        slippage_price: float,
+        spec: InstrumentSpec,
+    ) -> Dict[str, Any]:
+        """Seal exact cost arrays, scalars, flags and broker instrument inputs."""
+
+        spread_policy = {
+            "mode": str(spread_meta.get("mode") or ""),
+            "source": str(spread_meta.get("source") or ""),
+            "fallback_to_fixed": bool(
+                spread_meta.get("fallback_to_fixed", False)
+            ),
+            "entry_column": str(spread_meta.get("entry_column") or ""),
+            "bar_column": str(spread_meta.get("bar_column") or ""),
+            "entry_model": str(spread_meta.get("entry_model") or ""),
+            "stress_entry_fallback": bool(
+                spread_meta.get("stress_entry_fallback", False)
+            ),
+            "units": str(spread_meta.get("units") or ""),
+        }
+        spread_mode = json.dumps(
+            spread_policy,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        commission_inputs_sha256 = self._cost_attestation_json_sha256({
+            "schema_version": "fxpm-round-trip-commission-inputs-v1",
+            "commission_per_lot": float(spec.commission_per_lot),
+            "deduction_timing": "round_trip_at_trade_close",
+        })
+        instrument_spec_sha256 = self._cost_attestation_json_sha256({
+            "schema_version": "fxpm-backtester-instrument-spec-v1",
+            "instrument_spec": asdict(spec),
+        })
+        return build_numerical_execution_cost_attestation(
+            use_spread=bool(getattr(self.config, "use_spread", True)),
+            use_slippage=bool(getattr(self.config, "use_slippage", True)),
+            use_commission=bool(getattr(self.config, "use_commission", True)),
+            spread_mode=spread_mode,
+            spread_values_sha256=self._spread_arrays_sha256(
+                entry_half_spread,
+                intrabar_half_spread,
+            ),
+            commission_inputs_sha256=commission_inputs_sha256,
+            instrument_spec_sha256=instrument_spec_sha256,
+            slippage_pips=float(getattr(self.config, "slippage_pips", 0.0)),
+            slippage_price=float(slippage_price),
+        )
+
+    @staticmethod
     def _spread_points_to_half_price(raw: Any, spec: InstrumentSpec) -> Optional[np.ndarray]:
         """Convert MT5 spread points to half-spread price units for each bar."""
         try:
@@ -6441,11 +6560,16 @@ class Backtester:
                 np.empty(0, dtype=np.float64),
                 timeframe=timeframe,
             )
+            entry_half_spread_arr, half_spread_arr, spread_meta = (
+                self._build_half_spread_arrays(features, spec)
+            )
+            slippage_price = (
+                spec.pips_to_price(self.config.slippage_pips)
+                if self.config.use_slippage
+                else 0.0
+            )
             metrics = self._empty_result()
-            metrics["spread_model"] = {
-                "source": "unavailable_empty_input",
-                "spread_provenance_status": "unavailable",
-            }
+            metrics["spread_model"] = spread_meta
             metrics["execution_cost_contract"] = (
                 BACKTEST_EXECUTION_COST_CONTRACT_VERSION
             )
@@ -6454,6 +6578,15 @@ class Backtester:
                 "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
                 "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
             }
+            metrics["numerical_execution_cost_attestation"] = (
+                self._numerical_execution_cost_attestation(
+                    entry_half_spread=entry_half_spread_arr,
+                    intrabar_half_spread=half_spread_arr,
+                    spread_meta=spread_meta,
+                    slippage_price=slippage_price,
+                    spec=spec,
+                )
+            )
             return metrics
         
         # ----------------------------------------------------------------
@@ -6778,6 +6911,15 @@ class Backtester:
             "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
             "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
         }
+        metrics["numerical_execution_cost_attestation"] = (
+            self._numerical_execution_cost_attestation(
+                entry_half_spread=entry_half_spread_arr,
+                intrabar_half_spread=half_spread_arr,
+                spread_meta=spread_meta,
+                slippage_price=slippage_price,
+                spec=spec,
+            )
+        )
         return metrics
 
     @staticmethod
