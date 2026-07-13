@@ -288,7 +288,9 @@ class TestReturnDDRatioEarlyRejection(unittest.TestCase):
         opt._compute_regime_score = lambda t, v: float(v.get('_score', 0.0))
 
         # Always pass validation (ratio gate is in early rejection, not validation here)
-        opt._validate_regime_winner = lambda t, v, r, n="": (True, "forced pass")
+        opt._validate_regime_winner = (
+            lambda t, v, r, n="", **_kwargs: (True, "forced pass")
+        )
 
         candidates = [
             # Rank 1 by score but bad ratio (ret=6, dd=12 -> 0.5)
