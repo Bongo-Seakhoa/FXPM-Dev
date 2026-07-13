@@ -43,6 +43,12 @@ from pm_metrics import (
 )
 from pm_symbol import infer_asset_class
 from pm_native_activation import resolve_active_native_artifact
+from pm_broker_terms import (
+    BrokerTermsError,
+    project_session_events,
+    resolve_active_swap_contract,
+    sha256_file as broker_terms_sha256_file,
+)
 from pm_evidence import (
     CALENDAR_SPLIT_MODE,
     DEFAULT_MIN_NATIVE_BARS,
@@ -100,6 +106,7 @@ EXIT_EOD = 3
 BACKTEST_TRADE_RECORD_SCHEMA_VERSION = "2026-06-18-mae-mfe-v1"
 BACKTEST_EXECUTION_COST_CONTRACT_VERSION = "entry_slippage_parity_v1"
 BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION = "causal_swap_accrual_v1"
+NATIVE_SOURCE_BINDING_ATTR = "_fxpm_native_source_binding_v1"
 
 
 @jit(nopython=True, cache=True)
@@ -2673,6 +2680,15 @@ class InstrumentSpec:
     swap_short: float = 0.0  # Daily swap for short positions
     swap_mode: int = -1  # -1=config/account-currency-per-lot; MT5 mode otherwise
     swap_rollover3days: int = 3  # MT5 weekday index used for triple rollover when available
+    swap_sunday: Optional[float] = None
+    swap_monday: Optional[float] = None
+    swap_tuesday: Optional[float] = None
+    swap_wednesday: Optional[float] = None
+    swap_thursday: Optional[float] = None
+    swap_friday: Optional[float] = None
+    swap_saturday: Optional[float] = None
+    swap_terms_provenance_status: str = "LEGACY_UNTRUSTED"
+    swap_terms_snapshot_sha256: str = ""
     
     # Broker-real fields (populated from MT5 snapshot or broker_specs.json)
     tick_size: float = 0.0  # trade_tick_size from MT5
@@ -2882,6 +2898,20 @@ def sync_instrument_spec_from_mt5(spec: InstrumentSpec, mt5_symbol_info) -> Inst
     spec.swap_mode = int(raw_swap_mode if raw_swap_mode is not None else -1)
     raw_triple_rollover = getattr(mt5_symbol_info, "swap_rollover3days", 3)
     spec.swap_rollover3days = int(raw_triple_rollover if raw_triple_rollover is not None else 3)
+    for weekday in (
+        "sunday", "monday", "tuesday", "wednesday",
+        "thursday", "friday", "saturday",
+    ):
+        setattr(
+            spec,
+            f"swap_{weekday}",
+            getattr(mt5_symbol_info, f"swap_{weekday}", None),
+        )
+    spec.swap_terms_provenance_status = str(
+        getattr(mt5_symbol_info, "swap_terms_provenance_status", "INCOMPLETE")
+        or "INCOMPLETE"
+    )
+    spec.swap_terms_snapshot_sha256 = ""
     spec.asset_class = infer_asset_class(
         spec.symbol,
         broker_data={
@@ -3206,7 +3236,8 @@ def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
     float_fields = {
         "pip_value", "spread_avg", "min_lot", "max_lot", "commission_per_lot",
         "swap_long", "swap_short", "tick_size", "tick_value", "contract_size",
-        "volume_step", "point"
+        "volume_step", "point", "swap_sunday", "swap_monday", "swap_tuesday",
+        "swap_wednesday", "swap_thursday", "swap_friday", "swap_saturday"
     }
     int_fields = {"pip_position", "stops_level", "digits", "swap_mode", "swap_rollover3days"}
     for k in float_fields:
@@ -3394,6 +3425,20 @@ def _create_spec_from_broker_data(
             swap_rollover3days=int(
                 broker_data.get('swap_rollover3days', 3)
                 if broker_data.get('swap_rollover3days') is not None else 3
+            ),
+            swap_sunday=broker_data.get('swap_sunday'),
+            swap_monday=broker_data.get('swap_monday'),
+            swap_tuesday=broker_data.get('swap_tuesday'),
+            swap_wednesday=broker_data.get('swap_wednesday'),
+            swap_thursday=broker_data.get('swap_thursday'),
+            swap_friday=broker_data.get('swap_friday'),
+            swap_saturday=broker_data.get('swap_saturday'),
+            swap_terms_provenance_status=str(
+                broker_data.get('swap_terms_provenance_status')
+                or 'LEGACY_UNTRUSTED'
+            ),
+            swap_terms_snapshot_sha256=str(
+                broker_data.get('swap_terms_snapshot_sha256') or ''
             ),
             # Broker-real fields (used for MT5-parity sizing/P&L)
             digits=digits,
@@ -3829,6 +3874,18 @@ class DataLoader:
                 "activation_manifest_path": str(activation.activation_manifest_path),
                 "activation_manifest_sha256": activation.activation_manifest_sha256,
                 "activation_entry": dict(activation.entry or {}),
+            }
+            frame.attrs[NATIVE_SOURCE_BINDING_ATTR] = {
+                "symbol": str(symbol).upper(),
+                "timeframe": tf,
+                "activation_id": str(activation.activation_id or ""),
+                "activation_manifest_sha256": str(
+                    activation.activation_manifest_sha256 or ""
+                ).lower(),
+                "bars_sha256": str(digest or "").lower(),
+                "sidecar_sha256": str(
+                    (activation.entry or {}).get("sidecar_sha256") or ""
+                ).lower(),
             }
             if isinstance(sidecar, dict):
                 if "expected_session_coverage" in sidecar:
@@ -4516,7 +4573,7 @@ class FeatureComputer:
     _FEATURE_DISK_CACHE_READ_SECONDS = 0.0
     _FEATURE_DISK_CACHE_WRITE_SECONDS = 0.0
     _FEATURE_CODE_FINGERPRINT: Optional[str] = None
-    FEATURE_CACHE_VERSION = "2026-05-30-disk-v2"
+    FEATURE_CACHE_VERSION = "2026-07-13-native-binding-v3"
 
     @classmethod
     def configure_cache(cls,
@@ -4699,6 +4756,12 @@ class FeatureComputer:
             last_key,
             tuple(str(c) for c in df.columns),
             FeatureComputer._data_fingerprint(df),
+            json.dumps(
+                dict(df.attrs.get(NATIVE_SOURCE_BINDING_ATTR) or {}),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
         )
 
     @classmethod
@@ -4827,6 +4890,12 @@ class FeatureComputer:
                 if manifest_columns and manifest_columns != [str(col) for col in data.columns]:
                     cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
                     return None
+                native_binding = manifest.get("native_source_binding")
+                if native_binding is not None:
+                    if not isinstance(native_binding, dict):
+                        cls._FEATURE_DISK_CACHE_INVALIDATIONS += 1
+                        return None
+                    data.attrs[NATIVE_SOURCE_BINDING_ATTR] = dict(native_binding)
                 cls._FEATURE_DISK_CACHE_READ_SECONDS += max(0.0, time.perf_counter() - start)
                 cls._FEATURE_DISK_CACHE_BYTES_READ += int(data_path.stat().st_size + manifest_path.stat().st_size)
                 cls._FEATURE_DISK_CACHE_HITS += 1
@@ -4904,6 +4973,9 @@ class FeatureComputer:
                 "data_path": data_path.name,
                 "rows": int(len(value)),
                 "columns": [str(col) for col in value.columns],
+                "native_source_binding": dict(
+                    value.attrs.get(NATIVE_SOURCE_BINDING_ATTR) or {}
+                ),
             }
             tmp_manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
             os.replace(tmp_data_path, data_path)
@@ -5827,6 +5899,13 @@ class Backtester:
             config: Pipeline configuration
         """
         self.config = config
+        # Resolved broker-terms artifacts are immutable and shared by every
+        # trial in one optimizer lifetime.  Keep a small, hard-bounded cell
+        # cache and pin the terms pointer on first use; a mid-run activation
+        # change is a technical failure, never a silent mixture of cost models.
+        self._swap_contract_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._swap_contract_cache_max = 8
+        self._swap_terms_pointer_pin: Optional[str] = None
         # Discovery/backtest scoring must not use live-only regime TP overlays.
         # Stage 2 can still search `tp_atr_mult` normally via strategy grids.
 
@@ -5988,11 +6067,83 @@ class Backtester:
                 rollover_day = (mt5_rollover_day - 1) % 7
         return int(rollover_day)
 
+    def _resolve_broker_swap_projection(
+        self,
+        features: pd.DataFrame,
+        spec: InstrumentSpec,
+        timeframe: str,
+    ) -> Optional[Tuple[Any, Dict[str, Any]]]:
+        """Resolve one activation-bound schedule, or ``None`` for research.
+
+        A frame without an authenticated native-source binding can still be
+        used for diagnostic research, but it can never inherit the active
+        production terms overlay merely because its symbol/timeframe names
+        happen to match.
+        """
+        binding = dict(features.attrs.get(NATIVE_SOURCE_BINDING_ATTR) or {})
+        if not binding:
+            return None
+        native_root = Path(getattr(self.config, "data_dir", Path("./data"))) / "native"
+        pointer_path = native_root / "terms" / "ACTIVE.json"
+        if not pointer_path.is_file() or pointer_path.is_symlink():
+            return None
+        pointer_sha = broker_terms_sha256_file(pointer_path).lower()
+        if self._swap_terms_pointer_pin is None:
+            self._swap_terms_pointer_pin = pointer_sha
+        elif self._swap_terms_pointer_pin != pointer_sha:
+            raise BrokerTermsError(
+                "broker terms activation changed during Backtester lifetime"
+            )
+        canonical = str(spec.symbol or binding.get("symbol") or "").upper()
+        tf = str(timeframe or binding.get("timeframe") or "").upper()
+        key = (pointer_sha, canonical, tf)
+        resolved = self._swap_contract_cache.get(key)
+        if resolved is None:
+            resolved = resolve_active_swap_contract(native_root, canonical, tf)
+            if len(self._swap_contract_cache) >= self._swap_contract_cache_max:
+                oldest_key = next(iter(self._swap_contract_cache))
+                self._swap_contract_cache.pop(oldest_key, None)
+            self._swap_contract_cache[key] = resolved
+
+        expected_binding = {
+            "symbol": canonical,
+            "timeframe": tf,
+            "activation_id": str(resolved.get("price_activation_id") or ""),
+            "activation_manifest_sha256": str(
+                resolved.get("price_activation_manifest_sha256") or ""
+            ).lower(),
+            "bars_sha256": str(resolved.get("target_bars_sha256") or "").lower(),
+            "sidecar_sha256": str(
+                resolved.get("target_sidecar_sha256") or ""
+            ).lower(),
+        }
+        observed_binding = {
+            "symbol": str(binding.get("symbol") or "").upper(),
+            "timeframe": str(binding.get("timeframe") or "").upper(),
+            "activation_id": str(binding.get("activation_id") or ""),
+            "activation_manifest_sha256": str(
+                binding.get("activation_manifest_sha256") or ""
+            ).lower(),
+            "bars_sha256": str(binding.get("bars_sha256") or "").lower(),
+            "sidecar_sha256": str(binding.get("sidecar_sha256") or "").lower(),
+        }
+        if observed_binding != expected_binding:
+            raise BrokerTermsError(
+                f"{canonical} {tf}: feature source binding does not match "
+                "the active broker-terms overlay"
+            )
+        projection = project_session_events(
+            list(resolved.get("events") or []),
+            features,
+        )
+        return projection, resolved
+
     def _build_causal_swap_inputs(
         self,
         features: pd.DataFrame,
         spec: InstrumentSpec,
         entry_prices: np.ndarray,
+        timeframe: str = "",
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, Dict[str, Any]]:
         """Build observable per-close rollover and per-entry swap arrays."""
         count = int(len(features))
@@ -6049,6 +6200,103 @@ class Backtester:
             contract["reason"] = f"bar-open validation failed: {type(exc).__name__}"
             return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
 
+        overlay = self._resolve_broker_swap_projection(
+            features,
+            spec,
+            timeframe,
+        )
+        if overlay is not None:
+            projection, resolved = overlay
+            pre_open_rollover_units = np.asarray(
+                projection.pre_open_units, dtype=np.int32
+            )
+            rollover_units = np.asarray(
+                projection.at_close_units, dtype=np.int32
+            )
+            terms = dict(resolved.get("terms") or {})
+            raw_long = float(terms.get("swap_long", 0.0) or 0.0)
+            raw_short = float(terms.get("swap_short", 0.0) or 0.0)
+            terms_swap_mode = int(terms.get("swap_mode", -1))
+            for index in np.flatnonzero(np.isfinite(entry_prices)):
+                entry_price = float(entry_prices[int(index)])
+                long_per_lot[int(index)] = self._swap_value_per_lot_dollars(
+                    spec,
+                    raw_long,
+                    entry_price=entry_price,
+                    swap_mode=terms_swap_mode,
+                )
+                short_per_lot[int(index)] = self._swap_value_per_lot_dollars(
+                    spec,
+                    raw_short,
+                    entry_price=entry_price,
+                    swap_mode=terms_swap_mode,
+                )
+            provenance_status = str(
+                resolved.get("schedule_provenance_status") or ""
+            ).upper()
+            contract.update({
+                "status": "AVAILABLE",
+                "mode": "activation_bound_d1_session_projection",
+                "timestamp_source": "_BAR_CLOSE_TS",
+                "rollover_event_source": "authenticated_native_d1_intervals",
+                "timestamp_evidence_level": "activation_bound_d1_session_proxy",
+                "source_provenance_authenticated": bool(
+                    resolved.get("source_provenance_authenticated", False)
+                ),
+                "provenance_status": provenance_status,
+                # The direct export authenticates the broker's terms at one
+                # capture instant, not a historical financing-rate series.
+                # Historical statistical evidence therefore needs either a
+                # separate authenticated rate history or the explicit
+                # debit-only stress policy below.
+                "historical_rate_provenance": "current_terms_snapshot_only",
+                "historical_rates_authenticated": False,
+                "stress_policy_explicitly_approved": bool(
+                    resolved.get("stress_approved", False)
+                ),
+                "stress_policy_immutable": bool(
+                    resolved.get("stress_policy_immutable", False)
+                ),
+                "stress_policy_sha256": resolved.get("stress_policy_sha256"),
+                "execution_state_compounding": True,
+                "reason": (
+                    "activation-bound broker terms projected from immutable "
+                    "D1 session intervals"
+                ),
+                "price_activation_id": resolved.get("price_activation_id"),
+                "price_activation_manifest_sha256": resolved.get(
+                    "price_activation_manifest_sha256"
+                ),
+                "terms_activation_id": resolved.get("terms_activation_id"),
+                "terms_activation_manifest_sha256": resolved.get(
+                    "terms_activation_manifest_sha256"
+                ),
+                "terms_snapshot_sha256": resolved.get("terms_snapshot_sha256"),
+                "schedule_sha256": resolved.get("schedule_sha256"),
+                "target_bars_sha256": resolved.get("target_bars_sha256"),
+                "target_sidecar_sha256": resolved.get("target_sidecar_sha256"),
+                "projection_contract": resolved.get("projection_contract"),
+                "projection_sha256": projection.digest,
+                "rollover_event_bars": int(projection.event_count),
+                "pre_open_rollover_event_bars": int(
+                    np.count_nonzero(pre_open_rollover_units)
+                ),
+                "close_rollover_event_bars": int(
+                    np.count_nonzero(rollover_units)
+                ),
+                "rollover_units_on_axis": int(
+                    pre_open_rollover_units.sum() + rollover_units.sum()
+                ),
+            })
+            return (
+                pre_open_rollover_units,
+                rollover_units,
+                long_per_lot,
+                short_per_lot,
+                True,
+                contract,
+            )
+
         triple_day = self._resolved_triple_rollover_weekday(spec, self.config)
         first_day = pd.Timestamp(closes[0]).normalize()
         last_day = pd.Timestamp(closes[-1]).normalize()
@@ -6092,13 +6340,17 @@ class Backtester:
                 entry_price=entry_price,
             )
         contract.update({
-            "status": "AVAILABLE",
-            "mode": "explicit_observable_bar_close",
+            "status": "UNAVAILABLE",
+            "mode": "legacy_calendar_diagnostic_only",
             "timestamp_source": "_BAR_CLOSE_TS",
             "timestamp_evidence_level": "observable_validated_column",
             "source_provenance_authenticated": False,
+            "provenance_status": "LEGACY_UNTRUSTED",
             "execution_state_compounding": True,
-            "reason": "causal rollover cashflows enter live equity at observable closes",
+            "reason": (
+                "causal diagnostic rollover cashflows enter live equity, but "
+                "the source schedule is not authenticated for promotion"
+            ),
             "rollover_event_bars": int(np.count_nonzero(
                 pre_open_rollover_units.astype(np.int64)
                 + rollover_units.astype(np.int64)
@@ -6187,6 +6439,7 @@ class Backtester:
                 features,
                 spec,
                 np.empty(0, dtype=np.float64),
+                timeframe=timeframe,
             )
             metrics = self._empty_result()
             metrics["spread_model"] = {
@@ -6395,7 +6648,12 @@ class Backtester:
             swap_short_per_lot_arr,
             causal_swap_enabled,
             swap_accrual_contract,
-        ) = self._build_causal_swap_inputs(features, spec, entry_prices)
+        ) = self._build_causal_swap_inputs(
+            features,
+            spec,
+            entry_prices,
+            timeframe=timeframe,
+        )
         if NUMBA_AVAILABLE and normalized_governance is None:
             # Use Numba JIT-compiled kernel with live-equity sizing
             (
@@ -6647,6 +6905,7 @@ class Backtester:
         raw_swap: float,
         *,
         entry_price: Optional[float] = None,
+        swap_mode: Optional[int] = None,
     ) -> float:
         """Convert configured/MT5 swap value to account-currency dollars per lot."""
         try:
@@ -6654,7 +6913,11 @@ class Backtester:
         except Exception:
             return 0.0
         try:
-            mode = int(getattr(spec, "swap_mode", -1))
+            mode = int(
+                getattr(spec, "swap_mode", -1)
+                if swap_mode is None
+                else swap_mode
+            )
         except Exception:
             mode = -1
         if mode == 0:

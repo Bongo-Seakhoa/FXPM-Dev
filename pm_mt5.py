@@ -112,6 +112,18 @@ class MT5SymbolInfo:
     trade_mode: int = 2
     swap_mode: int = -1
     swap_rollover3days: int = 3
+    # The MetaTrader5 Python binding used by FxPM currently omits the seven
+    # official named-day swap multipliers.  Keep them nullable and never
+    # synthesize them from ``swap_rollover3days``: a complete authoritative
+    # schedule is supplied by the separately authenticated MQL5 terms export.
+    swap_sunday: Optional[float] = None
+    swap_monday: Optional[float] = None
+    swap_tuesday: Optional[float] = None
+    swap_wednesday: Optional[float] = None
+    swap_thursday: Optional[float] = None
+    swap_friday: Optional[float] = None
+    swap_saturday: Optional[float] = None
+    swap_terms_provenance_status: str = "INCOMPLETE"
     filling_mode: int = 0
     trade_exemode: int = 0
     trade_freeze_level: int = 0
@@ -186,6 +198,14 @@ class MT5SymbolInfo:
             swap_short=self.swap_short,
             swap_mode=self.swap_mode,
             swap_rollover3days=self.swap_rollover3days,
+            swap_sunday=self.swap_sunday,
+            swap_monday=self.swap_monday,
+            swap_tuesday=self.swap_tuesday,
+            swap_wednesday=self.swap_wednesday,
+            swap_thursday=self.swap_thursday,
+            swap_friday=self.swap_friday,
+            swap_saturday=self.swap_saturday,
+            swap_terms_provenance_status=self.swap_terms_provenance_status,
             tick_size=self.trade_tick_size,
             tick_value=self.trade_tick_value,
             contract_size=self.trade_contract_size,
@@ -571,6 +591,17 @@ class MT5Connector:
                 getattr(info, "swap_rollover3days", 3)
                 if getattr(info, "swap_rollover3days", None) is not None else 3
             ),
+            swap_sunday=getattr(info, "swap_sunday", None),
+            swap_monday=getattr(info, "swap_monday", None),
+            swap_tuesday=getattr(info, "swap_tuesday", None),
+            swap_wednesday=getattr(info, "swap_wednesday", None),
+            swap_thursday=getattr(info, "swap_thursday", None),
+            swap_friday=getattr(info, "swap_friday", None),
+            swap_saturday=getattr(info, "swap_saturday", None),
+            # Even if a future Python binding exposes these values, the
+            # production evidence contract requires the nonce/identity/hash
+            # checks performed by the MQL5 exporter overlay.
+            swap_terms_provenance_status="INCOMPLETE",
             filling_mode=int(getattr(info, "filling_mode", 0) or 0),
             trade_exemode=int(getattr(info, "trade_exemode", 0) or 0),
             trade_freeze_level=int(getattr(info, "trade_freeze_level", 0) or 0),
@@ -2094,6 +2125,14 @@ class MT5Connector:
                 'swap_short': info.swap_short,
                 'swap_mode': info.swap_mode,
                 'swap_rollover3days': info.swap_rollover3days,
+                'swap_sunday': info.swap_sunday,
+                'swap_monday': info.swap_monday,
+                'swap_tuesday': info.swap_tuesday,
+                'swap_wednesday': info.swap_wednesday,
+                'swap_thursday': info.swap_thursday,
+                'swap_friday': info.swap_friday,
+                'swap_saturday': info.swap_saturday,
+                'swap_terms_provenance_status': info.swap_terms_provenance_status,
                 'stops_level': info.trade_stops_level,
                 'pip_size': info.pip_size,
                 'pip_value': info.pip_value,

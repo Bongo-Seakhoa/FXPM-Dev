@@ -507,7 +507,8 @@ def test_rollover_event_is_classified_as_pre_open_across_a_session_gap():
     # because its close is the first close after midnight.  The event is kept
     # separately as a pre-open cashflow for any position held across the gap.
     assert causal is True
-    assert contract["status"] == "AVAILABLE"
+    assert contract["status"] == "UNAVAILABLE"
+    assert contract["mode"] == "legacy_calendar_diagnostic_only"
     assert pre_open_units.tolist() == [1, 3]
     assert close_units.tolist() == [0, 0]
 
@@ -565,6 +566,68 @@ def test_gap_carry_precedes_exit_and_replacement_sizing_in_both_engines(
         assert results[False]["equity_curve"] == pytest.approx(
             results[True]["equity_curve"]
         )
+
+
+def test_activation_bound_stress_projection_is_promotion_admissible(monkeypatch):
+    from pm_broker_terms import SwapProjection
+
+    frame = _flat_daily_frame(rows=4)
+    projection = SwapProjection(
+        pre_open_units=np.array([0, 3, 0, 0], dtype=np.int8),
+        at_close_units=np.array([0, 0, 3, 0], dtype=np.int8),
+        digest="a" * 64,
+        event_count=2,
+    )
+    resolved = {
+        "schedule_provenance_status": "STRESS_APPROVED",
+        "source_provenance_authenticated": False,
+        "stress_approved": True,
+        "stress_policy_immutable": True,
+        "stress_policy_sha256": "9" * 64,
+        "price_activation_id": "price-a1",
+        "price_activation_manifest_sha256": "b" * 64,
+        "terms_activation_id": "terms-a1",
+        "terms_activation_manifest_sha256": "c" * 64,
+        "terms_snapshot_sha256": "d" * 64,
+        "schedule_sha256": "e" * 64,
+        "target_bars_sha256": "f" * 64,
+        "target_sidecar_sha256": "1" * 64,
+        "projection_contract": "fxpm-swap-preopen-close-projection-v1",
+        "terms": {
+            "swap_mode": -1,
+            "swap_long": -10.0,
+            "swap_short": -5.0,
+        },
+    }
+    backtester = Backtester(
+        PipelineConfig(research_mode=True, swap_model_enabled=True)
+    )
+    monkeypatch.setattr(
+        backtester,
+        "_resolve_broker_swap_projection",
+        lambda *_args, **_kwargs: (projection, resolved),
+    )
+
+    pre, close, long_rate, short_rate, causal, contract = (
+        backtester._build_causal_swap_inputs(
+            frame,
+            _fx_spec(swap_mode=-1),
+            np.array([np.nan, 1.0, np.nan, np.nan], dtype=np.float64),
+            timeframe="D1",
+        )
+    )
+
+    assert causal is True
+    assert pre.tolist() == [0, 3, 0, 0]
+    assert close.tolist() == [0, 0, 3, 0]
+    assert long_rate[1] == pytest.approx(-10.0)
+    assert short_rate[1] == pytest.approx(-5.0)
+    assert contract["status"] == "AVAILABLE"
+    assert contract["provenance_status"] == "STRESS_APPROVED"
+    assert contract["stress_policy_explicitly_approved"] is True
+    assert contract["stress_policy_immutable"] is True
+    assert contract["historical_rates_authenticated"] is False
+    assert contract["projection_sha256"] == "a" * 64
 
 
 def test_new_post_gap_entry_does_not_pay_pre_entry_carry_in_both_engines(
@@ -678,7 +741,13 @@ def test_causal_swap_changes_the_next_trade_risk_budget_and_size(monkeypatch):
             spec=spec,
             timeframe="D1",
         )
-        assert result["swap_accrual_contract"]["status"] == "AVAILABLE"
+        assert result["swap_accrual_contract"]["status"] == "UNAVAILABLE"
+        assert result["swap_accrual_contract"]["mode"] == (
+            "legacy_calendar_diagnostic_only"
+        )
+        assert result["swap_accrual_contract"][
+            "source_provenance_authenticated"
+        ] is False
         assert result["swap_accrual_contract"]["execution_state_compounding"] is True
         assert result["execution_cost_timing_contract"] == {
             "entry_slippage": "entry_slippage_parity_v1",

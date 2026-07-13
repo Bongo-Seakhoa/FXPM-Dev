@@ -103,6 +103,38 @@ class InstrumentSpecTests(unittest.TestCase):
 
         self.assertEqual(spec.commission_per_lot, 0.0)
 
+    def test_python_mt5_weekday_fields_never_claim_authenticated_terms(self):
+        symbol_info = MT5SymbolInfo(
+            symbol="EURUSD",
+            digits=5,
+            point=0.00001,
+            trade_tick_value=1.0,
+            trade_tick_size=0.00001,
+            trade_contract_size=100000.0,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            spread=12,
+            spread_float=True,
+            swap_long=-1.0,
+            swap_short=0.5,
+            trade_stops_level=10,
+            swap_sunday=0.0,
+            swap_monday=1.0,
+            swap_tuesday=1.0,
+            swap_wednesday=3.0,
+            swap_thursday=1.0,
+            swap_friday=1.0,
+            swap_saturday=0.0,
+        )
+
+        spec = symbol_info.to_instrument_spec()
+
+        self.assertEqual(spec.swap_wednesday, 3.0)
+        self.assertEqual(spec.swap_sunday, 0.0)
+        self.assertEqual(spec.swap_terms_provenance_status, "INCOMPLETE")
+        self.assertEqual(spec.swap_terms_snapshot_sha256, "")
+
     def test_broker_spec_preserves_explicit_zero_commission(self):
         spec = _create_spec_from_broker_data(
             "US100",
@@ -360,6 +392,17 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(spec.stops_level, 10)
         self.assertEqual(spec.swap_long, -5.0)
         self.assertEqual(spec.swap_short, 2.0)
+        self.assertEqual(spec.swap_terms_provenance_status, "INCOMPLETE")
+        self.assertEqual(spec.swap_terms_snapshot_sha256, "")
+        self.assertTrue(
+            all(
+                getattr(spec, f"swap_{weekday}") is None
+                for weekday in (
+                    "sunday", "monday", "tuesday", "wednesday",
+                    "thursday", "friday", "saturday",
+                )
+            )
+        )
 
         # Verify spread conversion (15 points * 0.00001 / 0.0001 = 1.5 pips)
         self.assertAlmostEqual(spec.spread_avg, 1.5, places=2)
