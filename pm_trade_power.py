@@ -10,15 +10,36 @@ final-lockbox outcomes.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field, replace
 from statistics import NormalDist
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
+import pandas as pd
+
+from pm_sample_dependence import effective_sample_evidence
+from pm_search_outcomes import SearchOutcomeKind
 
 
 TRADE_POWER_SCHEMA_VERSION = "fxpm-cell-power-v1"
+TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v1"
+TRADE_POWER_DECISION_SCHEMA_VERSION = "fxpm-trade-power-decision-v1"
+TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v1"
+REQUIRED_ENTRY_SLIPPAGE_CONTRACT = "entry_slippage_parity_v1"
+REQUIRED_SWAP_ACCRUAL_CONTRACT = "causal_swap_accrual_v1"
+REQUIRED_TRADE_RECORD_SCHEMA = "2026-06-18-mae-mfe-v1"
 _NORMAL = NormalDist()
+_PRODUCTION_PARTITIONS = {
+    "optimizer_train",
+    "tuning_validation",
+    "final_lockbox",
+}
+_EXPECTED_SAMPLE_UNAVAILABLE_CODES = {
+    "INSUFFICIENT_RAW_OBSERVATIONS",
+    "VARIANCE_UNAVAILABLE",
+}
 
 
 @dataclass(frozen=True)
@@ -87,6 +108,19 @@ class TradePowerRequirement:
     required_effective_tuning_trades: Optional[int]
     required_effective_final_trades: Optional[int]
     reason_codes: tuple[str, ...] = ()
+    multiple_testing_adjustment: str = ""
+    pilot_dispersion_method: str = ""
+    policy_schema_version: str = ""
+    multiplicity_method: str = ""
+    calibration_partition: str = "unspecified"
+    calibration_sample_sha256: Optional[str] = None
+    calibration_source_contract_sha256: Optional[str] = None
+    entry_slippage_contract_version: str = ""
+    swap_accrual_contract_version: str = ""
+    trade_record_schema_version: str = ""
+    swap_provenance_class: str = ""
+    historical_financing_provenance: str = ""
+    frozen: bool = False
     schema_version: str = TRADE_POWER_SCHEMA_VERSION
 
     @property
@@ -95,6 +129,129 @@ class TradePowerRequirement:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class TradeEvidenceSourceContract:
+    """Compact attestation for the Backtester inputs underlying net R."""
+
+    source_contract_sha256: str
+    entry_slippage_contract_version: str
+    swap_accrual_contract_version: str
+    trade_record_schema_version: str
+    swap_status: str
+    swap_provenance_class: str
+    historical_financing_provenance: str
+    execution_state_compounding: bool
+    schema_version: str = TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TradeSampleEvidence:
+    """Compact dependence-aware evidence from strict post-cost trade records."""
+
+    status: str
+    outcome_kind: SearchOutcomeKind
+    reason: str
+    raw_trade_records: int
+    usable_trades: int
+    minimum_observations_required: int
+    mean_net_r: Optional[float]
+    sigma_r_robust: Optional[float]
+    effective_trades: float
+    net_r_min: Optional[float]
+    net_r_max: Optional[float]
+    net_r_values_sha256: str
+    holding_intervals_sha256: str
+    sample_sha256: str
+    source_contract: Optional[TradeEvidenceSourceContract] = None
+    dependence_evidence: Mapping[str, Any] = field(default_factory=dict)
+    reason_codes: tuple[str, ...] = ()
+    net_r_contract: str = "strict_post_cost_pnl_dollars_divided_by_entry_risk_v1"
+    schema_version: str = TRADE_SAMPLE_SCHEMA_VERSION
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "MEASURED" and self.outcome_kind is SearchOutcomeKind.VALID
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "outcome_kind": self.outcome_kind.value,
+            "reason": self.reason,
+            "reason_codes": list(self.reason_codes),
+            "raw_trade_records": int(self.raw_trade_records),
+            "usable_trades": int(self.usable_trades),
+            "minimum_observations_required": int(
+                self.minimum_observations_required
+            ),
+            "mean_net_r": self.mean_net_r,
+            "sigma_r_robust": self.sigma_r_robust,
+            "effective_trades": float(self.effective_trades),
+            "net_r_min": self.net_r_min,
+            "net_r_max": self.net_r_max,
+            "net_r_values_sha256": self.net_r_values_sha256,
+            "holding_intervals_sha256": self.holding_intervals_sha256,
+            "sample_sha256": self.sample_sha256,
+            "source_contract": (
+                self.source_contract.to_dict()
+                if self.source_contract is not None
+                else None
+            ),
+            "net_r_contract": self.net_r_contract,
+            "dependence_evidence": dict(self.dependence_evidence),
+        }
+
+
+@dataclass(frozen=True)
+class TradePowerDecision:
+    """One partition verdict against an immutable train-calibrated requirement."""
+
+    status: str
+    outcome_kind: SearchOutcomeKind
+    partition: str
+    reason: str
+    reason_codes: tuple[str, ...]
+    observed_effective_trades: float
+    required_effective_trades: Optional[int]
+    sample_evidence: Optional[TradeSampleEvidence]
+    frozen_requirement: Optional[TradePowerRequirement]
+    requirement_recalibrated: bool = False
+    requirement_sigma_source: str = "optimizer_train_frozen"
+    schema_version: str = TRADE_POWER_DECISION_SCHEMA_VERSION
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "PASS" and self.outcome_kind is SearchOutcomeKind.VALID
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "outcome_kind": self.outcome_kind.value,
+            "partition": self.partition,
+            "passed": self.passed,
+            "reason": self.reason,
+            "reason_codes": list(self.reason_codes),
+            "observed_effective_trades": float(self.observed_effective_trades),
+            "required_effective_trades": self.required_effective_trades,
+            "requirement_recalibrated": self.requirement_recalibrated,
+            "requirement_sigma_source": self.requirement_sigma_source,
+            "sample_evidence": (
+                self.sample_evidence.to_dict()
+                if self.sample_evidence is not None
+                else None
+            ),
+            "frozen_requirement": (
+                self.frozen_requirement.to_dict()
+                if self.frozen_requirement is not None
+                else None
+            ),
+        }
 
 
 def robust_r_dispersion(values: Iterable[Any]) -> Optional[float]:
@@ -145,6 +302,16 @@ def _precision_count(*, sigma: float, half_width: float, alpha: float) -> int:
     return int(math.ceil((z * sigma / half_width) ** 2))
 
 
+def _finite_report_value(value: Any) -> float:
+    """Return a JSON-safe reported number without creating a valid fallback."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
+
 def derive_trade_power_requirement(
     *,
     sigma_r_robust: Any,
@@ -168,13 +335,20 @@ def derive_trade_power_requirement(
         reasons.append("EFFECTIVE_TRIALS_INVALID")
     common = {
         "sigma_r_robust": sigma if math.isfinite(sigma) and sigma > 0.0 else None,
-        "minimum_economic_edge_r": float(policy.minimum_economic_edge_r),
-        "maximum_ci_half_width_r": float(policy.maximum_ci_half_width_r),
-        "target_power": float(policy.target_power),
-        "effective_trials": trials,
-        "alpha_train_nominal": float(policy.alpha_train),
-        "alpha_tuning": float(policy.alpha_tuning),
-        "alpha_final": float(policy.alpha_final),
+        "minimum_economic_edge_r": _finite_report_value(
+            policy.minimum_economic_edge_r
+        ),
+        "maximum_ci_half_width_r": _finite_report_value(
+            policy.maximum_ci_half_width_r
+        ),
+        "target_power": _finite_report_value(policy.target_power),
+        "effective_trials": trials if math.isfinite(trials) else 0.0,
+        "alpha_train_nominal": _finite_report_value(policy.alpha_train),
+        "alpha_tuning": _finite_report_value(policy.alpha_tuning),
+        "alpha_final": _finite_report_value(policy.alpha_final),
+        "multiple_testing_adjustment": str(policy.multiple_testing_adjustment),
+        "pilot_dispersion_method": str(policy.pilot_dispersion),
+        "policy_schema_version": str(policy.schema_version),
     }
     if reasons:
         return TradePowerRequirement(
@@ -231,11 +405,798 @@ def derive_trade_power_requirement(
     )
 
 
+def _sha256_json(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
+
+
+def _validate_trade_evidence_source_contract(
+    value: Any,
+) -> tuple[Optional[TradeEvidenceSourceContract], str, tuple[str, ...]]:
+    """Validate the exact execution, swap, schema and provenance attestation."""
+
+    if value is None:
+        return None, "trade evidence source contract is missing", (
+            "SOURCE_CONTRACT_MISSING",
+        )
+    if not isinstance(value, Mapping):
+        return None, "trade evidence source contract is not a mapping", (
+            "SOURCE_CONTRACT_INVALID",
+        )
+    if str(value.get("schema_version") or "") != (
+        TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
+    ):
+        return None, "trade evidence source contract schema is missing or stale", (
+            "SOURCE_CONTRACT_SCHEMA_INVALID",
+        )
+    timing = value.get("execution_cost_timing_contract")
+    swap = value.get("swap_accrual_contract")
+    if not isinstance(timing, Mapping) or not isinstance(swap, Mapping):
+        return None, "execution timing or swap source contract is missing", (
+            "SOURCE_CONTRACT_INVALID",
+        )
+    entry_version = str(timing.get("entry_slippage") or "")
+    timing_swap_version = str(timing.get("swap_accrual") or "")
+    swap_version = str(swap.get("contract_version") or "")
+    if (
+        entry_version != REQUIRED_ENTRY_SLIPPAGE_CONTRACT
+        or timing_swap_version != REQUIRED_SWAP_ACCRUAL_CONTRACT
+        or swap_version != REQUIRED_SWAP_ACCRUAL_CONTRACT
+    ):
+        return None, "execution timing contract is legacy, missing, or inconsistent", (
+            "SOURCE_CONTRACT_EXECUTION_TIMING_INVALID",
+        )
+    trade_schema = str(value.get("trade_record_schema_version") or "")
+    if trade_schema != REQUIRED_TRADE_RECORD_SCHEMA:
+        return None, "trade-record schema attestation is missing or stale", (
+            "SOURCE_CONTRACT_TRADE_SCHEMA_INVALID",
+        )
+    raw_binding = value.get("source_binding")
+    if not isinstance(raw_binding, Mapping):
+        return None, "source binding evidence is missing or malformed", (
+            "SOURCE_CONTRACT_BINDING_INVALID",
+        )
+    required_common_bindings = (
+        "price_activation_manifest_sha256",
+        "terms_activation_manifest_sha256",
+        "terms_snapshot_sha256",
+    )
+    source_binding = {
+        name: str(raw_binding.get(name) or "").lower()
+        for name in required_common_bindings
+    }
+    if not all(_is_sha256(value) for value in source_binding.values()):
+        return None, "source binding evidence is incomplete or malformed", (
+            "SOURCE_CONTRACT_BINDING_INVALID",
+        )
+    status = str(swap.get("status") or "").upper()
+    provenance = str(swap.get("provenance_status") or "").upper()
+    compounding = swap.get("execution_state_compounding") is True
+    source_authenticated = swap.get("source_provenance_authenticated") is True
+    stress_approved = swap.get("stress_policy_explicitly_approved") is True
+    stress_immutable = swap.get("stress_policy_immutable") is True
+    stress_policy_sha256 = str(swap.get("stress_policy_sha256") or "").lower()
+    broker_disabled = swap.get("broker_swap_disabled") is True
+    historical_rates_authenticated = (
+        swap.get("historical_rates_authenticated") is True
+    )
+    timestamp_source = str(swap.get("timestamp_source") or "")
+    if not compounding:
+        return None, "swap cashflows are not compounded in execution state", (
+            "SOURCE_CONTRACT_SWAP_COMPOUNDING_INVALID",
+        )
+    if status == "AVAILABLE" and provenance == "AUTHENTICATED":
+        if (
+            not source_authenticated
+            or not historical_rates_authenticated
+            or timestamp_source != "_BAR_CLOSE_TS"
+        ):
+            return None, "authenticated current swap terms lack historical-rate proof", (
+                "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+            )
+        provenance_class = "AUTHENTICATED"
+        historical_financing_provenance = "AUTHENTICATED_HISTORICAL_RATES"
+        historical_rates_sha256 = str(
+            raw_binding.get("historical_rates_sha256") or ""
+        ).lower()
+        if not _is_sha256(historical_rates_sha256):
+            return None, "historical swap-rate binding is missing", (
+                "SOURCE_CONTRACT_BINDING_INVALID",
+            )
+        source_binding["historical_rates_sha256"] = historical_rates_sha256
+    elif status == "AVAILABLE" and provenance == "STRESS_APPROVED":
+        if (
+            not stress_approved
+            or not stress_immutable
+            or not _is_sha256(stress_policy_sha256)
+            or timestamp_source != "_BAR_CLOSE_TS"
+        ):
+            return None, "stress swap provenance lacks immutable explicit approval", (
+                "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+            )
+        provenance_class = "STRESS_APPROVED"
+        historical_financing_provenance = "IMMUTABLE_STRESS_APPROVED"
+        source_binding["stress_policy_sha256"] = stress_policy_sha256
+    elif status == "DISABLED" and provenance == "AUTHENTICATED":
+        if not source_authenticated or not broker_disabled:
+            return None, "disabled swap is not authenticated as a broker term", (
+                "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+            )
+        provenance_class = "AUTHENTICATED_BROKER_DISABLED"
+        historical_financing_provenance = "AUTHENTICATED_BROKER_DISABLED"
+        disabled_proof_sha256 = str(
+            raw_binding.get("broker_disabled_proof_sha256") or ""
+        ).lower()
+        if not _is_sha256(disabled_proof_sha256):
+            return None, "authenticated broker-disabled proof is missing", (
+                "SOURCE_CONTRACT_BINDING_INVALID",
+            )
+        source_binding["broker_disabled_proof_sha256"] = disabled_proof_sha256
+    else:
+        return None, "swap provenance is unavailable, legacy, or unapproved", (
+            "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+        )
+    canonical = {
+        "schema_version": TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
+        "source_binding": source_binding,
+        "entry_slippage_contract_version": entry_version,
+        "swap_accrual_contract_version": swap_version,
+        "trade_record_schema_version": trade_schema,
+        "swap_status": status,
+        "swap_provenance_class": provenance_class,
+        "historical_financing_provenance": historical_financing_provenance,
+        "execution_state_compounding": True,
+        "timestamp_source": timestamp_source if status == "AVAILABLE" else None,
+        "stress_policy_sha256": (
+            stress_policy_sha256 if provenance_class == "STRESS_APPROVED" else None
+        ),
+    }
+    return TradeEvidenceSourceContract(
+        source_contract_sha256=_sha256_json(canonical),
+        entry_slippage_contract_version=entry_version,
+        swap_accrual_contract_version=swap_version,
+        trade_record_schema_version=trade_schema,
+        swap_status=status,
+        swap_provenance_class=provenance_class,
+        historical_financing_provenance=historical_financing_provenance,
+        execution_state_compounding=True,
+    ), "", ()
+
+
+def _sample_hash_payload(
+    *,
+    status: str,
+    raw_trade_records: int,
+    net_r_values_sha256: str,
+    holding_intervals_sha256: str,
+    source_contract_sha256: str,
+    reason_codes: Sequence[str],
+) -> str:
+    return _sha256_json({
+        "schema_version": TRADE_SAMPLE_SCHEMA_VERSION,
+        "status": status,
+        "raw_trade_records": int(raw_trade_records),
+        "net_r_values_sha256": str(net_r_values_sha256),
+        "holding_intervals_sha256": str(holding_intervals_sha256),
+        "source_contract_sha256": str(source_contract_sha256),
+        "reason_codes": list(reason_codes),
+    })
+
+
+def _unavailable_trade_sample(
+    *,
+    outcome_kind: SearchOutcomeKind,
+    reason: str,
+    reason_codes: Sequence[str],
+    raw_trade_records: int,
+    net_r_values_sha256: str = "",
+    holding_intervals_sha256: str = "",
+    source_contract: Optional[TradeEvidenceSourceContract] = None,
+    dependence_evidence: Optional[Mapping[str, Any]] = None,
+    usable_trades: int = 0,
+    minimum_observations_required: int = 8,
+    mean_net_r: Optional[float] = None,
+    sigma_r_robust: Optional[float] = None,
+    net_r_min: Optional[float] = None,
+    net_r_max: Optional[float] = None,
+) -> TradeSampleEvidence:
+    codes = tuple(dict.fromkeys(str(value) for value in reason_codes))
+    status = (
+        "EXPECTED_INELIGIBLE"
+        if outcome_kind is SearchOutcomeKind.EXPECTED_INELIGIBLE
+        else "INFRA_FAILURE"
+    )
+    return TradeSampleEvidence(
+        status=status,
+        outcome_kind=outcome_kind,
+        reason=str(reason),
+        reason_codes=codes,
+        raw_trade_records=max(0, int(raw_trade_records)),
+        usable_trades=max(0, int(usable_trades)),
+        minimum_observations_required=max(
+            3, int(minimum_observations_required)
+        ),
+        mean_net_r=mean_net_r,
+        sigma_r_robust=sigma_r_robust,
+        effective_trades=0.0,
+        net_r_min=net_r_min,
+        net_r_max=net_r_max,
+        net_r_values_sha256=str(net_r_values_sha256),
+        holding_intervals_sha256=str(holding_intervals_sha256),
+        sample_sha256=_sample_hash_payload(
+            status=status,
+            raw_trade_records=raw_trade_records,
+            net_r_values_sha256=net_r_values_sha256,
+            holding_intervals_sha256=holding_intervals_sha256,
+            source_contract_sha256=(
+                source_contract.source_contract_sha256
+                if source_contract is not None
+                else ""
+            ),
+            reason_codes=codes,
+        ),
+        source_contract=source_contract,
+        dependence_evidence=dict(dependence_evidence or {}),
+    )
+
+
+def _finite_trade_number(value: Any, *, field_name: str) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{field_name} must be a finite number, not boolean")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} is not numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} is not finite")
+    return number
+
+
+def _utc_interval_timestamp(value: Any, *, field_name: str) -> str:
+    if value in (None, ""):
+        raise ValueError(f"{field_name} is missing")
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} is invalid") from exc
+    if pd.isna(timestamp):
+        raise ValueError(f"{field_name} is invalid")
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return timestamp.isoformat()
+
+
+def build_trade_sample_evidence(
+    trades: Any,
+    *,
+    source_contract: Any = None,
+    minimum_observations: int = 8,
+) -> TradeSampleEvidence:
+    """Build strict post-cost net-R evidence without dropping corrupt records.
+
+    A non-empty record set is all-or-nothing.  Silently omitting one malformed
+    trade would change both the estimated edge and its effective sample size,
+    so any such record is an infrastructure failure.
+    """
+
+    try:
+        minimum = max(3, int(minimum_observations))
+    except (TypeError, ValueError, OverflowError):
+        return _unavailable_trade_sample(
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            reason="minimum observations contract is invalid",
+            reason_codes=("MINIMUM_OBSERVATIONS_INVALID",),
+            raw_trade_records=0,
+        )
+    source, source_reason, source_codes = (
+        _validate_trade_evidence_source_contract(source_contract)
+    )
+    if source is None:
+        return _unavailable_trade_sample(
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            reason=source_reason,
+            reason_codes=source_codes,
+            raw_trade_records=(
+                len(trades) if isinstance(trades, (list, tuple)) else 0
+            ),
+            minimum_observations_required=minimum,
+        )
+    if trades is None:
+        rows: Sequence[Any] = ()
+    elif isinstance(trades, (list, tuple)):
+        rows = trades
+    else:
+        return _unavailable_trade_sample(
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            reason="trade records must be a list or tuple",
+            reason_codes=("TRADE_RECORDS_INVALID",),
+            raw_trade_records=0,
+            minimum_observations_required=minimum,
+            source_contract=source,
+        )
+    raw_count = len(rows)
+    if raw_count == 0:
+        return _unavailable_trade_sample(
+            outcome_kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+            reason="strategy produced no trades",
+            reason_codes=("NO_TRADES",),
+            raw_trade_records=0,
+            minimum_observations_required=minimum,
+            source_contract=source,
+        )
+
+    net_r_values: list[float] = []
+    intervals: list[tuple[str, str]] = []
+    for index, trade in enumerate(rows):
+        if not isinstance(trade, Mapping):
+            return _unavailable_trade_sample(
+                outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+                reason=f"trade record {index} is not a mapping",
+                reason_codes=("TRADE_RECORD_INVALID",),
+                raw_trade_records=raw_count,
+                minimum_observations_required=minimum,
+                source_contract=source,
+            )
+        if str(trade.get("trade_record_schema_version") or "") != (
+            REQUIRED_TRADE_RECORD_SCHEMA
+        ):
+            return _unavailable_trade_sample(
+                outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+                reason=f"trade record {index} has a stale or missing schema",
+                reason_codes=("TRADE_RECORD_SCHEMA_MISMATCH",),
+                raw_trade_records=raw_count,
+                minimum_observations_required=minimum,
+                source_contract=source,
+            )
+        try:
+            pnl = _finite_trade_number(
+                trade.get("pnl_dollars"), field_name="pnl_dollars"
+            )
+            risk = _finite_trade_number(
+                trade.get("risk_amount"), field_name="risk_amount"
+            )
+            if risk <= 0.0:
+                raise ValueError("risk_amount must be positive")
+            net_r = pnl / risk
+            if not math.isfinite(net_r):
+                raise ValueError("derived net R is not finite")
+            entry = _utc_interval_timestamp(
+                trade.get("entry_time"), field_name="entry_time"
+            )
+            exit_ = _utc_interval_timestamp(
+                trade.get("exit_time"), field_name="exit_time"
+            )
+            if pd.Timestamp(exit_) < pd.Timestamp(entry):
+                raise ValueError("exit_time precedes entry_time")
+        except (TypeError, ValueError, OverflowError) as exc:
+            return _unavailable_trade_sample(
+                outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+                reason=f"trade record {index} violates net-R contract: {exc}",
+                reason_codes=("MALFORMED_POSITIVE_TRADE_EVIDENCE",),
+                raw_trade_records=raw_count,
+                minimum_observations_required=minimum,
+                source_contract=source,
+            )
+        net_r_values.append(float(net_r))
+        intervals.append((entry, exit_))
+
+    value_hash = _sha256_json([float(value).hex() for value in net_r_values])
+    interval_hash = _sha256_json(intervals)
+    vector = np.asarray(net_r_values, dtype=np.float64)
+    mean_net_r = float(vector.mean())
+    minimum_net_r = float(vector.min())
+    maximum_net_r = float(vector.max())
+    sigma = robust_r_dispersion(net_r_values)
+    dependence = effective_sample_evidence(
+        net_r_values,
+        holding_intervals=intervals,
+        minimum_observations=minimum,
+    )
+    dependence_payload = dependence.to_dict()
+    if not dependence.passed:
+        codes = tuple(dependence.reason_codes)
+        expected = bool(codes) and set(codes).issubset(
+            _EXPECTED_SAMPLE_UNAVAILABLE_CODES
+        )
+        return _unavailable_trade_sample(
+            outcome_kind=(
+                SearchOutcomeKind.EXPECTED_INELIGIBLE
+                if expected
+                else SearchOutcomeKind.INFRA_FAILURE
+            ),
+            reason=dependence.reason,
+            reason_codes=codes or ("TRADE_DEPENDENCE_EVIDENCE_UNAVAILABLE",),
+            raw_trade_records=raw_count,
+            usable_trades=raw_count,
+            minimum_observations_required=minimum,
+            mean_net_r=mean_net_r,
+            sigma_r_robust=sigma,
+            net_r_min=minimum_net_r,
+            net_r_max=maximum_net_r,
+            net_r_values_sha256=value_hash,
+            holding_intervals_sha256=interval_hash,
+            source_contract=source,
+            dependence_evidence=dependence_payload,
+        )
+    if sigma is None:
+        return _unavailable_trade_sample(
+            outcome_kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+            reason="robust net-R dispersion is unavailable",
+            reason_codes=("PILOT_SIGMA_R_UNAVAILABLE",),
+            raw_trade_records=raw_count,
+            usable_trades=raw_count,
+            minimum_observations_required=minimum,
+            mean_net_r=mean_net_r,
+            net_r_min=minimum_net_r,
+            net_r_max=maximum_net_r,
+            net_r_values_sha256=value_hash,
+            holding_intervals_sha256=interval_hash,
+            source_contract=source,
+            dependence_evidence=dependence_payload,
+        )
+    sample_hash = _sample_hash_payload(
+        status="MEASURED",
+        raw_trade_records=raw_count,
+        net_r_values_sha256=value_hash,
+        holding_intervals_sha256=interval_hash,
+        source_contract_sha256=source.source_contract_sha256,
+        reason_codes=(),
+    )
+    return TradeSampleEvidence(
+        status="MEASURED",
+        outcome_kind=SearchOutcomeKind.VALID,
+        reason="strict post-cost net-R effective sample measured",
+        reason_codes=(),
+        raw_trade_records=raw_count,
+        usable_trades=raw_count,
+        minimum_observations_required=minimum,
+        mean_net_r=mean_net_r,
+        sigma_r_robust=float(sigma),
+        effective_trades=float(dependence.effective_observations),
+        net_r_min=minimum_net_r,
+        net_r_max=maximum_net_r,
+        net_r_values_sha256=value_hash,
+        holding_intervals_sha256=interval_hash,
+        sample_sha256=sample_hash,
+        source_contract=source,
+        dependence_evidence=dependence_payload,
+    )
+
+
+def _required_for_partition(
+    requirement: TradePowerRequirement,
+    partition: str,
+) -> Optional[int]:
+    if partition == "optimizer_train":
+        return requirement.required_effective_train_trades
+    if partition == "tuning_validation":
+        return requirement.required_effective_tuning_trades
+    if partition == "final_lockbox":
+        return requirement.required_effective_final_trades
+    return None
+
+
+def _requirement_source_provenance_valid(
+    requirement: TradePowerRequirement,
+) -> bool:
+    admissible = {
+        ("AUTHENTICATED", "AUTHENTICATED_HISTORICAL_RATES"),
+        ("STRESS_APPROVED", "IMMUTABLE_STRESS_APPROVED"),
+        (
+            "AUTHENTICATED_BROKER_DISABLED",
+            "AUTHENTICATED_BROKER_DISABLED",
+        ),
+    }
+    return (
+        requirement.swap_provenance_class,
+        requirement.historical_financing_provenance,
+    ) in admissible
+
+
+def _sample_terminal_decision(
+    sample: TradeSampleEvidence,
+    *,
+    partition: str,
+    requirement: Optional[TradePowerRequirement],
+) -> TradePowerDecision:
+    return TradePowerDecision(
+        status=(
+            "INFRA_FAILURE"
+            if sample.outcome_kind is SearchOutcomeKind.INFRA_FAILURE
+            else "EXPECTED_INELIGIBLE"
+        ),
+        outcome_kind=sample.outcome_kind,
+        partition=partition,
+        reason=sample.reason,
+        reason_codes=sample.reason_codes,
+        observed_effective_trades=float(sample.effective_trades),
+        required_effective_trades=(
+            _required_for_partition(requirement, partition)
+            if requirement is not None
+            else None
+        ),
+        sample_evidence=sample,
+        frozen_requirement=requirement,
+    )
+
+
+def calibrate_train_trade_power(
+    trades: Any,
+    *,
+    effective_trials: Any,
+    policy: TradePowerPolicy,
+    source_contract: Any = None,
+    minimum_observations: int = 8,
+    multiplicity_method: str = "raw_trial_count_conservative_upper_bound_v1",
+) -> TradePowerDecision:
+    """Freeze train-only dispersion and multiplicity, then judge train ESS."""
+
+    sample = build_trade_sample_evidence(
+        trades,
+        source_contract=source_contract,
+        minimum_observations=minimum_observations,
+    )
+    if not sample.passed:
+        return _sample_terminal_decision(
+            sample,
+            partition="optimizer_train",
+            requirement=None,
+        )
+    method = str(multiplicity_method or "").strip()
+    if not method:
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition="optimizer_train",
+            reason="search multiplicity method is missing",
+            reason_codes=("MULTIPLICITY_METHOD_MISSING",),
+            observed_effective_trades=float(sample.effective_trades),
+            required_effective_trades=None,
+            sample_evidence=sample,
+            frozen_requirement=None,
+        )
+    requirement = derive_trade_power_requirement(
+        sigma_r_robust=sample.sigma_r_robust,
+        effective_trials=effective_trials,
+        policy=policy,
+    )
+    if not requirement.passed:
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition="optimizer_train",
+            reason=requirement.reason,
+            reason_codes=requirement.reason_codes,
+            observed_effective_trades=float(sample.effective_trades),
+            required_effective_trades=requirement.required_effective_train_trades,
+            sample_evidence=sample,
+            frozen_requirement=requirement,
+        )
+    requirement = replace(
+        requirement,
+        multiplicity_method=method,
+        calibration_partition="optimizer_train",
+        calibration_sample_sha256=sample.sample_sha256,
+        calibration_source_contract_sha256=(
+            sample.source_contract.source_contract_sha256
+            if sample.source_contract is not None
+            else None
+        ),
+        entry_slippage_contract_version=(
+            sample.source_contract.entry_slippage_contract_version
+            if sample.source_contract is not None
+            else ""
+        ),
+        swap_accrual_contract_version=(
+            sample.source_contract.swap_accrual_contract_version
+            if sample.source_contract is not None
+            else ""
+        ),
+        trade_record_schema_version=(
+            sample.source_contract.trade_record_schema_version
+            if sample.source_contract is not None
+            else ""
+        ),
+        swap_provenance_class=(
+            sample.source_contract.swap_provenance_class
+            if sample.source_contract is not None
+            else ""
+        ),
+        historical_financing_provenance=(
+            sample.source_contract.historical_financing_provenance
+            if sample.source_contract is not None
+            else ""
+        ),
+        frozen=True,
+    )
+    required = requirement.required_effective_train_trades
+    if required is None or sample.effective_trades < float(required):
+        return TradePowerDecision(
+            status="EXPECTED_INELIGIBLE",
+            outcome_kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+            partition="optimizer_train",
+            reason=(
+                f"effective train trades {sample.effective_trades:.6g} < {required}"
+            ),
+            reason_codes=("TRAIN_EFFECTIVE_TRADES_UNDERPOWERED",),
+            observed_effective_trades=float(sample.effective_trades),
+            required_effective_trades=required,
+            sample_evidence=sample,
+            frozen_requirement=requirement,
+        )
+    return TradePowerDecision(
+        status="PASS",
+        outcome_kind=SearchOutcomeKind.VALID,
+        partition="optimizer_train",
+        reason="train effective trades meet the frozen power requirement",
+        reason_codes=(),
+        observed_effective_trades=float(sample.effective_trades),
+        required_effective_trades=required,
+        sample_evidence=sample,
+        frozen_requirement=requirement,
+    )
+
+
+def evaluate_trade_power_partition(
+    trades: Any,
+    *,
+    frozen_requirement: TradePowerRequirement,
+    partition: str,
+    source_contract: Any = None,
+    minimum_observations: int = 8,
+) -> TradePowerDecision:
+    """Judge tuning/final ESS without recalibrating train-frozen thresholds."""
+
+    partition_name = str(partition or "").strip().lower()
+    if partition_name not in _PRODUCTION_PARTITIONS - {"optimizer_train"}:
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="partition must be tuning_validation or final_lockbox",
+            reason_codes=("PARTITION_INVALID",),
+            observed_effective_trades=0.0,
+            required_effective_trades=None,
+            sample_evidence=None,
+            frozen_requirement=(
+                frozen_requirement
+                if isinstance(frozen_requirement, TradePowerRequirement)
+                else None
+            ),
+        )
+    if (
+        not isinstance(frozen_requirement, TradePowerRequirement)
+        or not frozen_requirement.passed
+        or not frozen_requirement.frozen
+        or frozen_requirement.calibration_partition != "optimizer_train"
+        or not frozen_requirement.calibration_sample_sha256
+        or not frozen_requirement.calibration_source_contract_sha256
+        or frozen_requirement.entry_slippage_contract_version
+        != REQUIRED_ENTRY_SLIPPAGE_CONTRACT
+        or frozen_requirement.swap_accrual_contract_version
+        != REQUIRED_SWAP_ACCRUAL_CONTRACT
+        or frozen_requirement.trade_record_schema_version
+        != REQUIRED_TRADE_RECORD_SCHEMA
+        or not _requirement_source_provenance_valid(frozen_requirement)
+    ):
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="trade-power requirement is not an authenticated train-frozen artifact",
+            reason_codes=("FROZEN_REQUIREMENT_INVALID",),
+            observed_effective_trades=0.0,
+            required_effective_trades=None,
+            sample_evidence=None,
+            frozen_requirement=(
+                frozen_requirement
+                if isinstance(frozen_requirement, TradePowerRequirement)
+                else None
+            ),
+        )
+    required = _required_for_partition(frozen_requirement, partition_name)
+    if required is None or int(required) <= 0:
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="frozen partition requirement is missing or nonpositive",
+            reason_codes=("FROZEN_PARTITION_REQUIREMENT_INVALID",),
+            observed_effective_trades=0.0,
+            required_effective_trades=required,
+            sample_evidence=None,
+            frozen_requirement=frozen_requirement,
+        )
+    sample = build_trade_sample_evidence(
+        trades,
+        source_contract=source_contract,
+        minimum_observations=minimum_observations,
+    )
+    if sample.source_contract is None:
+        return _sample_terminal_decision(
+            sample,
+            partition=partition_name,
+            requirement=frozen_requirement,
+        )
+    if (
+        sample.source_contract.source_contract_sha256
+        != frozen_requirement.calibration_source_contract_sha256
+    ):
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="partition source contract differs from train calibration",
+            reason_codes=("SOURCE_CONTRACT_DRIFT",),
+            observed_effective_trades=float(sample.effective_trades),
+            required_effective_trades=required,
+            sample_evidence=sample,
+            frozen_requirement=frozen_requirement,
+        )
+    if not sample.passed:
+        return _sample_terminal_decision(
+            sample,
+            partition=partition_name,
+            requirement=frozen_requirement,
+        )
+    if sample.effective_trades < float(required):
+        return TradePowerDecision(
+            status="EXPECTED_INELIGIBLE",
+            outcome_kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+            partition=partition_name,
+            reason=(
+                f"effective {partition_name} trades "
+                f"{sample.effective_trades:.6g} < {required}"
+            ),
+            reason_codes=("PARTITION_EFFECTIVE_TRADES_UNDERPOWERED",),
+            observed_effective_trades=float(sample.effective_trades),
+            required_effective_trades=required,
+            sample_evidence=sample,
+            frozen_requirement=frozen_requirement,
+        )
+    return TradePowerDecision(
+        status="PASS",
+        outcome_kind=SearchOutcomeKind.VALID,
+        partition=partition_name,
+        reason="partition effective trades meet the train-frozen requirement",
+        reason_codes=(),
+        observed_effective_trades=float(sample.effective_trades),
+        required_effective_trades=required,
+        sample_evidence=sample,
+        frozen_requirement=frozen_requirement,
+    )
+
+
 __all__ = [
+    "REQUIRED_ENTRY_SLIPPAGE_CONTRACT",
+    "REQUIRED_SWAP_ACCRUAL_CONTRACT",
+    "REQUIRED_TRADE_RECORD_SCHEMA",
+    "TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION",
     "TRADE_POWER_SCHEMA_VERSION",
+    "TRADE_POWER_DECISION_SCHEMA_VERSION",
+    "TRADE_SAMPLE_SCHEMA_VERSION",
+    "TradePowerDecision",
+    "TradeEvidenceSourceContract",
     "TradePowerPolicy",
     "TradePowerRequirement",
+    "TradeSampleEvidence",
     "adjusted_alpha",
+    "build_trade_sample_evidence",
+    "calibrate_train_trade_power",
     "derive_trade_power_requirement",
+    "evaluate_trade_power_partition",
     "robust_r_dispersion",
 ]
