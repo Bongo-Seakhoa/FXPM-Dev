@@ -1,8 +1,9 @@
 """Institutional promotion statistics and one-shot lockbox lineage.
 
-All Sharpe-family tests use a dated daily realized-return series. Trade count
-is never substituted for the number of return observations. The functions are
-deterministic and fail closed when alignment, depth, or provenance is absent.
+All Sharpe-family tests use the versioned dated daily net mark-to-market equity
+return series. Trade count is never substituted for return observations. The
+functions are deterministic and fail closed when alignment, depth, or
+provenance is absent.
 """
 
 from __future__ import annotations
@@ -23,7 +24,17 @@ import numpy as np
 from pm_sample_dependence import effective_sample_evidence
 
 
-STATISTICS_CONTRACT_VERSION = "2026-07-10-institutional-promotion-statistics-v1"
+STATISTICS_CONTRACT_VERSION = (
+    "2026-07-13-institutional-promotion-statistics-v3-correlated-dsr"
+)
+DAILY_NET_MTM_CONTRACT_VERSION = "daily_net_mtm_v1"
+DSR_POPULATION_CONTRACT_VERSION = "aligned_validation_dsr_population_v1"
+ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION = "entry_slippage_parity_v1"
+SWAP_ACCRUAL_TIMING_CONTRACT_VERSION = "causal_swap_accrual_v1"
+EXECUTION_COST_TIMING_CONTRACT = {
+    "entry_slippage": ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION,
+    "swap_accrual": SWAP_ACCRUAL_TIMING_CONTRACT_VERSION,
+}
 LOCKBOX_REGISTRY_VERSION = "2026-07-11-nonoverlapping-lockbox-v2"
 _NORMAL = NormalDist()
 _EULER_GAMMA = 0.5772156649015329
@@ -109,31 +120,54 @@ def deflated_sharpe_evidence(
     values: Sequence[float],
     *,
     attempted_trials: int,
+    candidate_id: str = "",
+    population_evidence: Optional[Mapping[str, Any]] = None,
     min_observations: int = 60,
     min_effective_observations: float = 30.0,
     min_dsr: float = 0.95,
 ) -> Dict[str, Any]:
-    """Compute DSR from daily returns, non-normal moments, and actual multiplicity.
+    """Compute DSR using aligned cross-trial daily Sharpe dispersion.
 
-    The expected maximum null Sharpe uses the Bailey/Lopez de Prado extreme-
-    value approximation with the null standard error of a daily Sharpe. This
-    keeps the benchmark and observed Sharpe on the same (daily) clock.
+    The Bailey/Lopez de Prado expected-maximum benchmark is scaled by the
+    observed cross-trial Sharpe standard deviation and the correlation-adjusted
+    effective number of independent frozen validation alternatives. Candidate
+    PSR then uses its own non-normal moments and dependence-adjusted sample.
     """
     moments = return_moments(values)
     count = int(moments["observations"])
     effective = float(moments["effective_observations"])
     trials = max(1, int(attempted_trials or 0))
+    population = dict(population_evidence or {})
     base = {
         "contract_version": STATISTICS_CONTRACT_VERSION,
-        "return_frequency": "daily_realized",
+        "return_frequency": "daily_net_mtm",
         "attempted_trials": trials,
         **moments,
         "minimum_observations": int(min_observations),
         "minimum_effective_observations": float(min_effective_observations),
         "minimum_dsr": float(min_dsr),
+        "execution_cost_timing_contract": dict(EXECUTION_COST_TIMING_CONTRACT),
     }
+    population_ids = [str(value) for value in (population.get("candidate_ids") or [])]
+    population_valid = (
+        str(population.get("contract_version") or "")
+        == DSR_POPULATION_CONTRACT_VERSION
+        and str(population.get("status") or "").upper() == "AVAILABLE"
+        and int(population.get("raw_frozen_candidates", 0) or 0) == trials
+        and bool(candidate_id)
+        and str(candidate_id) in population_ids
+    )
+    if not population_valid:
+        return {
+            **base,
+            "status": "UNAVAILABLE",
+            "passed": False,
+            "reason": "canonical aligned validation DSR population is unavailable",
+            "deflated_sharpe": 0.0,
+            "population_evidence": population,
+        }
     if count < int(min_observations):
-        return {**base, "status": "UNAVAILABLE", "passed": False, "reason": "insufficient daily observations", "deflated_sharpe": 0.0}
+        return {**base, "status": "UNAVAILABLE", "passed": False, "reason": "insufficient daily net-MTM observations", "deflated_sharpe": 0.0}
     if effective < float(min_effective_observations):
         return {**base, "status": "UNAVAILABLE", "passed": False, "reason": "insufficient effective observations", "deflated_sharpe": 0.0}
     sharpe = float(moments["sharpe_daily"])
@@ -142,11 +176,36 @@ def deflated_sharpe_evidence(
     variance_term = 1.0 - skew * sharpe + ((kurtosis - 1.0) / 4.0) * sharpe * sharpe
     if variance_term <= 0.0 or not math.isfinite(variance_term):
         return {**base, "status": "UNAVAILABLE", "passed": False, "reason": "invalid Sharpe variance", "deflated_sharpe": 0.0}
-    null_sigma = 1.0 / math.sqrt(max(effective - 1.0, 1.0))
-    if trials > 1:
-        upper_one = min(1.0 - 1e-12, 1.0 - (1.0 / trials))
-        upper_two = min(1.0 - 1e-12, 1.0 - (1.0 / (trials * math.e)))
-        expected_max = null_sigma * (
+    independent_trials = float(
+        population.get("effective_independent_trials", 0.0) or 0.0
+    )
+    cross_trial_std = float(
+        population.get("cross_trial_sharpe_std_daily", 0.0) or 0.0
+    )
+    if (
+        not math.isfinite(independent_trials)
+        or not 1.0 <= independent_trials <= float(trials)
+        or not math.isfinite(cross_trial_std)
+        or cross_trial_std < 0.0
+    ):
+        return {
+            **base,
+            "status": "UNAVAILABLE",
+            "passed": False,
+            "reason": "canonical DSR population dispersion is invalid",
+            "deflated_sharpe": 0.0,
+            "population_evidence": population,
+        }
+    if independent_trials > 1.0:
+        upper_one = min(
+            1.0 - 1e-12,
+            1.0 - (1.0 / independent_trials),
+        )
+        upper_two = min(
+            1.0 - 1e-12,
+            1.0 - (1.0 / (independent_trials * math.e)),
+        )
+        expected_max = cross_trial_std * (
             (1.0 - _EULER_GAMMA) * _NORMAL.inv_cdf(upper_one)
             + _EULER_GAMMA * _NORMAL.inv_cdf(upper_two)
         )
@@ -164,9 +223,20 @@ def deflated_sharpe_evidence(
         "status": "PASS" if passed else "FAIL",
         "passed": passed,
         "reason": "DSR clears threshold" if passed else "DSR below threshold or non-positive Sharpe",
-        "expected_max_null_sharpe_daily": expected_max,
+        "candidate_id": str(candidate_id),
+        "raw_frozen_candidates": int(trials),
+        "effective_independent_trials": independent_trials,
+        "average_off_diagonal_return_correlation": float(
+            population.get("average_off_diagonal_return_correlation", 0.0) or 0.0
+        ),
+        "cross_trial_sharpe_variance_daily": float(
+            population.get("cross_trial_sharpe_variance_daily", 0.0) or 0.0
+        ),
+        "cross_trial_sharpe_std_daily": cross_trial_std,
+        "expected_max_selection_sharpe_daily": expected_max,
         "sharpe_standard_error": sharpe_se,
         "deflated_sharpe": dsr,
+        "population_contract_version": DSR_POPULATION_CONTRACT_VERSION,
     }
 
 
@@ -245,17 +315,50 @@ def aligned_cell_pbo(
     target = str(regime or "").upper()
     for index, candidate in enumerate(candidates or []):
         metrics = dict((candidate.get("val_regime_metrics") or {}).get(target, {}) or {})
-        raw_returns = list(metrics.get("daily_realized_returns", []) or [])
-        dates = [str(value) for value in (metrics.get("daily_return_dates", []) or [])]
+        contract = dict(metrics.get("daily_net_mtm_contract") or {})
+        swap_contract = dict(contract.get("swap_accrual_contract") or {})
+        swap_status = str(swap_contract.get("status") or "").upper()
+        raw_returns = list(metrics.get("daily_net_mtm_returns", []) or [])
+        dates = [str(value) for value in (metrics.get("daily_net_mtm_dates", []) or [])]
         if not raw_returns and not dates:
-            continue
+            return {
+                "contract_version": STATISTICS_CONTRACT_VERSION,
+                "status": "UNAVAILABLE",
+                "passed": False,
+                "reason": f"candidate {index} is missing its daily-net-MTM surface",
+                "pbo": None,
+            }
+        if (
+            str(contract.get("contract_version") or "")
+            != DAILY_NET_MTM_CONTRACT_VERSION
+            or str(contract.get("status") or "").upper() != "AVAILABLE"
+            or str(contract.get("partition") or "") != "tuning_validation"
+            or str(contract.get("origin") or "")
+            != "backtester_final_post_cost_equity_curve"
+            or dict(contract.get("execution_cost_timing_contract") or {})
+            != EXECUTION_COST_TIMING_CONTRACT
+            or swap_status not in {"AVAILABLE", "DISABLED"}
+            or not bool(swap_contract.get("execution_state_compounding", False))
+            or (
+                swap_status == "AVAILABLE"
+                and str(swap_contract.get("timestamp_source") or "")
+                != "_BAR_CLOSE_TS"
+            )
+        ):
+            return {
+                "contract_version": STATISTICS_CONTRACT_VERSION,
+                "status": "UNAVAILABLE",
+                "passed": False,
+                "reason": f"candidate {index} lacks an admissible validation daily-net-MTM contract",
+                "pbo": None,
+            }
         returns = _finite_returns(raw_returns)
         if returns.size == 0:
             return {
                 "contract_version": STATISTICS_CONTRACT_VERSION,
                 "status": "UNAVAILABLE",
                 "passed": False,
-                "reason": f"candidate {index} has an invalid daily-return vector",
+                "reason": f"candidate {index} has an invalid daily-net-MTM vector",
                 "pbo": None,
             }
         if len(dates) != len(raw_returns) or any(not value.strip() for value in dates):
@@ -263,7 +366,7 @@ def aligned_cell_pbo(
                 "contract_version": STATISTICS_CONTRACT_VERSION,
                 "status": "UNAVAILABLE",
                 "passed": False,
-                "reason": f"candidate {index} daily-return dates do not match its return vector",
+                "reason": f"candidate {index} daily-net-MTM dates do not match its return vector",
                 "pbo": None,
             }
         if len(set(dates)) != len(dates):
@@ -271,26 +374,28 @@ def aligned_cell_pbo(
                 "contract_version": STATISTICS_CONTRACT_VERSION,
                 "status": "UNAVAILABLE",
                 "passed": False,
-                "reason": f"candidate {index} daily-return axis contains duplicate dates",
+                "reason": f"candidate {index} daily-net-MTM axis contains duplicate dates",
                 "pbo": None,
             }
-        evidence = dict(candidate.get("oos_evidence") or {})
-        window = dict(evidence.get("window") or {})
         date_axis_sha256 = hashlib.sha256(
             json.dumps(dates, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         key = (
-            str(candidate.get("timeframe") or evidence.get("timeframe") or ""),
-            str(window.get("start_ts") or dates[0]),
-            str(window.get("end_ts") or dates[-1]),
+            str(candidate.get("timeframe") or contract.get("timeframe") or ""),
+            str(contract.get("scored_start_ts") or dates[0]),
+            str(contract.get("scored_end_ts") or dates[-1]),
             int(returns.size),
             date_axis_sha256,
         )
-        identifier = str(
-            evidence.get("candidate_id")
-            or candidate.get("candidate_id")
-            or f"candidate-{index}"
-        )
+        identifier = str(candidate.get("candidate_id") or "")
+        if not identifier:
+            return {
+                "contract_version": STATISTICS_CONTRACT_VERSION,
+                "status": "UNAVAILABLE",
+                "passed": False,
+                "reason": f"candidate {index} is missing exact-cell identity",
+                "pbo": None,
+            }
         prior = seen_identifiers.get(identifier)
         if prior is not None:
             prior_returns, prior_key = prior
@@ -312,10 +417,10 @@ def aligned_cell_pbo(
     if len(columns) < int(min_candidates):
         return {"contract_version": STATISTICS_CONTRACT_VERSION, "status": "UNAVAILABLE", "passed": False, "reason": f"unique aligned candidates {len(columns)} < {int(min_candidates)}", "pbo": None}
     if len(set(alignment_keys)) != 1 or len({column.size for column in columns}) != 1:
-        return {"contract_version": STATISTICS_CONTRACT_VERSION, "status": "UNAVAILABLE", "passed": False, "reason": "candidate daily-return axes are not identical", "pbo": None}
+        return {"contract_version": STATISTICS_CONTRACT_VERSION, "status": "UNAVAILABLE", "passed": False, "reason": "candidate daily-net-MTM axes are not identical", "pbo": None}
     matrix = np.column_stack(columns)
     if matrix.shape[0] < int(min_observations):
-        return {"contract_version": STATISTICS_CONTRACT_VERSION, "status": "UNAVAILABLE", "passed": False, "reason": f"daily observations {matrix.shape[0]} < {int(min_observations)}", "pbo": None}
+        return {"contract_version": STATISTICS_CONTRACT_VERSION, "status": "UNAVAILABLE", "passed": False, "reason": f"daily net-MTM observations {matrix.shape[0]} < {int(min_observations)}", "pbo": None}
     result = cscv_pbo(matrix, candidate_ids=identifiers, blocks=blocks)
     value = result.get("pbo")
     passed = value is not None and float(value) <= float(max_pbo)
@@ -325,8 +430,187 @@ def aligned_cell_pbo(
         "maximum_pbo": float(max_pbo),
         "passed": bool(passed),
         "status": "PASS" if passed else ("FAIL" if value is not None else "UNAVAILABLE"),
+        "execution_cost_timing_contract": dict(EXECUTION_COST_TIMING_CONTRACT),
     })
     return result
+
+
+def aligned_validation_dsr_population(
+    candidates: Sequence[Mapping[str, Any]],
+    regime: str,
+    *,
+    min_observations: int = 60,
+) -> Dict[str, Any]:
+    """Measure correlated frozen-model multiplicity on one validation axis."""
+    columns: List[np.ndarray] = []
+    identifiers: List[str] = []
+    alignment_keys: List[Tuple[str, str, str, int, str]] = []
+    seen: Dict[str, Tuple[np.ndarray, Tuple[str, str, str, int, str]]] = {}
+    target = str(regime or "").upper()
+    for index, candidate in enumerate(candidates or []):
+        metrics = dict(
+            (candidate.get("val_regime_metrics") or {}).get(target, {}) or {}
+        )
+        contract = dict(metrics.get("daily_net_mtm_contract") or {})
+        swap_contract = dict(contract.get("swap_accrual_contract") or {})
+        swap_status = str(swap_contract.get("status") or "").upper()
+        raw_returns = list(metrics.get("daily_net_mtm_returns", []) or [])
+        dates = [
+            str(value) for value in (metrics.get("daily_net_mtm_dates", []) or [])
+        ]
+        identifier = str(candidate.get("candidate_id") or "")
+        if not identifier:
+            return {
+                "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+                "status": "UNAVAILABLE",
+                "reason": f"candidate {index} is missing exact-cell identity",
+            }
+        if (
+            str(contract.get("contract_version") or "")
+            != DAILY_NET_MTM_CONTRACT_VERSION
+            or str(contract.get("status") or "").upper() != "AVAILABLE"
+            or str(contract.get("partition") or "") != "tuning_validation"
+            or str(contract.get("origin") or "")
+            != "backtester_final_post_cost_equity_curve"
+            or dict(contract.get("execution_cost_timing_contract") or {})
+            != EXECUTION_COST_TIMING_CONTRACT
+            or swap_status not in {"AVAILABLE", "DISABLED"}
+            or not bool(swap_contract.get("execution_state_compounding", False))
+            or (
+                swap_status == "AVAILABLE"
+                and str(swap_contract.get("timestamp_source") or "")
+                != "_BAR_CLOSE_TS"
+            )
+        ):
+            return {
+                "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+                "status": "UNAVAILABLE",
+                "reason": f"candidate {index} lacks admissible validation daily-net-MTM",
+            }
+        returns = _finite_returns(raw_returns)
+        if (
+            returns.size == 0
+            or len(dates) != len(raw_returns)
+            or len(dates) != len(set(dates))
+            or any(not value.strip() for value in dates)
+        ):
+            return {
+                "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+                "status": "UNAVAILABLE",
+                "reason": f"candidate {index} daily-net-MTM vector/axis is invalid",
+            }
+        date_axis_sha256 = hashlib.sha256(
+            json.dumps(
+                dates,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        key = (
+            str(candidate.get("timeframe") or contract.get("timeframe") or ""),
+            str(contract.get("scored_start_ts") or dates[0]),
+            str(contract.get("scored_end_ts") or dates[-1]),
+            int(returns.size),
+            date_axis_sha256,
+        )
+        prior = seen.get(identifier)
+        if prior is not None:
+            if prior[1] != key or not np.array_equal(prior[0], returns):
+                return {
+                    "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+                    "status": "UNAVAILABLE",
+                    "reason": f"duplicate candidate id {identifier!r} conflicts",
+                }
+            continue
+        seen[identifier] = (returns.copy(), key)
+        identifiers.append(identifier)
+        columns.append(returns)
+        alignment_keys.append(key)
+    raw_count = len(columns)
+    if raw_count < 2:
+        return {
+            "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+            "status": "UNAVAILABLE",
+            "reason": "cross-trial Sharpe dispersion requires at least two frozen models",
+            "raw_frozen_candidates": raw_count,
+        }
+    if len(set(alignment_keys)) != 1 or len({column.size for column in columns}) != 1:
+        return {
+            "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+            "status": "UNAVAILABLE",
+            "reason": "candidate daily-net-MTM axes are not identical",
+            "raw_frozen_candidates": raw_count,
+        }
+    matrix = np.column_stack(columns)
+    if matrix.shape[0] < int(min_observations):
+        return {
+            "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+            "status": "UNAVAILABLE",
+            "reason": (
+                f"daily net-MTM observations {matrix.shape[0]} < "
+                f"{int(min_observations)}"
+            ),
+            "raw_frozen_candidates": raw_count,
+        }
+    correlation = np.eye(raw_count, dtype=np.float64)
+    for left in range(raw_count):
+        left_values = matrix[:, left]
+        left_constant = bool(np.std(left_values, ddof=0) <= 1e-18)
+        for right in range(left + 1, raw_count):
+            right_values = matrix[:, right]
+            right_constant = bool(np.std(right_values, ddof=0) <= 1e-18)
+            if left_constant or right_constant:
+                value = (
+                    1.0
+                    if left_constant
+                    and right_constant
+                    and np.array_equal(left_values, right_values)
+                    else 0.0
+                )
+            else:
+                value = float(np.corrcoef(left_values, right_values)[0, 1])
+            if not math.isfinite(value):
+                return {
+                    "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+                    "status": "UNAVAILABLE",
+                    "reason": "cross-trial return correlation is non-finite",
+                    "raw_frozen_candidates": raw_count,
+                }
+            correlation[left, right] = value
+            correlation[right, left] = value
+    off_diagonal = correlation[np.triu_indices(raw_count, k=1)]
+    average_correlation = float(np.mean(off_diagonal))
+    average_correlation = max(-1.0, min(1.0, average_correlation))
+    independent_trials = 1.0 + (raw_count - 1.0) * (1.0 - average_correlation)
+    independent_trials = max(1.0, min(float(raw_count), independent_trials))
+    sharpe_estimates = _performance(matrix)
+    if not np.isfinite(sharpe_estimates).all():
+        return {
+            "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+            "status": "UNAVAILABLE",
+            "reason": "cross-trial Sharpe estimates are non-finite",
+            "raw_frozen_candidates": raw_count,
+        }
+    cross_trial_variance = float(np.var(sharpe_estimates, ddof=1))
+    cross_trial_std = math.sqrt(max(0.0, cross_trial_variance))
+    return {
+        "contract_version": DSR_POPULATION_CONTRACT_VERSION,
+        "status": "AVAILABLE",
+        "population_contract": (
+            "predeclared_train_eligible_frozen_validation_roster_v1"
+        ),
+        "candidate_ids": identifiers,
+        "raw_frozen_candidates": int(raw_count),
+        "observations": int(matrix.shape[0]),
+        "average_off_diagonal_return_correlation": average_correlation,
+        "effective_independent_trials": independent_trials,
+        "cross_trial_sharpe_variance_daily": cross_trial_variance,
+        "cross_trial_sharpe_std_daily": cross_trial_std,
+        "trial_sharpe_daily": [float(value) for value in sharpe_estimates.tolist()],
+        "alignment": "exact_regime_identical_daily_axis",
+        "alignment_key": list(alignment_keys[0]),
+        "execution_cost_timing_contract": dict(EXECUTION_COST_TIMING_CONTRACT),
+    }
 
 
 def _max_drawdown_fraction(returns: np.ndarray) -> float:
@@ -364,9 +648,10 @@ def block_bootstrap_evidence(
     effective = effective_sample_size(array)
     base = {
         "contract_version": STATISTICS_CONTRACT_VERSION,
-        "return_frequency": "daily_realized",
+        "return_frequency": "daily_net_mtm",
         "observations": count,
         "effective_observations": effective,
+        "execution_cost_timing_contract": dict(EXECUTION_COST_TIMING_CONTRACT),
     }
     if count < int(min_observations) or effective < float(min_effective_observations):
         return {**base, "status": "UNAVAILABLE", "passed": False, "reason": "insufficient daily/effective observations"}

@@ -7,8 +7,11 @@ import numpy as np
 import pytest
 
 from pm_statistics import (
+    DAILY_NET_MTM_CONTRACT_VERSION,
+    EXECUTION_COST_TIMING_CONTRACT,
     LockboxAccessRegistry,
     aligned_cell_pbo,
+    aligned_validation_dsr_population,
     block_bootstrap_evidence,
     deflated_sharpe_evidence,
     effective_sample_size,
@@ -20,14 +23,16 @@ def test_dsr_uses_daily_observations_actual_trials_and_non_normal_moments():
     strong = rng.normal(0.0020, 0.0040, size=756)
     result = deflated_sharpe_evidence(
         strong,
-        attempted_trials=500,
+        attempted_trials=5,
+        candidate_id="candidate-0",
+        population_evidence=_dsr_population(strong, count=5),
         min_observations=252,
         min_effective_observations=60,
         min_dsr=0.95,
     )
-    assert result["return_frequency"] == "daily_realized"
+    assert result["return_frequency"] == "daily_net_mtm"
     assert result["observations"] == 756
-    assert result["attempted_trials"] == 500
+    assert result["attempted_trials"] == 5
     assert result["kurtosis"] > 0.0
     assert result["status"] == "PASS"
     assert result["deflated_sharpe"] >= 0.95
@@ -38,14 +43,22 @@ def test_dsr_fails_closed_for_noise_or_insufficient_history():
     noise = rng.normal(0.0, 0.01, size=756)
     noisy = deflated_sharpe_evidence(
         noise,
-        attempted_trials=1000,
+        attempted_trials=5,
+        candidate_id="candidate-0",
+        population_evidence=_dsr_population(noise, count=5),
         min_observations=252,
         min_effective_observations=60,
         min_dsr=0.95,
     )
     short = deflated_sharpe_evidence(
         noise[:30],
-        attempted_trials=1,
+        attempted_trials=5,
+        candidate_id="candidate-0",
+        population_evidence=_dsr_population(
+            noise[:30],
+            count=5,
+            min_observations=2,
+        ),
         min_observations=252,
     )
     assert noisy["status"] == "FAIL"
@@ -59,16 +72,60 @@ def _candidate(column, dates, index):
         "strategy_name": f"S{index}",
         "val_regime_metrics": {
             "TREND": {
-                "daily_realized_returns": column.tolist(),
-                "daily_return_dates": dates,
+                "daily_net_mtm_returns": column.tolist(),
+                "daily_net_mtm_dates": list(dates),
+                "daily_net_mtm_contract": {
+                    "contract_version": DAILY_NET_MTM_CONTRACT_VERSION,
+                    "status": "AVAILABLE",
+                    "origin": "backtester_final_post_cost_equity_curve",
+                    "partition": "tuning_validation",
+                    "timeframe": "H1",
+                    "scored_start_ts": dates[0],
+                    "scored_end_ts": dates[-1],
+                    "observations": len(dates),
+                    "execution_cost_timing_contract": dict(
+                        EXECUTION_COST_TIMING_CONTRACT
+                    ),
+                    "swap_accrual_contract": {
+                        "status": "AVAILABLE",
+                        "provenance_status": "AUTHENTICATED",
+                        "execution_state_compounding": True,
+                        "timestamp_source": "_BAR_CLOSE_TS",
+                        "source_provenance_authenticated": True,
+                        "historical_rates_authenticated": True,
+                        "historical_rates_sha256": "8" * 64,
+                        "price_activation_manifest_sha256": "1" * 64,
+                        "terms_activation_manifest_sha256": "2" * 64,
+                        "terms_snapshot_sha256": "3" * 64,
+                        "schedule_sha256": "4" * 64,
+                        "target_bars_sha256": "5" * 64,
+                        "target_sidecar_sha256": "6" * 64,
+                        "projection_sha256": "7" * 64,
+                    },
+                },
             }
         },
-        "oos_evidence": {
-            "candidate_id": f"candidate-{index}",
-            "timeframe": "H1",
-            "window": {"start_ts": dates[0], "end_ts": dates[-1]},
-        },
+        "candidate_id": f"candidate-{index}",
+        "timeframe": "H1",
     }
+
+
+def _dsr_population(values, *, count: int, min_observations: int = 60):
+    base = np.asarray(values, dtype=np.float64)
+    rng = np.random.default_rng(700 + len(base) + count)
+    dates = [f"day-{index:04d}" for index in range(len(base))]
+    columns = [base]
+    for index in range(1, count):
+        columns.append(base + rng.normal(0.0, 0.001 * index, size=len(base)))
+    candidates = [
+        _candidate(column, dates, index)
+        for index, column in enumerate(columns)
+    ]
+    return aligned_validation_dsr_population(
+        candidates,
+        "TREND",
+        min_observations=min_observations,
+    )
 
 
 def test_aligned_exact_regime_pbo_passes_persistent_edge():
@@ -91,13 +148,34 @@ def test_aligned_exact_regime_pbo_passes_persistent_edge():
     assert result["pbo"] <= 0.50
 
 
+def test_correlated_dsr_population_retains_flat_frozen_validation_loser():
+    rng = np.random.default_rng(131)
+    observations = 300
+    matrix = rng.normal(0.001, 0.01, size=(observations, 5))
+    matrix[:, -1] = 0.0
+    dates = [f"day-{index:03d}" for index in range(observations)]
+    candidates = [_candidate(matrix[:, index], dates, index) for index in range(5)]
+
+    population = aligned_validation_dsr_population(
+        candidates,
+        "TREND",
+        min_observations=252,
+    )
+
+    assert population["status"] == "AVAILABLE"
+    assert population["raw_frozen_candidates"] == 5
+    assert len(population["candidate_ids"]) == 5
+    assert np.isfinite(population["average_off_diagonal_return_correlation"])
+    assert 1.0 <= population["effective_independent_trials"] <= 5.0
+    assert population["trial_sharpe_daily"][-1] == 0.0
+
+
 def test_pbo_rejects_misaligned_candidate_axis():
     rng = np.random.default_rng(17)
     matrix = rng.normal(0.0, 0.01, size=(300, 5))
     dates = [str(index) for index in range(300)]
     candidates = [_candidate(matrix[:, index], dates, index) for index in range(5)]
-    candidates[-1]["val_regime_metrics"]["TREND"]["daily_return_dates"][-1] = "different"
-    candidates[-1]["oos_evidence"]["window"]["end_ts"] = "different"
+    candidates[-1]["val_regime_metrics"]["TREND"]["daily_net_mtm_dates"][-1] = "different"
     result = aligned_cell_pbo(candidates, "TREND", min_candidates=5, min_observations=60)
     assert result["status"] == "UNAVAILABLE"
     assert not result["passed"]
@@ -109,8 +187,8 @@ def test_pbo_rejects_interior_calendar_mismatch_with_same_endpoints_and_count():
     matrix = rng.normal(0.0, 0.01, size=(300, 5))
     dates = [f"day-{index:03d}" for index in range(300)]
     candidates = [_candidate(matrix[:, index], dates, index) for index in range(5)]
-    candidates[-1]["val_regime_metrics"]["TREND"]["daily_return_dates"] = list(dates)
-    candidates[-1]["val_regime_metrics"]["TREND"]["daily_return_dates"][150] = "different-interior-day"
+    candidates[-1]["val_regime_metrics"]["TREND"]["daily_net_mtm_dates"] = list(dates)
+    candidates[-1]["val_regime_metrics"]["TREND"]["daily_net_mtm_dates"][150] = "different-interior-day"
 
     result = aligned_cell_pbo(candidates, "TREND", min_candidates=5, min_observations=60)
 
@@ -133,13 +211,53 @@ def test_pbo_counts_unique_effective_candidate_ids_only():
     assert "unique aligned candidates 4 < 5" in result["reason"]
 
 
+def test_pbo_fails_closed_when_passed_candidate_is_missing_daily_surface():
+    rng = np.random.default_rng(191)
+    matrix = rng.normal(0.0, 0.01, size=(300, 5))
+    dates = [f"day-{index:03d}" for index in range(300)]
+    candidates = [_candidate(matrix[:, index], dates, index) for index in range(5)]
+    candidates[-1]["val_regime_metrics"]["TREND"] = {}
+
+    result = aligned_cell_pbo(
+        candidates,
+        "TREND",
+        min_candidates=5,
+        min_observations=60,
+    )
+
+    assert result["status"] == "UNAVAILABLE"
+    assert not result["passed"]
+    assert "missing its daily-net-MTM surface" in result["reason"]
+
+
+def test_pbo_requires_export_independent_exact_cell_identity():
+    rng = np.random.default_rng(192)
+    matrix = rng.normal(0.0, 0.01, size=(300, 5))
+    dates = [f"day-{index:03d}" for index in range(300)]
+    candidates = [_candidate(matrix[:, index], dates, index) for index in range(5)]
+    candidates[-1].pop("candidate_id")
+
+    result = aligned_cell_pbo(
+        candidates,
+        "TREND",
+        min_candidates=5,
+        min_observations=60,
+    )
+
+    assert result["status"] == "UNAVAILABLE"
+    assert not result["passed"]
+    assert "missing exact-cell identity" in result["reason"]
+
+
 def test_dsr_and_bootstrap_do_not_silently_drop_ruin_or_nan_observations():
     rng = np.random.default_rng(20)
     corrupted = rng.normal(0.0025, 0.0020, size=500)
     corrupted[100] = -1.0
     dsr = deflated_sharpe_evidence(
         corrupted,
-        attempted_trials=10,
+        attempted_trials=5,
+        candidate_id="candidate-0",
+        population_evidence=_dsr_population(corrupted, count=5),
         min_observations=252,
         min_effective_observations=60,
     )

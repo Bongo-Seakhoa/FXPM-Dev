@@ -74,9 +74,14 @@ from pm_order_governance import candidate_policy_names, make_policy, policy_name
 from pm_fairness_audit import build_fairness_evidence, build_fairness_report
 from pm_regime_audit import audit_regime_profitability
 from pm_statistics import (
+    DAILY_NET_MTM_CONTRACT_VERSION,
+    ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION,
+    EXECUTION_COST_TIMING_CONTRACT,
     LockboxAccessRegistry,
     STATISTICS_CONTRACT_VERSION,
+    SWAP_ACCRUAL_TIMING_CONTRACT_VERSION,
     aligned_cell_pbo,
+    aligned_validation_dsr_population,
     block_bootstrap_evidence,
     deflated_sharpe_evidence,
 )
@@ -423,6 +428,12 @@ def build_artifact_meta(config: PipelineConfig,
         ),
         "false_discovery_symbol_count": int(getattr(config, "false_discovery_symbol_count", 0) or 0),
         "statistics_contract_version": STATISTICS_CONTRACT_VERSION,
+        "entry_slippage_timing_contract_version": (
+            ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION
+        ),
+        "swap_accrual_timing_contract_version": (
+            SWAP_ACCRUAL_TIMING_CONTRACT_VERSION
+        ),
         "false_discovery_min_daily_observations": int(
             getattr(config, "false_discovery_min_daily_observations", 252) or 252
         ),
@@ -752,7 +763,7 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                 ).upper()
                 if dsr_status != "PASS" or dsr < min_dsr:
                     false_discovery_reasons.append(
-                        f"false-discovery daily-return DSR {dsr_status} {dsr:.4f} < {min_dsr:.4f}"
+                        f"false-discovery daily-net-MTM DSR {dsr_status} {dsr:.4f} < {min_dsr:.4f}"
                     )
                 pbo_status = str(false_discovery.get("pbo_status", "unavailable")).upper()
                 if pbo_status != "PASS":
@@ -3012,6 +3023,141 @@ class RegimeOptimizer:
         return next(iter(metric_regimes)) if len(metric_regimes) == 1 else ""
 
     @staticmethod
+    def _exact_cell_candidate_id(
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        candidate: Mapping[str, Any],
+    ) -> str:
+        """Return export-independent identity for one frozen exact-cell model."""
+        return _stable_hash({
+            "symbol": str(symbol or "").upper(),
+            "timeframe": str(timeframe or "").upper(),
+            "regime": str(regime or "").upper(),
+            "strategy_name": str(candidate.get("strategy_name", "Unknown")),
+            "parameters": RegimeOptimizer._clean_candidate_params(
+                candidate.get("params", {})
+            ),
+        })
+
+    @staticmethod
+    def _sha256_attestation(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        return len(text) == 64 and all(
+            character in "0123456789abcdef" for character in text
+        )
+
+    @classmethod
+    def _admissible_swap_statistical_source(
+        cls,
+        swap_contract: Mapping[str, Any],
+    ) -> bool:
+        """Accept only immutable, hash-bound financing evidence."""
+        contract = dict(swap_contract or {})
+        status = str(contract.get("status") or "").upper()
+        provenance = str(contract.get("provenance_status") or "").upper()
+        if status == "DISABLED":
+            return (
+                provenance == "AUTHENTICATED"
+                and bool(contract.get("source_provenance_authenticated", False))
+                and bool(
+                    contract.get("broker_swap_disabled_authenticated", False)
+                )
+                and cls._sha256_attestation(
+                    contract.get("broker_disabled_proof_sha256")
+                )
+            )
+        if status != "AVAILABLE":
+            return False
+        required_bindings = (
+            "price_activation_manifest_sha256",
+            "terms_activation_manifest_sha256",
+            "terms_snapshot_sha256",
+            "schedule_sha256",
+            "target_bars_sha256",
+            "target_sidecar_sha256",
+            "projection_sha256",
+        )
+        if not all(
+            cls._sha256_attestation(contract.get(name))
+            for name in required_bindings
+        ):
+            return False
+        if provenance == "AUTHENTICATED":
+            return (
+                bool(contract.get("source_provenance_authenticated", False))
+                and bool(
+                    contract.get("historical_rates_authenticated", False)
+                )
+                and cls._sha256_attestation(
+                    contract.get("historical_rates_sha256")
+                )
+            )
+        if provenance == "STRESS_APPROVED":
+            return (
+                bool(
+                    contract.get(
+                        "stress_policy_explicitly_approved", False
+                    )
+                )
+                and bool(contract.get("stress_policy_immutable", False))
+                and cls._sha256_attestation(
+                    contract.get("stress_policy_sha256")
+                )
+            )
+        return False
+
+    @staticmethod
+    def _admissible_validation_daily_net_mtm(
+        metrics: Mapping[str, Any],
+    ) -> Tuple[List[float], List[str]]:
+        """Read only the versioned tuning-validation daily MTM surface."""
+        contract = dict(metrics.get("daily_net_mtm_contract") or {})
+        swap_contract = dict(contract.get("swap_accrual_contract") or {})
+        swap_status = str(swap_contract.get("status") or "").upper()
+        swap_source_admissible = (
+            RegimeOptimizer._admissible_swap_statistical_source(
+                swap_contract
+            )
+        )
+        if (
+            str(contract.get("contract_version") or "")
+            != DAILY_NET_MTM_CONTRACT_VERSION
+            or str(contract.get("status") or "").upper() != "AVAILABLE"
+            or str(contract.get("partition") or "") != "tuning_validation"
+            or str(contract.get("origin") or "")
+            != "backtester_final_post_cost_equity_curve"
+            or bool(contract.get("uses_final_lockbox", False))
+            or dict(contract.get("execution_cost_timing_contract") or {})
+            != EXECUTION_COST_TIMING_CONTRACT
+            or swap_status not in {"AVAILABLE", "DISABLED"}
+            or not swap_source_admissible
+            or not bool(swap_contract.get("execution_state_compounding", False))
+            or (
+                swap_status == "AVAILABLE"
+                and str(swap_contract.get("timestamp_source") or "")
+                != "_BAR_CLOSE_TS"
+            )
+        ):
+            return [], []
+        raw_returns = list(metrics.get("daily_net_mtm_returns", []) or [])
+        dates = [str(value) for value in (metrics.get("daily_net_mtm_dates", []) or [])]
+        if (
+            not raw_returns
+            or len(raw_returns) != len(dates)
+            or len(dates) != len(set(dates))
+            or int(contract.get("observations", -1) or -1) != len(raw_returns)
+        ):
+            return [], []
+        try:
+            returns = np.asarray(raw_returns, dtype=np.float64)
+        except Exception:
+            return [], []
+        if not np.isfinite(returns).all() or bool((returns <= -1.0).any()):
+            return [], []
+        return [float(value) for value in returns.tolist()], dates
+
+    @staticmethod
     def _compact_backtest_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Keep scalar metrics only after trades were bucketed."""
         if not isinstance(result, dict):
@@ -3283,14 +3429,12 @@ class RegimeOptimizer:
         params = self._clean_candidate_params(candidate.get("params", {}))
         strategy_name = str(candidate.get("strategy_name", "Unknown"))
         evaluation_regime = self._candidate_evaluation_regime(candidate)
-        candidate_key = {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "regime": evaluation_regime,
-            "strategy_name": strategy_name,
-            "parameters": params,
-        }
-        candidate_id = _stable_hash(candidate_key)
+        candidate_id = self._exact_cell_candidate_id(
+            symbol,
+            timeframe,
+            evaluation_regime,
+            {**candidate, "strategy_name": strategy_name, "params": params},
+        )
         start_ts = None
         end_ts = None
         try:
@@ -3821,6 +3965,218 @@ class RegimeOptimizer:
         compact["evaluation_regime"] = str(regime)
         return compact
 
+    def _build_daily_net_mtm_surface(
+        self,
+        *,
+        result: Dict[str, Any],
+        features: pd.DataFrame,
+        timeframe: str,
+        warmup_bars: int,
+        partition: str,
+    ) -> Dict[str, Any]:
+        """Build one dated UTC-daily surface from final post-cost equity marks."""
+        partition_name = str(partition or "").strip().lower() or "unspecified"
+        attested_cost_contract = dict(
+            result.get("execution_cost_timing_contract") or {}
+        )
+        swap_accrual_contract = dict(result.get("swap_accrual_contract") or {})
+        timestamp_source = (
+            "_BAR_CLOSE_TS"
+            if isinstance(features, pd.DataFrame)
+            and "_BAR_CLOSE_TS" in features.columns
+            else "feature_index_utc"
+        )
+        contract: Dict[str, Any] = {
+            "contract_version": DAILY_NET_MTM_CONTRACT_VERSION,
+            "status": "UNAVAILABLE",
+            "origin": "backtester_final_post_cost_equity_curve",
+            "partition": partition_name,
+            "timeframe": str(timeframe or "").upper(),
+            "timezone": "UTC",
+            "timestamp_source": timestamp_source,
+            "timestamp_axis_contract": "explicit_observable_bar_close_v1",
+            "daily_mark": "last_available_bar_mark_per_utc_date",
+            "return_type": "simple_net_equity_return",
+            "includes_zero_return_active_days": True,
+            "cost_contract": {
+                "spread_slippage_commission": "already_in_equity_curve",
+                "entry_slippage": ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION,
+                "swap_accrual": SWAP_ACCRUAL_TIMING_CONTRACT_VERSION,
+                "swap": "already_in_equity_curve_causal_rollover_accrual",
+            },
+            "execution_cost_timing_contract": dict(attested_cost_contract),
+            "swap_accrual_contract": dict(swap_accrual_contract),
+            "uses_final_lockbox": partition_name == "final_lockbox",
+            "required_execution_cost_timing_contract": dict(
+                EXECUTION_COST_TIMING_CONTRACT
+            ),
+        }
+
+        def unavailable(reason: str) -> Dict[str, Any]:
+            return {
+                "daily_net_mtm_returns": [],
+                "daily_net_mtm_dates": [],
+                "daily_net_mtm_observations": 0,
+                "daily_net_mtm_contract": {
+                    **contract,
+                    "reason": str(reason),
+                },
+            }
+
+        allowed_partitions = {
+            "optimizer_train",
+            "tuning_validation",
+            "final_lockbox",
+            "edge_challenger_fit",
+        }
+        if partition_name not in allowed_partitions:
+            return unavailable("partition contract is unspecified or unsupported")
+        if not isinstance(features, pd.DataFrame) or len(features) == 0:
+            return unavailable("feature frame is empty")
+        if timestamp_source != "_BAR_CLOSE_TS":
+            return unavailable(
+                "explicit observable _BAR_CLOSE_TS is required for causal post-close marks"
+            )
+        if attested_cost_contract != EXECUTION_COST_TIMING_CONTRACT:
+            return unavailable(
+                "Backtester result does not attest the required execution-cost timing contract"
+            )
+        swap_enabled = bool(getattr(self.config, "swap_model_enabled", True))
+        required_swap_status = "AVAILABLE" if swap_enabled else "DISABLED"
+        observed_swap_status = str(
+            swap_accrual_contract.get("status") or ""
+        ).upper()
+        if (
+            not bool(
+                swap_accrual_contract.get("execution_state_compounding", False)
+            )
+            or (
+                swap_enabled
+                and str(swap_accrual_contract.get("timestamp_source") or "")
+                != "_BAR_CLOSE_TS"
+            )
+        ):
+            return unavailable(
+                "Backtester swap accrual attestation is not causal on the explicit close axis"
+            )
+        if observed_swap_status != required_swap_status:
+            return unavailable(
+                "Backtester swap source contract is unavailable: "
+                + str(
+                    swap_accrual_contract.get("reason")
+                    or f"expected {required_swap_status}, observed {observed_swap_status}"
+                )
+            )
+        if swap_enabled and not self._admissible_swap_statistical_source(
+            swap_accrual_contract
+        ):
+            return unavailable(
+                "Backtester swap schedule/rate history lacks authenticated "
+                "source provenance or an explicitly approved immutable stress policy"
+            )
+        if not swap_enabled and not self._admissible_swap_statistical_source(
+            swap_accrual_contract
+        ):
+            return unavailable(
+                "Configured swap disablement is not authenticated proof that "
+                "the broker charges no financing"
+            )
+        try:
+            if timestamp_source == "_BAR_CLOSE_TS":
+                timestamps = pd.DatetimeIndex(
+                    pd.to_datetime(features["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+                )
+                bar_opens = pd.DatetimeIndex(
+                    pd.to_datetime(features.index, utc=True, errors="coerce")
+                )
+            else:
+                timestamps = pd.DatetimeIndex(
+                    pd.to_datetime(features.index, utc=True, errors="coerce")
+                )
+                bar_opens = timestamps
+        except Exception as exc:
+            return unavailable(f"timestamp conversion failed: {type(exc).__name__}")
+        if len(timestamps) != len(features) or timestamps.isna().any():
+            return unavailable("timestamp axis is incomplete")
+        if timestamps.has_duplicates:
+            return unavailable("timestamp axis contains duplicates")
+        if not timestamps.is_monotonic_increasing:
+            return unavailable("timestamp axis is not monotonic increasing")
+        if (
+            timestamp_source == "_BAR_CLOSE_TS"
+            and (
+                len(bar_opens) != len(timestamps)
+                or bar_opens.isna().any()
+                or bool((timestamps <= bar_opens).any())
+            )
+        ):
+            return unavailable("explicit bar-close timestamps are invalid")
+
+        try:
+            equity = np.asarray(result.get("equity_curve"), dtype=np.float64)
+        except Exception:
+            return unavailable("equity curve is non-numeric")
+        if equity.ndim != 1 or equity.size != len(features):
+            return unavailable(
+                f"equity/features length mismatch: {int(equity.size)} != {len(features)}"
+            )
+        if not np.isfinite(equity).all():
+            return unavailable("equity curve contains non-finite marks")
+
+        scored_start = max(0, int(warmup_bars or 0))
+        if scored_start >= len(features):
+            return unavailable("warmup consumes the complete partition")
+        baseline = (
+            float(getattr(self.config, "initial_capital", 10000.0))
+            if scored_start == 0
+            else float(equity[scored_start - 1])
+        )
+        if not math.isfinite(baseline) or baseline <= 0.0:
+            return unavailable("baseline equity is non-positive or non-finite")
+
+        scored_timestamps = timestamps[scored_start:]
+        scored_equity = equity[scored_start:]
+        marks = pd.Series(scored_equity, index=scored_timestamps, dtype=float)
+        daily_marks = marks.groupby(marks.index.normalize(), sort=True).last()
+        if daily_marks.empty:
+            return unavailable("no scored UTC-daily marks")
+        previous = np.concatenate(
+            ([baseline], daily_marks.to_numpy(dtype=np.float64)[:-1])
+        )
+        if not np.isfinite(previous).all() or bool((previous <= 0.0).any()):
+            return unavailable("daily return denominator is non-positive or non-finite")
+        returns = daily_marks.to_numpy(dtype=np.float64) / previous - 1.0
+        if (
+            not np.isfinite(returns).all()
+            or bool((returns <= -1.0).any())
+        ):
+            return unavailable("daily return vector contains ruin or non-finite values")
+        dates = [pd.Timestamp(value).isoformat() for value in daily_marks.index]
+        if len(dates) != len(set(dates)):
+            return unavailable("daily return axis contains duplicates")
+
+        return {
+            "daily_net_mtm_returns": [float(value) for value in returns.tolist()],
+            "daily_net_mtm_dates": dates,
+            "daily_net_mtm_observations": int(len(returns)),
+            "daily_net_mtm_contract": {
+                **contract,
+                "status": "AVAILABLE",
+                "reason": "final post-cost equity curve aggregated on UTC active days",
+                "scored_start_bar": int(scored_start),
+                "warmup_bars_excluded": int(scored_start),
+                "baseline_equity": baseline,
+                "scored_start_ts": pd.Timestamp(scored_timestamps[0]).isoformat(),
+                "scored_end_ts": pd.Timestamp(scored_timestamps[-1]).isoformat(),
+                "daily_axis_start": dates[0],
+                "daily_axis_end": dates[-1],
+                "observations": int(len(returns)),
+                "zero_return_days": int(np.count_nonzero(np.abs(returns) <= 1e-15)),
+                "equity_curve_points": int(equity.size),
+                "trade_count": int(result.get("total_trades", 0) or 0),
+            },
+        }
+
     def _run_one_exact_regime(
         self,
         *,
@@ -3831,6 +4187,7 @@ class RegimeOptimizer:
         regime: str,
         warmup_bars: int = 0,
         run_zero_signal_path: bool = False,
+        partition: str = "unspecified",
     ) -> Tuple[Dict[str, Any], bool]:
         """Run one exact-regime cell and report whether Backtester.run executed."""
         raw_signals = strategy.generate_signals(features, symbol)
@@ -3851,7 +4208,17 @@ class RegimeOptimizer:
             warmup_bars=warmup,
             timeframe=timeframe,
         )
-        return self._compact_exact_regime_result(result, regime), True
+        compact = self._compact_exact_regime_result(result, regime)
+        compact.update(
+            self._build_daily_net_mtm_surface(
+                result=result,
+                features=features,
+                timeframe=timeframe,
+                warmup_bars=warmup,
+                partition=partition,
+            )
+        )
+        return compact, True
 
     def _run_exact_regime_screening(
         self,
@@ -3993,6 +4360,7 @@ class RegimeOptimizer:
                             strategy=probe_strategy,
                             regime=regime,
                             warmup_bars=train_warmup_bars,
+                            partition="optimizer_train",
                         )
                         completed_trials += int(ran)
                         if int(metrics.get("total_trades", 0) or 0) <= 0:
@@ -4010,6 +4378,16 @@ class RegimeOptimizer:
                                 "strategy": probe_strategy,
                                 "strategy_name": probe_strategy.name,
                                 "params": clean_params,
+                                "timeframe": str(timeframe).upper(),
+                                "candidate_id": self._exact_cell_candidate_id(
+                                    symbol,
+                                    timeframe,
+                                    regime,
+                                    {
+                                        "strategy_name": probe_strategy.name,
+                                        "params": clean_params,
+                                    },
+                                ),
                                 "train_result": dict(metrics),
                                 "train_regime_metrics": {regime: dict(metrics)},
                                 "eligibility_result": dict(metrics),
@@ -4092,6 +4470,7 @@ class RegimeOptimizer:
                         regime=regime,
                         warmup_bars=val_warmup_bars,
                         run_zero_signal_path=True,
+                        partition="tuning_validation",
                     )
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
@@ -4466,8 +4845,56 @@ class RegimeOptimizer:
             )
             for regime, candidate in regime_results.items():
                 candidate['tuned_for_regime'] = regime
-                candidate['train_result'] = self._compact_backtest_result(
-                    candidate.get('train_result')
+                raw_train = dict(
+                    (candidate.get("train_regime_metrics") or {}).get(regime, {})
+                    or candidate.get("train_result")
+                    or {}
+                )
+                compact_train = self._compact_exact_regime_result(raw_train, regime)
+                compact_train.update(
+                    self._build_daily_net_mtm_surface(
+                        result=raw_train,
+                        features=train_features,
+                        timeframe=timeframe,
+                        warmup_bars=train_warmup_bars,
+                        partition="optimizer_train",
+                    )
+                )
+                raw_val = dict(
+                    (candidate.get("val_regime_metrics") or {}).get(regime, {}) or {}
+                )
+                compact_val = self._compact_exact_regime_result(raw_val, regime)
+                compact_val.update(
+                    self._build_daily_net_mtm_surface(
+                        result=raw_val,
+                        features=val_features,
+                        timeframe=timeframe,
+                        warmup_bars=val_warmup_bars,
+                        partition="tuning_validation",
+                    )
+                    if val_features is not None
+                    else {
+                        "daily_net_mtm_returns": [],
+                        "daily_net_mtm_dates": [],
+                        "daily_net_mtm_observations": 0,
+                        "daily_net_mtm_contract": {
+                            "contract_version": DAILY_NET_MTM_CONTRACT_VERSION,
+                            "status": "UNAVAILABLE",
+                            "origin": "backtester_final_post_cost_equity_curve",
+                            "partition": "tuning_validation",
+                            "reason": "validation features unavailable",
+                        },
+                    }
+                )
+                candidate["train_result"] = dict(compact_train)
+                candidate["train_regime_metrics"] = {regime: compact_train}
+                candidate["val_regime_metrics"] = {regime: compact_val}
+                candidate["timeframe"] = str(timeframe).upper()
+                candidate["candidate_id"] = self._exact_cell_candidate_id(
+                    symbol,
+                    timeframe,
+                    regime,
+                    candidate,
                 )
                 candidate['family_search_metadata'] = dict(
                     self._last_tuning_search_meta
@@ -4557,6 +4984,7 @@ class RegimeOptimizer:
                         strategy=test_strategy,
                         regime=regime,
                         warmup_bars=train_warmup_bars,
+                        partition="optimizer_train",
                     )
                     completed_trials += int(ran)
                     if int(train_m.get("total_trades", 0) or 0) < self.min_train_trades:
@@ -4596,6 +5024,13 @@ class RegimeOptimizer:
                                 "reason": "deterministic_grid_fallback",
                             },
                         }
+                        best_candidate["timeframe"] = str(timeframe).upper()
+                        best_candidate["candidate_id"] = self._exact_cell_candidate_id(
+                            symbol,
+                            timeframe,
+                            regime,
+                            best_candidate,
+                        )
                 except Exception as exc:
                     logger.debug(
                         "[%s] [%s] [%s] %s train-only grid trial failed: %s",
@@ -4625,6 +5060,7 @@ class RegimeOptimizer:
                             regime=regime,
                             warmup_bars=val_warmup_bars,
                             run_zero_signal_path=True,
+                            partition="tuning_validation",
                         )
                     except Exception as exc:
                         evaluation_error = f"{type(exc).__name__}: {exc}"
@@ -5214,7 +5650,11 @@ class RegimeOptimizer:
                                         candidates: List[Dict[str, Any]],
                                         candidate: Dict[str, Any],
                                         regime: str = "",
-                                        pbo_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                        pbo_evidence: Optional[Dict[str, Any]] = None,
+                                        validation_trials: int = 1,
+                                        dsr_population_evidence: Optional[
+                                            Dict[str, Any]
+                                        ] = None) -> Dict[str, Any]:
         enabled = bool(getattr(self.config, 'false_discovery_control_enabled', False))
         local_trials = self._effective_search_trials(candidates)
         local_includes_regimes = any(
@@ -5230,10 +5670,11 @@ class RegimeOptimizer:
             or [0]
         )
         candidate_trials = max(int(candidate.get('search_trials', 1) or 1), 1)
-        # Multiplicity is the actual attempted train-only trial count persisted
-        # by the optimizer. Estimated symbol/timeframe multipliers are reported
-        # separately but are never presented as observations that did not run.
-        effective_trials = max(local_trials, candidate_trials, 1)
+        # Validation multiplicity is the exact number of unique frozen models
+        # that reached this cell's validation competition. The potentially much
+        # larger inner train-only search belongs to train stability evidence and
+        # must not be charged again to the non-overlapping validation DSR.
+        effective_trials = max(int(validation_trials or 0), 1)
         min_daily = int(
             getattr(self.config, "false_discovery_min_daily_observations", 252) or 252
         )
@@ -5242,10 +5683,14 @@ class RegimeOptimizer:
             or 60.0
         )
         min_dsr = float(getattr(self.config, 'false_discovery_min_dsr', 0.95) or 0.95)
-        daily_returns = list(val_metrics.get("daily_realized_returns", []) or [])
+        daily_returns, daily_dates = self._admissible_validation_daily_net_mtm(
+            val_metrics
+        )
         dsr_evidence = deflated_sharpe_evidence(
             daily_returns,
             attempted_trials=effective_trials,
+            candidate_id=str(candidate.get("candidate_id") or ""),
+            population_evidence=dsr_population_evidence,
             min_observations=min_daily,
             min_effective_observations=min_effective,
             min_dsr=min_dsr,
@@ -5263,8 +5708,8 @@ class RegimeOptimizer:
             )
         pbo_evidence = dict(pbo_evidence or {})
         candidate_pbo_id = str(
-            (candidate.get("oos_evidence") or {}).get("candidate_id")
-            or candidate.get("candidate_id")
+            candidate.get("candidate_id")
+            or (candidate.get("oos_evidence") or {}).get("candidate_id")
             or ""
         )
         pbo_candidate_ids = [
@@ -5316,6 +5761,9 @@ class RegimeOptimizer:
             ),
         )
         dsr = float(dsr_evidence.get("deflated_sharpe", 0.0) or 0.0)
+        independent_validation_trials = float(
+            dsr_evidence.get("effective_independent_trials", 0.0) or 0.0
+        )
         val_sharpe = float(dsr_evidence.get("sharpe_annualized", 0.0) or 0.0)
         val_trades = int(val_metrics.get('total_trades', 0) or 0)
         try:
@@ -5337,14 +5785,34 @@ class RegimeOptimizer:
             "pbo_candidate_included": pbo_candidate_included,
             "bootstrap_evidence": dict(bootstrap),
             "dsr_evidence": dict(dsr_evidence),
+            "dsr_population_evidence": dict(
+                dsr_population_evidence or {}
+            ),
             "val_sharpe": val_sharpe,
             "val_trades": val_trades,
             "local_trials": int(local_trials),
             "local_search_cells": int(local_cells),
             "local_scope_includes_regimes": bool(local_includes_regimes),
             "candidate_trials": int(candidate_trials),
+            "validation_frozen_candidates": int(effective_trials),
             "scope_multiplier": int(scope_multiplier),
-            "effective_trials": int(effective_trials),
+            "effective_trials": independent_validation_trials,
+            "daily_net_mtm_observations": int(len(daily_returns)),
+            "daily_net_mtm_axis_start": daily_dates[0] if daily_dates else None,
+            "daily_net_mtm_axis_end": daily_dates[-1] if daily_dates else None,
+            "multiplicity_scope": {
+                "train_inner_attempted_trials_exact": int(local_trials),
+                "validation_frozen_candidates_exact": int(effective_trials),
+                "local_search_cells_exact": int(local_cells),
+                "global_roster_attempted_trials_exact": None,
+                "global_roster_scope_status": "UNAVAILABLE",
+                "global_roster_scope_reason": (
+                    "book-level attempted-trial ledger is not yet bound to this cell"
+                ),
+                "reported_symbol_timeframe_regime_scope_multiplier": int(
+                    scope_multiplier
+                ),
+            },
             "deflated_sharpe": round(float(dsr), 6),
             "confidence_floor": float(confidence_floor),
             "confidence_multiplier": round(float(confidence_multiplier), 6),
@@ -5442,17 +5910,66 @@ class RegimeOptimizer:
         false_discovery_enabled = bool(
             getattr(self.config, "false_discovery_control_enabled", False)
         )
-        cell_pbo_evidence = (
-            aligned_cell_pbo(
-                candidates,
+        train_eligible: List[
+            Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]
+        ] = []
+        for cand in candidates:
+            cand["timeframe"] = str(timeframe).upper()
+            cand["candidate_id"] = self._exact_cell_candidate_id(
+                symbol,
+                timeframe,
+                regime,
+                cand,
+            )
+            train_metrics = dict(
+                (cand.get('train_regime_metrics') or {}).get(regime, {}) or {}
+            )
+            val_metrics = dict(
+                (cand.get('val_regime_metrics') or {}).get(regime, {}) or {}
+            )
+            train_surface_failure = self._selection_surface_failure(
+                train_metrics,
+                label="train",
+            )
+            if train_surface_failure:
+                rejection_reasons.append(
+                    f"{cand.get('strategy_name', 'Unknown')}: {train_surface_failure}"
+                )
+                continue
+
+            train_trades = train_metrics.get('total_trades', 0)
+            if train_trades < self.min_train_trades:
+                continue
+            train_dd = train_metrics.get('max_drawdown_pct', 100.0)
+            if train_dd > self.val_max_drawdown * 1.25:
+                continue
+            # The multiplicity/PBO roster freezes here, before any full-period
+            # validation outcome (PF/return/DD/trade count) is inspected.
+            train_eligible.append((cand, train_metrics, val_metrics))
+
+        min_daily = int(
+            getattr(self.config, "false_discovery_min_daily_observations", 252)
+            or 252
+        )
+        pbo_candidates: List[Dict[str, Any]] = []
+        pbo_candidate_ids: set = set()
+        if false_discovery_enabled:
+            for cand, _train_metrics, _val_metrics in train_eligible:
+                candidate_id = str(cand.get("candidate_id") or "")
+                if not candidate_id:
+                    pbo_candidates.append(cand)
+                    continue
+                if candidate_id in pbo_candidate_ids:
+                    continue
+                pbo_candidate_ids.add(candidate_id)
+                pbo_candidates.append(cand)
+            cell_pbo_evidence = aligned_cell_pbo(
+                pbo_candidates,
                 regime,
                 min_candidates=int(
                     getattr(self.config, "false_discovery_pbo_min_candidates", 5) or 5
                 ),
-                min_observations=int(
-                    getattr(self.config, "false_discovery_min_daily_observations", 252)
-                    or 252
-                ),
+                min_observations=min_daily,
                 max_pbo=float(
                     getattr(self.config, "false_discovery_max_pbo", 0.50) or 0.50
                 ),
@@ -5460,73 +5977,80 @@ class RegimeOptimizer:
                     getattr(self.config, "false_discovery_pbo_blocks", 10) or 10
                 ),
             )
-            if false_discovery_enabled
-            else {"status": "DISABLED", "passed": True, "pbo": None}
-        )
+            cell_pbo_evidence = {
+                **dict(cell_pbo_evidence or {}),
+                "population_contract": (
+                    "predeclared_train_eligible_frozen_validation_roster_v1"
+                ),
+                "input_candidate_count": int(len(candidates)),
+                "train_predeclared_eligible_count": int(len(train_eligible)),
+                "unique_predeclared_frozen_validation_candidate_count": int(
+                    len(pbo_candidates)
+                ),
+            }
+            cell_dsr_population = aligned_validation_dsr_population(
+                pbo_candidates,
+                regime,
+                min_observations=min_daily,
+            )
+        else:
+            cell_pbo_evidence = {
+                "status": "DISABLED",
+                "passed": True,
+                "pbo": None,
+                "population_contract": "disabled",
+            }
+            cell_dsr_population = {
+                "status": "DISABLED",
+                "contract_version": "disabled",
+            }
+        validation_trials = max(1, len(pbo_candidate_ids))
 
-        for cand in candidates:
-            train_metrics = dict(
-                (cand.get('train_regime_metrics') or {}).get(regime, {}) or {}
-            )
-            val_metrics = dict(
-                (cand.get('val_regime_metrics') or {}).get(regime, {}) or {}
-            )
-            surface_failure = self._selection_surface_failure(
-                train_metrics,
-                label="train",
-            ) or self._selection_surface_failure(
+        for cand, train_metrics, val_metrics in train_eligible:
+            validation_surface_failure = self._selection_surface_failure(
                 val_metrics,
                 label="validation",
             )
-            if surface_failure:
+            if validation_surface_failure:
                 rejection_reasons.append(
-                    f"{cand.get('strategy_name', 'Unknown')}: {surface_failure}"
+                    f"{cand.get('strategy_name', 'Unknown')}: "
+                    f"{validation_surface_failure}"
                 )
                 continue
-
-            train_trades = train_metrics.get('total_trades', 0)
             val_trades = val_metrics.get('total_trades', 0)
-
-            # Check minimum trades
-            if train_trades < self.min_train_trades:
-                continue
             if val_trades < min_val_trades:
                 continue
-
-            # ===== EARLY REJECTION: Check drawdown before scoring =====
-            train_dd = train_metrics.get('max_drawdown_pct', 100.0)
             val_dd = val_metrics.get('max_drawdown_pct', 100.0)
-
-            # Reject if validation drawdown exceeds threshold
             if val_dd > self.val_max_drawdown:
                 continue
-
-            # Reject if training drawdown is excessively high (1.25x threshold)
-            if train_dd > self.val_max_drawdown * 1.25:
-                continue
-
-            # Return-to-DD efficiency gate (unconditional, same category as DD caps)
             val_return_early = val_metrics.get('total_return_pct', -100.0)
-            val_return_dd_ratio = self._compute_return_dd_ratio(val_return_early, val_dd)
+            val_return_dd_ratio = self._compute_return_dd_ratio(
+                val_return_early,
+                val_dd,
+            )
             if val_return_dd_ratio < self.min_val_return_dd_ratio:
                 rejection_reasons.append(
                     f"{cand['strategy_name']}: return/DD={val_return_dd_ratio:.2f} < "
-                    f"{self.min_val_return_dd_ratio:.2f} (ret={val_return_early:.1f}%, dd={val_dd:.1f}%)"
+                    f"{self.min_val_return_dd_ratio:.2f} "
+                    f"(ret={val_return_early:.1f}%, dd={val_dd:.1f}%)"
                 )
                 continue
-
-            # Reject clearly losing validation candidates before scoring.
             val_pf = val_metrics.get('profit_factor', 0.0)
             val_return = val_metrics.get('total_return_pct', -100.0)
-
             if not self.allow_losing_winners:
                 if val_pf < self.min_val_profit_factor:
-                    rejection_reasons.append(f"{cand['strategy_name']}: PF={val_pf:.2f} < {self.min_val_profit_factor}")
+                    rejection_reasons.append(
+                        f"{cand['strategy_name']}: PF={val_pf:.2f} < "
+                        f"{self.min_val_profit_factor}"
+                    )
                     continue
                 if val_return < self.min_val_return_pct:
-                    rejection_reasons.append(f"{cand['strategy_name']}: return={val_return:.1f}% < {self.min_val_return_pct}")
+                    rejection_reasons.append(
+                        f"{cand['strategy_name']}: return={val_return:.1f}% < "
+                        f"{self.min_val_return_pct}"
+                    )
                     continue
-            
+
             # Apply Deflated Sharpe Ratio through one explicit confidence channel only.
             # Do not mutate validation Sharpe in the metric surface; that created
             # model-dependent double weighting and also ran when false discovery was off.
@@ -5537,6 +6061,8 @@ class RegimeOptimizer:
                 cand,
                 regime=regime,
                 pbo_evidence=cell_pbo_evidence,
+                validation_trials=validation_trials,
+                dsr_population_evidence=cell_dsr_population,
             )
             min_dsr = float(false_discovery.get("min_dsr", 0.0) or 0.0)
             dsr = float(false_discovery.get("deflated_sharpe", 0.0) or 0.0)
@@ -5546,7 +6072,7 @@ class RegimeOptimizer:
                 ).upper()
                 if dsr_status != "PASS" or dsr < min_dsr:
                     rejection_reasons.append(
-                        f"{cand['strategy_name']}: daily-return DSR {dsr_status} "
+                        f"{cand['strategy_name']}: daily-net-MTM DSR {dsr_status} "
                         f"value={dsr:.4f} threshold={min_dsr:.4f} "
                         f"(actual_trials={false_discovery.get('effective_trials')})"
                     )
@@ -8136,6 +8662,7 @@ class OptimizationPipeline:
                             features=edge_features,
                             strategy=fixed,
                             regime=regime,
+                            partition="edge_challenger_fit",
                         )
                         if not ran:
                             continue
@@ -8350,6 +8877,15 @@ class OptimizationPipeline:
                         timeframe=tf,
                     )
                     compact = self.regime_optimizer._compact_backtest_result(holdout_result)
+                    compact.update(
+                        self.regime_optimizer._build_daily_net_mtm_surface(
+                            result=holdout_result,
+                            features=holdout_features,
+                            timeframe=tf,
+                            warmup_bars=holdout_warmup,
+                            partition="final_lockbox",
+                        )
+                    )
                     compact.update({
                         "validation_mode": "final_lockbox_regime_gated",
                         "timeframe": str(tf).upper(),
@@ -8361,13 +8897,8 @@ class OptimizationPipeline:
                         ),
                         "lockbox_access": lockbox_access,
                     })
-                    bucket_metrics = self.regime_optimizer._compute_bucket_metrics(
-                        list(holdout_result.get("trades", []) or []),
-                        features=holdout_features.iloc[holdout_warmup:].copy(),
-                        timeframe=tf,
-                    )
                     lockbox_bootstrap = block_bootstrap_evidence(
-                        bucket_metrics.get("daily_realized_returns", []) or [],
+                        compact.get("daily_net_mtm_returns", []) or [],
                         repetitions=int(
                             getattr(self.config, "false_discovery_bootstrap_repetitions", 300)
                             or 300

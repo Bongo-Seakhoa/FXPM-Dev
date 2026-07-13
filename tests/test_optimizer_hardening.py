@@ -252,7 +252,7 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(winner.strategy_name, "Rank6Passes")
         self.assertEqual(len(checked), 6)
 
-    def test_false_discovery_reports_actual_trials_without_invented_scope_trials(self):
+    def test_false_discovery_separates_train_trials_from_frozen_validation_trials(self):
         cfg = PipelineConfig(
             regime_min_train_trades=1,
             regime_min_val_trades=1,
@@ -296,6 +296,7 @@ class OptimizerHardeningTests(unittest.TestCase):
                 "status": "PASS",
                 "deflated_sharpe": 0.99,
                 "sharpe_annualized": 2.0,
+                "effective_independent_trials": 1.0,
             },
         ), patch(
             "pm_pipeline.block_bootstrap_evidence",
@@ -312,7 +313,15 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertTrue(evidence["enabled"])
         self.assertEqual(evidence["local_trials"], 100)
         self.assertEqual(evidence["scope_multiplier"], 50 * 6 * 4)
-        self.assertEqual(evidence["effective_trials"], evidence["local_trials"])
+        self.assertEqual(evidence["effective_trials"], 1)
+        self.assertEqual(evidence["validation_frozen_candidates"], 1)
+        self.assertEqual(
+            evidence["multiplicity_scope"]["train_inner_attempted_trials_exact"],
+            100,
+        )
+        self.assertIsNone(
+            evidence["multiplicity_scope"]["global_roster_attempted_trials_exact"]
+        )
         self.assertLess(evidence["confidence_multiplier"], 1.0)
 
     def test_false_discovery_confidence_does_not_mutate_val_metric_surface(self):
@@ -430,7 +439,7 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         self.assertFalse(is_valid)
         self.assertIsNone(best_config)
-        self.assertIn("daily-return DSR UNAVAILABLE", reason)
+        self.assertIn("daily-net-MTM DSR UNAVAILABLE", reason)
 
     def test_false_discovery_rejects_candidates_without_daily_aligned_evidence(self):
         cfg = PipelineConfig(
@@ -506,7 +515,7 @@ class OptimizerHardeningTests(unittest.TestCase):
 
         self.assertEqual(status, "BLOCKED")
         self.assertTrue(
-            any("false-discovery daily-return DSR" in reason for reason in reasons),
+            any("false-discovery daily-net-MTM DSR" in reason for reason in reasons),
             reasons,
         )
 
