@@ -108,7 +108,15 @@ def _relative(native_root: Path, value: Any) -> Path:
         or any(":" in part for part in pure.parts)
     ):
         raise NativeStorageIntegrityError(f"unsafe native relative path: {value!r}")
-    candidate = (native_root / Path(*pure.parts)).resolve()
+    lexical = native_root / Path(*pure.parts)
+    cursor = native_root
+    for part in pure.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise NativeStorageIntegrityError(
+                f"symlinks are forbidden in native evidence paths: {value!r}"
+            )
+    candidate = lexical.resolve()
     try:
         candidate.relative_to(native_root)
     except ValueError as exc:
@@ -270,7 +278,10 @@ def build_protection_graph(native_root: Path) -> ProtectionGraph:
     the current audit writer has no shared lifecycle lock, so an apparently
     orphan audit may still be in progress.
     """
-    native_root = Path(native_root).resolve()
+    supplied_root = Path(native_root)
+    if supplied_root.is_symlink():
+        raise NativeStorageIntegrityError("native_root itself cannot be a symlink")
+    native_root = supplied_root.resolve()
     if (
         not native_root.is_dir()
         or native_root.is_symlink()
@@ -519,6 +530,10 @@ def _archive_members(native_root: Path, paths: Iterable[Path]) -> list[tuple[str
         path = Path(supplied)
         if not path.is_absolute():
             path = native_root / path
+        if path.is_symlink():
+            raise NativeStorageIntegrityError(
+                f"symlinks are forbidden in native archives: {path}"
+            )
         path = path.resolve()
         relative = _rel(native_root, path)
         if path.is_symlink() or not path.exists():
