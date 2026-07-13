@@ -24,11 +24,15 @@ from pm_search_outcomes import SearchOutcomeKind
 
 
 TRADE_POWER_SCHEMA_VERSION = "fxpm-cell-power-v1"
-TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v1"
+TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v2"
 TRADE_POWER_DECISION_SCHEMA_VERSION = "fxpm-trade-power-decision-v1"
-TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v1"
+TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v2"
+NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION = (
+    "fxpm-numerical-execution-cost-v1"
+)
 REQUIRED_ENTRY_SLIPPAGE_CONTRACT = "entry_slippage_parity_v1"
 REQUIRED_SWAP_ACCRUAL_CONTRACT = "causal_swap_accrual_v1"
+REQUIRED_SWAP_PROJECTION_CONTRACT = "fxpm-swap-preopen-close-projection-v1"
 REQUIRED_TRADE_RECORD_SCHEMA = "2026-06-18-mae-mfe-v1"
 _NORMAL = NormalDist()
 _PRODUCTION_PARTITIONS = {
@@ -115,6 +119,14 @@ class TradePowerRequirement:
     calibration_partition: str = "unspecified"
     calibration_sample_sha256: Optional[str] = None
     calibration_source_contract_sha256: Optional[str] = None
+    calibration_partition_source_contract_sha256: Optional[str] = None
+    source_contract_schema_version: str = ""
+    target_bars_sha256: str = ""
+    target_sidecar_sha256: str = ""
+    financing_schedule_sha256: str = ""
+    projection_contract_version: str = ""
+    numerical_execution_cost_policy_sha256: str = ""
+    calibration_numerical_execution_cost_attestation_sha256: str = ""
     entry_slippage_contract_version: str = ""
     swap_accrual_contract_version: str = ""
     trade_record_schema_version: str = ""
@@ -135,7 +147,19 @@ class TradePowerRequirement:
 class TradeEvidenceSourceContract:
     """Compact attestation for the Backtester inputs underlying net R."""
 
+    # ``source_contract_sha256`` intentionally excludes the partition-local
+    # projection digest.  Train, tuning and final are distinct slices of the
+    # same authenticated bars artifact, so their projected event axes differ
+    # even though their immutable source and cost policy must not.
     source_contract_sha256: str
+    partition_source_contract_sha256: str
+    target_bars_sha256: str
+    target_sidecar_sha256: str
+    financing_schedule_sha256: str
+    projection_contract_version: str
+    projection_sha256: str
+    numerical_execution_cost_policy_sha256: str
+    numerical_execution_cost_attestation_sha256: str
     entry_slippage_contract_version: str
     swap_accrual_contract_version: str
     trade_record_schema_version: str
@@ -421,6 +445,199 @@ def _is_sha256(value: Any) -> bool:
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
 
 
+_NUMERICAL_COST_ATTESTATION_FIELDS = frozenset({
+    "schema_version",
+    "use_spread",
+    "use_slippage",
+    "use_commission",
+    "spread_mode",
+    "spread_values_sha256",
+    "commission_inputs_sha256",
+    "instrument_spec_sha256",
+    "slippage_pips_hex",
+    "slippage_price_hex",
+    "policy_sha256",
+    "attestation_sha256",
+})
+
+
+def _nonnegative_finite_float_hex(value: Any, *, field_name: str) -> str:
+    """Validate a canonical, platform-stable hexadecimal cost scalar."""
+
+    text = str(value or "").strip().lower()
+    try:
+        number = float.fromhex(text)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} is not a hexadecimal float") from exc
+    if (
+        not math.isfinite(number)
+        or number < 0.0
+        or text.startswith("-")
+        or number.hex().lower() != text
+    ):
+        raise ValueError(
+            f"{field_name} must be a canonical nonnegative finite float"
+        )
+    return text
+
+
+def build_numerical_execution_cost_attestation(
+    *,
+    use_spread: bool,
+    use_slippage: bool,
+    use_commission: bool,
+    spread_mode: str,
+    spread_values_sha256: str,
+    commission_inputs_sha256: str,
+    instrument_spec_sha256: str,
+    slippage_pips: Any,
+    slippage_price: Any,
+) -> dict[str, Any]:
+    """Build the exact immutable numerical-cost payload required by v2.
+
+    The caller remains responsible for deriving the three hashes from the
+    actual arrays/model inputs used by the Backtester.  This helper only
+    canonicalizes and seals those inputs; it cannot manufacture upstream
+    execution evidence after the fact.
+    """
+
+    flags = {
+        "use_spread": use_spread,
+        "use_slippage": use_slippage,
+        "use_commission": use_commission,
+    }
+    if any(not isinstance(value, (bool, np.bool_)) for value in flags.values()):
+        raise ValueError("execution-cost flags must be explicit booleans")
+    flags = {name: bool(value) for name, value in flags.items()}
+    mode = str(spread_mode or "").strip()
+    if not mode:
+        raise ValueError("spread_mode is missing")
+    hashes = {
+        "spread_values_sha256": str(spread_values_sha256 or "").lower(),
+        "commission_inputs_sha256": str(commission_inputs_sha256 or "").lower(),
+        "instrument_spec_sha256": str(instrument_spec_sha256 or "").lower(),
+    }
+    if not all(_is_sha256(value) for value in hashes.values()):
+        raise ValueError("numerical execution-cost hashes are malformed")
+    try:
+        slippage_pips_hex = float(slippage_pips).hex().lower()
+        slippage_price_hex = float(slippage_price).hex().lower()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("slippage inputs are not numeric") from exc
+    slippage_pips_hex = _nonnegative_finite_float_hex(
+        slippage_pips_hex,
+        field_name="slippage_pips_hex",
+    )
+    slippage_price_hex = _nonnegative_finite_float_hex(
+        slippage_price_hex,
+        field_name="slippage_price_hex",
+    )
+    policy: dict[str, Any] = {
+        "schema_version": NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION,
+        **flags,
+        "spread_mode": mode,
+        "commission_inputs_sha256": hashes["commission_inputs_sha256"],
+        "instrument_spec_sha256": hashes["instrument_spec_sha256"],
+        "slippage_pips_hex": slippage_pips_hex,
+        "slippage_price_hex": slippage_price_hex,
+    }
+    policy_sha256 = _sha256_json(policy)
+    canonical: dict[str, Any] = {
+        **policy,
+        "spread_values_sha256": hashes["spread_values_sha256"],
+        "policy_sha256": policy_sha256,
+    }
+    return {
+        **canonical,
+        "attestation_sha256": _sha256_json(canonical),
+    }
+
+
+def _validate_numerical_execution_cost_attestation(
+    value: Any,
+) -> tuple[Optional[str], Optional[str], str, tuple[str, ...]]:
+    if not isinstance(value, Mapping):
+        return None, None, "numerical execution-cost attestation is missing", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_MISSING",
+        )
+    if set(value) != _NUMERICAL_COST_ATTESTATION_FIELDS:
+        return None, None, "numerical execution-cost fields are incomplete or unbound", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        )
+    if str(value.get("schema_version") or "") != (
+        NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION
+    ):
+        return None, None, "numerical execution-cost schema is missing or stale", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_SCHEMA_INVALID",
+        )
+    if any(
+        value.get(name) is not True
+        for name in ("use_spread", "use_slippage", "use_commission")
+    ):
+        return None, None, "production cost components are disabled or ambiguous", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        )
+    mode = str(value.get("spread_mode") or "").strip()
+    if not mode:
+        return None, None, "numerical spread mode is missing", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        )
+    hashes = {
+        name: str(value.get(name) or "").lower()
+        for name in (
+            "spread_values_sha256",
+            "commission_inputs_sha256",
+            "instrument_spec_sha256",
+        )
+    }
+    if not all(_is_sha256(item) for item in hashes.values()):
+        return None, None, "numerical execution-cost hashes are malformed", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        )
+    try:
+        slippage_pips_hex = _nonnegative_finite_float_hex(
+            value.get("slippage_pips_hex"),
+            field_name="slippage_pips_hex",
+        )
+        slippage_price_hex = _nonnegative_finite_float_hex(
+            value.get("slippage_price_hex"),
+            field_name="slippage_price_hex",
+        )
+    except ValueError:
+        return None, None, "numerical slippage inputs are malformed", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        )
+    policy = {
+        "schema_version": NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION,
+        "use_spread": True,
+        "use_slippage": True,
+        "use_commission": True,
+        "spread_mode": mode,
+        "commission_inputs_sha256": hashes["commission_inputs_sha256"],
+        "instrument_spec_sha256": hashes["instrument_spec_sha256"],
+        "slippage_pips_hex": slippage_pips_hex,
+        "slippage_price_hex": slippage_price_hex,
+    }
+    expected_policy = _sha256_json(policy)
+    observed_policy = str(value.get("policy_sha256") or "").lower()
+    if not _is_sha256(observed_policy) or observed_policy != expected_policy:
+        return None, None, "numerical execution-cost policy hash does not verify", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",
+        )
+    canonical = {
+        **policy,
+        "spread_values_sha256": hashes["spread_values_sha256"],
+        "policy_sha256": expected_policy,
+    }
+    expected = _sha256_json(canonical)
+    observed = str(value.get("attestation_sha256") or "").lower()
+    if not _is_sha256(observed) or observed != expected:
+        return None, None, "numerical execution-cost attestation hash does not verify", (
+            "SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",
+        )
+    return expected_policy, expected, "", ()
+
+
 def _validate_trade_evidence_source_contract(
     value: Any,
 ) -> tuple[Optional[TradeEvidenceSourceContract], str, tuple[str, ...]]:
@@ -462,6 +679,13 @@ def _validate_trade_evidence_source_contract(
         return None, "trade-record schema attestation is missing or stale", (
             "SOURCE_CONTRACT_TRADE_SCHEMA_INVALID",
         )
+    cost_policy_sha256, cost_attestation_sha256, cost_reason, cost_codes = (
+        _validate_numerical_execution_cost_attestation(
+            value.get("numerical_execution_cost_attestation")
+        )
+    )
+    if cost_policy_sha256 is None or cost_attestation_sha256 is None:
+        return None, cost_reason, cost_codes
     raw_binding = value.get("source_binding")
     if not isinstance(raw_binding, Mapping):
         return None, "source binding evidence is missing or malformed", (
@@ -471,6 +695,9 @@ def _validate_trade_evidence_source_contract(
         "price_activation_manifest_sha256",
         "terms_activation_manifest_sha256",
         "terms_snapshot_sha256",
+        "schedule_sha256",
+        "target_bars_sha256",
+        "target_sidecar_sha256",
     )
     source_binding = {
         name: str(raw_binding.get(name) or "").lower()
@@ -492,6 +719,15 @@ def _validate_trade_evidence_source_contract(
         swap.get("historical_rates_authenticated") is True
     )
     timestamp_source = str(swap.get("timestamp_source") or "")
+    projection_contract = str(swap.get("projection_contract") or "")
+    projection_sha256 = str(swap.get("projection_sha256") or "").lower()
+    if (
+        projection_contract != REQUIRED_SWAP_PROJECTION_CONTRACT
+        or not _is_sha256(projection_sha256)
+    ):
+        return None, "financing projection contract is missing or stale", (
+            "SOURCE_CONTRACT_PROJECTION_INVALID",
+        )
     if not compounding:
         return None, "swap cashflows are not compounded in execution state", (
             "SOURCE_CONTRACT_SWAP_COMPOUNDING_INVALID",
@@ -550,8 +786,10 @@ def _validate_trade_evidence_source_contract(
     canonical = {
         "schema_version": TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
         "source_binding": source_binding,
+        "numerical_execution_cost_policy_sha256": cost_policy_sha256,
         "entry_slippage_contract_version": entry_version,
         "swap_accrual_contract_version": swap_version,
+        "projection_contract_version": projection_contract,
         "trade_record_schema_version": trade_schema,
         "swap_status": status,
         "swap_provenance_class": provenance_class,
@@ -562,8 +800,27 @@ def _validate_trade_evidence_source_contract(
             stress_policy_sha256 if provenance_class == "STRESS_APPROVED" else None
         ),
     }
+    stable_source_sha256 = _sha256_json(canonical)
+    partition_source_sha256 = _sha256_json({
+        "schema_version": TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
+        "source_contract_sha256": stable_source_sha256,
+        "projection_sha256": projection_sha256,
+        "numerical_execution_cost_attestation_sha256": (
+            cost_attestation_sha256
+        ),
+    })
     return TradeEvidenceSourceContract(
-        source_contract_sha256=_sha256_json(canonical),
+        source_contract_sha256=stable_source_sha256,
+        partition_source_contract_sha256=partition_source_sha256,
+        target_bars_sha256=source_binding["target_bars_sha256"],
+        target_sidecar_sha256=source_binding["target_sidecar_sha256"],
+        financing_schedule_sha256=source_binding["schedule_sha256"],
+        projection_contract_version=projection_contract,
+        projection_sha256=projection_sha256,
+        numerical_execution_cost_policy_sha256=cost_policy_sha256,
+        numerical_execution_cost_attestation_sha256=(
+            cost_attestation_sha256
+        ),
         entry_slippage_contract_version=entry_version,
         swap_accrual_contract_version=swap_version,
         trade_record_schema_version=trade_schema,
@@ -580,7 +837,7 @@ def _sample_hash_payload(
     raw_trade_records: int,
     net_r_values_sha256: str,
     holding_intervals_sha256: str,
-    source_contract_sha256: str,
+    partition_source_contract_sha256: str,
     reason_codes: Sequence[str],
 ) -> str:
     return _sha256_json({
@@ -589,7 +846,9 @@ def _sample_hash_payload(
         "raw_trade_records": int(raw_trade_records),
         "net_r_values_sha256": str(net_r_values_sha256),
         "holding_intervals_sha256": str(holding_intervals_sha256),
-        "source_contract_sha256": str(source_contract_sha256),
+        "partition_source_contract_sha256": str(
+            partition_source_contract_sha256
+        ),
         "reason_codes": list(reason_codes),
     })
 
@@ -639,8 +898,8 @@ def _unavailable_trade_sample(
             raw_trade_records=raw_trade_records,
             net_r_values_sha256=net_r_values_sha256,
             holding_intervals_sha256=holding_intervals_sha256,
-            source_contract_sha256=(
-                source_contract.source_contract_sha256
+            partition_source_contract_sha256=(
+                source_contract.partition_source_contract_sha256
                 if source_contract is not None
                 else ""
             ),
@@ -852,7 +1111,9 @@ def build_trade_sample_evidence(
         raw_trade_records=raw_count,
         net_r_values_sha256=value_hash,
         holding_intervals_sha256=interval_hash,
-        source_contract_sha256=source.source_contract_sha256,
+        partition_source_contract_sha256=(
+            source.partition_source_contract_sha256
+        ),
         reason_codes=(),
     )
     return TradeSampleEvidence(
@@ -995,6 +1256,46 @@ def calibrate_train_trade_power(
             if sample.source_contract is not None
             else None
         ),
+        calibration_partition_source_contract_sha256=(
+            sample.source_contract.partition_source_contract_sha256
+            if sample.source_contract is not None
+            else None
+        ),
+        source_contract_schema_version=(
+            sample.source_contract.schema_version
+            if sample.source_contract is not None
+            else ""
+        ),
+        target_bars_sha256=(
+            sample.source_contract.target_bars_sha256
+            if sample.source_contract is not None
+            else ""
+        ),
+        target_sidecar_sha256=(
+            sample.source_contract.target_sidecar_sha256
+            if sample.source_contract is not None
+            else ""
+        ),
+        financing_schedule_sha256=(
+            sample.source_contract.financing_schedule_sha256
+            if sample.source_contract is not None
+            else ""
+        ),
+        projection_contract_version=(
+            sample.source_contract.projection_contract_version
+            if sample.source_contract is not None
+            else ""
+        ),
+        numerical_execution_cost_policy_sha256=(
+            sample.source_contract.numerical_execution_cost_policy_sha256
+            if sample.source_contract is not None
+            else ""
+        ),
+        calibration_numerical_execution_cost_attestation_sha256=(
+            sample.source_contract.numerical_execution_cost_attestation_sha256
+            if sample.source_contract is not None
+            else ""
+        ),
         entry_slippage_contract_version=(
             sample.source_contract.entry_slippage_contract_version
             if sample.source_contract is not None
@@ -1084,6 +1385,26 @@ def evaluate_trade_power_partition(
         or frozen_requirement.calibration_partition != "optimizer_train"
         or not frozen_requirement.calibration_sample_sha256
         or not frozen_requirement.calibration_source_contract_sha256
+        or not _is_sha256(frozen_requirement.calibration_sample_sha256)
+        or not _is_sha256(
+            frozen_requirement.calibration_source_contract_sha256
+        )
+        or not _is_sha256(
+            frozen_requirement.calibration_partition_source_contract_sha256
+        )
+        or frozen_requirement.source_contract_schema_version
+        != TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
+        or not _is_sha256(frozen_requirement.target_bars_sha256)
+        or not _is_sha256(frozen_requirement.target_sidecar_sha256)
+        or not _is_sha256(frozen_requirement.financing_schedule_sha256)
+        or frozen_requirement.projection_contract_version
+        != REQUIRED_SWAP_PROJECTION_CONTRACT
+        or not _is_sha256(
+            frozen_requirement.numerical_execution_cost_policy_sha256
+        )
+        or not _is_sha256(
+            frozen_requirement.calibration_numerical_execution_cost_attestation_sha256
+        )
         or frozen_requirement.entry_slippage_contract_version
         != REQUIRED_ENTRY_SLIPPAGE_CONTRACT
         or frozen_requirement.swap_accrual_contract_version
@@ -1181,8 +1502,10 @@ def evaluate_trade_power_partition(
 
 
 __all__ = [
+    "NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION",
     "REQUIRED_ENTRY_SLIPPAGE_CONTRACT",
     "REQUIRED_SWAP_ACCRUAL_CONTRACT",
+    "REQUIRED_SWAP_PROJECTION_CONTRACT",
     "REQUIRED_TRADE_RECORD_SCHEMA",
     "TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION",
     "TRADE_POWER_SCHEMA_VERSION",
@@ -1194,6 +1517,7 @@ __all__ = [
     "TradePowerRequirement",
     "TradeSampleEvidence",
     "adjusted_alpha",
+    "build_numerical_execution_cost_attestation",
     "build_trade_sample_evidence",
     "calibrate_train_trade_power",
     "derive_trade_power_requirement",

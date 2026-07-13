@@ -10,6 +10,7 @@ from pm_search_outcomes import SearchOutcomeKind
 from pm_trade_power import (
     TradePowerPolicy,
     adjusted_alpha,
+    build_numerical_execution_cost_attestation,
     build_trade_sample_evidence,
     calibrate_train_trade_power,
     derive_trade_power_requirement,
@@ -148,6 +149,8 @@ def _source_contract(
     stress_approved=False,
     stress_immutable=False,
     broker_swap_disabled=False,
+    projection_sha256="7" * 64,
+    cost_overrides=None,
 ):
     swap = {
         "contract_version": "causal_swap_accrual_v1",
@@ -161,23 +164,44 @@ def _source_contract(
         "stress_policy_sha256": "b" * 64 if stress_immutable else "",
         "broker_swap_disabled": broker_swap_disabled,
         "timestamp_source": "_BAR_CLOSE_TS" if status == "AVAILABLE" else None,
+        "projection_contract": "fxpm-swap-preopen-close-projection-v1",
+        "projection_sha256": projection_sha256,
     }
     source_binding = {
         "price_activation_manifest_sha256": "1" * 64,
         "terms_activation_manifest_sha256": "2" * 64,
         "terms_snapshot_sha256": "3" * 64,
+        "schedule_sha256": "6" * 64,
+        "target_bars_sha256": "8" * 64,
+        "target_sidecar_sha256": "9" * 64,
         "historical_rates_sha256": "4" * 64,
         "broker_disabled_proof_sha256": "5" * 64,
     }
     source_binding.update(dict(binding_overrides or {}))
+    numerical_cost_inputs = {
+        "use_spread": True,
+        "use_slippage": True,
+        "use_commission": True,
+        "spread_mode": "conservative_max",
+        "spread_values_sha256": "a" * 64,
+        "commission_inputs_sha256": "b" * 64,
+        "instrument_spec_sha256": "c" * 64,
+        "slippage_pips": 0.5,
+        "slippage_price": 0.00005,
+    }
+    numerical_cost_inputs.update(dict(cost_overrides or {}))
+    numerical_cost = build_numerical_execution_cost_attestation(
+        **numerical_cost_inputs
+    )
     return {
-        "schema_version": "fxpm-trade-evidence-source-v1",
+        "schema_version": "fxpm-trade-evidence-source-v2",
         "source_binding": source_binding,
         "trade_record_schema_version": "2026-06-18-mae-mfe-v1",
         "execution_cost_timing_contract": {
             "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
         },
+        "numerical_execution_cost_attestation": numerical_cost,
         "swap_accrual_contract": swap,
     }
 
@@ -368,6 +392,82 @@ def test_source_bindings_and_every_nonempty_trade_schema_are_verified():
     assert wrong_trade_schema.reason_codes == ("TRADE_RECORD_SCHEMA_MISMATCH",)
 
 
+@pytest.mark.parametrize(
+    "binding_name",
+    [
+        "price_activation_manifest_sha256",
+        "terms_activation_manifest_sha256",
+        "terms_snapshot_sha256",
+        "schedule_sha256",
+        "target_bars_sha256",
+        "target_sidecar_sha256",
+    ],
+)
+def test_v2_requires_the_complete_authenticated_artifact_graph(binding_name):
+    records = _trade_records(np.linspace(-1.0, 1.0, 20))
+    evidence = build_trade_sample_evidence(
+        records,
+        source_contract=_source_contract(
+            binding_overrides={binding_name: ""}
+        ),
+    )
+
+    assert evidence.outcome_kind is SearchOutcomeKind.INFRA_FAILURE
+    assert evidence.reason_codes == ("SOURCE_CONTRACT_BINDING_INVALID",)
+
+
+def test_v2_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
+    records = _trade_records(np.linspace(-1.0, 1.0, 20))
+    missing_contract = _source_contract()
+    missing_contract.pop("numerical_execution_cost_attestation")
+    missing = build_trade_sample_evidence(records, source_contract=missing_contract)
+
+    tampered_contract = _source_contract()
+    tampered_contract["numerical_execution_cost_attestation"][
+        "slippage_pips_hex"
+    ] = float(99.0).hex()
+    tampered = build_trade_sample_evidence(
+        records,
+        source_contract=tampered_contract,
+    )
+
+    disabled_contract = _source_contract()
+    disabled_contract["numerical_execution_cost_attestation"][
+        "use_commission"
+    ] = False
+    disabled = build_trade_sample_evidence(
+        records,
+        source_contract=disabled_contract,
+    )
+
+    assert missing.reason_codes == (
+        "SOURCE_CONTRACT_NUMERICAL_COST_MISSING",
+    )
+    assert tampered.reason_codes == (
+        "SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",
+    )
+    assert disabled.reason_codes == (
+        "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("projection_contract", "legacy-projection-v0"),
+        ("projection_sha256", "not-a-hash"),
+    ],
+)
+def test_v2_requires_an_exact_slice_projection_attestation(field, value):
+    records = _trade_records(np.linspace(-1.0, 1.0, 20))
+    source = _source_contract()
+    source["swap_accrual_contract"][field] = value
+    evidence = build_trade_sample_evidence(records, source_contract=source)
+
+    assert evidence.outcome_kind is SearchOutcomeKind.INFRA_FAILURE
+    assert evidence.reason_codes == ("SOURCE_CONTRACT_PROJECTION_INVALID",)
+
+
 def test_net_r_is_always_recomputed_from_post_cost_pnl_and_risk():
     values = np.linspace(-0.8, 1.2, 40)
     honest = build_trade_sample_evidence(
@@ -434,6 +534,20 @@ def test_train_calibration_freezes_sigma_multiplicity_and_all_partition_threshol
         == "AUTHENTICATED_HISTORICAL_RATES"
     )
     assert len(requirement.calibration_source_contract_sha256) == 64
+    assert len(requirement.calibration_partition_source_contract_sha256) == 64
+    assert requirement.source_contract_schema_version == (
+        "fxpm-trade-evidence-source-v2"
+    )
+    assert requirement.target_bars_sha256 == "8" * 64
+    assert requirement.target_sidecar_sha256 == "9" * 64
+    assert requirement.financing_schedule_sha256 == "6" * 64
+    assert requirement.projection_contract_version == (
+        "fxpm-swap-preopen-close-projection-v1"
+    )
+    assert len(requirement.numerical_execution_cost_policy_sha256) == 64
+    assert len(
+        requirement.calibration_numerical_execution_cost_attestation_sha256
+    ) == 64
     assert requirement.required_effective_train_trades > 0
     assert requirement.required_effective_tuning_trades > 0
     assert requirement.required_effective_final_trades > 0
@@ -502,6 +616,96 @@ def test_partition_source_contract_drift_is_infrastructure_failure():
     assert decision.reason_codes == ("SOURCE_CONTRACT_DRIFT",)
     assert missing.outcome_kind is SearchOutcomeKind.INFRA_FAILURE
     assert missing.reason_codes == ("SOURCE_CONTRACT_MISSING",)
+
+
+def test_partition_projection_digests_may_differ_on_one_frozen_artifact():
+    records = _trade_records(_ar1(1_000, 0.0, seed=191) + 0.3)
+    train = calibrate_train_trade_power(
+        records,
+        effective_trials=5,
+        policy=_policy(),
+        source_contract=_source_contract(
+            projection_sha256="7" * 64,
+            cost_overrides={"spread_values_sha256": "a" * 64},
+        ),
+    )
+    tuning = evaluate_trade_power_partition(
+        records,
+        frozen_requirement=train.frozen_requirement,
+        partition="tuning_validation",
+        source_contract=_source_contract(
+            projection_sha256="d" * 64,
+            cost_overrides={"spread_values_sha256": "d" * 64},
+        ),
+    )
+    final = evaluate_trade_power_partition(
+        records,
+        frozen_requirement=train.frozen_requirement,
+        partition="final_lockbox",
+        source_contract=_source_contract(
+            projection_sha256="e" * 64,
+            cost_overrides={"spread_values_sha256": "e" * 64},
+        ),
+    )
+
+    assert train.passed and tuning.passed and final.passed
+    train_source = train.sample_evidence.source_contract
+    tuning_source = tuning.sample_evidence.source_contract
+    final_source = final.sample_evidence.source_contract
+    assert train_source.source_contract_sha256 == (
+        tuning_source.source_contract_sha256
+    )
+    assert train_source.source_contract_sha256 == final_source.source_contract_sha256
+    assert train_source.numerical_execution_cost_policy_sha256 == (
+        tuning_source.numerical_execution_cost_policy_sha256
+    )
+    assert train_source.numerical_execution_cost_policy_sha256 == (
+        final_source.numerical_execution_cost_policy_sha256
+    )
+    assert len({
+        train_source.numerical_execution_cost_attestation_sha256,
+        tuning_source.numerical_execution_cost_attestation_sha256,
+        final_source.numerical_execution_cost_attestation_sha256,
+    }) == 3
+    assert len({
+        train_source.partition_source_contract_sha256,
+        tuning_source.partition_source_contract_sha256,
+        final_source.partition_source_contract_sha256,
+    }) == 3
+    assert len({
+        train.sample_evidence.sample_sha256,
+        tuning.sample_evidence.sample_sha256,
+        final.sample_evidence.sample_sha256,
+    }) == 3
+
+
+@pytest.mark.parametrize(
+    "source_kwargs",
+    [
+        {"binding_overrides": {"target_bars_sha256": "d" * 64}},
+        {"binding_overrides": {"target_sidecar_sha256": "d" * 64}},
+        {"binding_overrides": {"schedule_sha256": "d" * 64}},
+        {"cost_overrides": {"slippage_pips": 0.75}},
+    ],
+)
+def test_artifact_schedule_or_numerical_cost_drift_is_infrastructure_failure(
+    source_kwargs,
+):
+    train = calibrate_train_trade_power(
+        _trade_records(_ar1(1_000, 0.0, seed=290) + 0.3),
+        effective_trials=5,
+        policy=_policy(),
+        source_contract=_source_contract(),
+    )
+    decision = evaluate_trade_power_partition(
+        _trade_records(_ar1(1_000, 0.0, seed=291) + 0.2),
+        frozen_requirement=train.frozen_requirement,
+        partition="tuning_validation",
+        source_contract=_source_contract(**source_kwargs),
+    )
+
+    assert decision.outcome_kind is SearchOutcomeKind.INFRA_FAILURE
+    assert decision.reason_codes == ("SOURCE_CONTRACT_DRIFT",)
 
 
 def test_overlapping_holds_can_fail_power_despite_large_raw_trade_count():
