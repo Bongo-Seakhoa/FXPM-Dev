@@ -13,7 +13,10 @@ from pm_state_contract import (
     StateContract,
     StateContractAuthority,
     StateEvidence,
+    STATE_FEATURE_ALIASES,
     StateKind,
+    WindowExpression,
+    WindowTerm,
 )
 from pm_strategies import StrategyRegistry
 
@@ -40,14 +43,18 @@ def test_default_authority_covers_actual_strategy_and_feature_registries() -> No
     for feature in FeatureComputer._FEATURE_DEPS:
         assert f"feature:{feature}" in DEFAULT_AUTHORITY.contract_names
     for feature in FeatureComputer._REGIME_FEATURE_COLUMNS:
-        assert f"feature:{feature}" in DEFAULT_AUTHORITY.contract_names
+        if feature in STATE_FEATURE_ALIASES:
+            assert f"feature:{feature}" not in DEFAULT_AUTHORITY.contract_names
+            assert STATE_FEATURE_ALIASES[feature] in DEFAULT_AUTHORITY.contract_names
+        else:
+            assert f"feature:{feature}" in DEFAULT_AUTHORITY.contract_names
     assert Counter(
         DEFAULT_AUTHORITY._contracts[f"strategy:{name}"].kind.value
         for name in ACTUAL_STRATEGY_NAMES
     ) == Counter({
-        "FINITE_WINDOW": 46,
+        "FINITE_WINDOW": 50,
         "RECURSIVE_CONTRACTIVE": 47,
-        "PATH_STATE": 7,
+        "PATH_STATE": 3,
     })
 
 
@@ -193,6 +200,32 @@ def test_finite_strategy_bound_is_parameter_sensitive() -> None:
     assert long.bounded_context_bars > short.bounded_context_bars
 
 
+def test_finite_window_additive_expression_is_fail_closed() -> None:
+    rule = FiniteWindowRule(
+        expressions=(
+            WindowExpression(
+                (
+                    WindowTerm("age", required=True),
+                    WindowTerm("wing", multiplier=2.0, required=True),
+                    WindowTerm("optional_zero", allow_zero=True, required=True),
+                ),
+                offset=3,
+            ),
+        ),
+    )
+    assert rule.bound(
+        {"age": 100, "wing": 5, "optional_zero": 0}, "H1"
+    ) == (113, ())
+    missing, reasons = rule.bound({"age": 100, "wing": 5}, "H1")
+    assert missing is None
+    assert reasons == ("PARAMETER_MISSING:optional_zero",)
+    invalid, reasons = rule.bound(
+        {"age": 100, "wing": True, "optional_zero": 0}, "H1"
+    )
+    assert invalid is None
+    assert reasons == ("PARAMETER_INVALID:wing",)
+
+
 def test_path_state_requires_exact_registry_bound_checkpoint_or_replay() -> None:
     node = "strategy:SupertrendStrategy"
     missing = DEFAULT_AUTHORITY.resolve_cell(
@@ -266,15 +299,44 @@ def test_session_cumulative_state_requires_authenticated_reset_boundary() -> Non
     assert admitted.admissible
 
 
-def test_fractal_confirmed_pivot_is_checkpoint_required_under_production_veto() -> None:
-    strategy = "FractalChannelBreakoutStrategy"
-    node = f"strategy:{strategy}"
+def test_disputed_cumulative_and_retained_pivot_strategies_have_explicit_finite_bounds() -> None:
+    expected_local = {
+        "AccumulationDistributionBreakoutStrategy": 22,
+        "FractalChannelBreakoutStrategy": 107,
+        "OBVDivergenceStrategy": 37,
+    }
+    for strategy, expected in expected_local.items():
+        result = DEFAULT_AUTHORITY.resolve_cell(
+            strategy, parameters=StrategyRegistry.get(strategy).params,
+            timeframe="H1", include_regime_controller=False,
+        )
+        assert result.admissible, (strategy, result.reason_codes)
+        strategy_node = next(
+            node for node in result.nodes if node.name == f"strategy:{strategy}"
+        )
+        assert strategy_node.kind == "FINITE_WINDOW"
+        assert strategy_node.local_context_bars == expected
+
+
+def test_regime_feature_aliases_resolve_only_through_controller_state() -> None:
     result = DEFAULT_AUTHORITY.resolve_cell(
-        strategy, parameters=StrategyRegistry.get(strategy).params,
-        timeframe="H1", include_regime_controller=False,
+        "RegimeTransitionBreakoutStrategy",
+        parameters=StrategyRegistry.get("RegimeTransitionBreakoutStrategy").params,
+        requested_features=("REGIME", "feature:REGIME_LIVE"),
+        timeframe="M15",
+        include_regime_controller=False,
     )
     assert not result.admissible
-    assert result.required_path_state_nodes == (node,)
+    assert result.roots.count("controller:REGIME_HYSTERESIS") == 1
+    assert result.required_path_state_nodes == ("controller:REGIME_HYSTERESIS",)
+    strategy_node = next(
+        node
+        for node in result.nodes
+        if node.name == "strategy:RegimeTransitionBreakoutStrategy"
+    )
+    assert strategy_node.kind == "FINITE_WINDOW"
+    assert "feature:REGIME" not in DEFAULT_AUTHORITY.contract_names
+    assert "feature:REGIME_LIVE" not in DEFAULT_AUTHORITY.contract_names
 
 
 def test_unknown_strategy_or_feature_is_quarantined() -> None:

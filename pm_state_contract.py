@@ -31,7 +31,8 @@ from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
-STATE_CONTRACT_SCHEMA_VERSION = "fxpm.state-contract.v1"
+STATE_CONTRACT_SCHEMA_VERSION = "fxpm.state-contract.v2"
+STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION = "fxpm.state-candidate-domain.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -61,6 +62,14 @@ _BARS_PER_UTC_DAY = {
     "H1": 24,
     "H4": 6,
     "D1": 1,
+}
+
+# FeatureComputer materializes both columns for compatibility, but they are
+# views of one hysteretic controller state, not two independently checkpointed
+# path states.  Resolution canonicalizes either request to this single node.
+STATE_FEATURE_ALIASES: Mapping[str, str] = {
+    "REGIME": "controller:REGIME_HYSTERESIS",
+    "REGIME_LIVE": "controller:REGIME_HYSTERESIS",
 }
 
 
@@ -93,6 +102,21 @@ class WindowTerm:
     multiplier: float = 1.0
     offset: int = 0
     required: bool = False
+    allow_zero: bool = False
+
+
+@dataclass(frozen=True)
+class WindowExpression:
+    """Additive parameter expression within a finite suffix bound.
+
+    Independent rolling requirements combine by maximum, but nested structures
+    combine by addition.  For example, a retained fractal may be
+    ``pivot_max_age_bars + 2 * wing_bars`` old.  Treating those axes as two
+    independent maxima understates the required prefix.
+    """
+
+    terms: tuple[WindowTerm, ...]
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -108,6 +132,7 @@ class FiniteWindowRule:
 
     fixed_bars: int = 1
     terms: tuple[WindowTerm, ...] = ()
+    expressions: tuple[WindowExpression, ...] = ()
     infer_window_parameters: bool = False
     calendar_days: int = 0
 
@@ -128,19 +153,78 @@ class FiniteWindowRule:
             else:
                 bars = max(bars, days * per_day + 1)
 
-        explicit = {term.key: term for term in self.terms}
-        for term in self.terms:
+        all_explicit_terms = self.terms + tuple(
+            term for expression in self.expressions for term in expression.terms
+        )
+        explicit = {term.key: term for term in all_explicit_terms}
+
+        def term_value(term: WindowTerm) -> tuple[Optional[int], Optional[str]]:
             raw = parameters.get(term.key)
             if raw is None:
                 if term.required:
-                    reasons.append(f"PARAMETER_MISSING:{term.key}")
+                    return None, f"PARAMETER_MISSING:{term.key}"
+                return None, None
+            if isinstance(raw, bool):
+                return None, f"PARAMETER_INVALID:{term.key}"
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return None, f"PARAMETER_INVALID:{term.key}"
+            if (
+                not math.isfinite(value)
+                or value < 0.0
+                or (value == 0.0 and not term.allow_zero)
+            ):
+                return None, f"PARAMETER_INVALID:{term.key}"
+            try:
+                multiplier = float(term.multiplier)
+                offset = int(term.offset)
+                raw_offset = float(term.offset)
+            except (TypeError, ValueError, OverflowError):
+                return None, f"FINITE_TERM_INVALID:{term.key}"
+            if (
+                isinstance(term.multiplier, bool)
+                or isinstance(term.offset, bool)
+                or not math.isfinite(multiplier)
+                or multiplier < 0.0
+                or offset < 0
+                or float(offset) != raw_offset
+            ):
+                return None, f"FINITE_TERM_INVALID:{term.key}"
+            return int(math.ceil(value * multiplier)) + offset, None
+
+        for term in self.terms:
+            candidate, reason = term_value(term)
+            if reason:
+                reasons.append(reason)
+            elif candidate is not None:
+                bars = max(bars, candidate)
+
+        for expression in self.expressions:
+            try:
+                candidate = int(expression.offset)
+                raw_offset = float(expression.offset)
+            except (TypeError, ValueError, OverflowError):
+                reasons.append("FINITE_EXPRESSION_INVALID")
                 continue
-            value = _finite_positive(raw)
-            if value is None:
-                reasons.append(f"PARAMETER_INVALID:{term.key}")
+            if (
+                isinstance(expression.offset, bool)
+                or candidate < 0
+                or float(candidate) != raw_offset
+                or not expression.terms
+            ):
+                reasons.append("FINITE_EXPRESSION_INVALID")
                 continue
-            candidate = int(math.ceil(value * float(term.multiplier))) + int(term.offset)
-            bars = max(bars, candidate)
+            expression_valid = True
+            for term in expression.terms:
+                contribution, reason = term_value(term)
+                if reason:
+                    reasons.append(reason)
+                    expression_valid = False
+                elif contribution is not None:
+                    candidate += contribution
+            if expression_valid:
+                bars = max(bars, candidate)
 
         if self.infer_window_parameters:
             for key, raw in sorted(parameters.items(), key=lambda item: str(item[0])):
@@ -344,8 +428,18 @@ class StateResolution:
 class StateContractAuthority:
     """Immutable registry plus deterministic fail-closed DAG resolver."""
 
-    def __init__(self, contracts: Iterable[StateContract]):
+    def __init__(
+        self,
+        contracts: Iterable[StateContract],
+        *,
+        candidate_domain_hash: Optional[str] = None,
+    ):
         supplied = tuple(contracts)
+        if candidate_domain_hash is not None and not _SHA256_RE.fullmatch(
+            str(candidate_domain_hash)
+        ):
+            raise ValueError("candidate_domain_hash must be a lowercase SHA-256 digest")
+        self.candidate_domain_hash = candidate_domain_hash
         groups: dict[str, list[StateContract]] = {}
         for contract in supplied:
             groups.setdefault(str(contract.name), []).append(contract)
@@ -364,6 +458,7 @@ class StateContractAuthority:
         self.registry_hash = _canonical_sha256(
             {
                 "schema_version": STATE_CONTRACT_SCHEMA_VERSION,
+                "candidate_domain_hash": candidate_domain_hash,
                 "contracts": canonical,
                 "ambiguous_names": sorted(self._ambiguous),
             }
@@ -539,10 +634,22 @@ class StateContractAuthority:
         state_evidence: Optional[Mapping[str, StateEvidence]] = None,
     ) -> StateResolution:
         roots = [f"strategy:{strategy_name}"]
-        roots.extend(
-            feature if str(feature).startswith("feature:") else f"feature:{feature}"
-            for feature in requested_features
-        )
+        for feature in requested_features:
+            feature_name = str(feature)
+            bare_name = (
+                feature_name.split(":", 1)[1]
+                if feature_name.startswith("feature:")
+                else feature_name
+            )
+            alias = STATE_FEATURE_ALIASES.get(bare_name)
+            roots.append(
+                alias
+                or (
+                    feature_name
+                    if feature_name.startswith("feature:")
+                    else f"feature:{feature_name}"
+                )
+            )
         if include_regime_controller:
             roots.append("controller:REGIME_HYSTERESIS")
         return self.resolve(
@@ -603,6 +710,35 @@ ACTUAL_STRATEGY_NAMES: tuple[str, ...] = (
     "HeadAndShouldersNecklineBreakStrategy", "VarianceRatioTrendStrategy",
     "AutocorrelationReversalStrategy",
 )
+
+# SHA-256 of the exact sorted StrategyRegistry candidate-domain document:
+# schema version plus every strategy name, normalized default parameters, and
+# normalized grid axes/values.  The contract remains import-independent while
+# tests make any candidate addition, removal, or value drift explicit.
+STRATEGY_CANDIDATE_DOMAIN_SHA256 = (
+    "8f2f82f1a7f3ca90c188b1d5e796cb057076ba64caf4284371af7430abc4bb9f"
+)
+
+
+def strategy_candidate_domain_sha256(
+    strategy_documents: Sequence[Mapping[str, Any]],
+) -> str:
+    """Hash a caller-normalized, name-sorted strategy candidate domain."""
+
+    documents = [dict(document) for document in strategy_documents]
+    names = [str(document.get("name", "")) for document in documents]
+    if (
+        names != sorted(names)
+        or len(names) != len(set(names))
+        or any(not name for name in names)
+    ):
+        raise ValueError("strategy candidate documents must have unique sorted names")
+    return _canonical_sha256(
+        {
+            "schema_version": STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION,
+            "strategies": documents,
+        }
+    )
 
 
 def _ema_term(*keys: str, fixed: Sequence[float] = (), required: bool = False, stages: int = 1) -> ContractionTerm:
@@ -683,21 +819,58 @@ def _feature_contracts() -> list[StateContract]:
         contracts.append(StateContract(f"feature:{name}", StateKind.FINITE_WINDOW, dependencies=("feature:EMA_20", "feature:ATR_20"), finite_rule=FiniteWindowRule(1)))
     for name in ("TREND_SCORE", "RANGE_SCORE", "BREAKOUT_SCORE", "CHOP_SCORE", "REGIME_RAW", "REGIME_STRENGTH", "REGIME_GAP", "REGIME_STRENGTH_LIVE"):
         contracts.append(StateContract(f"feature:{name}", StateKind.FINITE_WINDOW, dependencies=("feature:REGIME_SCORE_SURFACE",), finite_rule=FiniteWindowRule(2)))
-    for name in ("REGIME", "REGIME_LIVE"):
-        contracts.append(StateContract(f"feature:{name}", StateKind.PATH_STATE, dependencies=("feature:REGIME_SCORE_SURFACE",), checkpoint_schema="fxpm.regime-hysteresis-state.v1", transition_schema="fxpm.regime-hysteresis-transition.v1"))
     return contracts
 
 
 _PATH_STRATEGIES = {
     "SupertrendStrategy": "fxpm.supertrend-state.v1",
-    "RegimeTransitionBreakoutStrategy": "fxpm.regime-transition-state.v1",
-    "OBVDivergenceStrategy": "fxpm.obv-state.v1",
     "ParabolicSARTrendStrategy": "fxpm.psar-state.v1",
     "VIDYABandTrendStrategy": "fxpm.vidya-state.v1",
-    "AccumulationDistributionBreakoutStrategy": "fxpm.adl-state.v1",
-    # Production veto: the confirmed pivot carried forward into the current
-    # suffix must be authenticated, not inferred from an arbitrary slice.
-    "FractalChannelBreakoutStrategy": "fxpm.fractal-channel-state.v1",
+}
+
+
+_FINITE_STRATEGY_RULES: Mapping[str, FiniteWindowRule] = {
+    "AccumulationDistributionBreakoutStrategy": FiniteWindowRule(
+        # The implementation deliberately suppresses its first
+        # max(lookback, slope, ATR-period)+2 rows.  ATR-period is fixed at 14.
+        fixed_bars=16,
+        terms=(
+            WindowTerm("lookback", offset=2, required=True),
+            WindowTerm("adl_slope_bars", offset=2, required=True),
+        ),
+    ),
+    "FractalChannelBreakoutStrategy": FiniteWindowRule(
+        fixed_bars=3,
+        expressions=(
+            WindowExpression(
+                terms=(
+                    WindowTerm("pivot_max_age_bars", required=True),
+                    WindowTerm("wing_bars", multiplier=2.0, required=True),
+                ),
+                offset=3,
+            ),
+        ),
+    ),
+    "OBVDivergenceStrategy": FiniteWindowRule(
+        fixed_bars=3,
+        expressions=(
+            # The oldest eligible prior delayed swing requires its own two
+            # wings: 5*order search distance + 2*order confirmation context.
+            WindowExpression(
+                terms=(WindowTerm("swing_order", multiplier=7.0, required=True),),
+                offset=2,
+            ),
+            # Both smoothed OBV values must use full equal-width windows before
+            # their common cumulative offset cancels.
+            WindowExpression(
+                terms=(
+                    WindowTerm("swing_order", multiplier=5.0, required=True),
+                    WindowTerm("obv_smooth", required=True, allow_zero=True),
+                ),
+                offset=2,
+            ),
+        ),
+    ),
 }
 
 _RECURSIVE_STRATEGIES = {
@@ -808,13 +981,16 @@ def _strategy_contracts() -> list[StateContract]:
             contracts.append(StateContract(
                 f"strategy:{name}", StateKind.FINITE_WINDOW,
                 dependencies=tuple(sorted(set(dependencies))),
-                finite_rule=generic_window,
+                finite_rule=_FINITE_STRATEGY_RULES.get(name, generic_window),
                 description="Registered strategy is suffix-bounded under its declared parameters.",
             ))
     return contracts
 
 
-DEFAULT_AUTHORITY = StateContractAuthority((*_feature_contracts(), *_strategy_contracts()))
+DEFAULT_AUTHORITY = StateContractAuthority(
+    (*_feature_contracts(), *_strategy_contracts()),
+    candidate_domain_hash=STRATEGY_CANDIDATE_DOMAIN_SHA256,
+)
 DEFAULT_REGISTRY_HASH = DEFAULT_AUTHORITY.registry_hash
 
 
@@ -828,11 +1004,16 @@ __all__ = [
     "FiniteWindowRule",
     "RecursiveRule",
     "ResolvedNode",
+    "STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION",
     "STATE_CONTRACT_SCHEMA_VERSION",
+    "STATE_FEATURE_ALIASES",
+    "STRATEGY_CANDIDATE_DOMAIN_SHA256",
     "StateContract",
     "StateContractAuthority",
     "StateEvidence",
     "StateKind",
     "StateResolution",
+    "WindowExpression",
     "WindowTerm",
+    "strategy_candidate_domain_sha256",
 ]

@@ -6032,13 +6032,26 @@ class AccumulationDistributionBreakoutStrategy(BaseStrategy):
         return {"ATR_14"}
 
     @staticmethod
-    def _adl(features: pd.DataFrame) -> pd.Series:
+    def _adl_money_flow(features: pd.DataFrame) -> pd.Series:
         high = features["High"]
         low = features["Low"]
         close = features["Close"]
         vol = _get_volume(features, default=1.0)
         mfm = ((close - low) - (high - close)) / ((high - low) + 1e-10)
-        return (mfm * vol).cumsum()
+        return mfm * vol
+
+    @staticmethod
+    def _finite_adl_delta(adl_flow: pd.Series, slope_bars: int) -> pd.Series:
+        # Match ADL[t] - ADL[t-k]: the first comparable point is t == k,
+        # whereas a k-wide rolling sum alone becomes populated at t == k-1.
+        # An interior NaN contributes no flow under legacy cumsum(skipna=True),
+        # but a NaN at either comparison endpoint makes the result ineligible.
+        delta = adl_flow.fillna(0.0).rolling(
+            slope_bars, min_periods=slope_bars
+        ).sum()
+        return delta.where(
+            adl_flow.notna() & adl_flow.shift(slope_bars).notna()
+        )
 
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         lookback = int(self.params.get("lookback", 20))
@@ -6046,11 +6059,17 @@ class AccumulationDistributionBreakoutStrategy(BaseStrategy):
         buffer_atr = float(self.params.get("breakout_buffer_atr", 0.05))
         close = features["Close"]
         atr = _get_atr(features, 14)
-        adl = self._adl(features)
+        # Only the ADL change over ``slope_bars`` affects the signal.  The
+        # cumulative ADL level is an arbitrary prefix-dependent constant:
+        # ADL[t] - ADL[t-k] == sum(money_flow[t-k+1:t]).  Computing that finite
+        # difference directly makes the strategy exactly suffix-replayable and
+        # avoids retaining a meaningless unbounded accumulator.
+        adl_flow = self._adl_money_flow(features)
+        adl_delta = self._finite_adl_delta(adl_flow, slope_bars)
         prior_high = features["High"].shift(1).rolling(lookback, min_periods=lookback).max()
         prior_low = features["Low"].shift(1).rolling(lookback, min_periods=lookback).min()
-        adl_up = adl > adl.shift(slope_bars)
-        adl_down = adl < adl.shift(slope_bars)
+        adl_up = adl_delta > 0.0
+        adl_down = adl_delta < 0.0
         long_entry = adl_up & (close > prior_high + buffer_atr * atr)
         short_entry = adl_down & (close < prior_low - buffer_atr * atr)
         signals = pd.Series(0, index=features.index, dtype=int)
