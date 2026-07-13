@@ -344,7 +344,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 "EURUSD",
                 [
                     {
-                        "format_version": "oos_candidate_returns_v3",
+                        "format_version": "oos_candidate_returns_v4",
                         "candidate_id": "abc",
                         "symbol": "EURUSD",
                         "timeframe": "H1",
@@ -378,7 +378,7 @@ class PipelineArtifactTests(unittest.TestCase):
             path = pointer["path"]
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             self.assertEqual(payload["format_version"], "oos_candidate_matrix_v1")
-            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v3_spoke_evidence")
+            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v4_one_touch_evidence")
             self.assertEqual(payload["record_count"], 1)
             self.assertEqual(pointer["record_count"], payload["record_count"])
             self.assertEqual(payload["records"][0]["candidate_id"], "abc")
@@ -423,7 +423,7 @@ class PipelineArtifactTests(unittest.TestCase):
             self.assertEqual(pointer["completion_status"], "NO_CANDIDATE_RECORDS")
             payload = json.loads(Path(pointer["path"]).read_text(encoding="utf-8"))
             self.assertEqual(payload["format_version"], "oos_candidate_matrix_v1")
-            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v3_spoke_evidence")
+            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v4_one_touch_evidence")
             self.assertEqual(payload["record_count"], 0)
             self.assertEqual(payload["completion_status"], "NO_CANDIDATE_RECORDS")
             self.assertEqual(payload["records"], [])
@@ -449,7 +449,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 "EURUSD",
                 [
                     {
-                        "format_version": "oos_candidate_returns_v3",
+                        "format_version": "oos_candidate_returns_v4",
                         "candidate_id": "abc",
                         "symbol": "EURUSD",
                         "timeframe": "H1",

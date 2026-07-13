@@ -15,6 +15,12 @@ from pm_statistics import (
     SWAP_ACCRUAL_TIMING_CONTRACT_VERSION,
     STATISTICS_CONTRACT_VERSION,
 )
+from pm_trade_power import (
+    REQUIRED_ENTRY_SLIPPAGE_CONTRACT,
+    REQUIRED_SWAP_ACCRUAL_CONTRACT,
+    REQUIRED_TRADE_RECORD_SCHEMA,
+    build_numerical_execution_cost_attestation,
+)
 
 
 class _ExactStrategy:
@@ -49,9 +55,12 @@ class _EquityBacktester:
                 "signal_bar": max(0, index * 5 - 1),
                 "entry_bar": index * 5,
                 "exit_bar": min(len(features) - 1, index * 5 + 2),
+                "entry_time": features.index[min(len(features) - 1, index * 5)],
+                "exit_time": features.index[min(len(features) - 1, index * 5 + 2)],
                 "pnl_dollars": 20.0 if index % 3 else -5.0,
                 "risk_amount": 100.0,
                 "r_multiple": 0.2 if index % 3 else -0.05,
+                "trade_record_schema_version": REQUIRED_TRADE_RECORD_SCHEMA,
             }
             for index in range(1, 41)
         ]
@@ -73,10 +82,25 @@ class _EquityBacktester:
             "final_equity": float(equity[-1]),
             "equity_curve": equity.tolist(),
             "trades": trades,
-            "execution_cost_timing_contract": dict(
-                EXECUTION_COST_TIMING_CONTRACT
+            "execution_cost_timing_contract": {
+                "entry_slippage": REQUIRED_ENTRY_SLIPPAGE_CONTRACT,
+                "swap_accrual": REQUIRED_SWAP_ACCRUAL_CONTRACT,
+            },
+            "numerical_execution_cost_attestation": (
+                build_numerical_execution_cost_attestation(
+                    use_spread=True,
+                    use_slippage=True,
+                    use_commission=True,
+                    spread_mode="conservative_max",
+                    spread_values_sha256="9" * 64,
+                    commission_inputs_sha256="a" * 64,
+                    instrument_spec_sha256="b" * 64,
+                    slippage_pips=0.5,
+                    slippage_price=0.00005,
+                )
             ),
             "swap_accrual_contract": {
+                "contract_version": REQUIRED_SWAP_ACCRUAL_CONTRACT,
                 "status": "AVAILABLE",
                 "provenance_status": "AUTHENTICATED",
                 "execution_state_compounding": True,
@@ -90,6 +114,7 @@ class _EquityBacktester:
                 "schedule_sha256": "4" * 64,
                 "target_bars_sha256": "5" * 64,
                 "target_sidecar_sha256": "6" * 64,
+                "projection_contract": "fxpm-swap-preopen-close-projection-v1",
                 "projection_sha256": "7" * 64,
             },
         }
@@ -103,9 +128,12 @@ class _OpenAcrossDaysBacktester(_EquityBacktester):
             "signal_bar": 0,
             "entry_bar": 1,
             "exit_bar": len(features) - 1,
+            "entry_time": features.index[1],
+            "exit_time": features.index[-1],
             "pnl_dollars": 100.0,
             "risk_amount": 100.0,
             "r_multiple": 1.0,
+            "trade_record_schema_version": REQUIRED_TRADE_RECORD_SCHEMA,
         }]
         return result
 

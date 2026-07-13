@@ -16,6 +16,7 @@ from pm_trade_power import (
     derive_trade_power_requirement,
     evaluate_trade_power_partition,
     robust_r_dispersion,
+    trade_sample_identity_sha256,
 )
 
 
@@ -482,6 +483,32 @@ def test_net_r_is_always_recomputed_from_post_cost_pnl_and_risk():
     assert honest.mean_net_r == fabricated.mean_net_r
     assert honest.net_r_values_sha256 == fabricated.net_r_values_sha256
     assert honest.sample_sha256 == fabricated.sample_sha256
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.__setitem__("sigma_r_robust", 0.01),
+        lambda payload: payload.__setitem__("effective_trades", 1.0),
+        lambda payload: payload["dependence_evidence"].__setitem__(
+            "effective_observations", 1.0
+        ),
+        lambda payload: payload.__setitem__("mean_net_r", 999.0),
+        lambda payload: payload.__setitem__("usable_trades", 1),
+    ],
+)
+def test_sample_identity_binds_all_decision_relevant_derived_fields(mutate):
+    evidence = build_trade_sample_evidence(
+        _trade_records(_ar1(200, 0.4, seed=29)),
+        source_contract=_source_contract(),
+    )
+    assert evidence.passed
+    payload = copy.deepcopy(evidence.to_dict())
+    original = payload["sample_sha256"]
+
+    mutate(payload)
+
+    assert trade_sample_identity_sha256(payload) != original
 
 
 def test_serial_dependence_and_overlapping_holds_reduce_effective_trades():

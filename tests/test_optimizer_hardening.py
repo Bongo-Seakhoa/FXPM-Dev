@@ -20,6 +20,70 @@ from pm_pipeline import (
     classify_promotion_status,
 )
 from pm_strategies import StrategyRegistry
+from pm_trade_power import build_numerical_execution_cost_attestation
+
+
+def _with_authenticated_trade_evidence(payload):
+    result = dict(payload)
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    trades = []
+    for index in range(320):
+        entry = start + pd.Timedelta(hours=2 * index)
+        trades.append({
+            "pnl_dollars": 100.0 if index % 2 else -50.0,
+            "risk_amount": 100.0,
+            "entry_time": entry,
+            "exit_time": entry + pd.Timedelta(hours=1),
+            "trade_record_schema_version": "2026-06-18-mae-mfe-v1",
+        })
+    result["total_trades"] = len(trades)
+    result["trades"] = trades
+    result["execution_cost_timing_contract"] = {
+        "entry_slippage": "entry_slippage_parity_v1",
+        "swap_accrual": "causal_swap_accrual_v1",
+    }
+    result["numerical_execution_cost_attestation"] = (
+        build_numerical_execution_cost_attestation(
+            use_spread=True,
+            use_slippage=True,
+            use_commission=True,
+            spread_mode="conservative_max",
+            spread_values_sha256="7" * 64,
+            commission_inputs_sha256="8" * 64,
+            instrument_spec_sha256="9" * 64,
+            slippage_pips=0.5,
+            slippage_price=0.00005,
+        )
+    )
+    result["swap_accrual_contract"] = {
+        "contract_version": "causal_swap_accrual_v1",
+        "status": "AVAILABLE",
+        "provenance_status": "STRESS_APPROVED",
+        "execution_state_compounding": True,
+        "source_provenance_authenticated": False,
+        "historical_rates_authenticated": False,
+        "stress_policy_explicitly_approved": True,
+        "stress_policy_immutable": True,
+        "stress_policy_sha256": "a" * 64,
+        "timestamp_source": "_BAR_CLOSE_TS",
+        "price_activation_manifest_sha256": "1" * 64,
+        "terms_activation_manifest_sha256": "2" * 64,
+        "terms_snapshot_sha256": "3" * 64,
+        "schedule_sha256": "4" * 64,
+        "target_bars_sha256": "5" * 64,
+        "target_sidecar_sha256": "6" * 64,
+        "projection_contract": "fxpm-swap-preopen-close-projection-v1",
+        "projection_sha256": "a" * 64,
+    }
+    return result
+
+
+def _power_callbacks():
+    evaluator = RegimeOptimizer.__new__(RegimeOptimizer)
+    return (
+        evaluator._calibrate_train_power_result,
+        evaluator._evaluate_partition_power_result,
+    )
 
 
 class OptimizerHardeningTests(unittest.TestCase):
@@ -211,7 +275,14 @@ class OptimizerHardeningTests(unittest.TestCase):
             lambda train, val, candidate=None: float(candidate["rank_score"])
         )
 
-        def validate(_train, _val, _regime, candidate_name, timeframe=None):
+        def validate(
+            _train,
+            _val,
+            _regime,
+            candidate_name,
+            timeframe=None,
+            **_contract,
+        ):
             checked.append(candidate_name)
             if candidate_name == "Rank6Passes":
                 return True, "Validated rank six"
@@ -1165,6 +1236,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             },
         }
         val_result = {
+            "_baseline_gated_signals_sha256": "c" * 64,
             "equity_curve": [100.0, 101.0, 100.0, 103.0, 102.0],
             "total_trades": 3,
             "profit_factor": 1.2,
@@ -1211,7 +1283,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             val_warmup_bars=1,
         )
 
-        self.assertEqual(first["format_version"], "oos_candidate_returns_v3")
+        self.assertEqual(first["format_version"], "oos_candidate_returns_v4")
         self.assertEqual(first["candidate_id"], second["candidate_id"])
         self.assertNotEqual(first["candidate_id"], other_regime["candidate_id"])
         self.assertEqual(first["regime"], "TREND")
@@ -1254,6 +1326,7 @@ class OptimizerHardeningTests(unittest.TestCase):
         }
         trades = [{"pnl_dollars": 3.0, "risk_amount": 10.0, "r_multiple": 0.3}]
         compact_result = {
+            "_baseline_gated_signals_sha256": "d" * 64,
             "equity_curve": [100.0, 101.0, 99.0, 102.0, 101.0, 103.0],
             "trades": trades,
             "total_trades": 1,
@@ -1306,6 +1379,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             "H1",
             {"strategy_name": "NoTradeStrategy", "params": {}},
             {
+                "_baseline_gated_signals_sha256": "e" * 64,
                 "equity_curve": [100.0],
                 "total_trades": 0,
                 "profit_factor": 0.0,
@@ -1599,7 +1673,12 @@ class OptimizerHardeningTests(unittest.TestCase):
         )
         optimizer = RegimeOptimizer(cfg)
         optimizer._compute_regime_score = lambda train, val: 100.0
-        optimizer._validate_regime_winner = lambda train, val, regime, candidate_name="": (True, "forced pass")
+        optimizer._validate_regime_winner = (
+            lambda train, val, regime, candidate_name="", **_contract: (
+                True,
+                "forced pass",
+            )
+        )
 
         def candidate(name, train_trades):
             train = {
@@ -3123,20 +3202,21 @@ class OptimizerHardeningTests(unittest.TestCase):
                 anchor = float(strategy.get_params()["sl_atr_mult"])
                 pf_by_anchor = {1.0: 0.5, 2.0: 0.7, 3.0: 1.2}
                 pf = pf_by_anchor[anchor]
-                return {
+                return _with_authenticated_trade_evidence({
                     "total_trades": 30,
                     "profit_factor": pf,
                     "win_rate": 52.0,
                     "total_return_pct": 8.0 if pf >= 1.0 else -8.0,
                     "max_drawdown_pct": 4.0,
                     "trades": [{"pf": pf}],
-                }
+                })
 
         previous = StrategyRegistry._strategies.get("AnchorSensitiveStrategy")
         StrategyRegistry._strategies["AnchorSensitiveStrategy"] = AnchorSensitiveStrategy
         try:
             cfg = PipelineConfig(
                 regime_enable_hyperparam_tuning=False,
+                oos_evidence_export_enabled=False,
                 screening_atr_anchor_enabled=True,
                 screening_atr_anchor_multipliers=[1.0, 2.0, 3.0],
                 regime_family_probe_trials=3,
@@ -3177,7 +3257,7 @@ class OptimizerHardeningTests(unittest.TestCase):
                 "EURUSD",
                 "H1",
                 features,
-                None,
+                features.copy(),
                 [AnchorSensitiveStrategy()],
             )
         finally:
@@ -3317,12 +3397,12 @@ class OptimizerHardeningTests(unittest.TestCase):
                     score = 10.0 if not is_val else 100.0
                 else:
                     score = 100.0 if not is_val else -100.0
-                return {
+                return _with_authenticated_trade_evidence({
                     "total_trades": 20,
                     "max_drawdown_pct": 2.0,
                     "score": score,
                     "trades": [{"score": score}],
-                }
+                })
 
         def bucket_trades(trades, features):
             return {
@@ -3344,6 +3424,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             scorer=None,
             strategy_registry=FakeRegistry(),
         )
+        calibrate_power, validate_power = _power_callbacks()
         result = optimizer._fallback_regime_search(
             symbol="EURUSD",
             timeframe="H1",
@@ -3356,6 +3437,9 @@ class OptimizerHardeningTests(unittest.TestCase):
             compute_score_fn=lambda train_m, val_m: float(train_m.get("score", -999.0)),
             min_train_trades=10,
             max_drawdown_pct=10.0,
+            calibrate_train_power_fn=calibrate_power,
+            evaluate_validation_power_fn=validate_power,
+            train_economic_gate_fn=lambda _metrics: None,
         )
 
         self.assertEqual(result["TREND"]["params"]["p"], 1)
@@ -3392,11 +3476,11 @@ class OptimizerHardeningTests(unittest.TestCase):
 
             def run(self, features, signals, symbol, strategy, **kwargs):
                 self.calls.append(dict(kwargs))
-                return {
+                return _with_authenticated_trade_evidence({
                     "total_trades": 20,
                     "max_drawdown_pct": 2.0,
                     "trades": [{"score": 1.0}],
-                }
+                })
 
         def bucket_trades(trades, features, timeframe=None):
             return {
@@ -3417,6 +3501,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             strategy_registry=FakeRegistry(),
         )
 
+        calibrate_power, validate_power = _power_callbacks()
         optimizer.optimize_for_regimes(
             symbol="EURUSD",
             timeframe="M15",
@@ -3430,6 +3515,9 @@ class OptimizerHardeningTests(unittest.TestCase):
             min_train_trades=10,
             max_drawdown_pct=10.0,
             val_warmup_bars=3,
+            calibrate_train_power_fn=calibrate_power,
+            evaluate_validation_power_fn=validate_power,
+            train_economic_gate_fn=lambda _metrics: None,
         )
 
         self.assertGreaterEqual(len(backtester.calls), 2)

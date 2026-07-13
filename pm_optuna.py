@@ -25,12 +25,21 @@ import logging
 import hashlib
 import math
 import time
-from typing import Dict, List, Any, Optional, Tuple, Callable, Union
+from typing import Dict, List, Any, Optional, Tuple, Callable, Union, Sequence, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+
+from pm_search_outcomes import (
+    SearchInfrastructureError,
+    SearchOutcomeKind,
+    SearchStage,
+    TrialOutcome,
+    aggregate_family_cell_outcomes,
+    classify_search_exception,
+)
 
 # Optuna import with graceful fallback
 try:
@@ -66,6 +75,110 @@ def _stable_seed(*parts: Any) -> int:
     payload = "|".join(str(part) for part in parts).encode("utf-8", errors="replace")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
     return int.from_bytes(digest, "big") & 0x7FFFFFFF
+
+
+def _parameter_hash(params: Dict[str, Any]) -> str:
+    """Stable order-invariant identity for one cleaned parameter set."""
+    import json
+    payload = json.dumps(
+        params,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _signal_vector_sha256(signals: pd.Series) -> str:
+    """Canonical bounded identity for an exact gated signal vector."""
+    series = signals if isinstance(signals, pd.Series) else pd.Series(signals)
+    values = np.asarray(pd.to_numeric(series, errors="raise"), dtype="<f8")
+    if values.ndim != 1 or not np.isfinite(values).all():
+        raise ValueError("signal vector must be one-dimensional and finite")
+    index_hashes = pd.util.hash_pandas_object(series.index, index=True).to_numpy(
+        dtype="<u8", copy=False
+    )
+    digest = hashlib.sha256()
+    digest.update(b"fxpm-gated-signal-vector-v1\0")
+    digest.update(str(len(series)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(index_hashes.tobytes(order="C"))
+    digest.update(values.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _bounded_cartesian_combinations(
+    axes: Sequence[Sequence[Any]],
+    *,
+    limit: int,
+    seed: int,
+) -> tuple[list[tuple[Any, ...]], int]:
+    """Decode a bounded deterministic Cartesian design in O(limit) memory."""
+    values = [tuple(axis) for axis in axes]
+    if not values or any(not axis for axis in values):
+        return [], 0
+    total = int(math.prod(len(axis) for axis in values))
+    count = min(total, max(0, int(limit)))
+    if count <= 0:
+        return [], total
+    start = 0 if count == total else int(seed % total)
+    step = 1 if count == total else (int((seed // max(total, 1)) % total) or 1)
+    while math.gcd(step, total) != 1:
+        step = (step + 1) % total or 1
+
+    def decode(encoded: int) -> tuple[Any, ...]:
+        result: list[Any] = [None] * len(values)
+        remainder = int(encoded)
+        for index in range(len(values) - 1, -1, -1):
+            axis = values[index]
+            result[index] = axis[remainder % len(axis)]
+            remainder //= len(axis)
+        return tuple(result)
+
+    return [decode((start + offset * step) % total) for offset in range(count)], total
+
+
+def _classify_staged_search_exception(
+    exc: BaseException,
+    *,
+    stage: SearchStage,
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    strategy_family: str,
+    parameter_hash: str,
+) -> TrialOutcome:
+    """Keep invalid-parameter abstentions confined to parameter construction."""
+    outcome = classify_search_exception(
+        exc,
+        stage=stage,
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=regime,
+        strategy_family=strategy_family,
+        parameter_hash=parameter_hash,
+    )
+    if (
+        outcome.kind is SearchOutcomeKind.INVALID_PARAM
+        and stage not in {
+            SearchStage.PARAMETER_VALIDATION,
+            SearchStage.STRATEGY_CONSTRUCTION,
+        }
+    ):
+        return TrialOutcome(
+            kind=SearchOutcomeKind.INFRA_FAILURE,
+            stage=stage,
+            reason_code="INVALID_PARAMETER_EXCEPTION_OUTSIDE_PARAMETER_STAGE",
+            reason=outcome.reason,
+            symbol=symbol,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_family=strategy_family,
+            parameter_hash=parameter_hash,
+            exception_type=outcome.exception_type,
+        )
+    return outcome
 
 
 def _bounded_warmup(features: Optional[pd.DataFrame], warmup_bars: int) -> int:
@@ -480,56 +593,122 @@ class OptunaTPEOptimizer:
         regime: str,
         val_features: Optional[pd.DataFrame],
         val_warmup_bars: int,
+        evaluate_validation_power_fn: Optional[Callable] = None,
     ) -> int:
         """Evaluate one frozen train winner on tuning exactly once.
 
         The result is evidence only: it never changes the parameters selected
-        inside the train-only study. Errors fail closed through empty metrics.
+        inside the train-only study. Technical errors abort the cell; honest
+        underpowered evidence remains a typed ineligible decision.
         """
         params = dict(candidate.get("params", {}) or {})
+        parameter_hash = _parameter_hash(self._clean_params(params))
         frozen_strategy = candidate.get("strategy")
         try:
             frozen_strategy = self.strategy_registry.get(strategy_name, **params)
         except Exception as exc:
-            logger.debug(
-                "[%s] [%s] [%s] Could not recreate frozen %s candidate: %s",
-                symbol, timeframe, regime, strategy_name, exc,
+            outcome = classify_search_exception(
+                exc,
+                stage=SearchStage.FROZEN_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+                parameter_hash=parameter_hash,
             )
-        candidate["strategy"] = frozen_strategy
-        val_metrics = self._empty_val_metrics()
-        evaluations = 0
-        evaluation_error: Optional[str] = None
-        if _scored_rows(val_features, val_warmup_bars) >= 50:
-            evaluations = 1
-            try:
-                if frozen_strategy is None:
-                    raise RuntimeError("frozen strategy unavailable")
-                raw_val_signals = frozen_strategy.generate_signals(val_features, symbol)
-                val_signals = self._gate_signals_to_regime(
-                    raw_val_signals, val_features, regime
-                )
-                val_result = self.backtester.run(
-                    val_features,
-                    val_signals,
-                    symbol,
-                    frozen_strategy,
-                    warmup_bars=_bounded_warmup(
-                        val_features, val_warmup_bars
-                    ),
+            if outcome.kind is SearchOutcomeKind.INVALID_PARAM:
+                outcome = TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FROZEN_VALIDATION,
+                    reason_code="FROZEN_PARAMETER_RECONSTRUCTION_DRIFT",
+                    reason=outcome.reason,
+                    symbol=symbol,
                     timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=strategy_name,
+                    parameter_hash=parameter_hash,
+                    exception_type=outcome.exception_type,
                 )
-                val_metrics = dict(val_result or self._empty_val_metrics())
-            except Exception as exc:
-                evaluation_error = f"{type(exc).__name__}: {exc}"
-                val_metrics = self._empty_val_metrics()
-                val_metrics["evaluation_error"] = evaluation_error
-                logger.debug(
-                    "[%s] [%s] [%s] Frozen tuning evaluation failed for %s: %s",
-                    symbol, timeframe, regime, strategy_name, exc,
-                )
-        candidate["val_regime_metrics"] = {str(regime): val_metrics}
+            raise SearchInfrastructureError(outcome) from exc
+        candidate["strategy"] = frozen_strategy
+        if _scored_rows(val_features, val_warmup_bars) < 50:
+            raise SearchInfrastructureError(TrialOutcome(
+                kind=SearchOutcomeKind.INFRA_FAILURE,
+                stage=SearchStage.FROZEN_VALIDATION,
+                reason_code="TUNING_VALIDATION_SURFACE_UNAVAILABLE",
+                reason="frozen tuning-validation surface is missing or too short",
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+                parameter_hash=parameter_hash,
+            ))
+        if evaluate_validation_power_fn is None:
+            raise SearchInfrastructureError(TrialOutcome(
+                kind=SearchOutcomeKind.INFRA_FAILURE,
+                stage=SearchStage.FROZEN_VALIDATION,
+                reason_code="TRADE_POWER_VALIDATION_CALLBACK_MISSING",
+                reason="trade-power validation callback is missing",
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+                parameter_hash=parameter_hash,
+            ))
+        evaluations = 1
+        try:
+            raw_val_signals = frozen_strategy.generate_signals(val_features, symbol)
+            val_signals = self._gate_signals_to_regime(
+                raw_val_signals, val_features, regime
+            )
+            val_result = self.backtester.run(
+                val_features,
+                val_signals,
+                symbol,
+                frozen_strategy,
+                warmup_bars=_bounded_warmup(
+                    val_features, val_warmup_bars
+                ),
+                timeframe=timeframe,
+            )
+            val_result["_baseline_gated_signals_sha256"] = (
+                _signal_vector_sha256(val_signals)
+            )
+            candidate["_baseline_gated_signals_sha256"] = val_result[
+                "_baseline_gated_signals_sha256"
+            ]
+            val_metrics = dict(val_result or self._empty_val_metrics())
+            requirement = candidate.get("_trade_power_requirement")
+            power_decision = evaluate_validation_power_fn(
+                val_result,
+                frozen_requirement=requirement,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+                parameter_hash=parameter_hash,
+            )
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.FROZEN_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+                parameter_hash=parameter_hash,
+            )
+            raise SearchInfrastructureError(outcome) from exc
         candidate["tuning_validation_evaluations"] = int(evaluations)
-        candidate["tuning_validation_evaluation_error"] = evaluation_error
+        candidate["tuning_validation_evaluation_error"] = None
+        candidate["trade_power_validation"] = power_decision.to_dict()
+        val_metrics["effective_trades"] = float(
+            power_decision.observed_effective_trades
+        )
+        candidate["val_regime_metrics"] = {str(regime): val_metrics}
+        candidate.pop("_trade_power_requirement", None)
         candidate["search_contract"] = self.REGIME_SEARCH_CONTRACT
         return int(evaluations)
 
@@ -606,8 +785,22 @@ class OptunaTPEOptimizer:
         start_time = time.time()
         
         # Get default params
-        base_strategy = self.strategy_registry.get(strategy_name)
-        default_params = base_strategy.get_params()
+        try:
+            base_strategy = self.strategy_registry.get(strategy_name)
+            default_params = base_strategy.get_params()
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.STRATEGY_CONSTRUCTION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
         
         # Handle empty param grid
         if not param_grid:
@@ -620,8 +813,20 @@ class OptunaTPEOptimizer:
             )
         
         # Create parameter space
-        param_space = ParameterSpace(param_grid, default_params)
-        search_space_size = param_space.get_search_space_size()
+        try:
+            param_space = ParameterSpace(param_grid, default_params)
+            search_space_size = param_space.get_search_space_size()
+        except Exception as exc:
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.PARAMETER_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
 
         # D4 — emit one-time WARN if cartesian > threshold (observability only)
         try:
@@ -630,7 +835,19 @@ class OptunaTPEOptimizer:
             logger.debug("Param-grid size warning hook failed for %s: %s", strategy_name, exc)
 
         # Resolve effective trial budget — flat by default, family-size-aware when enabled (D3)
-        n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
+        try:
+            n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
+        except Exception as exc:
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.PARAMETER_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
 
         if budget_mode == "family_aware":
             coverage = (n_trials / search_space_size) if search_space_size else 1.0
@@ -811,7 +1028,11 @@ class OptunaTPEOptimizer:
                              min_train_trades: int = 25,
                              max_drawdown_pct: float = 25.0,
                              val_warmup_bars: int = 0,
-                             train_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
+                             train_warmup_bars: int = 0,
+                              calibrate_train_power_fn: Optional[Callable] = None,
+                              evaluate_validation_power_fn: Optional[Callable] = None,
+                              train_economic_gate_fn: Optional[Callable] = None,
+                              prior_effective_trials_by_regime: Optional[Mapping[str, int]] = None) -> Dict[str, Dict[str, Any]]:
         """Run independent train-only studies for exact regime-family cells.
 
         Tuning-validation rows are never generated or backtested inside a
@@ -840,20 +1061,62 @@ class OptunaTPEOptimizer:
                 symbol, timeframe, strategy_name, param_grid,
                 train_features, val_features, regimes,
                 bucket_trades_fn, compute_score_fn, min_train_trades,
-                max_drawdown_pct, val_warmup_bars, train_warmup_bars
+                max_drawdown_pct, val_warmup_bars, train_warmup_bars,
+                calibrate_train_power_fn, evaluate_validation_power_fn,
+                train_economic_gate_fn, prior_effective_trials_by_regime,
             )
         
         self.last_regime_search_metadata = {}
         start_time = time.time()
-        base_strategy = self.strategy_registry.get(strategy_name)
-        default_params = base_strategy.get_params()
+        try:
+            base_strategy = self.strategy_registry.get(strategy_name)
+            default_params = base_strategy.get_params()
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.STRATEGY_CONSTRUCTION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
         
         if not param_grid:
             return {}
+        if (
+            calibrate_train_power_fn is None
+            or evaluate_validation_power_fn is None
+            or train_economic_gate_fn is None
+        ):
+            raise SearchInfrastructureError(TrialOutcome(
+                kind=SearchOutcomeKind.INFRA_FAILURE,
+                stage=SearchStage.FAMILY_CELL,
+                reason_code="TRADE_POWER_CALLBACK_MISSING",
+                reason="production regime search requires train and validation power callbacks",
+                symbol=symbol,
+                timeframe=timeframe,
+                strategy_family=strategy_name,
+            ))
         
         # Create parameter space
-        param_space = ParameterSpace(param_grid, default_params)
-        search_space_size = param_space.get_search_space_size()
+        try:
+            param_space = ParameterSpace(param_grid, default_params)
+            search_space_size = param_space.get_search_space_size()
+        except Exception as exc:
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.PARAMETER_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
 
         # D4 — emit one-time WARN if cartesian > threshold (observability only)
         try:
@@ -862,7 +1125,19 @@ class OptunaTPEOptimizer:
             logger.debug("Param-grid size warning hook failed for %s: %s", strategy_name, exc)
 
         # Resolve effective trial budget — flat by default, family-size-aware when enabled (D3)
-        n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
+        try:
+            n_trials, budget_mode = self.config.resolve_trial_budget(search_space_size)
+        except Exception as exc:
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.PARAMETER_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
         if budget_mode == "family_aware":
             coverage = (n_trials / search_space_size) if search_space_size else 1.0
             logger.info(
@@ -877,37 +1152,33 @@ class OptunaTPEOptimizer:
         for regime in [str(value) for value in regimes]:
             cell_start = time.time()
             best_score = [float("-inf")]
+            best_effective_trades = [float("-inf")]
+            best_parameter_hash = [""]
             best_candidate: List[Optional[Dict[str, Any]]] = [None]
             trial_count = [0]
             eligible_train_trials = [0]
             early_rejections = [0]
+            trial_outcomes: List[TrialOutcome] = []
 
             def objective(trial: optuna.Trial, target_regime: str = regime) -> float:
                 """One exact-regime, optimizer-train-only objective."""
                 trial_count[0] += 1
-                params = param_space.suggest(trial)
-                clean_params = self._clean_params(params)
+                params: Dict[str, Any] = {}
+                clean_params: Dict[str, Any] = {}
+                parameter_hash = ""
+                current_stage = SearchStage.PARAMETER_VALIDATION
                 try:
+                    params = param_space.suggest(trial)
+                    clean_params = self._clean_params(params)
+                    parameter_hash = _parameter_hash(clean_params)
+                    current_stage = SearchStage.STRATEGY_CONSTRUCTION
                     strategy = self.strategy_registry.get(strategy_name, **params)
-                    progress = trial_count[0] / max(n_trials, 1)
-                    if (
-                        self.config.progressive_rejection
-                        and progress < self.config.progressive_warmup_frac
-                    ):
-                        dd_train_mult = (
-                            self.config.train_dd_multiplier
-                            * self.config.progressive_warmup_multiplier
-                        )
-                    else:
-                        dd_train_mult = self.config.train_dd_multiplier
+                    current_stage = SearchStage.SIGNAL_GENERATION
                     raw_train_signals = strategy.generate_signals(train_features, symbol)
                     train_signals = self._gate_signals_to_regime(
                         raw_train_signals, train_features, target_regime
                     )
-                    if not _has_scored_signal(
-                        train_signals, train_warmup_bars
-                    ):
-                        return float(self.config.penalty_no_trades)
+                    current_stage = SearchStage.TRAIN_BACKTEST
                     train_result = self.backtester.run(
                         train_features,
                         train_signals,
@@ -918,22 +1189,125 @@ class OptunaTPEOptimizer:
                             train_features, train_warmup_bars
                         ),
                     )
+                    current_stage = SearchStage.TRAIN_EVIDENCE
                     train_m = dict(train_result or {})
-                    if int(train_m.get("total_trades", 0) or 0) < min_train_trades:
+                    power_decision = calibrate_train_power_fn(
+                        train_result,
+                        effective_trials=(
+                            n_trials
+                            + max(
+                                0,
+                                int((prior_effective_trials_by_regime or {}).get(
+                                    target_regime, 0
+                                ) or 0),
+                            )
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=target_regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
+                    )
+                    if power_decision.outcome_kind is not SearchOutcomeKind.VALID:
+                        outcome = TrialOutcome(
+                            kind=power_decision.outcome_kind,
+                            stage=SearchStage.TRAIN_EVIDENCE,
+                            reason_code=(
+                                str(power_decision.reason_codes[0])
+                                if power_decision.reason_codes
+                                else str(power_decision.status)
+                            ),
+                            reason=str(power_decision.reason),
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=target_regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                            evidence={
+                                "observed_effective_trades": power_decision.observed_effective_trades,
+                                "required_effective_trades": power_decision.required_effective_trades,
+                            },
+                        )
+                        trial_outcomes.append(outcome)
+                        trial.set_user_attr("search_outcome", outcome.to_dict())
                         return float(self.config.penalty_no_trades)
-                    if float(train_m.get("max_drawdown_pct", 100.0) or 100.0) > (
-                        max_drawdown_pct * dd_train_mult
-                    ):
-                        early_rejections[0] += 1
+                    train_m["effective_trades"] = float(
+                        power_decision.observed_effective_trades
+                    )
+                    current_stage = SearchStage.TRAIN_SCORE
+                    economic_reason = train_economic_gate_fn(train_m)
+                    if economic_reason:
+                        if economic_reason == "TRAIN_DRAWDOWN_GATE":
+                            early_rejections[0] += 1
+                        outcome = TrialOutcome(
+                            kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+                            stage=SearchStage.TRAIN_SCORE,
+                            reason_code=str(economic_reason),
+                            reason="trial failed a predeclared train economic gate",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=target_regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        )
+                        trial_outcomes.append(outcome)
+                        trial.set_user_attr("search_outcome", outcome.to_dict())
                         return float(self.config.penalty_dd_rejection)
                     score = float(compute_score_fn(train_m, {}))
                     if not math.isfinite(score):
-                        return float(self.config.penalty_no_trades)
+                        raise SearchInfrastructureError(TrialOutcome(
+                            kind=SearchOutcomeKind.INFRA_FAILURE,
+                            stage=SearchStage.TRAIN_SCORE,
+                            reason_code="NONFINITE_TRAIN_SCORE",
+                            reason="train score is non-finite",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=target_regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        ))
                     eligible_train_trials[0] += 1
+                    valid_outcome = TrialOutcome(
+                        kind=SearchOutcomeKind.VALID,
+                        stage=SearchStage.TRAIN_EVIDENCE,
+                        reason_code="POWER_PASS",
+                        reason="strict post-cost effective-trade power gate passed",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=target_regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
+                        evidence={
+                            "observed_effective_trades": power_decision.observed_effective_trades,
+                            "required_effective_trades": power_decision.required_effective_trades,
+                        },
+                    )
+                    trial_outcomes.append(valid_outcome)
+                    trial.set_user_attr("search_outcome", valid_outcome.to_dict())
                     trial.set_user_attr("clean_params", clean_params)
                     trial.set_user_attr("regime_scores", {target_regime: score})
-                    if score > best_score[0]:
+                    effective_trades = float(
+                        power_decision.observed_effective_trades
+                    )
+                    if (
+                        score > best_score[0]
+                        or (
+                            score == best_score[0]
+                            and (
+                                effective_trades > best_effective_trades[0]
+                                or (
+                                    effective_trades == best_effective_trades[0]
+                                    and (
+                                        not best_parameter_hash[0]
+                                        or parameter_hash < best_parameter_hash[0]
+                                    )
+                                )
+                            )
+                        )
+                    ):
                         best_score[0] = score
+                        best_effective_trades[0] = effective_trades
+                        best_parameter_hash[0] = parameter_hash
                         best_candidate[0] = {
                             "strategy": strategy,
                             "strategy_name": strategy_name,
@@ -944,14 +1318,30 @@ class OptunaTPEOptimizer:
                             "regime_gated": True,
                             "evaluation_regime": target_regime,
                             "is_tuned": True,
+                            "trade_power_contract_enforced": True,
+                            "trade_power_train": power_decision.to_dict(),
+                            "_trade_power_requirement": (
+                                power_decision.frozen_requirement
+                            ),
                         }
                     return score
                 except Exception as exc:
-                    logger.debug(
-                        "[%s] [%s] [%s] Train-only trial failed for %s: %s",
-                        symbol, timeframe, target_regime, strategy_name, exc,
+                    if isinstance(exc, SearchInfrastructureError):
+                        raise
+                    outcome = _classify_staged_search_exception(
+                        exc,
+                        stage=current_stage,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=target_regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
                     )
-                    return float(self.config.penalty_no_trades)
+                    trial_outcomes.append(outcome)
+                    trial.set_user_attr("search_outcome", outcome.to_dict())
+                    if outcome.kind is SearchOutcomeKind.INVALID_PARAM:
+                        return float(self.config.penalty_no_trades)
+                    raise SearchInfrastructureError(outcome) from exc
 
             sampler_seed = _stable_seed(
                 self.config.seed,
@@ -975,8 +1365,17 @@ class OptunaTPEOptimizer:
                 n_trials=n_trials,
                 timeout=self.config.timeout_seconds,
                 show_progress_bar=False,
-                catch=(Exception,),
+                catch=(),
             )
+            family_outcome = aggregate_family_cell_outcomes(
+                trial_outcomes,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+            )
+            if family_outcome.kind is SearchOutcomeKind.INFRA_FAILURE:
+                raise SearchInfrastructureError(family_outcome)
             stats = self._compile_stats(study, time.time() - cell_start)
             stats.early_dd_rejections = early_rejections[0]
             actual_trials = int(len(getattr(study, "trials", []) or []))
@@ -1004,6 +1403,7 @@ class OptunaTPEOptimizer:
                     regime=regime,
                     val_features=val_features,
                     val_warmup_bars=val_warmup_bars,
+                    evaluate_validation_power_fn=evaluate_validation_power_fn,
                 )
                 results[regime] = candidate
             cell_records.append({
@@ -1015,9 +1415,36 @@ class OptunaTPEOptimizer:
                 "early_dd_rejections": int(early_rejections[0]),
                 "frozen_candidate": bool(candidate is not None),
                 "tuning_validation_evaluations": int(validation_evaluations),
+                "trade_power_validation_status": str(
+                    ((candidate or {}).get("trade_power_validation") or {}).get(
+                        "status", "NOT_EVALUATED"
+                    )
+                ),
+                "trade_power_validation_kind": str(
+                    ((candidate or {}).get("trade_power_validation") or {}).get(
+                        "outcome_kind", "MISSING"
+                    )
+                ),
+                "trade_power_validation_reason_code": str(
+                    next(
+                        iter(
+                            ((candidate or {}).get("trade_power_validation") or {}).get(
+                                "reason_codes", []
+                            )
+                        ),
+                        (
+                            "POWER_PASS"
+                            if ((candidate or {}).get("trade_power_validation") or {}).get(
+                                "passed"
+                            ) is True
+                            else "NOT_EVALUATED"
+                        ),
+                    )
+                ),
                 "best_train_score": (
                     float(best_score[0]) if math.isfinite(best_score[0]) else None
                 ),
+                "family_outcome": family_outcome.to_dict(),
             })
             logger.debug(
                 "[%s] [%s] [%s] %s independent train-only study: %s",
@@ -1229,13 +1656,26 @@ class OptunaTPEOptimizer:
                                 timeframe: str = "",
                                 train_warmup_bars: int = 0,
                                 val_warmup_bars: int = 0) -> OptimizationResult:
-        """Fallback to random search when Optuna unavailable (with drawdown early rejection)."""
-        from itertools import product
+        """Fallback to bounded deterministic search when Optuna is unavailable."""
         
         start_time = time.time()
         
-        base_strategy = self.strategy_registry.get(strategy_name)
-        default_params = base_strategy.get_params()
+        try:
+            base_strategy = self.strategy_registry.get(strategy_name)
+            default_params = base_strategy.get_params()
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.STRATEGY_CONSTRUCTION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
         
         if not param_grid:
             return self._evaluate_default_only(
@@ -1246,24 +1686,21 @@ class OptunaTPEOptimizer:
                 val_warmup_bars=val_warmup_bars,
             )
         
-        # Generate combinations with Latin Hypercube sampling
+        # Decode only the configured number of deterministic Cartesian points.
         param_names = list(param_grid.keys())
-        param_values = list(param_grid.values())
-        all_combos = list(product(*param_values))
-        
-        n_trials = min(self.config.n_trials, len(all_combos))
-        if len(all_combos) > n_trials:
-            _seed = _stable_seed(
-                symbol,
-                strategy_name,
-                "grid_fallback_train_only",
-                len(train_features),
-            )
-            rng = np.random.default_rng(_seed)
-            indices = rng.choice(len(all_combos), n_trials, replace=False)
-            combos = [all_combos[i] for i in indices]
-        else:
-            combos = all_combos
+        param_values = [list(param_grid[name] or []) for name in param_names]
+        _seed = _stable_seed(
+            symbol,
+            strategy_name,
+            "grid_fallback_train_only",
+            len(train_features),
+        )
+        combos, _total_space = _bounded_cartesian_combinations(
+            param_values,
+            limit=self.config.n_trials,
+            seed=_seed,
+        )
+        n_trials = len(combos)
 
         best_score = float('-inf')
         best_params = default_params.copy()
@@ -1376,67 +1813,106 @@ class OptunaTPEOptimizer:
                                 min_train_trades: int,
                                 max_drawdown_pct: float = 25.0,
                                 val_warmup_bars: int = 0,
-                                train_warmup_bars: int = 0) -> Dict[str, Dict[str, Any]]:
+                                train_warmup_bars: int = 0,
+                                calibrate_train_power_fn: Optional[Callable] = None,
+                                evaluate_validation_power_fn: Optional[Callable] = None,
+                                train_economic_gate_fn: Optional[Callable] = None,
+                                prior_effective_trials_by_regime: Optional[Mapping[str, int]] = None) -> Dict[str, Dict[str, Any]]:
         """Independent train-only grid cells, each followed by one frozen tuning eval."""
-        from itertools import product
         
-        base_strategy = self.strategy_registry.get(strategy_name)
-        default_params = base_strategy.get_params()
+        try:
+            base_strategy = self.strategy_registry.get(strategy_name)
+            default_params = base_strategy.get_params()
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.STRATEGY_CONSTRUCTION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
         
         if not param_grid:
             return {}
+        if (
+            calibrate_train_power_fn is None
+            or evaluate_validation_power_fn is None
+            or train_economic_gate_fn is None
+        ):
+            raise SearchInfrastructureError(TrialOutcome(
+                kind=SearchOutcomeKind.INFRA_FAILURE,
+                stage=SearchStage.FAMILY_CELL,
+                reason_code="TRADE_POWER_CALLBACK_MISSING",
+                reason="production fallback search requires trade-power callbacks",
+                symbol=symbol,
+                timeframe=timeframe,
+                strategy_family=strategy_name,
+            ))
         
-        param_names = list(param_grid.keys())
-        param_values = list(param_grid.values())
-        all_combos = list(product(*param_values))
+        try:
+            param_names = list(param_grid.keys())
+            param_values = [list(param_grid[name] or []) for name in param_names]
+            total_space = int(math.prod(len(values) for values in param_values))
+        except Exception as exc:
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.PARAMETER_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
         
         self.last_regime_search_metadata = {}
-        n_trials = min(self.config.n_trials, len(all_combos))
+        n_trials = min(self.config.n_trials, total_space)
         results: Dict[str, Dict[str, Any]] = {}
         cell_records: List[Dict[str, Any]] = []
         for regime in [str(value) for value in regimes]:
-            if len(all_combos) > n_trials:
-                seed = _stable_seed(
-                    symbol,
-                    timeframe,
-                    regime,
-                    strategy_name,
-                    "regime_grid_train_only",
-                    len(train_features),
-                )
-                rng = np.random.default_rng(seed)
-                indices = rng.choice(len(all_combos), n_trials, replace=False)
-                combos = [all_combos[int(index)] for index in indices]
-            else:
-                combos = list(all_combos)
+            seed = _stable_seed(
+                symbol,
+                timeframe,
+                regime,
+                strategy_name,
+                "regime_grid_train_only",
+                len(train_features),
+            )
+            combos, _ = _bounded_cartesian_combinations(
+                param_values,
+                limit=n_trials,
+                seed=seed,
+            )
             best_score = float("-inf")
+            best_effective_trades = float("-inf")
+            best_parameter_hash = ""
             best_candidate: Optional[Dict[str, Any]] = None
             completed_trials = 0
             eligible_train_trials = 0
             early_rejections = 0
+            trial_outcomes: List[TrialOutcome] = []
             for idx, combo in enumerate(combos):
-                params = {**default_params, **dict(zip(param_names, combo))}
-                progress = (idx + 1) / max(len(combos), 1)
-                if (
-                    self.config.progressive_rejection
-                    and progress < self.config.progressive_warmup_frac
-                ):
-                    dd_train_mult = (
-                        self.config.train_dd_multiplier
-                        * self.config.progressive_warmup_multiplier
-                    )
-                else:
-                    dd_train_mult = self.config.train_dd_multiplier
+                params: Dict[str, Any] = {}
+                clean_params: Dict[str, Any] = {}
+                parameter_hash = ""
+                current_stage = SearchStage.PARAMETER_VALIDATION
                 try:
+                    params = {**default_params, **dict(zip(param_names, combo))}
+                    clean_params = self._clean_params(params)
+                    parameter_hash = _parameter_hash(clean_params)
+                    current_stage = SearchStage.STRATEGY_CONSTRUCTION
                     strategy = self.strategy_registry.get(strategy_name, **params)
+                    current_stage = SearchStage.SIGNAL_GENERATION
                     raw_train_signals = strategy.generate_signals(train_features, symbol)
                     train_signals = self._gate_signals_to_regime(
                         raw_train_signals, train_features, regime
                     )
-                    if not _has_scored_signal(
-                        train_signals, train_warmup_bars
-                    ):
-                        continue
+                    current_stage = SearchStage.TRAIN_BACKTEST
                     train_result = self.backtester.run(
                         train_features,
                         train_signals,
@@ -1448,20 +1924,108 @@ class OptunaTPEOptimizer:
                         ),
                     )
                     completed_trials += 1
+                    current_stage = SearchStage.TRAIN_EVIDENCE
                     train_m = dict(train_result or {})
-                    if int(train_m.get("total_trades", 0) or 0) < min_train_trades:
+                    power_decision = calibrate_train_power_fn(
+                        train_result,
+                        effective_trials=(
+                            len(combos)
+                            + max(
+                                0,
+                                int((prior_effective_trials_by_regime or {}).get(
+                                    regime, 0
+                                ) or 0),
+                            )
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
+                    )
+                    if power_decision.outcome_kind is not SearchOutcomeKind.VALID:
+                        trial_outcomes.append(TrialOutcome(
+                            kind=power_decision.outcome_kind,
+                            stage=SearchStage.TRAIN_EVIDENCE,
+                            reason_code=(
+                                str(power_decision.reason_codes[0])
+                                if power_decision.reason_codes else str(power_decision.status)
+                            ),
+                            reason=str(power_decision.reason),
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        ))
                         continue
-                    if float(train_m.get("max_drawdown_pct", 100.0) or 100.0) > (
-                        max_drawdown_pct * dd_train_mult
-                    ):
-                        early_rejections += 1
+                    train_m["effective_trades"] = float(
+                        power_decision.observed_effective_trades
+                    )
+                    current_stage = SearchStage.TRAIN_SCORE
+                    economic_reason = train_economic_gate_fn(train_m)
+                    if economic_reason:
+                        if economic_reason == "TRAIN_DRAWDOWN_GATE":
+                            early_rejections += 1
+                        trial_outcomes.append(TrialOutcome(
+                            kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+                            stage=SearchStage.TRAIN_SCORE,
+                            reason_code=str(economic_reason),
+                            reason="trial failed a predeclared train economic gate",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        ))
                         continue
                     score = float(compute_score_fn(train_m, {}))
                     if not math.isfinite(score):
-                        continue
+                        raise SearchInfrastructureError(TrialOutcome(
+                            kind=SearchOutcomeKind.INFRA_FAILURE,
+                            stage=SearchStage.TRAIN_SCORE,
+                            reason_code="NONFINITE_TRAIN_SCORE",
+                            reason="train score is non-finite",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        ))
+                    trial_outcomes.append(TrialOutcome(
+                        kind=SearchOutcomeKind.VALID,
+                        stage=SearchStage.TRAIN_EVIDENCE,
+                        reason_code="POWER_PASS",
+                        reason="strict post-cost effective-trade power gate passed",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
+                    ))
                     eligible_train_trials += 1
-                    if score > best_score:
+                    effective_trades = float(
+                        power_decision.observed_effective_trades
+                    )
+                    if (
+                        score > best_score
+                        or (
+                            score == best_score
+                            and (
+                                effective_trades > best_effective_trades
+                                or (
+                                    effective_trades == best_effective_trades
+                                    and (
+                                        not best_parameter_hash
+                                        or parameter_hash < best_parameter_hash
+                                    )
+                                )
+                            )
+                        )
+                    ):
                         best_score = score
+                        best_effective_trades = effective_trades
+                        best_parameter_hash = parameter_hash
                         best_candidate = {
                             "strategy": strategy,
                             "strategy_name": strategy_name,
@@ -1472,12 +2036,35 @@ class OptunaTPEOptimizer:
                             "regime_gated": True,
                             "evaluation_regime": regime,
                             "is_tuned": True,
+                            "trade_power_contract_enforced": True,
+                            "trade_power_train": power_decision.to_dict(),
+                            "_trade_power_requirement": power_decision.frozen_requirement,
                         }
                 except Exception as exc:
-                    logger.debug(
-                        "[%s] [%s] [%s] Train-only grid trial failed for %s: %s",
-                        symbol, timeframe, regime, strategy_name, exc,
+                    if isinstance(exc, SearchInfrastructureError):
+                        raise
+                    outcome = _classify_staged_search_exception(
+                        exc,
+                        stage=current_stage,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
                     )
+                    trial_outcomes.append(outcome)
+                    if outcome.kind is SearchOutcomeKind.INVALID_PARAM:
+                        continue
+                    raise SearchInfrastructureError(outcome) from exc
+            family_outcome = aggregate_family_cell_outcomes(
+                trial_outcomes,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+            )
+            if family_outcome.kind is SearchOutcomeKind.INFRA_FAILURE:
+                raise SearchInfrastructureError(family_outcome)
             validation_evaluations = 0
             if best_candidate is not None:
                 best_candidate["search_trials"] = int(len(combos))
@@ -1492,6 +2079,7 @@ class OptunaTPEOptimizer:
                     regime=regime,
                     val_features=val_features,
                     val_warmup_bars=val_warmup_bars,
+                    evaluate_validation_power_fn=evaluate_validation_power_fn,
                 )
                 results[regime] = best_candidate
             cell_records.append({
@@ -1503,9 +2091,36 @@ class OptunaTPEOptimizer:
                 "early_dd_rejections": int(early_rejections),
                 "frozen_candidate": bool(best_candidate is not None),
                 "tuning_validation_evaluations": int(validation_evaluations),
+                "trade_power_validation_status": str(
+                    ((best_candidate or {}).get("trade_power_validation") or {}).get(
+                        "status", "NOT_EVALUATED"
+                    )
+                ),
+                "trade_power_validation_kind": str(
+                    ((best_candidate or {}).get("trade_power_validation") or {}).get(
+                        "outcome_kind", "MISSING"
+                    )
+                ),
+                "trade_power_validation_reason_code": str(
+                    next(
+                        iter(
+                            ((best_candidate or {}).get("trade_power_validation") or {}).get(
+                                "reason_codes", []
+                            )
+                        ),
+                        (
+                            "POWER_PASS"
+                            if ((best_candidate or {}).get("trade_power_validation") or {}).get(
+                                "passed"
+                            ) is True
+                            else "NOT_EVALUATED"
+                        ),
+                    )
+                ),
                 "best_train_score": (
                     float(best_score) if math.isfinite(best_score) else None
                 ),
+                "family_outcome": family_outcome.to_dict(),
             })
         self._record_regime_search_metadata(
             symbol=symbol,

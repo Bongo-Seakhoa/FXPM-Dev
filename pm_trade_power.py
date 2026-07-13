@@ -24,8 +24,8 @@ from pm_search_outcomes import SearchOutcomeKind
 
 
 TRADE_POWER_SCHEMA_VERSION = "fxpm-cell-power-v1"
-TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v2"
-TRADE_POWER_DECISION_SCHEMA_VERSION = "fxpm-trade-power-decision-v1"
+TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v3"
+TRADE_POWER_DECISION_SCHEMA_VERSION = "fxpm-trade-power-decision-v2"
 TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v2"
 NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION = (
     "fxpm-numerical-execution-cost-v1"
@@ -831,26 +831,36 @@ def _validate_trade_evidence_source_contract(
     ), "", ()
 
 
-def _sample_hash_payload(
-    *,
-    status: str,
-    raw_trade_records: int,
-    net_r_values_sha256: str,
-    holding_intervals_sha256: str,
-    partition_source_contract_sha256: str,
-    reason_codes: Sequence[str],
-) -> str:
-    return _sha256_json({
-        "schema_version": TRADE_SAMPLE_SCHEMA_VERSION,
-        "status": status,
-        "raw_trade_records": int(raw_trade_records),
-        "net_r_values_sha256": str(net_r_values_sha256),
-        "holding_intervals_sha256": str(holding_intervals_sha256),
-        "partition_source_contract_sha256": str(
-            partition_source_contract_sha256
-        ),
-        "reason_codes": list(reason_codes),
-    })
+_TRADE_SAMPLE_IDENTITY_KEYS = (
+    "schema_version",
+    "status",
+    "outcome_kind",
+    "reason",
+    "reason_codes",
+    "raw_trade_records",
+    "usable_trades",
+    "minimum_observations_required",
+    "mean_net_r",
+    "sigma_r_robust",
+    "effective_trades",
+    "net_r_min",
+    "net_r_max",
+    "net_r_values_sha256",
+    "holding_intervals_sha256",
+    "source_contract",
+    "net_r_contract",
+    "dependence_evidence",
+)
+
+
+def trade_sample_identity_sha256(sample: Mapping[str, Any]) -> str:
+    """Bind every decision-relevant persisted sample field."""
+    if not isinstance(sample, Mapping):
+        raise TypeError("trade sample identity requires a mapping")
+    payload = {key: sample.get(key) for key in _TRADE_SAMPLE_IDENTITY_KEYS}
+    if payload["schema_version"] != TRADE_SAMPLE_SCHEMA_VERSION:
+        raise ValueError("trade sample schema is stale")
+    return _sha256_json(payload)
 
 
 def _unavailable_trade_sample(
@@ -876,16 +886,40 @@ def _unavailable_trade_sample(
         if outcome_kind is SearchOutcomeKind.EXPECTED_INELIGIBLE
         else "INFRA_FAILURE"
     )
+    raw_count = max(0, int(raw_trade_records))
+    usable_count = max(0, int(usable_trades))
+    minimum_count = max(3, int(minimum_observations_required))
+    dependence_payload = dict(dependence_evidence or {})
+    identity_payload = {
+        "schema_version": TRADE_SAMPLE_SCHEMA_VERSION,
+        "status": status,
+        "outcome_kind": outcome_kind.value,
+        "reason": str(reason),
+        "reason_codes": list(codes),
+        "raw_trade_records": raw_count,
+        "usable_trades": usable_count,
+        "minimum_observations_required": minimum_count,
+        "mean_net_r": mean_net_r,
+        "sigma_r_robust": sigma_r_robust,
+        "effective_trades": 0.0,
+        "net_r_min": net_r_min,
+        "net_r_max": net_r_max,
+        "net_r_values_sha256": str(net_r_values_sha256),
+        "holding_intervals_sha256": str(holding_intervals_sha256),
+        "source_contract": (
+            source_contract.to_dict() if source_contract is not None else None
+        ),
+        "net_r_contract": "strict_post_cost_pnl_dollars_divided_by_entry_risk_v1",
+        "dependence_evidence": dependence_payload,
+    }
     return TradeSampleEvidence(
         status=status,
         outcome_kind=outcome_kind,
         reason=str(reason),
         reason_codes=codes,
-        raw_trade_records=max(0, int(raw_trade_records)),
-        usable_trades=max(0, int(usable_trades)),
-        minimum_observations_required=max(
-            3, int(minimum_observations_required)
-        ),
+        raw_trade_records=raw_count,
+        usable_trades=usable_count,
+        minimum_observations_required=minimum_count,
         mean_net_r=mean_net_r,
         sigma_r_robust=sigma_r_robust,
         effective_trades=0.0,
@@ -893,20 +927,9 @@ def _unavailable_trade_sample(
         net_r_max=net_r_max,
         net_r_values_sha256=str(net_r_values_sha256),
         holding_intervals_sha256=str(holding_intervals_sha256),
-        sample_sha256=_sample_hash_payload(
-            status=status,
-            raw_trade_records=raw_trade_records,
-            net_r_values_sha256=net_r_values_sha256,
-            holding_intervals_sha256=holding_intervals_sha256,
-            partition_source_contract_sha256=(
-                source_contract.partition_source_contract_sha256
-                if source_contract is not None
-                else ""
-            ),
-            reason_codes=codes,
-        ),
+        sample_sha256=trade_sample_identity_sha256(identity_payload),
         source_contract=source_contract,
-        dependence_evidence=dict(dependence_evidence or {}),
+        dependence_evidence=dependence_payload,
     )
 
 
@@ -1106,16 +1129,26 @@ def build_trade_sample_evidence(
             source_contract=source,
             dependence_evidence=dependence_payload,
         )
-    sample_hash = _sample_hash_payload(
-        status="MEASURED",
-        raw_trade_records=raw_count,
-        net_r_values_sha256=value_hash,
-        holding_intervals_sha256=interval_hash,
-        partition_source_contract_sha256=(
-            source.partition_source_contract_sha256
-        ),
-        reason_codes=(),
-    )
+    identity_payload = {
+        "schema_version": TRADE_SAMPLE_SCHEMA_VERSION,
+        "status": "MEASURED",
+        "outcome_kind": SearchOutcomeKind.VALID.value,
+        "reason": "strict post-cost net-R effective sample measured",
+        "reason_codes": [],
+        "raw_trade_records": raw_count,
+        "usable_trades": raw_count,
+        "minimum_observations_required": minimum,
+        "mean_net_r": mean_net_r,
+        "sigma_r_robust": float(sigma),
+        "effective_trades": float(dependence.effective_observations),
+        "net_r_min": minimum_net_r,
+        "net_r_max": maximum_net_r,
+        "net_r_values_sha256": value_hash,
+        "holding_intervals_sha256": interval_hash,
+        "source_contract": source.to_dict(),
+        "net_r_contract": "strict_post_cost_pnl_dollars_divided_by_entry_risk_v1",
+        "dependence_evidence": dependence_payload,
+    }
     return TradeSampleEvidence(
         status="MEASURED",
         outcome_kind=SearchOutcomeKind.VALID,
@@ -1131,7 +1164,7 @@ def build_trade_sample_evidence(
         net_r_max=maximum_net_r,
         net_r_values_sha256=value_hash,
         holding_intervals_sha256=interval_hash,
-        sample_sha256=sample_hash,
+        sample_sha256=trade_sample_identity_sha256(identity_payload),
         source_contract=source,
         dependence_evidence=dependence_payload,
     )
@@ -1150,7 +1183,7 @@ def _required_for_partition(
     return None
 
 
-def _requirement_source_provenance_valid(
+def requirement_source_provenance_valid(
     requirement: TradePowerRequirement,
 ) -> bool:
     admissible = {
@@ -1411,7 +1444,7 @@ def evaluate_trade_power_partition(
         != REQUIRED_SWAP_ACCRUAL_CONTRACT
         or frozen_requirement.trade_record_schema_version
         != REQUIRED_TRADE_RECORD_SCHEMA
-        or not _requirement_source_provenance_valid(frozen_requirement)
+        or not requirement_source_provenance_valid(frozen_requirement)
     ):
         return TradePowerDecision(
             status="INFRA_FAILURE",
@@ -1523,4 +1556,6 @@ __all__ = [
     "derive_trade_power_requirement",
     "evaluate_trade_power_partition",
     "robust_r_dispersion",
+    "requirement_source_provenance_valid",
+    "trade_sample_identity_sha256",
 ]

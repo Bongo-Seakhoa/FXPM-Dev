@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import pandas as pd
@@ -6,6 +7,106 @@ import pandas as pd
 import pm_optuna
 from pm_optuna import OptunaConfig, OptunaTPEOptimizer
 from pm_pipeline import RegimeOptimizer
+from pm_search_outcomes import SearchOutcomeKind
+from pm_trade_power import (
+    TradePowerDecision,
+    TradePowerPolicy,
+    build_numerical_execution_cost_attestation,
+    derive_trade_power_requirement,
+)
+
+
+def _with_authenticated_trade_evidence(payload):
+    result = dict(payload)
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    result["trades"] = [
+        {
+            "pnl_dollars": 100.0 if index % 2 else -50.0,
+            "risk_amount": 100.0,
+            "entry_time": start + pd.Timedelta(hours=2 * index),
+            "exit_time": start + pd.Timedelta(hours=2 * index + 1),
+            "trade_record_schema_version": "2026-06-18-mae-mfe-v1",
+        }
+        for index in range(320)
+    ]
+    result["total_trades"] = len(result["trades"])
+    result["execution_cost_timing_contract"] = {
+        "entry_slippage": "entry_slippage_parity_v1",
+        "swap_accrual": "causal_swap_accrual_v1",
+    }
+    result["numerical_execution_cost_attestation"] = (
+        build_numerical_execution_cost_attestation(
+            use_spread=True,
+            use_slippage=True,
+            use_commission=True,
+            spread_mode="conservative_max",
+            spread_values_sha256="7" * 64,
+            commission_inputs_sha256="8" * 64,
+            instrument_spec_sha256="9" * 64,
+            slippage_pips=0.5,
+            slippage_price=0.00005,
+        )
+    )
+    result["swap_accrual_contract"] = {
+        "contract_version": "causal_swap_accrual_v1",
+        "status": "AVAILABLE",
+        "provenance_status": "STRESS_APPROVED",
+        "execution_state_compounding": True,
+        "historical_rates_authenticated": False,
+        "stress_policy_explicitly_approved": True,
+        "stress_policy_immutable": True,
+        "stress_policy_sha256": "a" * 64,
+        "timestamp_source": "_BAR_CLOSE_TS",
+        "price_activation_manifest_sha256": "1" * 64,
+        "terms_activation_manifest_sha256": "2" * 64,
+        "terms_snapshot_sha256": "3" * 64,
+        "schedule_sha256": "4" * 64,
+        "target_bars_sha256": "5" * 64,
+        "target_sidecar_sha256": "6" * 64,
+        "projection_contract": "fxpm-swap-preopen-close-projection-v1",
+        "projection_sha256": "a" * 64,
+    }
+    return result
+
+
+def _power_callbacks():
+    evaluator = RegimeOptimizer.__new__(RegimeOptimizer)
+    return (
+        evaluator._calibrate_train_power_result,
+        evaluator._evaluate_partition_power_result,
+    )
+
+
+def _passing_power_decision(
+    partition: str = "optimizer_train",
+    *,
+    frozen_requirement=None,
+) -> TradePowerDecision:
+    requirement = frozen_requirement or replace(
+        derive_trade_power_requirement(
+            sigma_r_robust=1.0,
+            effective_trials=1,
+            policy=TradePowerPolicy(
+                minimum_economic_edge_r=1.0,
+                maximum_ci_half_width_r=2.0,
+            ),
+        ),
+        required_effective_train_trades=1,
+        required_effective_tuning_trades=1,
+        required_effective_final_trades=1,
+        frozen=True,
+    )
+    return TradePowerDecision(
+        status="PASS",
+        outcome_kind=SearchOutcomeKind.VALID,
+        partition=partition,
+        reason="focused selection fixture passed",
+        reason_codes=(),
+        observed_effective_trades=100.0,
+        required_effective_trades=1,
+        sample_evidence=None,
+        frozen_requirement=requirement,
+    )
 
 
 class RegimeGatedSelectionTests(unittest.TestCase):
@@ -145,13 +246,13 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             def run(self, features, signals, symbol, strategy, **kwargs):
                 active = features.loc[signals.ne(0), "REGIME_LIVE"]
                 self.calls.append(set(active.tolist()))
-                return {
+                return _with_authenticated_trade_evidence({
                     "total_trades": int(signals.ne(0).sum()),
                     "max_drawdown_pct": 1.0,
                     "profit_factor": 1.2,
                     "total_return_pct": 1.0,
                     "trades": [],
-                }
+                })
 
         regimes = (["TREND", "RANGE"] * 30)
         train = pd.DataFrame({"Close": range(60), "REGIME_LIVE": regimes})
@@ -164,6 +265,7 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             strategy_registry=Registry(),
         )
 
+        calibrate_power, validate_power = _power_callbacks()
         result = optimizer._fallback_regime_search(
             symbol="EURUSD",
             timeframe="H1",
@@ -176,6 +278,9 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             compute_score_fn=lambda train_m, val_m: float(train_m["profit_factor"]),
             min_train_trades=5,
             max_drawdown_pct=10.0,
+            calibrate_train_power_fn=calibrate_power,
+            evaluate_validation_power_fn=validate_power,
+            train_economic_gate_fn=lambda _metrics: None,
         )
 
         self.assertEqual(set(result), {"TREND", "RANGE"})
@@ -211,13 +316,13 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             def run(self, features, signals, symbol, strategy, **kwargs):
                 active = set(features.loc[signals.ne(0), "REGIME_LIVE"].tolist())
                 self.events.append((features.attrs["surface"], active))
-                return {
+                return _with_authenticated_trade_evidence({
                     "total_trades": int(signals.ne(0).sum()),
                     "max_drawdown_pct": 1.0,
                     "profit_factor": 1.2,
                     "total_return_pct": 1.0,
                     "trades": [],
-                }
+                })
 
         regime_values = ["TREND", "RANGE", "BREAKOUT", "CHOP"] * 20
         train = pd.DataFrame({"Close": range(80), "REGIME_LIVE": regime_values})
@@ -232,6 +337,7 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             strategy_registry=Registry(),
         )
         real_create_study = pm_optuna.optuna.create_study
+        calibrate_power, validate_power = _power_callbacks()
         with patch("pm_optuna.optuna.create_study", wraps=real_create_study) as create_study:
             result = optimizer.optimize_for_regimes(
                 symbol="EURUSD",
@@ -246,6 +352,9 @@ class RegimeGatedSelectionTests(unittest.TestCase):
                 min_train_trades=5,
                 max_drawdown_pct=10.0,
                 val_warmup_bars=3,
+                calibrate_train_power_fn=calibrate_power,
+                evaluate_validation_power_fn=validate_power,
+                train_economic_gate_fn=lambda _metrics: None,
             )
 
         self.assertEqual(create_study.call_count, 4)
@@ -281,12 +390,12 @@ class RegimeGatedSelectionTests(unittest.TestCase):
                 surface = features.attrs["surface"]
                 self.events.append((surface, strategy.p))
                 score = float(strategy.p if surface == "train" else -strategy.p)
-                return {
+                return _with_authenticated_trade_evidence({
                     "total_trades": int(signals.ne(0).sum()),
                     "max_drawdown_pct": 1.0,
                     "score": score,
                     "trades": [],
-                }
+                })
 
         regimes = ["TREND", "RANGE", "BREAKOUT", "CHOP"] * 20
         train = pd.DataFrame({"Close": range(80), "REGIME_LIVE": regimes})
@@ -300,6 +409,16 @@ class RegimeGatedSelectionTests(unittest.TestCase):
         optimizer.val_max_drawdown = 10.0
         optimizer._last_tuning_search_meta = {}
         optimizer._compute_train_regime_score = lambda train_m, _val_m: float(train_m["score"])
+        optimizer._calibrate_train_power_result = (
+            lambda *_args, **_kwargs: _passing_power_decision()
+        )
+        optimizer._evaluate_partition_power_result = (
+            lambda *_args, **kwargs: _passing_power_decision(
+                "tuning_validation",
+                frozen_requirement=kwargs["frozen_requirement"],
+            )
+        )
+        optimizer._train_trial_economic_ineligibility = lambda _metrics: None
         with patch("pm_pipeline.StrategyRegistry.get", side_effect=lambda _name, **params: Strategy(**params)):
             candidates = optimizer._tune_strategy_params_grid(
                 "EURUSD",
@@ -344,12 +463,12 @@ class RegimeGatedSelectionTests(unittest.TestCase):
                     score = 0.0 if strategy.p == 0 else 100.0
                 else:
                     score = 50.0 if strategy.p == 0 else 40.0
-                return {
+                return _with_authenticated_trade_evidence({
                     "total_trades": int(signals.ne(0).sum()),
                     "max_drawdown_pct": 1.0,
                     "score": score,
                     "trades": [],
-                }
+                })
 
         optimizer = RegimeOptimizer.__new__(RegimeOptimizer)
         optimizer.family_probe_trials = 2
@@ -358,6 +477,10 @@ class RegimeGatedSelectionTests(unittest.TestCase):
         optimizer.min_train_trades = 1
         optimizer.backtester = Backtester()
         optimizer._compute_train_regime_score = lambda metrics, _val: float(metrics["score"])
+        optimizer._calibrate_train_power_result = (
+            lambda *_args, **_kwargs: _passing_power_decision()
+        )
+        optimizer._train_trial_economic_ineligibility = lambda _metrics: None
         features = pd.DataFrame({
             "Close": range(80),
             "REGIME_LIVE": ["TREND", "RANGE", "BREAKOUT", "CHOP"] * 20,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -12,7 +13,48 @@ import pm_optuna
 from pm_core import Backtester, PipelineConfig, StrategyCategory
 from pm_optuna import OptunaConfig, OptunaTPEOptimizer
 from pm_pipeline import CALENDAR_SPLIT_MODE, OptimizationPipeline, RegimeOptimizer
+from pm_search_outcomes import SearchOutcomeKind
 from pm_strategies import BaseStrategy, FractalChannelBreakoutStrategy
+from pm_trade_power import (
+    TradePowerDecision,
+    TradePowerPolicy,
+    TradePowerRequirement,
+    derive_trade_power_requirement,
+)
+
+
+def _typed_pass_power_decision(
+    partition: str,
+    *,
+    frozen_requirement: TradePowerRequirement | None = None,
+) -> TradePowerDecision:
+    requirement = frozen_requirement
+    if requirement is None:
+        requirement = replace(
+            derive_trade_power_requirement(
+                sigma_r_robust=1.0,
+                effective_trials=1,
+                policy=TradePowerPolicy(
+                    minimum_economic_edge_r=1.0,
+                    maximum_ci_half_width_r=2.0,
+                ),
+            ),
+            required_effective_train_trades=1,
+            required_effective_tuning_trades=1,
+            required_effective_final_trades=1,
+            frozen=True,
+        )
+    return TradePowerDecision(
+        status="PASS",
+        outcome_kind=SearchOutcomeKind.VALID,
+        partition=partition,
+        reason="typed test evidence satisfies the frozen requirement",
+        reason_codes=("POWER_PASS",),
+        observed_effective_trades=1.0,
+        required_effective_trades=1,
+        sample_evidence=None,
+        frozen_requirement=requirement,
+    )
 
 
 class _PrefixStateStrategy:
@@ -251,6 +293,16 @@ def test_grid_search_threads_train_and_validation_prefixes() -> None:
     optimizer._compute_train_regime_score = (
         lambda train_metrics, _val_metrics: float(train_metrics["total_return_pct"])
     )
+    optimizer._calibrate_train_power_result = (
+        lambda _result, **_kwargs: _typed_pass_power_decision("optimizer_train")
+    )
+    optimizer._evaluate_partition_power_result = (
+        lambda _result, **kwargs: _typed_pass_power_decision(
+            "tuning_validation",
+            frozen_requirement=kwargs["frozen_requirement"],
+        )
+    )
+    optimizer._train_trial_economic_ineligibility = lambda _metrics: None
 
     with patch("pm_pipeline.StrategyRegistry.get", side_effect=_Registry.get):
         candidates = optimizer._tune_strategy_params_grid(
@@ -331,6 +383,18 @@ def test_optuna_grid_fallback_preserves_both_prefix_boundaries() -> None:
             max_drawdown_pct=10.0,
             train_warmup_bars=10,
             val_warmup_bars=20,
+            calibrate_train_power_fn=(
+                lambda _result, **_kwargs: _typed_pass_power_decision(
+                    "optimizer_train"
+                )
+            ),
+            evaluate_validation_power_fn=(
+                lambda _result, **kwargs: _typed_pass_power_decision(
+                    "tuning_validation",
+                    frozen_requirement=kwargs["frozen_requirement"],
+                )
+            ),
+            train_economic_gate_fn=lambda _metrics: None,
         )
 
     assert candidates["TREND"]["train_regime_metrics"]["TREND"]["total_trades"] == 1

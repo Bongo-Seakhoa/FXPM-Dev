@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from pm_core import PipelineConfig, StrategyScorer
 from pm_pipeline import RegimeOptimizer
+from pm_search_outcomes import SearchInfrastructureError
 
 
 class TestScoringFeatureFlags(unittest.TestCase):
@@ -463,7 +464,9 @@ class TestCandidateDescentSelection(unittest.TestCase):
         opt._compute_regime_score = lambda train_m, val_m: float(val_m.get('_score', 0.0))
 
         # Force rank #1 to fail validation, rank #2 to pass.
-        def fake_validate(train_m, val_m, regime, candidate_name="Unknown"):
+        def fake_validate(
+            train_m, val_m, regime, candidate_name="Unknown", **_contract
+        ):
             if candidate_name == "S1":
                 return False, "forced fail"
             return True, "forced pass"
@@ -496,7 +499,9 @@ class TestCandidateDescentSelection(unittest.TestCase):
         # legacy top_k must not manufacture NO_TRADE after S1 fails.
         attempted = []
 
-        def fake_validate(train_m, val_m, regime, candidate_name="Unknown"):
+        def fake_validate(
+            train_m, val_m, regime, candidate_name="Unknown", **_contract
+        ):
             attempted.append(candidate_name)
             return (candidate_name == "S2"), ("pass" if candidate_name == "S2" else "fail")
 
@@ -524,7 +529,9 @@ class TestCandidateDescentSelection(unittest.TestCase):
         opt._compute_regime_score = lambda _train, val: float(val["_score"])
         validated = []
 
-        def validate(_train, _val, _regime, candidate_name="Unknown"):
+        def validate(
+            _train, _val, _regime, candidate_name="Unknown", **_contract
+        ):
             validated.append(candidate_name)
             return True, "pass"
 
@@ -554,12 +561,15 @@ class TestCandidateDescentSelection(unittest.TestCase):
         finite = self._candidate("Finite", 10.0)
         opt._validate_regime_winner = lambda *_args, **_kwargs: (True, "pass")
 
-        cfg_out, is_valid, _reason = opt._select_best_for_regime(
-            "SYM", "H1", "TREND", [invalid, finite]
-        )
+        with self.assertRaises(SearchInfrastructureError) as raised:
+            opt._select_best_for_regime(
+                "SYM", "H1", "TREND", [invalid, finite]
+            )
 
-        self.assertTrue(is_valid)
-        self.assertEqual(cfg_out.strategy_name, "Finite")
+        self.assertEqual(
+            raised.exception.outcome.reason_code,
+            "VALIDATION_SELECTION_SURFACE_INVALID",
+        )
 
     def test_false_discovery_rejection_happens_before_descent_validation(self):
         cfg = PipelineConfig(
@@ -583,7 +593,9 @@ class TestCandidateDescentSelection(unittest.TestCase):
         opt._compute_regime_score = lambda train_m, val_m: float(val_m.get('_score', 0.0))
         validated = []
 
-        def fake_validate(train_m, val_m, regime, candidate_name="Unknown"):
+        def fake_validate(
+            train_m, val_m, regime, candidate_name="Unknown", **_contract
+        ):
             validated.append(candidate_name)
             return True, "forced pass"
 

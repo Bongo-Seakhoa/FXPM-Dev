@@ -24,8 +24,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Iterable, Mapping
-from itertools import product
+from typing import Dict, List, Any, Optional, Tuple, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 
 import pandas as pd
@@ -105,6 +104,33 @@ from pm_memory_governor import (
     MemoryTask,
     is_memory_failure,
 )
+from pm_search_outcomes import (
+    InvalidStrategyParameterError,
+    SearchInfrastructureError,
+    SearchOutcomeKind,
+    SearchStage,
+    TrialOutcome,
+    aggregate_family_cell_outcomes,
+    classify_search_exception,
+)
+from pm_trade_power import (
+    REQUIRED_ENTRY_SLIPPAGE_CONTRACT,
+    REQUIRED_SWAP_ACCRUAL_CONTRACT,
+    REQUIRED_SWAP_PROJECTION_CONTRACT,
+    REQUIRED_TRADE_RECORD_SCHEMA,
+    TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
+    TRADE_POWER_SCHEMA_VERSION,
+    TRADE_POWER_DECISION_SCHEMA_VERSION,
+    TRADE_SAMPLE_SCHEMA_VERSION,
+    TradePowerDecision,
+    TradePowerPolicy,
+    TradePowerRequirement,
+    calibrate_train_trade_power,
+    derive_trade_power_requirement,
+    evaluate_trade_power_partition,
+    requirement_source_provenance_valid,
+    trade_sample_identity_sha256,
+)
 
 # Import Optuna TPE optimizer
 try:
@@ -139,7 +165,7 @@ except ImportError:
 
 # Configure module logger
 logger = logging.getLogger(__name__)
-PIPELINE_ARTIFACT_VERSION = "2026-07-11-two-book-nonoverlap-deployment-v5"
+PIPELINE_ARTIFACT_VERSION = "2026-07-13-trade-power-derived-binding-deployment-v7"
 
 # Runtime-only optimizer resource contract.  These values control scheduling
 # and failure isolation only; they never alter bars, features, trials, scoring,
@@ -156,6 +182,17 @@ OPTIMIZER_ESTIMATE_BASE_BYTES = 512 * 1024 * 1024
 OPTIMIZER_ESTIMATE_FALLBACK_BYTES = 1 * 1024 * 1024 * 1024
 OPTIMIZER_NATIVE_INPUT_MULTIPLIER = 16
 
+# One immutable production evidence policy.  These are effect-size and
+# precision requirements in strict post-cost R units, not folklore raw-trade
+# floors.  Train dispersion and exact attempted-trial multiplicity determine
+# the cell-specific effective-observation requirement.
+PRODUCTION_TRADE_POWER_POLICY = TradePowerPolicy(
+    minimum_economic_edge_r=0.25,
+    maximum_ci_half_width_r=0.25,
+    target_power=0.80,
+)
+PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS = 8
+
 
 def _stable_seed(*parts: Any) -> int:
     """Deterministic non-negative seed derived from stable context parts."""
@@ -168,6 +205,153 @@ def _stable_hash(payload: Any) -> str:
     """Create a stable SHA1 hash for JSON-serializable payloads."""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()
+
+
+def _signal_vector_sha256(signals: pd.Series) -> str:
+    """Canonical bounded identity for an exact gated signal vector."""
+    series = signals if isinstance(signals, pd.Series) else pd.Series(signals)
+    values = np.asarray(pd.to_numeric(series, errors="raise"), dtype="<f8")
+    if values.ndim != 1 or not np.isfinite(values).all():
+        raise ValueError("signal vector must be one-dimensional and finite")
+    index_hashes = pd.util.hash_pandas_object(series.index, index=True).to_numpy(
+        dtype="<u8", copy=False
+    )
+    digest = hashlib.sha256()
+    digest.update(b"fxpm-gated-signal-vector-v1\0")
+    digest.update(str(len(series)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(index_hashes.tobytes(order="C"))
+    digest.update(values.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+_OOS_BASELINE_IMMUTABLE_KEYS = (
+    "format_version",
+    "candidate_id",
+    "symbol",
+    "timeframe",
+    "regime",
+    "strategy_name",
+    "parameters",
+    "oos_surface",
+    "return_index",
+    "period_count",
+    "period_returns",
+    "baseline_gated_signals_sha256",
+    "trade_path_evidence",
+    "equity_path_evidence",
+    "metrics",
+    "train_metrics",
+    "train_regime_metrics",
+    "val_regime_metrics",
+    "parameter_stability_evidence",
+    "generalization_metrics",
+    "window",
+)
+
+
+def _oos_baseline_evidence_sha256(record: Mapping[str, Any]) -> str:
+    """Digest immutable output of the single frozen validation replay."""
+    def canonical(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): canonical(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        if isinstance(value, (np.integer, np.floating)):
+            return canonical(value.item())
+        if isinstance(value, float):
+            if math.isnan(value):
+                raise ValueError("NaN is not valid OOS baseline evidence")
+            if math.isinf(value):
+                return "__FXPM_POSITIVE_INFINITY__" if value > 0 else "__FXPM_NEGATIVE_INFINITY__"
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        raise TypeError(f"unsupported OOS baseline evidence type: {type(value).__name__}")
+
+    payload = canonical({
+        key: record.get(key) for key in _OOS_BASELINE_IMMUTABLE_KEYS
+    })
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _bounded_cartesian_combinations(
+    axes: Sequence[Sequence[Any]],
+    *,
+    limit: int,
+    seed: int,
+) -> Tuple[List[Tuple[Any, ...]], int]:
+    """Decode at most ``limit`` Cartesian points without materializing the grid."""
+    values = [tuple(axis) for axis in axes]
+    if not values or any(not axis for axis in values):
+        return [], 0
+    total = int(math.prod(len(axis) for axis in values))
+    count = min(total, max(0, int(limit)))
+    if count <= 0:
+        return [], total
+    start = 0 if count == total else int(seed % total)
+    step = 1 if count == total else (int((seed // max(total, 1)) % total) or 1)
+    while math.gcd(step, total) != 1:
+        step = (step + 1) % total or 1
+
+    def decode(encoded: int) -> Tuple[Any, ...]:
+        result: List[Any] = [None] * len(values)
+        remainder = int(encoded)
+        for index in range(len(values) - 1, -1, -1):
+            axis = values[index]
+            result[index] = axis[remainder % len(axis)]
+            remainder //= len(axis)
+        return tuple(result)
+
+    return [decode((start + offset * step) % total) for offset in range(count)], total
+
+
+def _classify_staged_search_exception(
+    exc: BaseException,
+    *,
+    stage: SearchStage,
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    strategy_family: str,
+    parameter_hash: str,
+) -> TrialOutcome:
+    """Keep invalid-parameter abstentions confined to parameter construction."""
+    outcome = classify_search_exception(
+        exc,
+        stage=stage,
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=regime,
+        strategy_family=strategy_family,
+        parameter_hash=parameter_hash,
+    )
+    if (
+        outcome.kind is SearchOutcomeKind.INVALID_PARAM
+        and stage not in {
+            SearchStage.PARAMETER_VALIDATION,
+            SearchStage.STRATEGY_CONSTRUCTION,
+        }
+    ):
+        return TrialOutcome(
+            kind=SearchOutcomeKind.INFRA_FAILURE,
+            stage=stage,
+            reason_code="INVALID_PARAMETER_EXCEPTION_OUTSIDE_PARAMETER_STAGE",
+            reason=outcome.reason,
+            symbol=symbol,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_family=strategy_family,
+            parameter_hash=parameter_hash,
+            exception_type=outcome.exception_type,
+        )
+    return outcome
 
 
 def _deployment_contract_fingerprint(config: PipelineConfig) -> Dict[str, Any]:
@@ -488,7 +672,7 @@ def build_artifact_meta(config: PipelineConfig,
         "oos_evidence_periods": int(getattr(config, "oos_evidence_periods", 64) or 64),
         "oos_evidence_min_periods": int(getattr(config, "oos_evidence_min_periods", 8) or 8),
         "oos_evidence_dirname": str(getattr(config, "oos_evidence_dirname", "oos_evidence") or "oos_evidence"),
-        "oos_evidence_record_schema": "oos_candidate_returns_v3_spoke_evidence",
+        "oos_evidence_record_schema": "oos_candidate_returns_v4_one_touch_evidence",
         "oos_evidence_trade_path_max_points": int(
             getattr(config, "oos_evidence_trade_path_max_points", 256) or 0
         ),
@@ -2377,26 +2561,23 @@ class HyperparameterOptimizer:
         strategy = StrategyRegistry.get(strategy_name)
         default_params = strategy.get_params()
         
-        # Generate combinations
+        # Decode at most the configured cap; never allocate the full grid.
         param_names = list(param_grid.keys())
-        param_values = list(param_grid.values())
-        combinations = list(product(*param_values))
-        
-        # Limit combinations
-        if len(combinations) > self.config.max_param_combos:
-            # Deterministic but unique seed derived from strategy context (X2)
-            _seed = _stable_seed(
-                symbol,
-                strategy_name,
-                "grid",
-                len(train_features),
-                str(train_features.index[0]) if len(train_features) else "",
-                str(train_features.index[-1]) if len(train_features) else "",
-                len(val_features),
-            )
-            np.random.seed(_seed)
-            indices = np.random.choice(len(combinations), self.config.max_param_combos, replace=False)
-            combinations = [combinations[i] for i in indices]
+        param_values = [list(param_grid[name] or []) for name in param_names]
+        _seed = _stable_seed(
+            symbol,
+            strategy_name,
+            "grid",
+            len(train_features),
+            str(train_features.index[0]) if len(train_features) else "",
+            str(train_features.index[-1]) if len(train_features) else "",
+            len(val_features),
+        )
+        combinations, _total_space = _bounded_cartesian_combinations(
+            param_values,
+            limit=self.config.max_param_combos,
+            seed=_seed,
+        )
         
         logger.info(f"[{symbol}] Grid search {strategy_name}: {len(combinations)} combinations")
 
@@ -2726,6 +2907,8 @@ class RegimeOptimizer:
             1, int(getattr(config, 'regime_family_probe_trials', 5) or 5)
         )
         self._last_tuning_search_meta: Dict[str, Any] = {}
+        self._last_family_probe_cells: List[Dict[str, Any]] = []
+        self._last_search_cell_outcomes: List[Dict[str, Any]] = []
         
         # Validation thresholds (from fx_backtester config)
         self.val_max_drawdown = getattr(config, 'fx_val_max_drawdown', 20.0)
@@ -2797,9 +2980,16 @@ class RegimeOptimizer:
         except (TypeError, ValueError, OverflowError):
             return base
 
-    def _make_no_trade_marker(self, reason: str, now: Optional[datetime] = None) -> RegimeConfig:
+    def _make_no_trade_marker(
+        self,
+        reason: str,
+        now: Optional[datetime] = None,
+        *,
+        search_outcome_evidence: Optional[Mapping[str, Any]] = None,
+    ) -> RegimeConfig:
         """Create an explicit non-tradeable marker for a regime slot with no validated winner."""
         marker_time = now or datetime.now()
+        typed_evidence = dict(search_outcome_evidence or {})
         return RegimeConfig(
             strategy_name=self.no_winner_marker or "NO_TRADE",
             parameters={},
@@ -2810,15 +3000,110 @@ class RegimeOptimizer:
             regime_val_trades=0,
             trained_at=marker_time,
             valid_until=_scheduled_valid_until(self.config, marker_time),
-            artifact_meta={"no_trade": True, "reason": reason},
+            artifact_meta={
+                "no_trade": True,
+                "reason": reason,
+                "search_outcome_evidence": typed_evidence,
+            },
             validation_evidence={
                 "validation_reason": reason,
                 "tradeable": False,
                 "no_trade": True,
+                "search_outcome_evidence": typed_evidence,
             },
             promotion_status="NO_TRADE",
             promotion_reasons=[reason],
         )
+
+    @staticmethod
+    def _summarize_search_cell_outcomes(
+        cells: Sequence[Mapping[str, Any]],
+        *,
+        regime: str,
+    ) -> Dict[str, Any]:
+        """Persist a bounded typed audit summary without retaining trial payloads."""
+        selected = [
+            dict(cell)
+            for cell in cells
+            if str(cell.get("regime") or "").upper() == str(regime).upper()
+        ]
+        kind_counts: Dict[str, int] = {}
+        reason_counts: Dict[str, int] = {}
+        validation_status_counts: Dict[str, int] = {}
+        validation_kind_counts: Dict[str, int] = {}
+        validation_reason_counts: Dict[str, int] = {}
+        canonical: List[Dict[str, Any]] = []
+        for cell in selected:
+            outcome = dict(cell.get("family_outcome") or {})
+            kind = str(outcome.get("kind") or "MISSING")
+            reason = str(outcome.get("reason_code") or "MISSING")
+            kind_counts[kind] = int(kind_counts.get(kind, 0)) + 1
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+            validation_status = str(
+                cell.get("trade_power_validation_status") or "NOT_EVALUATED"
+            )
+            validation_kind = str(
+                cell.get("trade_power_validation_kind") or "MISSING"
+            )
+            validation_reason = str(
+                cell.get("trade_power_validation_reason_code") or "NOT_EVALUATED"
+            )
+            validation_status_counts[validation_status] = int(
+                validation_status_counts.get(validation_status, 0)
+            ) + 1
+            validation_kind_counts[validation_kind] = int(
+                validation_kind_counts.get(validation_kind, 0)
+            ) + 1
+            validation_reason_counts[validation_reason] = int(
+                validation_reason_counts.get(validation_reason, 0)
+            ) + 1
+            canonical.append({
+                "phase": str(cell.get("phase") or ""),
+                "strategy_family": str(cell.get("strategy_family") or ""),
+                "kind": kind,
+                "reason_code": reason,
+                "validation_status": validation_status,
+                "validation_kind": validation_kind,
+                "validation_reason_code": validation_reason,
+                "search_trials": int(cell.get("search_trials", 0) or 0),
+                "completed_trials": int(cell.get("completed_trials", 0) or 0),
+                "eligible_train_trials": int(
+                    cell.get("eligible_train_trials", 0) or 0
+                ),
+            })
+        canonical.sort(
+            key=lambda item: (item["phase"], item["strategy_family"])
+        )
+        return {
+            "schema_version": "fxpm-search-cell-summary-v2",
+            "regime": str(regime).upper(),
+            "cell_count": int(len(canonical)),
+            "planned_trials": int(sum(item["search_trials"] for item in canonical)),
+            "completed_trials": int(
+                sum(item["completed_trials"] for item in canonical)
+            ),
+            "eligible_train_trials": int(
+                sum(item["eligible_train_trials"] for item in canonical)
+            ),
+            "outcome_kind_counts": dict(sorted(kind_counts.items())),
+            "reason_code_counts": dict(sorted(reason_counts.items())),
+            "validation_status_counts": dict(
+                sorted(validation_status_counts.items())
+            ),
+            "validation_kind_counts": dict(
+                sorted(validation_kind_counts.items())
+            ),
+            "validation_reason_code_counts": dict(
+                sorted(validation_reason_counts.items())
+            ),
+            "cell_outcomes_sha256": hashlib.sha256(
+                json.dumps(
+                    canonical,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
     
     @staticmethod
     def _compute_return_dd_ratio(val_return: float, val_dd: float, eps: float = 0.5) -> float:
@@ -2921,8 +3206,28 @@ class RegimeOptimizer:
                 logger.debug(f"[{symbol}] [{tf}] No valid candidates")
                 now = datetime.now()
                 for regime in self.REGIMES:
-                    reason = "No strategies passed training eligibility or produced trades"
-                    regime_configs[tf][regime] = self._make_no_trade_marker(reason, now=now)
+                    search_evidence = self._summarize_search_cell_outcomes(
+                        getattr(self, "_last_search_cell_outcomes", []) or [],
+                        regime=regime,
+                    )
+                    kinds = set(search_evidence.get("outcome_kind_counts", {}))
+                    if kinds and kinds.issubset({
+                        SearchOutcomeKind.EXPECTED_INELIGIBLE.value,
+                        SearchOutcomeKind.INVALID_PARAM.value,
+                    }):
+                        reason = (
+                            "All planned family-cell trials were expected-ineligible "
+                            "or invalid under the typed train evidence policy"
+                        )
+                    else:
+                        reason = (
+                            "No strategies passed training eligibility or produced trades"
+                        )
+                    regime_configs[tf][regime] = self._make_no_trade_marker(
+                        reason,
+                        now=now,
+                        search_outcome_evidence=search_evidence,
+                    )
                     unvalidated_winners += 1
                 continue
             
@@ -2959,13 +3264,27 @@ class RegimeOptimizer:
                                    f"[VALIDATED: {val_reason}]")
                     else:
                         unvalidated_winners += 1
-                        regime_configs[tf][regime] = self._make_no_trade_marker(val_reason)
+                        search_evidence = self._summarize_search_cell_outcomes(
+                            getattr(self, "_last_search_cell_outcomes", []) or [],
+                            regime=regime,
+                        )
+                        regime_configs[tf][regime] = self._make_no_trade_marker(
+                            val_reason,
+                            search_outcome_evidence=search_evidence,
+                        )
                         logger.debug(f"[{symbol}] [{tf}] [{regime}] Candidate {best_config.strategy_name} "
                                     f"FAILED validation: {val_reason}")
                 else:
                     # NO WINNER - No fallback to best train
                     unvalidated_winners += 1
-                    regime_configs[tf][regime] = self._make_no_trade_marker(val_reason)
+                    search_evidence = self._summarize_search_cell_outcomes(
+                        getattr(self, "_last_search_cell_outcomes", []) or [],
+                        regime=regime,
+                    )
+                    regime_configs[tf][regime] = self._make_no_trade_marker(
+                        val_reason,
+                        search_outcome_evidence=search_evidence,
+                    )
                     logger.warning(
                         f"[{symbol}] [{tf}] [{regime}] No validated winner - {val_reason}. "
                         f"NO TRADE for this regime (no fallback to best train)."
@@ -3156,6 +3475,545 @@ class RegimeOptimizer:
         if not np.isfinite(returns).all() or bool((returns <= -1.0).any()):
             return [], []
         return [float(value) for value in returns.tolist()], dates
+
+    @staticmethod
+    def _trade_power_source_contract(result: Mapping[str, Any]) -> Dict[str, Any]:
+        """Bind strict net-R evidence to the exact Backtester source contract."""
+        payload = dict(result or {})
+        swap = dict(payload.get("swap_accrual_contract") or {})
+        source_binding = {
+            "price_activation_manifest_sha256": swap.get(
+                "price_activation_manifest_sha256"
+            ),
+            "terms_activation_manifest_sha256": swap.get(
+                "terms_activation_manifest_sha256"
+            ),
+            "terms_snapshot_sha256": swap.get("terms_snapshot_sha256"),
+            "schedule_sha256": swap.get("schedule_sha256"),
+            "target_bars_sha256": swap.get("target_bars_sha256"),
+            "target_sidecar_sha256": swap.get("target_sidecar_sha256"),
+        }
+        for name in (
+            "historical_rates_sha256",
+            "broker_disabled_proof_sha256",
+        ):
+            if swap.get(name) not in (None, ""):
+                source_binding[name] = swap.get(name)
+        # The broker-terms contract uses the more explicit authenticated name;
+        # the evidence validator consumes this normalized semantic flag.
+        if "broker_swap_disabled" not in swap:
+            swap["broker_swap_disabled"] = bool(
+                swap.get("broker_swap_disabled_authenticated", False)
+            )
+        return {
+            "schema_version": TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
+            "source_binding": source_binding,
+            "trade_record_schema_version": REQUIRED_TRADE_RECORD_SCHEMA,
+            "execution_cost_timing_contract": dict(
+                payload.get("execution_cost_timing_contract") or {}
+            ),
+            "numerical_execution_cost_attestation": dict(
+                payload.get("numerical_execution_cost_attestation") or {}
+            ),
+            "swap_accrual_contract": swap,
+        }
+
+    @staticmethod
+    def _power_trial_outcome(
+        decision: TradePowerDecision,
+        *,
+        stage: SearchStage,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        strategy_family: str,
+        parameter_hash: str,
+    ) -> TrialOutcome:
+        reason_codes = tuple(decision.reason_codes or ())
+        return TrialOutcome(
+            kind=decision.outcome_kind,
+            stage=stage,
+            reason_code=(
+                str(reason_codes[0]) if reason_codes else str(decision.status)
+            ),
+            reason=str(decision.reason),
+            symbol=str(symbol),
+            timeframe=str(timeframe),
+            regime=str(regime),
+            strategy_family=str(strategy_family),
+            parameter_hash=str(parameter_hash),
+            evidence={
+                "partition": decision.partition,
+                "status": decision.status,
+                "observed_effective_trades": decision.observed_effective_trades,
+                "required_effective_trades": decision.required_effective_trades,
+                "reason_codes": list(reason_codes),
+            },
+        )
+
+    def _calibrate_train_power_result(
+        self,
+        result: Mapping[str, Any],
+        *,
+        effective_trials: int,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        strategy_family: str,
+        parameter_hash: str,
+    ) -> TradePowerDecision:
+        """Calibrate and freeze one train-only effective-trade requirement."""
+        decision = calibrate_train_trade_power(
+            result.get("trades"),
+            effective_trials=max(1, int(effective_trials)),
+            policy=PRODUCTION_TRADE_POWER_POLICY,
+            source_contract=self._trade_power_source_contract(result),
+            minimum_observations=PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
+            multiplicity_method="planned_family_cell_trials_v1",
+        )
+        if decision.outcome_kind is SearchOutcomeKind.INFRA_FAILURE:
+            raise SearchInfrastructureError(self._power_trial_outcome(
+                decision,
+                stage=SearchStage.TRAIN_EVIDENCE,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_family,
+                parameter_hash=parameter_hash,
+            ))
+        return decision
+
+    def _evaluate_partition_power_result(
+        self,
+        result: Mapping[str, Any],
+        *,
+        frozen_requirement: TradePowerRequirement,
+        partition: str = "tuning_validation",
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        strategy_family: str,
+        parameter_hash: str,
+    ) -> TradePowerDecision:
+        """Apply one immutable train requirement to an out-of-train partition."""
+        decision = evaluate_trade_power_partition(
+            result.get("trades"),
+            frozen_requirement=frozen_requirement,
+            partition=partition,
+            source_contract=self._trade_power_source_contract(result),
+            minimum_observations=PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
+        )
+        if decision.outcome_kind is SearchOutcomeKind.INFRA_FAILURE:
+            raise SearchInfrastructureError(self._power_trial_outcome(
+                decision,
+                stage=SearchStage.FROZEN_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_family,
+                parameter_hash=parameter_hash,
+            ))
+        return decision
+
+    def _train_trial_economic_ineligibility(
+        self,
+        metrics: Mapping[str, Any],
+    ) -> Optional[str]:
+        """Return the predeclared train-only economic rejection, if any."""
+        surface_failure = self._selection_surface_failure(
+            dict(metrics or {}),
+            label="train",
+        )
+        if surface_failure:
+            raise ValueError(f"TRAIN_SELECTION_SURFACE_INVALID: {surface_failure}")
+        try:
+            profit_factor = float(metrics.get("profit_factor"))
+            total_return = float(metrics.get("total_return_pct"))
+            drawdown = float(metrics.get("max_drawdown_pct"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("TRAIN_ECONOMIC_METRICS_INVALID") from exc
+        if (
+            math.isnan(profit_factor)
+            or profit_factor < 0.0
+            or not math.isfinite(total_return)
+            or not math.isfinite(drawdown)
+            or drawdown < 0.0
+        ):
+            raise ValueError("TRAIN_ECONOMIC_METRICS_INVALID")
+        if profit_factor < float(self.config.train_min_profit_factor):
+            return "TRAIN_PROFIT_FACTOR_GATE"
+        if total_return < float(self.config.train_min_return_pct):
+            return "TRAIN_RETURN_GATE"
+        drawdown_ceiling = min(
+            float(self.config.train_max_drawdown),
+            float(self.val_max_drawdown) * 1.25,
+        )
+        if (
+            drawdown > drawdown_ceiling
+        ):
+            return "TRAIN_DRAWDOWN_GATE"
+        return None
+
+    @classmethod
+    def _trade_power_decision_state(
+        cls,
+        value: Any,
+        *,
+        partition: str,
+    ) -> Tuple[str, str]:
+        """Validate a persisted power decision as PASS, INELIGIBLE, or INFRA."""
+        if not isinstance(value, Mapping):
+            return "INFRA", "TRADE_POWER_DECISION_MISSING"
+        expected_keys = {
+            "schema_version",
+            "status",
+            "outcome_kind",
+            "partition",
+            "passed",
+            "reason",
+            "reason_codes",
+            "observed_effective_trades",
+            "required_effective_trades",
+            "requirement_recalibrated",
+            "requirement_sigma_source",
+            "sample_evidence",
+            "frozen_requirement",
+        }
+        if (
+            set(value) != expected_keys
+            or str(value.get("schema_version") or "")
+            != TRADE_POWER_DECISION_SCHEMA_VERSION
+            or str(value.get("partition") or "") != partition
+            or value.get("requirement_recalibrated") is not False
+            or str(value.get("requirement_sigma_source") or "")
+            != "optimizer_train_frozen"
+            or not isinstance(value.get("reason"), str)
+            or not isinstance(value.get("reason_codes"), list)
+        ):
+            return "INFRA", "TRADE_POWER_DECISION_CONTRACT_INVALID"
+        status = str(value.get("status") or "")
+        kind = str(value.get("outcome_kind") or "")
+        passed = value.get("passed") is True
+        if status == "INFRA_FAILURE" or kind == SearchOutcomeKind.INFRA_FAILURE.value:
+            return "INFRA", "PERSISTED_TRADE_POWER_INFRA_FAILURE"
+        pass_shape = (
+            status == "PASS"
+            and kind == SearchOutcomeKind.VALID.value
+            and passed
+        )
+        ineligible_shape = (
+            status == "EXPECTED_INELIGIBLE"
+            and kind == SearchOutcomeKind.EXPECTED_INELIGIBLE.value
+            and not passed
+        )
+        if not pass_shape and not ineligible_shape:
+            return "INFRA", "TRADE_POWER_DECISION_CONTRACT_INVALID"
+
+        try:
+            observed = float(value.get("observed_effective_trades"))
+            required_raw = value.get("required_effective_trades")
+            if isinstance(required_raw, bool):
+                raise ValueError("required effective trades is boolean")
+            required = int(required_raw)
+            if float(required) != float(required_raw):
+                raise ValueError("required effective trades is not integral")
+        except (TypeError, ValueError, OverflowError):
+            return "INFRA", "TRADE_POWER_DECISION_CONTRACT_INVALID"
+        if (
+            not math.isfinite(observed)
+            or observed < 0.0
+            or required <= 0
+            or (pass_shape and observed < float(required))
+            or (ineligible_shape and observed >= float(required))
+        ):
+            return "INFRA", "TRADE_POWER_DECISION_CONTRACT_INVALID"
+
+        requirement_payload = value.get("frozen_requirement")
+        sample = value.get("sample_evidence")
+        if not isinstance(requirement_payload, Mapping) or not isinstance(sample, Mapping):
+            return "INFRA", "TRADE_POWER_DECISION_EVIDENCE_MISSING"
+        try:
+            requirement = cls._frozen_requirement_from_validation_evidence({
+                "trade_power": {
+                    "train": {"frozen_requirement": dict(requirement_payload)}
+                }
+            })
+        except (TypeError, ValueError, OverflowError):
+            return "INFRA", "TRADE_POWER_DECISION_EVIDENCE_INVALID"
+        required_field = {
+            "optimizer_train": requirement.required_effective_train_trades,
+            "tuning_validation": requirement.required_effective_tuning_trades,
+            "final_lockbox": requirement.required_effective_final_trades,
+        }.get(partition)
+        derived_requirement = derive_trade_power_requirement(
+            sigma_r_robust=requirement.sigma_r_robust,
+            effective_trials=requirement.effective_trials,
+            policy=PRODUCTION_TRADE_POWER_POLICY,
+        )
+        policy_exact = (
+            requirement.minimum_economic_edge_r
+            == PRODUCTION_TRADE_POWER_POLICY.minimum_economic_edge_r
+            and requirement.maximum_ci_half_width_r
+            == PRODUCTION_TRADE_POWER_POLICY.maximum_ci_half_width_r
+            and requirement.target_power
+            == PRODUCTION_TRADE_POWER_POLICY.target_power
+            and requirement.alpha_train_nominal
+            == PRODUCTION_TRADE_POWER_POLICY.alpha_train
+            and requirement.alpha_tuning
+            == PRODUCTION_TRADE_POWER_POLICY.alpha_tuning
+            and requirement.alpha_final
+            == PRODUCTION_TRADE_POWER_POLICY.alpha_final
+            and requirement.multiple_testing_adjustment
+            == PRODUCTION_TRADE_POWER_POLICY.multiple_testing_adjustment
+            and requirement.pilot_dispersion_method
+            == PRODUCTION_TRADE_POWER_POLICY.pilot_dispersion
+            and requirement.policy_schema_version
+            == PRODUCTION_TRADE_POWER_POLICY.schema_version
+        )
+        derived_exact = (
+            derived_requirement.passed
+            and requirement.status == derived_requirement.status
+            and requirement.reason == derived_requirement.reason
+            and requirement.reason_codes == derived_requirement.reason_codes
+            and requirement.sigma_r_robust == derived_requirement.sigma_r_robust
+            and requirement.effective_trials == derived_requirement.effective_trials
+            and requirement.alpha_train_adjusted
+            == derived_requirement.alpha_train_adjusted
+            and requirement.required_effective_train_trades
+            == derived_requirement.required_effective_train_trades
+            and requirement.required_effective_tuning_trades
+            == derived_requirement.required_effective_tuning_trades
+            and requirement.required_effective_final_trades
+            == derived_requirement.required_effective_final_trades
+            and requirement.multiplicity_method == "planned_family_cell_trials_v1"
+        )
+        required_hashes = (
+            requirement.calibration_sample_sha256,
+            requirement.calibration_source_contract_sha256,
+            requirement.calibration_partition_source_contract_sha256,
+            requirement.target_bars_sha256,
+            requirement.target_sidecar_sha256,
+            requirement.financing_schedule_sha256,
+            requirement.numerical_execution_cost_policy_sha256,
+            requirement.calibration_numerical_execution_cost_attestation_sha256,
+        )
+        if (
+            not requirement.passed
+            or not requirement.frozen
+            or not policy_exact
+            or not derived_exact
+            or not requirement_source_provenance_valid(requirement)
+            or requirement.schema_version != TRADE_POWER_SCHEMA_VERSION
+            or requirement.calibration_partition != "optimizer_train"
+            or requirement.source_contract_schema_version
+            != TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
+            or requirement.projection_contract_version
+            != REQUIRED_SWAP_PROJECTION_CONTRACT
+            or requirement.entry_slippage_contract_version
+            != REQUIRED_ENTRY_SLIPPAGE_CONTRACT
+            or requirement.swap_accrual_contract_version
+            != REQUIRED_SWAP_ACCRUAL_CONTRACT
+            or requirement.trade_record_schema_version
+            != REQUIRED_TRADE_RECORD_SCHEMA
+            or required_field != required
+            or not all(cls._sha256_attestation(item) for item in required_hashes)
+        ):
+            return "INFRA", "TRADE_POWER_DECISION_REQUIREMENT_INVALID"
+
+        source = sample.get("source_contract")
+        if not isinstance(source, Mapping):
+            return "INFRA", "TRADE_POWER_DECISION_SAMPLE_INVALID"
+        sample_outcome = str(sample.get("outcome_kind") or "")
+        sample_status = str(sample.get("status") or "")
+        expected_sample_keys = {
+            "schema_version",
+            "status",
+            "outcome_kind",
+            "reason",
+            "reason_codes",
+            "raw_trade_records",
+            "usable_trades",
+            "minimum_observations_required",
+            "mean_net_r",
+            "sigma_r_robust",
+            "effective_trades",
+            "net_r_min",
+            "net_r_max",
+            "net_r_values_sha256",
+            "holding_intervals_sha256",
+            "sample_sha256",
+            "source_contract",
+            "net_r_contract",
+            "dependence_evidence",
+        }
+        measured_sample = (
+            sample_status == "MEASURED"
+            and sample_outcome == SearchOutcomeKind.VALID.value
+        )
+        try:
+            sample_effective = float(sample.get("effective_trades"))
+            sample_sigma = (
+                float(sample.get("sigma_r_robust"))
+                if measured_sample
+                else None
+            )
+            raw_trade_records = int(sample.get("raw_trade_records"))
+            usable_trades = int(sample.get("usable_trades"))
+            minimum_observations = int(
+                sample.get("minimum_observations_required")
+            )
+            expected_sample_hash = trade_sample_identity_sha256(sample)
+            dependence = sample.get("dependence_evidence")
+            if measured_sample:
+                if not isinstance(dependence, Mapping):
+                    raise ValueError("measured sample dependence evidence is missing")
+                dependence_effective = float(
+                    dependence.get("effective_observations")
+                )
+                dependence_raw = int(dependence.get("raw_observations"))
+            else:
+                dependence_effective = None
+                dependence_raw = None
+        except (TypeError, ValueError, OverflowError):
+            return "INFRA", "TRADE_POWER_DECISION_SAMPLE_INVALID"
+        source_hashes = [
+            sample.get("sample_sha256"),
+            source.get("source_contract_sha256"),
+            source.get("partition_source_contract_sha256"),
+            source.get("target_bars_sha256"),
+            source.get("target_sidecar_sha256"),
+            source.get("financing_schedule_sha256"),
+            source.get("numerical_execution_cost_policy_sha256"),
+            source.get("numerical_execution_cost_attestation_sha256"),
+        ]
+        if measured_sample:
+            source_hashes.extend([
+                sample.get("net_r_values_sha256"),
+                sample.get("holding_intervals_sha256"),
+            ])
+        if (
+            str(sample.get("schema_version") or "") != TRADE_SAMPLE_SCHEMA_VERSION
+            or set(sample) != expected_sample_keys
+            or not math.isfinite(sample_effective)
+            or sample_effective < 0.0
+            or raw_trade_records < 0
+            or usable_trades < 0
+            or minimum_observations < 3
+            or (
+                measured_sample
+                and (
+                    sample_sigma is None
+                    or not math.isfinite(sample_sigma)
+                    or sample_sigma <= 0.0
+                )
+            )
+            or not math.isclose(sample_effective, observed, rel_tol=1e-12, abs_tol=1e-12)
+            or sample.get("sample_sha256") != expected_sample_hash
+            or (
+                measured_sample
+                and (
+                    raw_trade_records != usable_trades
+                    or raw_trade_records < minimum_observations
+                    or dependence_raw != raw_trade_records
+                    or dependence_effective is None
+                    or not math.isfinite(dependence_effective)
+                    or not math.isclose(
+                        sample_effective,
+                        dependence_effective,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                    or str((dependence or {}).get("status") or "") != "MEASURED"
+                )
+            )
+            or (
+                partition == "optimizer_train"
+                and (
+                    not measured_sample
+                    or sample_sigma is None
+                    or not math.isclose(
+                        sample_sigma,
+                        float(requirement.sigma_r_robust),
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                    or sample.get("sample_sha256")
+                    != requirement.calibration_sample_sha256
+                )
+            )
+            or not all(cls._sha256_attestation(item) for item in source_hashes)
+            or str(source.get("schema_version") or "")
+            != TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
+            or source.get("source_contract_sha256")
+            != requirement.calibration_source_contract_sha256
+            or source.get("target_bars_sha256") != requirement.target_bars_sha256
+            or source.get("target_sidecar_sha256") != requirement.target_sidecar_sha256
+            or source.get("financing_schedule_sha256")
+            != requirement.financing_schedule_sha256
+            or source.get("projection_contract_version")
+            != requirement.projection_contract_version
+            or source.get("numerical_execution_cost_policy_sha256")
+            != requirement.numerical_execution_cost_policy_sha256
+            or source.get("entry_slippage_contract_version")
+            != requirement.entry_slippage_contract_version
+            or source.get("swap_accrual_contract_version")
+            != requirement.swap_accrual_contract_version
+            or source.get("trade_record_schema_version")
+            != requirement.trade_record_schema_version
+            or source.get("swap_provenance_class")
+            != requirement.swap_provenance_class
+            or source.get("historical_financing_provenance")
+            != requirement.historical_financing_provenance
+            or source.get("execution_state_compounding") is not True
+            or source.get("swap_status")
+            != (
+                "DISABLED"
+                if requirement.swap_provenance_class
+                == "AUTHENTICATED_BROKER_DISABLED"
+                else "AVAILABLE"
+            )
+            or (
+                partition == "optimizer_train"
+                and (
+                    source.get("partition_source_contract_sha256")
+                    != requirement.calibration_partition_source_contract_sha256
+                    or source.get("numerical_execution_cost_attestation_sha256")
+                    != requirement.calibration_numerical_execution_cost_attestation_sha256
+                )
+            )
+        ):
+            return "INFRA", "TRADE_POWER_DECISION_SAMPLE_INVALID"
+        if pass_shape and not (
+            sample_status == "MEASURED"
+            and sample_outcome == SearchOutcomeKind.VALID.value
+        ):
+            return "INFRA", "TRADE_POWER_DECISION_SAMPLE_INVALID"
+        if ineligible_shape and sample_outcome not in {
+            SearchOutcomeKind.VALID.value,
+            SearchOutcomeKind.EXPECTED_INELIGIBLE.value,
+        }:
+            return "INFRA", "TRADE_POWER_DECISION_SAMPLE_INVALID"
+        return (
+            ("PASS", "")
+            if pass_shape
+            else ("INELIGIBLE", "TRADE_POWER_UNDERPOWERED")
+        )
+
+    @staticmethod
+    def _frozen_requirement_from_validation_evidence(
+        evidence: Mapping[str, Any],
+    ) -> TradePowerRequirement:
+        trade_power = evidence.get("trade_power")
+        train = trade_power.get("train") if isinstance(trade_power, Mapping) else None
+        payload = train.get("frozen_requirement") if isinstance(train, Mapping) else None
+        if not isinstance(payload, Mapping):
+            raise ValueError("frozen trade-power requirement is absent")
+        values = dict(payload)
+        values["reason_codes"] = tuple(values.get("reason_codes") or ())
+        allowed = set(TradePowerRequirement.__dataclass_fields__)
+        if set(values) - allowed:
+            raise ValueError("frozen trade-power requirement has unknown fields")
+        return TradePowerRequirement(**values)
 
     @staticmethod
     def _compact_backtest_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3460,8 +4318,23 @@ class RegimeOptimizer:
         val_pf = float(val_metrics.get("profit_factor", 0.0) or 0.0)
         return_retention = val_return / train_return if abs(train_return) > 1e-9 else 0.0
         pf_retention = val_pf / train_pf if train_pf > 1e-9 else 0.0
-        return {
-            "format_version": "oos_candidate_returns_v3",
+        baseline_signal_sha256 = str(
+            val_result.get("_baseline_gated_signals_sha256", "") or ""
+        )
+        expected_signal_sha256 = str(
+            candidate.get("_baseline_gated_signals_sha256", "") or ""
+        )
+        if (
+            not self._sha256_attestation(baseline_signal_sha256)
+            or (
+                bool(candidate.get("trade_power_contract_enforced", False))
+                and expected_signal_sha256 != baseline_signal_sha256
+            )
+        ):
+            raise ValueError("frozen validation signal attestation is missing or mismatched")
+        candidate["_baseline_gated_signals_sha256"] = baseline_signal_sha256
+        record = {
+            "format_version": "oos_candidate_returns_v4",
             "candidate_id": candidate_id,
             "symbol": symbol,
             "timeframe": timeframe,
@@ -3491,6 +4364,7 @@ class RegimeOptimizer:
             "return_index": "relative_equal_blocks",
             "period_count": int(len(period_returns)),
             "period_returns": period_returns,
+            "baseline_gated_signals_sha256": baseline_signal_sha256,
             "trade_path_evidence": self._trade_path_evidence(
                 val_result.get("trades", []),
                 max_points=int(getattr(self.config, "oos_evidence_trade_path_max_points", 256) or 0),
@@ -3526,6 +4400,126 @@ class RegimeOptimizer:
                 "warmup_bars": int(val_warmup_bars or 0),
             },
         }
+        baseline_evidence_sha256 = _oos_baseline_evidence_sha256(record)
+        record["baseline_evidence_sha256"] = baseline_evidence_sha256
+        candidate["_oos_baseline_attestation_sha256"] = baseline_evidence_sha256
+        return record
+
+    def _validated_existing_oos_record(
+        self,
+        record: Mapping[str, Any],
+        *,
+        symbol: str,
+        timeframe: str,
+        candidate: Mapping[str, Any],
+        val_features: pd.DataFrame,
+        val_warmup_bars: int,
+    ) -> Dict[str, Any]:
+        """Authenticate one in-run baseline record and refresh final metadata."""
+        regime = self._candidate_evaluation_regime(candidate)
+        strategy_name = str(candidate.get("strategy_name", ""))
+        params = self._clean_candidate_params(candidate.get("params", {}))
+        expected_id = self._exact_cell_candidate_id(
+            symbol,
+            timeframe,
+            regime,
+            {**dict(candidate), "strategy_name": strategy_name, "params": params},
+        )
+        try:
+            expected_start = pd.Timestamp(val_features.index[0]).isoformat()
+            expected_end = pd.Timestamp(val_features.index[-1]).isoformat()
+        except Exception as exc:
+            raise ValueError("validation window identity is unavailable") from exc
+        window = record.get("window")
+        period_returns = record.get("period_returns")
+        required_maps = (
+            "metrics",
+            "train_metrics",
+            "train_regime_metrics",
+            "val_regime_metrics",
+            "trade_path_evidence",
+            "equity_path_evidence",
+            "execution_cost_survival",
+            "parameter_stability_evidence",
+            "generalization_metrics",
+        )
+        try:
+            finite_returns = [float(value) for value in period_returns]
+            recomputed_baseline_sha256 = _oos_baseline_evidence_sha256(record)
+            metrics = record.get("metrics")
+            metric_keys = {
+                "total_trades",
+                "profit_factor",
+                "total_return_pct",
+                "max_drawdown_pct",
+                "win_rate",
+            }
+            if not isinstance(metrics, Mapping) or set(metrics) != metric_keys:
+                raise ValueError("OOS baseline metrics schema is invalid")
+            total_trades = int(metrics.get("total_trades"))
+            profit_factor = float(metrics.get("profit_factor"))
+            total_return = float(metrics.get("total_return_pct"))
+            drawdown = float(metrics.get("max_drawdown_pct"))
+            win_rate = float(metrics.get("win_rate"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("OOS baseline evidence is malformed") from exc
+        if (
+            str(record.get("format_version") or "") != "oos_candidate_returns_v4"
+            or str(record.get("candidate_id") or "") != expected_id
+            or str(record.get("symbol") or "") != str(symbol)
+            or str(record.get("timeframe") or "").upper() != str(timeframe).upper()
+            or str(record.get("regime") or "") != regime
+            or str(record.get("strategy_name") or "") != strategy_name
+            or record.get("parameters") != params
+            or str(record.get("oos_surface") or "") != "stage3_selection"
+            or str(record.get("return_index") or "") != "relative_equal_blocks"
+            or not self._sha256_attestation(
+                record.get("baseline_gated_signals_sha256")
+            )
+            or not self._sha256_attestation(record.get("baseline_evidence_sha256"))
+            or record.get("baseline_evidence_sha256")
+            != recomputed_baseline_sha256
+            or candidate.get("_oos_baseline_attestation_sha256")
+            != recomputed_baseline_sha256
+            or candidate.get("_baseline_gated_signals_sha256")
+            != record.get("baseline_gated_signals_sha256")
+            or not isinstance(window, Mapping)
+            or window.get("start_ts") != expected_start
+            or window.get("end_ts") != expected_end
+            or int(window.get("bars", -1)) != int(len(val_features))
+            or int(window.get("warmup_bars", -1)) != int(val_warmup_bars or 0)
+            or int(record.get("period_count", -1)) != len(finite_returns)
+            or len(finite_returns) < int(
+                getattr(self.config, "oos_evidence_min_periods", 8) or 8
+            )
+            or not all(math.isfinite(value) for value in finite_returns)
+            or total_trades < 0
+            or math.isnan(profit_factor)
+            or not math.isfinite(total_return)
+            or not math.isfinite(drawdown)
+            or drawdown < 0.0
+            or not math.isfinite(win_rate)
+            or not 0.0 <= win_rate <= 100.0
+            or any(not isinstance(record.get(key), Mapping) for key in required_maps)
+        ):
+            raise ValueError("OOS baseline record identity or evidence is invalid")
+        refreshed = dict(record)
+        refreshed["is_tuned"] = bool(candidate.get("is_tuned", False))
+        refreshed["tuned_for_regime"] = candidate.get("tuned_for_regime")
+        for key in (
+            "search_trials",
+            "local_search_trials_total",
+            "local_search_cells_total",
+            "family_probe_search_trials_total",
+            "family_probe_search_cells_total",
+            "tuning_search_trials_total",
+            "tuning_search_cells_total",
+            "strategy_roster_count",
+        ):
+            default = 1 if key == "search_trials" else 0
+            refreshed[key] = int(candidate.get(key, default) or default)
+        refreshed["multiplicity_scope"] = candidate.get("multiplicity_scope")
+        return refreshed
 
     def _attach_oos_evidence_to_candidates(self,
                                            symbol: str,
@@ -3562,23 +4556,95 @@ class RegimeOptimizer:
                         f"{cand.get('strategy_name', 'Unknown')}: candidate has no exact regime identity"
                     )
                     continue
-                strategy = cand.get("strategy")
-                if strategy is None:
-                    strategy = StrategyRegistry.get(cand.get("strategy_name", ""), **(cand.get("params", {}) or {}))
-                raw_signals = strategy.generate_signals(val_features, symbol)
-                signals = self._gate_signals_to_exact_regime(
-                    raw_signals,
-                    val_features,
-                    evaluation_regime,
-                )
-                val_result = self.backtester.run(
-                    val_features,
-                    signals,
-                    symbol,
-                    strategy,
-                    timeframe=timeframe,
-                    warmup_bars=val_warmup_bars,
-                )
+                existing_record = cand.get("oos_evidence")
+                if isinstance(existing_record, Mapping):
+                    try:
+                        existing_record = self._validated_existing_oos_record(
+                            existing_record,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            candidate=cand,
+                            val_features=val_features,
+                            val_warmup_bars=val_warmup_bars,
+                        )
+                    except Exception as record_exc:
+                        raise SearchInfrastructureError(TrialOutcome(
+                            kind=SearchOutcomeKind.INFRA_FAILURE,
+                            stage=SearchStage.FROZEN_VALIDATION,
+                            reason_code="FROZEN_VALIDATION_REPLAY_EVIDENCE_INVALID",
+                            reason=f"{type(record_exc).__name__}: {record_exc}",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=evaluation_regime,
+                            strategy_family=str(cand.get("strategy_name", "")),
+                        )) from record_exc
+                if (
+                    not isinstance(existing_record, Mapping)
+                    and bool(cand.get("trade_power_contract_enforced", False))
+                ):
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FROZEN_VALIDATION,
+                        reason_code="FROZEN_VALIDATION_REPLAY_EVIDENCE_MISSING",
+                        reason=(
+                            "governed candidate did not retain evidence from its "
+                            "single tuning-validation evaluation"
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=evaluation_regime,
+                        strategy_family=str(cand.get("strategy_name", "")),
+                    ))
+                strategy = None
+                signals = None
+                if stress_enabled or not isinstance(existing_record, Mapping):
+                    strategy = (
+                        StrategyRegistry.get(
+                            cand.get("strategy_name", ""),
+                            **(cand.get("params", {}) or {}),
+                        )
+                        if isinstance(existing_record, Mapping)
+                        else cand.get("strategy")
+                    )
+                    if strategy is None:
+                        strategy = StrategyRegistry.get(
+                            cand.get("strategy_name", ""),
+                            **(cand.get("params", {}) or {}),
+                        )
+                    raw_signals = strategy.generate_signals(val_features, symbol)
+                    signals = self._gate_signals_to_exact_regime(
+                        raw_signals,
+                        val_features,
+                        evaluation_regime,
+                    )
+                    if (
+                        isinstance(existing_record, Mapping)
+                        and _signal_vector_sha256(signals)
+                        != existing_record.get("baseline_gated_signals_sha256")
+                    ):
+                        raise SearchInfrastructureError(TrialOutcome(
+                            kind=SearchOutcomeKind.INFRA_FAILURE,
+                            stage=SearchStage.FROZEN_VALIDATION,
+                            reason_code="FROZEN_VALIDATION_SIGNAL_REPLAY_MISMATCH",
+                            reason="stress replay signal vector differs from frozen baseline",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=evaluation_regime,
+                            strategy_family=str(cand.get("strategy_name", "")),
+                        ))
+                val_result = None
+                if not isinstance(existing_record, Mapping):
+                    val_result = self.backtester.run(
+                        val_features,
+                        signals,
+                        symbol,
+                        strategy,
+                        timeframe=timeframe,
+                        warmup_bars=val_warmup_bars,
+                    )
+                    val_result["_baseline_gated_signals_sha256"] = (
+                        _signal_vector_sha256(signals)
+                    )
                 stress_result = None
                 if stress_enabled and stress_backtester is not None:
                     if stress_cap > 0 and stress_attempts >= stress_cap:
@@ -3600,27 +4666,60 @@ class RegimeOptimizer:
                                 "stress_mode": stress_mode,
                                 "error": f"{type(stress_exc).__name__}: {stress_exc}",
                             }
-                record = self._build_oos_evidence_record(
-                    symbol,
-                    timeframe,
-                    cand,
-                    val_result,
-                    val_features,
-                    val_warmup_bars,
-                    stress_result=stress_result,
-                    stress_mode=stress_mode,
-                )
+                if isinstance(existing_record, Mapping):
+                    record = dict(existing_record)
+                    if stress_result is not None:
+                        baseline = dict(record.get("metrics") or {})
+                        record["execution_cost_survival"] = (
+                            self._execution_cost_survival_evidence(
+                                baseline,
+                                stress_result,
+                                stress_mode,
+                            )
+                        )
+                else:
+                    record = self._build_oos_evidence_record(
+                        symbol,
+                        timeframe,
+                        cand,
+                        dict(val_result or {}),
+                        val_features,
+                        val_warmup_bars,
+                        stress_result=stress_result,
+                        stress_mode=stress_mode,
+                    )
                 if record:
+                    if record["candidate_id"] in records_by_id:
+                        raise SearchInfrastructureError(TrialOutcome(
+                            kind=SearchOutcomeKind.INFRA_FAILURE,
+                            stage=SearchStage.FAMILY_CELL,
+                            reason_code="DUPLICATE_OOS_CANDIDATE_ID",
+                            reason="multiple OOS records share one exact candidate identity",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=evaluation_regime,
+                            strategy_family=str(cand.get("strategy_name", "")),
+                        ))
                     cand["oos_evidence"] = record
                     cost_evidence = record.get("execution_cost_survival")
                     if isinstance(cost_evidence, dict):
                         cand["selection_execution_cost_survival"] = cost_evidence
                     records_by_id[record["candidate_id"]] = record
             except Exception as exc:
-                logger.debug(
-                    f"[{symbol}] [{timeframe}] OOS evidence skipped for "
-                    f"{cand.get('strategy_name', 'Unknown')}: {exc}"
+                if isinstance(exc, SearchInfrastructureError):
+                    raise
+                outcome = _classify_staged_search_exception(
+                    exc,
+                    stage=SearchStage.FROZEN_VALIDATION,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=self._candidate_evaluation_regime(cand),
+                    strategy_family=str(cand.get("strategy_name", "")),
+                    parameter_hash=_stable_hash(
+                        self._clean_candidate_params(cand.get("params", {}))
+                    ),
                 )
+                raise SearchInfrastructureError(outcome) from exc
         if records_by_id:
             self.oos_candidate_evidence_records.extend(records_by_id.values())
 
@@ -3916,10 +5015,12 @@ class RegimeOptimizer:
             params['tp_atr_mult'] = float(anchor)
             try:
                 variants.append((StrategyRegistry.get(strategy.name, **params), float(anchor)))
-            except Exception as exc:
+            except InvalidStrategyParameterError as exc:
                 logger.debug(
                     f"{strategy.name} screening ATR anchor {anchor} skipped: {exc}"
                 )
+            except Exception:
+                raise
         return variants or [(strategy, None)]
 
     @staticmethod
@@ -4188,37 +5289,134 @@ class RegimeOptimizer:
         warmup_bars: int = 0,
         run_zero_signal_path: bool = False,
         partition: str = "unspecified",
+        capture_trade_power_inputs: bool = False,
     ) -> Tuple[Dict[str, Any], bool]:
         """Run one exact-regime cell and report whether Backtester.run executed."""
-        raw_signals = strategy.generate_signals(features, symbol)
-        gated = self._gate_signals_to_exact_regime(raw_signals, features, regime)
-        warmup = min(len(gated), max(0, int(warmup_bars or 0)))
-        signal_start = max(0, warmup - 1)
-        if gated.iloc[signal_start:].abs().sum() == 0 and not run_zero_signal_path:
-            return {
-                "total_trades": 0,
-                "regime_gated": True,
-                "evaluation_regime": str(regime),
-            }, False
-        result = self.backtester.run(
-            features,
-            gated,
-            symbol,
-            strategy,
-            warmup_bars=warmup,
-            timeframe=timeframe,
-        )
-        compact = self._compact_exact_regime_result(result, regime)
-        compact.update(
-            self._build_daily_net_mtm_surface(
-                result=result,
-                features=features,
-                timeframe=timeframe,
-                warmup_bars=warmup,
-                partition=partition,
+        family = str(getattr(strategy, "name", type(strategy).__name__))
+        validation_partition = str(partition) == "tuning_validation"
+        parameter_hash = ""
+        try:
+            parameter_hash = _stable_hash(
+                self._clean_candidate_params(strategy.get_params())
             )
-        )
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=(
+                    SearchStage.FROZEN_VALIDATION
+                    if validation_partition
+                    else SearchStage.TRAIN_EVIDENCE
+                ),
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=family,
+                parameter_hash=parameter_hash,
+            )
+            raise SearchInfrastructureError(outcome) from exc
+        try:
+            raw_signals = strategy.generate_signals(features, symbol)
+            gated = self._gate_signals_to_exact_regime(raw_signals, features, regime)
+            gated_signal_sha256 = (
+                _signal_vector_sha256(gated)
+                if capture_trade_power_inputs
+                else ""
+            )
+            warmup = min(len(gated), max(0, int(warmup_bars or 0)))
+            signal_start = max(0, warmup - 1)
+            if gated.iloc[signal_start:].abs().sum() == 0 and not run_zero_signal_path:
+                return {
+                    "total_trades": 0,
+                    "regime_gated": True,
+                    "evaluation_regime": str(regime),
+                }, False
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=(
+                    SearchStage.FROZEN_VALIDATION
+                    if validation_partition
+                    else SearchStage.SIGNAL_GENERATION
+                ),
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=family,
+                parameter_hash=parameter_hash,
+            )
+            raise SearchInfrastructureError(outcome) from exc
+        try:
+            result = self.backtester.run(
+                features,
+                gated,
+                symbol,
+                strategy,
+                warmup_bars=warmup,
+                timeframe=timeframe,
+            )
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=(
+                    SearchStage.FROZEN_VALIDATION
+                    if validation_partition
+                    else SearchStage.TRAIN_BACKTEST
+                ),
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=family,
+                parameter_hash=parameter_hash,
+            )
+            raise SearchInfrastructureError(outcome) from exc
+        try:
+            compact = self._compact_exact_regime_result(result, regime)
+            compact.update(
+                self._build_daily_net_mtm_surface(
+                    result=result,
+                    features=features,
+                    timeframe=timeframe,
+                    warmup_bars=warmup,
+                    partition=partition,
+                )
+            )
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=(
+                    SearchStage.FROZEN_VALIDATION
+                    if validation_partition
+                    else SearchStage.TRAIN_EVIDENCE
+                ),
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=family,
+                parameter_hash=parameter_hash,
+            )
+            raise SearchInfrastructureError(outcome) from exc
+        if capture_trade_power_inputs:
+            # This transient payload is consumed and popped by the immediate
+            # search callsite.  Candidate artifacts retain only the compact,
+            # hash-bound decision, so memory does not scale with all trials.
+            result["_baseline_gated_signals_sha256"] = gated_signal_sha256
+            compact["_trade_power_raw_result"] = result
         return compact, True
+
+    @staticmethod
+    def _pop_trade_power_raw_result(metrics: Dict[str, Any]) -> Dict[str, Any]:
+        raw = metrics.pop("_trade_power_raw_result", None)
+        if not isinstance(raw, dict):
+            raise RuntimeError("BACKTEST_TRADE_POWER_INPUT_MISSING")
+        return raw
 
     def _run_exact_regime_screening(
         self,
@@ -4340,19 +5538,43 @@ class RegimeOptimizer:
         cell_records: List[Dict[str, Any]] = []
         for base_strategy in strategies:
             for regime in self.REGIMES:
-                specs = self._family_probe_param_specs(
-                    base_strategy,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    regime=regime,
-                )
+                try:
+                    specs = self._family_probe_param_specs(
+                        base_strategy,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                    )
+                except Exception as exc:
+                    if isinstance(exc, SearchInfrastructureError):
+                        raise
+                    outcome = _classify_staged_search_exception(
+                        exc,
+                        stage=SearchStage.PARAMETER_VALIDATION,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=str(getattr(base_strategy, "name", "")),
+                        parameter_hash="",
+                    )
+                    raise SearchInfrastructureError(outcome) from exc
                 best_score = float("-inf")
+                best_effective_trades = float("-inf")
                 best_candidate: Optional[Dict[str, Any]] = None
+                best_parameter_hash = ""
                 completed_trials = 0
                 eligible_train_trials = 0
+                trial_outcomes: List[TrialOutcome] = []
                 for params, atr_anchor in specs:
+                    current_stage = SearchStage.PARAMETER_VALIDATION
+                    parameter_hash = ""
                     try:
+                        parameter_hash = _stable_hash(
+                            self._clean_candidate_params(params)
+                        )
+                        current_stage = SearchStage.STRATEGY_CONSTRUCTION
                         probe_strategy = StrategyRegistry.get(base_strategy.name, **params)
+                        current_stage = SearchStage.TRAIN_BACKTEST
                         metrics, ran = self._run_one_exact_regime(
                             symbol=symbol,
                             timeframe=timeframe,
@@ -4360,17 +5582,91 @@ class RegimeOptimizer:
                             strategy=probe_strategy,
                             regime=regime,
                             warmup_bars=train_warmup_bars,
+                            run_zero_signal_path=True,
                             partition="optimizer_train",
+                            capture_trade_power_inputs=True,
                         )
                         completed_trials += int(ran)
-                        if int(metrics.get("total_trades", 0) or 0) <= 0:
+                        current_stage = SearchStage.TRAIN_EVIDENCE
+                        raw_result = self._pop_trade_power_raw_result(metrics)
+                        power_decision = self._calibrate_train_power_result(
+                            raw_result,
+                            effective_trials=len(specs),
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=base_strategy.name,
+                            parameter_hash=parameter_hash,
+                        )
+                        power_outcome = self._power_trial_outcome(
+                            power_decision,
+                            stage=SearchStage.TRAIN_EVIDENCE,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=base_strategy.name,
+                            parameter_hash=parameter_hash,
+                        )
+                        if not power_decision.passed:
+                            trial_outcomes.append(power_outcome)
                             continue
+                        metrics["effective_trades"] = float(
+                            power_decision.observed_effective_trades
+                        )
+                        current_stage = SearchStage.TRAIN_SCORE
+                        economic_reason = self._train_trial_economic_ineligibility(
+                            metrics
+                        )
+                        if economic_reason:
+                            trial_outcomes.append(TrialOutcome(
+                                kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+                                stage=SearchStage.TRAIN_SCORE,
+                                reason_code=economic_reason,
+                                reason="trial failed a predeclared train economic gate",
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                regime=regime,
+                                strategy_family=base_strategy.name,
+                                parameter_hash=parameter_hash,
+                            ))
+                            continue
+                        trial_outcomes.append(power_outcome)
                         score = float(self._compute_train_regime_score(metrics, {}))
                         if not math.isfinite(score):
-                            continue
+                            raise SearchInfrastructureError(TrialOutcome(
+                                kind=SearchOutcomeKind.INFRA_FAILURE,
+                                stage=SearchStage.TRAIN_SCORE,
+                                reason_code="NONFINITE_TRAIN_SCORE",
+                                reason="train score is non-finite",
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                regime=regime,
+                                strategy_family=base_strategy.name,
+                                parameter_hash=parameter_hash,
+                            ))
                         eligible_train_trials += 1
-                        if score > best_score:
+                        effective_trades = float(
+                            power_decision.observed_effective_trades
+                        )
+                        if (
+                            score > best_score
+                            or (
+                                score == best_score
+                                and (
+                                    effective_trades > best_effective_trades
+                                    or (
+                                        effective_trades == best_effective_trades
+                                        and (
+                                            not best_parameter_hash
+                                            or parameter_hash < best_parameter_hash
+                                        )
+                                    )
+                                )
+                            )
+                        ):
                             best_score = score
+                            best_effective_trades = effective_trades
+                            best_parameter_hash = parameter_hash
                             clean_params = self._clean_candidate_params(
                                 probe_strategy.get_params()
                             )
@@ -4406,12 +5702,51 @@ class RegimeOptimizer:
                                 "search_contract": "independent_regime_family_train_only_v1",
                                 "regime_gated": True,
                                 "family_probe_budget": int(self.family_probe_trials),
+                                "trade_power_contract_enforced": True,
+                                "trade_power_train": power_decision.to_dict(),
+                                "_trade_power_requirement": (
+                                    power_decision.frozen_requirement
+                                ),
                             }
                     except Exception as exc:
-                        logger.debug(
-                            "[%s] [%s] [%s] B0 probe failed for %s: %s",
-                            symbol, timeframe, regime, base_strategy.name, exc,
+                        if isinstance(exc, SearchInfrastructureError):
+                            raise
+                        outcome = _classify_staged_search_exception(
+                            exc,
+                            stage=current_stage,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=base_strategy.name,
+                            parameter_hash=parameter_hash,
                         )
+                        trial_outcomes.append(outcome)
+                        if outcome.kind is SearchOutcomeKind.INVALID_PARAM:
+                            continue
+                        raise SearchInfrastructureError(outcome) from exc
+                family_outcome = aggregate_family_cell_outcomes(
+                    trial_outcomes,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=base_strategy.name,
+                )
+                if family_outcome.kind is SearchOutcomeKind.INFRA_FAILURE:
+                    raise SearchInfrastructureError(family_outcome)
+                if (
+                    family_outcome.kind is SearchOutcomeKind.VALID
+                    and best_candidate is None
+                ):
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FAMILY_CELL,
+                        reason_code="VALID_OUTCOME_WITHOUT_CANDIDATE",
+                        reason="valid family outcome has no frozen candidate",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=base_strategy.name,
+                    ))
                 if best_candidate is not None:
                     best_candidate["search_completed_trials"] = int(completed_trials)
                     best_candidate["eligible_train_trials"] = int(eligible_train_trials)
@@ -4428,6 +5763,7 @@ class RegimeOptimizer:
                     "best_train_score": (
                         float(best_score) if math.isfinite(best_score) else None
                     ),
+                    "family_outcome": family_outcome.to_dict(),
                 })
         return candidates, cell_records
 
@@ -4451,37 +5787,140 @@ class RegimeOptimizer:
             family = str(candidate.get("strategy_name", ""))
             evaluations = 0
             error: Optional[str] = None
-            metrics: Dict[str, Any] = {"total_trades": 0}
+            parameter_hash = _stable_hash(
+                self._clean_candidate_params(candidate.get("params", {}))
+            )
             if (
-                val_features is not None
-                and max(0, len(val_features) - int(val_warmup_bars or 0)) >= 50
+                val_features is None
+                or max(0, len(val_features) - int(val_warmup_bars or 0)) < 50
             ):
-                evaluations = 1
-                try:
-                    frozen_strategy = StrategyRegistry.get(
-                        family, **dict(candidate.get("params", {}) or {})
-                    )
-                    candidate["strategy"] = frozen_strategy
-                    metrics, _ = self._run_one_exact_regime(
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FROZEN_VALIDATION,
+                    reason_code="TUNING_VALIDATION_SURFACE_UNAVAILABLE",
+                    reason="frozen tuning-validation surface is missing or too short",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=family,
+                    parameter_hash=parameter_hash,
+                ))
+            requirement = candidate.get("_trade_power_requirement")
+            if not isinstance(requirement, TradePowerRequirement):
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FROZEN_VALIDATION,
+                    reason_code="FROZEN_TRADE_POWER_REQUIREMENT_MISSING",
+                    reason="train-frozen trade-power requirement is missing",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=family,
+                    parameter_hash=parameter_hash,
+                ))
+            evaluations = 1
+            try:
+                frozen_strategy = StrategyRegistry.get(
+                    family, **dict(candidate.get("params", {}) or {})
+                )
+                candidate["strategy"] = frozen_strategy
+                metrics, _ = self._run_one_exact_regime(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    features=val_features,
+                    strategy=frozen_strategy,
+                    regime=regime,
+                    warmup_bars=val_warmup_bars,
+                    run_zero_signal_path=True,
+                    partition="tuning_validation",
+                    capture_trade_power_inputs=True,
+                )
+                raw_result = self._pop_trade_power_raw_result(metrics)
+                candidate["_baseline_gated_signals_sha256"] = str(
+                    raw_result.get("_baseline_gated_signals_sha256", "") or ""
+                )
+                power_decision = self._evaluate_partition_power_result(
+                    raw_result,
+                    frozen_requirement=requirement,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=family,
+                    parameter_hash=parameter_hash,
+                )
+            except Exception as exc:
+                if isinstance(exc, SearchInfrastructureError):
+                    raise
+                outcome = classify_search_exception(
+                    exc,
+                    stage=SearchStage.FROZEN_VALIDATION,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=family,
+                    parameter_hash=parameter_hash,
+                )
+                if outcome.kind is SearchOutcomeKind.INVALID_PARAM:
+                    outcome = TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FROZEN_VALIDATION,
+                        reason_code="FROZEN_PARAMETER_RECONSTRUCTION_DRIFT",
+                        reason=outcome.reason,
                         symbol=symbol,
                         timeframe=timeframe,
-                        features=val_features,
-                        strategy=frozen_strategy,
                         regime=regime,
-                        warmup_bars=val_warmup_bars,
-                        run_zero_signal_path=True,
-                        partition="tuning_validation",
+                        strategy_family=family,
+                        parameter_hash=parameter_hash,
+                        exception_type=outcome.exception_type,
                     )
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-                    metrics = {"total_trades": 0, "evaluation_error": error}
+                raise SearchInfrastructureError(outcome) from exc
+            candidate["trade_power_validation"] = power_decision.to_dict()
+            metrics["effective_trades"] = float(
+                power_decision.observed_effective_trades
+            )
+            candidate.pop("_trade_power_requirement", None)
             candidate["val_regime_metrics"] = {regime: metrics}
+            if bool(getattr(
+                getattr(self, "config", None),
+                "oos_evidence_export_enabled",
+                False,
+            )):
+                oos_record = self._build_oos_evidence_record(
+                    symbol,
+                    timeframe,
+                    candidate,
+                    raw_result,
+                    val_features,
+                    val_warmup_bars,
+                )
+                if oos_record is None:
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FROZEN_VALIDATION,
+                        reason_code="FROZEN_VALIDATION_REPLAY_EVIDENCE_UNAVAILABLE",
+                        reason="single tuning-validation replay produced no OOS evidence",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=family,
+                        parameter_hash=parameter_hash,
+                    ))
+                candidate["oos_evidence"] = oos_record
             candidate["tuning_validation_evaluations"] = int(evaluations)
             candidate["tuning_validation_evaluation_error"] = error
             record = records.get((family, regime))
             if record is not None:
                 record["tuning_validation_evaluations"] = int(evaluations)
                 record["tuning_validation_evaluation_error"] = error
+                record["trade_power_validation_status"] = power_decision.status
+                record["trade_power_validation_kind"] = (
+                    power_decision.outcome_kind.value
+                )
+                record["trade_power_validation_reason_code"] = (
+                    str(power_decision.reason_codes[0])
+                    if power_decision.reason_codes
+                    else ("POWER_PASS" if power_decision.passed else power_decision.status)
+                )
 
     @staticmethod
     def _attach_local_search_multiplicity(
@@ -4582,6 +6021,8 @@ class RegimeOptimizer:
             strategies=strategies,
             train_warmup_bars=train_warmup_bars,
         )
+        self._last_family_probe_cells = [dict(cell) for cell in probe_cells]
+        self._last_search_cell_outcomes = [dict(cell) for cell in probe_cells]
 
         # ===== NEW: Apply training eligibility gates =====
         # Filter out strategies that are "obviously bad" on training data
@@ -4597,17 +6038,15 @@ class RegimeOptimizer:
             )
             return []  # Return empty list - no candidates to optimize
 
-        # Validation is touched only after the B0 train winner in each cell is frozen.
-        self._attach_frozen_probe_validation(
-            symbol=symbol,
-            timeframe=timeframe,
-            val_features=val_features,
-            val_warmup_bars=val_warmup_bars,
-            candidates=eligible_candidates,
-            cell_records=probe_cells,
-        )
-
         if not self.enable_hyperparam_tuning:
+            self._attach_frozen_probe_validation(
+                symbol=symbol,
+                timeframe=timeframe,
+                val_features=val_features,
+                val_warmup_bars=val_warmup_bars,
+                candidates=eligible_candidates,
+                cell_records=probe_cells,
+            )
             self._attach_local_search_multiplicity(
                 eligible_candidates,
                 probe_cells=probe_cells,
@@ -4650,6 +6089,14 @@ class RegimeOptimizer:
         
         if not strategy_regimes_to_tune:
             logger.debug(f"[{symbol}] [{timeframe}] No strategies eligible for hyperparameter tuning")
+            self._attach_frozen_probe_validation(
+                symbol=symbol,
+                timeframe=timeframe,
+                val_features=val_features,
+                val_warmup_bars=val_warmup_bars,
+                candidates=eligible_candidates,
+                cell_records=probe_cells,
+            )
             self._attach_local_search_multiplicity(
                 eligible_candidates,
                 probe_cells=probe_cells,
@@ -4684,6 +6131,14 @@ class RegimeOptimizer:
         # Run hyperparameter tuning for each strategy
         tuned_candidates = []
         tuning_summaries: List[Dict[str, Any]] = []
+        deep_replaced_cells: set[Tuple[str, str]] = set()
+        probe_trials_by_cell = {
+            (
+                str(cell.get("strategy_family", "")),
+                str(cell.get("regime", "")),
+            ): max(0, int(cell.get("search_trials", 0) or 0))
+            for cell in probe_cells
+        }
         for strategy_name in sorted(strategy_regimes_to_tune):
             target_regimes = [
                 regime for regime in self.REGIMES
@@ -4700,6 +6155,14 @@ class RegimeOptimizer:
                 # No params to tune, keep original
                 continue
 
+            prior_trials = {
+                regime: probe_trials_by_cell.get((strategy_name, regime), 0)
+                for regime in target_regimes
+            }
+            deep_replaced_cells.update(
+                (strategy_name, regime) for regime in target_regimes
+            )
+
             # Run grid search
             tuned_results = self._tune_strategy_params(
                 symbol, timeframe, strategy_name, param_grid,
@@ -4707,15 +6170,60 @@ class RegimeOptimizer:
                 val_warmup_bars=val_warmup_bars,
                 train_warmup_bars=train_warmup_bars,
                 regimes=target_regimes,
+                prior_effective_trials_by_regime=prior_trials,
             )
 
             tuned_candidates.extend(tuned_results)
             if self._last_tuning_search_meta:
                 tuning_summaries.append(dict(self._last_tuning_search_meta))
 
-        # Combine eligible candidates with tuned candidates
-        # The tuned candidates may replace or augment the defaults
-        all_candidates = eligible_candidates + tuned_candidates
+        # A deeper cell search supersedes its B0 probe hypothesis. Keeping both
+        # would admit the same model under two multiplicity requirements and can
+        # let the weaker B0 contract survive. Non-deep B0 cells are validated
+        # only now; every retained exact identity therefore touches validation
+        # exactly once.
+        retained_probe_candidates = [
+            candidate
+            for candidate in eligible_candidates
+            if (
+                str(candidate.get("strategy_name", "")),
+                self._candidate_evaluation_regime(candidate),
+            ) not in deep_replaced_cells
+        ]
+        self._attach_frozen_probe_validation(
+            symbol=symbol,
+            timeframe=timeframe,
+            val_features=val_features,
+            val_warmup_bars=val_warmup_bars,
+            candidates=retained_probe_candidates,
+            cell_records=probe_cells,
+        )
+        all_candidates = retained_probe_candidates + tuned_candidates
+        seen_candidate_ids: set[str] = set()
+        for candidate in all_candidates:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id or candidate_id in seen_candidate_ids:
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FAMILY_CELL,
+                    reason_code="DUPLICATE_OR_MISSING_EXACT_CANDIDATE_ID",
+                    reason="post-search candidate hypotheses are not uniquely identified",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=self._candidate_evaluation_regime(candidate),
+                    strategy_family=str(candidate.get("strategy_name", "")),
+                ))
+            seen_candidate_ids.add(candidate_id)
+        deep_cells = [
+            dict(cell)
+            for summary in tuning_summaries
+            for cell in (summary.get("cells") or [])
+            if isinstance(cell, Mapping)
+        ]
+        self._last_search_cell_outcomes = [
+            *[dict(cell) for cell in probe_cells],
+            *deep_cells,
+        ]
         self._attach_local_search_multiplicity(
             all_candidates,
             probe_cells=probe_cells,
@@ -4770,11 +6278,18 @@ class RegimeOptimizer:
         for cand in candidates:
             for regime in self.REGIMES:
                 train_metrics = cand.get('train_regime_metrics', {}).get(regime, {})
+                if not train_metrics:
+                    continue
                 
                 train_trades = train_metrics.get('total_trades', 0)
                 
-                # Only consider strategies with enough trades in this regime
-                if train_trades < screening_trade_floor:  # Relaxed, but never admits an empty cell.
+                # Production candidates already passed the dependence-aware
+                # train ESS gate.  The raw floor remains compatibility-only
+                # for injected/legacy research candidates.
+                if (
+                    not bool(cand.get("trade_power_contract_enforced", False))
+                    and train_trades < screening_trade_floor
+                ):
                     continue
                 
                 score = self._compute_train_regime_score(train_metrics, {})
@@ -4787,7 +6302,9 @@ class RegimeOptimizer:
         result = {}
         for regime, scores in regime_scores.items():
             if scores:
-                ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                ranked = sorted(
+                    scores.items(), key=lambda item: (-float(item[1]), str(item[0]))
+                )
                 result[regime] = [name for name, _ in ranked[:top_k]]
             else:
                 result[regime] = []
@@ -4803,7 +6320,8 @@ class RegimeOptimizer:
                               val_features: Optional[pd.DataFrame],
                               val_warmup_bars: int = 0,
                               train_warmup_bars: int = 0,
-                              regimes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                              regimes: Optional[List[str]] = None,
+                              prior_effective_trials_by_regime: Optional[Mapping[str, int]] = None) -> List[Dict[str, Any]]:
         """
         Tune hyperparameters for a strategy using Optuna TPE.
         
@@ -4836,70 +6354,145 @@ class RegimeOptimizer:
                 max_drawdown_pct=self.val_max_drawdown,  # Pass DD threshold for early rejection
                 train_warmup_bars=train_warmup_bars,
                 val_warmup_bars=val_warmup_bars,
+                calibrate_train_power_fn=self._calibrate_train_power_result,
+                evaluate_validation_power_fn=self._evaluate_partition_power_result,
+                train_economic_gate_fn=self._train_trial_economic_ineligibility,
+                prior_effective_trials_by_regime=prior_effective_trials_by_regime,
             )
             
             # Convert to candidate list format
             tuned_candidates = []
-            self._last_tuning_search_meta = dict(
-                getattr(self.optuna_optimizer, "last_regime_search_metadata", {}) or {}
+            raw_search_meta = getattr(
+                self.optuna_optimizer, "last_regime_search_metadata", {}
             )
+            if not isinstance(regime_results, Mapping) or not isinstance(
+                raw_search_meta, Mapping
+            ):
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FAMILY_CELL,
+                    reason_code="OPTUNA_RESULT_CONTAINER_INVALID",
+                    reason="Optuna search result or metadata container is malformed",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    strategy_family=strategy_name,
+                ))
+            self._last_tuning_search_meta = dict(raw_search_meta)
             for regime, candidate in regime_results.items():
-                candidate['tuned_for_regime'] = regime
-                raw_train = dict(
-                    (candidate.get("train_regime_metrics") or {}).get(regime, {})
-                    or candidate.get("train_result")
-                    or {}
-                )
-                compact_train = self._compact_exact_regime_result(raw_train, regime)
-                compact_train.update(
-                    self._build_daily_net_mtm_surface(
-                        result=raw_train,
-                        features=train_features,
-                        timeframe=timeframe,
-                        warmup_bars=train_warmup_bars,
-                        partition="optimizer_train",
+                current_stage = SearchStage.TRAIN_EVIDENCE
+                parameter_hash = ""
+                try:
+                    parameter_hash = _stable_hash(
+                        self._clean_candidate_params(candidate.get("params", {}))
                     )
-                )
-                raw_val = dict(
-                    (candidate.get("val_regime_metrics") or {}).get(regime, {}) or {}
-                )
-                compact_val = self._compact_exact_regime_result(raw_val, regime)
-                compact_val.update(
-                    self._build_daily_net_mtm_surface(
-                        result=raw_val,
-                        features=val_features,
-                        timeframe=timeframe,
-                        warmup_bars=val_warmup_bars,
-                        partition="tuning_validation",
+                    candidate['tuned_for_regime'] = regime
+                    raw_train = dict(
+                        (candidate.get("train_regime_metrics") or {}).get(regime, {})
+                        or candidate.get("train_result")
+                        or {}
                     )
-                    if val_features is not None
-                    else {
-                        "daily_net_mtm_returns": [],
-                        "daily_net_mtm_dates": [],
-                        "daily_net_mtm_observations": 0,
-                        "daily_net_mtm_contract": {
-                            "contract_version": DAILY_NET_MTM_CONTRACT_VERSION,
-                            "status": "UNAVAILABLE",
-                            "origin": "backtester_final_post_cost_equity_curve",
-                            "partition": "tuning_validation",
-                            "reason": "validation features unavailable",
-                        },
-                    }
-                )
-                candidate["train_result"] = dict(compact_train)
-                candidate["train_regime_metrics"] = {regime: compact_train}
-                candidate["val_regime_metrics"] = {regime: compact_val}
-                candidate["timeframe"] = str(timeframe).upper()
-                candidate["candidate_id"] = self._exact_cell_candidate_id(
-                    symbol,
-                    timeframe,
-                    regime,
-                    candidate,
-                )
-                candidate['family_search_metadata'] = dict(
-                    self._last_tuning_search_meta
-                )
-                tuned_candidates.append(candidate)
+                    compact_train = self._compact_exact_regime_result(raw_train, regime)
+                    compact_train.update(
+                        self._build_daily_net_mtm_surface(
+                            result=raw_train,
+                            features=train_features,
+                            timeframe=timeframe,
+                            warmup_bars=train_warmup_bars,
+                            partition="optimizer_train",
+                        )
+                    )
+                    current_stage = SearchStage.FROZEN_VALIDATION
+                    raw_val = dict(
+                        (candidate.get("val_regime_metrics") or {}).get(regime, {}) or {}
+                    )
+                    compact_val = self._compact_exact_regime_result(raw_val, regime)
+                    compact_val.update(
+                        self._build_daily_net_mtm_surface(
+                            result=raw_val,
+                            features=val_features,
+                            timeframe=timeframe,
+                            warmup_bars=val_warmup_bars,
+                            partition="tuning_validation",
+                        )
+                        if val_features is not None
+                        else {
+                            "daily_net_mtm_returns": [],
+                            "daily_net_mtm_dates": [],
+                            "daily_net_mtm_observations": 0,
+                            "daily_net_mtm_contract": {
+                                "contract_version": DAILY_NET_MTM_CONTRACT_VERSION,
+                                "status": "UNAVAILABLE",
+                                "origin": "backtester_final_post_cost_equity_curve",
+                                "partition": "tuning_validation",
+                                "reason": "validation features unavailable",
+                            },
+                        }
+                    )
+                    current_stage = SearchStage.FAMILY_CELL
+                    candidate["train_result"] = dict(compact_train)
+                    candidate["train_regime_metrics"] = {regime: compact_train}
+                    candidate["val_regime_metrics"] = {regime: compact_val}
+                    candidate["timeframe"] = str(timeframe).upper()
+                    candidate["candidate_id"] = self._exact_cell_candidate_id(
+                        symbol,
+                        timeframe,
+                        regime,
+                        candidate,
+                    )
+                    candidate['family_search_metadata'] = dict(
+                        self._last_tuning_search_meta
+                    )
+                    current_stage = SearchStage.FROZEN_VALIDATION
+                    if bool(getattr(
+                        getattr(self, "config", None),
+                        "oos_evidence_export_enabled",
+                        False,
+                    )):
+                        if val_features is None:
+                            raise SearchInfrastructureError(TrialOutcome(
+                                kind=SearchOutcomeKind.INFRA_FAILURE,
+                                stage=SearchStage.FROZEN_VALIDATION,
+                                reason_code="TUNING_VALIDATION_SURFACE_UNAVAILABLE",
+                                reason="Optuna frozen validation has no feature surface",
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                regime=regime,
+                                strategy_family=strategy_name,
+                            ))
+                        oos_record = self._build_oos_evidence_record(
+                            symbol,
+                            timeframe,
+                            candidate,
+                            raw_val,
+                            val_features,
+                            val_warmup_bars,
+                        )
+                        if oos_record is None:
+                            raise SearchInfrastructureError(TrialOutcome(
+                                kind=SearchOutcomeKind.INFRA_FAILURE,
+                                stage=SearchStage.FROZEN_VALIDATION,
+                                reason_code="FROZEN_VALIDATION_REPLAY_EVIDENCE_UNAVAILABLE",
+                                reason="Optuna single validation replay produced no OOS evidence",
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                regime=regime,
+                                strategy_family=strategy_name,
+                            ))
+                        candidate["oos_evidence"] = oos_record
+                    tuned_candidates.append(candidate)
+                except Exception as exc:
+                    if isinstance(exc, SearchInfrastructureError):
+                        raise
+                    outcome = _classify_staged_search_exception(
+                        exc,
+                        stage=current_stage,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=str(regime),
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
+                    )
+                    raise SearchInfrastructureError(outcome) from exc
             
             if tuned_candidates:
                 logger.debug(f"[{symbol}] [{timeframe}] {strategy_name}: "
@@ -4918,6 +6511,7 @@ class RegimeOptimizer:
             val_warmup_bars=val_warmup_bars,
             train_warmup_bars=train_warmup_bars,
             regimes=target_regimes,
+            prior_effective_trials_by_regime=prior_effective_trials_by_regime,
         )
     
     def _tune_strategy_params_grid(self,
@@ -4929,22 +6523,45 @@ class RegimeOptimizer:
                                    val_features: Optional[pd.DataFrame],
                                    val_warmup_bars: int = 0,
                                    train_warmup_bars: int = 0,
-                                   regimes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                                   regimes: Optional[List[str]] = None,
+                                   prior_effective_trials_by_regime: Optional[Mapping[str, int]] = None) -> List[Dict[str, Any]]:
         """
         Fallback grid search for hyperparameter tuning.
         
         Returns list of tuned candidate dicts with regime metrics.
         """
-        from itertools import product
-        
-        # Generate param combinations
-        param_names = list(param_grid.keys())
-        param_values = list(param_grid.values())
-        all_combos = list(product(*param_values))
-        
-        # Get default params as base
-        base_strategy = StrategyRegistry.get(strategy_name)
-        default_params = base_strategy.get_params()
+        # Generate only the bounded deterministic design; never materialize the
+        # full Cartesian domain before applying the configured cap.
+        try:
+            param_names = list(param_grid.keys())
+            param_values = [list(param_grid[name] or []) for name in param_names]
+        except Exception as exc:
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.PARAMETER_VALIDATION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
+        try:
+            base_strategy = StrategyRegistry.get(strategy_name)
+            default_params = base_strategy.get_params()
+        except Exception as exc:
+            if isinstance(exc, SearchInfrastructureError):
+                raise
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.STRATEGY_CONSTRUCTION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
         target_regimes = [
             regime for regime in self.REGIMES
             if regime in set(regimes or self.REGIMES)
@@ -4952,31 +6569,38 @@ class RegimeOptimizer:
         tuned_candidates: List[Dict[str, Any]] = []
         cell_records: List[Dict[str, Any]] = []
         for regime in target_regimes:
-            if len(all_combos) > self.hyperparam_max_combos:
-                seed = _stable_seed(
-                    symbol,
-                    timeframe,
-                    regime,
-                    strategy_name,
-                    "regime_grid_train_only",
-                    len(train_features),
-                )
-                rng = np.random.default_rng(seed)
-                indices = rng.choice(
-                    len(all_combos), self.hyperparam_max_combos, replace=False
-                )
-                combos = [all_combos[int(index)] for index in indices]
-            else:
-                combos = list(all_combos)
+            seed = _stable_seed(
+                symbol,
+                timeframe,
+                regime,
+                strategy_name,
+                "regime_grid_train_only",
+                len(train_features),
+            )
+            combos, _total_space = _bounded_cartesian_combinations(
+                param_values,
+                limit=self.hyperparam_max_combos,
+                seed=seed,
+            )
             best_score = float("-inf")
+            best_effective_trades = float("-inf")
             best_candidate: Optional[Dict[str, Any]] = None
+            best_parameter_hash = ""
             completed_trials = 0
             eligible_train_trials = 0
             early_dd_rejections = 0
+            trial_outcomes: List[TrialOutcome] = []
             for combo in combos:
                 params = {**default_params, **dict(zip(param_names, combo))}
+                current_stage = SearchStage.PARAMETER_VALIDATION
+                parameter_hash = ""
                 try:
+                    parameter_hash = _stable_hash(
+                        self._clean_candidate_params(params)
+                    )
+                    current_stage = SearchStage.STRATEGY_CONSTRUCTION
                     test_strategy = StrategyRegistry.get(strategy_name, **params)
+                    current_stage = SearchStage.TRAIN_BACKTEST
                     train_m, ran = self._run_one_exact_regime(
                         symbol=symbol,
                         timeframe=timeframe,
@@ -4984,22 +6608,106 @@ class RegimeOptimizer:
                         strategy=test_strategy,
                         regime=regime,
                         warmup_bars=train_warmup_bars,
+                        run_zero_signal_path=True,
                         partition="optimizer_train",
+                        capture_trade_power_inputs=True,
                     )
                     completed_trials += int(ran)
-                    if int(train_m.get("total_trades", 0) or 0) < self.min_train_trades:
+                    current_stage = SearchStage.TRAIN_EVIDENCE
+                    raw_result = self._pop_trade_power_raw_result(train_m)
+                    power_decision = self._calibrate_train_power_result(
+                        raw_result,
+                        effective_trials=(
+                            len(combos)
+                            + max(
+                                0,
+                                int((prior_effective_trials_by_regime or {}).get(
+                                    regime, 0
+                                ) or 0),
+                            )
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
+                    )
+                    if not power_decision.passed:
+                        trial_outcomes.append(self._power_trial_outcome(
+                            power_decision,
+                            stage=SearchStage.TRAIN_EVIDENCE,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        ))
                         continue
-                    if float(train_m.get("max_drawdown_pct", 100.0) or 100.0) > (
-                        self.val_max_drawdown * 1.25
-                    ):
-                        early_dd_rejections += 1
+                    train_m["effective_trades"] = float(
+                        power_decision.observed_effective_trades
+                    )
+                    current_stage = SearchStage.TRAIN_SCORE
+                    economic_reason = self._train_trial_economic_ineligibility(train_m)
+                    if economic_reason:
+                        if economic_reason == "TRAIN_DRAWDOWN_GATE":
+                            early_dd_rejections += 1
+                        trial_outcomes.append(TrialOutcome(
+                            kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
+                            stage=SearchStage.TRAIN_SCORE,
+                            reason_code=economic_reason,
+                            reason="trial failed a predeclared train economic gate",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        ))
                         continue
                     score = float(self._compute_train_regime_score(train_m, {}))
                     if not math.isfinite(score):
-                        continue
+                        raise SearchInfrastructureError(TrialOutcome(
+                            kind=SearchOutcomeKind.INFRA_FAILURE,
+                            stage=SearchStage.TRAIN_SCORE,
+                            reason_code="NONFINITE_TRAIN_SCORE",
+                            reason="train score is non-finite",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            regime=regime,
+                            strategy_family=strategy_name,
+                            parameter_hash=parameter_hash,
+                        ))
+                    trial_outcomes.append(self._power_trial_outcome(
+                        power_decision,
+                        stage=SearchStage.TRAIN_EVIDENCE,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
+                    ))
                     eligible_train_trials += 1
-                    if score > best_score:
+                    effective_trades = float(
+                        power_decision.observed_effective_trades
+                    )
+                    if (
+                        score > best_score
+                        or (
+                            score == best_score
+                            and (
+                                effective_trades > best_effective_trades
+                                or (
+                                    effective_trades == best_effective_trades
+                                    and (
+                                        not best_parameter_hash
+                                        or parameter_hash < best_parameter_hash
+                                    )
+                                )
+                            )
+                        )
+                    ):
                         best_score = score
+                        best_effective_trades = effective_trades
+                        best_parameter_hash = parameter_hash
                         best_candidate = {
                             "strategy": test_strategy,
                             "strategy_name": strategy_name,
@@ -5023,6 +6731,11 @@ class RegimeOptimizer:
                                 "status": "not_available",
                                 "reason": "deterministic_grid_fallback",
                             },
+                            "trade_power_contract_enforced": True,
+                            "trade_power_train": power_decision.to_dict(),
+                            "_trade_power_requirement": (
+                                power_decision.frozen_requirement
+                            ),
                         }
                         best_candidate["timeframe"] = str(timeframe).upper()
                         best_candidate["candidate_id"] = self._exact_cell_candidate_id(
@@ -5032,45 +6745,46 @@ class RegimeOptimizer:
                             best_candidate,
                         )
                 except Exception as exc:
-                    logger.debug(
-                        "[%s] [%s] [%s] %s train-only grid trial failed: %s",
-                        symbol, timeframe, regime, strategy_name, exc,
+                    if isinstance(exc, SearchInfrastructureError):
+                        raise
+                    outcome = _classify_staged_search_exception(
+                        exc,
+                        stage=current_stage,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=strategy_name,
+                        parameter_hash=parameter_hash,
                     )
+                    trial_outcomes.append(outcome)
+                    if outcome.kind is SearchOutcomeKind.INVALID_PARAM:
+                        continue
+                    raise SearchInfrastructureError(outcome) from exc
+            family_outcome = aggregate_family_cell_outcomes(
+                trial_outcomes,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_family=strategy_name,
+            )
+            if family_outcome.kind is SearchOutcomeKind.INFRA_FAILURE:
+                raise SearchInfrastructureError(family_outcome)
             evaluations = 0
             evaluation_error: Optional[str] = None
             if best_candidate is not None:
                 best_candidate["search_completed_trials"] = int(completed_trials)
                 best_candidate["eligible_train_trials"] = int(eligible_train_trials)
-                val_m: Dict[str, Any] = {"total_trades": 0}
-                if (
-                    val_features is not None
-                    and max(0, len(val_features) - int(val_warmup_bars or 0)) >= 50
-                ):
-                    evaluations = 1
-                    try:
-                        frozen_strategy = StrategyRegistry.get(
-                            strategy_name, **dict(best_candidate["params"])
-                        )
-                        best_candidate["strategy"] = frozen_strategy
-                        val_m, _ = self._run_one_exact_regime(
-                            symbol=symbol,
-                            timeframe=timeframe,
-                            features=val_features,
-                            strategy=frozen_strategy,
-                            regime=regime,
-                            warmup_bars=val_warmup_bars,
-                            run_zero_signal_path=True,
-                            partition="tuning_validation",
-                        )
-                    except Exception as exc:
-                        evaluation_error = f"{type(exc).__name__}: {exc}"
-                        val_m = {
-                            "total_trades": 0,
-                            "evaluation_error": evaluation_error,
-                        }
-                best_candidate["val_regime_metrics"] = {regime: val_m}
-                best_candidate["tuning_validation_evaluations"] = int(evaluations)
-                best_candidate["tuning_validation_evaluation_error"] = evaluation_error
+                self._attach_frozen_probe_validation(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    val_features=val_features,
+                    val_warmup_bars=val_warmup_bars,
+                    candidates=[best_candidate],
+                    cell_records=[],
+                )
+                evaluations = int(
+                    best_candidate.get("tuning_validation_evaluations", 0) or 0
+                )
                 tuned_candidates.append(best_candidate)
             cell_records.append({
                 "phase": "deep_grid",
@@ -5085,6 +6799,7 @@ class RegimeOptimizer:
                 "best_train_score": (
                     float(best_score) if math.isfinite(best_score) else None
                 ),
+                "family_outcome": family_outcome.to_dict(),
             })
         self._last_tuning_search_meta = {
             "contract": "independent_regime_family_train_only_v1",
@@ -5833,13 +7548,31 @@ class RegimeOptimizer:
                     raise
         return float(score_fn(train_metrics, val_metrics))
 
-    def _build_legacy_confidence_evidence(self, val_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_legacy_confidence_evidence(
+        self,
+        val_metrics: Dict[str, Any],
+        candidate: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Build positive-edge confidence evidence for post-search legacy reranking."""
-        r_count = int(val_metrics.get("r_count", val_metrics.get("total_trades", 0)) or 0)
-        mean_r = float(val_metrics.get("mean_r", 0.0) or 0.0)
-        std_r = float(val_metrics.get("std_r", 0.0) or 0.0)
-        se_r = float(val_metrics.get("se_r", 0.0) or 0.0)
-        if se_r <= 1e-12 and r_count >= 2 and std_r > 1e-12:
+        _, governed_val, _ = self._governed_scoring_inputs(
+            {}, val_metrics, candidate
+        )
+        scoring_metrics = governed_val if governed_val else dict(val_metrics or {})
+        r_count = int(
+            scoring_metrics.get(
+                "r_count", scoring_metrics.get("total_trades", 0)
+            )
+            or 0
+        )
+        mean_r = float(scoring_metrics.get("mean_r", 0.0) or 0.0)
+        std_r = float(scoring_metrics.get("std_r", 0.0) or 0.0)
+        se_r = float(scoring_metrics.get("se_r", 0.0) or 0.0)
+        if (
+            isinstance(candidate, Mapping)
+            and bool(candidate.get("trade_power_contract_enforced", False))
+        ):
+            se_r = std_r / math.sqrt(float(r_count)) if r_count >= 2 and std_r > 1e-12 else 0.0
+        elif se_r <= 1e-12 and r_count >= 2 and std_r > 1e-12:
             se_r = std_r / math.sqrt(float(r_count))
         t_stat = mean_r / se_r if mean_r > 0.0 and se_r > 1e-12 else 0.0
         confidence = max(0.0, min(1.0, 1.0 - (1.0 / t_stat))) if t_stat > 1.0 else 0.0
@@ -5888,6 +7621,126 @@ class RegimeOptimizer:
             return f"{label} win_rate is outside [0, 100]"
         return None
 
+    @staticmethod
+    def _candidate_selection_sample_strength(
+        candidate: Mapping[str, Any],
+        regime: str,
+    ) -> float:
+        """Use effective observations for governed candidate score ties."""
+        if bool(candidate.get("trade_power_contract_enforced", False)):
+            values: List[float] = []
+            for key in ("trade_power_train", "trade_power_validation"):
+                decision = candidate.get(key)
+                if not isinstance(decision, Mapping):
+                    return float("-inf")
+                try:
+                    value = float(decision.get("observed_effective_trades"))
+                except (TypeError, ValueError, OverflowError):
+                    return float("-inf")
+                if not math.isfinite(value) or value < 0.0:
+                    return float("-inf")
+                values.append(value)
+            return min(values) if values else float("-inf")
+        try:
+            return float(
+                (candidate.get("train_regime_metrics") or {})
+                .get(regime, {})
+                .get("total_trades", 0)
+                or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            return float("-inf")
+
+    @staticmethod
+    def _effective_count_surface(
+        metrics: Mapping[str, Any],
+        effective_trades: float,
+    ) -> Dict[str, Any]:
+        """Replace raw-count scoring authority with one authenticated ESS value."""
+        surface = dict(metrics or {})
+        surface["total_trades"] = float(effective_trades)
+        surface["r_count"] = float(effective_trades)
+        surface["effective_trades"] = float(effective_trades)
+        return surface
+
+    @classmethod
+    def _governed_scoring_inputs(
+        cls,
+        train_metrics: Mapping[str, Any],
+        val_metrics: Mapping[str, Any],
+        candidate: Optional[Mapping[str, Any]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Return score-only surfaces whose sample size is invariant to overlap."""
+        if not (
+            isinstance(candidate, Mapping)
+            and bool(candidate.get("trade_power_contract_enforced", False))
+        ):
+            return dict(train_metrics or {}), dict(val_metrics or {}), (
+                dict(candidate) if isinstance(candidate, Mapping) else None
+            )
+        try:
+            train_effective = float(
+                (candidate.get("trade_power_train") or {}).get(
+                    "observed_effective_trades"
+                )
+            )
+            val_effective = float(
+                (candidate.get("trade_power_validation") or {}).get(
+                    "observed_effective_trades"
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            return {}, {}, None
+        if (
+            not math.isfinite(train_effective)
+            or train_effective < 0.0
+            or not math.isfinite(val_effective)
+            or val_effective < 0.0
+        ):
+            return {}, {}, None
+
+        sanitized_candidate = dict(candidate)
+
+        def sanitize_aux_surface(value: Any) -> Any:
+            if not isinstance(value, Mapping):
+                return value
+            surface = dict(value)
+            raw_effective = surface.get("effective_trades")
+            try:
+                auxiliary_effective = float(raw_effective)
+            except (TypeError, ValueError, OverflowError):
+                auxiliary_effective = 0.0
+            if not math.isfinite(auxiliary_effective) or auxiliary_effective < 0.0:
+                auxiliary_effective = 0.0
+            return cls._effective_count_surface(surface, auxiliary_effective)
+
+        for key in (
+            "threadspark_selection_regime_metrics",
+            "threadspark_historical_regime_metrics",
+        ):
+            by_regime = sanitized_candidate.get(key)
+            if isinstance(by_regime, Mapping):
+                sanitized_candidate[key] = {
+                    str(regime): sanitize_aux_surface(surface)
+                    for regime, surface in by_regime.items()
+                }
+        chunks = sanitized_candidate.get("threadspark_historical_chunk_regime_metrics")
+        if isinstance(chunks, list):
+            sanitized_candidate["threadspark_historical_chunk_regime_metrics"] = [
+                {
+                    str(regime): sanitize_aux_surface(surface)
+                    for regime, surface in chunk.items()
+                }
+                if isinstance(chunk, Mapping)
+                else chunk
+                for chunk in chunks
+            ]
+        return (
+            cls._effective_count_surface(train_metrics, train_effective),
+            cls._effective_count_surface(val_metrics, val_effective),
+            sanitized_candidate,
+        )
+
     def _select_best_for_regime(self,
                                  symbol: str,
                                  timeframe: str,
@@ -5932,13 +7785,154 @@ class RegimeOptimizer:
                 label="train",
             )
             if train_surface_failure:
-                rejection_reasons.append(
-                    f"{cand.get('strategy_name', 'Unknown')}: {train_surface_failure}"
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FAMILY_CELL,
+                    reason_code="TRAIN_SELECTION_SURFACE_INVALID",
+                    reason=train_surface_failure,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=str(cand.get("strategy_name", "")),
+                    parameter_hash=_stable_hash(
+                        self._clean_candidate_params(cand.get("params", {}))
+                    ),
+                ))
+
+            power_enforced = bool(
+                cand.get("trade_power_contract_enforced", False)
+            )
+            if power_enforced:
+                train_power = cand.get("trade_power_train")
+                validation_power = cand.get("trade_power_validation")
+                train_power_state, train_power_reason = (
+                    self._trade_power_decision_state(
+                        train_power,
+                        partition="optimizer_train",
+                    )
                 )
-                continue
+                validation_power_state, validation_power_reason = (
+                    self._trade_power_decision_state(
+                        validation_power,
+                        partition="tuning_validation",
+                    )
+                )
+                if train_power_state == "INFRA" or validation_power_state == "INFRA":
+                    reason_code = (
+                        train_power_reason
+                        if train_power_state == "INFRA"
+                        else validation_power_reason
+                    )
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FAMILY_CELL,
+                        reason_code=reason_code,
+                        reason=(
+                            "candidate carries a missing, malformed, or infrastructure-"
+                            "failed trade-power decision"
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=str(cand.get("strategy_name", "")),
+                        parameter_hash=_stable_hash(
+                            self._clean_candidate_params(cand.get("params", {}))
+                        ),
+                    ))
+                train_requirement = (
+                    train_power.get("frozen_requirement")
+                    if isinstance(train_power, Mapping)
+                    else None
+                )
+                validation_requirement = (
+                    validation_power.get("frozen_requirement")
+                    if isinstance(validation_power, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(train_requirement, Mapping)
+                    or not isinstance(validation_requirement, Mapping)
+                    or dict(train_requirement) != dict(validation_requirement)
+                ):
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FAMILY_CELL,
+                        reason_code="TRADE_POWER_FROZEN_REQUIREMENT_DRIFT",
+                        reason=(
+                            "train and tuning-validation decisions do not share "
+                            "the exact frozen requirement"
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=str(cand.get("strategy_name", "")),
+                        parameter_hash=_stable_hash(
+                            self._clean_candidate_params(cand.get("params", {}))
+                        ),
+                    ))
+                try:
+                    train_observed = float(
+                        train_power.get("observed_effective_trades")
+                    )
+                    validation_observed = float(
+                        validation_power.get("observed_effective_trades")
+                    )
+                    train_metric_effective = float(
+                        train_metrics.get("effective_trades")
+                    )
+                    validation_metric_effective = float(
+                        val_metrics.get("effective_trades")
+                    )
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FAMILY_CELL,
+                        reason_code="TRADE_POWER_METRIC_EFFECTIVE_COUNT_DRIFT",
+                        reason="candidate metric surfaces lack authenticated effective counts",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=str(cand.get("strategy_name", "")),
+                    )) from exc
+                if (
+                    not math.isfinite(train_metric_effective)
+                    or train_metric_effective < 0.0
+                    or not math.isfinite(validation_metric_effective)
+                    or validation_metric_effective < 0.0
+                    or not math.isclose(
+                        train_metric_effective,
+                        train_observed,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                    or not math.isclose(
+                        validation_metric_effective,
+                        validation_observed,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                ):
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FAMILY_CELL,
+                        reason_code="TRADE_POWER_METRIC_EFFECTIVE_COUNT_DRIFT",
+                        reason=(
+                            "candidate metric effective counts differ from the "
+                            "authenticated power decisions"
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=str(cand.get("strategy_name", "")),
+                    ))
+                if train_power_state != "PASS":
+                    rejection_reasons.append(
+                        f"{cand.get('strategy_name', 'Unknown')}: train effective trades underpowered"
+                    )
+                    continue
 
             train_trades = train_metrics.get('total_trades', 0)
-            if train_trades < self.min_train_trades:
+            if not power_enforced and train_trades < self.min_train_trades:
                 continue
             train_dd = train_metrics.get('max_drawdown_pct', 100.0)
             if train_dd > self.val_max_drawdown * 1.25:
@@ -6007,18 +8001,55 @@ class RegimeOptimizer:
         validation_trials = max(1, len(pbo_candidate_ids))
 
         for cand, train_metrics, val_metrics in train_eligible:
+            if bool(cand.get("trade_power_contract_enforced", False)):
+                validation_power_state, validation_power_reason = (
+                    self._trade_power_decision_state(
+                        cand.get("trade_power_validation"),
+                        partition="tuning_validation",
+                    )
+                )
+                if validation_power_state == "INFRA":
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FAMILY_CELL,
+                        reason_code=validation_power_reason,
+                        reason=(
+                            "candidate validation trade-power decision became invalid "
+                            "after the frozen multiplicity roster was built"
+                        ),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=str(cand.get("strategy_name", "")),
+                    ))
+                if validation_power_state != "PASS":
+                    rejection_reasons.append(
+                        f"{cand.get('strategy_name', 'Unknown')}: validation effective trades underpowered"
+                    )
+                    continue
             validation_surface_failure = self._selection_surface_failure(
                 val_metrics,
                 label="validation",
             )
             if validation_surface_failure:
-                rejection_reasons.append(
-                    f"{cand.get('strategy_name', 'Unknown')}: "
-                    f"{validation_surface_failure}"
-                )
-                continue
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FAMILY_CELL,
+                    reason_code="VALIDATION_SELECTION_SURFACE_INVALID",
+                    reason=validation_surface_failure,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    strategy_family=str(cand.get("strategy_name", "")),
+                    parameter_hash=_stable_hash(
+                        self._clean_candidate_params(cand.get("params", {}))
+                    ),
+                ))
             val_trades = val_metrics.get('total_trades', 0)
-            if val_trades < min_val_trades:
+            if (
+                not bool(cand.get("trade_power_contract_enforced", False))
+                and val_trades < min_val_trades
+            ):
                 continue
             val_dd = val_metrics.get('max_drawdown_pct', 100.0)
             if val_dd > self.val_max_drawdown:
@@ -6100,22 +8131,43 @@ class RegimeOptimizer:
 
             scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
             if scoring_model == "specialist_spokes_threadspark":
+                scoring_train, scoring_val, scoring_candidate = (
+                    self._governed_scoring_inputs(
+                        train_metrics,
+                        val_metrics,
+                        cand,
+                    )
+                )
+                if not scoring_train or not scoring_val or scoring_candidate is None:
+                    raise SearchInfrastructureError(TrialOutcome(
+                        kind=SearchOutcomeKind.INFRA_FAILURE,
+                        stage=SearchStage.FAMILY_CELL,
+                        reason_code="TRADE_POWER_SCORING_SURFACE_INVALID",
+                        reason="governed scoring inputs could not be authenticated",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        strategy_family=str(cand.get("strategy_name", "")),
+                    ))
                 cand["_threadspark_l1_base_score"] = self._compute_threadspark_l1_score(
-                    train_metrics,
-                    val_metrics,
-                    cand,
+                    scoring_train,
+                    scoring_val,
+                    scoring_candidate,
                 )
                 score = self._compute_threadspark_spoke_score(
-                    train_metrics,
-                    val_metrics,
-                    candidate=cand,
+                    scoring_train,
+                    scoring_val,
+                    candidate=scoring_candidate,
                     regime=regime,
                 )
             else:
                 score = self._call_regime_score(train_metrics, val_metrics, candidate=cand)
             legacy_confidence = None
             if scoring_model == "legacy_confidence":
-                legacy_confidence = self._build_legacy_confidence_evidence(val_metrics)
+                legacy_confidence = self._build_legacy_confidence_evidence(
+                    val_metrics,
+                    candidate=cand,
+                )
                 score *= float(legacy_confidence.get("multiplier", 1.0) or 1.0)
             if bool(false_discovery.get("enabled", False)):
                 score *= float(false_discovery.get("confidence_multiplier", 1.0) or 1.0)
@@ -6164,7 +8216,7 @@ class RegimeOptimizer:
             scored_candidates.sort(
                 key=lambda item: (
                     -float(item[0]),
-                    -int(item[1]['train_regime_metrics'].get(regime, {}).get('total_trades', 0) or 0),
+                    -self._candidate_selection_sample_strength(item[1], regime),
                     int(item[1].get('search_trials', 1) or 1),
                     str(item[1].get('strategy_name', '')),
                     _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
@@ -6196,11 +8248,13 @@ class RegimeOptimizer:
 
             if bool(getattr(self.config, "regime_timeframe_val_trade_floors_enabled", False)):
                 is_validated, validation_reason = self._validate_regime_winner(
-                    train_metrics, val_metrics, regime, strategy_name, timeframe=timeframe
+                    train_metrics, val_metrics, regime, strategy_name, timeframe=timeframe,
+                    trade_power_enforced=bool(cand.get("trade_power_contract_enforced", False)),
                 )
             else:
                 is_validated, validation_reason = self._validate_regime_winner(
-                    train_metrics, val_metrics, regime, strategy_name
+                    train_metrics, val_metrics, regime, strategy_name,
+                    trade_power_enforced=bool(cand.get("trade_power_contract_enforced", False)),
                 )
 
             if is_validated:
@@ -6263,11 +8317,24 @@ class RegimeOptimizer:
         # Validate the winner using fx_backtester rules
         if bool(getattr(self.config, "regime_timeframe_val_trade_floors_enabled", False)):
             is_validated, validation_reason = self._validate_regime_winner(
-                train_metrics, val_metrics, regime, best_candidate['strategy_name'], timeframe=timeframe
+                train_metrics,
+                val_metrics,
+                regime,
+                best_candidate['strategy_name'],
+                timeframe=timeframe,
+                trade_power_enforced=bool(
+                    best_candidate.get("trade_power_contract_enforced", False)
+                ),
             )
         else:
             is_validated, validation_reason = self._validate_regime_winner(
-                train_metrics, val_metrics, regime, best_candidate['strategy_name']
+                train_metrics,
+                val_metrics,
+                regime,
+                best_candidate['strategy_name'],
+                trade_power_enforced=bool(
+                    best_candidate.get("trade_power_contract_enforced", False)
+                ),
             )
         
         # Normalize quality score to 0-1 using sigmoid mapping
@@ -6319,7 +8386,8 @@ class RegimeOptimizer:
                                  val_metrics: Dict[str, Any],
                                  regime: str,
                                  candidate_name: str = "Unknown",
-                                 timeframe: Optional[str] = None) -> Tuple[bool, str]:
+                                 timeframe: Optional[str] = None,
+                                 trade_power_enforced: bool = False) -> Tuple[bool, str]:
         """
         Validate a regime winner against fx_backtester thresholds.
 
@@ -6359,7 +8427,7 @@ class RegimeOptimizer:
         min_val_trades = self._min_val_trades_for_timeframe(timeframe)
 
         # Check minimum validation trades
-        if val_trades < min_val_trades:
+        if not trade_power_enforced and val_trades < min_val_trades:
             return False, f"Insufficient val trades: {val_trades} < {min_val_trades}"
 
         # Enforce drawdown limits before winner validation.
@@ -6385,7 +8453,9 @@ class RegimeOptimizer:
             #   * val_win_rate > 50% — edge must come from hit-rate, not lucky tail
             exceptional_val_pf = float(self.config.exceptional_val_profit_factor)
             exceptional_val_return = float(self.config.exceptional_val_return_pct)
-            exceptional_val_min_trades = max(min_val_trades * 2, 50)
+            exceptional_val_min_trades = (
+                0 if trade_power_enforced else max(min_val_trades * 2, 50)
+            )
             exceptional_val_min_sharpe = 0.5
             exceptional_val_min_win_rate = 50.0
             val_win_rate = float(val_metrics.get('win_rate', 0.0) or 0.0)
@@ -6438,8 +8508,44 @@ class RegimeOptimizer:
             )
 
         # Compute robustness ratio
-        train_full = self._bucket_to_full_metrics(train_metrics)
-        val_full = self._bucket_to_full_metrics(val_metrics)
+        if trade_power_enforced:
+            try:
+                train_effective = float(train_metrics.get("effective_trades"))
+                val_effective = float(val_metrics.get("effective_trades"))
+            except (TypeError, ValueError, OverflowError):
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FAMILY_CELL,
+                    reason_code="TRADE_POWER_METRIC_EFFECTIVE_COUNT_DRIFT",
+                    reason="trade-power effective counts are invalid during validation",
+                    regime=regime,
+                    strategy_family=candidate_name,
+                ))
+            if (
+                not math.isfinite(train_effective)
+                or train_effective < 0.0
+                or not math.isfinite(val_effective)
+                or val_effective < 0.0
+            ):
+                raise SearchInfrastructureError(TrialOutcome(
+                    kind=SearchOutcomeKind.INFRA_FAILURE,
+                    stage=SearchStage.FAMILY_CELL,
+                    reason_code="TRADE_POWER_METRIC_EFFECTIVE_COUNT_DRIFT",
+                    reason="trade-power effective counts are invalid during validation",
+                    regime=regime,
+                    strategy_family=candidate_name,
+                ))
+            train_score_surface = self._effective_count_surface(
+                train_metrics, train_effective
+            )
+            val_score_surface = self._effective_count_surface(
+                val_metrics, val_effective
+            )
+        else:
+            train_score_surface = dict(train_metrics)
+            val_score_surface = dict(val_metrics)
+        train_full = self._bucket_to_full_metrics(train_score_surface)
+        val_full = self._bucket_to_full_metrics(val_score_surface)
         robustness = self.scorer.calculate_fx_score_robustness_ratio(
             train_full, val_full, purpose="selection"
         )
@@ -6460,8 +8566,21 @@ class RegimeOptimizer:
                                     false_discovery_evidence: Optional[Dict[str, Any]] = None,
                                     legacy_confidence_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build compact, persisted validation evidence for dashboards and review."""
-        train_full = self._bucket_to_full_metrics(train_metrics or {})
-        val_full = self._bucket_to_full_metrics(val_metrics or {})
+        score_train_metrics = dict(train_metrics or {})
+        score_val_metrics = dict(val_metrics or {})
+        if (
+            isinstance(candidate, Mapping)
+            and bool(candidate.get("trade_power_contract_enforced", False))
+        ):
+            score_train_metrics, score_val_metrics, _ = self._governed_scoring_inputs(
+                train_metrics,
+                val_metrics,
+                candidate,
+            )
+            if not score_train_metrics or not score_val_metrics:
+                raise ValueError("governed validation evidence has invalid effective counts")
+        train_full = self._bucket_to_full_metrics(score_train_metrics)
+        val_full = self._bucket_to_full_metrics(score_val_metrics)
         robustness = self.scorer.calculate_fx_score_robustness_ratio(
             train_full, val_full, purpose="selection"
         )
@@ -6502,6 +8621,26 @@ class RegimeOptimizer:
             if oos_evidence.get("candidate_id"):
                 evidence["candidate_id"] = str(oos_evidence["candidate_id"])
             evidence["evaluation_regime"] = self._candidate_evaluation_regime(candidate)
+            if bool(candidate.get("trade_power_contract_enforced", False)):
+                evidence["trade_power"] = {
+                    "policy_role": (
+                        "declared_material_effect_and_precision_policy"
+                    ),
+                    "policy": {
+                        "minimum_economic_edge_r": (
+                            PRODUCTION_TRADE_POWER_POLICY.minimum_economic_edge_r
+                        ),
+                        "maximum_ci_half_width_r": (
+                            PRODUCTION_TRADE_POWER_POLICY.maximum_ci_half_width_r
+                        ),
+                        "target_power": PRODUCTION_TRADE_POWER_POLICY.target_power,
+                        "observed_mean_is_separate_economic_gate": True,
+                    },
+                    "train": dict(candidate.get("trade_power_train") or {}),
+                    "tuning_validation": dict(
+                        candidate.get("trade_power_validation") or {}
+                    ),
+                }
         if isinstance(false_discovery_evidence, dict):
             evidence["false_discovery"] = dict(false_discovery_evidence)
         if isinstance(legacy_confidence_evidence, dict):
@@ -7456,9 +9595,23 @@ class RegimeOptimizer:
         Final configured scoring models may use tuning/generalization spokes;
         those are intentionally unavailable before parameters are frozen.
         """
-        train_full = self._bucket_to_full_metrics(train_metrics or {})
+        metrics = dict(train_metrics or {})
+        trades = float(
+            metrics.get(
+                "effective_trades",
+                metrics.get("total_trades", 0),
+            )
+            or 0.0
+        )
+        if not math.isfinite(trades) or trades < 0.0:
+            return float("-inf")
+        scoring_surface = (
+            self._effective_count_surface(metrics, trades)
+            if "effective_trades" in metrics
+            else metrics
+        )
+        train_full = self._bucket_to_full_metrics(scoring_surface)
         base_score = float(self.scorer.score(train_full, purpose="selection"))
-        trades = int((train_metrics or {}).get("total_trades", 0) or 0)
         target = max(1, int(self.min_train_trades or 0) * 2)
         stability = min(1.0, math.log1p(trades) / math.log1p(target))
         floor = max(
@@ -7483,18 +9636,64 @@ class RegimeOptimizer:
         # ===== FIX Gap C: Trade count stability factor =====
         # Prefer candidates with more trades (more statistical confidence)
         # Uses log scaling: log1p(trades) / log1p(target) capped at 1.0
-        train_trades = train_metrics.get('total_trades', 0)
-        val_trades = val_metrics.get('total_trades', 0)
+        power_governed = bool(
+            isinstance(candidate, Mapping)
+            and candidate.get("trade_power_contract_enforced", False)
+        )
+        if power_governed:
+            try:
+                train_trades = float(
+                    (candidate.get("trade_power_train") or {}).get(
+                        "observed_effective_trades"
+                    )
+                )
+                val_trades = float(
+                    (candidate.get("trade_power_validation") or {}).get(
+                        "observed_effective_trades"
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                return float("-inf")
+            if (
+                not math.isfinite(train_trades)
+                or train_trades < 0.0
+                or not math.isfinite(val_trades)
+                or val_trades < 0.0
+            ):
+                return float("-inf")
+        else:
+            train_trades = float(train_metrics.get('total_trades', 0) or 0)
+            val_trades = float(val_metrics.get('total_trades', 0) or 0)
+
+        scoring_train, scoring_val, scoring_candidate = (
+            self._governed_scoring_inputs(
+                train_metrics,
+                val_metrics,
+                candidate,
+            )
+        )
+        if power_governed and (
+            not scoring_train or not scoring_val or scoring_candidate is None
+        ):
+            return float("-inf")
 
         scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
         if scoring_model == "specialist_spokes":
-            return self._compute_specialist_spoke_score(train_metrics, val_metrics, candidate)
+            return self._compute_specialist_spoke_score(
+                scoring_train, scoring_val, scoring_candidate
+            )
         if scoring_model == "specialist_spokes_threadspark":
-            return self._compute_threadspark_spoke_score(train_metrics, val_metrics, candidate)
+            return self._compute_threadspark_spoke_score(
+                scoring_train, scoring_val, scoring_candidate
+            )
         if scoring_model == "specialist_spokes_v2":
-            return self._compute_specialist_spoke_v2_score(train_metrics, val_metrics, candidate)
+            return self._compute_specialist_spoke_v2_score(
+                scoring_train, scoring_val, scoring_candidate
+            )
         if scoring_model == "specialist_spokes_asym":
-            return self._compute_asym_specialist_spoke_score(train_metrics, val_metrics, candidate)
+            return self._compute_asym_specialist_spoke_score(
+                scoring_train, scoring_val, scoring_candidate
+            )
 
         # Target trade counts for full stability bonus
         # (2x minimum is considered "healthy")
@@ -7513,11 +9712,11 @@ class RegimeOptimizer:
         stability_factor = stability_floor + (1.0 - stability_floor) * stability_factor
 
         # Build pseudo-metrics dicts for the scorer (regime bucket metrics -> full metrics format)
-        train_full = self._bucket_to_full_metrics(train_metrics)
-        val_full = self._bucket_to_full_metrics(val_metrics)
+        train_full = self._bucket_to_full_metrics(scoring_train)
+        val_full = self._bucket_to_full_metrics(scoring_val)
 
         # Use validation metrics if sufficient trades
-        if val_trades >= self.min_val_trades:
+        if power_governed or val_trades >= self.min_val_trades:
             # Use fx_generalization_score for proper gap penalty + robustness boost
             final_score, _, _, _ = self.scorer.fx_generalization_score(
                 train_full, val_full, purpose="selection"
@@ -8877,6 +11076,43 @@ class OptimizationPipeline:
                         timeframe=tf,
                     )
                     compact = self.regime_optimizer._compact_backtest_result(holdout_result)
+                    power_policy_passed = False
+                    power_policy_reason = (
+                        "final-lockbox trade-power evidence or its frozen train "
+                        "requirement is missing"
+                    )
+                    validation_evidence = dict(
+                        getattr(cfg, "validation_evidence", {}) or {}
+                    )
+                    if isinstance(validation_evidence.get("trade_power"), Mapping):
+                        frozen_requirement = (
+                            self.regime_optimizer
+                            ._frozen_requirement_from_validation_evidence(
+                                validation_evidence
+                            )
+                        )
+                        final_power_decision = (
+                            self.regime_optimizer._evaluate_partition_power_result(
+                                holdout_result,
+                                frozen_requirement=frozen_requirement,
+                                partition="final_lockbox",
+                                symbol=symbol,
+                                timeframe=tf,
+                                regime=regime,
+                                strategy_family=cfg.strategy_name,
+                                parameter_hash=_stable_hash(
+                                    self.regime_optimizer._clean_candidate_params(
+                                        cfg.parameters
+                                    )
+                                ),
+                            )
+                        )
+                        compact["trade_power_final"] = final_power_decision.to_dict()
+                        compact["effective_trades"] = float(
+                            final_power_decision.observed_effective_trades
+                        )
+                        power_policy_passed = final_power_decision.passed
+                        power_policy_reason = final_power_decision.reason
                     compact.update(
                         self.regime_optimizer._build_daily_net_mtm_surface(
                             result=holdout_result,
@@ -8930,10 +11166,22 @@ class OptimizationPipeline:
                         ),
                     )
                     compact["lockbox_bootstrap_evidence"] = lockbox_bootstrap
-                    if str(lockbox_bootstrap.get("status", "UNAVAILABLE")).upper() != "PASS":
+                    bootstrap_passed = (
+                        str(lockbox_bootstrap.get("status", "UNAVAILABLE")).upper()
+                        == "PASS"
+                    )
+                    if not power_policy_passed:
+                        compact["policy_status"] = "FAIL"
+                        compact["policy_reason"] = power_policy_reason
+                    elif not bootstrap_passed:
                         compact["policy_status"] = "FAIL"
                         compact["policy_reason"] = (
                             "final-lockbox block bootstrap did not establish positive edge"
+                        )
+                    else:
+                        compact["policy_status"] = "PASS"
+                        compact["policy_reason"] = (
+                            "final-lockbox effective-trade and block-bootstrap policies passed"
                         )
                     cfg.holdout_metrics = compact
                 except Exception as exc:
@@ -8946,6 +11194,8 @@ class OptimizationPipeline:
                         "min_trades_required": int(
                             self.regime_optimizer._min_val_trades_for_timeframe(tf)
                         ),
+                        "policy_status": "FAIL",
+                        "policy_reason": "final-lockbox evaluation infrastructure failure",
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                     logger.warning(f"[{symbol}] [{tf}] [{regime}] Holdout evaluation failed: {exc}")
@@ -9389,7 +11639,7 @@ class OptimizationPipeline:
                 "created_at": datetime.now().isoformat(),
                 "record_count": 0,
                 "return_index": "relative_equal_blocks",
-                "record_schema": "oos_candidate_returns_v3_spoke_evidence",
+                "record_schema": "oos_candidate_returns_v4_one_touch_evidence",
                 "completion_status": "NO_CANDIDATE_RECORDS",
                 "completion_reason": "no candidates survived training eligibility/evidence gates",
                 "matrix_contract": {
@@ -9462,7 +11712,7 @@ class OptimizationPipeline:
             "created_at": datetime.now().isoformat(),
             "record_count": len(ordered_records),
             "return_index": "relative_equal_blocks",
-            "record_schema": "oos_candidate_returns_v3_spoke_evidence",
+            "record_schema": "oos_candidate_returns_v4_one_touch_evidence",
             "matrix_contract": {
                 "returns_shape": [int(returns.shape[0]), int(returns.shape[1])],
                 "rows": "common trailing OOS periods",
