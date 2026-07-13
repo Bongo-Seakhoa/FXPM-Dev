@@ -6717,13 +6717,50 @@ class LiveTrader:
 
         risk_target_volume = volume_raw
 
-        # Clamp and normalize volume (risk-safe floor to step)
-        volume_raw = max(min_vol, min(max_vol, volume_raw))
-        volume = self.mt5.normalize_volume(volume_raw, symbol_info)
-
-        # If normalization pushed below min, force to min_vol (may exceed target; enforce cap below)
-        if volume < min_vol:
-            volume = min_vol
+        # The raw risk-sized volume is an exposure ceiling.  Cap it downward at
+        # the configured/broker maximum, then floor it to the broker grid.  A
+        # sub-minimum result is a no-order decision; never promote it to the
+        # broker minimum because doing so exceeds the requested risk budget.
+        volume_ceiling = min(max_vol, risk_target_volume)
+        normalized_volume = self.mt5.normalize_volume(volume_ceiling, symbol_info)
+        volume = _safe_float(normalized_volume)
+        invalid_normalized_volume = (
+            volume is None
+            or not math.isfinite(volume)
+            or volume <= 0.0
+            or volume < min_vol - 1e-12
+            or volume > volume_ceiling + 1e-12
+            or volume > risk_target_volume + 1e-12
+        )
+        if invalid_normalized_volume:
+            self.logger.info(
+                f"[{symbol}] Trade blocked: no broker-valid volume fits at or "
+                f"below requested volume {risk_target_volume:.8f} "
+                f"(min={min_vol:.8f}, max={max_vol:.8f})"
+            )
+            _record_throttle("BLOCKED_MIN_LOT_EXCEEDS_CAP")
+            _record_actionable(
+                action="BLOCKED_MIN_LOT_EXCEEDS_CAP",
+                entry_price_value=entry_price,
+                sl_value=sl_price,
+                tp_value=tp_price,
+                volume_value=(
+                    volume
+                    if volume is not None and math.isfinite(volume) and volume > 0.0
+                    else None
+                ),
+                target_risk_pct_value=target_risk_pct,
+                actual_risk_pct_value=None,
+                context={
+                    "risk_cap_reason": "no_broker_valid_volume_at_or_below_target",
+                    "requested_volume": risk_target_volume,
+                    "normalization_ceiling": volume_ceiling,
+                    "normalized_volume": volume,
+                    "min_volume": min_vol,
+                    "max_volume": max_vol,
+                },
+            )
+            return
 
         actual_risk_amount, _actual_risk_path = self._estimate_stop_loss_amount(
             order_type.value,
@@ -7469,16 +7506,33 @@ class LiveTrader:
                     },
                 )
                 return
-            conservative_volume = min(
-                float(volume),
-                float(self.mt5.normalize_volume(conservative_raw_volume, symbol_info)),
+            normalized_conservative_raw = self.mt5.normalize_volume(
+                conservative_raw_volume,
+                symbol_info,
             )
-            if conservative_volume < min_vol - 1e-12 or conservative_volume <= 0.0:
+            normalized_conservative_volume = _safe_float(normalized_conservative_raw)
+            if (
+                normalized_conservative_volume is None
+                or not math.isfinite(normalized_conservative_volume)
+                or normalized_conservative_volume <= 0.0
+                or normalized_conservative_volume < min_vol - 1e-12
+                or normalized_conservative_volume > conservative_raw_volume + 1e-12
+            ):
                 _block_pre_send(
                     "BLOCKED_MIN_LOT_EXCEEDS_CAP",
                     "no positive broker-valid volume fits conservative risk capital",
+                    {
+                        "conservative_risk_capital": conservative_capital,
+                        "conservative_raw_volume": conservative_raw_volume,
+                        "normalized_conservative_volume": normalized_conservative_volume,
+                        "minimum_volume": min_vol,
+                    },
                 )
                 return
+            conservative_volume = min(
+                float(volume),
+                normalized_conservative_volume,
+            )
             if conservative_volume < float(volume) - 1e-12:
                 volume = conservative_volume
                 actual_risk_amount, _actual_risk_path = self._estimate_stop_loss_amount(

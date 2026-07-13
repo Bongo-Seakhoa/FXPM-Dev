@@ -204,6 +204,70 @@ class MT5ConnectorTests(unittest.TestCase):
 
         self.assertEqual(volume, 0.123)
 
+    def test_invalid_or_subminimum_volume_never_reaches_mt5(self):
+        connector = MT5Connector(MT5Config())
+        connector._connected = True
+
+        for requested in (0.0, -0.01, float("nan"), 0.0001):
+            with self.subTest(requested=requested):
+                self.fake_mt5.order_check_request = None
+                self.fake_mt5.order_send_request = None
+                self.fake_mt5.tick_calls = 0
+
+                result = connector.send_market_order(
+                    symbol="EURUSD",
+                    order_type=OrderType.BUY,
+                    volume=requested,
+                    sl=1.09800,
+                    tp=1.10300,
+                )
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.retcode, 10014)
+                self.assertIn("Invalid volume", result.retcode_description)
+                self.assertIsNone(self.fake_mt5.order_check_request)
+                self.assertIsNone(self.fake_mt5.order_send_request)
+                self.assertEqual(self.fake_mt5.tick_calls, 0)
+
+    def test_normalize_volume_floors_without_increasing_exposure(self):
+        connector = MT5Connector(MT5Config())
+        symbol_info = SimpleNamespace(
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+        )
+
+        self.assertIsNone(connector.normalize_volume(0.0, symbol_info))
+        self.assertIsNone(connector.normalize_volume(-0.01, symbol_info))
+        self.assertIsNone(connector.normalize_volume(float("nan"), symbol_info))
+        self.assertIsNone(connector.normalize_volume(0.0001, symbol_info))
+        self.assertEqual(connector.normalize_volume(0.019, symbol_info), 0.01)
+        self.assertEqual(connector.normalize_volume(0.01, symbol_info), 0.01)
+        self.assertEqual(connector.normalize_volume(101.0, symbol_info), 100.0)
+
+    def test_normalize_volume_supports_millilot_precision(self):
+        connector = MT5Connector(MT5Config())
+        symbol_info = SimpleNamespace(
+            volume_min=0.001,
+            volume_max=2.0,
+            volume_step=0.001,
+        )
+
+        self.assertEqual(connector.normalize_volume(0.0199, symbol_info), 0.019)
+        self.assertEqual(connector.normalize_volume(0.001, symbol_info), 0.001)
+
+    def test_normalize_volume_rejects_invalid_broker_step_metadata(self):
+        connector = MT5Connector(MT5Config())
+
+        for step in (0.0, -0.01, float("nan"), float("inf")):
+            with self.subTest(step=step):
+                symbol_info = SimpleNamespace(
+                    volume_min=0.01,
+                    volume_max=100.0,
+                    volume_step=step,
+                )
+                self.assertIsNone(connector.normalize_volume(0.10, symbol_info))
+
     def test_return_fill_is_rejected_for_market_execution(self):
         connector = MT5Connector(MT5Config(preferred_filling_type="return"))
         connector._connected = True

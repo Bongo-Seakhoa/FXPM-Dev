@@ -449,7 +449,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         )
         return trader
 
-    def test_execute_entry_enforces_target_tolerance_below_hard_cap(self):
+    def test_execute_entry_blocks_subminimum_risk_target_without_promotion(self):
         trader = self._make_trader(
             SimpleNamespace(
                 risk_per_trade_pct=0.05,
@@ -489,7 +489,20 @@ class LiveRiskIntentTests(unittest.TestCase):
         actionable_payload = trader._actionable_log.record.call_args[0][1]
         self.assertEqual(actionable_payload["action"], "BLOCKED_MIN_LOT_EXCEEDS_CAP")
         self.assertAlmostEqual(actionable_payload["target_risk_pct"], 0.05, places=6)
-        self.assertAlmostEqual(actionable_payload["actual_risk_pct"], 0.10, places=6)
+        self.assertIsNone(actionable_payload["actual_risk_pct"])
+        self.assertAlmostEqual(
+            actionable_payload["context"]["requested_volume"],
+            0.005,
+            places=9,
+        )
+        normalized_request = trader.mt5.normalize_volume.call_args.args[0]
+        self.assertAlmostEqual(normalized_request, 0.005, places=9)
+        self.assertLess(normalized_request, 0.01)
+        requested_loss_volumes = [
+            call.args[2] for call in trader.mt5.calc_loss_amount.call_args_list
+        ]
+        self.assertEqual(requested_loss_volumes, [1.0])
+        trader.mt5.send_market_order.assert_not_called()
 
     def test_execute_entry_uses_fresh_symbol_positions_for_combined_risk(self):
         trader = self._make_trader(
@@ -714,7 +727,8 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         actionable_payload = trader._actionable_log.record.call_args[0][1]
         self.assertEqual(actionable_payload["action"], "BLOCKED_MIN_LOT_EXCEEDS_CAP")
-        self.assertAlmostEqual(actionable_payload["actual_risk_pct"], 0.10, places=6)
+        self.assertIsNone(actionable_payload["actual_risk_pct"])
+        trader.mt5.send_market_order.assert_not_called()
 
     def test_execute_entry_blocks_when_commission_pushes_min_lot_over_hard_cap(self):
         trader = self._make_trader(
@@ -756,7 +770,8 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         actionable_payload = trader._actionable_log.record.call_args[0][1]
         self.assertEqual(actionable_payload["action"], "BLOCKED_MIN_LOT_EXCEEDS_CAP")
-        self.assertGreater(actionable_payload["actual_risk_pct"], 0.10)
+        self.assertIsNone(actionable_payload["actual_risk_pct"])
+        trader.mt5.send_market_order.assert_not_called()
 
     def test_execute_entry_blocks_before_submit_when_margin_required_exceeds_free_margin(self):
         trader = self._make_trader(

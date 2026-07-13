@@ -443,6 +443,99 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
             ["artifact_authorization", "fresh_broker_snapshot"],
         )
 
+    def test_conservative_snapshot_none_volume_blocks_without_type_error(self):
+        trader = self._trader(0.25)
+        trader.pipeline_config = PipelineConfig(
+            manual_new_entries_enabled=True,
+            max_total_open_risk_pct=8.0,
+            max_factor_group_open_risk_pct=2.0,
+            max_new_entries_when_total_open_risk_above_pct=0.0,
+            open_risk_action="observe",
+            margin_entry_block_level=200.0,
+            margin_recovery_start_level=150.0,
+            margin_panic_level=120.0,
+            margin_reopen_level=300.0,
+        )
+        trader._fresh_cell_authorization_failure = MagicMock(return_value=None)
+        trader._promotion_authorization_block_reason = MagicMock(return_value=None)
+        fresh_account = SimpleNamespace(
+            balance=10_000.0,
+            equity=10_000.0,
+            margin=0.0,
+            margin_level=0.0,
+            margin_free=10_000.0,
+            trade_allowed=True,
+            trade_expert=True,
+            currency="USD",
+        )
+        trader._fresh_entry_account_validation = MagicMock(
+            return_value=(fresh_account, None)
+        )
+        trader._build_live_stop_risk_exposures = MagicMock(
+            return_value=([], 5_000.0, "")
+        )
+        trader.mt5.get_account_info.return_value = fresh_account
+        trader.mt5.calc_margin_required.return_value = 100.0
+        normalization_calls = []
+
+        def _normalize(volume, _symbol_info):
+            normalization_calls.append(volume)
+            return volume if len(normalization_calls) == 1 else None
+
+        trader.mt5.normalize_volume.side_effect = _normalize
+        features = pd.DataFrame(
+            {
+                "Open": [1.0, 1.0],
+                "High": [1.0, 1.0],
+                "Low": [1.0, 1.0],
+                "Close": [1.0, 1.0],
+            }
+        )
+
+        trader._execute_entry(
+            symbol="GBPUSD",
+            broker_symbol="GBPUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(
+                pip_size=0.01,
+                pip_value=1.0,
+                spread_avg=3.0,
+                point=0.01,
+                asset_class="fx",
+            ),
+            magic=12345,
+            config=SimpleNamespace(symbol="GBPUSD"),
+            decision_key="conservative-normalize-none",
+            bar_time_iso="2026-07-13T01:00:00",
+            best_candidate={
+                "timeframe": "M15",
+                "regime": "TREND",
+                "strategy_name": "MomentumBurstStrategy",
+                "signal": 1,
+            },
+            trade_intent=SimpleNamespace(
+                stop_loss_pips=10.0,
+                take_profit_pips=20.0,
+            ),
+            positions_snapshot=[],
+            account_info=fresh_account,
+        )
+
+        self.assertEqual(len(normalization_calls), 2)
+        self.assertAlmostEqual(normalization_calls[0], 0.02, places=8)
+        self.assertAlmostEqual(normalization_calls[1], 0.01, places=8)
+        trader.mt5.send_market_order.assert_not_called()
+        actionable_payload = trader._actionable_log.record.call_args.args[1]
+        self.assertEqual(
+            actionable_payload["action"],
+            "BLOCKED_MIN_LOT_EXCEEDS_CAP",
+        )
+        self.assertIsNone(
+            actionable_payload["context"]["normalized_conservative_volume"]
+        )
+
 
 class MT5RiskFallbackWarnTests(unittest.TestCase):
     """D7 — `_estimate_position_risk_pct` must surface a one-time-per-(symbol,

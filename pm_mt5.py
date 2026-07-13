@@ -18,6 +18,7 @@ Version: 3.1 (Portfolio Manager)
 import logging
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Dict, List, Mapping, Optional, Any, Tuple
 from enum import Enum
 import time
@@ -1221,6 +1222,20 @@ class MT5Connector:
         if symbol_info is None:
             return MT5OrderResult(False, -1, f"Symbol info not available: {broker_symbol}")
 
+        # A requested volume is a risk ceiling, never a target to round up to.
+        # Reject volumes that cannot be represented at or above the broker
+        # minimum before fetching a tick, preflighting, or submitting an order.
+        requested_volume = volume
+        volume = self._normalize_volume(requested_volume, symbol_info)
+        if volume is None:
+            description = (
+                f"Invalid volume {requested_volume!r}: no broker-valid volume "
+                f"at or below the request (min={symbol_info.volume_min}, "
+                f"max={symbol_info.volume_max}, step={symbol_info.volume_step})"
+            )
+            logger.warning("Rejected %s market order: %s", broker_symbol, description)
+            return MT5OrderResult(False, 10014, description)
+
         mt5_type = mt5.ORDER_TYPE_BUY if order_type == OrderType.BUY else mt5.ORDER_TYPE_SELL
         if price is None:
             # Get current price
@@ -1242,9 +1257,6 @@ class MT5Connector:
             mt5_type = mt5.ORDER_TYPE_BUY
         else:
             mt5_type = mt5.ORDER_TYPE_SELL
-        
-        # Normalize volume
-        volume = self._normalize_volume(volume, symbol_info)
         
         # Determine filling type
         filling_type = self._get_filling_type(broker_symbol, symbol_info=symbol_info)
@@ -1842,23 +1854,69 @@ class MT5Connector:
         
         return True
     
-    def _normalize_volume(self, volume: float, symbol_info: MT5SymbolInfo) -> float:
-        """Normalize volume to valid lot size."""
-        volume = max(symbol_info.volume_min, volume)
-        volume = min(symbol_info.volume_max, volume)
+    def _normalize_volume(
+        self,
+        volume: float,
+        symbol_info: MT5SymbolInfo,
+    ) -> Optional[float]:
+        """Floor a risk ceiling to the broker grid, or return ``None``.
 
-        # Round to volume step (guard against broker returning 0)
-        step = symbol_info.volume_step
-        if step <= 0:
-            step = 0.01
-        volume = math.floor((volume / step) + 1e-12) * step  # floor-to-step (risk-safe)
-        volume = max(symbol_info.volume_min, min(symbol_info.volume_max, volume))
+        Normalization must never increase requested exposure.  In particular,
+        a positive request below ``volume_min`` is not silently promoted to the
+        minimum lot: it is an invalid/no-order result.
+        """
+        try:
+            requested = float(volume)
+            min_volume = float(symbol_info.volume_min)
+            max_volume = float(symbol_info.volume_max)
+            step = float(symbol_info.volume_step)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if not math.isfinite(requested) or requested <= 0.0:
+            return None
+        if (
+            not math.isfinite(min_volume)
+            or not math.isfinite(max_volume)
+            or min_volume < 0.0
+            or max_volume <= 0.0
+            or max_volume < min_volume
+        ):
+            return None
+        if not math.isfinite(step) or step <= 0.0:
+            return None
+
+        try:
+            requested_decimal = Decimal(str(requested))
+            min_decimal = Decimal(str(min_volume))
+            max_decimal = Decimal(str(max_volume))
+            step_decimal = Decimal(str(step))
+            bounded_decimal = min(requested_decimal, max_decimal)
+            step_count = (bounded_decimal / step_decimal).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+            normalized_decimal = step_count * step_decimal
+        except (InvalidOperation, ValueError, OverflowError, ZeroDivisionError):
+            return None
+
+        if normalized_decimal <= 0 or normalized_decimal < min_decimal:
+            return None
 
         precision = max(
             self._volume_decimal_places(step),
-            self._volume_decimal_places(symbol_info.volume_min),
+            self._volume_decimal_places(min_volume),
         )
-        return round(volume, precision)
+        normalized = round(float(normalized_decimal), precision)
+
+        # Decimal arithmetic establishes the risk-safe invariant.  Retain a
+        # final float-domain guard for unusual broker precision metadata.
+        upper_bound = min(requested, max_volume)
+        if normalized > upper_bound:
+            normalized_decimal -= step_decimal
+            if normalized_decimal <= 0 or normalized_decimal < min_decimal:
+                return None
+            normalized = round(float(normalized_decimal), precision)
+        return normalized
 
     @staticmethod
     def _volume_decimal_places(value: float) -> int:
@@ -1868,8 +1926,12 @@ class MT5Connector:
         return min(8, len(text.rsplit(".", 1)[1]))
     
     
-    def normalize_volume(self, volume: float, symbol_info: MT5SymbolInfo) -> float:
-        """Public wrapper for volume normalization (risk-safe)."""
+    def normalize_volume(
+        self,
+        volume: float,
+        symbol_info: MT5SymbolInfo,
+    ) -> Optional[float]:
+        """Public wrapper for risk-safe volume normalization."""
         return self._normalize_volume(volume, symbol_info)
 
     def order_calc_profit(self, order_type: int, symbol: str, volume: float,
