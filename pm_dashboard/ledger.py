@@ -30,7 +30,10 @@ def iter_matching_files(pm_root: str, patterns: Iterable[str]) -> List[str]:
 
 
 def load_records_from_text(path: str, text: str) -> List[Dict[str, Any]]:
-    ext = os.path.splitext(path)[1].lower()
+    # Lossless month archives (signal_ledger_YYYYMM.jsonl.gz) parse as their
+    # underlying format; decompression happens in the reader.
+    base = path[:-3] if str(path).lower().endswith(".gz") else path
+    ext = os.path.splitext(base)[1].lower()
     if ext in _JSONL_EXTENSIONS:
         return _load_jsonl_records(text)
     if ext != ".json":

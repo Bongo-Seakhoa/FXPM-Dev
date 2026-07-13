@@ -41,7 +41,11 @@ logger = logging.getLogger(__name__)
 
 _TRADE_HISTORY_CACHE: Dict[Tuple[str, int, Tuple[Tuple[str, int, int], ...], Tuple[str, int, int]], List[Dict[str, Any]]] = {}
 _TRADE_HISTORY_CACHE_VERSION = "v4"
-_TRADE_HISTORY_PATTERNS = ("**/signal_ledger*.jsonl", "**/trades_*.json")
+_TRADE_HISTORY_PATTERNS = (
+    "**/signal_ledger*.jsonl",
+    "**/signal_ledger*.jsonl.gz",
+    "**/trades_*.json",
+)
 
 _REALIZED_STATUSES = {
     "CLOSED",

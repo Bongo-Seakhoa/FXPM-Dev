@@ -1118,19 +1118,81 @@ class StorageManager:
         decompresses to a sha256-identical payload. If an archive already
         exists (a late append recreated the raw file), the raw records are
         merged after the archived ones so no canonical event is ever lost.
+
+        Crash idempotency: a durable transaction sidecar records the raw and
+        combined hashes before the archive is replaced. If a crash strands
+        both the merged archive and the raw file, the retry recognizes the
+        already-merged raw by hash and completes the unlink instead of
+        concatenating the same records a second time.
         Runs under the same OS lock as ledger appends.
         """
         stem, _suffix = self._ledger_stem_suffix()
         lock_path = self.output_dir / f".{stem}.append.lock"
         with _exclusive_file_lock(lock_path):
             raw_bytes = path.read_bytes()
+            raw_sha = hashlib.sha256(raw_bytes).hexdigest()
             gz_path = path.with_name(f"{path.name}.gz")
+            txn_path = gz_path.with_name(f"{gz_path.name}.txn")
             prior_gz_size = _safe_size(gz_path)
             prior_bytes = b""
             if gz_path.exists():
                 prior_bytes = gzip.decompress(gz_path.read_bytes())
+
+            # Recovery: if a prior transaction already merged this raw payload
+            # (or a prefix of it, when a late append landed on the stranded
+            # file) into the current archive, only the unmerged remainder may
+            # be merged again - otherwise canonical records duplicate.
+            if txn_path.exists():
+                try:
+                    txn = json.loads(txn_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    txn = {}
+                archive_sha = hashlib.sha256(prior_bytes).hexdigest()
+                merged_len = _safe_int((txn or {}).get("raw_length"), -1)
+                if (
+                    isinstance(txn, dict)
+                    # A recovery marker is honored only when it provably
+                    # belongs to this schema generation and this month file;
+                    # a foreign/renamed marker must never satisfy recovery.
+                    and txn.get("schema") == "fxpm-ledger-compaction-txn-v1"
+                    and txn.get("month_file") == path.name
+                    and txn.get("combined_sha256") == archive_sha
+                    and 0 <= merged_len <= len(raw_bytes)
+                    and hashlib.sha256(raw_bytes[:merged_len]).hexdigest()
+                    == txn.get("raw_sha256")
+                ):
+                    remainder = raw_bytes[merged_len:]
+                    if not remainder:
+                        path.unlink()
+                        txn_path.unlink(missing_ok=True)
+                        return max(0, len(raw_bytes))
+                    # Atomically truncate the merged prefix off the raw file
+                    # first, so every subsequent state (including another
+                    # crash) is an ordinary merge of not-yet-archived bytes.
+                    truncate_tmp = path.with_name(
+                        f"{path.name}.truncate.{os.getpid()}.{threading.get_ident()}"
+                    )
+                    truncate_tmp.write_bytes(remainder)
+                    os.replace(truncate_tmp, path)
+                    txn_path.unlink(missing_ok=True)
+                    raw_bytes = remainder
+                    raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+                # Stale/foreign transaction marker: fall through and redo the
+                # merge from current state, then overwrite the marker.
+
             combined = prior_bytes + raw_bytes
             expected_sha = hashlib.sha256(combined).hexdigest()
+            _atomic_write_json(
+                txn_path,
+                {
+                    "schema": "fxpm-ledger-compaction-txn-v1",
+                    "month_file": path.name,
+                    "prior_archive_sha256": hashlib.sha256(prior_bytes).hexdigest(),
+                    "raw_sha256": raw_sha,
+                    "raw_length": len(raw_bytes),
+                    "combined_sha256": expected_sha,
+                },
+            )
             tmp_path = gz_path.with_name(
                 f"{gz_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
             )
@@ -1149,6 +1211,10 @@ class StorageManager:
                         "ledger archive roundtrip does not match canonical bytes"
                     )
                 os.replace(tmp_path, gz_path)
+            except BaseException:
+                # The archive was not replaced; the transaction never happened.
+                txn_path.unlink(missing_ok=True)
+                raise
             finally:
                 if tmp_path.exists():
                     try:
@@ -1156,6 +1222,7 @@ class StorageManager:
                     except OSError:
                         pass
             path.unlink()
+            txn_path.unlink(missing_ok=True)
             return max(0, len(raw_bytes) + prior_gz_size - _safe_size(gz_path))
 
     def _live_cache_cleanup_candidates(self, now: datetime) -> List[Dict[str, Any]]:

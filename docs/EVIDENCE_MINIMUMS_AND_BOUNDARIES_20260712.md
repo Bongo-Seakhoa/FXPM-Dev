@@ -153,8 +153,17 @@ boundedness sign-off):
   - Monthly `signal_ledger_YYYYMM.jsonl` files are canonical inputs to
     `pm_dashboard.analytics.load_trade_history`; deleting older months changes
     lifetime equity, drawdown, and performance results. The attempted
-    age-based deletion was therefore removed. Appends are now OS-locked, but
-    exact accuracy-preserving bounded compaction/archive remains open.
+    age-based deletion was therefore removed. Appends are now OS-locked.
+  - Closed months are losslessly gzip-archived (`.jsonl.gz`) with a sha256
+    roundtrip proof, a crash-idempotent transaction marker (schema and
+    month-file identity checked on recovery), and transparent readers.
+    **Honest scope of this bound**: gzip caps *hot raw-file* growth and the
+    on-disk footprint per month (~10–20×), but total cold-archive bytes still
+    grow monotonically as months accrue. The current analytics reader retains
+    all parsed trades from at most its default `max_files=100` selected files;
+    after 100 matching files it is silently no longer lifetime-complete. True
+    cold-archive bounding and horizon-complete streaming aggregation remain
+    OPEN (item 1 below); this compaction must not be cited as solving them.
 
 Accuracy guarantee: the implemented destructive bounds act only on the pure
 housekeeping manifest and disposable caches. Canonical signal/trade history,
@@ -166,9 +175,10 @@ bounded** rather than falsely claiming boundedness by degrading analytics.
 
 1. Exact bounded canonical-ledger design: either an externally archived,
    checksummed event stream with transparent readers, or a formally proven
-   exact summary contract plus a separately retained audit source. A rolling
-   delete that silently turns lifetime metrics into 12-month metrics is not
-   acceptable.
+   exact summary contract plus a separately retained audit source. Replace the
+   current `max_files=100` reader cap with horizon-complete streaming
+   aggregation whose memory stays bounded. A rolling delete or silent file cap
+   that turns lifetime metrics into a shorter horizon is not acceptable.
 2. Atomic generation promotion (contract pt 9): per-symbol incremental saves
    remain; a complete-generation gate before replacing the book is still open.
 3. Memory governor, per-timeframe release, and remaining copy elimination;

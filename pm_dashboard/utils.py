@@ -21,6 +21,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "**/*signal*.json",
         "**/*signal*.jsonl",
         "**/*signal_ledger*.jsonl",
+        "**/*signal_ledger*.jsonl.gz",
         "**/*signals*.json",
         "**/*signal*.csv",
         "**/*signals*.csv",
@@ -240,8 +241,14 @@ def resolve_pm_configs_path(pm_root: str, dashboard_config: Optional[Dict[str, A
 def safe_read_text(path: str) -> Optional[str]:
     try:
         stat_before = os.stat(path)
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            data = handle.read()
+        if str(path).lower().endswith(".gz"):
+            import gzip
+
+            with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as handle:
+                data = handle.read()
+        else:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                data = handle.read()
         stat_after = os.stat(path)
         if (stat_before.st_mtime != stat_after.st_mtime) or (stat_before.st_size != stat_after.st_size):
             return None
