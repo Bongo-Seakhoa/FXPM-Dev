@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -224,6 +225,56 @@ def _atomic_replace_json(path: Path, payload: Mapping[str, Any]) -> Path:
         raise
 
 
+def _replace_directory_with_retry(
+    staging: Path,
+    final_dir: Path,
+    *,
+    attempts: int = 8,
+    initial_delay_seconds: float = 0.025,
+    replace_fn: Any = None,
+    sleep_fn: Any = None,
+) -> None:
+    """Publish one immutable directory despite transient Windows share locks.
+
+    OneDrive, antivirus, and indexers can briefly open a newly fsynced staging
+    child without delete sharing.  Windows then reports ``PermissionError``
+    for the parent-directory rename even though neither this process nor a
+    competing audit owns the destination.  Retrying the same atomic rename is
+    safe; copying files as a fallback would not be atomic and is forbidden.
+
+    A destination appearing at any point is an immutable-record collision,
+    not a retryable sharing violation.  Exhaustion preserves the original OS
+    error and lets the caller remove only its private staging directory.
+    """
+
+    staging = Path(staging)
+    final_dir = Path(final_dir)
+    if attempts < 1:
+        raise ValueError("attempts must be at least one")
+    if initial_delay_seconds < 0.0:
+        raise ValueError("initial_delay_seconds cannot be negative")
+    replace = replace_fn or os.replace
+    sleep = sleep_fn or time.sleep
+    for attempt in range(attempts):
+        if final_dir.exists():
+            raise FileExistsError(
+                f"immutable audit leaf already exists: {final_dir}"
+            )
+        try:
+            replace(staging, final_dir)
+            return
+        except PermissionError:
+            # A concurrent publisher must never be overwritten, even if
+            # Windows surfaced its destination collision as access denied.
+            if final_dir.exists():
+                raise FileExistsError(
+                    f"immutable audit leaf already exists: {final_dir}"
+                ) from None
+            if attempt + 1 >= attempts or not staging.is_dir():
+                raise
+            sleep(initial_delay_seconds * (2**attempt))
+
+
 def _write_audit_leaf(
     audit_root: Path,
     symbol: str,
@@ -246,7 +297,7 @@ def _write_audit_leaf(
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-        os.replace(staging, final_dir)
+        _replace_directory_with_retry(staging, final_dir)
         return final_dir / "parity.json", final_dir / "bars.meta.json"
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)

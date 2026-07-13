@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,86 @@ from tests.native_v5_support import (
     rewrite_no_history as _rewrite_no_history,
     write_v5_run as _write_v5_run,
 )
+
+
+def test_atomic_audit_leaf_publish_retries_transient_windows_share_lock(tmp_path):
+    staging = tmp_path / ".H4.transient.staging"
+    final_dir = tmp_path / "H4"
+    staging.mkdir()
+    (staging / "parity.json").write_text("{}\n", encoding="utf-8")
+    attempts = []
+    delays = []
+
+    def transient_replace(source, target):
+        attempts.append((Path(source), Path(target)))
+        if len(attempts) < 3:
+            raise PermissionError(13, "simulated Windows sharing violation")
+        os.replace(source, target)
+
+    activation_tool._replace_directory_with_retry(
+        staging,
+        final_dir,
+        replace_fn=transient_replace,
+        sleep_fn=delays.append,
+    )
+
+    assert len(attempts) == 3
+    assert delays == [0.025, 0.05]
+    assert not staging.exists()
+    assert (final_dir / "parity.json").read_text(encoding="utf-8") == "{}\n"
+
+
+def test_atomic_audit_leaf_publish_never_retries_or_replaces_collision(tmp_path):
+    staging = tmp_path / ".H4.collision.staging"
+    final_dir = tmp_path / "H4"
+    staging.mkdir()
+    attempts = []
+
+    def colliding_replace(source, target):
+        attempts.append((Path(source), Path(target)))
+        final_dir.mkdir()
+        (final_dir / "owner.txt").write_text("other writer", encoding="utf-8")
+        raise PermissionError(13, "simulated destination collision")
+
+    with pytest.raises(FileExistsError, match="immutable audit leaf"):
+        activation_tool._replace_directory_with_retry(
+            staging,
+            final_dir,
+            replace_fn=colliding_replace,
+            sleep_fn=lambda _delay: pytest.fail("collision must not be retried"),
+        )
+
+    assert len(attempts) == 1
+    assert staging.is_dir()
+    assert (final_dir / "owner.txt").read_text(encoding="utf-8") == "other writer"
+
+
+def test_atomic_audit_leaf_retry_exhaustion_cleans_private_staging(
+    tmp_path, monkeypatch
+):
+    audit_root = tmp_path / "audits" / "activation"
+    audit_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        activation_tool.os,
+        "replace",
+        lambda _source, _target: (_ for _ in ()).throw(
+            PermissionError(13, "persistent simulated sharing violation")
+        ),
+    )
+    monkeypatch.setattr(activation_tool.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(PermissionError, match="persistent simulated"):
+        activation_tool._write_audit_leaf(
+            audit_root,
+            "USDCAD",
+            "H4",
+            {"status": "PENDING"},
+            {"complete": False},
+        )
+
+    symbol_dir = audit_root / "USDCAD"
+    assert not (symbol_dir / "H4").exists()
+    assert list(symbol_dir.glob(".H4.*.staging")) == []
 
 
 def test_v5_all_twelve_edges_survive_sorted_json_and_production_recomputation(tmp_path):
