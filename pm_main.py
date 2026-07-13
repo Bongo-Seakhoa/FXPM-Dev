@@ -1288,7 +1288,7 @@ class LiveTrader:
         return loader if isinstance(loader, DataLoader) else None
 
     def _get_live_cache_path(self, symbol: str, timeframe: str) -> Path:
-        """Path for the bounded live cache used during trading sweeps."""
+        """Path for the bounded research-mode live cache."""
         live_dir = Path(self.pipeline_config.data_dir) / ".live"
         live_dir.mkdir(parents=True, exist_ok=True)
         return live_dir / f"{symbol}_{str(timeframe or 'M5').upper()}.csv"
@@ -1480,6 +1480,12 @@ class LiveTrader:
         self._sweep_recent_m5_windows[symbol] = recent.copy()
         return recent.tail(fetch_rows).copy()
 
+    def _uses_native_calendar_live_sources(self) -> bool:
+        """Return whether live cells must retain broker-native timeframe semantics."""
+        return str(
+            getattr(self.pipeline_config, "production_split_mode", "") or ""
+        ).strip().lower() == "calendar_lockbox_v2"
+
     def _sync_live_timeframe_cache(self,
                                    symbol: str,
                                    broker_symbol: str,
@@ -1614,8 +1620,27 @@ class LiveTrader:
         min_required: int,
     ) -> Optional[pd.DataFrame]:
         """
-        Prefer PM-local canonical data for live evaluation, with MT5 fallback.
+        Load the exact production source or the explicit research compatibility path.
         """
+        if self._uses_native_calendar_live_sources():
+            required_bars = max(int(count or 0), int(min_required or 0), 1)
+            if not self.mt5 or not self.mt5.is_connected():
+                return None
+            bars = self.mt5.get_bars(
+                broker_symbol,
+                str(timeframe or "M5").upper(),
+                count=required_bars,
+            )
+            if not isinstance(bars, pd.DataFrame) or len(bars) < max(
+                int(min_required or 0), 1
+            ):
+                self._record_latest_bar_time(timeframe, bars)
+                return None
+            if len(bars) > required_bars:
+                bars = bars.tail(required_bars)
+            self._record_latest_bar_time(timeframe, bars)
+            return bars.copy()
+
         use_local = bool(getattr(self.pipeline_config, "storage_local_data_first_enabled", True))
         local_bars: Optional[pd.DataFrame] = None
         if use_local:
