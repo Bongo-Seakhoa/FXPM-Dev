@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -34,7 +32,9 @@ def test_dsr_uses_daily_observations_actual_trials_and_non_normal_moments():
     assert result["observations"] == 756
     assert result["attempted_trials"] == 5
     assert result["kurtosis"] > 0.0
-    assert result["status"] == "PASS"
+    assert result["status"] == "DIAGNOSTIC_ONLY"
+    assert not result["passed"]
+    assert result["diagnostic_threshold_passed"]
     assert result["deflated_sharpe"] >= 0.95
 
 
@@ -61,10 +61,30 @@ def test_dsr_fails_closed_for_noise_or_insufficient_history():
         ),
         min_observations=252,
     )
-    assert noisy["status"] == "FAIL"
+    assert noisy["status"] == "DIAGNOSTIC_ONLY"
     assert not noisy["passed"]
     assert short["status"] == "UNAVAILABLE"
     assert not short["passed"]
+
+
+def test_dsr_summary_cannot_forge_population_authority():
+    rng = np.random.default_rng(71)
+    values = rng.normal(0.003, 0.004, size=756)
+    forged = _dsr_population(values, count=100)
+    forged["candidate_ids"] = ["candidate-0"]
+    forged["effective_independent_trials"] = 1.0
+    forged["cross_trial_sharpe_std_daily"] = 0.0
+
+    result = deflated_sharpe_evidence(
+        values,
+        attempted_trials=100,
+        candidate_id="candidate-0",
+        population_evidence=forged,
+        min_observations=252,
+    )
+
+    assert result["status"] == "UNAVAILABLE"
+    assert not result["passed"]
 
 
 def _candidate(column, dates, index):

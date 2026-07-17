@@ -23,17 +23,17 @@ from pm_sample_dependence import effective_sample_evidence
 from pm_search_outcomes import SearchOutcomeKind
 
 
-TRADE_POWER_SCHEMA_VERSION = "fxpm-cell-power-v1"
-TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v3"
-TRADE_POWER_DECISION_SCHEMA_VERSION = "fxpm-trade-power-decision-v2"
-TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v2"
-NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION = (
-    "fxpm-numerical-execution-cost-v1"
-)
+TRADE_POWER_SCHEMA_VERSION = "fxpm-cell-power-v2"
+TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v4"
+TRADE_POWER_DECISION_SCHEMA_VERSION = "fxpm-trade-power-decision-v3"
+TRADE_POWER_MULTIPLICITY_VERSION = "fxpm-trade-power-multiplicity-v1"
+TRADE_POWER_PARTITION_VERSION = "fxpm-trade-power-partition-v1"
+TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v3"
+NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION = "fxpm-numerical-execution-cost-v1"
 REQUIRED_ENTRY_SLIPPAGE_CONTRACT = "entry_slippage_parity_v1"
 REQUIRED_SWAP_ACCRUAL_CONTRACT = "causal_swap_accrual_v1"
 REQUIRED_SWAP_PROJECTION_CONTRACT = "fxpm-swap-preopen-close-projection-v1"
-REQUIRED_TRADE_RECORD_SCHEMA = "2026-06-18-mae-mfe-v1"
+REQUIRED_TRADE_RECORD_SCHEMA = "2026-07-14-position-events-v2"
 _NORMAL = NormalDist()
 _PRODUCTION_PARTITIONS = {
     "optimizer_train",
@@ -55,7 +55,7 @@ class TradePowerPolicy:
     alpha_tuning: float = 0.05
     alpha_final: float = 0.05
     multiple_testing_adjustment: str = "sidak_effective_trials"
-    pilot_dispersion: str = "mad_then_sample_std_r"
+    pilot_dispersion: str = "max_mad_sample_std_r"
     schema_version: str = TRADE_POWER_SCHEMA_VERSION
 
     def validate(self) -> tuple[str, ...]:
@@ -92,6 +92,8 @@ class TradePowerPolicy:
             "bonferroni_effective_trials",
         }:
             reasons.append("MULTIPLE_TESTING_ADJUSTMENT_INVALID")
+        if self.pilot_dispersion != "max_mad_sample_std_r":
+            reasons.append("PILOT_DISPERSION_METHOD_INVALID")
         return tuple(reasons)
 
 
@@ -133,6 +135,17 @@ class TradePowerRequirement:
     swap_provenance_class: str = ""
     historical_financing_provenance: str = ""
     frozen: bool = False
+    attempt_ledger_payload_sha256: str = ""
+    attempts_sha256: str = ""
+    attempted_trials_exact: int = 0
+    multiplicity_receipt_sha256: str = ""
+    calibration_partition_contract_sha256: str = ""
+    calibration_start_utc: str = ""
+    calibration_end_utc: str = ""
+    calibration_horizon_receipt_sha256: str = ""
+    calibration_event_axis_sha256: str = ""
+    calibration_net_r_values_sha256: str = ""
+    calibration_holding_intervals_sha256: str = ""
     schema_version: str = TRADE_POWER_SCHEMA_VERSION
 
     @property
@@ -190,6 +203,10 @@ class TradeSampleEvidence:
     net_r_max: Optional[float]
     net_r_values_sha256: str
     holding_intervals_sha256: str
+    position_ids_sha256: str
+    event_order_sha256: str
+    event_start_utc: str
+    event_end_utc: str
     sample_sha256: str
     source_contract: Optional[TradeEvidenceSourceContract] = None
     dependence_evidence: Mapping[str, Any] = field(default_factory=dict)
@@ -199,7 +216,9 @@ class TradeSampleEvidence:
 
     @property
     def passed(self) -> bool:
-        return self.status == "MEASURED" and self.outcome_kind is SearchOutcomeKind.VALID
+        return (
+            self.status == "MEASURED" and self.outcome_kind is SearchOutcomeKind.VALID
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -210,9 +229,7 @@ class TradeSampleEvidence:
             "reason_codes": list(self.reason_codes),
             "raw_trade_records": int(self.raw_trade_records),
             "usable_trades": int(self.usable_trades),
-            "minimum_observations_required": int(
-                self.minimum_observations_required
-            ),
+            "minimum_observations_required": int(self.minimum_observations_required),
             "mean_net_r": self.mean_net_r,
             "sigma_r_robust": self.sigma_r_robust,
             "effective_trades": float(self.effective_trades),
@@ -220,6 +237,10 @@ class TradeSampleEvidence:
             "net_r_max": self.net_r_max,
             "net_r_values_sha256": self.net_r_values_sha256,
             "holding_intervals_sha256": self.holding_intervals_sha256,
+            "position_ids_sha256": self.position_ids_sha256,
+            "event_order_sha256": self.event_order_sha256,
+            "event_start_utc": self.event_start_utc,
+            "event_end_utc": self.event_end_utc,
             "sample_sha256": self.sample_sha256,
             "source_contract": (
                 self.source_contract.to_dict()
@@ -244,6 +265,7 @@ class TradePowerDecision:
     required_effective_trades: Optional[int]
     sample_evidence: Optional[TradeSampleEvidence]
     frozen_requirement: Optional[TradePowerRequirement]
+    partition_contract: Optional[Mapping[str, Any]] = None
     requirement_recalibrated: bool = False
     requirement_sigma_source: str = "optimizer_train_frozen"
     schema_version: str = TRADE_POWER_DECISION_SCHEMA_VERSION
@@ -275,7 +297,30 @@ class TradePowerDecision:
                 if self.frozen_requirement is not None
                 else None
             ),
+            "partition_contract": (
+                dict(self.partition_contract)
+                if self.partition_contract is not None
+                else None
+            ),
         }
+
+
+def trade_power_requirement_sha256(value: Any) -> str:
+    payload = value.to_dict() if isinstance(value, TradePowerRequirement) else value
+    if not isinstance(payload, Mapping):
+        raise TypeError("trade-power requirement must be a mapping")
+    if payload.get("schema_version") != TRADE_POWER_SCHEMA_VERSION:
+        raise ValueError("trade-power requirement schema is stale")
+    return _sha256_json(dict(payload))
+
+
+def trade_power_decision_sha256(value: Any) -> str:
+    payload = value.to_dict() if isinstance(value, TradePowerDecision) else value
+    if not isinstance(payload, Mapping):
+        raise TypeError("trade-power decision must be a mapping")
+    if payload.get("schema_version") != TRADE_POWER_DECISION_SCHEMA_VERSION:
+        raise ValueError("trade-power decision schema is stale")
+    return _sha256_json(dict(payload))
 
 
 def robust_r_dispersion(values: Iterable[Any]) -> Optional[float]:
@@ -288,10 +333,13 @@ def robust_r_dispersion(values: Iterable[Any]) -> Optional[float]:
         return None
     median = float(np.median(vector))
     mad_sigma = 1.4826 * float(np.median(np.abs(vector - median)))
-    if math.isfinite(mad_sigma) and mad_sigma > np.finfo(np.float64).eps:
-        return mad_sigma
     sample = float(np.std(vector, ddof=1))
-    return sample if math.isfinite(sample) and sample > np.finfo(np.float64).eps else None
+    candidates = [
+        value
+        for value in (mad_sigma, sample)
+        if math.isfinite(value) and value > np.finfo(np.float64).eps
+    ]
+    return max(candidates) if candidates else None
 
 
 def adjusted_alpha(
@@ -359,12 +407,8 @@ def derive_trade_power_requirement(
         reasons.append("EFFECTIVE_TRIALS_INVALID")
     common = {
         "sigma_r_robust": sigma if math.isfinite(sigma) and sigma > 0.0 else None,
-        "minimum_economic_edge_r": _finite_report_value(
-            policy.minimum_economic_edge_r
-        ),
-        "maximum_ci_half_width_r": _finite_report_value(
-            policy.maximum_ci_half_width_r
-        ),
+        "minimum_economic_edge_r": _finite_report_value(policy.minimum_economic_edge_r),
+        "maximum_ci_half_width_r": _finite_report_value(policy.maximum_ci_half_width_r),
         "target_power": _finite_report_value(policy.target_power),
         "effective_trials": trials if math.isfinite(trials) else 0.0,
         "alpha_train_nominal": _finite_report_value(policy.alpha_train),
@@ -445,20 +489,22 @@ def _is_sha256(value: Any) -> bool:
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
 
 
-_NUMERICAL_COST_ATTESTATION_FIELDS = frozenset({
-    "schema_version",
-    "use_spread",
-    "use_slippage",
-    "use_commission",
-    "spread_mode",
-    "spread_values_sha256",
-    "commission_inputs_sha256",
-    "instrument_spec_sha256",
-    "slippage_pips_hex",
-    "slippage_price_hex",
-    "policy_sha256",
-    "attestation_sha256",
-})
+_NUMERICAL_COST_ATTESTATION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "use_spread",
+        "use_slippage",
+        "use_commission",
+        "spread_mode",
+        "spread_values_sha256",
+        "commission_inputs_sha256",
+        "instrument_spec_sha256",
+        "slippage_pips_hex",
+        "slippage_price_hex",
+        "policy_sha256",
+        "attestation_sha256",
+    }
+)
 
 
 def _nonnegative_finite_float_hex(value: Any, *, field_name: str) -> str:
@@ -475,9 +521,7 @@ def _nonnegative_finite_float_hex(value: Any, *, field_name: str) -> str:
         or text.startswith("-")
         or number.hex().lower() != text
     ):
-        raise ValueError(
-            f"{field_name} must be a canonical nonnegative finite float"
-        )
+        raise ValueError(f"{field_name} must be a canonical nonnegative finite float")
     return text
 
 
@@ -557,30 +601,45 @@ def _validate_numerical_execution_cost_attestation(
     value: Any,
 ) -> tuple[Optional[str], Optional[str], str, tuple[str, ...]]:
     if not isinstance(value, Mapping):
-        return None, None, "numerical execution-cost attestation is missing", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_MISSING",
+        return (
+            None,
+            None,
+            "numerical execution-cost attestation is missing",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_MISSING",),
         )
     if set(value) != _NUMERICAL_COST_ATTESTATION_FIELDS:
-        return None, None, "numerical execution-cost fields are incomplete or unbound", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        return (
+            None,
+            None,
+            "numerical execution-cost fields are incomplete or unbound",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_INVALID",),
         )
     if str(value.get("schema_version") or "") != (
         NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION
     ):
-        return None, None, "numerical execution-cost schema is missing or stale", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_SCHEMA_INVALID",
+        return (
+            None,
+            None,
+            "numerical execution-cost schema is missing or stale",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_SCHEMA_INVALID",),
         )
     if any(
         value.get(name) is not True
         for name in ("use_spread", "use_slippage", "use_commission")
     ):
-        return None, None, "production cost components are disabled or ambiguous", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        return (
+            None,
+            None,
+            "production cost components are disabled or ambiguous",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_INVALID",),
         )
     mode = str(value.get("spread_mode") or "").strip()
     if not mode:
-        return None, None, "numerical spread mode is missing", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        return (
+            None,
+            None,
+            "numerical spread mode is missing",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_INVALID",),
         )
     hashes = {
         name: str(value.get(name) or "").lower()
@@ -591,8 +650,11 @@ def _validate_numerical_execution_cost_attestation(
         )
     }
     if not all(_is_sha256(item) for item in hashes.values()):
-        return None, None, "numerical execution-cost hashes are malformed", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        return (
+            None,
+            None,
+            "numerical execution-cost hashes are malformed",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_INVALID",),
         )
     try:
         slippage_pips_hex = _nonnegative_finite_float_hex(
@@ -604,8 +666,11 @@ def _validate_numerical_execution_cost_attestation(
             field_name="slippage_price_hex",
         )
     except ValueError:
-        return None, None, "numerical slippage inputs are malformed", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_INVALID",
+        return (
+            None,
+            None,
+            "numerical slippage inputs are malformed",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_INVALID",),
         )
     policy = {
         "schema_version": NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION,
@@ -621,8 +686,11 @@ def _validate_numerical_execution_cost_attestation(
     expected_policy = _sha256_json(policy)
     observed_policy = str(value.get("policy_sha256") or "").lower()
     if not _is_sha256(observed_policy) or observed_policy != expected_policy:
-        return None, None, "numerical execution-cost policy hash does not verify", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",
+        return (
+            None,
+            None,
+            "numerical execution-cost policy hash does not verify",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",),
         )
     canonical = {
         **policy,
@@ -632,8 +700,11 @@ def _validate_numerical_execution_cost_attestation(
     expected = _sha256_json(canonical)
     observed = str(value.get("attestation_sha256") or "").lower()
     if not _is_sha256(observed) or observed != expected:
-        return None, None, "numerical execution-cost attestation hash does not verify", (
-            "SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",
+        return (
+            None,
+            None,
+            "numerical execution-cost attestation hash does not verify",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",),
         )
     return expected_policy, expected, "", ()
 
@@ -644,24 +715,32 @@ def _validate_trade_evidence_source_contract(
     """Validate the exact execution, swap, schema and provenance attestation."""
 
     if value is None:
-        return None, "trade evidence source contract is missing", (
-            "SOURCE_CONTRACT_MISSING",
+        return (
+            None,
+            "trade evidence source contract is missing",
+            ("SOURCE_CONTRACT_MISSING",),
         )
     if not isinstance(value, Mapping):
-        return None, "trade evidence source contract is not a mapping", (
-            "SOURCE_CONTRACT_INVALID",
+        return (
+            None,
+            "trade evidence source contract is not a mapping",
+            ("SOURCE_CONTRACT_INVALID",),
         )
     if str(value.get("schema_version") or "") != (
         TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
     ):
-        return None, "trade evidence source contract schema is missing or stale", (
-            "SOURCE_CONTRACT_SCHEMA_INVALID",
+        return (
+            None,
+            "trade evidence source contract schema is missing or stale",
+            ("SOURCE_CONTRACT_SCHEMA_INVALID",),
         )
     timing = value.get("execution_cost_timing_contract")
     swap = value.get("swap_accrual_contract")
     if not isinstance(timing, Mapping) or not isinstance(swap, Mapping):
-        return None, "execution timing or swap source contract is missing", (
-            "SOURCE_CONTRACT_INVALID",
+        return (
+            None,
+            "execution timing or swap source contract is missing",
+            ("SOURCE_CONTRACT_INVALID",),
         )
     entry_version = str(timing.get("entry_slippage") or "")
     timing_swap_version = str(timing.get("swap_accrual") or "")
@@ -671,13 +750,17 @@ def _validate_trade_evidence_source_contract(
         or timing_swap_version != REQUIRED_SWAP_ACCRUAL_CONTRACT
         or swap_version != REQUIRED_SWAP_ACCRUAL_CONTRACT
     ):
-        return None, "execution timing contract is legacy, missing, or inconsistent", (
-            "SOURCE_CONTRACT_EXECUTION_TIMING_INVALID",
+        return (
+            None,
+            "execution timing contract is legacy, missing, or inconsistent",
+            ("SOURCE_CONTRACT_EXECUTION_TIMING_INVALID",),
         )
     trade_schema = str(value.get("trade_record_schema_version") or "")
     if trade_schema != REQUIRED_TRADE_RECORD_SCHEMA:
-        return None, "trade-record schema attestation is missing or stale", (
-            "SOURCE_CONTRACT_TRADE_SCHEMA_INVALID",
+        return (
+            None,
+            "trade-record schema attestation is missing or stale",
+            ("SOURCE_CONTRACT_TRADE_SCHEMA_INVALID",),
         )
     cost_policy_sha256, cost_attestation_sha256, cost_reason, cost_codes = (
         _validate_numerical_execution_cost_attestation(
@@ -688,8 +771,10 @@ def _validate_trade_evidence_source_contract(
         return None, cost_reason, cost_codes
     raw_binding = value.get("source_binding")
     if not isinstance(raw_binding, Mapping):
-        return None, "source binding evidence is missing or malformed", (
-            "SOURCE_CONTRACT_BINDING_INVALID",
+        return (
+            None,
+            "source binding evidence is missing or malformed",
+            ("SOURCE_CONTRACT_BINDING_INVALID",),
         )
     required_common_bindings = (
         "price_activation_manifest_sha256",
@@ -704,8 +789,10 @@ def _validate_trade_evidence_source_contract(
         for name in required_common_bindings
     }
     if not all(_is_sha256(value) for value in source_binding.values()):
-        return None, "source binding evidence is incomplete or malformed", (
-            "SOURCE_CONTRACT_BINDING_INVALID",
+        return (
+            None,
+            "source binding evidence is incomplete or malformed",
+            ("SOURCE_CONTRACT_BINDING_INVALID",),
         )
     status = str(swap.get("status") or "").upper()
     provenance = str(swap.get("provenance_status") or "").upper()
@@ -715,22 +802,23 @@ def _validate_trade_evidence_source_contract(
     stress_immutable = swap.get("stress_policy_immutable") is True
     stress_policy_sha256 = str(swap.get("stress_policy_sha256") or "").lower()
     broker_disabled = swap.get("broker_swap_disabled") is True
-    historical_rates_authenticated = (
-        swap.get("historical_rates_authenticated") is True
-    )
+    historical_rates_authenticated = swap.get("historical_rates_authenticated") is True
     timestamp_source = str(swap.get("timestamp_source") or "")
     projection_contract = str(swap.get("projection_contract") or "")
     projection_sha256 = str(swap.get("projection_sha256") or "").lower()
-    if (
-        projection_contract != REQUIRED_SWAP_PROJECTION_CONTRACT
-        or not _is_sha256(projection_sha256)
+    if projection_contract != REQUIRED_SWAP_PROJECTION_CONTRACT or not _is_sha256(
+        projection_sha256
     ):
-        return None, "financing projection contract is missing or stale", (
-            "SOURCE_CONTRACT_PROJECTION_INVALID",
+        return (
+            None,
+            "financing projection contract is missing or stale",
+            ("SOURCE_CONTRACT_PROJECTION_INVALID",),
         )
     if not compounding:
-        return None, "swap cashflows are not compounded in execution state", (
-            "SOURCE_CONTRACT_SWAP_COMPOUNDING_INVALID",
+        return (
+            None,
+            "swap cashflows are not compounded in execution state",
+            ("SOURCE_CONTRACT_SWAP_COMPOUNDING_INVALID",),
         )
     if status == "AVAILABLE" and provenance == "AUTHENTICATED":
         if (
@@ -738,8 +826,10 @@ def _validate_trade_evidence_source_contract(
             or not historical_rates_authenticated
             or timestamp_source != "_BAR_CLOSE_TS"
         ):
-            return None, "authenticated current swap terms lack historical-rate proof", (
-                "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+            return (
+                None,
+                "authenticated current swap terms lack historical-rate proof",
+                ("SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",),
             )
         provenance_class = "AUTHENTICATED"
         historical_financing_provenance = "AUTHENTICATED_HISTORICAL_RATES"
@@ -747,8 +837,10 @@ def _validate_trade_evidence_source_contract(
             raw_binding.get("historical_rates_sha256") or ""
         ).lower()
         if not _is_sha256(historical_rates_sha256):
-            return None, "historical swap-rate binding is missing", (
-                "SOURCE_CONTRACT_BINDING_INVALID",
+            return (
+                None,
+                "historical swap-rate binding is missing",
+                ("SOURCE_CONTRACT_BINDING_INVALID",),
             )
         source_binding["historical_rates_sha256"] = historical_rates_sha256
     elif status == "AVAILABLE" and provenance == "STRESS_APPROVED":
@@ -758,16 +850,20 @@ def _validate_trade_evidence_source_contract(
             or not _is_sha256(stress_policy_sha256)
             or timestamp_source != "_BAR_CLOSE_TS"
         ):
-            return None, "stress swap provenance lacks immutable explicit approval", (
-                "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+            return (
+                None,
+                "stress swap provenance lacks immutable explicit approval",
+                ("SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",),
             )
         provenance_class = "STRESS_APPROVED"
         historical_financing_provenance = "IMMUTABLE_STRESS_APPROVED"
         source_binding["stress_policy_sha256"] = stress_policy_sha256
     elif status == "DISABLED" and provenance == "AUTHENTICATED":
         if not source_authenticated or not broker_disabled:
-            return None, "disabled swap is not authenticated as a broker term", (
-                "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+            return (
+                None,
+                "disabled swap is not authenticated as a broker term",
+                ("SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",),
             )
         provenance_class = "AUTHENTICATED_BROKER_DISABLED"
         historical_financing_provenance = "AUTHENTICATED_BROKER_DISABLED"
@@ -775,13 +871,17 @@ def _validate_trade_evidence_source_contract(
             raw_binding.get("broker_disabled_proof_sha256") or ""
         ).lower()
         if not _is_sha256(disabled_proof_sha256):
-            return None, "authenticated broker-disabled proof is missing", (
-                "SOURCE_CONTRACT_BINDING_INVALID",
+            return (
+                None,
+                "authenticated broker-disabled proof is missing",
+                ("SOURCE_CONTRACT_BINDING_INVALID",),
             )
         source_binding["broker_disabled_proof_sha256"] = disabled_proof_sha256
     else:
-        return None, "swap provenance is unavailable, legacy, or unapproved", (
-            "SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",
+        return (
+            None,
+            "swap provenance is unavailable, legacy, or unapproved",
+            ("SOURCE_CONTRACT_SWAP_PROVENANCE_INVALID",),
         )
     canonical = {
         "schema_version": TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
@@ -801,34 +901,36 @@ def _validate_trade_evidence_source_contract(
         ),
     }
     stable_source_sha256 = _sha256_json(canonical)
-    partition_source_sha256 = _sha256_json({
-        "schema_version": TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
-        "source_contract_sha256": stable_source_sha256,
-        "projection_sha256": projection_sha256,
-        "numerical_execution_cost_attestation_sha256": (
-            cost_attestation_sha256
+    partition_source_sha256 = _sha256_json(
+        {
+            "schema_version": TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
+            "source_contract_sha256": stable_source_sha256,
+            "projection_sha256": projection_sha256,
+            "numerical_execution_cost_attestation_sha256": (cost_attestation_sha256),
+        }
+    )
+    return (
+        TradeEvidenceSourceContract(
+            source_contract_sha256=stable_source_sha256,
+            partition_source_contract_sha256=partition_source_sha256,
+            target_bars_sha256=source_binding["target_bars_sha256"],
+            target_sidecar_sha256=source_binding["target_sidecar_sha256"],
+            financing_schedule_sha256=source_binding["schedule_sha256"],
+            projection_contract_version=projection_contract,
+            projection_sha256=projection_sha256,
+            numerical_execution_cost_policy_sha256=cost_policy_sha256,
+            numerical_execution_cost_attestation_sha256=(cost_attestation_sha256),
+            entry_slippage_contract_version=entry_version,
+            swap_accrual_contract_version=swap_version,
+            trade_record_schema_version=trade_schema,
+            swap_status=status,
+            swap_provenance_class=provenance_class,
+            historical_financing_provenance=historical_financing_provenance,
+            execution_state_compounding=True,
         ),
-    })
-    return TradeEvidenceSourceContract(
-        source_contract_sha256=stable_source_sha256,
-        partition_source_contract_sha256=partition_source_sha256,
-        target_bars_sha256=source_binding["target_bars_sha256"],
-        target_sidecar_sha256=source_binding["target_sidecar_sha256"],
-        financing_schedule_sha256=source_binding["schedule_sha256"],
-        projection_contract_version=projection_contract,
-        projection_sha256=projection_sha256,
-        numerical_execution_cost_policy_sha256=cost_policy_sha256,
-        numerical_execution_cost_attestation_sha256=(
-            cost_attestation_sha256
-        ),
-        entry_slippage_contract_version=entry_version,
-        swap_accrual_contract_version=swap_version,
-        trade_record_schema_version=trade_schema,
-        swap_status=status,
-        swap_provenance_class=provenance_class,
-        historical_financing_provenance=historical_financing_provenance,
-        execution_state_compounding=True,
-    ), "", ()
+        "",
+        (),
+    )
 
 
 _TRADE_SAMPLE_IDENTITY_KEYS = (
@@ -847,6 +949,10 @@ _TRADE_SAMPLE_IDENTITY_KEYS = (
     "net_r_max",
     "net_r_values_sha256",
     "holding_intervals_sha256",
+    "position_ids_sha256",
+    "event_order_sha256",
+    "event_start_utc",
+    "event_end_utc",
     "source_contract",
     "net_r_contract",
     "dependence_evidence",
@@ -871,6 +977,10 @@ def _unavailable_trade_sample(
     raw_trade_records: int,
     net_r_values_sha256: str = "",
     holding_intervals_sha256: str = "",
+    position_ids_sha256: str = "",
+    event_order_sha256: str = "",
+    event_start_utc: str = "",
+    event_end_utc: str = "",
     source_contract: Optional[TradeEvidenceSourceContract] = None,
     dependence_evidence: Optional[Mapping[str, Any]] = None,
     usable_trades: int = 0,
@@ -906,6 +1016,10 @@ def _unavailable_trade_sample(
         "net_r_max": net_r_max,
         "net_r_values_sha256": str(net_r_values_sha256),
         "holding_intervals_sha256": str(holding_intervals_sha256),
+        "position_ids_sha256": str(position_ids_sha256),
+        "event_order_sha256": str(event_order_sha256),
+        "event_start_utc": str(event_start_utc),
+        "event_end_utc": str(event_end_utc),
         "source_contract": (
             source_contract.to_dict() if source_contract is not None else None
         ),
@@ -927,6 +1041,10 @@ def _unavailable_trade_sample(
         net_r_max=net_r_max,
         net_r_values_sha256=str(net_r_values_sha256),
         holding_intervals_sha256=str(holding_intervals_sha256),
+        position_ids_sha256=str(position_ids_sha256),
+        event_order_sha256=str(event_order_sha256),
+        event_start_utc=str(event_start_utc),
+        event_end_utc=str(event_end_utc),
         sample_sha256=trade_sample_identity_sha256(identity_payload),
         source_contract=source_contract,
         dependence_evidence=dependence_payload,
@@ -961,6 +1079,197 @@ def _utc_interval_timestamp(value: Any, *, field_name: str) -> str:
     return timestamp.isoformat()
 
 
+def _valid_utc_interval(start: Any, end: Any) -> bool:
+    try:
+        start_ts = pd.Timestamp(_utc_interval_timestamp(start, field_name="start"))
+        end_ts = pd.Timestamp(_utc_interval_timestamp(end, field_name="end"))
+    except ValueError:
+        return False
+    return start_ts < end_ts
+
+
+def build_trade_power_multiplicity_receipt(
+    attempt_ledger_payload: Any,
+) -> dict[str, Any]:
+    """Bind power multiplicity to the exact frozen attempt ledger."""
+
+    if not isinstance(attempt_ledger_payload, Mapping):
+        raise ValueError("attempt ledger must be a mapping")
+    if str(attempt_ledger_payload.get("contract_version") or "") != (
+        "fxpm.winner-attempt-ledger.v2"
+    ):
+        raise ValueError("attempt ledger contract is missing or stale")
+    attempts = attempt_ledger_payload.get("attempts")
+    count = attempt_ledger_payload.get("attempt_count")
+    if type(attempts) is not list or type(count) is not int or count <= 0:
+        raise ValueError("attempt ledger roster is invalid")
+    if count != len(attempts):
+        raise ValueError("attempt ledger count does not match roster")
+    expected_attempts_sha = _sha256_json(attempts)
+    if str(attempt_ledger_payload.get("attempts_sha256") or "").lower() != (
+        expected_attempts_sha
+    ):
+        raise ValueError("attempt ledger roster hash does not verify")
+    attempt_ids = [
+        str(value.get("attempt_id") or "") if isinstance(value, Mapping) else ""
+        for value in attempts
+    ]
+    if any(not value for value in attempt_ids) or len(set(attempt_ids)) != count:
+        raise ValueError("attempt ledger identities are missing or duplicated")
+    body = {
+        "schema_version": TRADE_POWER_MULTIPLICITY_VERSION,
+        "attempt_ledger_payload_sha256": _sha256_json(attempt_ledger_payload),
+        "attempts_sha256": expected_attempts_sha,
+        "attempt_ids_sha256": _sha256_json(attempt_ids),
+        "attempted_trials_exact": count,
+        "multiplicity_method": "raw_attempt_ledger_count_v1",
+    }
+    return {**body, "receipt_sha256": _sha256_json(body)}
+
+
+def _validate_multiplicity_receipt(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    keys = {
+        "schema_version",
+        "attempt_ledger_payload_sha256",
+        "attempts_sha256",
+        "attempt_ids_sha256",
+        "attempted_trials_exact",
+        "multiplicity_method",
+        "receipt_sha256",
+    }
+    if set(value) != keys:
+        return None
+    body = {key: value.get(key) for key in keys - {"receipt_sha256"}}
+    if (
+        body["schema_version"] != TRADE_POWER_MULTIPLICITY_VERSION
+        or body["multiplicity_method"] != "raw_attempt_ledger_count_v1"
+        or type(body["attempted_trials_exact"]) is not int
+        or body["attempted_trials_exact"] <= 0
+        or not all(
+            _is_sha256(body[name])
+            for name in (
+                "attempt_ledger_payload_sha256",
+                "attempts_sha256",
+                "attempt_ids_sha256",
+            )
+        )
+        or str(value.get("receipt_sha256") or "").lower() != _sha256_json(body)
+    ):
+        return None
+    return {**body, "receipt_sha256": _sha256_json(body)}
+
+
+def build_trade_power_partition_contract(
+    *,
+    partition: str,
+    start_utc: Any,
+    end_utc: Any,
+    horizon_receipt_sha256: str,
+    event_axis_sha256: str,
+    multiplicity_receipt: Any,
+    prior_partition_contract_sha256: str = "",
+) -> dict[str, Any]:
+    """Build one exact half-open partition and lineage receipt."""
+
+    role = str(partition or "").strip().lower()
+    if role not in _PRODUCTION_PARTITIONS:
+        raise ValueError("partition is invalid")
+    start = _utc_interval_timestamp(start_utc, field_name="start_utc")
+    end = _utc_interval_timestamp(end_utc, field_name="end_utc")
+    if pd.Timestamp(start) >= pd.Timestamp(end):
+        raise ValueError("partition interval must be nonempty and half-open")
+    receipt = _validate_multiplicity_receipt(multiplicity_receipt)
+    if receipt is None:
+        raise ValueError("multiplicity receipt is invalid")
+    horizon = str(horizon_receipt_sha256 or "").lower()
+    event_axis = str(event_axis_sha256 or "").lower()
+    prior = str(prior_partition_contract_sha256 or "").lower()
+    if not _is_sha256(horizon) or not _is_sha256(event_axis):
+        raise ValueError("partition evidence hashes are malformed")
+    if prior and not _is_sha256(prior):
+        raise ValueError("prior partition hash is malformed")
+    if role == "optimizer_train" and prior:
+        raise ValueError("optimizer train cannot have a prior partition")
+    if role != "optimizer_train" and not prior:
+        raise ValueError("validation partition requires prior lineage")
+    body = {
+        "schema_version": TRADE_POWER_PARTITION_VERSION,
+        "partition": role,
+        "start_utc": start,
+        "end_utc": end,
+        "horizon_receipt_sha256": horizon,
+        "event_axis_sha256": event_axis,
+        "attempt_ledger_payload_sha256": receipt["attempt_ledger_payload_sha256"],
+        "attempts_sha256": receipt["attempts_sha256"],
+        "attempted_trials_exact": receipt["attempted_trials_exact"],
+        "multiplicity_receipt_sha256": receipt["receipt_sha256"],
+        "prior_partition_contract_sha256": prior,
+    }
+    return {**body, "contract_sha256": _sha256_json(body)}
+
+
+def _validate_partition_contract(
+    value: Any,
+    *,
+    expected_partition: str,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    keys = {
+        "schema_version",
+        "partition",
+        "start_utc",
+        "end_utc",
+        "horizon_receipt_sha256",
+        "event_axis_sha256",
+        "attempt_ledger_payload_sha256",
+        "attempts_sha256",
+        "attempted_trials_exact",
+        "multiplicity_receipt_sha256",
+        "prior_partition_contract_sha256",
+        "contract_sha256",
+    }
+    if set(value) != keys:
+        return None
+    body = {key: value.get(key) for key in keys - {"contract_sha256"}}
+    try:
+        start = _utc_interval_timestamp(body["start_utc"], field_name="start_utc")
+        end = _utc_interval_timestamp(body["end_utc"], field_name="end_utc")
+    except ValueError:
+        return None
+    role = str(body["partition"] or "").lower()
+    prior = str(body["prior_partition_contract_sha256"] or "").lower()
+    if (
+        body["schema_version"] != TRADE_POWER_PARTITION_VERSION
+        or role != expected_partition
+        or pd.Timestamp(start) >= pd.Timestamp(end)
+        or type(body["attempted_trials_exact"]) is not int
+        or body["attempted_trials_exact"] <= 0
+        or any(
+            not _is_sha256(body[name])
+            for name in (
+                "horizon_receipt_sha256",
+                "event_axis_sha256",
+                "attempt_ledger_payload_sha256",
+                "attempts_sha256",
+                "multiplicity_receipt_sha256",
+            )
+        )
+        or (role == "optimizer_train" and prior)
+        or (role != "optimizer_train" and not _is_sha256(prior))
+    ):
+        return None
+    body["start_utc"] = start
+    body["end_utc"] = end
+    body["partition"] = role
+    body["prior_partition_contract_sha256"] = prior
+    if str(value.get("contract_sha256") or "").lower() != _sha256_json(body):
+        return None
+    return {**body, "contract_sha256": _sha256_json(body)}
+
+
 def build_trade_sample_evidence(
     trades: Any,
     *,
@@ -983,17 +1292,15 @@ def build_trade_sample_evidence(
             reason_codes=("MINIMUM_OBSERVATIONS_INVALID",),
             raw_trade_records=0,
         )
-    source, source_reason, source_codes = (
-        _validate_trade_evidence_source_contract(source_contract)
+    source, source_reason, source_codes = _validate_trade_evidence_source_contract(
+        source_contract
     )
     if source is None:
         return _unavailable_trade_sample(
             outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
             reason=source_reason,
             reason_codes=source_codes,
-            raw_trade_records=(
-                len(trades) if isinstance(trades, (list, tuple)) else 0
-            ),
+            raw_trade_records=(len(trades) if isinstance(trades, (list, tuple)) else 0),
             minimum_observations_required=minimum,
         )
     if trades is None:
@@ -1021,7 +1328,10 @@ def build_trade_sample_evidence(
         )
 
     net_r_values: list[float] = []
-    intervals: list[tuple[str, str]] = []
+    intervals: list[dict[str, Any]] = []
+    position_ids: list[str] = []
+    event_order: list[tuple[str, int, str, int, str]] = []
+    prior_order_key: Optional[tuple[pd.Timestamp, int, pd.Timestamp, int, str]] = None
     for index, trade in enumerate(rows):
         if not isinstance(trade, Mapping):
             return _unavailable_trade_sample(
@@ -1061,8 +1371,29 @@ def build_trade_sample_evidence(
             exit_ = _utc_interval_timestamp(
                 trade.get("exit_time"), field_name="exit_time"
             )
-            if pd.Timestamp(exit_) < pd.Timestamp(entry):
-                raise ValueError("exit_time precedes entry_time")
+            position_id = str(trade.get("position_id") or "").strip()
+            entry_order = trade.get("entry_event_order")
+            exit_order = trade.get("exit_event_order")
+            if not position_id or len(position_id) > 256:
+                raise ValueError("position_id is missing or oversized")
+            if type(entry_order) is not int or entry_order < 0:
+                raise ValueError("entry_event_order is invalid")
+            if type(exit_order) is not int or exit_order < 0:
+                raise ValueError("exit_event_order is invalid")
+            entry_key = (pd.Timestamp(entry), entry_order)
+            exit_key = (pd.Timestamp(exit_), exit_order)
+            if exit_key <= entry_key:
+                raise ValueError("exit event does not follow entry event")
+            order_key = (
+                exit_key[0],
+                exit_key[1],
+                entry_key[0],
+                entry_key[1],
+                position_id,
+            )
+            if prior_order_key is not None and order_key <= prior_order_key:
+                raise ValueError("trade records are not in canonical event order")
+            prior_order_key = order_key
         except (TypeError, ValueError, OverflowError) as exc:
             return _unavailable_trade_sample(
                 outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
@@ -1073,10 +1404,33 @@ def build_trade_sample_evidence(
                 source_contract=source,
             )
         net_r_values.append(float(net_r))
-        intervals.append((entry, exit_))
+        position_ids.append(position_id)
+        event_order.append((entry, entry_order, exit_, exit_order, position_id))
+        intervals.append(
+            {
+                "start": entry,
+                "end": exit_,
+                "start_event_order": entry_order,
+                "end_event_order": exit_order,
+            }
+        )
+
+    if len(set(position_ids)) != raw_count:
+        return _unavailable_trade_sample(
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            reason="position identities are duplicated or split across records",
+            reason_codes=("POSITION_ID_DUPLICATED",),
+            raw_trade_records=raw_count,
+            minimum_observations_required=minimum,
+            source_contract=source,
+        )
 
     value_hash = _sha256_json([float(value).hex() for value in net_r_values])
     interval_hash = _sha256_json(intervals)
+    position_hash = _sha256_json(position_ids)
+    event_order_hash = _sha256_json(event_order)
+    event_start = min(value[0] for value in event_order)
+    event_end = max(value[2] for value in event_order)
     vector = np.asarray(net_r_values, dtype=np.float64)
     mean_net_r = float(vector.mean())
     minimum_net_r = float(vector.min())
@@ -1110,6 +1464,10 @@ def build_trade_sample_evidence(
             net_r_max=maximum_net_r,
             net_r_values_sha256=value_hash,
             holding_intervals_sha256=interval_hash,
+            position_ids_sha256=position_hash,
+            event_order_sha256=event_order_hash,
+            event_start_utc=event_start,
+            event_end_utc=event_end,
             source_contract=source,
             dependence_evidence=dependence_payload,
         )
@@ -1126,6 +1484,10 @@ def build_trade_sample_evidence(
             net_r_max=maximum_net_r,
             net_r_values_sha256=value_hash,
             holding_intervals_sha256=interval_hash,
+            position_ids_sha256=position_hash,
+            event_order_sha256=event_order_hash,
+            event_start_utc=event_start,
+            event_end_utc=event_end,
             source_contract=source,
             dependence_evidence=dependence_payload,
         )
@@ -1145,6 +1507,10 @@ def build_trade_sample_evidence(
         "net_r_max": maximum_net_r,
         "net_r_values_sha256": value_hash,
         "holding_intervals_sha256": interval_hash,
+        "position_ids_sha256": position_hash,
+        "event_order_sha256": event_order_hash,
+        "event_start_utc": event_start,
+        "event_end_utc": event_end,
         "source_contract": source.to_dict(),
         "net_r_contract": "strict_post_cost_pnl_dollars_divided_by_entry_risk_v1",
         "dependence_evidence": dependence_payload,
@@ -1164,6 +1530,10 @@ def build_trade_sample_evidence(
         net_r_max=maximum_net_r,
         net_r_values_sha256=value_hash,
         holding_intervals_sha256=interval_hash,
+        position_ids_sha256=position_hash,
+        event_order_sha256=event_order_hash,
+        event_start_utc=event_start,
+        event_end_utc=event_end,
         sample_sha256=trade_sample_identity_sha256(identity_payload),
         source_contract=source,
         dependence_evidence=dependence_payload,
@@ -1205,6 +1575,7 @@ def _sample_terminal_decision(
     *,
     partition: str,
     requirement: Optional[TradePowerRequirement],
+    partition_contract: Optional[Mapping[str, Any]] = None,
 ) -> TradePowerDecision:
     return TradePowerDecision(
         status=(
@@ -1224,20 +1595,48 @@ def _sample_terminal_decision(
         ),
         sample_evidence=sample,
         frozen_requirement=requirement,
+        partition_contract=partition_contract,
     )
 
 
 def calibrate_train_trade_power(
     trades: Any,
     *,
-    effective_trials: Any,
     policy: TradePowerPolicy,
+    multiplicity_receipt: Any,
+    partition_contract: Any,
     source_contract: Any = None,
     minimum_observations: int = 8,
-    multiplicity_method: str = "raw_trial_count_conservative_upper_bound_v1",
 ) -> TradePowerDecision:
     """Freeze train-only dispersion and multiplicity, then judge train ESS."""
 
+    receipt = _validate_multiplicity_receipt(multiplicity_receipt)
+    partition_receipt = _validate_partition_contract(
+        partition_contract,
+        expected_partition="optimizer_train",
+    )
+    if (
+        receipt is None
+        or partition_receipt is None
+        or partition_receipt["attempt_ledger_payload_sha256"]
+        != receipt["attempt_ledger_payload_sha256"]
+        or partition_receipt["attempts_sha256"] != receipt["attempts_sha256"]
+        or partition_receipt["attempted_trials_exact"]
+        != receipt["attempted_trials_exact"]
+        or partition_receipt["multiplicity_receipt_sha256"] != receipt["receipt_sha256"]
+    ):
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition="optimizer_train",
+            reason="attempt multiplicity or train partition receipt is invalid",
+            reason_codes=("TRAIN_POWER_LINEAGE_INVALID",),
+            observed_effective_trades=0.0,
+            required_effective_trades=None,
+            sample_evidence=None,
+            frozen_requirement=None,
+            partition_contract=partition_receipt,
+        )
     sample = build_trade_sample_evidence(
         trades,
         source_contract=source_contract,
@@ -1248,23 +1647,28 @@ def calibrate_train_trade_power(
             sample,
             partition="optimizer_train",
             requirement=None,
+            partition_contract=partition_receipt,
         )
-    method = str(multiplicity_method or "").strip()
-    if not method:
+    if pd.Timestamp(sample.event_start_utc) < pd.Timestamp(
+        partition_receipt["start_utc"]
+    ) or pd.Timestamp(sample.event_end_utc) >= pd.Timestamp(
+        partition_receipt["end_utc"]
+    ):
         return TradePowerDecision(
             status="INFRA_FAILURE",
             outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
             partition="optimizer_train",
-            reason="search multiplicity method is missing",
-            reason_codes=("MULTIPLICITY_METHOD_MISSING",),
+            reason="train trade events fall outside the bound partition",
+            reason_codes=("TRADE_EVENTS_OUTSIDE_PARTITION",),
             observed_effective_trades=float(sample.effective_trades),
             required_effective_trades=None,
             sample_evidence=sample,
             frozen_requirement=None,
+            partition_contract=partition_receipt,
         )
     requirement = derive_trade_power_requirement(
         sigma_r_robust=sample.sigma_r_robust,
-        effective_trials=effective_trials,
+        effective_trials=receipt["attempted_trials_exact"],
         policy=policy,
     )
     if not requirement.passed:
@@ -1278,10 +1682,11 @@ def calibrate_train_trade_power(
             required_effective_trades=requirement.required_effective_train_trades,
             sample_evidence=sample,
             frozen_requirement=requirement,
+            partition_contract=partition_receipt,
         )
     requirement = replace(
         requirement,
-        multiplicity_method=method,
+        multiplicity_method=receipt["multiplicity_method"],
         calibration_partition="optimizer_train",
         calibration_sample_sha256=sample.sample_sha256,
         calibration_source_contract_sha256=(
@@ -1354,6 +1759,17 @@ def calibrate_train_trade_power(
             if sample.source_contract is not None
             else ""
         ),
+        attempt_ledger_payload_sha256=receipt["attempt_ledger_payload_sha256"],
+        attempts_sha256=receipt["attempts_sha256"],
+        attempted_trials_exact=receipt["attempted_trials_exact"],
+        multiplicity_receipt_sha256=receipt["receipt_sha256"],
+        calibration_partition_contract_sha256=partition_receipt["contract_sha256"],
+        calibration_start_utc=partition_receipt["start_utc"],
+        calibration_end_utc=partition_receipt["end_utc"],
+        calibration_horizon_receipt_sha256=partition_receipt["horizon_receipt_sha256"],
+        calibration_event_axis_sha256=partition_receipt["event_axis_sha256"],
+        calibration_net_r_values_sha256=sample.net_r_values_sha256,
+        calibration_holding_intervals_sha256=(sample.holding_intervals_sha256),
         frozen=True,
     )
     required = requirement.required_effective_train_trades
@@ -1370,6 +1786,7 @@ def calibrate_train_trade_power(
             required_effective_trades=required,
             sample_evidence=sample,
             frozen_requirement=requirement,
+            partition_contract=partition_receipt,
         )
     return TradePowerDecision(
         status="PASS",
@@ -1381,6 +1798,7 @@ def calibrate_train_trade_power(
         required_effective_trades=required,
         sample_evidence=sample,
         frozen_requirement=requirement,
+        partition_contract=partition_receipt,
     )
 
 
@@ -1389,6 +1807,8 @@ def evaluate_trade_power_partition(
     *,
     frozen_requirement: TradePowerRequirement,
     partition: str,
+    partition_contract: Any,
+    prior_partition_contract: Any,
     source_contract: Any = None,
     minimum_observations: int = 8,
 ) -> TradePowerDecision:
@@ -1411,6 +1831,36 @@ def evaluate_trade_power_partition(
                 else None
             ),
         )
+    current_receipt = _validate_partition_contract(
+        partition_contract,
+        expected_partition=partition_name,
+    )
+    prior_role = (
+        "optimizer_train"
+        if partition_name == "tuning_validation"
+        else "tuning_validation"
+    )
+    prior_receipt = _validate_partition_contract(
+        prior_partition_contract,
+        expected_partition=prior_role,
+    )
+    if current_receipt is None or prior_receipt is None:
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="partition lineage contract is invalid",
+            reason_codes=("PARTITION_LINEAGE_INVALID",),
+            observed_effective_trades=0.0,
+            required_effective_trades=None,
+            sample_evidence=None,
+            frozen_requirement=(
+                frozen_requirement
+                if isinstance(frozen_requirement, TradePowerRequirement)
+                else None
+            ),
+            partition_contract=current_receipt,
+        )
     if (
         not isinstance(frozen_requirement, TradePowerRequirement)
         or not frozen_requirement.passed
@@ -1419,9 +1869,7 @@ def evaluate_trade_power_partition(
         or not frozen_requirement.calibration_sample_sha256
         or not frozen_requirement.calibration_source_contract_sha256
         or not _is_sha256(frozen_requirement.calibration_sample_sha256)
-        or not _is_sha256(
-            frozen_requirement.calibration_source_contract_sha256
-        )
+        or not _is_sha256(frozen_requirement.calibration_source_contract_sha256)
         or not _is_sha256(
             frozen_requirement.calibration_partition_source_contract_sha256
         )
@@ -1432,9 +1880,7 @@ def evaluate_trade_power_partition(
         or not _is_sha256(frozen_requirement.financing_schedule_sha256)
         or frozen_requirement.projection_contract_version
         != REQUIRED_SWAP_PROJECTION_CONTRACT
-        or not _is_sha256(
-            frozen_requirement.numerical_execution_cost_policy_sha256
-        )
+        or not _is_sha256(frozen_requirement.numerical_execution_cost_policy_sha256)
         or not _is_sha256(
             frozen_requirement.calibration_numerical_execution_cost_attestation_sha256
         )
@@ -1444,6 +1890,24 @@ def evaluate_trade_power_partition(
         != REQUIRED_SWAP_ACCRUAL_CONTRACT
         or frozen_requirement.trade_record_schema_version
         != REQUIRED_TRADE_RECORD_SCHEMA
+        or frozen_requirement.policy_schema_version != TRADE_POWER_SCHEMA_VERSION
+        or frozen_requirement.pilot_dispersion_method != "max_mad_sample_std_r"
+        or not _is_sha256(frozen_requirement.attempt_ledger_payload_sha256)
+        or not _is_sha256(frozen_requirement.attempts_sha256)
+        or type(frozen_requirement.attempted_trials_exact) is not int
+        or frozen_requirement.attempted_trials_exact <= 0
+        or frozen_requirement.effective_trials
+        != float(frozen_requirement.attempted_trials_exact)
+        or not _is_sha256(frozen_requirement.multiplicity_receipt_sha256)
+        or not _is_sha256(frozen_requirement.calibration_partition_contract_sha256)
+        or not _is_sha256(frozen_requirement.calibration_horizon_receipt_sha256)
+        or not _is_sha256(frozen_requirement.calibration_event_axis_sha256)
+        or not _is_sha256(frozen_requirement.calibration_net_r_values_sha256)
+        or not _is_sha256(frozen_requirement.calibration_holding_intervals_sha256)
+        or not _valid_utc_interval(
+            frozen_requirement.calibration_start_utc,
+            frozen_requirement.calibration_end_utc,
+        )
         or not requirement_source_provenance_valid(frozen_requirement)
     ):
         return TradePowerDecision(
@@ -1460,6 +1924,74 @@ def evaluate_trade_power_partition(
                 if isinstance(frozen_requirement, TradePowerRequirement)
                 else None
             ),
+            partition_contract=current_receipt,
+        )
+    lineage_common = (
+        current_receipt["attempt_ledger_payload_sha256"]
+        == frozen_requirement.attempt_ledger_payload_sha256
+        and current_receipt["attempts_sha256"] == frozen_requirement.attempts_sha256
+        and current_receipt["attempted_trials_exact"]
+        == frozen_requirement.attempted_trials_exact
+        and current_receipt["multiplicity_receipt_sha256"]
+        == frozen_requirement.multiplicity_receipt_sha256
+        and prior_receipt["attempt_ledger_payload_sha256"]
+        == frozen_requirement.attempt_ledger_payload_sha256
+        and prior_receipt["attempts_sha256"] == frozen_requirement.attempts_sha256
+        and prior_receipt["attempted_trials_exact"]
+        == frozen_requirement.attempted_trials_exact
+        and prior_receipt["multiplicity_receipt_sha256"]
+        == frozen_requirement.multiplicity_receipt_sha256
+        and (
+            partition_name != "tuning_validation"
+            or (
+                prior_receipt["start_utc"] == frozen_requirement.calibration_start_utc
+                and prior_receipt["end_utc"] == frozen_requirement.calibration_end_utc
+                and prior_receipt["horizon_receipt_sha256"]
+                == frozen_requirement.calibration_horizon_receipt_sha256
+                and prior_receipt["event_axis_sha256"]
+                == frozen_requirement.calibration_event_axis_sha256
+            )
+        )
+    )
+    prior_chain_valid = (
+        prior_receipt["contract_sha256"]
+        == frozen_requirement.calibration_partition_contract_sha256
+        if partition_name == "tuning_validation"
+        else prior_receipt["prior_partition_contract_sha256"]
+        == frozen_requirement.calibration_partition_contract_sha256
+    )
+    if (
+        not lineage_common
+        or not prior_chain_valid
+        or current_receipt["prior_partition_contract_sha256"]
+        != prior_receipt["contract_sha256"]
+        or pd.Timestamp(current_receipt["start_utc"])
+        < pd.Timestamp(prior_receipt["end_utc"])
+        or (
+            partition_name == "final_lockbox"
+            and pd.Timestamp(prior_receipt["start_utc"])
+            < pd.Timestamp(frozen_requirement.calibration_end_utc)
+        )
+        or (
+            partition_name == "final_lockbox"
+            and prior_receipt["event_axis_sha256"]
+            == frozen_requirement.calibration_event_axis_sha256
+        )
+        or current_receipt["event_axis_sha256"]
+        == frozen_requirement.calibration_event_axis_sha256
+        or current_receipt["event_axis_sha256"] == prior_receipt["event_axis_sha256"]
+    ):
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="partition lineage is overlapping, replayed, or ledger-unbound",
+            reason_codes=("PARTITION_LINEAGE_INVALID",),
+            observed_effective_trades=0.0,
+            required_effective_trades=None,
+            sample_evidence=None,
+            frozen_requirement=frozen_requirement,
+            partition_contract=current_receipt,
         )
     required = _required_for_partition(frozen_requirement, partition_name)
     if required is None or int(required) <= 0:
@@ -1473,6 +2005,7 @@ def evaluate_trade_power_partition(
             required_effective_trades=required,
             sample_evidence=None,
             frozen_requirement=frozen_requirement,
+            partition_contract=current_receipt,
         )
     sample = build_trade_sample_evidence(
         trades,
@@ -1484,6 +2017,7 @@ def evaluate_trade_power_partition(
             sample,
             partition=partition_name,
             requirement=frozen_requirement,
+            partition_contract=current_receipt,
         )
     if (
         sample.source_contract.source_contract_sha256
@@ -1499,12 +2033,50 @@ def evaluate_trade_power_partition(
             required_effective_trades=required,
             sample_evidence=sample,
             frozen_requirement=frozen_requirement,
+            partition_contract=current_receipt,
         )
     if not sample.passed:
         return _sample_terminal_decision(
             sample,
             partition=partition_name,
             requirement=frozen_requirement,
+            partition_contract=current_receipt,
+        )
+    if pd.Timestamp(sample.event_start_utc) < pd.Timestamp(
+        current_receipt["start_utc"]
+    ) or pd.Timestamp(sample.event_end_utc) >= pd.Timestamp(current_receipt["end_utc"]):
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="trade events fall outside the bound partition",
+            reason_codes=("TRADE_EVENTS_OUTSIDE_PARTITION",),
+            observed_effective_trades=float(sample.effective_trades),
+            required_effective_trades=required,
+            sample_evidence=sample,
+            frozen_requirement=frozen_requirement,
+            partition_contract=current_receipt,
+        )
+    if (
+        sample.sample_sha256 == frozen_requirement.calibration_sample_sha256
+        or sample.source_contract.partition_source_contract_sha256
+        == frozen_requirement.calibration_partition_source_contract_sha256
+        or sample.net_r_values_sha256
+        == frozen_requirement.calibration_net_r_values_sha256
+        and sample.holding_intervals_sha256
+        == frozen_requirement.calibration_holding_intervals_sha256
+    ):
+        return TradePowerDecision(
+            status="INFRA_FAILURE",
+            outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
+            partition=partition_name,
+            reason="validation evidence replays optimizer-train observations",
+            reason_codes=("TRAIN_SAMPLE_REPLAYED",),
+            observed_effective_trades=float(sample.effective_trades),
+            required_effective_trades=required,
+            sample_evidence=sample,
+            frozen_requirement=frozen_requirement,
+            partition_contract=current_receipt,
         )
     if sample.effective_trades < float(required):
         return TradePowerDecision(
@@ -1520,6 +2092,7 @@ def evaluate_trade_power_partition(
             required_effective_trades=required,
             sample_evidence=sample,
             frozen_requirement=frozen_requirement,
+            partition_contract=current_receipt,
         )
     return TradePowerDecision(
         status="PASS",
@@ -1531,6 +2104,7 @@ def evaluate_trade_power_partition(
         required_effective_trades=required,
         sample_evidence=sample,
         frozen_requirement=frozen_requirement,
+        partition_contract=current_receipt,
     )
 
 
@@ -1543,6 +2117,8 @@ __all__ = [
     "TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION",
     "TRADE_POWER_SCHEMA_VERSION",
     "TRADE_POWER_DECISION_SCHEMA_VERSION",
+    "TRADE_POWER_MULTIPLICITY_VERSION",
+    "TRADE_POWER_PARTITION_VERSION",
     "TRADE_SAMPLE_SCHEMA_VERSION",
     "TradePowerDecision",
     "TradeEvidenceSourceContract",
@@ -1551,6 +2127,8 @@ __all__ = [
     "TradeSampleEvidence",
     "adjusted_alpha",
     "build_numerical_execution_cost_attestation",
+    "build_trade_power_multiplicity_receipt",
+    "build_trade_power_partition_contract",
     "build_trade_sample_evidence",
     "calibrate_train_trade_power",
     "derive_trade_power_requirement",
@@ -1558,4 +2136,6 @@ __all__ = [
     "robust_r_dispersion",
     "requirement_source_provenance_valid",
     "trade_sample_identity_sha256",
+    "trade_power_decision_sha256",
+    "trade_power_requirement_sha256",
 ]

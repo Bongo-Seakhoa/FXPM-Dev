@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +106,26 @@ def _make_trader(margin_level=0.0, positions=None, close_success=True, **cfg_ove
         pipeline_config=pipeline_config,
         enable_trading=False,
     )
+    # The margin entry/block threshold now comes from the signed selected
+    # capital envelope's min_margin_level_pct (seq1720).  Bind a coherent
+    # envelope so admission has its required authority; the block level is
+    # configurable but defaults to 200 (util 50 / free 50), a valid selected
+    # point (min_margin_level_pct=100 would force free-margin 0 and is not a
+    # valid envelope).
+    block_level = float(cfg_overrides.get("selected_min_margin_level_pct", 200.0))
+    margin_util = 10_000.0 / block_level
+    # Bind on the funded slot (default champion book reads it) so the accessor
+    # returns the envelope without switching the trader into the demo entry
+    # path.
+    trader._funded_capital_envelope = {
+        "max_total_stop_risk_pct": 8.0,
+        "max_factor_stop_risk_pct": 5.0,
+        "max_same_symbol_stop_risk_pct": 3.0,
+        "max_margin_utilization_pct": margin_util,
+        "min_margin_level_pct": block_level,
+        "min_free_margin_pct": 100.0 - margin_util,
+        "gap_stress_multiple": 2.5,
+    }
     return trader
 
 
@@ -157,11 +177,33 @@ class TestClassifyMarginState(unittest.TestCase):
     def setUp(self):
         self.trader = _make_trader()
 
-    def test_normal_at_100(self):
-        self.assertEqual(self.trader._classify_margin_state(100.0), "NORMAL")
+    def test_normal_at_block_level(self):
+        # Entry/block threshold is the selected envelope min_margin_level_pct
+        # (default 200 in the test fixture); at/above it the state is NORMAL.
+        self.assertEqual(self.trader._classify_margin_state(200.0), "NORMAL")
 
-    def test_normal_above_100(self):
+    def test_blocked_just_below_block_level(self):
+        self.assertEqual(self.trader._classify_margin_state(199.9), "BLOCKED")
+
+    def test_normal_above_block(self):
         self.assertEqual(self.trader._classify_margin_state(1200.0), "NORMAL")
+
+    def test_selected_margin_level_beats_static_no_pre_veto(self):
+        # A selected min_margin_level_pct of 111.11 must classify NORMAL at
+        # margin_level=150, which the legacy static 200 block would have blocked
+        # (seq1720 anti-arbitrary-cap).
+        trader = _make_trader(selected_min_margin_level_pct=111.11111111111111)
+        self.assertEqual(trader._classify_margin_state(150.0), "NORMAL")
+
+    def test_malformed_envelope_blocks_entry(self):
+        # An incoherent envelope (hierarchy violated) yields no bound envelope,
+        # so entry classification fails closed (never NORMAL) even when healthy.
+        trader = _make_trader()
+        trader._funded_capital_envelope = dict(
+            trader._funded_capital_envelope,
+            max_same_symbol_stop_risk_pct=999.0,
+        )
+        self.assertNotEqual(trader._classify_margin_state(5000.0), "NORMAL")
 
     def test_blocked_at_99(self):
         self.assertEqual(self.trader._classify_margin_state(99.9), "BLOCKED")
@@ -432,7 +474,7 @@ class TestEntryGateIntegration(unittest.TestCase):
 
     def test_margin_level_below_block_returns_early(self):
         """Simulate a call context where margin_level < 200 should block."""
-        trader = _make_trader(margin_level=195.0)
+        _trader = _make_trader(margin_level=195.0)
 
         # The entry gate is inside _execute_entry which has many dependencies.
         # Instead, test via the cycle state approach: _margin_state is set
@@ -488,7 +530,8 @@ class TestLiveMarginLevelSanity(unittest.TestCase):
         test_cases = [
             (5000.0, "NORMAL"),
             (1200.0, "NORMAL"),
-            (100.0, "NORMAL"),
+            (250.0, "NORMAL"),
+            (100.0, "BLOCKED"),
             (99.0, "BLOCKED"),
             (85.0, "BLOCKED"),
             (80.0, "BLOCKED"),
@@ -568,10 +611,13 @@ class TestMarginReopenCooldown(unittest.TestCase):
         self.assertTrue(trader._is_margin_reopen_required())
 
     def test_reopen_requirement_clears_at_reopen_level(self):
+        # Entry/block threshold is the selected envelope min_margin_level_pct
+        # (seq1720); use a coherent block (200) and a margin level above it so
+        # the reopen requirement clears when margin recovers past reopen level.
         trader = _make_trader(
-            margin_level=95.0,
-            margin_entry_block_level=80.0,
-            margin_reopen_level=90.0,
+            margin_level=250.0,
+            selected_min_margin_level_pct=200.0,
+            margin_reopen_level=200.0,
         )
         trader._margin_reopen_required = True
         trader._last_margin_close_ts = None

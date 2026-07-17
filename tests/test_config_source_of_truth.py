@@ -12,6 +12,7 @@ from pm_main import (
     FUNDED_FIXED_PIPELINE_VALUES,
     FUNDED_PIPELINE_CONFIG_KEYS,
     FUNDED_POSITION_CONFIG_KEYS,
+    FUNDED_RAW_PIPELINE_POLICY_KEYS,
     FXPortfolioManagerApp,
     LiveTrader,
     _apply_funded_pipeline_contract,
@@ -23,6 +24,7 @@ from pm_main import (
     _validate_funded_config_schema,
 )
 from pm_position import PositionConfig, TradeTagEncoder
+from pm_live_outcomes import LiveOutcomeError
 
 
 class ConfigSourceOfTruthTests(unittest.TestCase):
@@ -201,7 +203,10 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
 
         _validate_funded_config_schema(config_data)
 
-        self.assertEqual(set(config_data["pipeline"]), FUNDED_PIPELINE_CONFIG_KEYS)
+        self.assertEqual(
+            set(config_data["pipeline"]),
+            FUNDED_PIPELINE_CONFIG_KEYS | FUNDED_RAW_PIPELINE_POLICY_KEYS,
+        )
         self.assertEqual(set(config_data["position"]), FUNDED_POSITION_CONFIG_KEYS)
         self.assertEqual(len(FUNDED_POSITION_CONFIG_KEYS), 6)
         self.assertTrue(
@@ -209,6 +214,38 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         )
         self.assertEqual(len(FUNDED_PIPELINE_CONFIG_KEYS), 158)
         self.assertLess(len(FUNDED_PIPELINE_CONFIG_KEYS), len(PipelineConfig.__dataclass_fields__))
+
+    def test_funded_schema_admits_only_named_raw_capital_policy_surface(self):
+        self.assertEqual(
+            FUNDED_RAW_PIPELINE_POLICY_KEYS,
+            {"production_capital_authority"},
+        )
+        self.assertTrue(
+            FUNDED_RAW_PIPELINE_POLICY_KEYS.isdisjoint(
+                PipelineConfig.__dataclass_fields__
+            )
+        )
+        _validate_funded_config_schema(
+            {
+                "_meta": {"scope": "funded_live_v1"},
+                "pipeline": {
+                    # Full content verification belongs to the strict Capital
+                    # authority loader; this gate only proves the raw object is
+                    # not silently dropped as an unknown dataclass field.
+                    "production_capital_authority": {},
+                },
+            }
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "unsupported funded-live pipeline",
+        ):
+            _validate_funded_config_schema(
+                {
+                    "_meta": {"scope": "funded_live_v1"},
+                    "pipeline": {"production_capital_authority_typo": {}},
+                }
+            )
 
     def test_funded_schema_rejects_fixed_and_research_only_pipeline_knobs(self):
         for key, value in (
@@ -404,6 +441,22 @@ class LiveRiskIntentTests(unittest.TestCase):
             execution_quality_overlay=SimpleNamespace(enabled=False),
         )
         trader._equity_peak = 0.0
+        # These tests exercise logic after the production Capital V8 admission
+        # gate.  Bind a coherent test-only envelope so each case reaches the
+        # branch it is intended to verify; production deliberately remains
+        # fail-closed when no signed/replay-selected envelope is available.
+        trader._funded_capital_envelope = {
+            "max_total_stop_risk_pct": 10.0,
+            "max_factor_stop_risk_pct": 8.0,
+            "max_same_symbol_stop_risk_pct": 5.0,
+            "max_margin_utilization_pct": 50.0,
+            "min_margin_level_pct": 200.0,
+            "min_free_margin_pct": 50.0,
+            "gap_stress_multiple": 1.5,
+        }
+        trader._current_refit_demo_capital_envelope = dict(
+            trader._funded_capital_envelope
+        )
         trader._check_symbol_combined_risk_cap = MagicMock(
             return_value=(True, "Symbol risk OK for XAUUSD: 0.10% / 2.00% (0 open positions, adding 1 new)")
         )
@@ -448,6 +501,65 @@ class LiveRiskIntentTests(unittest.TestCase):
             trade_expert=True,
         )
         return trader
+
+    def _execute_standard_market_entry(self, trader, regime_config=None):
+        features = pd.DataFrame(
+            {
+                "Open": [1.0, 1.0],
+                "High": [1.0, 1.0],
+                "Low": [1.0, 1.0],
+                "Close": [1.0, 1.0],
+            }
+        )
+        best_candidate = {
+            "timeframe": "M15",
+            "regime": "CHOP",
+            "strategy_name": "MomentumBurstStrategy",
+            "signal": 1,
+        }
+        if regime_config is not None:
+            best_candidate["regime_config"] = regime_config
+        trader._execute_entry(
+            symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(
+                pip_size=0.01,
+                pip_value=1.0,
+                spread_avg=3.0,
+                point=0.01,
+            ),
+            magic=12345,
+            config=SimpleNamespace(symbol="XAUUSD"),
+            decision_key="pre-send-integration",
+            bar_time_iso="2026-04-02T15:15:52",
+            best_candidate=best_candidate,
+            trade_intent=SimpleNamespace(
+                stop_loss_pips=10.0,
+                take_profit_pips=20.0,
+            ),
+            positions_snapshot=[],
+            account_info=SimpleNamespace(
+                balance=10000.0,
+                equity=10000.0,
+                margin_level=0.0,
+                margin_free=10000.0,
+            ),
+        )
+
+    @staticmethod
+    def _enable_durable_feedback(trader):
+        ledger = MagicMock()
+        ledger.reserve_pre_send_intent.return_value = {
+            "reservation_id": "a" * 32
+        }
+        trader._live_outcome_feedback_initialized = True
+        trader._live_outcome_feedback_error = ""
+        trader._live_outcome_ledger = ledger
+        trader.pipeline_config.live_outcome_feedback_enabled = True
+        return ledger
 
     def test_execute_entry_blocks_subminimum_risk_target_without_promotion(self):
         trader = self._make_trader(
@@ -502,6 +614,81 @@ class LiveRiskIntentTests(unittest.TestCase):
             call.args[2] for call in trader.mt5.calc_loss_amount.call_args_list
         ]
         self.assertEqual(requested_loss_volumes, [1.0])
+        trader.mt5.send_market_order.assert_not_called()
+
+    def test_additional_specialist_ignores_legacy_d1_risk_derates(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.05,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.pipeline_config.d1_secondary_risk_multiplier = 0.10
+        trader.pipeline_config.secondary_trade_max_risk_pct = 0.01
+        existing = SimpleNamespace(
+            symbol="XAUUSD",
+            magic=TradeTagEncoder.encode_magic("XAUUSD", "H4", "TREND"),
+            ticket=42,
+            comment=TradeTagEncoder.encode_comment(
+                "XAUUSD",
+                "H4",
+                "MomentumBurstStrategy",
+                "LONG",
+                risk_pct=0.01,
+            ),
+        )
+        trader.mt5.get_position_by_symbol_magic.return_value = None
+        trader.mt5.get_positions.return_value = [existing]
+        features = pd.DataFrame(
+            {
+                "Open": [1.0, 1.0],
+                "High": [1.0, 1.0],
+                "Low": [1.0, 1.0],
+                "Close": [1.0, 1.0],
+            }
+        )
+
+        trader._execute_entry(
+            symbol="XAUUSD",
+            broker_symbol="XAUUSD",
+            signal=1,
+            strategy=MagicMock(),
+            features=features,
+            spec=SimpleNamespace(
+                pip_size=0.01,
+                pip_value=1.0,
+                spread_avg=3.0,
+                point=0.01,
+            ),
+            magic=TradeTagEncoder.encode_magic("XAUUSD", "M15", "CHOP"),
+            config=SimpleNamespace(symbol="XAUUSD"),
+            decision_key="additional-specialist-risk-parity",
+            bar_time_iso="2026-04-02T15:15:52",
+            best_candidate={
+                "timeframe": "M15",
+                "regime": "CHOP",
+                "strategy_name": "MomentumBurstStrategy",
+                "signal": 1,
+            },
+            is_secondary_trade=True,
+            positions_snapshot=[existing],
+            account_info=SimpleNamespace(
+                balance=10000.0,
+                equity=10000.0,
+                margin_level=0.0,
+                margin_free=10000.0,
+                margin_mode=2,
+                hedge_allowed=True,
+            ),
+        )
+
+        actionable_payload = trader._actionable_log.record.call_args[0][1]
+        self.assertEqual(actionable_payload["action"], "BLOCKED_MIN_LOT_EXCEEDS_CAP")
+        self.assertAlmostEqual(actionable_payload["target_risk_pct"], 0.05, places=6)
         trader.mt5.send_market_order.assert_not_called()
 
     def test_execute_entry_uses_fresh_symbol_positions_for_combined_risk(self):
@@ -567,7 +754,7 @@ class LiveRiskIntentTests(unittest.TestCase):
                 for call in trader._check_symbol_combined_risk_cap.call_args_list
             )
         )
-    def test_execute_entry_blocks_fresh_same_timeframe_pairing(self):
+    def test_execute_entry_blocks_fresh_exact_specialist_cell(self):
         trader = self._make_trader(
             SimpleNamespace(
                 risk_per_trade_pct=0.10,
@@ -599,7 +786,7 @@ class LiveRiskIntentTests(unittest.TestCase):
             strategy=MagicMock(),
             features=features,
             spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
-            magic=12345,
+            magic=TradeTagEncoder.encode_magic("XAUUSD", "D1", "TREND"),
             config=SimpleNamespace(symbol="XAUUSD"),
             decision_key="fresh-position-pairing",
             bar_time_iso="2026-04-02T15:15:52",
@@ -621,8 +808,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         )
 
         actionable_payload = trader._actionable_log.record.call_args[0][1]
-        self.assertEqual(actionable_payload["action"], "BLOCKED_SYMBOL_POSITION_LIMIT")
-        self.assertEqual(actionable_payload["position_context"]["fresh_open_positions_total"], 1)
+        self.assertEqual(actionable_payload["action"], "SKIPPED_POSITION_EXISTS")
 
     def test_execute_entry_blocks_cross_horizon_pair_on_netting_account(self):
         trader = self._make_trader(
@@ -1016,6 +1202,236 @@ class LiveRiskIntentTests(unittest.TestCase):
         self.assertAlmostEqual(actionable_payload["entry_slippage_pips"], 0.0, places=6)
         self.assertAlmostEqual(actionable_payload["entry_slippage_r"], 0.0, places=6)
         self.assertEqual(actionable_payload["entry_slippage_direction"], "flat")
+
+    def test_pre_send_reservation_precedes_send_and_fill_binding(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        ledger = self._enable_durable_feedback(trader)
+        events = []
+
+        def _reserve(**_kwargs):
+            events.append("reserve")
+            return {"reservation_id": "a" * 32}
+
+        def _send(**_kwargs):
+            events.append("send")
+            return SimpleNamespace(
+                success=True,
+                volume=0.05,
+                price=1.2050,
+                retcode=10009,
+                retcode_description="Done",
+                deal=701,
+                order=702,
+            )
+
+        def _bind(*_args, **_kwargs):
+            events.append("bind")
+            return {}
+
+        ledger.reserve_pre_send_intent.side_effect = _reserve
+        ledger.bind_pre_send_intent.side_effect = _bind
+        trader.mt5.send_market_order.side_effect = _send
+
+        self._execute_standard_market_entry(trader)
+
+        self.assertEqual(events, ["reserve", "send", "bind"])
+        reserve_kwargs = ledger.reserve_pre_send_intent.call_args.kwargs
+        self.assertGreater(reserve_kwargs["risk_cash"], 0.0)
+        self.assertEqual(reserve_kwargs["management_capsule_id"], "")
+        self.assertEqual(reserve_kwargs["management_generation_id"], "")
+        bind_args = ledger.bind_pre_send_intent.call_args
+        self.assertEqual(bind_args.args, ("a" * 32,))
+        self.assertEqual(bind_args.kwargs["opening_deal_ticket"], 701)
+        self.assertEqual(bind_args.kwargs["opening_order_ticket"], 702)
+
+    def test_send_exception_retains_ambiguous_reservation(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        ledger = self._enable_durable_feedback(trader)
+        trader.mt5.send_market_order.side_effect = OSError("transport lost")
+        trader.mt5.get_position_by_symbol_magic.return_value = None
+        trader.mt5.get_positions.return_value = []
+
+        self._execute_standard_market_entry(trader)
+
+        ledger.retain_ambiguous_pre_send_intent.assert_called_once()
+        self.assertEqual(
+            ledger.retain_ambiguous_pre_send_intent.call_args.args,
+            ("a" * 32,),
+        )
+        ledger.cancel_pre_send_intent.assert_not_called()
+        ledger.bind_pre_send_intent.assert_not_called()
+
+    def test_definitive_broker_rejection_cancels_reservation(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        ledger = self._enable_durable_feedback(trader)
+        trader.mt5.send_market_order.return_value = SimpleNamespace(
+            success=False,
+            retcode=10014,
+            retcode_description="Invalid volume",
+            error_message="",
+            ambiguous=False,
+        )
+
+        self._execute_standard_market_entry(trader)
+
+        ledger.cancel_pre_send_intent.assert_called_once_with(
+            "a" * 32,
+            definitive_no_fill=True,
+            reason="broker rejected order with retcode 10014",
+        )
+        ledger.retain_ambiguous_pre_send_intent.assert_not_called()
+        ledger.bind_pre_send_intent.assert_not_called()
+
+    def test_ambiguous_fill_reconciliation_binds_reservation(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        ledger = self._enable_durable_feedback(trader)
+        trader.mt5.send_market_order.return_value = SimpleNamespace(
+            success=False,
+            retcode=10012,
+            retcode_description="Request canceled by timeout",
+            error_message="",
+            ambiguous=True,
+            order=0,
+        )
+        trader.mt5.get_position_by_symbol_magic.side_effect = [
+            None,
+            SimpleNamespace(
+                symbol="XAUUSD",
+                magic=12345,
+                ticket=777,
+                identifier=778,
+                volume=0.05,
+                price_open=1.2050,
+            ),
+        ]
+
+        self._execute_standard_market_entry(trader)
+
+        ledger.bind_pre_send_intent.assert_called_once()
+        self.assertEqual(
+            ledger.bind_pre_send_intent.call_args.kwargs["position_id"], 778
+        )
+        ledger.cancel_pre_send_intent.assert_not_called()
+        ledger.retain_ambiguous_pre_send_intent.assert_not_called()
+
+    def test_demo_management_authority_binding_is_exact_and_one_way(self):
+        trader = LiveTrader.__new__(LiveTrader)
+        trader._is_current_refit_demo = True
+        trader._demo_management_capsule_id = ""
+        trader._demo_management_generation_id = ""
+
+        trader.bind_demo_management_authority("b" * 64, "generation-7")
+        trader.bind_demo_management_authority("b" * 64, "generation-7")
+
+        self.assertEqual(trader._demo_management_capsule_id, "b" * 64)
+        self.assertEqual(trader._demo_management_generation_id, "generation-7")
+        with self.assertRaises(LiveOutcomeError):
+            trader.bind_demo_management_authority("c" * 64, "generation-8")
+        invalid = LiveTrader.__new__(LiveTrader)
+        invalid._is_current_refit_demo = True
+        with self.assertRaises(ValueError):
+            invalid.bind_demo_management_authority("not-a-hash", "generation-7")
+
+    def test_demo_reservation_carries_exact_management_authority(self):
+        trader = self._make_trader(
+            SimpleNamespace(
+                risk_per_trade_pct=0.50,
+                max_risk_pct=1.0,
+                min_position_size=0.01,
+                max_position_size=0.0,
+                risk_basis="equity",
+                auto_widen_sl=True,
+            )
+        )
+        trader.enable_trading = True
+        trader._is_current_refit_demo = True
+        trader._demo_management_capsule_id = ""
+        trader._demo_management_generation_id = ""
+        ledger = self._enable_durable_feedback(trader)
+        account = trader.mt5.get_account_info.return_value
+        account.trade_mode = 0
+        account.margin_mode = 2
+        account.hedge_allowed = True
+        trader._promotion_authorization_block_reason = MagicMock(return_value=None)
+        trader._current_refit_demo_position_block_reason = MagicMock(
+            return_value=None
+        )
+        trader._get_management_configs = MagicMock(return_value={})
+        trader.mt5.send_market_order.return_value = SimpleNamespace(
+            success=True,
+            volume=0.05,
+            price=1.2050,
+            retcode=10009,
+            retcode_description="Done",
+            deal=701,
+            order=702,
+        )
+        regime_config = SimpleNamespace(
+            artifact_meta={
+                "current_refit_binding": {"current_refit_cell_id": "d" * 64}
+            }
+        )
+
+        self._execute_standard_market_entry(trader, regime_config=regime_config)
+
+        ledger.reserve_pre_send_intent.assert_not_called()
+        trader.mt5.send_market_order.assert_not_called()
+        self.assertEqual(
+            trader._actionable_log.record.call_args[0][1]["action"],
+            "BLOCKED_DEMO_MANAGEMENT_AUTHORITY",
+        )
+
+        trader.bind_demo_management_authority("b" * 64, "generation-7")
+        self._execute_standard_market_entry(trader, regime_config=regime_config)
+
+        reserve_kwargs = ledger.reserve_pre_send_intent.call_args.kwargs
+        self.assertEqual(reserve_kwargs["management_capsule_id"], "b" * 64)
+        self.assertEqual(
+            reserve_kwargs["management_generation_id"], "generation-7"
+        )
+        self.assertEqual(
+            reserve_kwargs["book_role"], "PROCESS_VALIDATED_CURRENT_REFIT"
+        )
 
     def test_execute_entry_reconciles_ambiguous_timeout_to_open_position(self):
         trader = self._make_trader(

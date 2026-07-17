@@ -79,6 +79,8 @@ class TradeTagEncoder:
     COMMENT_PREFIX_V1 = "PM:"
     COMMENT_PREFIX_V2 = "PM2:"
     COMMENT_PREFIX_V3 = "PM3:"
+    COMMENT_PREFIX_CURRENT_REFIT_V1 = "PMR:"
+    COMMENT_PREFIX_CURRENT_REFIT_V2 = "PMR2:"
     # Latest-data challengers use a distinct broker-visible namespace.  This
     # prevents a demo forward-probation order from being mistaken for a funded
     # champion when positions/deals are recovered after a restart.
@@ -130,6 +132,15 @@ class TradeTagEncoder:
         if risk_pct is not None:
             scode = TradeTagEncoder._strategy_code(strategy_name, max_len=5)
             risk_tenths = int(round(float(risk_pct) * 10.0))
+            if str(book_role or "").strip().upper() == "PROCESS_VALIDATED_CURRENT_REFIT":
+                risk_value = float(risk_pct)
+                if not math.isfinite(risk_value) or risk_value < 0.0:
+                    raise ValueError("risk_pct must be finite and nonnegative")
+                risk_hundredths = int(math.ceil(risk_value * 100.0 - 1e-12))
+                return (
+                    f"{TradeTagEncoder.COMMENT_PREFIX_CURRENT_REFIT_V2}"
+                    f"{symbol}:{timeframe}:{scode}:{dir_short}:{risk_hundredths}"
+                )
             if str(book_role or "").strip().upper() == "LATEST_DATA_EDGE_CHALLENGER":
                 return (
                     f"{TradeTagEncoder.COMMENT_PREFIX_EDGE_V1}"
@@ -165,6 +176,44 @@ class TradeTagEncoder:
             return None
 
         try:
+            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_CURRENT_REFIT_V2):
+                parts = comment[
+                    len(TradeTagEncoder.COMMENT_PREFIX_CURRENT_REFIT_V2):
+                ].split(':')
+                if len(parts) >= 3:
+                    result = {
+                        "symbol": parts[0],
+                        "timeframe": parts[1],
+                        "strategy_code": parts[2],
+                        "book_role": "PROCESS_VALIDATED_CURRENT_REFIT",
+                    }
+                    if len(parts) >= 4:
+                        direction = TradeTagEncoder._normalize_direction(parts[3])
+                        if direction:
+                            result["direction"] = direction
+                    if len(parts) >= 5:
+                        result["risk_pct"] = float(int(parts[4])) / 100.0
+                    return result
+
+            if comment.startswith(TradeTagEncoder.COMMENT_PREFIX_CURRENT_REFIT_V1):
+                parts = comment[
+                    len(TradeTagEncoder.COMMENT_PREFIX_CURRENT_REFIT_V1):
+                ].split(':')
+                if len(parts) >= 3:
+                    result = {
+                        "symbol": parts[0],
+                        "timeframe": parts[1],
+                        "strategy_code": parts[2],
+                        "book_role": "PROCESS_VALIDATED_CURRENT_REFIT",
+                    }
+                    if len(parts) >= 4:
+                        direction = TradeTagEncoder._normalize_direction(parts[3])
+                        if direction:
+                            result["direction"] = direction
+                    if len(parts) >= 5:
+                        result["risk_pct"] = max(0.0, float(int(parts[4]))) / 10.0 + 0.05
+                    return result
+
             # Edge challenger: PME:symbol:tf:scode:dir:risk_tenths.  The
             # explicit book role is durable even if the entry-intent state has
             # to be reconstructed from broker history.

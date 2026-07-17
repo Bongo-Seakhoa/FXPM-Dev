@@ -1,22 +1,20 @@
-"""Durable, position-level live outcome accounting for MetaTrader 5.
+"""Durable live-entry attribution and position-level outcome accounting.
 
-This module is deliberately observation-only.  It has no order API and no
-promotion API.  Its one downstream side effect is an idempotent delivery of a
-fully closed, exactly attributed position to :class:`CycleDriftMonitor`.
-
-The JSONL ledger is the append-only source of truth.  The JSON state file is a
-restart-safe index/outbox used for partial exits, entry-risk metadata, and
-deduplication.  A ledger record is appended before its state index is updated;
-therefore a crash can at worst leave stale state, which is reconstructed from
-the ledger on the next start.
+The module has no order or promotion API. Pre-send reservations and unresolved
+fills live in the fsynced state file. Closed outcomes move to the append-only
+ledger before state cleanup. Any ambiguous or corrupt transition fails closed.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+import re
 import threading
+import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -25,12 +23,73 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, 
 from pm_position import TradeTagEncoder
 
 
-STATE_SCHEMA_VERSION = "2026-07-10-live-outcome-state-v1"
+LEGACY_STATE_SCHEMA_VERSION = "2026-07-10-live-outcome-state-v1"
+STATE_SCHEMA_VERSION = "2026-07-14-live-outcome-state-v2"
 LEDGER_SCHEMA_VERSION = "2026-07-10-matched-position-close-v1"
+RESERVATION_SCHEMA_VERSION = "fxpm.live-entry-reservation.v1"
+
+# Evidence is never silently pruned. Capacity exhaustion blocks new entries.
+MAX_STATE_BYTES = 32 * 1024 * 1024
+MAX_LEDGER_BYTES = 512 * 1024 * 1024
+MAX_LEDGER_RECORD_BYTES = 256 * 1024
+MAX_LEDGER_RECORDS = 250_000
+MAX_LEDGER_INDEX_RECORDS = 250_000
+MAX_PENDING_POSITIONS = 10_000
+MAX_PENDING_EXIT_DEALS = 50_000
+MAX_ENTRY_INTENT_ALIASES = 30_000
+MAX_ENTRY_RESERVATIONS = 5_000
+MAX_STATE_ID_VALUES = 250_000
+MAX_TEXT_VALUE = 4_096
+
+_RESERVATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_INTENT_ALIAS_RE = re.compile(r"^(position|deal|order):[1-9][0-9]*$")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_DEMO_BOOK_ROLE = "PROCESS_VALIDATED_CURRENT_REFIT"
+_TIMEFRAMES = frozenset({"M5", "M15", "M30", "H1", "H4", "D1"})
+_REGIMES = frozenset({"TREND", "RANGE", "BREAKOUT", "CHOP"})
+_BOOK_ROLES = frozenset(
+    {
+        "LOCKBOX_VALIDATED_CHAMPION",
+        "FROZEN_PRELOCKBOX_CHAMPION",
+        "LATEST_DATA_EDGE_CHALLENGER",
+        _DEMO_BOOK_ROLE,
+    }
+)
 
 
 class LiveOutcomeError(RuntimeError):
     """Raised when durable outcome evidence cannot be trusted."""
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value}")
+
+
+def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(raw: Union[str, bytes]) -> Any:
+    return json.loads(
+        raw,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 @dataclass
@@ -141,6 +200,9 @@ class LiveOutcomeLedger:
         self.auto_promotion_enabled = False
         self._lock = threading.RLock()
         self._state_recovered = False
+        self._state_disk_sha256: Optional[str] = None
+        self._ledger_disk_size = 0
+        self._ledger_record_count = 0
         self._ledger_records: Dict[str, Dict[str, Any]] = {}
         self._state: Dict[str, Any] = self._empty_state()
         self._load_state()
@@ -158,6 +220,7 @@ class LiveOutcomeLedger:
             "drift_delivered_position_ids": [],
             "pending_positions": {},
             "entry_intents": {},
+            "pre_send_reservations": {},
             "updated_at": "",
         }
 
@@ -179,31 +242,37 @@ class LiveOutcomeLedger:
             str(regime or "").upper(),
             str(strategy_name or ""),
         )
+        exact_count = 0
+        r_count = 0
+        r_sum = 0.0
+        gains = 0.0
+        losses = 0.0
         with self._lock:
-            records = [
-                dict(record)
-                for record in self._ledger_records.values()
-                if str(record.get("cell_match_status", "") or "").upper() == "EXACT"
-                and (
+            for record in self._ledger_records.values():
+                if str(record.get("cell_match_status", "") or "").upper() != "EXACT":
+                    continue
+                if (
                     str(record.get("symbol", "") or "").upper(),
                     str(record.get("timeframe", "") or "").upper(),
                     str(record.get("regime", "") or "").upper(),
                     str(record.get("strategy_name", "") or ""),
-                ) == target
-            ]
-        realized_r = [
-            float(record["realized_r"])
-            for record in records
-            if record.get("realized_r") is not None
-            and math.isfinite(float(record.get("realized_r")))
-        ]
-        gains = sum(value for value in realized_r if value > 0.0)
-        losses = -sum(value for value in realized_r if value < 0.0)
+                ) != target:
+                    continue
+                exact_count += 1
+                value = record.get("realized_r")
+                if value is not None and math.isfinite(float(value)):
+                    numeric = float(value)
+                    r_count += 1
+                    r_sum += numeric
+                    if numeric > 0.0:
+                        gains += numeric
+                    elif numeric < 0.0:
+                        losses -= numeric
         profit_factor = gains / losses if losses > 1e-12 else (float("inf") if gains > 0.0 else 0.0)
         return {
-            "exact_closed_positions": len(records),
-            "r_observations": len(realized_r),
-            "mean_r": (sum(realized_r) / len(realized_r)) if realized_r else None,
+            "exact_closed_positions": exact_count,
+            "r_observations": r_count,
+            "mean_r": (r_sum / r_count) if r_count else None,
             "profit_factor_r": profit_factor,
         }
 
@@ -212,57 +281,525 @@ class LiveOutcomeLedger:
         numeric = _safe_int(position_id)
         return str(numeric) if numeric > 0 else ""
 
+    @classmethod
+    def _validate_ledger_record(cls, raw: Any) -> Dict[str, Any]:
+        required = {
+            "schema_version",
+            "event_id",
+            "position_id",
+            "symbol",
+            "broker_symbol",
+            "timeframe",
+            "regime",
+            "strategy_name",
+            "book_role",
+            "candidate_id",
+            "cell_match_status",
+            "cell_match_reason",
+            "opening_deal_tickets",
+            "opening_order_tickets",
+            "closing_deal_tickets",
+            "closing_order_tickets",
+            "opened_at",
+            "closed_at",
+            "entry_volume",
+            "exit_volume",
+            "volume_weighted_entry",
+            "volume_weighted_exit",
+            "gross_profit",
+            "commission",
+            "swap",
+            "fee",
+            "realized_net_pnl",
+            "entry_comment",
+            "entry_magic",
+            "entry_metadata",
+            "initial_stop",
+            "initial_risk_cash",
+            "initial_risk_source",
+            "realized_r",
+            "realized_r_unavailable_reason",
+            "eligible_for_auto_promotion",
+            "recorded_at",
+        }
+        optional = {
+            "entry_reservation_id",
+            "management_capsule_id",
+            "management_generation_id",
+            "reserved_at",
+            "reserved_entry_price",
+            "reserved_volume",
+            "reserved_risk_cash",
+        }
+        if not isinstance(raw, dict) or not required.issubset(raw) or not set(raw).issubset(required | optional):
+            raise ValueError("ledger record has an invalid schema")
+        record = dict(raw)
+        if record["schema_version"] != LEDGER_SCHEMA_VERSION:
+            raise ValueError("ledger record has an unsupported schema")
+        position_id = record["position_id"]
+        if not isinstance(position_id, int) or isinstance(position_id, bool) or position_id <= 0:
+            raise ValueError("ledger record has an invalid position_id")
+        if record["event_id"] != f"mt5-position-close:{position_id}":
+            raise ValueError("ledger record event_id does not match position_id")
+        for name in (
+            "symbol",
+            "broker_symbol",
+            "timeframe",
+            "regime",
+            "strategy_name",
+            "book_role",
+            "candidate_id",
+            "cell_match_status",
+            "cell_match_reason",
+            "entry_comment",
+            "initial_risk_source",
+            "realized_r_unavailable_reason",
+            "entry_reservation_id",
+            "management_capsule_id",
+            "management_generation_id",
+            "reserved_at",
+        ):
+            value = record.get(name)
+            if value is not None:
+                cls._bounded_text(value, name)
+        for name in (
+            "opening_deal_tickets",
+            "opening_order_tickets",
+            "closing_deal_tickets",
+            "closing_order_tickets",
+        ):
+            values = record[name]
+            if (
+                not isinstance(values, list)
+                or len(values) > MAX_PENDING_EXIT_DEALS
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in values
+                )
+                or len(set(values)) != len(values)
+            ):
+                raise ValueError(f"ledger record has invalid {name}")
+        if not record["opening_deal_tickets"] or not record["closing_deal_tickets"]:
+            raise ValueError("ledger record lacks opening or closing deals")
+        for name in ("opened_at", "closed_at", "recorded_at"):
+            value = cls._bounded_text(record[name], name, required=True)
+            if _iso_utc(value) != value:
+                raise ValueError(f"ledger record has invalid {name}")
+        for name in (
+            "entry_volume",
+            "exit_volume",
+            "volume_weighted_entry",
+            "volume_weighted_exit",
+        ):
+            cls._finite_number(record[name], name, positive=True)
+        for name in ("gross_profit", "commission", "swap", "fee", "realized_net_pnl"):
+            cls._finite_number(record[name], name)
+        for name in (
+            "initial_stop",
+            "initial_risk_cash",
+            "realized_r",
+            "reserved_entry_price",
+            "reserved_volume",
+            "reserved_risk_cash",
+        ):
+            value = record.get(name)
+            if value is not None:
+                cls._finite_number(
+                    value,
+                    name,
+                    positive=name != "realized_r",
+                )
+        if not isinstance(record["entry_magic"], int) or isinstance(record["entry_magic"], bool):
+            raise ValueError("ledger record has an invalid entry_magic")
+        if not isinstance(record["entry_metadata"], dict):
+            raise ValueError("ledger record entry_metadata is not an object")
+        if record["eligible_for_auto_promotion"] is not False:
+            raise ValueError("ledger record cannot authorize promotion")
+        expected_net = sum(float(record[name]) for name in ("gross_profit", "commission", "swap", "fee"))
+        tolerance = 1e-10 * max(1.0, abs(expected_net), abs(float(record["realized_net_pnl"])))
+        if abs(expected_net - float(record["realized_net_pnl"])) > tolerance:
+            raise ValueError("ledger record net PnL is inconsistent")
+        risk = record.get("initial_risk_cash")
+        realized_r = record.get("realized_r")
+        if risk is not None:
+            expected_r = float(record["realized_net_pnl"]) / float(risk)
+            r_tolerance = 1e-10 * max(1.0, abs(expected_r))
+            if realized_r is None or abs(float(realized_r) - expected_r) > r_tolerance:
+                raise ValueError("ledger record realized R is inconsistent")
+        elif realized_r is not None:
+            raise ValueError("ledger record has realized R without durable risk")
+        reservation_id = str(record.get("entry_reservation_id", "") or "")
+        if reservation_id and not _RESERVATION_ID_RE.fullmatch(reservation_id):
+            raise ValueError("ledger record has an invalid reservation id")
+        capsule_id = str(record.get("management_capsule_id", "") or "")
+        generation_id = str(record.get("management_generation_id", "") or "")
+        if reservation_id and record["book_role"] == _DEMO_BOOK_ROLE:
+            if not _HEX64_RE.fullmatch(capsule_id) or not generation_id:
+                raise ValueError("ledger record lacks demo management authority")
+        elif bool(capsule_id) != bool(generation_id):
+            raise ValueError("ledger record has an incomplete management authority pair")
+        return record
+
+    @staticmethod
+    def _finite_number(value: Any, field_name: str, *, positive: bool = False) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field_name} is not numeric")
+        result = float(value)
+        if not math.isfinite(result) or (positive and result <= 0.0):
+            raise ValueError(f"{field_name} is invalid")
+        return result
+
+    @staticmethod
+    def _bounded_text(value: Any, field_name: str, *, required: bool = False) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} is not text")
+        result = value.strip()
+        if required and not result:
+            raise ValueError(f"{field_name} is empty")
+        if len(result) > MAX_TEXT_VALUE:
+            raise ValueError(f"{field_name} is too long")
+        if any(ord(character) < 32 for character in result):
+            raise ValueError(f"{field_name} contains control characters")
+        return result
+
+    @classmethod
+    def _validate_reservation(cls, reservation_id: str, raw: Any) -> Dict[str, Any]:
+        if not _RESERVATION_ID_RE.fullmatch(reservation_id):
+            raise ValueError("invalid reservation id")
+        if not isinstance(raw, dict):
+            raise ValueError(f"reservation {reservation_id} is not an object")
+        fields = {
+            "schema_version",
+            "reservation_id",
+            "status",
+            "symbol",
+            "timeframe",
+            "regime",
+            "strategy_name",
+            "magic",
+            "entry_price",
+            "volume",
+            "initial_stop",
+            "risk_cash",
+            "book_role",
+            "candidate_id",
+            "management_capsule_id",
+            "management_generation_id",
+            "reserved_at",
+            "ambiguity_reason",
+            "observed_at",
+            "broker_order_ticket",
+            "reservation_sha256",
+        }
+        if set(raw) != fields:
+            raise ValueError(f"reservation {reservation_id} has an invalid schema")
+        payload = dict(raw)
+        if payload["schema_version"] != RESERVATION_SCHEMA_VERSION:
+            raise ValueError(f"reservation {reservation_id} has an unsupported schema")
+        if payload["reservation_id"] != reservation_id:
+            raise ValueError(f"reservation {reservation_id} has an identity mismatch")
+        if payload["status"] not in {"RESERVED", "AMBIGUOUS"}:
+            raise ValueError(f"reservation {reservation_id} has an invalid status")
+        for name in ("symbol", "timeframe", "regime"):
+            value = cls._bounded_text(payload[name], name, required=True)
+            if value != value.upper() or payload[name] != value:
+                raise ValueError(f"reservation {reservation_id} has non-canonical {name}")
+        strategy = cls._bounded_text(payload["strategy_name"], "strategy_name", required=True)
+        if payload["strategy_name"] != strategy:
+            raise ValueError(f"reservation {reservation_id} has non-canonical strategy_name")
+        role = cls._bounded_text(
+            payload["book_role"],
+            "book_role",
+            required=bool(payload.get("reservation_id")),
+        )
+        if payload["book_role"] != role.upper():
+            raise ValueError(f"reservation {reservation_id} has non-canonical book_role")
+        if payload["timeframe"] not in _TIMEFRAMES or payload["regime"] not in _REGIMES:
+            raise ValueError(f"reservation {reservation_id} has an unsupported cell")
+        if payload["book_role"] not in _BOOK_ROLES:
+            raise ValueError(f"reservation {reservation_id} has an unsupported book_role")
+        for name in ("candidate_id", "reserved_at", "ambiguity_reason", "observed_at"):
+            if payload[name] != cls._bounded_text(payload[name], name):
+                raise ValueError(f"reservation {reservation_id} has non-canonical {name}")
+        if not payload["reserved_at"] or _iso_utc(payload["reserved_at"]) != payload["reserved_at"]:
+            raise ValueError(f"reservation {reservation_id} has an invalid reserved_at")
+        if payload["status"] == "RESERVED" and any(
+            (payload["ambiguity_reason"], payload["observed_at"], payload["broker_order_ticket"])
+        ):
+            raise ValueError(f"reservation {reservation_id} has inconsistent reserved state")
+        if payload["status"] == "AMBIGUOUS" and (
+            not payload["ambiguity_reason"]
+            or not payload["observed_at"]
+            or _iso_utc(payload["observed_at"]) != payload["observed_at"]
+        ):
+            raise ValueError(f"reservation {reservation_id} has incomplete ambiguity evidence")
+        capsule_id = cls._bounded_text(payload["management_capsule_id"], "management_capsule_id")
+        generation_id = cls._bounded_text(
+            payload["management_generation_id"], "management_generation_id"
+        )
+        if payload["management_capsule_id"] != capsule_id or payload["management_generation_id"] != generation_id:
+            raise ValueError(f"reservation {reservation_id} has non-canonical management authority")
+        if len(generation_id.encode("utf-8")) > 256:
+            raise ValueError(f"reservation {reservation_id} generation id is too long")
+        if payload["book_role"] == _DEMO_BOOK_ROLE:
+            if not _HEX64_RE.fullmatch(capsule_id) or not generation_id:
+                raise ValueError(f"reservation {reservation_id} lacks demo management authority")
+        elif bool(capsule_id) != bool(generation_id) or (capsule_id and not _HEX64_RE.fullmatch(capsule_id)):
+            raise ValueError(f"reservation {reservation_id} has an invalid management authority pair")
+        if not isinstance(payload["magic"], int) or isinstance(payload["magic"], bool) or payload["magic"] <= 0:
+            raise ValueError(f"reservation {reservation_id} has an invalid magic")
+        for name in ("entry_price", "volume", "initial_stop", "risk_cash"):
+            cls._finite_number(payload[name], name, positive=True)
+        order_ticket = payload["broker_order_ticket"]
+        if not isinstance(order_ticket, int) or isinstance(order_ticket, bool) or order_ticket < 0:
+            raise ValueError(f"reservation {reservation_id} has an invalid order ticket")
+        digest = payload.pop("reservation_sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"reservation {reservation_id} has an invalid digest")
+        if hashlib.sha256(_canonical_json_bytes(payload)).hexdigest() != digest:
+            raise ValueError(f"reservation {reservation_id} digest mismatch")
+        payload["reservation_sha256"] = digest
+        return payload
+
+    @classmethod
+    def _validate_entry_intent(cls, alias: str, raw: Any) -> Dict[str, Any]:
+        if not _INTENT_ALIAS_RE.fullmatch(alias) or not isinstance(raw, dict):
+            raise ValueError(f"invalid entry intent alias {alias}")
+        required = {
+            "position_id",
+            "opening_deal_ticket",
+            "opening_order_ticket",
+            "symbol",
+            "timeframe",
+            "regime",
+            "strategy_name",
+            "magic",
+            "entry_price",
+            "volume",
+            "initial_stop",
+            "risk_cash",
+            "book_role",
+            "candidate_id",
+            "recorded_at",
+        }
+        optional = {
+            "reservation_id",
+            "reserved_at",
+            "reserved_entry_price",
+            "reserved_volume",
+            "reserved_risk_cash",
+            "management_capsule_id",
+            "management_generation_id",
+        }
+        if not required.issubset(raw) or not set(raw).issubset(required | optional):
+            raise ValueError(f"entry intent {alias} has an invalid schema")
+        payload = dict(raw)
+        for name in ("symbol", "timeframe", "regime"):
+            value = cls._bounded_text(payload[name], name, required=True)
+            if payload[name] != value.upper():
+                raise ValueError(f"entry intent {alias} has non-canonical {name}")
+        strategy = cls._bounded_text(payload["strategy_name"], "strategy_name", required=True)
+        if payload["strategy_name"] != strategy:
+            raise ValueError(f"entry intent {alias} has non-canonical strategy_name")
+        role = cls._bounded_text(
+            payload["book_role"],
+            "book_role",
+            required=bool(payload.get("reservation_id")),
+        )
+        if payload["book_role"] != role.upper():
+            raise ValueError(f"entry intent {alias} has non-canonical book_role")
+        if payload["timeframe"] not in _TIMEFRAMES or payload["regime"] not in _REGIMES:
+            raise ValueError(f"entry intent {alias} has an unsupported cell")
+        if payload["book_role"] and payload["book_role"] not in _BOOK_ROLES:
+            raise ValueError(f"entry intent {alias} has an unsupported book_role")
+        for name in ("candidate_id", "recorded_at", "reserved_at"):
+            value = payload.get(name, "")
+            if value != cls._bounded_text(value, name):
+                raise ValueError(f"entry intent {alias} has non-canonical {name}")
+        for name in ("position_id", "opening_deal_ticket", "opening_order_ticket"):
+            value = payload[name]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"entry intent {alias} has an invalid {name}")
+        if not isinstance(payload["magic"], int) or isinstance(payload["magic"], bool) or payload["magic"] <= 0:
+            raise ValueError(f"entry intent {alias} has an invalid magic")
+        for name in ("entry_price", "volume", "initial_stop"):
+            cls._finite_number(payload[name], name, positive=True)
+        for name in ("risk_cash", "reserved_entry_price", "reserved_volume", "reserved_risk_cash"):
+            value = payload.get(name)
+            if value is not None:
+                cls._finite_number(value, name, positive=True)
+        reservation_id = payload.get("reservation_id", "")
+        if reservation_id and not _RESERVATION_ID_RE.fullmatch(str(reservation_id)):
+            raise ValueError(f"entry intent {alias} has an invalid reservation id")
+        capsule_id = cls._bounded_text(
+            payload.get("management_capsule_id", ""), "management_capsule_id"
+        )
+        generation_id = cls._bounded_text(
+            payload.get("management_generation_id", ""), "management_generation_id"
+        )
+        if payload.get("management_capsule_id", "") != capsule_id or payload.get(
+            "management_generation_id", ""
+        ) != generation_id:
+            raise ValueError(f"entry intent {alias} has non-canonical management authority")
+        if len(generation_id.encode("utf-8")) > 256:
+            raise ValueError(f"entry intent {alias} generation id is too long")
+        if payload["book_role"] == _DEMO_BOOK_ROLE:
+            if (
+                not reservation_id
+                or not _HEX64_RE.fullmatch(capsule_id)
+                or not generation_id
+            ):
+                raise ValueError(f"entry intent {alias} lacks demo management authority")
+        elif bool(capsule_id) != bool(generation_id) or (capsule_id and not _HEX64_RE.fullmatch(capsule_id)):
+            raise ValueError(f"entry intent {alias} has an invalid management authority pair")
+        return payload
+
+    @classmethod
+    def _validate_state_payload(cls, raw: Any) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError("state is not an object")
+        allowed = set(cls._empty_state())
+        if not set(raw).issubset(allowed):
+            raise ValueError("state has unknown fields")
+        schema = raw.get("schema_version")
+        if schema not in {STATE_SCHEMA_VERSION, LEGACY_STATE_SCHEMA_VERSION}:
+            raise ValueError("unsupported or missing state schema")
+        state = cls._empty_state()
+        state.update(raw)
+        state["schema_version"] = STATE_SCHEMA_VERSION
+        for name in ("seen_deal_tickets", "emitted_position_ids", "drift_delivered_position_ids"):
+            values = state[name]
+            if not isinstance(values, list) or len(values) > MAX_STATE_ID_VALUES:
+                raise ValueError(f"state field {name} is invalid or exceeds its bound")
+            if name == "seen_deal_tickets":
+                valid = all(
+                    isinstance(value, int) and not isinstance(value, bool) and value > 0
+                    for value in values
+                )
+            else:
+                valid = all(
+                    isinstance(value, str)
+                    and value.isdigit()
+                    and not value.startswith("0")
+                    for value in values
+                )
+            if not valid:
+                raise ValueError(f"state field {name} has invalid identifiers")
+            if len({str(value) for value in values}) != len(values):
+                raise ValueError(f"state field {name} contains duplicates")
+        for name in ("pending_positions", "entry_intents", "pre_send_reservations"):
+            if not isinstance(state[name], dict):
+                raise ValueError(f"state field {name} is not an object")
+        if len(state["pending_positions"]) > MAX_PENDING_POSITIONS:
+            raise ValueError("pending position bound exceeded")
+        exit_deal_count = 0
+        for position_key, pending in state["pending_positions"].items():
+            if not cls._position_key(position_key) or not isinstance(pending, dict):
+                raise ValueError("invalid pending position")
+            if set(pending) != {"exit_deals", "last_reason"}:
+                raise ValueError(f"pending position {position_key} has an invalid schema")
+            if not isinstance(pending["exit_deals"], dict):
+                raise ValueError(f"pending position {position_key} deals are invalid")
+            cls._bounded_text(pending["last_reason"], "last_reason")
+            exit_deal_count += len(pending["exit_deals"])
+        if exit_deal_count > MAX_PENDING_EXIT_DEALS:
+            raise ValueError("pending exit deal bound exceeded")
+        if len(state["entry_intents"]) > MAX_ENTRY_INTENT_ALIASES:
+            raise ValueError("entry intent alias bound exceeded")
+        state["entry_intents"] = {
+            alias: cls._validate_entry_intent(alias, payload)
+            for alias, payload in state["entry_intents"].items()
+        }
+        if len(state["pre_send_reservations"]) > MAX_ENTRY_RESERVATIONS:
+            raise ValueError("pre-send reservation bound exceeded")
+        state["pre_send_reservations"] = {
+            reservation_id: cls._validate_reservation(reservation_id, payload)
+            for reservation_id, payload in state["pre_send_reservations"].items()
+        }
+        pending_keys = [
+            (payload["symbol"], payload["magic"])
+            for payload in state["pre_send_reservations"].values()
+        ]
+        if len(set(pending_keys)) != len(pending_keys):
+            raise ValueError("duplicate pending symbol/magic reservation")
+        bound_by_reservation: Dict[str, bytes] = {}
+        for payload in state["entry_intents"].values():
+            reservation_id = str(payload.get("reservation_id", "") or "")
+            if not reservation_id:
+                continue
+            encoded = _canonical_json_bytes(payload)
+            previous = bound_by_reservation.setdefault(reservation_id, encoded)
+            if previous != encoded:
+                raise ValueError(f"conflicting bound aliases for reservation {reservation_id}")
+        cls._bounded_text(state.get("updated_at", ""), "updated_at")
+        return state
+
     def _load_state(self) -> None:
         if not self.state_path.exists():
             return
         try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict) or payload.get("schema_version") != STATE_SCHEMA_VERSION:
-                raise ValueError("unsupported or missing state schema")
-            for key in (
-                "seen_deal_tickets",
-                "emitted_position_ids",
-                "drift_delivered_position_ids",
+            initial_stat = self.state_path.stat()
+            if initial_stat.st_size > MAX_STATE_BYTES:
+                raise ValueError("state file exceeds its hard byte bound")
+            encoded = self.state_path.read_bytes()
+            if len(encoded) > MAX_STATE_BYTES:
+                raise ValueError("state file exceeds its hard byte bound")
+            final_stat = self.state_path.stat()
+            if (
+                final_stat.st_size != initial_stat.st_size
+                or final_stat.st_mtime_ns != initial_stat.st_mtime_ns
+                or final_stat.st_ino != initial_stat.st_ino
             ):
-                if not isinstance(payload.get(key, []), list):
-                    raise ValueError(f"state field {key} is not a list")
-            for key in ("pending_positions", "entry_intents"):
-                if not isinstance(payload.get(key, {}), dict):
-                    raise ValueError(f"state field {key} is not an object")
-            self._state = self._empty_state()
-            self._state.update(payload)
-        except Exception:
-            self._state_recovered = True
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            backup = self.state_path.with_name(f"{self.state_path.name}.corrupt.{stamp}")
-            try:
-                self.state_path.replace(backup)
-            except OSError:
-                # Recovery still proceeds from the append-only ledger.  Failure
-                # to quarantine the broken cache must not destroy that evidence.
-                pass
-            self._state = self._empty_state()
+                raise ValueError("state changed while it was being loaded")
+            raw = _strict_json_loads(encoded)
+            legacy = isinstance(raw, dict) and raw.get("schema_version") == LEGACY_STATE_SCHEMA_VERSION
+            self._state = self._validate_state_payload(raw)
+            self._state_disk_sha256 = hashlib.sha256(encoded).hexdigest()
+            self._state_recovered = legacy
+        except Exception as exc:
+            raise LiveOutcomeError(
+                f"live outcome state is corrupt; reservations are fail-closed: {self.state_path}: {exc}"
+            ) from exc
 
     def _load_ledger_index(self) -> None:
         if not self.ledger_path.exists():
             return
         try:
-            with self.ledger_path.open("r", encoding="utf-8") as handle:
-                for line_number, raw_line in enumerate(handle, start=1):
+            initial_stat = self.ledger_path.stat()
+            size = initial_stat.st_size
+            if size > MAX_LEDGER_BYTES:
+                raise ValueError("ledger exceeds its hard byte bound")
+            with self.ledger_path.open("rb") as handle:
+                line_number = 0
+                while True:
+                    raw_line = handle.readline(MAX_LEDGER_RECORD_BYTES + 2)
+                    if not raw_line:
+                        break
+                    line_number += 1
+                    if len(raw_line) > MAX_LEDGER_RECORD_BYTES + 1 or not raw_line.endswith(b"\n"):
+                        raise ValueError(f"line {line_number} exceeds its bound or is truncated")
                     line = raw_line.strip()
                     if not line:
                         continue
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError(f"line {line_number} is not an object")
-                    if record.get("schema_version") != LEDGER_SCHEMA_VERSION:
-                        raise ValueError(f"line {line_number} has an unsupported schema")
+                    record = _strict_json_loads(line)
+                    record = self._validate_ledger_record(record)
                     position_key = self._position_key(record.get("position_id"))
                     if not position_key:
                         raise ValueError(f"line {line_number} has no position_id")
                     if position_key in self._ledger_records:
                         raise ValueError(f"duplicate position {position_key} in append-only ledger")
+                    if len(self._ledger_records) >= min(MAX_LEDGER_RECORDS, MAX_LEDGER_INDEX_RECORDS):
+                        raise ValueError("ledger record/index bound exceeded")
                     self._ledger_records[position_key] = record
+            final_stat = self.ledger_path.stat()
+            if (
+                final_stat.st_size != initial_stat.st_size
+                or final_stat.st_mtime_ns != initial_stat.st_mtime_ns
+                or final_stat.st_ino != initial_stat.st_ino
+            ):
+                raise ValueError("ledger changed while it was being loaded")
+            self._ledger_disk_size = size
+            self._ledger_record_count = len(self._ledger_records)
         except Exception as exc:
             raise LiveOutcomeError(
                 f"live outcome ledger is corrupt; feedback is fail-closed: {self.ledger_path}: {exc}"
@@ -270,19 +807,29 @@ class LiveOutcomeLedger:
 
     def _merge_ledger_index_into_state(self) -> None:
         emitted = {str(value) for value in self._state.get("emitted_position_ids", [])}
-        seen = {_safe_int(value) for value in self._state.get("seen_deal_tickets", []) if _safe_int(value) > 0}
         for position_key, record in self._ledger_records.items():
             emitted.add(position_key)
-            for field_name in ("opening_deal_tickets", "closing_deal_tickets"):
-                for ticket in record.get(field_name, []) or []:
-                    numeric = _safe_int(ticket)
-                    if numeric > 0:
-                        seen.add(numeric)
         self._state["emitted_position_ids"] = sorted(emitted, key=int)
-        self._state["seen_deal_tickets"] = sorted(seen)
         pending = self._state.get("pending_positions", {})
         for position_key in emitted:
             pending.pop(position_key, None)
+        self._remove_closed_intent_aliases()
+
+    def _remove_closed_intent_aliases(self) -> None:
+        intents = self._state.get("entry_intents", {})
+        for position_key, record in self._ledger_records.items():
+            aliases = {f"position:{position_key}"}
+            for field_name, prefix in (
+                ("opening_deal_tickets", "deal"),
+                ("opening_order_tickets", "order"),
+            ):
+                aliases.update(
+                    f"{prefix}:{ticket}"
+                    for ticket in record.get(field_name, []) or []
+                    if _safe_int(ticket) > 0
+                )
+            for alias in aliases:
+                intents.pop(alias, None)
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,13 +839,29 @@ class LiveOutcomeLedger:
         temp_path = self.state_path.with_name(
             f".{self.state_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
         )
-        encoded = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        validated = self._validate_state_payload(payload)
+        encoded = _canonical_json_bytes(validated)
+        if len(encoded) > MAX_STATE_BYTES:
+            raise LiveOutcomeError("live outcome state byte bound exhausted")
+        current: Optional[bytes] = None
+        if self.state_path.exists():
+            if self.state_path.stat().st_size > MAX_STATE_BYTES:
+                raise LiveOutcomeError("live outcome state changed or exceeds its bound")
+            current = self.state_path.read_bytes()
+        current_sha = hashlib.sha256(current).hexdigest() if current is not None else None
+        if current_sha != self._state_disk_sha256:
+            raise LiveOutcomeError("live outcome state changed concurrently; write blocked")
         try:
             with temp_path.open("wb") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.state_path)
+            persisted = self.state_path.read_bytes()
+            if persisted != encoded:
+                raise LiveOutcomeError("live outcome state post-write verification failed")
+            self._state = validated
+            self._state_disk_sha256 = hashlib.sha256(persisted).hexdigest()
         finally:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -307,12 +870,26 @@ class LiveOutcomeLedger:
 
     def _append_record(self, record: Dict[str, Any]) -> None:
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = (json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+        record = self._validate_ledger_record(record)
+        encoded = _canonical_json_bytes(record) + b"\n"
+        if self._validate_ledger_record(_strict_json_loads(encoded)) != record:
+            raise LiveOutcomeError("live outcome ledger record reparse mismatch")
+        if len(encoded) > MAX_LEDGER_RECORD_BYTES:
+            raise LiveOutcomeError("live outcome ledger record byte bound exhausted")
+        if self._ledger_record_count >= min(MAX_LEDGER_RECORDS, MAX_LEDGER_INDEX_RECORDS):
+            raise LiveOutcomeError("live outcome ledger record/index bound exhausted")
+        disk_size = self.ledger_path.stat().st_size if self.ledger_path.exists() else 0
+        if disk_size != self._ledger_disk_size:
+            raise LiveOutcomeError("live outcome ledger changed concurrently; append blocked")
+        if disk_size + len(encoded) > MAX_LEDGER_BYTES:
+            raise LiveOutcomeError("live outcome ledger byte bound exhausted")
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
         descriptor = os.open(str(self.ledger_path), flags, 0o600)
         try:
+            if os.fstat(descriptor).st_size != self._ledger_disk_size:
+                raise LiveOutcomeError("live outcome ledger changed during append")
             view = memoryview(encoded)
             while view:
                 written = os.write(descriptor, view)
@@ -320,6 +897,11 @@ class LiveOutcomeLedger:
                     raise OSError("zero-byte append to live outcome ledger")
                 view = view[written:]
             os.fsync(descriptor)
+            expected_size = self._ledger_disk_size + len(encoded)
+            if os.fstat(descriptor).st_size != expected_size:
+                raise LiveOutcomeError("live outcome ledger append verification failed")
+            self._ledger_disk_size = expected_size
+            self._ledger_record_count += 1
         finally:
             os.close(descriptor)
 
@@ -361,6 +943,371 @@ class LiveOutcomeLedger:
             "comment": str(order.get("comment", "") or ""),
             "type": order.get("type"),
         }
+
+    @staticmethod
+    def _reservation_digest(payload: Mapping[str, Any]) -> str:
+        unsigned = {key: value for key, value in payload.items() if key != "reservation_sha256"}
+        return hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+
+    def new_entry_reservation_block_reason(self) -> str:
+        """Return why new entries are blocked without affecting management."""
+        with self._lock:
+            reservations = self._state.get("pre_send_reservations", {})
+            intents = self._state.get("entry_intents", {})
+            if len(reservations) >= MAX_ENTRY_RESERVATIONS:
+                return "pre-send reservation bound exhausted"
+            if len(intents) > MAX_ENTRY_INTENT_ALIASES - 3:
+                return "entry intent alias bound cannot accept a filled reservation"
+            try:
+                size = len(_canonical_json_bytes(self._state))
+            except (TypeError, ValueError):
+                return "live outcome state is not serializable"
+            if size >= MAX_STATE_BYTES:
+                return "live outcome state byte bound exhausted"
+            return ""
+
+    def unresolved_pre_send_intents(self) -> List[Dict[str, Any]]:
+        """Return isolated copies of reservations requiring reconciliation."""
+        with self._lock:
+            reservations = self._state.get("pre_send_reservations", {})
+            return [deepcopy(reservations[key]) for key in sorted(reservations)]
+
+    def ambiguous_pre_send_intent(self, symbol: str, magic: int) -> Optional[Dict[str, Any]]:
+        """Resolve only an explicitly ambiguous pending send by symbol and magic."""
+        symbol_value = self._bounded_text(symbol, "symbol", required=True).upper()
+        if isinstance(magic, bool) or not isinstance(magic, int) or magic <= 0:
+            raise ValueError("magic must be a positive integer")
+        with self._lock:
+            matches = [
+                payload
+                for payload in self._state.get("pre_send_reservations", {}).values()
+                if payload.get("status") == "AMBIGUOUS"
+                and payload.get("symbol") == symbol_value
+                and payload.get("magic") == magic
+            ]
+            if len(matches) > 1:
+                raise LiveOutcomeError(
+                    f"multiple ambiguous reservations for {symbol_value} magic {magic}"
+                )
+            return deepcopy(matches[0]) if matches else None
+
+    def lookup_bound_entry_intent(
+        self,
+        *,
+        position_id: int = 0,
+        opening_deal_ticket: int = 0,
+        opening_order_ticket: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """Lookup one exact durable binding by broker identifiers."""
+        values = (
+            ("position", position_id),
+            ("deal", opening_deal_ticket),
+            ("order", opening_order_ticket),
+        )
+        for name, value in values:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} identifier must be a non-negative integer")
+        keys = [f"{name}:{value}" for name, value in values if value > 0]
+        if not keys:
+            raise ValueError("lookup requires a position, deal, or order ticket")
+        with self._lock:
+            intents = self._state.get("entry_intents", {})
+            matches = [intents[key] for key in keys if key in intents]
+            if not matches:
+                return None
+            canonical = matches[0]
+            if any(match != canonical for match in matches[1:]):
+                raise LiveOutcomeError("broker identifiers map to conflicting entry intents")
+            return deepcopy(canonical)
+
+    def reserve_pre_send_intent(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        strategy_name: str,
+        magic: int,
+        entry_price: float,
+        volume: float,
+        initial_stop: float,
+        risk_cash: float,
+        book_role: str,
+        candidate_id: str = "",
+        management_capsule_id: str = "",
+        management_generation_id: str = "",
+        reservation_id: str = "",
+        reserved_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Fsync exact order attribution before any broker send."""
+        if not self.enabled:
+            raise LiveOutcomeError("live outcome feedback is disabled")
+        identifier = reservation_id.strip() if isinstance(reservation_id, str) else ""
+        if not identifier:
+            identifier = uuid.uuid4().hex
+        if not _RESERVATION_ID_RE.fullmatch(identifier):
+            raise ValueError("reservation_id must be 32 lowercase hexadecimal characters")
+        symbol_value = self._bounded_text(symbol, "symbol", required=True).upper()
+        timeframe_value = self._bounded_text(timeframe, "timeframe", required=True).upper()
+        regime_value = self._bounded_text(regime, "regime", required=True).upper()
+        strategy_value = self._bounded_text(strategy_name, "strategy_name", required=True)
+        role_value = self._bounded_text(book_role, "book_role", required=True).upper()
+        candidate_value = self._bounded_text(candidate_id, "candidate_id")
+        capsule_value = self._bounded_text(management_capsule_id, "management_capsule_id")
+        generation_value = self._bounded_text(
+            management_generation_id, "management_generation_id"
+        )
+        if isinstance(magic, bool) or not isinstance(magic, int) or magic <= 0:
+            raise ValueError("magic must be a positive integer")
+        payload: Dict[str, Any] = {
+            "schema_version": RESERVATION_SCHEMA_VERSION,
+            "reservation_id": identifier,
+            "status": "RESERVED",
+            "symbol": symbol_value,
+            "timeframe": timeframe_value,
+            "regime": regime_value,
+            "strategy_name": strategy_value,
+            "magic": magic,
+            "entry_price": self._finite_number(entry_price, "entry_price", positive=True),
+            "volume": self._finite_number(volume, "volume", positive=True),
+            "initial_stop": self._finite_number(initial_stop, "initial_stop", positive=True),
+            "risk_cash": self._finite_number(risk_cash, "risk_cash", positive=True),
+            "book_role": role_value,
+            "candidate_id": candidate_value,
+            "management_capsule_id": capsule_value,
+            "management_generation_id": generation_value,
+            "reserved_at": _iso_utc(reserved_at or datetime.now(timezone.utc)),
+            "ambiguity_reason": "",
+            "observed_at": "",
+            "broker_order_ticket": 0,
+        }
+        payload["reservation_sha256"] = self._reservation_digest(payload)
+        payload = self._validate_reservation(identifier, payload)
+        with self._lock:
+            reservations = self._state.setdefault("pre_send_reservations", {})
+            existing = reservations.get(identifier)
+            if existing is not None:
+                if existing != payload:
+                    raise LiveOutcomeError(f"conflicting pre-send reservation {identifier}")
+                return deepcopy(existing)
+            reason = self.new_entry_reservation_block_reason()
+            if reason:
+                raise LiveOutcomeError(reason)
+            for other in reservations.values():
+                if other.get("symbol") == symbol_value and other.get("magic") == magic:
+                    raise LiveOutcomeError(
+                        f"unresolved reservation already exists for {symbol_value} magic {magic}"
+                    )
+            previous = deepcopy(self._state)
+            reservations[identifier] = payload
+            try:
+                self._save_state()
+            except Exception:
+                self._state = previous
+                raise
+            return deepcopy(payload)
+
+    def retain_ambiguous_pre_send_intent(
+        self,
+        reservation_id: str,
+        *,
+        reason: str,
+        broker_order_ticket: int = 0,
+        observed_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Retain an uncertain send for restart reconciliation."""
+        reason_value = self._bounded_text(reason, "reason", required=True)
+        if (
+            isinstance(broker_order_ticket, bool)
+            or not isinstance(broker_order_ticket, int)
+            or broker_order_ticket < 0
+        ):
+            raise ValueError("broker_order_ticket must be a non-negative integer")
+        with self._lock:
+            reservations = self._state.setdefault("pre_send_reservations", {})
+            if reservation_id not in reservations:
+                raise LiveOutcomeError(f"unknown pre-send reservation {reservation_id}")
+            previous = deepcopy(self._state)
+            payload = dict(reservations[reservation_id])
+            payload.update(
+                {
+                    "status": "AMBIGUOUS",
+                    "ambiguity_reason": reason_value,
+                    "observed_at": _iso_utc(observed_at or datetime.now(timezone.utc)),
+                    "broker_order_ticket": broker_order_ticket,
+                }
+            )
+            payload["reservation_sha256"] = self._reservation_digest(payload)
+            reservations[reservation_id] = self._validate_reservation(reservation_id, payload)
+            try:
+                self._save_state()
+            except Exception:
+                self._state = previous
+                raise
+            return deepcopy(reservations[reservation_id])
+
+    def cancel_pre_send_intent(
+        self,
+        reservation_id: str,
+        *,
+        definitive_no_fill: bool,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Cancel only after the broker proves no fill occurred."""
+        if definitive_no_fill is not True:
+            raise LiveOutcomeError("non-definitive outcome must retain its reservation")
+        self._bounded_text(reason, "reason", required=True)
+        with self._lock:
+            reservations = self._state.setdefault("pre_send_reservations", {})
+            if reservation_id not in reservations:
+                raise LiveOutcomeError(f"unknown pre-send reservation {reservation_id}")
+            previous = deepcopy(self._state)
+            removed = deepcopy(reservations.pop(reservation_id))
+            try:
+                self._save_state()
+            except Exception:
+                self._state = previous
+                raise
+            return removed
+
+    def bind_pre_send_intent(
+        self,
+        reservation_id: str,
+        *,
+        position_id: int = 0,
+        opening_deal_ticket: int = 0,
+        opening_order_ticket: int = 0,
+        fill_price: Optional[float] = None,
+        fill_volume: Optional[float] = None,
+        risk_cash: Optional[float] = None,
+        recorded_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Atomically bind a durable reservation to broker fill identifiers."""
+        identifiers = {
+            "position_id": position_id,
+            "opening_deal_ticket": opening_deal_ticket,
+            "opening_order_ticket": opening_order_ticket,
+        }
+        for name, value in identifiers.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        keys = [
+            f"{prefix}:{value}"
+            for prefix, value in (
+                ("position", position_id),
+                ("deal", opening_deal_ticket),
+                ("order", opening_order_ticket),
+            )
+            if value > 0
+        ]
+        if not keys:
+            raise ValueError("binding requires a position, deal, or order ticket")
+        with self._lock:
+            reservations = self._state.setdefault("pre_send_reservations", {})
+            reservation = reservations.get(reservation_id)
+            intents = self._state.setdefault("entry_intents", {})
+            if reservation is None:
+                bound_aliases = {
+                    alias: payload
+                    for alias, payload in intents.items()
+                    if payload.get("reservation_id") == reservation_id
+                }
+                canonical = {
+                    _canonical_json_bytes(payload): payload for payload in bound_aliases.values()
+                }
+                if len(canonical) != 1:
+                    raise LiveOutcomeError(f"unknown or conflicting reservation {reservation_id}")
+                existing = next(iter(canonical.values()))
+                if any(
+                    value > 0 and int(existing.get(name, 0)) not in {0, value}
+                    for name, value in identifiers.items()
+                ):
+                    raise LiveOutcomeError(f"conflicting broker binding for {reservation_id}")
+                for supplied, name in (
+                    (fill_price, "entry_price"),
+                    (fill_volume, "volume"),
+                    (risk_cash, "risk_cash"),
+                ):
+                    if supplied is not None and self._finite_number(
+                        supplied, name, positive=True
+                    ) != float(existing[name]):
+                        raise LiveOutcomeError(f"conflicting filled {name} for {reservation_id}")
+                merged = dict(existing)
+                for name, value in identifiers.items():
+                    if value > 0:
+                        merged[name] = value
+                all_keys = set(bound_aliases) | set(keys)
+                for key in all_keys:
+                    self._validate_entry_intent(key, merged)
+                    other = intents.get(key)
+                    if other is not None and other != existing:
+                        raise LiveOutcomeError(f"conflicting durable entry intent for {key}")
+                if len(intents) + sum(key not in intents for key in all_keys) > MAX_ENTRY_INTENT_ALIASES:
+                    raise LiveOutcomeError("entry intent alias bound exhausted")
+                previous = deepcopy(self._state)
+                for key in all_keys:
+                    intents[key] = merged
+                try:
+                    self._save_state()
+                except Exception:
+                    self._state = previous
+                    raise
+                return deepcopy(merged)
+            planned_price = float(reservation["entry_price"])
+            planned_volume = float(reservation["volume"])
+            planned_risk = float(reservation["risk_cash"])
+            payload = {
+                **identifiers,
+                "symbol": reservation["symbol"],
+                "timeframe": reservation["timeframe"],
+                "regime": reservation["regime"],
+                "strategy_name": reservation["strategy_name"],
+                "magic": reservation["magic"],
+                "entry_price": self._finite_number(
+                    planned_price if fill_price is None else fill_price,
+                    "fill_price",
+                    positive=True,
+                ),
+                "volume": self._finite_number(
+                    planned_volume if fill_volume is None else fill_volume,
+                    "fill_volume",
+                    positive=True,
+                ),
+                "initial_stop": reservation["initial_stop"],
+                "risk_cash": self._finite_number(
+                    planned_risk if risk_cash is None else risk_cash,
+                    "risk_cash",
+                    positive=True,
+                ),
+                "book_role": reservation["book_role"],
+                "candidate_id": reservation["candidate_id"],
+                "management_capsule_id": reservation["management_capsule_id"],
+                "management_generation_id": reservation["management_generation_id"],
+                "recorded_at": _iso_utc(recorded_at or datetime.now(timezone.utc)),
+                "reservation_id": reservation_id,
+                "reserved_at": reservation["reserved_at"],
+                "reserved_entry_price": planned_price,
+                "reserved_volume": planned_volume,
+                "reserved_risk_cash": planned_risk,
+            }
+            for key in keys:
+                self._validate_entry_intent(key, payload)
+                existing = intents.get(key)
+                if existing is not None and existing != payload:
+                    raise LiveOutcomeError(f"conflicting durable entry intent for {key}")
+            new_alias_count = sum(1 for key in keys if key not in intents)
+            if len(intents) + new_alias_count > MAX_ENTRY_INTENT_ALIASES:
+                raise LiveOutcomeError("entry intent alias bound exhausted; reservation retained")
+            previous = deepcopy(self._state)
+            for key in keys:
+                intents[key] = payload
+            reservations.pop(reservation_id)
+            try:
+                self._save_state()
+            except Exception:
+                self._state = previous
+                raise
+            return deepcopy(payload)
 
     def record_entry_intent(
         self,
@@ -418,11 +1365,21 @@ class LiveOutcomeLedger:
         with self._lock:
             intents = self._state.setdefault("entry_intents", {})
             for key in keys:
+                self._validate_entry_intent(key, payload)
                 existing = intents.get(key)
                 if existing is not None and existing != payload:
                     raise LiveOutcomeError(f"conflicting durable entry intent for {key}")
+            new_alias_count = sum(1 for key in keys if key not in intents)
+            if len(intents) + new_alias_count > MAX_ENTRY_INTENT_ALIASES:
+                raise LiveOutcomeError("entry intent alias bound exhausted")
+            previous = deepcopy(self._state)
+            for key in keys:
                 intents[key] = payload
-            self._save_state()
+            try:
+                self._save_state()
+            except Exception:
+                self._state = previous
+                raise
 
     def _find_entry_intent(
         self,
@@ -613,6 +1570,17 @@ class LiveOutcomeLedger:
             "entry_comment": entry_comment,
             "entry_magic": entry_magic,
             "entry_metadata": decoded,
+            "entry_reservation_id": str((intent or {}).get("reservation_id", "") or ""),
+            "management_capsule_id": str(
+                (intent or {}).get("management_capsule_id", "") or ""
+            ),
+            "management_generation_id": str(
+                (intent or {}).get("management_generation_id", "") or ""
+            ),
+            "reserved_at": str((intent or {}).get("reserved_at", "") or ""),
+            "reserved_entry_price": (intent or {}).get("reserved_entry_price"),
+            "reserved_volume": (intent or {}).get("reserved_volume"),
+            "reserved_risk_cash": (intent or {}).get("reserved_risk_cash"),
             "initial_stop": initial_stop if initial_stop > 0.0 else None,
             "initial_risk_cash": risk_cash if risk_cash > 0.0 else None,
             "initial_risk_source": risk_source or None,
@@ -678,6 +1646,11 @@ class LiveOutcomeLedger:
             seen = {_safe_int(value) for value in self._state.get("seen_deal_tickets", []) if _safe_int(value) > 0}
             emitted = {str(value) for value in self._state.get("emitted_position_ids", [])}
             pending_positions = self._state.setdefault("pending_positions", {})
+            pending_exit_count = sum(
+                len((pending.get("exit_deals", {}) or {}))
+                for pending in pending_positions.values()
+                if isinstance(pending, dict)
+            )
             for raw in closing_deals or []:
                 if not isinstance(raw, Mapping):
                     continue
@@ -687,15 +1660,29 @@ class LiveOutcomeLedger:
                 if ticket <= 0 or not position_key or deal["entry_kind"] not in {"OUT", "OUT_BY"}:
                     result.fail_closed_reasons.append("ignored malformed/non-exit closing deal")
                     continue
+                if position_key in emitted:
+                    result.duplicate_deal_count += 1
+                    continue
                 if ticket in seen:
                     result.duplicate_deal_count += 1
                     continue
+                if position_key not in pending_positions and len(pending_positions) >= MAX_PENDING_POSITIONS:
+                    result.fail_closed_reasons.append(
+                        f"position {position_key}: pending position bound exhausted"
+                    )
+                    continue
+                if pending_exit_count >= MAX_PENDING_EXIT_DEALS or len(seen) >= MAX_PENDING_EXIT_DEALS:
+                    result.fail_closed_reasons.append(
+                        f"position {position_key}: pending exit evidence bound exhausted"
+                    )
+                    continue
                 seen.add(ticket)
                 result.ingested_deal_count += 1
-                if position_key in emitted:
-                    continue
                 pending = pending_positions.setdefault(position_key, {"exit_deals": {}, "last_reason": ""})
-                pending.setdefault("exit_deals", {})[str(ticket)] = deal
+                exit_deals = pending.setdefault("exit_deals", {})
+                if str(ticket) not in exit_deals:
+                    pending_exit_count += 1
+                exit_deals[str(ticket)] = deal
             self._state["seen_deal_tickets"] = sorted(seen)
             self._save_state()
 
@@ -744,8 +1731,17 @@ class LiveOutcomeLedger:
                     self._ledger_records[position_key] = record
                     emitted.add(position_key)
                     pending_positions.pop(position_key, None)
+                    closed_tickets = {
+                        _safe_int(ticket)
+                        for field_name in ("opening_deal_tickets", "closing_deal_tickets")
+                        for ticket in record.get(field_name, []) or []
+                        if _safe_int(ticket) > 0
+                    }
+                    seen.difference_update(closed_tickets)
+                    self._state["seen_deal_tickets"] = sorted(seen)
                     result.emitted_records.append(record)
                     self._state["emitted_position_ids"] = sorted(emitted, key=int)
+                    self._remove_closed_intent_aliases()
                     self._save_state()
 
             try:

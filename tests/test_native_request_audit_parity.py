@@ -10,20 +10,12 @@ from tools.acquire_native_history import (
     NativeHistoryStore,
 )
 from tools.audit_activate_native_history import _v5_request_errors
+from tests.native_v5_support import SOURCE_ENVIRONMENT
 
 
 class _MetadataOnlyConnector:
     def get_runtime_metadata(self):
-        return {
-            "metadata_status": "available",
-            "terminal": {"name": "MetaTrader 5", "build": 5432, "max_bars": 10000},
-            "account": {
-                "login": 123456,
-                "server": "MockBroker-ReadOnly",
-                "company": "Mock Broker",
-                "currency": "USD",
-            },
-        }
+        return SOURCE_ENVIRONMENT
 
 
 def _generated_v5_request(tmp_path, as_of: datetime):
@@ -57,9 +49,10 @@ def test_generated_v5_contract_passes_offline_request_validator(tmp_path):
     )
 
     assert request["common_as_of_utc"] == "2026-07-12T21:45:00Z"
-    assert request["timeframe_strategy_evidence_intervals"]["M30"][
-        "end_exclusive_utc"
-    ] == "2026-07-12T21:30:00Z"
+    assert (
+        request["timeframe_strategy_evidence_intervals"]["M30"]["end_exclusive_utc"]
+        == "2026-07-12T21:30:00Z"
+    )
     assert _v5_request_errors(request, DEFAULT_TIMEFRAMES) == []
 
 

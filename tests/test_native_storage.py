@@ -2,10 +2,13 @@ import json
 import shutil
 import io
 import hashlib
+import multiprocessing
+import os
 import tarfile
 from pathlib import Path
 
 import pytest
+import pm_native_storage as storage
 
 from pm_native_storage import (
     PIN_SCHEMA,
@@ -13,13 +16,27 @@ from pm_native_storage import (
     NativeStorageIntegrityError,
     NativeStoragePolicy,
     NativeStorageProtectedError,
+    admit_native_run,
     build_protection_graph,
     create_lossless_archive,
     preflight_growth,
+    reconcile_native_storage,
+    retire_complete_native_runs,
+    retire_native_run,
     restore_lossless_archive,
     sha256_file,
     verify_lossless_archive,
 )
+
+
+def _retire_process(native: str, cold: str, queue) -> None:
+    try:
+        result = retire_native_run(
+            Path(native), Path(cold), "race-run", policy=_archive_policy()
+        )
+        queue.put(("ok", result is not None))
+    except Exception as exc:  # pragma: no cover - failure is asserted in parent
+        queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
 def _write_json(path: Path, value) -> Path:
@@ -155,6 +172,21 @@ def _archive_policy() -> NativeStoragePolicy:
         max_complete_hot_runs=10,
         max_inflight_runs=2,
     )
+
+
+def _minimal_run(native: Path, run_id: str, payload: bytes = b"exact-native-bytes") -> Path:
+    run = native / "runs" / run_id
+    bars = _write_file(run / "EURUSD" / "M5" / "bars.csv", payload)
+    _write_json(
+        run / "run_manifest.json",
+        {
+            "run_id": run_id,
+            "complete": True,
+            "bars_relative_path": f"runs/{run_id}/EURUSD/M5/bars.csv",
+            "bars_sha256": sha256_file(bars),
+        },
+    )
+    return run
 
 
 def test_protection_graph_covers_active_terms_pins_and_inflight(tmp_path):
@@ -377,3 +409,306 @@ def test_archive_verifier_rejects_links_devices_and_traversal(
         tar.addfile(member, io.BytesIO(payload) if member_type == tarfile.REGTYPE else None)
     with pytest.raises(NativeStorageIntegrityError):
         verify_lossless_archive(archive)
+
+
+def test_scandir_consumes_only_cap_plus_one_with_poison_iterator(tmp_path, monkeypatch):
+    root = tmp_path / "bounded"
+    root.mkdir()
+    for index in range(3):
+        _write_file(root / f"{index}.txt", b"x")
+
+    real_scandir = storage.os.scandir
+    observations = {"next": 0, "closed": False}
+
+    class PoisonScanner:
+        def __init__(self, path):
+            self._scanner = real_scandir(path)
+
+        def __enter__(self):
+            self._scanner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            observations["closed"] = True
+            return self._scanner.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            observations["next"] += 1
+            if observations["next"] > 3:
+                raise AssertionError("iterator consumed beyond cap+1")
+            return next(self._scanner)
+
+    monkeypatch.setattr(storage.os, "scandir", PoisonScanner)
+    with pytest.raises(NativeStorageBoundError, match="directory entry cap"):
+        storage.tree_bytes(root, max_directory_entries=2)
+    assert observations == {"next": 3, "closed": True}
+
+
+def test_duplicate_key_json_is_rejected_before_lifecycle_decision(tmp_path):
+    native = tmp_path / "native"
+    run = native / "runs" / "duplicate-run"
+    run.mkdir(parents=True)
+    (run / "run_manifest.json").write_bytes(
+        b'{"run_id":"duplicate-run","complete":true,"complete":false}'
+    )
+    cold = tmp_path / "cold"
+    with pytest.raises(NativeStorageIntegrityError, match="duplicate keys"):
+        preflight_growth(
+            native,
+            cold,
+            expected_growth_bytes=1,
+            policy=_archive_policy(),
+            filesystem_free_bytes=10_000,
+        )
+
+
+def test_retirement_is_journalled_verified_and_exactly_restorable(tmp_path):
+    native, cold = tmp_path / "native", tmp_path / "cold"
+    run = _minimal_run(native, "retire-run", b"\x00\xffexact\r\nbytes")
+    expected = {
+        path.relative_to(run).as_posix(): path.read_bytes()
+        for path in run.rglob("*")
+        if path.is_file()
+    }
+
+    result = retire_native_run(
+        native, cold, "retire-run", policy=_archive_policy()
+    )
+    assert result is not None
+    assert not run.exists()
+    transaction_id = result["transaction_id"]
+    assert (cold / "transactions" / "intents" / f"{transaction_id}.json").is_file()
+    assert (cold / "transactions" / "completed" / f"{transaction_id}.json").is_file()
+
+    restored = restore_lossless_archive(
+        native, cold, result["object_id"], policy=_archive_policy()
+    )
+    assert restored["restored_files"] == len(expected)
+    assert {
+        path.relative_to(run).as_posix(): path.read_bytes()
+        for path in run.rglob("*")
+        if path.is_file()
+    } == expected
+    assert reconcile_native_storage(native, cold, policy=_archive_policy())
+
+
+def test_explicit_retirement_refuses_active_pinned_and_inflight_runs(tmp_path):
+    native, _old, _unfinished, _orphan, _snapshot = _fixture(tmp_path)
+    cold = tmp_path / "cold"
+    with pytest.raises(NativeStorageProtectedError, match="active, pinned or inflight"):
+        retire_native_run(native, cold, "active-run", policy=_archive_policy())
+    with pytest.raises(NativeStorageProtectedError, match="active, pinned or inflight"):
+        retire_native_run(native, cold, "writing-run", policy=_archive_policy())
+
+    pinned = _minimal_run(native, "pinned-run")
+    manifest = pinned / "run_manifest.json"
+    _write_json(
+        native / "PINS" / "pinned-run.json",
+        {
+            "schema_version": PIN_SCHEMA,
+            "pin_id": "pinned-run",
+            "roots": [
+                {
+                    "relative_path": "runs/pinned-run/run_manifest.json",
+                    "sha256": sha256_file(manifest),
+                }
+            ],
+        },
+    )
+    with pytest.raises(NativeStorageProtectedError, match="active, pinned or inflight"):
+        retire_native_run(native, cold, "pinned-run", policy=_archive_policy())
+
+
+def test_retirement_refuses_hardlinked_and_symlinked_candidate_bytes(tmp_path):
+    native, cold = tmp_path / "native", tmp_path / "cold"
+    hard_run = _minimal_run(native, "hard-run")
+    bars = hard_run / "EURUSD" / "M5" / "bars.csv"
+    try:
+        os.link(bars, tmp_path / "outside-hardlink")
+    except OSError:
+        pytest.skip("filesystem does not support hard links")
+    with pytest.raises(NativeStorageIntegrityError, match="hard-linked"):
+        retire_native_run(native, cold, "hard-run", policy=_archive_policy())
+
+    bars.unlink()
+    _write_file(bars, b"replacement")
+    symlink_run = _minimal_run(native, "symlink-run")
+    linked = symlink_run / "EURUSD" / "M5" / "linked.csv"
+    try:
+        linked.symlink_to(tmp_path / "outside-hardlink")
+    except OSError:
+        pytest.skip("filesystem does not permit symlink creation")
+    with pytest.raises(NativeStorageIntegrityError, match="links/reparse"):
+        retire_native_run(native, cold, "symlink-run", policy=_archive_policy())
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    [
+        "archive_verified",
+        "intent_published",
+        "hot_renamed",
+        "before_stage_cleanup",
+        "stage_file_unlinked",
+        "stage_cleanup_complete",
+        "completion_published",
+    ],
+)
+def test_restart_reconciliation_never_loses_both_copies(tmp_path, crash_point):
+    native, cold = tmp_path / "native", tmp_path / "cold"
+    run = _minimal_run(native, "crash-run", b"crash-safe-exact")
+
+    def inject(point):
+        if point == crash_point:
+            raise RuntimeError(f"crash at {point}")
+
+    with pytest.raises(RuntimeError, match="crash at"):
+        retire_native_run(
+            native,
+            cold,
+            "crash-run",
+            policy=_archive_policy(),
+            crash_injector=inject,
+        )
+
+    if crash_point == "archive_verified":
+        assert run.is_dir()
+        assert reconcile_native_storage(native, cold, policy=_archive_policy()) == ()
+    else:
+        reconciled = reconcile_native_storage(native, cold, policy=_archive_policy())
+        assert reconciled
+        assert not run.exists()
+    indexes = list((cold / "indexes").glob("*.json"))
+    assert len(indexes) == 1
+    index = json.loads(indexes[0].read_text(encoding="utf-8"))
+    verify_lossless_archive(
+        cold / index["archive_relative_path"],
+        expected_sha256=index["archive_sha256"],
+    )
+
+
+def test_tampered_archive_before_cleanup_preserves_or_restores_hot(tmp_path):
+    native, cold = tmp_path / "native", tmp_path / "cold"
+    run = _minimal_run(native, "tamper-run", b"must-survive")
+
+    def inject(point):
+        if point == "hot_renamed":
+            raise RuntimeError("crash")
+
+    with pytest.raises(RuntimeError):
+        retire_native_run(
+            native,
+            cold,
+            "tamper-run",
+            policy=_archive_policy(),
+            crash_injector=inject,
+        )
+    index_path = next((cold / "indexes").glob("*.json"))
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    archive = cold / index["archive_relative_path"]
+    payload = bytearray(archive.read_bytes())
+    payload[len(payload) // 2] ^= 1
+    archive.write_bytes(payload)
+
+    with pytest.raises(NativeStorageIntegrityError, match="restored hot"):
+        reconcile_native_storage(native, cold, policy=_archive_policy())
+    assert (run / "EURUSD" / "M5" / "bars.csv").read_bytes() == b"must-survive"
+
+
+def test_two_process_retirement_has_exactly_one_winner(tmp_path):
+    native, cold = tmp_path / "native", tmp_path / "cold"
+    _minimal_run(native, "race-run")
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    workers = [
+        context.Process(target=_retire_process, args=(str(native), str(cold), queue))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(30)
+        assert worker.exitcode == 0
+    outcomes = [queue.get(timeout=5) for _ in workers]
+    assert all(kind == "ok" for kind, _value in outcomes), outcomes
+    assert sorted(value for _kind, value in outcomes) == [False, True]
+
+
+def test_deterministic_selection_and_admission_retire_only_complete_runs(tmp_path):
+    native, cold = tmp_path / "native", tmp_path / "cold"
+    _minimal_run(native, "z-run")
+    _minimal_run(native, "a-run")
+    incomplete = native / "runs" / "00-inflight"
+    _write_file(incomplete / "partial.csv", b"partial")
+
+    retired = retire_complete_native_runs(
+        native, cold, policy=_archive_policy(), max_runs=1
+    )
+    assert len(retired) == 1
+    assert not (native / "runs" / "a-run").exists()
+    assert (native / "runs" / "z-run").is_dir()
+    assert incomplete.is_dir()
+
+    policy = NativeStoragePolicy(
+        max_hot_bytes=64 * 1024 * 1024,
+        max_cold_bytes=64 * 1024 * 1024,
+        min_filesystem_free_bytes=1,
+        max_complete_hot_runs=1,
+        max_inflight_runs=2,
+    )
+    decision = admit_native_run(
+        native,
+        cold,
+        expected_growth_bytes=1,
+        expected_growth_files=1,
+        policy=policy,
+        retire_if_needed=True,
+        max_retirements=1,
+        filesystem_free_bytes=64 * 1024 * 1024,
+    )
+    assert decision.allowed
+    assert not (native / "runs" / "z-run").exists()
+    assert incomplete.is_dir()
+
+
+def test_hot_and_cold_file_caps_are_hard_failures(tmp_path):
+    native, cold = tmp_path / "native", tmp_path / "cold"
+    _minimal_run(native, "file-cap-run")
+    usage_files = len(
+        storage._walk_regular_files(
+            native,
+            max_files=100,
+            max_entries=100,
+            max_directory_entries=100,
+        )
+    )
+    policy = NativeStoragePolicy(
+        max_hot_bytes=64 * 1024 * 1024,
+        max_cold_bytes=64 * 1024 * 1024,
+        min_filesystem_free_bytes=1,
+        max_complete_hot_runs=10,
+        max_inflight_runs=2,
+        max_hot_files=usage_files,
+        max_cold_files=2,
+    )
+    decision = preflight_growth(
+        native,
+        cold,
+        expected_growth_bytes=1,
+        expected_growth_files=1,
+        policy=policy,
+        filesystem_free_bytes=1024,
+    )
+    assert not decision.allowed
+    assert any("projected hot files" in reason for reason in decision.reasons)
+    with pytest.raises(NativeStorageBoundError, match="cold-store file cap"):
+        create_lossless_archive(
+            native,
+            cold,
+            [native / "runs" / "file-cap-run"],
+            graph=build_protection_graph(native),
+            policy=policy,
+        )

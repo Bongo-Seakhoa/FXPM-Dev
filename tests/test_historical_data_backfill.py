@@ -1,8 +1,12 @@
+import hashlib
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 
+import pm_main
 from pm_main import FXPortfolioManagerApp
 
 
@@ -34,7 +38,9 @@ class _FakeMT5:
         self.full_fetches.append((broker_symbol, timeframe, count))
         return self.full_bars.copy()
 
-    def get_bars_range(self, broker_symbol, timeframe, start_date, end_date, sync_retry=False):
+    def get_bars_range(
+        self, broker_symbol, timeframe, start_date, end_date, sync_retry=False
+    ):
         self.range_fetches.append((broker_symbol, timeframe, start_date, end_date))
         return self.range_bars.copy()
 
@@ -57,6 +63,33 @@ class _OptimizationPortfolio:
 
     def get_live_eligible_configs(self):
         return {"EURUSD": object()}
+
+
+def _bind_promoted_generation(portfolio, ledger_path: Path) -> None:
+    ledger_sha = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
+    manifest_path = ledger_path.with_name("generation.active.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fxpm.optimization-generation.v2",
+                "generation_id": "test-generation",
+                "generation_status": "PROMOTED",
+                "ledger_sha256": ledger_sha,
+                "ledger_status": {"complete_current_contract_universe": True},
+                "technical_failures": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    portfolio.last_optimization_generation = SimpleNamespace(
+        generation_id="test-generation",
+        status="PROMOTED",
+        promoted=True,
+        ledger_changed=True,
+        technical_failures={},
+        promoted_ledger_sha256=ledger_sha,
+        manifest_path=str(manifest_path),
+    )
 
 
 def _bars(n):
@@ -85,23 +118,26 @@ def test_run_optimization_calendar_mode_never_invokes_legacy_m5_roster_filter(
     app.portfolio_manager = _OptimizationPortfolio(["EURUSD", "SOLUSD"])
     app.config_file = str(tmp_path / "pm_configs.json")
     (tmp_path / "pm_configs.json").write_text("{}", encoding="utf-8")
+    _bind_promoted_generation(app.portfolio_manager, Path(app.config_file))
     app.storage_manager = None
-    app._save_results = lambda _results: None
+    app._save_results = lambda *_args, **_kwargs: None
     app._fetch_historical_data = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("legacy M5 fetch must not run in calendar production")
     )
     monkeypatch.setattr(
-        "pm_main._phase_a_optimization_complete",
-        lambda _ledger, _symbols: (True, []),
+        "pm_main._governed_generation_cli_verdict",
+        lambda _outcome, _ledger: (True, []),
     )
-
     assert app.run_optimization()
     assert app.portfolio_manager.optimization_rosters == [["EURUSD", "SOLUSD"]]
     assert app.portfolio_manager.symbols == ["EURUSD", "SOLUSD"]
     assert app.portfolio_manager.saved_no_trade == []
 
 
-def test_run_optimization_legacy_mode_retains_m5_readiness_filter():
+def test_legacy_m5_readiness_filter_never_overwrites_winner_ledger(
+    tmp_path: Path,
+    monkeypatch,
+):
     app = FXPortfolioManagerApp.__new__(FXPortfolioManagerApp)
     app.logger = _Logger()
     app.pipeline_config = SimpleNamespace(
@@ -113,21 +149,30 @@ def test_run_optimization_legacy_mode_retains_m5_readiness_filter():
     )
     app.mt5 = SimpleNamespace(is_connected=lambda: True)
     app.portfolio_manager = _OptimizationPortfolio(["EURUSD", "SOLUSD"])
+    app.config_file = str(tmp_path / "pm_configs.json")
+    Path(app.config_file).write_text("{}", encoding="utf-8")
+    _bind_promoted_generation(app.portfolio_manager, Path(app.config_file))
     app.storage_manager = None
-    app._save_results = lambda _results: None
+    app._save_results = lambda *_args, **_kwargs: None
     app._fetch_historical_data = lambda *_args, **_kwargs: {
         "ready_symbols": ["EURUSD"],
         "incomplete_symbols": {"SOLUSD": 2},
         "no_data_symbols": [],
     }
+    monkeypatch.setattr(
+        "pm_main._governed_generation_cli_verdict",
+        lambda _outcome, _ledger: (True, []),
+    )
 
     assert app.run_optimization()
     assert app.portfolio_manager.optimization_rosters == [["EURUSD"]]
     assert app.portfolio_manager.symbols == ["EURUSD", "SOLUSD"]
-    assert [row[0] for row in app.portfolio_manager.saved_no_trade] == ["SOLUSD"]
+    assert app.portfolio_manager.saved_no_trade == []
 
 
-def test_fetch_historical_data_backfills_when_existing_file_below_target(tmp_path: Path):
+def test_fetch_historical_data_backfills_when_existing_file_below_target(
+    tmp_path: Path,
+):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     existing = _bars(3)
@@ -157,7 +202,66 @@ def test_fetch_historical_data_backfills_when_existing_file_below_target(tmp_pat
     assert stats["incomplete_symbols"] == {}
 
 
-def test_fetch_historical_data_marks_short_pull_incomplete_after_retries(tmp_path: Path):
+def test_main_returns_failure_when_optimization_generation_does_not_promote(
+    tmp_path: Path,
+    monkeypatch,
+):
+    observed = {}
+
+    class _App:
+        def __init__(self, **kwargs):
+            observed["init"] = kwargs
+            self.mt5 = None
+
+        def initialize(self):
+            return True
+
+        def run_optimization(self, *, overwrite=False):
+            observed["overwrite"] = overwrite
+            return False
+
+        def shutdown(self):
+            observed["shutdown"] = True
+
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(
+        pm_main,
+        "load_config_json",
+        lambda _path: {
+            "symbols": ["EURUSD"],
+            "pipeline": {
+                "data_dir": str(tmp_path / "data"),
+                "output_dir": str(tmp_path / "out"),
+                "log_dir": str(tmp_path / "logs"),
+                "winner_ledger_path": str(tmp_path / "pm_configs.json"),
+            },
+        },
+    )
+    monkeypatch.setattr(pm_main, "setup_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(pm_main, "log_resolved_config_summary", lambda *_args: None)
+    monkeypatch.setattr(pm_main.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(pm_main, "set_instrument_specs", lambda **_kwargs: None)
+    monkeypatch.setattr(pm_main, "FXPortfolioManagerApp", _App)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pm_main.py",
+            "--config",
+            str(config_path),
+            "--optimize",
+            "--overwrite",
+        ],
+    )
+
+    assert pm_main.main() == 2
+    assert observed["overwrite"] is True
+    assert observed["shutdown"] is True
+
+
+def test_fetch_historical_data_marks_short_pull_incomplete_after_retries(
+    tmp_path: Path,
+):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
 
@@ -243,13 +347,17 @@ def test_fetch_historical_data_marks_write_failure_without_aborting(tmp_path: Pa
 def test_effective_min_m5_bars_uses_fraction_of_max_bars():
     app = FXPortfolioManagerApp.__new__(FXPortfolioManagerApp)
     app.pipeline_config = SimpleNamespace(
-        max_bars=300000, optimization_min_m5_bars_fraction=0.85, optimization_min_m5_bars=300000
+        max_bars=300000,
+        optimization_min_m5_bars_fraction=0.85,
+        optimization_min_m5_bars=300000,
     )
     assert app._effective_min_m5_bars() == 255000
 
     # No fraction -> absolute floor.
     app.pipeline_config = SimpleNamespace(
-        max_bars=300000, optimization_min_m5_bars_fraction=0.0, optimization_min_m5_bars=300000
+        max_bars=300000,
+        optimization_min_m5_bars_fraction=0.0,
+        optimization_min_m5_bars=300000,
     )
     assert app._effective_min_m5_bars() == 300000
 
@@ -289,7 +397,13 @@ def test_backfill_start_clamped_for_corrupt_old_index(tmp_path: Path):
         ["1970-01-01 00:00:00", "2026-01-01 00:00:00", "2026-01-01 00:05:00"]
     )
     existing = pd.DataFrame(
-        {"Open": [1, 2, 3], "High": [1, 2, 3], "Low": [1, 2, 3], "Close": [1, 2, 3], "Volume": [1, 1, 1]},
+        {
+            "Open": [1, 2, 3],
+            "High": [1, 2, 3],
+            "Low": [1, 2, 3],
+            "Close": [1, 2, 3],
+            "Volume": [1, 1, 1],
+        },
         index=idx,
     )
     existing.to_csv(data_dir / "ALCOA_M5.csv", index_label="time")

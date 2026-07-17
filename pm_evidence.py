@@ -44,18 +44,40 @@ DEFAULT_TIMEFRAME_WINDOW_YEARS: Dict[str, Dict[str, int]] = {
     "D1": {"optimizer_train": 12, "tuning_validation": 2, "final_lockbox": 2},
 }
 
-# Absolute fallbacks for instruments with comparatively short regular trading
-# sessions. Calendar duration and expected broker-session coverage are
-# mandatory companions; these row counts are never sufficient on their own.
+# Diagnostic planning baselines for instruments with comparatively short
+# regular trading sessions.  Calendar duration and broker-session coverage are
+# retained alongside them, but none of the three is a search-eligibility veto;
+# authenticated horizon, dependence, trade-power, and multiplicity evidence is
+# the statistical authority.
 DEFAULT_MIN_NATIVE_BARS: Dict[str, Dict[str, int]] = {
     # A standard 6.5-hour equity session contributes about 98,280 M5 and
     # 32,760 M15 bars over five 252-session years (39,312/13,104 over two).
     # Floors retain a modest holiday/outage buffer without privileging 24x5 FX.
-    "M5": {"optimizer_train": 90_000, "tuning_validation": 36_000, "final_lockbox": 36_000},
-    "M15": {"optimizer_train": 30_000, "tuning_validation": 12_000, "final_lockbox": 12_000},
-    "M30": {"optimizer_train": 15_000, "tuning_validation": 6_500, "final_lockbox": 6_500},
-    "H1": {"optimizer_train": 7_500, "tuning_validation": 3_500, "final_lockbox": 3_500},
-    "H4": {"optimizer_train": 2_500, "tuning_validation": 1_000, "final_lockbox": 1_000},
+    "M5": {
+        "optimizer_train": 90_000,
+        "tuning_validation": 36_000,
+        "final_lockbox": 36_000,
+    },
+    "M15": {
+        "optimizer_train": 30_000,
+        "tuning_validation": 12_000,
+        "final_lockbox": 12_000,
+    },
+    "M30": {
+        "optimizer_train": 15_000,
+        "tuning_validation": 6_500,
+        "final_lockbox": 6_500,
+    },
+    "H1": {
+        "optimizer_train": 7_500,
+        "tuning_validation": 3_500,
+        "final_lockbox": 3_500,
+    },
+    "H4": {
+        "optimizer_train": 2_500,
+        "tuning_validation": 1_000,
+        "final_lockbox": 1_000,
+    },
     "D1": {"optimizer_train": 1_260, "tuning_validation": 500, "final_lockbox": 500},
 }
 
@@ -118,7 +140,7 @@ def latest_closed_bar_end(
     if tf not in TIMEFRAME_DURATION or frame is None or frame.empty:
         return None
     cutoff = _utc_timestamp(not_after_utc)
-    ordered = ensure_utc_index(frame)
+    ordered = ensure_utc_index(frame, copy=False)
     index = ordered.index
     if "_BAR_CLOSE_TS" in ordered.columns:
         closes = pd.DatetimeIndex(
@@ -136,20 +158,30 @@ def trim_to_closed_bars(
     timeframe: str,
     *,
     as_of_utc: Any,
+    copy: bool = True,
 ) -> pd.DataFrame:
     """Exclude every bar whose nominal close falls after the shared cutoff."""
     tf = str(timeframe or "").strip().upper()
-    ordered = ensure_utc_index(frame)
+    ordered = ensure_utc_index(frame, copy=False)
     if tf not in TIMEFRAME_DURATION or ordered.empty:
-        return ordered.iloc[0:0].copy()
+        empty = ordered.iloc[0:0]
+        return empty.copy() if copy else empty
     cutoff = _utc_timestamp(as_of_utc)
     if "_BAR_CLOSE_TS" in ordered.columns:
         closes = pd.DatetimeIndex(
             pd.to_datetime(ordered["_BAR_CLOSE_TS"], utc=True, errors="coerce")
         )
         valid_close = (closes > ordered.index) & (closes <= cutoff)
-        return ordered.loc[valid_close].copy()
-    return ordered.loc[(ordered.index + TIMEFRAME_DURATION[tf]) <= cutoff].copy()
+    else:
+        valid_close = (ordered.index + TIMEFRAME_DURATION[tf]) <= cutoff
+    if bool(valid_close.all()):
+        return ordered.copy() if copy else ordered
+    valid_count = int(valid_close.sum())
+    if valid_count and bool(valid_close[:valid_count].all()):
+        selected = ordered.iloc[:valid_count]
+    else:
+        selected = ordered.loc[valid_close]
+    return selected.copy() if copy else selected
 
 
 def derive_purge_duration(
@@ -190,7 +222,7 @@ def normalize_window_years(value: Any) -> Dict[str, int]:
 
 
 def normalize_timeframe_window_years(value: Any) -> Dict[str, Dict[str, int]]:
-    """Return a complete, non-weakenable per-timeframe calendar contract."""
+    """Return complete per-timeframe acquisition-planning windows."""
     source = value if isinstance(value, Mapping) else {}
     normalized: Dict[str, Dict[str, int]] = {}
     for timeframe in SUPPORTED_TIMEFRAMES:
@@ -220,7 +252,7 @@ def normalize_timeframe_window_years(value: Any) -> Dict[str, Dict[str, int]]:
 
 
 def normalize_min_native_bars(value: Any) -> Dict[str, Dict[str, int]]:
-    """Return the complete fail-closed timeframe/partition floor matrix."""
+    """Return the complete timeframe/partition diagnostic baseline matrix."""
     source = value if isinstance(value, Mapping) else {}
     normalized: Dict[str, Dict[str, int]] = {}
     for timeframe in SUPPORTED_TIMEFRAMES:
@@ -357,7 +389,12 @@ def calendar_window_meta(
     the first observed Monday as a partition boundary would silently give a
     daily market a different split contract from a continuously traded market.
     """
-    ordered = ensure_utc_index(frame)
+    # This function only searches the index and reads the two boundary rows.
+    # Borrow an already-normalized frame so callers can describe several
+    # partitions of a large native history without duplicating every column
+    # block once per partition.  ``ensure_utc_index`` still detaches when an
+    # index repair or sort is actually required.
+    ordered = ensure_utc_index(frame, copy=False)
     start = _utc_timestamp(start_ts)
     end = _utc_timestamp(end_ts)
     if end < start:
@@ -378,13 +415,19 @@ def calendar_window_meta(
         "start_ts": start.isoformat(),
         "end_ts": end.isoformat(),
         "end_ts_exclusive": end.isoformat(),
-        "end_ts_inclusive": observed_end.isoformat() if observed_end is not None else None,
-        "data_start_ts": observed_start.isoformat() if observed_start is not None else None,
+        "end_ts_inclusive": observed_end.isoformat()
+        if observed_end is not None
+        else None,
+        "data_start_ts": observed_start.isoformat()
+        if observed_start is not None
+        else None,
         "data_end_ts": observed_end.isoformat() if observed_end is not None else None,
     }
 
 
-def _source_bounds(frame: Optional[pd.DataFrame]) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+def _source_bounds(
+    frame: Optional[pd.DataFrame],
+) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
     if frame is None or frame.empty:
         return None, None
     if "_SOURCE_FIRST_TS" in frame.columns:
@@ -400,7 +443,9 @@ def _source_bounds(frame: Optional[pd.DataFrame]) -> Tuple[Optional[pd.Timestamp
     return _utc_timestamp(first.min()), _utc_timestamp(last.max())
 
 
-def _coverage_for_partition(source_meta: Mapping[str, Any], partition: str) -> Optional[float]:
+def _coverage_for_partition(
+    source_meta: Mapping[str, Any], partition: str
+) -> Optional[float]:
     values = source_meta.get("expected_session_coverage_by_partition")
     if isinstance(values, Mapping):
         raw = values.get(partition)
@@ -419,9 +464,21 @@ def _coverage_for_partition(source_meta: Mapping[str, Any], partition: str) -> O
 
 @dataclass
 class EvidenceVerdict:
+    """Timeframe source-integrity verdict plus non-binding planning diagnostics.
+
+    ``passed`` answers only whether the supplied native evidence is authentic
+    and operationally self-consistent enough to enter a statistical search.
+    It deliberately does *not* claim that a fixed row count, calendar span, or
+    broker-session coverage percentage is enough to support a trading edge.
+    Those quantities are retained in ``diagnostic_reason_codes`` so the
+    authenticated horizon, dependence, trade-power, and multiplicity layers
+    can make the actual search-sufficiency decision without losing context.
+    """
+
     timeframe: str
     passed: bool
     reason_codes: list[str] = field(default_factory=list)
+    diagnostic_reason_codes: list[str] = field(default_factory=list)
     source_kind: str = "unknown"
     source_sha256: Optional[str] = None
     partition_rows: Dict[str, int] = field(default_factory=dict)
@@ -429,10 +486,18 @@ class EvidenceVerdict:
     required_rows: Dict[str, int] = field(default_factory=dict)
     required_years: Dict[str, int] = field(default_factory=dict)
     expected_session_coverage: Dict[str, Optional[float]] = field(default_factory=dict)
+    search_sufficiency_authority: str = (
+        "DEFERRED_TO_AUTHENTICATED_HORIZON_ESS_TRADE_POWER_MULTIPLICITY"
+    )
     contract_version: str = EVIDENCE_CONTRACT_VERSION
 
     def concise_reason(self) -> str:
-        joined = ";".join(self.reason_codes) if self.reason_codes else "PASS"
+        if self.reason_codes:
+            joined = ";".join(self.reason_codes)
+        elif self.diagnostic_reason_codes:
+            joined = "PASS_WITH_DIAGNOSTICS:" + ";".join(self.diagnostic_reason_codes)
+        else:
+            joined = "PASS"
         return f"EVIDENCE:{self.timeframe}:{joined}"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -441,6 +506,7 @@ class EvidenceVerdict:
             "timeframe": self.timeframe,
             "passed": bool(self.passed),
             "reason_codes": list(self.reason_codes),
+            "diagnostic_reason_codes": list(self.diagnostic_reason_codes),
             "source_kind": self.source_kind,
             "source_sha256": self.source_sha256,
             "partition_rows": dict(self.partition_rows),
@@ -448,6 +514,7 @@ class EvidenceVerdict:
             "required_rows": dict(self.required_rows),
             "required_years": dict(self.required_years),
             "expected_session_coverage": dict(self.expected_session_coverage),
+            "search_sufficiency_authority": self.search_sufficiency_authority,
         }
 
 
@@ -466,10 +533,15 @@ def validate_timeframe_evidence(
     min_expected_session_coverage: float = 0.95,
     boundary_tolerance_days: float = 7.0,
 ) -> EvidenceVerdict:
-    """Validate necessary timeframe-level evidence before optimization.
+    """Validate native source integrity and report search-planning diagnostics.
 
-    This gate intentionally makes no profitability claim. It only determines
-    whether the quantity and provenance of data justify running model search.
+    Fixed bar counts, calendar durations, boundary reach, and estimated broker
+    session coverage are not interchangeable statistical experiments across
+    symbols or native timeframes.  They are therefore diagnostics only.  The
+    later authenticated horizon/ESS/trade-power/multiplicity contract decides
+    whether an experiment is statistically supportable.  Source-kind,
+    provenance, malformed boundaries, and declared/observed row mismatches
+    remain blocking because they indicate technical or authenticity failure.
     """
     tf = str(timeframe or "").strip().upper()
     meta: Mapping[str, Any] = source_meta if isinstance(source_meta, Mapping) else {}
@@ -481,6 +553,7 @@ def validate_timeframe_evidence(
     )
     floors = normalize_min_native_bars(min_native_bars)
     reasons: list[str] = []
+    diagnostics: list[str] = []
 
     if tf not in SUPPORTED_TIMEFRAMES:
         return EvidenceVerdict(
@@ -493,7 +566,9 @@ def validate_timeframe_evidence(
     if require_native and source_kind != NATIVE_SOURCE_KIND:
         reasons.append(f"NATIVE_SOURCE_REQUIRED:{source_kind}")
     if require_provenance and not bool(meta.get("provenance_valid", False)):
-        details = ",".join(str(value) for value in (meta.get("provenance_errors") or []))
+        details = ",".join(
+            str(value) for value in (meta.get("provenance_errors") or [])
+        )
         reasons.append(f"NATIVE_PROVENANCE_INVALID:{details or 'missing'}")
 
     try:
@@ -536,8 +611,13 @@ def validate_timeframe_evidence(
             required_rows[partition] = required
         else:
             required = int(required_rows[partition])
-        if rows < required:
-            reasons.append(f"INSUFFICIENT_BARS:{partition}:{rows}<{required}")
+        if rows <= 0:
+            # An activation that advertised an evidence-candidate partition
+            # but supplied no frame is internally inconsistent.  A genuine
+            # broker boundary shortfall with observations is merely diagnostic.
+            reasons.append(f"PARTITION_FRAME_EMPTY:{partition}")
+        elif rows < required:
+            diagnostics.append(f"INSUFFICIENT_BARS:{partition}:{rows}<{required}")
         if isinstance(observed_counts, Mapping):
             try:
                 declared_observed = int(observed_counts.get(partition, -1))
@@ -560,7 +640,7 @@ def validate_timeframe_evidence(
         required_start = anchor - pd.DateOffset(years=years[partition])
         required_days = float((anchor - required_start).total_seconds() / 86_400.0)
         if span_days + tolerance_days < required_days:
-            reasons.append(
+            diagnostics.append(
                 f"INSUFFICIENT_CALENDAR_SPAN:{partition}:{span_days:.1f}d<{required_days:.1f}d"
             )
 
@@ -571,25 +651,35 @@ def validate_timeframe_evidence(
             except Exception:
                 reasons.append(f"PARTITION_BOUNDARY_INVALID:{partition}")
             else:
-                if first is None or first > expected_start + pd.Timedelta(days=tolerance_days):
-                    gap = float("inf") if first is None else float(
-                        (first - expected_start).total_seconds() / 86_400.0
+                if first is None or first > expected_start + pd.Timedelta(
+                    days=tolerance_days
+                ):
+                    gap = (
+                        float("inf")
+                        if first is None
+                        else float((first - expected_start).total_seconds() / 86_400.0)
                     )
-                    reasons.append(f"PARTITION_START_GAP:{partition}:{gap:.1f}d")
+                    diagnostics.append(f"PARTITION_START_GAP:{partition}:{gap:.1f}d")
                 observed_end = None if last is None else last + TIMEFRAME_DURATION[tf]
-                if observed_end is None or observed_end < expected_end - pd.Timedelta(days=tolerance_days):
-                    gap = float("inf") if observed_end is None else float(
-                        (expected_end - observed_end).total_seconds() / 86_400.0
+                if observed_end is None or observed_end < expected_end - pd.Timedelta(
+                    days=tolerance_days
+                ):
+                    gap = (
+                        float("inf")
+                        if observed_end is None
+                        else float(
+                            (expected_end - observed_end).total_seconds() / 86_400.0
+                        )
                     )
-                    reasons.append(f"PARTITION_END_GAP:{partition}:{gap:.1f}d")
+                    diagnostics.append(f"PARTITION_END_GAP:{partition}:{gap:.1f}d")
 
         coverage = _coverage_for_partition(meta, partition)
         coverage_values[partition] = coverage
         if require_session_coverage:
             if coverage is None:
-                reasons.append(f"SESSION_COVERAGE_UNKNOWN:{partition}")
+                diagnostics.append(f"SESSION_COVERAGE_UNKNOWN:{partition}")
             elif coverage < minimum_coverage:
-                reasons.append(
+                diagnostics.append(
                     f"SESSION_COVERAGE_LOW:{partition}:{coverage:.4f}<{minimum_coverage:.4f}"
                 )
 
@@ -597,6 +687,7 @@ def validate_timeframe_evidence(
         timeframe=tf,
         passed=not reasons,
         reason_codes=reasons,
+        diagnostic_reason_codes=diagnostics,
         source_kind=source_kind,
         source_sha256=str(meta.get("sha256") or "") or None,
         partition_rows=partition_rows,

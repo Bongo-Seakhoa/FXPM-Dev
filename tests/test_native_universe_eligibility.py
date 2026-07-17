@@ -8,18 +8,19 @@ import pytest
 from pm_core import PipelineConfig
 from pm_native_activation import (
     ActiveNativeUniverse,
+    NATIVE_EVIDENCE_CANDIDATE,
     NATIVE_PRODUCTION_TIMEFRAMES,
-    resolve_active_native_artifact,
+    NATIVE_SOURCE_UNAVAILABLE,
     resolve_active_native_universe,
-    validate_native_cell_exclusion_no_trade,
 )
+from tests.native_v5_support import SYMBOL as V5_SYMBOL
 from pm_pipeline import (
     OptimizationGenerationOutcome,
     OptimizationPipeline,
     PipelineResult,
     PortfolioManager,
+    SymbolConfig,
 )
-from pm_portfolio_replay import active_native_portfolio_contract
 from tools.acquire_native_history import (
     ACQUISITION_CONTRACT_VERSION,
     DEFAULT_PAGE_DAYS,
@@ -366,7 +367,9 @@ def _availability_pagination(timeframe, request_contract, *, has_data):
         alignment_mode = "fixed_utc_native_boundary_v1"
         sentinel_slack = 0
     configured_slots = max(1, DEFAULT_PAGE_DAYS[timeframe] * 86400 // seconds)
-    configured_slots = min(configured_slots, int(_SOURCE_ENVIRONMENT["terminal"]["max_bars"] * 0.90))
+    configured_slots = min(
+        configured_slots, int(_SOURCE_ENVIRONMENT["terminal"]["max_bars"] * 0.90)
+    )
     page_span_seconds = configured_slots * seconds
     intervals = []
     cursor = fetch_start
@@ -456,18 +459,13 @@ def _write_unavailable_run(
         },
     }
     if production_v5:
-        request_contract, leaf_contracts = _availability_v5_request_contract(
-            boundaries
-        )
+        request_contract, leaf_contracts = _availability_v5_request_contract(boundaries)
     elif production_v4:
-        request_contract, leaf_contracts = _availability_v4_request_contract(
-            boundaries
-        )
+        request_contract, leaf_contracts = _availability_v4_request_contract(boundaries)
     else:
         request_contract = _availability_request_contract(boundaries)
         leaf_contracts = {
-            timeframe: request_contract
-            for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+            timeframe: request_contract for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
         }
     seconds = {
         "M5": 300,
@@ -525,7 +523,8 @@ def _write_unavailable_run(
                     "Low": [value - 1 for value in range(10)],
                     "Close": [value + 0.5 for value in range(10)],
                     "Volume": 1,
-                    "_BAR_CLOSE_TS": index + pd.to_timedelta(seconds[timeframe], unit="s"),
+                    "_BAR_CLOSE_TS": index
+                    + pd.to_timedelta(seconds[timeframe], unit="s"),
                 },
                 index=index,
             )
@@ -593,7 +592,7 @@ def _write_unavailable_run(
     )
 
 
-def test_short_history_symbol_is_immutable_excluded_no_trade_not_activation_failure(
+def test_ambiguous_short_history_cannot_become_a_trading_verdict(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
@@ -614,32 +613,21 @@ def test_short_history_symbol_is_immutable_excluded_no_trade_not_activation_fail
         activation_id="availability-only-sol",
     )
 
-    assert result["status"] == "active"
-    assert result["active_pointer_updated"]
+    assert result["status"] == "failed"
+    assert not result["active_pointer_updated"]
     eligibility = result["universe_eligibility"]
     assert eligibility["performance_inputs_used"] is False
     assert eligibility["eligible_symbols"] == []
-    assert list(eligibility["excluded_symbols"]) == ["SOLUSD"]
+    assert eligibility["excluded_symbols"] == {}
     assert all(
-        entry["status"] == "excluded_no_trade"
+        entry["status"] != "excluded_no_trade"
         for entry in result["entries"]["SOLUSD"].values()
     )
 
-    universe = resolve_active_native_universe(data_dir, ["SOLUSD"])
-    assert universe.valid, universe.errors
-    assert universe.symbol_status("SOLUSD") == "excluded_no_trade"
-    resolution = resolve_active_native_artifact(data_dir, "SOLUSD", "D1")
-    assert not resolution.valid
-    assert "NATIVE_ACTIVE_SYMBOL_EXCLUDED_NO_TRADE" in resolution.errors
 
-    contract, errors = active_native_portfolio_contract(data_dir, ["SOLUSD"])
-    assert errors == []
-    assert contract["eligible_symbols"] == []
-    assert contract["excluded_symbols"] == ["SOLUSD"]
-    assert contract["bars_sha256_by_source"] == {}
-
-
-def test_manifest_only_availability_exclusion_is_activation_failure(tmp_path: Path) -> None:
+def test_manifest_only_availability_exclusion_is_activation_failure(
+    tmp_path: Path,
+) -> None:
     native_root = tmp_path / "data" / "native"
     native_root.mkdir(parents=True)
     _write_unavailable_run(
@@ -647,7 +635,9 @@ def test_manifest_only_availability_exclusion_is_activation_failure(tmp_path: Pa
         "missing-proof",
         failure_status="partial_history",
     )
-    (native_root / "runs" / "missing-proof" / "SOLUSD" / "M5" / "provenance.json").unlink()
+    (
+        native_root / "runs" / "missing-proof" / "SOLUSD" / "M5" / "provenance.json"
+    ).unlink()
 
     result = audit_and_activate(
         native_root,
@@ -735,17 +725,14 @@ def test_internal_history_gap_is_technical_failure_not_no_trade(tmp_path: Path) 
     )
 
 
-def test_no_history_provenance_failure_status_must_match_manifest(tmp_path: Path) -> None:
+def test_no_history_provenance_failure_status_must_match_manifest(
+    tmp_path: Path,
+) -> None:
     native_root = tmp_path / "data" / "native"
     native_root.mkdir(parents=True)
     _write_unavailable_run(native_root, "false-no-history", failure_status="no_history")
     provenance_path = (
-        native_root
-        / "runs"
-        / "false-no-history"
-        / "SOLUSD"
-        / "D1"
-        / "provenance.json"
+        native_root / "runs" / "false-no-history" / "SOLUSD" / "D1" / "provenance.json"
     )
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     provenance["failure_status"] = "fetch_failed"
@@ -766,7 +753,9 @@ def test_no_history_provenance_failure_status_must_match_manifest(tmp_path: Path
 def test_no_history_one_page_cannot_claim_nine_year_horizon(tmp_path: Path) -> None:
     native_root = tmp_path / "data" / "native"
     native_root.mkdir(parents=True)
-    _write_unavailable_run(native_root, "truncated-no-history", failure_status="no_history")
+    _write_unavailable_run(
+        native_root, "truncated-no-history", failure_status="no_history"
+    )
     provenance_path = (
         native_root
         / "runs"
@@ -848,7 +837,9 @@ def test_availability_provenance_lineage_contract_is_exact(
     native_root.mkdir(parents=True)
     run_id = f"lineage-{tamper_kind}"
     _write_unavailable_run(native_root, run_id, failure_status="partial_history")
-    provenance_path = native_root / "runs" / run_id / "SOLUSD" / "H4" / "provenance.json"
+    provenance_path = (
+        native_root / "runs" / run_id / "SOLUSD" / "H4" / "provenance.json"
+    )
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     if tamper_kind == "acquisition_contract":
         provenance["acquisition_contract_version"] = "foreign-contract"
@@ -874,7 +865,9 @@ def test_availability_provenance_lineage_contract_is_exact(
     assert not result["active_pointer_updated"]
 
 
-def test_fetch_failure_cannot_masquerade_as_availability_exclusion(tmp_path: Path) -> None:
+def test_fetch_failure_cannot_masquerade_as_availability_exclusion(
+    tmp_path: Path,
+) -> None:
     native_root = tmp_path / "data" / "native"
     native_root.mkdir(parents=True)
     _write_unavailable_run(native_root, "fetch-broken", failure_status="fetch_failed")
@@ -914,7 +907,9 @@ def test_symbol_resolution_failure_blocks_instead_of_hiding_mapping_defect(
 
     assert result["status"] == "failed"
     assert result["universe_eligibility"]["excluded_symbols"] == {}
-    reasons = result["universe_eligibility"]["invalid_symbols"]["SOLUSD"]["reason_codes"]
+    reasons = result["universe_eligibility"]["invalid_symbols"]["SOLUSD"][
+        "reason_codes"
+    ]
     assert any("symbol_resolution_failed" in reason for reason in reasons)
 
 
@@ -952,9 +947,7 @@ def test_availability_exclusion_cannot_mask_broken_success_sibling(
     )
     manifest_path = native_root / "runs" / "mixed-source" / "run_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    h1 = next(
-        item for item in manifest["results"] if item["timeframe"] == "H1"
-    )
+    h1 = next(item for item in manifest["results"] if item["timeframe"] == "H1")
     h1.update(
         {
             "status": "success",
@@ -982,26 +975,43 @@ def test_availability_exclusion_cannot_mask_broken_success_sibling(
     assert result["entries"]["SOLUSD"]["H1"]["audit_status"] == "FAIL"
 
 
-def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
+def test_source_unavailable_cells_preserve_winner_ledger_and_skip_search(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     data_dir = tmp_path / "data"
-    native_root = data_dir / "native"
-    native_root.mkdir(parents=True)
-    _write_unavailable_run(
-        native_root,
-        "new-ton",
-        symbol="TONUSD",
-        production_v5=True,
+    authenticated_unavailable = ActiveNativeUniverse(
+        activation_id="availability-only-eurusd",
+        activation_manifest_sha256="a" * 64,
+        requested_symbols=(V5_SYMBOL,),
+        required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+        eligible_symbols=(),
+        cell_statuses={
+            V5_SYMBOL: {
+                timeframe: NATIVE_SOURCE_UNAVAILABLE
+                for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+            }
+        },
+        symbols_with_active_cells=(),
+        explicit_contract=True,
     )
-    audit_and_activate(
-        native_root,
-        run_id="new-ton",
-        symbols=["TONUSD"],
-        timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
-        activation_id="availability-only-ton",
-    )
+
+    ledger_path = tmp_path / "pm_configs.json"
+    original_ledger = (
+        json.dumps(
+            {
+                V5_SYMBOL: {
+                    "symbol": V5_SYMBOL,
+                    "strategy_name": "HISTORICAL_VALIDATED_REFERENCE",
+                    "is_validated": True,
+                }
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    ledger_path.write_bytes(original_ledger)
     config = PipelineConfig(
         data_dir=data_dir,
         output_dir=tmp_path / "outputs",
@@ -1010,73 +1020,124 @@ def test_portfolio_manager_materializes_bound_6x4_no_trade_grid_before_search(
     )
     manager = PortfolioManager(
         config,
-        ["TONUSD"],
-        config_file=str(tmp_path / "pm_configs.json"),
+        [V5_SYMBOL],
+        config_file=str(ledger_path),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_native_universe_for_optimization",
+        lambda: authenticated_unavailable,
     )
     monkeypatch.setattr(
         manager.pipeline,
         "run_for_symbol",
-        lambda _symbol: (_ for _ in ()).throw(AssertionError("excluded symbol was optimized")),
+        lambda _symbol: (_ for _ in ()).throw(
+            AssertionError("source-unavailable symbol was optimized")
+        ),
     )
     monkeypatch.setattr(manager, "_run_production_replay_audit", lambda: {})
 
-    assert manager.initial_optimization() == {}
-    payload = json.loads((tmp_path / "pm_configs.json").read_text(encoding="utf-8"))["TONUSD"]
-    universe = resolve_active_native_universe(data_dir, ["TONUSD"])
-    for timeframe in NATIVE_PRODUCTION_TIMEFRAMES:
-        binding = universe.cell_exclusion_binding("TONUSD", timeframe)
-        assert validate_native_cell_exclusion_no_trade(
-            payload["regime_configs"][timeframe], binding
-        ) == []
-    assert len(payload["regime_configs"]) == 6
-    assert sum(len(regimes) for regimes in payload["regime_configs"].values()) == 24
+    assert manager.initial_optimization(overwrite=True) == {}
+    assert ledger_path.read_bytes() == original_ledger
+    assert b"NO_TRADE" not in ledger_path.read_bytes()
+    outcome = manager.last_optimization_generation
+    assert outcome is not None and outcome.status == "NOOP"
+    generation = json.loads(Path(outcome.manifest_path).read_text(encoding="utf-8"))
+    receipt = generation["native_data_state_receipt"]
+    assert receipt["acquisition_emits_trading_verdicts"] is False
+    assert set(receipt["cells"][V5_SYMBOL].values()) == {NATIVE_SOURCE_UNAVAILABLE}
 
-    extra_timeframe = json.loads(json.dumps(payload))
-    extra_timeframe["regime_configs"]["M1"] = {
-        "TREND": extra_timeframe["regime_configs"]["M5"]["TREND"]
-    }
-    assert set(extra_timeframe["regime_configs"]) != set(NATIVE_PRODUCTION_TIMEFRAMES)
 
-    extra_regime = json.loads(json.dumps(payload))
-    extra_regime["regime_configs"]["M5"]["SECRET"] = extra_regime[
-        "regime_configs"
-    ]["M5"]["TREND"]
-    assert any(
-        "REGIME_GRID_NOT_EXACT" in error
-        for error in validate_native_cell_exclusion_no_trade(
-            extra_regime["regime_configs"]["M5"],
-            universe.cell_exclusion_binding("TONUSD", "M5"),
+def test_mixed_native_grid_has_no_strategy_leaf_for_source_unavailable_cell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = PipelineConfig(
+        data_dir=tmp_path / "data",
+        output_dir=tmp_path / "outputs",
+        log_dir=tmp_path / "logs",
+        timeframes=list(NATIVE_PRODUCTION_TIMEFRAMES),
+    )
+    manager = PortfolioManager(
+        config,
+        [V5_SYMBOL],
+        config_file=str(tmp_path / "pm_configs.json"),
+    )
+    candidate_timeframes = tuple(
+        timeframe for timeframe in NATIVE_PRODUCTION_TIMEFRAMES if timeframe != "D1"
+    )
+    states = {
+        timeframe: (
+            NATIVE_SOURCE_UNAVAILABLE
+            if timeframe == "D1"
+            else NATIVE_EVIDENCE_CANDIDATE
         )
+        for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+    }
+    universe = ActiveNativeUniverse(
+        activation_id="mixed-data-states",
+        activation_manifest_sha256="c" * 64,
+        requested_symbols=(V5_SYMBOL,),
+        required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+        eligible_symbols=(V5_SYMBOL,),
+        cell_statuses={V5_SYMBOL: states},
+        symbols_with_active_cells=(V5_SYMBOL,),
+        explicit_contract=True,
+    )
+    marker = manager.pipeline.regime_optimizer._make_no_trade_marker(
+        "statistical evaluation rejected every candidate"
+    )
+    support_sha256 = "d" * 64
+    monkeypatch.setattr(
+        "pm_pipeline.validate_regime_params_provenance",
+        lambda *_args, **_kwargs: {
+            "valid": True,
+            "status": "FIT",
+            "train_regime_support": {
+                "receipt_sha256": support_sha256,
+                "observed_regimes": ["TREND", "RANGE", "BREAKOUT", "CHOP"],
+            },
+        },
+    )
+    regime_configs = {
+        timeframe: {regime: marker for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")}
+        for timeframe in candidate_timeframes
+    }
+    symbol_config = SymbolConfig(
+        symbol=V5_SYMBOL,
+        regime_configs=regime_configs,
+        data_window_meta={
+            "regime_provenance_gate": {
+                timeframe: {
+                    "valid": True,
+                    "status": "FIT",
+                    "support_receipt_sha256": support_sha256,
+                }
+                for timeframe in candidate_timeframes
+            },
+            "native_cell_eligibility": {
+                "activation_id": universe.activation_id,
+                "activation_manifest_sha256": (universe.activation_manifest_sha256),
+                "active_timeframes": list(candidate_timeframes),
+                "evidence_candidate_timeframes": list(candidate_timeframes),
+                "source_unavailable_timeframes": ["D1"],
+                "excluded_timeframes": [],
+                "cell_states": states,
+                "acquisition_emits_trading_verdicts": False,
+            }
+        },
     )
 
-    missing_default = json.loads(json.dumps(payload))
-    missing_default.pop("default_config")
-    assert "default_config" not in missing_default
-
-    promoted_default = json.loads(json.dumps(payload))
-    promoted_default["default_config"]["promotion_status"] = "PROMOTED"
-    assert promoted_default["default_config"]["promotion_status"] == "PROMOTED"
-
-    # A strategy-name marker with a promoted cell is not an exact NO_TRADE
-    # grid.  Reconciliation must repair the persisted ledger rather than trust
-    # the looser in-memory marker predicate.
-    payload["regime_configs"]["M5"]["TREND"]["promotion_status"] = "PROMOTED"
-    (tmp_path / "pm_configs.json").write_text(
-        json.dumps({"TONUSD": payload}, indent=2),
-        encoding="utf-8",
-    )
-    manager._load_configs()
-    assert manager.initial_optimization() == {}
-    repaired = json.loads(
-        (tmp_path / "pm_configs.json").read_text(encoding="utf-8")
-    )["TONUSD"]
-    assert validate_native_cell_exclusion_no_trade(
-        repaired["regime_configs"]["M5"],
-        universe.cell_exclusion_binding("TONUSD", "M5"),
-    ) == []
+    assert manager._has_exact_native_cell_grid(V5_SYMBOL, symbol_config, universe)
+    symbol_config.regime_configs["D1"] = {
+        regime: marker for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
+    }
+    assert not manager._has_exact_native_cell_grid(V5_SYMBOL, symbol_config, universe)
 
 
-def test_calendar_loader_fails_before_legacy_m5_or_resampling(tmp_path: Path, monkeypatch) -> None:
+def test_calendar_loader_fails_before_legacy_m5_or_resampling(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = PipelineConfig(
         data_dir=tmp_path / "data",
         output_dir=tmp_path / "outputs",
@@ -1123,25 +1184,25 @@ def test_calendar_loader_fails_before_legacy_m5_or_resampling(tmp_path: Path, mo
     )
 
 
-def test_later_eligibility_forces_old_exclusion_back_into_retraining(
+def test_source_unavailable_to_candidate_transition_forces_evaluation(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     data_dir = tmp_path / "data"
-    native_root = data_dir / "native"
-    native_root.mkdir(parents=True)
-    _write_unavailable_run(
-        native_root,
-        "old-unavailable",
-        symbol="TONUSD",
-        production_v5=True,
-    )
-    audit_and_activate(
-        native_root,
-        run_id="old-unavailable",
-        symbols=["TONUSD"],
-        timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
-        activation_id="old-exclusion",
+    authenticated_unavailable = ActiveNativeUniverse(
+        activation_id="old-source-unavailable",
+        activation_manifest_sha256="a" * 64,
+        requested_symbols=(V5_SYMBOL,),
+        required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+        eligible_symbols=(),
+        cell_statuses={
+            V5_SYMBOL: {
+                timeframe: NATIVE_SOURCE_UNAVAILABLE
+                for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+            }
+        },
+        symbols_with_active_cells=(),
+        explicit_contract=True,
     )
     config = PipelineConfig(
         data_dir=data_dir,
@@ -1151,8 +1212,13 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
     )
     manager = PortfolioManager(
         config,
-        ["TONUSD"],
+        [V5_SYMBOL],
         config_file=str(tmp_path / "pm_configs.json"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_native_universe_for_optimization",
+        lambda: authenticated_unavailable,
     )
     monkeypatch.setattr(manager, "_run_production_replay_audit", lambda: {})
     assert manager.initial_optimization() == {}
@@ -1160,16 +1226,16 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
     authenticated_eligible = ActiveNativeUniverse(
         activation_id="now-eligible",
         activation_manifest_sha256="b" * 64,
-        requested_symbols=("TONUSD",),
+        requested_symbols=(V5_SYMBOL,),
         required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
-        eligible_symbols=("TONUSD",),
+        eligible_symbols=(V5_SYMBOL,),
         cell_statuses={
-            "TONUSD": {
-                timeframe: "active"
+            V5_SYMBOL: {
+                timeframe: NATIVE_EVIDENCE_CANDIDATE
                 for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
             }
         },
-        symbols_with_active_cells=("TONUSD",),
+        symbols_with_active_cells=(V5_SYMBOL,),
         explicit_contract=True,
     )
     monkeypatch.setattr(
@@ -1194,8 +1260,8 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
             retained_symbols=(),
             excluded_symbols=(),
             results={
-                "TONUSD": PipelineResult(
-                    symbol="TONUSD",
+                V5_SYMBOL: PipelineResult(
+                    symbol=V5_SYMBOL,
                     success=False,
                     error_message="test stop",
                 )
@@ -1208,9 +1274,9 @@ def test_later_eligibility_forces_old_exclusion_back_into_retraining(
         "run_for_symbol",
         lambda _symbol: pytest.fail("parent-process optimizer bypassed governor"),
     )
-    assert manager.retrain_symbol("TONUSD") is False
+    assert manager.retrain_symbol(V5_SYMBOL) is False
     assert len(requests) == 1
-    assert requests[0].target_symbols == ("TONUSD",)
+    assert requests[0].target_symbols == (V5_SYMBOL,)
 
 
 def test_performance_tamper_invalidates_universe_contract(tmp_path: Path) -> None:
@@ -1239,4 +1305,7 @@ def test_performance_tamper_invalidates_universe_contract(tmp_path: Path) -> Non
     pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
 
     universe = resolve_active_native_universe(data_dir, ["SOLUSD"])
-    assert "NATIVE_UNIVERSE_ELIGIBILITY_PERFORMANCE_INPUTS_NOT_FORBIDDEN" in universe.errors
+    assert (
+        "NATIVE_UNIVERSE_ELIGIBILITY_PERFORMANCE_INPUTS_NOT_FORBIDDEN"
+        in universe.errors
+    )

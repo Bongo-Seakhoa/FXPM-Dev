@@ -2682,7 +2682,7 @@ class EMARibbonADXStrategy(BaseStrategy):
     def get_param_grid(self) -> Dict[str, List]:
         return {
             "ema_fast": [5, 8, 10, 13, 15],
-            "ema_mid": [20, 25, 30, 35],
+            "ema_mid": [20, 21, 25, 30, 35],
             "ema_slow": [50, 100, 150, 200],
             "adx_threshold": [15, 20, 25, 30],
             "adx_period": [10, 14, 20],

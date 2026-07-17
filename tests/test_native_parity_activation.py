@@ -1,9 +1,12 @@
 import json
 import hashlib
+import inspect
 import sys
 import tempfile
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -14,15 +17,32 @@ PATCH_ROOT = Path(__file__).resolve().parents[1]
 if str(PATCH_ROOT) not in sys.path:
     sys.path.insert(0, str(PATCH_ROOT))
 
+import tools.audit_activate_native_history as native_activation_audit  # noqa: E402
+
 from pm_native_activation import (  # noqa: E402
+    NATIVE_EVIDENCE_CANDIDATE,
+    NATIVE_SOURCE_UNAVAILABLE,
+    NATIVE_TECHNICAL_ERROR,
     resolve_active_native_artifact,
     resolve_active_native_universe,
+    scope_native_pair_window_states,
     sha256_file,
+    validate_native_session_coverage_diagnostics,
+)
+from pm_native_consensus import (  # noqa: E402
+    EVIDENCE_PASS,
+    EVIDENCE_PENDING,
+    EVIDENCE_SEMANTIC_FAIL,
+    INTEGRITY_PASS,
+    REQUIRED_AUDIT_WINDOWS,
 )
 from pm_native_parity import (  # noqa: E402
     ParityThresholds,
     audit_native_cross_resolution,
     audit_native_vs_session_m5,
+)
+from pm_native_request_contract import (  # noqa: E402
+    build_valid_v5_contract_fixture,
 )
 from tools.acquire_native_history import (  # noqa: E402
     ACQUISITION_CONTRACT_VERSION,
@@ -36,7 +56,12 @@ from tools.acquire_native_history import (  # noqa: E402
     expected_session_coverage_by_partition,
     segmented_session_coverage_by_partition_v2,
 )
-from tools.audit_activate_native_history import audit_and_activate  # noqa: E402
+from tools.audit_activate_native_history import (  # noqa: E402
+    _derive_authenticity_state,
+    _parser,
+    _source_leaf,
+    audit_and_activate,
+)
 
 
 UTC = timezone.utc
@@ -54,6 +79,176 @@ _SOURCE_ENVIRONMENT = {
         "max_bars": 10000,
     },
 }
+
+
+def test_partial_reference_extent_keeps_uncovered_audit_windows_pending():
+    start = pd.Timestamp("2020-01-01T00:00:00Z")
+    end = pd.Timestamp("2021-01-01T00:00:00Z")
+
+    def _frame(first: pd.Timestamp) -> pd.DataFrame:
+        index = pd.DatetimeIndex([first, end - pd.Timedelta(hours=1)])
+        return pd.DataFrame(
+            {"_BAR_CLOSE_TS": [first + pd.Timedelta(hours=1), end]},
+            index=index,
+        )
+
+    states = {
+        window: {
+            "integrity_state": INTEGRITY_PASS,
+            "evidence_state": EVIDENCE_PASS,
+            "reason_codes": [],
+        }
+        for window in REQUIRED_AUDIT_WINDOWS
+    }
+    windows = {window: (start, end) for window in REQUIRED_AUDIT_WINDOWS}
+    scoped = scope_native_pair_window_states(
+        states,
+        target_frame=_frame(start),
+        reference_frame=_frame(start + pd.Timedelta(days=180)),
+        partition_windows=windows,
+        boundary_tolerance_seconds=3 * 86_400,
+    )
+    assert all(
+        state["evidence_state"] == EVIDENCE_PENDING for state in scoped.values()
+    )
+    assert all(
+        f"REFERENCE_AUDIT_PREFIX_PENDING:{window}" in scoped[window]["reason_codes"]
+        for window in REQUIRED_AUDIT_WINDOWS
+    )
+
+    failed = {window: dict(state) for window, state in states.items()}
+    failed[REQUIRED_AUDIT_WINDOWS[0]]["evidence_state"] = EVIDENCE_SEMANTIC_FAIL
+    scoped_failed = scope_native_pair_window_states(
+        failed,
+        target_frame=_frame(start),
+        reference_frame=_frame(start + pd.Timedelta(days=180)),
+        partition_windows=windows,
+        boundary_tolerance_seconds=3 * 86_400,
+    )
+    assert (
+        scoped_failed[REQUIRED_AUDIT_WINDOWS[0]]["evidence_state"]
+        == EVIDENCE_SEMANTIC_FAIL
+    )
+
+
+def test_source_leaf_invokes_exact_v5_connector_contract(monkeypatch, tmp_path):
+    fixture = build_valid_v5_contract_fixture()
+    provenance = deepcopy(fixture["provenance"])
+    diagnostics = provenance["pagination"]["page_attempts"][0][
+        "connector_diagnostics"
+    ]
+    diagnostics.update(
+        sync_status="hard_mt5_failure",
+        hard_failure=True,
+        hard_failure_call="copy_rates_range_initial",
+    )
+    run_id = provenance["run_id"]
+    leaf = tmp_path / "runs" / run_id / "EURUSD" / "M5"
+    leaf.mkdir(parents=True)
+    (leaf / "provenance.json").write_text(
+        json.dumps(provenance),
+        encoding="utf-8",
+    )
+    first = pd.Timestamp(fixture["artifact_observation"].first_open_utc)
+    frame = pd.DataFrame(
+        {
+            "Open": [1.0],
+            "High": [1.1],
+            "Low": [0.9],
+            "Close": [1.0],
+            "Volume": [1],
+            "_BAR_CLOSE_TS": [first + pd.Timedelta(minutes=5)],
+        },
+        index=pd.DatetimeIndex([first]),
+    )
+    frame.to_csv(leaf / "bars.csv", index_label="time", lineterminator="\n")
+    monkeypatch.setattr(
+        native_activation_audit,
+        "scan_native_csv_stream",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            artifact=fixture["artifact_observation"]
+        ),
+    )
+
+    loaded = _source_leaf(
+        tmp_path,
+        run_id,
+        "EURUSD",
+        "M5",
+        fixture["manifest_result"],
+        run_manifest_request=fixture["manifest_request"],
+        run_source_environment=fixture["source_environment"],
+    )
+
+    assert (
+        "SOURCE_PRODUCTION_CONTRACT_INVALID:V5_PAGE_MT5_V4_DIAGNOSTICS_INVALID"
+        in loaded["errors"]
+    )
+
+
+def test_activation_v4_coverage_is_diagnostic_not_a_trading_veto():
+    errors, normalized = validate_native_session_coverage_diagnostics(
+        {
+            "optimizer_train": 0.01,
+            "tuning_validation": 0.25,
+            "final_lockbox": 0.0,
+        }
+    )
+    assert errors == []
+    assert normalized == {
+        "optimizer_train": 0.01,
+        "tuning_validation": 0.25,
+        "final_lockbox": 0.0,
+    }
+
+
+def test_activation_v4_sparse_sibling_cannot_veto_authentic_target():
+    assert (
+        _derive_authenticity_state(
+            availability_class="success",
+            source_errors=[],
+            resolution_status="PASS",
+            consensus_status="PENDING",
+            source_unavailable_proven=False,
+        )
+        == NATIVE_EVIDENCE_CANDIDATE
+    )
+
+
+def test_activation_v4_exact_overlap_contradiction_is_technical_not_no_trade():
+    assert (
+        _derive_authenticity_state(
+            availability_class="success",
+            source_errors=[],
+            resolution_status="PASS",
+            consensus_status="FAIL",
+            source_unavailable_proven=False,
+        )
+        == NATIVE_TECHNICAL_ERROR
+    )
+
+
+def test_activation_v4_unavailable_requires_first_date_proof():
+    assert (
+        _derive_authenticity_state(
+            availability_class="unavailable",
+            source_errors=[],
+            resolution_status="PENDING",
+            consensus_status="FAIL",
+            source_unavailable_proven=False,
+        )
+        == NATIVE_TECHNICAL_ERROR
+    )
+    assert (
+        _derive_authenticity_state(
+            availability_class="unavailable",
+            source_errors=[],
+            resolution_status="PENDING",
+            consensus_status="FAIL",
+            source_unavailable_proven=True,
+        )
+        == NATIVE_SOURCE_UNAVAILABLE
+    )
 
 
 def _request_contract(partition_windows, timeframes):
@@ -107,9 +302,7 @@ def _timeframe_request_contract(timeframe_windows, timeframes):
         }
         for timeframe in timeframes
     }
-    common_as_of = pd.Timestamp(
-        timeframe_windows[timeframes[0]]["final_lockbox"][1]
-    )
+    common_as_of = pd.Timestamp(timeframe_windows[timeframes[0]]["final_lockbox"][1])
     common_start = min(
         pd.Timestamp(timeframe_windows[timeframe]["optimizer_train"][0])
         for timeframe in timeframes
@@ -247,7 +440,9 @@ def _pagination_contract(timeframe, request_contract, source_interval=None):
         alignment_mode = "fixed_utc_native_boundary_v1"
         sentinel_slack = 0
     configured_slots = max(1, DEFAULT_PAGE_DAYS[timeframe] * 86400 // seconds)
-    configured_slots = min(configured_slots, int(_SOURCE_ENVIRONMENT["terminal"]["max_bars"] * 0.90))
+    configured_slots = min(
+        configured_slots, int(_SOURCE_ENVIRONMENT["terminal"]["max_bars"] * 0.90)
+    )
     page_span_seconds = configured_slots * seconds
     pages_requested = int(
         np.ceil((fetch_end - fetch_start).total_seconds() / page_span_seconds)
@@ -334,9 +529,19 @@ def _weekly_m5_history(start="2025-01-06", weeks=50, *, omitted_weeks=()):
 
 
 def _resample(frame, rule):
-    return frame.resample(rule).agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    ).dropna()
+    return (
+        frame.resample(rule)
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        .dropna()
+    )
 
 
 def _write_source(
@@ -568,12 +773,7 @@ def _write_timeframe_v4_run(native_root, run_id):
         )
         results.append(result)
         provenance_path = (
-            native_root
-            / "runs"
-            / run_id
-            / "EURUSD"
-            / timeframe
-            / "provenance.json"
+            native_root / "runs" / run_id / "EURUSD" / timeframe / "provenance.json"
         )
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         coverage, details = segmented_session_coverage_by_partition_v2(
@@ -678,9 +878,7 @@ def _rewrite_m5_as_no_history(native_root, run_id):
     )
     manifest_path = native_root / "runs" / run_id / "run_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    m5_cell = next(
-        item for item in manifest["results"] if item["timeframe"] == "M5"
-    )
+    m5_cell = next(item for item in manifest["results"] if item["timeframe"] == "M5")
     m5_cell.update(
         {
             "status": "failed",
@@ -762,7 +960,11 @@ def _rewrite_source_frame(
                     if partition in detail_partitions
                     else None
                 )
-                for partition in ("optimizer_train", "tuning_validation", "final_lockbox")
+                for partition in (
+                    "optimizer_train",
+                    "tuning_validation",
+                    "final_lockbox",
+                )
             },
             "expected_session_bars_by_partition": {
                 partition: (
@@ -774,14 +976,16 @@ def _rewrite_source_frame(
                     if partition in detail_partitions
                     else None
                 )
-                for partition in ("optimizer_train", "tuning_validation", "final_lockbox")
+                for partition in (
+                    "optimizer_train",
+                    "tuning_validation",
+                    "final_lockbox",
+                )
             },
         }
     )
     if failure_status == "boundary_history_shortfall":
-        requested_start = pd.Timestamp(
-            provenance["request"]["native_fetch_start_utc"]
-        )
+        requested_start = pd.Timestamp(provenance["request"]["native_fetch_start_utc"])
         requested_end = pd.Timestamp(
             provenance["request"]["native_fetch_end_exclusive_utc"]
         )
@@ -872,16 +1076,20 @@ def _three_partition_windows(start):
 
 
 def _resample_with_real_volume(frame, rule="15min"):
-    return frame.resample(rule).agg(
-        {
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-            "RealVolume": "sum",
-        }
-    ).dropna()
+    return (
+        frame.resample(rule)
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+                "RealVolume": "sum",
+            }
+        )
+        .dropna()
+    )
 
 
 def test_cross_resolution_reconciliation_is_exact_and_partition_scoped():
@@ -1121,9 +1329,7 @@ def test_cross_resolution_fixed_coarse_target_detects_missing_edge_bars():
             thresholds=ParityThresholds(min_compared_native_bars=1),
         )
         assert report["status"] == "FAIL"
-        assert report["partitions"]["optimizer_train"][
-            "unassigned_fine_rows"
-        ] >= 12
+        assert report["partitions"]["optimizer_train"]["unassigned_fine_rows"] >= 12
 
 
 def test_cross_resolution_broker_aligned_h4_detects_bracketed_edge_gaps():
@@ -1177,9 +1383,7 @@ def test_cross_resolution_broker_aligned_h4_detects_bracketed_edge_gaps():
             thresholds=ParityThresholds(min_compared_native_bars=1),
         )
         assert report["status"] == "FAIL"
-        assert report["partitions"]["optimizer_train"][
-            "unassigned_fine_rows"
-        ] >= 4
+        assert report["partitions"]["optimizer_train"]["unassigned_fine_rows"] >= 4
 
 
 def test_missing_tick_tolerance_is_explicitly_pending():
@@ -1211,7 +1415,11 @@ def test_parity_report_labels_dst_and_holiday_candidate_weeks():
     for i, start in enumerate(opens[:-1]):
         following = opens[i + 1]
         delta = following - start
-        end = following if pd.Timedelta(hours=12) <= delta <= pd.Timedelta(hours=36) else start + pd.Timedelta(days=1)
+        end = (
+            following
+            if pd.Timedelta(hours=12) <= delta <= pd.Timedelta(hours=36)
+            else start + pd.Timedelta(days=1)
+        )
         group = m5[(m5.index >= start) & (m5.index < end)]
         if group.empty:
             continue
@@ -1265,8 +1473,13 @@ def test_successful_activation_pins_exact_hashes_and_resolver_uses_no_flat_fallb
         )
         resolution = resolve_active_native_artifact(data_dir, "EURUSD", "H1")
         assert resolution.valid, resolution.errors
-        assert resolution.data_path == native_root / "runs" / "run-good" / "EURUSD" / "H1" / "bars.csv"
-        assert "audits/activation-good" in str(resolution.sidecar_path).replace("\\", "/")
+        assert (
+            resolution.data_path
+            == native_root / "runs" / "run-good" / "EURUSD" / "H1" / "bars.csv"
+        )
+        assert "audits/activation-good" in str(resolution.sidecar_path).replace(
+            "\\", "/"
+        )
 
         # A tempting flat file is ignored; the hash-pinned run remains the only authority.
         flat = native_root / "EURUSD_H1.csv"
@@ -1414,9 +1627,7 @@ def test_timeframe_v4_cell_windows_activate_and_resolve_independently():
             production_contract_required=True,
         )
         assert not production.valid
-        assert "NATIVE_UNIVERSE_PRODUCTION_TIMEFRAME_V5_REQUIRED" in (
-            production.errors
-        )
+        assert "NATIVE_UNIVERSE_PRODUCTION_TIMEFRAME_V5_REQUIRED" in (production.errors)
         assert "NATIVE_UNIVERSE_PRODUCTION_SIX_TIMEFRAME_ROSTER_REQUIRED" in (
             production.errors
         )
@@ -1424,8 +1635,9 @@ def test_timeframe_v4_cell_windows_activate_and_resolve_independently():
         assert calendar["window_contract_version"] == (
             TIMEFRAME_EVIDENCE_CONTRACT_VERSION
         )
-        assert calendar["timeframe_calendar_boundaries"]["M5"] != (
-            calendar["timeframe_calendar_boundaries"]["H1"]
+        assert (
+            calendar["timeframe_calendar_boundaries"]["M5"]
+            != (calendar["timeframe_calendar_boundaries"]["H1"])
         )
         assert resolve_active_native_artifact(data_dir, "EURUSD", "H1").valid
 
@@ -1577,7 +1789,9 @@ def test_timeframe_v4_single_ohlc_corruption_is_not_diluted_by_horizon():
             for entry in result["entries"]["EURUSD"].values()
         )
         assert all(
-            any("OHLC_MISMATCH_RATIO_HIGH" in reason for reason in entry["reason_codes"])
+            any(
+                "OHLC_MISMATCH_RATIO_HIGH" in reason for reason in entry["reason_codes"]
+            )
             for entry in result["entries"]["EURUSD"].values()
         )
         universe = resolve_active_native_universe(
@@ -1617,7 +1831,7 @@ def test_timeframe_v4_tick_tolerance_override_cannot_weaken_source_contract():
         )
 
 
-def test_timeframe_v4_unavailable_reference_forms_valid_full_exclusion():
+def test_timeframe_v4_unavailable_reference_does_not_veto_valid_target_cell():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "data"
         native_root = data_dir / "native"
@@ -1637,18 +1851,18 @@ def test_timeframe_v4_unavailable_reference_forms_valid_full_exclusion():
 
         assert result["status"] == "active", result
         assert result["active_pointer_updated"]
-        assert result["entries"]["EURUSD"]["M5"]["status"] == (
-            "excluded_no_trade"
+        assert result["entries"]["EURUSD"]["M5"]["status"] == ("excluded_no_trade")
+        assert result["entries"]["EURUSD"]["H1"]["status"] == "active"
+        assert result["universe_eligibility"]["cell_statuses"]["EURUSD"] == {
+            "M5": "excluded_no_trade",
+            "H1": "active",
+        }
+        h1_entry = result["entries"]["EURUSD"]["H1"]
+        parity = json.loads(
+            (native_root / h1_entry["parity_relative_path"]).read_text(encoding="utf-8")
         )
-        assert result["entries"]["EURUSD"]["H1"]["status"] == (
-            "excluded_no_trade"
-        )
-        exclusion = result["universe_eligibility"]["excluded_symbols"]["EURUSD"]
-        assert "M5:NO_HISTORY" in exclusion["reason_codes"]
-        assert any(
-            reason.startswith("H1:AUDIT_REFERENCE_UNAVAILABLE:M5:NO_HISTORY")
-            for reason in exclusion["reason_codes"]
-        )
+        assert parity["status"] == "NOT_APPLICABLE"
+        assert parity["reason_codes"] == ["AUDIT_REFERENCE_UNAVAILABLE:M5:NO_HISTORY"]
 
         universe = resolve_active_native_universe(
             data_dir,
@@ -1656,8 +1870,9 @@ def test_timeframe_v4_unavailable_reference_forms_valid_full_exclusion():
             required_timeframes=("M5", "H1"),
         )
         assert universe.valid, universe.errors
-        assert universe.symbol_status("EURUSD") == "excluded_no_trade"
-        assert universe.active_timeframes("EURUSD") == ()
+        assert universe.symbol_status("EURUSD") == "eligible"
+        assert universe.active_timeframes("EURUSD") == ("H1",)
+        assert universe.excluded_timeframes("EURUSD") == ("M5",)
 
 
 def test_timeframe_v4_request_map_tamper_blocks_activation():
@@ -1674,9 +1889,9 @@ def test_timeframe_v4_request_map_tamper_blocks_activation():
             / "provenance.json"
         )
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-        provenance["request"]["timeframe_calendar_boundaries"]["H1"][
-            "optimizer_train"
-        ]["start_ts"] = "2024-01-01T00:00:00+00:00"
+        provenance["request"]["timeframe_calendar_boundaries"]["H1"]["optimizer_train"][
+            "start_ts"
+        ] = "2024-01-01T00:00:00+00:00"
         provenance_path.write_text(
             json.dumps(provenance, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -1736,8 +1951,7 @@ def test_timeframe_v4_repin_cannot_flip_parity_target_orientation():
 
         assert not universe.valid
         assert any(
-            "PARITY_TARGET_TIMEFRAME_MISMATCH" in error
-            for error in universe.errors
+            "PARITY_TARGET_TIMEFRAME_MISMATCH" in error for error in universe.errors
         )
 
 
@@ -1765,14 +1979,10 @@ def test_proven_no_history_m5_excludes_only_m5_and_does_not_veto_h1():
         }
         h1_entry = result["entries"]["EURUSD"]["H1"]
         parity = json.loads(
-            (native_root / h1_entry["parity_relative_path"]).read_text(
-                encoding="utf-8"
-            )
+            (native_root / h1_entry["parity_relative_path"]).read_text(encoding="utf-8")
         )
         assert parity["status"] == "NOT_APPLICABLE"
-        assert parity["reason_codes"] == [
-            "M5_ACQUISITION_UNAVAILABLE:NO_HISTORY"
-        ]
+        assert parity["reason_codes"] == ["M5_ACQUISITION_UNAVAILABLE:NO_HISTORY"]
         universe = resolve_active_native_universe(
             data_dir,
             ["EURUSD"],
@@ -1804,13 +2014,11 @@ def test_m5_technical_failure_still_blocks_sibling_instead_of_becoming_no_trade(
             json.dumps(provenance, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        manifest_path = (
-            native_root / "runs" / "run-m5-technical" / "run_manifest.json"
-        )
+        manifest_path = native_root / "runs" / "run-m5-technical" / "run_manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        next(
-            item for item in manifest["results"] if item["timeframe"] == "M5"
-        )["failure_status"] = "fetch_failed"
+        next(item for item in manifest["results"] if item["timeframe"] == "M5")[
+            "failure_status"
+        ] = "fetch_failed"
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -1858,7 +2066,7 @@ def test_exact_session_coverage_policy_boundary_remains_eligible():
         assert universe.symbol_status("EURUSD") == "eligible"
 
 
-def test_low_session_coverage_is_whole_symbol_hash_bound_no_trade_exclusion():
+def test_low_session_coverage_is_diagnostic_and_does_not_emit_no_trade():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "data"
         native_root = data_dir / "native"
@@ -1876,14 +2084,15 @@ def test_low_session_coverage_is_whole_symbol_hash_bound_no_trade_exclusion():
 
         assert result["status"] == "active", result
         eligibility = result["universe_eligibility"]
-        assert eligibility["eligible_symbols"] == []
-        exclusion = eligibility["excluded_symbols"]["EURUSD"]
-        assert set(exclusion["reason_codes"]) == {
-            "M5:SESSION_COVERAGE_LOW:final_lockbox:0.900000<0.950000",
-            "H1:SESSION_COVERAGE_LOW:final_lockbox:0.900000<0.950000",
-        }
+        assert eligibility["eligible_symbols"] == ["EURUSD"]
+        assert eligibility["excluded_symbols"] == {}
         assert all(
-            entry["status"] == "excluded_no_trade"
+            entry["status"] == "active"
+            for entry in result["entries"]["EURUSD"].values()
+        )
+        assert all(
+            entry["expected_session_coverage_by_partition"]["final_lockbox"]
+            == pytest.approx(0.9)
             for entry in result["entries"]["EURUSD"].values()
         )
         universe = resolve_active_native_universe(
@@ -1892,10 +2101,10 @@ def test_low_session_coverage_is_whole_symbol_hash_bound_no_trade_exclusion():
             required_timeframes=("M5", "H1"),
         )
         assert universe.valid, universe.errors
-        assert universe.symbol_status("EURUSD") == "excluded_no_trade"
+        assert universe.symbol_status("EURUSD") == "eligible"
 
 
-def test_one_partial_cell_excludes_only_that_cell_and_preserves_sibling():
+def test_ambiguous_legacy_partial_cell_blocks_activation_but_preserves_sibling_evidence():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "data"
         native_root = data_dir / "native"
@@ -1927,23 +2136,15 @@ def test_one_partial_cell_excludes_only_that_cell_and_preserves_sibling():
             thresholds=ParityThresholds(min_compared_native_bars=20),
         )
 
-        assert result["status"] == "active", result
-        assert result["universe_eligibility"]["eligible_symbols"] == ["EURUSD"]
-        assert result["universe_eligibility"]["excluded_symbols"] == {}
+        assert result["status"] == "failed", result
+        assert result["active_pointer_updated"] is False
         assert result["entries"]["EURUSD"]["M5"]["status"] == "active"
-        assert result["entries"]["EURUSD"]["H1"]["status"] == "excluded_no_trade"
-        universe = resolve_active_native_universe(
-            data_dir,
-            ["EURUSD"],
-            required_timeframes=("M5", "H1"),
+        assert result["entries"]["EURUSD"]["H1"]["status"] == "failed"
+        assert any(
+            "SOURCE_LEGACY_PARTIAL" in reason
+            for reason in result["entries"]["EURUSD"]["H1"]["reason_codes"]
         )
-        assert universe.valid, universe.errors
-        assert universe.active_timeframes("EURUSD") == ("M5",)
-        assert universe.excluded_timeframes("EURUSD") == ("H1",)
-        assert universe.cell_exclusion_binding("EURUSD", "H1")["timeframe"] == "H1"
-        assert resolve_active_native_artifact(data_dir, "EURUSD", "M5").valid
-        excluded = resolve_active_native_artifact(data_dir, "EURUSD", "H1")
-        assert "NATIVE_ACTIVE_CELL_EXCLUDED_NO_TRADE" in excluded.errors
+        assert not (native_root / "ACTIVE.json").exists()
 
 
 def test_v4_leading_audit_prefix_shortfall_does_not_veto_covered_target_cell():
@@ -1959,9 +2160,7 @@ def test_v4_leading_audit_prefix_shortfall_does_not_veto_covered_target_cell():
         own_train_start = pd.Timestamp("2025-01-06T00:00:00Z")
         # Remove only the oldest week of the H1-reference prefix. M5's own
         # train/tuning/lockbox strategy envelope remains byte-for-byte covered.
-        frame = frame.loc[
-            frame.index >= own_train_start - pd.Timedelta(weeks=9)
-        ]
+        frame = frame.loc[frame.index >= own_train_start - pd.Timedelta(weeks=9)]
         _rewrite_source_frame(
             native_root,
             run_id,
@@ -1992,7 +2191,7 @@ def test_v4_leading_audit_prefix_shortfall_does_not_veto_covered_target_cell():
         assert resolve_active_native_artifact(data_dir, "EURUSD", "M5").valid
 
 
-def test_one_low_coverage_cell_excludes_only_that_cell_with_sufficient_sibling():
+def test_one_low_coverage_cell_remains_data_eligible_for_downstream_power_test():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "data"
         native_root = data_dir / "native"
@@ -2007,7 +2206,9 @@ def test_one_low_coverage_cell_excludes_only_that_cell_with_sufficient_sibling()
         remove = pd.Series(False, index=frame.index)
         for week in (35, 36):
             start = origin + pd.Timedelta(weeks=week)
-            remove |= (frame.index >= start) & (frame.index < start + pd.Timedelta(days=1))
+            remove |= (frame.index >= start) & (
+                frame.index < start + pd.Timedelta(days=1)
+            )
         frame = frame.loc[~remove.to_numpy()]
         _rewrite_source_frame(
             native_root,
@@ -2036,19 +2237,22 @@ def test_one_low_coverage_cell_excludes_only_that_cell_with_sufficient_sibling()
         assert eligibility["excluded_symbols"] == {}
         assert eligibility["cell_statuses"]["EURUSD"] == {
             "M5": "active",
-            "H1": "excluded_no_trade",
+            "H1": "active",
         }
-        assert result["entries"]["EURUSD"]["M5"][
-            "expected_session_coverage_by_partition"
-        ]["final_lockbox"] >= 0.95
+        assert (
+            result["entries"]["EURUSD"]["M5"]["expected_session_coverage_by_partition"][
+                "final_lockbox"
+            ]
+            >= 0.95
+        )
         universe = resolve_active_native_universe(
             data_dir,
             ["EURUSD"],
             required_timeframes=("M5", "H1"),
         )
         assert universe.valid, universe.errors
-        assert universe.active_timeframes("EURUSD") == ("M5",)
-        assert universe.excluded_timeframes("EURUSD") == ("H1",)
+        assert universe.active_timeframes("EURUSD") == ("M5", "H1")
+        assert universe.excluded_timeframes("EURUSD") == ()
         assert universe.calendar_contract["common_as_of_utc"]
         assert set(universe.calendar_contract["common_calendar_boundaries"]) == {
             "optimizer_train",
@@ -2196,9 +2400,9 @@ def test_coverage_provenance_tamper_is_activation_failure(tamper_kind):
                 "start_ts"
             ] = "2025-01-07T00:00:00Z"
         else:
-            provenance["expected_session_coverage_details_by_partition"][
-                "status"
-            ] = "untrusted"
+            provenance["expected_session_coverage_details_by_partition"]["status"] = (
+                "untrusted"
+            )
         path.write_text(json.dumps(provenance), encoding="utf-8")
 
         result = audit_and_activate(
@@ -2250,24 +2454,24 @@ def test_low_coverage_cannot_hide_parity_failure():
         )
 
 
-def test_production_session_coverage_threshold_cannot_be_weakened():
-    with tempfile.TemporaryDirectory() as tmp:
-        native_root = Path(tmp) / "data" / "native"
-        native_root.mkdir(parents=True)
-        _write_run(native_root, "run-threshold")
+def test_production_session_coverage_threshold_has_no_public_override():
+    assert (
+        "minimum_session_coverage"
+        not in inspect.signature(audit_and_activate).parameters
+    )
 
-        with pytest.raises(ValueError, match="pinned at 0.95"):
-            audit_and_activate(
-                native_root,
-                run_id="run-threshold",
-                symbols=["EURUSD"],
-                timeframes=["M5", "H1"],
-                activation_id="activation-threshold",
-                minimum_session_coverage=0.0,
-            )
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "--run-id",
+                "run-threshold",
+                "--minimum-session-coverage",
+                "0.0",
+            ]
+        )
 
 
-def test_coverage_exclusion_ratio_tamper_invalidates_active_universe():
+def test_coverage_diagnostic_tamper_invalidates_active_universe():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "data"
         native_root = data_dir / "native"
@@ -2283,10 +2487,9 @@ def test_coverage_exclusion_ratio_tamper_invalidates_active_universe():
         )
         manifest_path = Path(result["manifest_path"])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        audited = manifest["universe_eligibility"]["excluded_symbols"]["EURUSD"][
-            "audited_sufficiency_cells"
-        ]["H1"]
-        audited["expected_session_coverage_by_partition"]["final_lockbox"] = 0.99
+        manifest["entries"]["EURUSD"]["H1"]["expected_session_coverage_by_partition"][
+            "final_lockbox"
+        ] = 0.99
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         pointer_path = native_root / "ACTIVE.json"
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -2300,7 +2503,7 @@ def test_coverage_exclusion_ratio_tamper_invalidates_active_universe():
         )
 
         assert not universe.valid
-        assert any("COVERAGE_REASON_MISMATCH" in error for error in universe.errors)
+        assert any("COVERAGE_MISMATCH" in error for error in universe.errors)
 
 
 @pytest.mark.parametrize("evidence_kind", ["bars", "provenance", "sidecar", "parity"])
@@ -2415,7 +2618,9 @@ def test_material_mismatch_writes_failed_manifest_without_advancing_existing_poi
         assert sha256_file(pointer) == pointer_before
         bad_entry = failed["entries"]["EURUSD"]["H1"]
         assert bad_entry["status"] == "failed"
-        assert any("OHLC_MISMATCH_RATIO_HIGH" in reason for reason in bad_entry["reason_codes"])
+        assert any(
+            "OHLC_MISMATCH_RATIO_HIGH" in reason for reason in bad_entry["reason_codes"]
+        )
 
 
 def test_unresolved_parity_is_immutable_pending_and_does_not_create_active_pointer():
@@ -2498,7 +2703,9 @@ def test_repin_cannot_promote_low_coverage_evidence_to_eligible():
             activation_id="activation-reverse-promote",
             thresholds=ParityThresholds(min_compared_native_bars=20),
         )
-        manifest = json.loads(Path(activated["manifest_path"]).read_text(encoding="utf-8"))
+        manifest = json.loads(
+            Path(activated["manifest_path"]).read_text(encoding="utf-8")
+        )
         universe = manifest["universe_eligibility"]
         universe["eligible_symbols"] = ["EURUSD"]
         universe["excluded_symbols"] = {}
@@ -2546,15 +2753,15 @@ def test_repin_cannot_demote_sufficient_evidence_to_coverage_exclusion():
             activation_id="activation-reverse-exclude",
             thresholds=ParityThresholds(min_compared_native_bars=20),
         )
-        manifest = json.loads(Path(activated["manifest_path"]).read_text(encoding="utf-8"))
-        run_manifest = json.loads(
-            (native_root / "runs" / "run-reverse-exclude" / "run_manifest.json").read_text(
-                encoding="utf-8"
-            )
+        manifest = json.loads(
+            Path(activated["manifest_path"]).read_text(encoding="utf-8")
         )
-        run_cells = {
-            item["timeframe"]: item for item in run_manifest["results"]
-        }
+        run_manifest = json.loads(
+            (
+                native_root / "runs" / "run-reverse-exclude" / "run_manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        run_cells = {item["timeframe"]: item for item in run_manifest["results"]}
         availability_cells = {}
         audited_cells = {}
         contract_reasons = []
@@ -2563,7 +2770,9 @@ def test_repin_cannot_demote_sufficient_evidence_to_coverage_exclusion():
             coverage = dict(entry["expected_session_coverage_by_partition"])
             coverage["final_lockbox"] = 0.9
             sidecar = json.loads(
-                (native_root / entry["sidecar_relative_path"]).read_text(encoding="utf-8")
+                (native_root / entry["sidecar_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
             )
             availability_cells[timeframe] = {
                 "status": run_cells[timeframe]["status"],
@@ -2583,9 +2792,7 @@ def test_repin_cannot_demote_sufficient_evidence_to_coverage_exclusion():
                     "expected_session_bars_by_partition"
                 ],
                 "coverage_method": entry["coverage_method"],
-                "source_provenance_sha256": sidecar[
-                    "source_provenance_sha256"
-                ],
+                "source_provenance_sha256": sidecar["source_provenance_sha256"],
                 "audited_sidecar_sha256": entry["sidecar_sha256"],
                 "parity_sha256": entry["parity_sha256"],
             }

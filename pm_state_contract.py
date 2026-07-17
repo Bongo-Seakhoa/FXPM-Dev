@@ -716,7 +716,7 @@ ACTUAL_STRATEGY_NAMES: tuple[str, ...] = (
 # normalized grid axes/values.  The contract remains import-independent while
 # tests make any candidate addition, removal, or value drift explicit.
 STRATEGY_CANDIDATE_DOMAIN_SHA256 = (
-    "8f2f82f1a7f3ca90c188b1d5e796cb057076ba64caf4284371af7430abc4bb9f"
+    "d4d8ae2deee050989bdc8e93b21d779c8d68ddb4666668a9c34c5d65177803e3"
 )
 
 

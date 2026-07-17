@@ -5,7 +5,7 @@ Validates that max_combined_risk_pct is properly enforced when opening
 multiple positions on same symbol across different timeframes (D1 + lower TF scenario).
 """
 import pytest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock
 from datetime import datetime
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -35,6 +35,27 @@ class MockInstrumentSpec:
     """Mock instrument specification."""
     pip_size: float
     pip_value: float
+
+
+def _bind_capital_envelope(trader, *, same_symbol_pct: float = 3.0):
+    """Bind a signed-selected capital envelope so admission gates have their
+    required envelope.  Post-seq1644 admission reads the selected envelope, not
+    static config; the same-symbol cap comes from max_same_symbol_stop_risk_pct.
+    The default trader uses the champion book, so the accessor reads the funded
+    envelope slot here.
+    """
+    # Hierarchy same <= factor <= total < 100 must hold (accessor coherence,
+    # seq1720), so factor/total sit at or above the same-symbol cap under test.
+    trader._funded_capital_envelope = {
+        "max_total_stop_risk_pct": max(8.0, same_symbol_pct),
+        "max_factor_stop_risk_pct": max(5.0, same_symbol_pct),
+        "max_same_symbol_stop_risk_pct": same_symbol_pct,
+        "max_margin_utilization_pct": 50.0,
+        "min_margin_level_pct": 200.0,
+        "min_free_margin_pct": 50.0,
+        "gap_stress_multiple": 2.5,
+    }
+    return trader
 
 
 class TestPortfolioRiskCap:
@@ -124,6 +145,7 @@ class TestPortfolioRiskCap:
         )
 
         # Test: no positions, should allow trade
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=1.5,
@@ -134,6 +156,90 @@ class TestPortfolioRiskCap:
         assert "Symbol risk OK" in reason
         assert "0 open positions" in reason
         logging.disable(logging.NOTSET)  # Re-enable logging
+
+    def test_check_portfolio_risk_cap_fails_closed_without_capital_envelope(self):
+        """No bound capital envelope must block same-symbol admission.
+
+        Static config is never a production fallback (seq1644/1684) and funded
+        fails closed while scope is DEMO_PROBATION only (seq1713), so admission
+        with no bound selected envelope returns can_trade=False.
+        """
+        mock_mt5 = Mock()
+        mock_mt5.get_account_info.return_value = MockAccountInfo(
+            equity=10000, balance=10000
+        )
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.get_positions.return_value = []
+
+        mock_pm = Mock()
+        mock_pm.symbols = []
+
+        mock_pipeline_config = Mock()
+        mock_pipeline_config.max_combined_risk_pct = 3.0
+
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+        import logging
+        logging.disable(logging.CRITICAL)
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            pipeline_config=mock_pipeline_config,
+            enable_trading=False,
+        )
+        # Intentionally do NOT bind a capital envelope: admission must fail
+        # closed rather than fall back to the static max_combined_risk_pct.
+        can_trade, reason = trader._check_portfolio_risk_cap(
+            symbol="EURUSD",
+            new_trade_risk_pct=1.5,
+            broker_symbol="EURUSD",
+        )
+
+        assert can_trade is False
+        assert "capital envelope" in reason.lower()
+        logging.disable(logging.NOTSET)
+
+    def test_selected_same_symbol_cap_beats_static_no_pre_veto(self):
+        """A selected same-symbol cap of 30% must admit a 20% trade that the
+        legacy static 3% would have pre-vetoed (seq1720 anti-arbitrary-cap)."""
+        mock_mt5 = Mock()
+        mock_mt5.get_account_info.return_value = MockAccountInfo(
+            equity=10000, balance=10000
+        )
+        mock_mt5.is_connected.return_value = False
+        mock_mt5.get_positions.return_value = []
+
+        mock_pm = Mock()
+        mock_pm.symbols = []
+
+        mock_pipeline_config = Mock()
+        mock_pipeline_config.max_combined_risk_pct = 3.0  # legacy static cap
+
+        from pm_main import LiveTrader
+        from pm_position import PositionConfig
+        import logging
+        logging.disable(logging.CRITICAL)
+
+        trader = LiveTrader(
+            mt5_connector=mock_mt5,
+            portfolio_manager=mock_pm,
+            position_config=PositionConfig(),
+            pipeline_config=mock_pipeline_config,
+            enable_trading=False,
+        )
+        # Selected envelope admits up to 30% same-symbol; a 20% trade (which the
+        # static 3% would deny) must be allowed.
+        _bind_capital_envelope(trader, same_symbol_pct=30.0)
+        can_trade, reason = trader._check_portfolio_risk_cap(
+            symbol="EURUSD",
+            new_trade_risk_pct=20.0,
+            broker_symbol="EURUSD",
+        )
+
+        assert can_trade is True, reason
+        logging.disable(logging.NOTSET)
 
     def test_check_portfolio_risk_cap_snapshot_unavailable_fails_closed(self):
         """Test risk cap check fails closed when the position snapshot is unavailable."""
@@ -159,6 +265,7 @@ class TestPortfolioRiskCap:
             enable_trading=False
         )
 
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=1.0,
@@ -204,6 +311,7 @@ class TestPortfolioRiskCap:
         )
 
         # Test: 1.2% existing + 1.5% new = 2.7% < 3.0% cap
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=1.5,
@@ -256,6 +364,7 @@ class TestPortfolioRiskCap:
         )
 
         # Test: 1.5% + 1.0% + 1.0% = 3.5% > 3.0% cap
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=1.0,
@@ -305,6 +414,7 @@ class TestPortfolioRiskCap:
         )
 
         # Test: checking EURUSD should not count GBPUSD position
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=2.5,
@@ -357,6 +467,7 @@ class TestPortfolioRiskCap:
         )
 
         # Test: should estimate risk from SL distance
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=1.0,
@@ -403,6 +514,7 @@ class TestPortfolioRiskCap:
         )
 
         # Test: 1.5% existing + 1.5% new = 3.0% == 3.0% cap (should allow)
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=1.5,
@@ -447,6 +559,7 @@ class TestPortfolioRiskCap:
             enable_trading=False
         )
 
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=1.6,
@@ -493,6 +606,7 @@ class TestPortfolioRiskCap:
             enable_trading=False
         )
 
+        _bind_capital_envelope(trader)
         can_trade, reason = trader._check_portfolio_risk_cap(
             symbol="EURUSD",
             new_trade_risk_pct=2.2,

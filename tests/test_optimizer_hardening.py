@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from unittest.mock import patch
 
@@ -23,21 +24,32 @@ from pm_strategies import StrategyRegistry
 from pm_trade_power import build_numerical_execution_cost_attestation
 
 
-def _with_authenticated_trade_evidence(payload):
+def _with_authenticated_trade_evidence(
+    payload,
+    *,
+    partition_start="2024-01-01",
+):
     result = dict(payload)
-    start = pd.Timestamp("2024-01-01", tz="UTC")
+    start = pd.Timestamp(partition_start)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+    projection_sha256 = hashlib.sha256(start.isoformat().encode("ascii")).hexdigest()
+    metadata = dict((payload.get("trades") or [{}])[0])
     trades = []
     for index in range(320):
         entry = start + pd.Timedelta(hours=2 * index)
-        trades.append({
+        trades.append({**metadata,
             "pnl_dollars": 100.0 if index % 2 else -50.0,
             "risk_amount": 100.0,
             "entry_time": entry,
             "exit_time": entry + pd.Timedelta(hours=1),
-            "trade_record_schema_version": "2026-06-18-mae-mfe-v1",
+            "position_id": f"{projection_sha256[:16]}:{index}",
+            "entry_event_order": index * 2,
+            "exit_event_order": index * 2 + 1,
+            "trade_record_schema_version": "2026-07-14-position-events-v2",
         })
     result["total_trades"] = len(trades)
     result["trades"] = trades
+    result["position_events"] = trades
     result["execution_cost_timing_contract"] = {
         "entry_slippage": "entry_slippage_parity_v1",
         "swap_accrual": "causal_swap_accrual_v1",
@@ -73,13 +85,13 @@ def _with_authenticated_trade_evidence(payload):
         "target_bars_sha256": "5" * 64,
         "target_sidecar_sha256": "6" * 64,
         "projection_contract": "fxpm-swap-preopen-close-projection-v1",
-        "projection_sha256": "a" * 64,
+        "projection_sha256": projection_sha256,
     }
     return result
 
 
 def _power_callbacks():
-    evaluator = RegimeOptimizer.__new__(RegimeOptimizer)
+    evaluator = RegimeOptimizer(PipelineConfig(oos_evidence_export_enabled=False))
     return (
         evaluator._calibrate_train_power_result,
         evaluator._evaluate_partition_power_result,
@@ -3202,14 +3214,17 @@ class OptimizerHardeningTests(unittest.TestCase):
                 anchor = float(strategy.get_params()["sl_atr_mult"])
                 pf_by_anchor = {1.0: 0.5, 2.0: 0.7, 3.0: 1.2}
                 pf = pf_by_anchor[anchor]
-                return _with_authenticated_trade_evidence({
-                    "total_trades": 30,
-                    "profit_factor": pf,
-                    "win_rate": 52.0,
-                    "total_return_pct": 8.0 if pf >= 1.0 else -8.0,
-                    "max_drawdown_pct": 4.0,
-                    "trades": [{"pf": pf}],
-                })
+                return _with_authenticated_trade_evidence(
+                    {
+                        "total_trades": 30,
+                        "profit_factor": pf,
+                        "win_rate": 52.0,
+                        "total_return_pct": 8.0 if pf >= 1.0 else -8.0,
+                        "max_drawdown_pct": 4.0,
+                        "trades": [{"pf": pf}],
+                    },
+                    partition_start=features.index[0],
+                )
 
         previous = StrategyRegistry._strategies.get("AnchorSensitiveStrategy")
         StrategyRegistry._strategies["AnchorSensitiveStrategy"] = AnchorSensitiveStrategy
@@ -3250,14 +3265,18 @@ class OptimizerHardeningTests(unittest.TestCase):
                         optimizer.REGIMES[i % len(optimizer.REGIMES)] for i in range(80)
                     ],
                 },
-                index=pd.date_range("2026-01-01", periods=80, freq="h"),
+                index=pd.date_range(
+                    "2026-01-01", periods=80, freq="h", tz="UTC"
+                ),
             )
+            validation = features.copy()
+            validation.index = validation.index + pd.Timedelta(days=365)
 
             candidates = optimizer._collect_candidates(
                 "EURUSD",
                 "H1",
                 features,
-                features.copy(),
+                validation,
                 [AnchorSensitiveStrategy()],
             )
         finally:
@@ -3397,12 +3416,15 @@ class OptimizerHardeningTests(unittest.TestCase):
                     score = 10.0 if not is_val else 100.0
                 else:
                     score = 100.0 if not is_val else -100.0
-                return _with_authenticated_trade_evidence({
-                    "total_trades": 20,
-                    "max_drawdown_pct": 2.0,
-                    "score": score,
-                    "trades": [{"score": score}],
-                })
+                return _with_authenticated_trade_evidence(
+                    {
+                        "total_trades": 20,
+                        "max_drawdown_pct": 2.0,
+                        "score": score,
+                        "trades": [{"score": score}],
+                    },
+                    partition_start=features.index[0],
+                )
 
         def bucket_trades(trades, features):
             return {
@@ -3413,8 +3435,14 @@ class OptimizerHardeningTests(unittest.TestCase):
                 }
             }
 
-        train = pd.DataFrame({"Close": range(60), "REGIME_LIVE": ["TREND"] * 60})
-        val = pd.DataFrame({"Close": range(60), "REGIME_LIVE": ["TREND"] * 60})
+        train = pd.DataFrame(
+            {"Close": range(60), "REGIME_LIVE": ["TREND"] * 60},
+            index=pd.date_range("2024-01-01", periods=60, freq="h", tz="UTC"),
+        )
+        val = pd.DataFrame(
+            {"Close": range(60), "REGIME_LIVE": ["TREND"] * 60},
+            index=pd.date_range("2025-01-01", periods=60, freq="h", tz="UTC"),
+        )
         val.attrs["is_val"] = True
 
         backtester = FakeBacktester()
@@ -3476,11 +3504,14 @@ class OptimizerHardeningTests(unittest.TestCase):
 
             def run(self, features, signals, symbol, strategy, **kwargs):
                 self.calls.append(dict(kwargs))
-                return _with_authenticated_trade_evidence({
-                    "total_trades": 20,
-                    "max_drawdown_pct": 2.0,
-                    "trades": [{"score": 1.0}],
-                })
+                return _with_authenticated_trade_evidence(
+                    {
+                        "total_trades": 20,
+                        "max_drawdown_pct": 2.0,
+                        "trades": [{"score": 1.0}],
+                    },
+                    partition_start=features.index[0],
+                )
 
         def bucket_trades(trades, features, timeframe=None):
             return {
@@ -3491,8 +3522,14 @@ class OptimizerHardeningTests(unittest.TestCase):
                 }
             }
 
-        train = pd.DataFrame({"Close": range(80), "REGIME_LIVE": ["TREND"] * 80})
-        val = pd.DataFrame({"Close": range(80), "REGIME_LIVE": ["TREND"] * 80})
+        train = pd.DataFrame(
+            {"Close": range(80), "REGIME_LIVE": ["TREND"] * 80},
+            index=pd.date_range("2024-01-01", periods=80, freq="h", tz="UTC"),
+        )
+        val = pd.DataFrame(
+            {"Close": range(80), "REGIME_LIVE": ["TREND"] * 80},
+            index=pd.date_range("2025-01-01", periods=80, freq="h", tz="UTC"),
+        )
         backtester = RecordingBacktester()
         optimizer = OptunaTPEOptimizer(
             OptunaConfig(n_trials=1),

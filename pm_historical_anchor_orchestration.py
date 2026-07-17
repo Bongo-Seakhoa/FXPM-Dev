@@ -1,0 +1,2576 @@
+"""Bounded orchestration for repeated historical optimizer anchors.
+
+This module schedules already-precommitted anchor-local optimization work.  It
+does not create returns, winner decisions, causal decisions, or current-refit
+authority.  A complete run is only eligible for the separate Causal verifier.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import hmac
+import json
+from pathlib import Path
+import re
+import secrets
+from typing import Any, Final, Sequence
+
+import pm_authority_spool as authority_spool
+import pm_book_multiplicity as book
+import pm_causal_process as causal
+import pm_training_horizon as training_horizon
+
+
+PRECOMMIT_SCHEMA: Final = "fxpm.historical-anchor-orchestration-precommit.v1"
+PRODUCER_REQUEST_SCHEMA: Final = "fxpm.historical-anchor-producer-request.v1"
+PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA: Final = (
+    "fxpm.historical-anchor-pre-evidence-planning-request.v1"
+)
+BOUNDED_RAW_WINNER_CANARY_REQUEST_SCHEMA: Final = (
+    "fxpm.bounded-raw-winner-canary-request.v1"
+)
+BOUNDED_RAW_WINNER_CANARY_SCOPE: Final = "BOUNDED_CANARY_NONAUTHORIZING"
+BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE: Final = (
+    "FIRST_EMPIRICALLY_OBSERVED_IN_PINNED_ORDER"
+)
+BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX: Final = (
+    "raw-winner-canary-nonauthorizing"
+)
+BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT: Final = 128
+SYMBOL_OUTPUT_SCHEMA: Final = "fxpm.historical-anchor-symbol-output.v1"
+RUN_RECEIPT_SCHEMA: Final = "fxpm.historical-anchor-orchestration-receipt.v1"
+HORIZON_BINDING_SCHEMA: Final = "fxpm.historical-horizon-plan-binding.v1"
+AUTHORITY_SCOPE: Final = "HISTORICAL_ANCHOR_ORCHESTRATION_ONLY"
+
+_ADAPTER_PAYLOAD_SCHEMA: Final = "fxpm.historical-optimizer-payload.v1"
+_ADAPTER_INDEX_SCHEMA: Final = "fxpm.historical-symbol-production-index.v1"
+_ADAPTER_GRAPH_SCHEMA: Final = "fxpm.historical-raw-winner-descriptor-graph.v1"
+_ADAPTER_CROSS_BINDING_SCHEMA: Final = "fxpm.historical-horizon-winner-cross-binding.v1"
+_ADAPTER_ASCII_JSON_FORMAT: Final = "fxpm-ascii-json-v1"
+_ADAPTER_CAPTURE_CONTRACT: Final = "fxpm.historical-search-capture.v2"
+_BOOK_ARTIFACT_TYPE: Final = "historical_book_multiplicity_v11"
+
+_HORIZON_PLAN_SCHEMA: Final = "fxpm.historical-horizon-plan.v1"
+_HORIZON_SCOPE: Final = "HISTORICAL_ANCHOR_LOCAL_HORIZON_EVIDENCE_ONLY"
+_MAX_PRECOMMIT_BYTES: Final = 16 * 1024 * 1024
+_MAX_RECEIPT_BYTES: Final = 16 * 1024 * 1024
+_HEX64 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", re.ASCII)
+_UTC = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+    re.ASCII,
+)
+
+_CELL_ROSTER: Final = tuple(causal.expected_cell_roster())
+_CELL_ORDINAL: Final = {cell: index for index, cell in enumerate(_CELL_ROSTER)}
+_CELLS_PER_SYMBOL: Final = len(book.TIMEFRAME_ORDER) * len(book.REGIME_ORDER)
+
+_ANCHOR_GEOMETRY_FIELDS: Final = frozenset(
+    {
+        "anchor_id",
+        "selection_cutoff_utc",
+        "forward_start_date",
+        "forward_end_date",
+        "purge_calendar_days",
+    }
+)
+_ANCHOR_FIELDS: Final = frozenset(
+    {
+        *_ANCHOR_GEOMETRY_FIELDS,
+        "horizon_binding_count",
+        "horizon_binding_roster_sha256",
+    }
+)
+_BINDING_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "ordinal",
+        "cell",
+        "anchor_id",
+        "selection_cutoff_utc",
+        "process_precommit_receipt_sha256",
+        "plan_receipt_sha256",
+        "source_prefix_receipt_sha256",
+        "candidate_registry_sha256",
+        "trial_registry_sha256",
+        "attempt_roster_sha256",
+        "evidence_roster_sha256",
+        "plan_status",
+    }
+)
+_PRECOMMIT_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "authority_scope",
+        "run_id",
+        "generation_id",
+        "native_universe_sha256",
+        "config_sha256",
+        "generation_context_sha256",
+        "process_precommit_receipt_sha256",
+        "optimizer_producer_release_sha256",
+        "book_contract_version",
+        "winner_contract_version",
+        "symbols",
+        "timeframes",
+        "regimes",
+        "source_group_count_per_anchor",
+        "accounting_slot_count_per_anchor",
+        "anchor_count",
+        "anchors",
+        "requires_exact_per_anchor_producer_callbacks",
+        "possible_regime_slots_are_forced_observations",
+        "authenticated_regime_unobserved_is_complete",
+        "technical_or_unsearched_blocks_anchor",
+        "confers_causal_authority",
+        "confers_current_refit_authority",
+        "confers_live_or_capital_authority",
+    }
+)
+_RUN_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "authority_scope",
+        "run_id",
+        "generation_id",
+        "native_universe_sha256",
+        "config_sha256",
+        "generation_context_sha256",
+        "precommit_receipt_sha256",
+        "anchor_count",
+        "anchors",
+        "symbol_count",
+        "symbol_receipts",
+        "complete_sparse_state_rosters",
+        "possible_regime_slots_are_forced_observations",
+        "eligible_for_downstream_causal_evaluation",
+        "causal_process_validated",
+        "current_refit_authorized",
+        "live_authorized",
+        "capital_authorized",
+        "profitability_claimed",
+    }
+)
+_ANCHOR_RESULT_FIELDS: Final = frozenset(
+    {
+        "anchor_id",
+        "producer_request_sha256",
+        "horizon_binding_roster_sha256",
+        "symbol_output_roster_sha256",
+        "book_decision_sha256",
+        "book_generation_sha256",
+        "book_status",
+        "historical_state_counts",
+        "source_group_count",
+        "accounting_slot_count",
+        "eligible_for_downstream_causal_evaluation",
+        "causal_process_validated",
+        "current_refit_authorized",
+    }
+)
+_HORIZON_PLAN_STATUSES: Final = frozenset(
+    {
+        "READY_FOR_HISTORICAL_EVIDENCE",
+        "HISTORICAL_SOURCE_UNAVAILABLE",
+        "HISTORICAL_TECHNICAL_INCOMPLETE",
+        "HISTORICAL_BOUNDARY_LIMITED",
+        "HISTORICAL_REGIME_UNOBSERVED",
+    }
+)
+_SYMBOL_OUTPUT_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "authority_scope",
+        "producer_request_sha256",
+        "anchor_id",
+        "symbol",
+        "horizon_binding_count",
+        "horizon_binding_roster_sha256",
+        "horizon_bindings",
+        "optimizer_payload",
+        "confers_causal_or_current_authority",
+    }
+)
+_CANARY_REQUEST_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "authority_scope",
+        "request_nonce",
+        "issued_at_utc",
+        "earliest_source_accessed_at_utc",
+        "run_id",
+        "generation_id",
+        "native_universe_sha256",
+        "config_sha256",
+        "generation_context_sha256",
+        "anchor_plan_receipt_sha256",
+        "activation_id",
+        "activation_manifest_sha256",
+        "native_run_manifest_sha256",
+        "native_v5_common_request_sha256",
+        "anchor_plan_sha256",
+        "anchor_count",
+        "anchor",
+        "search_process_receipt_sha256",
+        "causal_precommit_receipt_sha256",
+        "causal_evidence_access_deadline_utc",
+        "production_symbols",
+        "production_timeframes",
+        "production_regimes",
+        "symbol",
+        "timeframe",
+        "regime_selection_rule",
+        "attempt_count_exact",
+        "artifact_namespace",
+        "one_symbol_timeframe_regime_only",
+        "source_access_must_follow_request",
+        "planning_request_schema_accepted",
+        "book_projection_authorized",
+        "book_multiplicity_authorized",
+        "causal_authorized",
+        "current_refit_authorized",
+        "capital_authorized",
+        "publication_authorized",
+        "active_pointer_mutation_authorized",
+        "configuration_mutation_authorized",
+        "order_authorized",
+        "profitability_claimed",
+    }
+)
+_ADAPTER_PAYLOAD_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "capture_contract_version",
+        "producer_release_sha256",
+        "generation_context_sha256",
+        "producer_request_sha256",
+        "anchor_id",
+        "symbol",
+        "cell_count",
+        "state_counts",
+        "raw_artifact_namespace",
+        "raw_descriptor_graph",
+        "raw_descriptor_graph_root_count",
+        "raw_descriptor_graph_roster_sha256",
+        "production_index",
+        "complete_sparse_state_roster",
+        "posthoc_evidence_reconstruction",
+        "confers_causal_current_live_or_capital_authority",
+    }
+)
+_ADAPTER_INDEX_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "capture_contract_version",
+        "producer_release_sha256",
+        "generation_id",
+        "generation_context_sha256",
+        "producer_request_sha256",
+        "anchor",
+        "symbol",
+        "source_groups",
+        "regime_fits",
+        "horizon_bindings",
+        "cell_records",
+        "state_counts",
+        "cell_count",
+        "raw_artifact_namespace",
+        "raw_descriptor_graph",
+        "raw_descriptor_graph_root_count",
+        "raw_descriptor_graph_roster_sha256",
+        "raw_vectors_spooled_before_compaction",
+        "posthoc_evidence_reconstruction",
+        "complete_sparse_state_roster",
+        "confers_causal_current_live_or_capital_authority",
+    }
+)
+_ADAPTER_GRAPH_ROOT_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "generation_id",
+        "generation_context_sha256",
+        "producer_request_sha256",
+        "run_id",
+        "anchor_id",
+        "symbol",
+        "phase",
+        "artifact_namespace",
+        "artifact_count",
+        "artifact_total_bytes",
+        "artifact_roster_sha256",
+        "artifacts",
+        "complete_for_phase",
+        "confers_causal_current_live_or_capital_authority",
+    }
+)
+_ADAPTER_PHASE_GRAPH_FIELDS: Final = _ADAPTER_GRAPH_ROOT_FIELDS | frozenset(
+    {"timeframe", "regime"}
+)
+_ADAPTER_CROSS_BINDING_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "producer_request_sha256",
+        "anchor_id",
+        "selection_cutoff_utc",
+        "process_precommit_receipt_sha256",
+        "source_group_decision_sha256",
+        "regime_fit_decision_sha256",
+        "native_prefix_index_sha256",
+        "symbol",
+        "timeframe",
+        "regime",
+        "artifact_namespace",
+        "horizon_roster",
+        "winner_roster",
+        "mapping_count",
+        "mapping_sha256",
+        "mapping",
+        "bijective_coverage",
+        "created_before_winner_evidence_access",
+        "confers_causal_current_live_or_capital_authority",
+    }
+)
+
+
+class HistoricalAnchorOrchestrationError(ValueError):
+    """A fail-closed orchestration contract error."""
+
+
+def _fail(code: str) -> None:
+    raise HistoricalAnchorOrchestrationError(code)
+
+
+def _canonical_bytes(value: Any, maximum: int) -> bytes:
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise HistoricalAnchorOrchestrationError("CANONICAL_JSON_INVALID") from exc
+    if len(encoded) > maximum:
+        _fail("CANONICAL_JSON_BOUND_EXCEEDED")
+    return encoded
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_bytes(value, _MAX_PRECOMMIT_BYTES)).hexdigest()
+
+
+def _hex(value: Any, code: str) -> str:
+    if type(value) is not str or _HEX64.fullmatch(value) is None:
+        _fail(code)
+    return value
+
+
+def _safe_id(value: Any, code: str) -> str:
+    if type(value) is not str or _SAFE_ID.fullmatch(value) is None:
+        _fail(code)
+    return value
+
+
+def _utc(value: Any, code: str) -> datetime:
+    if type(value) is not str or _UTC.fullmatch(value) is None:
+        _fail(code)
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise HistoricalAnchorOrchestrationError(code) from exc
+
+
+def _date(value: Any, code: str) -> date:
+    if type(value) is not str or len(value) != 10:
+        _fail(code)
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise HistoricalAnchorOrchestrationError(code) from exc
+    if parsed.isoformat() != value:
+        _fail(code)
+    return parsed
+
+
+def _descriptor(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        _fail("ARTIFACT_DESCRIPTOR_INVALID")
+    required = {
+        "schema_version",
+        "relative_path",
+        "sha256",
+        "size_bytes",
+        "format",
+    }
+    if set(value) != required:
+        _fail("ARTIFACT_DESCRIPTOR_INVALID")
+    return json.loads(_canonical_bytes(value, 64 * 1024).decode("utf-8"))
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalAnchorPrecommit:
+    _body_json: bytes
+    _descriptor_json: bytes
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("utf-8"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+    @property
+    def artifact_descriptor(self) -> dict[str, Any]:
+        return json.loads(self._descriptor_json.decode("utf-8"))
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorProducerRequest:
+    _body_json: bytes
+    _symbol_sinks: Mapping[str, authority_spool.SymbolAuthoritySink] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("utf-8"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+    def symbol_sink(self, symbol: str) -> authority_spool.SymbolAuthoritySink:
+        """Return the exact orchestration-owned sink that this run will seal."""
+
+        if type(symbol) is not str or symbol not in book.PINNED_SYMBOL_ORDER:
+            _fail("PRODUCER_REQUEST_SYMBOL_INVALID")
+        if type(self._symbol_sinks) is not dict or set(self._symbol_sinks) != set(
+            book.PINNED_SYMBOL_ORDER
+        ):
+            _fail("PRODUCER_REQUEST_SYMBOL_SINKS_UNAVAILABLE")
+        sink = self._symbol_sinks.get(symbol)
+        if type(sink) is not authority_spool.SymbolAuthoritySink:
+            _fail("PRODUCER_REQUEST_SYMBOL_SINK_INVALID")
+        return sink
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedRawWinnerCanaryRequest:
+    """Issuer-authenticated authority for exactly one diagnostic raw-Winner cell.
+
+    The closure-held issuance tag is deliberately not serialized.  A direct
+    constructor call, ``dataclasses.replace`` operation, or copied tag cannot
+    authenticate changed request bytes or a substituted authority sink.
+    """
+
+    _body_json: bytes
+    _symbol_sink: authority_spool.SymbolAuthoritySink
+    _issuance_tag: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("utf-8"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+    def symbol_sink(self) -> authority_spool.SymbolAuthoritySink:
+        if not _verify_canary_request_issuance(self):
+            _fail("CANARY_REQUEST_ISSUANCE_INVALID")
+        return self._symbol_sink
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorSymbolProduct:
+    """One symbol's exact optimizer output for one historical anchor."""
+
+    symbol: str
+    horizon_plans: Iterable[Any]
+    book_evidence: Iterable[book.HistoricalBookCellEvidence]
+    optimizer_payload: Any
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalAnchorRunReceipt:
+    _body_json: bytes
+    _descriptor_json: bytes
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("utf-8"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+    @property
+    def artifact_descriptor(self) -> dict[str, Any]:
+        return json.loads(self._descriptor_json.decode("utf-8"))
+
+
+def _context_body(context: authority_spool.GenerationSpoolContext) -> dict[str, str]:
+    try:
+        observed = authority_spool.reopen_generation_context(
+            context.root,
+            expected_generation_id=context.generation_id,
+            expected_native_universe_sha256=context.native_universe_sha256,
+            expected_config_sha256=context.config_sha256,
+        )
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError("SPOOL_CONTEXT_INVALID") from exc
+    if observed.context_sha256 != context.context_sha256:
+        _fail("SPOOL_CONTEXT_CHANGED")
+    return {
+        "generation_id": context.generation_id,
+        "native_universe_sha256": context.native_universe_sha256,
+        "config_sha256": context.config_sha256,
+        "generation_context_sha256": context.context_sha256,
+    }
+
+
+def _utc_seconds(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        _fail("TRUSTED_UTC_CLOCK_INVALID")
+    return value.astimezone(timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _verified_canary_causal_precommit(
+    value: Any,
+    *,
+    expected_anchors: Sequence[Mapping[str, Any]],
+    expected_search_process_receipt_sha256: str,
+) -> tuple[dict[str, Any], bytes]:
+    """Reverify the exact producer-owned causal precommit without evidence access."""
+
+    try:
+        import pm_causal_evidence_producer as causal_evidence
+
+        if type(value) is not causal_evidence.FrozenCausalProcessPrecommit:
+            _fail("CANARY_CAUSAL_PRECOMMIT_OBJECT_INVALID")
+        body = value.to_dict()
+        body_json = _canonical_bytes(body, _MAX_PRECOMMIT_BYTES)
+        if body_json != value._body_json:
+            _fail("CANARY_CAUSAL_PRECOMMIT_BYTES_NONCANONICAL")
+        if hashlib.sha256(body_json).hexdigest() != value.receipt_sha256:
+            _fail("CANARY_CAUSAL_PRECOMMIT_RECEIPT_MISMATCH")
+        causal._validate_precommit_payload(body)
+    except HistoricalAnchorOrchestrationError:
+        raise
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "CANARY_CAUSAL_PRECOMMIT_REVERIFY_FAILED"
+        ) from exc
+    definition = body.get("process_definition")
+    if type(definition) is not dict:
+        _fail("CANARY_CAUSAL_PROCESS_DEFINITION_INVALID")
+    anchors = definition.get("anchor_plan")
+    expected = [dict(anchor) for anchor in expected_anchors]
+    if anchors != expected:
+        _fail("CANARY_CAUSAL_ANCHOR_PLAN_MISMATCH")
+    policies = definition.get("policy_identities")
+    if (
+        type(policies) is not dict
+        or policies.get("trial_registry_policy_sha256")
+        != expected_search_process_receipt_sha256
+    ):
+        _fail("CANARY_CAUSAL_SEARCH_PROCESS_MISMATCH")
+    return body, body_json
+
+
+def _build_bounded_raw_winner_canary_request_components(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    data_dir: Path,
+    anchor_plan_receipt: Any,
+    search_process: Any,
+    causal_precommit: Any,
+    symbol: str,
+    timeframe: str,
+) -> tuple[bytes, authority_spool.SymbolAuthoritySink]:
+    """Issue one non-authorizing raw-Winner canary before source access.
+
+    The active native authority and complete production anchor roster are
+    reopened here.  The caller can choose only a pinned symbol and timeframe;
+    the first empirically observed regime is derived later from the genuine
+    fitted prefix and can never be supplied post hoc.
+    """
+
+    try:
+        import pm_production_anchor_plan as production_anchor_plan
+        import pm_production_search_planner as search_planner
+        import pm_portfolio_replay as portfolio_replay
+
+        context_body = _context_body(context)
+        search_planner.verify_frozen_production_search_process(
+            context, search_process
+        )
+        process_body = search_process.to_dict()
+        verified_plan = production_anchor_plan.verify_production_anchor_plan_receipt(
+            Path(data_dir).resolve(strict=True), anchor_plan_receipt
+        )
+        native_contract, native_errors = (
+            portfolio_replay.active_native_portfolio_contract(
+                Path(data_dir).resolve(strict=True),
+                book.PINNED_SYMBOL_ORDER,
+                timeframes=book.TIMEFRAME_ORDER,
+            )
+        )
+    except HistoricalAnchorOrchestrationError:
+        raise
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "CANARY_ISSUANCE_PREREQUISITE_REVERIFY_FAILED"
+        ) from exc
+
+    run_id = process_body.get("run_id")
+    generation_id = context_body["generation_id"]
+    if (
+        type(run_id) is not str
+        or not run_id.startswith(BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX)
+        or not generation_id.startswith(BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX)
+        or run_id != generation_id
+    ):
+        _fail("CANARY_RUN_IDENTITY_INVALID")
+    if process_body.get("generation_context_sha256") != context.context_sha256:
+        _fail("CANARY_SEARCH_PROCESS_CONTEXT_MISMATCH")
+    if (
+        native_errors
+        or portfolio_replay.canonical_json_sha256(native_contract)
+        != context.native_universe_sha256
+        or native_contract.get("activation_id")
+        != verified_plan.get("activation_id")
+        or native_contract.get("activation_manifest_sha256")
+        != verified_plan.get("activation_manifest_sha256")
+        or native_contract.get("symbols")
+        != sorted(book.PINNED_SYMBOL_ORDER)
+        or native_contract.get("timeframes") != list(book.TIMEFRAME_ORDER)
+    ):
+        _fail("CANARY_ACTIVE_NATIVE_UNIVERSE_CONTEXT_MISMATCH")
+    if (
+        verified_plan.get("symbol_roster") != list(book.PINNED_SYMBOL_ORDER)
+        or verified_plan.get("timeframe_roster") != list(book.TIMEFRAME_ORDER)
+    ):
+        _fail("CANARY_PRODUCTION_GRID_MISMATCH")
+    anchors = verified_plan.get("anchor_plan")
+    if (
+        type(anchors) is not list
+        or len(anchors) < 4
+        or verified_plan.get("anchor_count") != len(anchors)
+    ):
+        _fail("CANARY_ANCHOR_PLAN_INVALID")
+    normalized_anchors = [_normalize_anchor_geometry(anchor) for anchor in anchors]
+    causal_body, _ = _verified_canary_causal_precommit(
+        causal_precommit,
+        expected_anchors=normalized_anchors,
+        expected_search_process_receipt_sha256=search_process.receipt_sha256,
+    )
+    if symbol not in book.PINNED_SYMBOL_ORDER or type(symbol) is not str:
+        _fail("CANARY_SYMBOL_INVALID")
+    if timeframe not in book.TIMEFRAME_ORDER or type(timeframe) is not str:
+        _fail("CANARY_TIMEFRAME_INVALID")
+
+    now = datetime.now(timezone.utc)
+    issued_at = _utc_seconds(now)
+    earliest_source_access = issued_at
+    deadline = causal_body.get("evidence_access_deadline_utc")
+    if _utc(deadline, "CANARY_CAUSAL_DEADLINE_INVALID") < _utc(
+        earliest_source_access, "CANARY_SOURCE_ACCESS_BOUNDARY_INVALID"
+    ):
+        _fail("CANARY_CAUSAL_EVIDENCE_WINDOW_EXPIRED")
+    nonce = secrets.token_hex(16)
+    anchor = normalized_anchors[-1]
+    artifact_namespace = "/".join(
+        (
+            BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX,
+            anchor["anchor_id"],
+            symbol.lower(),
+            timeframe.lower(),
+            nonce,
+        )
+    )
+    sink = authority_spool.open_symbol_sink(context, symbol)
+    body = {
+        "schema_version": BOUNDED_RAW_WINNER_CANARY_REQUEST_SCHEMA,
+        "authority_scope": BOUNDED_RAW_WINNER_CANARY_SCOPE,
+        "request_nonce": nonce,
+        "issued_at_utc": issued_at,
+        "earliest_source_accessed_at_utc": earliest_source_access,
+        "run_id": run_id,
+        **context_body,
+        "anchor_plan_receipt_sha256": _hex(
+            verified_plan.get("receipt_sha256"),
+            "CANARY_ANCHOR_PLAN_RECEIPT_INVALID",
+        ),
+        "activation_id": _safe_id(
+            verified_plan.get("activation_id"), "CANARY_ACTIVATION_ID_INVALID"
+        ),
+        "activation_manifest_sha256": _hex(
+            verified_plan.get("activation_manifest_sha256"),
+            "CANARY_ACTIVATION_MANIFEST_INVALID",
+        ),
+        "native_run_manifest_sha256": _hex(
+            verified_plan.get("native_run_manifest_sha256"),
+            "CANARY_NATIVE_RUN_MANIFEST_INVALID",
+        ),
+        "native_v5_common_request_sha256": _hex(
+            verified_plan.get("native_v5_common_request_sha256"),
+            "CANARY_NATIVE_COMMON_REQUEST_INVALID",
+        ),
+        "anchor_plan_sha256": _hex(
+            verified_plan.get("anchor_plan_sha256"),
+            "CANARY_ANCHOR_PLAN_SHA256_INVALID",
+        ),
+        "anchor_count": len(normalized_anchors),
+        "anchor": anchor,
+        "search_process_receipt_sha256": _hex(
+            search_process.receipt_sha256,
+            "CANARY_SEARCH_PROCESS_RECEIPT_INVALID",
+        ),
+        "causal_precommit_receipt_sha256": _hex(
+            causal_precommit.receipt_sha256,
+            "CANARY_CAUSAL_PRECOMMIT_RECEIPT_INVALID",
+        ),
+        "causal_evidence_access_deadline_utc": deadline,
+        "production_symbols": list(book.PINNED_SYMBOL_ORDER),
+        "production_timeframes": list(book.TIMEFRAME_ORDER),
+        "production_regimes": list(book.REGIME_ORDER),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "regime_selection_rule": BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE,
+        "attempt_count_exact": BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT,
+        "artifact_namespace": artifact_namespace,
+        "one_symbol_timeframe_regime_only": True,
+        "source_access_must_follow_request": True,
+        "planning_request_schema_accepted": False,
+        "book_projection_authorized": False,
+        "book_multiplicity_authorized": False,
+        "causal_authorized": False,
+        "current_refit_authorized": False,
+        "capital_authorized": False,
+        "publication_authorized": False,
+        "active_pointer_mutation_authorized": False,
+        "configuration_mutation_authorized": False,
+        "order_authorized": False,
+        "profitability_claimed": False,
+    }
+    body_json = _canonical_bytes(body, _MAX_PRECOMMIT_BYTES)
+    return body_json, sink
+
+
+def verify_bounded_raw_winner_canary_request(
+    context: authority_spool.GenerationSpoolContext,
+    request: Any,
+) -> dict[str, Any]:
+    """Verify issuer provenance and every immutable non-authority invariant."""
+
+    if type(request) is not BoundedRawWinnerCanaryRequest:
+        _fail("CANARY_REQUEST_OBJECT_INVALID")
+    if not _verify_canary_request_issuance(request):
+        _fail("CANARY_REQUEST_ISSUANCE_INVALID")
+    context_body = _context_body(context)
+    try:
+        body = request.to_dict()
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "CANARY_REQUEST_BYTES_INVALID"
+        ) from exc
+    if set(body) != _CANARY_REQUEST_FIELDS:
+        _fail("CANARY_REQUEST_FIELDS_INVALID")
+    if _canonical_bytes(body, _MAX_PRECOMMIT_BYTES) != request._body_json:
+        _fail("CANARY_REQUEST_BYTES_NONCANONICAL")
+    if (
+        body["schema_version"] != BOUNDED_RAW_WINNER_CANARY_REQUEST_SCHEMA
+        or body["authority_scope"] != BOUNDED_RAW_WINNER_CANARY_SCOPE
+    ):
+        _fail("CANARY_REQUEST_SCOPE_INVALID")
+    for key, expected in context_body.items():
+        if body.get(key) != expected:
+            _fail("CANARY_REQUEST_CONTEXT_MISMATCH")
+    if (
+        body["run_id"] != body["generation_id"]
+        or not body["run_id"].startswith(BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX)
+    ):
+        _fail("CANARY_REQUEST_RUN_IDENTITY_INVALID")
+    _safe_id(body["request_nonce"], "CANARY_REQUEST_NONCE_INVALID")
+    issued = _utc(body["issued_at_utc"], "CANARY_REQUEST_ISSUED_AT_INVALID")
+    earliest = _utc(
+        body["earliest_source_accessed_at_utc"],
+        "CANARY_REQUEST_SOURCE_BOUNDARY_INVALID",
+    )
+    deadline = _utc(
+        body["causal_evidence_access_deadline_utc"],
+        "CANARY_REQUEST_CAUSAL_DEADLINE_INVALID",
+    )
+    if earliest != issued or deadline < earliest:
+        _fail("CANARY_REQUEST_TIME_ORDER_INVALID")
+    for key in (
+        "native_universe_sha256",
+        "config_sha256",
+        "generation_context_sha256",
+        "anchor_plan_receipt_sha256",
+        "activation_manifest_sha256",
+        "native_run_manifest_sha256",
+        "native_v5_common_request_sha256",
+        "anchor_plan_sha256",
+        "search_process_receipt_sha256",
+        "causal_precommit_receipt_sha256",
+    ):
+        _hex(body[key], f"CANARY_REQUEST_{key.upper()}_INVALID")
+    _safe_id(body["activation_id"], "CANARY_REQUEST_ACTIVATION_ID_INVALID")
+    if (
+        body["production_symbols"] != list(book.PINNED_SYMBOL_ORDER)
+        or body["production_timeframes"] != list(book.TIMEFRAME_ORDER)
+        or body["production_regimes"] != list(book.REGIME_ORDER)
+        or body["symbol"] not in book.PINNED_SYMBOL_ORDER
+        or body["timeframe"] not in book.TIMEFRAME_ORDER
+    ):
+        _fail("CANARY_REQUEST_PRODUCTION_GRID_INVALID")
+    if type(body["anchor_count"]) is not int or body["anchor_count"] < 4:
+        _fail("CANARY_REQUEST_ANCHOR_COUNT_INVALID")
+    _normalize_anchor_geometry(body["anchor"])
+    if (
+        body["regime_selection_rule"]
+        != BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE
+        or body["attempt_count_exact"]
+        != BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+        or body["one_symbol_timeframe_regime_only"] is not True
+        or body["source_access_must_follow_request"] is not True
+        or body["planning_request_schema_accepted"] is not False
+    ):
+        _fail("CANARY_REQUEST_CELL_CONTRACT_INVALID")
+    authority_flags = (
+        "book_projection_authorized",
+        "book_multiplicity_authorized",
+        "causal_authorized",
+        "current_refit_authorized",
+        "capital_authorized",
+        "publication_authorized",
+        "active_pointer_mutation_authorized",
+        "configuration_mutation_authorized",
+        "order_authorized",
+        "profitability_claimed",
+    )
+    if any(body[key] is not False for key in authority_flags):
+        _fail("CANARY_REQUEST_AUTHORITY_ESCALATION")
+    expected_namespace_prefix = "/".join(
+        (
+            BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX,
+            body["anchor"]["anchor_id"],
+            body["symbol"].lower(),
+            body["timeframe"].lower(),
+            body["request_nonce"],
+        )
+    )
+    if body["artifact_namespace"] != expected_namespace_prefix:
+        _fail("CANARY_REQUEST_NAMESPACE_INVALID")
+    sink = request._symbol_sink
+    if (
+        type(sink) is not authority_spool.SymbolAuthoritySink
+        or sink.symbol != body["symbol"]
+        or sink.context is not context
+        or sink.context.context_sha256 != context.context_sha256
+    ):
+        _fail("CANARY_REQUEST_SINK_INVALID")
+    return json.loads(_canonical_bytes(body, _MAX_PRECOMMIT_BYTES).decode("utf-8"))
+
+
+def _make_bounded_raw_winner_canary_issuer(issue_builder: Callable[..., Any]):
+    """Return issuer and verifier while keeping the raw HMAC signer private.
+
+    Search-source, planning, capture, and one-shot state belong to the single
+    authoritative executor facade.  This module authenticates only the
+    prerequisite-valid request created before that facade opens any evidence.
+    """
+
+    request_key = secrets.token_bytes(32)
+
+    def request_payload(
+        body_json: bytes,
+        sink: authority_spool.SymbolAuthoritySink,
+    ) -> bytes:
+        try:
+            sink_binding = {
+                "object_identity": id(sink),
+                "symbol": sink.symbol,
+                "generation_id": sink.context.generation_id,
+                "generation_context_sha256": sink.context.context_sha256,
+                "native_universe_sha256": sink.context.native_universe_sha256,
+                "config_sha256": sink.context.config_sha256,
+            }
+        except AttributeError as exc:
+            raise HistoricalAnchorOrchestrationError(
+                "CANARY_REQUEST_SINK_INVALID"
+            ) from exc
+        return _canonical_bytes(
+            {
+                "schema_version": "fxpm.bounded-raw-winner-canary-issuance.v2",
+                "body_sha256": hashlib.sha256(body_json).hexdigest(),
+                "body_size_bytes": len(body_json),
+                "sink_binding": sink_binding,
+            },
+            64 * 1024,
+        )
+
+    def request_tag(body_json: bytes, sink: authority_spool.SymbolAuthoritySink) -> str:
+        return hmac.new(
+            request_key,
+            request_payload(body_json, sink),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def verify_request(value: Any) -> bool:
+        try:
+            if type(value) is not BoundedRawWinnerCanaryRequest:
+                return False
+            expected = request_tag(bytes(value._body_json), value._symbol_sink)
+            return hmac.compare_digest(value._issuance_tag, expected)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+
+    def issue(
+        context: authority_spool.GenerationSpoolContext,
+        *,
+        data_dir: Path,
+        anchor_plan_receipt: Any,
+        search_process: Any,
+        causal_precommit: Any,
+        symbol: str,
+        timeframe: str,
+    ) -> BoundedRawWinnerCanaryRequest:
+        body_json, sink = issue_builder(
+            context,
+            data_dir=data_dir,
+            anchor_plan_receipt=anchor_plan_receipt,
+            search_process=search_process,
+            causal_precommit=causal_precommit,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        request = BoundedRawWinnerCanaryRequest(
+            body_json,
+            sink,
+            request_tag(body_json, sink),
+        )
+        verify_bounded_raw_winner_canary_request(context, request)
+        return request
+    return issue, verify_request
+
+
+(
+    issue_bounded_raw_winner_canary_request,
+    _verify_canary_request_issuance,
+) = _make_bounded_raw_winner_canary_issuer(
+    _build_bounded_raw_winner_canary_request_components
+)
+
+
+def _normalize_anchor_geometry(value: Any) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _ANCHOR_GEOMETRY_FIELDS:
+        _fail("ANCHOR_FIELDS_INVALID")
+    anchor = json.loads(_canonical_bytes(value, 64 * 1024).decode("utf-8"))
+    _safe_id(anchor["anchor_id"], "ANCHOR_ID_INVALID")
+    cutoff = _utc(anchor["selection_cutoff_utc"], "ANCHOR_CUTOFF_INVALID")
+    start = _date(anchor["forward_start_date"], "ANCHOR_FORWARD_START_INVALID")
+    end = _date(anchor["forward_end_date"], "ANCHOR_FORWARD_END_INVALID")
+    purge = anchor["purge_calendar_days"]
+    policy = causal.pinned_process_policy()
+    if type(purge) is not int or type(purge) is bool:
+        _fail("ANCHOR_PURGE_INVALID")
+    if not policy["minimum_purge_calendar_days"] <= purge <= 366:
+        _fail("ANCHOR_PURGE_OUTSIDE_CAUSAL_POLICY")
+    if start != cutoff.date() + timedelta(days=purge):
+        _fail("ANCHOR_PURGE_GEOMETRY_INVALID")
+    days = (end - start).days + 1
+    if (
+        not policy["minimum_days_per_anchor"]
+        <= days
+        <= policy["maximum_days_per_anchor"]
+    ):
+        _fail("ANCHOR_FORWARD_LENGTH_INVALID")
+    return anchor
+
+
+def _normalize_anchor(value: Any) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _ANCHOR_FIELDS:
+        _fail("ANCHOR_FIELDS_INVALID")
+    anchor = json.loads(_canonical_bytes(value, 64 * 1024).decode("utf-8"))
+    _normalize_anchor_geometry(
+        {name: anchor[name] for name in _ANCHOR_GEOMETRY_FIELDS}
+    )
+    if anchor["horizon_binding_count"] != book.FAMILY_SIZE:
+        _fail("HORIZON_BINDING_COUNT_INCOMPLETE")
+    _hex(
+        anchor["horizon_binding_roster_sha256"],
+        "HORIZON_BINDING_ROSTER_SHA256_INVALID",
+    )
+    return anchor
+
+
+def issue_historical_pre_evidence_planning_request(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    run_id: str,
+    process_precommit_receipt_sha256: str,
+    optimizer_producer_release_sha256: str,
+    anchor: Mapping[str, Any],
+    symbol_sinks: Mapping[str, authority_spool.SymbolAuthoritySink],
+) -> AnchorProducerRequest:
+    """Issue a plan-only request before the historical roster is committed.
+
+    The causal process and anchor geometry are already frozen at this point.
+    This request authorizes deterministic native-prefix, empirical-regime and
+    Horizon-plan construction only.  It deliberately has no historical-run
+    precommit receipt: the exact 2,400 binding roster produced by this phase is
+    what the subsequent historical precommit commits.  Strategy-return and
+    winner evidence remain forbidden until the canonical producer request is
+    issued by :func:`execute_historical_anchor_run`.
+    """
+
+    context_body = _context_body(context)
+    normalized_anchor = _normalize_anchor_geometry(dict(anchor))
+    if type(symbol_sinks) is not dict or set(symbol_sinks) != set(
+        book.PINNED_SYMBOL_ORDER
+    ):
+        _fail("PRE_EVIDENCE_PLANNING_SYMBOL_SINKS_INVALID")
+    for symbol in book.PINNED_SYMBOL_ORDER:
+        sink = symbol_sinks.get(symbol)
+        if (
+            type(sink) is not authority_spool.SymbolAuthoritySink
+            or sink.symbol != symbol
+            or sink.context is not context
+            or sink.context.context_sha256 != context.context_sha256
+        ):
+            _fail("PRE_EVIDENCE_PLANNING_SYMBOL_SINK_INVALID")
+    body = {
+        "schema_version": PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA,
+        "authority_scope": AUTHORITY_SCOPE,
+        "run_id": _safe_id(run_id, "RUN_ID_INVALID"),
+        **context_body,
+        "historical_anchor_precommit_pending": True,
+        "process_precommit_receipt_sha256": _hex(
+            process_precommit_receipt_sha256,
+            "PROCESS_PRECOMMIT_RECEIPT_INVALID",
+        ),
+        "optimizer_producer_release_sha256": _hex(
+            optimizer_producer_release_sha256,
+            "OPTIMIZER_PRODUCER_RELEASE_INVALID",
+        ),
+        "anchor": normalized_anchor,
+        "symbols": list(book.PINNED_SYMBOL_ORDER),
+        "timeframes": list(book.TIMEFRAME_ORDER),
+        "regimes": list(book.REGIME_ORDER),
+        "requires_exact_sparse_state_roster": True,
+        "possible_regime_slots_are_forced_observations": False,
+        "planning_access_limited_to_native_prefix_and_process_design": True,
+        "return_or_winner_evidence_access_authorized": False,
+        "confers_causal_or_current_authority": False,
+    }
+    return AnchorProducerRequest(
+        _canonical_bytes(body, 256 * 1024),
+        symbol_sinks,
+    )
+
+
+def _normalize_anchors(values: Any) -> list[dict[str, Any]]:
+    if type(values) is not list:
+        _fail("ANCHORS_NOT_LIST")
+    policy = causal.pinned_process_policy()
+    if (
+        not policy["minimum_anchor_count"]
+        <= len(values)
+        <= policy["maximum_anchor_count"]
+    ):
+        _fail("ANCHOR_COUNT_OUTSIDE_CAUSAL_POLICY")
+    result: list[dict[str, Any]] = []
+    identifiers: set[str] = set()
+    prior_cutoff: datetime | None = None
+    prior_end: date | None = None
+    for value in values:
+        anchor = _normalize_anchor(value)
+        identifier = anchor["anchor_id"]
+        if identifier in identifiers:
+            _fail("ANCHOR_ID_DUPLICATED")
+        identifiers.add(identifier)
+        cutoff = _utc(anchor["selection_cutoff_utc"], "ANCHOR_CUTOFF_INVALID")
+        start = _date(anchor["forward_start_date"], "ANCHOR_FORWARD_START_INVALID")
+        end = _date(anchor["forward_end_date"], "ANCHOR_FORWARD_END_INVALID")
+        if prior_cutoff is not None and cutoff <= prior_cutoff:
+            _fail("ANCHOR_CUTOFF_ORDER_INVALID")
+        if prior_end is not None:
+            prior_end_exclusive = datetime.combine(
+                prior_end + timedelta(days=1), datetime.min.time(), timezone.utc
+            )
+            if start <= prior_end or cutoff <= prior_end_exclusive:
+                _fail("ANCHOR_FORWARD_SEGMENTS_NOT_ROLLING_DISJOINT")
+        result.append(anchor)
+        prior_cutoff = cutoff
+        prior_end = end
+    return result
+
+
+def precommit_historical_anchor_run(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    run_id: str,
+    process_precommit_receipt_sha256: str,
+    optimizer_producer_release_sha256: str,
+    anchors: list[dict[str, Any]],
+) -> HistoricalAnchorPrecommit:
+    """Freeze exact repeated anchors before any optimizer callback is invoked."""
+
+    context_body = _context_body(context)
+    normalized_anchors = _normalize_anchors(anchors)
+    body = {
+        "schema_version": PRECOMMIT_SCHEMA,
+        "authority_scope": AUTHORITY_SCOPE,
+        "run_id": _safe_id(run_id, "RUN_ID_INVALID"),
+        **context_body,
+        "process_precommit_receipt_sha256": _hex(
+            process_precommit_receipt_sha256,
+            "PROCESS_PRECOMMIT_RECEIPT_INVALID",
+        ),
+        "optimizer_producer_release_sha256": _hex(
+            optimizer_producer_release_sha256,
+            "OPTIMIZER_PRODUCER_RELEASE_INVALID",
+        ),
+        "book_contract_version": book.BOOK_MULTIPLICITY_CONTRACT_VERSION,
+        "winner_contract_version": book.PINNED_WINNER_SELECTION_CONTRACT_VERSION,
+        "symbols": list(book.PINNED_SYMBOL_ORDER),
+        "timeframes": list(book.TIMEFRAME_ORDER),
+        "regimes": list(book.REGIME_ORDER),
+        "source_group_count_per_anchor": book.SOURCE_GROUP_SIZE,
+        "accounting_slot_count_per_anchor": book.FAMILY_SIZE,
+        "anchor_count": len(normalized_anchors),
+        "anchors": normalized_anchors,
+        "requires_exact_per_anchor_producer_callbacks": True,
+        "possible_regime_slots_are_forced_observations": False,
+        "authenticated_regime_unobserved_is_complete": True,
+        "technical_or_unsearched_blocks_anchor": True,
+        "confers_causal_authority": False,
+        "confers_current_refit_authority": False,
+        "confers_live_or_capital_authority": False,
+    }
+    encoded = _canonical_bytes(body, _MAX_PRECOMMIT_BYTES)
+    descriptor = authority_spool.write_canonical_json_artifact(context, body)
+    if descriptor["sha256"] != hashlib.sha256(encoded).hexdigest():
+        _fail("PRECOMMIT_SPOOL_RECEIPT_MISMATCH")
+    return HistoricalAnchorPrecommit(
+        encoded,
+        _canonical_bytes(descriptor, 64 * 1024),
+    )
+
+
+def historical_horizon_plan_binding(plan: Any) -> dict[str, Any]:
+    """Derive the compact commitment from Horizon's exact sealed plan."""
+
+    try:
+        valid = training_horizon._valid_plan(plan)
+        body = plan.to_dict()
+        receipt = plan.receipt_sha256
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError("HORIZON_PLAN_OBJECT_INVALID") from exc
+    if valid is not True or type(body) is not dict:
+        _fail("HORIZON_PLAN_OBJECT_INVALID")
+    if type(
+        getattr(plan, "_body_json", None)
+    ) is not bytes or plan._body_json != _canonical_bytes(body, 96 * 1024 * 1024):
+        _fail("HORIZON_PLAN_BODY_INVALID")
+    encoded = plan._body_json
+    if (
+        _hex(receipt, "HORIZON_PLAN_RECEIPT_INVALID")
+        != hashlib.sha256(encoded).hexdigest()
+    ):
+        _fail("HORIZON_PLAN_RECEIPT_MISMATCH")
+    required = {
+        "schema_version",
+        "authority_scope",
+        "confers_trading_or_capital_authority",
+        "confers_final_oos_authority",
+        "anchor",
+        "cell",
+        "source_prefix_receipt_sha256",
+        "candidate_registry_sha256",
+        "trial_registry_sha256",
+        "attempt_roster_sha256",
+        "evidence_roster_sha256",
+        "plan_status",
+    }
+    if not required.issubset(body):
+        _fail("HORIZON_PLAN_FIELDS_INCOMPLETE")
+    if (
+        body["schema_version"] != _HORIZON_PLAN_SCHEMA
+        or body["authority_scope"] != _HORIZON_SCOPE
+        or body["confers_trading_or_capital_authority"] is not False
+        or body["confers_final_oos_authority"] is not False
+    ):
+        _fail("HORIZON_PLAN_AUTHORITY_INVALID")
+    cell = body["cell"]
+    anchor = body["anchor"]
+    if type(cell) is not dict or set(cell) != {"symbol", "timeframe", "regime"}:
+        _fail("HORIZON_PLAN_CELL_INVALID")
+    cell_tuple = (cell["symbol"], cell["timeframe"], cell["regime"])
+    ordinal = _CELL_ORDINAL.get(cell_tuple)
+    if ordinal is None:
+        _fail("HORIZON_PLAN_CELL_OUTSIDE_PINNED_ROSTER")
+    if type(anchor) is not dict:
+        _fail("HORIZON_PLAN_ANCHOR_INVALID")
+    for name in (
+        "anchor_id",
+        "selection_cutoff_utc",
+        "process_precommit_receipt_sha256",
+    ):
+        if name not in anchor:
+            _fail("HORIZON_PLAN_ANCHOR_INVALID")
+    source_prefix = body["source_prefix_receipt_sha256"]
+    if source_prefix is not None:
+        _hex(source_prefix, "HORIZON_SOURCE_PREFIX_RECEIPT_INVALID")
+    for name in (
+        "candidate_registry_sha256",
+        "trial_registry_sha256",
+        "attempt_roster_sha256",
+        "evidence_roster_sha256",
+    ):
+        _hex(body[name], f"HORIZON_{name.upper()}_INVALID")
+    if body["plan_status"] not in _HORIZON_PLAN_STATUSES:
+        _fail("HORIZON_PLAN_STATUS_INVALID")
+    return {
+        "schema_version": HORIZON_BINDING_SCHEMA,
+        "ordinal": ordinal,
+        "cell": dict(cell),
+        "anchor_id": _safe_id(anchor["anchor_id"], "HORIZON_ANCHOR_ID_INVALID"),
+        "selection_cutoff_utc": anchor["selection_cutoff_utc"],
+        "process_precommit_receipt_sha256": _hex(
+            anchor["process_precommit_receipt_sha256"],
+            "HORIZON_PROCESS_PRECOMMIT_INVALID",
+        ),
+        "plan_receipt_sha256": receipt,
+        "source_prefix_receipt_sha256": source_prefix,
+        "candidate_registry_sha256": body["candidate_registry_sha256"],
+        "trial_registry_sha256": body["trial_registry_sha256"],
+        "attempt_roster_sha256": body["attempt_roster_sha256"],
+        "evidence_roster_sha256": body["evidence_roster_sha256"],
+        "plan_status": body["plan_status"],
+    }
+
+
+def _normalize_binding(
+    value: Any,
+    *,
+    expected_cell: tuple[str, str, str],
+    anchor: Mapping[str, Any],
+    process_precommit_receipt_sha256: str,
+) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _BINDING_FIELDS:
+        _fail("HORIZON_BINDING_FIELDS_INVALID")
+    binding = json.loads(_canonical_bytes(value, 64 * 1024).decode("utf-8"))
+    if binding["schema_version"] != HORIZON_BINDING_SCHEMA:
+        _fail("HORIZON_BINDING_SCHEMA_INVALID")
+    expected_ordinal = _CELL_ORDINAL[expected_cell]
+    if binding["ordinal"] != expected_ordinal or binding["cell"] != {
+        "symbol": expected_cell[0],
+        "timeframe": expected_cell[1],
+        "regime": expected_cell[2],
+    }:
+        _fail("HORIZON_BINDING_ROSTER_MISMATCH")
+    if (
+        binding["anchor_id"] != anchor["anchor_id"]
+        or binding["selection_cutoff_utc"] != anchor["selection_cutoff_utc"]
+        or binding["process_precommit_receipt_sha256"]
+        != process_precommit_receipt_sha256
+    ):
+        _fail("HORIZON_BINDING_ANCHOR_MISMATCH")
+    for name in (
+        "process_precommit_receipt_sha256",
+        "plan_receipt_sha256",
+        "candidate_registry_sha256",
+        "trial_registry_sha256",
+        "attempt_roster_sha256",
+        "evidence_roster_sha256",
+    ):
+        _hex(binding[name], f"HORIZON_BINDING_{name.upper()}_INVALID")
+    source = binding["source_prefix_receipt_sha256"]
+    if source is not None:
+        _hex(source, "HORIZON_BINDING_SOURCE_PREFIX_INVALID")
+    if binding["plan_status"] not in _HORIZON_PLAN_STATUSES:
+        _fail("HORIZON_BINDING_PLAN_STATUS_INVALID")
+    return binding
+
+
+class _CanonicalListHasher:
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._digest.update(b"[")
+        self._count = 0
+
+    def add(self, value: Any) -> None:
+        if self._count:
+            self._digest.update(b",")
+        self._digest.update(_canonical_bytes(value, 64 * 1024))
+        self._count += 1
+
+    def finish(self) -> tuple[int, str]:
+        self._digest.update(b"]")
+        return self._count, self._digest.hexdigest()
+
+
+def historical_horizon_binding_roster_sha256(
+    bindings: Iterable[Mapping[str, Any]],
+) -> str:
+    """Hash the exact 2,400-slot Horizon roster without retaining it."""
+
+    if isinstance(bindings, (str, bytes, bytearray, dict)):
+        _fail("HORIZON_BINDING_ROSTER_ITERABLE_INVALID")
+    iterator = iter(bindings)
+    hasher = _CanonicalListHasher()
+    for expected_cell in _CELL_ROSTER:
+        try:
+            binding = next(iterator)
+        except StopIteration as exc:
+            raise HistoricalAnchorOrchestrationError(
+                "HORIZON_BINDING_ROSTER_INCOMPLETE"
+            ) from exc
+        if type(binding) is not dict or set(binding) != _BINDING_FIELDS:
+            _fail("HORIZON_BINDING_FIELDS_INVALID")
+        if binding.get("ordinal") != _CELL_ORDINAL[expected_cell] or binding.get(
+            "cell"
+        ) != {
+            "symbol": expected_cell[0],
+            "timeframe": expected_cell[1],
+            "regime": expected_cell[2],
+        }:
+            _fail("HORIZON_BINDING_ROSTER_MISMATCH")
+        hasher.add(binding)
+    try:
+        next(iterator)
+    except StopIteration:
+        return hasher.finish()[1]
+    _fail("HORIZON_BINDING_ROSTER_OVERSIZED")
+
+
+def _valid_precommit(
+    context: authority_spool.GenerationSpoolContext,
+    precommit: HistoricalAnchorPrecommit,
+) -> dict[str, Any]:
+    if type(precommit) is not HistoricalAnchorPrecommit:
+        _fail("PRECOMMIT_OBJECT_INVALID")
+    body = precommit.to_dict()
+    if _canonical_bytes(body, _MAX_PRECOMMIT_BYTES) != precommit._body_json:
+        _fail("PRECOMMIT_CANONICAL_MISMATCH")
+    context_body = _context_body(context)
+    if (
+        set(body) != _PRECOMMIT_FIELDS
+        or body.get("schema_version") != PRECOMMIT_SCHEMA
+        or body.get("authority_scope") != AUTHORITY_SCOPE
+        or any(body.get(name) != value for name, value in context_body.items())
+        or body.get("book_contract_version") != book.BOOK_MULTIPLICITY_CONTRACT_VERSION
+        or body.get("winner_contract_version")
+        != book.PINNED_WINNER_SELECTION_CONTRACT_VERSION
+        or body.get("symbols") != list(book.PINNED_SYMBOL_ORDER)
+        or body.get("timeframes") != list(book.TIMEFRAME_ORDER)
+        or body.get("regimes") != list(book.REGIME_ORDER)
+        or body.get("source_group_count_per_anchor") != book.SOURCE_GROUP_SIZE
+        or body.get("accounting_slot_count_per_anchor") != book.FAMILY_SIZE
+        or body.get("requires_exact_per_anchor_producer_callbacks") is not True
+        or body.get("possible_regime_slots_are_forced_observations") is not False
+        or body.get("authenticated_regime_unobserved_is_complete") is not True
+        or body.get("technical_or_unsearched_blocks_anchor") is not True
+        or body.get("confers_causal_authority") is not False
+        or body.get("confers_current_refit_authority") is not False
+        or body.get("confers_live_or_capital_authority") is not False
+    ):
+        _fail("PRECOMMIT_BODY_INVALID")
+    _safe_id(body.get("run_id"), "PRECOMMIT_RUN_ID_INVALID")
+    _hex(
+        body.get("process_precommit_receipt_sha256"),
+        "PRECOMMIT_PROCESS_RECEIPT_INVALID",
+    )
+    _hex(
+        body.get("optimizer_producer_release_sha256"),
+        "PRECOMMIT_PRODUCER_RELEASE_INVALID",
+    )
+    anchors = _normalize_anchors(body.get("anchors"))
+    if body.get("anchor_count") != len(anchors):
+        _fail("PRECOMMIT_ANCHOR_COUNT_MISMATCH")
+    descriptor = _descriptor(precommit.artifact_descriptor)
+    if (
+        descriptor["sha256"] != precommit.receipt_sha256
+        or descriptor["size_bytes"] != len(precommit._body_json)
+        or descriptor["format"] != authority_spool.CANONICAL_JSON_FORMAT
+    ):
+        _fail("PRECOMMIT_ARTIFACT_DESCRIPTOR_MISMATCH")
+    return body
+
+
+def _producer_request(
+    precommit: HistoricalAnchorPrecommit,
+    precommit_body: Mapping[str, Any],
+    anchor: Mapping[str, Any],
+    symbol_sinks: Mapping[str, authority_spool.SymbolAuthoritySink] | None = None,
+) -> AnchorProducerRequest:
+    body = {
+        "schema_version": PRODUCER_REQUEST_SCHEMA,
+        "authority_scope": AUTHORITY_SCOPE,
+        "run_id": precommit_body["run_id"],
+        "generation_id": precommit_body["generation_id"],
+        "precommit_receipt_sha256": precommit.receipt_sha256,
+        "process_precommit_receipt_sha256": precommit_body[
+            "process_precommit_receipt_sha256"
+        ],
+        "optimizer_producer_release_sha256": precommit_body[
+            "optimizer_producer_release_sha256"
+        ],
+        "anchor": dict(anchor),
+        "symbols": list(book.PINNED_SYMBOL_ORDER),
+        "timeframes": list(book.TIMEFRAME_ORDER),
+        "regimes": list(book.REGIME_ORDER),
+        "requires_exact_sparse_state_roster": True,
+        "possible_regime_slots_are_forced_observations": False,
+        "confers_causal_or_current_authority": False,
+    }
+    return AnchorProducerRequest(_canonical_bytes(body, 256 * 1024), symbol_sinks)
+
+
+def _iterable(value: Any, code: str) -> Any:
+    if isinstance(value, (str, bytes, bytearray, dict)) or value is None:
+        _fail(code)
+    try:
+        return iter(value)
+    except TypeError as exc:
+        raise HistoricalAnchorOrchestrationError(code) from exc
+
+
+def _historical_evidence_state(
+    evidence: book.HistoricalBookCellEvidence,
+) -> str:
+    """Classify one exact Book input without trusting producer labels."""
+
+    if type(evidence) is not book.HistoricalBookCellEvidence:
+        _fail("SYMBOL_BOOK_EVIDENCE_TYPE_INVALID")
+    if evidence.winner_decision is not None or evidence.winner_request is not None:
+        if (
+            evidence.winner_decision is None
+            or evidence.winner_request is None
+            or evidence.process_state_decision is not None
+        ):
+            _fail("SYMBOL_BOOK_EVIDENCE_KIND_INVALID")
+        try:
+            source = evidence.source_group_decision.to_dict()
+        except Exception as exc:
+            raise HistoricalAnchorOrchestrationError(
+                "SYMBOL_BOOK_SOURCE_DECISION_INVALID"
+            ) from exc
+        if source.get("availability") != book.AVAILABLE:
+            _fail("SYMBOL_BOOK_WINNER_SOURCE_NOT_AVAILABLE")
+        return "WINNER_EVIDENCE"
+    if type(evidence.process_state_decision) is not book.HistoricalProcessStateDecision:
+        _fail("SYMBOL_BOOK_EVIDENCE_KIND_INVALID")
+    state = evidence.process_state_decision.state_kind
+    if state not in {
+        book.TERMINAL_SOURCE_ABSENCE,
+        book.TECHNICAL_FAILURE,
+        book.UNSEARCHED,
+        book.REGIME_UNOBSERVED,
+        book.INSUFFICIENT_EVIDENCE,
+    }:
+        _fail("SYMBOL_BOOK_PROCESS_STATE_INVALID")
+    return state
+
+
+def _assert_horizon_evidence_consistency(
+    binding: Mapping[str, Any],
+    evidence: book.HistoricalBookCellEvidence,
+) -> None:
+    plan_status = binding["plan_status"]
+    state = _historical_evidence_state(evidence)
+    if plan_status == "HISTORICAL_TECHNICAL_INCOMPLETE":
+        _fail("HORIZON_TECHNICAL_INCOMPLETE_BLOCKS_ANCHOR")
+    if plan_status == "HISTORICAL_SOURCE_UNAVAILABLE":
+        if state != book.TERMINAL_SOURCE_ABSENCE:
+            _fail("HORIZON_SOURCE_UNAVAILABLE_EVIDENCE_MISMATCH")
+        return
+    if plan_status == "HISTORICAL_REGIME_UNOBSERVED":
+        if state != book.REGIME_UNOBSERVED:
+            _fail("HORIZON_REGIME_UNOBSERVED_EVIDENCE_MISMATCH")
+        return
+    if plan_status in {
+        "READY_FOR_HISTORICAL_EVIDENCE",
+        "HISTORICAL_BOUNDARY_LIMITED",
+    }:
+        if state not in {"WINNER_EVIDENCE", book.INSUFFICIENT_EVIDENCE}:
+            _fail("HORIZON_SEARCHABLE_EVIDENCE_MISMATCH")
+        if (
+            plan_status == "HISTORICAL_BOUNDARY_LIMITED"
+            and state != book.INSUFFICIENT_EVIDENCE
+        ):
+            _fail("HORIZON_BOUNDARY_EVIDENCE_MISMATCH")
+        if state == book.INSUFFICIENT_EVIDENCE:
+            state_body = evidence.process_state_decision.to_dict()
+            insufficient = state_body.get("insufficient_evidence_binding")
+            if type(insufficient) is not dict or any(
+                insufficient.get(evidence_name) != binding.get(binding_name)
+                for evidence_name, binding_name in (
+                    ("selection_cutoff_utc", "selection_cutoff_utc"),
+                    (
+                        "source_prefix_receipt_sha256",
+                        "source_prefix_receipt_sha256",
+                    ),
+                    ("horizon_plan_receipt_sha256", "plan_receipt_sha256"),
+                    ("candidate_registry_sha256", "candidate_registry_sha256"),
+                    ("trial_registry_sha256", "trial_registry_sha256"),
+                    (
+                        "horizon_attempt_roster_sha256",
+                        "attempt_roster_sha256",
+                    ),
+                    ("evidence_roster_sha256", "evidence_roster_sha256"),
+                )
+            ):
+                _fail("HORIZON_INSUFFICIENT_EVIDENCE_BINDING_MISMATCH")
+            attempted = state_body.get("attempted_trials_exact")
+            if plan_status == "HISTORICAL_BOUNDARY_LIMITED":
+                if (
+                    insufficient.get("terminal_stage")
+                    != book.INSUFFICIENT_PRESEARCH_STAGE
+                    or insufficient.get("reason_code")
+                    != book.INSUFFICIENT_PRESEARCH_BOUNDARY_REASON
+                    or attempted != 0
+                    or insufficient.get("process_rejected_attempt_count") != 0
+                ):
+                    _fail("HORIZON_BOUNDARY_INSUFFICIENT_EVIDENCE_MISMATCH")
+            elif (
+                insufficient.get("terminal_stage") != book.INSUFFICIENT_POSTSEARCH_STAGE
+                or insufficient.get("reason_code")
+                != book.INSUFFICIENT_ALL_ATTEMPTS_REJECTED_REASON
+                or type(attempted) is not int
+                or attempted <= 0
+                or insufficient.get("planned_attempt_count") != attempted
+                or insufficient.get("process_rejected_attempt_count") != attempted
+            ):
+                _fail("HORIZON_POSTSEARCH_INSUFFICIENT_EVIDENCE_MISMATCH")
+        return
+    _fail("HORIZON_BINDING_PLAN_STATUS_INVALID")
+
+
+def _read_canonical_descriptor_json(
+    context: authority_spool.GenerationSpoolContext,
+    descriptor_value: Any,
+    *,
+    maximum_bytes: int,
+) -> dict[str, Any]:
+    """Reopen an already manifest-verified canonical artifact exactly."""
+
+    descriptor = _descriptor(descriptor_value)
+    if (
+        descriptor["format"] != authority_spool.CANONICAL_JSON_FORMAT
+        or descriptor["size_bytes"] > maximum_bytes
+    ):
+        _fail("VERIFIED_ARTIFACT_FORMAT_OR_BOUND_INVALID")
+    root = Path(context.root).resolve(strict=True)
+    path = root.joinpath(*Path(descriptor["relative_path"]).parts).resolve(strict=True)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "VERIFIED_ARTIFACT_PATH_ESCAPE"
+        ) from exc
+    raw = path.read_bytes()
+    if (
+        len(raw) != descriptor["size_bytes"]
+        or len(raw) > maximum_bytes
+        or hashlib.sha256(raw).hexdigest() != descriptor["sha256"]
+    ):
+        _fail("VERIFIED_ARTIFACT_INTEGRITY_MISMATCH")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "VERIFIED_ARTIFACT_JSON_INVALID"
+        ) from exc
+    if type(value) is not dict or _canonical_bytes(value, maximum_bytes) != raw:
+        _fail("VERIFIED_ARTIFACT_CANONICAL_MISMATCH")
+    return value
+
+
+def _read_ascii_descriptor_json(
+    context: authority_spool.GenerationSpoolContext,
+    descriptor_value: Any,
+    *,
+    maximum_bytes: int,
+) -> dict[str, Any]:
+    """Reopen the adapter's intentionally ASCII-canonical Winner binding."""
+
+    descriptor = _descriptor(descriptor_value)
+    if (
+        descriptor["format"] != _ADAPTER_ASCII_JSON_FORMAT
+        or descriptor["size_bytes"] > maximum_bytes
+    ):
+        _fail("VERIFIED_ASCII_ARTIFACT_FORMAT_OR_BOUND_INVALID")
+    root = Path(context.root).resolve(strict=True)
+    path = root.joinpath(*Path(descriptor["relative_path"]).parts).resolve(strict=True)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "VERIFIED_ASCII_ARTIFACT_PATH_ESCAPE"
+        ) from exc
+    raw = path.read_bytes()
+    if (
+        len(raw) != descriptor["size_bytes"]
+        or len(raw) > maximum_bytes
+        or hashlib.sha256(raw).hexdigest() != descriptor["sha256"]
+    ):
+        _fail("VERIFIED_ASCII_ARTIFACT_INTEGRITY_MISMATCH")
+    try:
+        value = json.loads(raw.decode("ascii"))
+        canonical = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "VERIFIED_ASCII_ARTIFACT_JSON_INVALID"
+        ) from exc
+    if type(value) is not dict or canonical != raw:
+        _fail("VERIFIED_ASCII_ARTIFACT_CANONICAL_MISMATCH")
+    return value
+
+
+def _reopen_verified_book_decision(
+    payload: Any,
+) -> book.BookMultiplicityDecision:
+    """Rehydrate persisted Book bytes and invoke Book v11's exact authority."""
+
+    if type(payload) is not dict or "receipt_sha256" not in payload:
+        _fail("BOOK_DECISION_PAYLOAD_INVALID")
+    receipt_sha256 = _hex(
+        payload.get("receipt_sha256"), "BOOK_DECISION_RECEIPT_INVALID"
+    )
+    body = dict(payload)
+    body.pop("receipt_sha256")
+    try:
+        encoded = json.dumps(
+            body,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "BOOK_DECISION_CANONICAL_INVALID"
+        ) from exc
+    if hashlib.sha256(encoded).hexdigest() != receipt_sha256:
+        _fail("BOOK_DECISION_RECEIPT_MISMATCH")
+    decision = book.BookMultiplicityDecision(encoded, receipt_sha256)
+    if (
+        not book.verify_historical_book_multiplicity_decision(decision)
+        or decision.to_dict() != payload
+    ):
+        _fail("BOOK_DECISION_SEMANTICS_INVALID")
+    return decision
+
+
+def _manifest_entry(value: Any, *, code: str) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != {
+        "artifact_id",
+        "artifact_type",
+        "descriptor",
+    }:
+        _fail(code)
+    artifact_id = value.get("artifact_id")
+    artifact_type = value.get("artifact_type")
+    if (
+        type(artifact_id) is not str
+        or not artifact_id
+        or artifact_id != artifact_id.strip()
+        or type(artifact_type) is not str
+        or not artifact_type
+        or artifact_type != artifact_type.strip()
+    ):
+        _fail(code)
+    _descriptor(value.get("descriptor"))
+    return value
+
+
+def _verify_graph_roster(
+    body: Mapping[str, Any],
+    *,
+    expected_fields: frozenset[str],
+    code: str,
+) -> list[dict[str, Any]]:
+    if type(body) is not dict or set(body) != expected_fields:
+        _fail(code)
+    raw_entries = body.get("artifacts")
+    if type(raw_entries) is not list:
+        _fail(code)
+    entries = [_manifest_entry(value, code=code) for value in raw_entries]
+    ids = [entry["artifact_id"] for entry in entries]
+    if (
+        entries != sorted(entries, key=lambda item: item["artifact_id"])
+        or len(ids) != len(set(ids))
+        or body.get("artifact_count") != len(entries)
+        or body.get("artifact_total_bytes")
+        != sum(entry["descriptor"]["size_bytes"] for entry in entries)
+        or body.get("artifact_roster_sha256") != _canonical_sha256(entries)
+        or body.get("complete_for_phase") is not True
+        or body.get("confers_causal_current_live_or_capital_authority") is not False
+    ):
+        _fail(code)
+    return entries
+
+
+def _verify_adapter_manifest_graph(
+    context: authority_spool.GenerationSpoolContext,
+    artifacts: Mapping[str, Mapping[str, Any]],
+    payload_value: Any,
+    *,
+    precommit_body: Mapping[str, Any],
+    anchor: Mapping[str, Any],
+    symbol: str,
+    producer_request_sha256: str,
+    horizon_bindings: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    """Reopen every adapter graph edge and reject unreferenced raw artifacts."""
+
+    if type(payload_value) is not dict:
+        _fail("ADAPTER_OPTIMIZER_PAYLOAD_REQUIRED")
+    if payload_value.get("schema_version") != _ADAPTER_PAYLOAD_SCHEMA:
+        _fail("ADAPTER_OPTIMIZER_PAYLOAD_SCHEMA_INVALID")
+    payload = payload_value
+    if set(payload) != _ADAPTER_PAYLOAD_FIELDS:
+        _fail("ADAPTER_OPTIMIZER_PAYLOAD_FIELDS_INVALID")
+    anchor_id = anchor["anchor_id"]
+    run_id = precommit_body["run_id"]
+    namespace = f"historical-anchor/{run_id}/{anchor_id}"
+    release_sha256 = precommit_body["optimizer_producer_release_sha256"]
+    root_id = f"{anchor_id}/adapter/raw-winner-descriptor-graph"
+    index_id = f"{anchor_id}/adapter/production-index"
+    root_entry = _manifest_entry(
+        artifacts.get(root_id), code="ADAPTER_GRAPH_ROOT_ENTRY_INVALID"
+    )
+    index_entry = _manifest_entry(
+        artifacts.get(index_id), code="ADAPTER_PRODUCTION_INDEX_ENTRY_INVALID"
+    )
+    if (
+        root_entry["artifact_type"] != "historical_raw_winner_descriptor_graph_root"
+        or index_entry["artifact_type"] != "historical_symbol_production_index"
+        or payload.get("capture_contract_version") != _ADAPTER_CAPTURE_CONTRACT
+        or payload.get("producer_release_sha256") != release_sha256
+        or payload.get("generation_context_sha256") != context.context_sha256
+        or payload.get("producer_request_sha256") != producer_request_sha256
+        or payload.get("anchor_id") != anchor_id
+        or payload.get("symbol") != symbol
+        or payload.get("cell_count") != _CELLS_PER_SYMBOL
+        or payload.get("raw_artifact_namespace") != namespace
+        or payload.get("raw_descriptor_graph") != root_entry["descriptor"]
+        or payload.get("production_index") != index_entry["descriptor"]
+        or payload.get("complete_sparse_state_roster") is not True
+        or payload.get("posthoc_evidence_reconstruction") is not False
+        or payload.get("confers_causal_current_live_or_capital_authority") is not False
+    ):
+        _fail("ADAPTER_OPTIMIZER_PAYLOAD_BINDING_INVALID")
+
+    root = _read_canonical_descriptor_json(
+        context,
+        root_entry["descriptor"],
+        maximum_bytes=context.limits.max_json_bytes,
+    )
+    root_entries = _verify_graph_roster(
+        root,
+        expected_fields=_ADAPTER_GRAPH_ROOT_FIELDS,
+        code="ADAPTER_GRAPH_ROOT_INVALID",
+    )
+    if (
+        root.get("schema_version") != _ADAPTER_GRAPH_SCHEMA
+        or root.get("generation_id") != context.generation_id
+        or root.get("generation_context_sha256") != context.context_sha256
+        or root.get("producer_request_sha256") != producer_request_sha256
+        or root.get("run_id") != run_id
+        or root.get("anchor_id") != anchor_id
+        or root.get("symbol") != symbol
+        or root.get("phase") != "SYMBOL_ROOT"
+        or root.get("artifact_namespace") != namespace
+        or payload.get("raw_descriptor_graph_root_count") != len(root_entries)
+        or payload.get("raw_descriptor_graph_roster_sha256")
+        != _canonical_sha256(root_entries)
+    ):
+        _fail("ADAPTER_GRAPH_ROOT_BINDING_INVALID")
+
+    binding_by_cell = {
+        (
+            binding.get("cell", {}).get("timeframe"),
+            binding.get("cell", {}).get("regime"),
+        ): binding
+        for binding in horizon_bindings
+        if type(binding) is dict and type(binding.get("cell")) is dict
+    }
+    if len(binding_by_cell) != _CELLS_PER_SYMBOL:
+        _fail("ADAPTER_HORIZON_BINDING_ROSTER_INVALID")
+    referenced = {root_id, index_id}
+    cross_by_cell: dict[tuple[str, str], dict[str, Any]] = {}
+    for graph_entry in root_entries:
+        artifact_id = graph_entry["artifact_id"]
+        if artifacts.get(artifact_id) != graph_entry or artifact_id in referenced:
+            _fail("ADAPTER_GRAPH_MANIFEST_EDGE_INVALID")
+        referenced.add(artifact_id)
+        parts = artifact_id.split("/")
+        if (
+            len(parts) != 5
+            or parts[:2] != [anchor_id, "adapter"]
+            or parts[2] not in book.TIMEFRAME_ORDER
+            or parts[3] not in book.REGIME_ORDER
+        ):
+            _fail("ADAPTER_GRAPH_ROOT_ID_INVALID")
+        timeframe, regime, suffix = parts[2], parts[3], parts[4]
+        if graph_entry["artifact_type"] == "historical_raw_winner_descriptor_graph":
+            phase = {
+                "frozen-descriptor-graph": "FROZEN",
+                "production-descriptor-graph": "PRODUCTION",
+            }.get(suffix)
+            if phase is None:
+                _fail("ADAPTER_PHASE_GRAPH_ID_INVALID")
+            phase_body = _read_canonical_descriptor_json(
+                context,
+                graph_entry["descriptor"],
+                maximum_bytes=context.limits.max_json_bytes,
+            )
+            leaves = _verify_graph_roster(
+                phase_body,
+                expected_fields=_ADAPTER_PHASE_GRAPH_FIELDS,
+                code="ADAPTER_PHASE_GRAPH_INVALID",
+            )
+            prefix = f"{namespace}/winner-search/{timeframe}/{regime}/"
+            if (
+                phase_body.get("schema_version") != _ADAPTER_GRAPH_SCHEMA
+                or phase_body.get("generation_id") != context.generation_id
+                or phase_body.get("generation_context_sha256") != context.context_sha256
+                or phase_body.get("producer_request_sha256") != producer_request_sha256
+                or phase_body.get("run_id") != run_id
+                or phase_body.get("anchor_id") != anchor_id
+                or phase_body.get("symbol") != symbol
+                or phase_body.get("timeframe") != timeframe
+                or phase_body.get("regime") != regime
+                or phase_body.get("phase") != phase
+                or phase_body.get("artifact_namespace") != namespace
+                or any(not leaf["artifact_id"].startswith(prefix) for leaf in leaves)
+            ):
+                _fail("ADAPTER_PHASE_GRAPH_BINDING_INVALID")
+            for leaf in leaves:
+                leaf_id = leaf["artifact_id"]
+                if artifacts.get(leaf_id) != leaf or leaf_id in referenced:
+                    _fail("ADAPTER_RAW_LEAF_MANIFEST_EDGE_INVALID")
+                referenced.add(leaf_id)
+        elif graph_entry["artifact_type"] == "historical_horizon_winner_cross_binding":
+            if suffix != "horizon-winner-cross-binding":
+                _fail("ADAPTER_CROSS_BINDING_ID_INVALID")
+            cross = _read_ascii_descriptor_json(
+                context,
+                graph_entry["descriptor"],
+                maximum_bytes=context.limits.max_json_bytes,
+            )
+            mapping = cross.get("mapping") if type(cross) is dict else None
+            binding = binding_by_cell.get((timeframe, regime))
+            expected_horizon_roster = (
+                None
+                if type(binding) is not dict
+                else {
+                    "plan_receipt_sha256": binding["plan_receipt_sha256"],
+                    "source_prefix_receipt_sha256": binding[
+                        "source_prefix_receipt_sha256"
+                    ],
+                    "candidate_registry_sha256": binding["candidate_registry_sha256"],
+                    "trial_registry_sha256": binding["trial_registry_sha256"],
+                    "attempt_roster_sha256": binding["attempt_roster_sha256"],
+                    "evidence_roster_sha256": binding["evidence_roster_sha256"],
+                }
+            )
+            if (
+                type(cross) is not dict
+                or set(cross) != _ADAPTER_CROSS_BINDING_FIELDS
+                or cross.get("schema_version") != _ADAPTER_CROSS_BINDING_SCHEMA
+                or cross.get("producer_request_sha256") != producer_request_sha256
+                or cross.get("anchor_id") != anchor_id
+                or cross.get("selection_cutoff_utc") != anchor["selection_cutoff_utc"]
+                or cross.get("process_precommit_receipt_sha256")
+                != precommit_body["process_precommit_receipt_sha256"]
+                or cross.get("symbol") != symbol
+                or cross.get("timeframe") != timeframe
+                or cross.get("regime") != regime
+                or cross.get("artifact_namespace") != namespace
+                or cross.get("horizon_roster") != expected_horizon_roster
+                or type(mapping) is not list
+                or cross.get("mapping_count") != len(mapping)
+                or cross.get("mapping_sha256") != _canonical_sha256(mapping)
+                or cross.get("bijective_coverage") is not True
+                or cross.get("created_before_winner_evidence_access") is not True
+                or cross.get("confers_causal_current_live_or_capital_authority")
+                is not False
+            ):
+                _fail("ADAPTER_CROSS_BINDING_INVALID")
+            for name in (
+                "source_group_decision_sha256",
+                "regime_fit_decision_sha256",
+                "native_prefix_index_sha256",
+            ):
+                _hex(cross.get(name), "ADAPTER_CROSS_BINDING_IDENTITY_INVALID")
+            if (timeframe, regime) in cross_by_cell:
+                _fail("ADAPTER_CROSS_BINDING_DUPLICATE")
+            cross_by_cell[(timeframe, regime)] = {
+                "body": cross,
+                "descriptor": graph_entry["descriptor"],
+            }
+        else:
+            _fail("ADAPTER_GRAPH_ROOT_TYPE_INVALID")
+
+    index = _read_canonical_descriptor_json(
+        context,
+        index_entry["descriptor"],
+        maximum_bytes=context.limits.max_json_bytes,
+    )
+    if (
+        set(index) != _ADAPTER_INDEX_FIELDS
+        or index.get("schema_version") != _ADAPTER_INDEX_SCHEMA
+        or index.get("capture_contract_version") != _ADAPTER_CAPTURE_CONTRACT
+        or index.get("producer_release_sha256") != release_sha256
+        or index.get("generation_id") != context.generation_id
+        or index.get("generation_context_sha256") != context.context_sha256
+        or index.get("producer_request_sha256") != producer_request_sha256
+        or index.get("anchor") != dict(anchor)
+        or index.get("symbol") != symbol
+        or index.get("horizon_bindings") != list(horizon_bindings)
+        or type(index.get("source_groups")) is not list
+        or len(index["source_groups"]) != len(book.TIMEFRAME_ORDER)
+        or type(index.get("regime_fits")) is not list
+        or len(index["regime_fits"]) != len(book.TIMEFRAME_ORDER)
+        or type(index.get("cell_records")) is not list
+        or len(index["cell_records"]) != _CELLS_PER_SYMBOL
+        or index.get("cell_count") != _CELLS_PER_SYMBOL
+        or index.get("state_counts") != payload.get("state_counts")
+        or index.get("raw_artifact_namespace") != namespace
+        or index.get("raw_descriptor_graph") != root_entry["descriptor"]
+        or index.get("raw_descriptor_graph_root_count") != len(root_entries)
+        or index.get("raw_descriptor_graph_roster_sha256")
+        != _canonical_sha256(root_entries)
+        or index.get("raw_vectors_spooled_before_compaction") is not True
+        or index.get("posthoc_evidence_reconstruction") is not False
+        or index.get("complete_sparse_state_roster") is not True
+        or index.get("confers_causal_current_live_or_capital_authority") is not False
+    ):
+        _fail("ADAPTER_PRODUCTION_INDEX_INVALID")
+    source_by_timeframe = {
+        value.get("timeframe"): value
+        for value in index["source_groups"]
+        if type(value) is dict
+    }
+    fit_by_timeframe = {
+        value.get("timeframe"): value
+        for value in index["regime_fits"]
+        if type(value) is dict
+    }
+    cell_records = {
+        (value.get("timeframe"), value.get("regime")): value
+        for value in index["cell_records"]
+        if type(value) is dict
+    }
+    if (
+        set(source_by_timeframe) != set(book.TIMEFRAME_ORDER)
+        or set(fit_by_timeframe) != set(book.TIMEFRAME_ORDER)
+        or len(cell_records) != _CELLS_PER_SYMBOL
+    ):
+        _fail("ADAPTER_PRODUCTION_INDEX_ROSTER_INVALID")
+    for (timeframe, regime), observed in cross_by_cell.items():
+        cross = observed["body"]
+        record = cell_records.get((timeframe, regime))
+        if (
+            cross["source_group_decision_sha256"]
+            != source_by_timeframe[timeframe].get("receipt_sha256")
+            or cross["regime_fit_decision_sha256"]
+            != fit_by_timeframe[timeframe].get("receipt_sha256")
+            or type(record) is not dict
+            or record.get("horizon_winner_cross_binding") != observed["descriptor"]
+        ):
+            _fail("ADAPTER_CROSS_BINDING_INDEX_SPLICE")
+    return referenced
+
+
+def _anchor_book(
+    *,
+    sinks: Mapping[str, authority_spool.SymbolAuthoritySink],
+    precommit_body: Mapping[str, Any],
+    anchor: Mapping[str, Any],
+    request: AnchorProducerRequest,
+    producer: Callable[[AnchorProducerRequest], Iterable[AnchorSymbolProduct]],
+) -> tuple[book.BookMultiplicityDecision, list[dict[str, Any]]]:
+    try:
+        products = _iterable(producer(request), "ANCHOR_PRODUCER_OUTPUT_INVALID")
+    except HistoricalAnchorOrchestrationError:
+        raise
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError("ANCHOR_PRODUCER_FAILED") from exc
+
+    horizon_hasher = _CanonicalListHasher()
+    output_entries: list[dict[str, Any]] = []
+    stream_failure: list[Exception] = []
+
+    def evidence_stream() -> Iterable[book.HistoricalBookCellEvidence]:
+        try:
+            for symbol in book.PINNED_SYMBOL_ORDER:
+                try:
+                    product = next(products)
+                except StopIteration as exc:
+                    raise HistoricalAnchorOrchestrationError(
+                        "ANCHOR_SYMBOL_ROSTER_INCOMPLETE"
+                    ) from exc
+                if type(product) is not AnchorSymbolProduct or product.symbol != symbol:
+                    _fail("ANCHOR_SYMBOL_ROSTER_MISMATCH")
+                plans_iterator = _iterable(
+                    product.horizon_plans, "SYMBOL_HORIZON_PLANS_INVALID"
+                )
+                evidence_iterator = _iterable(
+                    product.book_evidence, "SYMBOL_BOOK_EVIDENCE_INVALID"
+                )
+                symbol_bindings: list[dict[str, Any]] = []
+                symbol_hasher = _CanonicalListHasher()
+                expected_cells = tuple(
+                    (symbol, timeframe, regime)
+                    for timeframe in book.TIMEFRAME_ORDER
+                    for regime in book.REGIME_ORDER
+                )
+                for expected_cell in expected_cells:
+                    try:
+                        horizon_plan = next(plans_iterator)
+                    except StopIteration as exc:
+                        raise HistoricalAnchorOrchestrationError(
+                            "SYMBOL_HORIZON_PLANS_INCOMPLETE"
+                        ) from exc
+                    derived_binding = historical_horizon_plan_binding(horizon_plan)
+                    binding = _normalize_binding(
+                        derived_binding,
+                        expected_cell=expected_cell,
+                        anchor=anchor,
+                        process_precommit_receipt_sha256=precommit_body[
+                            "process_precommit_receipt_sha256"
+                        ],
+                    )
+                    horizon_hasher.add(binding)
+                    symbol_hasher.add(binding)
+                    symbol_bindings.append(binding)
+                try:
+                    next(plans_iterator)
+                except StopIteration:
+                    pass
+                else:
+                    _fail("SYMBOL_HORIZON_PLANS_OVERSIZED")
+                _, symbol_horizon_sha = symbol_hasher.finish()
+                artifact = {
+                    "schema_version": SYMBOL_OUTPUT_SCHEMA,
+                    "authority_scope": AUTHORITY_SCOPE,
+                    "producer_request_sha256": request.receipt_sha256,
+                    "anchor_id": anchor["anchor_id"],
+                    "symbol": symbol,
+                    "horizon_binding_count": _CELLS_PER_SYMBOL,
+                    "horizon_binding_roster_sha256": symbol_horizon_sha,
+                    "horizon_bindings": symbol_bindings,
+                    "optimizer_payload": product.optimizer_payload,
+                    "confers_causal_or_current_authority": False,
+                }
+                entry = sinks[symbol].put_json(
+                    f"{anchor['anchor_id']}/optimizer-output",
+                    "historical_anchor_optimizer_output",
+                    artifact,
+                )
+                output_entries.append(
+                    {
+                        "symbol": symbol,
+                        "artifact_sha256": entry["descriptor"]["sha256"],
+                        "artifact_size_bytes": entry["descriptor"]["size_bytes"],
+                        "horizon_binding_roster_sha256": symbol_horizon_sha,
+                    }
+                )
+                for cell_index, expected_cell in enumerate(expected_cells):
+                    try:
+                        evidence = next(evidence_iterator)
+                    except StopIteration as exc:
+                        raise HistoricalAnchorOrchestrationError(
+                            "SYMBOL_BOOK_EVIDENCE_INCOMPLETE"
+                        ) from exc
+                    if (
+                        type(evidence) is not book.HistoricalBookCellEvidence
+                        or (
+                            evidence.symbol,
+                            evidence.timeframe,
+                            evidence.regime,
+                        )
+                        != expected_cell
+                    ):
+                        _fail("SYMBOL_BOOK_EVIDENCE_ROSTER_MISMATCH")
+                    _assert_horizon_evidence_consistency(
+                        symbol_bindings[cell_index], evidence
+                    )
+                    yield evidence
+                try:
+                    next(evidence_iterator)
+                except StopIteration:
+                    pass
+                else:
+                    _fail("SYMBOL_BOOK_EVIDENCE_OVERSIZED")
+            try:
+                next(products)
+            except StopIteration:
+                return
+            _fail("ANCHOR_SYMBOL_ROSTER_OVERSIZED")
+        # GeneratorExit is control flow from an early-closing consumer, not an
+        # evidence-production failure.  Recording it here previously replaced
+        # the consumer's real fail-closed diagnosis with the generic
+        # ANCHOR_EVIDENCE_STREAM_FAILED wrapper.
+        except Exception as exc:
+            stream_failure.append(exc)
+            raise
+
+    decision = book.evaluate_historical_book_multiplicity(evidence_stream())
+    if stream_failure:
+        failure = stream_failure[0]
+        if isinstance(failure, HistoricalAnchorOrchestrationError):
+            raise failure
+        raise HistoricalAnchorOrchestrationError(
+            "ANCHOR_EVIDENCE_STREAM_FAILED"
+        ) from failure
+    binding_count, binding_sha = horizon_hasher.finish()
+    if binding_count != book.FAMILY_SIZE:
+        _fail("ANCHOR_HORIZON_BINDING_ROSTER_INCOMPLETE")
+    if binding_sha != anchor["horizon_binding_roster_sha256"]:
+        _fail("ANCHOR_HORIZON_PRECOMMIT_MISMATCH")
+    if not book.verify_historical_book_multiplicity_decision(decision):
+        _fail("ANCHOR_BOOK_DECISION_INVALID")
+    body = decision.to_dict()
+    if (
+        body.get("valid") is not True
+        or body.get("optimization_run_complete") is not True
+        or body.get("source_group_size") != book.SOURCE_GROUP_SIZE
+        or body.get("family_size") != book.FAMILY_SIZE
+    ):
+        _fail("ANCHOR_BOOK_INCOMPLETE")
+    return decision, output_entries
+
+
+def execute_historical_anchor_run(
+    context: authority_spool.GenerationSpoolContext,
+    precommit: HistoricalAnchorPrecommit,
+    producers: Mapping[
+        str,
+        Callable[[AnchorProducerRequest], Iterable[AnchorSymbolProduct]],
+    ],
+) -> HistoricalAnchorRunReceipt:
+    """Run exact anchor callbacks and commit only complete historical Books."""
+
+    precommit_body = _valid_precommit(context, precommit)
+    anchors = precommit_body["anchors"]
+    expected_ids = [anchor["anchor_id"] for anchor in anchors]
+    if type(producers) is not dict or set(producers) != set(expected_ids):
+        _fail("EXACT_PER_ANCHOR_PRODUCER_CALLBACKS_REQUIRED")
+    if any(not callable(producers[identifier]) for identifier in expected_ids):
+        _fail("ANCHOR_PRODUCER_NOT_CALLABLE")
+    required_artifacts = 1 + 4 * len(anchors)
+    if context.limits.max_artifacts_per_symbol < required_artifacts:
+        _fail("SPOOL_ARTIFACT_COUNT_BOUND_TOO_SMALL")
+
+    sinks = {
+        symbol: authority_spool.open_symbol_sink(context, symbol)
+        for symbol in book.PINNED_SYMBOL_ORDER
+    }
+    precommit_descriptor = precommit.artifact_descriptor
+    for sink in sinks.values():
+        sink.register_artifact(
+            "run/precommit",
+            "historical_anchor_precommit",
+            precommit_descriptor,
+        )
+
+    anchor_results: list[dict[str, Any]] = []
+    book_receipts: set[str] = set()
+    for anchor in anchors:
+        request = _producer_request(precommit, precommit_body, anchor, sinks)
+        decision, outputs = _anchor_book(
+            sinks=sinks,
+            precommit_body=precommit_body,
+            anchor=anchor,
+            request=request,
+            producer=producers[anchor["anchor_id"]],
+        )
+        if decision.receipt_sha256 in book_receipts:
+            _fail("ANCHOR_BOOK_DECISION_REUSED")
+        book_receipts.add(decision.receipt_sha256)
+        decision_body = decision.to_dict()
+        decision_descriptor = authority_spool.write_canonical_json_artifact(
+            context, decision_body
+        )
+        for sink in sinks.values():
+            sink.register_artifact(
+                f"{anchor['anchor_id']}/book-decision",
+                _BOOK_ARTIFACT_TYPE,
+                decision_descriptor,
+            )
+        anchor_results.append(
+            {
+                "anchor_id": anchor["anchor_id"],
+                "producer_request_sha256": request.receipt_sha256,
+                "horizon_binding_roster_sha256": anchor[
+                    "horizon_binding_roster_sha256"
+                ],
+                "symbol_output_roster_sha256": _canonical_sha256(outputs),
+                "book_decision_sha256": decision.receipt_sha256,
+                "book_generation_sha256": decision.book_generation_sha256,
+                "book_status": decision.status,
+                "historical_state_counts": decision_body["counts"],
+                "source_group_count": decision_body["source_group_size"],
+                "accounting_slot_count": decision_body["family_size"],
+                "eligible_for_downstream_causal_evaluation": True,
+                "causal_process_validated": False,
+                "current_refit_authorized": False,
+            }
+        )
+
+    symbol_receipts = [sinks[symbol].seal() for symbol in book.PINNED_SYMBOL_ORDER]
+    body = {
+        "schema_version": RUN_RECEIPT_SCHEMA,
+        "authority_scope": AUTHORITY_SCOPE,
+        "run_id": precommit_body["run_id"],
+        "generation_id": context.generation_id,
+        "native_universe_sha256": context.native_universe_sha256,
+        "config_sha256": context.config_sha256,
+        "generation_context_sha256": context.context_sha256,
+        "precommit_receipt_sha256": precommit.receipt_sha256,
+        "anchor_count": len(anchor_results),
+        "anchors": anchor_results,
+        "symbol_count": len(symbol_receipts),
+        "symbol_receipts": symbol_receipts,
+        "complete_sparse_state_rosters": True,
+        "possible_regime_slots_are_forced_observations": False,
+        "eligible_for_downstream_causal_evaluation": True,
+        "causal_process_validated": False,
+        "current_refit_authorized": False,
+        "live_authorized": False,
+        "capital_authorized": False,
+        "profitability_claimed": False,
+    }
+    encoded = _canonical_bytes(body, _MAX_RECEIPT_BYTES)
+    descriptor = authority_spool.write_canonical_json_artifact(context, body)
+    if descriptor["sha256"] != hashlib.sha256(encoded).hexdigest():
+        _fail("RUN_RECEIPT_SPOOL_MISMATCH")
+    candidate = HistoricalAnchorRunReceipt(
+        encoded,
+        _canonical_bytes(descriptor, 64 * 1024),
+    )
+    if not verify_historical_anchor_run_receipt(context, precommit, candidate):
+        _fail("RUN_RECEIPT_SELF_VERIFICATION_FAILED")
+    return candidate
+
+
+def verify_historical_anchor_run_receipt(
+    context: authority_spool.GenerationSpoolContext,
+    precommit: HistoricalAnchorPrecommit,
+    receipt: HistoricalAnchorRunReceipt,
+) -> bool:
+    """Reopen every symbol manifest and verify a completed run receipt."""
+
+    try:
+        precommit_body = _valid_precommit(context, precommit)
+        if type(receipt) is not HistoricalAnchorRunReceipt:
+            return False
+        body = receipt.to_dict()
+        if _canonical_bytes(body, _MAX_RECEIPT_BYTES) != receipt._body_json:
+            return False
+        if (
+            set(body) != _RUN_FIELDS
+            or body.get("schema_version") != RUN_RECEIPT_SCHEMA
+            or body.get("authority_scope") != AUTHORITY_SCOPE
+            or body.get("run_id") != precommit_body["run_id"]
+            or body.get("precommit_receipt_sha256") != precommit.receipt_sha256
+            or body.get("generation_id") != context.generation_id
+            or body.get("native_universe_sha256") != context.native_universe_sha256
+            or body.get("config_sha256") != context.config_sha256
+            or body.get("generation_context_sha256") != context.context_sha256
+            or body.get("anchor_count") != len(precommit_body["anchors"])
+            or body.get("symbol_count")
+            != book.SOURCE_GROUP_SIZE // len(book.TIMEFRAME_ORDER)
+            or body.get("complete_sparse_state_rosters") is not True
+            or body.get("possible_regime_slots_are_forced_observations") is not False
+            or body.get("eligible_for_downstream_causal_evaluation") is not True
+            or body.get("causal_process_validated") is not False
+            or body.get("current_refit_authorized") is not False
+            or body.get("live_authorized") is not False
+            or body.get("capital_authorized") is not False
+            or body.get("profitability_claimed") is not False
+        ):
+            return False
+        anchor_results = body.get("anchors")
+        if type(anchor_results) is not list or len(anchor_results) != len(
+            precommit_body["anchors"]
+        ):
+            return False
+        results_by_anchor: dict[str, dict[str, Any]] = {}
+        planned_by_anchor = {
+            item["anchor_id"]: item for item in precommit_body["anchors"]
+        }
+        book_receipts: set[str] = set()
+        for result, planned in zip(
+            anchor_results, precommit_body["anchors"], strict=True
+        ):
+            if type(result) is not dict or set(result) != _ANCHOR_RESULT_FIELDS:
+                return False
+            counts = result.get("historical_state_counts")
+            expected_request = _producer_request(precommit, precommit_body, planned)
+            if (
+                result.get("anchor_id") != planned["anchor_id"]
+                or result.get("producer_request_sha256")
+                != expected_request.receipt_sha256
+                or result.get("horizon_binding_roster_sha256")
+                != planned["horizon_binding_roster_sha256"]
+                or result.get("book_status")
+                not in {"HISTORICAL_LOCAL_CANDIDATES_AVAILABLE", "NO_LOCAL_WINNERS"}
+                or result.get("source_group_count") != book.SOURCE_GROUP_SIZE
+                or result.get("accounting_slot_count") != book.FAMILY_SIZE
+                or result.get("eligible_for_downstream_causal_evaluation") is not True
+                or result.get("causal_process_validated") is not False
+                or result.get("current_refit_authorized") is not False
+                or type(counts) is not dict
+                or set(counts)
+                != {
+                    "WINNER",
+                    "NO_WINNER",
+                    "SOURCE_UNAVAILABLE",
+                    book.TECHNICAL_FAILURE,
+                    book.UNSEARCHED,
+                    book.REGIME_UNOBSERVED,
+                    book.INSUFFICIENT_EVIDENCE,
+                }
+                or any(type(value) is not int or value < 0 for value in counts.values())
+                or sum(counts.values()) != book.FAMILY_SIZE
+                or counts[book.TECHNICAL_FAILURE] != 0
+                or counts[book.UNSEARCHED] != 0
+            ):
+                return False
+            for name in (
+                "producer_request_sha256",
+                "horizon_binding_roster_sha256",
+                "symbol_output_roster_sha256",
+                "book_decision_sha256",
+                "book_generation_sha256",
+            ):
+                _hex(result.get(name), f"RUN_ANCHOR_{name.upper()}_INVALID")
+            if result["book_decision_sha256"] in book_receipts:
+                return False
+            book_receipts.add(result["book_decision_sha256"])
+            results_by_anchor[planned["anchor_id"]] = result
+        symbol_receipts = body.get("symbol_receipts")
+        if type(symbol_receipts) is not list or len(symbol_receipts) != len(
+            book.PINNED_SYMBOL_ORDER
+        ):
+            return False
+        expected_ids = {"run/precommit"}
+        for anchor in precommit_body["anchors"]:
+            expected_ids.add(f"{anchor['anchor_id']}/optimizer-output")
+            expected_ids.add(f"{anchor['anchor_id']}/book-decision")
+        output_rosters: dict[str, list[dict[str, Any]]] = {
+            identifier: [] for identifier in results_by_anchor
+        }
+        horizon_hashers = {
+            identifier: _CanonicalListHasher() for identifier in results_by_anchor
+        }
+        book_artifacts: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        precommit_descriptor = _descriptor(precommit.artifact_descriptor)
+        for symbol, symbol_receipt in zip(
+            book.PINNED_SYMBOL_ORDER, symbol_receipts, strict=True
+        ):
+            manifest = authority_spool.verify_symbol_receipt(
+                context.root,
+                symbol_receipt,
+                expected_generation_id=context.generation_id,
+                expected_symbol=symbol,
+                expected_native_universe_sha256=context.native_universe_sha256,
+                expected_config_sha256=context.config_sha256,
+            )
+            artifacts = {item["artifact_id"]: item for item in manifest["artifacts"]}
+            if not expected_ids.issubset(artifacts):
+                return False
+            if (
+                artifacts["run/precommit"]["artifact_type"]
+                != "historical_anchor_precommit"
+                or artifacts["run/precommit"].get("descriptor") != precommit_descriptor
+            ):
+                return False
+            adapter_artifact_ids: set[str] = set()
+            adapter_output_count = 0
+            for anchor in precommit_body["anchors"]:
+                anchor_id = anchor["anchor_id"]
+                output_entry = artifacts[f"{anchor_id}/optimizer-output"]
+                book_entry = artifacts[f"{anchor_id}/book-decision"]
+                if (
+                    output_entry["artifact_type"]
+                    != "historical_anchor_optimizer_output"
+                    or book_entry["artifact_type"] != _BOOK_ARTIFACT_TYPE
+                ):
+                    return False
+                output = _read_canonical_descriptor_json(
+                    context,
+                    output_entry.get("descriptor"),
+                    maximum_bytes=context.limits.max_json_bytes,
+                )
+                if (
+                    set(output) != _SYMBOL_OUTPUT_FIELDS
+                    or output.get("schema_version") != SYMBOL_OUTPUT_SCHEMA
+                    or output.get("authority_scope") != AUTHORITY_SCOPE
+                    or output.get("producer_request_sha256")
+                    != results_by_anchor[anchor_id]["producer_request_sha256"]
+                    or output.get("anchor_id") != anchor_id
+                    or output.get("symbol") != symbol
+                    or output.get("horizon_binding_count") != _CELLS_PER_SYMBOL
+                    or output.get("confers_causal_or_current_authority") is not False
+                ):
+                    return False
+                raw_bindings = output.get("horizon_bindings")
+                if (
+                    type(raw_bindings) is not list
+                    or len(raw_bindings) != _CELLS_PER_SYMBOL
+                ):
+                    return False
+                symbol_hasher = _CanonicalListHasher()
+                for cell_index, raw_binding in enumerate(raw_bindings):
+                    timeframe_index, regime_index = divmod(
+                        cell_index, len(book.REGIME_ORDER)
+                    )
+                    expected_cell = (
+                        symbol,
+                        book.TIMEFRAME_ORDER[timeframe_index],
+                        book.REGIME_ORDER[regime_index],
+                    )
+                    binding = _normalize_binding(
+                        raw_binding,
+                        expected_cell=expected_cell,
+                        anchor=anchor,
+                        process_precommit_receipt_sha256=precommit_body[
+                            "process_precommit_receipt_sha256"
+                        ],
+                    )
+                    symbol_hasher.add(binding)
+                    horizon_hashers[anchor_id].add(binding)
+                _, symbol_horizon_sha = symbol_hasher.finish()
+                if output.get("horizon_binding_roster_sha256") != symbol_horizon_sha:
+                    return False
+                adapter_ids = _verify_adapter_manifest_graph(
+                    context,
+                    artifacts,
+                    output.get("optimizer_payload"),
+                    precommit_body=precommit_body,
+                    anchor=anchor,
+                    symbol=symbol,
+                    producer_request_sha256=results_by_anchor[anchor_id][
+                        "producer_request_sha256"
+                    ],
+                    horizon_bindings=raw_bindings,
+                )
+                if not adapter_ids or adapter_artifact_ids.intersection(adapter_ids):
+                    return False
+                adapter_artifact_ids.update(adapter_ids)
+                adapter_output_count += 1
+                output_descriptor = _descriptor(output_entry.get("descriptor"))
+                output_rosters[anchor_id].append(
+                    {
+                        "symbol": symbol,
+                        "artifact_sha256": output_descriptor["sha256"],
+                        "artifact_size_bytes": output_descriptor["size_bytes"],
+                        "horizon_binding_roster_sha256": symbol_horizon_sha,
+                    }
+                )
+                decision_payload = _read_canonical_descriptor_json(
+                    context,
+                    book_entry.get("descriptor"),
+                    maximum_bytes=context.limits.max_json_bytes,
+                )
+                observed_book = book_artifacts.get(anchor_id)
+                if observed_book is None:
+                    book_artifacts[anchor_id] = (
+                        _descriptor(book_entry.get("descriptor")),
+                        decision_payload,
+                    )
+                elif observed_book != (
+                    _descriptor(book_entry.get("descriptor")),
+                    decision_payload,
+                ):
+                    return False
+            if adapter_output_count != len(precommit_body["anchors"]):
+                return False
+            if set(artifacts) != expected_ids | adapter_artifact_ids:
+                return False
+        for anchor_id, result in results_by_anchor.items():
+            planned = planned_by_anchor[anchor_id]
+            binding_count, binding_sha = horizon_hashers[anchor_id].finish()
+            if (
+                binding_count != book.FAMILY_SIZE
+                or binding_sha != planned["horizon_binding_roster_sha256"]
+                or _canonical_sha256(output_rosters[anchor_id])
+                != result["symbol_output_roster_sha256"]
+            ):
+                return False
+            _, decision_payload = book_artifacts[anchor_id]
+            decision = _reopen_verified_book_decision(decision_payload)
+            if (
+                decision.receipt_sha256 != result["book_decision_sha256"]
+                or decision_payload.get("contract_version")
+                != book.BOOK_MULTIPLICITY_CONTRACT_VERSION
+                or decision_payload.get("valid") is not True
+                or decision_payload.get("optimization_run_complete") is not True
+                or decision_payload.get("status") != result["book_status"]
+                or decision_payload.get("book_generation_sha256")
+                != result["book_generation_sha256"]
+                or decision_payload.get("counts") != result["historical_state_counts"]
+                or decision_payload.get("source_group_size")
+                != result["source_group_count"]
+                or decision_payload.get("family_size")
+                != result["accounting_slot_count"]
+            ):
+                return False
+        descriptor = _descriptor(receipt.artifact_descriptor)
+        return bool(
+            descriptor["sha256"] == receipt.receipt_sha256
+            and descriptor["size_bytes"] == len(receipt._body_json)
+            and descriptor["format"] == authority_spool.CANONICAL_JSON_FORMAT
+        )
+    except Exception:
+        return False
+
+
+__all__ = [
+    "AUTHORITY_SCOPE",
+    "AnchorProducerRequest",
+    "AnchorSymbolProduct",
+    "BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT",
+    "BOUNDED_RAW_WINNER_CANARY_REQUEST_SCHEMA",
+    "BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX",
+    "BOUNDED_RAW_WINNER_CANARY_SCOPE",
+    "BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE",
+    "BoundedRawWinnerCanaryRequest",
+    "HORIZON_BINDING_SCHEMA",
+    "HistoricalAnchorOrchestrationError",
+    "HistoricalAnchorPrecommit",
+    "HistoricalAnchorRunReceipt",
+    "PRECOMMIT_SCHEMA",
+    "PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA",
+    "PRODUCER_REQUEST_SCHEMA",
+    "RUN_RECEIPT_SCHEMA",
+    "SYMBOL_OUTPUT_SCHEMA",
+    "execute_historical_anchor_run",
+    "historical_horizon_binding_roster_sha256",
+    "historical_horizon_plan_binding",
+    "issue_historical_pre_evidence_planning_request",
+    "issue_bounded_raw_winner_canary_request",
+    "precommit_historical_anchor_run",
+    "verify_bounded_raw_winner_canary_request",
+    "verify_historical_anchor_run_receipt",
+]

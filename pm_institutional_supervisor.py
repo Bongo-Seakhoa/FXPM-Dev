@@ -8,6 +8,7 @@ or derates when configured hard breakpoints are already breached.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ class SupervisorContext:
     strategy_name: str = ""
     total_open_risk_pct: float = 0.0
     new_trade_risk_pct: float = 0.0
+    max_total_stop_risk_pct: Optional[float] = None
     daily_loss_pct: float = 0.0
     session_loss_pct: float = 0.0
     weekly_loss_pct: float = 0.0
@@ -104,6 +106,21 @@ class InstitutionalSupervisor:
                 risk_multiplier=0.0,
                 reasons=[self._persistence_error],
             )
+        selected_max_total = context.max_total_stop_risk_pct
+        if selected_max_total is not None and (
+            not isinstance(selected_max_total, (int, float))
+            or isinstance(selected_max_total, bool)
+            or not math.isfinite(float(selected_max_total))
+            or not 0.0 < float(selected_max_total) < 100.0
+        ):
+            # Invalid selected authority is never advisory, even if the legacy
+            # supervisor is configured in observe/off mode.
+            return SupervisorDecision(
+                allow_trade=False,
+                action="block_invalid_capital_envelope",
+                risk_multiplier=0.0,
+                reasons=["selected max_total_stop_risk_pct is invalid"],
+            )
         mode = self._enabled_mode()
         if mode == "off":
             return SupervisorDecision(action="disabled")
@@ -132,11 +149,28 @@ class InstitutionalSupervisor:
         prospective_total = max(0.0, float(context.total_open_risk_pct or 0.0)) + max(
             0.0, float(context.new_trade_risk_pct or 0.0)
         )
-        max_total = self._threshold(self.config, "max_total_open_risk_pct")
+        # Production callers bind the replay-selected Capital V8 total-stop
+        # envelope here.  The static config remains a compatibility default for
+        # standalone/research callers, but must not silently replace a supplied
+        # selected point.
+        if selected_max_total is None:
+            max_total = self._threshold(self.config, "max_total_open_risk_pct")
+        else:
+            max_total = float(selected_max_total)
         if max_total > 0.0 and prospective_total > max_total:
             admission_reasons.append(f"total_open_risk {prospective_total:.2f}% > {max_total:.2f}%")
 
-        elevated_open_risk = self._threshold(self.config, "max_new_entries_when_total_open_risk_above_pct")
+        # A selected Capital point owns the aggregate admission axis end to
+        # end.  The legacy early-pause/derate threshold is compatibility-only
+        # for callers without a selected envelope; otherwise it could silently
+        # pre-veto a replay-admitted exposure below the selected total cap.
+        elevated_open_risk = (
+            self._threshold(
+                self.config, "max_new_entries_when_total_open_risk_above_pct"
+            )
+            if selected_max_total is None
+            else 0.0
+        )
         open_risk_action = str(getattr(self.config, "open_risk_action", "pause_new_entries") or "").lower()
         if elevated_open_risk > 0.0 and context.total_open_risk_pct >= elevated_open_risk:
             if open_risk_action == "pause_new_entries":

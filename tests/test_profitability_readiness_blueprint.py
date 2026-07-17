@@ -1,6 +1,10 @@
+import ast
+import inspect
 import json
 import tempfile
+import textwrap
 import unittest
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +46,157 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
         self.assertFalse(decision.allow_trade)
         self.assertEqual(decision.action, "block_new_entry_transient")
         self.assertTrue(any("total_open_risk" in reason for reason in decision.reasons))
+
+    def test_institutional_supervisor_uses_selected_capital_total_axis(self):
+        cfg = PipelineConfig(
+            max_total_open_risk_pct=8.0,
+            max_new_entries_when_total_open_risk_above_pct=5.0,
+            open_risk_action="pause_new_entries",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = InstitutionalSupervisor(
+                cfg, state_path=Path(tmp) / "supervisor.json"
+            )
+            admitted = supervisor.evaluate(
+                SupervisorContext(
+                    symbol="EURUSD",
+                    total_open_risk_pct=10.0,
+                    new_trade_risk_pct=1.0,
+                    max_total_stop_risk_pct=20.0,
+                )
+            )
+            capped = supervisor.evaluate(
+                SupervisorContext(
+                    symbol="EURUSD",
+                    total_open_risk_pct=10.0,
+                    new_trade_risk_pct=1.0,
+                    max_total_stop_risk_pct=10.0,
+                )
+            )
+            invalid = supervisor.evaluate(
+                SupervisorContext(
+                    symbol="EURUSD",
+                    max_total_stop_risk_pct=float("nan"),
+                )
+            )
+
+        self.assertTrue(admitted.allow_trade)
+        self.assertFalse(capped.allow_trade)
+        self.assertEqual(capped.action, "block_new_entry_transient")
+        self.assertTrue(any("> 10.00%" in reason for reason in capped.reasons))
+        self.assertFalse(invalid.allow_trade)
+        self.assertEqual(invalid.action, "block_invalid_capital_envelope")
+        self.assertTrue(any("is invalid" in reason for reason in invalid.reasons))
+
+        observe_cfg = PipelineConfig(institutional_supervisor_mode="observe")
+        for invalid_value in (float("nan"), float("inf"), 0.0, 100.0, True, "20"):
+            with self.subTest(invalid_selected_total=invalid_value):
+                with tempfile.TemporaryDirectory() as tmp:
+                    invalid_observe = InstitutionalSupervisor(
+                        observe_cfg, state_path=Path(tmp) / "supervisor.json"
+                    ).evaluate(
+                        SupervisorContext(
+                            symbol="EURUSD",
+                            max_total_stop_risk_pct=invalid_value,
+                        )
+                    )
+                self.assertFalse(invalid_observe.allow_trade)
+                self.assertFalse(invalid_observe.observed_only)
+                self.assertEqual(
+                    invalid_observe.action, "block_invalid_capital_envelope"
+                )
+
+        derate_cfg = PipelineConfig(
+            max_total_open_risk_pct=8.0,
+            max_new_entries_when_total_open_risk_above_pct=5.0,
+            open_risk_action="derate",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            selected_derate = InstitutionalSupervisor(
+                derate_cfg, state_path=Path(tmp) / "supervisor.json"
+            ).evaluate(
+                SupervisorContext(
+                    symbol="EURUSD",
+                    total_open_risk_pct=10.0,
+                    new_trade_risk_pct=1.0,
+                    max_total_stop_risk_pct=20.0,
+                )
+            )
+        self.assertTrue(selected_derate.allow_trade)
+        self.assertEqual(selected_derate.action, "allow")
+        self.assertEqual(selected_derate.risk_multiplier, 1.0)
+
+    def test_institutional_supervisor_preserves_standalone_legacy_pause(self):
+        cfg = PipelineConfig(
+            max_total_open_risk_pct=20.0,
+            max_new_entries_when_total_open_risk_above_pct=5.0,
+            open_risk_action="pause_new_entries",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            decision = InstitutionalSupervisor(
+                cfg, state_path=Path(tmp) / "supervisor.json"
+            ).evaluate(
+                SupervisorContext(
+                    symbol="EURUSD",
+                    total_open_risk_pct=10.0,
+                    new_trade_risk_pct=1.0,
+                )
+            )
+
+        self.assertFalse(decision.allow_trade)
+        self.assertEqual(decision.action, "block_new_entry_transient")
+        self.assertTrue(
+            any("existing_open_risk" in reason for reason in decision.reasons)
+        )
+
+    def test_selected_capital_total_axis_does_not_weaken_account_breakers(self):
+        cfg = PipelineConfig(
+            max_total_open_risk_pct=8.0,
+            max_new_entries_when_total_open_risk_above_pct=0.0,
+            daily_loss_hard_block_pct=2.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            decision = InstitutionalSupervisor(
+                cfg, state_path=Path(tmp) / "supervisor.json"
+            ).evaluate(
+                SupervisorContext(
+                    symbol="EURUSD",
+                    total_open_risk_pct=10.0,
+                    new_trade_risk_pct=1.0,
+                    max_total_stop_risk_pct=20.0,
+                    daily_loss_pct=2.1,
+                )
+            )
+
+        self.assertFalse(decision.allow_trade)
+        self.assertEqual(decision.action, "block_new_entry")
+        self.assertTrue(any("daily_loss" in reason for reason in decision.reasons))
+
+    def test_execute_entry_binds_selected_total_axis_at_both_supervisor_checks(self):
+        source = textwrap.dedent(inspect.getsource(LiveTrader._execute_entry))
+        tree = ast.parse(source)
+        supervisor_contexts = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "SupervisorContext"
+        ]
+
+        self.assertEqual(len(supervisor_contexts), 2)
+        for context_call in supervisor_contexts:
+            bound_values = [
+                keyword.value
+                for keyword in context_call.keywords
+                if keyword.arg == "max_total_stop_risk_pct"
+            ]
+            self.assertEqual(len(bound_values), 1)
+            value = bound_values[0]
+            self.assertIsInstance(value, ast.Subscript)
+            self.assertIsInstance(value.value, ast.Name)
+            self.assertEqual(value.value.id, "_cap_env")
+            self.assertIsInstance(value.slice, ast.Constant)
+            self.assertEqual(value.slice.value, "max_total_stop_risk_pct")
 
     def test_institutional_supervisor_capacity_block_does_not_latch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -632,7 +787,7 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(item.code == "winner_ledger_no_tradeable_winners" for item in report.errors))
 
-    def test_data_failure_no_trade_marker_completes_symbol_ledger(self):
+    def test_data_failure_cannot_mutate_winner_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Path(tmp) / "pm_configs.json"
             cfg = PipelineConfig(
@@ -642,27 +797,18 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 regime_params_file="",
             )
             manager = PortfolioManager(cfg, symbols=["EURCHF"], config_file=str(ledger))
+            before = ledger.read_bytes() if ledger.exists() else None
 
-            manager.save_data_no_trade_config("EURCHF", "Insufficient M5 history after retry")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ACQUISITION_DATA_STATE_WINNER_LEDGER_MUTATION_FORBIDDEN",
+            ):
+                manager.save_data_no_trade_config(
+                    "EURCHF", "Insufficient M5 history after retry"
+                )
 
-            payload = json.loads(ledger.read_text(encoding="utf-8"))
-            self.assertEqual(set(payload), {"EURCHF"})
-            symbol_cfg = payload["EURCHF"]
-            self.assertEqual(symbol_cfg["strategy_name"], "NO_TRADE")
-            self.assertTrue(symbol_cfg["artifact_meta"]["data_failure"])
-            self.assertEqual(
-                {
-                    cell["promotion_status"]
-                    for regimes in symbol_cfg["regime_configs"].values()
-                    for cell in regimes.values()
-                },
-                {"NO_TRADE"},
-            )
-
-            report = validate_live_readiness(cfg, symbols=["EURCHF"], config_path=str(Path(tmp) / "config.json"))
-            self.assertFalse(report.ok)
-            self.assertTrue(any(item.code == "winner_ledger_no_tradeable_winners" for item in report.errors))
-            self.assertFalse(any(item.code == "production_symbol_ledger_incomplete" for item in report.errors))
+            after = ledger.read_bytes() if ledger.exists() else None
+            self.assertEqual(after, before)
 
     def test_optimization_failure_no_trade_marker_completes_symbol_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -962,7 +1108,10 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             self.assertFalse(report.ok)
             self.assertTrue(
-                any(item.code == "production_winner_ledger_promotion_mismatch" for item in report.errors)
+                any(
+                    item.code == "production_promotion_gate_not_immutable_exact"
+                    for item in report.errors
+                )
             )
 
     def test_live_readiness_blocks_legacy_ledger_status_gate_for_funded_use(self):
@@ -1122,7 +1271,10 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
 
             self.assertFalse(report.ok)
             self.assertTrue(
-                any(item.code == "production_completion_marker_not_review_ready" for item in report.errors)
+                any(
+                    item.code == "production_promotion_gate_not_immutable_exact"
+                    for item in report.errors
+                )
             )
 
     def test_live_readiness_blocks_symbols_missing_from_broker_specs(self):
@@ -1462,11 +1614,25 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
         trader.mt5 = Mock()
         trader.mt5.get_positions.return_value = []
         trader.mt5.find_broker_symbol.side_effect = lambda symbol: symbol
-        trader.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+        trader.logger = SimpleNamespace(
+            debug=lambda *_args, **_kwargs: None,
+            info=lambda *_args, **_kwargs: None,
+            warning=lambda *_args, **_kwargs: None,
+            error=lambda *_args, **_kwargs: None,
+        )
         trader.pm = Mock()
+        # _record_runtime_observability merges pm.update_live_observability's
+        # result and returns dict(merged); an empty dict keeps that a real dict.
+        trader.pm.update_live_observability.return_value = {}
         trader.drift_monitor = Mock()
         trader.drift_monitor.get_summary.return_value = {}
         trader._cycle_drift_monitor = Mock()
+        # _sync_drift_monitor now routes runtime state through
+        # _record_runtime_observability; the double needs the observability
+        # store it reads/writes. An empty get() is the clean "no existing
+        # badge" state so consecutive-loss accounting starts from zero.
+        trader._runtime_observability = Mock()
+        trader._runtime_observability.get.return_value = {}
         trader._seen_closing_deals = set()
         trader._seen_cycle_closure_keys = set()
         regime_cfg = SimpleNamespace(strategy_name="Demo", live_observability={}, val_metrics={})
@@ -1605,12 +1771,12 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 "{}", encoding="utf-8"
             )
             cfg = PipelineConfig(log_dir=str(log_dir))
-            def _state_only_failure(path):
+            def _state_only_failure(path, *_args, **_kwargs):
                 if Path(path).name == "institutional_supervisor_state.json":
                     raise RuntimeError("state read failed")
                 return None
             with patch(
-                "pm_live_readiness._load_json_file",
+                "pm_live_readiness._load_bounded_json_file",
                 side_effect=_state_only_failure,
             ):
                 report = validate_live_readiness(
@@ -1625,11 +1791,11 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                 )
             )
 
-    def test_live_readiness_accepts_aligned_tuning_cap_within_gap_boundary(self):
+    def test_live_readiness_defers_aligned_cap_selection_to_capital_authority(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = PipelineConfig(
-                max_total_open_risk_pct=7.25,
-                max_factor_group_open_risk_pct=2.0,
+                max_total_open_risk_pct=90.0,
+                max_factor_group_open_risk_pct=50.0,
             )
             report = validate_live_readiness(
                 cfg,
@@ -1642,13 +1808,19 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
                     for item in report.errors
                 )
             )
+            self.assertTrue(
+                any(
+                    item.code == "funded_sparse_authority_unproven"
+                    for item in report.errors
+                )
+            )
 
-            above_gap_budget = PipelineConfig(
-                max_total_open_risk_pct=8.25,
-                max_factor_group_open_risk_pct=2.0,
+            nominally_insolvent = PipelineConfig(
+                max_total_open_risk_pct=100.0,
+                max_factor_group_open_risk_pct=50.0,
             )
             rejected = validate_live_readiness(
-                above_gap_budget,
+                nominally_insolvent,
                 symbols=["EURUSD"],
                 config_path=str(Path(tmp) / "config.json"),
             )
@@ -1740,7 +1912,15 @@ class ProfitabilityReadinessBlueprintTests(unittest.TestCase):
     def test_shipped_config_passes_funded_breaker_contract(self):
         repo_root = Path(__file__).resolve().parents[1]
         payload = json.loads((repo_root / "config.json").read_text(encoding="utf-8"))
-        cfg = PipelineConfig(**payload["pipeline"])
+        # Production filters config.json to PipelineConfig dataclass fields
+        # (pm_main.py:250-257); coordinator-only raw keys such as
+        # production_capital_authority are read from the raw dict, not the
+        # dataclass. Mirror that filtering so the shipped-config contract is
+        # validated exactly as production loads it.
+        allowed = {f.name for f in fields(PipelineConfig)}
+        cfg = PipelineConfig(
+            **{k: v for k, v in payload["pipeline"].items() if k in allowed}
+        )
 
         report = validate_live_readiness(
             cfg,

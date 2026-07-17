@@ -791,6 +791,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    raise SystemExit(
+        "CAPITAL_AUTHORITY_UNAVAILABLE: legacy V7 replay cannot produce V8 capital "
+        "authority; use pm_cap_replay_producer with signed precommitment inputs"
+    )
+
     config_path = Path(args.config).resolve()
     ledger_path = Path(args.ledger).resolve()
     broker_path = Path(args.broker_specs).resolve()

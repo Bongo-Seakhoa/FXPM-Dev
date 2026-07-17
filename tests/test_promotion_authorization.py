@@ -28,6 +28,7 @@ def _activate_native(data_dir: Path, *, activation_id: str, close_value: float) 
         native_root,
         run_id,
         price_offset=float(close_value),
+        production_grid=True,
     )
     activated = activate_v5_run(native_root, run_id, activation_id)
     assert activated["status"] == "active", activated
@@ -98,7 +99,9 @@ def _winner(native: dict, now: datetime) -> tuple[RegimeConfig, SymbolConfig]:
 
 
 def _write_ledger(path: Path, symbol: SymbolConfig) -> str:
-    path.write_text(json.dumps({"EURUSD": symbol.to_dict()}, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps({"EURUSD": symbol.to_dict()}, indent=2), encoding="utf-8"
+    )
     return sha256_file(path)
 
 
@@ -186,9 +189,7 @@ def test_exact_immutable_authorization_accepts_matching_cell(tmp_path):
 
 
 def test_relative_native_data_dir_resolves_from_selected_config(tmp_path, monkeypatch):
-    now, config, ledger, _cell, symbol, _authorization = _authorized_fixture(
-        tmp_path
-    )
+    now, config, ledger, _cell, symbol, _authorization = _authorized_fixture(tmp_path)
     config.data_dir = Path("data")
     elsewhere = tmp_path / "unrelated-working-directory"
     elsewhere.mkdir()
@@ -217,7 +218,9 @@ def test_strategy_parameter_drift_blocks_authorized_cell(tmp_path):
     )
 
     assert not result.valid
-    assert any("CELL_CONTRACT_DRIFT:EURUSD|H1|TREND" in reason for reason in result.errors)
+    assert any(
+        "CELL_CONTRACT_DRIFT:EURUSD|H1|TREND" in reason for reason in result.errors
+    )
 
 
 def test_authorization_file_tampering_breaks_configured_hash_pin(tmp_path):
@@ -256,7 +259,9 @@ def test_winner_ledger_byte_drift_blocks_authorization(tmp_path):
 
 def test_active_native_activation_drift_blocks_authorization(tmp_path):
     now, config, ledger, _cell, symbol, _authorization = _authorized_fixture(tmp_path)
-    _activate_native(Path(config.data_dir), activation_id="activation-b", close_value=1.2)
+    _activate_native(
+        Path(config.data_dir), activation_id="activation-b", close_value=1.2
+    )
 
     result = verify_promotion_authorization(
         config,
@@ -266,7 +271,9 @@ def test_active_native_activation_drift_blocks_authorization(tmp_path):
     )
 
     assert not result.valid
-    assert any("ACTIVE_NATIVE_DRIFT:EURUSD|H1|TREND" in reason for reason in result.errors)
+    assert any(
+        "ACTIVE_NATIVE_DRIFT:EURUSD|H1|TREND" in reason for reason in result.errors
+    )
 
 
 def test_missing_or_nonapproved_human_review_blocks(tmp_path):
@@ -316,7 +323,9 @@ def test_portfolio_manager_rechecks_exact_cell_authorization(tmp_path):
     )
     assert authorized, reason
 
-    authorization.write_text(authorization.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    authorization.write_text(
+        authorization.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+    )
     authorized, reason = manager.is_exact_cell_authorized_for_live(
         "EURUSD", "H1", "TREND", refresh=True
     )
@@ -385,6 +394,7 @@ def test_funded_readiness_reports_missing_hash_pinned_authorization(tmp_path):
 
     assert not report.ok
     assert any(
-        finding.code == "production_promotion_authorization_path_missing"
+        finding.code == "production_promotion_authorization_invalid"
+        and "PROMOTION_AUTHORIZATION_PATH_MISSING" in finding.message
         for finding in report.errors
     )

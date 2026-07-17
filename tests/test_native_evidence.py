@@ -19,6 +19,7 @@ from pm_evidence import (
     TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
     build_calendar_boundaries,
     build_timeframe_calendar_boundaries,
+    calendar_window_meta,
     earliest_timeframe_evidence_start,
     ensure_utc_index,
     latest_closed_bar_end,
@@ -51,6 +52,46 @@ def test_ensure_utc_index_read_only_fast_path_avoids_full_frame_copy():
 
     assert borrowed is frame
     assert isolated is not frame
+
+
+def test_calendar_window_meta_borrows_normalized_frame_without_deep_copy():
+    frame = _ohlc(pd.date_range("2025-01-01", periods=10_000, freq="5min", tz="UTC"))
+
+    with mock.patch.object(
+        frame,
+        "copy",
+        side_effect=AssertionError("calendar metadata copied the full native frame"),
+    ):
+        metadata = calendar_window_meta(
+            frame,
+            frame.index[1_000],
+            frame.index[9_000],
+        )
+
+    assert metadata["start_index"] == 1_000
+    assert metadata["end_index"] == 9_000
+    assert metadata["rows"] == 8_000
+
+
+def test_closed_bar_trim_can_transfer_an_already_closed_frame_without_copy():
+    frame = _ohlc(pd.date_range("2025-01-01", periods=100, freq="5min", tz="UTC"))
+    frame["_BAR_CLOSE_TS"] = frame.index + pd.Timedelta(minutes=5)
+
+    borrowed = trim_to_closed_bars(
+        frame,
+        "M5",
+        as_of_utc=frame["_BAR_CLOSE_TS"].iloc[-1],
+        copy=False,
+    )
+    isolated = trim_to_closed_bars(
+        frame,
+        "M5",
+        as_of_utc=frame["_BAR_CLOSE_TS"].iloc[-1],
+    )
+
+    assert borrowed is frame
+    assert isolated is not frame
+    pd.testing.assert_frame_equal(isolated, frame)
 
 
 def test_calendar_boundaries_are_common_half_open_and_disjoint():
@@ -89,7 +130,10 @@ def test_v3_timeframe_windows_lengthen_without_changing_information_cutoff():
     assert d1.windows["final_lockbox"] == m5.windows["final_lockbox"]
     assert d1.windows["tuning_validation"] == m5.windows["tuning_validation"]
     assert d1.windows["optimizer_train"][0] < m5.windows["optimizer_train"][0]
-    assert earliest_timeframe_evidence_start(as_of, embargo="7d") == d1.windows["optimizer_train"][0]
+    assert (
+        earliest_timeframe_evidence_start(as_of, embargo="7d")
+        == d1.windows["optimizer_train"][0]
+    )
 
 
 def test_v3_timeframe_window_config_may_tighten_but_not_weaken_priors():
@@ -108,8 +152,12 @@ def test_v3_timeframe_window_config_may_tighten_but_not_weaken_priors():
         timeframe_window_years=attempted,
     )
 
-    assert (m5.windows["optimizer_train"][1].year - m5.windows["optimizer_train"][0].year) == 5
-    assert (d1.windows["optimizer_train"][1].year - d1.windows["optimizer_train"][0].year) == 15
+    assert (
+        m5.windows["optimizer_train"][1].year - m5.windows["optimizer_train"][0].year
+    ) == 5
+    assert (
+        d1.windows["optimizer_train"][1].year - d1.windows["optimizer_train"][0].year
+    ) == 15
     assert d1.windows["tuning_validation"] == m5.windows["tuning_validation"]
     assert d1.windows["final_lockbox"] == m5.windows["final_lockbox"]
     assert DEFAULT_TIMEFRAME_WINDOW_YEARS["D1"] == {
@@ -143,7 +191,7 @@ def test_five_two_two_year_d1_native_evidence_passes_necessary_gate():
     assert verdict.partition_rows["final_lockbox"] >= 500
 
 
-def test_roughly_174_daily_lockbox_bars_fail_even_with_claimed_provenance():
+def test_roughly_174_daily_lockbox_bars_are_diagnostic_not_a_trading_verdict():
     frames = {
         "optimizer_train": _ohlc(pd.date_range("2022-01-03", periods=520, freq="B")),
         "tuning_validation": _ohlc(pd.date_range("2024-01-02", periods=173, freq="B")),
@@ -158,9 +206,105 @@ def test_roughly_174_daily_lockbox_bars_fail_even_with_claimed_provenance():
 
     verdict = validate_timeframe_evidence("D1", frames, source_meta=source_meta)
 
+    assert verdict.passed
+    assert verdict.reason_codes == []
+    assert "INSUFFICIENT_BARS:final_lockbox:174<500" in verdict.diagnostic_reason_codes
+    assert any(
+        reason.startswith("INSUFFICIENT_CALENDAR_SPAN:final_lockbox")
+        for reason in verdict.diagnostic_reason_codes
+    )
+    assert verdict.search_sufficiency_authority == (
+        "DEFERRED_TO_AUTHENTICATED_HORIZON_ESS_TRADE_POWER_MULTIPLICITY"
+    )
+
+
+def test_low_session_coverage_and_boundary_shortfall_do_not_veto_native_cell():
+    frames = {
+        "optimizer_train": _ohlc(
+            pd.date_range("2024-01-02", periods=520, freq="B", tz="UTC")
+        ),
+        "tuning_validation": _ohlc(
+            pd.date_range("2025-01-02", periods=260, freq="B", tz="UTC")
+        ),
+        "final_lockbox": _ohlc(
+            pd.date_range("2026-01-02", periods=120, freq="B", tz="UTC")
+        ),
+    }
+    source_meta = {
+        "source_kind": "broker_native",
+        "provenance_valid": True,
+        "sha256": "c" * 64,
+        "expected_session_coverage_by_partition": {
+            "optimizer_train": 0.92,
+            "tuning_validation": 0.91,
+            "final_lockbox": 0.70,
+        },
+        "observed_session_bars_by_partition": {
+            partition: len(frame) for partition, frame in frames.items()
+        },
+    }
+    bounds = {
+        "optimizer_train": (
+            "2017-01-01T00:00:00Z",
+            "2022-01-01T00:00:00Z",
+        ),
+        "tuning_validation": (
+            "2022-01-01T00:00:00Z",
+            "2024-01-01T00:00:00Z",
+        ),
+        "final_lockbox": (
+            "2024-01-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        ),
+    }
+
+    verdict = validate_timeframe_evidence(
+        "D1",
+        frames,
+        source_meta=source_meta,
+        partition_bounds=bounds,
+    )
+
+    assert verdict.passed
+    assert verdict.reason_codes == []
+    assert any(
+        reason.startswith("SESSION_COVERAGE_LOW:final_lockbox")
+        for reason in verdict.diagnostic_reason_codes
+    )
+    assert any(
+        reason.startswith("PARTITION_START_GAP:optimizer_train")
+        for reason in verdict.diagnostic_reason_codes
+    )
+
+
+def test_declared_observed_row_mismatch_and_empty_partition_remain_blocking():
+    frames = {
+        "optimizer_train": _ohlc(
+            pd.date_range("2020-01-02", periods=520, freq="B", tz="UTC")
+        ),
+        "tuning_validation": _ohlc(
+            pd.date_range("2023-01-02", periods=260, freq="B", tz="UTC")
+        ),
+        "final_lockbox": pd.DataFrame(),
+    }
+    source_meta = {
+        "source_kind": "broker_native",
+        "provenance_valid": True,
+        "observed_session_bars_by_partition": {
+            "optimizer_train": len(frames["optimizer_train"]) + 1,
+            "tuning_validation": len(frames["tuning_validation"]),
+            "final_lockbox": 0,
+        },
+    }
+
+    verdict = validate_timeframe_evidence("D1", frames, source_meta=source_meta)
+
     assert not verdict.passed
-    assert "INSUFFICIENT_BARS:final_lockbox:174<500" in verdict.reason_codes
-    assert any(reason.startswith("INSUFFICIENT_CALENDAR_SPAN:final_lockbox") for reason in verdict.reason_codes)
+    assert "PARTITION_FRAME_EMPTY:final_lockbox" in verdict.reason_codes
+    assert any(
+        reason.startswith("SESSION_OBSERVED_COUNT_MISMATCH:optimizer_train")
+        for reason in verdict.reason_codes
+    )
 
 
 def test_malformed_floor_config_cannot_weaken_safe_defaults():
@@ -269,7 +413,9 @@ def test_native_loader_rejects_legacy_active_manifest_without_production_contrac
                 "final_lockbox": 0.99,
             },
         }
-        sidecar_path = native / "audits" / "activation-1" / "EURUSD" / "H4" / "bars.meta.json"
+        sidecar_path = (
+            native / "audits" / "activation-1" / "EURUSD" / "H4" / "bars.meta.json"
+        )
         sidecar_path.parent.mkdir(parents=True)
         sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
         manifest = {
@@ -285,7 +431,9 @@ def test_native_loader_rejects_legacy_active_manifest_without_production_contrac
                         "timeframe": "H4",
                         "bars_relative_path": data_file.relative_to(native).as_posix(),
                         "bars_sha256": digest,
-                        "sidecar_relative_path": sidecar_path.relative_to(native).as_posix(),
+                        "sidecar_relative_path": sidecar_path.relative_to(
+                            native
+                        ).as_posix(),
                         "sidecar_sha256": sha256_file(sidecar_path),
                     }
                 }
@@ -306,22 +454,26 @@ def test_native_loader_rejects_legacy_active_manifest_without_production_contrac
         loaded, meta = loader.load_native_timeframe("EURUSD", "H4")
         assert loaded is None
         assert not meta["provenance_valid"]
-        assert "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED" in meta[
-            "provenance_errors"
-        ]
+        assert (
+            "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED"
+            in meta["provenance_errors"]
+        )
 
         # A flat file is never a fallback when the production contract is absent.
-        (native / "EURUSD_H4.csv").write_text("time,Open,High,Low,Close\n", encoding="utf-8")
-        still_missing, strict_meta = DataLoader(root, cache_resampled=False).load_native_timeframe(
-            "EURUSD", "H4"
+        (native / "EURUSD_H4.csv").write_text(
+            "time,Open,High,Low,Close\n", encoding="utf-8"
         )
+        still_missing, strict_meta = DataLoader(
+            root, cache_resampled=False
+        ).load_native_timeframe("EURUSD", "H4")
         assert still_missing is None
-        assert "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED" in strict_meta[
-            "provenance_errors"
-        ]
+        assert (
+            "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED"
+            in strict_meta["provenance_errors"]
+        )
 
 
-def test_pipeline_evidence_failure_emits_four_markers_before_features_or_optimizer():
+def test_pipeline_evidence_failure_is_technical_and_never_emits_trade_verdict():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         cfg = PipelineConfig(
@@ -347,49 +499,46 @@ def test_pipeline_evidence_failure_emits_four_markers_before_features_or_optimiz
                 "provenance_errors": ["TEST_UNVERIFIED"],
             }
         }
-        captured = {}
-        original_marker_builder = pipeline._evidence_no_trade_markers
-
-        def capture_markers(verdict):
-            markers = original_marker_builder(verdict)
-            captured.update(markers)
-            return markers
-
-        with mock.patch.object(
-            pipeline,
-            "_load_symbol_timeframe_data",
-            return_value=({"M5": frame}, window_meta),
-        ), mock.patch(
-            "pm_pipeline.validate_regime_params_provenance",
-            return_value={"valid": True, "reason": "test", "provenance_path": "test"},
-            create=True,
-        ), mock.patch.object(
-            pipeline,
-            "_evidence_no_trade_markers",
-            side_effect=capture_markers,
-        ), mock.patch(
-            "pm_pipeline.StrategyRegistry.get_all_instances",
-            return_value=[],
-        ), mock.patch(
-            "pm_pipeline.FeatureComputer.compute_all",
-            side_effect=AssertionError("features must be unreachable"),
-        ), mock.patch.object(
-            pipeline.regime_optimizer,
-            "optimize_symbol",
-            side_effect=AssertionError("optimizer must be unreachable"),
+        with (
+            mock.patch.object(
+                pipeline,
+                "_load_symbol_timeframe_data",
+                return_value=({"M5": frame}, window_meta),
+            ),
+            mock.patch(
+                "pm_pipeline.validate_regime_params_provenance",
+                return_value={
+                    "valid": True,
+                    "reason": "test",
+                    "provenance_path": "test",
+                },
+                create=True,
+            ),
+            mock.patch(
+                "pm_pipeline.StrategyRegistry.get_all_instances",
+                return_value=[],
+            ),
+            mock.patch(
+                "pm_pipeline.FeatureComputer.compute_all",
+                side_effect=AssertionError("features must be unreachable"),
+            ),
+            mock.patch.object(
+                pipeline.regime_optimizer,
+                "optimize_symbol",
+                side_effect=AssertionError("optimizer must be unreachable"),
+            ),
         ):
             result = pipeline.run_for_symbol("EURUSD")
 
-        # A fully evaluated cell that honestly abstains is a completed semantic
-        # result, not an optimizer/infrastructure failure.  It must therefore
-        # be persistable as an explicit NO_TRADE grid.
-        assert result.success
-        assert result.config is not None
-        assert not result.config.is_validated
-        assert result.config.strategy_name == "NO_TRADE"
-        assert len(captured) == 4
-        assert set(captured) == {"TREND", "RANGE", "BREAKOUT", "CHOP"}
-        assert all(marker.is_no_trade_marker() for marker in captured.values())
+        # Invalid source/provenance is an infrastructure/data-integrity failure,
+        # not evidence that a strategy should abstain.  The run must fail before
+        # feature/search and leave the semantic winner ledger untouched.
+        assert not result.success
+        assert result.config is None
+        assert result.error_message.startswith("TECHNICAL_EVIDENCE_FAILURE:M5:")
         verdict = result.data_window_meta["timeframe_evidence"]["M5"]
         assert not verdict["passed"]
-        assert any(code.startswith("NATIVE_SOURCE_REQUIRED") for code in verdict["reason_codes"])
+        assert any(
+            code.startswith("NATIVE_SOURCE_REQUIRED")
+            for code in verdict["reason_codes"]
+        )

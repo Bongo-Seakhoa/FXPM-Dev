@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 
-SAMPLE_DEPENDENCE_SCHEMA_VERSION = "fxpm-effective-sample-v1"
+SAMPLE_DEPENDENCE_SCHEMA_VERSION = "fxpm-effective-sample-v2"
 
 
 @dataclass(frozen=True)
@@ -118,12 +118,32 @@ def _geyer_initial_monotone(
     return float(tau), int(last_lag)
 
 
-def _coerce_interval(value: Any) -> tuple[pd.Timestamp, pd.Timestamp]:
+def _event_order(value: Any, *, field_name: str) -> int:
+    if value is None:
+        return 0
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative integer")
+    return value
+
+
+def _coerce_interval(
+    value: Any,
+) -> tuple[tuple[pd.Timestamp, int], tuple[pd.Timestamp, int]]:
     if isinstance(value, Mapping):
         start = value.get("start", value.get("entry", value.get("open")))
         end = value.get("end", value.get("exit", value.get("close")))
+        start_order = _event_order(
+            value.get("start_event_order", value.get("entry_event_order")),
+            field_name="start_event_order",
+        )
+        end_order = _event_order(
+            value.get("end_event_order", value.get("exit_event_order")),
+            field_name="end_event_order",
+        )
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) == 2:
         start, end = value
+        start_order = 0
+        end_order = 0
     else:
         raise ValueError("holding interval must be a mapping or a two-item sequence")
     start_ts = pd.Timestamp(start)
@@ -138,20 +158,22 @@ def _coerce_interval(value: Any) -> tuple[pd.Timestamp, pd.Timestamp]:
         end_ts = end_ts.tz_localize("UTC")
     else:
         end_ts = end_ts.tz_convert("UTC")
-    if end_ts < start_ts:
+    start_event = (start_ts, start_order)
+    end_event = (end_ts, end_order)
+    if end_event < start_event:
         raise ValueError("holding interval ends before it starts")
-    return start_ts, end_ts
+    return start_event, end_event
 
 
 def overlap_component_count(intervals: Sequence[Any]) -> int:
-    """Count connected components of overlapping closed holding intervals."""
+    """Count connected components of half-open holding intervals."""
     normalized = sorted((_coerce_interval(value) for value in intervals), key=lambda item: item[0])
     if not normalized:
         return 0
     clusters = 1
     current_end = normalized[0][1]
     for start, end in normalized[1:]:
-        if start <= current_end:
+        if start < current_end:
             current_end = max(current_end, end)
         else:
             clusters += 1

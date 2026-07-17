@@ -480,6 +480,257 @@ def _source_sha256(path: Path) -> str:
     return value
 
 
+# Mirrors the tuner writer's non-search schema (pm_regime_tuner); the
+# cross-suite regression pins the two constants together.
+REGIME_NON_SEARCH_SCHEMA_VERSION = "fxpm.regime-detector-non-search/v1"
+REGIME_TRAIN_SUPPORT_SCHEMA_VERSION = "fxpm.regime-train-support/v1"
+_REGIME_LABEL_ORDER = ("TREND", "RANGE", "BREAKOUT", "CHOP")
+
+
+def _tuner_canonical_sha256(value: Dict[str, Any]) -> str:
+    # Must byte-match pm_regime_tuner._canonical_mapping_sha256.
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def recompute_train_regime_support_digest(
+    frame: "pd.DataFrame", params_cell: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Recompute counts/vector from the exact train REGIME_LIVE surface.
+
+    Byte-mirrors the tuner writer; the consumer never trusts a returned
+    receipt without this independent recompute (seq1024).
+    """
+    try:
+        detector = MarketRegimeDetector(RegimeParams.from_dict(dict(params_cell)))
+        surface_frame = detector.compute_regime_scores(frame)
+        if not surface_frame.index.equals(frame.index):
+            return None
+        if not {"REGIME_LIVE", "REGIME_WARMUP"}.issubset(surface_frame.columns):
+            return None
+        warmup = surface_frame["REGIME_WARMUP"]
+        if warmup.isna().any() or not warmup.isin([True, False]).all():
+            return None
+        warmup = warmup.astype(bool)
+        eligible = (~warmup) & (~warmup.shift(1, fill_value=True))
+        surface = surface_frame.loc[eligible, "REGIME_LIVE"]
+        if surface.empty or surface.isna().any():
+            return None
+        counts = {label: 0 for label in _REGIME_LABEL_ORDER}
+        digest = hashlib.sha256()
+        digest.update(b"fxpm.regime-live-labels-nul/v1\0")
+        for value in surface.array:
+            if not isinstance(value, str) or value not in counts:
+                return None
+            counts[value] += 1
+            digest.update(value.encode("ascii"))
+            digest.update(b"\0")
+        return {
+            "counts": counts,
+            "eligible_rows": int(len(surface)),
+            "vector_sha256": digest.hexdigest(),
+            "first_ts": pd.Timestamp(surface.index[0]).isoformat(),
+            "last_ts": pd.Timestamp(surface.index[-1]).isoformat(),
+        }
+    except Exception:
+        return None
+
+
+_DETECTOR_CODE_SHA256_CACHE: Optional[str] = None
+
+
+def detector_code_sha256() -> Optional[str]:
+    """Hash of this module's source file; mirrors the tuner binding."""
+    global _DETECTOR_CODE_SHA256_CACHE
+    if _DETECTOR_CODE_SHA256_CACHE is None:
+        try:
+            import inspect
+
+            source_file = inspect.getsourcefile(MarketRegimeDetector)
+            if not source_file:
+                return None
+            _DETECTOR_CODE_SHA256_CACHE = _source_sha256(
+                Path(source_file).resolve()
+            )
+        except Exception:
+            return None
+    return _DETECTOR_CODE_SHA256_CACHE
+
+
+def _validated_train_regime_support(
+    support: Any,
+    symbol: str,
+    timeframe: str,
+    params_cell: Optional[Dict[str, Any]],
+    expected_activation_id: Optional[str],
+    expected_activation_manifest_sha256: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Return validated support receipt or None (caller rejects).
+
+    seq1000/1005/1006: consumer validates the exact train-only support
+    receipt; leaf inference is never a substitute.
+    """
+    if not isinstance(support, dict):
+        return None
+    if support.get("schema_version") != REGIME_TRAIN_SUPPORT_SCHEMA_VERSION:
+        return None
+    if str(support.get("symbol", "")).upper() != str(symbol).upper():
+        return None
+    if str(support.get("timeframe", "")).upper() != str(timeframe).upper():
+        return None
+    if support.get("surface") != "REGIME_LIVE":
+        return None
+    if list(support.get("label_order") or []) != list(_REGIME_LABEL_ORDER):
+        return None
+    counts = support.get("counts")
+    if not isinstance(counts, dict) or set(counts) != set(_REGIME_LABEL_ORDER):
+        return None
+    for value in counts.values():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+    eligible = support.get("eligible_rows")
+    if isinstance(eligible, bool) or not isinstance(eligible, int) or eligible < 1:
+        return None
+    if sum(counts.values()) != eligible:
+        return None
+    observed = [lab for lab in _REGIME_LABEL_ORDER if counts[lab] > 0]
+    unobserved = [lab for lab in _REGIME_LABEL_ORDER if counts[lab] == 0]
+    if list(support.get("observed_regimes") or []) != observed:
+        return None
+    if list(support.get("unobserved_regimes") or []) != unobserved:
+        return None
+    state = support.get("support_state_by_regime")
+    if not isinstance(state, dict) or set(state) != set(_REGIME_LABEL_ORDER):
+        return None
+    for label in _REGIME_LABEL_ORDER:
+        want = "EMPIRICALLY_OBSERVED" if counts[label] > 0 else "UNOBSERVED"
+        if state.get(label) != want:
+            return None
+    if support.get("warmup_policy") != "CURRENT_AND_SOURCE_BAR_NOT_WARMUP":
+        return None
+    if support.get("vector_encoding") != "fxpm.regime-live-labels-nul/v1":
+        return None
+    for ts_key in ("first_ts", "last_ts"):
+        if not isinstance(support.get(ts_key), str) or not support[ts_key]:
+            return None
+    vector_sha = str(support.get("vector_sha256") or "").lower()
+    if len(vector_sha) != 64 or any(c not in "0123456789abcdef" for c in vector_sha):
+        return None
+    bindings = support.get("bindings")
+    if not isinstance(bindings, dict):
+        return None
+    if set(bindings) != {
+        "symbol",
+        "timeframe",
+        "activation_id",
+        "activation_manifest_sha256",
+        "source_sha256",
+        "train_window_sha256",
+        "params_sha256",
+        "detector_code_sha256",
+    }:
+        return None
+    for sha_key in (
+        "source_sha256",
+        "train_window_sha256",
+        "params_sha256",
+        "detector_code_sha256",
+    ):
+        value = str(bindings.get(sha_key) or "").lower()
+        if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            return None
+    if str(bindings.get("symbol", "")).upper() != str(symbol).upper():
+        return None
+    if str(bindings.get("timeframe", "")).upper() != str(timeframe).upper():
+        return None
+    if expected_activation_id is not None and str(
+        bindings.get("activation_id") or ""
+    ) != str(expected_activation_id):
+        return None
+    if expected_activation_manifest_sha256 is not None and str(
+        bindings.get("activation_manifest_sha256") or ""
+    ).lower() != str(expected_activation_manifest_sha256).lower():
+        return None
+    if params_cell is not None and bindings.get("params_sha256") != (
+        regime_params_sha256(params_cell)
+    ):
+        return None
+    declared = str(support.get("receipt_sha256") or "").lower()
+    body = {k: v for k, v in support.items() if k != "receipt_sha256"}
+    if declared != _tuner_canonical_sha256(body):
+        return None
+    return support
+
+
+def _validated_non_search_record(
+    record: Any,
+    symbol: str,
+    timeframe: str,
+    expected_activation_id: Optional[str],
+    expected_activation_manifest_sha256: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Return the record iff it is a bound, verdict-free NON_SEARCH decision."""
+    if not isinstance(record, dict):
+        return None
+    if record.get("schema_version") != REGIME_NON_SEARCH_SCHEMA_VERSION:
+        return None
+    if str(record.get("status", "")).upper() != "NON_SEARCH":
+        return None
+    if str(record.get("symbol", "")).upper() != str(symbol).upper():
+        return None
+    if str(record.get("timeframe", "")).upper() != str(timeframe).upper():
+        return None
+    # A non-search decision must never smuggle an economic verdict.
+    if record.get("no_trade") is not False:
+        return None
+    if record.get("trade_verdict") is not False:
+        return None
+    if record.get("strategy_search_authorized") is not False:
+        return None
+    # seq1012/seq1028: kind-bound vocabulary + terminal/retryable coherence.
+    kind = str(record.get("decision_kind", "")).strip().upper()
+    reason_code = str(record.get("reason_code", "")).strip().upper()
+    kind_reasons = {
+        "INSUFFICIENT_TRAIN_HISTORY": {
+            "INSUFFICIENT_OPTIMIZER_TRAIN_ROWS",
+            "INSUFFICIENT_DETECTOR_HOLDOUT_ROWS",
+        },
+        "TECHNICAL_EXCLUSION": {
+            "NATIVE_OPTIMIZER_TRAIN_INVALID",
+            "DETECTOR_FIT_NO_VALID_COMBINATION",
+            "REGIME_FIT_RAISED",
+            "REGIME_FIT_RESULT_INVALID",
+            "REGIME_FIT_RESULT_PROCESSING_FAILED",
+        },
+    }
+    if kind not in kind_reasons or reason_code not in kind_reasons[kind]:
+        return None
+    terminal = kind == "INSUFFICIENT_TRAIN_HISTORY"
+    if record.get("generation_terminal") is not terminal:
+        return None
+    if record.get("retryable") is not (not terminal):
+        return None
+    if str(record.get("fit_scope", "")).strip().lower() != "optimizer_train":
+        return None
+    if not str(record.get("window_contract_version", "") or "").strip():
+        return None
+    if expected_activation_id is not None and str(
+        record.get("activation_id") or ""
+    ) != str(expected_activation_id):
+        return None
+    if expected_activation_manifest_sha256 is not None and str(
+        record.get("activation_manifest_sha256") or ""
+    ).lower() != str(expected_activation_manifest_sha256).lower():
+        return None
+    declared_sha = str(record.get("decision_sha256") or "").strip().lower()
+    body = {key: value for key, value in record.items() if key != "decision_sha256"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    if declared_sha != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+        return None
+    return record
+
+
 def validate_regime_params_provenance(
     symbol: str,
     timeframe: str,
@@ -526,9 +777,9 @@ def validate_regime_params_provenance(
         return reject("regime params file is missing")
     except Exception as exc:
         return reject(f"regime params file is unreadable: {exc}")
+    # NOTE: a NON_SEARCH cell legitimately has no params entry; the
+    # params-cell requirement is enforced on the FIT path below.
     params_cell = _case_insensitive_nested_cell(params_payload, symbol, timeframe)
-    if not isinstance(params_cell, dict):
-        return reject("regime params cell is missing")
 
     try:
         provenance_payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -567,11 +818,69 @@ def validate_regime_params_provenance(
     ).lower() != str(expected_activation_manifest_sha256).lower():
         return reject("regime provenance activation manifest mismatch")
 
+    # seq936-specific fields only: legacy v3 sidecars carry
+    # fitted_active_cell_count/required_active_cell_count without the
+    # non-search vocabulary and must not trip the new identity.
+    _SEQ936_COUNT_FIELDS = (
+        "non_search_active_cell_count",
+        "resolved_active_cell_count",
+        "required_evidence_candidate_cell_count",
+    )
+    declares_counts = any(
+        count_key in provenance_payload for count_key in _SEQ936_COUNT_FIELDS
+    ) or bool(provenance_payload.get("non_search_cells"))
+    if require_complete_generation and declares_counts:
+        # seq936 counts identity: fitted + non_search = resolved = required.
+        # Legacy FIT-only sidecars predate the count contract and stay valid
+        # (each FIT cell is still individually validated below); any payload
+        # that carries counts or non_search_cells must satisfy the identity.
+        try:
+            fitted = int(provenance_payload.get("fitted_active_cell_count"))
+            non_search = int(provenance_payload.get("non_search_active_cell_count"))
+            resolved = int(provenance_payload.get("resolved_active_cell_count"))
+            required = int(
+                provenance_payload.get("required_evidence_candidate_cell_count")
+            )
+        except (TypeError, ValueError):
+            return reject("regime provenance cell counts are missing or invalid")
+        if fitted + non_search != resolved or resolved != required:
+            return reject(
+                "regime provenance cell counts identity broken: "
+                f"{fitted}+{non_search}!={resolved} or {resolved}!={required}"
+            )
+
     record = _case_insensitive_nested_cell(
         provenance_payload.get("cells", {}), symbol, timeframe
     )
     if not isinstance(record, dict):
+        non_search_record = _validated_non_search_record(
+            _case_insensitive_nested_cell(
+                provenance_payload.get("non_search_cells", {}), symbol, timeframe
+            ),
+            symbol,
+            timeframe,
+            expected_activation_id,
+            expected_activation_manifest_sha256,
+        )
+        if non_search_record is not None:
+            # Typed non-search authorization decision: the cell is VALIDLY
+            # excluded from strategy search.  Never an economic verdict and
+            # never a gate failure; the pipeline must skip search for this
+            # cell without touching the winner ledger.
+            return {
+                "valid": True,
+                "status": "NON_SEARCH",
+                "reason": str(non_search_record.get("reason_code")),
+                "decision_kind": str(non_search_record.get("decision_kind")),
+                "symbol": str(symbol),
+                "timeframe": str(timeframe).upper(),
+                "params_path": str(params_path),
+                "provenance_path": str(sidecar_path),
+                "record": dict(non_search_record),
+            }
         return reject("regime provenance cell is missing")
+    if not isinstance(params_cell, dict):
+        return reject("regime params cell is missing")
     if record.get("schema_version") != REGIME_PROVENANCE_SCHEMA_VERSION:
         return reject("regime provenance cell schema mismatch", record)
     if str(record.get("symbol", "")).upper() != str(symbol).upper():
@@ -707,14 +1016,33 @@ def validate_regime_params_provenance(
             if expected_ts is None or record_ts != expected_ts:
                 return reject(f"regime provenance optimizer-train {key} mismatch", record)
 
+    # seq1005: consume the train-only support receipt; leaf inference is
+    # never a substitute.  Required whenever the sidecar speaks the seq936
+    # vocabulary; validated whenever present.
+    raw_support = record.get("train_regime_support")
+    validated_support: Optional[Dict[str, Any]] = None
+    if raw_support is not None or declares_counts:
+        validated_support = _validated_train_regime_support(
+            raw_support,
+            symbol,
+            timeframe,
+            params_cell,
+            expected_activation_id,
+            expected_activation_manifest_sha256,
+        )
+        if validated_support is None:
+            return reject("regime train support receipt is missing or invalid", record)
+
     return {
         "valid": True,
+        "status": "FIT",
         "reason": "ok",
         "symbol": str(symbol),
         "timeframe": str(timeframe).upper(),
         "params_path": str(params_path),
         "provenance_path": str(sidecar_path),
         "record": record,
+        "train_regime_support": validated_support,
     }
 
 
@@ -1924,3 +2252,15 @@ if __name__ == "__main__":
     print(result['REGIME'].value_counts())
     
     print("\npm_regime.py loaded successfully!")
+
+
+def load_regime_params_cell(
+    filepath: str, symbol: str, timeframe: str
+) -> Optional[Dict[str, Any]]:
+    """Exact params cell for one symbol/timeframe, or None."""
+    try:
+        payload = json.loads(Path(str(filepath)).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    cell = _case_insensitive_nested_cell(payload, symbol, timeframe)
+    return cell if isinstance(cell, dict) else None

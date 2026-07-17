@@ -15,20 +15,25 @@ Outputs: regime_params.json + regime_params.provenance.json
 
 Usage:
     python pm_regime_tuner.py --config config.json
-    python pm_regime_tuner.py --data-dir ./data --output regime_params.json
+    python pm_regime_tuner.py --config config.json --data-dir ./data
     python pm_regime_tuner.py --symbols EURUSD GBPUSD --timeframes H1 H4
 
-This script is separate from the main optimization flow and should be run
-periodically (e.g., weekly) to calibrate regime detection parameters.
+Calendar production reads independently acquired native timeframe leaves from
+the authenticated ``<data-dir>/native/ACTIVE.json`` activation. Flat M5 CSV
+input is supported only by the legacy chronological-lockbox mode.
 
 Version: 4.0 (chronological train-only detector fitting)
 """
 
 import argparse
 import hashlib
+import inspect
 import json
 import logging
+import math
 import os
+import shutil
+import uuid
 from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +54,7 @@ from pm_evidence import (
     trim_to_closed_bars,
 )
 from pm_native_activation import (
+    NATIVE_EVIDENCE_CANDIDATE,
     NATIVE_PRODUCTION_TIMEFRAMES,
     resolve_active_native_universe,
 )
@@ -67,7 +73,36 @@ logger = logging.getLogger(__name__)
 
 
 class RegimeTuningIncompleteError(RuntimeError):
-    """Raised when any required active specialist cell fails detector fitting."""
+    """Raised when a regime generation cannot be safely promoted as a whole."""
+
+
+REGIME_NON_SEARCH_SCHEMA_VERSION = "fxpm.regime-detector-non-search/v1"
+REGIME_TRAIN_SUPPORT_SCHEMA_VERSION = "fxpm.regime-train-support/v1"
+REGIME_TRAIN_SUPPORT_VECTOR_ENCODING = "fxpm.regime-live-labels-nul/v1"
+REGIME_TRAIN_SUPPORT_WARMUP_POLICY = "CURRENT_AND_SOURCE_BAR_NOT_WARMUP"
+REGIME_TUNER_MIN_TRAIN_ROWS = 500
+REGIME_METADATA_MAX_DEPTH = 10
+REGIME_METADATA_MAX_NODES = 2048
+REGIME_METADATA_MAX_CONTAINER_ITEMS = 512
+REGIME_METADATA_MAX_STRING_BYTES = 4096
+REGIME_METADATA_MAX_SERIALIZED_BYTES = 64 * 1024
+_NON_SEARCH_DECISION_KINDS = {
+    "INSUFFICIENT_TRAIN_HISTORY",
+    "TECHNICAL_EXCLUSION",
+}
+_NON_SEARCH_REASON_CODES_BY_KIND = {
+    "INSUFFICIENT_TRAIN_HISTORY": {
+        "INSUFFICIENT_OPTIMIZER_TRAIN_ROWS",
+        "INSUFFICIENT_DETECTOR_HOLDOUT_ROWS",
+    },
+    "TECHNICAL_EXCLUSION": {
+        "NATIVE_OPTIMIZER_TRAIN_INVALID",
+        "DETECTOR_FIT_NO_VALID_COMBINATION",
+        "REGIME_FIT_RAISED",
+        "REGIME_FIT_RESULT_INVALID",
+        "REGIME_FIT_RESULT_PROCESSING_FAILED",
+    },
+}
 
 
 # =============================================================================
@@ -386,6 +421,9 @@ class RegimeParamTuner:
         self.split_mode = split_mode
         self.splitter = DataSplitter(self.config)
         self._active_native_universe = None
+        self._native_universe_resolved_from_disk = False
+        self._detector_code_sha256_cache: Optional[str] = None
+        self._fit_support_authority: Dict[Tuple[str, str], str] = {}
 
     def _native_universe(self):
         """Resolve and cache the single authenticated production activation."""
@@ -401,7 +439,773 @@ class RegimeParamTuner:
             if not universe.explicit_contract:
                 raise ValueError("active native universe lacks an explicit cell contract")
             self._active_native_universe = universe
+            self._native_universe_resolved_from_disk = True
         return self._active_native_universe
+
+    def _active_native_identity_still_current(self) -> Tuple[bool, str]:
+        if not self._native_universe_resolved_from_disk:
+            return True, "injected test universe"
+        pinned = self._native_universe()
+        current = resolve_active_native_universe(
+            self.data_dir,
+            required_timeframes=NATIVE_PRODUCTION_TIMEFRAMES,
+            production_contract_required=True,
+        )
+        if not current.valid or not current.explicit_contract:
+            return False, "active native universe became invalid during tuning"
+        if (
+            str(current.activation_id) != str(pinned.activation_id)
+            or str(current.activation_manifest_sha256).lower()
+            != str(pinned.activation_manifest_sha256).lower()
+        ):
+            return False, "active native universe changed during tuning"
+        return True, "active native universe identity unchanged"
+
+    @staticmethod
+    def _evidence_candidate_timeframes(universe: Any, symbol: str) -> Tuple[str, ...]:
+        """Return data-authentic cells without converting them to trade verdicts."""
+        reader = getattr(universe, "active_timeframes", None)
+        if callable(reader):
+            return tuple(
+                dict.fromkeys(str(value or "").strip().upper() for value in reader(symbol))
+            )
+        required_timeframes = tuple(
+            getattr(universe, "required_timeframes", ())
+            or NATIVE_PRODUCTION_TIMEFRAMES
+        )
+        return tuple(
+            timeframe
+            for timeframe in required_timeframes
+            if str(universe.cell_status(symbol, timeframe)).lower()
+            in {"active", NATIVE_EVIDENCE_CANDIDATE}
+        )
+
+    @staticmethod
+    def _bounded_text(value: Any, limit: int = 512) -> str:
+        """Return deterministic, bounded diagnostic text for persisted artifacts."""
+        text = str(value or "").replace("\x00", "").strip()
+        return text[: max(0, int(limit))]
+
+    @classmethod
+    def _json_safe_mapping(
+        cls,
+        value: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Copy exact metadata within fixed structural and byte bounds.
+
+        Oversized metadata is rejected instead of truncated so source and
+        split identities cannot lose accuracy while memory and artifacts stay
+        bounded.
+        """
+        if not isinstance(value, dict):
+            return {}
+
+        nodes = 0
+
+        def copy_value(item: Any, depth: int) -> Any:
+            nonlocal nodes
+            if depth > REGIME_METADATA_MAX_DEPTH:
+                raise ValueError("regime metadata exceeds the depth bound")
+            nodes += 1
+            if nodes > REGIME_METADATA_MAX_NODES:
+                raise ValueError("regime metadata exceeds the node bound")
+            if isinstance(item, dict):
+                if len(item) > REGIME_METADATA_MAX_CONTAINER_ITEMS:
+                    raise ValueError("regime metadata mapping exceeds the item bound")
+                copied: Dict[str, Any] = {}
+                for key, nested in item.items():
+                    if not isinstance(key, str):
+                        raise ValueError("regime metadata keys must be strings")
+                    if len(key.encode("utf-8")) > REGIME_METADATA_MAX_STRING_BYTES:
+                        raise ValueError("regime metadata key exceeds the byte bound")
+                    copied[key] = copy_value(nested, depth + 1)
+                return copied
+            if isinstance(item, (list, tuple)):
+                if len(item) > REGIME_METADATA_MAX_CONTAINER_ITEMS:
+                    raise ValueError("regime metadata sequence exceeds the item bound")
+                return [copy_value(nested, depth + 1) for nested in item]
+            if item is None or isinstance(item, (bool, int)):
+                return item
+            if isinstance(item, float):
+                if not math.isfinite(item):
+                    raise ValueError("regime metadata contains a non-finite number")
+                return item
+            text = item if isinstance(item, str) else str(item)
+            if len(text.encode("utf-8")) > REGIME_METADATA_MAX_STRING_BYTES:
+                raise ValueError("regime metadata string exceeds the byte bound")
+            return text
+
+        copied = copy_value(value, 0)
+        serialized = json.dumps(
+            copied,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(serialized) > REGIME_METADATA_MAX_SERIALIZED_BYTES:
+            raise ValueError("regime metadata exceeds the serialized byte bound")
+        return copied
+
+    @staticmethod
+    def _is_sha256(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        if len(text) != 64:
+            return False
+        try:
+            int(text, 16)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _canonical_mapping_sha256(value: Dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _detector_code_sha256(self) -> str:
+        if self._detector_code_sha256_cache is None:
+            source_file = inspect.getsourcefile(MarketRegimeDetector)
+            if not source_file:
+                raise ValueError("regime detector source file cannot be resolved")
+            self._detector_code_sha256_cache = TunerDataLoader._sha256(
+                Path(source_file).resolve()
+            )
+        return self._detector_code_sha256_cache
+
+    def _build_train_regime_support(
+        self,
+        frame: pd.DataFrame,
+        params: RegimeParams,
+        source_meta: Dict[str, Any],
+        train_meta: Dict[str, Any],
+        symbol: str,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """Hash the exact post-warmup optimizer-train REGIME_LIVE surface."""
+        detector = MarketRegimeDetector(params)
+        surface_frame = detector.compute_regime_scores(frame)
+        if not surface_frame.index.equals(frame.index):
+            raise ValueError("regime support surface index is inconsistent")
+        required = {"REGIME_LIVE", "REGIME_WARMUP"}
+        if not required.issubset(surface_frame.columns):
+            raise ValueError("regime support surface columns are missing")
+        warmup = surface_frame["REGIME_WARMUP"]
+        if warmup.isna().any() or not warmup.isin([True, False]).all():
+            raise ValueError("regime support warmup markers are invalid")
+        warmup = warmup.astype(bool)
+        source_warmup = warmup.shift(1, fill_value=True)
+        eligible_mask = (~warmup) & (~source_warmup)
+        surface = surface_frame.loc[eligible_mask, "REGIME_LIVE"]
+        if surface.empty:
+            raise ValueError("regime support surface has no post-warmup rows")
+        if surface.isna().any():
+            raise ValueError("regime support surface contains missing labels")
+
+        label_order = list(RegimeType.ALL)
+        counts = {label: 0 for label in label_order}
+        vector_digest = hashlib.sha256()
+        vector_digest.update(b"fxpm.regime-live-labels-nul/v1\0")
+        for value in surface.array:
+            if not isinstance(value, str) or value not in counts:
+                raise ValueError(f"regime support surface has unknown label: {value}")
+            counts[value] += 1
+            vector_digest.update(value.encode("ascii"))
+            vector_digest.update(b"\0")
+        observed = [label for label in label_order if counts[label] > 0]
+        unobserved = [label for label in label_order if counts[label] == 0]
+        support_state_by_regime = {
+            label: (
+                "EMPIRICALLY_OBSERVED" if counts[label] > 0 else "UNOBSERVED"
+            )
+            for label in label_order
+        }
+        source = self._json_safe_mapping(source_meta)
+        train = self._json_safe_mapping(train_meta)
+        params_sha256 = regime_params_sha256(params.to_dict())
+        bindings = {
+            "symbol": str(symbol or "").strip().upper(),
+            "timeframe": str(timeframe or "").strip().upper(),
+            "activation_id": source.get("activation_id"),
+            "activation_manifest_sha256": source.get(
+                "activation_manifest_sha256"
+            ),
+            "source_sha256": source.get("sha256"),
+            "train_window_sha256": self._canonical_mapping_sha256(train),
+            "params_sha256": params_sha256,
+            "detector_code_sha256": self._detector_code_sha256(),
+        }
+        receipt: Dict[str, Any] = {
+            "schema_version": REGIME_TRAIN_SUPPORT_SCHEMA_VERSION,
+            "symbol": str(symbol or "").strip().upper(),
+            "timeframe": str(timeframe or "").strip().upper(),
+            "surface": "REGIME_LIVE",
+            "warmup_policy": REGIME_TRAIN_SUPPORT_WARMUP_POLICY,
+            "label_order": label_order,
+            "eligible_rows": int(len(surface)),
+            "counts": counts,
+            "observed_regimes": observed,
+            "unobserved_regimes": unobserved,
+            "support_state_by_regime": support_state_by_regime,
+            "first_ts": pd.Timestamp(surface.index[0]).isoformat(),
+            "last_ts": pd.Timestamp(surface.index[-1]).isoformat(),
+            "vector_encoding": REGIME_TRAIN_SUPPORT_VECTOR_ENCODING,
+            "vector_sha256": vector_digest.hexdigest(),
+            "bindings": bindings,
+        }
+        receipt["receipt_sha256"] = self._canonical_mapping_sha256(receipt)
+        self._fit_support_authority[
+            (
+                str(symbol or "").strip().upper(),
+                str(timeframe or "").strip().upper(),
+            )
+        ] = receipt["receipt_sha256"]
+        return receipt
+
+    def _validate_train_regime_support(
+        self,
+        support_record: Dict[str, Any],
+        *,
+        source: Dict[str, Any],
+        train: Dict[str, Any],
+        params_dict: Dict[str, Any],
+        symbol: str,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        support = self._json_safe_mapping(support_record)
+        if support.get("schema_version") != REGIME_TRAIN_SUPPORT_SCHEMA_VERSION:
+            raise ValueError("regime train-support schema is invalid")
+        expected_symbol = str(symbol or "").strip().upper()
+        expected_timeframe = str(timeframe or "").strip().upper()
+        if support.get("symbol") != expected_symbol:
+            raise ValueError("regime train-support symbol is invalid")
+        if support.get("timeframe") != expected_timeframe:
+            raise ValueError("regime train-support timeframe is invalid")
+        if support.get("surface") != "REGIME_LIVE":
+            raise ValueError("regime train-support surface is invalid")
+        if support.get("warmup_policy") != REGIME_TRAIN_SUPPORT_WARMUP_POLICY:
+            raise ValueError("regime train-support warmup policy is invalid")
+        label_order = list(RegimeType.ALL)
+        if support.get("label_order") != label_order:
+            raise ValueError("regime train-support label order is invalid")
+        counts = support.get("counts")
+        if not isinstance(counts, dict) or set(counts) != set(label_order):
+            raise ValueError("regime train-support counts are invalid")
+        normalized_counts: Dict[str, int] = {}
+        for label in label_order:
+            value = counts.get(label)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("regime train-support count is invalid")
+            normalized_counts[label] = value
+        eligible_rows = support.get("eligible_rows")
+        if (
+            isinstance(eligible_rows, bool)
+            or not isinstance(eligible_rows, int)
+            or eligible_rows <= 0
+            or sum(normalized_counts.values()) != eligible_rows
+        ):
+            raise ValueError("regime train-support row accounting is invalid")
+        expected_observed = [
+            label for label in label_order if normalized_counts[label] > 0
+        ]
+        expected_unobserved = [
+            label for label in label_order if normalized_counts[label] == 0
+        ]
+        if support.get("observed_regimes") != expected_observed:
+            raise ValueError("regime train-support observed set is invalid")
+        if support.get("unobserved_regimes") != expected_unobserved:
+            raise ValueError("regime train-support unobserved set is invalid")
+        expected_states = {
+            label: (
+                "EMPIRICALLY_OBSERVED"
+                if normalized_counts[label] > 0
+                else "UNOBSERVED"
+            )
+            for label in label_order
+        }
+        if support.get("support_state_by_regime") != expected_states:
+            raise ValueError("regime train-support state mapping is invalid")
+        for field_name in ("first_ts", "last_ts"):
+            try:
+                timestamp = pd.Timestamp(support.get(field_name))
+            except Exception as exc:
+                raise ValueError(
+                    f"regime train-support timestamp is invalid: {field_name}"
+                ) from exc
+            if pd.isna(timestamp):
+                raise ValueError(
+                    f"regime train-support timestamp is missing: {field_name}"
+                )
+        if support.get("vector_encoding") != REGIME_TRAIN_SUPPORT_VECTOR_ENCODING:
+            raise ValueError("regime train-support vector encoding is invalid")
+        if not self._is_sha256(support.get("vector_sha256")):
+            raise ValueError("regime train-support vector hash is invalid")
+        bindings = support.get("bindings")
+        if not isinstance(bindings, dict):
+            raise ValueError("regime train-support bindings are missing")
+        expected_bindings = {
+            "symbol": expected_symbol,
+            "timeframe": expected_timeframe,
+            "activation_id": source.get("activation_id"),
+            "activation_manifest_sha256": source.get(
+                "activation_manifest_sha256"
+            ),
+            "source_sha256": source.get("sha256"),
+            "train_window_sha256": self._canonical_mapping_sha256(train),
+            "params_sha256": regime_params_sha256(params_dict),
+            "detector_code_sha256": self._detector_code_sha256(),
+        }
+        if bindings != expected_bindings:
+            raise ValueError("regime train-support bindings are invalid")
+        declared_hash = str(support.get("receipt_sha256") or "")
+        body = dict(support)
+        body.pop("receipt_sha256", None)
+        if declared_hash != self._canonical_mapping_sha256(body):
+            raise ValueError("regime train-support receipt hash is invalid")
+        return support
+
+    def _authenticated_window_contract_version(self) -> str:
+        universe = self._native_universe()
+        version = str(
+            (universe.calendar_contract or {}).get("window_contract_version") or ""
+        ).strip()
+        if version not in {
+            EVIDENCE_CONTRACT_VERSION,
+            TIMEFRAME_EVIDENCE_CONTRACT_VERSION,
+        }:
+            raise ValueError("authenticated native window contract is invalid")
+        return version
+
+    def _validate_native_source_identity(
+        self,
+        source_meta: Dict[str, Any],
+        symbol: str,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """Bind a native source fingerprint to the cached activation exactly."""
+        source = self._json_safe_mapping(source_meta)
+        universe = self._native_universe()
+        expected_symbol = str(symbol or "").strip().upper()
+        expected_timeframe = str(timeframe or "").strip().upper()
+        trusted_defaults = {
+            "symbol": expected_symbol,
+            "timeframe": expected_timeframe,
+            "activation_id": str(universe.activation_id),
+            "activation_manifest_sha256": str(
+                universe.activation_manifest_sha256
+            ),
+            "provenance_errors": [],
+        }
+        for field_name, trusted_value in trusted_defaults.items():
+            if field_name not in source:
+                source[field_name] = trusted_value
+        if str(source.get("source_kind") or "").strip().lower() != "broker_native":
+            raise ValueError("native source authority is invalid")
+        if source.get("provenance_valid") is not True:
+            raise ValueError("native source provenance is not valid")
+        if list(source.get("provenance_errors") or []):
+            raise ValueError("native source carries provenance errors")
+        if str(source.get("symbol") or "").strip().upper() != expected_symbol:
+            raise ValueError("native source symbol identity is invalid")
+        if str(source.get("timeframe") or "").strip().upper() != expected_timeframe:
+            raise ValueError("native source timeframe identity is invalid")
+        if str(source.get("activation_id") or "") != str(universe.activation_id):
+            raise ValueError("native source activation id changed during tuning")
+        if str(source.get("activation_manifest_sha256") or "").lower() != str(
+            universe.activation_manifest_sha256
+        ).lower():
+            raise ValueError("native source activation hash changed during tuning")
+        if not str(source.get("path") or "").strip():
+            raise ValueError("native source path is missing")
+        try:
+            source_size = int(source.get("size"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("native source size is invalid") from exc
+        if source_size < 0 or not self._is_sha256(source.get("sha256")):
+            raise ValueError("native source fingerprint is invalid")
+        return source
+
+    @staticmethod
+    def _validate_train_geometry(train: Dict[str, Any]) -> Tuple[int, int]:
+        try:
+            start = int(train.get("start_index"))
+            end = int(train.get("end_index"))
+            rows = int(train.get("rows"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("regime FIT train geometry is invalid") from exc
+        if start < 0 or end <= start or rows != end - start:
+            raise ValueError("regime FIT train geometry is inconsistent")
+        for field_name in ("start_ts", "end_ts_inclusive", "end_ts_exclusive"):
+            try:
+                timestamp = pd.Timestamp(train.get(field_name))
+            except Exception as exc:
+                raise ValueError(
+                    f"regime FIT train timestamp is invalid: {field_name}"
+                ) from exc
+            if pd.isna(timestamp):
+                raise ValueError(f"regime FIT train timestamp is missing: {field_name}")
+        return start, end
+
+    def _validate_fit_provenance(
+        self,
+        record: Dict[str, Any],
+        params_dict: Dict[str, Any],
+        symbol: str,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """Validate a complete detector FIT receipt before it can be promoted."""
+        receipt = self._json_safe_mapping(record)
+        expected_symbol = str(symbol or "").strip().upper()
+        expected_timeframe = str(timeframe or "").strip().upper()
+        if receipt.get("schema_version") != REGIME_PROVENANCE_SCHEMA_VERSION:
+            raise ValueError("regime FIT provenance schema is invalid")
+        if str(receipt.get("status") or "").upper() != "FIT":
+            raise ValueError("regime FIT provenance status is invalid")
+        if str(receipt.get("symbol") or "").upper() != expected_symbol:
+            raise ValueError("regime FIT provenance symbol is invalid")
+        if str(receipt.get("timeframe") or "").upper() != expected_timeframe:
+            raise ValueError("regime FIT provenance timeframe is invalid")
+        if str(receipt.get("fit_scope") or "").lower() != REGIME_PROVENANCE_FIT_SCOPE:
+            raise ValueError("regime FIT provenance scope is invalid")
+        if receipt.get("params_sha256") != regime_params_sha256(params_dict):
+            raise ValueError("regime FIT parameter hash is invalid")
+        try:
+            generated_at = pd.Timestamp(receipt.get("generated_at"))
+        except Exception as exc:
+            raise ValueError("regime FIT generation timestamp is invalid") from exc
+        if pd.isna(generated_at):
+            raise ValueError("regime FIT generation timestamp is missing")
+
+        source = receipt.get("source")
+        train = receipt.get("train")
+        split = receipt.get("split")
+        if not isinstance(source, dict) or not isinstance(train, dict) or not isinstance(split, dict):
+            raise ValueError("regime FIT source/train/split provenance is incomplete")
+        train_start, train_end = self._validate_train_geometry(train)
+        try:
+            optimizer_train = [int(value) for value in split.get("optimizer_train_indices", [])]
+            tuning_validation = [
+                int(value) for value in split.get("tuning_validation_indices", [])
+            ]
+            final_lockbox = [int(value) for value in split.get("final_lockbox_indices", [])]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("regime FIT split indices are invalid") from exc
+        if optimizer_train != [train_start, train_end]:
+            raise ValueError("regime FIT train and split geometry disagree")
+        if len(tuning_validation) != 2 or len(final_lockbox) != 2:
+            raise ValueError("regime FIT validation/lockbox geometry is missing")
+        if not (
+            train_end <= tuning_validation[0]
+            < tuning_validation[1]
+            <= final_lockbox[0]
+            < final_lockbox[1]
+        ):
+            raise ValueError("regime FIT split geometry leaks beyond optimizer_train")
+
+        if self.split_mode == CALENDAR_SPLIT_MODE:
+            source = self._validate_native_source_identity(
+                source,
+                expected_symbol,
+                expected_timeframe,
+            )
+            receipt["source"] = source
+            universe = self._native_universe()
+            expected_contract = self._authenticated_window_contract_version()
+            if split.get("contract_version") != expected_contract:
+                raise ValueError("regime FIT window contract is invalid")
+            if str(split.get("production_split_mode") or "").lower() != CALENDAR_SPLIT_MODE:
+                raise ValueError("regime FIT production split mode is invalid")
+            if str(split.get("source_authority") or "").lower() != "broker_native_timeframe":
+                raise ValueError("regime FIT source authority is invalid")
+            if str(split.get("cutoff_authority") or "").lower() != "authenticated_native_activation":
+                raise ValueError("regime FIT cutoff authority is invalid")
+            if str(split.get("activation_id") or "") != str(universe.activation_id):
+                raise ValueError("regime FIT split activation id is invalid")
+            if str(split.get("activation_manifest_sha256") or "").lower() != str(
+                universe.activation_manifest_sha256
+            ).lower():
+                raise ValueError("regime FIT split activation hash is invalid")
+            contract = dict(universe.calendar_contract or {})
+            expected_as_of = str(contract.get("common_as_of_utc") or "").strip()
+            if expected_as_of:
+                try:
+                    observed_as_of = pd.Timestamp(split.get("as_of_utc"))
+                    pinned_as_of = pd.Timestamp(expected_as_of)
+                except Exception as exc:
+                    raise ValueError("regime FIT information cutoff is invalid") from exc
+                if observed_as_of != pinned_as_of:
+                    raise ValueError("regime FIT information cutoff changed")
+            calendar_boundaries = split.get("calendar_boundaries")
+            if expected_as_of or contract.get("timeframe_calendar_boundaries"):
+                if not isinstance(calendar_boundaries, dict):
+                    raise ValueError("regime FIT calendar boundaries are missing")
+                if calendar_boundaries.get("contract_version") != expected_contract:
+                    raise ValueError("regime FIT calendar boundary contract is invalid")
+        else:
+            if split.get("contract_version") != DataSplitter.SPLIT_CONTRACT_VERSION:
+                raise ValueError("legacy regime FIT split contract is invalid")
+            if str(split.get("production_split_mode") or "").lower() != "chronological_lockbox_v1":
+                raise ValueError("legacy regime FIT split mode is invalid")
+            if not str(source.get("path") or "").strip():
+                raise ValueError("legacy regime FIT source path is missing")
+            try:
+                source_size = int(source.get("size"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("legacy regime FIT source size is invalid") from exc
+            if source_size < 0 or not self._is_sha256(source.get("sha256")):
+                raise ValueError("legacy regime FIT source fingerprint is invalid")
+        support = receipt.get("train_regime_support")
+        if not isinstance(support, dict):
+            raise ValueError("regime FIT train-support receipt is missing")
+        receipt["train_regime_support"] = self._validate_train_regime_support(
+            support,
+            source=source,
+            train=train,
+            params_dict=params_dict,
+            symbol=expected_symbol,
+            timeframe=expected_timeframe,
+        )
+        support_hash = receipt["train_regime_support"].get("receipt_sha256")
+        if self._fit_support_authority.get(
+            (expected_symbol, expected_timeframe)
+        ) != support_hash:
+            raise ValueError("regime FIT train-support writer authority is invalid")
+        return receipt
+
+    @staticmethod
+    def _promote_artifact_pair(
+        params_stage: Path,
+        params_path: Path,
+        sidecar_stage: Path,
+        sidecar_path: Path,
+    ) -> None:
+        """Publish both files and restore the exact previous pair on failure."""
+        if params_path.resolve() == sidecar_path.resolve():
+            raise RegimeTuningIncompleteError(
+                "regime params and provenance paths must be distinct"
+            )
+        token = f"{os.getpid()}-{uuid.uuid4().hex}"
+        targets = (
+            (params_stage, params_path),
+            (sidecar_stage, sidecar_path),
+        )
+        backups: List[Tuple[Path, Path, bool]] = []
+        try:
+            for _stage, target in targets:
+                existed = target.exists()
+                backup = target.with_name(f".{target.name}.{token}.rollback")
+                if existed:
+                    shutil.copy2(target, backup)
+                backups.append((target, backup, existed))
+        except Exception as exc:
+            for _target, backup, _existed in backups:
+                backup.unlink(missing_ok=True)
+            raise RegimeTuningIncompleteError(
+                f"could not snapshot the previous regime artifact pair: {exc}"
+            ) from exc
+
+        preserve_backups = False
+        try:
+            for stage, target in targets:
+                os.replace(stage, target)
+        except Exception as exc:
+            rollback_errors: List[str] = []
+            for target, backup, existed in backups:
+                try:
+                    if existed:
+                        os.replace(backup, target)
+                    else:
+                        target.unlink(missing_ok=True)
+                except Exception as rollback_exc:
+                    rollback_errors.append(
+                        f"{target}:{type(rollback_exc).__name__}:{rollback_exc}"
+                    )
+            preserve_backups = bool(rollback_errors)
+            suffix = (
+                "; rollback errors=" + "|".join(rollback_errors)
+                if rollback_errors
+                else "; previous pair restored"
+            )
+            raise RegimeTuningIncompleteError(
+                f"regime artifact pair publication failed: {exc}{suffix}"
+            ) from exc
+        finally:
+            if not preserve_backups:
+                for _target, backup, _existed in backups:
+                    backup.unlink(missing_ok=True)
+
+    def _build_non_search_decision(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        decision_kind: str,
+        reason_code: str,
+        reason: str,
+        fit_meta: Optional[Dict[str, Any]] = None,
+        source_meta: Optional[Dict[str, Any]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        error: Optional[BaseException] = None,
+    ) -> Dict[str, Any]:
+        """Build a provenance-bound non-search decision, never a trade verdict.
+
+        A calendar-native cell can be authentic but still unable to support a
+        detector fit (for example, a D1 optimizer-train partition with fewer
+        than 500 rows).  That is a data/search-authorization decision, not
+        evidence that the symbol or strategy should be marked NO_TRADE.
+        """
+        if self.split_mode != CALENDAR_SPLIT_MODE:
+            raise ValueError("typed non-search decisions require calendar-native mode")
+        universe = self._native_universe()
+        normalized_symbol = str(symbol or "").strip().upper()
+        normalized_timeframe = str(timeframe or "").strip().upper()
+        normalized_kind = str(decision_kind or "").strip().upper()
+        if normalized_kind not in _NON_SEARCH_DECISION_KINDS:
+            raise ValueError(f"unsupported non-search decision kind: {decision_kind}")
+        normalized_reason_code = self._bounded_text(reason_code, 128).upper()
+        if normalized_reason_code not in _NON_SEARCH_REASON_CODES_BY_KIND[
+            normalized_kind
+        ]:
+            raise ValueError("non-search reason code does not match its decision kind")
+        terminal_data_state = normalized_kind == "INSUFFICIENT_TRAIN_HISTORY"
+
+        record: Dict[str, Any] = {
+            "schema_version": REGIME_NON_SEARCH_SCHEMA_VERSION,
+            "status": "NON_SEARCH",
+            "symbol": normalized_symbol,
+            "timeframe": normalized_timeframe,
+            "fit_scope": REGIME_PROVENANCE_FIT_SCOPE,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "decision_kind": normalized_kind,
+            "reason_code": normalized_reason_code,
+            "reason": self._bounded_text(reason),
+            "activation_id": str(universe.activation_id),
+            "activation_manifest_sha256": str(
+                universe.activation_manifest_sha256
+            ),
+            "window_contract_version": self._authenticated_window_contract_version(),
+            "economic_evidence_used": False,
+            "economic_trade_verdict_emitted": False,
+            "trade_verdict": False,
+            "no_trade": False,
+            "strategy_search_authorized": False,
+            "generation_terminal": terminal_data_state,
+            "retryable": not terminal_data_state,
+        }
+        safe_fit_meta = self._json_safe_mapping(fit_meta)
+        if safe_fit_meta.get("train"):
+            record["train"] = safe_fit_meta["train"]
+        if safe_fit_meta.get("split"):
+            record["split"] = safe_fit_meta["split"]
+        safe_source = self._json_safe_mapping(source_meta)
+        if safe_source:
+            record["source"] = safe_source
+        safe_diagnostics = self._json_safe_mapping(diagnostics)
+        if safe_diagnostics:
+            record["diagnostics"] = safe_diagnostics
+        if error is not None:
+            record["error"] = {
+                "type": type(error).__name__,
+                "message": self._bounded_text(error),
+            }
+
+        canonical = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        record["decision_sha256"] = hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        return record
+
+    def _validate_non_search_decision(
+        self,
+        record: Dict[str, Any],
+        symbol: str,
+        timeframe: str,
+    ) -> None:
+        """Reject an unbound or verdict-bearing non-search record."""
+        universe = self._native_universe()
+        expected_symbol = str(symbol or "").strip().upper()
+        expected_timeframe = str(timeframe or "").strip().upper()
+        if not isinstance(record, dict):
+            raise ValueError("non-search decision is not a mapping")
+        record = self._json_safe_mapping(record)
+        if record.get("schema_version") != REGIME_NON_SEARCH_SCHEMA_VERSION:
+            raise ValueError("non-search decision schema is invalid")
+        if record.get("status") != "NON_SEARCH":
+            raise ValueError("non-search decision status is invalid")
+        if record.get("symbol") != expected_symbol or record.get("timeframe") != expected_timeframe:
+            raise ValueError("non-search decision cell identity is invalid")
+        decision_kind = str(record.get("decision_kind") or "")
+        if decision_kind not in _NON_SEARCH_DECISION_KINDS:
+            raise ValueError("non-search decision kind is invalid")
+        reason_code = str(record.get("reason_code") or "").strip()
+        if reason_code not in _NON_SEARCH_REASON_CODES_BY_KIND[decision_kind]:
+            raise ValueError("non-search reason code does not match its decision kind")
+        if str(record.get("fit_scope") or "").lower() != REGIME_PROVENANCE_FIT_SCOPE:
+            raise ValueError("non-search decision fit scope is invalid")
+        if str(record.get("window_contract_version") or "") != (
+            self._authenticated_window_contract_version()
+        ):
+            raise ValueError("non-search decision window contract is invalid")
+        if str(record.get("activation_id") or "") != str(universe.activation_id):
+            raise ValueError("non-search decision activation id is invalid")
+        if str(record.get("activation_manifest_sha256") or "") != str(
+            universe.activation_manifest_sha256
+        ):
+            raise ValueError("non-search decision activation hash is invalid")
+        for field_name in (
+            "economic_evidence_used",
+            "economic_trade_verdict_emitted",
+            "trade_verdict",
+            "no_trade",
+            "strategy_search_authorized",
+        ):
+            if record.get(field_name) is not False:
+                raise ValueError(
+                    f"non-search decision cannot set {field_name}"
+                )
+        terminal_data_state = decision_kind == "INSUFFICIENT_TRAIN_HISTORY"
+        if record.get("generation_terminal") is not terminal_data_state:
+            raise ValueError("non-search terminal-state marker is invalid")
+        if record.get("retryable") is not (not terminal_data_state):
+            raise ValueError("non-search retry marker is invalid")
+        split = record.get("split")
+        if split is not None:
+            if not isinstance(split, dict):
+                raise ValueError("non-search decision split metadata is invalid")
+            if split.get("contract_version") != self._authenticated_window_contract_version():
+                raise ValueError("non-search decision split contract is invalid")
+            if str(split.get("production_split_mode") or "").lower() != CALENDAR_SPLIT_MODE:
+                raise ValueError("non-search decision split mode is invalid")
+            if str(split.get("activation_id") or "") != str(universe.activation_id):
+                raise ValueError("non-search decision split activation id is invalid")
+            if str(split.get("activation_manifest_sha256") or "").lower() != str(
+                universe.activation_manifest_sha256
+            ).lower():
+                raise ValueError("non-search decision split activation hash is invalid")
+        source = record.get("source")
+        if source is not None:
+            self._validate_native_source_identity(
+                source,
+                expected_symbol,
+                expected_timeframe,
+            )
+        claimed_hash = str(record.get("decision_sha256") or "")
+        canonical_record = dict(record)
+        canonical_record.pop("decision_sha256", None)
+        expected_hash = hashlib.sha256(
+            json.dumps(
+                canonical_record,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if claimed_hash != expected_hash:
+            raise ValueError("non-search decision hash is invalid")
 
     @staticmethod
     def _window_meta(df: pd.DataFrame, start: int, end: int) -> Dict[str, Any]:
@@ -479,9 +1283,10 @@ class RegimeParamTuner:
         timeframe = str(timeframe or "").strip().upper()
         symbol = str(symbol or "").strip().upper()
         universe = self._native_universe()
-        if universe.cell_status(symbol, timeframe) != "active":
+        if timeframe not in self._evidence_candidate_timeframes(universe, symbol):
             raise ValueError(
-                f"native cell is not active in activation: {symbol}|{timeframe}"
+                "native cell is not an authenticated evidence candidate: "
+                f"{symbol}|{timeframe}"
             )
         contract = dict(universe.calendar_contract or {})
         as_of_raw = str(contract.get("common_as_of_utc") or "").strip()
@@ -518,8 +1323,18 @@ class RegimeParamTuner:
             raise ValueError(
                 f"native {timeframe} provenance is invalid: {errors or 'unknown'}"
             )
+        source_meta = self._validate_native_source_identity(
+            dict(source_meta or {}),
+            symbol,
+            timeframe,
+        )
 
-        workflow = trim_to_closed_bars(native, timeframe, as_of_utc=as_of)
+        workflow = trim_to_closed_bars(
+            native,
+            timeframe,
+            as_of_utc=as_of,
+            copy=False,
+        )
         purge = derive_purge_duration(
             configured_days=getattr(self.config, "evidence_purge_days", 7.0),
             split_embargo_bars=getattr(self.config, "split_embargo_bars", 0),
@@ -635,8 +1450,12 @@ class RegimeParamTuner:
         end_index = int(train_meta["end_index"])
         return workflow.iloc[start_index:end_index].copy(), fit_meta, dict(source_meta or {})
     
-    def tune_symbol_timeframe(self, symbol: str, timeframe: str,
-                               param_space: Optional[Dict] = None) -> Tuple[RegimeParams, Dict]:
+    def tune_symbol_timeframe(
+        self,
+        symbol: str,
+        timeframe: str,
+        param_space: Optional[Dict] = None,
+    ) -> Tuple[Optional[RegimeParams], Dict]:
         """
         Tune parameters for a single symbol/timeframe combination.
         
@@ -659,7 +1478,16 @@ class RegimeParamTuner:
                 logger.warning(
                     f"{symbol} {timeframe}: invalid native optimizer-train split: {exc}"
                 )
-                return DEFAULT_PARAMS_BY_TIMEFRAME.get(timeframe, RegimeParams()), {}
+                return None, {
+                    "non_search": self._build_non_search_decision(
+                        symbol,
+                        timeframe,
+                        decision_kind="TECHNICAL_EXCLUSION",
+                        reason_code="NATIVE_OPTIMIZER_TRAIN_INVALID",
+                        reason="native optimizer-train partition could not be authenticated",
+                        error=exc,
+                    )
+                }
         else:
             # Legacy v1 detector authority is the M5 optimizer-train slice,
             # resampled only after the split has been applied.
@@ -680,8 +1508,31 @@ class RegimeParamTuner:
             )
             source_meta = self.data_loader.get_source_meta(symbol)
 
-        if len(df) < 500:
-            logger.warning(f"{symbol} {timeframe}: Only {len(df)} bars, need 500+, using defaults")
+        if len(df) < REGIME_TUNER_MIN_TRAIN_ROWS:
+            logger.warning(
+                "%s %s: only %d optimizer-train bars; %d are required; "
+                "cell is not authorized for strategy search",
+                symbol,
+                timeframe,
+                len(df),
+                REGIME_TUNER_MIN_TRAIN_ROWS,
+            )
+            if self.split_mode == CALENDAR_SPLIT_MODE:
+                return None, {
+                    "non_search": self._build_non_search_decision(
+                        symbol,
+                        timeframe,
+                        decision_kind="INSUFFICIENT_TRAIN_HISTORY",
+                        reason_code="INSUFFICIENT_OPTIMIZER_TRAIN_ROWS",
+                        reason="optimizer-train partition is below the detector-fit minimum",
+                        fit_meta=fit_meta,
+                        source_meta=source_meta,
+                        diagnostics={
+                            "observed_optimizer_train_rows": int(len(df)),
+                            "required_optimizer_train_rows": REGIME_TUNER_MIN_TRAIN_ROWS,
+                        },
+                    )
+                }
             return DEFAULT_PARAMS_BY_TIMEFRAME.get(timeframe, RegimeParams()), {}
 
         # ----- Train / Holdout split (B8: evaluate on holdout, not training data) -----
@@ -693,7 +1544,32 @@ class RegimeParamTuner:
         default_detector = MarketRegimeDetector()
         min_eval_bars = max(default_detector.warmup_bars + 25, 100)
         if len(df_train) < max(300, min_eval_bars) or len(df_holdout) < min_eval_bars:
-            logger.warning(f"{symbol} {timeframe}: Insufficient bars for train/holdout split, using defaults")
+            logger.warning(
+                "%s %s: insufficient detector train/holdout rows; "
+                "cell is not authorized for strategy search",
+                symbol,
+                timeframe,
+            )
+            if self.split_mode == CALENDAR_SPLIT_MODE:
+                return None, {
+                    "non_search": self._build_non_search_decision(
+                        symbol,
+                        timeframe,
+                        decision_kind="INSUFFICIENT_TRAIN_HISTORY",
+                        reason_code="INSUFFICIENT_DETECTOR_HOLDOUT_ROWS",
+                        reason="optimizer-train partition cannot support the detector holdout",
+                        fit_meta=fit_meta,
+                        source_meta=source_meta,
+                        diagnostics={
+                            "detector_train_rows": int(len(df_train)),
+                            "detector_holdout_rows": int(len(df_holdout)),
+                            "required_detector_train_rows": int(
+                                max(300, min_eval_bars)
+                            ),
+                            "required_detector_holdout_rows": int(min_eval_bars),
+                        },
+                    )
+                }
             return DEFAULT_PARAMS_BY_TIMEFRAME.get(timeframe, RegimeParams()), {}
 
         # Get param search space
@@ -779,8 +1655,33 @@ class RegimeParamTuner:
         
         if best_score == -float('inf'):
             logger.warning(f"{symbol} {timeframe}: no detector combination produced valid evidence")
+            if self.split_mode == CALENDAR_SPLIT_MODE:
+                return None, {
+                    "non_search": self._build_non_search_decision(
+                        symbol,
+                        timeframe,
+                        decision_kind="TECHNICAL_EXCLUSION",
+                        reason_code="DETECTOR_FIT_NO_VALID_COMBINATION",
+                        reason="all detector parameter combinations failed to produce valid fit evidence",
+                        fit_meta=fit_meta,
+                        source_meta=source_meta,
+                        diagnostics={
+                            "tested_parameter_combinations": int(len(combinations)),
+                            "detector_train_rows": int(len(df_train)),
+                            "detector_holdout_rows": int(len(df_holdout)),
+                        },
+                    )
+                }
             return DEFAULT_PARAMS_BY_TIMEFRAME.get(timeframe, RegimeParams()), {}
 
+        train_regime_support = self._build_train_regime_support(
+            df,
+            best_params,
+            source_meta,
+            fit_meta["train"],
+            symbol,
+            timeframe,
+        )
         provenance = {
             "schema_version": REGIME_PROVENANCE_SCHEMA_VERSION,
             "status": "FIT",
@@ -796,6 +1697,7 @@ class RegimeParamTuner:
                 "train_rows": int(len(df_train)),
                 "validation_rows": int(len(df_holdout)),
             },
+            "train_regime_support": train_regime_support,
             "params_sha256": regime_params_sha256(best_params.to_dict()),
         }
         return best_params, {
@@ -808,12 +1710,13 @@ class RegimeParamTuner:
                  output_path: str = "regime_params.json",
                  provenance_output_path: Optional[str] = None
                  ) -> Dict[str, Dict[str, RegimeParams]]:
-        """Tune and atomically promote one complete active-cell generation.
+        """Tune and atomically promote one resolved active-cell generation.
 
         Availability-excluded cells are deliberately absent. Any active cell
-        that cannot produce a successful train-only fit makes the generation
-        incomplete: fixed-size staging artifacts are retained for diagnosis,
-        while the last promoted parameter/provenance pair remains untouched.
+        is resolved either by a successful train-only fit or, in native
+        calendar mode, by an activation-bound NON_SEARCH decision.  The latter
+        authorizes no strategy search and is never an economic NO_TRADE
+        verdict. Global roster/artifact failures remain fail-closed.
         """
         normalized_symbols = list(dict.fromkeys(
             str(symbol or "").strip().upper()
@@ -825,6 +1728,20 @@ class RegimeParamTuner:
             for timeframe in timeframes
             if str(timeframe or "").strip()
         ))
+        params_path = Path(output_path)
+        sidecar_path = (
+            Path(provenance_output_path)
+            if provenance_output_path
+            else regime_params_provenance_path(output_path)
+        )
+        if params_path.resolve() == sidecar_path.resolve():
+            raise RegimeTuningIncompleteError(
+                "regime params and provenance paths must be distinct"
+            )
+        params_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        params_stage = params_path.with_name(params_path.name + ".staging")
+        sidecar_stage = sidecar_path.with_name(sidecar_path.name + ".staging")
         activation_meta: Dict[str, Any] = {}
         if self.split_mode == CALENDAR_SPLIT_MODE:
             universe = self._native_universe()
@@ -855,18 +1772,21 @@ class RegimeParamTuner:
                     "requested timeframes are unbound from the active native universe: "
                     + ",".join(unknown_timeframes)
                 )
+            evidence_candidates_by_symbol = {
+                symbol: set(self._evidence_candidate_timeframes(universe, symbol))
+                for symbol in normalized_symbols
+            }
             required_cells = [
                 (symbol, timeframe)
                 for symbol in normalized_symbols
                 for timeframe in normalized_timeframes
-                if universe.cell_status(symbol, timeframe) == "active"
+                if timeframe in evidence_candidates_by_symbol[symbol]
             ]
             activation_meta = {
                 "activation_id": universe.activation_id,
                 "activation_manifest_sha256": universe.activation_manifest_sha256,
-                "window_contract_version": str(
-                    (universe.calendar_contract or {}).get("window_contract_version")
-                    or EVIDENCE_CONTRACT_VERSION
+                "window_contract_version": (
+                    self._authenticated_window_contract_version()
                 ),
             }
         else:
@@ -880,35 +1800,119 @@ class RegimeParamTuner:
 
         all_params: Dict[str, Dict[str, RegimeParams]] = {}
         provenance_cells: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        non_search_cells: Dict[str, Dict[str, Dict[str, Any]]] = {}
         failures: List[Dict[str, str]] = []
 
         total = len(required_cells)
         for current, (symbol, tf_key) in enumerate(required_cells, start=1):
             logger.info(f"Progress: {current}/{total} active cells")
+            support_key = (symbol, tf_key)
+            self._fit_support_authority.pop(support_key, None)
             try:
                 best_params, tuning_result = self.tune_symbol_timeframe(symbol, tf_key)
             except Exception as exc:
                 logger.exception("%s %s regime fitting raised", symbol, tf_key)
                 best_params, tuning_result = None, {}
-                failures.append({
-                    "symbol": symbol,
-                    "timeframe": tf_key,
-                    "reason": f"fit raised {type(exc).__name__}: {exc}",
-                })
-            else:
-                provenance = dict(tuning_result.get("provenance", {}) or {})
-                if provenance and best_params is not None:
-                    # Hash the exact row that will be serialized below.
-                    provenance["params_sha256"] = regime_params_sha256(best_params.to_dict())
-                    all_params.setdefault(symbol, {})[tf_key] = best_params
-                    provenance_cells.setdefault(symbol, {})[tf_key] = provenance
+                if self.split_mode == CALENDAR_SPLIT_MODE:
+                    non_search_cells.setdefault(symbol, {})[tf_key] = (
+                        self._build_non_search_decision(
+                            symbol,
+                            tf_key,
+                            decision_kind="TECHNICAL_EXCLUSION",
+                            reason_code="REGIME_FIT_RAISED",
+                            reason="regime detector fitting raised for this cell",
+                            error=exc,
+                        )
+                    )
                 else:
                     failures.append({
                         "symbol": symbol,
                         "timeframe": tf_key,
-                        "reason": "no successful optimizer_train-only fit",
+                        "reason": f"fit raised {type(exc).__name__}: {exc}",
                     })
+            else:
+                try:
+                    if not isinstance(tuning_result, dict):
+                        raise TypeError("regime fit result is not a mapping")
+                    provenance = dict(tuning_result.get("provenance", {}) or {})
+                    if provenance and best_params is not None:
+                        params_dict = best_params.to_dict()
+                        provenance = self._validate_fit_provenance(
+                            provenance,
+                            params_dict,
+                            symbol,
+                            tf_key,
+                        )
+                        all_params.setdefault(symbol, {})[tf_key] = best_params
+                        provenance_cells.setdefault(symbol, {})[tf_key] = provenance
+                    elif self.split_mode == CALENDAR_SPLIT_MODE:
+                        non_search = dict(tuning_result.get("non_search", {}) or {})
+                        try:
+                            self._validate_non_search_decision(
+                                non_search,
+                                symbol,
+                                tf_key,
+                            )
+                        except Exception as exc:
+                            non_search = self._build_non_search_decision(
+                                symbol,
+                                tf_key,
+                                decision_kind="TECHNICAL_EXCLUSION",
+                                reason_code="REGIME_FIT_RESULT_INVALID",
+                                reason=(
+                                    "regime fitting returned neither valid params/provenance "
+                                    "nor a valid non-search decision"
+                                ),
+                                error=exc,
+                            )
+                        non_search_cells.setdefault(symbol, {})[tf_key] = non_search
+                    else:
+                        failures.append({
+                            "symbol": symbol,
+                            "timeframe": tf_key,
+                            "reason": "no successful optimizer_train-only fit",
+                        })
+                except Exception as exc:
+                    logger.exception(
+                        "%s %s regime fit result processing raised",
+                        symbol,
+                        tf_key,
+                    )
+                    if self.split_mode == CALENDAR_SPLIT_MODE:
+                        non_search_cells.setdefault(symbol, {})[tf_key] = (
+                            self._build_non_search_decision(
+                                symbol,
+                                tf_key,
+                                decision_kind="TECHNICAL_EXCLUSION",
+                                reason_code="REGIME_FIT_RESULT_PROCESSING_FAILED",
+                                reason="regime fit result could not be authenticated",
+                                error=exc,
+                            )
+                        )
+                    else:
+                        failures.append({
+                            "symbol": symbol,
+                            "timeframe": tf_key,
+                            "reason": (
+                                "fit result processing raised "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        })
 
+            cell_non_search = non_search_cells.get(symbol, {}).get(tf_key)
+            if (
+                isinstance(cell_non_search, dict)
+                and cell_non_search.get("decision_kind") == "TECHNICAL_EXCLUSION"
+            ):
+                failures.append({
+                    "symbol": symbol,
+                    "timeframe": tf_key,
+                    "reason": (
+                        "retryable technical exclusion: "
+                        f"{cell_non_search.get('reason_code', 'UNKNOWN')}"
+                    ),
+                })
+            self._fit_support_authority.pop(support_key, None)
             next_symbol = (
                 required_cells[current][0] if current < total else None
             )
@@ -917,16 +1921,23 @@ class RegimeParamTuner:
                 # resample cache survives into the next symbol.
                 self.data_loader.clear_cache()
                 self.native_data_loader.clear_cache()
-        params_path = Path(output_path)
-        params_path.parent.mkdir(parents=True, exist_ok=True)
-        sidecar_path = (
-            Path(provenance_output_path)
-            if provenance_output_path
-            else regime_params_provenance_path(output_path)
-        )
-        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-        params_stage = params_path.with_name(params_path.name + ".staging")
-        sidecar_stage = sidecar_path.with_name(sidecar_path.name + ".staging")
+        if self.split_mode == CALENDAR_SPLIT_MODE:
+            try:
+                identity_current, identity_reason = (
+                    self._active_native_identity_still_current()
+                )
+            except Exception as exc:
+                identity_current = False
+                identity_reason = (
+                    "active native universe revalidation raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if not identity_current:
+                failures.append({
+                    "symbol": "*",
+                    "timeframe": "*",
+                    "reason": identity_reason,
+                })
         serialized_params = {
             symbol: {
                 timeframe: params.to_dict()
@@ -940,10 +1951,40 @@ class RegimeParamTuner:
             indent=2,
             sort_keys=True,
         ).encode("utf-8")
-        params_stage.write_bytes(params_bytes)
+        try:
+            params_stage.write_bytes(params_bytes)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RegimeTuningIncompleteError(
+                f"could not stage regime params; previous pair unchanged: {exc}"
+            ) from exc
         params_sha256 = hashlib.sha256(params_bytes).hexdigest()
         required_cell_ids = [
             f"{symbol}|{timeframe}" for symbol, timeframe in required_cells
+        ]
+        fitted_count = sum(len(tf_map) for tf_map in provenance_cells.values())
+        non_search_count = sum(
+            len(tf_map) for tf_map in non_search_cells.values()
+        )
+        resolved_count = fitted_count + non_search_count
+        if resolved_count != len(required_cells):
+            failures.append({
+                "symbol": "*",
+                "timeframe": "*",
+                "reason": (
+                    "generation outcome accounting mismatch: "
+                    f"resolved={resolved_count}, required={len(required_cells)}"
+                ),
+            })
+        if self.split_mode == CALENDAR_SPLIT_MODE and fitted_count == 0:
+            failures.append({
+                "symbol": "*",
+                "timeframe": "*",
+                "reason": "generation produced zero successful detector fits",
+            })
+        non_search_cell_ids = [
+            f"{symbol}|{timeframe}"
+            for symbol, timeframe in required_cells
+            if timeframe in non_search_cells.get(symbol, {})
         ]
         sidecar_payload = {
             "schema_version": REGIME_PROVENANCE_SCHEMA_VERSION,
@@ -954,9 +1995,12 @@ class RegimeParamTuner:
             "generation_status": "INCOMPLETE" if failures else "COMPLETE",
             "required_active_cells": required_cell_ids,
             "required_active_cell_count": len(required_cell_ids),
-            "fitted_active_cell_count": sum(
-                len(tf_map) for tf_map in provenance_cells.values()
-            ),
+            "required_evidence_candidate_cells": required_cell_ids,
+            "required_evidence_candidate_cell_count": len(required_cell_ids),
+            "fitted_active_cell_count": fitted_count,
+            "non_search_active_cells": non_search_cell_ids,
+            "non_search_active_cell_count": non_search_count,
+            "resolved_active_cell_count": resolved_count,
             **activation_meta,
             "split_contract_version": (
                 activation_meta.get("window_contract_version", EVIDENCE_CONTRACT_VERSION)
@@ -964,16 +2008,23 @@ class RegimeParamTuner:
                 else DataSplitter.SPLIT_CONTRACT_VERSION
             ),
             "cells": provenance_cells,
+            "non_search_cells": non_search_cells,
             "failures": failures,
         }
-        sidecar_stage.write_text(
-            json.dumps(sidecar_payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        try:
+            sidecar_stage.write_text(
+                json.dumps(sidecar_payload, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise RegimeTuningIncompleteError(
+                f"could not stage regime provenance; previous pair unchanged: {exc}"
+            ) from exc
         logger.info(
-            "Staged regime fit provenance for %d cells at %s (%d failed cells)",
-            sum(len(tf_map) for tf_map in provenance_cells.values()),
+            "Staged regime outcomes at %s (%d fit, %d non-search, %d failed)",
             sidecar_stage,
+            fitted_count,
+            non_search_count,
             len(failures),
         )
 
@@ -983,14 +2034,16 @@ class RegimeParamTuner:
                 f"last promoted artifacts were not changed; diagnostics: {sidecar_stage}"
             )
 
-        # Both staged artifacts are fully written before either promoted path
-        # changes. Readers validate the pair hash and therefore fail closed in
-        # the tiny two-replace interval; an incomplete run never reaches here.
-        os.replace(sidecar_stage, sidecar_path)
-        os.replace(params_stage, params_path)
+        self._promote_artifact_pair(
+            params_stage,
+            params_path,
+            sidecar_stage,
+            sidecar_path,
+        )
         logger.info(
-            "Promoted complete regime generation: %d active cells -> %s",
-            total,
+            "Promoted resolved regime generation: %d fit + %d non-search -> %s",
+            fitted_count,
+            non_search_count,
             params_path,
         )
         return all_params
@@ -1002,15 +2055,21 @@ class RegimeParamTuner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tune regime detection parameters for FX Portfolio Manager"
+        description=(
+            "Tune FXPM regime detectors from authenticated broker-native "
+            "timeframe cells"
+        )
     )
     parser.add_argument(
         '--config', type=str, default='config.json',
-        help='FXPM config containing the chronological lockbox split'
+        help='FXPM config containing the production calendar/native split policy'
     )
     parser.add_argument(
         '--data-dir', type=str, default=None,
-        help='Data directory with M5 CSV files (overrides config.pipeline.data_dir)'
+        help=(
+            'FXPM data root containing native/ACTIVE.json; flat M5 CSV files '
+            'are legacy chronological-mode input only'
+        )
     )
     parser.add_argument(
         '--output', type=str, default=None,
@@ -1022,7 +2081,7 @@ def main():
     )
     parser.add_argument(
         '--symbols', type=str, nargs='+', default=None,
-        help='Symbols to tune (default: all in data dir)'
+        help='Complete activated symbol roster (default: config symbols)'
     )
     parser.add_argument(
         '--timeframes', type=str, nargs='+', 
@@ -1091,7 +2150,10 @@ def main():
         symbols = [s.upper() for s in args.symbols]
     
     if not symbols:
-        logger.error("No symbols found. Check --data-dir path.")
+        logger.error(
+            "No symbols found. Configure the production roster; calendar mode "
+            "also requires data/native/ACTIVE.json."
+        )
         return 1
     
     logger.info("Tuning regime parameters")

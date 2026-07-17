@@ -30,6 +30,7 @@ import numpy as np
 # MT5 import with fallback
 try:
     import MetaTrader5 as mt5
+
     MT5_AVAILABLE = True
 except ImportError:
     MT5_AVAILABLE = False
@@ -46,8 +47,10 @@ logger = logging.getLogger(__name__)
 # ENUMERATIONS
 # =============================================================================
 
+
 class OrderType(Enum):
     """Order types."""
+
     BUY = 0
     SELL = 1
     BUY_LIMIT = 2
@@ -58,6 +61,7 @@ class OrderType(Enum):
 
 class FillingType(Enum):
     """Order filling types."""
+
     FOK = 0  # Fill or Kill
     IOC = 1  # Immediate or Cancel
     RETURN = 2  # Return (partial fill allowed)
@@ -67,9 +71,11 @@ class FillingType(Enum):
 # DATA CLASSES
 # =============================================================================
 
+
 @dataclass
 class MT5Config:
     """MT5 connection configuration."""
+
     login: int = 0
     password: str = ""
     server: str = ""
@@ -94,6 +100,7 @@ class MT5Config:
 @dataclass
 class MT5SymbolInfo:
     """Symbol information from MT5."""
+
     symbol: str
     digits: int
     point: float
@@ -129,11 +136,11 @@ class MT5SymbolInfo:
     trade_freeze_level: int = 0
     path: str = ""
     asset_class: str = "unknown"
-    
+
     # Calculated values
     pip_size: float = 0.0
     pip_value: float = 0.0
-    
+
     def __post_init__(self):
         """Calculate pip values (robust to MT5 edge cases)."""
         # Some brokers/CFDs can report point=0 for certain symbols.
@@ -154,11 +161,15 @@ class MT5SymbolInfo:
         # Ultimate fallback if point was still unusable
         if not self.pip_size or self.pip_size <= 0.0:
             pip_position = (self.digits - 1) if self.digits in (5, 3) else self.digits
-            self.pip_size = float(10 ** (-pip_position)) if pip_position >= 0 else 0.0001
+            self.pip_size = (
+                float(10 ** (-pip_position)) if pip_position >= 0 else 0.0001
+            )
 
         # Pip value calculation (tick-math parity when available)
         if self.trade_tick_size > 0.0 and self.trade_tick_value > 0.0:
-            self.pip_value = (self.pip_size / self.trade_tick_size) * self.trade_tick_value
+            self.pip_value = (
+                self.pip_size / self.trade_tick_size
+            ) * self.trade_tick_value
         else:
             self.pip_value = float(self.trade_tick_value or 0.0)
         self.asset_class = infer_asset_class(
@@ -166,10 +177,12 @@ class MT5SymbolInfo:
             broker_data={"path": self.path, "asset_class": self.asset_class},
             default="unknown",
         )
-    
-    def to_instrument_spec(self,
-                           base_spec: Optional[InstrumentSpec] = None,
-                           commission_per_lot: Optional[float] = None) -> InstrumentSpec:
+
+    def to_instrument_spec(
+        self,
+        base_spec: Optional[InstrumentSpec] = None,
+        commission_per_lot: Optional[float] = None,
+    ) -> InstrumentSpec:
         """Convert to InstrumentSpec for backtesting compatibility."""
         pip_position = self.digits - 1 if self.digits in [3, 5] else self.digits
 
@@ -178,19 +191,23 @@ class MT5SymbolInfo:
             resolved_commission = getattr(base_spec, "commission_per_lot", None)
         if resolved_commission is None:
             try:
-                resolved_commission = get_instrument_spec(self.symbol).commission_per_lot
+                resolved_commission = get_instrument_spec(
+                    self.symbol
+                ).commission_per_lot
             except Exception:
                 resolved_commission = None
         try:
             resolved_commission = float(resolved_commission)
         except (TypeError, ValueError):
             resolved_commission = 7.0
-        
+
         return InstrumentSpec(
             symbol=self.symbol,
             pip_position=pip_position,
             pip_value=self.pip_value,
-            spread_avg=(self.spread * self.point / self.pip_size) if self.pip_size > 0 else float(self.spread),
+            spread_avg=(self.spread * self.point / self.pip_size)
+            if self.pip_size > 0
+            else float(self.spread),
             min_lot=self.volume_min,
             max_lot=self.volume_max,
             commission_per_lot=resolved_commission,
@@ -220,6 +237,7 @@ class MT5SymbolInfo:
 @dataclass
 class MT5AccountInfo:
     """Account information from MT5."""
+
     login: int
     server: str
     company: str
@@ -237,11 +255,13 @@ class MT5AccountInfo:
     # mode permits multiple independently attributed positions per symbol.
     margin_mode: int = -1
     hedge_allowed: Optional[bool] = None
+    trade_mode: int = -1
 
 
 @dataclass
 class MT5Tick:
     """Tick data from MT5."""
+
     time: datetime
     bid: float
     ask: float
@@ -252,6 +272,7 @@ class MT5Tick:
 @dataclass
 class MT5Position:
     """Position from MT5."""
+
     ticket: int
     symbol: str
     type: int  # 0=Buy, 1=Sell
@@ -265,14 +286,17 @@ class MT5Position:
     magic: int
     comment: str
     time: datetime
-    identifier: int = 0        # POSITION_IDENTIFIER (stable ID for history lookups)
-    reason: int = 0            # POSITION_REASON (0=CLIENT, 1=MOBILE, 2=WEB, 3=EXPERT, 4=SL, 5=TP, 6=SO)
+    identifier: int = 0  # POSITION_IDENTIFIER (stable ID for history lookups)
+    reason: int = (
+        0  # POSITION_REASON (0=CLIENT, 1=MOBILE, 2=WEB, 3=EXPERT, 4=SL, 5=TP, 6=SO)
+    )
     time_update: Optional[datetime] = None  # Last modification time
 
 
 @dataclass
 class MT5OrderResult:
     """Result of order execution."""
+
     success: bool
     retcode: int
     retcode_description: str
@@ -334,10 +358,11 @@ RETCODE_DESCRIPTIONS = {
 # MT5 CONNECTOR CLASS
 # =============================================================================
 
+
 class MT5Connector:
     """
     MetaTrader 5 connection and trading class.
-    
+
     Provides:
     - Connection management
     - Symbol information retrieval
@@ -346,24 +371,24 @@ class MT5Connector:
     - Order execution
     - Position management
     """
-    
+
     # Timeframe mapping
     TIMEFRAME_MAP = {
-        'M1': mt5.TIMEFRAME_M1 if MT5_AVAILABLE else 1,
-        'M5': mt5.TIMEFRAME_M5 if MT5_AVAILABLE else 5,
-        'M15': mt5.TIMEFRAME_M15 if MT5_AVAILABLE else 15,
-        'M30': mt5.TIMEFRAME_M30 if MT5_AVAILABLE else 30,
-        'H1': mt5.TIMEFRAME_H1 if MT5_AVAILABLE else 60,
-        'H4': mt5.TIMEFRAME_H4 if MT5_AVAILABLE else 240,
-        'D1': mt5.TIMEFRAME_D1 if MT5_AVAILABLE else 1440,
-        'W1': mt5.TIMEFRAME_W1 if MT5_AVAILABLE else 10080,
-        'MN1': mt5.TIMEFRAME_MN1 if MT5_AVAILABLE else 43200,
+        "M1": mt5.TIMEFRAME_M1 if MT5_AVAILABLE else 1,
+        "M5": mt5.TIMEFRAME_M5 if MT5_AVAILABLE else 5,
+        "M15": mt5.TIMEFRAME_M15 if MT5_AVAILABLE else 15,
+        "M30": mt5.TIMEFRAME_M30 if MT5_AVAILABLE else 30,
+        "H1": mt5.TIMEFRAME_H1 if MT5_AVAILABLE else 60,
+        "H4": mt5.TIMEFRAME_H4 if MT5_AVAILABLE else 240,
+        "D1": mt5.TIMEFRAME_D1 if MT5_AVAILABLE else 1440,
+        "W1": mt5.TIMEFRAME_W1 if MT5_AVAILABLE else 10080,
+        "MN1": mt5.TIMEFRAME_MN1 if MT5_AVAILABLE else 43200,
     }
-    
+
     def __init__(self, config: Optional[MT5Config] = None):
         """
         Initialize MT5 connector.
-        
+
         Args:
             config: Optional MT5 configuration
         """
@@ -377,54 +402,56 @@ class MT5Connector:
         """Return a copy of the most recent range-fetch synchronization facts."""
 
         return dict(self._last_history_range_diagnostics)
-    
+
     # =========================================================================
     # Connection Management
     # =========================================================================
-    
-    def connect(self,
-                login: int = None,
-                password: str = None,
-                server: str = None,
-                path: str = None) -> bool:
+
+    def connect(
+        self,
+        login: int = None,
+        password: str = None,
+        server: str = None,
+        path: str = None,
+    ) -> bool:
         """
         Connect to MT5 terminal.
-        
+
         Args:
             login: Account login (optional, uses config)
             password: Account password (optional, uses config)
             server: Server name (optional, uses config)
             path: Path to terminal (optional, uses config)
-            
+
         Returns:
             True if connected successfully
         """
         if not MT5_AVAILABLE:
             logger.error("MetaTrader5 package not installed")
             return False
-        
+
         # Use provided or config values
         login = login or self.config.login
         password = password or self.config.password
         server = server or self.config.server
         path = path or self.config.path
-        
+
         # Initialize MT5
         init_kwargs = {}
         if path:
-            init_kwargs['path'] = path
+            init_kwargs["path"] = path
         if self.config.timeout:
-            init_kwargs['timeout'] = self.config.timeout
+            init_kwargs["timeout"] = self.config.timeout
         if self.config.portable:
-            init_kwargs['portable'] = self.config.portable
-        
+            init_kwargs["portable"] = self.config.portable
+
         self._symbol_cache.clear()
 
         if not mt5.initialize(**init_kwargs):
             error = mt5.last_error()
             logger.error(f"MT5 initialization failed: {error}")
             return False
-        
+
         # Login if credentials provided
         if login and password and server:
             authorized = mt5.login(login, password=password, server=server)
@@ -448,40 +475,39 @@ class MT5Connector:
             self._connected = False
             self._symbol_cache.clear()
             logger.info("Disconnected from MT5")
-    
+
     def is_connected(self) -> bool:
         """Check if connected to MT5."""
         if not MT5_AVAILABLE or not self._connected:
             return False
-        
+
         # Verify connection by getting terminal info
         info = mt5.terminal_info()
         return info is not None
-    
+
     def get_last_error(self) -> Tuple[int, str]:
         """Get last MT5 error."""
         if not MT5_AVAILABLE:
             return (-1, "MT5 not available")
         return mt5.last_error()
-    
+
     # =========================================================================
     # Account Information
     # =========================================================================
-    
+
     def get_account_info(self) -> Optional[MT5AccountInfo]:
         """Get current account information."""
         if not self._check_connection():
             return None
-        
+
         info = mt5.account_info()
         if info is None:
             return None
-        
+
+        trade_mode_raw = getattr(info, "trade_mode", None)
+        trade_mode = trade_mode_raw if type(trade_mode_raw) is int else -1
         margin_mode_raw = getattr(info, "margin_mode", None)
-        try:
-            margin_mode = int(margin_mode_raw)
-        except (TypeError, ValueError, OverflowError):
-            margin_mode = -1
+        margin_mode = margin_mode_raw if type(margin_mode_raw) is int else -1
         hedge_allowed_raw = getattr(info, "hedge_allowed", None)
         # MetaTrader5.account_info() exposes margin_mode but some package
         # versions omit the separate MQL5 ACCOUNT_HEDGE_ALLOWED property.
@@ -491,7 +517,9 @@ class MT5Connector:
         hedge_allowed = (
             bool(hedge_allowed_raw)
             if hedge_allowed_raw is not None
-            else (True if margin_mode == 2 else False if margin_mode in {0, 1} else None)
+            else (
+                True if margin_mode == 2 else False if margin_mode in {0, 1} else None
+            )
         )
 
         return MT5AccountInfo(
@@ -508,20 +536,21 @@ class MT5Connector:
             currency=info.currency,
             trade_allowed=info.trade_allowed,
             trade_expert=info.trade_expert,
+            trade_mode=trade_mode,
             margin_mode=margin_mode,
             hedge_allowed=hedge_allowed,
         )
-    
+
     def get_equity(self) -> float:
         """Get current account equity."""
         info = self.get_account_info()
         return info.equity if info else 0.0
-    
+
     def get_balance(self) -> float:
         """Get current account balance."""
         info = self.get_account_info()
         return info.balance if info else 0.0
-    
+
     # =========================================================================
     # Symbol Information
     # =========================================================================
@@ -541,21 +570,21 @@ class MT5Connector:
             self._broker_symbol_cache[symbol] = resolved
             self._broker_symbol_cache[resolved] = resolved
         return resolved
-    
+
     def get_symbol_info(self, symbol: str) -> Optional[MT5SymbolInfo]:
         """
         Get symbol information.
-        
+
         Args:
             symbol: Symbol name
-            
+
         Returns:
             MT5SymbolInfo or None
         """
         # Check cache
         if symbol in self._symbol_cache:
             return self._symbol_cache[symbol]
-        
+
         resolved_symbol = self._resolve_symbol(symbol)
         if resolved_symbol is None:
             logger.warning(f"Failed to resolve symbol: {symbol}")
@@ -568,7 +597,7 @@ class MT5Connector:
         info = mt5.symbol_info(resolved_symbol)
         if info is None:
             return None
-        
+
         symbol_info = MT5SymbolInfo(
             symbol=info.name,
             digits=info.digits,
@@ -586,10 +615,15 @@ class MT5Connector:
             trade_stops_level=info.trade_stops_level,
             visible=bool(getattr(info, "visible", True)),
             trade_mode=int(getattr(info, "trade_mode", 2) or 0),
-            swap_mode=int(getattr(info, "swap_mode", -1) if getattr(info, "swap_mode", None) is not None else -1),
+            swap_mode=int(
+                getattr(info, "swap_mode", -1)
+                if getattr(info, "swap_mode", None) is not None
+                else -1
+            ),
             swap_rollover3days=int(
                 getattr(info, "swap_rollover3days", 3)
-                if getattr(info, "swap_rollover3days", None) is not None else 3
+                if getattr(info, "swap_rollover3days", None) is not None
+                else 3
             ),
             swap_sunday=getattr(info, "swap_sunday", None),
             swap_monday=getattr(info, "swap_monday", None),
@@ -612,30 +646,30 @@ class MT5Connector:
                 default="unknown",
             ),
         )
-        
+
         # Cache it under both the requested alias and the broker symbol.
         self._symbol_cache[symbol] = symbol_info
         self._symbol_cache[resolved_symbol] = symbol_info
         self._broker_symbol_cache[symbol] = resolved_symbol
         self._broker_symbol_cache[resolved_symbol] = resolved_symbol
-        
+
         return symbol_info
-    
+
     def find_broker_symbol(self, base_symbol: str) -> Optional[str]:
         """
         Find actual broker symbol for a base symbol.
-        
+
         Handles broker-specific suffixes like .a, .pro, m, etc.
-        
+
         Args:
             base_symbol: Standard symbol name (e.g., 'EURUSD')
-            
+
         Returns:
             Actual broker symbol or None
         """
         if not self._check_connection():
             return None
-        
+
         cached = self._broker_symbol_cache.get(base_symbol)
         if cached:
             return cached
@@ -644,16 +678,16 @@ class MT5Connector:
         if mt5.symbol_select(base_symbol, True):
             self._broker_symbol_cache[base_symbol] = base_symbol
             return base_symbol
-        
+
         # Get all symbols
         all_symbols = mt5.symbols_get()
         if all_symbols is None:
             return None
-        
+
         # Common broker suffixes. We intentionally avoid loose prefix matching
         # because it can bind the PM to the wrong custom symbol/feed.
-        suffixes = ['', '.a', '.pro', 'm', '.std', '.raw', '.ecn', '#', '.i']
-        
+        suffixes = ["", ".a", ".pro", "m", ".std", ".raw", ".ecn", "#", ".i"]
+
         for suffix in suffixes:
             test_symbol = base_symbol + suffix
             for sym in all_symbols:
@@ -661,12 +695,14 @@ class MT5Connector:
                     continue
                 if sym.name.upper() == test_symbol.upper():
                     if mt5.symbol_select(sym.name, True):
-                        logger.debug(f"Found broker symbol: {sym.name} for {base_symbol}")
+                        logger.debug(
+                            f"Found broker symbol: {sym.name} for {base_symbol}"
+                        )
                         self._broker_symbol_cache[base_symbol] = sym.name
                         self._broker_symbol_cache[sym.name] = sym.name
                         return sym.name
         return None
-    
+
     def get_tick(self, symbol: str) -> Optional[MT5Tick]:
         """Get current tick for symbol."""
         if not self._check_connection():
@@ -679,25 +715,27 @@ class MT5Connector:
         tick = mt5.symbol_info_tick(resolved_symbol)
         if tick is None:
             return None
-        
+
         return MT5Tick(
             time=datetime.fromtimestamp(tick.time),
             bid=tick.bid,
             ask=tick.ask,
             last=tick.last,
-            volume=tick.volume
+            volume=tick.volume,
         )
-    
+
     # =========================================================================
     # Historical Data
     # =========================================================================
 
-    def _copy_rates_with_sync(self,
-                              broker_symbol: str,
-                              tf: Any,
-                              count: int,
-                              from_date: Optional[datetime] = None,
-                              force_full: bool = False):
+    def _copy_rates_with_sync(
+        self,
+        broker_symbol: str,
+        tf: Any,
+        count: int,
+        from_date: Optional[datetime] = None,
+        force_full: bool = False,
+    ):
         """
         Fetch rates, forcing a server-side history download so the terminal
         returns the FULL requested ``count`` rather than only its local cache.
@@ -726,6 +764,7 @@ class MT5Connector:
                 which needs the full window; left off for the live hot path so a
                 normal short/empty live probe is not slowed.
         """
+
         def _len(arr) -> int:
             return 0 if arr is None else len(arr)
 
@@ -753,8 +792,12 @@ class MT5Connector:
         if best_len > 0 and not force_full:
             return rates
 
-        max_attempts = max(0, int(getattr(self.config, "history_sync_max_attempts", 0) or 0))
-        sleep_s = max(0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0))
+        max_attempts = max(
+            0, int(getattr(self.config, "history_sync_max_attempts", 0) or 0)
+        )
+        sleep_s = max(
+            0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0)
+        )
         if max_attempts <= 0:
             return best
 
@@ -815,9 +858,13 @@ class MT5Connector:
         except Exception:
             pass
         try:
-            info = mt5.symbol_info(broker_symbol) if hasattr(mt5, "symbol_info") else None
+            info = (
+                mt5.symbol_info(broker_symbol) if hasattr(mt5, "symbol_info") else None
+            )
             if info is None:
-                details.append("symbol_info=None (symbol not in broker universe / not selectable)")
+                details.append(
+                    "symbol_info=None (symbol not in broker universe / not selectable)"
+                )
             else:
                 for attr in ("visible", "select", "trade_mode"):
                     if hasattr(info, attr):
@@ -840,7 +887,9 @@ class MT5Connector:
             err = mt5.last_error() if hasattr(mt5, "last_error") else None
         except Exception:
             return False
-        return bool(err and isinstance(err, (tuple, list)) and len(err) and int(err[0]) == -2)
+        return bool(
+            err and isinstance(err, (tuple, list)) and len(err) and int(err[0]) == -2
+        )
 
     @staticmethod
     def _rates_to_df(rates) -> Optional[pd.DataFrame]:
@@ -851,10 +900,17 @@ class MT5Connector:
             return None
         df["time"] = pd.to_datetime(df["time"], unit="s")
         df = df.set_index("time")
-        return df.rename(columns={
-            "open": "Open", "high": "High", "low": "Low", "close": "Close",
-            "tick_volume": "Volume", "spread": "Spread", "real_volume": "RealVolume",
-        })
+        return df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "tick_volume": "Volume",
+                "spread": "Spread",
+                "real_volume": "RealVolume",
+            }
+        )
 
     def _terminal_maxbars(self) -> int:
         try:
@@ -863,7 +919,9 @@ class MT5Connector:
         except Exception:
             return 0
 
-    def _paged_history(self, broker_symbol: str, tf: Any, count: int) -> Optional[pd.DataFrame]:
+    def _paged_history(
+        self, broker_symbol: str, tf: Any, count: int
+    ) -> Optional[pd.DataFrame]:
         """Retrieve up to ``count`` bars by walking the history backwards by date.
 
         A single oversized request returns (-2, 'Invalid params') because the
@@ -873,12 +931,18 @@ class MT5Connector:
         progressively older windows from the server, accumulating well past the
         per-call limit until ``count`` is reached or the broker's history ends.
         """
-        max_attempts = max(1, int(getattr(self.config, "history_sync_max_attempts", 6) or 6))
-        sleep_s = max(0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.6) or 0.6))
+        max_attempts = max(
+            1, int(getattr(self.config, "history_sync_max_attempts", 6) or 6)
+        )
+        sleep_s = max(
+            0.0, float(getattr(self.config, "history_sync_sleep_seconds", 0.6) or 0.6)
+        )
         page = max(1000, int(getattr(self.config, "history_page_size", 50000) or 50000))
         maxbars = self._terminal_maxbars()
         if maxbars > 0:
-            page = min(page, max(1000, maxbars - 1))  # stay strictly under the per-call cap
+            page = min(
+                page, max(1000, maxbars - 1)
+            )  # stay strictly under the per-call cap
         min_page = 500
 
         try:
@@ -900,12 +964,16 @@ class MT5Connector:
                 try:
                     chunk = mt5.copy_rates_from(broker_symbol, tf, anchor, n)
                 except Exception as exc:
-                    logger.debug(f"paged copy_rates_from failed for {broker_symbol}: {exc}")
+                    logger.debug(
+                        f"paged copy_rates_from failed for {broker_symbol}: {exc}"
+                    )
                     chunk = None
                 if chunk is not None and len(chunk) > 0:
                     break
                 if self._is_invalid_params_error():
-                    saw_invalid = True  # window too large for the cap: shrink, don't retry
+                    saw_invalid = (
+                        True  # window too large for the cap: shrink, don't retry
+                    )
                     break
                 if sleep_s > 0:
                     time.sleep(sleep_s)
@@ -922,7 +990,9 @@ class MT5Connector:
             if prev_oldest is not None and oldest >= prev_oldest:
                 break  # no older bars served -> reached start of broker history
             prev_oldest = oldest
-            anchor = datetime.fromtimestamp(oldest, tz=timezone.utc) - timedelta(seconds=1)
+            anchor = datetime.fromtimestamp(oldest, tz=timezone.utc) - timedelta(
+                seconds=1
+            )
 
         if not frames:
             return None
@@ -934,12 +1004,14 @@ class MT5Connector:
             df = df.iloc[-count:]
         return df
 
-    def get_bars(self,
-                 symbol: str,
-                 timeframe: str,
-                 count: int = 1000,
-                 from_date: datetime = None,
-                 force_full: bool = False) -> Optional[pd.DataFrame]:
+    def get_bars(
+        self,
+        symbol: str,
+        timeframe: str,
+        count: int = 1000,
+        from_date: datetime = None,
+        force_full: bool = False,
+    ) -> Optional[pd.DataFrame]:
         """
         Get historical bars.
 
@@ -957,18 +1029,18 @@ class MT5Connector:
         """
         if not self._check_connection():
             return None
-        
+
         tf = self.TIMEFRAME_MAP.get(timeframe)
         if tf is None:
             logger.error(f"Unknown timeframe: {timeframe}")
             return None
-        
+
         # Ensure symbol is selected
         broker_symbol = self.find_broker_symbol(symbol)
         if broker_symbol is None:
             logger.debug(f"Broker universe miss while fetching bars: {symbol}")
             return None
-        
+
         # Historical path pages the request so a count larger than the symbol's
         # locally-synced depth does not trigger MT5 "Invalid params" (-2); the
         # live path keeps the fast single-call + empty-sync behavior.
@@ -990,28 +1062,32 @@ class MT5Connector:
 
         # Convert to DataFrame
         df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df = df.set_index('time')
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df = df.set_index("time")
 
         # Rename columns
-        df = df.rename(columns={
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close',
-            'tick_volume': 'Volume',
-            'spread': 'Spread',
-            'real_volume': 'RealVolume'
-        })
-        
+        df = df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "tick_volume": "Volume",
+                "spread": "Spread",
+                "real_volume": "RealVolume",
+            }
+        )
+
         return df
-    
-    def get_bars_range(self,
-                       symbol: str,
-                       timeframe: str,
-                       start_date: datetime,
-                       end_date: datetime,
-                       sync_retry: bool = False) -> Optional[pd.DataFrame]:
+
+    def get_bars_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        start_date: datetime,
+        end_date: datetime,
+        sync_retry: bool = False,
+    ) -> Optional[pd.DataFrame]:
         """
         Get historical bars within date range.
 
@@ -1020,214 +1096,588 @@ class MT5Connector:
             timeframe: Timeframe string
             start_date: Start date
             end_date: End date
-            sync_retry: When True, poll an empty *or boundary-incomplete* result
-                while the terminal downloads/builds the requested timeseries.
-                The widest response seen is retained and polling uses the full
-                bounded budget unless both requested boundaries are covered.
-                Off by default so the live
-                delta-sync hot path is not slowed by a normal "no new bars"
-                result.
+            sync_retry: When True, an empty or boundary-incomplete result may
+                use one bounded synchronization sequence: initial exact read,
+                one date-anchored warm call, and one exact reread.  Off by
+                default so the live delta-sync hot path is not slowed by a
+                normal "no new bars" result.
 
         Returns:
             DataFrame with OHLCV data or None
         """
-        self._last_history_range_diagnostics = {
+        diagnostics: Dict[str, Any] = {
+            "range_contract_version": "mt5-half-open-range-v4",
             "symbol": str(symbol),
             "broker_symbol": None,
             "timeframe": str(timeframe).upper(),
             "sync_retry": bool(sync_retry),
+            "sync_status": "not_started",
+            "request_start_epoch_second": None,
+            "request_end_epoch_second_exclusive": None,
             "copy_rates_range_attempts": 0,
             "copy_rates_range_max_attempts": 0,
+            "history_download_trigger_attempts": 0,
+            "history_download_trigger_nonempty": 0,
+            "history_download_trigger_max_bars": 0,
+            "history_download_trigger_errors": [],
+            "terminal_confirmation_consumed": False,
+            "call_ledger_schema": "mt5.range-call-ledger.v1",
+            "call_ledger": [],
+            "hard_failure": False,
+            "hard_failure_call": None,
+            "last_error": None,
+            "initial_raw_relation": None,
+            "confirmation_raw_relation": None,
+            "raw_relation": None,
+            "raw_count": 0,
+            "raw_extent": None,
+            "admitted_count": 0,
+            "admitted_extent": None,
+            "boundary_span_seconds": 0,
+            "boundary_slack_seconds": 0,
             "boundary_complete": False,
             "best_extent": None,
         }
+        self._last_history_range_diagnostics = diagnostics
+        try:
+            start_epoch = int(start_date.timestamp())
+            end_epoch = int(end_date.timestamp())
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            diagnostics["sync_status"] = "invalid_datetime"
+            return None
+        diagnostics["request_start_epoch_second"] = int(start_epoch)
+        diagnostics["request_end_epoch_second_exclusive"] = int(end_epoch)
+        if end_epoch <= start_epoch:
+            # An invalid half-open interval can never contain admissible bars.
+            # Reject it before connection checks or any MT5 range/download call;
+            # connector responses outside this contract are not evidence.
+            diagnostics["sync_status"] = "invalid_interval"
+            return None
         if not self._check_connection():
+            diagnostics["sync_status"] = "connection_unavailable"
             return None
 
         tf = self.TIMEFRAME_MAP.get(timeframe)
         if tf is None:
+            diagnostics["sync_status"] = "invalid_timeframe"
             return None
 
         broker_symbol = self.find_broker_symbol(symbol)
         if broker_symbol is None:
+            diagnostics["sync_status"] = "symbol_unavailable"
             return None
+        diagnostics["broker_symbol"] = str(broker_symbol)
+        diagnostics["copy_rates_range_max_attempts"] = 2 if sync_retry else 1
 
-        def _copy_range():
-            try:
-                return mt5.copy_rates_range(broker_symbol, tf, start_date, end_date)
-            except Exception as exc:
-                # MT5/Windows rejects out-of-range dates (e.g. pre-1970) with
-                # OSError Errno 22; never let that crash the fetch.
-                logger.debug(
-                    f"copy_rates_range failed for {broker_symbol} "
-                    f"({start_date}..{end_date}): {exc}"
-                )
+        tf_seconds = {
+            "M1": 60,
+            "M5": 5 * 60,
+            "M15": 15 * 60,
+            "M30": 30 * 60,
+            "H1": 60 * 60,
+            "H4": 4 * 60 * 60,
+            "D1": 24 * 60 * 60,
+        }.get(str(timeframe).upper(), 5 * 60)
+
+        def _extent_dict(values: np.ndarray) -> Optional[Dict[str, int]]:
+            if values.size <= 0:
                 return None
+            return {
+                "rows": int(values.size),
+                "first_epoch_second": int(values.min()),
+                "last_epoch_second": int(values.max()),
+            }
 
-        def _range_extent(candidate) -> Optional[Tuple[int, int, int]]:
-            """Return (rows, first epoch second, last epoch second)."""
+        def _empty_analysis() -> Dict[str, Any]:
+            return {
+                "raw_relation": None,
+                "raw_count": 0,
+                "raw_extent": None,
+                "admitted_count": 0,
+                "admitted_extent": None,
+                "admitted_data": None,
+                "parse_error": None,
+            }
+
+        def _analyse_candidate(candidate: Any) -> Dict[str, Any]:
+            """Classify raw timestamps and admit only the requested half-open range."""
+            analysis = _empty_analysis()
             if candidate is None:
-                return None
-            try:
-                rows = int(len(candidate))
-            except (TypeError, ValueError):
-                return None
-            if rows <= 0:
-                return None
-            try:
-                # MetaTrader's numpy structured array supports the fast column
-                # path; the fallback keeps injected list/dict test connectors
-                # and older package builds compatible.
-                raw_times = candidate["time"]
-            except (TypeError, ValueError, KeyError, IndexError):
+                return analysis
+            if isinstance(candidate, Mapping):
+                rows = 1
+                raw_times = [candidate.get("time")]
+                row_items = [candidate]
+            else:
                 try:
-                    raw_times = [
-                        item.get("time") if isinstance(item, Mapping) else getattr(item, "time")
-                        for item in candidate
-                    ]
-                except (TypeError, ValueError, AttributeError):
-                    return None
-            try:
-                values = np.asarray(raw_times, dtype=np.int64)
-                if values.size != rows or not np.isfinite(values.astype(np.float64)).all():
-                    return None
-                return rows, int(values.min()), int(values.max())
-            except (TypeError, ValueError, OverflowError):
-                return None
+                    rows = int(len(candidate))
+                except (TypeError, ValueError):
+                    analysis.update(
+                        raw_relation="MIXED_INVALID",
+                        parse_error="response_has_no_bounded_length",
+                    )
+                    return analysis
+                if rows <= 0:
+                    return analysis
+                try:
+                    # MetaTrader structured arrays support this zero-copy path.
+                    raw_times = candidate["time"]
+                except (TypeError, ValueError, KeyError, IndexError):
+                    try:
+                        raw_times = [
+                            item.get("time")
+                            if isinstance(item, Mapping)
+                            else getattr(item, "time")
+                            for item in candidate
+                        ]
+                    except (TypeError, ValueError, AttributeError):
+                        analysis.update(
+                            raw_relation="MIXED_INVALID",
+                            raw_count=rows,
+                            parse_error="response_time_column_unreadable",
+                        )
+                        return analysis
+                row_items = candidate
 
-        def _boundary_complete(extent: Optional[Tuple[int, int, int]]) -> bool:
-            if extent is None:
-                return False
+            analysis["raw_count"] = rows
+            try:
+                numeric_times = np.asarray(raw_times, dtype=np.float64).reshape(-1)
+                if numeric_times.size != rows:
+                    raise ValueError("time_count_mismatch")
+                if not np.isfinite(numeric_times).all():
+                    raise ValueError("non_finite_time")
+                if not np.equal(numeric_times, np.floor(numeric_times)).all():
+                    raise ValueError("fractional_epoch_second")
+                int64 = np.iinfo(np.int64)
+                if (numeric_times < int64.min).any() or (
+                    numeric_times > int64.max
+                ).any():
+                    raise ValueError("epoch_second_out_of_int64_range")
+                epochs = numeric_times.astype(np.int64)
+            except (TypeError, ValueError, OverflowError) as exc:
+                analysis.update(
+                    raw_relation="MIXED_INVALID",
+                    parse_error=str(exc)[:256] or type(exc).__name__,
+                )
+                return analysis
+
+            in_range = (epochs >= start_epoch) & (epochs < end_epoch)
+            analysis["raw_extent"] = _extent_dict(epochs)
+            if bool(in_range.all()):
+                relation = "IN_RANGE"
+            elif bool((epochs >= end_epoch).all()):
+                relation = "RIGHT_DISJOINT_PREFIX"
+            elif bool((epochs < start_epoch).all()):
+                relation = "LEFT_DISJOINT_SUFFIX"
+            else:
+                relation = "MIXED_INVALID"
+            analysis["raw_relation"] = relation
+
+            admitted_epochs = epochs[in_range]
+            analysis["admitted_count"] = int(admitted_epochs.size)
+            analysis["admitted_extent"] = _extent_dict(admitted_epochs)
+            if admitted_epochs.size <= 0:
+                return analysis
+            indices = np.flatnonzero(in_range)
+            try:
+                if isinstance(row_items, pd.DataFrame):
+                    admitted = row_items.iloc[indices].copy()
+                elif isinstance(row_items, np.ndarray):
+                    admitted = row_items[in_range]
+                else:
+                    admitted = [row_items[int(index)] for index in indices]
+            except (IndexError, KeyError, TypeError, ValueError) as exc:
+                analysis.update(
+                    raw_relation="MIXED_INVALID",
+                    admitted_count=0,
+                    admitted_extent=None,
+                    parse_error=f"response_filter_failed:{type(exc).__name__}"[:256],
+                )
+                return analysis
+            analysis["admitted_data"] = admitted
+            return analysis
+
+        def _capture_last_error() -> Dict[str, Any]:
+            getter = getattr(mt5, "last_error", None)
+            if not callable(getter):
+                return {"code": None, "message": "unavailable", "capture_error": None}
+            try:
+                raw_error = getter()
+            except Exception as exc:
+                return {
+                    "code": None,
+                    "message": "unavailable",
+                    "capture_error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:512],
+                    },
+                }
+            code: Optional[int] = None
+            message = ""
+            if isinstance(raw_error, (tuple, list)):
+                if raw_error:
+                    try:
+                        code = int(raw_error[0])
+                    except (TypeError, ValueError, OverflowError):
+                        code = None
+                if len(raw_error) > 1:
+                    message = str(raw_error[1])[:512]
+            elif raw_error is not None:
+                message = str(raw_error)[:512]
+            return {"code": code, "message": message, "capture_error": None}
+
+        def _is_hard_error(last_error: Mapping[str, Any]) -> bool:
+            if last_error.get("capture_error") is not None:
+                return True
+            code = last_error.get("code")
+            # -4 (not found) can represent an unsynchronized/empty history page.
+            # Every other negative Python-API code is invalid, resource, auth,
+            # unsupported, generic, or IPC failure and must terminate the sequence.
+            return isinstance(code, int) and code < 0 and code != -4
+
+        call_ledger: List[Dict[str, Any]] = diagnostics["call_ledger"]
+
+        def _invoke_data_call(call_type: str, call) -> Tuple[Dict[str, Any], bool]:
+            started = time.perf_counter()
+            result = None
+            exception: Optional[Dict[str, str]] = None
+            try:
+                result = call()
+            except Exception as exc:
+                exception = {
+                    "type": type(exc).__name__,
+                    "message": str(exc)[:512],
+                }
+            # MT5 exposes the authoritative failure only via this thread-local
+            # value.  Capture it before logging, sleeping, or making another call.
+            last_error = _capture_last_error()
+            elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+            analysis = _analyse_candidate(result)
+            hard_failure = bool(exception is not None or _is_hard_error(last_error))
+            entry = {
+                "sequence": len(call_ledger) + 1,
+                "call_type": call_type,
+                "elapsed_ms": round(elapsed_ms, 3),
+                "last_error": last_error,
+                "exception": exception,
+                "hard_failure": hard_failure,
+                "raw_relation": analysis["raw_relation"],
+                "raw_count": int(analysis["raw_count"]),
+                "raw_extent": analysis["raw_extent"],
+                "admitted_count": int(analysis["admitted_count"]),
+                "admitted_extent": analysis["admitted_extent"],
+                "parse_error": analysis["parse_error"],
+            }
+            # The range contract permits at most two exact reads and one warm.
+            # This guard keeps the diagnostic bounded even if future code regresses.
+            if len(call_ledger) < 3:
+                call_ledger.append(entry)
+            else:  # pragma: no cover - defensive invariant
+                raise RuntimeError("MT5 range call ledger exceeded its fixed bound")
+            return analysis, hard_failure
+
+        def _boundary_geometry() -> Tuple[int, int]:
             try:
                 start_epoch = int(start_date.timestamp())
                 end_epoch = int(end_date.timestamp())
             except (AttributeError, OSError, OverflowError, ValueError):
-                return False
-            tf_seconds = {
-                "M1": 60,
-                "M5": 5 * 60,
-                "M15": 15 * 60,
-                "M30": 30 * 60,
-                "H1": 60 * 60,
-                "H4": 4 * 60 * 60,
-                "D1": 24 * 60 * 60,
-            }.get(str(timeframe).upper(), 5 * 60)
+                return 0, 0
+            span = max(0, end_epoch - start_epoch)
+            if span <= 0:
+                return span, 0
             # Weekend/holiday and exchange-session gaps are not missing data.
             # Four calendar days covers normal weekend boundaries; slower bars
-            # receive at least four nominal periods of slack.
-            slack = max(4 * 86400, 4 * int(tf_seconds))
-            _, first_epoch, last_epoch = extent
+            # receive at least four nominal periods of slack.  The tolerance on
+            # each edge must never overlap the other edge, however: otherwise
+            # one cached bar can falsely prove both boundaries on a short
+            # request and suppress the MT5 download trigger.
+            base_slack = max(4 * 86400, 4 * int(tf_seconds))
+            nonoverlap_budget = span - int(tf_seconds)
+            if nonoverlap_budget <= 0:
+                return span, 0
+            nonoverlap_cap = max(0, (nonoverlap_budget - 1) // 2)
+            return span, min(base_slack, nonoverlap_cap)
+
+        def _boundary_complete(extent: Optional[Mapping[str, int]]) -> bool:
+            if extent is None:
+                return False
+            span, slack = _boundary_geometry()
+            if span <= 0:
+                return False
+            first_epoch = int(extent["first_epoch_second"])
+            last_epoch = int(extent["last_epoch_second"])
             return bool(
                 first_epoch <= start_epoch + slack
                 and last_epoch >= end_epoch - int(tf_seconds) - slack
             )
 
-        rates = _copy_range()
-        attempts = 1
-        max_attempts = 1
+        trigger_attempts = 0
+        trigger_nonempty = 0
+        trigger_max_bars = 0
+        trigger_errors: List[Dict[str, str]] = []
 
-        if sync_retry:
-            max_attempts = max(
-                1,
-                int(getattr(self.config, "history_sync_max_attempts", 1) or 1),
-            )
-            sleep_s = max(
-                0.0,
-                float(getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0),
-            )
+        def _trigger_history_download() -> Tuple[Dict[str, Any], bool]:
+            """Prompt MT5 to build/download the exact range before re-reading it.
+
+            ``copy_rates_range`` can repeatedly expose the same incomplete local
+            cache even though the terminal can load the requested history.  A
+            bounded date-anchored ``copy_rates_from`` call is MT5's stronger
+            synchronization trigger.  Its returned rows are deliberately not
+            used as evidence; the subsequent exact range read remains the only
+            result admitted by this method.
+            """
+            nonlocal trigger_attempts, trigger_nonempty, trigger_max_bars
+            trigger = getattr(mt5, "copy_rates_from", None)
+            if not callable(trigger):
+                return _empty_analysis(), False
             try:
-                mt5.symbol_select(broker_symbol, True)
-                if hasattr(mt5, "symbol_info_tick"):
-                    mt5.symbol_info_tick(broker_symbol)
-            except Exception:
-                pass
+                span_seconds = max(0.0, float((end_date - start_date).total_seconds()))
+            except (AttributeError, OverflowError, TypeError, ValueError):
+                span_seconds = 0.0
+            requested_bars = max(1, int(math.ceil(span_seconds / tf_seconds)) + 2)
+            try:
+                configured_cap = int(
+                    getattr(self.config, "history_page_size", 50_000) or 50_000
+                )
+            except (TypeError, ValueError, OverflowError):
+                configured_cap = 50_000
+            # Resource ceiling only: acquisition pages are intentionally below
+            # this value, while an accidental multi-decade intraday range cannot
+            # allocate an unbounded trigger array.
+            trigger_count = min(requested_bars, max(1, min(configured_cap, 50_000)))
+            trigger_attempts += 1
+            trigger_max_bars = max(trigger_max_bars, trigger_count)
+            analysis, hard_failure = _invoke_data_call(
+                "copy_rates_from_warm",
+                lambda: trigger(broker_symbol, tf, end_date, trigger_count),
+            )
+            if analysis["raw_count"] > 0:
+                trigger_nonempty += 1
+            entry = call_ledger[-1]
+            if entry["exception"] is not None:
+                trigger_errors.append(dict(entry["exception"]))
+            elif hard_failure:
+                last_error = entry["last_error"]
+                trigger_errors.append(
+                    {
+                        "type": "MT5LastError",
+                        "message": (
+                            f"{last_error.get('code')}: {last_error.get('message', '')}"
+                        )[:512],
+                    }
+                )
+            return analysis, hard_failure
 
-            best = rates
-            best_extent = _range_extent(best)
-            # A response spanning both requested boundaries is already usable.
-            # Otherwise MT5 may still be asynchronously extending/building the
-            # series even though repeated calls return the same cached tail.
-            # Only boundary completion or the explicit attempt budget may stop
-            # synchronization; one repeated incomplete extent proves nothing.
-            while attempts < max_attempts and not _boundary_complete(best_extent):
+        initial, hard_failure = _invoke_data_call(
+            "copy_rates_range_initial",
+            lambda: mt5.copy_rates_range(broker_symbol, tf, start_date, end_date),
+        )
+        exact_analyses = [initial]
+        best = initial if initial["admitted_count"] > 0 else None
+        hard_failure_call = "copy_rates_range_initial" if hard_failure else None
+
+        # A wholly newer terminal prefix is the observed MT5 sentinel defect:
+        # it is neither requested data nor evidence of broker absence.  The
+        # historical path gets exactly one confirmation sequence; live callers
+        # remain single-read because sync_retry is false there.
+        initial_right_disjoint = initial["raw_relation"] == "RIGHT_DISJOINT_PREFIX"
+        invalid_initial = initial["parse_error"] is not None
+        should_retry = bool(
+            sync_retry
+            and not hard_failure
+            and not invalid_initial
+            and not _boundary_complete(initial["admitted_extent"])
+        )
+        terminal_confirmation_consumed = False
+
+        if should_retry:
+            terminal_confirmation_consumed = bool(initial_right_disjoint)
+            warm, warm_hard_failure = _trigger_history_download()
+            if warm["parse_error"] is not None:
+                warm_hard_failure = True
+            if warm_hard_failure:
+                hard_failure = True
+                hard_failure_call = "copy_rates_from_warm"
+            else:
+                sleep_s = max(
+                    0.0,
+                    float(
+                        getattr(self.config, "history_sync_sleep_seconds", 0.0) or 0.0
+                    ),
+                )
                 if sleep_s > 0:
                     time.sleep(sleep_s)
-                candidate = _copy_range()
-                attempts += 1
-                extent = _range_extent(candidate)
-                if extent is not None:
-                    if best_extent is None:
-                        best, best_extent = candidate, extent
+                retry, retry_hard_failure = _invoke_data_call(
+                    "copy_rates_range_retry",
+                    lambda: mt5.copy_rates_range(
+                        broker_symbol, tf, start_date, end_date
+                    ),
+                )
+                exact_analyses.append(retry)
+                if retry_hard_failure or retry["parse_error"] is not None:
+                    hard_failure = True
+                    hard_failure_call = "copy_rates_range_retry"
+                if retry["admitted_count"] > 0:
+                    if best is None:
+                        best = retry
                     else:
-                        _, best_first, best_last = best_extent
-                        _, first, last = extent
-                        best_span = best_last - best_first
-                        span = last - first
-                        if (span, extent[0]) > (best_span, best_extent[0]):
-                            best, best_extent = candidate, extent
-            rates = best
+                        best_extent = best["admitted_extent"]
+                        retry_extent = retry["admitted_extent"]
+                        best_score = (
+                            int(best_extent["last_epoch_second"])
+                            - int(best_extent["first_epoch_second"]),
+                            int(best["admitted_count"]),
+                        )
+                        retry_score = (
+                            int(retry_extent["last_epoch_second"])
+                            - int(retry_extent["first_epoch_second"]),
+                            int(retry["admitted_count"]),
+                        )
+                        if retry_score > best_score:
+                            best = retry
 
-        final_extent = _range_extent(rates)
-        self._last_history_range_diagnostics = {
-            "symbol": str(symbol),
-            "broker_symbol": str(broker_symbol),
-            "timeframe": str(timeframe).upper(),
-            "sync_retry": bool(sync_retry),
-            "copy_rates_range_attempts": int(attempts),
-            "copy_rates_range_max_attempts": int(max_attempts),
-            "boundary_complete": bool(_boundary_complete(final_extent)),
-            "best_extent": (
-                {
-                    "rows": int(final_extent[0]),
-                    "first_epoch_second": int(final_extent[1]),
-                    "last_epoch_second": int(final_extent[2]),
-                }
-                if final_extent is not None
-                else None
-            ),
-        }
+        selected = best
+        if selected is None:
+            selected = next(
+                (
+                    item
+                    for item in reversed(exact_analyses)
+                    if item["raw_relation"] is not None
+                ),
+                exact_analyses[-1],
+            )
+        rates = selected["admitted_data"] if best is not None else None
+        final_extent = selected["admitted_extent"] if best is not None else None
+        boundary_span_seconds, boundary_slack_seconds = _boundary_geometry()
+        exact_attempts = sum(
+            entry["call_type"].startswith("copy_rates_range") for entry in call_ledger
+        )
+        exact_relations = [item["raw_relation"] for item in exact_analyses]
+        if hard_failure:
+            sync_status = "hard_mt5_failure"
+        elif best is None and initial_right_disjoint:
+            sync_status = "terminal_prefix_unsynchronized"
+        elif best is None and "LEFT_DISJOINT_SUFFIX" in exact_relations:
+            sync_status = "terminal_suffix_unsynchronized"
+        elif best is None and "RIGHT_DISJOINT_PREFIX" in exact_relations:
+            sync_status = "terminal_prefix_unsynchronized"
+        elif best is None and "MIXED_INVALID" in exact_relations:
+            sync_status = "mixed_invalid_no_admissible_data"
+        elif best is None:
+            sync_status = "empty_unsynchronized" if sync_retry else "empty"
+        elif _boundary_complete(final_extent):
+            sync_status = "boundary_complete"
+        elif selected["raw_relation"] == "MIXED_INVALID":
+            sync_status = "mixed_invalid_filtered"
+        else:
+            sync_status = "boundary_incomplete"
+
+        diagnostics.update(
+            {
+                "sync_status": sync_status,
+                "copy_rates_range_attempts": int(exact_attempts),
+                "history_download_trigger_attempts": int(trigger_attempts),
+                "history_download_trigger_nonempty": int(trigger_nonempty),
+                "history_download_trigger_max_bars": int(trigger_max_bars),
+                "history_download_trigger_errors": list(trigger_errors),
+                "terminal_confirmation_consumed": bool(terminal_confirmation_consumed),
+                "hard_failure": bool(hard_failure),
+                "hard_failure_call": hard_failure_call,
+                "last_error": (
+                    dict(call_ledger[-1]["last_error"]) if call_ledger else None
+                ),
+                "initial_raw_relation": initial["raw_relation"],
+                "confirmation_raw_relation": (
+                    exact_analyses[1]["raw_relation"]
+                    if len(exact_analyses) > 1
+                    else None
+                ),
+                "raw_relation": selected["raw_relation"],
+                "raw_count": int(selected["raw_count"]),
+                "raw_extent": selected["raw_extent"],
+                "admitted_count": int(selected["admitted_count"]),
+                "admitted_extent": final_extent,
+                "boundary_span_seconds": int(boundary_span_seconds),
+                "boundary_slack_seconds": int(boundary_slack_seconds),
+                "boundary_complete": bool(_boundary_complete(final_extent)),
+                # Backward-compatible name consumed by native acquisition.  Under
+                # V4 it is deliberately the admitted, never the raw, extent.
+                "best_extent": final_extent,
+            }
+        )
 
         if rates is None or len(rates) == 0:
-            if sync_retry:
-                self._log_history_fetch_failure(broker_symbol, tf)
+            logger.warning(
+                "MT5 range fetch returned no admissible bars for %s: status=%s "
+                "request=[%s,%s) raw_relation=%s raw_extent=%s",
+                broker_symbol,
+                sync_status,
+                start_epoch,
+                end_epoch,
+                selected["raw_relation"],
+                selected["raw_extent"],
+            )
             return None
-        
+
         df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df = df.set_index('time')
-        df = df.rename(columns={
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close',
-            'tick_volume': 'Volume',
-            'spread': 'Spread',
-            'real_volume': 'RealVolume'
-        })
+        if df.empty or "time" not in df.columns:
+            diagnostics["sync_status"] = "invalid_filtered_response"
+            diagnostics["hard_failure"] = True
+            diagnostics["hard_failure_call"] = "dataframe_conversion"
+            return None
+        # Defense in depth: candidate admission already enforces this mask, but
+        # never trust container indexing behavior to weaken the half-open bound.
+        numeric_time = pd.to_numeric(df["time"], errors="coerce")
+        valid = numeric_time.ge(start_epoch) & numeric_time.lt(end_epoch)
+        df = df.loc[valid].copy()
+        if df.empty:
+            diagnostics["sync_status"] = "invalid_filtered_response"
+            diagnostics["hard_failure"] = True
+            diagnostics["hard_failure_call"] = "dataframe_half_open_guard"
+            diagnostics["admitted_count"] = 0
+            diagnostics["admitted_extent"] = None
+            diagnostics["best_extent"] = None
+            diagnostics["boundary_complete"] = False
+            return None
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df = df.set_index("time")
+        df = df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "tick_volume": "Volume",
+                "spread": "Spread",
+                "real_volume": "RealVolume",
+            }
+        )
         df.attrs["mt5_history_range_diagnostics"] = dict(
             self._last_history_range_diagnostics
         )
-        
+
         return df
-    
+
     # =========================================================================
     # Order Execution
     # =========================================================================
-    
-    def send_market_order(self,
-                          symbol: str,
-                          order_type: OrderType,
-                          volume: float,
-                          sl: float = 0.0,
-                          tp: float = 0.0,
-                          deviation: int = 30,
-                          magic: int = 0,
-                          comment: str = "",
-                          price: Optional[float] = None,
-                          symbol_info: Optional[MT5SymbolInfo] = None) -> MT5OrderResult:
+
+    def send_market_order(
+        self,
+        symbol: str,
+        order_type: OrderType,
+        volume: float,
+        sl: float = 0.0,
+        tp: float = 0.0,
+        deviation: int = 30,
+        magic: int = 0,
+        comment: str = "",
+        price: Optional[float] = None,
+        symbol_info: Optional[MT5SymbolInfo] = None,
+    ) -> MT5OrderResult:
         """
         Send a market order.
-        
+
         Args:
             symbol: Symbol to trade
             order_type: BUY or SELL
@@ -1237,7 +1687,7 @@ class MT5Connector:
             deviation: Maximum price deviation in points
             magic: Magic number
             comment: Order comment
-            
+
         Returns:
             MT5OrderResult
         """
@@ -1251,7 +1701,9 @@ class MT5Connector:
         # Get symbol info
         symbol_info = symbol_info or self.get_symbol_info(broker_symbol)
         if symbol_info is None:
-            return MT5OrderResult(False, -1, f"Symbol info not available: {broker_symbol}")
+            return MT5OrderResult(
+                False, -1, f"Symbol info not available: {broker_symbol}"
+            )
 
         # A requested volume is a risk ceiling, never a target to round up to.
         # Reject volumes that cannot be represented at or above the broker
@@ -1267,7 +1719,9 @@ class MT5Connector:
             logger.warning("Rejected %s market order: %s", broker_symbol, description)
             return MT5OrderResult(False, 10014, description)
 
-        mt5_type = mt5.ORDER_TYPE_BUY if order_type == OrderType.BUY else mt5.ORDER_TYPE_SELL
+        mt5_type = (
+            mt5.ORDER_TYPE_BUY if order_type == OrderType.BUY else mt5.ORDER_TYPE_SELL
+        )
         if price is None:
             # Get current price
             tick = self.get_tick(broker_symbol)
@@ -1280,51 +1734,73 @@ class MT5Connector:
             try:
                 price = float(price)
             except (TypeError, ValueError):
-                return MT5OrderResult(False, 10015, f"Invalid price override: {price!r}")
+                return MT5OrderResult(
+                    False, 10015, f"Invalid price override: {price!r}"
+                )
             if price <= 0.0:
-                return MT5OrderResult(False, 10015, f"Invalid price override: {price!r}")
+                return MT5OrderResult(
+                    False, 10015, f"Invalid price override: {price!r}"
+                )
 
         if order_type == OrderType.BUY:
             mt5_type = mt5.ORDER_TYPE_BUY
         else:
             mt5_type = mt5.ORDER_TYPE_SELL
-        
+
         # Determine filling type
         filling_type = self._get_filling_type(broker_symbol, symbol_info=symbol_info)
-        
+
         # Validate SL/TP against minimum stop level
         min_stop_distance = symbol_info.trade_stops_level * symbol_info.point
-        
+
         if sl > 0:
             sl_distance = abs(price - sl)
             if sl_distance < min_stop_distance and min_stop_distance > 0:
                 return MT5OrderResult(
-                    False, 10016, 
+                    False,
+                    10016,
                     f"SL too close: {sl_distance:.5f} < min {min_stop_distance:.5f} "
-                    f"(stops_level={symbol_info.trade_stops_level}, point={symbol_info.point})"
+                    f"(stops_level={symbol_info.trade_stops_level}, point={symbol_info.point})",
                 )
-        
+
         if tp > 0:
             tp_distance = abs(price - tp)
             if tp_distance < min_stop_distance and min_stop_distance > 0:
                 return MT5OrderResult(
-                    False, 10016,
+                    False,
+                    10016,
                     f"TP too close: {tp_distance:.5f} < min {min_stop_distance:.5f} "
-                    f"(stops_level={symbol_info.trade_stops_level}, point={symbol_info.point})"
+                    f"(stops_level={symbol_info.trade_stops_level}, point={symbol_info.point})",
                 )
-        
+
         # Validate SL/TP are on correct side of entry price
         if order_type == OrderType.BUY:
             if sl > 0 and sl >= price:
-                return MT5OrderResult(False, 10016, f"SL ({sl:.5f}) must be below entry ({price:.5f}) for BUY")
+                return MT5OrderResult(
+                    False,
+                    10016,
+                    f"SL ({sl:.5f}) must be below entry ({price:.5f}) for BUY",
+                )
             if tp > 0 and tp <= price:
-                return MT5OrderResult(False, 10016, f"TP ({tp:.5f}) must be above entry ({price:.5f}) for BUY")
+                return MT5OrderResult(
+                    False,
+                    10016,
+                    f"TP ({tp:.5f}) must be above entry ({price:.5f}) for BUY",
+                )
         else:  # SELL
             if sl > 0 and sl <= price:
-                return MT5OrderResult(False, 10016, f"SL ({sl:.5f}) must be above entry ({price:.5f}) for SELL")
+                return MT5OrderResult(
+                    False,
+                    10016,
+                    f"SL ({sl:.5f}) must be above entry ({price:.5f}) for SELL",
+                )
             if tp > 0 and tp >= price:
-                return MT5OrderResult(False, 10016, f"TP ({tp:.5f}) must be below entry ({price:.5f}) for SELL")
-        
+                return MT5OrderResult(
+                    False,
+                    10016,
+                    f"TP ({tp:.5f}) must be below entry ({price:.5f}) for SELL",
+                )
+
         # Create request
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -1338,7 +1814,7 @@ class MT5Connector:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_type,
         }
-        
+
         # Round SL/TP to symbol digits to avoid rejection
         if sl > 0:
             request["sl"] = round(sl, symbol_info.digits)
@@ -1348,16 +1824,18 @@ class MT5Connector:
         preflight = self._preflight_order_request(request)
         if preflight is not None:
             return preflight
-        
+
         # Send order
         result = mt5.order_send(request)
-        
+
         if result is None:
             error = mt5.last_error()
             return MT5OrderResult(False, error[0], str(error[1]), ambiguous=True)
-        
-        retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
-        
+
+        retcode_desc = RETCODE_DESCRIPTIONS.get(
+            result.retcode, f"Unknown ({result.retcode})"
+        )
+
         result_price = float(getattr(result, "price", 0.0) or 0.0)
         if result_price <= 0.0:
             result_price = float(request["price"])
@@ -1369,33 +1847,35 @@ class MT5Connector:
             deal=result.deal,
             order=result.order,
             volume=result.volume,
-            price=result_price
+            price=result_price,
         )
-    
-    def close_position(self,
-                       position: MT5Position,
-                       deviation: int = 30,
-                       magic: int = 0,
-                       comment: str = "") -> MT5OrderResult:
+
+    def close_position(
+        self,
+        position: MT5Position,
+        deviation: int = 30,
+        magic: int = 0,
+        comment: str = "",
+    ) -> MT5OrderResult:
         """
         Close an open position.
-        
+
         Args:
             position: Position to close
             deviation: Maximum price deviation
             magic: Magic number
             comment: Order comment
-            
+
         Returns:
             MT5OrderResult
         """
         if not self._check_connection():
             return MT5OrderResult(False, -1, "Not connected")
-        
+
         tick = self.get_tick(position.symbol)
         if tick is None:
             return MT5OrderResult(False, -1, "No tick data")
-        
+
         # Determine close type and price
         if position.type == 0:  # Long position
             close_type = mt5.ORDER_TYPE_SELL
@@ -1403,10 +1883,10 @@ class MT5Connector:
         else:  # Short position
             close_type = mt5.ORDER_TYPE_BUY
             price = tick.ask
-        
+
         symbol_info = self.get_symbol_info(position.symbol)
         filling_type = self._get_filling_type(position.symbol, symbol_info=symbol_info)
-        
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": position.symbol,
@@ -1424,15 +1904,17 @@ class MT5Connector:
         preflight = self._preflight_order_request(request)
         if preflight is not None:
             return preflight
-        
+
         result = mt5.order_send(request)
-        
+
         if result is None:
             error = mt5.last_error()
             return MT5OrderResult(False, error[0], str(error[1]))
-        
-        retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
-        
+
+        retcode_desc = RETCODE_DESCRIPTIONS.get(
+            result.retcode, f"Unknown ({result.retcode})"
+        )
+
         result_price = float(getattr(result, "price", 0.0) or 0.0)
         if result_price <= 0.0:
             result_price = float(price)
@@ -1444,15 +1926,17 @@ class MT5Connector:
             deal=result.deal,
             order=result.order,
             volume=result.volume,
-            price=result_price
+            price=result_price,
         )
 
-    def close_position_partial(self,
-                               position: MT5Position,
-                               percent: float = 50.0,
-                               deviation: int = 30,
-                               magic: int = 0,
-                               comment: str = "") -> MT5OrderResult:
+    def close_position_partial(
+        self,
+        position: MT5Position,
+        percent: float = 50.0,
+        deviation: int = 30,
+        magic: int = 0,
+        comment: str = "",
+    ) -> MT5OrderResult:
         """Close a percentage of an open position volume."""
         if not self._check_connection():
             return MT5OrderResult(False, -1, "Not connected")
@@ -1463,14 +1947,23 @@ class MT5Connector:
         except (TypeError, ValueError):
             return MT5OrderResult(False, -1, "Invalid partial close volume")
         if pct <= 0.0 or current_volume <= 0.0:
-            return MT5OrderResult(False, -1, "Partial close percent/volume must be positive")
+            return MT5OrderResult(
+                False, -1, "Partial close percent/volume must be positive"
+            )
 
         symbol_info = self.get_symbol_info(position.symbol)
         if symbol_info is None:
-            return MT5OrderResult(False, -1, f"Symbol info not available: {position.symbol}")
+            return MT5OrderResult(
+                False, -1, f"Symbol info not available: {position.symbol}"
+            )
 
         if pct >= 99.999:
-            return self.close_position(position, deviation=deviation, magic=magic, comment=comment or "Partial close full")
+            return self.close_position(
+                position,
+                deviation=deviation,
+                magic=magic,
+                comment=comment or "Partial close full",
+            )
 
         raw_target_volume = current_volume * pct / 100.0
         step = float(symbol_info.volume_step or 0.01)
@@ -1484,10 +1977,16 @@ class MT5Connector:
         target_volume = round(target_volume, precision)
         min_volume = float(symbol_info.volume_min)
         if target_volume < min_volume:
-            return MT5OrderResult(False, -1, "Partial close below broker minimum volume")
+            return MT5OrderResult(
+                False, -1, "Partial close below broker minimum volume"
+            )
         remaining = current_volume - target_volume
         if remaining < min_volume:
-            return MT5OrderResult(False, -1, "Partial close would leave remainder below broker minimum volume")
+            return MT5OrderResult(
+                False,
+                -1,
+                "Partial close would leave remainder below broker minimum volume",
+            )
         if target_volume <= 0.0:
             return MT5OrderResult(False, -1, "Partial close normalized to zero")
 
@@ -1526,7 +2025,9 @@ class MT5Connector:
             error = mt5.last_error()
             return MT5OrderResult(False, error[0], str(error[1]), ambiguous=True)
 
-        retcode_desc = RETCODE_DESCRIPTIONS.get(result.retcode, f"Unknown ({result.retcode})")
+        retcode_desc = RETCODE_DESCRIPTIONS.get(
+            result.retcode, f"Unknown ({result.retcode})"
+        )
         result_price = float(getattr(result, "price", 0.0) or 0.0)
         if result_price <= 0.0:
             result_price = float(price)
@@ -1540,19 +2041,18 @@ class MT5Connector:
             volume=target_volume,
             price=result_price,
         )
-    
-    def modify_position(self,
-                        position: MT5Position,
-                        sl: float = None,
-                        tp: float = None) -> MT5OrderResult:
+
+    def modify_position(
+        self, position: MT5Position, sl: float = None, tp: float = None
+    ) -> MT5OrderResult:
         """
         Modify position SL/TP.
-        
+
         Args:
             position: Position to modify
             sl: New stop loss (None = keep current)
             tp: New take profit (None = keep current)
-            
+
         Returns:
             MT5OrderResult
         """
@@ -1561,15 +2061,21 @@ class MT5Connector:
 
         symbol_info = self.get_symbol_info(position.symbol)
         if symbol_info is None:
-            return MT5OrderResult(False, -1, f"Symbol info not available: {position.symbol}")
+            return MT5OrderResult(
+                False, -1, f"Symbol info not available: {position.symbol}"
+            )
         tick = self.get_tick(position.symbol)
         if tick is None:
             return MT5OrderResult(False, -1, "No tick data")
 
         is_long = position.type == 0
         reference_price = tick.bid if is_long else tick.ask
-        min_stop_distance = float(symbol_info.trade_stops_level or 0) * float(symbol_info.point)
-        freeze_distance = float(symbol_info.trade_freeze_level or 0) * float(symbol_info.point)
+        min_stop_distance = float(symbol_info.trade_stops_level or 0) * float(
+            symbol_info.point
+        )
+        freeze_distance = float(symbol_info.trade_freeze_level or 0) * float(
+            symbol_info.point
+        )
         required_distance = max(min_stop_distance, freeze_distance)
 
         new_sl = round(sl, symbol_info.digits) if sl is not None else position.sl
@@ -1577,19 +2083,33 @@ class MT5Connector:
 
         if new_sl:
             if is_long and new_sl >= reference_price:
-                return MT5OrderResult(False, 10016, "SL must be below current price for BUY")
+                return MT5OrderResult(
+                    False, 10016, "SL must be below current price for BUY"
+                )
             if (not is_long) and new_sl <= reference_price:
-                return MT5OrderResult(False, 10016, "SL must be above current price for SELL")
-            if required_distance > 0 and abs(reference_price - new_sl) < required_distance:
+                return MT5OrderResult(
+                    False, 10016, "SL must be above current price for SELL"
+                )
+            if (
+                required_distance > 0
+                and abs(reference_price - new_sl) < required_distance
+            ):
                 return MT5OrderResult(False, 10016, "SL violates stop/freeze distance")
         if new_tp:
             if is_long and new_tp <= reference_price:
-                return MT5OrderResult(False, 10016, "TP must be above current price for BUY")
+                return MT5OrderResult(
+                    False, 10016, "TP must be above current price for BUY"
+                )
             if (not is_long) and new_tp >= reference_price:
-                return MT5OrderResult(False, 10016, "TP must be below current price for SELL")
-            if required_distance > 0 and abs(reference_price - new_tp) < required_distance:
+                return MT5OrderResult(
+                    False, 10016, "TP must be below current price for SELL"
+                )
+            if (
+                required_distance > 0
+                and abs(reference_price - new_tp) < required_distance
+            ):
                 return MT5OrderResult(False, 10016, "TP violates stop/freeze distance")
-        
+
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "symbol": position.symbol,
@@ -1601,31 +2121,33 @@ class MT5Connector:
         preflight = self._preflight_order_request(request)
         if preflight is not None:
             return preflight
-        
+
         result = mt5.order_send(request)
-        
+
         if result is None:
             error = mt5.last_error()
             return MT5OrderResult(False, error[0], str(error[1]))
-        
+
         return MT5OrderResult(
             success=(result.retcode in [10008, 10009, 10010]),
             retcode=result.retcode,
-            retcode_description=RETCODE_DESCRIPTIONS.get(result.retcode, "Unknown")
+            retcode_description=RETCODE_DESCRIPTIONS.get(result.retcode, "Unknown"),
         )
-    
+
     # =========================================================================
     # Position Management
     # =========================================================================
-    
-    def get_positions(self, symbol: str = None, magic: int = None) -> Optional[List[MT5Position]]:
+
+    def get_positions(
+        self, symbol: str = None, magic: int = None
+    ) -> Optional[List[MT5Position]]:
         """
         Get open positions.
-        
+
         Args:
             symbol: Filter by symbol (optional)
             magic: Filter by magic number (optional)
-            
+
         Returns:
             List of MT5Position, or None if MT5 could not provide a snapshot
         """
@@ -1645,29 +2167,33 @@ class MT5Connector:
         for pos in positions:
             if magic is not None and pos.magic != magic:
                 continue
-            
-            time_update_raw = getattr(pos, 'time_update', None)
-            result.append(MT5Position(
-                ticket=pos.ticket,
-                symbol=pos.symbol,
-                type=pos.type,
-                volume=pos.volume,
-                price_open=pos.price_open,
-                price_current=pos.price_current,
-                sl=pos.sl,
-                tp=pos.tp,
-                swap=pos.swap,
-                profit=pos.profit,
-                magic=pos.magic,
-                comment=pos.comment,
-                time=datetime.fromtimestamp(pos.time),
-                identifier=int(getattr(pos, 'identifier', 0) or 0),
-                reason=int(getattr(pos, 'reason', 0) or 0),
-                time_update=datetime.fromtimestamp(time_update_raw) if time_update_raw else None,
-            ))
-        
+
+            time_update_raw = getattr(pos, "time_update", None)
+            result.append(
+                MT5Position(
+                    ticket=pos.ticket,
+                    symbol=pos.symbol,
+                    type=pos.type,
+                    volume=pos.volume,
+                    price_open=pos.price_open,
+                    price_current=pos.price_current,
+                    sl=pos.sl,
+                    tp=pos.tp,
+                    swap=pos.swap,
+                    profit=pos.profit,
+                    magic=pos.magic,
+                    comment=pos.comment,
+                    time=datetime.fromtimestamp(pos.time),
+                    identifier=int(getattr(pos, "identifier", 0) or 0),
+                    reason=int(getattr(pos, "reason", 0) or 0),
+                    time_update=datetime.fromtimestamp(time_update_raw)
+                    if time_update_raw
+                    else None,
+                )
+            )
+
         return result
-    
+
     def get_position_by_ticket(self, ticket: int) -> Optional[MT5Position]:
         """Get position by ticket number."""
         positions = self.get_positions()
@@ -1678,7 +2204,9 @@ class MT5Connector:
                 return pos
         return None
 
-    def get_position_by_symbol_magic(self, symbol: str, magic: int) -> Optional[MT5Position]:
+    def get_position_by_symbol_magic(
+        self, symbol: str, magic: int
+    ) -> Optional[MT5Position]:
         """Get position by symbol and magic number."""
         positions = self.get_positions(symbol=symbol, magic=magic)
         if positions is None:
@@ -1690,7 +2218,9 @@ class MT5Connector:
         positions = self.get_positions(symbol=symbol, magic=magic)
         return len(positions) if positions is not None else 0
 
-    def get_position_opening_metadata(self, position_identifier: int) -> Optional[Dict[str, Any]]:
+    def get_position_opening_metadata(
+        self, position_identifier: int
+    ) -> Optional[Dict[str, Any]]:
         """
         Retrieve the opening order/deal metadata for a position by its identifier.
 
@@ -1707,20 +2237,20 @@ class MT5Connector:
             # Try deals first — deals carry the final executed metadata
             deals = mt5.history_deals_get(position=position_identifier)
             if deals:
-                entry_type = getattr(mt5, 'DEAL_ENTRY_IN', 0)
+                entry_type = getattr(mt5, "DEAL_ENTRY_IN", 0)
                 for deal in deals:
-                    if getattr(deal, 'entry', None) == entry_type:
+                    if getattr(deal, "entry", None) == entry_type:
                         return {
-                            'comment': getattr(deal, 'comment', '') or '',
-                            'magic': int(getattr(deal, 'magic', 0) or 0),
-                            'reason': int(getattr(deal, 'reason', 0) or 0),
+                            "comment": getattr(deal, "comment", "") or "",
+                            "magic": int(getattr(deal, "magic", 0) or 0),
+                            "reason": int(getattr(deal, "reason", 0) or 0),
                         }
                 # Fallback: first deal if no explicit ENTRY_IN found
                 deal = deals[0]
                 return {
-                    'comment': getattr(deal, 'comment', '') or '',
-                    'magic': int(getattr(deal, 'magic', 0) or 0),
-                    'reason': int(getattr(deal, 'reason', 0) or 0),
+                    "comment": getattr(deal, "comment", "") or "",
+                    "magic": int(getattr(deal, "magic", 0) or 0),
+                    "reason": int(getattr(deal, "reason", 0) or 0),
                 }
         except Exception:
             pass
@@ -1731,16 +2261,18 @@ class MT5Connector:
             if orders:
                 order = orders[0]
                 return {
-                    'comment': getattr(order, 'comment', '') or '',
-                    'magic': int(getattr(order, 'magic', 0) or 0),
-                    'reason': int(getattr(order, 'reason', 0) or 0),
+                    "comment": getattr(order, "comment", "") or "",
+                    "magic": int(getattr(order, "magic", 0) or 0),
+                    "reason": int(getattr(order, "reason", 0) or 0),
                 }
         except Exception:
             pass
 
         return None
 
-    def get_position_history(self, position_identifier: int) -> Optional[Dict[str, Any]]:
+    def get_position_history(
+        self, position_identifier: int
+    ) -> Optional[Dict[str, Any]]:
         """Return complete broker deals/orders for one stable MT5 position id.
 
         This is read-only accounting evidence. ``history_complete`` is true
@@ -1765,45 +2297,53 @@ class MT5Connector:
 
         deals: List[Dict[str, Any]] = []
         for deal in raw_deals:
-            deals.append({
-                "ticket": int(getattr(deal, "ticket", 0) or 0),
-                "order_ticket": int(getattr(deal, "order", 0) or 0),
-                "position_id": int(getattr(deal, "position_id", identifier) or identifier),
-                "symbol": str(getattr(deal, "symbol", "") or ""),
-                "entry": getattr(deal, "entry", None),
-                "type": getattr(deal, "type", None),
-                "volume": float(getattr(deal, "volume", 0.0) or 0.0),
-                "price": float(getattr(deal, "price", 0.0) or 0.0),
-                "profit": float(getattr(deal, "profit", 0.0) or 0.0),
-                "commission": float(getattr(deal, "commission", 0.0) or 0.0),
-                "swap": float(getattr(deal, "swap", 0.0) or 0.0),
-                "fee": float(getattr(deal, "fee", 0.0) or 0.0),
-                "magic": int(getattr(deal, "magic", 0) or 0),
-                "comment": str(getattr(deal, "comment", "") or ""),
-                "reason": getattr(deal, "reason", None),
-                "time_msc": getattr(deal, "time_msc", None),
-                "time": getattr(deal, "time", None),
-            })
+            deals.append(
+                {
+                    "ticket": int(getattr(deal, "ticket", 0) or 0),
+                    "order_ticket": int(getattr(deal, "order", 0) or 0),
+                    "position_id": int(
+                        getattr(deal, "position_id", identifier) or identifier
+                    ),
+                    "symbol": str(getattr(deal, "symbol", "") or ""),
+                    "entry": getattr(deal, "entry", None),
+                    "type": getattr(deal, "type", None),
+                    "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+                    "price": float(getattr(deal, "price", 0.0) or 0.0),
+                    "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+                    "commission": float(getattr(deal, "commission", 0.0) or 0.0),
+                    "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+                    "fee": float(getattr(deal, "fee", 0.0) or 0.0),
+                    "magic": int(getattr(deal, "magic", 0) or 0),
+                    "comment": str(getattr(deal, "comment", "") or ""),
+                    "reason": getattr(deal, "reason", None),
+                    "time_msc": getattr(deal, "time_msc", None),
+                    "time": getattr(deal, "time", None),
+                }
+            )
 
         orders: List[Dict[str, Any]] = []
         for order in raw_orders:
-            orders.append({
-                "ticket": int(getattr(order, "ticket", 0) or 0),
-                "position_id": int(
-                    getattr(order, "position_id", 0)
-                    or getattr(order, "position_by_id", 0)
-                    or identifier
-                ),
-                "time_setup_msc": getattr(order, "time_setup_msc", None),
-                "time_setup": getattr(order, "time_setup", None),
-                "price_open": float(getattr(order, "price_open", 0.0) or 0.0),
-                "volume_initial": float(getattr(order, "volume_initial", 0.0) or 0.0),
-                "initial_stop": float(getattr(order, "sl", 0.0) or 0.0),
-                "initial_take_profit": float(getattr(order, "tp", 0.0) or 0.0),
-                "magic": int(getattr(order, "magic", 0) or 0),
-                "comment": str(getattr(order, "comment", "") or ""),
-                "type": getattr(order, "type", None),
-            })
+            orders.append(
+                {
+                    "ticket": int(getattr(order, "ticket", 0) or 0),
+                    "position_id": int(
+                        getattr(order, "position_id", 0)
+                        or getattr(order, "position_by_id", 0)
+                        or identifier
+                    ),
+                    "time_setup_msc": getattr(order, "time_setup_msc", None),
+                    "time_setup": getattr(order, "time_setup", None),
+                    "price_open": float(getattr(order, "price_open", 0.0) or 0.0),
+                    "volume_initial": float(
+                        getattr(order, "volume_initial", 0.0) or 0.0
+                    ),
+                    "initial_stop": float(getattr(order, "sl", 0.0) or 0.0),
+                    "initial_take_profit": float(getattr(order, "tp", 0.0) or 0.0),
+                    "magic": int(getattr(order, "magic", 0) or 0),
+                    "comment": str(getattr(order, "comment", "") or ""),
+                    "type": getattr(order, "type", None),
+                }
+            )
         return {
             "history_complete": True,
             "position_id": identifier,
@@ -1811,7 +2351,9 @@ class MT5Connector:
             "orders": orders,
         }
 
-    def get_recent_closing_deals(self, lookback_hours: int = 48) -> Optional[List[Dict[str, Any]]]:
+    def get_recent_closing_deals(
+        self, lookback_hours: int = 48
+    ) -> Optional[List[Dict[str, Any]]]:
         """Fetch recent closing deals with full accounting fields.
 
         ``None`` means broker history could not be obtained; an empty list means
@@ -1835,56 +2377,60 @@ class MT5Connector:
 
         result: List[Dict[str, Any]] = []
         exit_entries = {
-            getattr(mt5, 'DEAL_ENTRY_OUT', 1),
-            getattr(mt5, 'DEAL_ENTRY_OUT_BY', 3),
+            getattr(mt5, "DEAL_ENTRY_OUT", 1),
+            getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
         }
         for deal in deals:
-            entry_type = getattr(deal, 'entry', None)
+            entry_type = getattr(deal, "entry", None)
             if entry_type is not None and entry_type not in exit_entries:
                 continue
-            deal_time = getattr(deal, 'time', None)
-            result.append({
-                'ticket': int(getattr(deal, 'ticket', 0) or 0),
-                'order_ticket': int(getattr(deal, 'order', 0) or 0),
-                'position_id': int(getattr(deal, 'position_id', 0) or 0),
-                'symbol': getattr(deal, 'symbol', ''),
-                'profit': float(getattr(deal, 'profit', 0.0) or 0.0),
-                'commission': float(getattr(deal, 'commission', 0.0) or 0.0),
-                'swap': float(getattr(deal, 'swap', 0.0) or 0.0),
-                'fee': float(getattr(deal, 'fee', 0.0) or 0.0),
-                'volume': float(getattr(deal, 'volume', 0.0) or 0.0),
-                'price': float(getattr(deal, 'price', 0.0) or 0.0),
-                'entry': entry_type,
-                'entry_kind': (
-                    'OUT_BY'
-                    if entry_type == getattr(mt5, 'DEAL_ENTRY_OUT_BY', 3)
-                    else 'OUT'
-                ),
-                'type': getattr(deal, 'type', None),
-                'comment': getattr(deal, 'comment', '') or '',
-                'magic': int(getattr(deal, 'magic', 0) or 0),
-                'reason': getattr(deal, 'reason', None),
-                'time_msc': getattr(deal, 'time_msc', None),
-                'time': datetime.fromtimestamp(deal_time, tz=timezone.utc) if deal_time else to_time,
-            })
+            deal_time = getattr(deal, "time", None)
+            result.append(
+                {
+                    "ticket": int(getattr(deal, "ticket", 0) or 0),
+                    "order_ticket": int(getattr(deal, "order", 0) or 0),
+                    "position_id": int(getattr(deal, "position_id", 0) or 0),
+                    "symbol": getattr(deal, "symbol", ""),
+                    "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+                    "commission": float(getattr(deal, "commission", 0.0) or 0.0),
+                    "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+                    "fee": float(getattr(deal, "fee", 0.0) or 0.0),
+                    "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+                    "price": float(getattr(deal, "price", 0.0) or 0.0),
+                    "entry": entry_type,
+                    "entry_kind": (
+                        "OUT_BY"
+                        if entry_type == getattr(mt5, "DEAL_ENTRY_OUT_BY", 3)
+                        else "OUT"
+                    ),
+                    "type": getattr(deal, "type", None),
+                    "comment": getattr(deal, "comment", "") or "",
+                    "magic": int(getattr(deal, "magic", 0) or 0),
+                    "reason": getattr(deal, "reason", None),
+                    "time_msc": getattr(deal, "time_msc", None),
+                    "time": datetime.fromtimestamp(deal_time, tz=timezone.utc)
+                    if deal_time
+                    else to_time,
+                }
+            )
         return result
-    
+
     # =========================================================================
     # Helper Methods
     # =========================================================================
-    
+
     def _check_connection(self) -> bool:
         """Check and log connection status."""
         if not MT5_AVAILABLE:
             logger.error("MetaTrader5 package not installed")
             return False
-        
+
         if not self._connected:
             logger.error("Not connected to MT5")
             return False
-        
+
         return True
-    
+
     def _normalize_volume(
         self,
         volume: float,
@@ -1955,8 +2501,7 @@ class MT5Connector:
         if "." not in text:
             return 0
         return min(8, len(text.rsplit(".", 1)[1]))
-    
-    
+
     def normalize_volume(
         self,
         volume: float,
@@ -1965,28 +2510,45 @@ class MT5Connector:
         """Public wrapper for risk-safe volume normalization."""
         return self._normalize_volume(volume, symbol_info)
 
-    def order_calc_profit(self, order_type: int, symbol: str, volume: float,
-                          price_open: float, price_close: float) -> Optional[float]:
+    def order_calc_profit(
+        self,
+        order_type: int,
+        symbol: str,
+        volume: float,
+        price_open: float,
+        price_close: float,
+    ) -> Optional[float]:
         """Wrapper around MT5 order_calc_profit (returns profit in deposit currency)."""
         if not MT5_AVAILABLE:
             return None
         try:
             resolved_symbol = self._resolve_symbol(symbol) or symbol
-            return mt5.order_calc_profit(order_type, resolved_symbol, volume, price_open, price_close)
+            return mt5.order_calc_profit(
+                order_type, resolved_symbol, volume, price_open, price_close
+            )
         except Exception as e:
             logger.debug(f"order_calc_profit failed for {symbol}: {e}")
             return None
 
-    def calc_loss_amount(self, order_type: int, symbol: str, volume: float,
-                         entry_price: float, stop_price: float) -> Optional[float]:
+    def calc_loss_amount(
+        self,
+        order_type: int,
+        symbol: str,
+        volume: float,
+        entry_price: float,
+        stop_price: float,
+    ) -> Optional[float]:
         """Compute absolute loss at stop (deposit currency) using MT5 contract math."""
-        profit = self.order_calc_profit(order_type, symbol, volume, entry_price, stop_price)
+        profit = self.order_calc_profit(
+            order_type, symbol, volume, entry_price, stop_price
+        )
         if profit is None:
             return None
         return abs(float(profit))
 
-    def calc_margin_required(self, order_type: int, symbol: str, volume: float,
-                             price: float) -> Optional[float]:
+    def calc_margin_required(
+        self, order_type: int, symbol: str, volume: float, price: float
+    ) -> Optional[float]:
         """Estimate required margin for a proposed market order."""
         if not MT5_AVAILABLE or not hasattr(mt5, "order_calc_margin"):
             return None
@@ -1996,7 +2558,9 @@ class MT5Connector:
                 mt5_type = mt5.ORDER_TYPE_BUY
             else:
                 mt5_type = mt5.ORDER_TYPE_SELL
-            margin = mt5.order_calc_margin(mt5_type, resolved_symbol, float(volume), float(price))
+            margin = mt5.order_calc_margin(
+                mt5_type, resolved_symbol, float(volume), float(price)
+            )
         except Exception as e:
             logger.debug(f"order_calc_margin failed for {symbol}: {e}")
             return None
@@ -2007,7 +2571,9 @@ class MT5Connector:
         except (TypeError, ValueError):
             return None
 
-    def _preflight_order_request(self, request: Dict[str, Any]) -> Optional[MT5OrderResult]:
+    def _preflight_order_request(
+        self, request: Dict[str, Any]
+    ) -> Optional[MT5OrderResult]:
         """Validate an MT5 trade request with order_check when available."""
         if not MT5_AVAILABLE or not hasattr(mt5, "order_check"):
             return None
@@ -2021,13 +2587,14 @@ class MT5Connector:
         retcode = int(getattr(result, "retcode", 0) or 0)
         if retcode == 0:
             return None
-        description = (
-            getattr(result, "comment", "")
-            or RETCODE_DESCRIPTIONS.get(retcode, f"Order check failed ({retcode})")
+        description = getattr(result, "comment", "") or RETCODE_DESCRIPTIONS.get(
+            retcode, f"Order check failed ({retcode})"
         )
         return MT5OrderResult(False, retcode, str(description))
 
-    def _get_filling_type(self, symbol: str, symbol_info: Optional[MT5SymbolInfo] = None) -> int:
+    def _get_filling_type(
+        self, symbol: str, symbol_info: Optional[MT5SymbolInfo] = None
+    ) -> int:
         """Get appropriate filling type for symbol."""
         if not MT5_AVAILABLE:
             return 0
@@ -2053,7 +2620,11 @@ class MT5Connector:
                 return mt5.ORDER_FILLING_RETURN
             return mt5.ORDER_FILLING_FOK
 
-        policy = str(getattr(self.config, "preferred_filling_type", "broker") or "broker").strip().lower()
+        policy = (
+            str(getattr(self.config, "preferred_filling_type", "broker") or "broker")
+            .strip()
+            .lower()
+        )
         if policy in {"fok", "ioc", "return"}:
             override_map = {
                 "fok": mt5.ORDER_FILLING_FOK,
@@ -2061,7 +2632,10 @@ class MT5Connector:
                 "return": mt5.ORDER_FILLING_RETURN,
             }
             requested = override_map[policy]
-            if requested == mt5.ORDER_FILLING_RETURN and trade_exemode == market_execution:
+            if (
+                requested == mt5.ORDER_FILLING_RETURN
+                and trade_exemode == market_execution
+            ):
                 logger.warning(
                     f"{symbol}: ORDER_FILLING_RETURN requested but forbidden for market execution; "
                     "falling back to broker-supported mode"
@@ -2075,71 +2649,73 @@ class MT5Connector:
         """Alias for get_tick (used by pm_main.py)."""
         return self.get_tick(symbol)
 
-    def save_broker_specs_to_json(self, symbols: List[str], filepath: str = "broker_specs.json") -> bool:
+    def save_broker_specs_to_json(
+        self, symbols: List[str], filepath: str = "broker_specs.json"
+    ) -> bool:
         """
         Save MT5 symbol specifications to JSON file for offline backtesting.
-        
+
         This creates a broker_specs.json that can be used by the backtester
         to achieve parity with live trading sizing and P&L calculation.
-        
+
         Args:
             symbols: List of symbols to save specs for
             filepath: Output file path
-            
+
         Returns:
             True if successful
         """
         import json
-        
+
         if not self._check_connection():
             return False
-        
+
         specs = {}
         for symbol in symbols:
             broker_symbol = self.find_broker_symbol(symbol)
             if broker_symbol is None:
                 logger.warning(f"Symbol not found: {symbol}")
                 continue
-            
+
             info = self.get_symbol_info(broker_symbol)
             if info is None:
                 continue
-            
+
             # Store all relevant MT5 fields
             specs[symbol] = {
-                'symbol': symbol,
-                'broker_symbol': broker_symbol,
-                'asset_class': info.asset_class,
-                'path': info.path,
-                'digits': info.digits,
-                'point': info.point,
-                'tick_size': info.trade_tick_size,
-                'tick_value': info.trade_tick_value,
-                'contract_size': info.trade_contract_size,
-                'volume_min': info.volume_min,
-                'volume_max': info.volume_max,
-                'volume_step': info.volume_step,
-                'spread': info.spread,
-                'spread_float': info.spread_float,
-                'swap_long': info.swap_long,
-                'swap_short': info.swap_short,
-                'swap_mode': info.swap_mode,
-                'swap_rollover3days': info.swap_rollover3days,
-                'swap_sunday': info.swap_sunday,
-                'swap_monday': info.swap_monday,
-                'swap_tuesday': info.swap_tuesday,
-                'swap_wednesday': info.swap_wednesday,
-                'swap_thursday': info.swap_thursday,
-                'swap_friday': info.swap_friday,
-                'swap_saturday': info.swap_saturday,
-                'swap_terms_provenance_status': info.swap_terms_provenance_status,
-                'stops_level': info.trade_stops_level,
-                'pip_size': info.pip_size,
-                'pip_value': info.pip_value,
+                "symbol": symbol,
+                "broker_symbol": broker_symbol,
+                "asset_class": info.asset_class,
+                "path": info.path,
+                "digits": info.digits,
+                "point": info.point,
+                "tick_size": info.trade_tick_size,
+                "tick_value": info.trade_tick_value,
+                "contract_size": info.trade_contract_size,
+                "volume_min": info.volume_min,
+                "volume_max": info.volume_max,
+                "volume_step": info.volume_step,
+                "spread": info.spread,
+                "spread_float": info.spread_float,
+                "swap_long": info.swap_long,
+                "swap_short": info.swap_short,
+                "swap_mode": info.swap_mode,
+                "swap_rollover3days": info.swap_rollover3days,
+                "swap_sunday": info.swap_sunday,
+                "swap_monday": info.swap_monday,
+                "swap_tuesday": info.swap_tuesday,
+                "swap_wednesday": info.swap_wednesday,
+                "swap_thursday": info.swap_thursday,
+                "swap_friday": info.swap_friday,
+                "swap_saturday": info.swap_saturday,
+                "swap_terms_provenance_status": info.swap_terms_provenance_status,
+                "stops_level": info.trade_stops_level,
+                "pip_size": info.pip_size,
+                "pip_value": info.pip_value,
             }
-        
+
         try:
-            with open(filepath, 'w') as f:
+            with open(filepath, "w") as f:
                 json.dump(specs, f, indent=2)
             logger.info(f"Saved broker specs for {len(specs)} symbols to {filepath}")
             return True
@@ -2152,17 +2728,18 @@ class MT5Connector:
 # CONTEXT MANAGER
 # =============================================================================
 
+
 class MT5Connection:
     """Context manager for MT5 connection."""
-    
+
     def __init__(self, config: MT5Config = None):
         self.connector = MT5Connector(config)
-    
+
     def __enter__(self) -> MT5Connector:
         if not self.connector.connect():
             raise ConnectionError("Failed to connect to MT5")
         return self.connector
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.connector.disconnect()
 
@@ -2172,39 +2749,39 @@ class MT5Connection:
 # =============================================================================
 
 __all__ = [
-    'MT5_AVAILABLE',
-    'MT5Config',
-    'MT5SymbolInfo',
-    'MT5AccountInfo',
-    'MT5Tick',
-    'MT5Position',
-    'MT5OrderResult',
-    'OrderType',
-    'FillingType',
-    'MT5Connector',
-    'MT5Connection',
-    'RETCODE_DESCRIPTIONS',
+    "MT5_AVAILABLE",
+    "MT5Config",
+    "MT5SymbolInfo",
+    "MT5AccountInfo",
+    "MT5Tick",
+    "MT5Position",
+    "MT5OrderResult",
+    "OrderType",
+    "FillingType",
+    "MT5Connector",
+    "MT5Connection",
+    "RETCODE_DESCRIPTIONS",
 ]
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    
+
     print(f"MT5 Available: {MT5_AVAILABLE}")
-    
+
     if MT5_AVAILABLE:
         connector = MT5Connector()
         if connector.connect():
             print("Connected to MT5")
-            
+
             account = connector.get_account_info()
             if account:
                 print(f"Account: {account.login}")
                 print(f"Balance: {account.balance} {account.currency}")
                 print(f"Equity: {account.equity} {account.currency}")
-            
+
             connector.disconnect()
     else:
         print("Install MetaTrader5 package: pip install MetaTrader5")
-    
+
     print("\npm_mt5.py loaded successfully!")

@@ -54,6 +54,46 @@ def test_overlap_component_count_keeps_disjoint_intervals_independent():
     assert overlap_component_count(intervals) == 10
 
 
+def test_touching_half_open_intervals_do_not_collapse_information():
+    base = pd.Timestamp("2024-01-01", tz="UTC")
+    intervals = [
+        (base + pd.Timedelta(days=index), base + pd.Timedelta(days=index + 1))
+        for index in range(100)
+    ]
+
+    assert overlap_component_count(intervals) == 100
+
+
+def test_same_timestamp_event_order_controls_overlap_exactly():
+    moment = pd.Timestamp("2024-01-01", tz="UTC")
+    sequential = [
+        {
+            "start": moment,
+            "end": moment,
+            "start_event_order": 0,
+            "end_event_order": 1,
+        },
+        {
+            "start": moment,
+            "end": moment,
+            "start_event_order": 1,
+            "end_event_order": 2,
+        },
+    ]
+    overlapping = [
+        sequential[0],
+        {
+            "start": moment,
+            "end": moment,
+            "start_event_order": 0,
+            "end_event_order": 2,
+        },
+    ]
+
+    assert overlap_component_count(sequential) == 2
+    assert overlap_component_count(overlapping) == 1
+
+
 def test_effective_count_never_exceeds_raw_count():
     evidence = effective_sample_evidence(_ar1(500, -0.75))
 

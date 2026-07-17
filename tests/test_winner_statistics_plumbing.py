@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from unittest.mock import patch
 
 import numpy as np
@@ -52,6 +53,9 @@ class _EquityBacktester:
         total_return = (equity[-1] / self.initial_capital - 1.0) * 100.0
         trades = [
             {
+                "position_id": f"mock-position-{index:04d}",
+                "entry_event_order": index * 2,
+                "exit_event_order": index * 2 + 1,
                 "signal_bar": max(0, index * 5 - 1),
                 "entry_bar": index * 5,
                 "exit_bar": min(len(features) - 1, index * 5 + 2),
@@ -115,7 +119,12 @@ class _EquityBacktester:
                 "target_bars_sha256": "5" * 64,
                 "target_sidecar_sha256": "6" * 64,
                 "projection_contract": "fxpm-swap-preopen-close-projection-v1",
-                "projection_sha256": "7" * 64,
+                "projection_sha256": hashlib.sha256(
+                    (
+                        f"{features.index[0].isoformat()}|"
+                        f"{features.index[-1].isoformat()}"
+                    ).encode("utf-8")
+                ).hexdigest(),
             },
         }
 
@@ -125,6 +134,9 @@ class _OpenAcrossDaysBacktester(_EquityBacktester):
         result = super().run(features, signals, symbol, strategy, **kwargs)
         result["total_trades"] = 1
         result["trades"] = [{
+            "position_id": "mock-open-across-days",
+            "entry_event_order": 0,
+            "exit_event_order": 1,
             "signal_bar": 0,
             "entry_bar": 1,
             "exit_bar": len(features) - 1,
@@ -151,8 +163,8 @@ class _FrozenOptuna:
         return {"TREND": copy.deepcopy(self.candidate)}
 
 
-def _features(periods: int) -> pd.DataFrame:
-    opens = pd.date_range("2020-01-01", periods=periods, freq="D", tz="UTC")
+def _features(periods: int, *, start: str = "2020-01-01") -> pd.DataFrame:
+    opens = pd.date_range(start, periods=periods, freq="D", tz="UTC")
     closes = opens + pd.Timedelta(days=1)
     return pd.DataFrame(
         {
@@ -310,6 +322,7 @@ def test_optuna_frozen_candidate_raw_equity_is_plumbed_before_compaction():
 def test_real_optuna_tpe_candidate_reaches_regime_optimizer_daily_mtm():
     strategy_name = "WinnerStatisticsRealOptunaStrategy"
     features = _features(320)
+    validation_features = _features(320, start="2022-01-01")
     base_returns = np.random.default_rng(7701).normal(0.002, 0.001, size=320)
     base_returns[0] = 0.0
 
@@ -340,7 +353,7 @@ def test_real_optuna_tpe_candidate_reaches_regime_optimizer_daily_mtm():
             strategy_name,
             {"variant": [1, 2]},
             features,
-            features,
+            validation_features,
             regimes=["TREND"],
         )
 
@@ -552,13 +565,21 @@ def test_true_exact_regime_runs_supply_default_hard_gates_and_ignore_export_togg
 
         assert validated, reason
         false_discovery = winner.validation_evidence["false_discovery"]
-        assert false_discovery["dsr_evidence"]["status"] == "PASS"
+        assert false_discovery["dsr_evidence"]["status"] == "DIAGNOSTIC_ONLY"
+        assert false_discovery["dsr_evidence"]["diagnostic_threshold_passed"] is True
         assert false_discovery["pbo_status"] == "pass"
         assert false_discovery["bootstrap_evidence"]["status"] == "PASS"
         assert false_discovery["validation_frozen_candidates"] == 5
         assert 1.0 <= false_discovery["effective_trials"] <= 5.0
         assert false_discovery["daily_net_mtm_observations"] == 320
         assert false_discovery["pbo_candidate_included"] is True
+        selected = next(
+            candidate
+            for candidate in candidates
+            if candidate["strategy_name"] == winner.strategy_name
+            and candidate["params"] == winner.parameters
+        )
+        assert winner.validation_evidence["candidate_id"] == selected["candidate_id"]
         outcomes.append(
             (
                 winner.strategy_name,
@@ -568,6 +589,29 @@ def test_true_exact_regime_runs_supply_default_hard_gates_and_ignore_export_togg
             )
         )
     assert outcomes[0] == outcomes[1]
+
+
+def test_validation_evidence_rejects_conflicting_optional_oos_candidate_id():
+    optimizer = _optimizer()
+    _features_frame, candidates = _candidate_pool(optimizer)
+    candidate = candidates[0]
+    candidate["candidate_id"] = optimizer._exact_cell_candidate_id(
+        "EURUSD",
+        "D1",
+        "TREND",
+        candidate,
+    )
+    candidate["oos_evidence"] = {"candidate_id": "f" * 64}
+
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "OOS evidence candidate_id does not match",
+    ):
+        optimizer._build_validation_evidence(
+            candidate["train_regime_metrics"]["TREND"],
+            candidate["val_regime_metrics"]["TREND"],
+            candidate=candidate,
+        )
 
 
 def test_train_eligible_validation_loser_remains_in_dsr_and_pbo_population():

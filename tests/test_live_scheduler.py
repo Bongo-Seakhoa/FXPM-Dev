@@ -185,10 +185,12 @@ class LiveSchedulerTests(unittest.TestCase):
         trader._run_margin_protection_cycle.assert_called_once()
         trader._run_order_governance_cycle.assert_called_once()
         trader._process_symbol.assert_not_called()
-        trader.mt5.get_recent_closing_deals.assert_not_called()
-        trader._sync_drift_monitor.assert_not_called()
-        trader._evaluate_daily_loss_advisory.assert_not_called()
-        trader._run_portfolio_observatory.assert_not_called()
+        trader.mt5.get_recent_closing_deals.assert_called_once_with(
+            lookback_hours=24 * 8
+        )
+        trader._sync_drift_monitor.assert_called_once()
+        trader._evaluate_daily_loss_advisory.assert_called_once()
+        trader._run_portfolio_observatory.assert_called_once()
         trader.storage_manager.on_sweep_complete.assert_not_called()
 
 

@@ -21,10 +21,12 @@ import logging
 import math
 import os
 import shutil
+import stat
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Iterable, Mapping, Sequence
+from typing import Dict, List, Any, Optional, Set, Tuple, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 
 import pandas as pd
@@ -64,6 +66,9 @@ from pm_strategies import (
 from pm_position import PositionConfig, PositionManager
 from pm_regime import (
     load_regime_params,
+    detector_code_sha256,
+    load_regime_params_cell,
+    recompute_train_regime_support_digest,
     materialize_regime_params_from_symbol_config,
     regime_params_provenance_path,
     validate_regime_params_provenance,
@@ -85,16 +90,38 @@ from pm_statistics import (
     deflated_sharpe_evidence,
 )
 from pm_model_lifecycle import (
+    CURRENT_PROCESS_BOOK_RECEIPT_TYPE,
     EDGE_CHALLENGER_ROLE,
     build_edge_challenger_lineage,
     build_empty_edge_challenger_book,
     build_lockbox_champion_lineage,
     build_prelockbox_champion_lineage,
+    canonical_receipt_sha256,
+    compute_current_refit_cell_id,
+    compute_current_winner_roster_sha256,
+    open_typed_receipt,
     temporal_role_block_reason,
 )
+from pm_current_refit_execution import (
+    CURRENT_REGIME_PARAMS_BUNDLE_VERSION,
+    RAW_CURRENT_REFIT_EXECUTOR_VERSION,
+    RAW_CURRENT_REFIT_REPLAY_REQUEST_VERSION,
+    RAW_CURRENT_REFIT_REPLAY_RESULT_VERSION,
+    validate_current_regime_params_bundle,
+)
+from pm_current_refit_parameters import (
+    CurrentRefitParameterCodecError,
+    canonical_parameter_bytes,
+    canonicalize_parameter_mapping,
+    decode_parameter_mapping,
+    parameter_values_equal,
+)
+from pm_book_multiplicity import BOOK_MULTIPLICITY_CONTRACT_VERSION
 from pm_two_phase_lockbox import FROZEN_PRELOCKBOX_STATUS
 from pm_native_activation import (
+    NATIVE_EVIDENCE_CANDIDATE,
     NATIVE_PRODUCTION_TIMEFRAMES,
+    NATIVE_SOURCE_UNAVAILABLE,
     resolve_active_native_universe,
     validate_native_cell_exclusion_no_trade,
     validate_native_exclusion_no_trade_grid,
@@ -121,10 +148,13 @@ from pm_trade_power import (
     TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION,
     TRADE_POWER_SCHEMA_VERSION,
     TRADE_POWER_DECISION_SCHEMA_VERSION,
+    TRADE_POWER_PARTITION_VERSION,
     TRADE_SAMPLE_SCHEMA_VERSION,
     TradePowerDecision,
     TradePowerPolicy,
     TradePowerRequirement,
+    build_trade_power_multiplicity_receipt,
+    build_trade_power_partition_contract,
     calibrate_train_trade_power,
     derive_trade_power_requirement,
     evaluate_trade_power_partition,
@@ -165,6 +195,14 @@ except ImportError:
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+
+def _optimization_ledger_lock_path(filepath: Any) -> Path:
+    ledger_path = Path(filepath)
+    if not ledger_path.is_absolute():
+        ledger_path = Path.cwd() / ledger_path
+    ledger_path = ledger_path.resolve()
+    return ledger_path.with_name(f".{ledger_path.name}.generation.lock")
 PIPELINE_ARTIFACT_VERSION = "2026-07-13-trade-power-derived-binding-deployment-v7"
 
 # Runtime-only optimizer resource contract.  These values control scheduling
@@ -172,6 +210,1284 @@ PIPELINE_ARTIFACT_VERSION = "2026-07-13-trade-power-derived-binding-deployment-v
 # or promotion decisions and are intentionally absent from PipelineConfig.
 OPTIMIZER_RECEIPT_SCHEMA = "fxpm.optimizer-symbol-receipt.v1"
 OPTIMIZER_RECEIPT_POINTER_SCHEMA = "fxpm.optimizer-symbol-receipt-pointer.v1"
+OPTIMIZER_DATA_STATE_RECEIPT_SCHEMA = "fxpm.optimizer-symbol-data-state.v1"
+
+CURRENT_REFIT_RAW_EXECUTOR_VERSION = RAW_CURRENT_REFIT_EXECUTOR_VERSION
+CURRENT_REFIT_SOURCE_SNAPSHOT_VERSION = "fxpm.current-refit-source-snapshot.v1"
+CURRENT_REFIT_SOURCE_BUNDLE_VERSION = "fxpm.current-refit-source-bundle.v1"
+CURRENT_REFIT_BAR_FILE_VERSION = "fxpm.current-refit-bars.csv.v1"
+CURRENT_REFIT_PROCESS_VERSION = "fxpm.current-refit-winner-process.v1"
+CURRENT_REFIT_HORIZON_VERSION = "fxpm.current-refit-horizon-process.v2"
+CURRENT_REFIT_HORIZON_BUNDLE_VERSION = "fxpm.current-refit-horizon-bundle.v1"
+CURRENT_REFIT_TRIAL_VERSION = "fxpm.current-refit-trial-definition.v1"
+CURRENT_REFIT_RECIPE_VERSION = "fxpm.current-refit-recipe.v1"
+CURRENT_REFIT_BOOK_ENTRY_VERSION = "fxpm.book-multiplicity-cell.v9"
+CURRENT_REFIT_PARAMETER_VERSION = "fxpm.current-refit-parameters.v1"
+CURRENT_REFIT_SPECIALIST_VERSION = "fxpm.current-refit-specialist.v1"
+CURRENT_REFIT_CELL_TRACE_VERSION = "fxpm.current-refit-cell-trace.v1"
+CURRENT_REFIT_OUTPUT_BOOK_VERSION = "fxpm.current-refit-output-book.v1"
+CURRENT_REFIT_EXECUTION_TRACE_VERSION = "fxpm.current-refit-execution-trace.v1"
+CURRENT_PROCESS_BOOK_ARTIFACT_VERSION = "fxpm.current-process-book-receipt.v1"
+
+_CURRENT_REFIT_MAX_JSON_BYTES = 16 * 1024 * 1024
+_CURRENT_REFIT_MAX_BAR_ROWS = 10_000_000
+_CURRENT_REFIT_BAR_COLUMNS = (
+    "timestamp_utc",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+)
+_CURRENT_REFIT_DESCRIPTOR_FIELDS = {
+    "artifact_id",
+    "relative_path",
+    "size_bytes",
+    "content_sha256",
+    "format_version",
+}
+_CURRENT_REFIT_REQUEST_FIELDS = {
+    "current_refit_cell_id",
+    "symbol",
+    "timeframe",
+    "regime",
+    "strategy_id",
+    "fit_start_utc",
+    "fit_end_utc",
+    "latest_closed_bar_utc",
+    "artifact_ids",
+}
+_CURRENT_REFIT_CELL_ARTIFACT_ROLES = {
+    "source_snapshot",
+    "winner_process",
+    "horizon_process",
+    "trial_definition",
+    "refit_recipe",
+    "winner_book_entry",
+}
+_CURRENT_REFIT_BUNDLE_ROLES = {
+    "accepted_book_generation",
+    "source_snapshot_bundle",
+    "regime_params_bundle",
+    "horizon_decisions_bundle",
+}
+_CURRENT_REFIT_RESULT_CELL_FIELDS = {
+    "current_refit_cell_id",
+    "parameter_sha256",
+    "output_artifact_sha256",
+    "execution_trace_sha256",
+    "source_snapshot_sha256",
+    "winner_horizon_process_sha256",
+    "winner_trial_definition_sha256",
+    "winner_refit_recipe_sha256",
+    "regime_fit_receipt_sha256",
+    "regime_detector_record_sha256",
+    "regime_detector_parameters_sha256",
+    "regime_detector_code_sha256",
+    "fit_start_utc",
+    "fit_end_utc",
+    "latest_closed_bar_utc",
+}
+_CURRENT_REFIT_SOURCE_FIELDS = {
+    "schema_version",
+    "symbol",
+    "timeframe",
+    "fit_start_utc",
+    "fit_end_utc",
+    "latest_closed_bar_utc",
+    "first_bar_utc",
+    "last_bar_utc",
+    "bar_count",
+    "bars_artifact_id",
+    "bars_content_sha256",
+    "activation_id",
+    "activation_manifest_sha256",
+    "native_source_sha256",
+    "source_contract_sha256",
+    "continuity_receipt_sha256",
+    "columns",
+    "timestamp_encoding",
+}
+_CURRENT_REFIT_PROCESS_FIELDS = {
+    "schema_version",
+    "process_candidate_id",
+    "strategy_id",
+    "strategy_family",
+    "strategy_module",
+    "strategy_class",
+    "strategy_code_sha256",
+    "entry_rule_identity_sha256",
+    "exit_rule_identity_sha256",
+    "regime_conditioning",
+}
+_CURRENT_REFIT_HORIZON_FIELDS = {
+    "schema_version",
+    "symbol",
+    "timeframe",
+    "lookback_kind",
+    "lookback_value",
+    "source_bar_count",
+    "fit_start_utc",
+    "fit_end_utc",
+    "latest_closed_bar_utc",
+    "source_snapshot_sha256",
+}
+_CURRENT_REFIT_TRIAL_FIELDS = {
+    "schema_version",
+    "strategy_id",
+    "strategy_family",
+    "process_sha256",
+    "horizon_process_sha256",
+    "feature_contract_sha256",
+    "indicator_contract_sha256",
+    "parameter_count",
+    "parameters",
+}
+_CURRENT_REFIT_RECIPE_FIELDS = {
+    "schema_version",
+    "strategy_id",
+    "winner_process_sha256",
+    "winner_horizon_process_sha256",
+    "winner_trial_definition_sha256",
+    "refit_mode",
+    "parameter_source",
+    "source_validation",
+    "fit_window_rule",
+    "deterministic_fit_procedure_id",
+    "seed",
+    "version_pins",
+    "data_requirements",
+    "attempts",
+    "post_selection_search",
+    "output_schema_version",
+}
+_CURRENT_REFIT_BOOK_ENTRY_FIELDS = {
+    "ordinal",
+    "cell_id",
+    "symbol",
+    "timeframe",
+    "regime",
+    "source_group_id",
+    "source_group_decision_sha256",
+    "regime_receipt_sha256",
+    "regime_detector_record_sha256",
+    "train_regime_support_receipt_sha256",
+    "historical_state",
+    "state_reason",
+    "historical_outcome_receipt_sha256",
+    "winner_request_sha256",
+    "winner_attempt_ledger_payload_sha256",
+    "winner_decision_sha256",
+    "winner_evidence_ledger_payload_sha256",
+    "local_process_candidate_id",
+    "local_process_sha256",
+    "process_state_payload",
+    "process_state_receipt_sha256",
+    "within_cell_attempted_trials_exact",
+    "effective_trials",
+    "marginal_p_value",
+    "adjusted_q_value",
+    "by_qualified",
+    "historical_local_candidate_pending_causal",
+    "historical_book_entry_sha256",
+}
+_CURRENT_REFIT_SOURCE_BUNDLE_FIELDS = {
+    "schema_version",
+    "current_cutoff_utc",
+    "entries",
+}
+_CURRENT_REFIT_SOURCE_BUNDLE_ENTRY_FIELDS = {
+    "symbol",
+    "timeframe",
+    "source_snapshot_sha256",
+}
+_CURRENT_REFIT_HORIZON_BUNDLE_FIELDS = {
+    "schema_version",
+    "current_cutoff_utc",
+    "entries",
+}
+_CURRENT_REFIT_HORIZON_BUNDLE_ENTRY_FIELDS = {
+    "symbol",
+    "timeframe",
+    "regime",
+    "horizon_process_sha256",
+}
+_CURRENT_REFIT_TIMEFRAME_ORDER = {
+    timeframe: index
+    for index, timeframe in enumerate(("M5", "M15", "M30", "H1", "H4", "D1"))
+}
+
+
+def _current_refit_canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _current_refit_sha256(value: Any) -> str:
+    return hashlib.sha256(_current_refit_canonical_bytes(value)).hexdigest()
+
+
+def _current_refit_is_sha(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _current_refit_exact(value: Any, fields: Set[str], code: str) -> Dict[str, Any]:
+    if type(value) is not dict or set(value) != fields:
+        raise ValueError(code)
+    return value
+
+
+def _current_refit_utc(value: Any, code: str) -> str:
+    if type(value) is not str or not 1 <= len(value) <= 64:
+        raise ValueError(code)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        normalized = parsed.astimezone(timezone.utc).isoformat()
+    except Exception as exc:
+        raise ValueError(code) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None or normalized != value:
+        raise ValueError(code)
+    return value
+
+
+def _current_refit_artifact_path(root: Path, descriptor: Mapping[str, Any]) -> Path:
+    relative = descriptor["relative_path"]
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("CURRENT_REFIT_ARTIFACT_PATH_INVALID")
+    path = (root / candidate).resolve(strict=True)
+    path.relative_to(root)
+    current = root
+    for part in path.relative_to(root).parts:
+        current = current / part
+        info = current.lstat()
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        if current.is_symlink() or attributes & 0x400:
+            raise ValueError("CURRENT_REFIT_ARTIFACT_REPARSE_POINT")
+    if not path.is_file():
+        raise ValueError("CURRENT_REFIT_ARTIFACT_NOT_FILE")
+    return path
+
+
+def _current_refit_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _current_refit_read_json(
+    root: Path,
+    descriptor: Mapping[str, Any],
+    *,
+    format_version: str,
+    maximum_bytes: int = _CURRENT_REFIT_MAX_JSON_BYTES,
+) -> Dict[str, Any]:
+    if set(descriptor) != _CURRENT_REFIT_DESCRIPTOR_FIELDS:
+        raise ValueError("CURRENT_REFIT_DESCRIPTOR_FIELDS_INVALID")
+    size = descriptor["size_bytes"]
+    if (
+        descriptor["format_version"] != format_version
+        or type(size) is not int
+        or not 0 < size <= maximum_bytes
+        or not _current_refit_is_sha(descriptor["content_sha256"])
+    ):
+        raise ValueError("CURRENT_REFIT_DESCRIPTOR_INVALID")
+    path = _current_refit_artifact_path(root, descriptor)
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno()).st_size
+        raw = handle.read(maximum_bytes + 1)
+        after = os.fstat(handle.fileno()).st_size
+    if (
+        before != size
+        or after != size
+        or len(raw) != size
+        or hashlib.sha256(raw).hexdigest() != descriptor["content_sha256"]
+    ):
+        raise ValueError("CURRENT_REFIT_ARTIFACT_CHANGED")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("CURRENT_REFIT_ARTIFACT_JSON_INVALID") from exc
+    if type(value) is not dict or _current_refit_canonical_bytes(value) != raw:
+        raise ValueError("CURRENT_REFIT_ARTIFACT_JSON_NONCANONICAL")
+    return value
+
+
+def _current_refit_strategy_code_sha256(strategy_id: str) -> str:
+    if strategy_id not in StrategyRegistry.list_all():
+        raise ValueError("CURRENT_REFIT_STRATEGY_UNKNOWN")
+    strategy = StrategyRegistry.get(strategy_id)
+    source_path = Path(inspect.getsourcefile(type(strategy)) or "").resolve(strict=True)
+    return _current_refit_file_sha256(source_path)
+
+
+def _current_refit_core_code_sha256() -> str:
+    source_path = Path(inspect.getsourcefile(FeatureComputer) or "").resolve(strict=True)
+    return _current_refit_file_sha256(source_path)
+
+
+def _current_refit_callable_sha256(value: Any) -> str:
+    source = inspect.getsource(value).replace("\r\n", "\n").encode("utf-8")
+    return hashlib.sha256(source).hexdigest()
+
+
+def _current_refit_feature_contract(strategy: BaseStrategy) -> str:
+    return _current_refit_sha256(
+        {
+            "schema_version": "fxpm.current-refit-feature-contract.v1",
+            "required_features": sorted(strategy.get_feature_request()),
+            "minimum_bars": int(strategy.MIN_BARS),
+        }
+    )
+
+
+def _current_refit_json_parameters(value: Any) -> Dict[str, Any]:
+    try:
+        normalized = canonicalize_parameter_mapping(value)
+    except CurrentRefitParameterCodecError as exc:
+        raise ValueError("CURRENT_REFIT_PARAMETERS_INVALID") from exc
+    _current_refit_canonical_bytes(normalized)
+    return normalized
+
+
+def _current_refit_process_candidate_id(
+    *,
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    strategy_id: str,
+    parameters: Mapping[str, Any],
+    horizon_process_sha256: str,
+) -> str:
+    """Re-derive the search-time candidate identity from executable facts."""
+
+    payload = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "regime": regime,
+        "strategy_name": strategy_id,
+        "parameters": dict(parameters),
+        "horizon_process_sha256": horizon_process_sha256,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()
+
+
+def _current_refit_validate_bars(
+    root: Path,
+    source: Mapping[str, Any],
+    descriptors: Mapping[str, Mapping[str, Any]],
+) -> None:
+    descriptor = descriptors.get(source["bars_artifact_id"])
+    if descriptor is None or set(descriptor) != _CURRENT_REFIT_DESCRIPTOR_FIELDS:
+        raise ValueError("CURRENT_REFIT_BAR_ARTIFACT_MISSING")
+    if (
+        descriptor["format_version"] != CURRENT_REFIT_BAR_FILE_VERSION
+        or descriptor["content_sha256"] != source["bars_content_sha256"]
+    ):
+        raise ValueError("CURRENT_REFIT_BAR_ARTIFACT_SPLICE")
+    path = _current_refit_artifact_path(root, descriptor)
+    if (
+        path.stat().st_size != descriptor["size_bytes"]
+        or _current_refit_file_sha256(path) != descriptor["content_sha256"]
+    ):
+        raise ValueError("CURRENT_REFIT_BAR_ARTIFACT_CHANGED")
+    expected_count = source["bar_count"]
+    if type(expected_count) is not int or not 2 <= expected_count <= _CURRENT_REFIT_MAX_BAR_ROWS:
+        raise ValueError("CURRENT_REFIT_BAR_COUNT_INVALID")
+    old_limit = csv.field_size_limit()
+    csv.field_size_limit(4096)
+    count = 0
+    first_timestamp = None
+    previous_timestamp = None
+    try:
+        with path.open("r", encoding="utf-8", errors="strict", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != list(_CURRENT_REFIT_BAR_COLUMNS):
+                raise ValueError("CURRENT_REFIT_BAR_COLUMNS_INVALID")
+            for row in reader:
+                if set(row) != set(_CURRENT_REFIT_BAR_COLUMNS):
+                    raise ValueError("CURRENT_REFIT_BAR_ROW_INVALID")
+                timestamp = _current_refit_utc(
+                    row["timestamp_utc"], "CURRENT_REFIT_BAR_TIMESTAMP_INVALID"
+                )
+                parsed = datetime.fromisoformat(timestamp)
+                if previous_timestamp is not None and parsed <= previous_timestamp:
+                    raise ValueError("CURRENT_REFIT_BAR_ORDER_INVALID")
+                if first_timestamp is None:
+                    first_timestamp = timestamp
+                previous_timestamp = parsed
+                try:
+                    open_price, high, low, close, volume = (
+                        float(row[name])
+                        for name in ("open", "high", "low", "close", "volume")
+                    )
+                except Exception as exc:
+                    raise ValueError("CURRENT_REFIT_BAR_VALUE_INVALID") from exc
+                if (
+                    not all(
+                        math.isfinite(item)
+                        for item in (open_price, high, low, close, volume)
+                    )
+                    or min(open_price, high, low, close) <= 0.0
+                    or low > min(open_price, close)
+                    or high < max(open_price, close)
+                    or high < low
+                    or volume < 0.0
+                ):
+                    raise ValueError("CURRENT_REFIT_BAR_VALUE_INVALID")
+                count += 1
+                if count > expected_count:
+                    raise ValueError("CURRENT_REFIT_BAR_COUNT_INVALID")
+    finally:
+        csv.field_size_limit(old_limit)
+    last_timestamp = previous_timestamp.isoformat() if previous_timestamp else None
+    if (
+        count != expected_count
+        or first_timestamp != source["first_bar_utc"]
+        or last_timestamp != source["last_bar_utc"]
+        or _current_refit_file_sha256(path) != descriptor["content_sha256"]
+    ):
+        raise ValueError("CURRENT_REFIT_BAR_SNAPSHOT_MISMATCH")
+
+
+def _current_refit_validate_source(
+    source: Any,
+    *,
+    request: Mapping[str, Any],
+    root: Path,
+    descriptors: Mapping[str, Mapping[str, Any]],
+) -> str:
+    source = _current_refit_exact(
+        source, _CURRENT_REFIT_SOURCE_FIELDS, "CURRENT_REFIT_SOURCE_FIELDS_INVALID"
+    )
+    if (
+        source["schema_version"] != CURRENT_REFIT_SOURCE_SNAPSHOT_VERSION
+        or source["symbol"] != request["symbol"]
+        or source["timeframe"] != request["timeframe"]
+        or source["fit_start_utc"] != request["fit_start_utc"]
+        or source["fit_end_utc"] != request["fit_end_utc"]
+        or source["latest_closed_bar_utc"] != request["latest_closed_bar_utc"]
+        or source["columns"] != list(_CURRENT_REFIT_BAR_COLUMNS)
+        or source["timestamp_encoding"] != "UTC_ISO8601_PLUS00"
+        or not _current_refit_is_sha(source["bars_artifact_id"])
+        or not _current_refit_is_sha(source["bars_content_sha256"])
+        or type(source["activation_id"]) is not str
+        or not 1 <= len(source["activation_id"]) <= 256
+        or any(
+            not _current_refit_is_sha(source[name])
+            for name in (
+                "activation_manifest_sha256",
+                "native_source_sha256",
+                "source_contract_sha256",
+                "continuity_receipt_sha256",
+            )
+        )
+    ):
+        raise ValueError("CURRENT_REFIT_SOURCE_INVALID")
+    fit_start = datetime.fromisoformat(
+        _current_refit_utc(source["fit_start_utc"], "CURRENT_REFIT_SOURCE_TIME_INVALID")
+    )
+    fit_end = datetime.fromisoformat(
+        _current_refit_utc(source["fit_end_utc"], "CURRENT_REFIT_SOURCE_TIME_INVALID")
+    )
+    first = datetime.fromisoformat(
+        _current_refit_utc(source["first_bar_utc"], "CURRENT_REFIT_SOURCE_TIME_INVALID")
+    )
+    last = datetime.fromisoformat(
+        _current_refit_utc(source["last_bar_utc"], "CURRENT_REFIT_SOURCE_TIME_INVALID")
+    )
+    latest = datetime.fromisoformat(
+        _current_refit_utc(
+            source["latest_closed_bar_utc"], "CURRENT_REFIT_SOURCE_TIME_INVALID"
+        )
+    )
+    if not fit_start == first < last == latest <= fit_end:
+        raise ValueError("CURRENT_REFIT_SOURCE_TIME_INVALID")
+    _current_refit_validate_bars(root, source, descriptors)
+    return _current_refit_sha256(source)
+
+
+def _current_refit_validate_bundle(
+    value: Any,
+    *,
+    fields: Set[str],
+    entry_fields: Set[str],
+    schema_version: str,
+    current_cutoff_utc: str,
+    kind: str,
+) -> Tuple[Dict[str, Any], str]:
+    bundle = _current_refit_exact(value, fields, f"CURRENT_REFIT_{kind}_FIELDS_INVALID")
+    if (
+        bundle["schema_version"] != schema_version
+        or bundle["current_cutoff_utc"] != current_cutoff_utc
+        or type(bundle["entries"]) is not list
+        or not 1 <= len(bundle["entries"]) <= 2400
+    ):
+        raise ValueError(f"CURRENT_REFIT_{kind}_INVALID")
+    entries = []
+    for raw in bundle["entries"]:
+        entry = _current_refit_exact(
+            raw, entry_fields, f"CURRENT_REFIT_{kind}_ENTRY_INVALID"
+        )
+        if (
+            type(entry["symbol"]) is not str
+            or not 1 <= len(entry["symbol"]) <= 64
+            or entry["timeframe"] not in _CURRENT_REFIT_TIMEFRAME_ORDER
+            or not _current_refit_is_sha(
+                entry[
+                    "source_snapshot_sha256"
+                    if kind == "SOURCE_BUNDLE"
+                    else "horizon_process_sha256"
+                ]
+            )
+        ):
+            raise ValueError(f"CURRENT_REFIT_{kind}_ENTRY_INVALID")
+        if kind == "HORIZON_BUNDLE" and entry["regime"] not in {
+            "TREND",
+            "RANGE",
+            "BREAKOUT",
+            "CHOP",
+        }:
+            raise ValueError("CURRENT_REFIT_HORIZON_BUNDLE_ENTRY_INVALID")
+        entries.append(dict(entry))
+    def sort_key(item: Mapping[str, Any]) -> Tuple[Any, ...]:
+        return (
+            item["symbol"],
+            _CURRENT_REFIT_TIMEFRAME_ORDER[item["timeframe"]],
+            item.get("regime", ""),
+        )
+    if entries != sorted(entries, key=sort_key):
+        raise ValueError(f"CURRENT_REFIT_{kind}_ORDER_INVALID")
+    identities = [
+        (item["symbol"], item["timeframe"], item.get("regime")) for item in entries
+    ]
+    if len(set(identities)) != len(identities):
+        raise ValueError(f"CURRENT_REFIT_{kind}_DUPLICATE")
+    return dict(bundle), _current_refit_sha256(bundle)
+
+
+def _current_refit_validate_trial(
+    value: Any,
+    *,
+    strategy_id: str,
+    process_sha256: str,
+    horizon_sha256: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    trial = _current_refit_exact(
+        value, _CURRENT_REFIT_TRIAL_FIELDS, "CURRENT_REFIT_TRIAL_FIELDS_INVALID"
+    )
+    parameters = _current_refit_json_parameters(trial["parameters"])
+    base = StrategyRegistry.get(strategy_id)
+    if (
+        trial["schema_version"] != CURRENT_REFIT_TRIAL_VERSION
+        or trial["strategy_id"] != strategy_id
+        or trial["strategy_family"] != base.category.value
+        or trial["process_sha256"] != process_sha256
+        or trial["horizon_process_sha256"] != horizon_sha256
+        or trial["feature_contract_sha256"] != _current_refit_feature_contract(base)
+        or trial["indicator_contract_sha256"] != _current_refit_core_code_sha256()
+        or type(trial["parameter_count"]) is not int
+        or trial["parameter_count"] != len(parameters)
+    ):
+        raise ValueError("CURRENT_REFIT_TRIAL_INVALID")
+    allowed_keys = set(base.get_default_params()) | set(base.get_param_grid())
+    if not set(parameters) <= allowed_keys:
+        raise ValueError("CURRENT_REFIT_TRIAL_PARAMETER_UNKNOWN")
+    try:
+        runtime_parameters = decode_parameter_mapping(
+            parameters, base.get_default_params()
+        )
+        fitted = StrategyRegistry.get(strategy_id, **runtime_parameters)
+    except Exception as exc:
+        raise ValueError("CURRENT_REFIT_TRIAL_PARAMETERS_NONCANONICAL") from exc
+    normalized = _current_refit_json_parameters(fitted.get_params())
+    if canonical_parameter_bytes(normalized) != canonical_parameter_bytes(parameters):
+        raise ValueError("CURRENT_REFIT_TRIAL_PARAMETERS_NONCANONICAL")
+    defaults = base.get_default_params()
+    grid = base.get_param_grid()
+    for name, choices in grid.items():
+        if name in parameters and not any(
+            parameter_values_equal(parameters[name], choice) for choice in choices
+        ):
+            raise ValueError("CURRENT_REFIT_TRIAL_PARAMETER_OUTSIDE_PROCESS")
+    for name, expected in defaults.items():
+        if name not in grid and not parameter_values_equal(
+            parameters.get(name), expected
+        ):
+            raise ValueError("CURRENT_REFIT_TRIAL_FIXED_DEFAULT_MISMATCH")
+    return dict(trial), parameters
+
+
+def _current_refit_validate_process(
+    value: Any,
+    *,
+    strategy_id: str,
+) -> Tuple[Dict[str, Any], str]:
+    process = _current_refit_exact(
+        value, _CURRENT_REFIT_PROCESS_FIELDS, "CURRENT_REFIT_PROCESS_FIELDS_INVALID"
+    )
+    strategy = StrategyRegistry.get(strategy_id)
+    if (
+        process["schema_version"] != CURRENT_REFIT_PROCESS_VERSION
+        or process["strategy_id"] != strategy_id
+        or process["strategy_family"] != strategy.category.value
+        or process["strategy_module"] != "pm_strategies"
+        or process["strategy_class"] != type(strategy).__name__
+        or type(process["process_candidate_id"]) is not str
+        or not 1 <= len(process["process_candidate_id"]) <= 512
+        or process["strategy_code_sha256"]
+        != _current_refit_strategy_code_sha256(strategy_id)
+        or process["entry_rule_identity_sha256"]
+        != _current_refit_callable_sha256(type(strategy).generate_signals)
+        or process["exit_rule_identity_sha256"]
+        != _current_refit_callable_sha256(type(strategy).calculate_stops)
+        or process["regime_conditioning"]
+        != "EXACT_SYMBOL_TIMEFRAME_REGIME_CELL"
+    ):
+        raise ValueError("CURRENT_REFIT_PROCESS_INVALID")
+    return dict(process), _current_refit_sha256(process)
+
+
+def _current_refit_validate_horizon(
+    value: Any,
+    *,
+    request: Mapping[str, Any],
+    source_sha256: str,
+    source_bar_count: int,
+) -> Tuple[Dict[str, Any], str]:
+    horizon = _current_refit_exact(
+        value, _CURRENT_REFIT_HORIZON_FIELDS, "CURRENT_REFIT_HORIZON_FIELDS_INVALID"
+    )
+    if (
+        horizon["schema_version"] != CURRENT_REFIT_HORIZON_VERSION
+        or horizon["symbol"] != request["symbol"]
+        or horizon["timeframe"] != request["timeframe"]
+        or horizon["lookback_kind"]
+        not in {"NATIVE_OBSERVATIONS", "ACTIVE_SESSIONS", "CALENDAR_INTERVAL"}
+        or type(horizon["lookback_value"]) is not int
+        or not 1 <= horizon["lookback_value"] <= 10_000_000_000
+        or type(horizon["source_bar_count"]) is not int
+        or horizon["source_bar_count"] != source_bar_count
+        or (
+            horizon["lookback_kind"] == "NATIVE_OBSERVATIONS"
+            and horizon["lookback_value"] != source_bar_count
+        )
+        or horizon["fit_start_utc"] != request["fit_start_utc"]
+        or horizon["fit_end_utc"] != request["fit_end_utc"]
+        or horizon["latest_closed_bar_utc"] != request["latest_closed_bar_utc"]
+        or horizon["source_snapshot_sha256"] != source_sha256
+    ):
+        raise ValueError("CURRENT_REFIT_HORIZON_INVALID")
+    return dict(horizon), _current_refit_sha256(horizon)
+
+
+def _current_refit_validate_recipe(
+    value: Any,
+    *,
+    strategy_id: str,
+    process_sha256: str,
+    horizon_sha256: str,
+    trial_sha256: str,
+    source_bar_count: int,
+) -> Tuple[Dict[str, Any], str]:
+    recipe = _current_refit_exact(
+        value, _CURRENT_REFIT_RECIPE_FIELDS, "CURRENT_REFIT_RECIPE_FIELDS_INVALID"
+    )
+    strategy = StrategyRegistry.get(strategy_id)
+    seed = recipe.get("seed")
+    if type(seed) is not int or not 0 <= seed <= 0x7FFFFFFF:
+        raise ValueError("CURRENT_REFIT_RECIPE_SEED_INVALID")
+    expected = {
+        "schema_version": CURRENT_REFIT_RECIPE_VERSION,
+        "strategy_id": strategy_id,
+        "winner_process_sha256": process_sha256,
+        "winner_horizon_process_sha256": horizon_sha256,
+        "winner_trial_definition_sha256": trial_sha256,
+        "refit_mode": "STATELESS_RULE_MATERIALIZATION",
+        "parameter_source": "CURRENT_WINNER_TRIAL",
+        "source_validation": "FULL_NATIVE_PREFIX_STREAM",
+        "fit_window_rule": "HORIZON_NATIVE_PREFIX_THROUGH_CURRENT_CUTOFF",
+        "deterministic_fit_procedure_id": "FXPM_STATELESS_RULE_MATERIALIZE_V1",
+        "seed": seed,
+        "version_pins": {
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "pm_core_sha256": _current_refit_core_code_sha256(),
+            "pm_strategies_sha256": _current_refit_strategy_code_sha256(strategy_id),
+        },
+        "data_requirements": {
+            "columns": list(_CURRENT_REFIT_BAR_COLUMNS),
+            "minimum_bars": max(2, int(strategy.MIN_BARS)),
+            "warmup_bars": max(0, int(strategy.MIN_BARS)),
+        },
+        "attempts": 1,
+        "post_selection_search": False,
+        "output_schema_version": CURRENT_REFIT_SPECIALIST_VERSION,
+    }
+    if recipe != expected:
+        raise ValueError("CURRENT_REFIT_RECIPE_INVALID")
+    if source_bar_count < expected["data_requirements"]["minimum_bars"]:
+        raise ValueError("CURRENT_REFIT_RECIPE_SOURCE_TOO_SHORT")
+    return dict(recipe), _current_refit_sha256(recipe)
+
+
+def _current_refit_validate_book_entry(
+    value: Any,
+    *,
+    request: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], str]:
+    entry = _current_refit_exact(
+        value,
+        _CURRENT_REFIT_BOOK_ENTRY_FIELDS,
+        "CURRENT_REFIT_BOOK_ENTRY_FIELDS_INVALID",
+    )
+    identity = {
+        name: value
+        for name, value in entry.items()
+        if name
+        not in {
+            "adjusted_q_value",
+            "by_qualified",
+            "historical_local_candidate_pending_causal",
+            "historical_book_entry_sha256",
+        }
+    }
+    derived_sha = _current_refit_sha256(
+        {"book_contract_version": BOOK_MULTIPLICITY_CONTRACT_VERSION, **identity}
+    )
+    if (
+        any(entry[name] != request[name] for name in ("symbol", "timeframe", "regime"))
+        or entry["historical_state"] != "WINNER"
+        or entry["historical_local_candidate_pending_causal"] is not True
+        or type(entry["local_process_candidate_id"]) is not str
+        or not 1 <= len(entry["local_process_candidate_id"]) <= 256
+        or not _current_refit_is_sha(entry["local_process_sha256"])
+        or not _current_refit_is_sha(entry["winner_decision_sha256"])
+        or not _current_refit_is_sha(entry["regime_receipt_sha256"])
+        or not _current_refit_is_sha(entry["regime_detector_record_sha256"])
+        or entry["historical_book_entry_sha256"] != derived_sha
+    ):
+        raise ValueError("CURRENT_REFIT_BOOK_ENTRY_INVALID")
+    return dict(entry), derived_sha
+
+
+def _current_refit_regime_map(
+    regime_bundle: Mapping[str, Any],
+) -> Tuple[
+    Dict[Tuple[str, str], Dict[str, str]],
+    Dict[Tuple[str, str], Dict[str, str]],
+]:
+    result: Dict[Tuple[str, str], Dict[str, str]] = {}
+    source_bindings: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for envelope in regime_bundle.get("regime_fits", []):
+        if type(envelope) is not dict or type(envelope.get("payload")) is not dict:
+            raise ValueError("CURRENT_REFIT_REGIME_BUNDLE_INVALID")
+        payload = envelope["payload"]
+        record = payload.get("regime_detector_record")
+        if type(record) is not dict:
+            raise ValueError("CURRENT_REFIT_REGIME_BUNDLE_INVALID")
+        group = (payload.get("symbol"), payload.get("timeframe"))
+        if group in result:
+            raise ValueError("CURRENT_REFIT_REGIME_BUNDLE_DUPLICATE")
+        result[group] = {
+            "regime_fit_receipt_sha256": envelope.get("receipt_sha256"),
+            "regime_detector_record_sha256": record.get("record_sha256"),
+            "regime_detector_parameters_sha256": record.get("parameters_sha256"),
+            "regime_detector_code_sha256": record.get("detector_code_sha256"),
+        }
+        source_bindings[group] = {
+            "activation_id": record.get("activation_id"),
+            "activation_manifest_sha256": record.get("activation_manifest_sha256"),
+            "native_source_sha256": record.get("native_source_sha256"),
+            "source_contract_sha256": record.get("source_contract_sha256"),
+        }
+    return result, source_bindings
+
+
+def replay_current_refit_execution_from_raw_manifest(
+    plan: Mapping[str, Any],
+    *,
+    artifact_root: Path,
+) -> Dict[str, Any]:
+    """Recompute one current specialist book from physical inputs."""
+    if type(plan) is not dict or plan.get("schema_version") != RAW_CURRENT_REFIT_REPLAY_REQUEST_VERSION:
+        raise ValueError("CURRENT_REFIT_REPLAY_PLAN_INVALID")
+    if plan.get("executor_contract_version") != CURRENT_REFIT_RAW_EXECUTOR_VERSION:
+        raise ValueError("CURRENT_REFIT_EXECUTOR_VERSION_INVALID")
+    root = Path(artifact_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("CURRENT_REFIT_ARTIFACT_ROOT_INVALID")
+    raw_descriptors = plan.get("artifact_descriptors")
+    if type(raw_descriptors) is not list or not 1 <= len(raw_descriptors) <= 16_384:
+        raise ValueError("CURRENT_REFIT_DESCRIPTOR_ROSTER_INVALID")
+    descriptors: Dict[str, Mapping[str, Any]] = {}
+    for raw in raw_descriptors:
+        descriptor = _current_refit_exact(
+            raw,
+            _CURRENT_REFIT_DESCRIPTOR_FIELDS,
+            "CURRENT_REFIT_DESCRIPTOR_FIELDS_INVALID",
+        )
+        artifact_id = descriptor["artifact_id"]
+        if not _current_refit_is_sha(artifact_id) or artifact_id in descriptors:
+            raise ValueError("CURRENT_REFIT_DESCRIPTOR_ID_INVALID")
+        descriptors[artifact_id] = descriptor
+    bundle_ids = _current_refit_exact(
+        plan.get("bundle_artifact_ids"),
+        _CURRENT_REFIT_BUNDLE_ROLES,
+        "CURRENT_REFIT_BUNDLE_ROSTER_INVALID",
+    )
+    if any(value not in descriptors for value in bundle_ids.values()):
+        raise ValueError("CURRENT_REFIT_BUNDLE_ARTIFACT_MISSING")
+    cutoff = _current_refit_utc(
+        plan.get("current_cutoff_utc"), "CURRENT_REFIT_CUTOFF_INVALID"
+    )
+
+    raw_book = _current_refit_read_json(
+        root,
+        descriptors[bundle_ids["accepted_book_generation"]],
+        format_version=CURRENT_PROCESS_BOOK_ARTIFACT_VERSION,
+    )
+    book_payload, book_receipt_sha256 = open_typed_receipt(
+        raw_book, expected_receipt_type=CURRENT_PROCESS_BOOK_RECEIPT_TYPE
+    )
+    if type(book_payload) is not dict or book_payload.get("current_cutoff_utc") != cutoff:
+        raise ValueError("CURRENT_REFIT_ACCEPTED_BOOK_INVALID")
+    book_identity = dict(book_payload)
+    generation_sha256 = book_identity.pop("generation_sha256", None)
+    if (
+        not _current_refit_is_sha(generation_sha256)
+        or generation_sha256 != canonical_receipt_sha256(book_identity)
+        or not _current_refit_is_sha(
+            book_payload.get("historical_process_decision_sha256")
+        )
+    ):
+        raise ValueError("CURRENT_REFIT_ACCEPTED_BOOK_INVALID")
+
+    raw_source_bundle = _current_refit_read_json(
+        root,
+        descriptors[bundle_ids["source_snapshot_bundle"]],
+        format_version=CURRENT_REFIT_SOURCE_BUNDLE_VERSION,
+    )
+    source_bundle, source_bundle_sha256 = _current_refit_validate_bundle(
+        raw_source_bundle,
+        fields=_CURRENT_REFIT_SOURCE_BUNDLE_FIELDS,
+        entry_fields=_CURRENT_REFIT_SOURCE_BUNDLE_ENTRY_FIELDS,
+        schema_version=CURRENT_REFIT_SOURCE_BUNDLE_VERSION,
+        current_cutoff_utc=cutoff,
+        kind="SOURCE_BUNDLE",
+    )
+    raw_horizon_bundle = _current_refit_read_json(
+        root,
+        descriptors[bundle_ids["horizon_decisions_bundle"]],
+        format_version=CURRENT_REFIT_HORIZON_BUNDLE_VERSION,
+    )
+    horizon_bundle, horizon_bundle_sha256 = _current_refit_validate_bundle(
+        raw_horizon_bundle,
+        fields=_CURRENT_REFIT_HORIZON_BUNDLE_FIELDS,
+        entry_fields=_CURRENT_REFIT_HORIZON_BUNDLE_ENTRY_FIELDS,
+        schema_version=CURRENT_REFIT_HORIZON_BUNDLE_VERSION,
+        current_cutoff_utc=cutoff,
+        kind="HORIZON_BUNDLE",
+    )
+    raw_regime_bundle = _current_refit_read_json(
+        root,
+        descriptors[bundle_ids["regime_params_bundle"]],
+        format_version=CURRENT_REGIME_PARAMS_BUNDLE_VERSION,
+    )
+    regime_by_group, regime_sources = _current_refit_regime_map(raw_regime_bundle)
+
+    requests = plan.get("cell_requests")
+    if type(requests) is not list or not 1 <= len(requests) <= 2400:
+        raise ValueError("CURRENT_REFIT_REQUEST_ROSTER_INVALID")
+    source_cache: Dict[str, Tuple[Dict[str, Any], str]] = {}
+    full_cells: List[Dict[str, Any]] = []
+    result_cells: List[Dict[str, Any]] = []
+    specialist_refs: List[Dict[str, str]] = []
+    trace_refs: List[Dict[str, str]] = []
+    used_sources: Dict[Tuple[str, str], str] = {}
+    used_horizons: Dict[Tuple[str, str, str], str] = {}
+    seen_cell_ids: Set[str] = set()
+
+    for raw_request in requests:
+        request = _current_refit_exact(
+            raw_request,
+            _CURRENT_REFIT_REQUEST_FIELDS,
+            "CURRENT_REFIT_REQUEST_FIELDS_INVALID",
+        )
+        if (
+            request["timeframe"] not in _CURRENT_REFIT_TIMEFRAME_ORDER
+            or request["regime"] not in {"TREND", "RANGE", "BREAKOUT", "CHOP"}
+            or not _current_refit_is_sha(request["current_refit_cell_id"])
+            or request["current_refit_cell_id"] in seen_cell_ids
+        ):
+            raise ValueError("CURRENT_REFIT_REQUEST_INVALID")
+        seen_cell_ids.add(request["current_refit_cell_id"])
+        for name in ("fit_start_utc", "fit_end_utc", "latest_closed_bar_utc"):
+            _current_refit_utc(request[name], "CURRENT_REFIT_REQUEST_TIME_INVALID")
+        artifact_ids = _current_refit_exact(
+            request["artifact_ids"],
+            _CURRENT_REFIT_CELL_ARTIFACT_ROLES,
+            "CURRENT_REFIT_CELL_ARTIFACT_ROSTER_INVALID",
+        )
+        if any(value not in descriptors for value in artifact_ids.values()):
+            raise ValueError("CURRENT_REFIT_CELL_ARTIFACT_MISSING")
+
+        source_id = artifact_ids["source_snapshot"]
+        if source_id not in source_cache:
+            source = _current_refit_read_json(
+                root,
+                descriptors[source_id],
+                format_version=CURRENT_REFIT_SOURCE_SNAPSHOT_VERSION,
+            )
+            source_sha256 = _current_refit_validate_source(
+                source, request=request, root=root, descriptors=descriptors
+            )
+            source_cache[source_id] = (source, source_sha256)
+        source, source_sha256 = source_cache[source_id]
+        if any(
+            source[name] != request[name]
+            for name in (
+                "symbol",
+                "timeframe",
+                "fit_start_utc",
+                "fit_end_utc",
+                "latest_closed_bar_utc",
+            )
+        ):
+            raise ValueError("CURRENT_REFIT_SHARED_SOURCE_SPLICE")
+
+        process, process_sha256 = _current_refit_validate_process(
+            _current_refit_read_json(
+                root,
+                descriptors[artifact_ids["winner_process"]],
+                format_version=CURRENT_REFIT_PROCESS_VERSION,
+            ),
+            strategy_id=request["strategy_id"],
+        )
+        horizon, horizon_sha256 = _current_refit_validate_horizon(
+            _current_refit_read_json(
+                root,
+                descriptors[artifact_ids["horizon_process"]],
+                format_version=CURRENT_REFIT_HORIZON_VERSION,
+            ),
+            request=request,
+            source_sha256=source_sha256,
+            source_bar_count=source["bar_count"],
+        )
+        trial, parameters = _current_refit_validate_trial(
+            _current_refit_read_json(
+                root,
+                descriptors[artifact_ids["trial_definition"]],
+                format_version=CURRENT_REFIT_TRIAL_VERSION,
+            ),
+            strategy_id=request["strategy_id"],
+            process_sha256=process_sha256,
+            horizon_sha256=horizon_sha256,
+        )
+        expected_process_candidate_id = _current_refit_process_candidate_id(
+            symbol=request["symbol"],
+            timeframe=request["timeframe"],
+            regime=request["regime"],
+            strategy_id=request["strategy_id"],
+            parameters=parameters,
+            horizon_process_sha256=horizon_sha256,
+        )
+        if process["process_candidate_id"] != expected_process_candidate_id:
+            raise ValueError("CURRENT_REFIT_PROCESS_CANDIDATE_ID_MISMATCH")
+        trial_sha256 = _current_refit_sha256(trial)
+        recipe, recipe_sha256 = _current_refit_validate_recipe(
+            _current_refit_read_json(
+                root,
+                descriptors[artifact_ids["refit_recipe"]],
+                format_version=CURRENT_REFIT_RECIPE_VERSION,
+            ),
+            strategy_id=request["strategy_id"],
+            process_sha256=process_sha256,
+            horizon_sha256=horizon_sha256,
+            trial_sha256=trial_sha256,
+            source_bar_count=source["bar_count"],
+        )
+        book_entry, book_entry_sha256 = _current_refit_validate_book_entry(
+            _current_refit_read_json(
+                root,
+                descriptors[artifact_ids["winner_book_entry"]],
+                format_version=CURRENT_REFIT_BOOK_ENTRY_VERSION,
+            ),
+            request=request,
+        )
+        if (
+            book_entry["local_process_sha256"] != process_sha256
+            or book_entry["local_process_candidate_id"]
+            != process["process_candidate_id"]
+        ):
+            raise ValueError("CURRENT_REFIT_PROCESS_CANDIDATE_SPLICE")
+        detector = regime_by_group.get((request["symbol"], request["timeframe"]))
+        if detector is None or (
+            book_entry["regime_receipt_sha256"]
+            != detector["regime_fit_receipt_sha256"]
+            or book_entry["regime_detector_record_sha256"]
+            != detector["regime_detector_record_sha256"]
+        ):
+            raise ValueError("CURRENT_REFIT_REGIME_BINDING_SPLICE")
+        source_binding = regime_sources.get((request["symbol"], request["timeframe"]))
+        if source_binding is None or any(
+            source[name] != value for name, value in source_binding.items()
+        ):
+            raise ValueError("CURRENT_REFIT_SOURCE_ACTIVATION_SPLICE")
+
+        parameter_payload = {
+            "schema_version": CURRENT_REFIT_PARAMETER_VERSION,
+            "strategy_id": request["strategy_id"],
+            "parameters": parameters,
+        }
+        parameter_sha256 = _current_refit_sha256(parameter_payload)
+        output_payload = {
+            "schema_version": CURRENT_REFIT_SPECIALIST_VERSION,
+            "symbol": request["symbol"],
+            "timeframe": request["timeframe"],
+            "regime": request["regime"],
+            "strategy_id": request["strategy_id"],
+            "parameters": parameters,
+            "parameter_sha256": parameter_sha256,
+            "source_snapshot_sha256": source_sha256,
+            "winner_process_sha256": process_sha256,
+            "winner_horizon_process_sha256": horizon_sha256,
+            "winner_trial_definition_sha256": trial_sha256,
+            "winner_refit_recipe_sha256": recipe_sha256,
+            "winner_book_entry_sha256": book_entry_sha256,
+            **detector,
+            "fit_start_utc": request["fit_start_utc"],
+            "fit_end_utc": request["fit_end_utc"],
+            "latest_closed_bar_utc": request["latest_closed_bar_utc"],
+        }
+        output_artifact_sha256 = _current_refit_sha256(output_payload)
+        identity = {
+            "historical_process_decision_sha256": book_payload[
+                "historical_process_decision_sha256"
+            ],
+            "accepted_book_generation_receipt_sha256": book_receipt_sha256,
+            "symbol": request["symbol"],
+            "timeframe": request["timeframe"],
+            "regime": request["regime"],
+            "strategy_id": request["strategy_id"],
+            "winner_process_candidate_id": process["process_candidate_id"],
+            "winner_process_sha256": process_sha256,
+            "winner_horizon_process_sha256": horizon_sha256,
+            "winner_trial_definition_sha256": trial_sha256,
+            "winner_refit_recipe_sha256": recipe_sha256,
+            "winner_decision_sha256": book_entry["winner_decision_sha256"],
+            "winner_book_entry_sha256": book_entry_sha256,
+            **detector,
+            "fit_start_utc": request["fit_start_utc"],
+            "fit_end_utc": request["fit_end_utc"],
+            "latest_closed_bar_utc": request["latest_closed_bar_utc"],
+            "source_snapshot_sha256": source_sha256,
+            "parameter_sha256": parameter_sha256,
+            "output_artifact_sha256": output_artifact_sha256,
+        }
+        cell_id = compute_current_refit_cell_id(identity)
+        if cell_id != request["current_refit_cell_id"]:
+            raise ValueError("CURRENT_REFIT_CELL_ID_REPLAY_MISMATCH")
+        input_content_sha256 = {
+            role: descriptors[artifact_ids[role]]["content_sha256"]
+            for role in sorted(artifact_ids)
+        }
+        trace_payload = {
+            "schema_version": CURRENT_REFIT_CELL_TRACE_VERSION,
+            "current_refit_cell_id": cell_id,
+            "input_content_sha256": input_content_sha256,
+            "parameter_sha256": parameter_sha256,
+            "output_artifact_sha256": output_artifact_sha256,
+            "execution_mode": "STATELESS_RULE_MATERIALIZATION",
+        }
+        execution_trace_sha256 = _current_refit_sha256(trace_payload)
+        full_cell = {
+            "current_refit_cell_id": cell_id,
+            **identity,
+            "execution_trace_sha256": execution_trace_sha256,
+            "attempts": 1,
+            "status": "COMPLETE",
+            "refit_process_frozen": True,
+            "parameter_level_oos_evidence_claimed": False,
+        }
+        result_cell = {
+            "current_refit_cell_id": cell_id,
+            "parameter_sha256": parameter_sha256,
+            "output_artifact_sha256": output_artifact_sha256,
+            "execution_trace_sha256": execution_trace_sha256,
+            "source_snapshot_sha256": source_sha256,
+            "winner_horizon_process_sha256": horizon_sha256,
+            "winner_trial_definition_sha256": trial_sha256,
+            "winner_refit_recipe_sha256": recipe_sha256,
+            **detector,
+            "fit_start_utc": request["fit_start_utc"],
+            "fit_end_utc": request["fit_end_utc"],
+            "latest_closed_bar_utc": request["latest_closed_bar_utc"],
+        }
+        if set(result_cell) != _CURRENT_REFIT_RESULT_CELL_FIELDS:
+            raise AssertionError("CURRENT_REFIT_INTERNAL_RESULT_FIELDS")
+        full_cells.append(full_cell)
+        result_cells.append(result_cell)
+        specialist_refs.append(
+            {
+                "current_refit_cell_id": cell_id,
+                "parameter_sha256": parameter_sha256,
+                "output_artifact_sha256": output_artifact_sha256,
+            }
+        )
+        trace_refs.append(
+            {
+                "current_refit_cell_id": cell_id,
+                "execution_trace_sha256": execution_trace_sha256,
+            }
+        )
+        used_sources[(request["symbol"], request["timeframe"])] = source_sha256
+        used_horizons[
+            (request["symbol"], request["timeframe"], request["regime"])
+        ] = horizon_sha256
+
+    expected_source_entries = [
+        {"symbol": symbol, "timeframe": timeframe, "source_snapshot_sha256": digest}
+        for (symbol, timeframe), digest in sorted(
+            used_sources.items(),
+            key=lambda item: (
+                item[0][0],
+                _CURRENT_REFIT_TIMEFRAME_ORDER[item[0][1]],
+            ),
+        )
+    ]
+    expected_horizon_entries = [
+        {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "regime": regime,
+            "horizon_process_sha256": digest,
+        }
+        for (symbol, timeframe, regime), digest in sorted(
+            used_horizons.items(),
+            key=lambda item: (
+                item[0][0],
+                _CURRENT_REFIT_TIMEFRAME_ORDER[item[0][1]],
+                item[0][2],
+            ),
+        )
+    ]
+    if source_bundle["entries"] != expected_source_entries:
+        raise ValueError("CURRENT_REFIT_SOURCE_BUNDLE_ROSTER_MISMATCH")
+    if horizon_bundle["entries"] != expected_horizon_entries:
+        raise ValueError("CURRENT_REFIT_HORIZON_BUNDLE_ROSTER_MISMATCH")
+    normalized_regime_bundle = validate_current_regime_params_bundle(
+        raw_regime_bundle,
+        current_cutoff_utc=cutoff,
+        selected_cells=full_cells,
+    )
+    regime_bundle_sha256 = canonical_receipt_sha256(normalized_regime_bundle)
+    if (
+        book_payload.get("source_snapshot_bundle_sha256") != source_bundle_sha256
+        or book_payload.get("regime_params_sha256") != regime_bundle_sha256
+        or book_payload.get("horizon_decisions_sha256") != horizon_bundle_sha256
+        or book_payload.get("selected_winner_roster_sha256")
+        != compute_current_winner_roster_sha256(full_cells)
+    ):
+        raise ValueError("CURRENT_REFIT_ACCEPTED_BOOK_ROSTER_MISMATCH")
+
+    cell_bundle_sha256 = canonical_receipt_sha256({"cell_executions": full_cells})
+    output_book_sha256 = _current_refit_sha256(
+        {
+            "schema_version": CURRENT_REFIT_OUTPUT_BOOK_VERSION,
+            "current_cutoff_utc": cutoff,
+            "accepted_book_generation_receipt_sha256": book_receipt_sha256,
+            "specialists": specialist_refs,
+        }
+    )
+    execution_trace_sha256 = _current_refit_sha256(
+        {
+            "schema_version": CURRENT_REFIT_EXECUTION_TRACE_VERSION,
+            "current_cutoff_utc": cutoff,
+            "accepted_book_generation_receipt_sha256": book_receipt_sha256,
+            "source_snapshot_bundle_sha256": source_bundle_sha256,
+            "regime_params_sha256": regime_bundle_sha256,
+            "horizon_decisions_sha256": horizon_bundle_sha256,
+            "cell_execution_traces": trace_refs,
+        }
+    )
+    return {
+        "schema_version": RAW_CURRENT_REFIT_REPLAY_RESULT_VERSION,
+        "executor_contract_version": CURRENT_REFIT_RAW_EXECUTOR_VERSION,
+        "current_cutoff_utc": cutoff,
+        "cell_results": result_cells,
+        "cell_execution_bundle_sha256": cell_bundle_sha256,
+        "output_book_sha256": output_book_sha256,
+        "execution_trace_sha256": execution_trace_sha256,
+    }
+
+_DATA_STATE_KIND_REASONS = {
+    "INSUFFICIENT_TRAIN_HISTORY": {
+        "INSUFFICIENT_OPTIMIZER_TRAIN_ROWS",
+        "INSUFFICIENT_DETECTOR_HOLDOUT_ROWS",
+    },
+}
+
+
+def _validated_symbol_data_state(value: Any) -> Optional[Dict[str, Any]]:
+    """Strict shared validator for the typed all-NON_SEARCH data-state.
+
+    Only sidecar-bound TERMINAL kinds are admissible; anything else is
+    technical.  Used identically by builder, worker and consumer (seq1035).
+    """
+    if not isinstance(value, dict):
+        return None
+    if set(value) != {"kind", "timeframes", "decisions", "generation_terminal"}:
+        return None
+    if value["kind"] != "ALL_TIMEFRAMES_NON_SEARCH":
+        return None
+    decisions = value["decisions"]
+    if not isinstance(decisions, dict) or not decisions:
+        return None
+    timeframes = value["timeframes"]
+    if not isinstance(timeframes, list) or timeframes != sorted(decisions):
+        return None
+    for tf_key, decision in decisions.items():
+        if not isinstance(decision, dict) or set(decision) != {
+            "decision_kind",
+            "decision_sha256",
+            "reason_code",
+            "generation_terminal",
+        }:
+            return None
+        kind = str(decision["decision_kind"] or "")
+        reason = str(decision["reason_code"] or "")
+        if kind not in _DATA_STATE_KIND_REASONS:
+            return None
+        if reason not in _DATA_STATE_KIND_REASONS[kind]:
+            return None
+        sha = str(decision["decision_sha256"] or "").lower()
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+            return None
+        if decision["generation_terminal"] is not True:
+            return None
+    if value["generation_terminal"] is not True:
+        return None
+    return dict(value)
+
 FEATURE_PRECOMPUTE_RESULT_SCHEMA = "fxpm.feature-precompute-result.v1"
 OPTIMIZER_MEMORY_RESERVE_BYTES = 1 * 1024 * 1024 * 1024
 OPTIMIZER_TASK_TIMEOUT_SECONDS = 4 * 60 * 60
@@ -310,6 +1626,180 @@ def _bounded_cartesian_combinations(
         return tuple(result)
 
     return [decode((start + offset * step) % total) for offset in range(count)], total
+
+
+class _BoundedNativeSource:
+    """Lazy one-timeframe-resident native source (seq1019/seq1055).
+
+    Preflight computed and released every frame; each pop/iteration reloads
+    exactly one immutable timeframe and verifies it against the preflight
+    fingerprint (meta equality, trimmed rows, boundary timestamps).
+    """
+
+    def __init__(self, pipeline, symbol, as_of_utc, expected):
+        self._pipeline = pipeline
+        self._symbol = str(symbol)
+        self._as_of_utc = as_of_utc
+        self._expected = dict(expected)
+
+    def keys(self):
+        return list(self._expected)
+
+    def __len__(self):
+        return len(self._expected)
+
+    def __bool__(self):
+        return bool(self._expected)
+
+    def __contains__(self, key):
+        return key in self._expected
+
+    def __iter__(self):
+        return iter(list(self._expected))
+
+    def _reload(self, timeframe):
+        spec = self._expected[timeframe]
+        frame, meta = self._pipeline.data_loader.load_native_timeframe(
+            self._symbol, timeframe
+        )
+        if dict(meta or {}) != spec["meta"]:
+            raise RuntimeError(
+                f"NATIVE_SOURCE_RELOAD_META_MISMATCH:{timeframe}"
+            )
+        data = trim_to_closed_bars(
+            ensure_utc_index(frame, copy=False),
+            timeframe,
+            as_of_utc=self._as_of_utc,
+            copy=False,
+        )
+        if (
+            data is None
+            or len(data) != spec["rows"]
+            or str(data.index[0].isoformat()) != spec["first_ts"]
+            or str(data.index[-1].isoformat()) != spec["last_ts"]
+        ):
+            raise RuntimeError(
+                f"NATIVE_SOURCE_RELOAD_FRAME_MISMATCH:{timeframe}"
+            )
+        return data
+
+    def pop(self, timeframe):
+        data = self._reload(timeframe)
+        del self._expected[timeframe]
+        return data
+
+    def items(self):
+        for timeframe in list(self._expected):
+            yield timeframe, self._reload(timeframe)
+
+
+def _aggregate_search_trial_telemetry(
+    search_cell_outcomes_by_tf: Mapping[str, Sequence[Mapping[str, Any]]],
+    oos_evidence_records: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """seq932/seq950 exact trial telemetry.
+
+    Primary source is the per-timeframe search-cell outcome ledger
+    (``RegimeOptimizer._last_search_cell_outcomes``): probe and deep-tuning
+    cells carry exact planned ``search_trials`` and ``completed_trials`` and
+    exist even when every candidate is gated out before any OOS evidence
+    record is produced (the seq950 all-searched-all-rejected case).  OOS
+    evidence records supply the survivor-side cross-check only.  A timeframe
+    that planned trials but completed none is a typed anomaly, never a
+    silent zero.
+    """
+    planned_by_tf: Dict[str, int] = {}
+    completed_by_tf: Dict[str, int] = {}
+    eligible_by_tf: Dict[str, int] = {}
+    rejected_by_tf: Dict[str, int] = {}
+    anomalies: List[str] = []
+    fatal_errors: List[str] = []
+
+    def _count(cell: Mapping[str, Any], key: str) -> int:
+        value = cell.get(key, 0)
+        if value is None:
+            value = 0
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key}={value!r}")
+        if value < 0:
+            raise ValueError(f"{key}={value!r}")
+        return value
+
+    for raw_tf, cells in sorted((search_cell_outcomes_by_tf or {}).items()):
+        record_tf = str(raw_tf or "").upper()
+        planned = completed = eligible = 0
+        for index, cell in enumerate(cells):
+            try:
+                cell_planned = _count(cell, "search_trials")
+                cell_completed = _count(cell, "completed_trials")
+                cell_eligible = _count(cell, "eligible_train_trials")
+            except ValueError as exc:
+                # seq979: an impossible count is an institutional invariant
+                # violation, never advisory — the run must fail typed before
+                # any SymbolConfig can be constructed or promoted.
+                fatal_errors.append(
+                    f"INVALID_SEARCH_CELL_COUNTS:{record_tf}:cell={index}:{exc}"
+                )
+                continue
+            planned += cell_planned
+            completed += cell_completed
+            eligible += cell_eligible
+        planned_by_tf[record_tf] = planned
+        completed_by_tf[record_tf] = completed
+        eligible_by_tf[record_tf] = eligible
+        if completed > planned:
+            fatal_errors.append(
+                f"COMPLETED_EXCEEDS_PLANNED:{record_tf}:"
+                f"completed={completed}:planned={planned}"
+            )
+        if eligible > completed:
+            fatal_errors.append(
+                f"ELIGIBLE_EXCEEDS_COMPLETED:{record_tf}:"
+                f"eligible={eligible}:completed={completed}"
+            )
+            rejected_by_tf[record_tf] = 0
+        else:
+            rejected_by_tf[record_tf] = completed - eligible
+        if planned > 0 and completed == 0:
+            anomalies.append(
+                f"SEARCHED_BUT_ZERO_COMPLETED_TRIALS:{record_tf}:planned={planned}"
+            )
+    surviving_sum = 0
+    survivor_local_totals_by_tf: Dict[str, int] = {}
+    for record in oos_evidence_records:
+        record_tf = str(record.get("timeframe", "") or "").upper()
+        survivor_local_totals_by_tf[record_tf] = max(
+            survivor_local_totals_by_tf.get(record_tf, 0),
+            int(record.get("local_search_trials_total", 0) or 0),
+        )
+        surviving_sum += int(record.get("search_trials", 0) or 0)
+    return {
+        "planned_search_trials_total": int(sum(planned_by_tf.values())),
+        "completed_search_trials_total": int(sum(completed_by_tf.values())),
+        "eligible_train_trials_total": int(sum(eligible_by_tf.values())),
+        "rejected_train_trials_total": int(sum(rejected_by_tf.values())),
+        "planned_search_trials_by_timeframe": {
+            key: int(value) for key, value in sorted(planned_by_tf.items())
+        },
+        "completed_search_trials_by_timeframe": {
+            key: int(value) for key, value in sorted(completed_by_tf.items())
+        },
+        "eligible_train_trials_by_timeframe": {
+            key: int(value) for key, value in sorted(eligible_by_tf.items())
+        },
+        "rejected_train_trials_by_timeframe": {
+            key: int(value) for key, value in sorted(rejected_by_tf.items())
+        },
+        "telemetry_anomalies": anomalies,
+        "fatal_telemetry_errors": fatal_errors,
+        # Survivor-side cross-check (candidate-declared cell totals).
+        "survivor_local_search_trials_by_timeframe": {
+            key: int(value)
+            for key, value in sorted(survivor_local_totals_by_tf.items())
+        },
+        "surviving_candidate_search_trials_sum": int(surviving_sum),
+        "oos_candidate_evidence_records": int(len(oos_evidence_records)),
+    }
 
 
 def _classify_staged_search_exception(
@@ -945,7 +2435,15 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                 dsr_status = str(
                     (false_discovery.get("dsr_evidence") or {}).get("status", "UNAVAILABLE")
                 ).upper()
-                if dsr_status != "PASS" or dsr < min_dsr:
+                dsr_detail = dict(false_discovery.get("dsr_evidence") or {})
+                dsr_selection_passed = (
+                    dsr_status == "PASS"
+                    or (
+                        dsr_status == "DIAGNOSTIC_ONLY"
+                        and dsr_detail.get("diagnostic_threshold_passed") is True
+                    )
+                )
+                if not dsr_selection_passed or dsr < min_dsr:
                     false_discovery_reasons.append(
                         f"false-discovery daily-net-MTM DSR {dsr_status} {dsr:.4f} < {min_dsr:.4f}"
                     )
@@ -1297,6 +2795,29 @@ def _governed_optimize_symbol_worker(
         _restore_pipeline_runtime_bindings(cfg, runtime_bindings)
         pipeline = OptimizationPipeline(cfg)
         result = pipeline.run_for_symbol(symbol)
+        data_state = _validated_symbol_data_state(
+            (result.data_window_meta or {}).get("symbol_data_state")
+        )
+        if not result.success and result.config is None and data_state:
+            # seq1028: typed terminal data-state receipt; never an exception.
+            receipt = {
+                "schema_version": OPTIMIZER_DATA_STATE_RECEIPT_SCHEMA,
+                "generation_id": str(generation_id),
+                "symbol": str(symbol),
+                "data_state": data_state,
+            }
+            resolved_receipt = Path(receipt_path).resolve()
+            digest, byte_count = _atomic_write_optimizer_receipt(
+                resolved_receipt, receipt
+            )
+            return {
+                "schema_version": OPTIMIZER_RECEIPT_POINTER_SCHEMA,
+                "generation_id": str(generation_id),
+                "symbol": str(symbol),
+                "path": str(resolved_receipt),
+                "sha256": digest,
+                "bytes": int(byte_count),
+            }
         if not result.success or result.config is None:
             _raise_worker_failure(result.error_message)
         counters = {
@@ -1412,6 +2933,29 @@ def _consume_optimizer_receipt(
             receipt = json.loads(encoded.decode("utf-8"))
         except Exception as exc:
             raise RuntimeError("OPTIMIZER_RECEIPT_JSON_INVALID") from exc
+        if (
+            isinstance(receipt, dict)
+            and str(receipt.get("schema_version"))
+            == OPTIMIZER_DATA_STATE_RECEIPT_SCHEMA
+        ):
+            # seq1028 typed data-state: exact keys + typed decision fields.
+            if set(receipt) != {
+                "schema_version", "generation_id", "symbol", "data_state"
+            }:
+                raise RuntimeError("OPTIMIZER_DATA_STATE_FIELDS_INVALID")
+            if str(receipt.get("generation_id")) != str(expected_generation_id):
+                raise RuntimeError("OPTIMIZER_DATA_STATE_GENERATION_MISMATCH")
+            if str(receipt.get("symbol")) != str(expected_symbol):
+                raise RuntimeError("OPTIMIZER_DATA_STATE_SYMBOL_MISMATCH")
+            ds = _validated_symbol_data_state(receipt.get("data_state"))
+            if ds is None:
+                raise RuntimeError("OPTIMIZER_DATA_STATE_PAYLOAD_INVALID")
+            return PipelineResult(
+                symbol=str(expected_symbol),
+                success=False,
+                error_message="TYPED_DATA_STATE",
+                data_window_meta={"symbol_data_state": dict(ds)},
+            )
         expected_receipt_keys = {
             "schema_version", "generation_id", "symbol", "config", "counters"
         }
@@ -1511,6 +3055,37 @@ class ConfigLedger:
         current_signature = self._current_file_signature()
         if current_signature != self._file_signature:
             self.load()
+
+    def _governed_publication_active(self) -> bool:
+        """Return whether symbol-wise writes are forbidden for this ledger."""
+
+        path = self.filepath
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        journal_path = path.with_name(
+            f".{path.name}.generation.promotion.json"
+        )
+        if journal_path.exists() or journal_path.is_symlink():
+            return True
+        active_manifest = path.with_name(f"{path.stem}.generation.json")
+        if not active_manifest.exists():
+            return False
+        try:
+            if active_manifest.stat().st_size > 64 * 1024 * 1024:
+                return True
+            payload = json.loads(active_manifest.read_text(encoding="utf-8"))
+        except Exception:
+            return True
+        if type(payload) is not dict:
+            return True
+        return bool(
+            payload.get("generation_status") == "PROMOTED"
+            and type(payload.get("authority_chain_receipt")) is dict
+            and type(payload.get("ledger_status")) is dict
+            and payload["ledger_status"].get("complete_current_contract_universe")
+            is True
+        )
     
     def load(self) -> int:
         """
@@ -1567,6 +3142,18 @@ class ConfigLedger:
             raise RuntimeError(f"Failed to load {self.filepath}: {e}")
     
     def _atomic_save(self):
+        """Save while sharing the production publication lock."""
+
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(_optimization_ledger_lock_path(self.filepath)):
+            if self._governed_publication_active():
+                raise RuntimeError(
+                    "GOVERNED_PRODUCTION_LEDGER_REQUIRES_FULL_GENERATION_CAS"
+                )
+            self._atomic_save_locked()
+
+    def _atomic_save_locked(self):
         """
         Save configs atomically using temp file + rename pattern.
         
@@ -1620,25 +3207,34 @@ class ConfigLedger:
         Returns:
             True if saved successfully
         """
-        if not self._loaded:
-            self.load()
-        else:
-            self._refresh_if_changed()
-        
-        previous = self.configs.get(symbol)
-        self.configs[symbol] = config
-        
-        try:
-            self._atomic_save()
-            logger.debug(f"Saved {symbol} to {self.filepath} (atomic)")
-            return True
-        except Exception as e:
-            if previous is None:
-                self.configs.pop(symbol, None)
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(_optimization_ledger_lock_path(self.filepath)):
+            if not self._loaded:
+                self.load()
             else:
-                self.configs[symbol] = previous
-            logger.error(f"Failed to save {symbol}: {e}")
-            return False
+                self._refresh_if_changed()
+            if self._governed_publication_active():
+                logger.error(
+                    "Refusing symbol-wise write to governed production ledger %s",
+                    self.filepath,
+                )
+                return False
+
+            previous = self.configs.get(symbol)
+            self.configs[symbol] = config
+
+            try:
+                self._atomic_save_locked()
+                logger.debug(f"Saved {symbol} to {self.filepath} (atomic)")
+                return True
+            except Exception as e:
+                if previous is None:
+                    self.configs.pop(symbol, None)
+                else:
+                    self.configs[symbol] = previous
+                logger.error(f"Failed to save {symbol}: {e}")
+                return False
     
     def get_config(self, symbol: str) -> Optional['SymbolConfig']:
         """Get config for a symbol."""
@@ -1820,20 +3416,31 @@ class ConfigLedger:
         Returns:
             True if removed and saved
         """
-        self._refresh_if_changed()
-        
-        if symbol not in self.configs:
-            return False
-        
-        del self.configs[symbol]
-        
-        try:
-            self._atomic_save()
-            logger.info(f"Removed {symbol} from {self.filepath}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to remove {symbol}: {e}")
-            return False
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(_optimization_ledger_lock_path(self.filepath)):
+            self._refresh_if_changed()
+            if self._governed_publication_active():
+                logger.error(
+                    "Refusing symbol-wise removal from governed production ledger %s",
+                    self.filepath,
+                )
+                return False
+
+            if symbol not in self.configs:
+                return False
+
+            previous = self.configs[symbol]
+            del self.configs[symbol]
+
+            try:
+                self._atomic_save_locked()
+                logger.info(f"Removed {symbol} from {self.filepath}")
+                return True
+            except Exception as e:
+                self.configs[symbol] = previous
+                logger.error(f"Failed to remove {symbol}: {e}")
+                return False
     
     def get_stats(self) -> Dict[str, Any]:
         """Get ledger statistics."""
@@ -2266,6 +3873,9 @@ class OptimizationGenerationOutcome:
     promoted_ledger_sha256: str = ""
     manifest_path: str = ""
     replay_evidence: Dict[str, Any] = field(default_factory=dict)
+    authority_chain_receipt: Dict[str, Any] = field(default_factory=dict)
+    authority_artifacts: Dict[str, Any] = field(default_factory=dict)
+    authority_assembly_path: str = ""
 
 
 # =============================================================================
@@ -2937,6 +4547,9 @@ class RegimeOptimizer:
         
         self.training_gate_telemetry: Dict[str, Any] = {}
         self.oos_candidate_evidence_records: List[Dict[str, Any]] = []
+        self._trade_power_multiplicity_cache: Dict[
+            Tuple[str, str, str, str, int], Dict[str, Any]
+        ] = {}
         
         # Initialize Optuna optimizer for regime tuning
         if OPTUNA_AVAILABLE and self.enable_hyperparam_tuning:
@@ -3121,7 +4734,8 @@ class RegimeOptimizer:
                         selection_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
                         selection_warmup_by_tf: Optional[Dict[str, int]] = None,
                         selection_surface_by_tf: Optional[Dict[str, str]] = None,
-                        historical_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None) -> Tuple[Dict[str, Dict[str, RegimeConfig]], Optional[RegimeConfig], int, int]:
+                        historical_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
+                        allowed_regimes_by_tf: Optional[Dict[str, Sequence[str]]] = None) -> Tuple[Dict[str, Dict[str, RegimeConfig]], Optional[RegimeConfig], int, int]:
         """
         Optimize for all (timeframe, regime) combinations with validation.
         
@@ -3154,6 +4768,14 @@ class RegimeOptimizer:
         
         tf_iter = tqdm(train_features_by_tf.items(), desc=f"[{symbol}] Timeframes", unit="tf", leave=False) if _TQDM else train_features_by_tf.items()
         for tf, train_features in tf_iter:
+            # seq1005: receipt-unobserved regimes are skipped BEFORE search.
+            active_regimes = tuple(
+                regime
+                for regime in self.REGIMES
+                if allowed_regimes_by_tf is None
+                or allowed_regimes_by_tf.get(tf) is None
+                or regime in set(allowed_regimes_by_tf[tf])
+            )
             val_features = val_features_by_tf.get(tf)
             eligibility_features = (
                 None if eligibility_features_by_tf is None else eligibility_features_by_tf.get(tf)
@@ -3200,12 +4822,13 @@ class RegimeOptimizer:
                 selection_warmup_bars=selection_warmup_bars,
                 selection_surface=selection_surface,
                 historical_features=historical_features,
+                allowed_regimes=active_regimes,
             )
-            
+
             if not tf_candidates:
                 logger.debug(f"[{symbol}] [{tf}] No valid candidates")
                 now = datetime.now()
-                for regime in self.REGIMES:
+                for regime in active_regimes:
                     search_evidence = self._summarize_search_cell_outcomes(
                         getattr(self, "_last_search_cell_outcomes", []) or [],
                         regime=regime,
@@ -3232,7 +4855,7 @@ class RegimeOptimizer:
                 continue
             
             # Select best per regime (with validation)
-            for regime in self.REGIMES:
+            for regime in active_regimes:
                 best_config, is_valid, val_reason = self._select_best_for_regime(
                     symbol, tf, regime, tf_candidates
                 )
@@ -3347,8 +4970,15 @@ class RegimeOptimizer:
         timeframe: str,
         regime: str,
         candidate: Mapping[str, Any],
+        *,
+        horizon_process_sha256: Optional[str] = None,
     ) -> str:
         """Return export-independent identity for one frozen exact-cell model."""
+        horizon_sha256 = (
+            horizon_process_sha256
+            if horizon_process_sha256 is not None
+            else candidate.get("horizon_process_sha256")
+        )
         return _stable_hash({
             "symbol": str(symbol or "").upper(),
             "timeframe": str(timeframe or "").upper(),
@@ -3357,6 +4987,7 @@ class RegimeOptimizer:
             "parameters": RegimeOptimizer._clean_candidate_params(
                 candidate.get("params", {})
             ),
+            "horizon_process_sha256": horizon_sha256,
         })
 
     @staticmethod
@@ -3519,6 +5150,172 @@ class RegimeOptimizer:
         }
 
     @staticmethod
+    def _trade_power_sha256(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        ).hexdigest()
+
+    @staticmethod
+    def _valid_trade_power_interval(start: Any, end: Any) -> bool:
+        try:
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            not pd.isna(start_ts)
+            and not pd.isna(end_ts)
+            and start_ts.tzinfo is not None
+            and end_ts.tzinfo is not None
+            and start_ts < end_ts
+        )
+
+    @staticmethod
+    def _sample_events_within_contract(
+        sample: Mapping[str, Any],
+        contract: Mapping[str, Any],
+    ) -> bool:
+        try:
+            event_start = pd.Timestamp(sample.get("event_start_utc"))
+            event_end = pd.Timestamp(sample.get("event_end_utc"))
+            contract_start = pd.Timestamp(contract.get("start_utc"))
+            contract_end = pd.Timestamp(contract.get("end_utc"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            not any(
+                pd.isna(value)
+                for value in (event_start, event_end, contract_start, contract_end)
+            )
+            and event_start.tzinfo is not None
+            and event_end.tzinfo is not None
+            and contract_start.tzinfo is not None
+            and contract_end.tzinfo is not None
+            and contract_start <= event_start <= event_end < contract_end
+        )
+
+    def _search_multiplicity_receipt(
+        self,
+        *,
+        effective_trials: int,
+        symbol: str,
+        timeframe: str,
+        regime: str,
+        strategy_family: str,
+    ) -> Dict[str, Any]:
+        count = max(1, int(effective_trials))
+        key = (
+            str(symbol).upper(),
+            str(timeframe).upper(),
+            str(regime).upper(),
+            str(strategy_family),
+            count,
+        )
+        cached = self._trade_power_multiplicity_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+        attempts = [
+            {
+                "attempt_id": self._trade_power_sha256(
+                    {
+                        "schema_version": "fxpm.search-attempt-identity.v1",
+                        "symbol": key[0],
+                        "timeframe": key[1],
+                        "regime": key[2],
+                        "strategy_family": key[3],
+                        "ordinal": ordinal,
+                    }
+                )
+            }
+            for ordinal in range(count)
+        ]
+        ledger = {
+            "contract_version": "fxpm.winner-attempt-ledger.v2",
+            "attempt_count": count,
+            "attempts_sha256": self._trade_power_sha256(attempts),
+            "attempts": attempts,
+        }
+        receipt = build_trade_power_multiplicity_receipt(ledger)
+        if len(self._trade_power_multiplicity_cache) >= 4096:
+            self._trade_power_multiplicity_cache.pop(
+                next(iter(self._trade_power_multiplicity_cache))
+            )
+        self._trade_power_multiplicity_cache[key] = dict(receipt)
+        return dict(receipt)
+
+    def _search_partition_contract(
+        self,
+        result: Mapping[str, Any],
+        *,
+        partition: str,
+        multiplicity_receipt: Mapping[str, Any],
+        prior_partition_contract_sha256: str = "",
+    ) -> Dict[str, Any]:
+        axis = result.get("trade_power_partition_axis")
+        if isinstance(axis, Mapping):
+            start_utc = axis.get("start_utc")
+            end_utc = axis.get("end_utc")
+            horizon_sha = axis.get("horizon_receipt_sha256")
+            event_axis_sha = axis.get("event_axis_sha256")
+        else:
+            rows = result.get("position_events")
+            if rows is None:
+                rows = result.get("trades")
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("TRADE_POWER_PARTITION_AXIS_MISSING")
+            starts = [pd.Timestamp(item.get("entry_time")) for item in rows]
+            ends = [pd.Timestamp(item.get("exit_time")) for item in rows]
+            if any(pd.isna(value) for value in [*starts, *ends]):
+                raise ValueError("TRADE_POWER_PARTITION_AXIS_INVALID")
+            start = min(starts)
+            end = max(ends) + pd.Timedelta(microseconds=1)
+            start = (
+                start.tz_localize("UTC")
+                if start.tzinfo is None
+                else start.tz_convert("UTC")
+            )
+            end = (
+                end.tz_localize("UTC")
+                if end.tzinfo is None
+                else end.tz_convert("UTC")
+            )
+            start_utc = start.isoformat()
+            end_utc = end.isoformat()
+            event_axis_sha = self._trade_power_sha256(
+                [
+                    {
+                        "entry_time": str(item.get("entry_time")),
+                        "exit_time": str(item.get("exit_time")),
+                        "position_id": str(item.get("position_id") or ""),
+                    }
+                    for item in rows
+                ]
+            )
+            horizon_sha = self._trade_power_sha256(
+                {
+                    "schema_version": "fxpm.search-partition-fallback.v1",
+                    "start_utc": start_utc,
+                    "end_utc": end_utc,
+                    "event_axis_sha256": event_axis_sha,
+                }
+            )
+        return build_trade_power_partition_contract(
+            partition=partition,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            horizon_receipt_sha256=str(horizon_sha or ""),
+            event_axis_sha256=str(event_axis_sha or ""),
+            multiplicity_receipt=multiplicity_receipt,
+            prior_partition_contract_sha256=prior_partition_contract_sha256,
+        )
+
+    @staticmethod
     def _power_trial_outcome(
         decision: TradePowerDecision,
         *,
@@ -3563,13 +5360,28 @@ class RegimeOptimizer:
         parameter_hash: str,
     ) -> TradePowerDecision:
         """Calibrate and freeze one train-only effective-trade requirement."""
+        position_events = result.get("position_events")
+        if position_events is None:
+            position_events = result.get("trades")
+        multiplicity_receipt = self._search_multiplicity_receipt(
+            effective_trials=effective_trials,
+            symbol=symbol,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_family=strategy_family,
+        )
+        partition_contract = self._search_partition_contract(
+            result,
+            partition="optimizer_train",
+            multiplicity_receipt=multiplicity_receipt,
+        )
         decision = calibrate_train_trade_power(
-            result.get("trades"),
-            effective_trials=max(1, int(effective_trials)),
+            position_events,
             policy=PRODUCTION_TRADE_POWER_POLICY,
+            multiplicity_receipt=multiplicity_receipt,
+            partition_contract=partition_contract,
             source_contract=self._trade_power_source_contract(result),
             minimum_observations=PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
-            multiplicity_method="planned_family_cell_trials_v1",
         )
         if decision.outcome_kind is SearchOutcomeKind.INFRA_FAILURE:
             raise SearchInfrastructureError(self._power_trial_outcome(
@@ -3594,12 +5406,75 @@ class RegimeOptimizer:
         regime: str,
         strategy_family: str,
         parameter_hash: str,
+        prior_partition_decision: Optional[Mapping[str, Any]] = None,
     ) -> TradePowerDecision:
         """Apply one immutable train requirement to an out-of-train partition."""
+        position_events = result.get("position_events")
+        if position_events is None:
+            position_events = result.get("trades")
+        multiplicity_receipt = self._search_multiplicity_receipt(
+            effective_trials=frozen_requirement.attempted_trials_exact,
+            symbol=symbol,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_family=strategy_family,
+        )
+        if (
+            multiplicity_receipt.get("attempt_ledger_payload_sha256")
+            != frozen_requirement.attempt_ledger_payload_sha256
+            or multiplicity_receipt.get("attempts_sha256")
+            != frozen_requirement.attempts_sha256
+            or multiplicity_receipt.get("attempted_trials_exact")
+            != frozen_requirement.attempted_trials_exact
+            or multiplicity_receipt.get("receipt_sha256")
+            != frozen_requirement.multiplicity_receipt_sha256
+        ):
+            raise ValueError("TRADE_POWER_MULTIPLICITY_LINEAGE_DRIFT")
+        train_contract = build_trade_power_partition_contract(
+            partition="optimizer_train",
+            start_utc=frozen_requirement.calibration_start_utc,
+            end_utc=frozen_requirement.calibration_end_utc,
+            horizon_receipt_sha256=(
+                frozen_requirement.calibration_horizon_receipt_sha256
+            ),
+            event_axis_sha256=frozen_requirement.calibration_event_axis_sha256,
+            multiplicity_receipt=multiplicity_receipt,
+        )
+        if (
+            train_contract.get("contract_sha256")
+            != frozen_requirement.calibration_partition_contract_sha256
+        ):
+            raise ValueError("TRADE_POWER_TRAIN_PARTITION_LINEAGE_DRIFT")
+        prior_contract: Mapping[str, Any] = train_contract
+        if partition == "final_lockbox":
+            if not isinstance(prior_partition_decision, Mapping):
+                raise ValueError("TUNING_PARTITION_DECISION_MISSING")
+            prior_state, prior_reason = self._trade_power_decision_state(
+                prior_partition_decision,
+                partition="tuning_validation",
+            )
+            if prior_state != "PASS":
+                raise ValueError(
+                    prior_reason or "TUNING_PARTITION_DECISION_NOT_PASSING"
+                )
+            prior_payload = prior_partition_decision.get("partition_contract")
+            if not isinstance(prior_payload, Mapping):
+                raise ValueError("TUNING_PARTITION_CONTRACT_MISSING")
+            prior_contract = dict(prior_payload)
+        current_contract = self._search_partition_contract(
+            result,
+            partition=partition,
+            multiplicity_receipt=multiplicity_receipt,
+            prior_partition_contract_sha256=str(
+                prior_contract.get("contract_sha256") or ""
+            ),
+        )
         decision = evaluate_trade_power_partition(
-            result.get("trades"),
+            position_events,
             frozen_requirement=frozen_requirement,
             partition=partition,
+            partition_contract=current_contract,
+            prior_partition_contract=prior_contract,
             source_contract=self._trade_power_source_contract(result),
             minimum_observations=PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
         )
@@ -3678,6 +5553,7 @@ class RegimeOptimizer:
             "requirement_sigma_source",
             "sample_evidence",
             "frozen_requirement",
+            "partition_contract",
         }
         if (
             set(value) != expected_keys
@@ -3785,7 +5661,7 @@ class RegimeOptimizer:
             == derived_requirement.required_effective_tuning_trades
             and requirement.required_effective_final_trades
             == derived_requirement.required_effective_final_trades
-            and requirement.multiplicity_method == "planned_family_cell_trials_v1"
+            and requirement.multiplicity_method == "raw_attempt_ledger_count_v1"
         )
         required_hashes = (
             requirement.calibration_sample_sha256,
@@ -3796,6 +5672,14 @@ class RegimeOptimizer:
             requirement.financing_schedule_sha256,
             requirement.numerical_execution_cost_policy_sha256,
             requirement.calibration_numerical_execution_cost_attestation_sha256,
+            requirement.attempt_ledger_payload_sha256,
+            requirement.attempts_sha256,
+            requirement.multiplicity_receipt_sha256,
+            requirement.calibration_partition_contract_sha256,
+            requirement.calibration_horizon_receipt_sha256,
+            requirement.calibration_event_axis_sha256,
+            requirement.calibration_net_r_values_sha256,
+            requirement.calibration_holding_intervals_sha256,
         )
         if (
             not requirement.passed
@@ -3815,10 +5699,109 @@ class RegimeOptimizer:
             != REQUIRED_SWAP_ACCRUAL_CONTRACT
             or requirement.trade_record_schema_version
             != REQUIRED_TRADE_RECORD_SCHEMA
+            or type(requirement.attempted_trials_exact) is not int
+            or requirement.attempted_trials_exact <= 0
+            or requirement.effective_trials
+            != float(requirement.attempted_trials_exact)
+            or not cls._valid_trade_power_interval(
+                requirement.calibration_start_utc,
+                requirement.calibration_end_utc,
+            )
             or required_field != required
             or not all(cls._sha256_attestation(item) for item in required_hashes)
         ):
             return "INFRA", "TRADE_POWER_DECISION_REQUIREMENT_INVALID"
+
+        contract = value.get("partition_contract")
+        contract_keys = {
+            "schema_version",
+            "partition",
+            "start_utc",
+            "end_utc",
+            "horizon_receipt_sha256",
+            "event_axis_sha256",
+            "attempt_ledger_payload_sha256",
+            "attempts_sha256",
+            "attempted_trials_exact",
+            "multiplicity_receipt_sha256",
+            "prior_partition_contract_sha256",
+            "contract_sha256",
+        }
+        if not isinstance(contract, Mapping) or set(contract) != contract_keys:
+            return "INFRA", "TRADE_POWER_PARTITION_CONTRACT_INVALID"
+        contract_body = {
+            key: contract.get(key)
+            for key in contract_keys - {"contract_sha256"}
+        }
+        prior_hash = str(contract.get("prior_partition_contract_sha256") or "")
+        try:
+            contract_start = pd.Timestamp(contract.get("start_utc"))
+            contract_end = pd.Timestamp(contract.get("end_utc"))
+        except (TypeError, ValueError, OverflowError):
+            return "INFRA", "TRADE_POWER_PARTITION_CONTRACT_INVALID"
+        if (
+            str(contract.get("schema_version") or "")
+            != TRADE_POWER_PARTITION_VERSION
+            or str(contract.get("partition") or "") != partition
+            or pd.isna(contract_start)
+            or pd.isna(contract_end)
+            or contract_start.tzinfo is None
+            or contract_end.tzinfo is None
+            or contract_start >= contract_end
+            or contract.get("contract_sha256")
+            != cls._trade_power_sha256(contract_body)
+            or not cls._sha256_attestation(
+                contract.get("horizon_receipt_sha256")
+            )
+            or not cls._sha256_attestation(contract.get("event_axis_sha256"))
+            or contract.get("attempt_ledger_payload_sha256")
+            != requirement.attempt_ledger_payload_sha256
+            or contract.get("attempts_sha256") != requirement.attempts_sha256
+            or contract.get("attempted_trials_exact")
+            != requirement.attempted_trials_exact
+            or contract.get("multiplicity_receipt_sha256")
+            != requirement.multiplicity_receipt_sha256
+            or (
+                partition == "optimizer_train"
+                and (
+                    prior_hash
+                    or contract.get("contract_sha256")
+                    != requirement.calibration_partition_contract_sha256
+                    or contract.get("start_utc")
+                    != requirement.calibration_start_utc
+                    or contract.get("end_utc")
+                    != requirement.calibration_end_utc
+                    or contract.get("horizon_receipt_sha256")
+                    != requirement.calibration_horizon_receipt_sha256
+                    or contract.get("event_axis_sha256")
+                    != requirement.calibration_event_axis_sha256
+                )
+            )
+            or (
+                partition == "tuning_validation"
+                and (
+                    prior_hash
+                    != requirement.calibration_partition_contract_sha256
+                    or contract_start
+                    < pd.Timestamp(requirement.calibration_end_utc)
+                    or contract.get("event_axis_sha256")
+                    == requirement.calibration_event_axis_sha256
+                )
+            )
+            or (
+                partition == "final_lockbox"
+                and (
+                    not cls._sha256_attestation(prior_hash)
+                    or prior_hash
+                    == requirement.calibration_partition_contract_sha256
+                    or contract_start
+                    < pd.Timestamp(requirement.calibration_end_utc)
+                    or contract.get("event_axis_sha256")
+                    == requirement.calibration_event_axis_sha256
+                )
+            )
+        ):
+            return "INFRA", "TRADE_POWER_PARTITION_CONTRACT_INVALID"
 
         source = sample.get("source_contract")
         if not isinstance(source, Mapping):
@@ -3841,6 +5824,10 @@ class RegimeOptimizer:
             "net_r_max",
             "net_r_values_sha256",
             "holding_intervals_sha256",
+            "position_ids_sha256",
+            "event_order_sha256",
+            "event_start_utc",
+            "event_end_utc",
             "sample_sha256",
             "source_contract",
             "net_r_contract",
@@ -3890,6 +5877,8 @@ class RegimeOptimizer:
             source_hashes.extend([
                 sample.get("net_r_values_sha256"),
                 sample.get("holding_intervals_sha256"),
+                sample.get("position_ids_sha256"),
+                sample.get("event_order_sha256"),
             ])
         if (
             str(sample.get("schema_version") or "") != TRADE_SAMPLE_SCHEMA_VERSION
@@ -3924,6 +5913,7 @@ class RegimeOptimizer:
                         abs_tol=1e-12,
                     )
                     or str((dependence or {}).get("status") or "") != "MEASURED"
+                    or not cls._sample_events_within_contract(sample, contract)
                 )
             )
             or (
@@ -4023,7 +6013,7 @@ class RegimeOptimizer:
         return {
             key: value
             for key, value in result.items()
-            if key not in {"equity_curve", "trades"}
+            if key not in {"equity_curve", "trades", "position_events"}
         }
 
     @staticmethod
@@ -4033,7 +6023,7 @@ class RegimeOptimizer:
             return {
                 str(key): RegimeOptimizer._compact_metric_tree(item)
                 for key, item in value.items()
-                if key not in {"equity_curve", "trades"}
+                if key not in {"equity_curve", "trades", "position_events"}
             }
         if isinstance(value, (list, tuple)):
             return [RegimeOptimizer._compact_metric_tree(item) for item in value]
@@ -5532,12 +7522,18 @@ class RegimeOptimizer:
         train_features: pd.DataFrame,
         strategies: List[BaseStrategy],
         train_warmup_bars: int = 0,
+        allowed_regimes: Optional[Sequence[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Freeze the train-best B0 candidate independently for every cell."""
         candidates: List[Dict[str, Any]] = []
         cell_records: List[Dict[str, Any]] = []
+        # seq1028: receipt-unobserved regimes consume zero probes/attempts.
+        probe_regimes = tuple(
+            r for r in self.REGIMES
+            if allowed_regimes is None or r in set(allowed_regimes)
+        )
         for base_strategy in strategies:
-            for regime in self.REGIMES:
+            for regime in probe_regimes:
                 try:
                     specs = self._family_probe_param_specs(
                         base_strategy,
@@ -6000,7 +7996,8 @@ class RegimeOptimizer:
                             selection_features: Optional[pd.DataFrame] = None,
                             selection_warmup_bars: int = 0,
                             selection_surface: str = "validation",
-                            historical_features: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+                            historical_features: Optional[pd.DataFrame] = None,
+                            allowed_regimes: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
         """
         Collect all strategy candidates with per-regime metrics.
         
@@ -6020,6 +8017,7 @@ class RegimeOptimizer:
             train_features=train_features,
             strategies=strategies,
             train_warmup_bars=train_warmup_bars,
+            allowed_regimes=allowed_regimes,
         )
         self._last_family_probe_cells = [dict(cell) for cell in probe_cells]
         self._last_search_cell_outcomes = [dict(cell) for cell in probe_cells]
@@ -8098,10 +10096,18 @@ class RegimeOptimizer:
             min_dsr = float(false_discovery.get("min_dsr", 0.0) or 0.0)
             dsr = float(false_discovery.get("deflated_sharpe", 0.0) or 0.0)
             if bool(false_discovery.get("enabled", False)):
+                dsr_evidence = dict(false_discovery.get("dsr_evidence") or {})
                 dsr_status = str(
-                    (false_discovery.get("dsr_evidence") or {}).get("status", "UNAVAILABLE")
+                    dsr_evidence.get("status", "UNAVAILABLE")
                 ).upper()
-                if dsr_status != "PASS" or dsr < min_dsr:
+                dsr_selection_passed = (
+                    dsr_status == "PASS"
+                    or (
+                        dsr_status == "DIAGNOSTIC_ONLY"
+                        and dsr_evidence.get("diagnostic_threshold_passed") is True
+                    )
+                )
+                if not dsr_selection_passed or dsr < min_dsr:
                     rejection_reasons.append(
                         f"{cand['strategy_name']}: daily-net-MTM DSR {dsr_status} "
                         f"value={dsr:.4f} threshold={min_dsr:.4f} "
@@ -8612,14 +10618,23 @@ class RegimeOptimizer:
         if score is not None:
             evidence["selection_score_raw"] = float(score)
         if isinstance(candidate, dict):
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id:
+                raise ValueError(
+                    "validation evidence requires the exact selected candidate_id"
+                )
             try:
                 strategy = StrategyRegistry.get(candidate.get("strategy_name", ""), **(candidate.get("params", {}) or {}))
             except Exception:
                 strategy = None
             evidence["fairness_evidence"] = build_fairness_evidence(candidate, strategy=strategy)
             oos_evidence = dict(candidate.get("oos_evidence") or {})
-            if oos_evidence.get("candidate_id"):
-                evidence["candidate_id"] = str(oos_evidence["candidate_id"])
+            oos_candidate_id = str(oos_evidence.get("candidate_id") or "")
+            if oos_candidate_id and oos_candidate_id != candidate_id:
+                raise ValueError(
+                    "OOS evidence candidate_id does not match the exact selected candidate"
+                )
+            evidence["candidate_id"] = candidate_id
             evidence["evaluation_regime"] = self._candidate_evaluation_regime(candidate)
             if bool(candidate.get("trade_power_contract_enforced", False)):
                 evidence["trade_power"] = {
@@ -10042,17 +12057,8 @@ class OptimizationPipeline:
             ),
         )
 
-    def _evidence_no_trade_markers(self, verdict: EvidenceVerdict) -> Dict[str, RegimeConfig]:
-        """Create an explicit NO_TRADE slot for every regime without optimizing."""
-        reason = verdict.concise_reason()
-        now = datetime.now()
-        regimes = tuple(getattr(self.regime_optimizer, "REGIMES", ()) or ())
-        if not regimes:
-            regimes = ("TREND", "RANGE", "BREAKOUT", "CHOP")
-        return {
-            regime: self.regime_optimizer._make_no_trade_marker(reason, now=now)
-            for regime in regimes
-        }
+    # _evidence_no_trade_markers was deleted (seq961/seq972): a technical
+    # EvidenceVerdict failure must never manufacture NO_TRADE leaves.
 
     def _native_cell_exclusion_markers(
         self,
@@ -10378,8 +12384,13 @@ class OptimizationPipeline:
         timeframe_window_meta: Dict[str, Dict[str, Any]] = {}
         native_gate_errors: Dict[str, List[str]] = {}
         active_timeframes = set(configured_timeframes)
+        source_unavailable_timeframes: set[str] = set()
         excluded_timeframes: set[str] = set()
         excluded_bindings: Dict[str, Dict[str, Any]] = {}
+        native_cell_states: Dict[str, str] = {
+            timeframe: NATIVE_EVIDENCE_CANDIDATE
+            for timeframe in configured_timeframes
+        }
         calendar_contract: Dict[str, Any] = {}
         universe = None
 
@@ -10409,10 +12420,31 @@ class OptimizationPipeline:
                     active_timeframes = {
                         str(tf).upper() for tf in universe.active_timeframes(symbol)
                     }
+                    source_unavailable_reader = getattr(
+                        universe, "source_unavailable_timeframes", None
+                    )
+                    source_unavailable_timeframes = {
+                        str(tf).upper()
+                        for tf in (
+                            source_unavailable_reader(symbol)
+                            if callable(source_unavailable_reader)
+                            else ()
+                        )
+                    }
                     excluded_timeframes = {
                         str(tf).upper() for tf in universe.excluded_timeframes(symbol)
                     }
-                    if active_timeframes | excluded_timeframes != set(configured_timeframes):
+                    partition = (
+                        active_timeframes
+                        | source_unavailable_timeframes
+                        | excluded_timeframes
+                    )
+                    if (
+                        partition != set(configured_timeframes)
+                        or active_timeframes & source_unavailable_timeframes
+                        or active_timeframes & excluded_timeframes
+                        or source_unavailable_timeframes & excluded_timeframes
+                    ):
                         return {}, {
                             "production_split_mode": split_mode,
                             "native_source_gate": {
@@ -10427,10 +12459,17 @@ class OptimizationPipeline:
                         tf: dict(universe.cell_exclusion_binding(symbol, tf) or {})
                         for tf in sorted(excluded_timeframes)
                     }
+                    native_cell_states = {
+                        timeframe: str(universe.cell_status(symbol, timeframe)).lower()
+                        for timeframe in configured_timeframes
+                    }
                     calendar_contract = dict(
                         getattr(universe, "calendar_contract", {}) or {}
                     )
 
+            # seq1019/seq1055 bounded preflight: exactly one frame lives at
+            # a time; gate facts are recorded and the frame is released.
+            native_rows_by_tf: Dict[str, int] = {}
             for tf_name in configured_timeframes:
                 if tf_name not in active_timeframes:
                     continue
@@ -10465,7 +12504,8 @@ class OptimizationPipeline:
                 if reasons:
                     native_gate_errors[tf_name] = list(dict.fromkeys(reasons))
                 else:
-                    preloaded_native[tf_name] = native_data
+                    native_rows_by_tf[tf_name] = int(len(native_data))
+                del native_data
 
             if native_gate_errors:
                 logger.error(
@@ -10485,8 +12525,14 @@ class OptimizationPipeline:
                     },
                     "native_cell_eligibility": {
                         "active_timeframes": sorted(active_timeframes),
+                        "evidence_candidate_timeframes": sorted(active_timeframes),
+                        "source_unavailable_timeframes": sorted(
+                            source_unavailable_timeframes
+                        ),
                         "excluded_timeframes": sorted(excluded_timeframes),
                         "excluded_bindings": excluded_bindings,
+                        "cell_states": dict(native_cell_states),
+                        "acquisition_emits_trading_verdicts": False,
                     },
                     "timeframe_sources": preloaded_meta,
                 }
@@ -10501,9 +12547,19 @@ class OptimizationPipeline:
                     },
                     "native_cell_eligibility": {
                         "active_timeframes": [],
+                        "evidence_candidate_timeframes": [],
+                        "source_unavailable_timeframes": sorted(
+                            source_unavailable_timeframes
+                        ),
                         "excluded_timeframes": sorted(excluded_timeframes),
                         "excluded_bindings": excluded_bindings,
-                        "all_cells_excluded": True,
+                        "no_evidence_candidates": True,
+                        "cell_states": dict(native_cell_states),
+                        "acquisition_emits_trading_verdicts": False,
+                        "activation_id": getattr(universe, "activation_id", None),
+                        "activation_manifest_sha256": getattr(
+                            universe, "activation_manifest_sha256", None
+                        ),
                     },
                     "native_calendar_contract": calendar_contract,
                     "timeframe_sources": {},
@@ -10514,7 +12570,8 @@ class OptimizationPipeline:
                 next(tf for tf in configured_timeframes if tf in active_timeframes)
             )
             reference_data = ensure_utc_index(
-                preloaded_native[reference_tf], copy=False
+                self.data_loader.load_native_timeframe(symbol, reference_tf)[0],
+                copy=False,
             )
             if calendar_contract:
                 try:
@@ -10555,7 +12612,10 @@ class OptimizationPipeline:
                     },
                 }
             reference_data = trim_to_closed_bars(
-                reference_data, reference_tf, as_of_utc=as_of_utc
+                reference_data,
+                reference_tf,
+                as_of_utc=as_of_utc,
+                copy=False,
             )
             if reference_data is None or len(reference_data) == 0:
                 return {}, {
@@ -10575,14 +12635,27 @@ class OptimizationPipeline:
                 calendar_contract=calendar_contract,
             )
             base_source_meta = dict(preloaded_meta.get(reference_tf) or {})
-            data_by_tf: Dict[str, pd.DataFrame] = {}
+            # Release the reference frame before any other TF loads.
+            del reference_data
+            import gc as _gc
+
+            _gc.collect()
+            source_fingerprints: Dict[str, Dict[str, Any]] = {}
             timeframe_sources: Dict[str, Dict[str, Any]] = {}
             for tf_name in configured_timeframes:
                 if tf_name not in active_timeframes:
                     continue
                 try:
                     data = trim_to_closed_bars(
-                        preloaded_native[tf_name], tf_name, as_of_utc=as_of_utc
+                        ensure_utc_index(
+                            self.data_loader.load_native_timeframe(
+                                symbol, tf_name
+                            )[0],
+                            copy=False,
+                        ),
+                        tf_name,
+                        as_of_utc=as_of_utc,
+                        copy=False,
                     )
                     if data is None or len(data) == 0:
                         raise ValueError("closed native workflow is empty")
@@ -10590,7 +12663,12 @@ class OptimizationPipeline:
                     timeframe_meta["workflow_rows"] = int(len(data))
                     timeframe_meta["as_of_utc"] = as_of_utc.isoformat()
                     timeframe_sources[tf_name] = timeframe_meta
-                    data_by_tf[tf_name] = data
+                    source_fingerprints[tf_name] = {
+                        "meta": dict(preloaded_meta.get(tf_name) or {}),
+                        "rows": int(len(data)),
+                        "first_ts": str(data.index[0].isoformat()),
+                        "last_ts": str(data.index[-1].isoformat()),
+                    }
                     tf_workflow_meta = self._build_calendar_workflow_meta(
                         data,
                         as_of_utc=as_of_utc,
@@ -10609,10 +12687,14 @@ class OptimizationPipeline:
                         ),
                         "windows": tf_workflow_meta.get("windows", {}),
                     }
+                    del data
                 except Exception as exc:
                     native_gate_errors[tf_name] = [
                         f"NATIVE_CLOSED_WORKFLOW_PREPARATION_FAILED:{type(exc).__name__}"
                     ]
+            data_by_tf = _BoundedNativeSource(
+                self, symbol, as_of_utc, source_fingerprints
+            )
             if native_gate_errors:
                 workflow_meta["timeframe_sources"] = timeframe_sources
                 workflow_meta["native_source_gate"] = {
@@ -10709,12 +12791,21 @@ class OptimizationPipeline:
                 "passed": True,
                 "strict_no_fallback": True,
                 "timeframes": sorted(active_timeframes),
+                "source_unavailable_timeframes": sorted(
+                    source_unavailable_timeframes
+                ),
                 "excluded_timeframes": sorted(excluded_timeframes),
             }
             workflow_meta["native_cell_eligibility"] = {
                 "active_timeframes": sorted(active_timeframes),
+                "evidence_candidate_timeframes": sorted(active_timeframes),
+                "source_unavailable_timeframes": sorted(
+                    source_unavailable_timeframes
+                ),
                 "excluded_timeframes": sorted(excluded_timeframes),
                 "excluded_bindings": excluded_bindings,
+                "cell_states": dict(native_cell_states),
+                "acquisition_emits_trading_verdicts": False,
                 "activation_id": getattr(universe, "activation_id", None),
                 "activation_manifest_sha256": getattr(
                     universe, "activation_manifest_sha256", None
@@ -11104,6 +13195,10 @@ class OptimizationPipeline:
                                     self.regime_optimizer._clean_candidate_params(
                                         cfg.parameters
                                     )
+                                ),
+                                prior_partition_decision=(
+                                    validation_evidence.get("trade_power", {})
+                                    .get("tuning_validation")
                                 ),
                             )
                         )
@@ -11974,6 +14069,7 @@ class OptimizationPipeline:
             validated_count = 0
             unvalidated_count = 0
             oos_evidence_records: List[Dict[str, Any]] = []
+            search_cell_outcomes_by_tf: Dict[str, List[Dict[str, Any]]] = {}
             edge_challenger_configs: Dict[str, Dict[str, Dict[str, Any]]] = {}
             edge_challenger_failures: List[str] = []
             
@@ -12141,6 +14237,8 @@ class OptimizationPipeline:
             # the detector parameters cannot be proven to come from this exact
             # optimizer-train source/window. Calendar v2 is native-timeframe
             # authoritative; legacy v1 remains M5-derived.
+            non_search_timeframes: Set[str] = set()
+            fit_observed_by_tf: Dict[str, List[str]] = {}
             if split_mode in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
                 provenance_checks: Dict[str, Dict[str, Any]] = {}
                 current_source = dict(data_window_meta.get("source", {}) or {})
@@ -12188,14 +14286,132 @@ class OptimizationPipeline:
                             split_mode == CALENDAR_SPLIT_MODE
                         ),
                     )
+                    # seq1024: never trust the returned receipt - recompute
+                    # counts/vector from the exact optimizer-train surface.
+                    support = check.get("train_regime_support")
+                    if (
+                        check.get("valid")
+                        and check.get("status") == "FIT"
+                        and support is not None
+                        and split_mode == CALENDAR_SPLIT_MODE
+                    ):
+                        train_index = ensure_utc_index(tf_data, copy=False).index
+                        s_idx = int(
+                            train_index.searchsorted(
+                                pd.Timestamp(geometry["opt_train_start"]),
+                                side="left",
+                            )
+                        )
+                        e_idx = int(
+                            train_index.searchsorted(
+                                pd.Timestamp(geometry["opt_train_end"]),
+                                side="left",
+                            )
+                        )
+                        recomputed = recompute_train_regime_support_digest(
+                            tf_data.iloc[s_idx:e_idx],
+                            load_regime_params_cell(
+                                regime_params_file, symbol, tf
+                            )
+                            or {},
+                        )
+                        record_body = check.get("record") or {}
+                        bindings = (support or {}).get("bindings") or {}
+                        record_source_sha = str(
+                            ((record_body.get("source") or {}).get("sha256"))
+                            or ""
+                        ).lower()
+                        record_train_sha = hashlib.sha256(
+                            json.dumps(
+                                record_body.get("train") or {},
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        code_sha = detector_code_sha256()
+                        if (
+                            recomputed is None
+                            or recomputed["counts"] != support["counts"]
+                            or recomputed["vector_sha256"]
+                            != support["vector_sha256"]
+                            or recomputed["eligible_rows"]
+                            != support["eligible_rows"]
+                            or recomputed["first_ts"] != support["first_ts"]
+                            or recomputed["last_ts"] != support["last_ts"]
+                            or str(bindings.get("source_sha256") or "").lower()
+                            != record_source_sha
+                            or bindings.get("train_window_sha256")
+                            != record_train_sha
+                            or code_sha is None
+                            or bindings.get("detector_code_sha256") != code_sha
+                        ):
+                            check = {
+                                "valid": False,
+                                "status": "FIT",
+                                "reason": (
+                                    "regime train support recompute mismatch"
+                                ),
+                            }
                     provenance_checks[str(tf).upper()] = {
                         "valid": bool(check.get("valid", False)),
+                        "status": str(check.get("status", "") or ""),
                         "reason": str(check.get("reason", "unknown")),
+                        "decision_kind": check.get("decision_kind"),
+                        # seq981: exact binding so later grid validation can
+                        # re-verify the typed NON_SEARCH decision by hash.
+                        "decision_sha256": (
+                            (check.get("record") or {}).get("decision_sha256")
+                        ),
+                        "generation_terminal": (
+                            (check.get("record") or {}).get("generation_terminal")
+                        ),
+                        "reason_code": (
+                            (check.get("record") or {}).get("reason_code")
+                        ),
+                        # seq1005: exact train-support binding for FIT cells.
+                        "support_receipt_sha256": (
+                            (check.get("train_regime_support") or {}).get(
+                                "receipt_sha256"
+                            )
+                        ),
+                        "observed_regimes": list(
+                            (check.get("train_regime_support") or {}).get(
+                                "observed_regimes", []
+                            )
+                        ),
+                        "unobserved_regimes": list(
+                            (check.get("train_regime_support") or {}).get(
+                                "unobserved_regimes", []
+                            )
+                        ),
                         "provenance_path": check.get("provenance_path"),
                     }
                 data_window_meta = dict(data_window_meta or {})
                 data_window_meta["regime_provenance_gate"] = provenance_checks
                 result.data_window_meta = dict(data_window_meta)
+                # seq936/937: a typed NON_SEARCH decision is a VALID
+                # authorization outcome, not a gate failure.  The cell is
+                # skipped from strategy search with the ledger untouched;
+                # it is never an economic NO_TRADE.
+                non_search_timeframes = {
+                    tf
+                    for tf, check in provenance_checks.items()
+                    if check["valid"] and check["status"] == "NON_SEARCH"
+                }
+                # seq1005: receipt-observed labels per FIT timeframe.
+                fit_observed_by_tf = {
+                    tf: list(check.get("observed_regimes") or [])
+                    for tf, check in provenance_checks.items()
+                    if check["valid"]
+                    and check["status"] == "FIT"
+                    and check.get("support_receipt_sha256")
+                }
+                if non_search_timeframes:
+                    logger.info(
+                        f"[{symbol}] Typed NON_SEARCH timeframes (skipped from "
+                        f"search, ledger unchanged): "
+                        f"{sorted(non_search_timeframes)}"
+                    )
                 failed = {
                     tf: check for tf, check in provenance_checks.items()
                     if not check["valid"]
@@ -12210,7 +14426,18 @@ class OptimizationPipeline:
 
             import gc
 
-            for tf, data in data_by_tf.items():
+            for tf in tuple(data_by_tf):
+                # Transfer ownership of one native frame into this iteration.
+                # Completed timeframes are released instead of retaining all
+                # six full histories until the symbol finishes.
+                data = data_by_tf.pop(tf)
+                if str(tf).upper() in non_search_timeframes:
+                    # Typed NON_SEARCH authorization (seq936): no strategy
+                    # search, no ledger leaves, never NO_TRADE.  The typed
+                    # decision already lives in the provenance sidecar and in
+                    # data_window_meta["regime_provenance_gate"].
+                    del data
+                    continue
                 geometry = _timeframe_geometry(tf)
                 hist_start = geometry["hist_start"]
                 hist_end = geometry["hist_end"]
@@ -12262,15 +14489,24 @@ class OptimizationPipeline:
                         evidence_verdict.to_dict()
                     )
                     result.data_window_meta = dict(data_window_meta)
+                    del evidence_frames
                     if not evidence_verdict.passed:
-                        markers = self._evidence_no_trade_markers(evidence_verdict)
-                        regime_configs[tf] = markers
-                        unvalidated_count += len(markers)
-                        logger.warning(
-                            f"[{symbol}] [{tf}] Evidence gate failed before feature/search: "
-                            f"{evidence_verdict.concise_reason()}"
+                        # seq931 invariant: a failed EvidenceVerdict is a
+                        # TECHNICAL/data-integrity state, never a trading
+                        # verdict.  It must not become NO_TRADE leaves and the
+                        # winner ledger must stay byte-unchanged; the symbol
+                        # run reports unsuccessful with a typed reason so the
+                        # cell can be repaired and re-run.
+                        result.error_message = (
+                            "TECHNICAL_EVIDENCE_FAILURE:"
+                            f"{str(tf).upper()}:{evidence_verdict.concise_reason()}"
                         )
-                        continue
+                        logger.error(
+                            f"[{symbol}] [{tf}] Evidence gate failed before "
+                            f"feature/search; typed technical failure, ledger "
+                            f"unchanged: {evidence_verdict.concise_reason()}"
+                        )
+                        return result
 
                 # Phase A never computes features on final-lockbox prices.
                 # This is stronger than relying on every current feature to be
@@ -12339,20 +14575,19 @@ class OptimizationPipeline:
 
                 scored_train_rows = max(0, len(active_features) - train_warmup_bars)
                 if scored_train_rows < 200:
-                    reason = (
-                        f"Active native timeframe has only {scored_train_rows} "
-                        "optimizer-train feature rows; at least 200 are required"
+                    # seq1035: runtime feature-row insufficiency has no
+                    # authenticated typed schema, so it stays TECHNICAL:
+                    # unsuccessful, typed, ledger untouched, retryable.
+                    result.error_message = (
+                        "TECHNICAL_SEARCH_PREREQUISITE:"
+                        f"{str(tf).upper()}:train_feature_rows="
+                        f"{scored_train_rows}<200"
                     )
-                    regime_configs[tf] = {
-                        regime: self.regime_optimizer._make_no_trade_marker(reason)
-                        for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
-                    }
-                    unvalidated_count += 4
-                    logger.warning(f"[{symbol}] [{tf}] {reason}; stored explicit NO_TRADE cells")
+                    logger.error(f"[{symbol}] {result.error_message}")
                     del full_features, eligibility_features, active_features, stage2_features, historical_features, holdout_features
                     FeatureComputer.clear_cache()
                     gc.collect()
-                    continue
+                    return result
 
                 train_features_by_tf = {tf: active_features}
                 train_warmup_by_tf = {tf: train_warmup_bars}
@@ -12429,12 +14664,31 @@ class OptimizationPipeline:
                         selection_warmup_by_tf=selection_warmup_by_tf,
                         selection_surface_by_tf=selection_surface_by_tf,
                         historical_features_by_tf={tf: threadspark_historical_features} if len(threadspark_historical_features) >= 50 else {},
+                        allowed_regimes_by_tf=(
+                            {tf: fit_observed_by_tf[tf]}
+                            if tf in fit_observed_by_tf
+                            else None
+                        ),
                     )
 
                 regime_configs.update(tf_regime_configs)
                 validated_count += int(tf_validated or 0)
                 unvalidated_count += int(tf_unvalidated or 0)
                 oos_evidence_records.extend(self.regime_optimizer.consume_oos_candidate_evidence())
+                # seq950: capture the exact per-cell search outcome ledger for
+                # this timeframe NOW — it survives even when every candidate
+                # is gated out before any OOS evidence record exists.
+                search_cell_outcomes_by_tf[str(tf).upper()] = [
+                    dict(cell)
+                    for cell in (
+                        getattr(
+                            self.regime_optimizer,
+                            "_last_search_cell_outcomes",
+                            [],
+                        )
+                        or []
+                    )
+                ]
 
                 if tf_default_config is not None and tf_default_config.quality_score > best_overall_score:
                     best_overall_score = float(tf_default_config.quality_score)
@@ -12532,25 +14786,233 @@ class OptimizationPipeline:
             )
             result.regime_winners = total_winners
 
+            # seq932/seq950: exact trial telemetry from the search outcome
+            # ledger (primary) plus OOS records (survivor cross-check).
+            # param_combos_tested reports COMPLETED trials.
+            telemetry = _aggregate_search_trial_telemetry(
+                search_cell_outcomes_by_tf, oos_evidence_records
+            )
+            result.param_combos_tested = int(
+                telemetry["completed_search_trials_total"]
+            )
+            data_window_meta = dict(data_window_meta or {})
+            data_window_meta["search_trial_telemetry"] = telemetry
+            result.data_window_meta = dict(data_window_meta)
+            for anomaly in telemetry["telemetry_anomalies"]:
+                logger.warning(f"[{symbol}] search telemetry anomaly: {anomaly}")
+            if telemetry["fatal_telemetry_errors"]:
+                # seq979: impossible/garbage trial accounting is an
+                # institutional invariant violation.  Fail typed BEFORE any
+                # SymbolConfig exists so governed generation preserves the
+                # live winner ledger; never promote on advisory warnings.
+                result.error_message = (
+                    "TECHNICAL_SEARCH_TELEMETRY_FAILURE:"
+                    + ";".join(telemetry["fatal_telemetry_errors"])
+                )
+                logger.error(f"[{symbol}] {result.error_message}")
+                return result
+
             configured_grid = tuple(
                 str(value or "").strip().upper()
                 for value in (getattr(self.config, "timeframes", []) or [])
                 if str(value or "").strip()
             )
+            strategy_timeframes = set(configured_grid)
+            if split_mode == CALENDAR_SPLIT_MODE and native_cell_eligibility:
+                candidate_timeframes = {
+                    str(value).upper()
+                    for value in (
+                        native_cell_eligibility.get(
+                            "evidence_candidate_timeframes",
+                            native_cell_eligibility.get("active_timeframes", []),
+                        )
+                        or []
+                    )
+                }
+                unavailable_timeframes = {
+                    str(value).upper()
+                    for value in (
+                        native_cell_eligibility.get(
+                            "source_unavailable_timeframes", []
+                        )
+                        or []
+                    )
+                }
+                legacy_excluded_timeframes = {
+                    str(value).upper()
+                    for value in (
+                        native_cell_eligibility.get("excluded_timeframes", []) or []
+                    )
+                }
+                if (
+                    candidate_timeframes
+                    | unavailable_timeframes
+                    | legacy_excluded_timeframes
+                ) != set(configured_grid) or (
+                    candidate_timeframes & unavailable_timeframes
+                    or candidate_timeframes & legacy_excluded_timeframes
+                    or unavailable_timeframes & legacy_excluded_timeframes
+                ):
+                    result.error_message = (
+                        "Authenticated native-cell partition changed during optimization"
+                    )
+                    logger.error(f"[{symbol}] {result.error_message}")
+                    return result
+                if (
+                    unavailable_timeframes
+                    and native_cell_eligibility.get(
+                        "acquisition_emits_trading_verdicts"
+                    )
+                    is not False
+                ):
+                    result.error_message = (
+                        "Native data-state receipt permits acquisition trading verdicts"
+                    )
+                    logger.error(f"[{symbol}] {result.error_message}")
+                    return result
+                strategy_timeframes = (
+                    candidate_timeframes | legacy_excluded_timeframes
+                )
             expected_regimes = {"TREND", "RANGE", "BREAKOUT", "CHOP"}
-            missing_timeframes = sorted(set(configured_grid) - set(regime_configs))
+            # seq981: search-authorized timeframes = native candidates MINUS
+            # activation-bound validated NON_SEARCH decisions.  A NON_SEARCH
+            # timeframe must have NO strategy leaves; its typed decision is
+            # its complete accounting, and it never counts as missing.
+            search_authorized_timeframes = (
+                set(strategy_timeframes) - non_search_timeframes
+            )
+            non_search_with_leaves = sorted(
+                non_search_timeframes & set(regime_configs)
+            )
+            missing_timeframes = sorted(
+                search_authorized_timeframes - set(regime_configs)
+            )
+            unexpected_timeframes = sorted(
+                set(regime_configs) - search_authorized_timeframes
+            )
+            # seq1005: leaf keys must EXACTLY equal the receipt-observed
+            # labels for FIT timeframes (honest no-winner leaves included);
+            # receipt-unobserved labels must be absent.  Leaf inference is
+            # never the support authority; TFs without a receipt (legacy)
+            # keep the nonempty-subset rule.
+            def _tf_leaves_valid(tf: str) -> bool:
+                leaves = set(regime_configs.get(tf, {}) or {})
+                if tf in fit_observed_by_tf:
+                    return leaves == set(fit_observed_by_tf[tf])
+                return bool(leaves) and leaves <= expected_regimes
+
             malformed_timeframes = sorted(
                 tf
-                for tf in set(configured_grid) & set(regime_configs)
-                if set(regime_configs.get(tf, {})) != expected_regimes
+                for tf in search_authorized_timeframes & set(regime_configs)
+                if not _tf_leaves_valid(tf)
             )
-            if missing_timeframes or malformed_timeframes:
+            regime_support = {
+                tf: {
+                    "supported": (
+                        list(fit_observed_by_tf[tf])
+                        if tf in fit_observed_by_tf
+                        else sorted(regime_configs.get(tf, {}))
+                    ),
+                    "unsupported": sorted(
+                        expected_regimes
+                        - set(
+                            fit_observed_by_tf.get(
+                                tf, list(regime_configs.get(tf, {}))
+                            )
+                        )
+                    ),
+                    "authority": (
+                        "train_regime_support_receipt"
+                        if tf in fit_observed_by_tf
+                        else "legacy_leaf_keys"
+                    ),
+                }
+                for tf in sorted(search_authorized_timeframes & set(regime_configs))
+            }
+            data_window_meta = dict(data_window_meta or {})
+            data_window_meta["regime_support"] = regime_support
+            result.data_window_meta = dict(data_window_meta)
+            if (
+                missing_timeframes
+                or unexpected_timeframes
+                or malformed_timeframes
+                or non_search_with_leaves
+            ):
                 result.error_message = (
                     "Independent-cell grid incomplete after optimization: "
                     f"missing_timeframes={missing_timeframes}, "
-                    f"malformed_timeframes={malformed_timeframes}"
+                    f"unexpected_timeframes={unexpected_timeframes}, "
+                    f"malformed_timeframes={malformed_timeframes}, "
+                    f"non_search_with_leaves={non_search_with_leaves}"
                 )
                 logger.error(f"[{symbol}] {result.error_message}")
+                return result
+
+            # seq981: an all-NON_SEARCH symbol is a typed data/search-
+            # authorization state.  It must never manufacture a default
+            # NO_TRADE (the forbidden economic verdict) and never touch the
+            # winner ledger; it returns unsuccessful with a typed reason so
+            # governed generation records it for repair/re-fit.
+            if non_search_timeframes and not search_authorized_timeframes:
+                kinds = sorted(
+                    str(
+                        (data_window_meta.get("regime_provenance_gate", {}) or {})
+                        .get(tf, {})
+                        .get("decision_kind")
+                        or (data_window_meta.get("non_search_decisions", {}) or {})
+                        .get(tf, {})
+                        .get("decision_kind")
+                        or "UNKNOWN"
+                    )
+                    for tf in sorted(non_search_timeframes)
+                )
+                gate = dict(
+                    data_window_meta.get("regime_provenance_gate", {}) or {}
+                )
+                decisions = {
+                    tf_key: {
+                        "decision_kind": (gate.get(tf_key, {}) or {}).get(
+                            "decision_kind"
+                        ),
+                        "decision_sha256": (gate.get(tf_key, {}) or {}).get(
+                            "decision_sha256"
+                        ),
+                        "reason_code": (gate.get(tf_key, {}) or {}).get(
+                            "reason_code"
+                        ),
+                        "generation_terminal": (gate.get(tf_key, {}) or {}).get(
+                            "generation_terminal"
+                        ),
+                    }
+                    for tf_key in sorted(non_search_timeframes)
+                }
+                candidate_state = {
+                    "kind": "ALL_TIMEFRAMES_NON_SEARCH",
+                    "timeframes": sorted(non_search_timeframes),
+                    "decisions": decisions,
+                    "generation_terminal": all(
+                        d.get("generation_terminal") is True
+                        for d in decisions.values()
+                    ),
+                }
+                typed_state = _validated_symbol_data_state(candidate_state)
+                if typed_state is None:
+                    # Unbound/retryable/incoherent decisions: technical.
+                    result.error_message = (
+                        "TECHNICAL_DATA_STATE_UNBOUND:"
+                        + ",".join(sorted(non_search_timeframes))
+                    )
+                    logger.error(f"[{symbol}] {result.error_message}")
+                    return result
+                data_window_meta["symbol_data_state"] = typed_state
+                result.data_window_meta = dict(data_window_meta)
+                result.error_message = (
+                    "NON_SEARCH_ALL_TIMEFRAMES:"
+                    + ",".join(sorted(non_search_timeframes))
+                    + ":kinds="
+                    + ",".join(kinds)
+                )
+                logger.warning(f"[{symbol}] {result.error_message}")
                 return result
 
             # A complete search that honestly finds no carrier is a semantic
@@ -12886,6 +15348,9 @@ class PortfolioManager:
         self.last_optimization_generation: Optional[OptimizationGenerationOutcome] = None
         
         # Load existing configs via ledger
+        self._last_promotion_recovery_status = (
+            self._reconcile_interrupted_promotion()
+        )
         self._load_configs()
     
     def _load_configs(self):
@@ -12979,10 +15444,20 @@ class PortfolioManager:
     def _build_ledger_status(
         self,
         configs: Optional[Dict[str, SymbolConfig]] = None,
+        *,
+        required_symbols: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
         """Build operator-facing completion metadata for the active winner ledger."""
         source_configs = self.symbol_configs if configs is None else configs
         configured_symbols = [str(symbol) for symbol in (self.symbols or [])]
+        required_winner_symbols = list(
+            dict.fromkeys(
+                str(symbol)
+                for symbol in (
+                    configured_symbols if required_symbols is None else required_symbols
+                )
+            )
+        )
         optimized_symbols = sorted(str(symbol) for symbol in source_configs.keys())
         artifact_contract_counts: Dict[str, int] = {}
         artifact_contract_symbols: Dict[str, set] = {}
@@ -13000,14 +15475,25 @@ class PortfolioManager:
             artifact_contract_counts[key] = artifact_contract_counts.get(key, 0) + 1
             artifact_contract_symbols.setdefault(key, set()).add(str(symbol).upper())
         configured_set = {symbol.upper() for symbol in configured_symbols}
+        required_set = {symbol.upper() for symbol in required_winner_symbols}
+        if not required_set.issubset(configured_set):
+            raise RuntimeError("WINNER_LEDGER_REQUIRED_SYMBOL_OUTSIDE_CONFIGURED_UNIVERSE")
         optimized_set = {symbol.upper() for symbol in optimized_symbols}
         current_contract_set = artifact_contract_symbols.get(current_artifact_key, set())
-        missing_symbol_entries = sorted(configured_set - optimized_set)
-        missing_current_contract = sorted(configured_set - current_contract_set)
-        complete_symbol_universe = bool(configured_set) and configured_set.issubset(optimized_set)
-        complete_current_contract = bool(configured_set) and configured_set.issubset(current_contract_set)
+        missing_symbol_entries = sorted(required_set - optimized_set)
+        missing_current_contract = sorted(required_set - current_contract_set)
+        # seq1049 e2e: an all-data-state generation has an EMPTY required
+        # set by typed removal; completeness is then vacuous so the
+        # authenticated empty ledger can promote atomically.
+        complete_symbol_universe = required_set.issubset(optimized_set)
+        complete_current_contract = required_set.issubset(current_contract_set)
+        data_state_only_symbols = sorted(configured_set - required_set)
         return {
             "configured_symbol_count": len(configured_symbols),
+            "required_winner_symbol_count": len(required_set),
+            "required_winner_symbols": sorted(required_set),
+            "data_state_only_symbol_count": len(data_state_only_symbols),
+            "data_state_only_symbols": data_state_only_symbols,
             "optimized_symbol_count": len(optimized_symbols),
             "current_artifact_contract": current_artifact_key,
             "current_contract_symbol_count": len(current_contract_set),
@@ -13138,8 +15624,11 @@ class PortfolioManager:
         return config
 
     def save_data_no_trade_config(self, symbol: str, reason: str) -> SymbolConfig:
-        """Persist an explicit NO_TRADE config for symbols with insufficient historical data."""
-        return self._save_no_trade_config(symbol, reason, failure_kind="data_failure")
+        """Reject the retired acquisition-to-winner-ledger mutation path."""
+        raise RuntimeError(
+            "ACQUISITION_DATA_STATE_WINNER_LEDGER_MUTATION_FORBIDDEN:"
+            f"{str(symbol).upper()}:{reason}"
+        )
 
     def save_native_exclusion_no_trade_config(
         self,
@@ -13349,6 +15838,17 @@ class PortfolioManager:
             )
         return universe
 
+    def _resolve_deployment_path(self, raw_path: Any) -> Path:
+        """Resolve a pipeline artifact relative to the deployed config file."""
+        path = Path(str(raw_path or "").strip())
+        if path.is_absolute():
+            return path.resolve()
+        source_config = str(
+            getattr(self.config, "_deployment_config_path", "") or ""
+        ).strip()
+        base = Path(source_config).resolve().parent if source_config else Path.cwd()
+        return (base / path).resolve()
+
     def _preflight_active_regime_provenance(
         self,
         universe: Any,
@@ -13373,8 +15873,10 @@ class PortfolioManager:
             else DataSplitter.SPLIT_CONTRACT_VERSION
         )
         params_file = str(
-            getattr(self.config, "regime_params_file", "regime_params.json")
-            or "regime_params.json"
+            self._resolve_deployment_path(
+                getattr(self.config, "regime_params_file", "regime_params.json")
+                or "regime_params.json"
+            )
         )
         failures: List[str] = []
         target_symbols = list(symbols if symbols is not None else self.symbols)
@@ -13416,10 +15918,38 @@ class PortfolioManager:
                 expected_cells
             ):
                 failures.append("GENERATION:required active-cell count mismatch")
-            if int(sidecar_payload.get("fitted_active_cell_count") or -1) != len(
-                expected_cells
-            ):
-                failures.append("GENERATION:fitted active-cell count mismatch")
+            # seq1028: FIT + terminal NON_SEARCH together resolve the roster;
+            # any TECHNICAL_EXCLUSION keeps the generation incomplete.
+            fitted_count = int(
+                sidecar_payload.get("fitted_active_cell_count") or 0
+            )
+            non_search_count = int(
+                sidecar_payload.get("non_search_active_cell_count") or 0
+            )
+            technical_exclusions = [
+                f"{sym}|{tf}"
+                for sym, tfs in (
+                    sidecar_payload.get("non_search_cells", {}) or {}
+                ).items()
+                for tf, rec in (tfs or {}).items()
+                if isinstance(rec, dict)
+                and (
+                    str(rec.get("decision_kind", "")).upper()
+                    == "TECHNICAL_EXCLUSION"
+                    or rec.get("generation_terminal") is False
+                )
+            ]
+            if technical_exclusions:
+                failures.append(
+                    "GENERATION:retryable technical exclusions keep generation "
+                    f"incomplete: {sorted(technical_exclusions)}"
+                )
+            if fitted_count + non_search_count != len(expected_cells):
+                failures.append(
+                    "GENERATION:fitted+non_search cell count does not resolve "
+                    f"the active roster: {fitted_count}+{non_search_count}"
+                    f"!={len(expected_cells)}"
+                )
         for symbol in target_symbols:
             canonical = str(symbol or "").strip().upper()
             for timeframe in universe.active_timeframes(canonical):
@@ -13449,6 +15979,117 @@ class PortfolioManager:
                 "ACTIVE_REGIME_PROVENANCE_PREFLIGHT_FAILED: " + preview
             )
 
+    def _ensure_active_regime_provenance(
+        self,
+        universe: Any,
+        symbols: Optional[List[str]] = None,
+    ) -> bool:
+        """Validate or atomically rebuild the complete detector generation.
+
+        ``--optimize`` is an end-to-end production command.  A missing or stale
+        detector sidecar must therefore be repaired before any optimization
+        worker starts, rather than surfacing later as one failure per symbol.
+        The tuner itself stages both artifacts and only promotes a complete
+        activation-bound generation, so an unsuccessful repair cannot alter
+        the previous parameter book or the winner ledger.
+
+        Returns ``True`` only when this call rebuilt the detector generation.
+        """
+        try:
+            self._preflight_active_regime_provenance(universe, symbols)
+            return False
+        except RuntimeError as exc:
+            if not str(exc).startswith(
+                "ACTIVE_REGIME_PROVENANCE_PREFLIGHT_FAILED:"
+            ):
+                raise
+            preflight_error = exc
+
+        split_mode = str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower()
+        if split_mode != CALENDAR_SPLIT_MODE:
+            raise preflight_error
+        if universe is None or not getattr(universe, "explicit_contract", False):
+            raise preflight_error
+
+        activated_symbols = list(
+            dict.fromkeys(
+                str(value or "").strip().upper()
+                for value in (
+                    getattr(universe, "requested_symbols", ()) or self.symbols
+                )
+                if str(value or "").strip()
+            )
+        )
+        activated_timeframes = list(
+            dict.fromkeys(
+                str(value or "").strip().upper()
+                for value in (
+                    getattr(universe, "required_timeframes", ())
+                    or getattr(self.config, "timeframes", ())
+                )
+                if str(value or "").strip()
+            )
+        )
+        candidate_count = sum(
+            len(tuple(universe.active_timeframes(symbol)))
+            for symbol in activated_symbols
+        )
+        if candidate_count <= 0:
+            # The preflight has already established that a generation was
+            # unexpectedly required; never invent an empty detector book.
+            raise RuntimeError(
+                "ACTIVE_REGIME_PROVENANCE_REBUILD_FORBIDDEN_NO_CANDIDATES"
+            ) from preflight_error
+
+        data_dir = self._resolve_deployment_path(
+            getattr(self.config, "data_dir", "data") or "data"
+        )
+        params_path = self._resolve_deployment_path(
+            getattr(self.config, "regime_params_file", "regime_params.json")
+            or "regime_params.json"
+        )
+        logger.warning(
+            "Regime provenance is absent or stale; rebuilding all %d authenticated "
+            "evidence-candidate detector cells before optimization",
+            candidate_count,
+        )
+
+        # Lazy import keeps the standalone tuner independent of pipeline module
+        # import order while making this prerequisite part of the command.
+        from pm_regime_tuner import RegimeParamTuner
+
+        tuner = None
+        try:
+            tuner = RegimeParamTuner(data_dir, config=self.config)
+            tuner.tune_all(
+                activated_symbols,
+                activated_timeframes,
+                output_path=str(params_path),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "ACTIVE_REGIME_PROVENANCE_REBUILD_FAILED: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        finally:
+            if tuner is not None:
+                for loader_name in ("data_loader", "native_data_loader"):
+                    loader = getattr(tuner, loader_name, None)
+                    clear = getattr(loader, "clear_cache", None)
+                    if callable(clear):
+                        clear()
+
+        # Re-read both promoted artifacts and bind them to the activation using
+        # the same fail-closed validator that guards every optimizer worker.
+        self._preflight_active_regime_provenance(universe, symbols)
+        logger.info(
+            "Regime prerequisite rebuilt and revalidated for activation %s",
+            getattr(universe, "activation_id", "unknown"),
+        )
+        return True
+
     def _has_exact_native_exclusion_grid(
         self,
         config: Optional[SymbolConfig],
@@ -13472,7 +16113,13 @@ class PortfolioManager:
         config: Optional[SymbolConfig],
         universe: Any,
     ) -> bool:
-        """Check active/excluded cell bindings without trusting symbol summary flags."""
+        """Check the strategy grid against authenticated per-cell data states.
+
+        Evidence-candidate cells must have exactly four evaluated regime leaves.
+        Source-unavailable cells must have no strategy leaves at all: acquisition
+        cannot manufacture a trading verdict.  The old ``excluded_no_trade``
+        branch remains readable solely for pre-v4 activation compatibility.
+        """
         if config is None:
             return False
         stored_eligibility = dict(
@@ -13486,16 +16133,74 @@ class PortfolioManager:
             getattr(universe, "activation_manifest_sha256", None) or ""
         ):
             return False
+        configured_timeframes = {
+            str(value or "").strip().upper()
+            for value in (getattr(self.config, "timeframes", []) or [])
+            if str(value or "").strip()
+        }
+        expected_states = {
+            timeframe: str(universe.cell_status(symbol, timeframe) or "").lower()
+            for timeframe in configured_timeframes
+        }
+        stored_states = {
+            str(timeframe).upper(): str(status).lower()
+            for timeframe, status in dict(
+                stored_eligibility.get("cell_states", {}) or {}
+            ).items()
+        }
+        legacy_partition = any(
+            status == "excluded_no_trade" for status in expected_states.values()
+        )
+        if stored_states and stored_states != expected_states:
+            return False
+        if not stored_states and not legacy_partition:
+            return False
+        if (
+            not legacy_partition
+            and stored_eligibility.get("acquisition_emits_trading_verdicts") is not False
+        ):
+            return False
+        expected_candidates = {
+            timeframe
+            for timeframe, status in expected_states.items()
+            if status in {"active", NATIVE_EVIDENCE_CANDIDATE}
+        }
+        expected_unavailable = {
+            timeframe
+            for timeframe, status in expected_states.items()
+            if status == NATIVE_SOURCE_UNAVAILABLE
+        }
+        if {
+            str(value).upper()
+            for value in (
+                stored_eligibility.get(
+                    "evidence_candidate_timeframes",
+                    stored_eligibility.get("active_timeframes", []),
+                )
+                or []
+            )
+        } != expected_candidates:
+            return False
+        if {
+            str(value).upper()
+            for value in (
+                stored_eligibility.get("source_unavailable_timeframes", []) or []
+            )
+        } != expected_unavailable:
+            return False
+
         grid = config.regime_configs or {}
+        expected_grid_timeframes: set[str] = set()
         for raw_timeframe in list(getattr(self.config, "timeframes", []) or []):
             timeframe = str(raw_timeframe or "").strip().upper()
-            regimes = grid.get(timeframe)
-            if not isinstance(regimes, dict) or set(regimes) != {
-                "TREND", "RANGE", "BREAKOUT", "CHOP"
-            }:
-                return False
-            status = str(universe.cell_status(symbol, timeframe) or "").lower()
+            status = expected_states.get(timeframe, "")
             if status == "excluded_no_trade":
+                expected_grid_timeframes.add(timeframe)
+                regimes = grid.get(timeframe)
+                if not isinstance(regimes, dict) or set(regimes) != {
+                    "TREND", "RANGE", "BREAKOUT", "CHOP"
+                }:
+                    return False
                 expected = dict(universe.cell_exclusion_binding(symbol, timeframe) or {})
                 if not expected:
                     return False
@@ -13505,7 +16210,102 @@ class PortfolioManager:
                 }
                 if validate_native_cell_exclusion_no_trade(serialized, expected):
                     return False
-            elif status == "active":
+            elif status in {"active", NATIVE_EVIDENCE_CANDIDATE}:
+                stored_gate_check = dict(
+                    (
+                        (config.data_window_meta or {}).get(
+                            "regime_provenance_gate", {}
+                        )
+                        or {}
+                    ).get(timeframe, {})
+                    or {}
+                )
+                if (
+                    stored_gate_check.get("valid")
+                    and stored_gate_check.get("status") == "NON_SEARCH"
+                ):
+                    # seq981: an activation-bound NON_SEARCH timeframe must
+                    # have NO strategy leaves, and its typed decision must
+                    # still be verifiable against the CURRENT regime sidecar
+                    # by exact decision hash — never trusted from stale
+                    # stored metadata alone.
+                    if timeframe in grid:
+                        return False
+                    current = validate_regime_params_provenance(
+                        symbol,
+                        timeframe,
+                        getattr(
+                            self.config,
+                            "regime_params_file",
+                            "regime_params.json",
+                        ),
+                        expected_activation_id=str(
+                            getattr(universe, "activation_id", None) or ""
+                        ),
+                        expected_activation_manifest_sha256=str(
+                            getattr(
+                                universe, "activation_manifest_sha256", None
+                            )
+                            or ""
+                        ),
+                        require_complete_generation=True,
+                    )
+                    if not (
+                        current.get("valid")
+                        and current.get("status") == "NON_SEARCH"
+                        and (current.get("record") or {}).get("decision_sha256")
+                        == stored_gate_check.get("decision_sha256")
+                    ):
+                        return False
+                    continue
+                expected_grid_timeframes.add(timeframe)
+                regimes = grid.get(timeframe)
+                # Empirical-regime rule: nonempty SUBSET of the four.
+                if (
+                    not isinstance(regimes, dict)
+                    or not regimes
+                    or not set(regimes)
+                    <= {"TREND", "RANGE", "BREAKOUT", "CHOP"}
+                ):
+                    return False
+                # seq1035: current explicit-contract activations REQUIRE the
+                # support receipt; legacy leaf inference is not acceptance.
+                if not stored_gate_check.get("support_receipt_sha256") and bool(
+                    getattr(universe, "explicit_contract", False)
+                ):
+                    return False
+                # seq1005: FIT support receipt is revalidated live; leaves
+                # must equal receipt-observed labels exactly.
+                if stored_gate_check.get("support_receipt_sha256"):
+                    current = validate_regime_params_provenance(
+                        symbol,
+                        timeframe,
+                        getattr(
+                            self.config,
+                            "regime_params_file",
+                            "regime_params.json",
+                        ),
+                        expected_activation_id=str(
+                            getattr(universe, "activation_id", None) or ""
+                        ),
+                        expected_activation_manifest_sha256=str(
+                            getattr(
+                                universe, "activation_manifest_sha256", None
+                            )
+                            or ""
+                        ),
+                        require_complete_generation=True,
+                    )
+                    support = current.get("train_regime_support") or {}
+                    if not (
+                        current.get("valid")
+                        and current.get("status") == "FIT"
+                        and support.get("receipt_sha256")
+                        == stored_gate_check.get("support_receipt_sha256")
+                        and set(regimes)
+                        == set(support.get("observed_regimes") or [])
+                    ):
+                        return False
                 for cell in regimes.values():
                     if cell is not None and (
                         (cell.artifact_meta or {}).get("native_cell_exclusion_binding")
@@ -13514,9 +16314,12 @@ class PortfolioManager:
                         )
                     ):
                         return False
+            elif status == NATIVE_SOURCE_UNAVAILABLE:
+                if timeframe in grid:
+                    return False
             else:
                 return False
-        return True
+        return set(grid) == expected_grid_timeframes
     
     def needs_retraining(self, symbol: str) -> bool:
         """
@@ -13535,6 +16338,8 @@ class PortfolioManager:
         if universe is not None and universe.explicit_contract:
             for symbol in self.symbols:
                 canonical = str(symbol).upper()
+                if not universe.active_timeframes(canonical):
+                    continue
                 existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(
                     canonical
                 )
@@ -13560,7 +16365,11 @@ class PortfolioManager:
         result = outcome.results.get(str(symbol)) or outcome.results.get(
             str(symbol).upper()
         )
-        return bool(outcome.promoted and (result is None or result.success))
+        return bool(
+            outcome.status == "PROMOTED"
+            and outcome.promoted
+            and (result is None or result.success)
+        )
     
     def retrain_all_needed(self) -> Dict[str, bool]:
         """
@@ -13594,7 +16403,11 @@ class PortfolioManager:
             result = outcome.results.get(symbol)
             results[symbol] = bool(
                 outcome.status == "NOOP"
-                or (outcome.promoted and (result is None or result.success))
+                or (
+                    outcome.status == "PROMOTED"
+                    and outcome.promoted
+                    and (result is None or result.success)
+                )
             )
         return results
 
@@ -13789,7 +16602,9 @@ class PortfolioManager:
         if not ledger_path.is_absolute():
             ledger_path = Path.cwd() / ledger_path
         try:
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
+            ledger_source_bytes = ledger_path.read_bytes()
+            ledger_source_sha = hashlib.sha256(ledger_source_bytes).hexdigest()
+            ledger = json.loads(ledger_source_bytes.decode("utf-8-sig"))
         except Exception as exc:
             message = f"production replay audit could not read ledger {ledger_path}: {type(exc).__name__}: {exc}"
             if bool(getattr(self.config, "production_replay_audit_fail_on_error", True)):
@@ -13914,26 +16729,49 @@ class PortfolioManager:
         }
 
         if mode == "apply":
-            backup = None
-            if ledger_override is None:
-                backup = ledger_path.with_name(
-                    f"{ledger_path.stem}.backup_replay_audit_{stamp}{ledger_path.suffix}"
+            from pm_storage import _exclusive_file_lock
+
+            with _exclusive_file_lock(_optimization_ledger_lock_path(ledger_path)):
+                live_ledger_path = Path(self.config_file)
+                if not live_ledger_path.is_absolute():
+                    live_ledger_path = Path.cwd() / live_ledger_path
+                if (
+                    ledger_path.resolve() == live_ledger_path.resolve()
+                    and ConfigLedger(str(ledger_path))._governed_publication_active()
+                ):
+                    raise RuntimeError(
+                        "PRODUCTION_REPLAY_AUDIT_APPLY_FORBIDDEN_GOVERNED_LEDGER"
+                    )
+                current_bytes = ledger_path.read_bytes()
+                if hashlib.sha256(current_bytes).hexdigest() != ledger_source_sha:
+                    raise RuntimeError(
+                        "PRODUCTION_REPLAY_AUDIT_LEDGER_CHANGED_DURING_REPLAY"
+                    )
+                backup = None
+                if ledger_override is None:
+                    backup = ledger_path.with_name(
+                        f"{ledger_path.stem}.backup_replay_audit_{stamp}{ledger_path.suffix}"
+                    )
+                    shutil.copy2(ledger_path, backup)
+                counters = replay_audit.apply_audit(
+                    ledger,
+                    results,
+                    block_unverified=block_unverified,
                 )
-                shutil.copy2(ledger_path, backup)
-            counters = replay_audit.apply_audit(
-                ledger,
-                results,
-                block_unverified=block_unverified,
-            )
-            tmp_path = ledger_path.with_suffix(f"{ledger_path.suffix}.tmp_replay_audit")
-            tmp_path.write_text(json.dumps(ledger, indent=2, default=str), encoding="utf-8")
-            tmp_path.replace(ledger_path)
-            if mutate_manager and ledger_override is None:
-                self.ledger.load()
-                self.symbol_configs = self.ledger.get_all_configs()
-            if backup is not None:
-                summary["backup_path"] = str(backup)
-            summary["counters"] = counters
+                tmp_path = ledger_path.with_suffix(
+                    f"{ledger_path.suffix}.tmp_replay_audit"
+                )
+                tmp_path.write_text(
+                    json.dumps(ledger, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                tmp_path.replace(ledger_path)
+                if mutate_manager and ledger_override is None:
+                    self.ledger.load()
+                    self.symbol_configs = self.ledger.get_all_configs()
+                if backup is not None:
+                    summary["backup_path"] = str(backup)
+                summary["counters"] = counters
 
         logger.info(
             "Production replay audit complete: "
@@ -13958,6 +16796,999 @@ class PortfolioManager:
         return stage_path, stage_manifest, active_manifest
 
     @staticmethod
+    def _is_digest_owned_name(name: str, prefix: str) -> bool:
+        suffix = str(name)[len(prefix) :] if str(name).startswith(prefix) else ""
+        return bool(
+            len(suffix) == 64
+            and all(character in "0123456789abcdef" for character in suffix)
+        )
+
+    @classmethod
+    def _production_generation_retention_descriptor(
+        cls,
+        manifest: Mapping[str, Any],
+        *,
+        deployment_root: Path,
+    ) -> Optional[Dict[str, str]]:
+        """Derive exact current/rollback roots from one authority manifest."""
+
+        if type(manifest) is not dict:
+            return None
+        generation_id = manifest.get("generation_id")
+        ledger_sha = str(manifest.get("ledger_sha256") or "").lower()
+        receipt = manifest.get("authority_chain_receipt")
+        is_retention_descriptor = (
+            manifest.get("schema_version")
+            == "fxpm.production-generation-retention.v1"
+        )
+        run_value = manifest.get("production_authority_run_root")
+        assembly_value = manifest.get("authority_assembly_path")
+        if (
+            type(generation_id) is not str
+            or not generation_id
+            or len(ledger_sha) != 64
+            or any(character not in "0123456789abcdef" for character in ledger_sha)
+            or (
+                not is_retention_descriptor
+                and (
+                    type(receipt) is not dict
+                    or receipt.get("generation_id") != generation_id
+                    or str(receipt.get("ledger_sha256") or "").lower()
+                    != ledger_sha
+                )
+            )
+            or type(run_value) is not str
+            or type(assembly_value) is not str
+            or type(manifest.get("production_staged_ledger_source_path"))
+            is not str
+            or not manifest.get("production_staged_ledger_source_path")
+        ):
+            return None
+        try:
+            root = Path(deployment_root).resolve(strict=True)
+            runs_root = (root / "fxpm-production-runs").resolve(strict=True)
+            run_root = Path(run_value).resolve(strict=True)
+            assembly_root = Path(assembly_value).resolve(strict=True)
+            expected_digest = hashlib.sha256(generation_id.encode("utf-8")).hexdigest()
+            if (
+                run_root.parent != runs_root
+                or assembly_root.parent != root
+                or not cls._is_digest_owned_name(run_root.name, "run-")
+                or not cls._is_digest_owned_name(
+                    assembly_root.name, "fxpm-authority-"
+                )
+                or run_root.name[4:] != expected_digest
+                or assembly_root.name[15:] != expected_digest
+                or not run_root.is_dir()
+                or not assembly_root.is_dir()
+            ):
+                return None
+            source_value = manifest.get("production_staged_ledger_source_path")
+            source = Path(source_value).resolve(strict=True)
+            source.relative_to(run_root)
+            if (
+                not source.is_file()
+                or source.stat().st_size > 64 * 1024 * 1024
+                or hashlib.sha256(source.read_bytes()).hexdigest() != ledger_sha
+            ):
+                return None
+            source_path = str(source)
+            snapshot_path = ""
+            snapshot_sha = ""
+            if is_retention_descriptor:
+                snapshot_value = manifest.get(
+                    "previous_active_manifest_snapshot_path"
+                )
+                snapshot_sha = str(
+                    manifest.get("previous_active_manifest_snapshot_sha256") or ""
+                ).lower()
+                snapshot = Path(snapshot_value).resolve(strict=True)
+                relative_snapshot = snapshot.relative_to(runs_root)
+                if (
+                    not snapshot.is_file()
+                    or snapshot.stat().st_size > 64 * 1024 * 1024
+                ):
+                    return None
+                snapshot_raw = snapshot.read_bytes()
+                snapshot_manifest = json.loads(snapshot_raw.decode("utf-8"))
+                if (
+                    type(snapshot_value) is not str
+                    or len(snapshot_sha) != 64
+                    or len(relative_snapshot.parts) != 3
+                    or not cls._is_digest_owned_name(
+                        relative_snapshot.parts[0], "run-"
+                    )
+                    or relative_snapshot.parts[1] != "rollback"
+                    or snapshot.name != f"manifest-{snapshot_sha}.json"
+                    or not snapshot.is_file()
+                    or snapshot.stat().st_size > 64 * 1024 * 1024
+                    or hashlib.sha256(snapshot_raw).hexdigest() != snapshot_sha
+                    or type(snapshot_manifest) is not dict
+                    or snapshot_manifest.get("generation_status") != "PROMOTED"
+                    or snapshot_manifest.get("generation_id") != generation_id
+                    or str(snapshot_manifest.get("ledger_sha256") or "").lower()
+                    != ledger_sha
+                    or type(snapshot_manifest.get("authority_chain_receipt"))
+                    is not dict
+                    or snapshot_manifest["authority_chain_receipt"].get(
+                        "generation_id"
+                    )
+                    != generation_id
+                    or str(
+                        snapshot_manifest["authority_chain_receipt"].get(
+                            "ledger_sha256"
+                        )
+                        or ""
+                    ).lower()
+                    != ledger_sha
+                    or str(
+                        snapshot_manifest.get("production_authority_run_root")
+                        or ""
+                    )
+                    != str(run_root)
+                    or str(snapshot_manifest.get("authority_assembly_path") or "")
+                    != str(assembly_root)
+                    or str(
+                        snapshot_manifest.get(
+                            "production_staged_ledger_source_path"
+                        )
+                        or ""
+                    )
+                    != source_path
+                ):
+                    return None
+                snapshot_path = str(snapshot)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return {
+            "schema_version": "fxpm.production-generation-retention.v1",
+            "generation_id": generation_id,
+            "ledger_sha256": ledger_sha,
+            "production_authority_run_root": str(run_root),
+            "authority_assembly_path": str(assembly_root),
+            "production_staged_ledger_source_path": source_path,
+            **(
+                {
+                    "previous_active_manifest_snapshot_path": snapshot_path,
+                    "previous_active_manifest_snapshot_sha256": snapshot_sha,
+                }
+                if is_retention_descriptor
+                else {}
+            ),
+        }
+
+    @staticmethod
+    def _remove_owned_generation_directory(path: Path, parent: Path) -> None:
+        parent = Path(parent).resolve(strict=True)
+        path = Path(path)
+        metadata = path.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or int(getattr(metadata, "st_file_attributes", 0) or 0)
+            & reparse_flag
+            or not stat.S_ISDIR(metadata.st_mode)
+            or path.resolve(strict=True).parent != parent
+        ):
+            raise RuntimeError("PRODUCTION_RETENTION_OWNED_DIRECTORY_INVALID")
+        shutil.rmtree(path)
+        if path.exists() or path.is_symlink():
+            raise RuntimeError("PRODUCTION_RETENTION_REMOVE_INCOMPLETE")
+
+    @staticmethod
+    def _remove_owned_generation_file(path: Path, parent: Path) -> None:
+        parent = Path(parent).resolve(strict=True)
+        path = Path(path)
+        metadata = path.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or int(getattr(metadata, "st_file_attributes", 0) or 0)
+            & reparse_flag
+            or not stat.S_ISREG(metadata.st_mode)
+            or path.resolve(strict=True).parent != parent
+        ):
+            raise RuntimeError("PRODUCTION_RETENTION_OWNED_FILE_INVALID")
+        path.unlink()
+        if path.exists() or path.is_symlink():
+            raise RuntimeError("PRODUCTION_RETENTION_FILE_REMOVE_INCOMPLETE")
+
+    def _prune_production_generation_storage_locked(
+        self,
+        promoted_manifest: Mapping[str, Any],
+    ) -> Dict[str, int]:
+        """Discharge the journaled exact-old-predecessor cleanup intent."""
+
+        policy = promoted_manifest.get("production_retention_policy")
+        if type(policy) is not dict:
+            return {
+                "retained_generation_count": 0,
+                "removed_run_root_count": 0,
+                "removed_authority_assembly_count": 0,
+                "removed_manifest_snapshot_count": 0,
+            }
+        if policy != {
+            "schema_version": "fxpm.production-retention-policy.v1",
+            "maximum_complete_generations": 2,
+            "keep_current_and_previous": True,
+        }:
+            raise RuntimeError("PRODUCTION_RETENTION_POLICY_INVALID")
+        deployment_config = str(
+            getattr(self.config, "_deployment_config_path", "") or ""
+        )
+        root = Path(deployment_config).resolve(strict=True).parent
+        runs_root = (root / "fxpm-production-runs").resolve(strict=True)
+        current = self._production_generation_retention_descriptor(
+            promoted_manifest,
+            deployment_root=root,
+        )
+        if current is None:
+            raise RuntimeError("PRODUCTION_RETENTION_CURRENT_INVALID")
+        previous = promoted_manifest.get("previous_production_generation")
+        if previous is not None:
+            verified_previous = self._production_generation_retention_descriptor(
+                previous,
+                deployment_root=root,
+            )
+            if verified_previous != previous:
+                raise RuntimeError("PRODUCTION_RETENTION_PREVIOUS_INVALID")
+        _stage, _stage_manifest, active_manifest_path = (
+            self._optimization_generation_paths()
+        )
+        if active_manifest_path.stat().st_size > 64 * 1024 * 1024:
+            raise RuntimeError("PRODUCTION_RETENTION_ACTIVE_MANIFEST_TOO_LARGE")
+        active = json.loads(active_manifest_path.read_text(encoding="utf-8"))
+        active_current = self._production_generation_retention_descriptor(
+            active,
+            deployment_root=root,
+        )
+        if (
+            active_current != current
+            or active.get("previous_production_generation") != previous
+        ):
+            raise RuntimeError("PRODUCTION_RETENTION_ACTIVE_BINDING_MISMATCH")
+        obsolete = promoted_manifest.get("obsolete_production_generation")
+        if obsolete is None:
+            return {
+                "retained_generation_count": 1 + int(previous is not None),
+                "removed_run_root_count": 0,
+                "removed_authority_assembly_count": 0,
+                "removed_manifest_snapshot_count": 0,
+            }
+        if type(obsolete) is not dict:
+            raise RuntimeError("PRODUCTION_RETENTION_OBSOLETE_INVALID")
+        if previous is None:
+            raise RuntimeError("PRODUCTION_RETENTION_OBSOLETE_WITHOUT_PREVIOUS")
+        previous_snapshot = Path(
+            previous["previous_active_manifest_snapshot_path"]
+        )
+        previous_snapshot_payload = json.loads(
+            previous_snapshot.read_text(encoding="utf-8")
+        )
+        if previous_snapshot_payload.get("previous_production_generation") != obsolete:
+            raise RuntimeError(
+                "PRODUCTION_RETENTION_OBSOLETE_SNAPSHOT_BINDING_MISMATCH"
+            )
+        protected = {
+            str(current["production_authority_run_root"]),
+            str(current["authority_assembly_path"]),
+        }
+        if previous is not None:
+            protected.update(
+                {
+                    str(previous["production_authority_run_root"]),
+                    str(previous["authority_assembly_path"]),
+                }
+            )
+        obsolete_run = str(obsolete.get("production_authority_run_root") or "")
+        obsolete_assembly = str(obsolete.get("authority_assembly_path") or "")
+        if obsolete_run in protected or obsolete_assembly in protected:
+            raise RuntimeError("PRODUCTION_RETENTION_PROTECTED_PATH_SELECTED")
+        removed_assembly = 0
+        removed_run = 0
+        removed_snapshot = 0
+        assembly_path = Path(obsolete_assembly)
+        run_path = Path(obsolete_run)
+        snapshot = Path(
+            str(obsolete.get("previous_active_manifest_snapshot_path") or "")
+        )
+        obsolete_generation = str(obsolete.get("generation_id") or "")
+        obsolete_digest = hashlib.sha256(
+            obsolete_generation.encode("utf-8")
+        ).hexdigest()
+        expected_snapshot_parent = (
+            Path(previous["production_authority_run_root"]) / "rollback"
+        ).resolve(strict=True)
+        if (
+            run_path.parent.resolve(strict=True) != runs_root
+            or run_path.name != f"run-{obsolete_digest}"
+            or assembly_path.parent.resolve(strict=True) != root
+            or assembly_path.name != f"fxpm-authority-{obsolete_digest}"
+            or snapshot.parent.resolve(strict=True) != expected_snapshot_parent
+            or snapshot.name
+            != "manifest-"
+            + str(obsolete.get("previous_active_manifest_snapshot_sha256") or "")
+            + ".json"
+            or snapshot == previous_snapshot
+        ):
+            raise RuntimeError("PRODUCTION_RETENTION_OBSOLETE_GEOMETRY_INVALID")
+        if snapshot.exists():
+            if snapshot.stat().st_size > 64 * 1024 * 1024:
+                raise RuntimeError(
+                    "PRODUCTION_RETENTION_OBSOLETE_SNAPSHOT_TOO_LARGE"
+                )
+            snapshot_raw = snapshot.read_bytes()
+            snapshot_payload = json.loads(snapshot_raw.decode("utf-8"))
+            snapshot_sha = str(
+                obsolete.get("previous_active_manifest_snapshot_sha256") or ""
+            )
+            if (
+                hashlib.sha256(snapshot_raw).hexdigest() != snapshot_sha
+                or snapshot_payload.get("generation_status") != "PROMOTED"
+                or snapshot_payload.get("generation_id") != obsolete_generation
+                or str(snapshot_payload.get("ledger_sha256") or "").lower()
+                != str(obsolete.get("ledger_sha256") or "").lower()
+                or snapshot_payload.get("production_authority_run_root")
+                != obsolete_run
+                or snapshot_payload.get("authority_assembly_path")
+                != obsolete_assembly
+                or snapshot_payload.get("production_staged_ledger_source_path")
+                != obsolete.get("production_staged_ledger_source_path")
+                or type(snapshot_payload.get("authority_chain_receipt"))
+                is not dict
+                or snapshot_payload["authority_chain_receipt"].get(
+                    "generation_id"
+                )
+                != obsolete_generation
+            ):
+                raise RuntimeError(
+                    "PRODUCTION_RETENTION_OBSOLETE_SNAPSHOT_INVALID"
+                )
+        if run_path.exists() and assembly_path.exists() and snapshot.exists():
+            verified_obsolete = (
+                self._production_generation_retention_descriptor(
+                    obsolete,
+                    deployment_root=root,
+                )
+            )
+            if verified_obsolete != obsolete:
+                raise RuntimeError("PRODUCTION_RETENTION_OBSOLETE_VERIFY_FAILED")
+        elif not snapshot.exists() and (run_path.exists() or assembly_path.exists()):
+            raise RuntimeError(
+                "PRODUCTION_RETENTION_OBSOLETE_PROOF_MISSING"
+            )
+        if assembly_path.exists() or assembly_path.is_symlink():
+            self._remove_owned_generation_directory(assembly_path, root)
+            removed_assembly = 1
+        if run_path.exists() or run_path.is_symlink():
+            self._remove_owned_generation_directory(run_path, runs_root)
+            removed_run = 1
+        if snapshot.exists() or snapshot.is_symlink():
+            self._remove_owned_generation_file(snapshot, snapshot.parent)
+            removed_snapshot = 1
+        return {
+            "retained_generation_count": 1 + int(previous is not None),
+            "removed_run_root_count": removed_run,
+            "removed_authority_assembly_count": removed_assembly,
+            "removed_manifest_snapshot_count": removed_snapshot,
+        }
+
+    def _optimization_promotion_journal_path(self) -> Path:
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        ledger_path = ledger_path.resolve()
+        return ledger_path.with_name(
+            f".{ledger_path.name}.generation.promotion.json"
+        )
+
+    def _optimization_failure_manifest_path(self) -> Path:
+        """Return the bounded diagnostic path that never aliases live staging."""
+
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        ledger_path = ledger_path.resolve()
+        return ledger_path.with_name(
+            f".{ledger_path.name}.generation.last-failure.json"
+        )
+
+    def _optimization_promotion_lock_path(self) -> Path:
+        return _optimization_ledger_lock_path(self.config_file)
+
+    @staticmethod
+    def _promotion_journal_digest(payload: Mapping[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _promotion_journal_authorizes(
+        self,
+        *,
+        base_ledger_sha256: str,
+        target_ledger_sha256: str,
+        generation_id: str,
+    ) -> bool:
+        """Return whether the durable journal authorizes this exact promotion.
+
+        Hash equality alone cannot prove that a compare-and-swap happened: a
+        repeat optimization may legitimately reproduce the live ledger bytes.
+        Recovery therefore requires the journal that is written only after the
+        raw-authority gate and immediately before the ledger replacement.
+        """
+
+        journal_path = self._optimization_promotion_journal_path()
+        try:
+            if not journal_path.exists() or journal_path.stat().st_size > 64 * 1024 * 1024:
+                return False
+            raw = journal_path.read_bytes()
+            if len(raw) > 64 * 1024 * 1024:
+                return False
+            payload = json.loads(raw.decode("utf-8"))
+            if type(payload) is not dict:
+                return False
+            digest = payload.get("content_sha256")
+            body = dict(payload)
+            body.pop("content_sha256", None)
+            if (
+                payload.get("schema_version")
+                != "fxpm.optimization-promotion-journal.v1"
+                or type(digest) is not str
+                or self._promotion_journal_digest(body) != digest
+            ):
+                return False
+            ledger_path = Path(self.config_file)
+            if not ledger_path.is_absolute():
+                ledger_path = Path.cwd() / ledger_path
+            ledger_path = ledger_path.resolve()
+            _stage, stage_manifest, active_manifest = (
+                self._optimization_generation_paths()
+            )
+            promoted_manifest = payload.get("promoted_manifest")
+            base_sha = str(base_ledger_sha256 or "").lower()
+            target_sha = str(target_ledger_sha256 or "").lower()
+            expected_generation = str(generation_id or "")
+            authority_receipt = (
+                promoted_manifest.get("authority_chain_receipt")
+                if type(promoted_manifest) is dict
+                else None
+            )
+            return bool(
+                payload.get("ledger_path") == str(ledger_path)
+                and payload.get("active_manifest_path")
+                == str(active_manifest.resolve())
+                and payload.get("stage_manifest_path")
+                == str(stage_manifest.resolve())
+                and str(payload.get("base_ledger_sha256") or "").lower()
+                == base_sha
+                and str(payload.get("target_ledger_sha256") or "").lower()
+                == target_sha
+                and type(promoted_manifest) is dict
+                and promoted_manifest.get("generation_status") == "PROMOTED"
+                and promoted_manifest.get("generation_id") == expected_generation
+                and type(authority_receipt) is dict
+                and authority_receipt.get("generation_id") == expected_generation
+                and str(promoted_manifest.get("ledger_sha256") or "").lower()
+                == target_sha
+            )
+        except Exception:
+            return False
+
+    def _active_production_generation_reference_locked(
+        self,
+        *,
+        generation_id: str,
+        ledger_sha256: str,
+        run_root: Path,
+        authority_assembly_path: Path,
+        staged_ledger_source_path: Path,
+    ) -> Optional[str]:
+        """Return ACTIVE/PREVIOUS only for an exact durable generation ref."""
+
+        _stage, _stage_manifest, active_path = self._optimization_generation_paths()
+        if not active_path.exists():
+            return None
+        try:
+            if active_path.stat().st_size > 64 * 1024 * 1024:
+                return None
+            active = json.loads(active_path.read_text(encoding="utf-8"))
+            exact = {
+                "generation_id": str(generation_id),
+                "ledger_sha256": str(ledger_sha256).lower(),
+                "production_authority_run_root": str(Path(run_root).resolve(strict=True)),
+                "authority_assembly_path": str(
+                    Path(authority_assembly_path).resolve(strict=True)
+                ),
+                "production_staged_ledger_source_path": str(
+                    Path(staged_ledger_source_path).resolve(strict=True)
+                ),
+            }
+            deployment_config = str(
+                getattr(self.config, "_deployment_config_path", "") or ""
+            )
+            deployment_root = Path(deployment_config).resolve(strict=True).parent
+            live_ledger = Path(self.config_file)
+            if not live_ledger.is_absolute():
+                live_ledger = Path.cwd() / live_ledger
+            live_bytes = live_ledger.resolve(strict=True).read_bytes()
+            if hashlib.sha256(live_bytes).hexdigest() != str(
+                active.get("ledger_sha256") or ""
+            ).lower():
+                return None
+            receipt = active.get("authority_chain_receipt")
+            active_descriptor = (
+                self._production_generation_retention_descriptor(
+                    active,
+                    deployment_root=deployment_root,
+                )
+            )
+            if (
+                active.get("generation_status") == "PROMOTED"
+                and active.get("generation_id") == exact["generation_id"]
+                and str(active.get("ledger_sha256") or "").lower()
+                == exact["ledger_sha256"]
+                and active.get("production_authority_run_root")
+                == exact["production_authority_run_root"]
+                and active.get("authority_assembly_path")
+                == exact["authority_assembly_path"]
+                and active.get("production_staged_ledger_source_path")
+                == exact["production_staged_ledger_source_path"]
+                and type(receipt) is dict
+                and receipt.get("generation_id") == exact["generation_id"]
+                and str(receipt.get("ledger_sha256") or "").lower()
+                == exact["ledger_sha256"]
+                and type(active.get("ledger_status")) is dict
+                and active["ledger_status"].get(
+                    "complete_current_contract_universe"
+                )
+                is True
+                and active_descriptor is not None
+            ):
+                return "ACTIVE"
+            previous = active.get("previous_production_generation")
+            verified_previous = (
+                self._production_generation_retention_descriptor(
+                    previous,
+                    deployment_root=deployment_root,
+                )
+                if type(previous) is dict
+                else None
+            )
+            if (
+                active_descriptor is not None
+                and active.get("generation_status") == "PROMOTED"
+                and type(active.get("ledger_status")) is dict
+                and active["ledger_status"].get(
+                    "complete_current_contract_universe"
+                )
+                is True
+                and verified_previous is not None
+                and all(
+                verified_previous.get(key) == value
+                for key, value in exact.items()
+                )
+            ):
+                return "PREVIOUS"
+        except Exception:
+            return None
+        return None
+
+    def _promotion_journal_reference_locked(
+        self,
+        *,
+        generation_id: str,
+        ledger_sha256: str,
+        run_root: Path,
+        authority_assembly_path: Path,
+        staged_ledger_source_path: Path,
+    ) -> str:
+        """Classify the durable journal as NONE/EXACT/UNRELATED/AMBIGUOUS."""
+
+        journal_path = self._optimization_promotion_journal_path()
+        if not journal_path.exists() and not journal_path.is_symlink():
+            return "NONE"
+        try:
+            if journal_path.stat().st_size > 64 * 1024 * 1024:
+                return "AMBIGUOUS"
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            if type(payload) is not dict:
+                return "AMBIGUOUS"
+            digest = payload.get("content_sha256")
+            body = dict(payload)
+            body.pop("content_sha256", None)
+            _stage, stage_manifest, active_manifest = (
+                self._optimization_generation_paths()
+            )
+            ledger_path = Path(self.config_file)
+            if not ledger_path.is_absolute():
+                ledger_path = Path.cwd() / ledger_path
+            ledger_path = ledger_path.resolve()
+            promoted = payload.get("promoted_manifest")
+            if (
+                payload.get("schema_version")
+                != "fxpm.optimization-promotion-journal.v1"
+                or type(digest) is not str
+                or self._promotion_journal_digest(body) != digest
+                or payload.get("ledger_path") != str(ledger_path)
+                or payload.get("active_manifest_path")
+                != str(active_manifest.resolve())
+                or payload.get("stage_manifest_path")
+                != str(stage_manifest.resolve())
+                or type(promoted) is not dict
+                or promoted.get("generation_status") != "PROMOTED"
+            ):
+                return "AMBIGUOUS"
+            receipt = promoted.get("authority_chain_receipt")
+            journal_generation = promoted.get("generation_id")
+            target_sha = str(payload.get("target_ledger_sha256") or "").lower()
+            promoted_sha = str(promoted.get("ledger_sha256") or "").lower()
+            base_sha = str(payload.get("base_ledger_sha256") or "").lower()
+            if (
+                type(journal_generation) is not str
+                or not journal_generation
+                or any(
+                    len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                    for value in (base_sha, target_sha, promoted_sha)
+                )
+                or target_sha != promoted_sha
+                or type(receipt) is not dict
+                or receipt.get("generation_id") != journal_generation
+                or str(receipt.get("ledger_sha256") or "").lower() != target_sha
+            ):
+                return "AMBIGUOUS"
+            deployment_config = str(
+                getattr(self.config, "_deployment_config_path", "") or ""
+            )
+            deployment_root = Path(deployment_config).resolve(strict=True).parent
+            journal_descriptor = self._production_generation_retention_descriptor(
+                promoted,
+                deployment_root=deployment_root,
+            )
+            if journal_descriptor is None:
+                return "AMBIGUOUS"
+            candidate_paths = {
+                str(Path(run_root).resolve(strict=True)),
+                str(Path(authority_assembly_path).resolve(strict=True)),
+                str(Path(staged_ledger_source_path).resolve(strict=True)),
+            }
+            journal_paths = {
+                str(journal_descriptor["production_authority_run_root"]),
+                str(journal_descriptor["authority_assembly_path"]),
+                str(journal_descriptor["production_staged_ledger_source_path"]),
+            }
+            if journal_generation != generation_id:
+                # A journal for another generation is harmless only when its
+                # complete, content-bound storage is disjoint.  Treat any alias
+                # or malformed descriptor as ambiguous so cleanup fails closed.
+                return (
+                    "UNRELATED"
+                    if candidate_paths.isdisjoint(journal_paths)
+                    else "AMBIGUOUS"
+                )
+            exact = bool(
+                target_sha == str(ledger_sha256).lower()
+                and journal_descriptor["production_authority_run_root"]
+                == str(Path(run_root).resolve(strict=True))
+                and journal_descriptor["authority_assembly_path"]
+                == str(Path(authority_assembly_path).resolve(strict=True))
+                and journal_descriptor["production_staged_ledger_source_path"]
+                == str(Path(staged_ledger_source_path).resolve(strict=True))
+            )
+            return "EXACT" if exact else "AMBIGUOUS"
+        except Exception:
+            return "AMBIGUOUS"
+
+    def _write_promotion_journal(
+        self,
+        *,
+        base_ledger_sha256: str,
+        target_ledger_sha256: str,
+        stage_manifest_path: Path,
+        promoted_manifest: Mapping[str, Any],
+    ) -> Path:
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        ledger_path = ledger_path.resolve()
+        _stage, expected_stage_manifest, active_manifest = (
+            self._optimization_generation_paths()
+        )
+        if Path(stage_manifest_path).resolve() != expected_stage_manifest.resolve():
+            raise RuntimeError("OPTIMIZATION_PROMOTION_STAGE_MANIFEST_PATH_INVALID")
+        body: Dict[str, Any] = {
+            "schema_version": "fxpm.optimization-promotion-journal.v1",
+            "ledger_path": str(ledger_path),
+            "active_manifest_path": str(active_manifest.resolve()),
+            "stage_manifest_path": str(expected_stage_manifest.resolve()),
+            "base_ledger_sha256": str(base_ledger_sha256).lower(),
+            "target_ledger_sha256": str(target_ledger_sha256).lower(),
+            "promoted_manifest": dict(promoted_manifest),
+        }
+        for field in ("base_ledger_sha256", "target_ledger_sha256"):
+            value = body[field]
+            if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+                raise RuntimeError("OPTIMIZATION_PROMOTION_JOURNAL_HASH_INVALID")
+        body["content_sha256"] = self._promotion_journal_digest(body)
+        journal_path = self._optimization_promotion_journal_path()
+        if journal_path.exists() or journal_path.is_symlink():
+            raise RuntimeError("OPTIMIZATION_PROMOTION_JOURNAL_ALREADY_EXISTS")
+        self._atomic_write_json(journal_path, body)
+        return journal_path
+
+    def _reconcile_interrupted_promotion(self) -> str:
+        """Serialize recovery with every writer of this exact live ledger."""
+
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+            return self._reconcile_interrupted_promotion_locked()
+
+    def _reconcile_interrupted_promotion_locked(self) -> str:
+        """Finish or safely abort a journaled ledger/manifest publication."""
+        journal_path = self._optimization_promotion_journal_path()
+        if not journal_path.exists():
+            return "NONE"
+        try:
+            if journal_path.stat().st_size > 64 * 1024 * 1024:
+                raise ValueError("PROMOTION_JOURNAL_TOO_LARGE")
+            raw = journal_path.read_bytes()
+            if len(raw) > 64 * 1024 * 1024:
+                raise ValueError("PROMOTION_JOURNAL_TOO_LARGE")
+            payload = json.loads(raw.decode("utf-8"))
+            if type(payload) is not dict:
+                raise ValueError("PROMOTION_JOURNAL_INVALID")
+            digest = payload.get("content_sha256")
+            body = dict(payload)
+            body.pop("content_sha256", None)
+            if (
+                payload.get("schema_version")
+                != "fxpm.optimization-promotion-journal.v1"
+                or type(digest) is not str
+                or self._promotion_journal_digest(body) != digest
+            ):
+                raise ValueError("PROMOTION_JOURNAL_CONTENT_INVALID")
+            ledger_path = Path(self.config_file)
+            if not ledger_path.is_absolute():
+                ledger_path = Path.cwd() / ledger_path
+            ledger_path = ledger_path.resolve()
+            _stage, stage_manifest, active_manifest = (
+                self._optimization_generation_paths()
+            )
+            if (
+                payload.get("ledger_path") != str(ledger_path)
+                or payload.get("active_manifest_path")
+                != str(active_manifest.resolve())
+                or payload.get("stage_manifest_path")
+                != str(stage_manifest.resolve())
+            ):
+                raise ValueError("PROMOTION_JOURNAL_PATH_BINDING_INVALID")
+            base_sha = str(payload.get("base_ledger_sha256") or "").lower()
+            target_sha = str(payload.get("target_ledger_sha256") or "").lower()
+            promoted_manifest = payload.get("promoted_manifest")
+            if (
+                len(base_sha) != 64
+                or len(target_sha) != 64
+                or type(promoted_manifest) is not dict
+                or promoted_manifest.get("generation_status") != "PROMOTED"
+                or str(promoted_manifest.get("ledger_sha256") or "").lower()
+                != target_sha
+            ):
+                raise ValueError("PROMOTION_JOURNAL_SEMANTICS_INVALID")
+            live_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+            live_sha = hashlib.sha256(live_bytes).hexdigest()
+            if live_sha == target_sha:
+                self._atomic_write_json(active_manifest, promoted_manifest)
+                self._prune_production_generation_storage_locked(
+                    promoted_manifest
+                )
+                stage_manifest.unlink(missing_ok=True)
+                journal_path.unlink()
+                self._last_promotion_authorization = None
+                return "COMPLETED"
+            if live_sha == base_sha:
+                journal_path.unlink()
+                return "ABORTED_BEFORE_CAS"
+            raise RuntimeError(
+                "OPTIMIZATION_PROMOTION_EXTERNAL_LEDGER_CHANGE:" + live_sha
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"OPTIMIZATION_PROMOTION_JOURNAL_INVALID:{type(exc).__name__}:{exc}"
+            ) from exc
+
+    def rollback_to_previous_production_generation(self) -> Dict[str, Any]:
+        """Re-publish the retained predecessor through the normal raw/CAS gate.
+
+        Rollback is deliberately one generation deep.  It re-verifies the
+        predecessor's retained ledger and authority artifacts, retains the
+        displaced current generation as the new predecessor, and uses the same
+        durable journal as an optimization promotion.  A crash therefore leaves
+        either the old current generation or a recoverable rollback publication.
+        """
+
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+            self._reconcile_interrupted_promotion_locked()
+            ledger_path = Path(self.config_file)
+            if not ledger_path.is_absolute():
+                ledger_path = Path.cwd() / ledger_path
+            ledger_path = ledger_path.resolve(strict=True)
+            stage_path, stage_manifest_path, active_path = (
+                self._optimization_generation_paths()
+            )
+            if not active_path.exists() or active_path.stat().st_size > 64 * 1024 * 1024:
+                raise RuntimeError("PRODUCTION_ROLLBACK_ACTIVE_MANIFEST_UNAVAILABLE")
+            active_raw = active_path.read_bytes()
+            active = json.loads(active_raw.decode("utf-8"))
+            if type(active) is not dict or active.get("generation_status") != "PROMOTED":
+                raise RuntimeError("PRODUCTION_ROLLBACK_ACTIVE_MANIFEST_INVALID")
+            live_raw = ledger_path.read_bytes()
+            live_sha = hashlib.sha256(live_raw).hexdigest()
+            active_ledger_sha = str(active.get("ledger_sha256") or "").lower()
+            if live_sha != active_ledger_sha:
+                raise RuntimeError("PRODUCTION_ROLLBACK_LIVE_ACTIVE_MISMATCH")
+            if (
+                type(active.get("ledger_status")) is not dict
+                or active["ledger_status"].get("complete_current_contract_universe")
+                is not True
+            ):
+                raise RuntimeError("PRODUCTION_ROLLBACK_CURRENT_LEDGER_INCOMPLETE")
+            policy = active.get("production_retention_policy")
+            expected_policy = {
+                "schema_version": "fxpm.production-retention-policy.v1",
+                "maximum_complete_generations": 2,
+                "keep_current_and_previous": True,
+            }
+            if policy != expected_policy:
+                raise RuntimeError("PRODUCTION_ROLLBACK_RETENTION_POLICY_INVALID")
+            deployment_config = str(
+                getattr(self.config, "_deployment_config_path", "") or ""
+            )
+            deployment_root = Path(deployment_config).resolve(strict=True).parent
+            current_descriptor = self._production_generation_retention_descriptor(
+                active,
+                deployment_root=deployment_root,
+            )
+            previous = active.get("previous_production_generation")
+            previous_descriptor = (
+                self._production_generation_retention_descriptor(
+                    previous,
+                    deployment_root=deployment_root,
+                )
+                if type(previous) is dict
+                else None
+            )
+            if current_descriptor is None or previous_descriptor != previous:
+                raise RuntimeError("PRODUCTION_ROLLBACK_RETAINED_GENERATION_INVALID")
+            previous_snapshot_path = Path(
+                previous_descriptor["previous_active_manifest_snapshot_path"]
+            ).resolve(strict=True)
+            previous_snapshot_raw = previous_snapshot_path.read_bytes()
+            previous_snapshot = json.loads(previous_snapshot_raw.decode("utf-8"))
+            if (
+                type(previous_snapshot) is not dict
+                or previous_snapshot.get("generation_status") != "PROMOTED"
+                or type(previous_snapshot.get("ledger_status")) is not dict
+                or previous_snapshot["ledger_status"].get(
+                    "complete_current_contract_universe"
+                )
+                is not True
+            ):
+                raise RuntimeError("PRODUCTION_ROLLBACK_PREVIOUS_MANIFEST_INVALID")
+            previous_source = Path(
+                previous_descriptor["production_staged_ledger_source_path"]
+            ).resolve(strict=True)
+            if previous_source.stat().st_size > 64 * 1024 * 1024:
+                raise RuntimeError("PRODUCTION_ROLLBACK_LEDGER_TOO_LARGE")
+            previous_ledger_raw = previous_source.read_bytes()
+            previous_ledger_sha = hashlib.sha256(previous_ledger_raw).hexdigest()
+            if previous_ledger_sha != previous_descriptor["ledger_sha256"]:
+                raise RuntimeError("PRODUCTION_ROLLBACK_LEDGER_HASH_MISMATCH")
+
+            active_sha = hashlib.sha256(active_raw).hexdigest()
+            displaced_snapshot = (
+                Path(previous_descriptor["production_authority_run_root"])
+                / "rollback"
+                / f"manifest-{active_sha}.json"
+            )
+            self._atomic_write_exact_bytes(displaced_snapshot, active_raw)
+            if hashlib.sha256(displaced_snapshot.read_bytes()).hexdigest() != active_sha:
+                raise RuntimeError("PRODUCTION_ROLLBACK_CURRENT_SNAPSHOT_MISMATCH")
+            displaced_descriptor = {
+                **dict(current_descriptor),
+                "previous_active_manifest_snapshot_path": str(
+                    displaced_snapshot.resolve(strict=True)
+                ),
+                "previous_active_manifest_snapshot_sha256": active_sha,
+            }
+            rollback_manifest = dict(previous_snapshot)
+            for stale_key in (
+                "previous_production_generation",
+                "obsolete_production_generation",
+                "promoted_at",
+                "ledger_path",
+            ):
+                rollback_manifest.pop(stale_key, None)
+            rollback_manifest.update(
+                {
+                    "generation_status": "COMPLETE",
+                    "base_ledger_sha256": live_sha,
+                    "base_active_manifest_sha256": active_sha,
+                    "ledger_sha256": previous_ledger_sha,
+                    "previous_production_generation": displaced_descriptor,
+                    "production_retention_policy": expected_policy,
+                    "rollback_publication": {
+                        "schema_version": "fxpm.production-rollback.v1",
+                        "rolled_back_from_generation_id": active.get("generation_id"),
+                        "rolled_back_to_generation_id": previous_snapshot.get(
+                            "generation_id"
+                        ),
+                        "source_manifest_snapshot_sha256": previous_descriptor[
+                            "previous_active_manifest_snapshot_sha256"
+                        ],
+                        "requested_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                }
+            )
+            rollback_descriptor = self._production_generation_retention_descriptor(
+                rollback_manifest,
+                deployment_root=deployment_root,
+            )
+            descriptor_keys = (
+                "generation_id",
+                "ledger_sha256",
+                "production_authority_run_root",
+                "authority_assembly_path",
+                "production_staged_ledger_source_path",
+            )
+            if (
+                rollback_descriptor is None
+                or any(
+                    rollback_descriptor.get(key) != previous_descriptor.get(key)
+                    for key in descriptor_keys
+                )
+                or self._production_generation_retention_descriptor(
+                    displaced_descriptor,
+                    deployment_root=deployment_root,
+                )
+                != displaced_descriptor
+            ):
+                raise RuntimeError("PRODUCTION_ROLLBACK_DESCRIPTOR_REVERIFY_FAILED")
+
+            self._atomic_write_exact_bytes(stage_path, previous_ledger_raw)
+            self._atomic_write_json(
+                stage_manifest_path,
+                {**rollback_manifest, "ledger_staging_path": str(stage_path)},
+            )
+            self._promote_staged_generation_locked(
+                stage_path,
+                stage_manifest_path,
+                rollback_manifest,
+                universe=self._native_universe_for_optimization(),
+            )
+            published = json.loads(active_path.read_text(encoding="utf-8"))
+            return {
+                "schema_version": "fxpm.production-rollback-result.v1",
+                "status": "ROLLED_BACK_TO_PREVIOUS",
+                "rolled_back_from_generation_id": active.get("generation_id"),
+                "active_generation_id": published.get("generation_id"),
+                "active_ledger_sha256": published.get("ledger_sha256"),
+                "ledger_changed": previous_ledger_sha != live_sha,
+                "active_manifest_path": str(active_path.resolve(strict=True)),
+            }
+
+    @staticmethod
     def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -13967,6 +17798,24 @@ class PortfolioManager:
         try:
             with temp.open("w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _atomic_write_exact_bytes(path: Path, payload: bytes) -> None:
+        """Atomically stage already-verified bytes without reserialization."""
+
+        if type(payload) is not bytes or not payload:
+            raise RuntimeError("OPTIMIZATION_EXACT_STAGE_BYTES_INVALID")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            with temp.open("xb") as handle:
+                handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp, path)
@@ -14014,11 +17863,43 @@ class PortfolioManager:
         self._atomic_write_json(stage_manifest, staged_manifest)
         return stage_path, stage_manifest, ledger_sha
 
+    def _discard_fixed_stage_for_generation_locked(
+        self,
+        *,
+        generation_id: str,
+        ledger_sha256: str,
+    ) -> bool:
+        """Delete fixed staging only when its manifest proves exact ownership."""
+
+        stage_path, stage_manifest_path, _active = self._optimization_generation_paths()
+        if not stage_manifest_path.exists() or not stage_path.exists():
+            return False
+        try:
+            if stage_manifest_path.stat().st_size > 64 * 1024 * 1024:
+                return False
+            payload = json.loads(stage_manifest_path.read_text(encoding="utf-8"))
+            expected_sha = str(ledger_sha256 or "").lower()
+            if (
+                type(payload) is not dict
+                or payload.get("generation_id") != generation_id
+                or str(payload.get("ledger_sha256") or "").lower() != expected_sha
+                or payload.get("ledger_staging_path") != str(stage_path)
+                or hashlib.sha256(stage_path.read_bytes()).hexdigest() != expected_sha
+            ):
+                return False
+            stage_path.unlink()
+            stage_manifest_path.unlink()
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+
     def _validate_staged_generation(
         self,
         stage_path: Path,
         expected_configs: Dict[str, SymbolConfig],
         universe: Any,
+        *,
+        required_symbols: Optional[Iterable[str]] = None,
     ) -> None:
         """Deserialize and prove the complete staged roster before promotion."""
         try:
@@ -14029,15 +17910,35 @@ class PortfolioManager:
             ) from exc
         if not isinstance(raw, dict):
             raise RuntimeError("OPTIMIZATION_GENERATION_STAGE_NOT_OBJECT")
-        expected_symbols = [str(symbol) for symbol in self.symbols]
-        if set(raw) != set(expected_symbols):
-            missing = sorted(set(expected_symbols) - set(raw))
-            extra = sorted(set(raw) - set(expected_symbols))
+        configured_symbols = {str(symbol) for symbol in self.symbols}
+        expected_serialized_symbols = {str(symbol) for symbol in expected_configs}
+        required_winner_symbols = {
+            str(symbol)
+            for symbol in (
+                self.symbols if required_symbols is None else required_symbols
+            )
+        }
+        if not required_winner_symbols.issubset(configured_symbols):
+            raise RuntimeError(
+                "OPTIMIZATION_GENERATION_REQUIRED_SYMBOL_OUTSIDE_CONFIGURED_UNIVERSE"
+            )
+        if set(raw) != expected_serialized_symbols:
+            missing = sorted(expected_serialized_symbols - set(raw))
+            extra = sorted(set(raw) - expected_serialized_symbols)
             raise RuntimeError(
                 f"OPTIMIZATION_GENERATION_ROSTER_MISMATCH:missing={missing}:extra={extra}"
             )
+        missing_required = sorted(required_winner_symbols - set(raw))
+        # seq987: staged roster equals the required set exactly; a stale
+        # data-state-only symbol inside the configured universe is rejected.
+        extra_config = sorted(set(raw) - required_winner_symbols)
+        if missing_required or extra_config:
+            raise RuntimeError(
+                "OPTIMIZATION_GENERATION_REQUIRED_ROSTER_MISMATCH:"
+                f"missing={missing_required}:extra={extra_config}"
+            )
         parsed: Dict[str, SymbolConfig] = {}
-        for symbol in expected_symbols:
+        for symbol in expected_configs:
             try:
                 parsed[symbol] = SymbolConfig.from_dict(raw[symbol])
             except Exception as exc:
@@ -14048,7 +17949,8 @@ class PortfolioManager:
             invalid = [
                 symbol
                 for symbol, config in parsed.items()
-                if not self._has_exact_native_cell_grid(symbol, config, universe)
+                if universe.active_timeframes(symbol)
+                and not self._has_exact_native_cell_grid(symbol, config, universe)
             ]
             if invalid:
                 raise RuntimeError(
@@ -14062,6 +17964,26 @@ class PortfolioManager:
         stage_path: Path,
         stage_manifest_path: Path,
         manifest: Dict[str, Any],
+        universe: Any = None,
+    ) -> None:
+        """Serialize final raw verification and publication for one ledger."""
+
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+            self._promote_staged_generation_locked(
+                stage_path,
+                stage_manifest_path,
+                manifest,
+                universe,
+            )
+
+    def _promote_staged_generation_locked(
+        self,
+        stage_path: Path,
+        stage_manifest_path: Path,
+        manifest: Dict[str, Any],
+        universe: Any = None,
     ) -> None:
         """Atomically replace the live ledger once the entire generation passes."""
         ledger_path = Path(self.config_file)
@@ -14074,27 +17996,919 @@ class PortfolioManager:
         if not expected_sha or observed_sha != expected_sha:
             raise RuntimeError("OPTIMIZATION_GENERATION_STAGE_HASH_MISMATCH")
         expected_base_sha = str(manifest.get("base_ledger_sha256") or "").lower()
+        expected_base_manifest_sha = str(
+            manifest.get("base_active_manifest_sha256") or ""
+        ).lower()
+        if expected_base_manifest_sha and (
+            len(expected_base_manifest_sha) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_base_manifest_sha
+            )
+        ):
+            raise RuntimeError(
+                "OPTIMIZATION_GENERATION_BASE_MANIFEST_HASH_INVALID"
+            )
         current_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
         if hashlib.sha256(current_bytes).hexdigest() != expected_base_sha:
             raise RuntimeError(
                 "OPTIMIZATION_GENERATION_LIVE_LEDGER_CHANGED_DURING_RUN"
             )
-        os.replace(stage_path, ledger_path)
-        # A detached funded-live authorization is bound to the pre-CAS ledger
-        # hash. Never allow refresh=False entry checks to reuse it after the
-        # winner book changes.
-        self._last_promotion_authorization = None
+        if expected_base_manifest_sha:
+            _stage, _stage_manifest, active_manifest = (
+                self._optimization_generation_paths()
+            )
+            active_bytes = (
+                active_manifest.read_bytes() if active_manifest.exists() else b""
+            )
+            if hashlib.sha256(active_bytes).hexdigest() != expected_base_manifest_sha:
+                raise RuntimeError(
+                    "OPTIMIZATION_GENERATION_ACTIVE_MANIFEST_CHANGED_DURING_RUN"
+                )
+        self._verify_staged_authority_before_cas(
+            stage_path,
+            manifest,
+            universe=universe,
+        )
+        # The raw verifier can be slow.  Re-read under the same interprocess
+        # publication lock so a newer ledger can never be overwritten after
+        # the first base check.
+        current_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+        if hashlib.sha256(current_bytes).hexdigest() != expected_base_sha:
+            raise RuntimeError(
+                "OPTIMIZATION_GENERATION_LIVE_LEDGER_CHANGED_DURING_VERIFY"
+            )
+        if expected_base_manifest_sha:
+            active_bytes = (
+                active_manifest.read_bytes() if active_manifest.exists() else b""
+            )
+            if hashlib.sha256(active_bytes).hexdigest() != expected_base_manifest_sha:
+                raise RuntimeError(
+                    "OPTIMIZATION_GENERATION_ACTIVE_MANIFEST_CHANGED_DURING_VERIFY"
+                )
+        final_stage_bytes = Path(stage_path).read_bytes()
+        if hashlib.sha256(final_stage_bytes).hexdigest() != expected_sha:
+            raise RuntimeError(
+                "OPTIMIZATION_GENERATION_STAGE_CHANGED_DURING_VERIFY"
+            )
         promoted_manifest = {
             **dict(manifest),
             "generation_status": "PROMOTED",
             "promoted_at": datetime.now(timezone.utc).isoformat(),
             "ledger_path": str(ledger_path),
         }
+        journal_path = self._write_promotion_journal(
+            base_ledger_sha256=expected_base_sha,
+            target_ledger_sha256=expected_sha,
+            stage_manifest_path=stage_manifest_path,
+            promoted_manifest=promoted_manifest,
+        )
+        os.replace(stage_path, ledger_path)
+        # A detached funded-live authorization is bound to the pre-CAS ledger
+        # hash. Never allow refresh=False entry checks to reuse it after the
+        # winner book changes.
+        self._last_promotion_authorization = None
         self._atomic_write_json(active_manifest, promoted_manifest)
-        Path(stage_manifest_path).unlink(missing_ok=True)
         self.ledger.load()
         self.symbol_configs = self.ledger.get_all_configs()
-    
+        self._prune_production_generation_storage_locked(promoted_manifest)
+        Path(stage_manifest_path).unlink(missing_ok=True)
+        journal_path.unlink()
+
+    def _stage_and_promote_exact_production_generation(
+        self,
+        *,
+        stage_path: Path,
+        stage_manifest_path: Path,
+        staged_bytes: bytes,
+        manifest: Dict[str, Any],
+        universe: Any,
+    ) -> None:
+        """Hold one lock from exact staging through publication completion."""
+
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+            try:
+                self._atomic_write_exact_bytes(stage_path, staged_bytes)
+                observed = stage_path.read_bytes()
+                expected_sha = str(manifest.get("ledger_sha256") or "").lower()
+                if (
+                    observed != staged_bytes
+                    or hashlib.sha256(observed).hexdigest() != expected_sha
+                ):
+                    raise RuntimeError(
+                        "PRODUCTION_AUTHORITY_EXACT_STAGE_REVERIFY_FAILED"
+                    )
+                self._atomic_write_json(
+                    stage_manifest_path,
+                    {**manifest, "ledger_staging_path": str(stage_path)},
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "PRODUCTION_AUTHORITY_EXACT_STAGE_FAILED:"
+                    f"{type(exc).__name__}:{exc}"
+                ) from exc
+            self._promote_staged_generation_locked(
+                stage_path,
+                stage_manifest_path,
+                manifest,
+                universe,
+            )
+
+    def _verify_staged_authority_before_cas(
+        self,
+        stage_path: Path,
+        manifest: Mapping[str, Any],
+        *,
+        universe: Any,
+    ) -> None:
+        """Reverify the raw authority chain against staged bytes before CAS."""
+
+        deployment_config = str(
+            getattr(self.config, "_deployment_config_path", "") or ""
+        ).strip()
+        if not deployment_config:
+            return
+        split_mode = str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower()
+        calendar_modes = {
+            CALENDAR_SPLIT_MODE,
+            "calendar",
+            "calendar_lockbox",
+            "lockbox",
+            "three_way",
+        }
+        explicit_research = getattr(self.config, "research_mode", None) is True
+        funded_execution = (
+            getattr(self.config, "_funded_live_execution", None) is True
+        )
+        # A deployment-bound generation is production unless it is explicitly
+        # configured as non-funded research.  The raw authority gate must not
+        # depend on one exact split-mode spelling: stale aliases, legacy
+        # deployment modes, and unknown production labels all fail closed.
+        # Calendar modes retain their existing authority requirement even if a
+        # caller accidentally carries a research flag into that context.
+        if (
+            explicit_research
+            and not funded_execution
+            and split_mode not in calendar_modes
+        ):
+            return
+        if universe is None:
+            raise RuntimeError("OPTIMIZATION_AUTHORITY_NATIVE_UNIVERSE_REQUIRED")
+        try:
+            from pm_optimization_authority import (
+                ARTIFACTS,
+                verify_live_readiness_authority_chain,
+            )
+
+            config_path = Path(deployment_config).resolve(strict=True)
+            root = config_path.parent.resolve(strict=True)
+            config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+            ledger_path = Path(stage_path).resolve(strict=True)
+            ledger_path.relative_to(root)
+            ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+            receipt = manifest.get("authority_chain_receipt")
+            descriptors = manifest.get("authority_artifacts")
+            if type(receipt) is not dict or type(descriptors) is not dict:
+                raise ValueError("AUTHORITY_ASSEMBLY_MISSING")
+            if set(descriptors) != set(ARTIFACTS):
+                raise ValueError("AUTHORITY_ARTIFACT_ROSTER_INVALID")
+            if str(receipt.get("generation_id") or "") != str(
+                manifest.get("generation_id") or ""
+            ):
+                raise ValueError("AUTHORITY_GENERATION_MISMATCH")
+            if str(receipt.get("ledger_sha256") or "").lower() != hashlib.sha256(
+                ledger_path.read_bytes()
+            ).hexdigest():
+                raise ValueError("AUTHORITY_LEDGER_MISMATCH")
+            requested = receipt.get("requested_symbols")
+            canonical_requested = tuple(
+                dict.fromkeys(
+                    str(symbol).strip().upper()
+                    for symbol in self.symbols
+                    if str(symbol).strip()
+                )
+            )
+            if type(requested) is not list or tuple(requested) != canonical_requested:
+                raise ValueError("AUTHORITY_REQUESTED_ROSTER_MISMATCH")
+            index_paths: Dict[str, Path] = {}
+            for name in ARTIFACTS:
+                descriptor = descriptors.get(name)
+                relative = (
+                    descriptor.get("relative_path")
+                    if type(descriptor) is dict
+                    else None
+                )
+                if type(relative) is not str or not relative:
+                    raise ValueError("AUTHORITY_ARTIFACT_PATH_INVALID")
+                path = (root / relative).resolve(strict=True)
+                path.relative_to(root)
+                index_paths[name] = path
+            probe_manifest = {
+                **dict(manifest),
+                "generation_status": "PROMOTED",
+                "technical_failures": {},
+            }
+            funded = receipt.get("authorization_scope") == "FUNDED_LIVE"
+            probe_path = root / (
+                f".{ledger_path.name}.{manifest.get('generation_id', 'unknown')}."
+                f"authority-probe-{os.getpid()}-{time.time_ns()}.json"
+            )
+            try:
+                self._atomic_write_json(probe_path, probe_manifest)
+                result = verify_live_readiness_authority_chain(
+                    manifest=probe_manifest,
+                    manifest_path=probe_path,
+                    authority_index_paths=index_paths,
+                    ledger=ledger_payload,
+                    ledger_path=ledger_path,
+                    config=self.config,
+                    config_payload=config_payload,
+                    config_path=config_path,
+                    requested_symbols=tuple(requested),
+                    native_universe=universe,
+                    validation_time_utc=datetime.now(timezone.utc),
+                    require_funded_authorization=funded,
+                )
+            finally:
+                probe_path.unlink(missing_ok=True)
+            expected = (
+                "FUNDED_AUTHORIZED" if funded else "DEMO_PROBATION_AUTHORIZED"
+            )
+            if (
+                result.get("status") != expected
+                or result.get("errors") != []
+                or set(result.get("raw_reverification", {}).values()) != {True}
+            ):
+                detail = ",".join(str(value) for value in result.get("errors", [])[:8])
+                raise ValueError(f"AUTHORITY_RAW_REVERIFY_BLOCKED:{detail}")
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "OPTIMIZATION_AUTHORITY_"
+            ):
+                raise
+            raise RuntimeError(
+                "OPTIMIZATION_AUTHORITY_PRE_CAS_BLOCKED:"
+                f"{type(exc).__name__}:{exc}"
+            ) from exc
+
+    def _requires_production_authority_runner(self) -> bool:
+        """Classify the same production surface as the final pre-CAS gate."""
+
+        deployment_config = str(
+            getattr(self.config, "_deployment_config_path", "") or ""
+        ).strip()
+        if not deployment_config:
+            return False
+        split_mode = str(
+            getattr(self.config, "production_split_mode", "") or ""
+        ).strip().lower()
+        calendar_modes = {
+            CALENDAR_SPLIT_MODE,
+            "calendar",
+            "calendar_lockbox",
+            "lockbox",
+            "three_way",
+        }
+        if split_mode in calendar_modes:
+            return True
+        explicit_research = getattr(self.config, "research_mode", None) is True
+        funded_execution = (
+            getattr(self.config, "_funded_live_execution", None) is True
+        )
+        return not (explicit_research and not funded_execution)
+
+    def _validated_sparse_current_ledger(
+        self,
+        raw: bytes,
+    ) -> Tuple[Dict[str, SymbolConfig], int]:
+        """Validate the sparse physical winners; coverage lives in raw Book evidence."""
+
+        try:
+            payload = json.loads(raw.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "PRODUCTION_AUTHORITY_LEDGER_JSON_INVALID"
+            ) from exc
+        if type(payload) is not dict or not payload or len(payload) > len(self.symbols):
+            raise RuntimeError("PRODUCTION_AUTHORITY_LEDGER_ROSTER_INVALID")
+        configured = {str(symbol).strip().upper() for symbol in self.symbols}
+        if set(payload) - configured:
+            raise RuntimeError("PRODUCTION_AUTHORITY_LEDGER_SYMBOL_OUTSIDE_UNIVERSE")
+        parsed: Dict[str, SymbolConfig] = {}
+        cell_count = 0
+        for symbol, body in payload.items():
+            try:
+                config = SymbolConfig.from_dict(body)
+            except Exception as exc:
+                raise RuntimeError(
+                    "PRODUCTION_AUTHORITY_LEDGER_SYMBOL_INVALID:"
+                    f"{symbol}:{type(exc).__name__}"
+                ) from exc
+            if str(config.symbol).strip().upper() != symbol:
+                raise RuntimeError(
+                    f"PRODUCTION_AUTHORITY_LEDGER_SYMBOL_IDENTITY_MISMATCH:{symbol}"
+                )
+            symbol_cells = 0
+            for regimes in (config.regime_configs or {}).values():
+                for candidate in (regimes or {}).values():
+                    role = str(
+                        (candidate.artifact_meta or {}).get("book_role", "") or ""
+                    ).strip().upper()
+                    status = str(candidate.promotion_status or "").strip().upper()
+                    if (
+                        role != "PROCESS_VALIDATED_CURRENT_REFIT"
+                        or status != "PROCESS_VALIDATED_CURRENT_REFIT"
+                    ):
+                        raise RuntimeError(
+                            "PRODUCTION_AUTHORITY_LEDGER_CELL_ROLE_INVALID:"
+                            f"{symbol}"
+                        )
+                    symbol_cells += 1
+            if symbol_cells <= 0:
+                raise RuntimeError(
+                    f"PRODUCTION_AUTHORITY_LEDGER_SYMBOL_EMPTY:{symbol}"
+                )
+            parsed[symbol] = config
+            cell_count += symbol_cells
+        return parsed, cell_count
+
+    def _run_production_authority_generation(
+        self,
+        request: OptimizationGenerationRequest,
+    ) -> OptimizationGenerationOutcome:
+        """Run genuine anchors/current/replay/Capital once, then atomically CAS."""
+
+        from pm_production_capital_bootstrap import DEMO_PROBATION_SCOPE
+        from pm_production_optimization_runner import (
+            ProductionOptimizationRequest,
+            discard_unpublished_production_result,
+            run_production_optimization,
+        )
+
+        request_kind = str(request.kind or "").strip().upper()
+        started_at = datetime.now(timezone.utc).isoformat()
+        total_start = time.time()
+        # A retry in the same process must resolve the prior publication before
+        # it can derive a new base hash or write another promotion journal.
+        self._reconcile_interrupted_promotion()
+        configured_symbols = tuple(str(symbol) for symbol in self.symbols)
+        configured_canonical = {
+            str(symbol).strip().upper() for symbol in configured_symbols
+        }
+        for raw_symbol in request.target_symbols:
+            canonical = str(raw_symbol or "").strip().upper()
+            if canonical not in configured_canonical:
+                raise ValueError(
+                    f"OPTIMIZATION_GENERATION_TARGET_UNKNOWN:{canonical}"
+                )
+        ledger_path = Path(self.config_file)
+        if not ledger_path.is_absolute():
+            ledger_path = Path.cwd() / ledger_path
+        ledger_path = ledger_path.resolve()
+        base_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+        base_sha = hashlib.sha256(base_bytes).hexdigest()
+        config_path = Path(
+            str(getattr(self.config, "_deployment_config_path", "") or "")
+        ).resolve(strict=True)
+        try:
+            config_payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            raise RuntimeError(
+                "PRODUCTION_ACTIVE_CONFIG_READ_FAILED:"
+                f"{type(exc).__name__}:{exc}"
+            ) from exc
+        universe = self._native_universe_for_optimization()
+        generation_id = _stable_hash(
+            {
+                "schema": "fxpm.optimization-generation.v2",
+                "runner": "fxpm.production-optimization-runner.v1",
+                "started_at": started_at,
+                "time_ns": time.time_ns(),
+                "pid": os.getpid(),
+                "base_ledger_sha256": base_sha,
+                "activation_id": getattr(universe, "activation_id", None),
+                "activation_manifest_sha256": getattr(
+                    universe, "activation_manifest_sha256", None
+                ),
+                "kind": request_kind,
+                "requested_symbols": list(configured_symbols),
+                "overwrite": bool(request.overwrite_targets),
+            }
+        )
+        stage_path, stage_manifest_path, active_manifest_path = (
+            self._optimization_generation_paths()
+        )
+        failure_manifest_path = self._optimization_failure_manifest_path()
+        previous_active_manifest: Dict[str, Any] = {}
+        previous_active_manifest_raw = b""
+        if active_manifest_path.exists():
+            try:
+                if active_manifest_path.stat().st_size > 64 * 1024 * 1024:
+                    raise ValueError("ACTIVE_MANIFEST_TOO_LARGE")
+                previous_active_manifest_raw = active_manifest_path.read_bytes()
+                previous_active_manifest = json.loads(
+                    previous_active_manifest_raw.decode("utf-8")
+                )
+                if type(previous_active_manifest) is not dict:
+                    raise ValueError("ACTIVE_MANIFEST_NOT_OBJECT")
+            except Exception as exc:
+                raise RuntimeError(
+                    "PRODUCTION_ACTIVE_MANIFEST_READ_FAILED:"
+                    f"{type(exc).__name__}:{exc}"
+                ) from exc
+        base_active_manifest_sha = hashlib.sha256(
+            previous_active_manifest_raw
+        ).hexdigest()
+        previous_retention = self._production_generation_retention_descriptor(
+            previous_active_manifest,
+            deployment_root=config_path.parent,
+        )
+        if previous_active_manifest and any(
+            key in previous_active_manifest
+            for key in (
+                "production_authority_run_root",
+                "authority_assembly_path",
+                "production_staged_ledger_source_path",
+            )
+        ) and previous_retention is None:
+            raise RuntimeError("PRODUCTION_ACTIVE_RETENTION_DESCRIPTOR_INVALID")
+        obsolete_retention = None
+        if "previous_production_generation" in previous_active_manifest:
+            obsolete_value = previous_active_manifest.get(
+                "previous_production_generation"
+            )
+            obsolete_retention = (
+                self._production_generation_retention_descriptor(
+                    obsolete_value,
+                    deployment_root=config_path.parent,
+                )
+            )
+            if obsolete_retention is None:
+                raise RuntimeError(
+                    "PRODUCTION_OBSOLETE_RETENTION_DESCRIPTOR_INVALID"
+                )
+
+        def _outcome(
+            status: str,
+            *,
+            results: Optional[Dict[str, PipelineResult]] = None,
+            failures: Optional[Dict[str, str]] = None,
+            promoted: bool = False,
+            ledger_changed: bool = False,
+            promoted_sha: str = "",
+            manifest_path: Optional[Path] = None,
+            authority_fields: Optional[Mapping[str, Any]] = None,
+            replay_evidence: Optional[Mapping[str, Any]] = None,
+        ) -> OptimizationGenerationOutcome:
+            fields = dict(authority_fields or {})
+            value = OptimizationGenerationOutcome(
+                generation_id=generation_id,
+                status=status,
+                requested_symbols=configured_symbols,
+                effective_symbols=configured_symbols,
+                retained_symbols=(),
+                excluded_symbols=(),
+                results=dict(results or {}),
+                technical_failures=dict(failures or {}),
+                promoted=promoted,
+                ledger_changed=ledger_changed,
+                base_ledger_sha256=base_sha,
+                promoted_ledger_sha256=promoted_sha,
+                manifest_path=str(
+                    manifest_path
+                    if manifest_path is not None
+                    else active_manifest_path if promoted else stage_manifest_path
+                ),
+                replay_evidence=dict(replay_evidence or {}),
+                authority_chain_receipt=dict(
+                    fields.get("authority_chain_receipt", {}) or {}
+                ),
+                authority_artifacts=dict(fields.get("authority_artifacts", {}) or {}),
+                authority_assembly_path=str(
+                    fields.get("authority_assembly_path", "") or ""
+                ),
+            )
+            self.last_optimization_generation = value
+            return value
+
+        if request_kind == "SCHEDULED_RETRAIN" and request.require_fresh_native_activation:
+            current_activation = str(getattr(universe, "activation_id", "") or "")
+            previous_activation = ""
+            if previous_active_manifest:
+                previous_activation = str(
+                    (
+                        previous_active_manifest.get("authority_chain_receipt", {})
+                        or {}
+                    ).get("native_activation_id", "")
+                    or ""
+                )
+            if not current_activation or current_activation == previous_activation:
+                failure = {
+                    "__GENERATION__": "BLOCKED_STALE_NATIVE_ACTIVATION"
+                }
+                manifest = {
+                    "schema_version": "fxpm.optimization-generation.v2",
+                    "generation_id": generation_id,
+                    "generation_status": "BLOCKED_STALE_SOURCE",
+                    "generation_kind": request_kind,
+                    "base_ledger_sha256": base_sha,
+                    "requested_symbols": list(configured_symbols),
+                    "technical_failures": failure,
+                }
+                from pm_storage import _exclusive_file_lock
+
+                with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+                    current = ledger_path.read_bytes() if ledger_path.exists() else b""
+                    if hashlib.sha256(current).hexdigest() != base_sha:
+                        raise RuntimeError(
+                            "PRODUCTION_STALE_SOURCE_FOUND_EXTERNAL_LEDGER_CHANGE"
+                        )
+                    self._atomic_write_json(failure_manifest_path, manifest)
+                return _outcome(
+                    "BLOCKED_STALE_SOURCE",
+                    failures=failure,
+                    manifest_path=failure_manifest_path,
+                )
+
+        try:
+            production = run_production_optimization(
+                ProductionOptimizationRequest(
+                    active_config_path=config_path,
+                    config=self.config,
+                    config_payload=config_payload,
+                    requested_symbols=configured_symbols,
+                    native_universe=universe,
+                    generation_id=generation_id,
+                    authorization_scope=DEMO_PROBATION_SCOPE,
+                )
+            )
+        except Exception as exc:
+            detail = f"PRODUCTION_AUTHORITY_RUN_FAILED:{type(exc).__name__}:{exc}"
+            failures = {"__GENERATION__": detail}
+            manifest = {
+                "schema_version": "fxpm.optimization-generation.v2",
+                "generation_id": generation_id,
+                "generation_status": "FAILED_TECHNICAL",
+                "generation_kind": request_kind,
+                "base_ledger_sha256": base_sha,
+                "requested_symbols": list(configured_symbols),
+                "technical_failures": failures,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            from pm_storage import _exclusive_file_lock
+
+            with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+                current = ledger_path.read_bytes() if ledger_path.exists() else b""
+                if hashlib.sha256(current).hexdigest() != base_sha:
+                    raise RuntimeError(
+                        "PRODUCTION_AUTHORITY_FAILURE_FOUND_EXTERNAL_LEDGER_CHANGE"
+                    ) from exc
+                self._atomic_write_json(failure_manifest_path, manifest)
+            return _outcome(
+                "FAILED_TECHNICAL",
+                failures=failures,
+                manifest_path=failure_manifest_path,
+            )
+
+        try:
+            if production.generation_id != generation_id:
+                raise RuntimeError("PRODUCTION_AUTHORITY_GENERATION_ID_MISMATCH")
+            staged_bytes = production.staged_ledger_bytes
+            if type(staged_bytes) is not bytes or not staged_bytes:
+                raise RuntimeError("PRODUCTION_AUTHORITY_STAGED_LEDGER_BYTES_INVALID")
+            staged_sha = hashlib.sha256(staged_bytes).hexdigest()
+            if staged_sha != production.staged_ledger_content_sha256:
+                raise RuntimeError("PRODUCTION_AUTHORITY_STAGED_LEDGER_HASH_MISMATCH")
+            parsed, winner_cell_count = self._validated_sparse_current_ledger(
+                staged_bytes
+            )
+            result_rows = {
+                symbol: PipelineResult(
+                    symbol=symbol,
+                    success=True,
+                    config=config,
+                    duration_seconds=max(0.0, time.time() - total_start),
+                    timeframes_tested=len(config.regime_configs or {}),
+                    regime_winners=sum(
+                        len(regimes or {})
+                        for regimes in (config.regime_configs or {}).values()
+                    ),
+                    data_window_meta={
+                        "evaluation_scope": "COMPLETE_100x6x4_RAW_BOOK",
+                        "physical_current_winner": True,
+                    },
+                )
+                for symbol, config in parsed.items()
+            }
+            authority_fields = production.manifest_fields()
+            ledger_status = {
+                "schema_version": "fxpm.production-ledger-status.v2",
+                "complete_current_contract_universe": True,
+                "coverage_authority": "RAW_REVERIFIED_COMPLETE_100x6x4_BOOK",
+                "configured_symbol_count": len(configured_symbols),
+                "configured_cell_count": len(configured_symbols) * 6 * 4,
+                "physical_winner_symbol_count": len(parsed),
+                "physical_winner_cell_count": winner_cell_count,
+                "sparse_physical_winner_book": True,
+            }
+            replay_evidence = {
+                "ok": True,
+                "mode": "SYNCHRONIZED_AUTHORITY_REPLAY_AND_CAPITAL_V8",
+                "capital_decision_sha256": production.capital_decision_sha256,
+                "selected_policy_point_id": production.selected_policy_point_id,
+            }
+            manifest: Dict[str, Any] = {
+                "schema_version": "fxpm.optimization-generation.v2",
+                "generation_id": generation_id,
+                "generation_status": "COMPLETE",
+                "generation_kind": request_kind,
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "base_ledger_sha256": base_sha,
+                "base_active_manifest_sha256": base_active_manifest_sha,
+                "ledger_sha256": staged_sha,
+                "configured_symbols": list(configured_symbols),
+                "requested_symbols": list(configured_symbols),
+                "effective_symbols": list(configured_symbols),
+                "completed_symbols": list(configured_symbols),
+                "physical_winner_symbols": sorted(parsed),
+                "activation_id": getattr(universe, "activation_id", None),
+                "activation_manifest_sha256": getattr(
+                    universe, "activation_manifest_sha256", None
+                ),
+                "technical_failures": {},
+                "ledger_status": ledger_status,
+                "replay_evidence": replay_evidence,
+                "physical_ledger_sha256": production.physical_ledger_sha256,
+                "production_authority_run_root": str(production.run_root),
+                "production_staged_ledger_source_path": str(
+                    production.staged_ledger_source_path
+                ),
+                **authority_fields,
+            }
+            previous_retention_for_manifest = None
+            if previous_retention is not None:
+                rollback_snapshot = (
+                    Path(production.run_root)
+                    / "rollback"
+                    / f"manifest-{base_active_manifest_sha}.json"
+                )
+                self._atomic_write_exact_bytes(
+                    rollback_snapshot,
+                    previous_active_manifest_raw,
+                )
+                if (
+                    hashlib.sha256(rollback_snapshot.read_bytes()).hexdigest()
+                    != base_active_manifest_sha
+                ):
+                    raise RuntimeError(
+                        "PRODUCTION_PREVIOUS_MANIFEST_SNAPSHOT_MISMATCH"
+                    )
+                previous_retention_for_manifest = {
+                    **dict(previous_retention),
+                    "previous_active_manifest_snapshot_path": str(
+                        rollback_snapshot.resolve(strict=True)
+                    ),
+                    "previous_active_manifest_snapshot_sha256": (
+                        base_active_manifest_sha
+                    ),
+                }
+                manifest["previous_production_generation"] = dict(
+                    previous_retention_for_manifest
+                )
+            if obsolete_retention is not None:
+                manifest["obsolete_production_generation"] = dict(
+                    obsolete_retention
+                )
+            manifest["production_retention_policy"] = {
+                "schema_version": "fxpm.production-retention-policy.v1",
+                "maximum_complete_generations": 2,
+                "keep_current_and_previous": True,
+            }
+            current_retention = (
+                self._production_generation_retention_descriptor(
+                    manifest,
+                    deployment_root=config_path.parent,
+                )
+            )
+            if current_retention is None:
+                raise RuntimeError(
+                    "PRODUCTION_CURRENT_RETENTION_DESCRIPTOR_INVALID"
+                )
+        except Exception as exc:
+            cleanup_status = "NOT_ATTEMPTED"
+            try:
+                cleanup_status = (
+                    "DISCARDED"
+                    if discard_unpublished_production_result(production)
+                    else "ALREADY_ABSENT"
+                )
+            except Exception as cleanup_exc:
+                cleanup_status = (
+                    "FAILED:"
+                    f"{type(cleanup_exc).__name__}:{cleanup_exc}"
+                )
+            failures = {
+                "__POST_RUN__": (
+                    "PRODUCTION_AUTHORITY_POST_RUN_FAILED:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+            }
+            failed_manifest = {
+                "schema_version": "fxpm.optimization-generation.v2",
+                "generation_id": generation_id,
+                "generation_status": "FAILED_POST_RUN_TECHNICAL",
+                "generation_kind": request_kind,
+                "base_ledger_sha256": base_sha,
+                "requested_symbols": list(configured_symbols),
+                "technical_failures": failures,
+                "unpublished_artifact_cleanup": cleanup_status,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            from pm_storage import _exclusive_file_lock
+
+            with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+                live = ledger_path.read_bytes() if ledger_path.exists() else b""
+                live_sha = hashlib.sha256(live).hexdigest()
+                if live_sha != base_sha:
+                    failed_manifest["generation_status"] = (
+                        "FAILED_POST_RUN_SUPERSEDED"
+                    )
+                    failed_manifest["superseded_by_ledger_sha256"] = live_sha
+                self._atomic_write_json(failure_manifest_path, failed_manifest)
+            return _outcome(
+                failed_manifest["generation_status"],
+                failures=failures,
+                manifest_path=failure_manifest_path,
+            )
+
+        try:
+            self._stage_and_promote_exact_production_generation(
+                stage_path=stage_path,
+                stage_manifest_path=stage_manifest_path,
+                staged_bytes=staged_bytes,
+                manifest=manifest,
+                universe=universe,
+            )
+        except Exception as exc:
+            from pm_storage import _exclusive_file_lock
+
+            with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+                journal_reference = self._promotion_journal_reference_locked(
+                    generation_id=generation_id,
+                    ledger_sha256=staged_sha,
+                    run_root=production.run_root,
+                    authority_assembly_path=Path(
+                        authority_fields["authority_assembly_path"]
+                    ),
+                    staged_ledger_source_path=(
+                        production.staged_ledger_source_path
+                    ),
+                )
+                journal_authorized = bool(
+                    journal_reference == "EXACT"
+                    and self._promotion_journal_authorizes(
+                        base_ledger_sha256=base_sha,
+                        target_ledger_sha256=staged_sha,
+                        generation_id=generation_id,
+                    )
+                )
+                if journal_authorized:
+                    try:
+                        self._reconcile_interrupted_promotion_locked()
+                    except Exception:
+                        pass
+                live = ledger_path.read_bytes() if ledger_path.exists() else b""
+                live_sha = hashlib.sha256(live).hexdigest()
+                active_reference = (
+                    self._active_production_generation_reference_locked(
+                        generation_id=generation_id,
+                        ledger_sha256=staged_sha,
+                        run_root=production.run_root,
+                        authority_assembly_path=Path(
+                            authority_fields["authority_assembly_path"]
+                        ),
+                        staged_ledger_source_path=(
+                            production.staged_ledger_source_path
+                        ),
+                    )
+                )
+                cas_applied = bool(
+                    live_sha == staged_sha
+                    and (
+                        journal_authorized
+                        or active_reference == "ACTIVE"
+                    )
+                )
+                generation_referenced = bool(
+                    journal_reference in {"EXACT", "AMBIGUOUS"}
+                    or active_reference in {"ACTIVE", "PREVIOUS"}
+                )
+                if active_reference in {"ACTIVE", "PREVIOUS"}:
+                    self.ledger.load()
+                    self.symbol_configs = self.ledger.get_all_configs()
+                    return _outcome(
+                        (
+                            "PROMOTED"
+                            if active_reference == "ACTIVE"
+                            else "PROMOTED_SUPERSEDED"
+                        ),
+                        results=result_rows,
+                        promoted=True,
+                        ledger_changed=staged_sha != base_sha,
+                        promoted_sha=staged_sha,
+                        authority_fields=authority_fields,
+                        replay_evidence=replay_evidence,
+                    )
+                if not generation_referenced:
+                    self._discard_fixed_stage_for_generation_locked(
+                        generation_id=generation_id,
+                        ledger_sha256=staged_sha,
+                    )
+            unpublished_cleanup = "NOT_SAFE_TO_DISCARD"
+            if not generation_referenced:
+                try:
+                    unpublished_cleanup = (
+                        "DISCARDED"
+                        if discard_unpublished_production_result(production)
+                        else "ALREADY_ABSENT"
+                    )
+                except Exception as cleanup_exc:
+                    unpublished_cleanup = (
+                        "FAILED:"
+                        f"{type(cleanup_exc).__name__}:{cleanup_exc}"
+                    )
+            if cas_applied:
+                # The ledger is already the durable truth even when active-
+                # manifest recovery remains pending.  Runtime state must never
+                # continue trading the superseded in-memory book.
+                self.ledger.load()
+                self.symbol_configs = self.ledger.get_all_configs()
+            failures = {
+                (
+                    "__POST_RUN__"
+                    if str(exc).startswith(
+                        "PRODUCTION_AUTHORITY_EXACT_STAGE_FAILED:"
+                    )
+                    else "__PROMOTION__"
+                ): (
+                    (
+                        "PRODUCTION_AUTHORITY_POST_RUN_FAILED:"
+                        if str(exc).startswith(
+                            "PRODUCTION_AUTHORITY_EXACT_STAGE_FAILED:"
+                        )
+                        else "PRODUCTION_PROMOTION_FAILED:"
+                    )
+                    + f"{type(exc).__name__}:{exc}"
+                )
+            }
+            pre_cas_stage_failure = str(exc).startswith(
+                "PRODUCTION_AUTHORITY_EXACT_STAGE_FAILED:"
+            )
+            failed = {
+                **manifest,
+                "generation_status": (
+                    "PROMOTED_RECOVERY_REQUIRED"
+                    if cas_applied
+                    else "FAILED_POST_RUN_TECHNICAL"
+                    if pre_cas_stage_failure
+                    else "FAILED_PROMOTION_TECHNICAL"
+                ),
+                "technical_failures": failures,
+                "promotion_failure_evidence": {
+                    "cas_applied": cas_applied,
+                    "observed_live_ledger_sha256": live_sha,
+                    "target_ledger_sha256": staged_sha,
+                    "unpublished_artifact_cleanup": unpublished_cleanup,
+                },
+            }
+            with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+                self._atomic_write_json(failure_manifest_path, failed)
+            return _outcome(
+                failed["generation_status"],
+                results=result_rows,
+                failures=failures,
+                promoted=cas_applied,
+                ledger_changed=cas_applied and staged_sha != base_sha,
+                promoted_sha=staged_sha if cas_applied else "",
+                manifest_path=failure_manifest_path,
+                authority_fields=authority_fields,
+                replay_evidence=replay_evidence,
+            )
+        return _outcome(
+            "PROMOTED",
+            results=result_rows,
+            promoted=True,
+            ledger_changed=staged_sha != base_sha,
+            promoted_sha=staged_sha,
+            authority_fields=authority_fields,
+            replay_evidence=replay_evidence,
+        )
+
     def _run_governed_symbol_generation(
         self,
         request: OptimizationGenerationRequest,
@@ -14130,6 +18944,8 @@ class PortfolioManager:
             raise ValueError(
                 "FRESH_NATIVE_ACTIVATION_POLICY_REQUIRES_PRODUCTION_CALENDAR_CONTEXT"
             )
+        if self._requires_production_authority_runner():
+            return self._run_production_authority_generation(request)
         require_fresh_native_activation = bool(
             request_kind == "SCHEDULED_RETRAIN" and production_native_context
         )
@@ -14149,10 +18965,10 @@ class PortfolioManager:
 
         total_start = time.time()
         
-        # Freeze the availability-only universe before model search. Excluded
-        # symbols receive a complete, manifest-bound NO_TRADE grid and never
-        # enter scoring/optimization. A prior exclusion that becomes eligible
-        # under a later activation is forced back through optimization.
+        # Freeze the authenticated data-state universe before model search.
+        # Only evidence candidates enter optimization. Source-unavailable cells
+        # remain outside the winner ledger, and a later transition to candidate
+        # state is forced through evaluation.
         universe = self._native_universe_for_optimization()
         ledger_path = Path(self.config_file)
         if not ledger_path.is_absolute():
@@ -14202,17 +19018,109 @@ class PortfolioManager:
             "completed_symbols": [],
             "technical_failures": {},
         }
+        required_winner_symbols = list(self.symbols)
+        if universe is not None and getattr(universe, "explicit_contract", False):
+            required_timeframes = tuple(
+                str(value or "").strip().upper()
+                for value in (getattr(self.config, "timeframes", []) or [])
+                if str(value or "").strip()
+            )
+            receipt_cells = {
+                str(symbol).upper(): {
+                    timeframe: str(
+                        universe.cell_status(str(symbol).upper(), timeframe)
+                    ).lower()
+                    for timeframe in required_timeframes
+                }
+                for symbol in self.symbols
+            }
+            legacy_trading_verdicts = any(
+                status == "excluded_no_trade"
+                for cells in receipt_cells.values()
+                for status in cells.values()
+            )
+            data_state_receipt: Dict[str, Any] = {
+                "schema_version": "fxpm.native-data-state-receipt.v1",
+                "activation_id": getattr(universe, "activation_id", None),
+                "activation_manifest_sha256": getattr(
+                    universe, "activation_manifest_sha256", None
+                ),
+                "acquisition_emits_trading_verdicts": legacy_trading_verdicts,
+                "statistical_sufficiency_authority": (
+                    "authenticated_horizon_ess_trade_power_and_multiplicity_v1"
+                ),
+                "cells": receipt_cells,
+            }
+            data_state_receipt["receipt_sha256"] = _stable_hash(
+                data_state_receipt
+            )
+            generation_manifest["native_data_state_receipt"] = data_state_receipt
+            required_winner_symbols = [
+                str(symbol)
+                for symbol in self.symbols
+                if universe.active_timeframes(str(symbol).upper())
+                or any(
+                    str(universe.cell_status(str(symbol).upper(), timeframe)).lower()
+                    == "excluded_no_trade"
+                    for timeframe in required_timeframes
+                )
+            ]
+        generation_manifest["required_winner_symbols"] = list(
+            required_winner_symbols
+        )
+        # seq987: staged roster == required winner-symbol set.  Formerly
+        # tradeable symbols that are now data-state-only are dropped before
+        # promotion, never carried forward and re-stamped current.
+        required_upper = {str(s).upper() for s in required_winner_symbols}
+        dropped_stale = sorted(
+            key for key in staged_configs
+            if str(key).upper() not in required_upper
+        )
+        for key in dropped_stale:
+            staged_configs.pop(key, None)
+        if dropped_stale:
+            generation_manifest["dropped_data_state_symbols"] = dropped_stale
+            logger.warning(
+                f"Generation drops {len(dropped_stale)} data-state-only "
+                f"symbols from staged roster: {dropped_stale}"
+            )
 
         effective_symbols = list(requested)
         if universe is not None and universe.explicit_contract:
             for symbol in self.symbols:
                 canonical = str(symbol).upper()
+                if not universe.active_timeframes(canonical):
+                    continue
                 existing = self.symbol_configs.get(symbol) or self.symbol_configs.get(canonical)
                 if existing is not None and not self._has_exact_native_cell_grid(
                     canonical, existing, universe
                 ) and symbol not in effective_symbols:
                     effective_symbols.append(symbol)
-        self._preflight_active_regime_provenance(universe, effective_symbols)
+        regime_generation_rebuilt = self._ensure_active_regime_provenance(
+            universe,
+            effective_symbols,
+        )
+        generation_manifest["regime_generation_preflight"] = {
+            "status": (
+                "REBUILT_AND_VALIDATED"
+                if regime_generation_rebuilt
+                else "VALIDATED_EXISTING"
+            ),
+            "activation_id": getattr(universe, "activation_id", None),
+            "activation_manifest_sha256": getattr(
+                universe, "activation_manifest_sha256", None
+            ),
+            "params_path": str(
+                self._resolve_deployment_path(
+                    getattr(
+                        self.config,
+                        "regime_params_file",
+                        "regime_params.json",
+                    )
+                    or "regime_params.json"
+                )
+            ),
+        }
         generation_manifest["effective_symbols"] = list(effective_symbols)
 
         def _outcome(
@@ -14249,6 +19157,15 @@ class PortfolioManager:
                 promoted_ledger_sha256=str(promoted_sha or ""),
                 manifest_path=str(manifest_path),
                 replay_evidence=dict(replay_evidence or {}),
+                authority_chain_receipt=dict(
+                    generation_manifest.get("authority_chain_receipt", {}) or {}
+                ),
+                authority_artifacts=dict(
+                    generation_manifest.get("authority_artifacts", {}) or {}
+                ),
+                authority_assembly_path=str(
+                    generation_manifest.get("authority_assembly_path", "") or ""
+                ),
             )
             self.last_optimization_generation = outcome
             return outcome
@@ -14323,8 +19240,12 @@ class PortfolioManager:
                         )
                         generation_manifest["completed_symbols"].append(symbol)
                         generation_dirty = True
-                elif existing is not None and not self._has_exact_native_cell_grid(
-                    canonical, existing, universe
+                elif (
+                    canonical in eligible_set
+                    and existing is not None
+                    and not self._has_exact_native_cell_grid(
+                        canonical, existing, universe
+                    )
                 ):
                     stale_exclusions_now_eligible.append(symbol)
 
@@ -14499,6 +19420,66 @@ class PortfolioManager:
                             symbol,
                             generation_id,
                         )
+                    elif (
+                        (
+                            _typed_state := _validated_symbol_data_state(
+                                (result.data_window_meta or {}).get(
+                                    "symbol_data_state"
+                                )
+                            )
+                        )
+                        is not None
+                        and universe is not None
+                        # seq1049: the terminal receipt must cover the
+                        # activation's EXACT active candidate TF roster in
+                        # canonical vocabulary; anything else is technical
+                        # and preserves the live ledger.
+                        and _typed_state["timeframes"]
+                        == sorted(
+                            str(tf_value).upper()
+                            for tf_value in (
+                                universe.active_timeframes(
+                                    str(symbol).upper()
+                                )
+                                or []
+                            )
+                        )
+                        and all(
+                            tf_value
+                            in {"M5", "M15", "M30", "H1", "H4", "D1"}
+                            for tf_value in _typed_state["timeframes"]
+                        )
+                    ):
+                        # seq1024: statistical/structural all-NON_SEARCH is a
+                        # typed terminal data-state: symbol leaves the required
+                        # roster, siblings continue, never technical.
+                        generation_manifest.setdefault(
+                            "data_state_symbols", {}
+                        )[symbol] = dict(
+                            (result.data_window_meta or {}).get(
+                                "symbol_data_state", {}
+                            )
+                        )
+                        staged_configs.pop(symbol, None)
+                        if symbol in required_winner_symbols:
+                            required_winner_symbols = [
+                                s for s in required_winner_symbols if s != symbol
+                            ]
+                            generation_manifest["required_winner_symbols"] = list(
+                                required_winner_symbols
+                            )
+                        generation_dirty = True
+                        self._stage_optimization_generation(
+                            staged_configs,
+                            generation_manifest,
+                        )
+                        logger.info(
+                            "DATA-STATE %s: %s (removed from required roster, "
+                            "generation continues)",
+                            symbol,
+                            result.error_message,
+                        )
+                        continue
                     else:
                         detail = str(
                             result.error_message
@@ -14566,9 +19547,10 @@ class PortfolioManager:
             )
             return _outcome("FAILED_TECHNICAL")
 
-        expected_symbol_set = {str(symbol) for symbol in self.symbols}
-        missing_staged = sorted(expected_symbol_set - set(staged_configs))
-        extra_staged = sorted(set(staged_configs) - expected_symbol_set)
+        configured_symbol_set = {str(symbol) for symbol in self.symbols}
+        required_symbol_set = {str(symbol) for symbol in required_winner_symbols}
+        missing_staged = sorted(required_symbol_set - set(staged_configs))
+        extra_staged = sorted(set(staged_configs) - configured_symbol_set)
         if missing_staged or extra_staged:
             generation_manifest["generation_status"] = "FAILED_INCOMPLETE_ROSTER"
             generation_manifest["technical_failures"] = {
@@ -14583,7 +19565,10 @@ class PortfolioManager:
             )
             return _outcome("FAILED_INCOMPLETE_ROSTER")
 
-        ledger_status = self._build_ledger_status(staged_configs)
+        ledger_status = self._build_ledger_status(
+            staged_configs,
+            required_symbols=required_winner_symbols,
+        )
         if not bool(ledger_status.get("complete_current_contract_universe", False)):
             generation_manifest["generation_status"] = "FAILED_ARTIFACT_CONTRACT"
             generation_manifest["technical_failures"] = {
@@ -14611,6 +19596,7 @@ class PortfolioManager:
                 universe, "activation_manifest_sha256", None
             ),
             "configured_symbol_count": len(self.symbols),
+            "required_winner_symbol_count": len(required_winner_symbols),
             "configured_cell_count": len(self.symbols)
             * len(getattr(self.config, "timeframes", []) or [])
             * 4,
@@ -14624,7 +19610,7 @@ class PortfolioManager:
 
         generation_manifest["generation_status"] = "COMPLETE"
         generation_manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
-        generation_manifest["completed_symbols"] = sorted(expected_symbol_set)
+        generation_manifest["completed_symbols"] = sorted(required_symbol_set)
         stage_path, stage_manifest_path, ledger_sha = (
             self._stage_optimization_generation(
                 staged_configs,
@@ -14637,7 +19623,12 @@ class PortfolioManager:
             **generation_manifest,
             "ledger_staging_path": str(stage_path),
         })
-        self._validate_staged_generation(stage_path, staged_configs, universe)
+        self._validate_staged_generation(
+            stage_path,
+            staged_configs,
+            universe,
+            required_symbols=required_winner_symbols,
+        )
 
         # Replay the complete resulting roster before the compare-and-swap.
         # Apply-mode audit mutations are confined to staging, then parsed,
@@ -14678,7 +19669,10 @@ class PortfolioManager:
             self._stage_optimization_generation(staged_configs, generation_manifest)
             return _outcome("FAILED_REPLAY_ARTIFACT", replay_evidence=replay_evidence)
 
-        ledger_status = self._build_ledger_status(staged_configs)
+        ledger_status = self._build_ledger_status(
+            staged_configs,
+            required_symbols=required_winner_symbols,
+        )
         stage_path, stage_manifest_path, ledger_sha = self._stage_optimization_generation(
             staged_configs,
             generation_manifest,
@@ -14690,12 +19684,19 @@ class PortfolioManager:
             **generation_manifest,
             "ledger_staging_path": str(stage_path),
         })
-        self._validate_staged_generation(stage_path, staged_configs, universe)
+        # seq987: identical required set on every validation incl. post-replay.
+        self._validate_staged_generation(
+            stage_path,
+            staged_configs,
+            universe,
+            required_symbols=required_winner_symbols,
+        )
         try:
             self._promote_staged_generation(
                 stage_path,
                 stage_manifest_path,
                 generation_manifest,
+                universe,
             )
         except Exception as exc:
             detail = f"PROMOTION_TECHNICAL:{type(exc).__name__}:{exc}"
@@ -14711,19 +19712,55 @@ class PortfolioManager:
                 else "FAILED_PROMOTION_TECHNICAL"
             )
             reconciled = False
+            publication_reconciled = False
             reconciliation_error = ""
             if cas_applied:
-                # The target bytes are already live. This is a promoted ledger,
-                # regardless of a later manifest/load failure. Never roll it
-                # back; invalidate old authorization and reconcile memory.
+                # The target bytes are already live and the pre-CAS journal is
+                # the only recovery authority. Complete the exact manifest
+                # publication immediately when possible; never restore a stale
+                # pre-run snapshot over a completed compare-and-swap.
                 self._last_promotion_authorization = None
                 try:
+                    journal_status = self._reconcile_interrupted_promotion()
+                    if journal_status != "COMPLETED":
+                        raise RuntimeError(
+                            "OPTIMIZATION_PROMOTION_JOURNAL_NOT_COMPLETED:"
+                            f"{journal_status}"
+                        )
                     self.ledger.load()
                     self.symbol_configs = self.ledger.get_all_configs()
                     reconciled = True
+                    publication_reconciled = True
                 except Exception as reconcile_exc:
                     reconciliation_error = (
                         f"{type(reconcile_exc).__name__}:{reconcile_exc}"
+                    )
+                    # The compare-and-swap is already durable even if the
+                    # active-manifest write is still recoverable from the
+                    # journal.  Runtime memory must immediately follow live
+                    # bytes and must never keep trading the superseded book.
+                    try:
+                        self.ledger.load()
+                        self.symbol_configs = self.ledger.get_all_configs()
+                        reconciled = True
+                    except Exception as reload_exc:
+                        reconciliation_error += (
+                            "|RUNTIME_RELOAD_FAILED:"
+                            f"{type(reload_exc).__name__}:{reload_exc}"
+                        )
+                if publication_reconciled:
+                    logger.warning(
+                        "Recovered post-CAS promotion %s from its durable journal "
+                        "after %s",
+                        generation_id,
+                        detail,
+                    )
+                    return _outcome(
+                        "PROMOTED",
+                        promoted=True,
+                        ledger_changed=True,
+                        promoted_sha=ledger_sha,
+                        replay_evidence=replay_evidence,
                     )
             generation_manifest["generation_status"] = recovery_status
             generation_manifest["technical_failures"] = {
@@ -14737,6 +19774,7 @@ class PortfolioManager:
                 "observed_live_ledger_sha256": live_sha,
                 "target_ledger_sha256": ledger_sha,
                 "manager_reconciled": bool(reconciled),
+                "publication_reconciled": bool(publication_reconciled),
                 "manager_reconciliation_error": reconciliation_error,
             }
             # Persist only the detached generation manifest. If os.replace()
@@ -15242,6 +20280,10 @@ class PortfolioManager:
                                   updates: Dict[str, Any],
                                   *,
                                   save: bool = False) -> Dict[str, Any]:
+        if save:
+            raise RuntimeError(
+                "RUNTIME_OBSERVABILITY_AUTHORITY_MUTATION_FORBIDDEN"
+            )
         symbol_cfg = self.symbol_configs.get(symbol)
         tf = str(timeframe or "").upper()
         rg = str(regime or "").upper()
@@ -15257,8 +20299,6 @@ class PortfolioManager:
         cfg.live_observability = merged
         if symbol_cfg.default_config is cfg:
             symbol_cfg.live_observability = dict(merged)
-        if save:
-            self._save_symbol_config(symbol, symbol_cfg)
         return dict(merged)
     
     def get_ledger_stats(self) -> Dict[str, Any]:

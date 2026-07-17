@@ -4,6 +4,7 @@ from copy import deepcopy
 from enum import Enum
 from typing import Any
 
+from pm_current_refit_parameters import parameter_values_equal
 from pm_state_contract import (
     ACTUAL_STRATEGY_NAMES,
     DEFAULT_AUTHORITY,
@@ -59,6 +60,20 @@ def test_candidate_domain_hash_detects_one_axis_value_change() -> None:
     assert strategy_candidate_domain_sha256(changed) != STRATEGY_CANDIDATE_DOMAIN_SHA256
 
 
+def test_every_grid_axis_contains_its_default_candidate_value() -> None:
+    """The mandatory default attempt must pass the strict process-grid verifier."""
+
+    for name in StrategyRegistry.list_all():
+        strategy = StrategyRegistry.get(name)
+        defaults = strategy.get_default_params()
+        for axis_name, choices in strategy.get_param_grid().items():
+            assert axis_name in defaults, (name, axis_name)
+            assert any(
+                parameter_values_equal(defaults[axis_name], choice)
+                for choice in choices
+            ), (name, axis_name, defaults[axis_name])
+
+
 def test_candidate_domain_rejects_unsorted_or_duplicate_names() -> None:
     documents = _live_candidate_documents()
     try:
@@ -84,4 +99,3 @@ def test_regime_alias_domain_is_exact_and_nonduplicative() -> None:
     }
     assert "feature:REGIME" not in DEFAULT_AUTHORITY.contract_names
     assert "feature:REGIME_LIVE" not in DEFAULT_AUTHORITY.contract_names
-

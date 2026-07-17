@@ -25,7 +25,7 @@ from pm_sample_dependence import effective_sample_evidence
 
 
 STATISTICS_CONTRACT_VERSION = (
-    "2026-07-13-institutional-promotion-statistics-v3-correlated-dsr"
+    "2026-07-14-institutional-promotion-statistics-v4-diagnostic-dsr"
 )
 DAILY_NET_MTM_CONTRACT_VERSION = "daily_net_mtm_v1"
 DSR_POPULATION_CONTRACT_VERSION = "aligned_validation_dsr_population_v1"
@@ -136,7 +136,7 @@ def deflated_sharpe_evidence(
     moments = return_moments(values)
     count = int(moments["observations"])
     effective = float(moments["effective_observations"])
-    trials = max(1, int(attempted_trials or 0))
+    trials = attempted_trials if type(attempted_trials) is int else 0
     population = dict(population_evidence or {})
     base = {
         "contract_version": STATISTICS_CONTRACT_VERSION,
@@ -149,11 +149,25 @@ def deflated_sharpe_evidence(
         "execution_cost_timing_contract": dict(EXECUTION_COST_TIMING_CONTRACT),
     }
     population_ids = [str(value) for value in (population.get("candidate_ids") or [])]
+    try:
+        population_count = int(population.get("raw_frozen_candidates", 0))
+        trial_sharpes = np.asarray(
+            population.get("trial_sharpe_daily") or [], dtype=np.float64
+        )
+    except (TypeError, ValueError, OverflowError):
+        population_count = 0
+        trial_sharpes = np.asarray([], dtype=np.float64)
     population_valid = (
+        trials > 0
+        and
         str(population.get("contract_version") or "")
         == DSR_POPULATION_CONTRACT_VERSION
         and str(population.get("status") or "").upper() == "AVAILABLE"
-        and int(population.get("raw_frozen_candidates", 0) or 0) == trials
+        and population_count == trials
+        and len(population_ids) == trials
+        and len(set(population_ids)) == trials
+        and trial_sharpes.shape == (trials,)
+        and bool(np.isfinite(trial_sharpes).all())
         and bool(candidate_id)
         and str(candidate_id) in population_ids
     )
@@ -176,17 +190,44 @@ def deflated_sharpe_evidence(
     variance_term = 1.0 - skew * sharpe + ((kurtosis - 1.0) / 4.0) * sharpe * sharpe
     if variance_term <= 0.0 or not math.isfinite(variance_term):
         return {**base, "status": "UNAVAILABLE", "passed": False, "reason": "invalid Sharpe variance", "deflated_sharpe": 0.0}
-    independent_trials = float(
-        population.get("effective_independent_trials", 0.0) or 0.0
-    )
-    cross_trial_std = float(
-        population.get("cross_trial_sharpe_std_daily", 0.0) or 0.0
+    try:
+        independent_trials = float(
+            population.get("effective_independent_trials", 0.0)
+        )
+        cross_trial_std = float(
+            population.get("cross_trial_sharpe_std_daily", 0.0)
+        )
+        average_correlation = float(
+            population.get("average_off_diagonal_return_correlation", 0.0)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return {
+            **base,
+            "status": "UNAVAILABLE",
+            "passed": False,
+            "reason": "canonical DSR population dispersion is invalid",
+            "deflated_sharpe": 0.0,
+            "population_evidence": population,
+        }
+    recomputed_std = float(np.std(trial_sharpes, ddof=1))
+    recomputed_independent = max(
+        1.0,
+        min(float(trials), 1.0 + (trials - 1.0) * (1.0 - average_correlation)),
     )
     if (
         not math.isfinite(independent_trials)
         or not 1.0 <= independent_trials <= float(trials)
         or not math.isfinite(cross_trial_std)
         or cross_trial_std < 0.0
+        or not math.isfinite(average_correlation)
+        or not -1.0 <= average_correlation <= 1.0
+        or not math.isclose(cross_trial_std, recomputed_std, rel_tol=1e-12, abs_tol=1e-15)
+        or not math.isclose(
+            independent_trials,
+            recomputed_independent,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
     ):
         return {
             **base,
@@ -217,18 +258,18 @@ def deflated_sharpe_evidence(
     else:
         dsr = float(_NORMAL.cdf((sharpe - expected_max) / sharpe_se))
     dsr = max(0.0, min(1.0, dsr))
-    passed = bool(dsr >= float(min_dsr) and sharpe > 0.0)
+    diagnostic_passed = bool(dsr >= float(min_dsr) and sharpe > 0.0)
     return {
         **base,
-        "status": "PASS" if passed else "FAIL",
-        "passed": passed,
-        "reason": "DSR clears threshold" if passed else "DSR below threshold or non-positive Sharpe",
+        "status": "DIAGNOSTIC_ONLY",
+        "passed": False,
+        "authoritative": False,
+        "diagnostic_threshold_passed": diagnostic_passed,
+        "reason": "unrecomputable population summaries cannot authorize promotion",
         "candidate_id": str(candidate_id),
         "raw_frozen_candidates": int(trials),
         "effective_independent_trials": independent_trials,
-        "average_off_diagonal_return_correlation": float(
-            population.get("average_off_diagonal_return_correlation", 0.0) or 0.0
-        ),
+        "average_off_diagonal_return_correlation": average_correlation,
         "cross_trial_sharpe_variance_daily": float(
             population.get("cross_trial_sharpe_variance_daily", 0.0) or 0.0
         ),

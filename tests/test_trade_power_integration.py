@@ -1,3 +1,4 @@
+import hashlib
 from unittest.mock import patch
 
 import numpy as np
@@ -8,23 +9,31 @@ from pm_pipeline import OptimizationPipeline, RegimeConfig, RegimeOptimizer
 from pm_trade_power import build_numerical_execution_cost_attestation
 
 
-def _authenticated_result(seed: int = 41, observations: int = 500):
+def _authenticated_result(
+    seed: int = 41,
+    observations: int = 500,
+    start: str = "2020-01-01",
+):
     rng = np.random.default_rng(seed)
     net_r = rng.normal(loc=0.30, scale=0.70, size=observations)
-    start = pd.Timestamp("2020-01-01", tz="UTC")
+    start_ts = pd.Timestamp(start, tz="UTC")
     trades = []
     for index, value in enumerate(net_r):
-        entry = start + pd.Timedelta(hours=3 * index)
+        entry = start_ts + pd.Timedelta(hours=3 * index)
         trades.append({
+            "position_id": f"position-{start_ts.value}-{index:06d}",
+            "entry_event_order": index * 2,
+            "exit_event_order": index * 2 + 1,
             "pnl_dollars": float(value * 100.0),
             "risk_amount": 100.0,
             "entry_time": entry,
             "exit_time": entry + pd.Timedelta(hours=1),
-            "trade_record_schema_version": "2026-06-18-mae-mfe-v1",
+            "trade_record_schema_version": "2026-07-14-position-events-v2",
         })
     return {
         "total_trades": len(trades),
         "trades": trades,
+        "position_events": trades,
         "execution_cost_timing_contract": {
             "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
@@ -59,7 +68,9 @@ def _authenticated_result(seed: int = 41, observations: int = 500):
             "target_bars_sha256": "5" * 64,
             "target_sidecar_sha256": "6" * 64,
             "projection_contract": "fxpm-swap-preopen-close-projection-v1",
-            "projection_sha256": "a" * 64,
+            "projection_sha256": hashlib.sha256(
+                f"partition:{start_ts.isoformat()}:{observations}".encode("ascii")
+            ).hexdigest(),
         },
     }
 
@@ -69,7 +80,9 @@ class _Strategy:
 
 
 def test_frozen_validation_consumes_train_requirement_and_drops_transient_state():
-    optimizer = RegimeOptimizer.__new__(RegimeOptimizer)
+    optimizer = RegimeOptimizer(
+        PipelineConfig(oos_evidence_export_enabled=False)
+    )
     train = _authenticated_result(seed=51)
     train_decision = optimizer._calibrate_train_power_result(
         train,
@@ -95,7 +108,7 @@ def test_frozen_validation_consumes_train_requirement_and_drops_transient_state(
         "strategy_family": _Strategy.name,
         "regime": "TREND",
     }]
-    validation = _authenticated_result(seed=52)
+    validation = _authenticated_result(seed=52, start="2021-01-01")
     compact = {
         "total_trades": validation["total_trades"],
         "_trade_power_raw_result": validation,
@@ -122,7 +135,7 @@ def test_frozen_validation_consumes_train_requirement_and_drops_transient_state(
 
 
 def test_trade_power_artifacts_are_compact_and_expose_required_ess():
-    optimizer = RegimeOptimizer.__new__(RegimeOptimizer)
+    optimizer = RegimeOptimizer(PipelineConfig())
     decision = optimizer._calibrate_train_power_result(
         _authenticated_result(seed=61),
         effective_trials=4,
@@ -145,7 +158,7 @@ def test_trade_power_artifacts_are_compact_and_expose_required_ess():
 def test_final_lockbox_consumes_frozen_train_ess_requirement():
     optimizer = RegimeOptimizer(PipelineConfig())
     train_decision = optimizer._calibrate_train_power_result(
-        _authenticated_result(seed=71, observations=500),
+        _authenticated_result(seed=71, observations=500, start="2020-01-01"),
         effective_trials=4,
         symbol="EURUSD",
         timeframe="H1",
@@ -155,7 +168,26 @@ def test_final_lockbox_consumes_frozen_train_ess_requirement():
     )
     assert train_decision.passed
 
-    final_result = _authenticated_result(seed=72, observations=12)
+    tuning_result = _authenticated_result(
+        seed=72,
+        observations=500,
+        start="2021-01-01",
+    )
+    tuning_decision = optimizer._evaluate_partition_power_result(
+        tuning_result,
+        frozen_requirement=train_decision.frozen_requirement,
+        symbol="EURUSD",
+        timeframe="H1",
+        regime="TREND",
+        strategy_family=_Strategy.name,
+        parameter_hash="d" * 64,
+    )
+    assert tuning_decision.passed
+    final_result = _authenticated_result(
+        seed=73,
+        observations=12,
+        start="2022-01-01",
+    )
     optimizer.backtester = type(
         "_Backtester",
         (),
@@ -171,7 +203,10 @@ def test_final_lockbox_consumes_frozen_train_ess_requirement():
         parameters={},
         quality_score=1.0,
         validation_evidence={
-            "trade_power": {"train": train_decision.to_dict()}
+            "trade_power": {
+                "train": train_decision.to_dict(),
+                "tuning_validation": tuning_decision.to_dict(),
+            }
         },
     )
     index = pd.date_range("2026-01-01", periods=20, freq="h", tz="UTC")

@@ -1,0 +1,1425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FxPM — Production Authority Documentation</title>
+<style>
+  :root{
+    --ground:#F7F8F6; --surface:#FFFFFF; --ink:#15201D; --muted:#5A6B66;
+    --line:#D8DED9; --accent:#0E6B5C; --accent-soft:#E3EFEC;
+    --ok:#0E6B5C; --ok-bg:#E3EFEC; --warn:#B4540A; --warn-bg:#F7EADB;
+    --blocked:#B3402E; --blocked-bg:#F6E3DF; --pending:#5A6B66; --pending-bg:#EAEDEA;
+    --code-bg:#EEF1EF; --sidebar-bg:#EFF2EF; --flow-bg:#FBFCFB;
+    --display:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --body:"Segoe UI",system-ui,-apple-system,sans-serif;
+    --mono:"Cascadia Code",Consolas,"SF Mono",monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ground:#101615; --surface:#182220; --ink:#E5ECE8; --muted:#93A49E;
+      --line:#2A3733; --accent:#3FBFA4; --accent-soft:#1C2F2B;
+      --ok:#3FBFA4; --ok-bg:#1C2F2B; --warn:#E08A3C; --warn-bg:#332417;
+      --blocked:#E06550; --blocked-bg:#331E19; --pending:#93A49E; --pending-bg:#1E2826;
+      --code-bg:#1E2A27; --sidebar-bg:#131C1A; --flow-bg:#141D1B;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#101615; --surface:#182220; --ink:#E5ECE8; --muted:#93A49E;
+    --line:#2A3733; --accent:#3FBFA4; --accent-soft:#1C2F2B;
+    --ok:#3FBFA4; --ok-bg:#1C2F2B; --warn:#E08A3C; --warn-bg:#332417;
+    --blocked:#E06550; --blocked-bg:#331E19; --pending:#93A49E; --pending-bg:#1E2826;
+    --code-bg:#1E2A27; --sidebar-bg:#131C1A; --flow-bg:#141D1B;
+  }
+  :root[data-theme="light"]{
+    --ground:#F7F8F6; --surface:#FFFFFF; --ink:#15201D; --muted:#5A6B66;
+    --line:#D8DED9; --accent:#0E6B5C; --accent-soft:#E3EFEC;
+    --ok:#0E6B5C; --ok-bg:#E3EFEC; --warn:#B4540A; --warn-bg:#F7EADB;
+    --blocked:#B3402E; --blocked-bg:#F6E3DF; --pending:#5A6B66; --pending-bg:#EAEDEA;
+    --code-bg:#EEF1EF; --sidebar-bg:#EFF2EF; --flow-bg:#FBFCFB;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);
+       font-size:16px;line-height:1.65}
+  .app{display:flex;min-height:100vh}
+  nav{width:250px;flex-shrink:0;background:var(--sidebar-bg);border-right:1px solid var(--line);
+      padding:28px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+  .brand{padding:0 24px 20px;border-bottom:1px solid var(--line);margin-bottom:16px}
+  .brand h1{font-family:var(--display);font-size:22px;margin:0}
+  .brand .sub{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.09em;margin-top:4px}
+  nav a{display:block;padding:9px 24px;color:var(--muted);text-decoration:none;font-size:14px;
+        border-left:3px solid transparent;cursor:pointer}
+  nav a:hover{color:var(--ink)}
+  nav a:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  nav a.active{color:var(--accent);border-left-color:var(--accent);font-weight:600;background:var(--accent-soft)}
+  nav .navlabel{font-size:10.5px;text-transform:uppercase;letter-spacing:.11em;color:var(--muted);
+        padding:18px 24px 6px}
+  main{flex:1;min-width:0;padding:44px 56px 96px}
+  .page{display:none;max-width:860px}
+  .page.visible{display:block}
+  .eyebrow{font-size:11.5px;text-transform:uppercase;letter-spacing:.11em;color:var(--accent);
+           font-weight:600;margin-bottom:6px}
+  h2{font-family:var(--display);font-size:34px;line-height:1.15;margin:0 0 6px;text-wrap:balance;font-weight:600}
+  .lede{font-size:18px;color:var(--muted);margin:0 0 30px;max-width:64ch;text-wrap:pretty}
+  h3{font-family:var(--display);font-size:22px;margin:42px 0 10px;text-wrap:balance;font-weight:600}
+  h4{font-size:14.5px;margin:26px 0 8px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  p{max-width:70ch;margin:0 0 14px}
+  li{max-width:66ch;margin-bottom:7px}
+  ul,ol{padding-left:22px;margin:0 0 16px}
+  code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);padding:2px 6px;border-radius:3px}
+  .cmd{font-family:var(--mono);font-size:14px;background:var(--code-bg);border:1px solid var(--line);
+       border-radius:6px;padding:14px 18px;margin:14px 0;overflow-x:auto;white-space:pre}
+  .pill{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;
+        padding:2px 9px;border-radius:20px;letter-spacing:.03em;white-space:nowrap;vertical-align:1px}
+  .pill.ok{color:var(--ok);background:var(--ok-bg)}
+  .pill.warn{color:var(--warn);background:var(--warn-bg)}
+  .pill.blocked{color:var(--blocked);background:var(--blocked-bg)}
+  .pill.pending{color:var(--pending);background:var(--pending-bg)}
+  table{width:100%;border-collapse:collapse;font-size:14px;margin:16px 0 24px}
+  th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+     padding:8px 12px;border-bottom:2px solid var(--line)}
+  td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  td.num{font-family:var(--mono);font-size:13px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  th.num{text-align:right}
+  .tablewrap{overflow-x:auto;margin:0 -4px;padding:0 4px}
+  .callout{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--accent);
+           border-radius:6px;padding:16px 20px;margin:20px 0;max-width:74ch}
+  .callout.warn{border-left-color:var(--warn)}
+  .callout.blocked{border-left-color:var(--blocked)}
+  .callout p:last-child{margin-bottom:0}
+  .callout .co-label{font-size:11px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;
+           color:var(--accent);display:block;margin-bottom:6px}
+  .callout.warn .co-label{color:var(--warn)}
+  .callout.blocked .co-label{color:var(--blocked)}
+  .ba{display:grid;grid-template-columns:1fr 1fr;gap:0;border:1px solid var(--line);border-radius:8px;
+      overflow:hidden;margin:18px 0 26px;font-size:14px}
+  .ba > div{padding:16px 20px}
+  .ba .before{background:var(--blocked-bg);border-right:1px solid var(--line)}
+  .ba .after{background:var(--ok-bg)}
+  .ba .ba-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;margin-bottom:8px}
+  .ba .before .ba-label{color:var(--blocked)}
+  .ba .after .ba-label{color:var(--ok)}
+  .ba p{font-size:13.5px;margin:0}
+
+  /* ---- Pure-CSS process flows (no external renderer, works offline) ---- */
+  .flow{list-style:none;padding:0;margin:22px 0 30px;counter-reset:step}
+  .flow > li{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:8px;
+      padding:16px 20px 16px 66px;max-width:none}
+  .flow > li + li{margin-top:34px}
+  .flow > li + li::before{content:"";position:absolute;left:34px;top:-35px;width:2px;height:34px;
+      background:var(--accent);opacity:.55}
+  .flow > li + li::after{content:"";position:absolute;left:29px;top:-9px;width:0;height:0;
+      border-left:6px solid transparent;border-right:6px solid transparent;border-top:9px solid var(--accent);opacity:.75}
+  .flow > li .stepnum{counter-increment:step;position:absolute;left:16px;top:16px;width:36px;height:36px;
+      border-radius:50%;background:var(--accent-soft);color:var(--accent);font-family:var(--mono);
+      font-weight:700;font-size:14px;display:flex;align-items:center;justify-content:center}
+  .flow > li .stepnum::before{content:counter(step)}
+  .flow h5{margin:0 0 5px;font-size:15px;font-weight:700;font-family:var(--body)}
+  .flow h5 .who{font-family:var(--mono);font-weight:500;font-size:11px;color:var(--muted);margin-left:8px}
+  .flow p{font-size:13.8px;color:var(--muted);margin:0 0 6px;max-width:none}
+  .flow p strong{color:var(--ink)}
+  .flow .io{font-family:var(--mono);font-size:12px;background:var(--code-bg);border-radius:5px;
+      padding:8px 12px;margin-top:8px;line-height:1.6}
+  .flow .io b{color:var(--accent);font-weight:600}
+  .flow > li.gate{border-left:4px solid var(--warn)}
+  .flow > li.gate .stepnum{background:var(--warn-bg);color:var(--warn)}
+  .flow > li.abort{border-left:4px solid var(--blocked)}
+  .flow > li.abort .stepnum{background:var(--blocked-bg);color:var(--blocked)}
+
+  /* layered architecture map */
+  .layers{display:flex;flex-direction:column;margin:22px 0 30px}
+  .layer{display:grid;grid-template-columns:170px 1fr;border:1px solid var(--line);border-top:none;background:var(--surface)}
+  .layer:first-child{border-top:1px solid var(--line);border-radius:8px 8px 0 0}
+  .layer:last-child{border-radius:0 0 8px 8px}
+  .layer .lname{padding:14px 16px;background:var(--flow-bg);border-right:1px solid var(--line)}
+  .layer .lname b{font-size:13px;display:block}
+  .layer .lname span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .layer .lmods{padding:12px 16px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .mod{font-family:var(--mono);font-size:11.5px;background:var(--code-bg);border:1px solid var(--line);
+       border-radius:4px;padding:3px 8px;white-space:nowrap}
+  .mod.hot{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
+  .stamp{font-family:var(--mono);font-size:12px;color:var(--muted);border-top:1px solid var(--line);
+         margin-top:48px;padding-top:14px}
+  .flagrow{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:4px}
+  .flagrow code{font-size:15px;font-weight:600}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:6px 0 0}
+  @media (max-width:880px){
+    .app{flex-direction:column} nav{width:100%;height:auto;position:static}
+    main{padding:28px 20px 64px} .ba{grid-template-columns:1fr}
+    .ba .before{border-right:none;border-bottom:1px solid var(--line)}
+    .layer{grid-template-columns:1fr} .layer .lname{border-right:none;border-bottom:1px solid var(--line)}
+  }
+  @media (prefers-reduced-motion: no-preference){
+    .page.visible{animation:fadein .18s ease}
+    @keyframes fadein{from{opacity:.6}to{opacity:1}}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+<nav>
+  <div class="brand">
+    <h1>FxPM</h1>
+    <div class="sub">Production Authority Docs</div>
+  </div>
+  <div class="navlabel">Orientation</div>
+  <a data-page="overview" class="active">Overview &amp; status</a>
+  <a data-page="architecture">Architecture, before &amp; after</a>
+  <a data-page="data">The data pipeline</a>
+  <div class="navlabel">Operations</div>
+  <a data-page="optimize">--optimize · step by step</a>
+  <a data-page="validation">Folds, anchors &amp; freshness</a>
+  <a data-page="paper">--trade --paper · demo</a>
+  <a data-page="trade">--trade · live operation</a>
+  <div class="navlabel">Foundations</div>
+  <a data-page="integrity">Integrity principles</a>
+  <a data-page="runbook">Operator runbook</a>
+</nav>
+<main>
+
+<!-- ============================ OVERVIEW ============================ -->
+<section class="page visible" id="page-overview">
+  <div class="eyebrow">Orientation</div>
+  <h2>One command, one honest book</h2>
+  <p class="lede">FxPM searches 100 currency-pair and CFD symbols across six timeframes and four
+  market regimes — 2,400 possible strategy slots — and publishes a validated “winner book” that the
+  execution loop trades. The rebuild documented here changes one thing everywhere: every number that
+  reaches a trading decision must be <em>derived from raw evidence and re-verifiable from bytes</em>
+  — never declared, never assumed, never quietly relabeled.</p>
+
+  <h3>The operator workflow, end state</h3>
+  <ol class="flow">
+    <li><span class="stepnum"></span><h5>Run the optimizer</h5>
+      <p><code>python pm_main.py --optimize</code> — a multi-day unattended run that executes the
+      complete evidence chain and publishes a validated book, or stops with a typed reason.</p></li>
+    <li><span class="stepnum"></span><h5>Read the evidence pack</h5>
+      <p>Causal PASS/FAIL, the book's contents, capital calibration receipts, per-cell outcomes.
+      This step is yours: the system explains itself but doesn't decide for you.</p></li>
+    <li><span class="stepnum"></span><h5>Paper-trade the book</h5>
+      <p><code>--trade --paper</code> executes the book with real orders on the verified demo account.
+      Forward outcomes accumulate against the validation predictions.</p></li>
+    <li class="gate"><span class="stepnum"></span><h5>Deliberate go/no-go</h5>
+      <p>Comparing probation evidence to validation expectations is a human decision, always.</p></li>
+    <li><span class="stepnum"></span><h5>Go live</h5>
+      <p><code>--trade</code>, inside an externally signed capital envelope, with expiry forcing
+      periodic re-validation through the same full chain.</p></li>
+  </ol>
+
+  <h3>Where the build stands</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Chain stage</th><th>Status</th><th>Meaning</th></tr>
+    <tr><td>Standalone statistical and evidence authorities</td>
+        <td><span class="pill ok">LARGELY&nbsp;REVIEWED</span></td>
+        <td>Winner V11, TradePower, Book, causal math, current-artifact codecs, replay and capital
+        components have substantial focused test and hostile-review evidence. This is component
+        evidence, not an end-to-end trading result.</td></tr>
+    <tr><td>Search coverage and false-discovery method</td>
+        <td><span class="pill warn">PRE-RUN&nbsp;DECISION</span></td>
+        <td>The 128-design search is bounded and multiplicity-aware but not proven to cover the
+        strategy domains adequately. Production Winner V11 has DSR/dependence gates; its raw path
+        does not yet include PBO/moving-block bootstrap.</td></tr>
+    <tr><td>Historical anchor orchestration and genuine raw evidence path</td>
+        <td><span class="pill ok">REVIEW&nbsp;ACCEPTED</span></td>
+        <td>The latest exact historical orchestration/adapter successor passed independent hostile
+        review. That establishes this component's provenance closure, not constructibility of the
+        still-incomplete Forward/Capital/current chain.</td></tr>
+    <tr><td>Authenticated anchor calendar</td>
+        <td><span class="pill ok">REVIEW&nbsp;ACCEPTED</span></td>
+        <td>The corrected four-anchor / Capital-window geometry and exact current native authority
+        binding passed focused and independent review. It also proves the default v5 history is
+        currently 78–81 calendar days short.</td></tr>
+    <tr><td>Capital phase and complete candidate binding</td>
+        <td><span class="pill warn">IN&nbsp;PROGRESS</span></td>
+        <td>Forward replay still needs the complete pre-policy inner/outer candidate rosters and
+        exact shared bootstrap/lineage connection required by Capital calibration.</td></tr>
+    <tr><td>Forward replay → causal → current-refit → Capital integration</td>
+        <td><span class="pill warn">IN&nbsp;PROGRESS</span></td>
+        <td>The missing complete pre-policy candidate rosters and exact current-mode cross-binding
+        are active core implementation work.</td></tr>
+    <tr><td><code>--optimize</code> wiring into the chain</td>
+        <td><span class="pill pending">NOT&nbsp;WIRED</span></td>
+        <td>The CLI still routes to the legacy generation path and therefore does not execute the
+        authority chain described here. Do not use its present behavior as production evidence.</td></tr>
+    <tr><td>Bounded real end-to-end canary and production publication</td>
+        <td><span class="pill blocked">NOT&nbsp;YET&nbsp;PROVEN</span></td>
+        <td>No real current <code>--optimize</code> run has yet crossed every authority and atomically
+        published a production-ready book. There is no demo or funded-live GO.</td></tr>
+  </table></div>
+
+  <div class="callout">
+    <span class="co-label">How to read these docs</span>
+    <p><strong>Architecture</strong> shows the system's layers and how they differ from before.
+    <strong>The data pipeline</strong> follows one bar of market data from the broker to a frozen,
+    sealed dataset — with the actual record counts. <strong>--optimize</strong> is the full
+    step-by-step process. <strong>Folds, anchors &amp; freshness</strong> explains the experiment and
+    answers what is and is not re-trained. The <strong>runbook</strong> is the command reference.</p>
+  </div>
+</section>
+
+<!-- ============================ ARCHITECTURE ============================ -->
+<section class="page" id="page-architecture">
+  <div class="eyebrow">Orientation</div>
+  <h2>Architecture, before &amp; after</h2>
+  <p class="lede">The old system was one pipeline that computed results and wrote them down. The new
+  system is a chain of small, single-purpose <em>authorities</em>, where each layer produces sealed
+  evidence and the next layer re-verifies it from raw bytes before using it.</p>
+
+  <h3>The old shape</h3>
+  <div class="ba">
+    <div class="before"><span class="ba-label">Before — one trusted pipeline</span>
+      <p>One large optimizer loop per symbol: load data → compute indicators → grid-search →
+      score → write the winner into a config file. Results were trusted because the code that
+      produced them was trusted. If any step was wrong — a leaky validation window, a missing cost,
+      a silently skipped failure — nothing downstream could tell. Publication was a file write;
+      a crash could corrupt the live book.</p></div>
+    <div class="after"><span class="ba-label">After — a chain of verifying authorities</span>
+      <p>Each stage is a separate module with one job, producing content-addressed artifacts
+      (files named by the hash of their bytes). The consumer of each artifact independently
+      re-derives and re-checks it. The practical purpose is reproducibility and accidental-drift
+      detection: the reviewed calculation, data and deployed model must be the same bytes.</p></div>
+  </div>
+
+  <h3>The layer map</h3>
+  <p>Reading top to bottom is reading the <code>--optimize</code> run in order. Highlighted modules
+  are the primary authority at each layer.</p>
+  <div class="layers">
+    <div class="layer">
+      <div class="lname"><b>Data</b><span>market history</span></div>
+      <div class="lmods">
+        <span class="mod hot">acquire_native_history</span><span class="mod">pm_native_activation</span>
+        <span class="mod">pm_native_prefix_production</span><span class="mod">pm_storage</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Planning</b><span>what may be searched</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_production_search_planner</span><span class="mod">pm_state_contract</span>
+        <span class="mod">pm_strategies (registry)</span><span class="mod">pm_training_horizon</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Execution</b><span>real backtests</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_authoritative_search_execution</span><span class="mod">pm_core (Backtester, FeatureComputer)</span>
+        <span class="mod">execution-spec receipt</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Evidence</b><span>selection statistics</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_winner_raw_evidence</span><span class="mod">pm_trade_power</span>
+        <span class="mod">pm_winner_selection (V11)</span><span class="mod">pm_current_refit_artifacts</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Aggregation</b><span>anchor books</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_historical_production_adapter</span><span class="mod">pm_historical_anchor_orchestration</span>
+        <span class="mod">pm_book_multiplicity</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Validation</b><span>out-of-sample proof</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_forward_oos_replay_producer</span><span class="mod">pm_causal_evidence_producer</span>
+        <span class="mod">pm_causal_process</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Current book</b><span>the deployable output</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_current_refit_search_producer</span><span class="mod">pm_current_refit_production</span>
+        <span class="mod">pm_current_refit_execution</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Risk</b><span>position sizing</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_cap_calibration (Capital V8)</span><span class="mod">pm_portfolio_replay</span>
+        <span class="mod">pm_production_capital_bootstrap</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Publication</b><span>atomic promotion</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_production_authority_coordinator</span><span class="mod">pm_authority_assembly</span>
+        <span class="mod">pm_optimization_authority</span><span class="mod">journaled CAS in pm_pipeline</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lname"><b>Runtime</b><span>trading loop</span></div>
+      <div class="lmods">
+        <span class="mod hot">pm_main</span><span class="mod">pm_position</span>
+        <span class="mod">pm_live_readiness / pm_demo_readiness</span><span class="mod">pm_mt5</span>
+      </div>
+    </div>
+  </div>
+
+  <h3>Why the dependencies only point forward</h3>
+  <div class="cmd">run-start precommitment
+  ├─ native-data, code, feature, cost, search and Capital policy identities
+  └─ exact attempt / anchor / risk-policy rosters
+                         ↓
+four historical as-of searches → four anchor-local books → four unseen replays
+                         ↓
+             CAUSAL PASS for the frozen PROCESS
+                         ↓  (mandatory authorization dependency)
+latest-cutoff search → current winners/refits → synchronized current replay
+                         ↓
+historically validated Capital rule + current selection data → current envelope
+                         ↓
+raw readiness re-verification → journaled compare-and-swap publication → demo
+
+Any failure before publication ───────────────────────────────→ keep last-good book</div>
+  <p>The historical books are evidence, never deployment candidates. Their unseen outcomes can
+  approve or reject the frozen discovery/refit process, but they cannot directly nominate today's
+  parameters. The current-search authorization is allowed to exist only after an independently
+  reverified causal PASS and is hash-bound to that decision. The only book eligible to move toward
+  demo is the separately produced latest-cutoff current book.</p>
+
+  <h3>Three structural differences that matter most</h3>
+  <h4>Commitment before evidence</h4>
+  <p>In the old system, the search space was whatever the loop happened to iterate. Now the planner
+  freezes the entire strategy/parameter domain, the exact 128 designs that will actually be tried,
+  the timeframe depth ladders and geometry-only depth rule, and the anchor calendar into sealed
+  plans <em>before</em> the first backtest. Multiplicity accounting (how many things were actually
+  tried, which determines how skeptical to be of the winner) becomes a mechanical fact instead of
+  an estimate.</p>
+  <h4>Two agents, independent correctness review</h4>
+  <p>Two AI agents (Claude and Codex) build in separately claimed lanes on a hash-chained
+  coordination ledger. Every change freezes to exact byte hashes; the <em>other</em> agent checks
+  chronology, statistical gates, genuine-evidence construction, cost realism, model parity,
+  bounded execution and failure behavior on those same bytes. The producer of a component is not
+  the only reviewer of it.</p>
+  <h4>Failure is a first-class output</h4>
+  <p>The old pipeline had two outcomes: a winner, or nothing. The new book records a typed
+  disposition per cell (see Integrity principles), so “no result” always carries <em>why</em> — no data,
+  no regime occurrences, not enough statistical power, or an infrastructure fault that aborts the
+  run rather than being written down as a market opinion.</p>
+
+  <h3>Legacy path versus the production authority target</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Question</th><th>Legacy path / risk being replaced</th><th>Production authority target</th></tr>
+    <tr><td>What is validated?</td><td>A result flowing through one optimizer and its persisted
+        train/tuning/lockbox-style segments could be read as validating a fixed old result.</td>
+        <td>The whole frozen discovery, selection, refit and portfolio process is rerun at several
+        past cutoffs and judged only on later synchronized outcomes.</td></tr>
+    <tr><td>What is deployed?</td><td>A parameter vector selected from an old validation clock can
+        become stale by the actual application date.</td><td>After process PASS, every cell is
+        searched again through the latest closed cutoff; only that current selection is refit and
+        made eligible for demo.</td></tr>
+    <tr><td>What is the unit of eligibility?</td><td>Broad symbol-level coverage or a missing regime
+        can veto useful evidence, and a technical miss can look like no market edge.</td><td>Each
+        symbol × native timeframe × empirically observed regime resolves separately. Unobserved and
+        insufficient are honest sparse states; technical failure blocks publication.</td></tr>
+    <tr><td>How are portfolio effects handled?</td><td>Adding standalone backtests can hide
+        simultaneous exposure, margin and cost interactions.</td><td>All selected experts replay on
+        one clock and one account before process validation and capital selection.</td></tr>
+    <tr><td>What protects the live book?</td><td>A successful computation and a file write are too
+        easy to confuse with production authority.</td><td>Each consumer reopens raw bytes; final
+        authority is assembled separately and publication uses a recoverable journaled
+        compare-and-swap. This target is implemented in components but not yet wired into the
+        current <code>--optimize</code> caller.</td></tr>
+  </table></div>
+</section>
+
+<!-- ============================ DATA ============================ -->
+<section class="page" id="page-data">
+  <div class="eyebrow">Orientation</div>
+  <h2>The data pipeline — from broker tick to sealed dataset</h2>
+  <p class="lede">Everything downstream is only as honest as the data. This page follows market
+  history from the MT5 terminal to the frozen, content-addressed datasets the search actually
+  runs on — including how much data that is, and what cleaning and validation happens where.</p>
+
+  <h3>How much data is frozen</h3>
+  <p>Each of the six timeframes is acquired <em>independently and natively</em> — D1 bars come from
+  the broker as D1 bars, never resampled from M5. The source-history contract
+  (<code>fxpm-timeframe-evidence-v3</code>) fixes a bounded calendar envelope per timeframe. Its
+  persisted segment names are still <code>optimizer_train</code>, <code>tuning_validation</code>, and
+  <code>final_lockbox</code>, but those names do <strong>not</strong> describe the new experiment.
+  The production experiment is formed later from repeated as-of anchors, rolling inner folds, and
+  unseen outer periods.</p>
+  <div class="callout warn">
+    <span class="co-label">Do not infer a stale lockbox deployment</span>
+    <p>The source envelope is inventory, not a command to train once at its beginning and deploy a
+    parameter vector from its end. Historical anchors take causal prefixes from this inventory.
+    After the historical process passes, the entire search is rerun through the latest fully closed
+    common cutoff.</p>
+  </div>
+  <div class="tablewrap"><table>
+    <tr><th>Timeframe</th><th class="num">Legacy “train” segment</th><th class="num">Legacy “tuning” segment</th><th class="num">Legacy “lockbox” segment</th>
+        <th class="num">Total window</th><th class="num">≈ bars / symbol</th><th class="num">≈ bars × 100 symbols</th></tr>
+    <tr><td>M5</td><td class="num">5 y</td><td class="num">2 y</td><td class="num">2 y</td>
+        <td class="num">9 y</td><td class="num">~675,000</td><td class="num">~67.5 M</td></tr>
+    <tr><td>M15</td><td class="num">5 y</td><td class="num">2 y</td><td class="num">2 y</td>
+        <td class="num">9 y</td><td class="num">~225,000</td><td class="num">~22.5 M</td></tr>
+    <tr><td>M30</td><td class="num">6 y</td><td class="num">2 y</td><td class="num">2 y</td>
+        <td class="num">10 y</td><td class="num">~125,000</td><td class="num">~12.5 M</td></tr>
+    <tr><td>H1</td><td class="num">7 y</td><td class="num">2 y</td><td class="num">2 y</td>
+        <td class="num">11 y</td><td class="num">~69,000</td><td class="num">~6.9 M</td></tr>
+    <tr><td>H4</td><td class="num">8 y</td><td class="num">2 y</td><td class="num">2 y</td>
+        <td class="num">12 y</td><td class="num">~19,000</td><td class="num">~1.9 M</td></tr>
+    <tr><td>D1</td><td class="num">12 y</td><td class="num">2 y</td><td class="num">2 y</td>
+        <td class="num">16 y</td><td class="num">~4,200</td><td class="num">~420 K</td></tr>
+  </table></div>
+  <p class="legend">Bar counts are approximate (24×5 FX trading week; exact counts vary by symbol
+  and holidays and are recorded per dataset in its receipt). Total on-disk native store:
+  ~19&nbsp;GiB across 600 symbol-timeframe datasets. The current planner does not optimize depth:
+  for each cell it selects the largest source-feasible entry from a frozen timeframe ladder without
+  reading returns, then tests the 128 strategy/parameter designs at that one depth.</p>
+
+  <h3>Why the data contract is this strict</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Design choice</th><th>Reason</th><th>Failure it prevents</th></tr>
+    <tr><td>Acquire M5, M15, M30, H1, H4 and D1 independently</td><td>Broker-native bars can have
+        different session boundaries, spread observations and available history.</td><td>A gap or
+        microstructure assumption in M5 cannot silently manufacture every higher-timeframe
+        experiment.</td></tr>
+    <tr><td>Resolve 600 symbol × timeframe source groups, then four regime states inside each</td>
+        <td>Evidence naturally varies by cell; a valid H4 specialist does not become invalid because
+        its M5 sibling is sparse.</td><td>No arbitrary whole-symbol or whole-universe coverage veto,
+        and no invented occupancy for a regime that did not occur.</td></tr>
+    <tr><td>Keep technical failure separate from market abstention</td><td>“No winner after a valid
+        search” is economic evidence; corruption, broker failure or an interrupted evaluator is
+        not.</td><td>An outage cannot overwrite the last-good book with a false
+        <code>NO_TRADE</code> opinion.</td></tr>
+    <tr><td>Seal a causal prefix at every cutoff</td><td>An anchor must see only bars whose close was
+        knowable at that anchor.</td><td>Future bars, future regime labels and post-hoc source
+        substitution cannot improve an earlier decision.</td></tr>
+    <tr><td>Use timeframe-specific bounded depths</td><td>Fast strategies need recent evidence;
+        slow strategies need more calendar time to collect trades.</td><td>Equal bar counts or equal
+        spans are not mistaken for equal statistical experiments, and obsolete M5 history cannot
+        grow without bound.</td></tr>
+    <tr><td>Retain one concurrent evaluation clock for portfolio stages</td><td>Capital, margin and
+        correlation depend on which positions coexist.</td><td>Asynchronous standalone curves
+        cannot masquerade as a tradable joint account.</td></tr>
+  </table></div>
+
+  <h3>The pipeline, step by step</h3>
+  <ol class="flow">
+    <li><span class="stepnum"></span><h5>Acquisition <span class="who">tools/acquire_native_history.py · MT5 API</span></h5>
+      <p>Bars are pulled per symbol × timeframe from the terminal connected to the <strong>live-data
+      account</strong> (FBS-Real). Each pull records the account identity, server, and terminal state
+      into provenance — a per-cell identity check aborts if the account changes mid-run (this caught
+      a real incident where demo data would otherwise have contaminated the store).</p>
+      <div class="io"><b>in</b> broker history via MT5 &nbsp;→&nbsp; <b>out</b> per-cell CSV leaf + provenance receipt</div></li>
+    <li class="gate"><span class="stepnum"></span><h5>Validation at write time <span class="who">acquisition contract v5 / authenticity v4</span></h5>
+      <p>Before a leaf commits: schema and column checks, strictly increasing UTC timestamps,
+      duplicate-bar rejection, OHLC sanity (high ≥ low, open/close inside range), spread column
+      presence, declared-versus-observed count consistency, and gap classification. Authenticity,
+      provenance, an empty advertised source, or a declaration mismatch are blocking. Calendar
+      reach, fixed row targets, and the ≈95% session-coverage estimate are <strong>diagnostics</strong>:
+      they may later produce typed insufficient evidence, but cannot erase genuine observations or
+      become a market verdict. Expected closures are classified, never synthetically filled.</p>
+      <div class="io"><b>reject ⇒</b> typed quarantine (mixed-source · corrupt · empty or declaration-mismatched) — never silently repaired</div></li>
+    <li><span class="stepnum"></span><h5>Activation <span class="who">pm_native_activation · data/native/ACTIVE.json</span></h5>
+      <p>A validated acquisition run is <em>activated</em>: every available file and every legitimate
+      terminal-unavailable record is hashed into one 100 × 6 roster and ACTIVE points at that
+      identity. Consumers refuse bytes that do not match the activation manifest. A technical or
+      provenance failure is not an unavailable market cell; it blocks the generation.</p>
+      <div class="io"><b>out</b> activation manifest — the single source-of-truth ID every downstream receipt references</div></li>
+    <li><span class="stepnum"></span><h5>Sealed cutoff prefixes <span class="who">pm_native_prefix_production</span></h5>
+      <p>The engine never touches raw files. For each search (historical anchor or current), the
+      activated dataset is trimmed <em>causally</em> at an exact cutoff timestamp — only bars whose
+      <strong>close</strong> is at or before the cutoff — re-hashed, and wrapped in a receipt binding
+      schema, index, content hash, row count, activation identity, and account provenance. Every
+      later consumer re-opens and re-hashes these exact bytes; the executor does it again immediately
+      before evidence access.</p>
+      <div class="io"><b>out</b> NativePrefixProduct — content-addressed · byte-reopenable · causally trimmed</div></li>
+    <li><span class="stepnum"></span><h5>Features &amp; indicators <span class="who">pm_core.FeatureComputer · at search time, never stored</span></h5>
+      <p>Indicators (EMAs, ATR, ADX, structure levels, volume features…) are <strong>computed on
+      demand from the sealed prefix</strong>, never precomputed and stored — there is no stale
+      indicator cache to drift from the data. Each strategy declares its required features, and the
+      identity of the feature code itself (a hash of <code>pm_core</code>) is pinned into every
+      trial artifact — change the indicator math and the identity of everything built on it changes.
+      Warmup is a verified quantity: each strategy declares minimum bars, and state-dependent
+      features additionally require authenticated predecessor context, not a guessed constant.</p>
+      <div class="io"><b>in</b> sealed prefix &nbsp;→&nbsp; <b>out</b> feature frame in memory, code-identity pinned</div></li>
+    <li><span class="stepnum"></span><h5>Regime classification <span class="who">frozen detector · four regimes</span></h5>
+      <p>Every bar is classified TREND / RANGE / BREAKOUT / CHOP by a regime detector whose
+      parameters are fitted on training data only, then frozen and hash-recorded. The same frozen
+      detector record follows the winner into live trading — the runtime is hash-verified to run
+      the exact detector its book was validated with. Regime support counts become a receipt: a
+      regime that never occurred in training is typed <code>REGIME_UNOBSERVED</code> with zero
+      attempts, rather than force-fitted.</p>
+      <div class="io"><b>out</b> regime fit decision + per-regime support receipt (counts must sum to eligible rows)</div></li>
+    <li><span class="stepnum"></span><h5>Cost surfaces <span class="who">Backtester · base + stress lanes</span></h5>
+      <p>Execution-cost inputs are frozen and provenance-bound: observed per-bar spreads (the base
+      lane uses <em>conservative-maximum</em> spread mode); broker-bound volume, swap and instrument
+      terms; and deployment-config commission and slippage assumptions. A second
+      <strong>stress lane</strong> re-prices everything at empirically derived worse spreads
+      (P90/P95/max of the same closed partition) — and a stress lane numerically identical to base
+      is itself rejected as invalid.</p>
+      <div class="io"><b>out</b> execution-spec receipt + BASE/STRESS cost-policy identities, frozen before any search</div></li>
+  </ol>
+
+  <div class="callout warn">
+    <span class="co-label">Current data status — re-resolve before acting</span>
+    <p>No current 600-cell production activation has yet been proven sufficient for the corrected
+    experiment. The latest authenticated geometry check reported a 78–81 calendar-day history
+    shortfall under the default v5 request, while a longer warmup fixture was constructible. The
+    corrected anchor-plan receipt has now passed independent review; the production activation and
+    extra authentic history still do not exist merely because the geometry is valid. Treat old
+    “137 ready / 463 remaining” counts as a stale snapshot, not an acquisition order. Preserve
+    existing provenance, reacquire only verified missing or corrupt cells, and do not delete the
+    terminal cache until the final acquisition manifest and resume contract both verify.</p>
+  </div>
+</section>
+
+<!-- ============================ OPTIMIZE ============================ -->
+<section class="page" id="page-optimize">
+  <div class="eyebrow">Operations</div>
+  <h2><code>--optimize</code> — what happens, in order</h2>
+  <p class="lede">One unattended run. Each numbered step consumes the sealed outputs of the previous
+  step, re-verifies them from bytes, and produces sealed outputs of its own. If any step fails, the
+  run stops with a typed reason and the previous book remains untouched.</p>
+
+  <ol class="flow">
+    <li><span class="stepnum"></span><h5>Freeze the search domain <span class="who">planner</span></h5>
+      <p>The domain is committed before looking at any outcome. For each empirically observed cell,
+      the current planner creates exactly <strong>128 attempts</strong>: one full default for each of
+      the 100 registered strategies plus 28 deterministic, outcome-blind non-default designs. It
+      also freezes one timeframe-specific trailing depth selected from a ladder using source
+      geometry only. The full parameter domains are recorded, but their Cartesian product is
+      <strong>not</strong> exhaustively searched.</p>
+      <div class="io"><b>scale</b> observed cells × 128 attempts · unobserved regimes × 0 attempts · every attempted hypothesis counted</div></li>
+    <li><span class="stepnum"></span><h5>Seal the data at each anchor <span class="who">native prefix producer</span></h5>
+      <p>For each of the <strong>4 historical anchor dates</strong> and each symbol × timeframe,
+      the activated dataset is causally trimmed at the anchor cutoff and sealed (see Data pipeline).
+      Genuine terminal source absence becomes <code>SOURCE_UNAVAILABLE</code>. A corrupt source,
+      identity mismatch, or infrastructure fault is <code>TECHNICAL_FAILURE</code> and aborts the
+      generation; it can never be persisted as “no trade.”</p>
+      <div class="io"><b>scale</b> per anchor: 600 resolved source groups · one sealed prefix per available group · authenticated terminal state for genuine source absence</div></li>
+    <li><span class="stepnum"></span><h5>Run the historical search <span class="who">authoritative executor + Backtester</span></h5>
+      <p>Per cell, per attempt: features are computed from the sealed prefix, the strategy generates
+      signals, and the real backtest engine executes them with full costs in <strong>both lanes</strong>
+      (base and stress). The same attempt's strategy, parameters, and depth are tested on four
+      rolling-origin inner folds. Each has at least <strong>63 unseen days</strong>, for at least 252
+      validation days in total; dependency-derived purge gaps keep its preceding fit slice away
+      from validation.
+      Every trade becomes a position-event record (entry/exit time, order counters, P&amp;L, risk)
+      — the raw atoms of all later statistics.</p>
+      <div class="io"><b>out</b> per attempt × fold: position events + daily mark-to-market series, staged to bounded immutable files</div></li>
+    <li class="gate"><span class="stepnum"></span><h5>Select winners under multiplicity control <span class="who">TradePower + Winner V11</span></h5>
+      <p>Selection runs the gauntlet: <strong>trade-power floors</strong> (enough effective,
+      autocorrelation-adjusted trades to mean anything — calibrated on training, enforced on
+      validation), exact accounting identities (daily sums must equal per-trade sums to the last
+      decimal), stress-lane survival, and <strong>deflated significance</strong> counting all
+      committed attempts, including failures. A cell with real data but nothing surviving becomes
+      <code>NO_WINNER</code> or <code>INSUFFICIENT_EVIDENCE</code>, both bound to the rejection
+      evidence.</p>
+      <div class="io"><b>out</b> per anchor: all 2,400 cells typed and hash-committed; any TECHNICAL_FAILURE or UNSEARCHED cell makes the generation incomplete</div></li>
+    <li><span class="stepnum"></span><h5>Replay each anchor book forward <span class="who">forward-OOS replay producer</span></h5>
+      <p>Each anchor's independently selected winners then run as a <strong>synchronized portfolio</strong>
+      over an exact 365-day outer period after that anchor — data that played no part in selecting
+      that anchor book. Real fills at
+      executable bid/ask, shared capital admission, full round-trip costs, margin, exposure —
+      with a strict valuation order (close existing, then mark, then admit) that kills same-bar
+      lookahead.</p>
+      <div class="io"><b>out</b> six content-addressed ledgers × 4 anchors — the only inputs causal validation accepts</div></li>
+    <li class="gate"><span class="stepnum"></span><h5>The causal gate <span class="who">causal process decision</span></h5>
+      <p>The one question that matters: <em>did the selection process, applied at past cutoffs,
+      actually work on data it had never seen — as a portfolio, after costs?</em> The decision is
+      re-derived from the sealed ledgers by an independent evaluator plus its own verifier.
+      <strong>FAIL stops the run here.</strong> No current book is minted from a process that
+      didn't prove itself forward.</p>
+      <div class="io"><b>gate</b> OFFLINE_PROCESS_VALIDATION_PASS — recomputed, never accepted from a flag</div></li>
+    <li><span class="stepnum"></span><h5>Mint the current book <span class="who">current-refit producer (in progress)</span></h5>
+      <p>Only after PASS, the <em>entire identical search process</em> runs again at the latest fully
+      closed common cutoff. It does not deploy an old anchor winner. The current run evaluates the
+      same frozen 128-attempt design on fresh cutoff-local evidence, may select a different strategy
+      and parameter vector, and then refits that selected vector on its tested trailing depth ending
+      at the cutoff. Parameters are decoded and round-tripped through the live strategy registry;
+      the physical ledger is reconstructed from verified artifacts and stamped for demo probation.</p>
+      <div class="io"><b>out</b> the deployable winner book + raw manifest — every entry traceable to its full evidence chain</div></li>
+    <li><span class="stepnum"></span><h5>Calibrate capital <span class="who">portfolio replay + Capital V8</span></h5>
+      <p>The whole book replays as one account under a frozen roster of up to 64 multi-axis policies.
+      Its total-stop-risk axis must cover at least
+      <strong>3 / 5 / 8 / 10 / 12 / 20 / 33.25 / 50 / 75 / 90%</strong>, alongside frozen
+      same-symbol, factor, margin, free-margin, drawdown, and gap-stress limits. Historical inner
+      periods select a policy and unseen outer periods test that selection rule; the latest 365-day
+      current-selection period chooses the present envelope. The selected cap is evidence-driven and
+      may be low; 33.25% or higher is never presumed.</p>
+      <div class="io"><b>out</b> signed capital envelope — the maximum total stop-risk the runtime may hold</div></li>
+    <li class="gate"><span class="stepnum"></span><h5>Assemble, re-verify, publish <span class="who">coordinator + journaled CAS</span></h5>
+      <p>A final assembly re-verifies the complete chain from raw artifacts — seven authority
+      indexes and a chain receipt. Publication journals its intent, compare-and-swaps the ledger,
+      writes the manifest, and confirms. A crash at any instant leaves either the old book or the
+      new book, never a hybrid; recovery is deterministic from the journal.</p>
+      <div class="io"><b>out</b> promoted generation · previous book preserved · eligible for the separate raw readiness preflight, which may still refuse</div></li>
+  </ol>
+
+  <h3>The exact per-cell gauntlet, in plain language</h3>
+  <p>One cell means one symbol × timeframe × observed regime. A candidate does not win by having
+  the highest headline return; it must survive every earlier row before comparison is allowed:</p>
+  <div class="tablewrap"><table>
+    <tr><th>Gate</th><th>Current production rule</th><th>Why it exists</th></tr>
+    <tr><td>1 · Authentic source</td><td>Reopen the exact activated native source, provenance,
+        request and cutoff prefix. Empty advertised data, corruption or identity mismatch is
+        technical failure. Fixed row/coverage targets are diagnostic, not automatic market
+        rejection.</td><td>Only broker evidence that was genuinely available at the cutoff enters
+        economics.</td></tr>
+    <tr><td>2 · Empirical regime support</td><td>Fit the pinned regime controller on training-only
+        data and count actual labels. Zero support produces <code>REGIME_UNOBSERVED</code> and zero
+        attempts; the other regimes remain eligible.</td><td>No forced four-regime symmetry or
+        invented trades.</td></tr>
+    <tr><td>3 · Frozen search tickets</td><td>Commit exactly 128 ordered attempts: all 100 strategies
+        at defaults plus 28 deterministic non-default designs, one outcome-blind feasible depth,
+        full domain/code/feature/cost identities, before returns are read.</td><td>The system cannot
+        add a promising parameter after seeing results, and every ticket is charged to
+        multiplicity.</td></tr>
+    <tr><td>4 · Rolling evidence geometry</td><td>Each attempt keeps the same strategy, parameters
+        and depth across four non-overlapping rolling-origin validation folds. Each fold has at
+        least 63 calendar days and at least 5 completed trades; total evidence has at least 252
+        days, with dependency-derived purge between fit and validation.</td><td>One lucky slice or
+        same-bar leakage cannot constitute a candidate.</td></tr>
+    <tr><td>5 · Genuine execution atoms</td><td>The real backtester produces
+        <code>position-events-v2</code>, daily net mark-to-market returns, order counters and exact
+        accounting identities for base and stressed costs. Builder v3 must feed those bytes through
+        the actual TradePower chain.</td><td>A summary, reconstructed equity curve or caller-asserted
+        score cannot stand in for fills and positions.</td></tr>
+    <tr><td>6 · Sample and dependence power</td><td>At least 40 completed trades overall, at least
+        126 HAC-effective days, at least 4 dependence blocks and at least 20 HAC-effective completed
+        trades. TradePower uses the stricter of the train-frozen and base/stress requirements,
+        calibrated for a 0.25R minimum economic edge, at most 0.25R confidence half-width, 80%
+        target power and 5% alpha. <strong>Every one of these calculations is internal to this one
+        symbol × timeframe × regime candidate.</strong> No other cell's returns or correlation enter
+        its admission decision.</td><td>Repeated observations created by the same long-lived trade or
+        adjacent autocorrelated days are not pretended to be independent proof. This is not a
+        diversification preference and does not favour an uncorrelated winner.</td></tr>
+    <tr><td>7 · Positive edge under both cost lanes</td><td>Base and stress overall mean log growth,
+        worst-fold mean and newest-fold mean must each be positive. The attempt-aware DSR p-value,
+        already penalized for all 128 attempts, must be ≤0.05. The score is the lower of the base
+        and stress dependence-robust 95% lower confidence bounds on daily log growth at 0.25% cell
+        risk.</td><td>Late improvement cannot erase a losing fold; a candidate must survive costs,
+        uncertainty, serial dependence and search luck.</td></tr>
+    <tr><td>8 · Winner ordering</td><td>Among admissible candidates, paired base/stress daily-log
+        differences are dependence-adjusted and jointly Holm-corrected at 0.05. A uniquely
+        significant higher-score survivor wins. If survivors are statistically indistinguishable,
+        the authenticated strategy-family / strategy / process identity is the deterministic
+        tie-break; a contradictory significant ordering or an over-budget pairwise evaluation
+        returns no winner.</td><td>“Highest decimal wins” would overstate differences the evidence
+        cannot resolve.</td></tr>
+    <tr><td>9 · Complete sparse Book</td><td>All 2,400 slots must resolve. Local winners, genuine
+        no-winners, unavailable sources, unobserved regimes and insufficient evidence are recorded;
+        any technical failure or unsearched slot makes the Book incomplete. A 10% Benjamini–Yekutieli
+        family q-value is reported as a diagnostic only; local winners remain pending the separate
+        whole-process causal test.</td><td>Completeness is mechanical, while the ultimate claim is
+        about the joint selection process—not 2,400 isolated discoveries.</td></tr>
+  </table></div>
+
+  <div class="callout">
+    <span class="co-label">Two different meanings of “dependence”</span>
+    <p><strong>Gate 6 measures temporal dependence inside one candidate's own evidence.</strong> It
+    asks whether its apparent 40 trades or 252 days contain enough independent information to
+    support an edge estimate. It does not compare EURUSD with GBPUSD, prefer low-correlation cells,
+    or delete a qualified winner because several specialists share USD exposure. Cross-cell
+    interaction appears only after every local winner has been retained, in synchronized account
+    replay. There, total stop risk, same-symbol exposure, currency-factor concentration, margin and
+    gap loss are policy axes to test quantitatively—not alternative definitions of which strategy
+    won its cell.</p>
+  </div>
+
+  <div class="callout warn">
+    <span class="co-label">An unresolved methodology boundary: PBO and bootstrap</span>
+    <p>Winner V11's new production decision uses exact-attempt DSR, HAC/sensitivity-HAC and
+    precommitted block dependence inference. It does <strong>not</strong> currently contain a PBO or
+    moving-block-bootstrap admission gate. PBO/bootstrap implementations still exist in the legacy
+    <code>pm_pipeline</code>; the separate synchronized current-portfolio replay uses a sequence
+    bootstrap for ruin/drawdown stress. Those are not the same as wiring PBO/bootstrap into the
+    genuine raw Winner V11 chain. Therefore
+    the stated production requirement for per-cell DSR/PBO/bootstrap has not yet been fully met and
+    must be resolved before the full optimization; legacy results cannot be cited as if they passed
+    the new authority seam.</p>
+  </div>
+
+  <div class="callout">
+    <span class="co-label">Multiplicity, without the statistics vocabulary</span>
+    <p>Trying 128 candidates is like buying 128 lottery tickets: even if every candidate has zero
+    true edge, one may look excellent by accident. FxPM records every ticket, including failed
+    executions, and makes the apparent winner clear a harder DSR benchmark. Expanding the roster can
+    discover better parameters, but it also raises the luck penalty and the evidence needed to tell
+    signal from noise.</p>
+  </div>
+
+  <div class="callout blocked">
+    <span class="co-label">Current status</span>
+    <p>This is the intended production chain, not a claim that the command already performs it.
+    Several standalone stages and the authenticated anchor plan are reviewed, but the complete
+    pre-policy Capital candidate path, current-mode raw cross-binding, coordinator wiring, and a real
+    bounded end-to-end canary remain open. The <code>--optimize</code> entry point still routes to
+    the legacy generation path and must not be treated as production-ready until those seams land
+    and the canaries pass.</p>
+  </div>
+</section>
+
+<!-- ============================ VALIDATION CLOCKS ============================ -->
+<section class="page" id="page-validation">
+  <div class="eyebrow">Operations · experiment design</div>
+  <h2>Folds, anchors, and why the current book is fresh</h2>
+  <p class="lede">There are three different clocks in the optimizer. Confusing them makes the
+  process look like one stale parameter vector is run four times. That is not the intended design.</p>
+
+  <div class="callout">
+    <span class="co-label">The short answer</span>
+    <p><strong>The four 63-day folds are inside one search at one cutoff.</strong> They compare a
+    precommitted roster of candidate strategy/parameter vectors. <strong>The four historical anchors
+    are separate past cutoffs.</strong> At every anchor the entire search is run again, so that anchor
+    may choose a different strategy and parameters. Its resulting whole book is then tested for 365
+    genuinely later days. Only after those repeated process tests pass is the same entire search run
+    again through the latest closed cutoff to create today's book.</p>
+  </div>
+
+  <h3>What historical PASS approves—and what it does not</h3>
+  <p>The causal result is a license to rerun a <em>method</em>, not a certificate for an old set of
+  parameters. This distinction is the dependency that makes the current output meaningful:</p>
+  <div class="tablewrap"><table>
+    <tr><th>Inherited into the current rerun</th><th>Recomputed at the latest cutoff</th><th>Never inherited as current evidence</th></tr>
+    <tr><td>The process definition; exact 128-design roster and ordering; complete parameter-domain
+        record; timeframe depth ladders and largest-feasible outcome-blind rule; fold/purge geometry;
+        eligibility, TradePower and Winner gates; code, feature, regime, data and cost pins; sparse
+        state rules; causal PASS identity.</td>
+        <td>Latest causal source prefixes; current regime fit and occupancy; the raw four-fold
+        position events for all 128 attempts; TradePower/DSR/score; the current winning strategy and
+        parameter vector (or abstention); cutoff-local refit artifacts; synchronized current
+        candidates; current book and current Capital policy.</td>
+        <td>The strategy/parameters that won at any historical anchor; an anchor's return score;
+        outer-period trades as weights for current candidate ranking; a claim that an old parameter
+        itself has four years of OOS proof.</td></tr>
+  </table></div>
+  <p>A latest-cutoff search depends on history because its authorization receipt must bind an
+  independently verified historical causal PASS. But the current ranking does not consume the
+  outer winners or losses. The market bars from those calendar years may legitimately appear in a
+  current trailing training window—by now they are past and knowable—but they enter under the same
+  frozen rules for every current candidate. Using the outer <em>results</em> to change the roster,
+  score, thresholds or depth after inspection would turn test evidence into design data and void
+  the PASS; the changed process would need all anchors rerun.</p>
+
+  <h3>The three clocks</h3>
+  <div class="cmd">FROZEN PROCESS (same rules, roster, costs and decision math)
+
+Anchor 1 cutoff T1:  search on data available at T1  → Book 1 → unseen outer year 1
+Anchor 2 cutoff T2:  search on data available at T2  → Book 2 → unseen outer year 2
+Anchor 3 cutoff T3:  search on data available at T3  → Book 3 → unseen outer year 3
+Anchor 4 cutoff T4:  search on data available at T4  → Book 4 → unseen outer year 4
+                                                               ↓
+                                       causal test of the selection PROCESS
+                                                               ↓ PASS only
+Latest cutoff NOW:  run the entire same search again → fresh current book
+                                                               ↓
+                       synchronized replay → evidence-selected capital envelope</div>
+
+  <div class="tablewrap"><table>
+    <tr><th>Term</th><th>What it is</th><th>What it is not</th></tr>
+    <tr><td><strong>Attempt</strong></td><td>One strategy, one complete parameter vector, one
+        timeframe depth, for one symbol × timeframe × observed regime.</td>
+        <td>Not a winner and not an adaptive trial created after seeing results.</td></tr>
+    <tr><td><strong>Inner fold</strong></td><td>One rolling fit slice followed by ≥63 unseen
+        validation days. There are exactly four per eligible attempt.</td>
+        <td>Not final causal proof and not one of the four historical anchors.</td></tr>
+    <tr><td><strong>Historical anchor</strong></td><td>A complete “as if today were T” run: causal
+        data prefix, full cell searches, Winner V11 decisions, and a complete 2,400-cell book.</td>
+        <td>Not another fold for the same already-selected parameter vector.</td></tr>
+    <tr><td><strong>Outer period</strong></td><td>365 later calendar days used to replay that
+        anchor's independently selected book as one account, after a minimum 35-day purge.</td>
+        <td>Never available to that anchor's search or winner selection.</td></tr>
+    <tr><td><strong>Current rerun</strong></td><td>The full frozen process repeated through the
+        latest fully closed common cutoff, followed by cutoff-local refitting.</td>
+        <td>Not deployment of the winner selected years ago.</td></tr>
+  </table></div>
+
+  <h3>A worked cell example</h3>
+  <div class="callout">
+    <span class="co-label">Hypothetical only—this is not a reported FxPM winner</span>
+    <p>At historical cutoff A1, take <code>EURUSD × H1 × TREND</code>. The frozen planner creates its
+    128 attempts. Attempt 42 uses one fixed strategy, parameter vector and H1 depth across four
+    rolling validation folds; attempt 87 uses a different precommitted design. Winner V11 may select
+    attempt 42, reject all 128, or mark the evidence insufficient. The same happens independently
+    for every other cell. Selected cells are refit through A1's cutoff, forming Book A1, then—after
+    purge—the whole Book is replayed for the next unseen 365 days.</p>
+    <p>At A2 the entire search starts again from the same rules. Changed market evidence may make
+    attempt 87 win, a different strategy win, or produce no winner; A1's attempt 42 is not carried
+    forward by privilege. After A1–A4, the four synchronized unseen account histories answer only:
+    “Did this selection/refit process generalize?” If that answer passes, the current cutoff repeats
+    all 128 trials again. Suppose current attempt 91 wins: attempt 91—not A1's 42, A2's 87, or the
+    best-looking outer result—is the only parameter vector eligible for the current book.</p>
+  </div>
+
+  <h3>Inside one anchor: what the four folds actually do</h3>
+  <p>For one observed cell, the current planner freezes 128 attempts before evidence is read. For
+  each attempt, the strategy and its parameters stay fixed across the four folds. The fit and
+  validation windows move forward:</p>
+  <div class="cmd">time ───────────────────────────────────────────────────────────────→
+
+fold 1: [ trailing fit window 1 ][purge][ unseen validation 1: ≥63d ]
+fold 2:          [ trailing fit window 2 ][purge][ unseen validation 2: ≥63d ]
+fold 3:                   [ trailing fit window 3 ][purge][ unseen validation 3: ≥63d ]
+fold 4:                            [ trailing fit window 4 ][purge][ unseen validation 4: ≥63d ]
+
+No validation interval overlaps another. No later fold can change the attempt roster.</div>
+  <p>All completed position events and daily base/stress returns from the four folds feed Winner
+  V11. The primary score is the worse of the base-cost and stressed-cost, dependence-robust lower
+  confidence bounds on daily log growth. The selector also requires adequate effective days and
+  trades, attempt-aware significance, accounting identities, positive overall log growth, and
+  positive mean log growth in both the worst and newest fold under both cost lanes. A per-fold
+  confidence bound is reported as a diagnostic; requiring four separate significance tests was
+  deliberately rejected because it destroys statistical power.</p>
+
+  <div class="callout warn">
+    <span class="co-label">Deterministic does not mean certain</span>
+    <p>Given identical frozen bytes, code, and clock inputs, the score and winner are reproducible.
+    The score is still an estimate from noisy market history. FxPM selects the best <em>admissible
+    candidate in the tested roster</em>; it does not discover a provably optimal law of the market.</p>
+  </div>
+
+  <h3>What stays fixed, and what is allowed to change</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Across…</th><th>Fixed</th><th>Allowed to change</th></tr>
+    <tr><td>The four inner folds of one attempt</td><td>Strategy, parameter vector, depth, cost
+        contract, attempt identity</td><td>The chronological fit/validation slice and the market
+        outcomes</td></tr>
+    <tr><td>Attempts in one cell</td><td>Precommitted 128-entry roster and all multiplicity</td>
+        <td>Strategy and parameter vector by attempt</td></tr>
+    <tr><td>Historical anchors</td><td>The process definition, search design, scoring rules, cost
+        rules and risk rules</td><td>The fitted regime record, evidence, winning strategy,
+        parameters, and resulting book</td></tr>
+    <tr><td>Historical proof → current rerun</td><td>The validated process</td><td>The current winner
+        roster and cutoff-local fitted outputs</td></tr>
+  </table></div>
+
+  <h3>If early periods are weak and later periods improve</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Observed pattern</th><th>How the frozen rules treat it</th></tr>
+    <tr><td>First two <strong>inner folds</strong> have negative mean log growth; last two are
+        positive</td><td>The candidate is rejected. The worst-fold positivity gates apply in base
+        and stressed costs, so later folds cannot erase a negative early fold.</td></tr>
+    <tr><td>Early inner folds are weak but positive; later folds are stronger</td><td>Every day still
+        enters the pooled dependence-aware estimate. The improvement may help, but weak early
+        evidence lowers the aggregate and can widen uncertainty. No fold is dropped or reweighted
+        after looking.</td></tr>
+    <tr><td>One or two early <strong>outer anchor years</strong> lose; later anchor years win</td>
+        <td>This does not automatically fail. Causal v8 tests pooled stressed daily log growth with
+        the most conservative of HAC, sensitivity-HAC, between-anchor cluster, and IPS variance.
+        Early losses reduce the mean and increase cross-anchor uncertainty. The lower confidence
+        bound must still exceed zero, portfolio drawdown/tail gates must pass, and the newest anchor
+        mean must be positive.</td></tr>
+    <tr><td>The newest inner fold is nonpositive, or the newest outer anchor's <strong>stressed</strong>
+        mean log growth is nonpositive</td><td>The relevant candidate or process fails its recency
+        guard even if older history was profitable. The newest outer base mean is diagnostic.</td></tr>
+    <tr><td>A regime changes only after the latest cutoff</td><td>No historical method can observe
+        that future. Expiry, scheduled full reruns, fail-closed runtime checks, and demo probation
+        are the defenses; they are not a guarantee.</td></tr>
+  </table></div>
+  <p>The outer causal gate does not require a separate significant lower bound for every anchor.
+  Four simultaneous per-anchor tests would have very low power. Instead, it uses one precommitted
+  pooled confirmatory test with explicit between-anchor uncertainty and a newest-anchor direction
+  guard. Worst-anchor and “remove the best block” results remain visible diagnostics.</p>
+
+  <h3>The exact outer process gauntlet</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Outer requirement</th><th>Current causal-v8 rule</th><th>Interpretation</th></tr>
+    <tr><td>Causal geometry</td><td>At least 4 anchors; each contributes at least 365 complete UTC
+        calendar days; at least 35 purge days separate selection cutoff from outer execution.</td>
+        <td>Each result is a genuinely later deployment simulation, not another inner fold.</td></tr>
+    <tr><td>Complete portfolio evidence</td><td>Only issuer-authenticated synchronized fill, event,
+        daily mark-to-market, cost, exposure and reconciliation ledgers are accepted. A technical or
+        partial cell blocks the process.</td><td>The test measures the complete book on one account,
+        not a handpicked set of successful experts.</td></tr>
+    <tr><td>Confirmatory edge</td><td>The pooled stressed daily equity log-growth 95% one-sided
+        Student-t lower bound must exceed zero. Its variance is the maximum—not the average—of
+        primary HAC, double-bandwidth sensitivity HAC, between-anchor cluster and daily initial
+        positive-sequence estimates.</td><td>The edge must remain positive under the most conservative
+        supported dependence view.</td></tr>
+    <tr><td>Recency and variation</td><td>The newest anchor's stressed mean log growth must be
+        positive; at least two distinct anchor means and positive within- and between-anchor
+        variation are required.</td><td>Old success cannot wholly conceal current deterioration, and
+        degenerate copy-like evidence is rejected.</td></tr>
+    <tr><td>Path risk</td><td>Base/stress 5% expected shortfall may not exceed 20%/25%; base/stress
+        arithmetic maximum drawdown may not exceed 50%/60%.</td><td>These are broad process-level
+        catastrophe gates, not the final deployable capital limits; Capital V8 applies a separate,
+        generally tighter envelope.</td></tr>
+  </table></div>
+
+  <div class="callout warn">
+    <span class="co-label">What “edge decay” currently means</span>
+    <p>The frozen production path has concrete recency defenses: shorter M5 depth, a positive newest
+    inner fold, a positive newest outer anchor, full latest-cutoff reselection, and runtime
+    validity-through/retrain-due fields tied to an edge-decay receipt. Causal v8 itself does not fit
+    and publish a numeric timeframe-specific decay curve or half-life. Until a genuine current run
+    produces and verifies those expiry calibrations, “edge decay is handled” would be too strong;
+    this remains an evidence item for the pre-run design and later canaries.</p>
+  </div>
+
+  <h3>Freshness: there is no untrained final year</h3>
+  <p>The corrected target calendar reserves the final 365 days before the current cutoff as a
+  <code>CURRENT_SELECTION</code> window and ends historical outer proof immediately before it. That
+  does <em>not</em> leave the latest year ignored. After causal PASS, the current search consumes the
+  causal prefix through the latest fully closed cutoff. Its selected strategy is then refit on the
+  tested trailing depth ending at that cutoff. The final year also supplies current Capital policy
+  selection. What the current book necessarily lacks is <em>future</em> evidence after its own
+  creation; that is why it begins at probation size on demo.</p>
+
+  <p>The process is frozen; the old parameters are not. “Refit” here has two parts that are easy to
+  collapse mentally:</p>
+  <ol>
+    <li><strong>Rerun selection now:</strong> reevaluate the complete precommitted candidate roster
+        on current cutoff-local evidence and choose today's eligible winner for each cell.</li>
+    <li><strong>Fit the chosen current winner:</strong> realize its validated trailing depth ending
+        at the latest cutoff, build the current regime/controller bindings, and mint deployable
+        artifacts. This step may fit the state explicitly allowed by the frozen recipe; it does not
+        get a second opportunity to alter the chosen strategy or parameter vector.</li>
+  </ol>
+
+  <h3>How much history each timeframe uses</h3>
+  <p>The current planner does not give every timeframe the same bar count or calendar span. It picks
+  the largest source-feasible entry from a frozen ladder <em>without looking at returns</em>:</p>
+  <div class="tablewrap"><table>
+    <tr><th>Timeframe</th><th>Precommitted trailing-depth ladder (calendar days)</th><th>Maximum</th></tr>
+    <tr><td>M5</td><td>90 · 180 · 270 · 365</td><td class="num">365</td></tr>
+    <tr><td>M15</td><td>120 · 270 · 365 · 548</td><td class="num">548</td></tr>
+    <tr><td>M30</td><td>180 · 365 · 548 · 730</td><td class="num">730</td></tr>
+    <tr><td>H1</td><td>270 · 548 · 730 · 1,095</td><td class="num">1,095</td></tr>
+    <tr><td>H4</td><td>365 · 730 · 1,095 · 1,460</td><td class="num">1,460</td></tr>
+    <tr><td>D1</td><td>365 · 730 · 1,095 · 1,460 · 1,825</td><td class="num">1,825</td></tr>
+  </table></div>
+  <p>This intentionally keeps fast M5 evidence relatively recent and gives slow D1 strategies more
+  calendar time to accumulate trades. The four validation folds sit outside each rolling fit
+  window, so the required source prefix is longer than the listed depth.</p>
+  <div class="callout warn">
+    <span class="co-label">A real methodological limitation</span>
+    <p>The current planner does <strong>not</strong> empirically compare several depths and does not
+    exhaust every point in every strategy grid. It represents all 100 strategies at defaults plus
+    28 deterministic non-default designs, then chooses one depth from source geometry. This keeps
+    the immutable roster within Winner V11's 128-attempt bound and makes multiplicity/resource use
+    tractable, but “best” means best among those 128 attempts. Untested parameters and a possibly
+    better depth remain unknown. Changing this requires a new precommitted design and fresh outer
+    validation; it cannot be patched after seeing results.</p>
+  </div>
+
+  <h4>How the search can be improved without turning into post-hoc fishing</h4>
+  <div class="tablewrap"><table>
+    <tr><th>Change</th><th>Statistically defensible route</th><th>Invalid route</th></tr>
+    <tr><td>Better coverage inside the present 128-attempt bound</td><td>Before any full-run evidence,
+        replace or redesign the 28 non-default points using a deterministic space-filling or
+        domain-informed roster; freeze it; rerun every historical anchor and all hostile tests.</td>
+        <td>Inspect current/outer winners, then add nearby parameters only where they would have
+        helped.</td></tr>
+    <tr><td>More than 128 attempts</td><td>Version the Winner/planner bounds, resource limits and
+        multiplicity/power contract; freeze the expanded roster before evidence; prove bounded
+        execution; rerun the complete outer-anchor validation. More trials may require materially
+        more independent evidence.</td><td>Run extra trials off-ledger or count only the candidates
+        that completed or looked promising.</td></tr>
+    <tr><td>Staged/coarse-to-fine search</td><td>Precommit the stage transitions, budgets, promotion
+        rule and total hypothesis accounting as one discovery process, then validate that exact
+        adaptive process at every anchor.</td><td>Let each anchor or the current market choose a
+        convenient refinement rule after seeing returns.</td></tr>
+    <tr><td>Empirically select training depth</td><td>Precommit depth candidates as explicit trials,
+        charge their multiplicity and rerun the whole process validation.</td><td>Report the best
+        of several silently tried depths while counting one attempt.</td></tr>
+  </table></div>
+  <p>The present 128 designs are a bounded, reproducible starting method—not evidence that the
+  strategy hyperparameter domains are sufficiently covered or that the globally best strategy was
+  found. Because the full optimization has not started, this is still a legitimate operator design
+  decision; changing it later after outcomes arrive would be much more expensive scientifically.</p>
+
+  <h3>Capital is a second nested experiment</h3>
+  <div class="cmd">At each historical anchor:
+  anchor-local winner book
+      ├─ replay all frozen cap policies on INNER_SELECTION (365d) → choose one
+      └─ evaluate that chosen policy on unseen OUTER_EVALUATION (365d)
+
+Across four anchors:
+  validate whether the capital-selection rule survives unseen outer periods
+
+At the current cutoff:
+  current winner book + CURRENT_SELECTION (365d) → choose today's envelope
+  future evidence after selection → demo probation</div>
+  <p>Every expert is replayed on one synchronized account rather than adding standalone returns.
+  Existing positions close, then remaining positions are marked, then new candidates are admitted.
+  Admission uses per-trade risk (normally about 0.25%), total stop risk, same-symbol risk, factor
+  concentration, margin and free margin. Higher and lower timeframes are not automatically treated
+  as independent; the explicit dual-timeframe rule permits at most one D1 plus one lower-timeframe
+  position on a symbol when enabled, still subject to the same-symbol cap.</p>
+  <p>The bounded roster may contain up to 64 policy points and must cover total-stop-risk candidates
+  from 3% through 90%; each point also specifies factor, same-symbol, margin, free-margin and gap
+  axes. Safety and evidence gates remove inadmissible policies, then the Pareto rule prioritizes
+  stressed log-growth lower confidence bound before gap loss, drawdown, stop stress, margin, and
+  finally lower caps as tie-breakers. A high cap is an option to test, not a target.</p>
+
+  <h4>Capital V8's current evidence floors and safety ceilings</h4>
+  <div class="tablewrap"><table>
+    <tr><th>Area</th><th>Current code default</th><th>Consequence</th></tr>
+    <tr><td>Enough exposure</td><td>≥100 accepted positions, ≥100 HAC-effective observations,
+        ≥4 dependence blocks, and ≥20 observations near each total/factor/same-symbol cap axis.</td>
+        <td>A cap cannot be called safe if the replay rarely approached it.</td></tr>
+    <tr><td>Current/inner policy admission</td><td>Stressed daily log-growth LCB &gt;0; mark-to-market
+        drawdown UCB ≤35%; initial-stop drawdown UCB ≤40%; joint/factor gap-loss UCB ≤35%/15%;
+        margin utilization UCB ≤90%; margin-level LCB ≥111.11%; free-margin LCB ≥10%.</td>
+        <td>Only evidence-supported, constraint-satisfying policies reach the Pareto frontier.</td></tr>
+    <tr><td>Outer proof of the selection rule</td><td>Four or more anchors, pooled stressed LCB &gt;0,
+        newest outer mean &gt;0, and at least 75% of outer anchors profitable, with the same path and
+        margin limits under joint familywise correction.</td><td>The rule must choose tolerable risk
+        on data not used to select the anchor-local policy.</td></tr>
+    <tr><td>Sequence stress in replay readiness</td><td>At least 500 daily observations for the
+        sequence bootstrap; the coordinator currently supplies a 5% maximum upper 95% ruin bound
+        and a p95 bootstrap drawdown bound no looser than the configured drawdown ceiling.</td>
+        <td>Reordering adverse days is treated as a stress test, not a forecast or profit
+        guarantee.</td></tr>
+  </table></div>
+  <p>These are current code defaults, not recommendations carved in stone. The run-start Capital
+  precommitment must bind the exact final values before seeing replay results. Changing them after a
+  policy wins would invalidate the nested evidence.</p>
+
+  <h3>From current Book to permission to execute</h3>
+  <div class="cmd">current Book raw bytes reverified
+        ↓ exact selected-cell / parameter / detector roster
+complete pre-policy synchronized candidates replayed
+        ↓ costs · fills · MTM · stop risk · factor/symbol concentration · margin
+Capital V8 historical rule PASS + current envelope selected
+        ↓ expiry · config · activation · ledger · management isolation checks
+DEMO readiness on exact authorized account
+        ↓ only after a controlled round-trip canary
+journaled publication / demo probation
+
+Historical PASS alone ─X→ orders
+Current winner alone   ─X→ orders
+Capital seal alone     ─X→ orders</div>
+  <p>Every layer is necessary and none is sufficient by itself. Readiness reopens the raw authority
+  chain; it does not accept a producer's “passed” boolean. Funded execution adds a separate external
+  signature and deliberate go/no-go after demo evidence. At present the caller seams and real
+  canaries are incomplete, so this diagram describes the required dependency, not current GO.</p>
+
+  <h3>What this says about profitability — and what it cannot say</h3>
+  <div class="tablewrap"><table>
+    <tr><th>If the full real chain passes…</th><th>It supports</th><th>It does not establish</th></tr>
+    <tr><td>Winner V11</td><td>An admissible cell candidate had positive, stressed,
+        multiplicity- and dependence-adjusted evidence inside the tested roster.</td><td>That it is
+        globally optimal, or that its next trade will win.</td></tr>
+    <tr><td>Causal v8</td><td>The frozen selection process achieved a positive lower confidence bound
+        on stressed portfolio log growth across repeated unseen historical periods, under the tested
+        costs and assumptions.</td><td>Guaranteed future profit, coverage of a new regime, or even
+        sufficiency for fixed business/operating costs.</td></tr>
+    <tr><td>Capital V8</td><td>A particular current risk envelope was selected by a historically
+        validated nested rule and passed tested drawdown, gap, concentration and margin limits.</td>
+        <td>That the highest cap is safe outside the evidence, or that leverage creates edge.</td></tr>
+    <tr><td>Demo probation</td><td>A direct check of fills, costs, runtime parity and early forward
+        behavior on the exact current book.</td><td>A permanent guarantee or permission to skip a
+        deliberate funded-live decision.</td></tr>
+  </table></div>
+  <div class="callout blocked">
+    <span class="co-label">Evidence status today</span>
+    <p>No current full-universe run has yet produced this complete evidence chain. Component tests,
+    fixture rosters, and hostile reviews support mechanical reliability; they are not evidence that
+    the as-yet-unrun current winner book has positive expected profit. That claim becomes discussable
+    only after a genuine bounded canary, the full optimization evidence pack, and demo outcomes.</p>
+  </div>
+
+  <h3>Operator intervention decisions before the full run</h3>
+  <p>These are the compact, legitimate intervention points. They are core methodology, not cosmetic
+  preferences:</p>
+  <div class="tablewrap"><table>
+    <tr><th>Decision</th><th>Current state</th><th>What must happen before proceeding</th></tr>
+    <tr><td>Search coverage</td><td>100 defaults + 28 deterministic non-defaults; not exhaustive and
+        not proven optimal.</td><td>Accept it explicitly, or replace/version it now with a better
+        precommitted bounded/staged design and rerun all anchor validation.</td></tr>
+    <tr><td>PBO/bootstrap in the raw cell chain</td><td>DSR/dependence are in Winner V11; PBO and
+        moving-block bootstrap are not wired into that production decision.</td><td>Resolve the gap
+        in code and evidence, or explicitly revise the acceptance methodology; do not cite legacy
+        pipeline checks as production proof.</td></tr>
+    <tr><td>Depth and decay</td><td>One largest-feasible outcome-blind depth per timeframe ladder;
+        recency gates exist, but no causal-v8 numeric decay curve has yet been produced.</td><td>Judge
+        whether the ladders/expiry calibration suit plausible edge half-lives, or precommit a
+        depth-comparison process and revalidate it.</td></tr>
+    <tr><td>Historical diversity</td><td>Four 365-day outer anchors is the minimum and gives only
+        four between-anchor observations.</td><td>Decide whether that is enough market diversity for
+        the desired confidence or precommit more anchors before evidence access.</td></tr>
+    <tr><td>Broker and stress realism</td><td>Base/stress spreads, commission, swap, margin and gap
+        rules are hash-pinned but no full current evidence pack exists.</td><td>Match every term to
+        the intended FBS instruments/account and verify stress is numerically non-trivial.</td></tr>
+    <tr><td>Capital appetite</td><td>The roster tests 3% through 90%; default path ceilings include
+        35% MTM drawdown and 35% joint gap loss.</td><td>Confirm the evidence floors and loss
+        tolerances before freezing Capital. Medium-to-high appetite is not permission to weaken
+        sample, margin or ruin gates.</td></tr>
+    <tr><td>Native history and demo boundary</td><td>Default v5 history is short by 78–81 days for
+        corrected geometry; shared config pins data-only login 28829971, not demo 106165989.</td>
+        <td>Resolve authentic history without relabeling it, finish caller canaries, and provide a
+        separately verified demo runtime profile before any order-bearing test.</td></tr>
+  </table></div>
+  <p>Any change must be made before evidence access, frozen into a new process identity, and tested
+  again through the historical outer anchors. Choosing a rule after seeing which one would have won
+  would invalidate the causal claim.</p>
+</section>
+
+<!-- ============================ PAPER ============================ -->
+<section class="page" id="page-paper">
+  <div class="eyebrow">Operations</div>
+  <h2><code>--trade --paper</code> — demo probation</h2>
+  <p class="lede">Paper mode executes the freshly validated book against a real broker — real order
+  round-trips, real fills, real spreads — on the authorized FBS demo login <strong>106165989</strong>.
+  It is the mandatory probation period between statistical validation and any funded capital.
+  The command must include both flags; <code>--paper</code> by itself does not enter the trading loop.</p>
+
+  <ol class="flow">
+    <li class="gate"><span class="stepnum"></span><h5>Runtime identity preflight</h5>
+      <p>Before any order: the connected MT5 account's login must be exactly
+      <strong>106165989</strong> and the broker-reported trade mode must be <strong>DEMO</strong>.
+      The final send boundary refreshes the broker snapshot, requires DEMO mode, and requires the
+      observed login to match the connector's configured identity pin. Therefore the demo runtime
+      must use a separately verified pin for 106165989; merely logging the terminal into demo is not
+      enough. Account-bound receipts keep demo evidence separate from funded evidence.</p></li>
+    <li><span class="stepnum"></span><h5>Book authority check</h5>
+      <p>Only a <code>PROCESS_VALIDATED_CURRENT_REFIT</code> book that passes demo-probation
+      readiness executes. The legacy self-asserted demo path was deleted. The live regime detector
+      is hash-verified to be the exact frozen detector the book was validated with.</p></li>
+    <li><span class="stepnum"></span><h5>Execution loop</h5>
+      <p>Signals evaluate on closed bars; orders carry the book's magic number and an attribution
+      comment namespace; position sizing stays inside the capital envelope. Expired winners stop
+      opening new positions rather than trading on stale authority.</p></li>
+    <li><span class="stepnum"></span><h5>Attributed forward ledger</h5>
+      <p>Every closed deal is fetched from broker history and attributed back to the exact cell,
+      strategy, and parameters that produced it — into a telemetry store physically separate from
+      the book (runtime can never mutate promoted authority bytes).</p></li>
+    <li class="gate"><span class="stepnum"></span><h5>Probation evidence review</h5>
+      <p>You compare forward outcomes to validation expectations: hit rates, cost realism, regime
+      behavior. This evidence feeds the live-readiness gate — and your go/no-go decision.</p></li>
+  </ol>
+
+  <div class="callout">
+    <span class="co-label">Data boundary</span>
+    <p>The demo account is for <em>controlled order execution only</em>. Preferred production market
+    history comes from FBS-Real login <strong>28829971</strong>, data-only. Existing histories retain
+    their original provenance; changing the terminal login is not permission to relabel or
+    redownload them. Demo bars can never enter the production evidence chain merely because the
+    terminal is currently connected to demo.</p>
+  </div>
+
+  <div class="callout blocked">
+    <span class="co-label">Not executable yet</span>
+    <p>Do not start demo probation until a current-refit generation has passed the full authority
+    chain, demo readiness, and the controlled round-trip canary. The order path has a fresh account
+    identity/mode check, but the generic readiness helper does not by itself pin login 106165989 and
+    the present shared <code>config.json</code> is pinned to live-data login 28829971. A dedicated,
+    mechanically verified demo runtime profile is therefore also an open prerequisite.</p>
+  </div>
+</section>
+
+<!-- ============================ TRADE ============================ -->
+<section class="page" id="page-trade">
+  <div class="eyebrow">Operations</div>
+  <h2><code>--trade</code> — live operation</h2>
+  <p class="lede">Live mode runs the same execution loop as paper, but crossing into funded
+  territory requires passing every readiness gate — and funded capital authorization is
+  cryptographically two-staged so no run can self-authorize risk.</p>
+
+  <ol class="flow">
+    <li class="gate"><span class="stepnum"></span><h5>Readiness preflight <span class="who">--preflight</span></h5>
+      <p>Every gate re-checked from raw artifacts: the authority chain receipt (book traces
+      byte-for-byte to a complete verified generation), probation evidence present, detector
+      binding, capital envelope validity, winner expiry, account scope. Any failure reports the
+      exact gate and refuses.</p></li>
+    <li><span class="stepnum"></span><h5>Funded authorization — stage one</h5>
+      <p>The runtime issues a content-addressed authorization <em>request</em> bound to this exact
+      generation and capital selection, and halts as <strong>PENDING</strong>. By design the first
+      request always pends — even if a valid response is already staged — so live risk always
+      involves a second, later step.</p></li>
+    <li class="gate"><span class="stepnum"></span><h5>External signature — outside the process</h5>
+      <p>The request is signed externally (Ed25519) with a key the trading process does not hold —
+      the funded boundary exposes no signing capability, only a trusted public key. Scope separation
+      is cryptographic: a demo authorization cannot be replayed onto a funded account, nor across
+      generations.</p></li>
+    <li><span class="stepnum"></span><h5>Stage two — verify and go</h5>
+      <p>On the next invocation the signed response is verified against the trusted key and the
+      exact request bytes; only then does the loop trade — inside the signed total-risk cap.</p></li>
+    <li><span class="stepnum"></span><h5>Ongoing discipline</h5>
+      <p>Scheduled refits re-run the <em>full</em> chain before expiry (no shortcut re-validation);
+      fill/cost drift accumulates in isolated telemetry feeding the next validation; a publication
+      that required crash recovery is typed as such and cannot count as a routine promotion.</p></li>
+  </ol>
+
+  <div class="callout blocked">
+    <span class="co-label">Standing boundary</span>
+    <p>There is currently <strong>no funded-live GO</strong>. No funded or live order is ever sent
+    without explicit operator instruction. Every
+    evidence-producing stage declares <code>grants_trading_authority: false</code> in its receipts —
+    trading authority exists only at this gate, only with the external signature.</p>
+  </div>
+</section>
+
+<!-- ============================ INTEGRITY ============================ -->
+<section class="page" id="page-integrity">
+  <div class="eyebrow">Foundations</div>
+  <h2>Integrity principles</h2>
+  <p class="lede">Five rules, applied uniformly from data acquisition to publication. Most of the
+  defects caught in review were violations of exactly one of these.</p>
+
+  <h3>1 · Derive, never accept</h3>
+  <p>No component believes what a caller tells it. Identities are recomputed from bytes; parameters
+  are round-tripped through the live strategy registry; counts are re-counted from reopened source
+  files; rosters are re-derived and compared. Where two authorities must agree across different
+  schemas, they are joined by an explicit frozen cross-binding — never by pretending their hashes
+  are equal.</p>
+
+  <h3>2 · Fail closed, with types</h3>
+  <p>Every failure has a typed code stating exactly what failed. No generic fallback, no silent
+  skip. A production run either completes with full evidence or stops with a precise reason — and
+  infrastructure failure aborts rather than being recorded as any market state.</p>
+
+  <h3>3 · Commit before you look</h3>
+  <p>Search domains, attempt rosters, fold geometry, cost policies, and capital constraints are
+  frozen and content-addressed <em>before</em> evidence is accessed. You cannot widen a search,
+  drop a failure, or tune a window after seeing outcomes — the commitment already exists in
+  immutable storage and everything downstream binds to it.</p>
+
+  <h3>4 · Count everything</h3>
+  <p>Search enough and something will look good by chance. Every attempt — including rejections —
+  enters the attempt ledger and deflates the significance of whatever wins. Trade-power floors
+  ensure a winner has enough effective sample to mean anything; identical trials at different
+  training depths count as distinct hypotheses.</p>
+
+  <h3>5 · The whole vocabulary of honesty</h3>
+  <p>Every cell in the 2,400-slot decision resolves to exactly one recorded disposition. A
+  generation containing <code>TECHNICAL_FAILURE</code> or <code>UNSEARCHED</code> is incomplete and
+  cannot publish:</p>
+  <div class="tablewrap"><table>
+    <tr><th>State</th><th>Meaning</th><th>Downstream effect</th></tr>
+    <tr><td><span class="pill ok">WINNER</span></td><td>A locally admissible Winner V11 cell with
+        full raw evidence</td><td>Eligible for the anchor book; still pending whole-process causal validation</td></tr>
+    <tr><td><span class="pill pending">NO_WINNER</span></td><td>Searched honestly; nothing survived the gates</td><td>Cell stays empty</td></tr>
+    <tr><td><span class="pill pending">SOURCE_UNAVAILABLE</span></td><td>Verified terminal source
+        absence, with no technical/provenance failure</td><td>Non-economic; never a market verdict</td></tr>
+    <tr><td><span class="pill pending">REGIME_UNOBSERVED</span></td><td>The regime empirically never occurred in training data</td><td>Zero attempts; complete, non-vetoing</td></tr>
+    <tr><td><span class="pill warn">INSUFFICIENT_EVIDENCE</span></td><td>Observed but below precommitted statistical floors</td><td>Bound to rejection evidence; non-vetoing</td></tr>
+    <tr><td><span class="pill blocked">TECHNICAL_FAILURE</span></td><td>Infrastructure, corruption,
+        provenance, or evaluator failure</td><td>Generation cannot publish; retryable; never economics</td></tr>
+    <tr><td><span class="pill blocked">UNSEARCHED</span></td><td>A required cell never reached a
+        complete terminal decision</td><td>Generation cannot publish</td></tr>
+  </table></div>
+
+  <h3>The two-agent review protocol</h3>
+  <p>All substantial changes flow through a hash-chained coordination ledger: a lane is claimed, the
+  work is frozen to exact per-file hashes, and the other agent reviews the same bytes. The review
+  priority is trading correctness and statistical validity: chronology, data geometry, cost stress,
+  genuine evidence, deployed-model parity, bounded execution and failure semantics. Content hashes
+  are operational drift checks, not a claim that a single-user laptop needs an elaborate adversary
+  model. Critical correctness seams may get a second independent reviewer.</p>
+  <p>Recent catches, as a flavor of what this process finds: a deployment-window bias that would
+  have degraded live performance versus backtests; a missing complete pre-policy Capital roster; a
+  stress lane that could be a numerical no-op; and an integration premise that synthetic fixtures
+  satisfied but genuine evidence never could. Those affect expected performance or reliability and
+  belong on the critical path.</p>
+</section>
+
+<!-- ============================ RUNBOOK ============================ -->
+<section class="page" id="page-runbook">
+  <div class="eyebrow">Foundations</div>
+  <h2>Operator runbook</h2>
+  <p class="lede">The practical reference: commands, the order to run them in, and the prerequisites
+  that must hold first.</p>
+
+  <h3>Commands</h3>
+  <div class="callout blocked">
+    <span class="co-label">Current command boundary</span>
+    <p>The commands below describe the target operating surface. Today, <code>--optimize</code> still
+    reaches the legacy generation path and no production current book exists. Do not start the full
+    optimization or any order-bearing mode until the integration and bounded canaries are complete.</p>
+  </div>
+  <div class="flagrow"><code>--optimize</code><span class="pill pending">wiring in progress</span></div>
+  <p>Runs the full authority chain. Expect a multi-day run for the full universe.
+  <code>--overwrite</code> forces re-optimization regardless of existing valid configs.</p>
+  <div class="cmd">python pm_main.py --optimize --config config.json</div>
+
+  <div class="flagrow"><code>--preflight</code></div>
+  <p>Runs every live-readiness check and exits — no trading loop. Reports the exact failing gate.</p>
+  <div class="cmd">python pm_main.py --preflight</div>
+
+  <div class="flagrow"><code>--trade --paper</code></div>
+  <p>Executes the authorized current-refit book on the broker-verified MT5 demo account. It must
+  use a connector identity pin for login 106165989 and verify that login plus trade mode DEMO
+  immediately before order-bearing work. The present shared config is pinned to the data-only
+  account, so this command remains blocked pending a verified demo runtime profile.</p>
+  <div class="cmd">python pm_main.py --trade --paper</div>
+
+  <div class="flagrow"><code>--trade</code><span class="pill blocked">NO FUNDED GO</span></div>
+  <p>Live trading inside the signed capital envelope. Requires all gates plus two-stage funded
+  authorization.</p>
+  <div class="cmd">python pm_main.py --trade</div>
+
+  <div class="flagrow"><code>--status</code></div>
+  <p>Prints current system status and exits.</p>
+  <div class="cmd">python pm_main.py --status</div>
+
+  <h3>Useful options</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Option</th><th>Effect</th></tr>
+    <tr><td><code>--config PATH</code></td><td>Config file (default <code>config.json</code>)</td></tr>
+    <tr><td><code>--symbols A B C</code></td><td>Restrict a bounded diagnostic run; a partial roster
+        cannot publish full production authority</td></tr>
+    <tr><td><code>--winner-ledger PATH</code></td><td>Override the validated-winner ledger location</td></tr>
+    <tr><td><code>--close-on-opposite-signal</code></td><td>Not permitted with authorized demo or
+        funded execution because it would change the frozen exit policy; those invocations fail closed</td></tr>
+    <tr><td><code>--log-level LEVEL</code></td><td>DEBUG / INFO / WARNING / ERROR</td></tr>
+  </table></div>
+
+  <h3>Prerequisites before the first full optimize run</h3>
+  <ol>
+    <li><strong>Native data sufficient.</strong> Reactivation under the current production contract,
+      exact 100 × 6 cell resolution, corrected anchor-plan history proof, and only demonstrably
+      missing or corrupt leaves reacquired on the live-data account. The integrated production
+      preflight must fail closed until this holds; the present legacy CLI path cannot establish that
+      fact.</li>
+    <li><strong>Disk decision made from verified state.</strong> Reclaim the MT5 terminal history
+      cache only after acquisition, activation, and resume verification complete. It is the
+      terminal's serving cache, and broker-side history depth may be limited.</li>
+    <li><strong>Terminal identity.</strong> Optimization data flows only on the live-data account;
+      paper execution only on the verified demo. Keep the production-data and demo-execution
+      identity pins in distinct, verified runtime profiles: the current shared config pins
+      28829971, while demo order work must pin and observe 106165989 plus broker DEMO mode. Do not
+      change the active acquisition config without first checking processes and resume integrity.</li>
+  </ol>
+
+  <h3>The sequence, end to end</h3>
+  <ol class="flow">
+    <li><span class="stepnum"></span><h5>Complete and verify native acquisition</h5>
+      <p>600 / 600 symbol-timeframe cells resolved under one activation, each either authentic and
+      available or carrying a genuine terminal-unavailable receipt, with no technical failure.</p></li>
+    <li><span class="stepnum"></span><h5>Reclaim MT5 history disk space</h5>
+      <p>Free only cache bytes proven no longer required; record the resulting bounded workspace
+      capacity before the run.</p></li>
+    <li><span class="stepnum"></span><h5><code>python pm_main.py --optimize</code></h5>
+      <p>Multi-day, unattended. Ends in a published book or a typed stop.</p></li>
+    <li class="gate"><span class="stepnum"></span><h5>Review the evidence pack</h5>
+      <p>Causal PASS, capital receipts, per-cell outcomes. Your call to proceed.</p></li>
+    <li><span class="stepnum"></span><h5><code>python pm_main.py --trade --paper</code></h5>
+      <p>Demo probation; observe attributed forward outcomes against expectations.</p></li>
+    <li class="gate"><span class="stepnum"></span><h5>Deliberate go/no-go</h5>
+      <p>The system never takes this step for you.</p></li>
+    <li><span class="stepnum"></span><h5><code>python pm_main.py --trade</code></h5>
+      <p>Live, inside the signed capital envelope, with expiry forcing re-validation.</p></li>
+  </ol>
+
+  <div class="stamp">Documentation generated 2026-07-15 · reflects the coordination ledger through
+  seq 1501 · bar counts are per-symbol approximations under the fxpm-timeframe-evidence-v3 window
+  contract; exact per-dataset counts live in each dataset's receipt.</div>
+</section>
+
+</main>
+</div>
+
+<script>
+  const links = document.querySelectorAll("nav a[data-page]");
+  const pages = document.querySelectorAll(".page");
+  links.forEach(link => {
+    link.setAttribute("tabindex","0");
+    const go = () => {
+      links.forEach(l => l.classList.remove("active"));
+      link.classList.add("active");
+      pages.forEach(p => p.classList.remove("visible"));
+      document.getElementById("page-" + link.dataset.page).classList.add("visible");
+      window.scrollTo(0,0);
+    };
+    link.addEventListener("click", go);
+    link.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+  });
+</script>
+</body>
+</html>
