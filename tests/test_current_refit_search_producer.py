@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -146,7 +147,339 @@ def test_causal_gate_and_production_inputs_accept_no_outcome_callbacks() -> None
         "native_products",
         "current_selection_window",
         "output_root",
+        "symbol_scheduler",
     }
+
+
+def _scheduler_unit_inputs(tmp_path: Path):
+    pipeline_config = producer.PipelineConfig(optimization_max_workers=5)
+    context = SimpleNamespace(
+        root=tmp_path / "spool",
+        generation_id="generation-scheduler",
+        native_universe_sha256="a" * 64,
+        config_sha256="b" * 64,
+        context_sha256="c" * 64,
+    )
+    search_process = SimpleNamespace(
+        receipt_sha256="d" * 64,
+        to_dict=lambda: {"run_id": "run-scheduler"},
+    )
+    scheduler = producer.CurrentRefitSymbolSchedulerInputs(
+        active_config_path=tmp_path / "config.json",
+        data_dir=tmp_path / "data",
+        cutoff_utc="2026-07-15T00:00:00+00:00",
+        source_accessed_at_utc="2026-07-26T00:00:00+00:00",
+        requested_workers=12,
+    )
+    inputs = SimpleNamespace(
+        context=context,
+        search_process=search_process,
+        pipeline_config=pipeline_config,
+        symbol_scheduler=scheduler,
+    )
+    request = {
+        "causal_precommit_payload": {"precommit": True},
+        "causal_evidence_payload": {"evidence": True},
+        "causal_reconciliation_payload": {"reconciliation": True},
+    }
+    authorization = SimpleNamespace(receipt_sha256="e" * 64)
+    return inputs, request, authorization
+
+
+def test_symbol_scheduler_uses_requested_workers_without_ram_admission_waves(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    symbols = tuple(f"SYM{index:02d}" for index in range(12))
+    monkeypatch.setattr(producer.book, "PINNED_SYMBOL_ORDER", symbols)
+    monkeypatch.setattr(producer.book, "TIMEFRAME_ORDER", ("M5",))
+    inputs, request, authorization = _scheduler_unit_inputs(tmp_path)
+    monkeypatch.setattr(
+        producer.config_binding,
+        "load_effective_pipeline_config",
+        lambda _path: ({}, inputs.pipeline_config),
+    )
+    monkeypatch.setattr(
+        producer.config_binding,
+        "freeze_production_pipeline_config",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            effective_config_sha256="f" * 64
+        ),
+    )
+    governors = []
+    class _Governor:
+        def __init__(self, **kwargs):
+            governors.append(kwargs)
+
+        def iter_completed(self, _worker, tasks):
+            for task in tasks:
+                yield SimpleNamespace(
+                    task_key=task.key,
+                    status="COMPLETED",
+                    technical_failure=False,
+                    value={"symbol": task.key},
+                    error_type="",
+                    error_message="",
+                    measured_peak_bytes=128 * 1024**2,
+                )
+
+    monkeypatch.setattr(producer.memory_governor, "MemoryGovernor", _Governor)
+
+    results = producer._run_symbol_scheduler(  # noqa: SLF001
+        inputs,
+        request=request,
+        authorization=authorization,
+        current_cutoff="2026-07-15T00:00:00+00:00",
+    )
+
+    assert list(results) == list(symbols)
+    assert governors == [
+        {
+            "requested_workers": len(symbols),
+            "termination_grace_seconds": (
+                producer.SYMBOL_SCHEDULER_TERMINATION_SECONDS
+            ),
+        }
+    ]
+
+
+def test_scheduler_parallel_completion_has_byte_identical_assembled_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    symbols = ("EURUSD", "GBPUSD", "USDJPY")
+    monkeypatch.setattr(producer.book, "PINNED_SYMBOL_ORDER", symbols)
+    monkeypatch.setattr(producer.book, "TIMEFRAME_ORDER", ("H1",))
+    inputs, request, authorization = _scheduler_unit_inputs(tmp_path)
+    monkeypatch.setattr(
+        producer.config_binding,
+        "load_effective_pipeline_config",
+        lambda _path: ({}, inputs.pipeline_config),
+    )
+    monkeypatch.setattr(
+        producer.config_binding,
+        "freeze_production_pipeline_config",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            effective_config_sha256="f" * 64
+        ),
+    )
+    active_run = ""
+    completion_orders = {"serial": [], "parallel": []}
+
+    class _Governor:
+        def __init__(self, **kwargs):
+            self.requested_workers = kwargs["requested_workers"]
+
+        def iter_completed(self, _worker, tasks):
+            ordered = list(tasks)
+            if self.requested_workers > 1:
+                ordered.reverse()
+            for task in ordered:
+                completion_orders[active_run].append(task.key)
+                yield SimpleNamespace(
+                    task_key=task.key,
+                    status="COMPLETED",
+                    technical_failure=False,
+                    value={
+                        "schema_version": producer.SYMBOL_SCHEDULER_SCHEMA,
+                        "symbol": task.key,
+                        "index": {"kind": "symbol", "symbol": task.key},
+                        "compact_receipt": {"symbol": task.key},
+                    },
+                    error_type="",
+                    error_message="",
+                    measured_peak_bytes=128 * 1024**2,
+                )
+
+    monkeypatch.setattr(producer.memory_governor, "MemoryGovernor", _Governor)
+    monkeypatch.setattr(
+        producer.authority_spool,
+        "verify_symbol_receipt",
+        lambda *_args, **kwargs: {"symbol": kwargs["expected_symbol"]},
+    )
+    monkeypatch.setattr(
+        producer,
+        "_manifest_artifact",
+        lambda _manifest, binding, *, artifact_type: {
+            "artifact_type": artifact_type,
+            "binding": dict(binding),
+        },
+    )
+
+    def read_index(_context, entry, *, maximum):
+        del maximum
+        binding = entry["binding"]
+        if entry["artifact_type"] == "current_refit_worker_symbol_index":
+            symbol = binding["symbol"]
+            return {
+                "schema_version": producer.SYMBOL_BUNDLE_SCHEMA,
+                "generation_context_sha256": inputs.context.context_sha256,
+                "search_process_receipt_sha256": (
+                    inputs.search_process.receipt_sha256
+                ),
+                "authorization_receipt_sha256": authorization.receipt_sha256,
+                "current_cutoff_utc": "2026-07-15T00:00:00+00:00",
+                "symbol": symbol,
+                "timeframe_order": ["H1"],
+                "timeframe_artifacts": [
+                    {"kind": "timeframe", "symbol": symbol, "timeframe": "H1"}
+                ],
+            }
+        return {
+            "symbol": binding["symbol"],
+            "timeframe": binding["timeframe"],
+        }
+
+    monkeypatch.setattr(producer, "_read_spooled_json", read_index)
+    monkeypatch.setattr(
+        producer,
+        "_rebuild_timeframe_evidence",
+        lambda **kwargs: (
+            [
+                {
+                    "symbol": kwargs["symbol"],
+                    "timeframe": kwargs["timeframe"],
+                    "evidence_sha256": _sha(
+                        [kwargs["symbol"], kwargs["timeframe"]]
+                    ),
+                }
+            ],
+            [],
+        ),
+    )
+
+    assembled: dict[str, tuple[list[dict], str]] = {}
+    for run_name, requested_workers in (("serial", 1), ("parallel", 3)):
+        active_run = run_name
+        inputs.symbol_scheduler = producer.CurrentRefitSymbolSchedulerInputs(
+            active_config_path=tmp_path / "config.json",
+            data_dir=tmp_path / "data",
+            cutoff_utc="2026-07-15T00:00:00+00:00",
+            source_accessed_at_utc="2026-07-26T00:00:00+00:00",
+            requested_workers=requested_workers,
+        )
+        evidence = list(
+            producer._scheduled_book_evidence_stream(  # noqa: SLF001
+                inputs,
+                request=request,
+                authorization=authorization,
+                current_cutoff="2026-07-15T00:00:00+00:00",
+                selected={},
+                compact_receipts={},
+            )
+        )
+        assembled[run_name] = (evidence, _sha(evidence))
+
+    assert completion_orders["serial"] == list(symbols)
+    assert completion_orders["parallel"] == ["USDJPY", "GBPUSD", "EURUSD"]
+    assert completion_orders["serial"] != completion_orders["parallel"]
+    assert [row["symbol"] for row in assembled["serial"][0]] == list(symbols)
+    assert assembled["serial"] == assembled["parallel"]
+
+
+def test_selected_source_capture_is_bound_to_exact_manifest_entries() -> None:
+    source_spool_descriptor = {
+        "relative_path": "symbols/EURUSD/source.json",
+        "size_bytes": 101,
+        "sha256": "1" * 64,
+        "format": "canonical_json_ascii",
+    }
+    bars_spool_descriptor = {
+        "relative_path": "symbols/EURUSD/bars.csv",
+        "size_bytes": 202,
+        "sha256": "2" * 64,
+        "format": "csv",
+    }
+    source_entry = {
+        "artifact_id": "source",
+        "artifact_type": "current_refit_source",
+        "descriptor": source_spool_descriptor,
+    }
+    bars_entry = {
+        "artifact_id": "bars",
+        "artifact_type": "current_refit_bars",
+        "descriptor": bars_spool_descriptor,
+    }
+    bars_raw = current_execution.build_raw_artifact_descriptor(
+        relative_path=bars_spool_descriptor["relative_path"],
+        size_bytes=bars_spool_descriptor["size_bytes"],
+        content_sha256=bars_spool_descriptor["sha256"],
+        semantic_sha256="3" * 64,
+        format_version=producer.planner.CURRENT_BAR_FILE_SCHEMA,
+    )
+    source = {
+        "bars_artifact_id": bars_raw["artifact_id"],
+        "bars_content_sha256": "3" * 64,
+    }
+    source_raw = current_execution.build_raw_artifact_descriptor(
+        relative_path=source_spool_descriptor["relative_path"],
+        size_bytes=source_spool_descriptor["size_bytes"],
+        content_sha256=source_spool_descriptor["sha256"],
+        semantic_sha256=producer.current_artifacts.canonical_artifact_sha256(
+            source
+        ),
+        format_version=producer.planner.CURRENT_SOURCE_SNAPSHOT_SCHEMA,
+    )
+    capture = {
+        "source_snapshot": source,
+        "source_spool_entry": source_entry,
+        "bars_spool_entry": bars_entry,
+        "source_raw_descriptor": source_raw,
+        "bars_raw_descriptor": bars_raw,
+    }
+    manifest = {"artifacts": [source_entry, bars_entry]}
+
+    producer._require_source_capture_manifest_entries(  # noqa: SLF001
+        manifest,
+        capture,
+        code="TEST_CAPTURE_UNBOUND",
+    )
+
+    tampered = {
+        **capture,
+        "bars_raw_descriptor": {
+            **bars_raw,
+            "semantic_sha256": "4" * 64,
+        },
+    }
+    with pytest.raises(
+        CurrentRefitSearchProducerError,
+        match="TEST_CAPTURE_UNBOUND",
+    ):
+        producer._require_source_capture_manifest_entries(  # noqa: SLF001
+            manifest,
+            tampered,
+            code="TEST_CAPTURE_UNBOUND",
+        )
+
+
+def test_required_valid_until_uses_authenticated_completion_and_utc_schedule() -> None:
+    config = producer.PipelineConfig(production_retrain_anchor_date="2026-06-07")
+    payload = {"execution": {"completed_at_utc": "2026-07-22T15:00:00+00:00"}}
+
+    deadline = producer._required_valid_until_utc(config, payload)  # noqa: SLF001
+
+    assert deadline == datetime(2026, 8, 2, 0, 1, tzinfo=timezone.utc)
+    source = inspect.getsource(producer._produce)  # noqa: SLF001
+    assert source.index("verify_raw_current_refit_execution") < source.index(
+        "_required_valid_until_utc"
+    )
+    assert source.count("_required_valid_until_utc(") == 1
+
+
+@pytest.mark.parametrize(
+    "completed_at",
+    [None, "2026-07-22T15:00:00", "not-a-datetime"],
+)
+def test_required_valid_until_rejects_unauthenticated_time_forms(completed_at) -> None:
+    with pytest.raises(
+        CurrentRefitSearchProducerError,
+        match="CURRENT_REFIT_COMPLETED_AT_UTC_INVALID",
+    ):
+        producer._required_valid_until_utc(  # noqa: SLF001
+            producer.PipelineConfig(),
+            {"execution": {"completed_at_utc": completed_at}},
+        )
 
 
 def test_rich_request_is_exact_and_never_caller_authorized() -> None:
@@ -289,7 +622,9 @@ def test_book_stream_releases_timeframe_before_yield_and_on_failure(
             return "sealed"
 
     monkeypatch.setattr(
-        producer.authority_spool, "open_symbol_sink", lambda *args: _Sink()
+        producer.authority_spool,
+        "open_symbol_sink",
+        lambda *args, **kwargs: _Sink(),
     )
     decision = SimpleNamespace(to_dict=lambda: {"reason_code": "NO_SOURCE"})
     terminal = SimpleNamespace(
@@ -349,6 +684,259 @@ def test_book_stream_releases_timeframe_before_yield_and_on_failure(
     assert releases == ["released"]
 
 
+def test_book_stream_preserves_authenticated_terminal_technical_abstention(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(producer.book, "PINNED_SYMBOL_ORDER", ("EURUSD",))
+    monkeypatch.setattr(producer.book, "TIMEFRAME_ORDER", ("H1",))
+    monkeypatch.setattr(producer.book, "REGIME_ORDER", ("TREND",))
+
+    class _Sink:
+        def seal(self):
+            return "sealed-terminal-technical"
+
+    monkeypatch.setattr(
+        producer.authority_spool,
+        "open_symbol_sink",
+        lambda *args, **kwargs: _Sink(),
+    )
+    fit = SimpleNamespace(
+        to_dict=lambda: {
+            "reason_code": "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
+        }
+    )
+    terminal = SimpleNamespace(source_group_decision=object(), regime_fit_decision=fit)
+    monkeypatch.setattr(
+        producer.search_execution,
+        "fit_terminal_native_timeframe",
+        lambda **kwargs: terminal,
+    )
+    plan_calls = []
+    monkeypatch.setattr(
+        producer.planner,
+        "build_current_terminal_cell_plan",
+        lambda *args, **kwargs: plan_calls.append(kwargs) or object(),
+    )
+    captured = []
+    evidence = object()
+    monkeypatch.setattr(
+        producer,
+        "_state_evidence",
+        lambda **kwargs: captured.append(kwargs) or evidence,
+    )
+    inputs = SimpleNamespace(
+        context=object(),
+        search_process=object(),
+        pipeline_config=producer.PipelineConfig(),
+        native_products={
+            "EURUSD|H1": SimpleNamespace(source_state=native_prefix.TECHNICAL_TERMINAL)
+        },
+    )
+    compact = {}
+
+    assert list(
+        producer._book_evidence_stream(  # noqa: SLF001
+            inputs,
+            authorization=object(),
+            selected={},
+            compact_receipts=compact,
+        )
+    ) == [evidence]
+    assert captured[0]["state_kind"] == producer.book.TERMINAL_TECHNICAL
+    assert captured[0]["attempted"] == 0
+    assert plan_calls[0]["product"].source_state == (native_prefix.TECHNICAL_TERMINAL)
+    assert compact == {"EURUSD": "sealed-terminal-technical"}
+
+
+def test_current_book_stream_coexists_with_sealed_historical_symbol_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context = producer.authority_spool.freeze_generation_context(
+        tmp_path / "spool",
+        generation_id="generation-phase-domain",
+        native_universe_sha256="a" * 64,
+        config_sha256="b" * 64,
+    )
+    historical_sink = producer.authority_spool.open_symbol_sink(
+        context,
+        "EURUSD",
+        manifest_domain=(
+            producer.authority_spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN
+        ),
+    )
+    historical_sink.put_json(
+        "run/precommit",
+        "historical_anchor_precommit",
+        {"phase": "historical"},
+    )
+    historical_receipt = historical_sink.seal()
+
+    monkeypatch.setattr(producer.book, "PINNED_SYMBOL_ORDER", ("EURUSD",))
+    monkeypatch.setattr(producer.book, "TIMEFRAME_ORDER", ("H1",))
+    monkeypatch.setattr(producer.book, "REGIME_ORDER", ("TREND",))
+    terminal = SimpleNamespace(
+        source_group_decision=object(),
+        regime_fit_decision=SimpleNamespace(
+            to_dict=lambda: {"reason_code": "SOURCE_UNAVAILABLE"}
+        ),
+    )
+    monkeypatch.setattr(
+        producer.search_execution,
+        "fit_terminal_native_timeframe",
+        lambda **_kwargs: terminal,
+    )
+
+    def build_plan(*_args, **kwargs):
+        kwargs["sink"].put_json(
+            "current-refit/run/cutoff/search-cell-plan/H1/TREND",
+            "production_search_cell_plan",
+            {"phase": "current-refit"},
+        )
+        return object()
+
+    monkeypatch.setattr(
+        producer.planner,
+        "build_current_terminal_cell_plan",
+        build_plan,
+    )
+    evidence = object()
+    monkeypatch.setattr(producer, "_state_evidence", lambda **_kwargs: evidence)
+    monkeypatch.setattr(producer, "_release_timeframe_state", lambda: None)
+    inputs = SimpleNamespace(
+        context=context,
+        search_process=object(),
+        pipeline_config=producer.PipelineConfig(),
+        native_products={
+            "EURUSD|H1": SimpleNamespace(
+                source_state=native_prefix.SOURCE_UNAVAILABLE
+            )
+        },
+    )
+    compact: dict[str, object] = {}
+
+    assert list(
+        producer._book_evidence_stream(  # noqa: SLF001
+            inputs,
+            authorization=object(),
+            selected={},
+            compact_receipts=compact,
+        )
+    ) == [evidence]
+    current_receipt = compact["EURUSD"]
+    assert type(current_receipt) is dict
+    assert current_receipt["manifest_domain"] == (
+        producer.authority_spool.CURRENT_REFIT_MANIFEST_DOMAIN
+    )
+    assert historical_receipt["symbol_manifest"]["relative_path"] != (
+        current_receipt["symbol_manifest"]["relative_path"]
+    )
+    producer.authority_spool.verify_symbol_receipt(
+        context.root,
+        current_receipt,
+        expected_generation_id=context.generation_id,
+        expected_symbol="EURUSD",
+        expected_native_universe_sha256=context.native_universe_sha256,
+        expected_config_sha256=context.config_sha256,
+        expected_manifest_domain=(
+            producer.authority_spool.CURRENT_REFIT_MANIFEST_DOMAIN
+        ),
+    )
+
+
+def test_exact_empty_current_book_is_typed_not_promotable() -> None:
+    current_book = {
+        "status": "NO_LOCAL_WINNERS",
+        "reason_codes": ["COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS"],
+        "historical_local_candidate_count": 0,
+        "historical_local_candidate_cell_ids": [],
+        "cells": [],
+    }
+
+    with pytest.raises(producer.CurrentRefitSearchNotPromotable) as caught:
+        producer._selected_book_cells(current_book, {})  # noqa: SLF001
+
+    assert caught.value.code == "CURRENT_BOOK_HAS_NO_ELIGIBLE_WINNERS"
+    assert caught.value.details == (
+        "NO_LOCAL_WINNERS",
+        "COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS",
+    )
+    assert not isinstance(caught.value, CurrentRefitSearchProducerError)
+    source = inspect.getsource(producer._produce)  # noqa: SLF001
+    assert source.index("_selected_book_cells") < source.index("generation_sink =")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "selected"),
+    [
+        ({"status": "HISTORICAL_LOCAL_CANDIDATES_AVAILABLE"}, {}),
+        (
+            {
+                "reason_codes": [
+                    "LOCAL_WINNERS_REQUIRE_SEPARATE_CAUSAL_PROCESS_VALIDATION"
+                ]
+            },
+            {},
+        ),
+        ({"historical_local_candidate_count": 1}, {}),
+        ({"historical_local_candidate_cell_ids": ["cell-1"]}, {}),
+        ({}, {"EURUSD|H1|TREND": object()}),
+    ],
+)
+def test_inconsistent_empty_current_book_remains_technical(
+    mutation: dict[str, object],
+    selected: dict[str, object],
+) -> None:
+    current_book = {
+        "status": "NO_LOCAL_WINNERS",
+        "reason_codes": ["COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS"],
+        "historical_local_candidate_count": 0,
+        "historical_local_candidate_cell_ids": [],
+        "cells": [],
+    }
+    current_book.update(mutation)
+
+    with pytest.raises(
+        CurrentRefitSearchProducerError,
+        match="CURRENT_BOOK_EMPTY_SELECTION_CONTRACT_INVALID",
+    ):
+        producer._selected_book_cells(current_book, selected)  # noqa: SLF001
+
+
+def test_book_stream_still_aborts_unresolved_technical_failure(monkeypatch) -> None:
+    monkeypatch.setattr(producer.book, "PINNED_SYMBOL_ORDER", ("EURUSD",))
+    monkeypatch.setattr(producer.book, "TIMEFRAME_ORDER", ("H1",))
+
+    class _Sink:
+        def seal(self):
+            return "sealed"
+
+    monkeypatch.setattr(
+        producer.authority_spool,
+        "open_symbol_sink",
+        lambda *args, **kwargs: _Sink(),
+    )
+    inputs = SimpleNamespace(
+        context=object(),
+        search_process=object(),
+        pipeline_config=producer.PipelineConfig(),
+        native_products={
+            "EURUSD|H1": SimpleNamespace(source_state=native_prefix.TECHNICAL_FAILURE)
+        },
+    )
+    with pytest.raises(
+        CurrentRefitSearchProducerError, match="CURRENT_NATIVE_TECHNICAL_FAILURE"
+    ):
+        list(
+            producer._book_evidence_stream(  # noqa: SLF001
+                inputs,
+                authorization=object(),
+                selected={},
+                compact_receipts={},
+            )
+        )
+
+
 def test_common_cutoff_requires_exact_ordered_sealed_roster(monkeypatch) -> None:
     monkeypatch.setattr(producer.book, "PINNED_SYMBOL_ORDER", ("EURUSD",))
     monkeypatch.setattr(producer.book, "TIMEFRAME_ORDER", ("H1",))
@@ -375,6 +963,41 @@ def test_common_cutoff_requires_exact_ordered_sealed_roster(monkeypatch) -> None
         CurrentRefitSearchProducerError, match="CURRENT_NATIVE_PRODUCT_ROSTER_INVALID"
     ):
         producer._current_cutoff(inputs)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_common_cutoff_preserves_exact_mt5_symbol(monkeypatch, symbol: str) -> None:
+    monkeypatch.setattr(producer.book, "PINNED_SYMBOL_ORDER", (symbol,))
+    monkeypatch.setattr(producer.book, "TIMEFRAME_ORDER", ("H4",))
+    product = native_prefix.NativePrefixProduct(
+        source_state=native_prefix.SOURCE_UNAVAILABLE,
+        index={
+            "symbol": symbol,
+            "timeframe": "H4",
+            "cutoff_utc": "2026-07-15T00:00:00Z",
+        },
+        index_descriptor={},
+        index_sha256="0" * 64,
+        native_prefix={},
+        instrument_snapshot=None,
+        prefix_path=None,
+        prefix_descriptor=None,
+        artifact_descriptors=(),
+        _seal=native_prefix._PRODUCT_SEAL,  # noqa: SLF001
+    )
+
+    assert producer._current_cutoff(  # noqa: SLF001
+        SimpleNamespace(native_products={f"{symbol}|H4": product})
+    ) == "2026-07-15T00:00:00+00:00"
+
+    product.index["symbol"] = symbol.upper()
+    with pytest.raises(
+        CurrentRefitSearchProducerError,
+        match="CURRENT_NATIVE_PRODUCT_IDENTITY_MISMATCH",
+    ):
+        producer._current_cutoff(  # noqa: SLF001
+            SimpleNamespace(native_products={f"{symbol}|H4": product})
+        )
 
 
 def test_current_replay_contract_projects_the_frozen_capital_window_and_native_facts() -> (
@@ -414,6 +1037,24 @@ def test_current_replay_contract_projects_the_frozen_capital_window_and_native_f
         "native_prefix_index_sha256": "4" * 64,
         "native_source_identity_sha256": "5" * 64,
     }
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_management_native_contract_preserves_exact_mt5_symbol(symbol: str) -> None:
+    contract = producer._management_native_source_contract(  # noqa: SLF001
+        {
+            "symbol": symbol,
+            "timeframe": "H4",
+            "activation_id": "activation-v5",
+            "activation_manifest_sha256": "1" * 64,
+            "source_bars_sha256": "2" * 64,
+            "source_audit_sidecar_sha256": "3" * 64,
+            "index_sha256": "4" * 64,
+            "source_identity_sha256": "5" * 64,
+        }
+    )
+
+    assert contract["symbol"] == symbol
 
 
 @pytest.mark.parametrize(
@@ -591,7 +1232,6 @@ def _selected_material() -> producer._SelectedMaterial:  # noqa: SLF001
         symbol="EURUSD",
         timeframe="H1",
         regime="TREND",
-        product=object(),
         artifacts={},
         source_capture={"source_snapshot": source},
         winner_decision_sha256="4" * 64,

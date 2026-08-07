@@ -16,6 +16,8 @@ import json
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -25,8 +27,10 @@ from pm_regime import (  # noqa: E402
     REGIME_NON_SEARCH_SCHEMA_VERSION,
     REGIME_PROVENANCE_SCHEMA_VERSION,
     REGIME_TRAIN_SUPPORT_SCHEMA_VERSION,
+    RegimeParams,
     _tuner_canonical_sha256,
     _validated_train_regime_support,
+    recompute_train_regime_support_digest,
     validate_regime_params_provenance,
 )
 
@@ -369,8 +373,12 @@ def _support_receipt(counts: dict, **overrides) -> dict:
             lab: "EMPIRICALLY_OBSERVED" if counts[lab] > 0 else "UNOBSERVED"
             for lab in order
         },
-        "first_ts": "2020-01-01T00:00:00+00:00",
-        "last_ts": "2021-12-31T00:00:00+00:00",
+        "first_ts": (
+            "2020-01-01T00:00:00+00:00" if sum(counts.values()) > 0 else None
+        ),
+        "last_ts": (
+            "2021-12-31T00:00:00+00:00" if sum(counts.values()) > 0 else None
+        ),
         "vector_encoding": "fxpm.regime-live-labels-nul/v1",
         "vector_sha256": "e" * 64,
         "bindings": {
@@ -419,9 +427,48 @@ def test_support_receipt_omission_partition_mismatch_rejected() -> None:
     assert _check_support(r) is None
 
 
-def test_support_receipt_zero_eligible_rejected() -> None:
+def test_support_receipt_zero_eligible_is_authenticated_and_time_range_empty() -> None:
     r = _support_receipt({"TREND": 0, "RANGE": 0, "BREAKOUT": 0, "CHOP": 0})
-    assert _check_support(r) is None
+    assert _check_support(r) == r
+
+    for poison in (
+        {"first_ts": "2020-01-01T00:00:00+00:00"},
+        {"last_ts": "2020-01-01T00:00:00+00:00"},
+    ):
+        bad = dict(r)
+        bad.update(poison)
+        bad["receipt_sha256"] = _tuner_canonical_sha256(
+            {k: v for k, v in bad.items() if k != "receipt_sha256"}
+        )
+        assert _check_support(bad) is None
+
+
+def test_support_recompute_preserves_all_warmup_zero_domain() -> None:
+    index = pd.date_range("2022-01-24", periods=50, freq="D", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "Open": 1.0,
+            "High": 1.1,
+            "Low": 0.9,
+            "Close": 1.0,
+        },
+        index=index,
+    )
+
+    result = recompute_train_regime_support_digest(
+        frame,
+        RegimeParams().to_dict(),
+    )
+
+    assert result == {
+        "counts": {"TREND": 0, "RANGE": 0, "BREAKOUT": 0, "CHOP": 0},
+        "eligible_rows": 0,
+        "vector_sha256": hashlib.sha256(
+            b"fxpm.regime-live-labels-nul/v1\x00"
+        ).hexdigest(),
+        "first_ts": None,
+        "last_ts": None,
+    }
 
 
 def test_support_receipt_counts_sum_mismatch_rejected() -> None:

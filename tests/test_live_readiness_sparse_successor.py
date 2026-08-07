@@ -87,6 +87,7 @@ def _authority_result(selected):
         "source_unavailable_cell_ids": [],
         "regime_unobserved_cell_ids": sorted(unobserved),
         "no_local_winner_cell_ids": sorted(possible - set(selected) - unobserved),
+        "insufficient_evidence_cell_ids": [],
         "technical_cell_ids": [],
         "unsearched_cell_ids": [],
         "missing_observed_cell_ids": [],
@@ -117,12 +118,12 @@ def _verify_authority_result(tmp_path, monkeypatch, result):
     monkeypatch.setitem(
         sys.modules,
         "pm_optimization_authority",
-        SimpleNamespace(
-            verify_live_readiness_authority_chain=lambda **_kwargs: result
-        ),
+        SimpleNamespace(verify_live_readiness_authority_chain=lambda **_kwargs: result),
     )
     native = SimpleNamespace(
-        activation_id="activation-1", activation_manifest_sha256=SHA
+        activation_id="activation-1",
+        activation_manifest_sha256=SHA,
+        cell_status=lambda _symbol, _timeframe: "active",
     )
     return readiness._verify_sparse_live_authority(
         config=_config(),
@@ -165,9 +166,7 @@ def test_physical_ledger_rejects_no_trade_accounting_placeholders():
         "promotion_status": "NO_TRADE",
         "artifact_meta": {"no_trade": True},
     }
-    _cells, errors = readiness._sparse_current_refit_projection(
-        ledger, ["EURUSD"]
-    )
+    _cells, errors = readiness._sparse_current_refit_projection(ledger, ["EURUSD"])
     assert "LEDGER_NON_WINNER_PLACEHOLDER_FORBIDDEN:EURUSD|H1|CHOP" in errors
 
 
@@ -189,9 +188,7 @@ def test_physical_ledger_never_promotes_accounting_sentinels(sentinel):
         "promotion_status": "PROCESS_VALIDATED_CURRENT_REFIT",
         "artifact_meta": {"current_refit_binding": _binding()},
     }
-    cells, errors = readiness._sparse_current_refit_projection(
-        ledger, ["EURUSD"]
-    )
+    cells, errors = readiness._sparse_current_refit_projection(ledger, ["EURUSD"])
     assert cells == {"EURUSD|H1|TREND"}
     assert "LEDGER_NON_WINNER_PLACEHOLDER_FORBIDDEN:EURUSD|H1|CHOP" in errors
 
@@ -215,16 +212,16 @@ def test_authority_index_rejects_parent_traversal(tmp_path):
     assert all(error.startswith("AUTHORITY_ARTIFACT_PATH_INVALID") for error in errors)
 
 
-def test_missing_raw_current_refit_verifier_is_explicit_blocker(
-    tmp_path, monkeypatch
-):
+def test_missing_raw_current_refit_verifier_is_explicit_blocker(tmp_path, monkeypatch):
     ledger = _winner_ledger()
     ledger_path = tmp_path / "pm_configs.json"
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
     _write_authority_manifest(tmp_path, ledger_path)
     monkeypatch.setitem(sys.modules, "pm_optimization_authority", None)
     native = SimpleNamespace(
-        activation_id="activation-1", activation_manifest_sha256=SHA
+        activation_id="activation-1",
+        activation_manifest_sha256=SHA,
+        cell_status=lambda _symbol, _timeframe: "active",
     )
     result, errors = readiness._verify_sparse_live_authority(
         config=_config(),
@@ -257,7 +254,9 @@ def test_self_asserted_receipts_cannot_replace_raw_reverification(
     )
     monkeypatch.setitem(sys.modules, "pm_optimization_authority", module)
     native = SimpleNamespace(
-        activation_id="activation-1", activation_manifest_sha256=SHA
+        activation_id="activation-1",
+        activation_manifest_sha256=SHA,
+        cell_status=lambda _symbol, _timeframe: "active",
     )
     _result, errors = readiness._verify_sparse_live_authority(
         config=_config(),
@@ -287,7 +286,9 @@ def test_exact_raw_authority_result_can_clear_successor_gate(tmp_path, monkeypat
     )
     monkeypatch.setitem(sys.modules, "pm_optimization_authority", module)
     native = SimpleNamespace(
-        activation_id="activation-1", activation_manifest_sha256=SHA
+        activation_id="activation-1",
+        activation_manifest_sha256=SHA,
+        cell_status=lambda _symbol, _timeframe: "active",
     )
     result, errors = readiness._verify_sparse_live_authority(
         config=_config(),
@@ -311,6 +312,16 @@ def test_statistical_no_local_winner_cells_are_non_blocking(tmp_path, monkeypatc
     assert errors == []
 
 
+def test_statistical_insufficient_evidence_cells_are_non_blocking(
+    tmp_path, monkeypatch
+):
+    result = _authority_result({"EURUSD|H1|TREND"})
+    cell = result["no_local_winner_cell_ids"].pop()
+    result["insufficient_evidence_cell_ids"] = [cell]
+    _verified, errors = _verify_authority_result(tmp_path, monkeypatch, result)
+    assert errors == []
+
+
 def test_sparse_slot_partition_rejects_omitted_cell(tmp_path, monkeypatch):
     result = _authority_result({"EURUSD|H1|TREND"})
     result["no_local_winner_cell_ids"].pop()
@@ -323,9 +334,7 @@ def test_missing_observed_leaf_blocks_sparse_authority(tmp_path, monkeypatch):
     missing = result["no_local_winner_cell_ids"].pop()
     result["missing_observed_cell_ids"] = [missing]
     _verified, errors = _verify_authority_result(tmp_path, monkeypatch, result)
-    assert (
-        "LIVE_AUTHORITY_BLOCKING_CELLS_PRESENT:missing_observed_cell_ids" in errors
-    )
+    assert "LIVE_AUTHORITY_BLOCKING_CELLS_PRESENT:missing_observed_cell_ids" in errors
 
 
 def test_sparse_slot_partition_rejects_overlap(tmp_path, monkeypatch):
@@ -334,8 +343,7 @@ def test_sparse_slot_partition_rejects_overlap(tmp_path, monkeypatch):
     result["no_local_winner_cell_ids"].sort()
     _verified, errors = _verify_authority_result(tmp_path, monkeypatch, result)
     assert any(
-        error.startswith("LIVE_AUTHORITY_CELL_PARTITION_OVERLAP")
-        for error in errors
+        error.startswith("LIVE_AUTHORITY_CELL_PARTITION_OVERLAP") for error in errors
     )
 
 
@@ -345,15 +353,12 @@ def test_sparse_slot_partition_rejects_forged_cell(tmp_path, monkeypatch):
     result["no_local_winner_cell_ids"].sort()
     _verified, errors = _verify_authority_result(tmp_path, monkeypatch, result)
     assert (
-        "LIVE_AUTHORITY_CELL_OUTSIDE_POSSIBLE_BOOK:no_local_winner_cell_ids"
-        in errors
+        "LIVE_AUTHORITY_CELL_OUTSIDE_POSSIBLE_BOOK:no_local_winner_cell_ids" in errors
     )
     assert "LIVE_AUTHORITY_CELL_PARTITION_INCOMPLETE" in errors
 
 
-def test_blocking_book_states_cannot_be_hidden_by_a_pass_status(
-    tmp_path, monkeypatch
-):
+def test_terminal_technical_roster_must_match_native_truth(tmp_path, monkeypatch):
     ledger = _winner_ledger()
     ledger_path = tmp_path / "pm_configs.json"
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
@@ -365,12 +370,12 @@ def test_blocking_book_states_cannot_be_hidden_by_a_pass_status(
     monkeypatch.setitem(
         sys.modules,
         "pm_optimization_authority",
-        SimpleNamespace(
-            verify_live_readiness_authority_chain=lambda **_kwargs: forged
-        ),
+        SimpleNamespace(verify_live_readiness_authority_chain=lambda **_kwargs: forged),
     )
     native = SimpleNamespace(
-        activation_id="activation-1", activation_manifest_sha256=SHA
+        activation_id="activation-1",
+        activation_manifest_sha256=SHA,
+        cell_status=lambda _symbol, _timeframe: "active",
     )
     _result, errors = readiness._verify_sparse_live_authority(
         config=_config(),
@@ -383,7 +388,50 @@ def test_blocking_book_states_cannot_be_hidden_by_a_pass_status(
         native_universe=native,
         validation_time_utc="2026-07-14T00:00:00Z",
     )
-    assert "LIVE_AUTHORITY_BLOCKING_CELLS_PRESENT:technical_cell_ids" in errors
+    assert "LIVE_AUTHORITY_NATIVE_TERMINAL_TECHNICAL_ROSTER_MISMATCH" in errors
+
+
+def test_authenticated_terminal_technical_cells_do_not_veto_valid_siblings(
+    tmp_path, monkeypatch
+):
+    result = _authority_result({"EURUSD|H1|TREND"})
+    terminal_cells = {
+        f"EURUSD|M5|{regime}" for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
+    }
+    result["no_local_winner_cell_ids"] = sorted(
+        set(result["no_local_winner_cell_ids"]) - terminal_cells
+    )
+    result["technical_cell_ids"] = sorted(terminal_cells)
+    ledger = _winner_ledger()
+    ledger_path = tmp_path / "pm_configs.json"
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    _write_authority_manifest(tmp_path, ledger_path)
+    result["ledger_sha256"] = hashlib.sha256(ledger_path.read_bytes()).hexdigest()
+    monkeypatch.setitem(
+        sys.modules,
+        "pm_optimization_authority",
+        SimpleNamespace(verify_live_readiness_authority_chain=lambda **_kwargs: result),
+    )
+    native = SimpleNamespace(
+        activation_id="activation-1",
+        activation_manifest_sha256=SHA,
+        cell_status=lambda _symbol, timeframe: (
+            "technical_error" if timeframe == "M5" else "active"
+        ),
+    )
+    verified, errors = readiness._verify_sparse_live_authority(
+        config=_config(),
+        config_path=str(tmp_path / "config.json"),
+        config_payload={},
+        ledger=ledger,
+        ledger_path=ledger_path,
+        requested_symbols=["EURUSD"],
+        selected_cells={"EURUSD|H1|TREND"},
+        native_universe=native,
+        validation_time_utc="2026-07-14T00:00:00Z",
+    )
+    assert errors == []
+    assert verified["technical_cell_ids"] == sorted(terminal_cells)
 
 
 def test_selected_cap_cannot_pass_without_live_enforcement(tmp_path, monkeypatch):
@@ -398,12 +446,12 @@ def test_selected_cap_cannot_pass_without_live_enforcement(tmp_path, monkeypatch
     monkeypatch.setitem(
         sys.modules,
         "pm_optimization_authority",
-        SimpleNamespace(
-            verify_live_readiness_authority_chain=lambda **_kwargs: forged
-        ),
+        SimpleNamespace(verify_live_readiness_authority_chain=lambda **_kwargs: forged),
     )
     native = SimpleNamespace(
-        activation_id="activation-1", activation_manifest_sha256=SHA
+        activation_id="activation-1",
+        activation_manifest_sha256=SHA,
+        cell_status=lambda _symbol, _timeframe: "active",
     )
     _result, errors = readiness._verify_sparse_live_authority(
         config=_config(),
@@ -423,13 +471,15 @@ def test_transient_runtime_findings_are_separate_from_evidence():
     report = readiness.ReadinessReport(
         False,
         [
-            readiness.ReadinessFinding("error", "mt5_account_identity_unverified", "x", "runtime"),
-            readiness.ReadinessFinding("error", "historical_book_invalid", "x", "evidence"),
+            readiness.ReadinessFinding(
+                "error", "mt5_account_identity_unverified", "x", "runtime"
+            ),
+            readiness.ReadinessFinding(
+                "error", "historical_book_invalid", "x", "evidence"
+            ),
         ],
     )
     assert [item.code for item in report.runtime_errors] == [
         "mt5_account_identity_unverified"
     ]
-    assert [item.code for item in report.evidence_errors] == [
-        "historical_book_invalid"
-    ]
+    assert [item.code for item in report.evidence_errors] == ["historical_book_invalid"]

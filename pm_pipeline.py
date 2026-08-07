@@ -24,7 +24,7 @@ import shutil
 import stat
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, Tuple, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -1489,14 +1489,7 @@ def _validated_symbol_data_state(value: Any) -> Optional[Dict[str, Any]]:
     return dict(value)
 
 FEATURE_PRECOMPUTE_RESULT_SCHEMA = "fxpm.feature-precompute-result.v1"
-OPTIMIZER_MEMORY_RESERVE_BYTES = 1 * 1024 * 1024 * 1024
-OPTIMIZER_TASK_TIMEOUT_SECONDS = 4 * 60 * 60
-OPTIMIZER_WORKER_START_TIMEOUT_SECONDS = 180.0
-OPTIMIZER_ADMISSION_TIMEOUT_SECONDS = 60.0
 OPTIMIZER_TERMINATION_GRACE_SECONDS = 5.0
-OPTIMIZER_ESTIMATE_BASE_BYTES = 512 * 1024 * 1024
-OPTIMIZER_ESTIMATE_FALLBACK_BYTES = 1 * 1024 * 1024 * 1024
-OPTIMIZER_NATIVE_INPUT_MULTIPLIER = 16
 
 # One immutable production evidence policy.  These are effect-size and
 # precision requirements in strict post-cost R units, not folklore raw-trade
@@ -2607,87 +2600,11 @@ def _restore_pipeline_runtime_bindings(
     config._funded_live_execution = bool(bindings["funded_live_execution"])
 
 
-def _native_artifact_input_bytes(
-    config: PipelineConfig,
-    symbol: str,
-    universe: Any = None,
-) -> int:
-    """Return authenticated active-native input bytes without loading a frame."""
-
-    if universe is None or not bool(getattr(universe, "explicit_contract", False)):
-        return 0
-    canonical = str(symbol or "").strip().upper()
-    entries = getattr(universe, "entries", {}) or {}
-    symbol_entries = entries.get(canonical) if isinstance(entries, Mapping) else None
-    if not isinstance(symbol_entries, Mapping):
-        return 0
-    try:
-        active_timeframes = tuple(universe.active_timeframes(canonical))
-    except Exception:
-        active_timeframes = tuple(
-            str(tf).upper()
-            for tf, entry in symbol_entries.items()
-            if isinstance(entry, Mapping)
-            and str(entry.get("status") or "").strip().lower() == "active"
-        )
-    native_root = (Path(config.data_dir) / "native").resolve()
-    total = 0
-    for timeframe in active_timeframes:
-        entry = symbol_entries.get(str(timeframe).upper())
-        if not isinstance(entry, Mapping):
-            continue
-        relative = entry.get("bars_relative_path")
-        if not relative:
-            continue
-        try:
-            path = (native_root / str(relative)).resolve(strict=True)
-            path.relative_to(native_root)
-            if path.is_file() and not path.is_symlink():
-                total += max(0, int(path.stat().st_size))
-        except (OSError, ValueError):
-            continue
-    return int(total)
-
-
-def _optimizer_peak_estimate_bytes(
-    config: PipelineConfig,
-    symbol: str,
-    universe: Any = None,
-) -> int:
-    """Conservative, monotone bootstrap estimate from native artifact bytes."""
-
-    source_bytes = _native_artifact_input_bytes(config, symbol, universe)
-    if source_bytes <= 0:
-        return OPTIMIZER_ESTIMATE_FALLBACK_BYTES
-    return (
-        OPTIMIZER_ESTIMATE_BASE_BYTES
-        + OPTIMIZER_NATIVE_INPUT_MULTIPLIER * int(source_bytes)
-    )
-
-
-def _ordered_optimizer_memory_work(
-    config: PipelineConfig,
-    symbols: Iterable[str],
-    universe: Any = None,
-) -> List[Tuple[str, int]]:
-    """Schedule the largest authenticated inputs first to calibrate safely."""
-
-    work = [
-        (str(symbol), _optimizer_peak_estimate_bytes(config, str(symbol), universe))
-        for symbol in symbols
-    ]
-    return sorted(work, key=lambda item: (-int(item[1]), item[0]))
-
-
 def _new_optimizer_memory_governor(requested_workers: int) -> MemoryGovernor:
-    """Construct the mandatory runtime governor from code-owned safety policy."""
+    """Construct the fresh-process scheduler with no RAM admission policy."""
 
     return MemoryGovernor(
         requested_workers=max(1, int(requested_workers)),
-        reserve_bytes=OPTIMIZER_MEMORY_RESERVE_BYTES,
-        task_timeout_seconds=OPTIMIZER_TASK_TIMEOUT_SECONDS,
-        worker_start_timeout_seconds=OPTIMIZER_WORKER_START_TIMEOUT_SECONDS,
-        admission_timeout_seconds=OPTIMIZER_ADMISSION_TIMEOUT_SECONDS,
         termination_grace_seconds=OPTIMIZER_TERMINATION_GRACE_SECONDS,
     )
 
@@ -3853,6 +3770,7 @@ class OptimizationGenerationRequest:
     target_symbols: Tuple[str, ...]
     overwrite_targets: bool = False
     require_fresh_native_activation: bool = False
+    supervised_generation_id: Optional[str] = None
 
 
 @dataclass
@@ -3873,6 +3791,7 @@ class OptimizationGenerationOutcome:
     promoted_ledger_sha256: str = ""
     manifest_path: str = ""
     replay_evidence: Dict[str, Any] = field(default_factory=dict)
+    non_promotable: Dict[str, Any] = field(default_factory=dict)
     authority_chain_receipt: Dict[str, Any] = field(default_factory=dict)
     authority_artifacts: Dict[str, Any] = field(default_factory=dict)
     authority_assembly_path: str = ""
@@ -15315,10 +15234,12 @@ class PortfolioManager:
     - Explicit overwrite mode for full re-optimization
     """
     
-    def __init__(self, 
-                 config: PipelineConfig,
-                 symbols: List[str],
-                 config_file: str = "pm_configs.json"):
+    def __init__(
+        self,
+        config: PipelineConfig,
+        symbols: List[str],
+        config_file: str = "pm_configs.json",
+    ):
         """
         Initialize Portfolio Manager.
         
@@ -16458,15 +16379,14 @@ class PortfolioManager:
 
         cfg_dict = _pipeline_config_to_dict(self.config)
         runtime_bindings = _pipeline_runtime_bindings(self.config)
-        work = _ordered_optimizer_memory_work(self.config, symbols, universe)
+        work = [str(symbol) for symbol in symbols]
         governor = _new_optimizer_memory_governor(workers)
 
         def _tasks() -> Iterable[MemoryTask]:
-            for symbol, estimate in work:
+            for symbol in work:
                 yield MemoryTask(
                     key=symbol,
                     args=(cfg_dict, runtime_bindings, symbol),
-                    estimated_peak_bytes=estimate,
                 )
 
         outcomes = governor.iter_completed(
@@ -16477,7 +16397,7 @@ class PortfolioManager:
             tqdm(outcomes, total=len(work), desc="Feature cache", unit="sym")
             if _TQDM else outcomes
         )
-        requested_symbols = {symbol for symbol, _estimate in work}
+        requested_symbols = set(work)
         terminal_symbols = set()
         precompute_aborted = False
         try:
@@ -16520,7 +16440,7 @@ class PortfolioManager:
                 outcomes.close()
 
         if precompute_aborted:
-            for symbol, _estimate in work:
+            for symbol in work:
                 if symbol in terminal_symbols:
                     continue
                 summary["symbols_failed"] += 1
@@ -16976,6 +16896,98 @@ class PortfolioManager:
             raise RuntimeError("PRODUCTION_RETENTION_REMOVE_INCOMPLETE")
 
     @staticmethod
+    def _remove_owned_generation_directory_verified(
+        path: Path,
+        parent: Path,
+    ) -> None:
+        """Remove one exact tree iteratively with bounded entry geometry."""
+
+        parent = Path(parent).resolve(strict=True)
+        root = Path(path)
+        metadata = root.lstat()
+        reparse_flag = getattr(
+            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+        )
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or int(getattr(metadata, "st_file_attributes", 0) or 0)
+            & reparse_flag
+            or not stat.S_ISDIR(metadata.st_mode)
+            or root.resolve(strict=True).parent != parent
+        ):
+            raise RuntimeError(
+                "PRODUCTION_RETENTION_OWNED_DIRECTORY_INVALID"
+            )
+        stack: list[tuple[Path, Any]] = [(root, None)]
+        entries_seen = 0
+        try:
+            while stack:
+                current, stream = stack[-1]
+                if stream is None:
+                    current_metadata = current.lstat()
+                    if (
+                        stat.S_ISLNK(current_metadata.st_mode)
+                        or int(
+                            getattr(
+                                current_metadata,
+                                "st_file_attributes",
+                                0,
+                            )
+                            or 0
+                        )
+                        & reparse_flag
+                        or not stat.S_ISDIR(current_metadata.st_mode)
+                    ):
+                        raise RuntimeError(
+                            "PRODUCTION_RETENTION_OWNED_DIRECTORY_INVALID"
+                        )
+                    stream = os.scandir(current)
+                    stack[-1] = (current, stream)
+                try:
+                    entry = next(stream)
+                except StopIteration:
+                    stream.close()
+                    stack.pop()
+                    current.rmdir()
+                    continue
+                entries_seen += 1
+                if entries_seen > 2_000_000:
+                    raise RuntimeError(
+                        "SUPERVISED_GENERATION_RECOVERY_ENTRY_BOUND_EXCEEDED"
+                    )
+                child = Path(entry.path)
+                child_metadata = child.lstat()
+                if (
+                    entry.is_symlink()
+                    or int(
+                        getattr(
+                            child_metadata,
+                            "st_file_attributes",
+                            0,
+                        )
+                        or 0
+                    )
+                    & reparse_flag
+                ):
+                    raise RuntimeError(
+                        "SUPERVISED_GENERATION_RECOVERY_REPARSE_FORBIDDEN"
+                    )
+                if stat.S_ISDIR(child_metadata.st_mode):
+                    stack.append((child, None))
+                elif stat.S_ISREG(child_metadata.st_mode):
+                    child.unlink()
+                else:
+                    raise RuntimeError(
+                        "SUPERVISED_GENERATION_RECOVERY_NONREGULAR_FORBIDDEN"
+                    )
+        finally:
+            for _path, stream in stack:
+                if stream is not None:
+                    stream.close()
+        if root.exists() or root.is_symlink():
+            raise RuntimeError("PRODUCTION_RETENTION_REMOVE_INCOMPLETE")
+
+    @staticmethod
     def _remove_owned_generation_file(path: Path, parent: Path) -> None:
         parent = Path(parent).resolve(strict=True)
         path = Path(path)
@@ -17158,10 +17170,16 @@ class PortfolioManager:
                 "PRODUCTION_RETENTION_OBSOLETE_PROOF_MISSING"
             )
         if assembly_path.exists() or assembly_path.is_symlink():
-            self._remove_owned_generation_directory(assembly_path, root)
+            self._remove_owned_generation_directory(
+                assembly_path,
+                root,
+            )
             removed_assembly = 1
         if run_path.exists() or run_path.is_symlink():
-            self._remove_owned_generation_directory(run_path, runs_root)
+            self._remove_owned_generation_directory(
+                run_path,
+                runs_root,
+            )
             removed_run = 1
         if snapshot.exists() or snapshot.is_symlink():
             self._remove_owned_generation_file(snapshot, snapshot.parent)
@@ -17523,13 +17541,315 @@ class PortfolioManager:
         self._atomic_write_json(journal_path, body)
         return journal_path
 
-    def _reconcile_interrupted_promotion(self) -> str:
+    def _reconcile_interrupted_promotion(
+        self,
+        *,
+        lock_timeout_seconds: Optional[float] = None,
+    ) -> str:
         """Serialize recovery with every writer of this exact live ledger."""
 
         from pm_storage import _exclusive_file_lock
 
-        with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+        with _exclusive_file_lock(
+            self._optimization_promotion_lock_path(),
+            timeout_seconds=lock_timeout_seconds,
+        ):
             return self._reconcile_interrupted_promotion_locked()
+
+    def _supervised_generation_reference_state_locked(
+        self,
+        *,
+        generation_id: str,
+        deployment_root: Path,
+    ) -> str:
+        """Classify exact durable references without collapsing corruption.
+
+        ``DISJOINT`` is returned only after the live ledger, active manifest,
+        current authority, and optional predecessor all re-open coherently.
+        Any unreadable or partly valid state is ``AMBIGUOUS`` and is never a
+        deletion authorization.
+        """
+
+        _stage, _stage_manifest, active_path = (
+            self._optimization_generation_paths()
+        )
+        if not active_path.exists() and not active_path.is_symlink():
+            return "DISJOINT"
+        try:
+            metadata = active_path.lstat()
+            reparse_flag = getattr(
+                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+            )
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or int(
+                    getattr(metadata, "st_file_attributes", 0) or 0
+                )
+                & reparse_flag
+                or not stat.S_ISREG(metadata.st_mode)
+                or not 0 < metadata.st_size <= 64 * 1024 * 1024
+            ):
+                return "AMBIGUOUS"
+            raw = active_path.read_bytes()
+            if len(raw) != metadata.st_size:
+                return "AMBIGUOUS"
+            active = json.loads(raw.decode("utf-8"))
+            if (
+                type(active) is not dict
+                or active.get("generation_status") != "PROMOTED"
+            ):
+                return "AMBIGUOUS"
+            ledger_path = Path(self.config_file)
+            if not ledger_path.is_absolute():
+                ledger_path = Path.cwd() / ledger_path
+            ledger_path = ledger_path.resolve(strict=True)
+            live_raw = ledger_path.read_bytes()
+            active_sha = str(active.get("ledger_sha256") or "").lower()
+            if (
+                len(active_sha) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in active_sha
+                )
+                or hashlib.sha256(live_raw).hexdigest() != active_sha
+            ):
+                return "AMBIGUOUS"
+            current = self._production_generation_retention_descriptor(
+                active,
+                deployment_root=deployment_root,
+            )
+            if current is None:
+                return "AMBIGUOUS"
+            previous_payload = active.get(
+                "previous_production_generation"
+            )
+            previous = None
+            if previous_payload is not None:
+                if type(previous_payload) is not dict:
+                    return "AMBIGUOUS"
+                previous = (
+                    self._production_generation_retention_descriptor(
+                        previous_payload,
+                        deployment_root=deployment_root,
+                    )
+                )
+                if previous is None or previous != previous_payload:
+                    return "AMBIGUOUS"
+            if current.get("generation_id") == generation_id:
+                return "REFERENCED_ACTIVE"
+            if (
+                previous is not None
+                and previous.get("generation_id") == generation_id
+            ):
+                return "REFERENCED_PREVIOUS"
+            obsolete = active.get("obsolete_production_generation")
+            if type(obsolete) is dict and (
+                obsolete.get("generation_id") == generation_id
+            ):
+                return "REFERENCED_OBSOLETE"
+            return "DISJOINT"
+        except Exception:
+            return "AMBIGUOUS"
+
+    def _discard_supervised_fixed_stage_locked(
+        self,
+        *,
+        generation_id: str,
+    ) -> str:
+        """Discard fixed staging only when its complete identity is exact."""
+
+        stage_path, stage_manifest_path, _active = (
+            self._optimization_generation_paths()
+        )
+        stage_exists = stage_path.exists() or stage_path.is_symlink()
+        manifest_exists = (
+            stage_manifest_path.exists()
+            or stage_manifest_path.is_symlink()
+        )
+        if not stage_exists and not manifest_exists:
+            return "NONE"
+        # A stage without its manifest has no ownership proof.  A manifest
+        # without its stage is different: fixed-stage cleanup deliberately
+        # unlinks the stage first, so that exact intermediate state must be
+        # recoverable after an ordinary interruption.
+        if stage_exists and not manifest_exists:
+            return "AMBIGUOUS"
+        try:
+            reparse_flag = getattr(
+                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+            )
+            manifest_metadata = stage_manifest_path.lstat()
+            if (
+                stat.S_ISLNK(manifest_metadata.st_mode)
+                or int(
+                    getattr(
+                        manifest_metadata,
+                        "st_file_attributes",
+                        0,
+                    )
+                    or 0
+                )
+                & reparse_flag
+                or not stat.S_ISREG(manifest_metadata.st_mode)
+                or not 0
+                < manifest_metadata.st_size
+                <= 64 * 1024 * 1024
+            ):
+                return "AMBIGUOUS"
+            payload = json.loads(
+                stage_manifest_path.read_text(encoding="utf-8")
+            )
+            ledger_sha = str(
+                payload.get("ledger_sha256") if type(payload) is dict else ""
+            ).lower()
+            if (
+                type(payload) is not dict
+                or type(payload.get("generation_id")) is not str
+                or len(ledger_sha) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in ledger_sha
+                )
+                or payload.get("ledger_staging_path") != str(stage_path)
+            ):
+                return "AMBIGUOUS"
+            if payload["generation_id"] != generation_id:
+                return "UNRELATED"
+            ledger_path = Path(self.config_file)
+            if not ledger_path.is_absolute():
+                ledger_path = Path.cwd() / ledger_path
+            live_raw = (
+                ledger_path.resolve().read_bytes()
+                if ledger_path.resolve().exists()
+                else b""
+            )
+            if hashlib.sha256(live_raw).hexdigest() == ledger_sha:
+                return "AMBIGUOUS"
+            if not stage_exists:
+                stage_manifest_path.unlink()
+                if (
+                    stage_manifest_path.exists()
+                    or stage_manifest_path.is_symlink()
+                ):
+                    return "AMBIGUOUS"
+                return "DISCARDED_MANIFEST_ONLY"
+            stage_metadata = stage_path.lstat()
+            if (
+                stat.S_ISLNK(stage_metadata.st_mode)
+                or int(
+                    getattr(
+                        stage_metadata,
+                        "st_file_attributes",
+                        0,
+                    )
+                    or 0
+                )
+                & reparse_flag
+                or not stat.S_ISREG(stage_metadata.st_mode)
+                or not 0
+                < stage_metadata.st_size
+                <= 64 * 1024 * 1024
+                or hashlib.sha256(stage_path.read_bytes()).hexdigest()
+                != ledger_sha
+            ):
+                return "AMBIGUOUS"
+            if not self._discard_fixed_stage_for_generation_locked(
+                generation_id=generation_id,
+                ledger_sha256=ledger_sha,
+            ):
+                return "AMBIGUOUS"
+            return "DISCARDED"
+        except Exception:
+            return "AMBIGUOUS"
+
+    def _recover_abandoned_supervised_generation(
+        self,
+        generation_id: str,
+        *,
+        lock_timeout_seconds: float = 0.0,
+    ) -> str:
+        """Reconcile and reclaim one exact, process-tree-empty generation.
+
+        The caller is responsible for proving that the supervised process tree
+        is gone.  This method adds the independent durable-state proof needed
+        before any exact runner-owned directory can be removed.
+        """
+
+        if (
+            type(generation_id) is not str
+            or len(generation_id) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in generation_id
+            )
+        ):
+            raise ValueError(
+                "SUPERVISED_GENERATION_RECOVERY_ID_INVALID"
+            )
+        from pm_storage import _exclusive_file_lock
+
+        with _exclusive_file_lock(
+            self._optimization_promotion_lock_path(),
+            timeout_seconds=lock_timeout_seconds,
+        ):
+            reconciliation = self._reconcile_interrupted_promotion_locked()
+            journal_path = self._optimization_promotion_journal_path()
+            if journal_path.exists() or journal_path.is_symlink():
+                raise RuntimeError(
+                    "SUPERVISED_GENERATION_RECOVERY_JOURNAL_REMAINS"
+                )
+            deployment_config = str(
+                getattr(self.config, "_deployment_config_path", "") or ""
+            )
+            deployment_root = Path(deployment_config).resolve(
+                strict=True
+            ).parent
+            reference = (
+                self._supervised_generation_reference_state_locked(
+                    generation_id=generation_id,
+                    deployment_root=deployment_root,
+                )
+            )
+            if reference == "AMBIGUOUS":
+                raise RuntimeError(
+                    "SUPERVISED_GENERATION_RECOVERY_REFERENCE_AMBIGUOUS"
+                )
+            if reference.startswith("REFERENCED_"):
+                return f"{reference}:{reconciliation}"
+            stage_state = self._discard_supervised_fixed_stage_locked(
+                generation_id=generation_id,
+            )
+            if stage_state == "AMBIGUOUS":
+                raise RuntimeError(
+                    "SUPERVISED_GENERATION_RECOVERY_STAGE_AMBIGUOUS"
+                )
+            digest = hashlib.sha256(
+                generation_id.encode("utf-8")
+            ).hexdigest()
+            runs_root = deployment_root / "fxpm-production-runs"
+            run_root = runs_root / f"run-{digest}"
+            assembly = deployment_root / f"fxpm-authority-{digest}"
+            removed: list[str] = []
+            for path, parent, label in (
+                (assembly, deployment_root, "ASSEMBLY"),
+                (run_root, runs_root, "RUN_ROOT"),
+            ):
+                if not path.exists() and not path.is_symlink():
+                    continue
+                if not parent.exists() or not parent.is_dir():
+                    raise RuntimeError(
+                        "SUPERVISED_GENERATION_RECOVERY_PARENT_INVALID"
+                    )
+                self._remove_owned_generation_directory_verified(
+                    path,
+                    parent,
+                )
+                removed.append(label)
+            status = "REMOVED" if removed else "ABSENT"
+            return (
+                f"{status}:{','.join(removed) or 'NONE'}:"
+                f"stage={stage_state}:journal={reconciliation}"
+            )
 
     def _reconcile_interrupted_promotion_locked(self) -> str:
         """Finish or safely abort a journaled ledger/manifest publication."""
@@ -18051,6 +18371,11 @@ class PortfolioManager:
             raise RuntimeError(
                 "OPTIMIZATION_GENERATION_STAGE_CHANGED_DURING_VERIFY"
             )
+        if self._requires_production_authority_runner():
+            self._validated_sparse_current_ledger(
+                final_stage_bytes,
+                validation_time_utc=datetime.now(timezone.utc),
+            )
         promoted_manifest = {
             **dict(manifest),
             "generation_status": "PROMOTED",
@@ -18187,7 +18512,7 @@ class PortfolioManager:
             requested = receipt.get("requested_symbols")
             canonical_requested = tuple(
                 dict.fromkeys(
-                    str(symbol).strip().upper()
+                    str(symbol).strip()
                     for symbol in self.symbols
                     if str(symbol).strip()
                 )
@@ -18284,6 +18609,8 @@ class PortfolioManager:
     def _validated_sparse_current_ledger(
         self,
         raw: bytes,
+        *,
+        validation_time_utc: Optional[datetime] = None,
     ) -> Tuple[Dict[str, SymbolConfig], int]:
         """Validate the sparse physical winners; coverage lives in raw Book evidence."""
 
@@ -18295,11 +18622,21 @@ class PortfolioManager:
             ) from exc
         if type(payload) is not dict or not payload or len(payload) > len(self.symbols):
             raise RuntimeError("PRODUCTION_AUTHORITY_LEDGER_ROSTER_INVALID")
-        configured = {str(symbol).strip().upper() for symbol in self.symbols}
+        configured = {str(symbol).strip() for symbol in self.symbols}
         if set(payload) - configured:
             raise RuntimeError("PRODUCTION_AUTHORITY_LEDGER_SYMBOL_OUTSIDE_UNIVERSE")
+        probe = validation_time_utc or datetime.now(timezone.utc)
+        if (
+            not isinstance(probe, datetime)
+            or probe.tzinfo is None
+            or probe.utcoffset() != timedelta(0)
+        ):
+            raise RuntimeError("PRODUCTION_AUTHORITY_VALIDATION_TIME_NOT_UTC")
+        probe = probe.astimezone(timezone.utc)
         parsed: Dict[str, SymbolConfig] = {}
         cell_count = 0
+        generation_optimized_at: Optional[datetime] = None
+        generation_valid_until: Optional[datetime] = None
         for symbol, body in payload.items():
             try:
                 config = SymbolConfig.from_dict(body)
@@ -18308,9 +18645,55 @@ class PortfolioManager:
                     "PRODUCTION_AUTHORITY_LEDGER_SYMBOL_INVALID:"
                     f"{symbol}:{type(exc).__name__}"
                 ) from exc
-            if str(config.symbol).strip().upper() != symbol:
+            if str(config.symbol).strip() != symbol:
                 raise RuntimeError(
                     f"PRODUCTION_AUTHORITY_LEDGER_SYMBOL_IDENTITY_MISMATCH:{symbol}"
+                )
+            optimized_at = config.optimized_at
+            valid_until = config.valid_until
+            if (
+                not isinstance(optimized_at, datetime)
+                or optimized_at.tzinfo is None
+                or optimized_at.utcoffset() != timedelta(0)
+            ):
+                raise RuntimeError(
+                    f"PRODUCTION_AUTHORITY_LEDGER_OPTIMIZED_AT_NOT_UTC:{symbol}"
+                )
+            if (
+                not isinstance(valid_until, datetime)
+                or valid_until.tzinfo is None
+                or valid_until.utcoffset() != timedelta(0)
+            ):
+                raise RuntimeError(
+                    f"PRODUCTION_AUTHORITY_LEDGER_VALID_UNTIL_NOT_UTC:{symbol}"
+                )
+            optimized_at = optimized_at.astimezone(timezone.utc)
+            valid_until = valid_until.astimezone(timezone.utc)
+            try:
+                expected_valid_until = self.config.get_next_retrain_at_utc(
+                    optimized_at
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"PRODUCTION_AUTHORITY_LEDGER_RETRAIN_SCHEDULE_INVALID:{symbol}"
+                ) from exc
+            if valid_until != expected_valid_until:
+                raise RuntimeError(
+                    f"PRODUCTION_AUTHORITY_LEDGER_VALID_UNTIL_MISMATCH:{symbol}"
+                )
+            if valid_until <= probe:
+                raise RuntimeError(
+                    f"PRODUCTION_AUTHORITY_LEDGER_VALID_UNTIL_EXPIRED:{symbol}"
+                )
+            if generation_optimized_at is None:
+                generation_optimized_at = optimized_at
+                generation_valid_until = valid_until
+            elif (
+                optimized_at != generation_optimized_at
+                or valid_until != generation_valid_until
+            ):
+                raise RuntimeError(
+                    "PRODUCTION_AUTHORITY_LEDGER_GENERATION_DEADLINE_MISMATCH"
                 )
             symbol_cells = 0
             for regimes in (config.regime_configs or {}).values():
@@ -18325,6 +18708,16 @@ class PortfolioManager:
                     ):
                         raise RuntimeError(
                             "PRODUCTION_AUTHORITY_LEDGER_CELL_ROLE_INVALID:"
+                            f"{symbol}"
+                        )
+                    if candidate.trained_at != optimized_at:
+                        raise RuntimeError(
+                            "PRODUCTION_AUTHORITY_LEDGER_CELL_TRAINED_AT_MISMATCH:"
+                            f"{symbol}"
+                        )
+                    if candidate.valid_until != valid_until:
+                        raise RuntimeError(
+                            "PRODUCTION_AUTHORITY_LEDGER_CELL_VALID_UNTIL_MISMATCH:"
                             f"{symbol}"
                         )
                     symbol_cells += 1
@@ -18344,6 +18737,7 @@ class PortfolioManager:
 
         from pm_production_capital_bootstrap import DEMO_PROBATION_SCOPE
         from pm_production_optimization_runner import (
+            ProductionOptimizationNotPromotable,
             ProductionOptimizationRequest,
             discard_unpublished_production_result,
             run_production_optimization,
@@ -18354,16 +18748,16 @@ class PortfolioManager:
         total_start = time.time()
         # A retry in the same process must resolve the prior publication before
         # it can derive a new base hash or write another promotion journal.
-        self._reconcile_interrupted_promotion()
+        self._reconcile_interrupted_promotion(
+            lock_timeout_seconds=0.0,
+        )
         configured_symbols = tuple(str(symbol) for symbol in self.symbols)
-        configured_canonical = {
-            str(symbol).strip().upper() for symbol in configured_symbols
-        }
+        configured_exact = {str(symbol).strip() for symbol in configured_symbols}
         for raw_symbol in request.target_symbols:
-            canonical = str(raw_symbol or "").strip().upper()
-            if canonical not in configured_canonical:
+            exact_symbol = str(raw_symbol or "").strip()
+            if exact_symbol not in configured_exact:
                 raise ValueError(
-                    f"OPTIMIZATION_GENERATION_TARGET_UNKNOWN:{canonical}"
+                    f"OPTIMIZATION_GENERATION_TARGET_UNKNOWN:{exact_symbol}"
                 )
         ledger_path = Path(self.config_file)
         if not ledger_path.is_absolute():
@@ -18382,23 +18776,38 @@ class PortfolioManager:
                 f"{type(exc).__name__}:{exc}"
             ) from exc
         universe = self._native_universe_for_optimization()
-        generation_id = _stable_hash(
-            {
-                "schema": "fxpm.optimization-generation.v2",
-                "runner": "fxpm.production-optimization-runner.v1",
-                "started_at": started_at,
-                "time_ns": time.time_ns(),
-                "pid": os.getpid(),
-                "base_ledger_sha256": base_sha,
-                "activation_id": getattr(universe, "activation_id", None),
-                "activation_manifest_sha256": getattr(
-                    universe, "activation_manifest_sha256", None
-                ),
-                "kind": request_kind,
-                "requested_symbols": list(configured_symbols),
-                "overwrite": bool(request.overwrite_targets),
-            }
-        )
+        supervised_generation_id = request.supervised_generation_id
+        if supervised_generation_id is not None:
+            if (
+                type(supervised_generation_id) is not str
+                or len(supervised_generation_id) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in supervised_generation_id
+                )
+            ):
+                raise ValueError(
+                    "OPTIMIZATION_SUPERVISED_GENERATION_ID_INVALID"
+                )
+            generation_id = supervised_generation_id
+        else:
+            generation_id = _stable_hash(
+                {
+                    "schema": "fxpm.optimization-generation.v2",
+                    "runner": "fxpm.production-optimization-runner.v1",
+                    "started_at": started_at,
+                    "time_ns": time.time_ns(),
+                    "pid": os.getpid(),
+                    "base_ledger_sha256": base_sha,
+                    "activation_id": getattr(universe, "activation_id", None),
+                    "activation_manifest_sha256": getattr(
+                        universe, "activation_manifest_sha256", None
+                    ),
+                    "kind": request_kind,
+                    "requested_symbols": list(configured_symbols),
+                    "overwrite": bool(request.overwrite_targets),
+                }
+            )
         stage_path, stage_manifest_path, active_manifest_path = (
             self._optimization_generation_paths()
         )
@@ -18463,6 +18872,7 @@ class PortfolioManager:
             manifest_path: Optional[Path] = None,
             authority_fields: Optional[Mapping[str, Any]] = None,
             replay_evidence: Optional[Mapping[str, Any]] = None,
+            non_promotable: Optional[Mapping[str, Any]] = None,
         ) -> OptimizationGenerationOutcome:
             fields = dict(authority_fields or {})
             value = OptimizationGenerationOutcome(
@@ -18484,6 +18894,7 @@ class PortfolioManager:
                     else active_manifest_path if promoted else stage_manifest_path
                 ),
                 replay_evidence=dict(replay_evidence or {}),
+                non_promotable=dict(non_promotable or {}),
                 authority_chain_receipt=dict(
                     fields.get("authority_chain_receipt", {}) or {}
                 ),
@@ -18545,6 +18956,48 @@ class PortfolioManager:
                     generation_id=generation_id,
                     authorization_scope=DEMO_PROBATION_SCOPE,
                 )
+            )
+        except ProductionOptimizationNotPromotable as exc:
+            terminal = {
+                "code": str(exc.code),
+                "details": [str(value)[:512] for value in exc.details[:8]],
+                "preserved_last_good_ledger": True,
+                "confers_publication_or_trading_authority": False,
+            }
+            manifest = {
+                "schema_version": "fxpm.optimization-generation.v2",
+                "generation_id": generation_id,
+                "generation_status": "NOT_PROMOTABLE",
+                "generation_kind": request_kind,
+                "base_ledger_sha256": base_sha,
+                "base_active_manifest_sha256": base_active_manifest_sha,
+                "requested_symbols": list(configured_symbols),
+                "technical_failures": {},
+                "non_promotable": terminal,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            from pm_storage import _exclusive_file_lock
+
+            with _exclusive_file_lock(self._optimization_promotion_lock_path()):
+                current = ledger_path.read_bytes() if ledger_path.exists() else b""
+                current_active = (
+                    active_manifest_path.read_bytes()
+                    if active_manifest_path.exists()
+                    else b""
+                )
+                if (
+                    hashlib.sha256(current).hexdigest() != base_sha
+                    or hashlib.sha256(current_active).hexdigest()
+                    != base_active_manifest_sha
+                ):
+                    raise RuntimeError(
+                        "PRODUCTION_NOT_PROMOTABLE_FOUND_EXTERNAL_STATE_CHANGE"
+                    ) from exc
+                self._atomic_write_json(failure_manifest_path, manifest)
+            return _outcome(
+                "NOT_PROMOTABLE",
+                manifest_path=failure_manifest_path,
+                non_promotable=terminal,
             )
         except Exception as exc:
             detail = f"PRODUCTION_AUTHORITY_RUN_FAILED:{type(exc).__name__}:{exc}"
@@ -18713,10 +19166,8 @@ class PortfolioManager:
                     f"{type(cleanup_exc).__name__}:{cleanup_exc}"
                 )
             failures = {
-                "__POST_RUN__": (
-                    "PRODUCTION_AUTHORITY_POST_RUN_FAILED:"
-                    f"{type(exc).__name__}:{exc}"
-                )
+                "__POST_RUN__": "PRODUCTION_AUTHORITY_POST_RUN_FAILED:"
+                f"{type(exc).__name__}:{exc}"
             }
             failed_manifest = {
                 "schema_version": "fxpm.optimization-generation.v2",
@@ -18848,27 +19299,22 @@ class PortfolioManager:
                 # continue trading the superseded in-memory book.
                 self.ledger.load()
                 self.symbol_configs = self.ledger.get_all_configs()
-            failures = {
-                (
-                    "__POST_RUN__"
-                    if str(exc).startswith(
-                        "PRODUCTION_AUTHORITY_EXACT_STAGE_FAILED:"
-                    )
-                    else "__PROMOTION__"
-                ): (
-                    (
-                        "PRODUCTION_AUTHORITY_POST_RUN_FAILED:"
-                        if str(exc).startswith(
-                            "PRODUCTION_AUTHORITY_EXACT_STAGE_FAILED:"
-                        )
-                        else "PRODUCTION_PROMOTION_FAILED:"
-                    )
-                    + f"{type(exc).__name__}:{exc}"
-                )
-            }
             pre_cas_stage_failure = str(exc).startswith(
                 "PRODUCTION_AUTHORITY_EXACT_STAGE_FAILED:"
             )
+            if pre_cas_stage_failure:
+                failure_key = "__POST_RUN__"
+                failure_detail = (
+                    "PRODUCTION_AUTHORITY_POST_RUN_FAILED:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+            else:
+                failure_key = "__PROMOTION__"
+                failure_detail = (
+                    "PRODUCTION_PROMOTION_FAILED:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+            failures = {failure_key: failure_detail}
             failed = {
                 **manifest,
                 "generation_status": (
@@ -19312,14 +19758,14 @@ class PortfolioManager:
 
         cfg_dict = _pipeline_config_to_dict(self.config)
         runtime_bindings = _pipeline_runtime_bindings(self.config)
-        work = _ordered_optimizer_memory_work(self.config, to_optimize, universe)
+        work = [str(symbol) for symbol in to_optimize]
         receipt_paths = {
             symbol: _optimizer_receipt_path(
                 self.config_file,
                 generation_id,
                 symbol,
             )
-            for symbol, _estimate in work
+            for symbol in work
         }
         _cleanup_optimizer_receipts(receipt_paths.values())
         outcome_stream = None
@@ -19327,15 +19773,13 @@ class PortfolioManager:
         try:
             if not precompute_failed:
                 logger.info(
-                    "Memory-governed optimization enabled: requested_workers=%d, "
-                    "reserve_bytes=%d",
+                    "Process-isolated optimization enabled: requested_workers=%d",
                     max_workers,
-                    OPTIMIZER_MEMORY_RESERVE_BYTES,
                 )
                 governor = _new_optimizer_memory_governor(max_workers)
 
                 def _tasks() -> Iterable[MemoryTask]:
-                    for symbol, estimate in work:
+                    for symbol in work:
                         yield MemoryTask(
                             key=symbol,
                             args=(
@@ -19345,7 +19789,6 @@ class PortfolioManager:
                                 generation_id,
                                 str(receipt_paths[symbol].resolve()),
                             ),
-                            estimated_peak_bytes=estimate,
                         )
 
                 outcome_stream = governor.iter_completed(
@@ -19845,6 +20288,11 @@ class PortfolioManager:
                 target_symbols=tuple(str(symbol) for symbol in self.symbols),
                 overwrite_targets=bool(overwrite),
                 require_fresh_native_activation=False,
+                supervised_generation_id=getattr(
+                    self,
+                    "_supervised_generation_id",
+                    None,
+                ),
             )
         )
         return dict(outcome.results)

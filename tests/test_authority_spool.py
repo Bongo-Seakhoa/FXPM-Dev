@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import copy
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import threading
 
 import pytest
 
 import pm_authority_spool as spool
+import pm_authority_spool_quota as spool_quota
 
 
 GENERATION = "generation-001"
@@ -28,7 +31,13 @@ def _context(tmp_path: Path, *, limits: spool.SpoolLimits | None = None):
     )
 
 
-def _verify(root: Path, receipt: dict, *, symbol: str = "EURUSD"):
+def _verify(
+    root: Path,
+    receipt: dict,
+    *,
+    symbol: str = "EURUSD",
+    manifest_domain: str | None = None,
+):
     return spool.verify_symbol_receipt(
         root,
         receipt,
@@ -36,6 +45,7 @@ def _verify(root: Path, receipt: dict, *, symbol: str = "EURUSD"):
         expected_symbol=symbol,
         expected_native_universe_sha256=NATIVE,
         expected_config_sha256=CONFIG,
+        expected_manifest_domain=manifest_domain,
     )
 
 
@@ -87,11 +97,13 @@ def test_regular_spool_preserves_complete_stream_and_exact_receipt(tmp_path: Pat
         "schema_version",
         "generation_id",
         "symbol",
+        "manifest_domain",
         "native_universe_sha256",
         "config_sha256",
         "generation_context_sha256",
         "symbol_manifest",
     }
+    assert receipt["manifest_domain"] == spool.GENERAL_MANIFEST_DOMAIN
     assert set(receipt["symbol_manifest"]) == {
         "schema_version",
         "relative_path",
@@ -112,6 +124,25 @@ def test_regular_spool_preserves_complete_stream_and_exact_receipt(tmp_path: Pat
     assert opaque["size_bytes"] == len(expected)
     assert opaque["sha256"] == hashlib.sha256(expected).hexdigest()
     assert json_entry["descriptor"]["format"] == spool.CANONICAL_JSON_FORMAT
+
+
+def test_unsealed_artifact_roster_is_canonical_read_only_and_not_published(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(
+        context,
+        "EURUSD",
+        manifest_domain=spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN,
+    )
+    second = sink.put_json("b", "test", {"value": 2})
+    first = sink.put_json("a", "test", {"value": 1})
+
+    observed = sink.artifact_roster()
+    assert observed == [first, second]
+    observed[0]["artifact_id"] = "tampered"
+    assert sink.artifact_roster() == [first, second]
+    assert not (context.root / "symbols").exists()
 
 
 def test_context_and_symbol_resume_require_byte_identity(tmp_path: Path) -> None:
@@ -192,6 +223,11 @@ def test_receipt_identity_splices_fail_closed(
     [
         ("generation_id", "generation-002", "GENERATION_ID_MISMATCH"),
         ("symbol", "GBPUSD", "SYMBOL_MISMATCH"),
+        (
+            "manifest_domain",
+            spool.CURRENT_REFIT_MANIFEST_DOMAIN,
+            "SYMBOL_MANIFEST_DOMAIN_MISMATCH",
+        ),
         ("native_universe_sha256", "c" * 64, "NATIVE_UNIVERSE_SHA256_MISMATCH"),
         ("config_sha256", "d" * 64, "CONFIG_SHA256_MISMATCH"),
     ],
@@ -273,12 +309,68 @@ def test_partial_preexisting_manifest_blocks_seal_without_overwrite(tmp_path: Pa
     sink = spool.open_symbol_sink(context, "EURUSD")
     sink.put_json("cell", "winner", {"value": 1})
     symbol_key = hashlib.sha256(b"EURUSD").hexdigest()
-    manifest = context.root / "symbols" / symbol_key / "manifest.json"
+    domain_key = hashlib.sha256(spool.GENERAL_MANIFEST_DOMAIN.encode("ascii")).hexdigest()
+    manifest = (
+        context.root
+        / "symbols"
+        / symbol_key
+        / "domains"
+        / domain_key
+        / "manifest.json"
+    )
     manifest.parent.mkdir(parents=True)
     manifest.write_bytes(b'{"partial":')
     with pytest.raises(spool.AuthoritySpoolError, match="IMMUTABLE_FILE_CONFLICT"):
         sink.seal()
     assert manifest.read_bytes() == b'{"partial":'
+
+
+def test_linked_target_remains_reserved_when_post_link_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    relative_path = "recovery/post-link.json"
+    payload = {"complete": True}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            spool,
+            "_fsync_directory",
+            lambda _path: (_ for _ in ()).throw(OSError("injected-fsync")),
+        )
+        with pytest.raises(OSError, match="injected-fsync"):
+            spool._publish_exact_json(
+                context,
+                relative_path,
+                payload,
+                1024,
+            )
+
+    target = context.root.joinpath(*Path(relative_path).parts)
+    assert target.is_file()
+    dirty = json.loads(
+        (context.root / spool_quota.QUOTA_STATE_NAME).read_text(
+            encoding="ascii"
+        )
+    )
+    assert dirty["status"] == "DIRTY"
+    assert len(dirty["reservations"]) == 1
+
+    descriptor = spool._publish_exact_json(
+        context,
+        relative_path,
+        payload,
+        1024,
+    )
+    assert descriptor["size_bytes"] == target.stat().st_size
+    clean = json.loads(
+        (context.root / spool_quota.QUOTA_STATE_NAME).read_text(
+            encoding="ascii"
+        )
+    )
+    assert clean["status"] == "CLEAN"
+    assert clean["reservations"] == []
 
 
 def test_bounds_fail_instead_of_sampling_or_truncating(tmp_path: Path) -> None:
@@ -316,6 +408,75 @@ def test_bounds_fail_instead_of_sampling_or_truncating(tmp_path: Path) -> None:
         count_sink.put_json("two", "evidence", {"two": 2})
 
 
+def test_generation_quota_is_enforced_across_real_spool_publications(
+    tmp_path: Path,
+) -> None:
+    limits = spool.SpoolLimits(
+        max_artifact_bytes=1024,
+        max_symbol_bytes=2048,
+        max_artifacts_per_symbol=10,
+        max_manifest_bytes=1024,
+        max_json_bytes=1024,
+        stream_chunk_bytes=128,
+        max_generation_bytes=2048,
+        min_free_bytes=0,
+    )
+    context = _context(tmp_path, limits=limits)
+    first = spool.write_opaque_artifact(
+        context,
+        [b"a" * 1000],
+        format="binary-v1",
+    )
+    with pytest.raises(
+        spool.AuthoritySpoolError,
+        match="SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
+    ):
+        spool.write_opaque_artifact(
+            context,
+            [b"b" * 1000],
+            format="binary-v1",
+        )
+    assert context.root.joinpath(*Path(first["relative_path"]).parts).is_file()
+    assert not list((context.root / "tmp").glob("*.part"))
+
+
+def test_legacy_generation_context_reopens_read_only(tmp_path: Path) -> None:
+    root = (tmp_path / "legacy-spool").resolve()
+    root.mkdir()
+    limits = asdict(spool.SpoolLimits())
+    limits.pop("max_generation_bytes")
+    limits.pop("min_free_bytes")
+    payload = {
+        "schema_version": spool.LEGACY_GENERATION_CONTEXT_SCHEMA,
+        "generation_id": GENERATION,
+        "native_universe_sha256": NATIVE,
+        "config_sha256": CONFIG,
+        "limits": limits,
+    }
+    (root / spool.CONTEXT_RELATIVE_PATH).write_bytes(
+        json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+    context = spool.reopen_generation_context(
+        root,
+        expected_generation_id=GENERATION,
+        expected_native_universe_sha256=NATIVE,
+        expected_config_sha256=CONFIG,
+    )
+    assert context.writable is False
+    with pytest.raises(
+        spool.AuthoritySpoolError,
+        match="GENERATION_CONTEXT_READ_ONLY",
+    ):
+        spool.write_canonical_json_artifact(context, {"forbidden": True})
+
+
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_nonfinite_json_is_rejected(tmp_path: Path, value: float) -> None:
     context = _context(tmp_path)
@@ -334,15 +495,32 @@ def test_duplicate_and_noncanonical_json_receipts_are_rejected(tmp_path: Path) -
 
 
 def test_opaque_writer_rejects_json_alias_and_bad_chunks(tmp_path: Path) -> None:
-    context = _context(tmp_path)
+    context = _context(
+        tmp_path,
+        limits=spool.SpoolLimits(stream_chunk_bytes=2),
+    )
     with pytest.raises(spool.AuthoritySpoolError, match="COLLIDES"):
         spool.write_opaque_artifact(
             context,
             [b"{}"],
             format=spool.CANONICAL_JSON_FORMAT,
         )
-    with pytest.raises(spool.AuthoritySpoolError, match="CHUNK_TYPE_INVALID"):
-        spool.write_opaque_artifact(context, [b"ok", "bad"], format="binary-v1")
+    with spool.reserve_transient_publication(context) as held:
+        with pytest.raises(spool.AuthoritySpoolError, match="CHUNK_TYPE_INVALID"):
+            spool.write_opaque_artifact(
+                context,
+                [b"ok", "bad"],
+                format="binary-v1",
+            )
+        state = json.loads(
+            (context.root / spool_quota.QUOTA_STATE_NAME).read_text(
+                encoding="ascii"
+            )
+        )
+        assert [value["token"] for value in state["reservations"]] == [
+            held.token
+        ]
+        held.cancel_after_cleanup()
 
 
 def test_root_and_artifact_links_are_rejected(tmp_path: Path) -> None:
@@ -422,3 +600,94 @@ def test_concurrent_publication_is_exclusive_and_identity_safe(tmp_path: Path) -
             outcomes.append(str(exc))
     assert sum(type(value) is dict for value in outcomes) == 1
     assert sum("IMMUTABLE_FILE_CONFLICT" in str(value) for value in outcomes) == 1
+
+
+def test_stream_iterators_run_concurrently_outside_quota_lock(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    entered = threading.Barrier(2)
+
+    def publish(payload: bytes):
+        def chunks():
+            entered.wait(timeout=5)
+            yield payload
+
+        return spool.write_opaque_artifact(
+            context,
+            chunks(),
+            format="binary-v1",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        descriptors = list(pool.map(publish, (b"first", b"second")))
+    assert {descriptor["size_bytes"] for descriptor in descriptors} == {5, 6}
+    assert {
+        context.root.joinpath(
+            *Path(descriptor["relative_path"]).parts
+        ).read_bytes()
+        for descriptor in descriptors
+    } == {b"first", b"second"}
+
+
+def test_distinct_authenticated_manifest_domains_coexist_for_one_symbol(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    historical = spool.open_symbol_sink(
+        context,
+        "EURUSD",
+        manifest_domain=spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN,
+    )
+    historical.put_json(
+        "run/precommit",
+        "historical_anchor_precommit",
+        {"phase": "historical"},
+    )
+    historical_receipt = historical.seal()
+
+    current = spool.open_symbol_sink(
+        context,
+        "EURUSD",
+        manifest_domain=spool.CURRENT_REFIT_MANIFEST_DOMAIN,
+    )
+    current.put_json(
+        "current-refit/cell",
+        "production_search_cell_plan",
+        {"phase": "current-refit"},
+    )
+    current_receipt = current.seal()
+
+    assert historical_receipt["symbol_manifest"]["relative_path"] != (
+        current_receipt["symbol_manifest"]["relative_path"]
+    )
+    historical_manifest = _verify(
+        context.root,
+        historical_receipt,
+        manifest_domain=spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN,
+    )
+    current_manifest = _verify(
+        context.root,
+        current_receipt,
+        manifest_domain=spool.CURRENT_REFIT_MANIFEST_DOMAIN,
+    )
+    assert historical_manifest["manifest_domain"] == (
+        spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN
+    )
+    assert current_manifest["manifest_domain"] == spool.CURRENT_REFIT_MANIFEST_DOMAIN
+    assert [item["artifact_id"] for item in historical_manifest["artifacts"]] == [
+        "run/precommit"
+    ]
+    assert [item["artifact_id"] for item in current_manifest["artifacts"]] == [
+        "current-refit/cell"
+    ]
+
+    with pytest.raises(
+        spool.AuthoritySpoolError,
+        match="COMPACT_RECEIPT_MANIFEST_DOMAIN_MISMATCH",
+    ):
+        _verify(
+            context.root,
+            historical_receipt,
+            manifest_domain=spool.CURRENT_REFIT_MANIFEST_DOMAIN,
+        )

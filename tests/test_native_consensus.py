@@ -19,6 +19,7 @@ from pm_native_consensus import (
     REFERENCE_GRAPH,
     REFERENCE_GRAPH_SHA256,
     REQUIRED_AUDIT_WINDOWS,
+    TECHNICAL_TERMINAL,
     WINDOW_ERROR,
     WINDOW_FAIL,
     WINDOW_PASS,
@@ -32,6 +33,7 @@ from pm_native_consensus import (
     production_consensus_schema_valid,
     validate_consensus_envelope,
     validate_reference_graph,
+    _binding_errors,
 )
 
 
@@ -61,6 +63,64 @@ def _states(evidence=EVIDENCE_PASS, integrity=INTEGRITY_PASS):
     }
 
 
+def test_terminal_technical_binding_is_pending_evidence_not_integrity_failure():
+    binding = {
+        "availability_state": TECHNICAL_TERMINAL,
+        "bars_sha256": None,
+        "provenance_sha256": "a" * 64,
+    }
+    assert _binding_errors(binding, "REFERENCE", unavailable_ok=True) == []
+
+    forged = dict(binding, bars_sha256="b" * 64)
+    assert _binding_errors(forged, "REFERENCE", unavailable_ok=True) == [
+        "CONSENSUS_REFERENCE_TECHNICAL_BAR_HASH_PRESENT"
+    ]
+
+
+def test_terminal_technical_reference_keeps_consensus_mechanically_valid():
+    target = "H1"
+    references = expected_reference_timeframes(target)
+    source = _binding("a")
+    reference_bindings = {
+        references[0]: {
+            "availability_state": TECHNICAL_TERMINAL,
+            "bars_sha256": None,
+            "provenance_sha256": "c" * 64,
+        },
+        references[1]: _binding("d"),
+    }
+    edge_reports = {}
+    for reference in references:
+        technical = reference == references[0]
+        edge_reports[reference] = build_edge_report(
+            symbol="EURUSD",
+            target_timeframe=target,
+            reference_timeframe=reference,
+            source_binding=source,
+            reference_binding=reference_bindings[reference],
+            window_states=_states(EVIDENCE_PENDING if technical else EVIDENCE_PASS),
+        )
+    envelope = build_consensus_envelope(
+        symbol="EURUSD",
+        target_timeframe=target,
+        source_binding=source,
+        reference_bindings=reference_bindings,
+        edge_reports=edge_reports,
+    )
+
+    assert envelope["status"] == WINDOW_PASS
+    assert (
+        validate_consensus_envelope(
+            envelope,
+            symbol="EURUSD",
+            target_timeframe=target,
+            source_binding=source,
+            reference_bindings=reference_bindings,
+        )
+        == []
+    )
+
+
 def _envelope(target="H1", overrides=None, unavailable=()):
     references = expected_reference_timeframes(target)
     source = _binding("a")
@@ -71,9 +131,7 @@ def _envelope(target="H1", overrides=None, unavailable=()):
     edge_reports = {}
     for reference in references:
         states = _states(
-            EVIDENCE_TERMINAL_UNAVAILABLE
-            if reference in unavailable
-            else EVIDENCE_PASS
+            EVIDENCE_TERMINAL_UNAVAILABLE if reference in unavailable else EVIDENCE_PASS
         )
         for window, state in ((overrides or {}).get(reference, {}) or {}).items():
             states[window] = dict(state)
@@ -136,13 +194,16 @@ def test_all_targets_survive_sorted_json_roundtrip(target):
     assert persisted_envelope["reference_timeframes"] == list(
         expected_reference_timeframes(target)
     )
-    assert validate_consensus_envelope(
-        persisted_envelope,
-        symbol="EURUSD",
-        target_timeframe=target,
-        source_binding=source,
-        reference_bindings=persisted_references,
-    ) == []
+    assert (
+        validate_consensus_envelope(
+            persisted_envelope,
+            symbol="EURUSD",
+            target_timeframe=target,
+            source_binding=source,
+            reference_bindings=persisted_references,
+        )
+        == []
+    )
 
     rebuilt = build_consensus_envelope(
         symbol="EURUSD",
@@ -154,13 +215,16 @@ def test_all_targets_survive_sorted_json_roundtrip(target):
             for reference in sorted(persisted_envelope["edges"])
         },
     )
-    assert validate_consensus_envelope(
-        json.loads(json.dumps(rebuilt, sort_keys=True)),
-        symbol="EURUSD",
-        target_timeframe=target,
-        source_binding=source,
-        reference_bindings=persisted_references,
-    ) == []
+    assert (
+        validate_consensus_envelope(
+            json.loads(json.dumps(rebuilt, sort_keys=True)),
+            symbol="EURUSD",
+            target_timeframe=target,
+            source_binding=source,
+            reference_bindings=persisted_references,
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -198,12 +262,18 @@ def test_window_consensus_truth_table(left, right, expected):
 
 
 def test_integrity_error_dominates_even_when_other_reference_passes():
-    assert consensus_window_state(
-        [
-            {"integrity_state": INTEGRITY_ERROR, "evidence_state": EVIDENCE_PENDING},
-            {"integrity_state": INTEGRITY_PASS, "evidence_state": EVIDENCE_PASS},
-        ]
-    ) == WINDOW_ERROR
+    assert (
+        consensus_window_state(
+            [
+                {
+                    "integrity_state": INTEGRITY_ERROR,
+                    "evidence_state": EVIDENCE_PENDING,
+                },
+                {"integrity_state": INTEGRITY_PASS, "evidence_state": EVIDENCE_PASS},
+            ]
+        )
+        == WINDOW_ERROR
+    )
     assert consensus_window_state([]) == WINDOW_ERROR
 
 
@@ -233,13 +303,16 @@ def test_clean_envelope_binds_both_edges_and_recomputes_validly():
         envelope["windows"][window]["status"] == WINDOW_PASS
         for window in REQUIRED_AUDIT_WINDOWS
     )
-    assert validate_consensus_envelope(
-        envelope,
-        symbol="EURUSD",
-        target_timeframe="H1",
-        source_binding=source,
-        reference_bindings=references,
-    ) == []
+    assert (
+        validate_consensus_envelope(
+            envelope,
+            symbol="EURUSD",
+            target_timeframe="H1",
+            source_binding=source,
+            reference_bindings=references,
+        )
+        == []
+    )
 
 
 def test_partition_mosaic_passes_when_each_window_has_one_supporting_edge():
@@ -256,13 +329,16 @@ def test_partition_mosaic_passes_when_each_window_has_one_supporting_edge():
     assert envelope["status"] == WINDOW_PASS
     assert envelope["windows"]["optimizer_train"]["status"] == WINDOW_PASS
     assert envelope["windows"]["tuning_validation"]["status"] == WINDOW_PASS
-    assert validate_consensus_envelope(
-        envelope,
-        symbol="EURUSD",
-        target_timeframe="H1",
-        source_binding=source,
-        reference_bindings=references,
-    ) == []
+    assert (
+        validate_consensus_envelope(
+            envelope,
+            symbol="EURUSD",
+            target_timeframe="H1",
+            source_binding=source,
+            reference_bindings=references,
+        )
+        == []
+    )
 
 
 def test_window_fails_only_when_both_references_are_terminal():
@@ -308,13 +384,16 @@ def test_fail_plus_pending_is_pending_without_a_passing_witness():
 def test_one_unavailable_reference_plus_one_pass_still_passes():
     envelope, source, references = _envelope(unavailable=("M30",))
     assert envelope["status"] == WINDOW_PASS
-    assert validate_consensus_envelope(
-        envelope,
-        symbol="EURUSD",
-        target_timeframe="H1",
-        source_binding=source,
-        reference_bindings=references,
-    ) == []
+    assert (
+        validate_consensus_envelope(
+            envelope,
+            symbol="EURUSD",
+            target_timeframe="H1",
+            source_binding=source,
+            reference_bindings=references,
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -323,7 +402,10 @@ def test_one_unavailable_reference_plus_one_pass_still_passes():
         ("top_status", "CONSENSUS_STATUS_DERIVATION_MISMATCH"),
         ("edge_hash", "CONSENSUS_EDGE_HASH_INVALID:M30"),
         ("orientation", "CONSENSUS_EDGE_TARGET_MISMATCH:H1:M30"),
-        ("window_projection", "CONSENSUS_WINDOW_EDGE_PROJECTION_MISMATCH:optimizer_train"),
+        (
+            "window_projection",
+            "CONSENSUS_WINDOW_EDGE_PROJECTION_MISMATCH:optimizer_train",
+        ),
         ("drop_edge", "CONSENSUS_EDGE_ROSTER_INVALID"),
     ],
 )

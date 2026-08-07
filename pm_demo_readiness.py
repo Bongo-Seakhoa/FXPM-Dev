@@ -199,6 +199,7 @@ _ROSTER_FIELDS = (
     "source_unavailable_cell_ids",
     "regime_unobserved_cell_ids",
     "no_local_winner_cell_ids",
+    "insufficient_evidence_cell_ids",
     "technical_cell_ids",
     "unsearched_cell_ids",
     "missing_observed_cell_ids",
@@ -851,6 +852,7 @@ def _partition_errors(
     *,
     requested_symbols: Sequence[str],
     selected_cells: Set[str],
+    native_universe: Any,
 ) -> List[str]:
     possible = {
         f"{symbol}|{timeframe}|{regime}"
@@ -886,8 +888,24 @@ def _partition_errors(
         seen.update(rosters[field])
     if seen != possible:
         errors.append("DEMO_AUTHORITY_CELL_PARTITION_INCOMPLETE")
+    # Only activation-authenticated terminal-technical cells may survive the
+    # raw authority verifier.  They are complete zero-attempt abstentions, not a
+    # whole-book veto.  Reconcile them independently here so a mocked or forged
+    # result cannot dress an ordinary failure as terminal evidence.
+    try:
+        expected_terminal_technical = {
+            f"{symbol}|{timeframe}|{regime}"
+            for symbol in requested_symbols
+            for timeframe in _TIMEFRAMES
+            if native_universe.cell_status(symbol, timeframe) == "technical_error"
+            for regime in _REGIMES
+        }
+    except Exception:
+        expected_terminal_technical = set()
+        errors.append("DEMO_AUTHORITY_NATIVE_TERMINAL_TECHNICAL_ROSTER_UNAVAILABLE")
+    if rosters["technical_cell_ids"] != expected_terminal_technical:
+        errors.append("DEMO_AUTHORITY_NATIVE_TERMINAL_TECHNICAL_ROSTER_MISMATCH")
     for field in (
-        "technical_cell_ids",
         "unsearched_cell_ids",
         "missing_observed_cell_ids",
     ):
@@ -1063,6 +1081,7 @@ def verify_demo_probation_authority(
             normalized,
             requested_symbols=requested_symbols,
             selected_cells=selected_cells,
+            native_universe=native_universe,
         )
     )
     if normalized.get("native_activation_id") != getattr(
@@ -1164,9 +1183,7 @@ def validate_demo_probation_readiness(
 
     requested_symbols = list(
         dict.fromkeys(
-            str(symbol).strip().upper()
-            for symbol in symbols
-            if str(symbol).strip()
+            str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()
         )
     )
     for error in _requested_symbol_errors(requested_symbols):
@@ -1310,7 +1327,12 @@ def validate_demo_probation_readiness(
         )
         if not native_universe.valid or not native_universe.explicit_contract:
             add("error", "demo_native_universe_invalid", "native authority invalid")
-        allowed = {"active", NATIVE_EVIDENCE_CANDIDATE, NATIVE_SOURCE_UNAVAILABLE}
+        allowed = {
+            "active",
+            NATIVE_EVIDENCE_CANDIDATE,
+            NATIVE_SOURCE_UNAVAILABLE,
+            "technical_error",
+        }
         if any(
             native_universe.cell_status(symbol, timeframe) not in allowed
             for symbol in requested_symbols

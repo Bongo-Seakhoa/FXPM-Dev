@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strategic Audit - Corrective Deep Pass</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --paper: #ffffff;
+  --ink: #111827;
+  --muted: #4b5563;
+  --line: #d9dee8;
+  --soft: #f8fafc;
+  --accent: #1f6feb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", Inter, Arial, sans-serif;
+  line-height: 1.58;
+}
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+article {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 34px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: auto;
+}
+h1, h2, h3, h4 {
+  line-height: 1.22;
+  margin: 1.5em 0 0.55em;
+}
+h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.1em;
+  font-size: 1.45rem;
+}
+h3 {
+  font-size: 1.13rem;
+}
+p {
+  margin: 0.75em 0;
+}
+ul, ol {
+  padding-left: 1.45rem;
+}
+li + li {
+  margin-top: 0.25rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.35rem;
+  font-size: 0.91rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #eef3f8;
+  font-weight: 650;
+}
+tr:nth-child(even) td {
+  background: var(--soft);
+}
+code {
+  background: #edf2f7;
+  border: 1px solid #d8e0ea;
+  border-radius: 4px;
+  padding: 0.08rem 0.28rem;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.92em;
+}
+pre {
+  overflow-x: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+a {
+  color: var(--accent);
+}
+blockquote {
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+</style>
+</head>
+<body>
+<main>
+<article>
+<h1>Strategic Audit - Corrective Deep Pass</h1>
+<p>Date: 2026-06-17<br>
+Agent: Codex<br>
+Partner agent: Claude Code<br>
+Scope: profitability, drawdown/recovery, methodology, scaling, execution realism, and internal consistency</p>
+<h2>Executive Verdict</h2>
+<p>The system is not disqualified because it is aggressive at approximately USD 22. That risk profile is intentional micro-account growth mode. The strategic issue is whether the aggression is measured, rewarded, repeatable, and capable of scaling toward a larger account.</p>
+<p>The codebase contains several strong pieces: account identity pinning, explicit split geometry, broker-aware tick PnL math, live min-lot hard-cap blocking, margin protection, cycle-drift/supervisor overlays, OOS artifact export, and false-discovery scaffolding. The deeper audit also found no off-by-one bug in the main bleeding-edge split. The latest-half and 50k pre-cutoff validation windows are placed as intended.</p>
+<p>The weaknesses are more subtle and more important than generic "high risk" warnings:</p>
+<ol>
+<li>Winner selection is not tested under the same sizing regime as current live execution. Discovery uses USD 10k / 1% / no cap-block semantics; live uses approximately USD 22 / 0.5% target / 25% cap / min-lot floor / blocking.</li>
+<li>The 50k validation window is geometrically correct, but it is also a model-selection surface. Its metrics are not clean post-selection evidence.</li>
+<li>The report/dashboard/engine metric layer is internally inconsistent, especially PF no-loss handling, Sharpe basis, expectancy units, recovery factor, and realized-vs-floating drawdown.</li>
+<li>High-drawdown trade root cause cannot be answered honestly yet because per-trade MAE/MFE and expected-vs-fill slippage are missing.</li>
+<li>The "aggressive now, conservative later" scaling thesis is not implemented as explicit account-size regimes. It currently depends on manual retuning.</li>
+</ol>
+<p>The strategic direction should be: keep the bleeding-edge philosophy and the micro-account growth intent, but add measurement and replay layers that prove when risk is paid for and when it is just noise, execution leakage, or untradeable min-lot exposure.</p>
+<h2>Evidence Base</h2>
+<h3>Exact Files Inspected</h3>
+<ul>
+<li><code>config.json</code></li>
+<li><code>pm_configs.json</code></li>
+<li><code>pm_core.py</code></li>
+<li><code>pm_pipeline.py</code></li>
+<li><code>pm_optuna.py</code></li>
+<li><code>pm_main.py</code></li>
+<li><code>pm_position.py</code></li>
+<li><code>pm_mt5.py</code></li>
+<li><code>pm_live_readiness.py</code></li>
+<li><code>pm_dashboard/analytics.py</code></li>
+<li><code>tools/benchmark.py</code></li>
+<li><code>tests/test_data_splitter.py</code></li>
+<li><code>tests/test_optimizer_hardening.py</code></li>
+<li><code>tests/test_backtester.py</code></li>
+<li><code>tests/test_position_sizing_edge_cases.py</code></li>
+<li><code>tests/test_margin_protection.py</code></li>
+<li><code>tests/test_dashboard_trade_enrichment.py</code></li>
+<li><code>tests/test_profitability_readiness_blueprint.py</code></li>
+<li><code>agent_audit/findings/F001-F005</code></li>
+<li><code>agent_audit/findings/F101-F113</code></li>
+<li><code>agent_audit/agents/claude_code.md</code></li>
+<li><code>agent_audit/agents/Codex.md</code></li>
+</ul>
+<h3>Exact Functions and Classes Inspected</h3>
+<ul>
+<li><code>pm_core.DataSplitter.get_workflow_indices</code></li>
+<li><code>pm_core.Backtester.run</code></li>
+<li><code>pm_core.Backtester._run_python_loop</code></li>
+<li><code>pm_core.Backtester._calculate_metrics</code></li>
+<li><code>pm_core._round_volume_numba</code></li>
+<li><code>pm_core.InstrumentSpec.calculate_tick_profit</code></li>
+<li><code>pm_core.InstrumentSpec.calculate_loss_at_stop</code></li>
+<li><code>pm_core.InstrumentSpec.round_volume</code></li>
+<li><code>pm_pipeline.ProductionPipeline.run_for_symbol</code></li>
+<li><code>pm_pipeline.RegimeOptimizer.optimize_symbol</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._compute_bucket_metrics</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._aggregate_purged_kfold_metrics</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._deflated_sharpe_ratio</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._build_false_discovery_evidence</code></li>
+<li><code>pm_optuna.HyperparameterOptimizer.optimize</code></li>
+<li><code>pm_main.ProductionLiveTrader._execute_entry</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_stop_loss_amount</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_position_risk_pct</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_open_drawdown_pct</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_realized_loss_pct</code></li>
+<li><code>pm_position.PositionCalculator.calculate_position_size</code></li>
+<li><code>pm_dashboard.analytics.compute_equity_curve</code></li>
+<li><code>pm_dashboard.analytics.compute_drawdown_curve</code></li>
+<li><code>pm_dashboard.analytics.compute_performance_metrics</code></li>
+<li><code>tools.benchmark.path_dependent_dd</code></li>
+<li><code>tools.benchmark.evaluate_winner</code></li>
+</ul>
+<h3>Historical Result Files and Logs Reviewed</h3>
+<ul>
+<li><code>pm_outputs/production_live/optimization_summary.csv</code></li>
+<li><code>pm_outputs/production_live/signal_ledger_202606.jsonl</code></li>
+<li><code>pm_outputs/production_live/oos_evidence/*.json</code></li>
+<li><code>pm_outputs/production_live/storage_state.json</code></li>
+<li><code>last_trade_log.json</code></li>
+<li><code>last_actionable_log.json</code></li>
+<li><code>logs/production_live/cycle_drift_state.json</code></li>
+<li><code>logs/institutional_supervisor_state.json</code></li>
+<li><code>logs/production_live/pm_20260607.log</code></li>
+<li><code>logs/production_live/pm_20260608.log</code></li>
+<li><code>logs/production_live/pm_20260609.log</code></li>
+<li><code>logs/production_live/pm_20260610.log</code></li>
+<li><code>logs/production_live/pm_20260611.log</code></li>
+<li><code>logs/production_live/pm_20260614.log</code></li>
+<li><code>logs/production_live/pm_20260617.log</code></li>
+<li><code>logs/production_live/live_trade_20260608_*.out.log</code></li>
+<li><code>logs/production_live/live_trade_20260608_*.err.log</code></li>
+<li><code>logs/production_live/bleeding_edge_retrain_20260609_*.out.log</code></li>
+<li><code>logs/production_live/bleeding_edge_retrain_20260609_*.err.log</code></li>
+</ul>
+<h3>Commands Run</h3>
+<ul>
+<li><code>python agent_audit\scripts\collect_audit_evidence.py</code></li>
+<li><code>python agent_audit\scripts\deep_consistency_audit.py</code></li>
+<li>targeted JSON validation for audited config/ledger artifacts</li>
+<li>targeted <code>rg</code> and PowerShell line reads across the code files above</li>
+<li><code>python -m pytest tests\test_backtester.py ... tests\test_profitability_readiness_blueprint.py -q</code> -&gt; 245 passed, 11 subtests passed</li>
+<li><code>python -m pytest tests\test_data_splitter.py tests\test_position_sizing_edge_cases.py tests\test_dashboard_trade_enrichment.py -q</code> -&gt; 35 passed</li>
+<li><code>python -m pytest tests\test_optimizer_hardening.py -q</code> -&gt; 75 passed, 2 Optuna experimental warnings</li>
+</ul>
+<p>Full command log: <code>agent_audit/COMMAND_LOG.md</code>.</p>
+<h2>Deep Internal Consistency Review</h2>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Intended Behavior</th>
+<th>Actual Code Behavior</th>
+<th>Evidence</th>
+<th>Consistent?</th>
+<th>Impact</th>
+<th>Required Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data loading</td>
+<td>One base-M5 workflow should define the calendar boundary for derived timeframes</td>
+<td>Pipeline loads base workflow and derives higher timeframes</td>
+<td><code>pm_pipeline.py:6465-6468</code></td>
+<td>Mostly yes</td>
+<td>Reduces timeframe boundary leakage</td>
+<td>Keep and expose fingerprint per cell</td>
+</tr>
+<tr>
+<td>Data splitting</td>
+<td>Latest half optimization plus 50k validation before cutoff</td>
+<td>Implemented: at 400k bars WFV <code>224700-274700</code>, embargo <code>274700-275000</code>, optimization <code>275000-400000</code></td>
+<td><code>deep_split_geometry.csv</code></td>
+<td>Yes</td>
+<td>Methodology geometry matches theory</td>
+<td>Preserve tests</td>
+</tr>
+<tr>
+<td>Strategy design</td>
+<td>Strategy candidates train on recent train segment only</td>
+<td>Optuna trains on <code>train_features</code>; validation evaluated separately</td>
+<td><code>pm_optuna.py:514-560</code></td>
+<td>Mostly yes</td>
+<td>No direct future leak found in objective training</td>
+<td>Keep</td>
+</tr>
+<tr>
+<td>Optimization</td>
+<td>Optimize for fresh market behavior</td>
+<td>Uses latest-half train features</td>
+<td><code>pm_pipeline.py:6560</code>, <code>6574</code></td>
+<td>Yes</td>
+<td>Matches bleeding-edge philosophy</td>
+<td>Keep</td>
+</tr>
+<tr>
+<td>Validation</td>
+<td>50k validation should check reliability without being training data</td>
+<td>It is non-overlapping but used to select/rank winners</td>
+<td><code>pm_pipeline.py:6593-6602</code>; <code>pm_optuna.py:545-567</code></td>
+<td>Partially</td>
+<td>Stored validation stats are selection-biased</td>
+<td>Add post-selection audit or penalty</td>
+</tr>
+<tr>
+<td>Backtesting</td>
+<td>Selected performance should reflect live account mode</td>
+<td>Backtest uses USD 10k/1% discovery risk/no live block semantics</td>
+<td><code>config.json:20-22</code>; <code>pm_core.py:80-103</code>; F110</td>
+<td>No</td>
+<td>Current live tradeability and drawdown path are not represented</td>
+<td>Add live-account replay</td>
+</tr>
+<tr>
+<td>Demo/live execution</td>
+<td>Fail closed on wrong account; safe order result handling</td>
+<td>Account pins and ambiguous-order reconciliation exist</td>
+<td><code>pm_live_readiness.py</code>; <code>pm_main.py:5428-5564</code></td>
+<td>Mostly yes</td>
+<td>Live switch is safer than credential swap alone</td>
+<td>Keep and verify terminal account</td>
+</tr>
+<tr>
+<td>Risk sizing</td>
+<td>Position size should mean the same across discovery, replay, and live</td>
+<td>Discovery risk, pipeline risk, and live risk are separate; backtest clamps min lot, live can block</td>
+<td><code>config.json:20-22</code>, <code>281-285</code>; F110/F113</td>
+<td>No</td>
+<td>Results can be interpreted under wrong risk basis</td>
+<td>Formalize regimes</td>
+</tr>
+<tr>
+<td>Trade filtering</td>
+<td>Filter trades that are untradeable or low edge at current balance</td>
+<td>Live blocks many min-lot cap breaches; promoted universe still includes them</td>
+<td><code>deep_consistency_summary.json</code></td>
+<td>Partially</td>
+<td>Noise and missed opportunity-cost analysis</td>
+<td>Add tradeability flags</td>
+</tr>
+<tr>
+<td>Metric calculation</td>
+<td>Same metric names should share definitions</td>
+<td>Engine/dashboard/tools differ on PF, Sharpe, expectancy, recovery</td>
+<td>F112; <code>deep_metric_definition_mismatches.csv</code></td>
+<td>No</td>
+<td>Operator can compare incompatible numbers</td>
+<td>Canonical metric contract</td>
+</tr>
+<tr>
+<td>Reporting</td>
+<td>Reports should state whether metrics are train, validation, OOS, live, or dashboard</td>
+<td>Previous reports mixed surfaces; revised reports separate them</td>
+<td>Audit workspace</td>
+<td>Partially</td>
+<td>Prior confidence was too generic</td>
+<td>Keep source labels</td>
+</tr>
+<tr>
+<td>Logging</td>
+<td>Logs should support root-cause diagnosis</td>
+<td>Action/risk logs exist; MAE/MFE and fill slippage absent</td>
+<td>F005/F107</td>
+<td>Partially</td>
+<td>Cannot classify high-drawdown trades</td>
+<td>Add fields</td>
+</tr>
+<tr>
+<td>Parameter selection</td>
+<td>Multiple testing and selection bias should be controlled</td>
+<td>DSR scaffolding exists; PBO unavailable for current cells; validation selection drives winners</td>
+<td><code>ledger_tradeable_cells.csv</code>; F002/F111</td>
+<td>Partially</td>
+<td>False confidence risk</td>
+<td>Enforce floors and audit slices</td>
+</tr>
+<tr>
+<td>Symbol/timeframe handling</td>
+<td>Symbol set should be coherent with active balance tier</td>
+<td>45 symbols/157 cells; high-notional symbols dominate min-lot blocks</td>
+<td><code>deep_risk_symbol_actions.csv</code></td>
+<td>No at USD 22</td>
+<td>Current account cannot act on full book evenly</td>
+<td>Add equity-tiered universe</td>
+</tr>
+<tr>
+<td>Balance/equity accounting</td>
+<td>Balance and equity drawdown should be distinct</td>
+<td>Backtest floating equity, live open DD, dashboard closed curve all coexist</td>
+<td><code>pm_core.py:5803-5816</code>; <code>pm_main.py:2824-2831</code>; <code>pm_dashboard/analytics.py:433-504</code></td>
+<td>Partially</td>
+<td>Drawdown/recovery narratives can conflict</td>
+<td>Report all three explicitly</td>
+</tr>
+<tr>
+<td>Drawdown accounting</td>
+<td>High-drawdown trades should be classifiable by root cause</td>
+<td>Account DD exists; per-trade MAE/MFE absent</td>
+<td>F107</td>
+<td>No</td>
+<td>Profitable pain vs bad risk cannot be proven</td>
+<td>Instrument MAE/MFE</td>
+</tr>
+<tr>
+<td>Recovery accounting</td>
+<td>Recovery should measure path after drawdown consistently</td>
+<td>Recovery factor differs between dashboard/tools and missing in engine</td>
+<td><code>pm_dashboard/analytics.py:660-661</code>; <code>tools/benchmark.py:61-87</code></td>
+<td>No</td>
+<td>Recovery-factor comparisons unreliable</td>
+<td>Add canonical engine recovery</td>
+</tr>
+</tbody>
+</table>
+<h2>Bleeding Edge Optimization Methodology Review</h2>
+<h3>1. My Understanding of the Intended Theory</h3>
+<p>The intended theory is coherent in outline:</p>
+<ul>
+<li>Use the full available dataset to define the symbol/strategy universe and the broad strategy context.</li>
+<li>Focus optimization on the most recent half of the active data because live edge decays and recent market behavior matters more than old regimes.</li>
+<li>Use approximately 50,000 bars before the latest-half cutoff as a reliability check so the optimizer is not blindly fitting only the newest data.</li>
+<li>Keep the production book fresh with retraining rather than pretending old long-history validation is always relevant.</li>
+<li>Accept that this is adaptive and aggressive, but require enough evidence that recent edge is not just noise.</li>
+</ul>
+<p>This is a legitimate philosophy for a fast-adapting trading system. The question is whether the implementation preserves the distinction between recency, validation, selection, and proof.</p>
+<h3>2. Actual Implementation in the Code</h3>
+<ul>
+<li><code>pm_core.DataSplitter.get_workflow_indices</code> implements <code>production_split_mode="bleeding_edge"</code>.</li>
+<li>Current config uses <code>max_bars=300000</code>, <code>active_universe_bars=250000</code>, <code>historical_stress_audit_bars=50000</code>, <code>active_stage2_pct=50</code>, <code>walk_forward_validation_bars=50000</code>, <code>oos_embargo_bars=300</code>, and <code>clean_holdout_pct=0</code>.</li>
+<li><code>pm_pipeline.ProductionPipeline.run_for_symbol</code> slices <code>active_features</code> from the optimization train window and <code>stage2_features</code> from WFV.</li>
+<li><code>pm_optuna.HyperparameterOptimizer.optimize</code> evaluates train metrics on train features and validation metrics on validation features, then scores via <code>scoring_fn(train_metrics, val_metrics)</code>.</li>
+<li><code>threadspark_selection_surface="validation"</code> causes the validation surface to feed final winner selection.</li>
+</ul>
+<h3>3. Data Window Verification</h3>
+<p>Verified with code and <code>agent_audit/data/deep_split_geometry.csv</code>.</p>
+<p>For 400,000 bars:</p>
+<table>
+<thead>
+<tr>
+<th>Window</th>
+<th style="text-align: right;">Start</th>
+<th style="text-align: right;">End</th>
+<th style="text-align: right;">Rows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>workflow_window</td>
+<td style="text-align: right;">100000</td>
+<td style="text-align: right;">400000</td>
+<td style="text-align: right;">300000</td>
+</tr>
+<tr>
+<td>historical_stress_audit</td>
+<td style="text-align: right;">100000</td>
+<td style="text-align: right;">150000</td>
+<td style="text-align: right;">50000</td>
+</tr>
+<tr>
+<td>active_universe</td>
+<td style="text-align: right;">150000</td>
+<td style="text-align: right;">400000</td>
+<td style="text-align: right;">250000</td>
+</tr>
+<tr>
+<td>walk_forward_validation</td>
+<td style="text-align: right;">224700</td>
+<td style="text-align: right;">274700</td>
+<td style="text-align: right;">50000</td>
+</tr>
+<tr>
+<td>embargo gap</td>
+<td style="text-align: right;">274700</td>
+<td style="text-align: right;">275000</td>
+<td style="text-align: right;">300</td>
+</tr>
+<tr>
+<td>optimization_train</td>
+<td style="text-align: right;">275000</td>
+<td style="text-align: right;">400000</td>
+<td style="text-align: right;">125000</td>
+</tr>
+<tr>
+<td>clean_holdout</td>
+<td style="text-align: right;">400000</td>
+<td style="text-align: right;">400000</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+<p>The latest-half selection is correct: 50% of 250k active bars = 125k optimization train bars. The 50k validation window is before the optimization cutoff and separated by the configured 300-bar embargo. No off-by-one or forward overlap was found in the splitter tests.</p>
+<h3>4. Leakage and Overfitting Risks</h3>
+<p>There is no evidence that Optuna trains directly on future validation bars. The leakage risk is subtler: validation is used for selection. Once the final winner is chosen using the validation surface, the stored validation metrics are no longer an unbiased out-of-sample estimate. They are the best-looking validation result after a search process.</p>
+<p>This matters because current evidence shows:</p>
+<ul>
+<li>157 tradeable cells.</li>
+<li>75/157 have fewer than 20 validation trades.</li>
+<li>147/157 have validation Sharpe above 10.</li>
+<li>all 157 show <code>pbo_status=not_available</code>.</li>
+<li>OOS manifests exist for 93 symbols, but current promoted cells do not have active PBO status in the ledger evidence.</li>
+</ul>
+<p>That pattern is not proof that the system is bad. It is proof that the reported validation evidence is too optimistic to stand alone.</p>
+<h3>5. Statistical Strengths</h3>
+<ul>
+<li>Recency focus is appropriate if the strategy edge decays over time.</li>
+<li>The split geometry is explicit and tested.</li>
+<li>The validation window is before, not after, the optimized latest-half segment, matching the user's intended theory.</li>
+<li>The 300-bar embargo reduces immediate boundary contamination.</li>
+<li>False-discovery and DSR scaffolding exist.</li>
+<li>OOS evidence export exists across a broad candidate surface.</li>
+<li>Historical stress audit scaffolding exists.</li>
+</ul>
+<h3>6. Statistical Weaknesses</h3>
+<ul>
+<li>The validation window is a selection surface, not pristine OOS.</li>
+<li>Validation samples are often small, so high Sharpe/PF can be noisy.</li>
+<li><code>clean_holdout_pct=0.0</code> leaves no untouched post-selection measurement in production split mode.</li>
+<li>PBO status is unavailable for the current tradeable cells.</li>
+<li>The USD 10k discovery basis does not model the current USD 22 live path.</li>
+<li>Sharpe/Sortino are vulnerable to sparse-trade annualization artifacts.</li>
+<li>The method does not yet quantify parameter decay directly; it assumes decay and retrains.</li>
+<li>The system does not yet test whether high-drawdown trades are compensated by future return because MAE/MFE is missing.</li>
+</ul>
+<h3>7. Better Version of This Methodology</h3>
+<p>Keep the bleeding-edge philosophy, but make the evidence hierarchy explicit:</p>
+<ol>
+<li>Use latest-half optimization for candidate adaptation.</li>
+<li>Use the 50k pre-cutoff validation window as a selection/ranking surface, clearly labeled as such.</li>
+<li>Add a post-selection audit that is never used to choose the winner. It can be small and non-gating at first; its purpose is to measure decay.</li>
+<li>Add live-account replay at multiple balances: USD 22, USD 200, USD 1k, USD 5k, USD 10k.</li>
+<li>Add selection-bias penalties: validation trade-count floor, deflated Sharpe with candidate count, and PBO or purged folds where feasible.</li>
+<li>Add MAE/MFE and slippage attribution so drawdown and execution cost can be evaluated as paid or unpaid risk.</li>
+<li>Track live-vs-validation drift by symbol/timeframe/regime, not only aggregate account performance.</li>
+</ol>
+<p>This keeps freshness while reducing false confidence.</p>
+<h3>8. Code-Level Changes Needed</h3>
+<ul>
+<li>Add a <code>live_account_replay</code> or <code>account_regime_replay</code> mode around <code>Backtester</code> or a companion replay engine that applies <code>risk_per_trade_pct</code>, <code>max_risk_pct</code>, min-lot block rules, margin checks, and blocked-trade records.</li>
+<li>Add <code>mae_pips</code>, <code>mfe_pips</code>, <code>mae_r</code>, and <code>mfe_r</code> to backtest trade records in <code>pm_core.Backtester._run_python_loop</code> and the Numba result conversion path.</li>
+<li>Add <code>expected_entry_price</code>, <code>filled_entry_price</code>, <code>entry_slippage_pips</code>, and <code>entry_slippage_r</code> to live/actionable logs in <code>pm_main._execute_entry</code>.</li>
+<li>Add canonical metric functions shared by <code>pm_core</code>, <code>pm_dashboard/analytics.py</code>, <code>pm_pipeline.py</code>, and <code>tools/benchmark.py</code>.</li>
+<li>Fix dashboard profit factor for no-loss samples.</li>
+<li>Rename/label validation metrics as <code>selection_validation_*</code> when <code>threadspark_selection_surface="validation"</code>.</li>
+<li>Add <code>post_selection_audit_metrics</code> beside <code>val_metrics</code> and <code>holdout_metrics</code>.</li>
+<li>Add explicit account-size regimes to config and startup logging.</li>
+</ul>
+<h3>9. Validation Plan</h3>
+<ol>
+<li>Recompute current promoted cells under USD 22 replay with min-lot/cap/block semantics. Compare trade count, blocked count, PF, return/DD, Sharpe, Sortino, recovery factor, and max DD against USD 10k discovery results.</li>
+<li>Repeat replay at USD 200, USD 1k, USD 5k, and USD 10k to identify transition points where the current static risk profile stops being appropriate.</li>
+<li>Add MAE/MFE instrumentation and bucket trades into profitable pain, bad risk, poor entry timing, poor exit management, and regime mismatch.</li>
+<li>Apply validation trade-count floors such as 20 and 30 to current 157 cells and measure retained trade flow.</li>
+<li>Add a non-gating post-selection audit slice for one bounded symbol set first, then compare live/demo decay against it.</li>
+<li>Stress current winners with observed entry slippage once fill attribution exists.</li>
+<li>Only after the replay/audit layer agrees with live/demo behavior should these gates be allowed to change production selection.</li>
+</ol>
+<h2>Account-Size Regime Assessment</h2>
+<p>The code has static risk settings:</p>
+<ul>
+<li>Pipeline <code>initial_capital=10000</code></li>
+<li>Pipeline <code>risk_per_trade_pct=1.5</code></li>
+<li>Discovery <code>discovery_risk_per_trade_pct=1.0</code></li>
+<li>Live position <code>risk_per_trade_pct=0.5</code></li>
+<li>Live hard cap <code>max_risk_pct=25.0</code></li>
+<li>Total open risk cap <code>75.0</code></li>
+<li>Daily/session/weekly/open-DD hard blocks <code>50/40/60/50</code></li>
+<li><code>live_min_account_equity=20</code></li>
+</ul>
+<p>This is not an explicit regime system. At USD 22 the aggression is intentional. At USD 1k or USD 10k, the same caps are no longer obviously intentional. The code should support:</p>
+<table>
+<thead>
+<tr>
+<th>Regime</th>
+<th>Example Trigger</th>
+<th>Purpose</th>
+<th>Risk Posture</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Micro-account growth mode</td>
+<td>Equity &lt; USD 200</td>
+<td>Accept high percentage risk for account growth</td>
+<td>Aggressive, but measured</td>
+</tr>
+<tr>
+<td>Intermediate account mode</td>
+<td>USD 200-2k</td>
+<td>Reduce min-lot distortion and widen symbol access carefully</td>
+<td>Moderate</td>
+</tr>
+<tr>
+<td>Full safety mode</td>
+<td>USD 2k-10k+</td>
+<td>Use conventional caps and portfolio controls</td>
+<td>Conservative relative to micro mode</td>
+</tr>
+<tr>
+<td>Capital-preservation mode</td>
+<td>New equity high or larger capital</td>
+<td>Protect accumulated gains</td>
+<td>Lower risk and tighter DD</td>
+</tr>
+<tr>
+<td>Drawdown recovery mode</td>
+<td>Equity below peak by threshold</td>
+<td>Preserve optionality and avoid revenge-churn</td>
+<td>Lower frequency, tighter filters</td>
+</tr>
+</tbody>
+</table>
+<p>The strategic value is not simply lowering risk. It is making the growth thesis executable without relying on a manual retune at the exact moment the account scales.</p>
+<h2>Value Leakage Map</h2>
+<table>
+<thead>
+<tr>
+<th>Leakage Source</th>
+<th>Evidence</th>
+<th>Profitability Impact</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Selection metrics not modeled at live balance</td>
+<td>F110; <code>deep_consistency_summary.json</code></td>
+<td>Winners may be valid at USD 10k but untradeable/noisy at USD 22</td>
+<td>Live-account replay</td>
+</tr>
+<tr>
+<td>Validation is selection-biased</td>
+<td>F111; 147/157 Sharpe &gt;10; PBO unavailable</td>
+<td>Overstates edge and durability</td>
+<td>Post-selection audit/penalty</td>
+</tr>
+<tr>
+<td>Entry/TP slippage not attributed</td>
+<td>F005</td>
+<td>Thin-edge cells may leak profit live</td>
+<td>Fill-slippage logs and stress</td>
+</tr>
+<tr>
+<td>Metric definition mismatch</td>
+<td>F112</td>
+<td>Bad operational decisions from inconsistent reports</td>
+<td>Canonical metrics</td>
+</tr>
+<tr>
+<td>No MAE/MFE</td>
+<td>F107</td>
+<td>Cannot remove bad drawdown without killing good pain</td>
+<td>Instrument excursions</td>
+</tr>
+<tr>
+<td>Static risk profile</td>
+<td>F113</td>
+<td>Micro-account settings can persist into larger capital</td>
+<td>Account-size regimes</td>
+</tr>
+<tr>
+<td>High-notional symbol tradeability</td>
+<td>F003/F103/F110; XAUGBP/US100/DE30 blocks</td>
+<td>Opportunity cost and noisy action logs</td>
+<td>Balance-tier symbol filters</td>
+</tr>
+</tbody>
+</table>
+<h2>Prioritized Recommendations</h2>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Recommendation</th>
+<th>Why It Comes First</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P0</td>
+<td>Build live-account replay at USD 22/USD 200/USD 1k/USD 5k/USD 10k</td>
+<td>Directly tests whether aggressive scaling is rewarded under actual live constraints</td>
+<td>F110, F003</td>
+</tr>
+<tr>
+<td>P0</td>
+<td>Add MAE/MFE and expected-vs-fill slippage instrumentation</td>
+<td>Required to answer high-drawdown root cause and execution leakage</td>
+<td>F005, F107</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Canonicalize metrics across engine/dashboard/pipeline/tools</td>
+<td>Current reports can contradict selection engine</td>
+<td>F112</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Add post-selection audit or selection-bias penalty</td>
+<td>Keeps bleeding edge while reducing false confidence</td>
+<td>F002, F111</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Add explicit account-size regimes</td>
+<td>Makes the USD 22-to-USD 10k scaling plan real in code</td>
+<td>F113</td>
+</tr>
+<tr>
+<td>P2</td>
+<td>Add equity-tiered symbol/timeframe filters</td>
+<td>Removes currently untradeable cells without rejecting the full strategy</td>
+<td>F003, F103</td>
+</tr>
+<tr>
+<td>P2</td>
+<td>Add broker-spec parity reports for tick/pip/margin</td>
+<td>Protects PnL/risk math across CFDs, metals, indices, crypto</td>
+<td>Technical audit</td>
+</tr>
+</tbody>
+</table>
+<h2>Collaboration Status</h2>
+<table>
+<thead>
+<tr>
+<th>Finding</th>
+<th>Found By</th>
+<th>Partner Review</th>
+<th>Final Position</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>F001-F004</td>
+<td>Codex</td>
+<td>Claude Code agreed</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F005</td>
+<td>Codex</td>
+<td>Claude Code agreed</td>
+<td>Confirmed; execution-cost sibling of F110/F107</td>
+</tr>
+<tr>
+<td>F101-F109</td>
+<td>Claude Code</td>
+<td>Codex agreed</td>
+<td>Confirmed with scale-aware reframing</td>
+</tr>
+<tr>
+<td>F110</td>
+<td>Claude Code</td>
+<td>Codex agreed</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F111</td>
+<td>Claude Code</td>
+<td>Codex agreed</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F112</td>
+<td>Claude Code</td>
+<td>Codex agreed</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F113</td>
+<td>Claude Code</td>
+<td>Codex agreed</td>
+<td>Confirmed</td>
+</tr>
+</tbody>
+</table>
+<p>The strongest partner finding was F111: the windowing math is correct, but validation is a selection surface. Codex agrees and treats that as the central methodology correction. The strongest Codex extension is F005, and Claude Code agreed with it: execution slippage attribution is not yet strong enough to separate strategy decay from fill-quality leakage.</p>
+<h2>Assumptions</h2>
+<ul>
+<li>The approximately USD 22 account risk profile is intentional.</li>
+<li><code>config.json</code> and <code>pm_configs.json</code> dirty state predated this audit and was not reverted.</li>
+<li>The current work product is audit documentation and read-only evidence scripts, not production behavior changes.</li>
+<li>Historical demo success is relevant evidence, but not enough to prove USD 22 live behavior unless replayed with live sizing/cap semantics.</li>
+<li>No live trades were placed during the audit.</li>
+</ul>
+<h2>Resolved Operator Decisions</h2>
+<p>The open strategy questions were answered in <code>agent_audit/QUESTIONS.md</code>. The strategic defaults are now:</p>
+<ul>
+<li>Keep the USD 22 account in aggressive micro-account growth mode.</li>
+<li>Keep most of the account working; do not implement account-size regimes as default trade suppressors.</li>
+<li>Keep the 25% live hard cap in micro-account mode.</li>
+<li>Keep all 100 valid-parameter symbols eligible, including high-notional symbols that may frequently block on min-lot/cap.</li>
+<li>Treat FBS demo specs as matching real live specs unless future read-only parity checks show drift.</li>
+<li>Use the latest completed demo/evaluation run before the current run as the primary historical performance source for risk-bucket analysis.</li>
+<li>Use timeframe-aware validation trade-count floors; D1 cells can have lower trade counts if supported by stronger stability/R evidence.</li>
+<li>Use a composite high-drawdown promotion control once MAE/MFE exists, so profitable pain is not removed just because it is uncomfortable.</li>
+</ul>
+</article>
+</main>
+</body>
+</html>

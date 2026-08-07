@@ -1,12 +1,117 @@
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 import pm_authoritative_search_execution as execution
+import pm_production_search_planner as search_planner
 import pm_winner_selection as winner
+
+
+def _d1_frame(periods: int) -> pd.DataFrame:
+    index = pd.date_range("2022-01-24", periods=periods, freq="D", tz="UTC")
+    close = pd.Series(
+        [1.0 + ordinal / 1000 for ordinal in range(periods)],
+        index=index,
+    )
+    return pd.DataFrame(
+        {
+            "Open": close,
+            "High": close + 0.01,
+            "Low": close - 0.01,
+            "Close": close,
+        },
+        index=index,
+    )
+
+
+def _prefix_product(frame: pd.DataFrame) -> SimpleNamespace:
+    return SimpleNamespace(
+        native_prefix={
+            "activation_id": "activation-test",
+            "activation_manifest_sha256": "a" * 64,
+            "artifact_sha256": "b" * 64,
+            "prefix_content_sha256": "c" * 64,
+            "prefix_start_utc": frame.index[0].isoformat(),
+            "prefix_end_exclusive_utc": (
+                frame.index[-1] + pd.Timedelta(days=1)
+            ).isoformat(),
+            "prefix_rows": len(frame),
+        }
+    )
+
+
+def test_all_warmup_prefix_builds_authenticated_zero_regime_support() -> None:
+    frame = _d1_frame(47)
+    detector = execution.pm_regime.MarketRegimeDetector(
+        execution.pm_regime.DEFAULT_PARAMS_BY_TIMEFRAME["D1"]
+    )
+    surface = detector.compute_regime_scores(frame)
+    assert surface["REGIME_WARMUP"].all()
+
+    product = _prefix_product(frame)
+    support = execution._build_train_regime_support(
+        frame=frame,
+        surface=surface,
+        product=product,
+        symbol="XAUGBP",
+        timeframe="D1",
+        parameters_sha256="d" * 64,
+        detector_code_sha256="e" * 64,
+    )
+
+    assert support["eligible_rows"] == 0
+    assert support["counts"] == {regime: 0 for regime in execution.book.REGIME_ORDER}
+    assert support["observed_regimes"] == []
+    assert support["unobserved_regimes"] == list(execution.book.REGIME_ORDER)
+    assert support["first_ts"] is None
+    assert support["last_ts"] is None
+    assert support["vector_sha256"] == hashlib.sha256(
+        b"fxpm.regime-live-labels-nul/v1\x00"
+    ).hexdigest()
+
+    invalid = surface.copy()
+    invalid.loc[frame.index[:2], "REGIME_WARMUP"] = False
+    invalid.loc[frame.index[1], "REGIME_LIVE"] = None
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="REGIME_SUPPORT_LABEL_MISSING",
+    ):
+        execution._build_train_regime_support(
+            frame=frame,
+            surface=invalid,
+            product=product,
+            symbol="XAUGBP",
+            timeframe="D1",
+            parameters_sha256="d" * 64,
+            detector_code_sha256="e" * 64,
+        )
+
+
+def test_d1_detector_threshold_still_builds_nonempty_regime_support() -> None:
+    frame = _d1_frame(110)
+    detector = execution.pm_regime.MarketRegimeDetector(
+        execution.pm_regime.DEFAULT_PARAMS_BY_TIMEFRAME["D1"]
+    )
+    surface = detector.compute_regime_scores(frame)
+    support = execution._build_train_regime_support(
+        frame=frame,
+        surface=surface,
+        product=_prefix_product(frame),
+        symbol="THRESHOLD",
+        timeframe="D1",
+        parameters_sha256="d" * 64,
+        detector_code_sha256="e" * 64,
+    )
+
+    assert support["eligible_rows"] == 9
+    assert sum(support["counts"].values()) == 9
+    assert support["observed_regimes"]
+    assert support["first_ts"] is not None
+    assert support["last_ts"] is not None
 
 
 def _verified_attempt_with_folds(
@@ -88,6 +193,30 @@ def test_stage_byte_bound_fails_without_leaving_partial_file(tmp_path) -> None:
     execution._cleanup_stage(stage, [])
 
 
+def test_shared_fit_adequacy_preserves_train_tuning_methodological_floor() -> None:
+    rejected_required = execution.minimum_fold_fit_rows(
+        recipe_warmup_bars=50,
+        dependency_warmup_bars=943,
+    )
+    admitted_required = execution.minimum_fold_fit_rows(
+        recipe_warmup_bars=50,
+        dependency_warmup_bars=545,
+    )
+    assert rejected_required == 1_890
+    assert admitted_required == 1_094
+    failed_canary_fit_rows = (1_296, 1_296, 1_298, 1_296)
+    assert all(rows < rejected_required for rows in failed_canary_fit_rows)
+    assert all(rows >= admitted_required for rows in failed_canary_fit_rows)
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="DEPENDENCY_WARMUP_INVALID",
+    ):
+        execution.minimum_fold_fit_rows(
+            recipe_warmup_bars=50,
+            dependency_warmup_bars=-1,
+        )
+
+
 def test_signed_dependency_warmup_controls_every_partition() -> None:
     opens = pd.date_range("2020-01-01T00:00:00Z", periods=30, freq="h")
     frame = pd.DataFrame(
@@ -129,6 +258,165 @@ def test_signed_dependency_warmup_controls_every_partition() -> None:
     assert final.scored_start_utc == "2020-01-02T01:00:00Z"
 
 
+def test_path_state_is_computed_once_on_full_prefix_then_sliced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opens = pd.date_range("2020-01-01T00:00:00Z", periods=9, freq="h")
+    frame = pd.DataFrame(
+        {
+            "Open": 1.0,
+            "High": 1.1,
+            "Low": 0.9,
+            "Close": 1.0,
+            "_BAR_CLOSE_TS": opens + pd.Timedelta(hours=1),
+            "REGIME_LIVE": "TREND",
+        },
+        index=opens,
+    )
+    calls = {"features": 0, "signals": 0}
+
+    def compute(source, _strategy, **_kwargs):
+        calls["features"] += 1
+        return source.copy(deep=True)
+
+    class PathStrategy:
+        def generate_signals(self, features, _symbol):
+            calls["signals"] += 1
+            return pd.Series(
+                (pd.RangeIndex(len(features)).to_numpy() % 3) - 1,
+                index=features.index,
+            )
+
+    monkeypatch.setattr(
+        execution.FeatureComputer,
+        "compute_for_strategy",
+        compute,
+    )
+    surface = execution._build_full_prefix_strategy_surface(
+        frame=frame,
+        strategy=PathStrategy(),
+        symbol="EURUSD",
+        timeframe="H1",
+    )
+    partition_frame = frame.iloc[5:].copy(deep=True)
+    partition = execution._PartitionSlice(
+        role="final_lockbox",
+        frame=partition_frame,
+        warmup_bars=1,
+        scored_start_utc=opens[6].isoformat(),
+        end_exclusive_utc=(opens[-1] + pd.Timedelta(hours=1)).isoformat(),
+        geometry_receipt={},
+    )
+    _, sliced = execution._slice_full_prefix_strategy_surface(
+        partition=partition,
+        full_prefix_surface=surface,
+    )
+
+    assert calls == {"features": 1, "signals": 1}
+    assert sliced.tolist() == [1, -1, 0, 1]
+    assert sliced.tolist() != [-1, 0, 1, -1]
+
+
+def test_cost_stress_adversity_plan_is_source_frozen_and_partition_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opens = pd.date_range("2020-01-01T00:00:00Z", periods=96, freq="h")
+    frame = pd.DataFrame(
+        {
+            "Open": 1.1,
+            "High": 1.2,
+            "Low": 1.0,
+            "Close": 1.1,
+            "Volume": 100,
+            "Spread": 8.0,
+            "_BAR_CLOSE_TS": opens + pd.Timedelta(hours=1),
+            "REGIME_LIVE": "TREND",
+        },
+        index=opens,
+    )
+    fold = {
+        "role": "CAUSAL_ROLLING_ORIGIN_INNER",
+        "fold_id": "horizon-fold",
+        "validation_warmup_start_utc": opens[0].isoformat(),
+        "validation_start_utc": opens[24].isoformat(),
+        "validation_end_exclusive_utc": (opens[-1] + pd.Timedelta(hours=1)).isoformat(),
+    }
+    attempts = tuple(
+        execution._VerifiedAttempt(
+            ordinal=ordinal,
+            plan_attempt={
+                "attempt_id": f"horizon-attempt-{ordinal}",
+                "status": "PLANNED",
+            },
+            candidate={"folds": [fold]},
+            trial={},
+            artifacts=SimpleNamespace(
+                refit_recipe={"data_requirements": {"warmup_bars": 2}}
+            ),
+        )
+        for ordinal in range(2)
+    )
+    winner_fold = {
+        "anchor_as_of_utc": opens[24].isoformat(),
+        "oos_start_date_utc": opens[24].date().isoformat(),
+        "oos_end_date_utc": opens[-1].date().isoformat(),
+    }
+    fitted = SimpleNamespace(
+        _frame=frame,
+        instrument_spec=execution.InstrumentSpec(
+            symbol="EURUSD",
+            pip_position=4,
+            spread_avg=2.3,
+            point=0.00001,
+            digits=5,
+        ),
+    )
+    calls: list[str] = []
+    original = execution._partition_cost_attestation
+
+    def counted(**kwargs):
+        calls.append(str(kwargs["backtester"].config.backtest_spread_mode))
+        return original(**kwargs)
+
+    monkeypatch.setattr(execution, "_partition_cost_attestation", counted)
+    plan = execution._build_cost_stress_adversity_plan(
+        attempts=attempts,
+        fold_plan=(winner_fold,),
+        plan_body={
+            "cell": {
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "regime": "TREND",
+            },
+            "derived_dependency_geometry": {"warmup_bars": 2},
+        },
+        fitted=fitted,
+        config=execution.PipelineConfig(
+            use_spread=True,
+            use_slippage=False,
+            use_commission=False,
+            swap_model_enabled=False,
+            backtest_spread_mode="conservative_max",
+            oos_evidence_execution_stress_mode="stress_p95",
+        ),
+    )
+
+    assert plan["row_count"] == 2
+    assert plan["rows_sha256"] == execution._sha256(plan["rows"])
+    assert calls == ["conservative_max", "stress_p95"]
+    first, second = plan["rows"]
+    assert first["attempt_ordinal"] == 0
+    assert second["attempt_ordinal"] == 1
+    assert (
+        first["final_partition_geometry_receipt_sha256"]
+        == second["final_partition_geometry_receipt_sha256"]
+    )
+    assert first["base_spread_values_sha256"] == (first["stress_spread_values_sha256"])
+    assert first["expected_adversity_status"] == (
+        execution.raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
+    )
+
+
 def test_process_rejection_is_typed_nontechnical_abstention() -> None:
     attempt = execution._VerifiedAttempt(
         ordinal=4,
@@ -150,6 +438,79 @@ def test_process_rejection_is_typed_nontechnical_abstention() -> None:
     assert outcome.kind is execution.SearchOutcomeKind.EXPECTED_INELIGIBLE
     assert outcome.reason_code == "SOURCE_BOUNDARY_SHORTFALL"
     assert outcome.evidence["decision_was_pre_search"] is True
+
+
+def test_state_context_rejection_evidence_carries_exact_frozen_bounds() -> None:
+    disposition_body = {
+        "schema_version": "fxpm.production-trial-state-context-disposition.v1",
+        "candidate_id": "candidate",
+        "candidate_definition_sha256": "b" * 64,
+        "state_requirement_sha256": "c" * 64,
+        "required_context_bars": 3_882,
+        "selected_context_bars": 943,
+        "status": "PROCESS_REJECTED",
+        "reason_code": "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL",
+    }
+    disposition = {
+        **disposition_body,
+        "disposition_sha256": execution._sha256(disposition_body),
+    }
+    attempt = execution._VerifiedAttempt(
+        ordinal=44,
+        plan_attempt={
+            "attempt_id": "horizon-attempt",
+            "status": "PROCESS_REJECTED",
+            "reason_code": "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL",
+        },
+        candidate={"candidate_id": "candidate"},
+        trial={
+            "trial_id": "trial",
+            "parameter_set_sha256": "a" * 64,
+            "state_context_disposition": disposition,
+        },
+        artifacts=SimpleNamespace(winner_process={"strategy_family": "KAMA_TREND"}),
+    )
+    outcome = execution._process_rejection_outcome(
+        attempt=attempt,
+        symbol="EURUSD",
+        timeframe="D1",
+        regime="TREND",
+    )
+
+    assert outcome.kind is execution.SearchOutcomeKind.EXPECTED_INELIGIBLE
+    assert outcome.reason_code == "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+    assert outcome.evidence["required_context_bars"] == 3_882
+    assert outcome.evidence["selected_context_bars"] == 943
+    assert outcome.evidence["state_requirement_sha256"] == "c" * 64
+
+
+def test_canary_failure_diagnostic_preserves_exact_stress_tuple() -> None:
+    exc = execution.AuthoritativeSearchExecutionError(
+        "FROZEN_PATH_COST_STRESS_FAILED",
+        (
+            "0",
+            "0",
+            "FrozenPathCostStressError",
+            "STRESS_NOT_NUMERICALLY_ADVERSE:stress_p95:genuine evidence required",
+        ),
+    )
+
+    diagnostic = execution._bounded_canary_failure_diagnostic(
+        exc,
+        attempted_trials_exact=128,
+    )
+
+    assert diagnostic == {
+        "exception_type": "FrozenPathCostStressError",
+        "failure_details": (
+            "0",
+            "0",
+            "FrozenPathCostStressError",
+            "STRESS_NOT_NUMERICALLY_ADVERSE:stress_p95:genuine evidence required",
+        ),
+        "attempt_ordinal": 0,
+        "fold_ordinal": 0,
+    }
 
 
 def test_winner_evidence_roles_are_derived_from_sealed_horizon_status() -> None:
@@ -182,6 +543,110 @@ def test_release_contract_binds_all_execution_dependencies() -> None:
     }
     assert all(
         len(value) == 64 for value in contract["dependency_source_sha256"].values()
+    )
+
+
+def test_source_identity_uses_the_raw_winner_trade_power_policy_owner() -> None:
+    from tests.test_trade_power import _source_contract
+
+    assert execution.raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS == 8
+    assert execution._source_identity(_source_contract()) == (
+        "3170012d89a064587cd5abbc3ab40677c7a5e6533124fa5ad921cd48337e1454"
+    )
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="TRADE_POWER_SOURCE_CONTRACT_INVALID",
+    ):
+        execution._source_identity({})
+
+
+def test_native_z_cutoff_is_adapted_to_book_canonical_utc() -> None:
+    source = book.create_historical_source_group_decision(
+        symbol="EURUSD",
+        timeframe="D1",
+        availability=book.AVAILABLE,
+        reason_code="AUTHENTICATED_NATIVE_PREFIX_AVAILABLE",
+        source_contract_sha256="1" * 64,
+        source_group_evidence_sha256="2" * 64,
+        activation_id="activation-1",
+        activation_manifest_sha256="3" * 64,
+        native_source_sha256="4" * 64,
+        acquisition_attempts_exact=1,
+    )
+    assert source is not None
+
+    cutoff = execution._book_canonical_utc(
+        "2024-06-08T00:00:00Z",
+        "REGIME_DETECTOR_CUTOFF_INVALID",
+    )
+    assert cutoff == "2024-06-08T00:00:00+00:00"
+    record = book.create_regime_detector_record(
+        source_group_decision=source,
+        fit_cutoff_utc=cutoff,
+        detector_version=execution.REGIME_FIT_POLICY_VERSION,
+        detector_code_sha256=execution.pm_regime.detector_code_sha256(),
+        parameters=execution._default_regime_parameters("D1"),
+    )
+    assert record is not None
+    assert record["fit_cutoff_utc"] == cutoff
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="REGIME_DETECTOR_CUTOFF_INVALID",
+    ):
+        execution._book_canonical_utc(
+            "2024-06-08T00:00:00",
+            "REGIME_DETECTOR_CUTOFF_INVALID",
+        )
+
+
+def test_canary_prefix_binding_uses_requested_cutoff_across_weekend_gap() -> None:
+    source_accessed_at = "2026-07-22T16:59:43Z"
+    request = {
+        "symbol": "EURUSD",
+        "timeframe": "D1",
+        "activation_id": "activation-1",
+        "activation_manifest_sha256": "a" * 64,
+        "anchor": {"selection_cutoff_utc": "2024-06-09T00:00:00Z"},
+    }
+    native = {
+        "source_accessed_at_utc": source_accessed_at,
+        "symbol": "EURUSD",
+        "timeframe": "D1",
+        # Friday's authenticated D1 bar closes before the Sunday cutoff.
+        "prefix_end_exclusive_utc": "2024-06-08T00:00:00Z",
+        "activation_id": "activation-1",
+        "activation_manifest_sha256": "a" * 64,
+    }
+    index = {"cutoff_utc": "2024-06-09T00:00:00Z"}
+
+    assert execution._canary_native_prefix_matches_request(
+        native,
+        index=index,
+        request_body=request,
+        source_accessed_at_utc=source_accessed_at,
+    )
+
+    for field, replacement in {
+        "source_accessed_at_utc": "2026-07-22T16:59:44Z",
+        "symbol": "GBPUSD",
+        "timeframe": "H1",
+        "activation_id": "activation-2",
+        "activation_manifest_sha256": "b" * 64,
+    }.items():
+        changed = dict(native)
+        changed[field] = replacement
+        assert not execution._canary_native_prefix_matches_request(
+            changed,
+            index=index,
+            request_body=request,
+            source_accessed_at_utc=source_accessed_at,
+        )
+
+    assert not execution._canary_native_prefix_matches_request(
+        native,
+        index={"cutoff_utc": native["prefix_end_exclusive_utc"]},
+        request_body=request,
+        source_accessed_at_utc=source_accessed_at,
     )
 
 
@@ -401,6 +866,36 @@ def test_terminal_source_unavailable_derives_bound_book_decisions():
     )
 
 
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_terminal_fit_preserves_exact_mt5_symbol(symbol: str) -> None:
+    product = _terminal_product(
+        native_prefix.SOURCE_UNAVAILABLE,
+        symbol=symbol,
+        timeframe="H4",
+    )
+
+    fitted = execution.fit_terminal_native_timeframe(product=product, config=_config())
+
+    assert fitted.terminal_source_contract["symbol"] == symbol
+    assert fitted.source_group_decision.to_dict()["symbol"] == symbol
+    assert fitted.regime_fit_decision.to_dict()["symbol"] == symbol
+
+
+@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
+def test_terminal_fit_rejects_wrong_case_mt5_symbol(wrong_case: str) -> None:
+    product = _terminal_product(
+        native_prefix.SOURCE_UNAVAILABLE,
+        symbol=wrong_case,
+        timeframe="H4",
+    )
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="TERMINAL_NATIVE_CELL_INVALID",
+    ):
+        execution.fit_terminal_native_timeframe(product=product, config=_config())
+
+
 def test_terminal_activation_fields_cannot_be_smuggled_into_book_state():
     product = _terminal_product(native_prefix.SOURCE_UNAVAILABLE)
     fitted = execution.fit_terminal_native_timeframe(product=product, config=_config())
@@ -437,6 +932,43 @@ def test_terminal_technical_failure_raises_and_makes_no_decision():
     assert "NO_TRADE" not in caught.value.code
 
 
+def test_authenticated_terminal_technical_is_complete_distinct_abstention():
+    product = _terminal_product(native_prefix.TECHNICAL_TERMINAL)
+    fitted = execution.fit_terminal_native_timeframe(product=product, config=_config())
+    source = fitted.source_group_decision.to_dict()
+    fit = fitted.regime_fit_decision.to_dict()
+
+    assert source["availability"] == book.TERMINAL_TECHNICAL
+    assert source["reason_code"] == execution.TERMINAL_TECHNICAL_REASON_CODE
+    assert source["activation_id"] == product.native_prefix["activation_id"]
+    assert (
+        source["activation_manifest_sha256"]
+        == product.native_prefix["activation_manifest_sha256"]
+    )
+    assert (
+        source["activation_entry_sha256"]
+        == product.native_prefix["activation_entry_sha256"]
+    )
+    assert source["native_source_sha256"] is None
+    assert (
+        source["terminal_proof_sha256"]
+        == (product.native_prefix["source_terminal_receipt_sha256"])
+    )
+    assert fit["fit_state"] == book.REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL
+    assert fit["complete"] is True
+    assert fitted.terminal_source_contract["source_state"] == (
+        native_prefix.TECHNICAL_TERMINAL
+    )
+
+
+def test_terminal_technical_cannot_omit_real_activation_entry():
+    product = _terminal_product(native_prefix.TECHNICAL_TERMINAL)
+    product.native_prefix["activation_entry_sha256"] = None
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution.fit_terminal_native_timeframe(product=product, config=_config())
+    assert caught.value.code == "TERMINAL_ACTIVATION_ENTRY_MISSING"
+
+
 def test_terminal_fit_rejects_unsealed_and_non_terminal_product():
     unsealed = execution.replace(
         _terminal_product(native_prefix.SOURCE_UNAVAILABLE), _seal=object()
@@ -469,6 +1001,416 @@ class _PlanBody:
 
 def _decision(receipt, body):
     return SimpleNamespace(receipt_sha256=receipt, to_dict=lambda: dict(body))
+
+
+def test_historical_execution_rejects_capture_horizon_plan_substitution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_body = {"schema_version": "test-horizon-plan", "attempts": []}
+    bound_plan = _PlanBody(plan_body)
+    substituted_plan = _PlanBody(plan_body)
+    binding = {"plan_receipt_sha256": execution._sha256(plan_body)}
+    capture = object.__new__(execution.historical_adapter.HistoricalSymbolSearchCapture)
+    capture._horizon_plans = {("D1", "TREND"): bound_plan}
+    capture._horizon_plan_bodies = {("D1", "TREND"): dict(plan_body)}
+    capture._bindings = {("D1", "TREND"): binding}
+    capture.context = object()
+    capture.sink = object()
+    process = SimpleNamespace(receipt_sha256="p" * 64)
+    capture.request_body = {"search_process_receipt_sha256": process.receipt_sha256}
+    cell_plan = SimpleNamespace(
+        mode="HISTORICAL_ANCHOR",
+        symbol="EURUSD",
+        timeframe="D1",
+        regime="TREND",
+        search_process_receipt_sha256=process.receipt_sha256,
+        horizon_plan=substituted_plan,
+        attempt_artifacts=lambda: ({},),
+    )
+    fitted = SimpleNamespace(
+        source_group_decision=_decision(
+            "s" * 64,
+            {"symbol": "EURUSD", "timeframe": "D1"},
+        )
+    )
+    verified = []
+    monkeypatch.setattr(
+        search_planner,
+        "verify_production_cell_search_plan",
+        lambda context, *, process, sink, plan: (
+            verified.append((context, process, sink, plan)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        execution.historical,
+        "historical_horizon_plan_binding",
+        lambda _plan: binding,
+    )
+    monkeypatch.setattr(
+        execution,
+        "_reverify_fitted_timeframe",
+        lambda *_args, **_kwargs: pytest.fail(
+            "substituted plan reached native re-verification"
+        ),
+    )
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="HISTORICAL_CAPTURE_HORIZON_PLAN_SUBSTITUTION",
+    ):
+        execution.execute_historical_observed_cell(
+            capture=capture,
+            fitted=fitted,
+            regime="TREND",
+            search_process=process,
+            cell_plan=cell_plan,
+            config=_config(),
+        )
+    assert verified == [(capture.context, process, capture.sink, cell_plan)]
+
+
+def _attempt_roster_fixture(*, boundary: bool, attempt_count: int):
+    symbol = "EURUSD"
+    timeframe = "D1"
+    regime = "TREND"
+    opens = pd.date_range("2021-01-01T00:00:00Z", periods=800, freq="D")
+    prefix_end = pd.Timestamp(opens[-1]) + pd.Timedelta(days=1)
+    current_start = pd.Timestamp(opens[opens >= prefix_end - pd.Timedelta(days=365)][0])
+    source_count = int(((opens >= current_start) & (opens < prefix_end)).sum())
+    native = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "prefix_start_utc": pd.Timestamp(opens[0]).isoformat(),
+        "prefix_end_exclusive_utc": prefix_end.isoformat(),
+        "prefix_last_close_utc": prefix_end.isoformat(),
+        "prefix_content_sha256": "c" * 64,
+    }
+    frame = pd.DataFrame(
+        {"_BAR_CLOSE_TS": opens + pd.Timedelta(days=1)},
+        index=opens,
+    )
+    fitted = execution.FittedNativeSearchTimeframe(
+        product=SimpleNamespace(native_prefix=native),
+        source_group_decision=_decision(
+            "s" * 64,
+            {"symbol": symbol, "timeframe": timeframe},
+        ),
+        regime_fit_decision=_decision("r" * 64, {"fit_state": "REGIME_FITTED"}),
+        source_contract_seed={},
+        base_cost_policy={"lane": "base"},
+        stress_cost_policy={"lane": "stress"},
+        regime_parameters={},
+        train_regime_support={},
+        instrument_spec=None,
+        execution_spec_receipt={},
+        frame_sha256="f" * 64,
+        _frame=frame,
+    )
+    discovery_start = (
+        pd.Timestamp(opens[0]) - pd.Timedelta(days=1)
+        if boundary
+        else pd.Timestamp(opens[30])
+    )
+    candidate_body = {
+        "candidate_id": "DEPTH-D1-365-regression",
+        "lookback_kind": "CALENDAR_INTERVAL",
+        "lookback_value": 365,
+        "realized_start_utc": discovery_start.isoformat(),
+    }
+    candidate = {
+        **candidate_body,
+        "candidate_definition_sha256": execution._sha256(candidate_body),
+        "folds": []
+        if boundary
+        else [
+            {
+                "fold_id": "CAUSAL-01",
+                "fit_start_utc": discovery_start.isoformat(),
+            }
+        ],
+    }
+    process_body = {
+        "semantics": search_planner._process_semantics(
+            search_planner._strategy_domains()
+        )
+    }
+    designs = search_planner._attempt_designs(
+        process_body,
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=regime,
+    )[:attempt_count]
+    artifacts = []
+    trials = []
+    attempts = []
+    for ordinal, design in enumerate(designs):
+        built = execution.current_refit.build_current_refit_search_artifacts_v2(
+            symbol=symbol,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_id=design["strategy_id"],
+            parameters=design["parameters"],
+            lookback_kind=candidate["lookback_kind"],
+            lookback_value=candidate["lookback_value"],
+            fit_start_utc=current_start.isoformat(),
+            fit_end_utc=prefix_end.isoformat(),
+            latest_closed_bar_utc=prefix_end.isoformat(),
+            source_snapshot_sha256=native["prefix_content_sha256"],
+            source_bar_count=source_count,
+            seed=ordinal + 1,
+        )
+        artifacts.append(
+            {
+                "winner_process": built.winner_process,
+                "horizon_process": built.horizon_process,
+                "trial_definition": built.trial_definition,
+                "refit_recipe": built.refit_recipe,
+            }
+        )
+        parameter_sha = execution._sha256(built.trial_definition["parameters"])
+        trial_body = {
+            "trial_id": f"TRIAL-{ordinal:03d}-{parameter_sha[:16]}",
+            "strategy_id": design["strategy_id"],
+            "strategy_release_sha256": built.winner_process["strategy_code_sha256"],
+            "parameter_set_sha256": parameter_sha,
+        }
+        trial = {
+            **trial_body,
+            "trial_definition_sha256": execution._sha256(trial_body),
+        }
+        trials.append(trial)
+        attempts.append(
+            {
+                "attempt_id": f"ATTEMPT-{ordinal:03d}",
+                "candidate_id": candidate["candidate_id"],
+                "trial_id": trial["trial_id"],
+                "strategy_id": trial["strategy_id"],
+                "status": "PROCESS_REJECTED" if boundary else "PLANNED",
+                "reason_code": "SOURCE_BOUNDARY_SHORTFALL" if boundary else None,
+            }
+        )
+    candidate_registry = [
+        {
+            "candidate_id": candidate["candidate_id"],
+            "candidate_definition_sha256": candidate["candidate_definition_sha256"],
+            "boundary_shortfall": boundary,
+        }
+    ]
+    trial_registry = [
+        {
+            key: trial[key]
+            for key in (
+                "trial_id",
+                "strategy_id",
+                "strategy_release_sha256",
+                "parameter_set_sha256",
+                "trial_definition_sha256",
+            )
+        }
+        for trial in trials
+    ]
+    source_prefix_receipt_sha256 = "e" * 64
+    plan_body = {
+        "cell": {"symbol": symbol, "timeframe": timeframe, "regime": regime},
+        "native_prefix": native,
+        "source_prefix_receipt_sha256": source_prefix_receipt_sha256,
+        "plan_status": (
+            "HISTORICAL_BOUNDARY_LIMITED"
+            if boundary
+            else "READY_FOR_HISTORICAL_EVIDENCE"
+        ),
+        "candidates": [candidate],
+        "trials": trials,
+        "attempts": attempts,
+        "candidate_registry": candidate_registry,
+        "candidate_registry_sha256": execution._sha256(candidate_registry),
+        "trial_registry": trial_registry,
+        "trial_registry_sha256": execution._sha256(trial_registry),
+        "attempt_roster_sha256": execution._sha256(attempts),
+        "expected_evaluations": [],
+        "evidence_roster_sha256": execution._sha256([]),
+        "horizon_policy": {
+            "evaluator_release_sha256": (
+                execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
+            ),
+            "cost_contract_sha256": execution._sha256(fitted.base_cost_policy),
+            "cost_stress_contract_sha256": execution._sha256(fitted.stress_cost_policy),
+        },
+    }
+    binding = {
+        "cell": plan_body["cell"],
+        "source_prefix_receipt_sha256": source_prefix_receipt_sha256,
+    }
+    return _PlanBody(plan_body), tuple(artifacts), fitted, binding
+
+
+def test_boundary_roster_maps_128_cutoff_refits_and_skips_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, artifacts, fitted, binding = _attempt_roster_fixture(
+        boundary=True,
+        attempt_count=128,
+    )
+    monkeypatch.setattr(
+        execution.historical,
+        "historical_horizon_plan_binding",
+        lambda _plan: binding,
+    )
+    plan_body, verified = execution._verify_attempt_roster(
+        plan=plan,
+        attempt_artifacts=artifacts,
+        fitted=fitted,
+        regime="TREND",
+    )
+    assert len(verified) == 128
+    assert {attempt.plan_attempt["status"] for attempt in verified} == {
+        "PROCESS_REJECTED"
+    }
+    assert {
+        attempt.artifacts.horizon_process["fit_start_utc"] for attempt in verified
+    } != {verified[0].candidate["realized_start_utc"]}
+
+    cell_plan = SimpleNamespace(
+        symbol="EURUSD",
+        timeframe="D1",
+        regime="TREND",
+        horizon_plan=plan,
+        attempt_artifacts=lambda: artifacts,
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verified_current_observed_inputs",
+        lambda **_kwargs: (fitted, {}, {}),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verify_attempt_roster",
+        lambda **_kwargs: (plan_body, verified),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_winner_fold_plan",
+        lambda _attempts: pytest.fail("boundary terminal reached evaluation"),
+    )
+    result = execution.execute_current_observed_cell(
+        process=SimpleNamespace(),
+        sink=SimpleNamespace(),
+        cell_plan=cell_plan,
+        fitted=fitted,
+        config=_config(),
+    )
+    assert result.status == "UNSEARCHED_SOURCE_BOUNDARY_SHORTFALL"
+    assert result.attempted_trials_exact == 0
+
+
+def test_attempt_roster_rejects_lookback_and_cutoff_window_splices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, artifacts, fitted, binding = _attempt_roster_fixture(
+        boundary=True,
+        attempt_count=1,
+    )
+    monkeypatch.setattr(
+        execution.historical,
+        "historical_horizon_plan_binding",
+        lambda _plan: binding,
+    )
+    wrong_lookback = list(artifacts)
+    wrong_lookback[0] = execution.json.loads(
+        execution._canonical_bytes(wrong_lookback[0]).decode("ascii")
+    )
+    wrong_lookback[0]["horizon_process"]["lookback_value"] = 366
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="ATTEMPT_HORIZON_SEMANTIC_MAPPING_INVALID",
+    ):
+        execution._verify_attempt_roster(
+            plan=plan,
+            attempt_artifacts=wrong_lookback,
+            fitted=fitted,
+            regime="TREND",
+        )
+
+    wrong_start = list(artifacts)
+    wrong_start[0] = execution.json.loads(
+        execution._canonical_bytes(wrong_start[0]).decode("ascii")
+    )
+    observed = pd.Timestamp(wrong_start[0]["horizon_process"]["fit_start_utc"])
+    wrong_start[0]["horizon_process"]["fit_start_utc"] = (
+        observed + pd.Timedelta(days=1)
+    ).isoformat()
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="ATTEMPT_CUTOFF_REFIT_WINDOW_INVALID",
+    ):
+        execution._verify_attempt_roster(
+            plan=plan,
+            attempt_artifacts=wrong_start,
+            fitted=fitted,
+            regime="TREND",
+        )
+
+    duplicated_body = plan.to_dict()
+    duplicate = execution.json.loads(
+        execution._canonical_bytes(duplicated_body["candidates"][0]).decode("ascii")
+    )
+    duplicate["candidate_id"] = "DEPTH-D1-365-duplicate"
+    duplicate_definition = {
+        key: duplicate[key]
+        for key in (
+            "candidate_id",
+            "lookback_kind",
+            "lookback_value",
+            "realized_start_utc",
+        )
+    }
+    duplicate["candidate_definition_sha256"] = execution._sha256(duplicate_definition)
+    duplicated_body["candidates"].append(duplicate)
+    duplicate_registry = {
+        "candidate_id": duplicate["candidate_id"],
+        "candidate_definition_sha256": duplicate["candidate_definition_sha256"],
+        "boundary_shortfall": True,
+    }
+    duplicated_body["candidate_registry"].append(duplicate_registry)
+    duplicated_body["candidate_registry_sha256"] = execution._sha256(
+        duplicated_body["candidate_registry"]
+    )
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="HORIZON_CANDIDATE_SEMANTIC_IDENTITY_INVALID",
+    ):
+        execution._verify_attempt_roster(
+            plan=_PlanBody(duplicated_body),
+            attempt_artifacts=artifacts,
+            fitted=fitted,
+            regime="TREND",
+        )
+
+
+def test_feasible_roster_maps_distinct_discovery_and_cutoff_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, artifacts, fitted, binding = _attempt_roster_fixture(
+        boundary=False,
+        attempt_count=1,
+    )
+    monkeypatch.setattr(
+        execution.historical,
+        "historical_horizon_plan_binding",
+        lambda _plan: binding,
+    )
+    _plan_body, verified = execution._verify_attempt_roster(
+        plan=plan,
+        attempt_artifacts=artifacts,
+        fitted=fitted,
+        regime="TREND",
+    )
+    assert len(verified) == 1
+    assert verified[0].plan_attempt["status"] == "PLANNED"
+    assert (
+        verified[0].candidate["realized_start_utc"]
+        != verified[0].artifacts.horizon_process["fit_start_utc"]
+    )
 
 
 def test_current_executor_rejects_fitted_support_receipt_splice_before_search(
@@ -711,16 +1653,33 @@ def test_current_executor_persists_binding_before_strategy_evaluation(
             ({"count": 0},),
         ),
     )
+    adversity_plan = {
+        "schema_version": execution.raw_winner.COST_STRESS_ADVERSITY_PLAN_SCHEMA,
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "regime": "TREND",
+        "row_count": 0,
+        "rows_sha256": execution._sha256([]),
+        "rows": [],
+    }
+    monkeypatch.setattr(
+        execution,
+        "_build_cost_stress_adversity_plan",
+        lambda **_kwargs: adversity_plan,
+    )
     frozen_bytes = b"{}"
     frozen = SimpleNamespace(
         precommitment={"latest_evidence_boundary_utc": "2020-06-01T00:00:00Z"},
+        cost_stress_adversity_plan=adversity_plan,
         frozen_receipt_bytes=frozen_bytes,
         frozen_receipt_entry={
             "descriptor": {"sha256": execution.hashlib.sha256(frozen_bytes).hexdigest()}
         },
     )
+
     def freeze(*_args, **kwargs):
         assert kwargs["precommitted_evidence_roles"] == ("EVALUATION_REQUIRED",)
+        assert kwargs["cost_stress_adversity_plan"] == adversity_plan
         return frozen
 
     monkeypatch.setattr(
@@ -754,6 +1713,7 @@ def test_current_executor_persists_binding_before_strategy_evaluation(
 
     def build_attempt(**kwargs):
         assert persisted["value"] is True
+        assert kwargs["cost_stress_adversity_plan"] == adversity_plan
         return {"attempt_id": kwargs["raw_attempt_id"], "folds": []}
 
     monkeypatch.setattr(execution, "_build_planned_attempt_evidence", build_attempt)

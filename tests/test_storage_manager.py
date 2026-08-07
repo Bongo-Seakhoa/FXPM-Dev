@@ -1,12 +1,13 @@
 import json
 import os
 import shutil
+import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from pm_core import PipelineConfig
-from pm_storage import StorageManager
+from pm_storage import StorageManager, _exclusive_file_lock
 
 
 class StorageManagerTests(unittest.TestCase):
@@ -175,6 +176,28 @@ class StorageManagerTests(unittest.TestCase):
 
         self.assertFalse(inactive_live.exists())
         self.assertTrue(active_live.exists())
+
+    def test_zero_wait_file_lock_fails_immediately_while_writer_owns_lock(self):
+        lock_path = self.root / "bounded-recovery.lock"
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_lock() -> None:
+            with _exclusive_file_lock(lock_path):
+                entered.set()
+                release.wait(timeout=5)
+
+        thread = threading.Thread(target=hold_lock, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=2))
+        try:
+            with self.assertRaisesRegex(TimeoutError, "FXPM_FILE_LOCK_TIMEOUT"):
+                with _exclusive_file_lock(lock_path, timeout_seconds=0.0):
+                    self.fail("contended zero-wait lock must not be entered")
+        finally:
+            release.set()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

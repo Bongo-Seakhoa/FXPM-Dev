@@ -1,0 +1,5 @@
+metric,engine_definition,dashboard_definition,impact
+profit_factor_no_loss,inf if gross_loss==0 and gross_profit>0,0.0 if gross_loss==0,zero-loss systems look best in engine and worst in dashboard
+expectancy,expected pips per trade,average realized dollars per trade,"same label, different units"
+sharpe,per-bar equity returns annualized by timeframe bars/year,per-trade pnl annualized by sqrt(252),"same label, different sampling basis"
+bucket_drawdown,full backtest floating equity at bar close,realized trade equity curve only,sub-bucket and dashboard reports can miss open-trade pain

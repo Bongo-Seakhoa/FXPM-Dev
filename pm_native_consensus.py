@@ -54,6 +54,7 @@ EVIDENCE_PASS = "PASS"
 EVIDENCE_SEMANTIC_FAIL = "SEMANTIC_FAIL"
 EVIDENCE_TERMINAL_UNAVAILABLE = "TERMINAL_UNAVAILABLE"
 EVIDENCE_PENDING = "PENDING"
+TECHNICAL_TERMINAL = "TECHNICAL_TERMINAL"
 
 WINDOW_PASS = "PASS"
 WINDOW_FAIL = "FAIL"
@@ -115,7 +116,9 @@ def _json_copy(value: Any) -> Any:
 
 def _is_sha256(value: Any) -> bool:
     text = str(value or "").strip().lower()
-    return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+    return len(text) == 64 and all(
+        character in "0123456789abcdef" for character in text
+    )
 
 
 def expected_reference_timeframes(target_timeframe: str) -> Tuple[str, str]:
@@ -170,8 +173,7 @@ def consensus_window_state(edge_states: Sequence[Mapping[str, Any]]) -> str:
         return WINDOW_ERROR
     normalized = [_normalized_edge_state(value) for value in edge_states]
     if any(
-        integrity not in VALID_INTEGRITY_STATES
-        or evidence not in VALID_EVIDENCE_STATES
+        integrity not in VALID_INTEGRITY_STATES or evidence not in VALID_EVIDENCE_STATES
         for integrity, evidence in normalized
     ):
         return WINDOW_ERROR
@@ -193,7 +195,9 @@ def consensus_window_state(edge_states: Sequence[Mapping[str, Any]]) -> str:
 def aggregate_window_states(states: Mapping[str, Any]) -> str:
     if set(states) != set(REQUIRED_AUDIT_WINDOWS):
         return WINDOW_ERROR
-    normalized = [str(states[name] or "").strip().upper() for name in REQUIRED_AUDIT_WINDOWS]
+    normalized = [
+        str(states[name] or "").strip().upper() for name in REQUIRED_AUDIT_WINDOWS
+    ]
     if any(value not in VALID_WINDOW_STATES for value in normalized):
         return WINDOW_ERROR
     for candidate in (WINDOW_ERROR, WINDOW_FAIL, WINDOW_PENDING):
@@ -202,14 +206,27 @@ def aggregate_window_states(states: Mapping[str, Any]) -> str:
     return WINDOW_PASS
 
 
-def _binding_errors(binding: Any, label: str, *, unavailable_ok: bool = False) -> list[str]:
+def _binding_errors(
+    binding: Any, label: str, *, unavailable_ok: bool = False
+) -> list[str]:
     if not isinstance(binding, Mapping):
         return [f"CONSENSUS_{label}_BINDING_INVALID"]
     availability = str(binding.get("availability_state") or "AVAILABLE").strip().upper()
     if availability == EVIDENCE_TERMINAL_UNAVAILABLE and unavailable_ok:
-        if any(binding.get(field) not in {None, ""} for field in ("bars_sha256", "provenance_sha256")):
+        if any(
+            binding.get(field) not in {None, ""}
+            for field in ("bars_sha256", "provenance_sha256")
+        ):
             return [f"CONSENSUS_{label}_UNAVAILABLE_HASH_PRESENT"]
         return []
+    if availability == TECHNICAL_TERMINAL:
+        if binding.get("bars_sha256") is not None:
+            return [f"CONSENSUS_{label}_TECHNICAL_BAR_HASH_PRESENT"]
+        if not _is_sha256(binding.get("provenance_sha256")):
+            return [f"CONSENSUS_{label}_TECHNICAL_PROVENANCE_INVALID"]
+        return []
+    if availability != "AVAILABLE":
+        return [f"CONSENSUS_{label}_AVAILABILITY_INVALID"]
     errors = []
     for field in ("bars_sha256", "provenance_sha256"):
         if not _is_sha256(binding.get(field)):
@@ -233,17 +250,26 @@ def build_edge_report(
         raise ValueError(f"{reference} is not an authenticated reference for {target}")
     if set(window_states) != set(REQUIRED_AUDIT_WINDOWS):
         raise ValueError("edge window roster is incomplete")
-    fine = target if TIMEFRAME_SECONDS[target] < TIMEFRAME_SECONDS[reference] else reference
+    fine = (
+        target
+        if TIMEFRAME_SECONDS[target] < TIMEFRAME_SECONDS[reference]
+        else reference
+    )
     coarse = reference if fine == target else target
     normalized_windows: Dict[str, Dict[str, Any]] = {}
     pair_reports = pair_reports or {}
     for window in REQUIRED_AUDIT_WINDOWS:
         state = dict(window_states[window])
         integrity, evidence = _normalized_edge_state(state)
-        if integrity not in VALID_INTEGRITY_STATES or evidence not in VALID_EVIDENCE_STATES:
+        if (
+            integrity not in VALID_INTEGRITY_STATES
+            or evidence not in VALID_EVIDENCE_STATES
+        ):
             raise ValueError(f"invalid edge state for {window}")
         pair_report = pair_reports.get(window)
-        pair_digest = canonical_sha256(pair_report) if isinstance(pair_report, Mapping) else None
+        pair_digest = (
+            canonical_sha256(pair_report) if isinstance(pair_report, Mapping) else None
+        )
         normalized_windows[window] = {
             "integrity_state": integrity,
             "evidence_state": evidence,
@@ -303,7 +329,11 @@ def validate_edge_report(
         errors.append(f"CONSENSUS_EDGE_TARGET_MISMATCH:{label}")
     if str(report.get("reference_timeframe") or "").upper() != reference:
         errors.append(f"CONSENSUS_EDGE_REFERENCE_MISMATCH:{label}")
-    fine = target if TIMEFRAME_SECONDS[target] < TIMEFRAME_SECONDS[reference] else reference
+    fine = (
+        target
+        if TIMEFRAME_SECONDS[target] < TIMEFRAME_SECONDS[reference]
+        else reference
+    )
     coarse = reference if fine == target else target
     if str(report.get("fine_timeframe") or "").upper() != fine:
         errors.append(f"CONSENSUS_EDGE_FINE_ORIENTATION_INVALID:{label}")
@@ -315,7 +345,9 @@ def validate_edge_report(
         errors.append(f"CONSENSUS_EDGE_REFERENCE_BINDING_MISMATCH:{label}")
     errors.extend(_binding_errors(source_binding, f"EDGE_SOURCE:{label}"))
     errors.extend(
-        _binding_errors(reference_binding, f"EDGE_REFERENCE:{label}", unavailable_ok=True)
+        _binding_errors(
+            reference_binding, f"EDGE_REFERENCE:{label}", unavailable_ok=True
+        )
     )
     windows = report.get("windows")
     if not isinstance(windows, Mapping) or set(windows) != set(REQUIRED_AUDIT_WINDOWS):
@@ -329,7 +361,10 @@ def validate_edge_report(
             statuses[window] = WINDOW_ERROR
             continue
         integrity, evidence = _normalized_edge_state(state)
-        if integrity not in VALID_INTEGRITY_STATES or evidence not in VALID_EVIDENCE_STATES:
+        if (
+            integrity not in VALID_INTEGRITY_STATES
+            or evidence not in VALID_EVIDENCE_STATES
+        ):
             errors.append(f"CONSENSUS_EDGE_STATE_INVALID:{label}:{window}")
         pair_digest = state.get("pair_report_sha256")
         if pair_digest is not None and not _is_sha256(pair_digest):
@@ -381,7 +416,9 @@ def build_consensus_envelope(
         raise ValueError("; ".join(errors))
     windows: Dict[str, Dict[str, Any]] = {}
     for window in REQUIRED_AUDIT_WINDOWS:
-        states = [edge_reports[reference]["windows"][window] for reference in references]
+        states = [
+            edge_reports[reference]["windows"][window] for reference in references
+        ]
         windows[window] = {
             "status": consensus_window_state(states),
             "edge_states": {
@@ -543,9 +580,10 @@ def validate_consensus_envelope(
     if declared_digest != observed_digest:
         errors.append("CONSENSUS_ENVELOPE_HASH_INVALID")
     diagnostics = envelope.get("diagnostics")
-    if not isinstance(diagnostics, Mapping) or diagnostics.get(
-        "all_references_evaluated"
-    ) is not True:
+    if (
+        not isinstance(diagnostics, Mapping)
+        or diagnostics.get("all_references_evaluated") is not True
+    ):
         errors.append("CONSENSUS_ALL_REFERENCES_NOT_PROVEN")
     return list(dict.fromkeys(errors))
 

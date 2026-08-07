@@ -977,7 +977,7 @@ class _M5ValuationTape:
 def native_product_key(symbol: str, timeframe: str) -> str:
     """Return the exact public key used by an anchor's native-product map."""
 
-    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_symbol = str(symbol or "").strip()
     normalized_timeframe = str(timeframe or "").strip().upper()
     if (
         normalized_symbol not in book.PINNED_SYMBOL_ORDER
@@ -1202,7 +1202,7 @@ def _native_product_identity(
     ]
     native = dict(product.native_prefix)
     instrument = dict(product.instrument_snapshot or {})
-    symbol = str(index.get("symbol") or "").upper()
+    symbol = str(index.get("symbol") or "")
     timeframe = str(index.get("timeframe") or "").upper()
     expected_cutoff = _utc_seconds(
         expected_cutoff_utc, "FORWARD_NATIVE_EXPECTED_CUTOFF_INVALID"
@@ -1824,8 +1824,14 @@ def _selected_group_records(
         raise ForwardOOSReplayProductionError(
             "SELECTED_TIMEFRAME_INVALID", (cell_id, timeframe)
         ) from exc
+    try:
+        symbol_ordinal = book.PINNED_SYMBOL_ORDER.index(symbol)
+    except ValueError as exc:
+        raise ForwardOOSReplayProductionError(
+            "SELECTED_SYMBOL_INVALID", (cell_id, symbol)
+        ) from exc
     expected_global_group = (
-        book.PINNED_SYMBOL_ORDER.index(symbol) * len(book.TIMEFRAME_ORDER)
+        symbol_ordinal * len(book.TIMEFRAME_ORDER)
         + local_group_ordinal
     )
     if global_group_ordinal != expected_global_group:
@@ -1851,7 +1857,7 @@ def _selected_artifacts(
     book_cell: Mapping[str, Any],
     index: Mapping[str, Any],
 ) -> _VerifiedSpecialist:
-    symbol = str(book_cell.get("symbol") or "").upper()
+    symbol = str(book_cell.get("symbol") or "")
     timeframe = str(book_cell.get("timeframe") or "").upper()
     regime = str(book_cell.get("regime") or "").upper()
     cell_id = _hex(book_cell.get("cell_id"), "BOOK_WINNER_CELL_ID_INVALID")
@@ -3049,7 +3055,7 @@ def _open_m5_valuation_tape(
     if (
         frame.empty
         or expected_identity.get("timeframe") != "M5"
-        or str(expected_identity.get("symbol")) != str(spec.symbol).upper()
+        or str(expected_identity.get("symbol")) != str(spec.symbol)
         or not bool((opens < forward_end_exclusive).all())
         or not bool((opens <= forward_start).any())
     ):

@@ -39,21 +39,22 @@ import math
 import re
 from typing import Any, Final
 
+import pm_current_refit_artifacts as current_refit
 import pm_winner_selection as winner
 import pm_training_horizon as horizon
 
 
-BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v12"
+BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v13"
 BOOK_MULTIPLICITY_SCOPE: Final = "OFFLINE_HISTORICAL_BOOK_ONLY"
 PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = "fxpm.winner-selection.v13"
 PINNED_WINNER_SELECTION_REQUEST_VERSION: Final = "fxpm.winner-selection-request.v1"
 PINNED_WINNER_ATTEMPT_LEDGER_VERSION: Final = "fxpm.winner-attempt-ledger.v2"
 PINNED_WINNER_EVIDENCE_LEDGER_VERSION: Final = "fxpm.winner-evidence-ledger.v4"
 PINNED_WINNER_TRADE_POWER_BINDING_VERSION: Final = "fxpm.winner-trade-power-binding.v1"
-SOURCE_GROUP_CONTRACT_VERSION: Final = "fxpm.historical-source-group.v2"
-REGIME_FIT_CONTRACT_VERSION: Final = "fxpm.historical-regime-fit.v3"
+SOURCE_GROUP_CONTRACT_VERSION: Final = "fxpm.historical-source-group.v3"
+REGIME_FIT_CONTRACT_VERSION: Final = "fxpm.historical-regime-fit.v4"
 REGIME_DETECTOR_RECORD_SCHEMA_VERSION: Final = "fxpm.regime-detector-record/v1"
-PROCESS_STATE_CONTRACT_VERSION: Final = "fxpm.historical-process-state.v4"
+PROCESS_STATE_CONTRACT_VERSION: Final = "fxpm.historical-process-state.v5"
 INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION: Final = (
     "fxpm.historical-insufficient-evidence-binding.v2"
 )
@@ -180,6 +181,7 @@ PINNED_P_VALUE_CONTRACT_SHA256: Final = winner.PINNED_BOOK_P_VALUE_CONTRACT_SHA2
 
 WINNER_EVIDENCE: Final = "WINNER_SELECTION_DECISION"
 TERMINAL_SOURCE_ABSENCE: Final = "TERMINAL_SOURCE_ABSENCE"
+TERMINAL_TECHNICAL: Final = "TERMINAL_TECHNICAL"
 TECHNICAL_FAILURE: Final = "TECHNICAL_FAILURE"
 UNSEARCHED: Final = "UNSEARCHED"
 REGIME_UNOBSERVED: Final = "REGIME_UNOBSERVED"
@@ -192,6 +194,7 @@ INSUFFICIENT_PRESEARCH_STAGE: Final = "PRE_SEARCH_BOUNDARY"
 INSUFFICIENT_POSTSEARCH_STAGE: Final = "POST_SEARCH_ALL_PROCESS_REJECTED"
 AVAILABLE: Final = "AVAILABLE"
 TERMINAL_UNAVAILABLE: Final = "TERMINAL_UNAVAILABLE"
+REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL: Final = "NOT_APPLICABLE_TECHNICAL_TERMINAL"
 REGIME_FITTED: Final = "FITTED"
 REGIME_FIT_TECHNICAL_FAILURE: Final = "TECHNICAL_FAILURE"
 REGIME_NOT_APPLICABLE: Final = "NOT_APPLICABLE_SOURCE_UNAVAILABLE"
@@ -244,6 +247,7 @@ _REGIME_DETECTOR_INTEGER_PARAMETERS: Final = frozenset(
 _PROCESS_STATE_KINDS: Final = frozenset(
     {
         TERMINAL_SOURCE_ABSENCE,
+        TERMINAL_TECHNICAL,
         TECHNICAL_FAILURE,
         UNSEARCHED,
         REGIME_UNOBSERVED,
@@ -255,6 +259,7 @@ _OUTPUT_STATES: Final = frozenset(
         "WINNER",
         "NO_WINNER",
         "SOURCE_UNAVAILABLE",
+        TERMINAL_TECHNICAL,
         TECHNICAL_FAILURE,
         UNSEARCHED,
         REGIME_UNOBSERVED,
@@ -500,6 +505,9 @@ def _family_precommitment() -> dict[str, Any]:
         "p_value_contract_sha256": PINNED_P_VALUE_CONTRACT_SHA256,
         "regimes": list(REGIME_ORDER),
         "selection_rule": SELECTION_RULE,
+        "multiplicity_tested_state_rule": (
+            "ALL_PHYSICAL_BOOK_CELLS_EXCEPT_AUTHENTICATED_TERMINAL_TECHNICAL"
+        ),
         "symbols": list(PINNED_SYMBOL_ORDER),
         "target_fdr": TARGET_FDR,
         "timeframes": list(TIMEFRAME_ORDER),
@@ -588,6 +596,7 @@ _SOURCE_KEYS: Final = frozenset(
         "source_group_evidence_sha256",
         "activation_id",
         "activation_manifest_sha256",
+        "activation_entry_sha256",
         "native_source_sha256",
         "acquisition_attempts_exact",
         "terminal_proof_sha256",
@@ -944,17 +953,14 @@ def _horizon_winner_cross_binding_identity(
     plan_anchor = plan_body["anchor"]
     prefix = plan_body["native_prefix"]
     if (
-        binding["schema_version"]
-        != HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION
+        binding["schema_version"] != HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION
         or binding["anchor_id"] != plan_anchor["anchor_id"]
-        or binding["selection_cutoff_utc"]
-        != plan_anchor["selection_cutoff_utc"]
+        or binding["selection_cutoff_utc"] != plan_anchor["selection_cutoff_utc"]
         or binding["process_precommit_receipt_sha256"]
         != plan_anchor["process_precommit_receipt_sha256"]
         or binding["source_group_decision_sha256"] != _sha256_json(source_body)
         or binding["regime_fit_decision_sha256"] != _sha256_json(fit_body)
-        or binding["native_prefix_index_sha256"]
-        != prefix["prefix_index_sha256"]
+        or binding["native_prefix_index_sha256"] != prefix["prefix_index_sha256"]
         or {
             "symbol": binding["symbol"],
             "timeframe": binding["timeframe"],
@@ -1034,17 +1040,14 @@ def _horizon_winner_cross_binding_identity(
         "causal_fold_plan_sha256": precommitment["causal_fold_plan_sha256"],
         "source_contract_sha256": precommitment["source_contract_sha256"],
         "cost_contract_sha256": precommitment["cost_contract_sha256"],
-        "cost_stress_contract_sha256": precommitment[
-            "cost_stress_contract_sha256"
-        ],
+        "cost_stress_contract_sha256": precommitment["cost_stress_contract_sha256"],
     }
     _hex64(
         winner_roster["frozen_receipt_sha256"],
         "INSUFFICIENT_CROSS_BINDING_FROZEN_RECEIPT_INVALID",
     )
     if any(
-        winner_roster[key] != value
-        for key, value in expected_winner_roster.items()
+        winner_roster[key] != value for key, value in expected_winner_roster.items()
     ):
         raise _BookError("INSUFFICIENT_CROSS_BINDING_WINNER_SPLICE")
 
@@ -1061,9 +1064,7 @@ def _horizon_winner_cross_binding_identity(
         or binding["mapping_sha256"] != _sha256_json(mapping)
     ):
         raise _BookError("INSUFFICIENT_CROSS_BINDING_MAPPING_INVALID")
-    candidates = {
-        item["candidate_id"]: item for item in plan_body["candidates"]
-    }
+    candidates = {item["candidate_id"]: item for item in plan_body["candidates"]}
     trials = {item["trial_id"]: item for item in plan_body["trials"]}
     expected_by_attempt: dict[str, list[dict[str, Any]]] = {}
     for item in plan_body["expected_evaluations"]:
@@ -1088,9 +1089,7 @@ def _horizon_winner_cross_binding_identity(
             "fold_mapping_sha256",
         }
     )
-    execution_keys = frozenset(
-        {"lookback_kind", "lookback_value", "source_bar_count"}
-    )
+    execution_keys = frozenset({"lookback_kind", "lookback_value", "source_bar_count"})
     source_count_keys = frozenset(
         {
             "schema_version",
@@ -1194,22 +1193,38 @@ def _horizon_winner_cross_binding_identity(
             or any(source_count[key] != value for key, value in execution.items())
             or execution["lookback_kind"] != candidate["lookback_kind"]
             or execution["lookback_value"] != candidate["lookback_value"]
-            or source_count["fit_start_utc"] != candidate["realized_start_utc"]
             or source_count["fit_end_exclusive_utc"]
             != prefix["prefix_end_exclusive_utc"]
-            or source_count["latest_closed_bar_utc"]
-            != prefix["prefix_last_close_utc"]
+            or source_count["latest_closed_bar_utc"] != prefix["prefix_last_close_utc"]
             or type(execution["source_bar_count"]) is not int
             or type(execution["source_bar_count"]) is bool
             or execution["source_bar_count"] < 1
         ):
             raise _BookError("INSUFFICIENT_CROSS_BINDING_SOURCE_COUNT_SPLICE")
         _hex64(source_count["fit_frame_sha256"], "INSUFFICIENT_FIT_FRAME_INVALID")
+        try:
+            _horizon_process, horizon_process_sha256 = (
+                current_refit.build_horizon_process_artifact_v2(
+                    symbol=source_count["symbol"],
+                    timeframe=source_count["timeframe"],
+                    lookback_kind=execution["lookback_kind"],
+                    lookback_value=execution["lookback_value"],
+                    fit_start_utc=source_count["fit_start_utc"],
+                    fit_end_utc=source_count["fit_end_exclusive_utc"],
+                    latest_closed_bar_utc=source_count["latest_closed_bar_utc"],
+                    source_snapshot_sha256=source_count["native_prefix_content_sha256"],
+                    source_bar_count=execution["source_bar_count"],
+                )
+            )
+        except current_refit.CurrentRefitArtifactError as exc:
+            raise _BookError(
+                "INSUFFICIENT_CROSS_BINDING_HORIZON_PROCESS_SPLICE"
+            ) from exc
+        if horizon_process_sha256 != attempted["horizon_process_sha256"]:
+            raise _BookError("INSUFFICIENT_CROSS_BINDING_HORIZON_PROCESS_SPLICE")
 
         folds = row["fold_mapping"]
-        if type(folds) is not list or row["fold_mapping_sha256"] != _sha256_json(
-            folds
-        ):
+        if type(folds) is not list or row["fold_mapping_sha256"] != _sha256_json(folds):
             raise _BookError("INSUFFICIENT_CROSS_BINDING_FOLD_MAPPING_INVALID")
         causal_expected = [
             value
@@ -1219,9 +1234,7 @@ def _horizon_winner_cross_binding_identity(
         winner_folds = precommitment["causal_fold_plan"]
         if planned["status"] == "PLANNED":
             if len(folds) != len(causal_expected) or len(folds) != len(winner_folds):
-                raise _BookError(
-                    "INSUFFICIENT_CROSS_BINDING_FOLD_CARDINALITY_INVALID"
-                )
+                raise _BookError("INSUFFICIENT_CROSS_BINDING_FOLD_CARDINALITY_INVALID")
         elif planned["status"] == "PROCESS_REJECTED":
             if folds or causal_expected:
                 raise _BookError("INSUFFICIENT_CROSS_BINDING_TERMINAL_FOLD_INVALID")
@@ -1248,12 +1261,10 @@ def _horizon_winner_cross_binding_identity(
                 != candidate_fold["fold_definition_sha256"]
                 or fold["horizon_context_sha256"] != expected["context_sha256"]
                 or fold["winner_fold_id"] != winner_fold["fold_id"]
-                or fold["validation_start_utc"]
-                != expected["validation_start_utc"]
+                or fold["validation_start_utc"] != expected["validation_start_utc"]
                 or fold["validation_end_exclusive_utc"]
                 != expected["validation_end_exclusive_utc"]
-                or fold["validation_start_utc"]
-                != winner_fold["anchor_as_of_utc"]
+                or fold["validation_start_utc"] != winner_fold["anchor_as_of_utc"]
             ):
                 raise _BookError("INSUFFICIENT_CROSS_BINDING_FOLD_SPLICE")
     if (
@@ -1265,9 +1276,7 @@ def _horizon_winner_cross_binding_identity(
     try:
         production = json.loads(winner_raw_production_receipt_bytes.decode("ascii"))
     except Exception as exc:
-        raise _BookError(
-            "INSUFFICIENT_RAW_PRODUCTION_RECEIPT_BYTES_INVALID"
-        ) from exc
+        raise _BookError("INSUFFICIENT_RAW_PRODUCTION_RECEIPT_BYTES_INVALID") from exc
     production_keys = frozenset(
         {
             "schema_version",
@@ -1296,8 +1305,7 @@ def _horizon_winner_cross_binding_identity(
     cross_binding_sha256 = _sha256_bytes(encoded)
     evidence_ledger = process_rejection_request.evidence_ledger.to_dict()
     if (
-        production["schema_version"]
-        != WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION
+        production["schema_version"] != WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION
         or production["run_id"] != precommitment["run_id"]
         or production["artifact_namespace"] != binding["artifact_namespace"]
         or {
@@ -1308,11 +1316,9 @@ def _horizon_winner_cross_binding_identity(
         != plan_cell
         or production["precommitment_sha256"] != _sha256_json(precommitment)
         or production["attempt_ledger_sha256"] != _sha256_json(attempt_ledger)
-        or production["provenance_cross_binding_sha256"]
-        != cross_binding_sha256
+        or production["provenance_cross_binding_sha256"] != cross_binding_sha256
         or production["evidence_ledger_sha256"] != _sha256_json(evidence_ledger)
-        or production["request_sha256"]
-        != process_rejection_request.request_sha256
+        or production["request_sha256"] != process_rejection_request.request_sha256
         or production["decision_receipt_sha256"]
         != process_rejection_decision.receipt_sha256
     ):
@@ -1515,9 +1521,7 @@ def _build_insufficient_binding(
             fit_body=fit_body,
             process_rejection_request=process_rejection_request,
             process_rejection_decision=process_rejection_decision,
-            winner_raw_production_receipt_bytes=(
-                winner_raw_production_receipt_bytes
-            ),
+            winner_raw_production_receipt_bytes=(winner_raw_production_receipt_bytes),
         )
         planned_axes: tuple[tuple[str, str], ...] | None = None
         for candidate, registry in zip(
@@ -1625,6 +1629,9 @@ def _source_body(decision: Any) -> dict[str, Any]:
     activation_manifest = _optional_hex64(
         body["activation_manifest_sha256"], "ACTIVATION_MANIFEST_INVALID"
     )
+    activation_entry = _optional_hex64(
+        body["activation_entry_sha256"], "ACTIVATION_ENTRY_INVALID"
+    )
     native_source = _optional_hex64(
         body["native_source_sha256"], "NATIVE_SOURCE_INVALID"
     )
@@ -1654,10 +1661,26 @@ def _source_body(decision: Any) -> dict[str, Any]:
             or proof is None
             or any(
                 value is not None
-                for value in (activation_id, activation_manifest, native_source)
+                for value in (
+                    activation_id,
+                    activation_manifest,
+                    activation_entry,
+                    native_source,
+                )
             )
         ):
             raise _BookError("TERMINAL_SOURCE_SEMANTICS_INVALID")
+    elif body["availability"] == TERMINAL_TECHNICAL:
+        if (
+            not terminal
+            or not complete
+            or proof is None
+            or activation_id is None
+            or activation_manifest is None
+            or activation_entry is None
+            or native_source is not None
+        ):
+            raise _BookError("TERMINAL_TECHNICAL_SOURCE_SEMANTICS_INVALID")
     else:
         raise _BookError("SOURCE_AVAILABILITY_INVALID")
     return body
@@ -1674,6 +1697,7 @@ def create_historical_source_group_decision(
     acquisition_attempts_exact: Any,
     activation_id: Any = None,
     activation_manifest_sha256: Any = None,
+    activation_entry_sha256: Any = None,
     native_source_sha256: Any = None,
     terminal_proof_sha256: Any = None,
 ) -> HistoricalSourceGroupDecision | None:
@@ -1704,6 +1728,9 @@ def create_historical_source_group_decision(
             "activation_manifest_sha256": _optional_hex64(
                 activation_manifest_sha256, "ACTIVATION_MANIFEST_INVALID"
             ),
+            "activation_entry_sha256": _optional_hex64(
+                activation_entry_sha256, "ACTIVATION_ENTRY_INVALID"
+            ),
             "native_source_sha256": _optional_hex64(
                 native_source_sha256, "NATIVE_SOURCE_INVALID"
             ),
@@ -1716,7 +1743,7 @@ def create_historical_source_group_decision(
             "terminal_proof_sha256": _optional_hex64(
                 terminal_proof_sha256, "TERMINAL_PROOF_INVALID"
             ),
-            "terminal": availability == TERMINAL_UNAVAILABLE,
+            "terminal": availability in {TERMINAL_UNAVAILABLE, TERMINAL_TECHNICAL},
             "complete": True,
         }
         decision = _owned_decision(HistoricalSourceGroupDecision, body)
@@ -1882,7 +1909,7 @@ def _train_regime_support_body(
     counts = _regime_counts(support["counts"], "TRAIN_SUPPORT_COUNTS_INVALID")
     eligible = _exact_int(
         support["eligible_rows"],
-        1,
+        0,
         _MAX_TRAIN_LABEL_COUNT,
         "TRAIN_SUPPORT_ELIGIBLE_ROWS_INVALID",
     )
@@ -1900,15 +1927,21 @@ def _train_regime_support_body(
         or support["support_state_by_regime"] != states
     ):
         raise _BookError("TRAIN_SUPPORT_PARTITION_INVALID")
-    first_text = _bounded_id(support["first_ts"], "TRAIN_SUPPORT_FIRST_TS_INVALID")
-    last_text = _bounded_id(support["last_ts"], "TRAIN_SUPPORT_LAST_TS_INVALID")
-    try:
-        first_ts = datetime.fromisoformat(first_text.replace("Z", "+00:00"))
-        last_ts = datetime.fromisoformat(last_text.replace("Z", "+00:00"))
-        if first_ts > last_ts:
-            raise ValueError
-    except Exception as exc:
-        raise _BookError("TRAIN_SUPPORT_TIME_RANGE_INVALID") from exc
+    if eligible == 0:
+        if support["first_ts"] is not None or support["last_ts"] is not None:
+            raise _BookError("TRAIN_SUPPORT_EMPTY_TIME_RANGE_INVALID")
+    else:
+        first_text = _bounded_id(
+            support["first_ts"], "TRAIN_SUPPORT_FIRST_TS_INVALID"
+        )
+        last_text = _bounded_id(support["last_ts"], "TRAIN_SUPPORT_LAST_TS_INVALID")
+        try:
+            first_ts = datetime.fromisoformat(first_text.replace("Z", "+00:00"))
+            last_ts = datetime.fromisoformat(last_text.replace("Z", "+00:00"))
+            if first_ts > last_ts:
+                raise ValueError
+        except Exception as exc:
+            raise _BookError("TRAIN_SUPPORT_TIME_RANGE_INVALID") from exc
     _hex64(support["vector_sha256"], "TRAIN_SUPPORT_VECTOR_INVALID")
     bindings = _exact_dict(
         support["bindings"],
@@ -2012,9 +2045,9 @@ def _regime_fit_body(
         support = _train_regime_support_body(
             body["train_regime_support"], source_body, params_sha, detector
         )
-        if datetime.fromisoformat(support["last_ts"].replace("Z", "+00:00")) > (
-            datetime.fromisoformat(record["fit_cutoff_utc"].replace("Z", "+00:00"))
-        ):
+        if support["last_ts"] is not None and datetime.fromisoformat(
+            support["last_ts"].replace("Z", "+00:00")
+        ) > datetime.fromisoformat(record["fit_cutoff_utc"].replace("Z", "+00:00")):
             raise _BookError("REGIME_DETECTOR_CUTOFF_PRECEDES_TRAIN_SUPPORT")
     elif body["fit_state"] == REGIME_FIT_TECHNICAL_FAILURE:
         if (
@@ -2051,6 +2084,22 @@ def _regime_fit_body(
             raise _BookError("INAPPLICABLE_REGIME_FIT_SEMANTICS_INVALID")
         if source_body["availability"] != TERMINAL_UNAVAILABLE:
             raise _BookError("INAPPLICABLE_REGIME_SOURCE_INVALID")
+    elif body["fit_state"] == REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL:
+        if not complete or any(
+            value is not None
+            for value in (
+                detector,
+                evidence,
+                mapping,
+                params_sha,
+                detector_record_sha,
+                body["regime_detector_record"],
+                body["train_regime_support"],
+            )
+        ):
+            raise _BookError("TECHNICAL_TERMINAL_REGIME_FIT_SEMANTICS_INVALID")
+        if source_body["availability"] != TERMINAL_TECHNICAL:
+            raise _BookError("TECHNICAL_TERMINAL_REGIME_SOURCE_INVALID")
     else:
         raise _BookError("REGIME_FIT_STATE_INVALID")
     return body
@@ -2185,6 +2234,9 @@ def _process_state_body(
     if body["state_kind"] == TERMINAL_SOURCE_ABSENCE:
         if attempts != 0 or not terminal or not complete:
             raise _BookError("TERMINAL_PROCESS_STATE_INVALID")
+    elif body["state_kind"] == TERMINAL_TECHNICAL:
+        if attempts != 0 or not terminal or not complete:
+            raise _BookError("TERMINAL_TECHNICAL_PROCESS_STATE_INVALID")
     elif body["state_kind"] == TECHNICAL_FAILURE:
         if terminal or complete:
             raise _BookError("TECHNICAL_PROCESS_STATE_INVALID")
@@ -2231,6 +2283,12 @@ def _process_state_body(
                 or fit_body["fit_state"] != REGIME_NOT_APPLICABLE
             ):
                 raise _BookError("TERMINAL_PROCESS_PROVENANCE_INVALID")
+        elif body["state_kind"] == TERMINAL_TECHNICAL:
+            if (
+                source_body["availability"] != TERMINAL_TECHNICAL
+                or fit_body["fit_state"] != REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL
+            ):
+                raise _BookError("TERMINAL_TECHNICAL_PROCESS_PROVENANCE_INVALID")
         else:
             if source_body["availability"] != AVAILABLE:
                 raise _BookError("NONTERMINAL_PROCESS_PROVENANCE_INVALID")
@@ -2308,9 +2366,7 @@ def create_historical_process_state_decision(
                 horizon_plan=horizon_plan,
                 process_rejection_request=process_rejection_request,
                 process_rejection_decision=process_rejection_decision,
-                horizon_winner_cross_binding_bytes=(
-                    horizon_winner_cross_binding_bytes
-                ),
+                horizon_winner_cross_binding_bytes=(horizon_winner_cross_binding_bytes),
                 winner_raw_production_receipt_bytes=(
                     winner_raw_production_receipt_bytes
                 ),
@@ -2350,12 +2406,14 @@ def create_historical_process_state_decision(
             "terminal": state_kind
             in {
                 TERMINAL_SOURCE_ABSENCE,
+                TERMINAL_TECHNICAL,
                 REGIME_UNOBSERVED,
                 INSUFFICIENT_EVIDENCE,
             },
             "complete": state_kind
             in {
                 TERMINAL_SOURCE_ABSENCE,
+                TERMINAL_TECHNICAL,
                 REGIME_UNOBSERVED,
                 INSUFFICIENT_EVIDENCE,
             },
@@ -2467,9 +2525,7 @@ def process_state_cell_evidence(
                 horizon_plan=horizon_plan,
                 process_rejection_request=process_rejection_request,
                 process_rejection_decision=process_rejection_decision,
-                horizon_winner_cross_binding_bytes=(
-                    horizon_winner_cross_binding_bytes
-                ),
+                horizon_winner_cross_binding_bytes=(horizon_winner_cross_binding_bytes),
                 winner_raw_production_receipt_bytes=(
                     winner_raw_production_receipt_bytes
                 ),
@@ -2765,6 +2821,7 @@ def _state_record(
         raise _BookError(f"CELL_{ordinal:04d}_PROCESS_CELL_MISMATCH")
     state = {
         TERMINAL_SOURCE_ABSENCE: "SOURCE_UNAVAILABLE",
+        TERMINAL_TECHNICAL: TERMINAL_TECHNICAL,
         TECHNICAL_FAILURE: TECHNICAL_FAILURE,
         UNSEARCHED: UNSEARCHED,
         REGIME_UNOBSERVED: REGIME_UNOBSERVED,
@@ -2862,6 +2919,9 @@ _DECISION_KEYS: Final = frozenset(
         "diagnostic_by_qualified_count",
         "historical_local_candidate_count",
         "historical_local_candidate_cell_ids",
+        "multiplicity_tested_family_size",
+        "multiplicity_excluded_terminal_technical_count",
+        "multiplicity_tested_cell_ids_sha256",
         "book_generation_sha256",
         "source_groups",
         "regime_fits",
@@ -3097,6 +3157,15 @@ def evaluate_historical_book_multiplicity(
                     raise _BookError(
                         f"GROUP_{group_ordinal:03d}_TERMINAL_SOURCE_CONTRADICTION"
                     )
+            elif source_payload["availability"] == TERMINAL_TECHNICAL:
+                if (
+                    states != {TERMINAL_TECHNICAL}
+                    or fit_payload["fit_state"]
+                    != REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL
+                ):
+                    raise _BookError(
+                        f"GROUP_{group_ordinal:03d}_TERMINAL_TECHNICAL_CONTRADICTION"
+                    )
             elif fit_payload["fit_state"] == REGIME_FIT_TECHNICAL_FAILURE:
                 if states != {TECHNICAL_FAILURE}:
                     raise _BookError(
@@ -3115,11 +3184,26 @@ def evaluate_historical_book_multiplicity(
                             f"GROUP_{group_ordinal:03d}_REGIME_OBSERVATION_CONTRADICTION"
                         )
 
-        q_values = adjust_p_values_by(
-            [record["marginal_p_value"] for record in records]
+        tested_indices = [
+            index
+            for index, record in enumerate(records)
+            if record["historical_state"] != TERMINAL_TECHNICAL
+        ]
+        tested_q_values = (
+            adjust_p_values_by(
+                [records[index]["marginal_p_value"] for index in tested_indices]
+            )
+            if tested_indices
+            else ()
         )
-        if q_values is None or len(q_values) != FAMILY_SIZE:
+        if tested_q_values is None or len(tested_q_values) != len(tested_indices):
             raise _BookError("BY_ADJUSTMENT_FAILED")
+        q_values = [1.0] * FAMILY_SIZE
+        for index, q_value in zip(tested_indices, tested_q_values, strict=True):
+            q_values[index] = q_value
+        tested_cell_ids_sha256 = _sha256_json(
+            [records[index]["cell_id"] for index in tested_indices]
+        )
         incomplete = any(
             record["historical_state"] in {TECHNICAL_FAILURE, UNSEARCHED}
             for record in records
@@ -3151,7 +3235,7 @@ def evaluate_historical_book_multiplicity(
             state: sum(
                 item["payload"]["availability"] == state for item in source_groups
             )
-            for state in (AVAILABLE, TERMINAL_UNAVAILABLE)
+            for state in (AVAILABLE, TERMINAL_UNAVAILABLE, TERMINAL_TECHNICAL)
         }
         regime_counts = {
             state: sum(item["payload"]["fit_state"] == state for item in regime_fits)
@@ -3159,6 +3243,7 @@ def evaluate_historical_book_multiplicity(
                 REGIME_FITTED,
                 REGIME_FIT_TECHNICAL_FAILURE,
                 REGIME_NOT_APPLICABLE,
+                REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
             )
         }
         if incomplete:
@@ -3213,6 +3298,11 @@ def evaluate_historical_book_multiplicity(
                 "diagnostic_by_qualified_count": diagnostic_count,
                 "historical_local_candidate_count": len(candidate_ids),
                 "historical_local_candidate_cell_ids": candidate_ids,
+                "multiplicity_tested_family_size": len(tested_indices),
+                "multiplicity_excluded_terminal_technical_count": (
+                    FAMILY_SIZE - len(tested_indices)
+                ),
+                "multiplicity_tested_cell_ids_sha256": tested_cell_ids_sha256,
                 "book_generation_sha256": generation_sha,
                 "source_groups": source_groups,
                 "regime_fits": regime_fits,
@@ -3296,6 +3386,14 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
             or len(body["regime_fits"]) != SOURCE_GROUP_SIZE
             or type(body["cells"]) is not list
             or len(body["cells"]) != FAMILY_SIZE
+            or type(body["multiplicity_tested_family_size"]) is not int
+            or not 0 <= body["multiplicity_tested_family_size"] <= FAMILY_SIZE
+            or type(body["multiplicity_excluded_terminal_technical_count"]) is not int
+            or body["multiplicity_tested_family_size"]
+            + body["multiplicity_excluded_terminal_technical_count"]
+            != FAMILY_SIZE
+            or _HEX64.fullmatch(body["multiplicity_tested_cell_ids_sha256"] or "")
+            is None
         ):
             return False
         sources: list[HistoricalSourceGroupDecision] = []
@@ -3418,6 +3516,7 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
                 process_body = _process_state_body(process, source, fit)
                 expected_state = {
                     TERMINAL_SOURCE_ABSENCE: "SOURCE_UNAVAILABLE",
+                    TERMINAL_TECHNICAL: TERMINAL_TECHNICAL,
                     TECHNICAL_FAILURE: TECHNICAL_FAILURE,
                     UNSEARCHED: UNSEARCHED,
                     REGIME_UNOBSERVED: REGIME_UNOBSERVED,
@@ -3458,6 +3557,12 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
             if source_body["availability"] == TERMINAL_UNAVAILABLE:
                 if group_states != {"SOURCE_UNAVAILABLE"}:
                     return False
+            elif source_body["availability"] == TERMINAL_TECHNICAL:
+                if (
+                    group_states != {TERMINAL_TECHNICAL}
+                    or fit_body["fit_state"] != REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL
+                ):
+                    return False
             elif fit_body["fit_state"] == REGIME_FIT_TECHNICAL_FAILURE:
                 if group_states != {TECHNICAL_FAILURE}:
                     return False
@@ -3475,9 +3580,22 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
                     for cell in group_cells
                 ):
                     return False
-        q_values = adjust_p_values_by(p_values)
-        if q_values is None:
+        tested_indices = [
+            index for index, state in enumerate(states) if state != TERMINAL_TECHNICAL
+        ]
+        tested_q_values = (
+            adjust_p_values_by([p_values[index] for index in tested_indices])
+            if tested_indices
+            else ()
+        )
+        if tested_q_values is None or len(tested_q_values) != len(tested_indices):
             return False
+        q_values = [1.0] * FAMILY_SIZE
+        for index, q_value in zip(tested_indices, tested_q_values, strict=True):
+            q_values[index] = q_value
+        tested_cell_ids_sha256 = _sha256_json(
+            [body["cells"][index]["cell_id"] for index in tested_indices]
+        )
         incomplete = any(state in {TECHNICAL_FAILURE, UNSEARCHED} for state in states)
         candidates: list[str] = []
         diagnostic_count = 0
@@ -3498,7 +3616,7 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
             state: sum(
                 _source_body(source)["availability"] == state for source in sources
             )
-            for state in (AVAILABLE, TERMINAL_UNAVAILABLE)
+            for state in (AVAILABLE, TERMINAL_UNAVAILABLE, TERMINAL_TECHNICAL)
         }
         regime_counts = {
             state: sum(
@@ -3509,18 +3627,24 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
                 REGIME_FITTED,
                 REGIME_FIT_TECHNICAL_FAILURE,
                 REGIME_NOT_APPLICABLE,
+                REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
             )
         }
         for mapping, expected_keys, expected_total in (
             (body["counts"], sorted(_OUTPUT_STATES), FAMILY_SIZE),
             (
                 body["source_group_counts"],
-                [AVAILABLE, TERMINAL_UNAVAILABLE],
+                [AVAILABLE, TERMINAL_UNAVAILABLE, TERMINAL_TECHNICAL],
                 SOURCE_GROUP_SIZE,
             ),
             (
                 body["regime_fit_counts"],
-                [REGIME_FITTED, REGIME_FIT_TECHNICAL_FAILURE, REGIME_NOT_APPLICABLE],
+                [
+                    REGIME_FITTED,
+                    REGIME_FIT_TECHNICAL_FAILURE,
+                    REGIME_NOT_APPLICABLE,
+                    REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
+                ],
                 SOURCE_GROUP_SIZE,
             ),
         ):
@@ -3570,6 +3694,10 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
             and body["diagnostic_by_qualified_count"] == diagnostic_count
             and body["historical_local_candidate_count"] == len(candidates)
             and body["historical_local_candidate_cell_ids"] == candidates
+            and body["multiplicity_tested_family_size"] == len(tested_indices)
+            and body["multiplicity_excluded_terminal_technical_count"]
+            == FAMILY_SIZE - len(tested_indices)
+            and body["multiplicity_tested_cell_ids_sha256"] == tested_cell_ids_sha256
             and body["book_generation_sha256"] == generation_sha
         )
     except Exception:
@@ -3650,6 +3778,10 @@ def pinned_policy_snapshot() -> dict[str, Any]:
         "positive_regime_count_has_no_occupancy_threshold": True,
         "technical_or_unsearched_invalidates_complete_process": True,
         "terminal_source_absence_is_p_one": True,
+        "terminal_technical_is_complete_p_one_zero_attempts": True,
+        "terminal_technical_is_not_source_unavailable_or_no_trade": True,
+        "terminal_technical_excluded_from_candidate_family_without_global_veto": True,
+        "terminal_technical_excluded_from_by_hypothesis_denominator": True,
         "by_is_diagnostic_only": True,
         "individual_family_wide_fdr_claimed": False,
         "causal_process_validation_required": True,
@@ -3695,6 +3827,7 @@ __all__ = [
     "REGIME_DETECTOR_WEIGHT_GROUPS",
     "REGIME_FIT_TECHNICAL_FAILURE",
     "REGIME_NOT_APPLICABLE",
+    "REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL",
     "REGIME_ORDER",
     "REGIME_UNOBSERVED",
     "REGIME_UNOBSERVED_REASON",
@@ -3708,6 +3841,7 @@ __all__ = [
     "TARGET_FDR",
     "TECHNICAL_FAILURE",
     "TERMINAL_SOURCE_ABSENCE",
+    "TERMINAL_TECHNICAL",
     "TERMINAL_UNAVAILABLE",
     "TIMEFRAME_ORDER",
     "UNSEARCHED",

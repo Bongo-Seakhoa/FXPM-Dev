@@ -590,10 +590,13 @@ def test_later_native_frame_must_contain_byte_exact_selection_prefix() -> None:
         producer._selection_prefix_match(tampered, specialist)
 
 
-def test_nonfirst_symbol_uses_local_adapter_timeframe_group_and_exact_book_copy() -> (
-    None
-):
-    symbol = book.PINNED_SYMBOL_ORDER[17]
+@pytest.mark.parametrize(
+    "symbol",
+    (book.PINNED_SYMBOL_ORDER[17], "Platinum", "Palladium"),
+)
+def test_nonfirst_symbol_uses_local_adapter_timeframe_group_and_exact_book_copy(
+    symbol: str,
+) -> None:
     timeframe = "H4"
     regime = "BREAKOUT"
     group_ordinal = book.PINNED_SYMBOL_ORDER.index(symbol) * len(
@@ -628,6 +631,20 @@ def test_nonfirst_symbol_uses_local_adapter_timeframe_group_and_exact_book_copy(
     )
     assert source == sources[group_ordinal]
     assert fit == fits[group_ordinal]
+
+    if symbol in {"Platinum", "Palladium"}:
+        with pytest.raises(
+            producer.ForwardOOSReplayProductionError,
+            match="SELECTED_SYMBOL_INVALID",
+        ):
+            producer._selected_group_records(
+                book_body=book_body,
+                book_cell=cell,
+                index=index,
+                symbol=symbol.upper(),
+                timeframe=timeframe,
+                cell_id="1" * 64,
+            )
 
     index["regime_fits"][local_ordinal] = {"fit": "post-hoc"}
     with pytest.raises(
@@ -672,7 +689,12 @@ def test_winner_v11_request_and_decision_are_standalone_replayed() -> None:
 
 @pytest.mark.parametrize(
     ("symbol", "timeframe"),
-    [("NOT_A_SYMBOL", "M5"), ("AUDUSD", "H2")],
+    [
+        ("NOT_A_SYMBOL", "M5"),
+        ("AUDUSD", "H2"),
+        ("PLATINUM", "H4"),
+        ("platinum", "H4"),
+    ],
 )
 def test_native_product_key_rejects_out_of_contract_cells(
     symbol: str, timeframe: str
@@ -682,6 +704,36 @@ def test_native_product_key_rejects_out_of_contract_cells(
         match="NATIVE_PRODUCT_KEY_INVALID",
     ):
         producer.native_product_key(symbol, timeframe)
+
+
+def test_native_product_key_preserves_exact_mt5_symbol_for_full_roster() -> None:
+    for symbol in book.PINNED_SYMBOL_ORDER:
+        assert producer.native_product_key(symbol, "H4") == f"{symbol}|H4"
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_forward_native_identity_preserves_exact_mt5_symbol(
+    symbol: str,
+) -> None:
+    cutoff = "2026-02-01T00:00:00Z"
+    product = _sealed_identity_only_product(
+        symbol=symbol,
+        timeframe="H4",
+        cutoff_utc=cutoff,
+    )
+
+    identity = producer._native_product_identity(
+        product,
+        expected_symbol=symbol,
+        expected_timeframe="H4",
+        expected_cutoff_utc=cutoff,
+        role=f"EXECUTION:test:{symbol}|H4",
+    )
+
+    assert identity["symbol"] == symbol
+    assert producer.native_product_key(
+        identity["symbol"], identity["timeframe"]
+    ) == f"{symbol}|H4"
 
 
 def test_m5_specialist_cannot_implicitly_self_supply_valuation_roster() -> None:

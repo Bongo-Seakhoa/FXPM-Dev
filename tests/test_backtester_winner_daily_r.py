@@ -418,7 +418,7 @@ def test_spread_only_frozen_path_stress_uses_closed_partition_p95() -> None:
     )
 
 
-def test_trade_bearing_spread_only_noop_stress_fails_closed() -> None:
+def test_trade_bearing_equal_cost_vectors_are_explicitly_non_adverse() -> None:
     frame = _frame().assign(Spread=[2, 2, 2, 2, 2])
     config = PipelineConfig(
         research_mode=True,
@@ -442,19 +442,33 @@ def test_trade_bearing_spread_only_noop_stress_fails_closed() -> None:
         timeframe="D1",
     )
 
-    with pytest.raises(pm_core.FrozenPathCostStressError) as error:
-        backtester.replay_frozen_path_cost_stress(
-            frame,
-            signals,
-            "ZZZUSD",
-            strategy,
-            base,
-            stress_mode="stress_p95",
-            spec=spec,
-            timeframe="D1",
-        )
+    stress = backtester.replay_frozen_path_cost_stress(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        base,
+        stress_mode="stress_p95",
+        spec=spec,
+        timeframe="D1",
+    )
 
-    assert error.value.code == "STRESS_NOT_NUMERICALLY_ADVERSE"
+    receipt = stress["cost_stress_frozen_path_receipt"]
+    assert receipt["schema_version"] == (
+        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION
+    )
+    assert receipt["realized_adversity_status"] == (
+        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+    )
+    assert (
+        receipt["base_spread_values_sha256"]
+        == receipt["stress_spread_values_sha256"]
+    )
+    assert receipt["strictly_worse_trade_count"] == 0
+    assert receipt["strictly_worse_daily_observation_count"] == 0
+    assert receipt["stress_never_improves"] is True
+    assert stress["position_events"] == base["position_events"]
+    assert stress["winner_daily_r_surface"] == base["winner_daily_r_surface"]
 
 
 def test_noncausal_swap_never_claims_full_path_daily_r() -> None:

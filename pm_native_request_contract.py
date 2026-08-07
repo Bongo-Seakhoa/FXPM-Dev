@@ -227,6 +227,13 @@ AVAILABLE_HISTORY_BOUNDARY_CONFIRMATION_METHOD: Final = (
     "mt5_v4_three_call_single_bar_boundary_match_v1"
 )
 MANIFEST_SCHEMA_VERSION: Final = "fxpm.native_history_run_manifest.v1"
+TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION: Final = (
+    "fxpm.native_history.terminal_technical_evidence.v1"
+)
+TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION: Final = (
+    "fxpm.native_history.retryable_attempt.v2"
+)
+TERMINAL_TECHNICAL_ATTEMPT_CAP: Final = 2
 TRUSTED_POLICY_SCHEMA_VERSION: Final = "fxpm.native_history.trusted_policy.v1"
 SOURCE_IDENTITY_SCHEMA_VERSION: Final = "fxpm.native_history.source_identity.v2"
 _SOURCE_IDENTITY_DOMAIN: Final = b"fxpm.native-history.source-identity.v2\x00"
@@ -282,6 +289,11 @@ TERMINAL_MIN_FREE_BYTES: Final = 2 * TERMINAL_HCC_MAX_FILE_BYTES
 MAX_TERMINAL_HCC_SCAN_ENTRIES: Final = 1_000_000
 OUTPUT_MIN_FREE_BYTES: Final = 4 * 1024**3
 OUTPUT_MAX_CELL_BYTES: Final = MAX_ARTIFACT_BYTES
+MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES: Final = 1024 * 1024
+MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES: Final = (
+    TERMINAL_TECHNICAL_ATTEMPT_CAP * MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES
+    + 128 * 1024
+)
 _DEFAULT_PAGE_DAYS: Final[dict[str, int]] = {
     "M5": 30,
     "M15": 90,
@@ -547,6 +559,8 @@ _AUTHORITY_VERSIONS = (
     MANIFEST_SCHEMA_VERSION,
     TRUSTED_POLICY_SCHEMA_VERSION,
     SOURCE_IDENTITY_SCHEMA_VERSION,
+    TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION,
+    TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION,
     PRODUCTION_SYMBOL_ORDER_SHA256,
     PRODUCTION_TIMEFRAME_ORDER_SHA256,
 )
@@ -578,6 +592,9 @@ _AUTHORITY_CAPS = (
     MAX_TERMINAL_HCC_SCAN_ENTRIES,
     OUTPUT_MIN_FREE_BYTES,
     OUTPUT_MAX_CELL_BYTES,
+    TERMINAL_TECHNICAL_ATTEMPT_CAP,
+    MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES,
+    MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES,
 )
 
 
@@ -718,6 +735,8 @@ def _assert_runtime_authority_intact(
                 MANIFEST_SCHEMA_VERSION,
                 TRUSTED_POLICY_SCHEMA_VERSION,
                 SOURCE_IDENTITY_SCHEMA_VERSION,
+                TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION,
+                TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_SYMBOL_ORDER_SHA256,
                 PRODUCTION_TIMEFRAME_ORDER_SHA256,
             )
@@ -750,6 +769,9 @@ def _assert_runtime_authority_intact(
                 MAX_TERMINAL_HCC_SCAN_ENTRIES,
                 OUTPUT_MIN_FREE_BYTES,
                 OUTPUT_MAX_CELL_BYTES,
+                TERMINAL_TECHNICAL_ATTEMPT_CAP,
+                MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES,
+                MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES,
             )
             == _caps
         )
@@ -4103,9 +4125,12 @@ def _pagination_evidence(
                         )
                     )
                     errors.extend(boundary_errors)
-            if expected_intervals[0][1] > strategy_start:
-                if authenticated_boundary is None:
-                    errors.append("V5_TERMINAL_PREFIX_INTERSECTS_STRATEGY_INTERVAL")
+            if (
+                evidence_mode == "publishable"
+                and expected_intervals[0][1] > strategy_start
+                and authenticated_boundary is None
+            ):
+                errors.append("V5_TERMINAL_PREFIX_INTERSECTS_STRATEGY_INTERVAL")
     elif prefix_pages:
         errors.append("V5_TERMINAL_PREFIX_EVIDENCE_WITHOUT_STOP")
     elif boundary_proof is not None:
@@ -5203,6 +5228,426 @@ def validate_v5_cell_status(
     return cell_state
 
 
+def _terminal_attempt_receipt_payload(envelope: Mapping[str, Any]) -> bytes:
+    """Reproduce the retry writer's exact compact JSON file bytes."""
+
+    canonical_json_bytes(envelope)
+    try:
+        return (
+            json.dumps(
+                envelope,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+    except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
+        raise NativeRequestContractError(
+            ("V5_TERMINAL_ATTEMPT_RECEIPT_ENCODING_INVALID",)
+        ) from exc
+
+
+@_total_function("V5_TERMINAL_TECHNICAL_CELL_VALIDATION_ERROR")
+def validate_v5_terminal_technical_cell(
+    provenance: Any,
+    manifest_result: Any,
+    common_request: Mapping[str, Any],
+    *,
+    symbol: Any,
+    timeframe: str,
+    run_id: Any,
+    manifest_source_environment: Any,
+    expected_retries: int,
+    manifest_acquisition_started_utc: Any,
+    manifest_acquisition_completed_utc: Any,
+) -> str:
+    """Authenticate a provenance-only cell finalized after two real gaps.
+
+    This is a mechanical terminal state for one acquisition run.  It is not a
+    source-unavailable assertion, market verdict, optimizer candidate, or
+    trading authorization.  Finality comes only from the exact embedded
+    retry receipts and their independently replayed page evidence.
+    """
+
+    if not isinstance(provenance, Mapping) or not isinstance(manifest_result, Mapping):
+        raise NativeRequestContractError(("V5_TERMINAL_TECHNICAL_RECORD_INVALID",))
+    canonical_json_bytes(provenance)
+    canonical_json_bytes(manifest_result)
+    common = validate_v5_common_request(common_request)
+    expected_symbol = canonical_symbol(symbol)
+    tf = _canonical_timeframe(timeframe)
+    retries = _strict_positive_int(
+        expected_retries,
+        "V5_RETRIES_INVALID",
+        maximum=MAX_PAGE_ATTEMPTS,
+    )
+    if retries != 1:
+        raise NativeRequestContractError(("V5_ACQUISITION_RETRY_OWNER_INVALID",))
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+        raise NativeRequestContractError(("V5_PRODUCTION_RUN_ID_INVALID",))
+    manifest_started = _aware_utc(
+        manifest_acquisition_started_utc,
+        "V5_MANIFEST_ACQUISITION_STARTED_INVALID",
+    )
+    manifest_completed = _aware_utc(
+        manifest_acquisition_completed_utc,
+        "V5_MANIFEST_ACQUISITION_COMPLETED_INVALID",
+    )
+    if manifest_completed < manifest_started:
+        raise NativeRequestContractError(("V5_MANIFEST_ACQUISITION_ORDER_INVALID",))
+    source_identity = canonical_source_identity(manifest_source_environment)
+    errors: list[str] = []
+    errors.extend(
+        _manifest_result_errors(
+            manifest_result,
+            symbol=expected_symbol,
+            timeframe=tf,
+            publishable_only=True,
+        )
+    )
+    if (
+        manifest_result.get("resume_disposition") != "terminal_technical"
+        or manifest_result.get("status") != "failed"
+        or manifest_result.get("failure_status") != "technical_history_gap"
+        or manifest_result.get("rows") != 0
+        or type(manifest_result.get("rows")) is not int
+        or manifest_result.get("sha256") is not None
+        or manifest_result.get("eligible_for_optimization") is not False
+        or manifest_result.get("eligible_for_downstream_validation") is not False
+    ):
+        errors.append("V5_TERMINAL_TECHNICAL_MANIFEST_INVALID")
+
+    evidence = provenance.get("terminal_technical_evidence")
+    terminal_schema = (
+        _FAILED_PROVENANCE_BASE_FIELDS
+        | _FAILED_PROVENANCE_FETCH_FIELDS
+        | {"terminal_technical_evidence"}
+    )
+    if frozenset(provenance) != terminal_schema:
+        errors.append("V5_TERMINAL_TECHNICAL_PROVENANCE_SCHEMA_INVALID")
+    if not isinstance(evidence, Mapping) or set(evidence) != {
+        "schema_version",
+        "attempt_cap",
+        "accepted_failure_status",
+        "receipts",
+    }:
+        errors.append("V5_TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_INVALID")
+        evidence = {}
+    evidence_bytes = canonical_json_bytes(evidence)
+    if not 0 < len(evidence_bytes) <= MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES:
+        errors.append("V5_TERMINAL_TECHNICAL_EVIDENCE_SIZE_INVALID")
+    if (
+        evidence.get("schema_version") != TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION
+        or evidence.get("attempt_cap") != TERMINAL_TECHNICAL_ATTEMPT_CAP
+        or type(evidence.get("attempt_cap")) is not int
+        or evidence.get("accepted_failure_status") != "technical_history_gap"
+    ):
+        errors.append("V5_TERMINAL_TECHNICAL_EVIDENCE_POLICY_INVALID")
+    receipts = evidence.get("receipts")
+    if (
+        not isinstance(receipts, list)
+        or len(receipts) != TERMINAL_TECHNICAL_ATTEMPT_CAP
+    ):
+        errors.append("V5_TERMINAL_TECHNICAL_RECEIPT_COUNT_INVALID")
+        receipts = []
+
+    expected_attempt_fields = (
+        _FAILED_PROVENANCE_BASE_FIELDS | _FAILED_PROVENANCE_FETCH_FIELDS
+    )
+    envelope_fields = {
+        "schema_version",
+        "immutable_record",
+        "nonfinal",
+        "retryable",
+        "attempt_id",
+        "run_id",
+        "symbol",
+        "timeframe",
+        "retention_status",
+        "full_record_sha256",
+        "full_record_bytes",
+        "record",
+    }
+    descriptor_fields = {"relative_path", "sha256", "bytes", "envelope"}
+    descriptor_order: list[tuple[str, str]] = []
+    relative_paths: set[str] = set()
+    attempt_ids: set[str] = set()
+    full_record_hashes: set[str] = set()
+    shared_broker_symbol: str | None = None
+    shared_instrument: dict[str, Any] | None = None
+    attempt_records: list[tuple[datetime, datetime, str, dict[str, Any]]] = []
+    expected_path = re.compile(
+        rf"^_attempts/{re.escape(expected_symbol)}/{re.escape(tf)}/"
+        r"attempt-[0-9a-f]{32}\.json$",
+        re.ASCII,
+    )
+    source_interval = common["timeframe_source_request_intervals"][tf]
+    strategy_interval = common["timeframe_strategy_evidence_intervals"][tf]
+    terminal_max_bars = source_identity["terminal"]["max_bars"]
+    configured_slots = max(
+        1,
+        int(_DEFAULT_PAGE_DAYS[tf] * 86_400 // TIMEFRAME_SECONDS[tf]),
+    )
+    safe_slots = max(1, int(terminal_max_bars * 0.90))
+    expected_page_span_seconds = (
+        min(configured_slots, safe_slots) * TIMEFRAME_SECONDS[tf]
+    )
+    boundary_tolerance_seconds = float(common["boundary_tolerance_days"] * 86_400)
+    information_cutoff = _aware_utc(
+        common["requested_information_cutoff_utc"],
+        "V5_REQUESTED_CUTOFF_INVALID",
+    )
+
+    for index, descriptor in enumerate(receipts):
+        if not isinstance(descriptor, Mapping) or set(descriptor) != descriptor_fields:
+            errors.append(f"V5_TERMINAL_ATTEMPT_DESCRIPTOR_INVALID:{index}")
+            continue
+        relative_path = descriptor.get("relative_path")
+        digest = descriptor.get("sha256")
+        size = descriptor.get("bytes")
+        envelope = descriptor.get("envelope")
+        if (
+            not isinstance(relative_path, str)
+            or expected_path.fullmatch(relative_path) is None
+        ):
+            errors.append(f"V5_TERMINAL_ATTEMPT_PATH_INVALID:{index}")
+        if not _is_sha256(digest):
+            errors.append(f"V5_TERMINAL_ATTEMPT_SHA256_INVALID:{index}")
+            digest = ""
+        if (
+            type(size) is not int
+            or not 0 < size <= MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES
+        ):
+            errors.append(f"V5_TERMINAL_ATTEMPT_SIZE_INVALID:{index}")
+        if not isinstance(envelope, Mapping) or set(envelope) != envelope_fields:
+            errors.append(f"V5_TERMINAL_ATTEMPT_ENVELOPE_INVALID:{index}")
+            continue
+        attempt_id = envelope.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_id, re.ASCII) is None
+        ):
+            errors.append(f"V5_TERMINAL_ATTEMPT_ID_INVALID:{index}")
+            attempt_id = ""
+        expected_relative_path = (
+            f"_attempts/{expected_symbol}/{tf}/attempt-{attempt_id}.json"
+        )
+        if relative_path != expected_relative_path:
+            errors.append(f"V5_TERMINAL_ATTEMPT_PATH_ID_MISMATCH:{index}")
+        if str(relative_path) in relative_paths:
+            errors.append("V5_TERMINAL_ATTEMPT_DUPLICATE_PATH")
+        relative_paths.add(str(relative_path))
+        if attempt_id in attempt_ids:
+            errors.append("V5_TERMINAL_ATTEMPT_DUPLICATE_ID")
+        attempt_ids.add(attempt_id)
+        try:
+            receipt_payload = _terminal_attempt_receipt_payload(envelope)
+        except NativeRequestContractError as exc:
+            errors.extend(exc.errors)
+            continue
+        if (
+            len(receipt_payload) != size
+            or hashlib.sha256(receipt_payload).hexdigest() != digest
+        ):
+            errors.append(f"V5_TERMINAL_ATTEMPT_FILE_BINDING_INVALID:{index}")
+        descriptor_order.append((str(digest), str(relative_path)))
+        record = envelope.get("record")
+        full_digest = envelope.get("full_record_sha256")
+        full_size = envelope.get("full_record_bytes")
+        if (
+            envelope.get("schema_version")
+            != TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION
+            or envelope.get("immutable_record") is not True
+            or envelope.get("nonfinal") is not True
+            or envelope.get("retryable") is not True
+            or envelope.get("run_id") != run_id
+            or envelope.get("symbol") != expected_symbol
+            or envelope.get("timeframe") != tf
+            or envelope.get("retention_status") != "full"
+            or not _is_sha256(full_digest)
+            or type(full_size) is not int
+            or not 0 < full_size <= MAX_ARTIFACT_BYTES
+            or not isinstance(record, Mapping)
+        ):
+            errors.append(f"V5_TERMINAL_ATTEMPT_ENVELOPE_BINDING_INVALID:{index}")
+            continue
+        try:
+            full_bytes = json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError, OverflowError):
+            errors.append(f"V5_TERMINAL_ATTEMPT_RECORD_ENCODING_INVALID:{index}")
+            continue
+        if (
+            len(full_bytes) != full_size
+            or hashlib.sha256(full_bytes).hexdigest() != full_digest
+        ):
+            errors.append(f"V5_TERMINAL_ATTEMPT_RECORD_DIGEST_INVALID:{index}")
+        if str(full_digest) in full_record_hashes:
+            errors.append("V5_TERMINAL_ATTEMPT_DUPLICATE_EVIDENCE")
+        full_record_hashes.add(str(full_digest))
+        if frozenset(record) != expected_attempt_fields:
+            errors.append(f"V5_TERMINAL_ATTEMPT_RECORD_SCHEMA_INVALID:{index}")
+            continue
+        strict_attempt_fields = {
+            "schema_version": PROVENANCE_SCHEMA_VERSION,
+            "acquisition_contract_version": ACQUISITION_CONTRACT_VERSION,
+            "immutable_record": True,
+            "run_id": run_id,
+            "status": "partial",
+            "failure_status": "technical_history_gap",
+            "eligible_for_optimization": False,
+            "eligible_for_downstream_validation": False,
+            "statistical_sufficiency_assessed": False,
+            "canonical_symbol": expected_symbol,
+            "symbol": expected_symbol,
+            "timeframe": tf,
+            "source_kind": "broker_native",
+            "timezone": "UTC",
+            "timeframe_seconds": TIMEFRAME_SECONDS[tf],
+            "timestamp_semantics": "bar_open_utc",
+            "bar_interval_semantics": "half_open_[bar_open,bar_close)",
+            "bar_close_column": "_BAR_CLOSE_TS",
+            "artifact": None,
+            "sha256": None,
+            "rows": 0,
+            "start_ts": None,
+            "end_ts": None,
+            "complete": False,
+        }
+        for field, expected in strict_attempt_fields.items():
+            if record.get(field) != expected or type(record.get(field)) is not type(
+                expected
+            ):
+                errors.append(f"V5_TERMINAL_ATTEMPT_FIELD_INVALID:{index}:{field}")
+        broker_symbol = record.get("broker_symbol")
+        if not isinstance(broker_symbol, str) or not broker_symbol:
+            errors.append(f"V5_TERMINAL_ATTEMPT_BROKER_SYMBOL_INVALID:{index}")
+            broker_symbol = ""
+        elif shared_broker_symbol is None:
+            shared_broker_symbol = broker_symbol
+        elif broker_symbol != shared_broker_symbol:
+            errors.append("V5_TERMINAL_ATTEMPT_BROKER_SYMBOL_MISMATCH")
+        instrument = record.get("instrument")
+        if not isinstance(instrument, Mapping):
+            errors.append(f"V5_TERMINAL_ATTEMPT_INSTRUMENT_INVALID:{index}")
+        elif shared_instrument is None:
+            shared_instrument = deepcopy(dict(instrument))
+        elif not _same(instrument, shared_instrument):
+            errors.append("V5_TERMINAL_ATTEMPT_INSTRUMENT_MISMATCH")
+        if (
+            not _error_diagnostic_valid(record.get("error"))
+            or record.get("error", {}).get("type") != "TechnicalHistoryGap"
+        ):
+            errors.append(f"V5_TERMINAL_ATTEMPT_ERROR_INVALID:{index}")
+        try:
+            validate_v5_failed_leaf_request(record.get("request"), common, tf)
+        except NativeRequestContractError as exc:
+            errors.extend(exc.errors)
+        try:
+            validate_source_identity_match(
+                record.get("source_environment"), source_identity
+            )
+        except NativeRequestContractError as exc:
+            errors.extend(exc.errors)
+        errors.extend(
+            _output_resource_snapshot_errors(
+                record.get("output_storage_resource_snapshot")
+            )
+        )
+        errors.extend(
+            _authority_claim_errors(
+                record,
+                code_prefix=f"V5_TERMINAL_ATTEMPT_AUTHORITY_CLAIM_PRESENT:{index}",
+            )
+        )
+        try:
+            attempt_started = _aware_utc(
+                record.get("acquisition_started_utc"),
+                f"V5_TERMINAL_ATTEMPT_STARTED_INVALID:{index}",
+            )
+            attempt_completed = _aware_utc(
+                record.get("acquisition_completed_utc"),
+                f"V5_TERMINAL_ATTEMPT_COMPLETED_INVALID:{index}",
+            )
+            if (
+                not (
+                    manifest_started
+                    <= attempt_started
+                    < attempt_completed
+                    <= manifest_completed
+                )
+                or attempt_started < information_cutoff
+            ):
+                errors.append(f"V5_TERMINAL_ATTEMPT_INTERVAL_INVALID:{index}")
+            attempt_records.append(
+                (
+                    attempt_started,
+                    attempt_completed,
+                    str(digest),
+                    deepcopy(dict(record)),
+                )
+            )
+        except NativeRequestContractError as exc:
+            errors.extend(exc.errors)
+        pagination_evidence = _pagination_evidence(
+            record.get("pagination"),
+            source_interval,
+            strategy_interval,
+            tf,
+            expected_symbol=expected_symbol,
+            expected_broker_symbol=str(broker_symbol),
+            expected_source_environment=source_identity,
+            expected_retries=retries,
+            expected_page_span_seconds=expected_page_span_seconds,
+            boundary_tolerance_seconds=boundary_tolerance_seconds,
+            evidence_mode="failed",
+        )
+        errors.extend(pagination_evidence["errors"])
+        if not pagination_evidence["technical_gap"]:
+            errors.append(f"V5_TERMINAL_ATTEMPT_TECHNICAL_GAP_MISSING:{index}")
+
+    if descriptor_order != sorted(descriptor_order) or len(
+        set(descriptor_order)
+    ) != len(descriptor_order):
+        errors.append("V5_TERMINAL_ATTEMPT_ORDER_OR_IDENTITY_INVALID")
+    if len(attempt_records) == TERMINAL_TECHNICAL_ATTEMPT_CAP:
+        chronological = sorted(
+            attempt_records,
+            key=lambda item: (item[0], item[1], item[2]),
+        )
+        first, second = chronological
+        if first[1] >= second[0] or first[0] >= second[0]:
+            errors.append("V5_TERMINAL_ATTEMPT_SEQUENCE_INVALID")
+        latest = second[3]
+        expected_provenance = {
+            **latest,
+            "status": "failed",
+            "terminal_technical_evidence": deepcopy(dict(evidence)),
+        }
+        if not _same(provenance, expected_provenance):
+            errors.append("V5_TERMINAL_TECHNICAL_PROVENANCE_BINDING_INVALID")
+    else:
+        errors.append("V5_TERMINAL_TECHNICAL_ATTEMPTS_INCOMPLETE")
+
+    expected_evidence_sha = hashlib.sha256(evidence_bytes).hexdigest()
+    if manifest_result.get(
+        "terminal_evidence_sha256"
+    ) != expected_evidence_sha or manifest_result.get("terminal_evidence_bytes") != len(
+        evidence_bytes
+    ):
+        errors.append("V5_TERMINAL_TECHNICAL_MANIFEST_EVIDENCE_MISMATCH")
+    if errors:
+        raise NativeRequestContractError(tuple(dict.fromkeys(errors)))
+    return "technical_history_gap"
+
+
 @_total_function("V5_FAILED_CELL_ENVELOPE_VALIDATION_ERROR")
 def validate_v5_failed_cell_envelope(
     provenance: Any,
@@ -5509,19 +5954,34 @@ def _manifest_result_errors(
         "relative_leaf",
         "resume_disposition",
     }
+    disposition = result.get("resume_disposition")
+    if disposition == "terminal_technical":
+        expected_fields |= {
+            "terminal_evidence_sha256",
+            "terminal_evidence_bytes",
+        }
     if set(result) != expected_fields:
         errors.append(f"V5_MANIFEST_RESULT_SCHEMA_INVALID:{symbol}:{timeframe}")
     if result.get("symbol") != symbol or result.get("timeframe") != timeframe:
         errors.append(f"V5_MANIFEST_RESULT_IDENTITY_MISMATCH:{symbol}:{timeframe}")
     if result.get("relative_leaf") != f"{symbol}/{timeframe}":
         errors.append(f"V5_MANIFEST_RESULT_PATH_INVALID:{symbol}:{timeframe}")
-    if result.get("resume_disposition") not in {"newly_acquired", "reused"}:
+    if disposition not in {"newly_acquired", "reused", "terminal_technical"}:
         errors.append(f"V5_MANIFEST_RESULT_DISPOSITION_INVALID:{symbol}:{timeframe}")
     status = result.get("status")
     failure = result.get("failure_status")
-    allowed_statuses = (
-        {"success", "partial"} if publishable_only else {"success", "partial", "failed"}
-    )
+    # A terminalized chronic-technical cell is the one typed FAILED form a
+    # sealed production manifest may carry: cap-many bounded attempts
+    # reproduced technical_history_gap, the receipt record is embedded in the
+    # result, and the cell is excluded (never published, never eligible).
+    if disposition == "terminal_technical":
+        allowed_statuses = {"failed"}
+    else:
+        allowed_statuses = (
+            {"success", "partial"}
+            if publishable_only
+            else {"success", "partial", "failed"}
+        )
     if not isinstance(status, str) or status not in allowed_statuses:
         errors.append(f"V5_MANIFEST_RESULT_STATUS_INVALID:{symbol}:{timeframe}")
         return errors
@@ -5556,6 +6016,21 @@ def _manifest_result_errors(
         )
         if failure not in allowed_partial_failures:
             errors.append(f"V5_MANIFEST_RESULT_FAILURE_INVALID:{symbol}:{timeframe}")
+    elif disposition == "terminal_technical":
+        if failure != "technical_history_gap":
+            errors.append(f"V5_MANIFEST_RESULT_FAILURE_INVALID:{symbol}:{timeframe}")
+        if not _is_sha256(result.get("terminal_evidence_sha256")):
+            errors.append(
+                f"V5_MANIFEST_RESULT_TERMINAL_EVIDENCE_SHA256_INVALID:{symbol}:{timeframe}"
+            )
+        try:
+            _strict_positive_int(
+                result.get("terminal_evidence_bytes"),
+                f"V5_MANIFEST_RESULT_TERMINAL_EVIDENCE_BYTES_INVALID:{symbol}:{timeframe}",
+                maximum=MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES,
+            )
+        except NativeRequestContractError as exc:
+            errors.extend(exc.errors)
     elif not isinstance(failure, str) or failure not in _FAILED_ACQUISITION_STATES:
         errors.append(f"V5_MANIFEST_RESULT_FAILURE_INVALID:{symbol}:{timeframe}")
     if status in {"success", "partial"}:
@@ -5707,7 +6182,22 @@ def validate_v5_production_manifest(
         "reused_cells",
         "stale_staging_removed",
     }
-    if not isinstance(resume, Mapping) or set(resume) != expected_resume_fields:
+    terminal_cell_count = sum(
+        result.get("resume_disposition") == "terminal_technical"
+        for result in result_map.values()
+    )
+    # terminalized_technical_cells is optional so pre-terminalization sealed
+    # manifests stay valid; when terminal cells exist the key must be present
+    # and reconcile exactly.
+    observed_resume_fields = (
+        set(resume) - {"terminalized_technical_cells"}
+        if isinstance(resume, Mapping)
+        else set()
+    )
+    if (
+        not isinstance(resume, Mapping)
+        or observed_resume_fields != expected_resume_fields
+    ):
         errors.append("V5_MANIFEST_RESUME_INVALID")
     else:
         if type(resume.get("enabled")) is not bool:
@@ -5722,6 +6212,8 @@ def validate_v5_production_manifest(
                 for result in result_map.values()
             ),
         }
+        if terminal_cell_count or "terminalized_technical_cells" in resume:
+            disposition_counts["terminalized_technical_cells"] = terminal_cell_count
         for field, expected in disposition_counts.items():
             try:
                 observed = _strict_nonnegative_int(
@@ -5778,6 +6270,25 @@ def validate_v5_production_cell(
         or provenance.get("run_id") != bound["run_id"]
     ):
         raise NativeRequestContractError(("V5_PRODUCTION_RUN_BINDING_MISMATCH",))
+    if expected_result.get("resume_disposition") == "terminal_technical":
+        if artifact_observation is not None:
+            raise NativeRequestContractError(
+                ("V5_TERMINAL_TECHNICAL_ARTIFACT_FORBIDDEN",)
+            )
+        return validate_v5_terminal_technical_cell(
+            provenance,
+            manifest_result,
+            bound["common_request"],
+            symbol=canonical,
+            timeframe=tf,
+            run_id=bound["run_id"],
+            manifest_source_environment=bound["source_environment"],
+            expected_retries=policy.retries,
+            manifest_acquisition_started_utc=manifest.get("acquisition_started_utc"),
+            manifest_acquisition_completed_utc=manifest.get(
+                "acquisition_completed_utc"
+            ),
+        )
     return validate_v5_cell_status(
         provenance,
         manifest_result,
@@ -6346,6 +6857,7 @@ _finalize_runtime_functions(
             "_strict_production_symbol_order",
             "_strict_timeframe_order",
             "_strict_year_matrix",
+            "_terminal_attempt_receipt_payload",
             "_terminal_prefix_diagnostics_errors",
             "_terminal_resource_limit_snapshot_errors",
             "_validate_artifact_observation",
@@ -6383,6 +6895,7 @@ _finalize_runtime_functions(
             "validate_v5_manifest_request",
             "validate_v5_production_cell",
             "validate_v5_production_manifest",
+            "validate_v5_terminal_technical_cell",
         )
     }
 )
@@ -6410,6 +6923,8 @@ __all__ = [
     "MAX_PAGES_PER_CELL",
     "MAX_PARTITION_YEARS",
     "MAX_SOURCE_QUALITY_OMISSIONS_PER_CELL",
+    "MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES",
+    "MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES",
     "NativeRequestContractError",
     "OUTPUT_MAX_CELL_BYTES",
     "OUTPUT_MIN_FREE_BYTES",
@@ -6426,6 +6941,9 @@ __all__ = [
     "PRODUCTION_TIMEFRAME_ORDER_SHA256",
     "PROVENANCE_SCHEMA_VERSION",
     "SOURCE_IDENTITY_SCHEMA_VERSION",
+    "TERMINAL_TECHNICAL_ATTEMPT_CAP",
+    "TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION",
+    "TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION",
     "TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION",
     "TRUSTED_POLICY_SCHEMA_VERSION",
     "TrustedV5Policy",
@@ -6460,4 +6978,5 @@ __all__ = [
     "validate_v5_manifest_request",
     "validate_v5_production_cell",
     "validate_v5_production_manifest",
+    "validate_v5_terminal_technical_cell",
 ]

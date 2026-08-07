@@ -126,7 +126,7 @@ def test_run_optimization_calendar_mode_never_invokes_legacy_m5_roster_filter(
     )
     monkeypatch.setattr(
         "pm_main._governed_generation_cli_verdict",
-        lambda _outcome, _ledger: (True, []),
+        lambda _outcome, _ledger, **_kwargs: (True, []),
     )
     assert app.run_optimization()
     assert app.portfolio_manager.optimization_rosters == [["EURUSD", "SOLUSD"]]
@@ -161,7 +161,7 @@ def test_legacy_m5_readiness_filter_never_overwrites_winner_ledger(
     }
     monkeypatch.setattr(
         "pm_main._governed_generation_cli_verdict",
-        lambda _outcome, _ledger: (True, []),
+        lambda _outcome, _ledger, **_kwargs: (True, []),
     )
 
     assert app.run_optimization()

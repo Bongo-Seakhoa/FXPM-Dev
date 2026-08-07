@@ -15,10 +15,13 @@ import json
 import math
 import os
 import secrets
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,8 +33,55 @@ TERMS_SNAPSHOT_SCHEMA = "fxpm-broker-terms-snapshot-v1"
 TERMS_ACTIVATION_SCHEMA = "fxpm-native-terms-activation-v1"
 TERMS_ACTIVE_POINTER_SCHEMA = "fxpm-native-terms-active-pointer-v1"
 D1_SESSION_SCHEDULE_SCHEMA = "fxpm-d1-swap-session-schedule-v2"
+SESSION_SCHEDULE_SCHEMA = "fxpm-swap-session-schedule-v3"
+D1_SESSION_DERIVATION_CONTRACT = "d1-interval-axis-v1"
+INTRADAY_SESSION_DERIVATION_CONTRACT = "intraday-session-date-axis-v1"
 SWAP_PROJECTION_CONTRACT = "fxpm-swap-preopen-close-projection-v1"
 STRESS_POLICY_ID = "all_sessions_triple_debit_v1"
+PRICE_UNIVERSE_V4_SCHEMA = "fxpm-native-universe-authenticity-v4"
+PRICE_CELL_EVIDENCE_CANDIDATE = "evidence_candidate"
+PRICE_CELL_TERMINAL_NONCANDIDATES = frozenset({"technical_error", "source_unavailable"})
+_SCHEDULE_SOURCE_PREFERENCE = ("D1", "H4", "H1", "M30", "M15", "M5")
+SCHEDULE_SOURCE_POLICY = "d1-preferred-coarsest-intraday-fallback-v1"
+SCHEDULE_SOURCE_SELECTION_SCHEMA = "fxpm-schedule-source-selection-v1"
+
+_DIRECT_SNAPSHOT_KEYS = frozenset({
+    "schema_version",
+    "provenance_status",
+    "extractor_contract",
+    "nonce",
+    "captured_at_utc",
+    "capture_started_at_utc",
+    "broker_identity",
+    "roster",
+    "symbols",
+    "source_export_sha256",
+    "content_sha256",
+})
+_DIRECT_RECORD_KEYS = frozenset({
+    "canonical_symbol",
+    "broker_symbol",
+    "swap_mode",
+    "swap_long",
+    "swap_short",
+    "swap_rollover3days",
+    "weekday_factors",
+    "d1_anchors",
+    "provenance_status",
+})
+_BROKER_IDENTITY_KEYS = frozenset({
+    "broker_server",
+    "terminal_company",
+    "account_currency",
+    "terminal_build",
+})
+_STRESS_POLICY = {
+    "policy_id": STRESS_POLICY_ID,
+    "explicit_approval_required": True,
+    "positive_credits_suppressed": True,
+}
+_TERMS_POINTER_THREAD_LOCK = threading.RLock()
+_NATIVE_POINTER_THREAD_LOCK = threading.RLock()
 
 AUTHENTICATED = "AUTHENTICATED"
 STRESS_APPROVED = "STRESS_APPROVED"
@@ -83,6 +133,14 @@ class BrokerTermsError(ValueError):
     """A broker-terms artifact is incomplete, inconsistent, or unsafe."""
 
 
+class ScheduleSourceUnsuitableError(BrokerTermsError):
+    """One authentic candidate cannot represent the required broker days."""
+
+    def __init__(self, reason_code: str, message: str):
+        super().__init__(message)
+        self.reason_code = str(reason_code)
+
+
 class TermsStorageBoundError(BrokerTermsError):
     """Protected evidence alone exceeds the configured storage bound."""
 
@@ -111,6 +169,19 @@ def _aware_utc(value: Any, field: str) -> datetime:
 
 def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _require_snapshot_fresh(
+    capture_started_at_utc: datetime,
+    observed_at_utc: datetime,
+    max_age_seconds: int,
+) -> None:
+    age_seconds = (
+        observed_at_utc.astimezone(timezone.utc)
+        - capture_started_at_utc.astimezone(timezone.utc)
+    ).total_seconds()
+    if age_seconds < -60 or age_seconds > int(max_age_seconds):
+        raise BrokerTermsError("terms snapshot is not fresh at activation time")
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -173,13 +244,18 @@ def _safe_relative(root: Path, relative: Any) -> Path:
 
 def _read_bounded(path: Path, max_bytes: int) -> bytes:
     path = Path(path)
-    if not path.is_file() or path.is_symlink():
-        raise BrokerTermsError(f"artifact is missing or unsafe: {path}")
-    size = path.stat().st_size
-    if size <= 0 or size > int(max_bytes):
-        raise BrokerTermsError(f"artifact size {size} is outside the allowed bound")
-    with path.open("rb") as handle:
-        payload = handle.read(int(max_bytes) + 1)
+    try:
+        if not path.is_file() or path.is_symlink():
+            raise BrokerTermsError(f"artifact is missing or unsafe: {path}")
+        size = path.stat().st_size
+        if size <= 0 or size > int(max_bytes):
+            raise BrokerTermsError(f"artifact size {size} is outside the allowed bound")
+        with path.open("rb") as handle:
+            payload = handle.read(int(max_bytes) + 1)
+    except BrokerTermsError:
+        raise
+    except OSError as exc:
+        raise BrokerTermsError(f"artifact cannot be read safely: {path}") from exc
     if len(payload) > int(max_bytes):
         raise BrokerTermsError("artifact exceeded its read bound")
     return payload
@@ -204,7 +280,12 @@ def _atomic_create_json(path: Path, value: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _atomic_replace_json(path: Path, value: Mapping[str, Any]) -> None:
+def _atomic_replace_json(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    before_replace: Optional[Callable[[], None]] = None,
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
@@ -214,9 +295,120 @@ def _atomic_replace_json(path: Path, value: Mapping[str, Any]) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _file_pointer_lock(
+    lock_path: Path,
+    process_lock: threading.RLock,
+    *,
+    label: str,
+    timeout_seconds: float = 30.0,
+) -> Iterator[None]:
+    """Acquire one persistent one-byte advisory publication lock."""
+
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    with process_lock:
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if time.monotonic() >= deadline:
+                            raise BrokerTermsError(
+                                f"timed out waiting for the {label} pointer lock"
+                            ) from exc
+                        time.sleep(0.025)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        # Closing the handle releases the kernel lock.  An
+                        # unlock diagnostic must not turn a completed pointer
+                        # swap into a false publication failure.
+                        pass
+            else:
+                import fcntl
+
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError as exc:
+                        if time.monotonic() >= deadline:
+                            raise BrokerTermsError(
+                                f"timed out waiting for the {label} pointer lock"
+                            ) from exc
+                        time.sleep(0.025)
+                try:
+                    yield
+                finally:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        # Handle close remains the authoritative release.
+                        pass
+
+
+@contextmanager
+def _terms_pointer_lock(
+    native_root: Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> Iterator[None]:
+    """Serialize terms publication and pruning across processes."""
+
+    with _file_pointer_lock(
+        Path(native_root).resolve() / ".TERMS_ACTIVE.json.lock",
+        _TERMS_POINTER_THREAD_LOCK,
+        label="broker-terms",
+        timeout_seconds=timeout_seconds,
+    ):
+        yield
+
+
+@contextmanager
+def _native_price_pointer_lock(
+    native_root: Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> Iterator[None]:
+    """Coordinate the final price snapshot with the canonical native promoter."""
+
+    with _file_pointer_lock(
+        Path(native_root).resolve() / ".ACTIVE.json.lock",
+        _NATIVE_POINTER_THREAD_LOCK,
+        label="native ACTIVE",
+        timeout_seconds=timeout_seconds,
+    ):
+        yield
+
+
+def _optional_pointer_bytes(path: Path, max_bytes: int = 1024 * 1024) -> Optional[bytes]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    return _read_bounded(path, max_bytes)
 
 
 def classify_terms_provenance(
@@ -283,7 +475,9 @@ def parse_terms_export(
     }
     if not roster or len(roster) > int(max_symbols) or any(not key or not value for key, value in roster.items()):
         raise BrokerTermsError("expected roster is empty, oversized, or malformed")
-    payload = _read_bounded(Path(export_path), max_bytes).decode("utf-8-sig", errors="strict")
+    source_payload = _read_bounded(Path(export_path), max_bytes)
+    source_export_sha256 = hashlib.sha256(source_payload).hexdigest()
+    payload = source_payload.decode("utf-8-sig", errors="strict")
     reader = csv.DictReader(io.StringIO(payload, newline=""))
     if tuple(reader.fieldnames or ()) != EXPORT_COLUMNS:
         raise BrokerTermsError("export header does not exactly match the v1 schema")
@@ -387,17 +581,167 @@ def parse_terms_export(
         "broker_identity": observed_identity or {},
         "roster": sorted(rows),
         "symbols": {key: rows[key] for key in sorted(rows)},
-        "source_export_sha256": sha256_file(Path(export_path)),
+        "source_export_sha256": source_export_sha256,
     }
     snapshot["content_sha256"] = canonical_sha256(snapshot)
     return snapshot
 
 
-def build_explicit_stress_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
-    """Create an explicit debit-only stress snapshot; never called implicitly."""
+def _casefold_key_map(payload: Mapping[str, Any], field: str) -> Dict[str, str]:
+    """Map case-insensitive identities while rejecting ambiguous manifests."""
+
+    if not isinstance(payload, Mapping):
+        raise BrokerTermsError(f"{field} is not an object")
+    index: Dict[str, str] = {}
+    for raw_key in payload:
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise BrokerTermsError(f"{field} contains an empty or non-string key")
+        key = raw_key.strip()
+        folded = key.casefold()
+        previous = index.get(folded)
+        if previous is not None and previous != key:
+            raise BrokerTermsError(
+                f"{field} contains a case-insensitive identity collision: "
+                f"{previous!r} versus {key!r}"
+            )
+        index[folded] = key
+    return index
+
+
+def _snapshot_content_sha256(snapshot: Mapping[str, Any]) -> str:
+    declared = str(snapshot.get("content_sha256") or "").strip().lower()
+    without_hash = dict(snapshot)
+    without_hash.pop("content_sha256", None)
+    if not _is_sha256(declared) or declared != canonical_sha256(without_hash):
+        raise BrokerTermsError("terms snapshot content hash is invalid")
+    return declared
+
+
+def _validate_direct_terms_snapshot(snapshot: Mapping[str, Any]) -> str:
+    """Verify the exact JSON product emitted by ``parse_terms_export``."""
+
+    if not isinstance(snapshot, Mapping):
+        raise BrokerTermsError("authenticated terms snapshot is not an object")
+    if set(snapshot) != set(_DIRECT_SNAPSHOT_KEYS):
+        raise BrokerTermsError("authenticated snapshot shape is not the direct-export shape")
     if str(snapshot.get("schema_version") or "") != TERMS_SNAPSHOT_SCHEMA:
-        raise BrokerTermsError("stress source snapshot schema is invalid")
-    output = json.loads(json.dumps(snapshot))
+        raise BrokerTermsError("terms snapshot schema is invalid")
+    if str(snapshot.get("provenance_status") or "") != AUTHENTICATED:
+        raise BrokerTermsError("stress source is not an authenticated direct export")
+    if str(snapshot.get("extractor_contract") or "") != "mql5-symbolinfo-direct-v1":
+        raise BrokerTermsError("authenticated snapshot lacks direct-export provenance")
+    nonce = str(snapshot.get("nonce") or "")
+    if not 16 <= len(nonce) <= 128 or not _is_sha256(snapshot.get("source_export_sha256")):
+        raise BrokerTermsError("authenticated snapshot lacks direct-export provenance")
+
+    captured = _aware_utc(snapshot.get("captured_at_utc"), "snapshot.captured_at_utc")
+    started = _aware_utc(
+        snapshot.get("capture_started_at_utc"),
+        "snapshot.capture_started_at_utc",
+    )
+    if started > captured or (captured - started).total_seconds() > 300:
+        raise BrokerTermsError("authenticated snapshot capture interval is invalid")
+
+    identity = snapshot.get("broker_identity")
+    if not isinstance(identity, Mapping) or set(identity) != set(_BROKER_IDENTITY_KEYS):
+        raise BrokerTermsError("authenticated snapshot broker identity is incomplete")
+    if (
+        not str(identity.get("broker_server") or "").strip()
+        or not str(identity.get("terminal_company") or "").strip()
+        or not str(identity.get("account_currency") or "").strip()
+        or str(identity.get("account_currency") or "")
+        != str(identity.get("account_currency") or "").upper()
+        or type(identity.get("terminal_build")) is not int
+        or int(identity.get("terminal_build")) <= 0
+    ):
+        raise BrokerTermsError("authenticated snapshot broker identity is incomplete")
+
+    roster = snapshot.get("roster")
+    symbols = snapshot.get("symbols")
+    if not isinstance(roster, list) or not isinstance(symbols, Mapping):
+        raise BrokerTermsError("terms snapshot roster and symbol records are not exact")
+    _casefold_key_map(symbols, "terms snapshot symbols")
+    if (
+        not roster
+        or len(roster) > 1000
+        or any(not isinstance(value, str) or not value for value in roster)
+        or roster != sorted(symbols)
+        or len(roster) != len(set(roster))
+    ):
+        raise BrokerTermsError("terms snapshot roster and symbol records are not exact")
+
+    for symbol in roster:
+        record = symbols.get(symbol)
+        if not isinstance(record, Mapping) or set(record) != set(_DIRECT_RECORD_KEYS):
+            raise BrokerTermsError(f"{symbol}: direct-export record shape is invalid")
+        if (
+            symbol != symbol.upper()
+            or str(record.get("canonical_symbol") or "") != symbol
+            or not str(record.get("broker_symbol") or "").strip()
+            or str(record.get("provenance_status") or "") != AUTHENTICATED
+        ):
+            raise BrokerTermsError(f"{symbol}: direct-export record identity is invalid")
+        if type(record.get("swap_mode")) is not int:
+            raise BrokerTermsError(f"{symbol}.swap_mode is not an integer")
+        swap_mode = int(record.get("swap_mode"))
+        if swap_mode < 0:
+            raise BrokerTermsError(f"{symbol}: invalid swap mode")
+        for rate_field in ("swap_long", "swap_short"):
+            if type(record.get(rate_field)) is not float:
+                raise BrokerTermsError(f"{symbol}.{rate_field} is not a direct-export float")
+            _finite_float(record.get(rate_field), f"{symbol}.{rate_field}")
+        if type(record.get("swap_rollover3days")) is not int:
+            raise BrokerTermsError(f"{symbol}.swap_rollover3days is not an integer")
+        rollover_day = int(record.get("swap_rollover3days"))
+        if not 0 <= rollover_day <= 7:
+            raise BrokerTermsError(f"{symbol}: invalid rollover weekday")
+        factors = record.get("weekday_factors")
+        if not isinstance(factors, Mapping) or set(factors) != set(WEEKDAYS):
+            raise BrokerTermsError(f"{symbol}: seven direct weekday factors are required")
+        normalized_factors: Dict[str, int] = {}
+        for weekday in WEEKDAYS:
+            if type(factors.get(weekday)) is not int:
+                raise BrokerTermsError(f"{symbol}.{weekday} factor is not an integer")
+            factor = int(factors.get(weekday))
+            if factor not in {0, 1, 3}:
+                raise BrokerTermsError(f"{symbol}: unsupported {weekday} swap factor")
+            normalized_factors[weekday] = factor
+        triple_days = [
+            index for index, weekday in enumerate(WEEKDAYS)
+            if normalized_factors[weekday] == 3
+        ]
+        expected_triple_days = [] if rollover_day == 7 else [rollover_day]
+        if (
+            (swap_mode == 0 and any(normalized_factors.values()))
+            or (swap_mode != 0 and triple_days != expected_triple_days)
+        ):
+            raise BrokerTermsError(f"{symbol}: weekday factors contradict swap metadata")
+
+        anchors = record.get("d1_anchors")
+        if not isinstance(anchors, list) or not 1 <= len(anchors) <= 128:
+            raise BrokerTermsError(f"{symbol}: D1 anchors are missing")
+        epochs: set[int] = set()
+        for anchor in anchors:
+            if (
+                not isinstance(anchor, Mapping)
+                or set(anchor) != {"open_epoch", "server_weekday"}
+                or type(anchor.get("open_epoch")) is not int
+                or type(anchor.get("server_weekday")) is not int
+            ):
+                raise BrokerTermsError(f"{symbol}: D1 anchor shape is invalid")
+            epoch = int(anchor.get("open_epoch"))
+            weekday = int(anchor.get("server_weekday"))
+            if epoch <= 0 or not 0 <= weekday <= 6 or epoch in epochs:
+                raise BrokerTermsError(f"{symbol}: D1 anchor is invalid or duplicated")
+            epochs.add(epoch)
+
+    return _snapshot_content_sha256(snapshot)
+
+
+def _stress_transform(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    source = json.loads(json.dumps(snapshot, allow_nan=False))
+    output = json.loads(json.dumps(snapshot, allow_nan=False))
+    output["stress_source_snapshot"] = source
     for symbol, record in dict(output.get("symbols") or {}).items():
         long_rate = _finite_float(record.get("swap_long"), f"{symbol}.swap_long")
         short_rate = _finite_float(record.get("swap_short"), f"{symbol}.swap_short")
@@ -407,73 +751,230 @@ def build_explicit_stress_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any
         record["weekday_factors"] = {weekday: 3 for weekday in WEEKDAYS}
         record["provenance_status"] = STRESS_APPROVED
     output["provenance_status"] = STRESS_APPROVED
-    output["stress_policy"] = {
-        "policy_id": STRESS_POLICY_ID,
-        "explicit_approval_required": True,
-        "positive_credits_suppressed": True,
-    }
+    output["stress_policy"] = dict(_STRESS_POLICY)
     output.pop("content_sha256", None)
     output["content_sha256"] = canonical_sha256(output)
     return output
 
 
-def _load_json_bounded(path: Path, max_bytes: int = 64 * 1024 * 1024) -> Dict[str, Any]:
+def _validate_terms_snapshot(snapshot: Mapping[str, Any]) -> str:
+    provenance = str(snapshot.get("provenance_status") or "")
+    if provenance == AUTHENTICATED:
+        return _validate_direct_terms_snapshot(snapshot)
+    if provenance != STRESS_APPROVED:
+        raise BrokerTermsError("terms snapshot is not admissible for activation")
+    source = snapshot.get("stress_source_snapshot")
+    if not isinstance(source, Mapping):
+        raise BrokerTermsError("stress snapshot lacks its authenticated direct-export source")
+    _validate_direct_terms_snapshot(source)
+    expected = _stress_transform(source)
+    if _canonical_bytes(snapshot) != _canonical_bytes(expected):
+        raise BrokerTermsError("stress snapshot is not the exact approved source transform")
+    return _snapshot_content_sha256(snapshot)
+
+
+def build_explicit_stress_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    """Create the exact approved debit-only transform of one direct export."""
+
+    _validate_direct_terms_snapshot(snapshot)
+    return _stress_transform(snapshot)
+
+
+def _load_json_bounded_hashed(
+    path: Path,
+    max_bytes: int = 64 * 1024 * 1024,
+) -> Tuple[Dict[str, Any], str, bytes]:
+    payload = _read_bounded(path, max_bytes)
     try:
-        value = json.loads(_read_bounded(path, max_bytes).decode("utf-8"))
+        value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BrokerTermsError(f"invalid JSON artifact: {path}") from exc
     if not isinstance(value, dict):
         raise BrokerTermsError(f"JSON artifact is not an object: {path}")
+    return value, hashlib.sha256(payload).hexdigest(), payload
+
+
+def _load_json_bounded(path: Path, max_bytes: int = 64 * 1024 * 1024) -> Dict[str, Any]:
+    value, _digest, _payload = _load_json_bounded_hashed(path, max_bytes)
     return value
+
+
+def _price_contract_mode(pointer: Mapping[str, Any], manifest: Mapping[str, Any]) -> str:
+    universe = manifest.get("universe_eligibility")
+    production_markers_present = (
+        "production_authoritative" in pointer
+        or any(
+            field in manifest
+            for field in (
+                "production_authoritative",
+                "native_is_signal_authority",
+                "silent_fallback_allowed",
+                "universe_eligibility",
+            )
+        )
+    )
+    if not production_markers_present:
+        return "legacy-active-v1"
+    if (
+        pointer.get("production_authoritative") is not True
+        or manifest.get("production_authoritative") is not True
+        or manifest.get("native_is_signal_authority") is not True
+        or manifest.get("silent_fallback_allowed") is not False
+        or not isinstance(universe, Mapping)
+        or str(universe.get("schema_version") or "") != PRICE_UNIVERSE_V4_SCHEMA
+        or universe.get("trading_verdicts_emitted") is not False
+        or universe.get("performance_inputs_used") is not False
+    ):
+        raise BrokerTermsError("native production price authority contract is incomplete")
+    counts = manifest.get("counts")
+    if (
+        not isinstance(counts, Mapping)
+        or type(counts.get("pending")) is not int
+        or type(counts.get("terminal")) is not int
+        or type(counts.get("total")) is not int
+        or int(counts.get("pending")) != 0
+        or int(counts.get("terminal")) <= 0
+        or int(counts.get("terminal")) != int(counts.get("total"))
+    ):
+        raise BrokerTermsError("native production price authority is not fully terminal")
+    if list(universe.get("required_timeframes") or []) != [
+        "M5",
+        "M15",
+        "M30",
+        "H1",
+        "H4",
+        "D1",
+    ]:
+        raise BrokerTermsError("native production price authority timeframe contract is invalid")
+    if not isinstance(universe.get("cell_statuses"), Mapping) or not isinstance(
+        universe.get("evidence_candidate_timeframes_by_symbol"), Mapping
+    ):
+        raise BrokerTermsError("native production price authority eligibility map is missing")
+    return "promoted-v4"
+
+
+def _price_cell_is_admissible(
+    price: Mapping[str, Any],
+    symbol: str,
+    timeframe: str,
+    cell: Mapping[str, Any],
+) -> bool:
+    status = str(cell.get("status") or "").strip().lower()
+    if price.get("contract_mode") != "promoted-v4":
+        return status == "active"
+
+    manifest = price.get("manifest")
+    if not isinstance(manifest, Mapping):
+        raise BrokerTermsError("native production price manifest is unavailable")
+    universe = manifest.get("universe_eligibility")
+    if not isinstance(universe, Mapping):
+        raise BrokerTermsError("native production price eligibility contract is unavailable")
+    declared_status = str(
+        ((universe.get("cell_statuses") or {}).get(symbol) or {}).get(timeframe) or ""
+    ).strip().lower()
+    if declared_status != status:
+        raise BrokerTermsError(
+            f"{symbol} {timeframe}: price-cell status contradicts universe eligibility"
+        )
+    if status in PRICE_CELL_TERMINAL_NONCANDIDATES:
+        return False
+    if status != PRICE_CELL_EVIDENCE_CANDIDATE:
+        raise BrokerTermsError(
+            f"{symbol} {timeframe}: unsupported production price-cell status {status!r}"
+        )
+    candidate_timeframes = list(
+        ((universe.get("evidence_candidate_timeframes_by_symbol") or {}).get(symbol) or [])
+    )
+    if (
+        timeframe not in candidate_timeframes
+        or str(cell.get("universe_eligibility_status") or "").strip().lower()
+        != PRICE_CELL_EVIDENCE_CANDIDATE
+        or str(cell.get("symbol") or "") != symbol
+        or str(cell.get("timeframe") or "").upper() != timeframe
+    ):
+        raise BrokerTermsError(
+            f"{symbol} {timeframe}: evidence-candidate identity is not authenticated"
+        )
+    return True
+
+
+def _same_price_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return (
+        left.get("pointer_bytes") == right.get("pointer_bytes")
+        and left.get("manifest_bytes") == right.get("manifest_bytes")
+        and left.get("pointer_sha256") == right.get("pointer_sha256")
+        and left.get("manifest_sha256") == right.get("manifest_sha256")
+        and left.get("activation_id") == right.get("activation_id")
+        and left.get("contract_mode") == right.get("contract_mode")
+    )
 
 
 def load_current_price_activation(native_root: Path) -> Dict[str, Any]:
     native_root = Path(native_root).resolve()
     pointer_path = native_root / "ACTIVE.json"
-    pointer = _load_json_bounded(pointer_path, 1024 * 1024)
+    pointer, pointer_sha, pointer_bytes = _load_json_bounded_hashed(
+        pointer_path,
+        1024 * 1024,
+    )
     if str(pointer.get("schema_version") or "") != "fxpm-native-active-pointer-v1":
         raise BrokerTermsError("native price pointer schema is unsupported")
     manifest_path = _safe_relative(native_root, pointer.get("manifest_relative_path"))
-    manifest_sha = sha256_file(manifest_path)
+    manifest, manifest_sha, manifest_bytes = _load_json_bounded_hashed(manifest_path)
     if manifest_sha != str(pointer.get("manifest_sha256") or "").lower():
         raise BrokerTermsError("native price manifest hash mismatch")
-    manifest = _load_json_bounded(manifest_path)
     if str(manifest.get("schema_version") or "") != "fxpm-native-activation-v1":
         raise BrokerTermsError("native price activation schema is unsupported")
     if str(manifest.get("status") or "").lower() != "active":
         raise BrokerTermsError("native price activation is not active")
     if str(manifest.get("activation_id") or "") != str(pointer.get("activation_id") or ""):
         raise BrokerTermsError("native price activation identity mismatch")
+    contract_mode = _price_contract_mode(pointer, manifest)
+    if _read_bounded(pointer_path, 1024 * 1024) != pointer_bytes:
+        raise BrokerTermsError("native price pointer changed during activation read")
     return {
         "pointer": pointer,
         "pointer_path": pointer_path,
-        "pointer_sha256": sha256_file(pointer_path),
+        "pointer_sha256": pointer_sha,
+        "pointer_bytes": pointer_bytes,
         "manifest": manifest,
         "manifest_path": manifest_path,
         "manifest_sha256": manifest_sha,
+        "manifest_bytes": manifest_bytes,
         "activation_id": str(manifest.get("activation_id") or ""),
+        "contract_mode": contract_mode,
     }
 
 
-def derive_d1_session_events(
-    d1_csv_path: Path,
+def _read_interval_axis_hashed(
+    csv_path: Path,
     *,
-    symbol_terms: Mapping[str, Any],
-    max_rows: int = 100_000,
-    max_bytes: int = 256 * 1024 * 1024,
-) -> list[Dict[str, Any]]:
-    """Derive broker-day rollover events exclusively from immutable D1 intervals."""
-    path = Path(d1_csv_path)
-    if path.stat().st_size > int(max_bytes):
-        raise BrokerTermsError("D1 artifact exceeds the schedule read bound")
+    label: str,
+    max_rows: int,
+    max_bytes: int,
+    expected_sha256: Optional[str],
+) -> Tuple[pd.DatetimeIndex, pd.DatetimeIndex, str]:
+    """Hash and validate one exact native interval axis from the same bytes."""
+
+    path = Path(csv_path)
+    payload = _read_bounded(path, int(max_bytes))
+    observed_sha256 = hashlib.sha256(payload).hexdigest()
+    if expected_sha256 is not None and observed_sha256 != str(expected_sha256).lower():
+        raise BrokerTermsError(f"{label} bars hash mismatch before schedule derivation")
     try:
-        frame = pd.read_csv(path, usecols=["time", "_BAR_CLOSE_TS"])
+        frame = pd.read_csv(
+            io.BytesIO(payload),
+            usecols=["time", "_BAR_CLOSE_TS"],
+        )
     except Exception as exc:
-        raise BrokerTermsError("D1 artifact lacks the required interval columns") from exc
+        raise BrokerTermsError(
+            f"{label} artifact lacks the required interval columns"
+        ) from exc
     if len(frame) <= 0 or len(frame) > int(max_rows):
-        raise BrokerTermsError("D1 row count is outside the permitted bound")
+        raise BrokerTermsError(f"{label} row count is outside the permitted bound")
     opens = pd.DatetimeIndex(pd.to_datetime(frame["time"], utc=True, errors="coerce"))
-    closes = pd.DatetimeIndex(pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce"))
+    closes = pd.DatetimeIndex(
+        pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+    )
     if (
         opens.isna().any()
         or closes.isna().any()
@@ -483,21 +984,149 @@ def derive_d1_session_events(
         or not closes.is_monotonic_increasing
         or not bool((closes > opens).all())
     ):
-        raise BrokerTermsError("D1 interval axis is invalid")
-    open_epochs = {int(value.timestamp()): index for index, value in enumerate(opens)}
+        raise BrokerTermsError(f"{label} interval axis is invalid")
+    return opens, closes, observed_sha256
+
+
+def _bind_session_anchors(
+    opens: pd.DatetimeIndex,
+    *,
+    symbol_terms: Mapping[str, Any],
+    require_single_phase: bool,
+    allow_represented_session: bool = False,
+    closes: Optional[pd.DatetimeIndex] = None,
+) -> Tuple[int, int, Optional[int]]:
+    """Bind direct-export broker weekdays to an authenticated price axis.
+
+    D1 bars bind by exact open.  Intraday sources may legitimately omit the
+    first bar of a broker day, so they bind when the authenticated anchor's
+    broker-day bucket is represented by at least one source bar.  The session
+    phase and weekday offset still come only from the direct-export anchors.
+    """
+
+    open_epochs = {int(value.timestamp()) for value in opens}
     offsets: set[int] = set()
+    phases: set[int] = set()
     matched = 0
+    anchors: list[Tuple[int, int]] = []
     for anchor in list(symbol_terms.get("d1_anchors") or []):
         epoch = _strict_int(anchor.get("open_epoch"), "anchor.open_epoch")
         weekday = _strict_int(anchor.get("server_weekday"), "anchor.server_weekday")
-        if epoch not in open_epochs:
+        anchors.append((epoch, weekday))
+        if allow_represented_session:
+            offsets.add(
+                (
+                    weekday
+                    - ((pd.Timestamp(epoch, unit="s", tz="UTC").weekday() + 1) % 7)
+                )
+                % 7
+            )
+            phases.add(epoch % 86_400)
+        elif epoch not in open_epochs:
             continue
-        utc_weekday_mql5 = (opens[open_epochs[epoch]].weekday() + 1) % 7
-        offsets.add((weekday - utc_weekday_mql5) % 7)
-        matched += 1
+        else:
+            opened = pd.Timestamp(epoch, unit="s", tz="UTC")
+            utc_weekday_mql5 = (opened.weekday() + 1) % 7
+            offsets.add((weekday - utc_weekday_mql5) % 7)
+            phases.add(epoch % 86_400)
+            matched += 1
+
+    if allow_represented_session:
+        if len(phases) != 1 or len(offsets) != 1:
+            raise BrokerTermsError(
+                "broker-day anchors do not bind one intraday session phase contract"
+            )
+        if closes is None or len(closes) != len(opens):
+            raise BrokerTermsError(
+                "intraday anchor binding requires the exact close axis"
+            )
+        phase = next(iter(phases))
+        represented_sessions = set(
+            _completed_or_represented_session_epochs(
+                opens,
+                phase_seconds=phase,
+            )
+        )
+        first_open_epoch = int(opens.asi8[0] // 1_000_000_000)
+        last_close_epoch = int(closes.asi8[-1] // 1_000_000_000)
+        overlapping_anchors = [
+            epoch
+            for epoch, _weekday in anchors
+            if epoch < last_close_epoch and epoch + 86_400 > first_open_epoch
+        ]
+        if not overlapping_anchors:
+            raise ScheduleSourceUnsuitableError(
+                "ANCHOR_INTERVAL_NOT_OVERLAPPED",
+                "broker-day anchors do not overlap the source interval"
+            )
+        missing_anchors = sorted(
+            set(overlapping_anchors) - represented_sessions
+        )
+        if missing_anchors:
+            raise ScheduleSourceUnsuitableError(
+                "ANCHOR_SESSION_UNREPRESENTED",
+                "source does not represent every overlapping broker-day anchor"
+            )
+        matched = len(overlapping_anchors)
+    else:
+        phase = next(iter(phases)) if len(phases) == 1 else None
+
     if matched <= 0 or len(offsets) != 1:
-        raise BrokerTermsError("D1 broker-weekday anchors do not bind to the active artifact")
-    weekday_offset = next(iter(offsets))
+        raise BrokerTermsError(
+            "broker-weekday anchors do not bind uniquely to the active artifact"
+        )
+    if require_single_phase and len(phases) != 1:
+        raise BrokerTermsError(
+            "broker-day anchors do not bind one intraday session phase"
+        )
+    return next(iter(offsets)), matched, phase
+
+
+def _completed_or_represented_session_epochs(
+    opens: pd.DatetimeIndex,
+    *,
+    phase_seconds: int,
+    closes: Optional[pd.DatetimeIndex] = None,
+) -> np.ndarray:
+    """Return represented broker days, optionally restricted to completed days."""
+
+    phase = int(phase_seconds)
+    if not 0 <= phase < 86_400:
+        raise BrokerTermsError("broker-day phase is outside one UTC day")
+    open_epochs = opens.asi8 // 1_000_000_000
+    sessions = np.unique(
+        ((open_epochs - phase) // 86_400) * 86_400 + phase
+    )
+    if closes is None:
+        return sessions
+    if len(closes) != len(opens) or len(closes) <= 0:
+        raise BrokerTermsError("session source close axis is invalid")
+    last_verified_close_epoch = int(closes.asi8[-1] // 1_000_000_000)
+    return sessions[sessions + 86_400 <= last_verified_close_epoch]
+
+
+def _derive_d1_session_events_hashed(
+    d1_csv_path: Path,
+    *,
+    symbol_terms: Mapping[str, Any],
+    max_rows: int = 100_000,
+    max_bytes: int = 256 * 1024 * 1024,
+    expected_sha256: Optional[str] = None,
+) -> Tuple[list[Dict[str, Any]], str]:
+    """Hash and parse one bounded D1 payload from the same exact bytes."""
+
+    opens, closes, observed_sha256 = _read_interval_axis_hashed(
+        d1_csv_path,
+        label="D1",
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+        expected_sha256=expected_sha256,
+    )
+    weekday_offset, _matched, _phase = _bind_session_anchors(
+        opens,
+        symbol_terms=symbol_terms,
+        require_single_phase=False,
+    )
     factors = dict(symbol_terms.get("weekday_factors") or {})
     if set(factors) != set(WEEKDAYS):
         raise BrokerTermsError("seven weekday factors are required")
@@ -517,6 +1146,107 @@ def derive_d1_session_events(
             "from_weekday_name": weekday_name,
             "factor": factor,
         })
+    return events, observed_sha256
+
+
+def _derive_intraday_session_events_hashed(
+    source_csv_path: Path,
+    *,
+    source_timeframe: str,
+    symbol_terms: Mapping[str, Any],
+    max_rows: int = 2_000_000,
+    max_bytes: int = 256 * 1024 * 1024,
+    expected_sha256: Optional[str] = None,
+) -> Tuple[list[Dict[str, Any]], str, Dict[str, Any]]:
+    """Derive completed broker-day boundaries from one exact intraday axis.
+
+    A broker-day event is tied to the authenticated D1 anchor phase, not to
+    whichever intraday bar happens to be last before a holiday close.  A
+    session is emitted only when its expected boundary is within the verified
+    source axis, so a trailing partial day cannot manufacture a future event.
+    """
+
+    timeframe = str(source_timeframe or "").strip().upper()
+    if timeframe not in _SCHEDULE_SOURCE_PREFERENCE[1:]:
+        raise BrokerTermsError(
+            f"{timeframe}: unsupported intraday schedule-source timeframe"
+        )
+    opens, closes, observed_sha256 = _read_interval_axis_hashed(
+        source_csv_path,
+        label=timeframe,
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+        expected_sha256=expected_sha256,
+    )
+    weekday_offset, matched, phase_seconds = _bind_session_anchors(
+        opens,
+        symbol_terms=symbol_terms,
+        require_single_phase=True,
+        allow_represented_session=True,
+        closes=closes,
+    )
+    if phase_seconds is None:
+        raise BrokerTermsError(
+            f"{timeframe} schedule source has no authenticated session phase"
+        )
+
+    factors = dict(symbol_terms.get("weekday_factors") or {})
+    if set(factors) != set(WEEKDAYS):
+        raise BrokerTermsError("seven weekday factors are required")
+    completed_sessions = _completed_or_represented_session_epochs(
+        opens,
+        closes=closes,
+        phase_seconds=int(phase_seconds),
+    )
+    if len(completed_sessions) <= 0:
+        raise ScheduleSourceUnsuitableError(
+            "NO_COMPLETED_SOURCE_SESSION",
+            f"{timeframe} schedule source has no completed broker day"
+        )
+
+    events: list[Dict[str, Any]] = []
+    for index, session_epoch in enumerate(completed_sessions.tolist()):
+        opened = pd.Timestamp(int(session_epoch), unit="s", tz="UTC")
+        event = pd.Timestamp(int(session_epoch) + 86_400, unit="s", tz="UTC")
+        utc_mql5_weekday = (opened.weekday() + 1) % 7
+        from_weekday = (utc_mql5_weekday + weekday_offset) % 7
+        weekday_name = WEEKDAYS[from_weekday]
+        factor = _strict_int(factors[weekday_name], f"weekday_factors.{weekday_name}")
+        if factor not in {0, 1, 3}:
+            raise BrokerTermsError("session factor is outside the official factor set")
+        events.append({
+            "session_index": index,
+            "session_open_utc": opened.isoformat(),
+            "event_utc": event.isoformat(),
+            "from_weekday": from_weekday,
+            "from_weekday_name": weekday_name,
+            "factor": factor,
+        })
+    return events, observed_sha256, {
+        "matched_anchor_count": int(matched),
+        "phase_seconds": int(phase_seconds),
+        "source_first_open_utc": opens[0].isoformat(),
+        "source_last_close_utc": closes[-1].isoformat(),
+        "source_row_count": int(len(opens)),
+        "weekday_offset": int(weekday_offset),
+    }
+
+
+def derive_d1_session_events(
+    d1_csv_path: Path,
+    *,
+    symbol_terms: Mapping[str, Any],
+    max_rows: int = 100_000,
+    max_bytes: int = 256 * 1024 * 1024,
+) -> list[Dict[str, Any]]:
+    """Derive broker-day rollover events exclusively from immutable D1 intervals."""
+
+    events, _digest = _derive_d1_session_events_hashed(
+        d1_csv_path,
+        symbol_terms=symbol_terms,
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+    )
     return events
 
 
@@ -596,6 +1326,151 @@ def _write_or_verify_immutable_json(path: Path, value: Mapping[str, Any]) -> str
     return sha256_file(path)
 
 
+def _verified_price_cell_binding(
+    native_root: Path,
+    cell: Mapping[str, Any],
+    *,
+    label: str,
+    digest_cache: Dict[Path, str],
+) -> Dict[str, str]:
+    binding: Dict[str, str] = {}
+    for artifact in ("bars", "sidecar"):
+        relative_field = f"{artifact}_relative_path"
+        sha_field = f"{artifact}_sha256"
+        path = _safe_relative(native_root, cell.get(relative_field))
+        expected = str(cell.get(sha_field) or "").strip().lower()
+        if not _is_sha256(expected):
+            raise BrokerTermsError(f"{label}: {artifact} pin is invalid")
+        resolved = path.resolve()
+        observed = digest_cache.get(resolved)
+        if observed is None:
+            try:
+                observed = sha256_file(path)
+            except OSError as exc:
+                raise BrokerTermsError(f"{label}: {artifact} cannot be read") from exc
+            digest_cache[resolved] = observed
+        if observed != expected:
+            raise BrokerTermsError(f"{label}: {artifact} hash mismatch")
+        binding[relative_field] = path.relative_to(native_root).as_posix()
+        binding[sha_field] = observed
+    return binding
+
+
+def _verified_price_cell_axis(
+    native_root: Path,
+    cell: Mapping[str, Any],
+    *,
+    label: str,
+    digest_cache: Dict[Path, str],
+    phase_seconds: int,
+) -> Dict[str, Any]:
+    """Reopen one exact target axis for completed-session coverage proof."""
+
+    path = _safe_relative(native_root, cell.get("bars_relative_path"))
+    expected = str(cell.get("bars_sha256") or "").strip().lower()
+    if not _is_sha256(expected):
+        raise BrokerTermsError(f"{label}: bars pin is invalid")
+    opens, closes, observed = _read_interval_axis_hashed(
+        path,
+        label=label,
+        max_rows=2_000_000,
+        max_bytes=256 * 1024 * 1024,
+        expected_sha256=expected,
+    )
+    digest_cache[path.resolve()] = observed
+    completed_sessions = _completed_or_represented_session_epochs(
+        opens,
+        closes=closes,
+        phase_seconds=phase_seconds,
+    )
+    return {
+        "first_open_utc": opens[0].isoformat(),
+        "last_close_utc": closes[-1].isoformat(),
+        "row_count": int(len(opens)),
+        "completed_session_epochs": tuple(
+            int(value) for value in completed_sessions.tolist()
+        ),
+    }
+
+
+def _verify_exact_artifact(path: Path, expected_sha256: str, label: str) -> None:
+    try:
+        observed = sha256_file(path)
+    except OSError as exc:
+        raise BrokerTermsError(f"{label} is missing or unreadable") from exc
+    if observed != str(expected_sha256 or "").lower():
+        raise BrokerTermsError(f"{label} hash mismatch")
+
+
+def _validated_active_terms_repair_source(
+    native_root: Path,
+    *,
+    expected_pointer_sha256: str,
+    snapshot: Mapping[str, Any],
+    price: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Authenticate the exact active overlay whose stale snapshot is repaired."""
+
+    expected = str(expected_pointer_sha256 or "").strip().lower()
+    if not _is_sha256(expected):
+        raise BrokerTermsError("repair source terms pointer pin is invalid")
+    terms_root = Path(native_root).resolve() / "terms"
+    pointer_path = terms_root / "ACTIVE.json"
+    pointer, pointer_sha, pointer_bytes = _load_json_bounded_hashed(
+        pointer_path,
+        1024 * 1024,
+    )
+    if pointer_sha != expected:
+        raise BrokerTermsError("repair source terms pointer pin mismatch")
+    if str(pointer.get("schema_version") or "") != TERMS_ACTIVE_POINTER_SCHEMA:
+        raise BrokerTermsError("repair source terms pointer schema is invalid")
+    manifest_path = _safe_relative(
+        native_root,
+        pointer.get("manifest_relative_path"),
+    )
+    manifest, manifest_sha, manifest_bytes = _load_json_bounded_hashed(manifest_path)
+    if (
+        manifest_sha != str(pointer.get("manifest_sha256") or "")
+        or str(manifest.get("schema_version") or "") != TERMS_ACTIVATION_SCHEMA
+        or str(manifest.get("status") or "").lower() != "active"
+        or str(manifest.get("activation_id") or "")
+        != str(pointer.get("activation_id") or "")
+    ):
+        raise BrokerTermsError("repair source terms activation is invalid")
+    if (
+        str(manifest.get("price_activation_manifest_sha256") or "")
+        != price.get("manifest_sha256")
+        or str(pointer.get("price_activation_manifest_sha256") or "")
+        != price.get("manifest_sha256")
+    ):
+        raise BrokerTermsError("repair source is bound to a different price activation")
+    snapshot_path = _safe_relative(
+        native_root,
+        manifest.get("terms_snapshot_relative_path"),
+    )
+    persisted_snapshot, snapshot_sha, _snapshot_bytes = _load_json_bounded_hashed(
+        snapshot_path
+    )
+    if (
+        snapshot_sha != str(manifest.get("terms_snapshot_sha256") or "")
+        or _canonical_bytes(persisted_snapshot) != _canonical_bytes(snapshot)
+        or persisted_snapshot.get("provenance_status")
+        != manifest.get("provenance_status")
+    ):
+        raise BrokerTermsError("repair source terms snapshot binding is invalid")
+    if (
+        _read_bounded(pointer_path, 1024 * 1024) != pointer_bytes
+        or _read_bounded(manifest_path, 64 * 1024 * 1024) != manifest_bytes
+    ):
+        raise BrokerTermsError("repair source terms activation changed during validation")
+    return {
+        "activation_id": str(manifest.get("activation_id") or ""),
+        "manifest_sha256": manifest_sha,
+        "pointer_sha256": pointer_sha,
+        "pointer_bytes": pointer_bytes,
+    }
+
+
 def activate_broker_terms(
     native_root: Path,
     snapshot: Mapping[str, Any],
@@ -604,177 +1479,603 @@ def activate_broker_terms(
     now_utc: Optional[datetime] = None,
     update_pointer: bool = True,
     max_snapshot_age_seconds: int = 3600,
+    repair_source_terms_pointer_sha256: Optional[str] = None,
+    staged_manifest_created_at_utc: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Bind terms and D1 schedules to the current immutable price activation."""
+    """Bind terms schedules to the current immutable price activation."""
+    activation_started_monotonic = time.monotonic()
     native_root = Path(native_root).resolve()
-    if str(snapshot.get("schema_version") or "") != TERMS_SNAPSHOT_SCHEMA:
-        raise BrokerTermsError("terms snapshot schema is invalid")
     provenance = str(snapshot.get("provenance_status") or "")
-    if provenance not in {AUTHENTICATED, STRESS_APPROVED}:
-        raise BrokerTermsError("terms snapshot is not admissible for activation")
-    declared_content_sha = str(snapshot.get("content_sha256") or "")
-    without_hash = dict(snapshot)
-    without_hash.pop("content_sha256", None)
-    if declared_content_sha != canonical_sha256(without_hash):
-        raise BrokerTermsError("terms snapshot content hash is invalid")
+    declared_content_sha = _validate_terms_snapshot(snapshot)
     now = (now_utc or _utc_now()).astimezone(timezone.utc)
-    captured = _aware_utc(snapshot.get("captured_at_utc"), "snapshot.captured_at_utc")
-    age_seconds = (now - captured).total_seconds()
-    if age_seconds < -60 or age_seconds > int(max_snapshot_age_seconds):
-        raise BrokerTermsError("terms snapshot is not fresh at activation time")
-    roster = [str(value or "").strip().upper() for value in (snapshot.get("roster") or [])]
+    manifest_created_at = (
+        _aware_utc(
+            staged_manifest_created_at_utc,
+            "staged_manifest_created_at_utc",
+        )
+        if staged_manifest_created_at_utc is not None
+        else now
+    )
+    capture_started = _aware_utc(
+        snapshot.get("capture_started_at_utc"),
+        "snapshot.capture_started_at_utc",
+    )
+    roster = list(snapshot.get("roster") or [])
     symbols_payload = dict(snapshot.get("symbols") or {})
-    if not roster or len(roster) != len(set(roster)) or set(roster) != set(symbols_payload):
-        raise BrokerTermsError("terms snapshot roster and symbol records are not exact")
-    if provenance == AUTHENTICATED and (
-        str(snapshot.get("extractor_contract") or "") != "mql5-symbolinfo-direct-v1"
-        or not _is_sha256(snapshot.get("source_export_sha256"))
-        or len(str(snapshot.get("nonce") or "")) < 16
-    ):
-        raise BrokerTermsError("authenticated snapshot lacks direct-export provenance")
-    if provenance == STRESS_APPROVED and (
-        str((snapshot.get("stress_policy") or {}).get("policy_id") or "")
-        != STRESS_POLICY_ID
-    ):
-        raise BrokerTermsError("stress snapshot lacks the approved immutable policy")
     price = load_current_price_activation(native_root)
-    pointer_sha_at_start = str(price["pointer_sha256"])
+    repair_source: Optional[Dict[str, Any]] = None
+    if repair_source_terms_pointer_sha256 is None:
+        _require_snapshot_fresh(capture_started, now, max_snapshot_age_seconds)
+    else:
+        repair_source = _validated_active_terms_repair_source(
+            native_root,
+            expected_pointer_sha256=repair_source_terms_pointer_sha256,
+            snapshot=snapshot,
+            price=price,
+        )
     activation_id = str(activation_id or f"{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(4)}")
     if not activation_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in activation_id):
         raise BrokerTermsError("terms activation id is unsafe")
     terms_root = native_root / "terms"
+    terms_pointer_path = terms_root / "ACTIVE.json"
+    expected_terms_pointer_bytes: Optional[bytes] = None
+    if update_pointer:
+        with _terms_pointer_lock(native_root):
+            expected_terms_pointer_bytes = _optional_pointer_bytes(terms_pointer_path)
+            if (
+                repair_source is not None
+                and expected_terms_pointer_bytes != repair_source["pointer_bytes"]
+            ):
+                raise BrokerTermsError(
+                    "repair source terms pointer changed before staging"
+                )
     snapshot_id = declared_content_sha[:24]
     snapshot_path = terms_root / "snapshots" / f"{snapshot_id}.json"
     snapshot_sha = _write_or_verify_immutable_json(snapshot_path, dict(snapshot))
 
-    entries = dict(price["manifest"].get("entries") or {})
+    raw_entries = price["manifest"].get("entries")
+    if not isinstance(raw_entries, Mapping):
+        raise BrokerTermsError("native price manifest has no symbol entries")
+    entries = dict(raw_entries)
+    price_symbol_index = _casefold_key_map(entries, "native price symbols")
+    snapshot_symbol_index = _casefold_key_map(symbols_payload, "terms snapshot symbols")
+    if set(price_symbol_index) != set(snapshot_symbol_index):
+        raise BrokerTermsError("terms snapshot roster does not exactly match price authority")
+
     symbol_results: Dict[str, Any] = {}
-    for symbol in list(snapshot.get("roster") or []):
-        terms = dict((snapshot.get("symbols") or {}).get(symbol) or {})
-        price_cells = dict(entries.get(symbol) or {})
-        d1_entry = dict(price_cells.get("D1") or {})
-        if str(d1_entry.get("status") or "").lower() != "active":
-            symbol_results[symbol] = {"status": INVALID, "reason": "D1_NOT_ACTIVE"}
+    unscheduled_candidate_cells: list[Dict[str, str]] = []
+    active_target_binding_count = 0
+    staged_schedule_pins: list[Tuple[Path, str]] = []
+    schedule_contracts_used: set[str] = set()
+    for symbol in roster:
+        terms = dict(symbols_payload.get(symbol) or {})
+        price_symbol = price_symbol_index[symbol.casefold()]
+        raw_price_cells = entries.get(price_symbol)
+        if not isinstance(raw_price_cells, Mapping):
+            raise BrokerTermsError(f"{price_symbol}: native price cells are invalid")
+        price_cells = dict(raw_price_cells)
+        timeframe_index = _casefold_key_map(
+            price_cells,
+            f"{price_symbol} native price timeframes",
+        )
+        if "d1" not in timeframe_index:
+            raise BrokerTermsError(f"{price_symbol}: native D1 price cell is missing")
+        admissible_cells: Dict[str, Dict[str, Any]] = {}
+        for raw_timeframe, raw_entry in sorted(price_cells.items()):
+            timeframe = str(raw_timeframe).upper()
+            cell = dict(raw_entry or {})
+            if _price_cell_is_admissible(
+                price,
+                price_symbol,
+                timeframe,
+                cell,
+            ):
+                admissible_cells[timeframe] = cell
+
+        source_preference = (
+            ("D1",)
+            if price.get("contract_mode") != "promoted-v4"
+            else _SCHEDULE_SOURCE_PREFERENCE
+        )
+        source_candidates = [
+            timeframe
+            for timeframe in source_preference
+            if timeframe in admissible_cells
+        ]
+        if not source_candidates:
+            unscheduled_timeframes = sorted(admissible_cells)
+            for timeframe in unscheduled_timeframes:
+                unscheduled_candidate_cells.append({
+                    "symbol": price_symbol,
+                    "timeframe": timeframe,
+                    "reason": "NO_ADMISSIBLE_SESSION_SCHEDULE_SOURCE",
+                })
+            symbol_results[symbol] = {
+                "status": INVALID,
+                "reason": "NO_ADMISSIBLE_SESSION_SCHEDULE_SOURCE",
+                "price_symbol": price_symbol,
+                "unscheduled_evidence_candidate_timeframes": unscheduled_timeframes,
+            }
             continue
-        d1_path = _safe_relative(native_root, d1_entry.get("bars_relative_path"))
-        d1_sha = sha256_file(d1_path)
-        if d1_sha != str(d1_entry.get("bars_sha256") or "").lower():
-            raise BrokerTermsError(f"{symbol}: D1 bars hash mismatch")
-        events = derive_d1_session_events(d1_path, symbol_terms=terms)
-        schedule: Dict[str, Any] = {
-            "schema_version": D1_SESSION_SCHEDULE_SCHEMA,
-            "symbol": symbol,
-            "price_activation_id": price["activation_id"],
-            "price_activation_manifest_sha256": price["manifest_sha256"],
-            "d1_bars_sha256": d1_sha,
-            "terms_snapshot_sha256": snapshot_sha,
-            "terms_record_sha256": canonical_sha256(terms),
-            # Persist only the two values required to replay the event.  The
-            # D1 bars hash and derivation contract authenticate bar index,
-            # open, close and weekday semantics without repeating those
-            # verbose fields thousands of times per symbol.
-            "event_axis_contract": "event_utc_factor_pairs_v1",
-            "events": [
-                [str(event["event_utc"]), int(event["factor"])]
-                for event in events
-            ],
-        }
+
+        digest_cache: Dict[Path, str] = {}
+        target_axis_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        source_rejections: list[Dict[str, Any]] = []
+        selected_source_completed_sessions: set[int] = set()
+        selected_target_session_union: set[int] = set()
+        selected_source: Optional[Tuple[
+            str,
+            list[Dict[str, Any]],
+            Dict[str, Any],
+            Dict[str, str],
+            str,
+        ]] = None
+        for candidate_timeframe in source_candidates:
+            candidate_entry = admissible_cells[candidate_timeframe]
+            candidate_path = _safe_relative(
+                native_root,
+                candidate_entry.get("bars_relative_path"),
+            )
+            candidate_expected_sha = str(
+                candidate_entry.get("bars_sha256") or ""
+            ).strip().lower()
+            if not _is_sha256(candidate_expected_sha):
+                raise BrokerTermsError(
+                    f"{price_symbol} {candidate_timeframe}: bars pin is invalid"
+                )
+            if candidate_timeframe == "D1":
+                candidate_events, candidate_sha = (
+                    _derive_d1_session_events_hashed(
+                        candidate_path,
+                        symbol_terms=terms,
+                        expected_sha256=candidate_expected_sha,
+                    )
+                )
+                candidate_metadata: Dict[str, Any] = {}
+                candidate_contract = D1_SESSION_DERIVATION_CONTRACT
+            else:
+                try:
+                    (
+                        candidate_events,
+                        candidate_sha,
+                        candidate_metadata,
+                    ) = _derive_intraday_session_events_hashed(
+                        candidate_path,
+                        source_timeframe=candidate_timeframe,
+                        symbol_terms=terms,
+                        expected_sha256=candidate_expected_sha,
+                    )
+                except ScheduleSourceUnsuitableError as exc:
+                    # This exception is raised only after the exact bars
+                    # payload has passed its hash and interval-axis checks.
+                    digest_cache[candidate_path.resolve()] = (
+                        candidate_expected_sha
+                    )
+                    rejected_binding = _verified_price_cell_binding(
+                        native_root,
+                        candidate_entry,
+                        label=(
+                            f"{price_symbol} {candidate_timeframe} "
+                            "rejected schedule source"
+                        ),
+                        digest_cache=digest_cache,
+                    )
+                    source_rejections.append({
+                        "timeframe": candidate_timeframe,
+                        "binding": rejected_binding,
+                        "reason": exc.reason_code,
+                        "missing_target_session_count": 0,
+                        "missing_target_sessions_sha256": canonical_sha256([]),
+                    })
+                    continue
+                candidate_contract = INTRADAY_SESSION_DERIVATION_CONTRACT
+
+            digest_cache[candidate_path.resolve()] = candidate_sha
+            candidate_binding = _verified_price_cell_binding(
+                native_root,
+                candidate_entry,
+                label=(
+                    f"{price_symbol} {candidate_timeframe} schedule source"
+                ),
+                digest_cache=digest_cache,
+            )
+            if candidate_timeframe != "D1":
+                phase_seconds = int(candidate_metadata["phase_seconds"])
+                source_completed_sessions = {
+                    int(pd.Timestamp(event["session_open_utc"]).timestamp())
+                    for event in candidate_events
+                }
+                target_session_union: set[int] = set()
+                missing_by_target: Dict[str, Tuple[int, ...]] = {}
+                for target_timeframe, target_cell in sorted(
+                    admissible_cells.items()
+                ):
+                    if target_timeframe == candidate_timeframe:
+                        target_completed_sessions = source_completed_sessions
+                    else:
+                        cache_key = (phase_seconds, target_timeframe)
+                        target_axis = target_axis_cache.get(cache_key)
+                        if target_axis is None:
+                            target_axis = _verified_price_cell_axis(
+                                native_root,
+                                target_cell,
+                                label=(
+                                    f"{price_symbol} {target_timeframe} "
+                                    "target axis"
+                                ),
+                                digest_cache=digest_cache,
+                                phase_seconds=phase_seconds,
+                            )
+                            target_axis_cache[cache_key] = target_axis
+                        target_completed_sessions = set(
+                            target_axis["completed_session_epochs"]
+                        )
+                    target_session_union.update(target_completed_sessions)
+                    missing_sessions = tuple(
+                        sorted(
+                            target_completed_sessions
+                            - source_completed_sessions
+                        )
+                    )
+                    if missing_sessions:
+                        missing_by_target[target_timeframe] = missing_sessions
+                if missing_by_target:
+                    missing_rows = [
+                        [target, int(session)]
+                        for target, missing in sorted(
+                            missing_by_target.items()
+                        )
+                        for session in missing
+                    ]
+                    source_rejections.append({
+                        "timeframe": candidate_timeframe,
+                        "binding": candidate_binding,
+                        "reason": "INCOMPLETE_TARGET_SESSION_COVERAGE",
+                        "missing_target_session_count": len(missing_rows),
+                        "missing_target_sessions_sha256": canonical_sha256(
+                            missing_rows
+                        ),
+                    })
+                    continue
+                selected_source_completed_sessions = (
+                    source_completed_sessions
+                )
+                selected_target_session_union = target_session_union
+            selected_source = (
+                candidate_timeframe,
+                candidate_events,
+                candidate_metadata,
+                candidate_binding,
+                candidate_contract,
+            )
+            break
+
+        if selected_source is None:
+            detail = "; ".join(
+                f"{rejection['timeframe']}:{rejection['reason']}"
+                for rejection in source_rejections
+            )[:2048]
+            raise BrokerTermsError(
+                f"{price_symbol}: no intraday schedule source covers all "
+                f"completed target sessions ({detail})"
+            )
+        (
+            schedule_source_timeframe,
+            events,
+            schedule_derivation_metadata,
+            schedule_source_binding,
+            schedule_derivation_contract,
+        ) = selected_source
+        schedule_source_selection_receipt: Optional[Dict[str, Any]] = None
+        if source_rejections:
+            schedule_source_selection_receipt = {
+                "schema_version": SCHEDULE_SOURCE_SELECTION_SCHEMA,
+                "policy": SCHEDULE_SOURCE_POLICY,
+                "rejected_candidates": source_rejections,
+                "selected_source_timeframe": schedule_source_timeframe,
+                "selected_source_completed_session_count": len(
+                    selected_source_completed_sessions
+                ),
+                "selected_source_completed_sessions_sha256": canonical_sha256(
+                    sorted(selected_source_completed_sessions)
+                ),
+                "target_completed_session_union_count": len(
+                    selected_target_session_union
+                ),
+                "target_completed_session_union_sha256": canonical_sha256(
+                    sorted(selected_target_session_union)
+                ),
+            }
+        if schedule_source_timeframe == "D1":
+            # Keep the established D1-v2 artifact and record shape exact.
+            schedule: Dict[str, Any] = {
+                "schema_version": D1_SESSION_SCHEDULE_SCHEMA,
+                "symbol": symbol,
+                "price_symbol": price_symbol,
+                "price_activation_id": price["activation_id"],
+                "price_activation_manifest_sha256": price["manifest_sha256"],
+                "d1_bars_relative_path": schedule_source_binding[
+                    "bars_relative_path"
+                ],
+                "d1_bars_sha256": schedule_source_binding["bars_sha256"],
+                "d1_sidecar_relative_path": schedule_source_binding[
+                    "sidecar_relative_path"
+                ],
+                "d1_sidecar_sha256": schedule_source_binding["sidecar_sha256"],
+                "terms_snapshot_sha256": snapshot_sha,
+                "terms_record_sha256": canonical_sha256(terms),
+                "event_axis_contract": "event_utc_factor_pairs_v1",
+                "events": [
+                    [str(event["event_utc"]), int(event["factor"])]
+                    for event in events
+                ],
+            }
+            schedule_schema = D1_SESSION_SCHEDULE_SCHEMA
+        else:
+            schedule = {
+                "schema_version": SESSION_SCHEDULE_SCHEMA,
+                "symbol": symbol,
+                "price_symbol": price_symbol,
+                "price_activation_id": price["activation_id"],
+                "price_activation_manifest_sha256": price["manifest_sha256"],
+                "schedule_source_timeframe": schedule_source_timeframe,
+                "schedule_source_binding": dict(schedule_source_binding),
+                "schedule_derivation_contract": schedule_derivation_contract,
+                "schedule_derivation_metadata": dict(
+                    schedule_derivation_metadata
+                ),
+                "terms_snapshot_sha256": snapshot_sha,
+                "terms_record_sha256": canonical_sha256(terms),
+                "event_axis_contract": "event_utc_factor_pairs_v1",
+                "events": [
+                    [str(event["event_utc"]), int(event["factor"])]
+                    for event in events
+                ],
+            }
+            if schedule_source_selection_receipt is not None:
+                schedule["schedule_source_selection_receipt"] = dict(
+                    schedule_source_selection_receipt
+                )
+            schedule_schema = SESSION_SCHEDULE_SCHEMA
+        schedule_contracts_used.add(schedule_schema)
         schedule_path = (
             terms_root
             / "schedules"
-            / D1_SESSION_SCHEDULE_SCHEMA
+            / schedule_schema
             / price["manifest_sha256"]
             / snapshot_sha
             / f"{symbol}.json"
         )
         schedule_sha = _write_or_verify_immutable_json(schedule_path, schedule)
+        staged_schedule_pins.append((schedule_path, schedule_sha))
         target_bindings: Dict[str, Any] = {}
-        for timeframe, raw_entry in sorted(price_cells.items()):
-            cell = dict(raw_entry or {})
-            if str(cell.get("status") or "").lower() != "active":
-                continue
-            bars_path = _safe_relative(native_root, cell.get("bars_relative_path"))
-            sidecar_path = _safe_relative(native_root, cell.get("sidecar_relative_path"))
-            bars_sha = sha256_file(bars_path)
-            sidecar_sha = sha256_file(sidecar_path)
-            if (
-                bars_sha != str(cell.get("bars_sha256") or "").lower()
-                or sidecar_sha != str(cell.get("sidecar_sha256") or "").lower()
-            ):
-                raise BrokerTermsError(f"{symbol} {timeframe}: active price artifact hash mismatch")
-            target_bindings[str(timeframe).upper()] = {
-                "bars_relative_path": bars_path.relative_to(native_root).as_posix(),
-                "bars_sha256": bars_sha,
-                "sidecar_relative_path": sidecar_path.relative_to(native_root).as_posix(),
-                "sidecar_sha256": sidecar_sha,
+        for normalized_timeframe, cell in sorted(admissible_cells.items()):
+            target_bindings[normalized_timeframe] = _verified_price_cell_binding(
+                native_root,
+                cell,
+                label=f"{price_symbol} {normalized_timeframe}",
+                digest_cache=digest_cache,
+            )
+        active_target_binding_count += len(target_bindings)
+        if schedule_source_timeframe == "D1":
+            symbol_results[symbol] = {
+                "status": provenance,
+                "price_symbol": price_symbol,
+                "broker_symbol": terms.get("broker_symbol"),
+                "terms_record_sha256": canonical_sha256(terms),
+                "d1_binding": dict(schedule_source_binding),
+                "d1_bars_sha256": schedule_source_binding["bars_sha256"],
+                "d1_sidecar_sha256": schedule_source_binding["sidecar_sha256"],
+                "schedule_relative_path": schedule_path.relative_to(
+                    native_root
+                ).as_posix(),
+                "schedule_sha256": schedule_sha,
+                "event_count": len(events),
+                "target_bindings": target_bindings,
             }
-        symbol_results[symbol] = {
-            "status": provenance,
-            "broker_symbol": terms.get("broker_symbol"),
-            "terms_record_sha256": canonical_sha256(terms),
-            "d1_bars_sha256": d1_sha,
-            "schedule_relative_path": schedule_path.relative_to(native_root).as_posix(),
-            "schedule_sha256": schedule_sha,
-            "event_count": len(events),
-            "target_bindings": target_bindings,
-        }
+        else:
+            symbol_results[symbol] = {
+                "status": provenance,
+                "price_symbol": price_symbol,
+                "broker_symbol": terms.get("broker_symbol"),
+                "terms_record_sha256": canonical_sha256(terms),
+                "schedule_source_timeframe": schedule_source_timeframe,
+                "schedule_source_binding": dict(schedule_source_binding),
+                "schedule_derivation_contract": schedule_derivation_contract,
+                "schedule_derivation_metadata": dict(
+                    schedule_derivation_metadata
+                ),
+                "schedule_relative_path": schedule_path.relative_to(
+                    native_root
+                ).as_posix(),
+                "schedule_sha256": schedule_sha,
+                "event_count": len(events),
+                "target_bindings": target_bindings,
+            }
+            if schedule_source_selection_receipt is not None:
+                symbol_results[symbol][
+                    "schedule_source_selection_receipt"
+                ] = dict(schedule_source_selection_receipt)
 
     active_symbols = sorted(
         symbol for symbol, value in symbol_results.items()
         if value.get("status") in {AUTHENTICATED, STRESS_APPROVED}
     )
     if not active_symbols:
-        raise BrokerTermsError("no symbol has an active D1-bound terms schedule")
+        raise BrokerTermsError("no symbol has an active source-bound terms schedule")
+    primary_schedule_contract = (
+        D1_SESSION_SCHEDULE_SCHEMA
+        if D1_SESSION_SCHEDULE_SCHEMA in schedule_contracts_used
+        else SESSION_SCHEDULE_SCHEMA
+    )
     manifest: Dict[str, Any] = {
         "schema_version": TERMS_ACTIVATION_SCHEMA,
         "activation_id": activation_id,
         "status": "active",
-        "created_at_utc": _iso(now),
+        "created_at_utc": _iso(manifest_created_at),
         "provenance_status": provenance,
         "price_activation_id": price["activation_id"],
         "price_activation_manifest_sha256": price["manifest_sha256"],
-        "price_active_pointer_sha256_at_creation": pointer_sha_at_start,
+        "price_active_pointer_sha256_at_creation": price["pointer_sha256"],
         "terms_snapshot_relative_path": snapshot_path.relative_to(native_root).as_posix(),
         "terms_snapshot_sha256": snapshot_sha,
-        "schedule_contract": D1_SESSION_SCHEDULE_SCHEMA,
+        "schedule_contract": primary_schedule_contract,
         "projection_contract": SWAP_PROJECTION_CONTRACT,
         "symbols": symbol_results,
         "active_symbols": active_symbols,
+        "active_target_binding_count": active_target_binding_count,
+        "unscheduled_evidence_candidate_cells": sorted(
+            unscheduled_candidate_cells,
+            key=lambda value: (value["symbol"], value["timeframe"]),
+        ),
     }
+    if len(schedule_contracts_used) > 1:
+        manifest["schedule_contracts"] = sorted(schedule_contracts_used)
+        manifest["schedule_source_policy"] = SCHEDULE_SOURCE_POLICY
+    if repair_source is not None:
+        manifest["repair_source_terms_activation_id"] = repair_source[
+            "activation_id"
+        ]
+        manifest["repair_source_terms_manifest_sha256"] = repair_source[
+            "manifest_sha256"
+        ]
+        manifest["repair_source_terms_pointer_sha256"] = repair_source[
+            "pointer_sha256"
+        ]
     manifest_path = terms_root / "activations" / f"{activation_id}.json"
-    _atomic_create_json(manifest_path, manifest)
-    manifest_sha = sha256_file(manifest_path)
-    if sha256_file(native_root / "ACTIVE.json") != pointer_sha_at_start:
-        raise BrokerTermsError("native price pointer changed during terms activation")
+    if staged_manifest_created_at_utc is not None and not manifest_path.is_file():
+        raise BrokerTermsError(
+            "staged manifest creation time is valid only for an existing activation"
+        )
+    staged_manifest_sha = _write_or_verify_immutable_json(manifest_path, manifest)
+    persisted_manifest, manifest_sha, _manifest_bytes = _load_json_bounded_hashed(
+        manifest_path
+    )
+    if (
+        manifest_sha != staged_manifest_sha
+        or _canonical_bytes(persisted_manifest) != _canonical_bytes(manifest)
+    ):
+        raise BrokerTermsError("persisted terms activation manifest changed during creation")
+    pointer_updated = False
     if update_pointer:
-        pointer = {
-            "schema_version": TERMS_ACTIVE_POINTER_SCHEMA,
-            "activation_id": activation_id,
-            "manifest_relative_path": manifest_path.relative_to(native_root).as_posix(),
-            "manifest_sha256": manifest_sha,
-            "price_activation_manifest_sha256": price["manifest_sha256"],
-            "activated_at_utc": _iso(now),
-        }
-        _atomic_replace_json(terms_root / "ACTIVE.json", pointer)
+        with _terms_pointer_lock(native_root):
+            if _optional_pointer_bytes(terms_pointer_path) != expected_terms_pointer_bytes:
+                raise BrokerTermsError("broker-terms pointer changed during activation")
+            with _native_price_pointer_lock(native_root):
+                current_price = load_current_price_activation(native_root)
+                if not _same_price_identity(price, current_price):
+                    raise BrokerTermsError(
+                        "native price authority changed during terms activation"
+                    )
+                _verify_exact_artifact(
+                    snapshot_path,
+                    snapshot_sha,
+                    "staged terms snapshot",
+                )
+                for staged_schedule_path, staged_schedule_sha in staged_schedule_pins:
+                    _verify_exact_artifact(
+                        staged_schedule_path,
+                        staged_schedule_sha,
+                        "staged D1 session schedule",
+                    )
+                _verify_exact_artifact(
+                    manifest_path,
+                    manifest_sha,
+                    "staged terms activation manifest",
+                )
+                commit_now = now + timedelta(
+                    seconds=max(0.0, time.monotonic() - activation_started_monotonic)
+                )
+                if repair_source is None:
+                    _require_snapshot_fresh(
+                        capture_started,
+                        commit_now,
+                        max_snapshot_age_seconds,
+                    )
+                pointer = {
+                    "schema_version": TERMS_ACTIVE_POINTER_SCHEMA,
+                    "activation_id": activation_id,
+                    "manifest_relative_path": manifest_path.relative_to(native_root).as_posix(),
+                    "manifest_sha256": manifest_sha,
+                    "price_activation_manifest_sha256": price["manifest_sha256"],
+                    "activated_at_utc": _iso(commit_now),
+                }
+
+                def _check_fresh_immediately_before_replace() -> None:
+                    if repair_source is not None:
+                        return
+                    replace_now = now + timedelta(
+                        seconds=max(
+                            0.0,
+                            time.monotonic() - activation_started_monotonic,
+                        )
+                    )
+                    _require_snapshot_fresh(
+                        capture_started,
+                        replace_now,
+                        max_snapshot_age_seconds,
+                    )
+
+                _atomic_replace_json(
+                    terms_pointer_path,
+                    pointer,
+                    before_replace=_check_fresh_immediately_before_replace,
+                )
+                pointer_updated = True
+    else:
+        with _terms_pointer_lock(native_root):
+            with _native_price_pointer_lock(native_root):
+                current_price = load_current_price_activation(native_root)
+                if not _same_price_identity(price, current_price):
+                    raise BrokerTermsError(
+                        "native price authority changed during terms activation"
+                    )
+                _verify_exact_artifact(
+                    snapshot_path,
+                    snapshot_sha,
+                    "staged terms snapshot",
+                )
+                for staged_schedule_path, staged_schedule_sha in staged_schedule_pins:
+                    _verify_exact_artifact(
+                        staged_schedule_path,
+                        staged_schedule_sha,
+                        "staged D1 session schedule",
+                    )
+                _verify_exact_artifact(
+                    manifest_path,
+                    manifest_sha,
+                    "staged terms activation manifest",
+                )
+                staged_now = now + timedelta(
+                    seconds=max(0.0, time.monotonic() - activation_started_monotonic)
+                )
+                if repair_source is None:
+                    _require_snapshot_fresh(
+                        capture_started,
+                        staged_now,
+                        max_snapshot_age_seconds,
+                    )
     return {
         **manifest,
         "manifest_path": str(manifest_path),
         "manifest_sha256": manifest_sha,
-        "pointer_updated": bool(update_pointer),
+        "pointer_updated": pointer_updated,
     }
 
 
 def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str) -> Dict[str, Any]:
     native_root = Path(native_root).resolve()
     terms_root = native_root / "terms"
-    pointer = _load_json_bounded(terms_root / "ACTIVE.json", 1024 * 1024)
+    pointer, pointer_sha, pointer_bytes = _load_json_bounded_hashed(
+        terms_root / "ACTIVE.json",
+        1024 * 1024,
+    )
     if str(pointer.get("schema_version") or "") != TERMS_ACTIVE_POINTER_SCHEMA:
         raise BrokerTermsError("terms pointer schema is invalid")
     manifest_path = _safe_relative(native_root, pointer.get("manifest_relative_path"))
-    manifest_sha = sha256_file(manifest_path)
+    manifest, manifest_sha, manifest_bytes = _load_json_bounded_hashed(manifest_path)
     if manifest_sha != str(pointer.get("manifest_sha256") or ""):
         raise BrokerTermsError("terms activation manifest hash mismatch")
-    manifest = _load_json_bounded(manifest_path)
     if (
         str(manifest.get("schema_version") or "") != TERMS_ACTIVATION_SCHEMA
         or str(manifest.get("status") or "").lower() != "active"
@@ -786,53 +2087,446 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
         raise BrokerTermsError("terms overlay is bound to a different price activation")
     if str(pointer.get("price_activation_manifest_sha256") or "") != price["manifest_sha256"]:
         raise BrokerTermsError("terms pointer price binding mismatch")
-    canonical = str(symbol or "").strip().upper()
+    raw_schedule_contracts = manifest.get("schedule_contracts")
+    if raw_schedule_contracts is None:
+        declared_schedule_contracts = [str(manifest.get("schedule_contract") or "")]
+    else:
+        declared_schedule_contracts = list(raw_schedule_contracts or [])
+        if (
+            declared_schedule_contracts != sorted(set(declared_schedule_contracts))
+            or str(manifest.get("schedule_contract") or "")
+            not in declared_schedule_contracts
+            or str(manifest.get("schedule_source_policy") or "")
+            != SCHEDULE_SOURCE_POLICY
+        ):
+            raise BrokerTermsError("terms schedule-contract declaration is invalid")
+    if (
+        not declared_schedule_contracts
+        or not set(declared_schedule_contracts).issubset(
+            {D1_SESSION_SCHEDULE_SCHEMA, SESSION_SCHEDULE_SCHEMA}
+        )
+    ):
+        raise BrokerTermsError("terms schedule contract is unsupported")
+
+    raw_terms_symbols = manifest.get("symbols")
+    if not isinstance(raw_terms_symbols, Mapping):
+        raise BrokerTermsError("terms activation symbol map is invalid")
+    terms_symbol_index = _casefold_key_map(raw_terms_symbols, "terms activation symbols")
+    requested = str(symbol or "").strip()
+    terms_symbol = terms_symbol_index.get(requested.casefold())
+    if terms_symbol is None:
+        raise BrokerTermsError(f"{requested or symbol}: no active terms record")
     tf = str(timeframe or "").strip().upper()
-    record = dict((manifest.get("symbols") or {}).get(canonical) or {})
+    record = dict(raw_terms_symbols.get(terms_symbol) or {})
     if record.get("status") not in {AUTHENTICATED, STRESS_APPROVED}:
-        raise BrokerTermsError(f"{canonical}: no admissible active terms schedule")
+        raise BrokerTermsError(f"{terms_symbol}: no admissible active terms schedule")
+
+    raw_price_entries = price["manifest"].get("entries")
+    if not isinstance(raw_price_entries, Mapping):
+        raise BrokerTermsError("native price manifest has no symbol entries")
+    price_symbol_index = _casefold_key_map(raw_price_entries, "native price symbols")
+    price_symbol = price_symbol_index.get(terms_symbol.casefold())
+    if price_symbol is None or str(record.get("price_symbol") or "") != price_symbol:
+        raise BrokerTermsError(f"{terms_symbol}: price-symbol identity mismatch")
+    raw_price_cells = raw_price_entries.get(price_symbol)
+    if not isinstance(raw_price_cells, Mapping):
+        raise BrokerTermsError(f"{price_symbol}: native price cells are invalid")
+    price_cells = dict(raw_price_cells)
+    timeframe_index = _casefold_key_map(
+        price_cells,
+        f"{price_symbol} native price timeframes",
+    )
+    target_key = timeframe_index.get(tf.casefold())
+    if target_key is None:
+        raise BrokerTermsError(f"{price_symbol} {tf}: target price cell is missing")
     binding = dict((record.get("target_bindings") or {}).get(tf) or {})
-    price_cell = dict(((price["manifest"].get("entries") or {}).get(canonical) or {}).get(tf) or {})
-    if (
-        str(price_cell.get("status") or "").lower() != "active"
-        or binding.get("bars_sha256") != price_cell.get("bars_sha256")
-        or binding.get("sidecar_sha256") != price_cell.get("sidecar_sha256")
+    price_cell = dict(price_cells.get(target_key) or {})
+    if not _price_cell_is_admissible(price, price_symbol, tf, price_cell):
+        raise BrokerTermsError(f"{price_symbol} {tf}: target price cell is not admissible")
+
+    digest_cache: Dict[Path, str] = {}
+    expected_target_binding = _verified_price_cell_binding(
+        native_root,
+        price_cell,
+        label=f"{price_symbol} {tf} target artifact",
+        digest_cache=digest_cache,
+    )
+    if _canonical_bytes(binding) != _canonical_bytes(expected_target_binding):
+        raise BrokerTermsError(f"{price_symbol} {tf}: target price binding mismatch")
+
+    admissible_source_cells: Dict[str, Dict[str, Any]] = {}
+    source_preference = (
+        ("D1",)
+        if price.get("contract_mode") != "promoted-v4"
+        else _SCHEDULE_SOURCE_PREFERENCE
+    )
+    for source_timeframe in source_preference:
+        source_key = timeframe_index.get(source_timeframe.casefold())
+        if source_key is None:
+            if source_timeframe == "D1":
+                raise BrokerTermsError(
+                    f"{price_symbol}: native D1 price cell is missing"
+                )
+            continue
+        source_cell = dict(price_cells.get(source_key) or {})
+        if _price_cell_is_admissible(
+            price,
+            price_symbol,
+            source_timeframe,
+            source_cell,
+        ):
+            admissible_source_cells[source_timeframe] = source_cell
+    preferred_source_timeframe = next(
+        (
+            source_timeframe
+            for source_timeframe in source_preference
+            if source_timeframe in admissible_source_cells
+        ),
+        None,
+    )
+    if preferred_source_timeframe is None:
+        raise BrokerTermsError(
+            f"{price_symbol}: no admissible session schedule source"
+        )
+
+    selection_receipt = record.get(
+        "schedule_source_selection_receipt"
+    )
+    generic_source_fields = {
+        "schedule_source_timeframe",
+        "schedule_source_binding",
+        "schedule_derivation_contract",
+        "schedule_derivation_metadata",
+    }
+    present_generic_fields = generic_source_fields.intersection(record)
+    if present_generic_fields and present_generic_fields != generic_source_fields:
+        raise BrokerTermsError("terms record has an incomplete schedule-source binding")
+    is_generic_schedule = bool(present_generic_fields)
+    if is_generic_schedule:
+        if preferred_source_timeframe == "D1":
+            raise BrokerTermsError(
+                f"{price_symbol}: generic schedule cannot override native D1"
+            )
+        schedule_source_timeframe = str(
+            record.get("schedule_source_timeframe") or ""
+        ).strip().upper()
+        if schedule_source_timeframe not in _SCHEDULE_SOURCE_PREFERENCE[1:]:
+            raise BrokerTermsError(
+                f"{price_symbol}: schedule-source preference mismatch"
+            )
+        if selection_receipt is None:
+            if schedule_source_timeframe != preferred_source_timeframe:
+                raise BrokerTermsError(
+                    f"{price_symbol}: schedule-source preference mismatch"
+                )
+        else:
+            if (
+                not isinstance(selection_receipt, Mapping)
+                or set(selection_receipt)
+                != {
+                    "schema_version",
+                    "policy",
+                    "rejected_candidates",
+                    "selected_source_timeframe",
+                    "selected_source_completed_session_count",
+                    "selected_source_completed_sessions_sha256",
+                    "target_completed_session_union_count",
+                    "target_completed_session_union_sha256",
+                }
+                or selection_receipt.get("schema_version")
+                != SCHEDULE_SOURCE_SELECTION_SCHEMA
+                or selection_receipt.get("policy")
+                != SCHEDULE_SOURCE_POLICY
+                or selection_receipt.get("selected_source_timeframe")
+                != schedule_source_timeframe
+            ):
+                raise BrokerTermsError(
+                    "terms record schedule-source selection receipt is invalid"
+                )
+            rejected_candidates = selection_receipt.get(
+                "rejected_candidates"
+            )
+            selected_index = _SCHEDULE_SOURCE_PREFERENCE.index(
+                schedule_source_timeframe
+            )
+            expected_rejected_timeframes = [
+                source_timeframe
+                for source_timeframe in _SCHEDULE_SOURCE_PREFERENCE[
+                    1:selected_index
+                ]
+                if source_timeframe in admissible_source_cells
+            ]
+            if (
+                schedule_source_timeframe == preferred_source_timeframe
+                or not isinstance(rejected_candidates, list)
+                or [
+                    str(rejection.get("timeframe") or "")
+                    if isinstance(rejection, Mapping)
+                    else ""
+                    for rejection in rejected_candidates
+                ]
+                != expected_rejected_timeframes
+            ):
+                raise BrokerTermsError(
+                    "terms record schedule-source rejection chain is invalid"
+                )
+            allowed_rejection_reasons = {
+                "ANCHOR_INTERVAL_NOT_OVERLAPPED",
+                "ANCHOR_SESSION_UNREPRESENTED",
+                "NO_COMPLETED_SOURCE_SESSION",
+                "INCOMPLETE_TARGET_SESSION_COVERAGE",
+            }
+            for rejection in rejected_candidates:
+                if (
+                    not isinstance(rejection, Mapping)
+                    or set(rejection)
+                    != {
+                        "timeframe",
+                        "binding",
+                        "reason",
+                        "missing_target_session_count",
+                        "missing_target_sessions_sha256",
+                    }
+                    or rejection.get("reason")
+                    not in allowed_rejection_reasons
+                    or type(rejection.get("missing_target_session_count"))
+                    is not int
+                    or int(rejection["missing_target_session_count"]) < 0
+                    or not _is_sha256(
+                        rejection.get("missing_target_sessions_sha256")
+                    )
+                    or not isinstance(rejection.get("binding"), Mapping)
+                ):
+                    raise BrokerTermsError(
+                        "terms record schedule-source rejection is invalid"
+                    )
+                missing_count = int(
+                    rejection["missing_target_session_count"]
+                )
+                if (
+                    rejection["reason"]
+                    == "INCOMPLETE_TARGET_SESSION_COVERAGE"
+                ) != (missing_count > 0):
+                    raise BrokerTermsError(
+                        "terms record schedule-source rejection count is invalid"
+                    )
+                if (
+                    missing_count == 0
+                    and rejection["missing_target_sessions_sha256"]
+                    != canonical_sha256([])
+                ):
+                    raise BrokerTermsError(
+                        "terms record schedule-source rejection digest is invalid"
+                    )
+                rejected_timeframe = str(rejection["timeframe"])
+                expected_rejected_binding = _verified_price_cell_binding(
+                    native_root,
+                    admissible_source_cells[rejected_timeframe],
+                    label=(
+                        f"{price_symbol} {rejected_timeframe} rejected "
+                        "schedule source"
+                    ),
+                    digest_cache=digest_cache,
+                )
+                if _canonical_bytes(
+                    rejection["binding"]
+                ) != _canonical_bytes(expected_rejected_binding):
+                    raise BrokerTermsError(
+                        "terms record rejected schedule-source binding mismatch"
+                    )
+            selected_session_count = selection_receipt.get(
+                "selected_source_completed_session_count"
+            )
+            target_session_count = selection_receipt.get(
+                "target_completed_session_union_count"
+            )
+            if (
+                type(selected_session_count) is not int
+                or type(target_session_count) is not int
+                or int(selected_session_count) <= 0
+                or int(target_session_count) <= 0
+                or int(selected_session_count) < int(target_session_count)
+                or not _is_sha256(
+                    selection_receipt.get(
+                        "selected_source_completed_sessions_sha256"
+                    )
+                )
+                or not _is_sha256(
+                    selection_receipt.get(
+                        "target_completed_session_union_sha256"
+                    )
+                )
+            ):
+                raise BrokerTermsError(
+                    "terms record schedule-source selection summary is invalid"
+                )
+        schedule_source_binding = record.get("schedule_source_binding")
+        schedule_derivation_contract = str(
+            record.get("schedule_derivation_contract") or ""
+        )
+        schedule_derivation_metadata = record.get(
+            "schedule_derivation_metadata"
+        )
+        if (
+            not isinstance(schedule_source_binding, Mapping)
+            or schedule_derivation_contract
+            != INTRADAY_SESSION_DERIVATION_CONTRACT
+            or not isinstance(schedule_derivation_metadata, Mapping)
+            or set(schedule_derivation_metadata)
+            != {
+                "matched_anchor_count",
+                "phase_seconds",
+                "source_first_open_utc",
+                "source_last_close_utc",
+                "source_row_count",
+                "weekday_offset",
+            }
+        ):
+            raise BrokerTermsError("terms record schedule-source contract is invalid")
+        if (
+            type(schedule_derivation_metadata.get("matched_anchor_count")) is not int
+            or int(schedule_derivation_metadata["matched_anchor_count"]) <= 0
+            or type(schedule_derivation_metadata.get("phase_seconds")) is not int
+            or not 0 <= int(schedule_derivation_metadata["phase_seconds"]) < 86_400
+            or type(schedule_derivation_metadata.get("source_row_count")) is not int
+            or int(schedule_derivation_metadata["source_row_count"]) <= 0
+            or type(schedule_derivation_metadata.get("weekday_offset")) is not int
+            or not 0 <= int(schedule_derivation_metadata["weekday_offset"]) <= 6
+        ):
+            raise BrokerTermsError("terms record schedule-source metadata is invalid")
+        try:
+            source_first_open = pd.Timestamp(
+                schedule_derivation_metadata["source_first_open_utc"]
+            )
+            source_last_close = pd.Timestamp(
+                schedule_derivation_metadata["source_last_close_utc"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise BrokerTermsError(
+                "terms record schedule-source interval is invalid"
+            ) from exc
+        if (
+            source_first_open.tzinfo is None
+            or source_last_close.tzinfo is None
+            or source_last_close <= source_first_open
+        ):
+            raise BrokerTermsError("terms record schedule-source interval is invalid")
+    else:
+        schedule_source_timeframe = "D1"
+        if selection_receipt is not None:
+            raise BrokerTermsError(
+                "legacy D1 record has an unexpected source-selection receipt"
+            )
+        if preferred_source_timeframe != "D1":
+            raise BrokerTermsError(
+                f"{price_symbol}: legacy D1 schedule source is not admissible"
+            )
+        schedule_source_binding = record.get("d1_binding")
+        schedule_derivation_contract = D1_SESSION_DERIVATION_CONTRACT
+        schedule_derivation_metadata = {}
+        if not isinstance(schedule_source_binding, Mapping):
+            raise BrokerTermsError("terms record lacks its D1 artifact binding")
+
+    schedule_source_cell = admissible_source_cells[schedule_source_timeframe]
+    expected_schedule_source_binding = _verified_price_cell_binding(
+        native_root,
+        schedule_source_cell,
+        label=f"{price_symbol} {schedule_source_timeframe} schedule source",
+        digest_cache=digest_cache,
+    )
+    if _canonical_bytes(schedule_source_binding) != _canonical_bytes(
+        expected_schedule_source_binding
     ):
-        raise BrokerTermsError(f"{canonical} {tf}: target price binding mismatch")
-    target_bars_path = _safe_relative(native_root, binding.get("bars_relative_path"))
-    target_sidecar_path = _safe_relative(native_root, binding.get("sidecar_relative_path"))
-    if (
-        sha256_file(target_bars_path) != binding.get("bars_sha256")
-        or sha256_file(target_sidecar_path) != binding.get("sidecar_sha256")
-    ):
-        raise BrokerTermsError(f"{canonical} {tf}: target artifact hash mismatch")
+        raise BrokerTermsError(f"{price_symbol}: schedule-source binding mismatch")
+
     schedule_path = _safe_relative(native_root, record.get("schedule_relative_path"))
-    if sha256_file(schedule_path) != str(record.get("schedule_sha256") or ""):
+    schedule, schedule_sha, _schedule_bytes = _load_json_bounded_hashed(schedule_path)
+    if schedule_sha != str(record.get("schedule_sha256") or ""):
         raise BrokerTermsError("session schedule hash mismatch")
-    schedule = _load_json_bounded(schedule_path)
-    if (
-        str(schedule.get("schema_version") or "") != D1_SESSION_SCHEDULE_SCHEMA
+    schedule_schema = str(schedule.get("schema_version") or "")
+    common_schedule_invalid = (
+        schedule.get("symbol") != terms_symbol
+        or schedule.get("price_symbol") != price_symbol
+        or schedule.get("price_activation_id") != price["activation_id"]
         or schedule.get("price_activation_manifest_sha256") != price["manifest_sha256"]
         or schedule.get("terms_snapshot_sha256") != manifest.get("terms_snapshot_sha256")
-    ):
+        or schedule.get("terms_record_sha256") != record.get("terms_record_sha256")
+        or schedule.get("event_axis_contract") != "event_utc_factor_pairs_v1"
+        or not isinstance(schedule.get("events"), list)
+    )
+    if common_schedule_invalid:
         raise BrokerTermsError("session schedule binding/schema mismatch")
+    if is_generic_schedule:
+        if (
+            schedule_schema != SESSION_SCHEDULE_SCHEMA
+            or SESSION_SCHEDULE_SCHEMA not in declared_schedule_contracts
+            or schedule.get("schedule_source_timeframe")
+            != schedule_source_timeframe
+            or _canonical_bytes(schedule.get("schedule_source_binding"))
+            != _canonical_bytes(expected_schedule_source_binding)
+            or schedule.get("schedule_derivation_contract")
+            != schedule_derivation_contract
+            or _canonical_bytes(schedule.get("schedule_derivation_metadata"))
+            != _canonical_bytes(schedule_derivation_metadata)
+            or _canonical_bytes(
+                schedule.get("schedule_source_selection_receipt")
+            )
+            != _canonical_bytes(selection_receipt)
+        ):
+            raise BrokerTermsError("session schedule source binding/schema mismatch")
+    elif (
+        schedule_schema != D1_SESSION_SCHEDULE_SCHEMA
+        or D1_SESSION_SCHEDULE_SCHEMA not in declared_schedule_contracts
+        or schedule.get("schedule_source_selection_receipt") is not None
+        or schedule.get("d1_bars_relative_path")
+        != expected_schedule_source_binding["bars_relative_path"]
+        or schedule.get("d1_bars_sha256")
+        != expected_schedule_source_binding["bars_sha256"]
+        or schedule.get("d1_sidecar_relative_path")
+        != expected_schedule_source_binding["sidecar_relative_path"]
+        or schedule.get("d1_sidecar_sha256")
+        != expected_schedule_source_binding["sidecar_sha256"]
+    ):
+        raise BrokerTermsError("D1 session schedule binding/schema mismatch")
     snapshot_path = _safe_relative(native_root, manifest.get("terms_snapshot_relative_path"))
-    if sha256_file(snapshot_path) != str(manifest.get("terms_snapshot_sha256") or ""):
+    snapshot, snapshot_sha, _snapshot_bytes = _load_json_bounded_hashed(snapshot_path)
+    if snapshot_sha != str(manifest.get("terms_snapshot_sha256") or ""):
         raise BrokerTermsError("terms snapshot hash mismatch")
-    snapshot = _load_json_bounded(snapshot_path)
-    if str(snapshot.get("schema_version") or "") != TERMS_SNAPSHOT_SCHEMA:
-        raise BrokerTermsError("active terms snapshot schema mismatch")
-    terms = dict((snapshot.get("symbols") or {}).get(canonical) or {})
+    _validate_terms_snapshot(snapshot)
+    if (
+        snapshot.get("provenance_status") != manifest.get("provenance_status")
+        or record.get("status") != manifest.get("provenance_status")
+    ):
+        raise BrokerTermsError("terms snapshot provenance does not match its activation")
+    snapshot_symbols = snapshot.get("symbols")
+    if not isinstance(snapshot_symbols, Mapping):
+        raise BrokerTermsError("active terms snapshot symbol map is invalid")
+    snapshot_symbol_index = _casefold_key_map(snapshot_symbols, "terms snapshot symbols")
+    snapshot_symbol = snapshot_symbol_index.get(terms_symbol.casefold())
+    if snapshot_symbol != terms_symbol:
+        raise BrokerTermsError("symbol terms snapshot identity mismatch")
+    terms = dict(snapshot_symbols.get(terms_symbol) or {})
     if canonical_sha256(terms) != record.get("terms_record_sha256"):
         raise BrokerTermsError("symbol terms record hash mismatch")
     stress_policy = dict(snapshot.get("stress_policy") or {})
     stress_approved = record["status"] == STRESS_APPROVED
+    if (
+        _read_bounded(terms_root / "ACTIVE.json", 1024 * 1024) != pointer_bytes
+        or _read_bounded(manifest_path, 64 * 1024 * 1024) != manifest_bytes
+    ):
+        raise BrokerTermsError("broker terms activation changed during resolution")
+    if (
+        _read_bounded(price["pointer_path"], 1024 * 1024) != price["pointer_bytes"]
+        or _read_bounded(price["manifest_path"], 64 * 1024 * 1024)
+        != price["manifest_bytes"]
+    ):
+        raise BrokerTermsError("native price authority changed during terms resolution")
     return {
         "status": "AVAILABLE",
         "schedule_provenance_status": record["status"],
         "source_provenance_authenticated": record["status"] == AUTHENTICATED,
         "stress_approved": stress_approved,
-        "stress_policy_immutable": stress_approved and bool(stress_policy),
+        "stress_policy_immutable": stress_approved and stress_policy == _STRESS_POLICY,
         "stress_policy_sha256": (
             canonical_sha256(stress_policy)
             if stress_approved and stress_policy
@@ -842,10 +2536,29 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
         "price_activation_manifest_sha256": price["manifest_sha256"],
         "terms_activation_id": manifest.get("activation_id"),
         "terms_activation_manifest_sha256": manifest_sha,
+        "terms_active_pointer_sha256": pointer_sha,
         "terms_snapshot_sha256": manifest.get("terms_snapshot_sha256"),
         "schedule_sha256": record.get("schedule_sha256"),
         "target_bars_sha256": binding.get("bars_sha256"),
         "target_sidecar_sha256": binding.get("sidecar_sha256"),
+        "schedule_source_timeframe": schedule_source_timeframe,
+        "schedule_derivation_contract": schedule_derivation_contract,
+        "schedule_source_bars_sha256": expected_schedule_source_binding.get(
+            "bars_sha256"
+        ),
+        "schedule_source_sidecar_sha256": expected_schedule_source_binding.get(
+            "sidecar_sha256"
+        ),
+        "d1_bars_sha256": (
+            expected_schedule_source_binding.get("bars_sha256")
+            if schedule_source_timeframe == "D1"
+            else None
+        ),
+        "d1_sidecar_sha256": (
+            expected_schedule_source_binding.get("sidecar_sha256")
+            if schedule_source_timeframe == "D1"
+            else None
+        ),
         "projection_contract": SWAP_PROJECTION_CONTRACT,
         "terms": terms,
         "events": list(schedule.get("events") or []),
@@ -896,14 +2609,14 @@ def write_capture_request(
     return {"nonce": nonce, "requested_at_utc": _iso(requested), "rows": len(rows), "path": str(path)}
 
 
-def prune_terms_store(
+def _prune_terms_store_locked(
     native_root: Path,
     *,
     max_snapshots: int = 16,
     max_total_bytes: int = 64 * 1024 * 1024,
     referenced_sha256: Iterable[str] = (),
 ) -> Dict[str, Any]:
-    """Bound unreferenced terms artifacts while preserving active evidence."""
+    """Prune with the caller holding the shared terms-pointer lock."""
     native_root = Path(native_root).resolve()
     terms_root = native_root / "terms"
     protected_hashes = {str(value).lower() for value in referenced_sha256 if _is_sha256(value)}
@@ -975,3 +2688,22 @@ def prune_terms_store(
     if total > int(max_total_bytes):
         raise TermsStorageBoundError("broker-terms store cannot satisfy its hard byte cap")
     return {"deleted": deleted, "remaining_bytes": total, "protected_bytes": protected_bytes}
+
+
+def prune_terms_store(
+    native_root: Path,
+    *,
+    max_snapshots: int = 16,
+    max_total_bytes: int = 64 * 1024 * 1024,
+    referenced_sha256: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Bound unreferenced terms artifacts without racing pointer publication."""
+
+    native_root = Path(native_root).resolve()
+    with _terms_pointer_lock(native_root):
+        return _prune_terms_store_locked(
+            native_root,
+            max_snapshots=max_snapshots,
+            max_total_bytes=max_total_bytes,
+            referenced_sha256=referenced_sha256,
+        )

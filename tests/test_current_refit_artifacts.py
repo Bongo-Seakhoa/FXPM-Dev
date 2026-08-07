@@ -601,6 +601,61 @@ def test_search_attempt_spools_all_executable_artifacts_and_verifies(
     )
 
 
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_search_attempt_preserves_exact_mt5_symbol(
+    tmp_path: Path,
+    symbol: str,
+) -> None:
+    context, sink, written = _spool_attempt(tmp_path, symbol=symbol)
+    receipt = sink.seal()
+
+    spool.verify_symbol_receipt(
+        context.root,
+        receipt,
+        expected_generation_id="generation-001",
+        expected_symbol=symbol,
+        expected_native_universe_sha256="b" * 64,
+        expected_config_sha256="c" * 64,
+    )
+    assert written.artifacts.horizon_process["symbol"] == symbol
+
+
+@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
+def test_search_attempt_rejects_wrong_case_mt5_symbol(
+    tmp_path: Path,
+    wrong_case: str,
+) -> None:
+    context = spool.freeze_generation_context(
+        tmp_path / "authority-spool",
+        generation_id="generation-001",
+        native_universe_sha256="b" * 64,
+        config_sha256="c" * 64,
+    )
+    sink = spool.open_symbol_sink(context, "Platinum")
+    strategy = StrategyRegistry.get(STRATEGY_ID)
+
+    with pytest.raises(
+        CurrentRefitArtifactError,
+        match="AUTHORITY_SINK_SYMBOL_MISMATCH",
+    ):
+        spool_current_refit_search_attempt_v2(
+            sink,
+            symbol=wrong_case,
+            timeframe="H1",
+            regime="TREND",
+            strategy_id=STRATEGY_ID,
+            parameters=strategy.get_params(),
+            lookback_kind="NATIVE_OBSERVATIONS",
+            lookback_value=1_000,
+            fit_start_utc="2021-01-01T00:00:00Z",
+            fit_end_utc="2026-01-02T00:00:00Z",
+            latest_closed_bar_utc="2026-01-01T23:00:00Z",
+            source_snapshot_sha256="a" * 64,
+            source_bar_count=1_000,
+            seed=20260714,
+        )
+
+
 def test_search_attempt_spool_is_byte_idempotent(tmp_path: Path) -> None:
     context, sink, written = _spool_attempt(tmp_path)
     first_receipt = sink.seal()

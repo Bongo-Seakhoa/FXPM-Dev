@@ -1,0 +1,251 @@
+file,line,kind,text
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,17,connected_mt5,00:57:36 [INFO] Connected to MT5 (using existing session)
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,18,connected_mt5,00:57:36 [INFO] [OK] Connected to MT5
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,151,error,01:01:04 [ERROR] Application error: [Errno 22] Invalid argument: 'data\\TRXUSD_M5.csv'
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,152,error,Traceback (most recent call last):
+logs/production_live/bleeding_edge_retrain_20260609_010116.err.log,17,connected_mt5,01:04:54 [INFO] Connected to MT5 (using existing session)
+logs/production_live/bleeding_edge_retrain_20260609_010116.err.log,18,connected_mt5,01:04:54 [INFO] [OK] Connected to MT5
+logs/production_live/bleeding_edge_retrain_20260609_012215.err.log,17,connected_mt5,01:22:23 [INFO] Connected to MT5 (using existing session)
+logs/production_live/bleeding_edge_retrain_20260609_012215.err.log,18,connected_mt5,01:22:23 [INFO] [OK] Connected to MT5
+logs/production_live/bleeding_edge_retrain_20260609_012215.err.log,486,error,01:29:59 [ERROR] Failed to save XAUEUR: Failed to save configs: [WinError 5] Access is denied: 'pm_configs.json.tmp' -> 'pm_configs.json'
+logs/production_live/bleeding_edge_retrain_20260609_012215.err.log,490,error,01:30:04 [ERROR] Failed to save AIG: Failed to save configs: [WinError 5] Access is denied: 'pm_configs.json.tmp' -> 'pm_configs.json'
+logs/production_live/bleeding_edge_retrain_20260609_104109.err.log,17,connected_mt5,10:41:15 [INFO] Connected to MT5 (using existing session)
+logs/production_live/bleeding_edge_retrain_20260609_104109.err.log,18,connected_mt5,10:41:15 [INFO] [OK] Connected to MT5
+logs/production_live/bleeding_edge_retrain_20260609_110346.err.log,17,connected_mt5,11:03:49 [INFO] Connected to MT5 (using existing session)
+logs/production_live/bleeding_edge_retrain_20260609_110346.err.log,18,connected_mt5,11:03:49 [INFO] [OK] Connected to MT5
+logs/production_live/bleeding_edge_retrain_20260609_110346.err.log,19424,error,16:04:33 [ERROR] [BTCETH] Optimization error: A process in the process pool was terminated abruptly while the future was running or pending.
+logs/production_live/bleeding_edge_retrain_20260609_110346.err.log,19425,error,Traceback (most recent call last):
+logs/production_live/bleeding_edge_retrain_20260609_110346.err.log,19438,error,"Optimizing:  25%|##5       | 14/55 [4:53:06<14:21:49, 1261.20s/sym]16:04:36 [ERROR] [BTCUSD] Optimization error: A process in the process pool was terminated abruptly while the future was running or pending."
+logs/production_live/bleeding_edge_retrain_20260609_110346.err.log,19439,error,Traceback (most recent call last):
+logs/production_live/live_trade_20260608_124046.err.log,17,connected_mt5,12:40:48 [INFO] Connected to MT5 (using existing session)
+logs/production_live/live_trade_20260608_124046.err.log,18,connected_mt5,12:40:48 [INFO] [OK] Connected to MT5
+logs/production_live/live_trade_20260608_124046.err.log,28,trading_enabled,12:40:49 [INFO] Trading enabled: True
+logs/production_live/live_trade_20260608_124046.err.log,225,risk_cap,12:41:27 [WARNING] [GBPUSD] Symbol risk cap exceeded for GBPUSD: existing 0.00% (0 positions: ) + new 50.00% = 50.00% > max 20.00%
+logs/production_live/live_trade_20260608_124352.err.log,17,connected_mt5,12:43:55 [INFO] Connected to MT5 (using existing session)
+logs/production_live/live_trade_20260608_124352.err.log,18,connected_mt5,12:43:55 [INFO] [OK] Connected to MT5
+logs/production_live/live_trade_20260608_124352.err.log,28,trading_enabled,12:43:55 [INFO] Trading enabled: True
+logs/production_live/live_trade_20260608_145123.err.log,17,connected_mt5,14:51:27 [INFO] Connected to MT5 (using existing session)
+logs/production_live/live_trade_20260608_145123.err.log,18,connected_mt5,14:51:27 [INFO] [OK] Connected to MT5
+logs/production_live/live_trade_20260608_145123.err.log,28,trading_enabled,14:51:27 [INFO] Trading enabled: True
+logs/production_live/live_trade_20260608_191455.err.log,17,connected_mt5,19:14:59 [INFO] Connected to MT5 (using existing session)
+logs/production_live/live_trade_20260608_191455.err.log,18,connected_mt5,19:14:59 [INFO] [OK] Connected to MT5
+logs/production_live/live_trade_20260608_191455.err.log,28,trading_enabled,19:15:00 [INFO] Trading enabled: True
+logs/production_live/live_trade_20260608_191455.err.log,501,error,"01:09:26 [ERROR] Error in trading loop: Corrupted JSON in pm_configs.json: Expecting ',' delimiter: line 227834 column 39 (char 8820231)"
+logs/production_live/live_trade_20260608_191455.err.log,527,error,01:13:15 [ERROR] Error in trading loop: Failed to load pm_configs.json: [Errno 13] Permission denied: 'pm_configs.json'
+logs/production_live/live_trade_20260608_191455.err.log,1504,error,11:11:23 [ERROR] Application error: Failed to load pm_configs.json: [Errno 13] Permission denied: 'pm_configs.json'
+logs/production_live/live_trade_20260608_191455.err.log,1505,error,Traceback (most recent call last):
+logs/production_live/live_trade_20260608_191455.err.log,1513,error,Traceback (most recent call last):
+logs/production_live/optimize_100_20260607_202037.err.log,17,connected_mt5,20:20:42 [INFO] Connected to MT5 (using existing session)
+logs/production_live/optimize_100_20260607_202037.err.log,18,connected_mt5,20:20:42 [INFO] [OK] Connected to MT5
+logs/production_live/optimize_100_deep_20260608_042334.err.log,17,connected_mt5,04:23:38 [INFO] Connected to MT5 (using existing session)
+logs/production_live/optimize_100_deep_20260608_042334.err.log,18,connected_mt5,04:23:38 [INFO] [OK] Connected to MT5
+logs/production_live/optimize_100_failclosed_20260608_050917.err.log,17,connected_mt5,05:09:21 [INFO] Connected to MT5 (using existing session)
+logs/production_live/optimize_100_failclosed_20260608_050917.err.log,18,connected_mt5,05:09:21 [INFO] [OK] Connected to MT5
+logs/production_live/optimize_100_notrade_20260608_043815.err.log,17,connected_mt5,04:38:18 [INFO] Connected to MT5 (using existing session)
+logs/production_live/optimize_100_notrade_20260608_043815.err.log,18,connected_mt5,04:38:18 [INFO] [OK] Connected to MT5
+logs/production_live/optimize_100_strict_20260607_203755.err.log,17,connected_mt5,20:38:00 [INFO] Connected to MT5 (using existing session)
+logs/production_live/optimize_100_strict_20260607_203755.err.log,18,connected_mt5,20:38:00 [INFO] [OK] Connected to MT5
+logs/production_live/pm_20260607.log,17,connected_mt5,2026-06-07 17:10:30 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,18,connected_mt5,2026-06-07 17:10:30 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,43,connected_mt5,2026-06-07 17:27:34 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,44,connected_mt5,2026-06-07 17:27:34 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,69,connected_mt5,2026-06-07 17:58:36 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,70,connected_mt5,2026-06-07 17:58:36 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,95,connected_mt5,2026-06-07 18:16:53 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,96,connected_mt5,2026-06-07 18:16:53 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,121,connected_mt5,2026-06-07 18:27:37 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,122,connected_mt5,2026-06-07 18:27:37 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,147,connected_mt5,2026-06-07 18:30:21 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,148,connected_mt5,2026-06-07 18:30:21 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,173,connected_mt5,2026-06-07 18:42:36 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,174,connected_mt5,2026-06-07 18:42:36 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,199,connected_mt5,2026-06-07 20:03:04 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,200,connected_mt5,2026-06-07 20:03:04 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,225,connected_mt5,2026-06-07 20:04:16 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,226,connected_mt5,2026-06-07 20:04:16 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,251,connected_mt5,2026-06-07 20:19:35 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,252,connected_mt5,2026-06-07 20:19:35 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,277,connected_mt5,2026-06-07 20:20:42 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,278,connected_mt5,2026-06-07 20:20:42 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260607.log,582,connected_mt5,2026-06-07 20:38:00 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260607.log,583,connected_mt5,2026-06-07 20:38:00 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,17,connected_mt5,2026-06-08 04:23:38 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,18,connected_mt5,2026-06-08 04:23:38 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,555,connected_mt5,2026-06-08 04:38:18 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,556,connected_mt5,2026-06-08 04:38:18 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,1140,connected_mt5,2026-06-08 05:09:21 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,1141,connected_mt5,2026-06-08 05:09:21 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,1740,connected_mt5,2026-06-08 06:38:59 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,1741,connected_mt5,2026-06-08 06:38:59 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,1747,error,"2026-06-08 06:39:00 [ERROR] __main__: Live readiness ERROR [production_symbol_ledger_incomplete]: symbols missing from winner ledger: JP225, US100, US30, US500, USDCHF, USDMXN, USDNOK, USDPLN, USDSEK, USDSGD, USDZAR, XAGUSD, XAUUSD, XBRUSD, XNGUSD, XRPUSD, XTIUSD"
+logs/production_live/pm_20260608.log,1748,error,"2026-06-08 06:39:00 [ERROR] __main__: Live readiness ERROR [production_winner_ledger_promotion_mismatch]: tradeable winner ledger cells do not exactly match corrected promotion PROMOTE cells: ledger_only=AUDJPY|H1|RANGE, BTCUSD|D1|CHOP, BTCUSD|H4|TREND, BTCUSD|M30|TREND, DE30|H4|CHOP, ETHUSD|M30|CHOP, EURAUD|H4|CHOP, EURCAD|H4|TREND, GBPUSD|D1|CHOP, GBPUSD|H1|CHOP, GBPUSD|H4|CHOP, NZDCAD|H4|CHOP, +2 more; review_only=AUDUSD|H4|CHOP, EURUSD|H4|TREND, USDCAD|H4|TREND, USDJPY|H4|TREND"
+logs/production_live/pm_20260608.log,1749,error,2026-06-08 06:39:00 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260608.log,1769,connected_mt5,2026-06-08 07:07:26 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,1770,connected_mt5,2026-06-08 07:07:26 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,1795,connected_mt5,2026-06-08 07:10:25 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,1796,connected_mt5,2026-06-08 07:10:25 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,1821,connected_mt5,2026-06-08 07:15:53 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,1822,connected_mt5,2026-06-08 07:15:53 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,1832,trading_enabled,2026-06-08 07:15:54 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260608.log,2063,connected_mt5,2026-06-08 07:51:26 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2064,connected_mt5,2026-06-08 07:51:26 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2089,connected_mt5,2026-06-08 07:54:11 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2090,connected_mt5,2026-06-08 07:54:11 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2115,connected_mt5,2026-06-08 07:58:02 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2116,connected_mt5,2026-06-08 07:58:02 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2141,connected_mt5,2026-06-08 07:59:38 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2142,connected_mt5,2026-06-08 07:59:38 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2167,connected_mt5,2026-06-08 08:04:49 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2168,connected_mt5,2026-06-08 08:04:49 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2193,connected_mt5,2026-06-08 08:05:39 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2194,connected_mt5,2026-06-08 08:05:39 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2205,trading_enabled,2026-06-08 08:05:40 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260608.log,2414,connected_mt5,2026-06-08 08:08:45 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2415,connected_mt5,2026-06-08 08:08:45 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2442,connected_mt5,2026-06-08 08:10:16 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2443,connected_mt5,2026-06-08 08:10:16 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2468,connected_mt5,2026-06-08 08:13:26 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2469,connected_mt5,2026-06-08 08:13:26 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2499,connected_mt5,2026-06-08 08:25:24 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2500,connected_mt5,2026-06-08 08:25:24 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2526,connected_mt5,2026-06-08 08:28:34 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2527,connected_mt5,2026-06-08 08:28:34 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2555,connected_mt5,2026-06-08 08:35:45 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2556,connected_mt5,2026-06-08 08:35:45 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2596,connected_mt5,2026-06-08 09:18:59 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2597,connected_mt5,2026-06-08 09:18:59 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2622,connected_mt5,2026-06-08 09:19:53 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2623,connected_mt5,2026-06-08 09:19:53 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2649,connected_mt5,2026-06-08 09:21:32 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2650,connected_mt5,2026-06-08 09:21:32 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2695,connected_mt5,2026-06-08 10:04:20 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2696,connected_mt5,2026-06-08 10:04:20 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2707,trading_enabled,2026-06-08 10:04:21 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260608.log,2984,connected_mt5,2026-06-08 11:03:07 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,2985,connected_mt5,2026-06-08 11:03:07 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,2992,error,2026-06-08 11:03:08 [ERROR] __main__: Live readiness ERROR [storage_free_space_below_entry_floor]: free disk space 8.61GB is below new-entry floor 10.00GB
+logs/production_live/pm_20260608.log,2994,error,"2026-06-08 11:03:08 [ERROR] __main__: Live readiness ERROR [live_tuned_regime_params_missing]: live entries require explicitly tuned regime params; missing tuned entries for US100|D1|CHOP, US100|H1|CHOP, US100|H4|CHOP, US100|H4|TREND, US100|M15|CHOP, US100|M15|RANGE in regime_params.json"
+logs/production_live/pm_20260608.log,2995,error,2026-06-08 11:03:08 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260608.log,3015,connected_mt5,2026-06-08 11:11:25 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,3016,connected_mt5,2026-06-08 11:11:25 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,3043,connected_mt5,2026-06-08 12:34:34 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,3044,connected_mt5,2026-06-08 12:34:34 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,3084,connected_mt5,2026-06-08 12:40:48 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,3085,connected_mt5,2026-06-08 12:40:48 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,3095,trading_enabled,2026-06-08 12:40:49 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260608.log,3292,risk_cap,2026-06-08 12:41:27 [WARNING] __main__: [GBPUSD] Symbol risk cap exceeded for GBPUSD: existing 0.00% (0 positions: ) + new 50.00% = 50.00% > max 20.00%
+logs/production_live/pm_20260608.log,3314,connected_mt5,2026-06-08 12:43:55 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,3315,connected_mt5,2026-06-08 12:43:55 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,3325,trading_enabled,2026-06-08 12:43:55 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260608.log,3603,connected_mt5,2026-06-08 14:51:27 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,3604,connected_mt5,2026-06-08 14:51:27 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,3614,trading_enabled,2026-06-08 14:51:27 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260608.log,3968,connected_mt5,2026-06-08 19:14:59 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260608.log,3969,connected_mt5,2026-06-08 19:14:59 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260608.log,3979,trading_enabled,2026-06-08 19:15:00 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260608.log,4452,error,"2026-06-09 01:09:26 [ERROR] __main__: Error in trading loop: Corrupted JSON in pm_configs.json: Expecting ',' delimiter: line 227834 column 39 (char 8820231)"
+logs/production_live/pm_20260608.log,4478,error,2026-06-09 01:13:15 [ERROR] __main__: Error in trading loop: Failed to load pm_configs.json: [Errno 13] Permission denied: 'pm_configs.json'
+logs/production_live/pm_20260608.log,5455,error,2026-06-09 11:11:23 [ERROR] __main__: Application error: Failed to load pm_configs.json: [Errno 13] Permission denied: 'pm_configs.json'
+logs/production_live/pm_20260608.log,5456,error,Traceback (most recent call last):
+logs/production_live/pm_20260608.log,5464,error,Traceback (most recent call last):
+logs/production_live/pm_20260609.log,17,connected_mt5,2026-06-09 00:57:36 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,18,connected_mt5,2026-06-09 00:57:36 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,151,error,2026-06-09 01:01:04 [ERROR] __main__: Application error: [Errno 22] Invalid argument: 'data\\TRXUSD_M5.csv'
+logs/production_live/pm_20260609.log,152,error,Traceback (most recent call last):
+logs/production_live/pm_20260609.log,195,connected_mt5,2026-06-09 01:04:54 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,196,connected_mt5,2026-06-09 01:04:54 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,779,connected_mt5,2026-06-09 01:22:23 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,780,connected_mt5,2026-06-09 01:22:23 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,1248,error,2026-06-09 01:29:59 [ERROR] pm_pipeline: Failed to save XAUEUR: Failed to save configs: [WinError 5] Access is denied: 'pm_configs.json.tmp' -> 'pm_configs.json'
+logs/production_live/pm_20260609.log,1252,error,2026-06-09 01:30:04 [ERROR] pm_pipeline: Failed to save AIG: Failed to save configs: [WinError 5] Access is denied: 'pm_configs.json.tmp' -> 'pm_configs.json'
+logs/production_live/pm_20260609.log,1406,connected_mt5,2026-06-09 10:41:15 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,1407,connected_mt5,2026-06-09 10:41:15 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,1989,connected_mt5,2026-06-09 11:03:49 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,1990,connected_mt5,2026-06-09 11:03:49 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,2573,connected_mt5,2026-06-09 11:17:31 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,2574,connected_mt5,2026-06-09 11:17:31 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,3167,connected_mt5,2026-06-09 11:44:38 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,3168,connected_mt5,2026-06-09 11:44:38 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,3485,connected_mt5,2026-06-09 12:33:43 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,3486,connected_mt5,2026-06-09 12:33:43 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,3990,connected_mt5,2026-06-09 13:23:02 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,3991,connected_mt5,2026-06-09 13:23:02 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,4318,error,2026-06-09 16:04:33 [ERROR] pm_pipeline: [BTCETH] Optimization error: A process in the process pool was terminated abruptly while the future was running or pending.
+logs/production_live/pm_20260609.log,4319,error,Traceback (most recent call last):
+logs/production_live/pm_20260609.log,4331,error,2026-06-09 16:04:36 [ERROR] pm_pipeline: [BTCUSD] Optimization error: A process in the process pool was terminated abruptly while the future was running or pending.
+logs/production_live/pm_20260609.log,4332,error,Traceback (most recent call last):
+logs/production_live/pm_20260609.log,4366,connected_mt5,2026-06-09 16:07:54 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,4367,connected_mt5,2026-06-09 16:07:54 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,4461,error,2026-06-09 16:12:35 [ERROR] __main__: Application error: <built-in function copy_rates_range> returned a result with an exception set
+logs/production_live/pm_20260609.log,4466,error,Traceback (most recent call last):
+logs/production_live/pm_20260609.log,4499,connected_mt5,2026-06-09 16:13:54 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,4500,connected_mt5,2026-06-09 16:13:54 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,4594,error,2026-06-09 16:17:49 [ERROR] __main__: Application error: <built-in function copy_rates_range> returned a result with an exception set
+logs/production_live/pm_20260609.log,4599,error,Traceback (most recent call last):
+logs/production_live/pm_20260609.log,4632,connected_mt5,2026-06-09 16:55:11 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,4633,connected_mt5,2026-06-09 16:55:11 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,4729,connected_mt5,2026-06-09 17:04:54 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,4730,connected_mt5,2026-06-09 17:04:54 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,5036,connected_mt5,2026-06-09 23:41:56 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,5037,connected_mt5,2026-06-09 23:41:56 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,5044,error,2026-06-09 23:41:57 [ERROR] __main__: Live readiness ERROR [manual_kill_switch_active]: manual kill switch blocks new entries: C:\Users\Bongo\OneDrive\Desktop\FxPM-Dev\runtime\manual_new_entries_enabled.flag
+logs/production_live/pm_20260609.log,5045,error,"2026-06-09 23:41:57 [ERROR] __main__: Live readiness ERROR [winner_ledger_artifact_drift]: winner ledger artifacts do not match the current optimization/cost contract: ETHUSD, GBPUSD, NZDCAD, US500, USDCHF, US30, US100, XRPUSD, XAUUSD"
+logs/production_live/pm_20260609.log,5046,error,2026-06-09 23:41:57 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260609.log,5066,connected_mt5,2026-06-09 23:48:06 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,5067,connected_mt5,2026-06-09 23:48:06 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260609.log,5074,error,"2026-06-09 23:48:07 [ERROR] __main__: Live readiness ERROR [winner_ledger_artifact_drift]: winner ledger artifacts do not match the current optimization/cost contract: ETHUSD, GBPUSD, NZDCAD, US500, USDCHF, US30, US100, XRPUSD, XAUUSD"
+logs/production_live/pm_20260609.log,5075,error,2026-06-09 23:48:07 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260609.log,5095,connected_mt5,2026-06-09 23:48:43 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260609.log,5096,connected_mt5,2026-06-09 23:48:43 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,17,connected_mt5,2026-06-10 08:09:37 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,18,connected_mt5,2026-06-10 08:09:37 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,25,error,"2026-06-10 08:09:38 [ERROR] __main__: Live readiness ERROR [winner_ledger_artifact_drift]: winner ledger artifacts do not match the current optimization/cost contract: XRPUSD, XAUUSD"
+logs/production_live/pm_20260610.log,26,error,2026-06-10 08:09:38 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260610.log,46,connected_mt5,2026-06-10 08:11:40 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,47,connected_mt5,2026-06-10 08:11:40 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,337,connected_mt5,2026-06-10 10:45:46 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,338,connected_mt5,2026-06-10 10:45:46 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,345,error,"2026-06-10 10:45:47 [ERROR] __main__: Live readiness ERROR [winner_ledger_artifact_drift]: winner ledger artifacts do not match the current optimization/cost contract: XRPUSD, XAUUSD"
+logs/production_live/pm_20260610.log,346,error,2026-06-10 10:45:47 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260610.log,372,connected_mt5,2026-06-10 11:31:41 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,373,connected_mt5,2026-06-10 11:31:41 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,380,error,"2026-06-10 11:31:42 [ERROR] __main__: Live readiness ERROR [winner_ledger_artifact_drift]: winner ledger artifacts do not match the current optimization/cost contract: XRPUSD, XAUUSD"
+logs/production_live/pm_20260610.log,381,error,2026-06-10 11:31:42 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260610.log,410,connected_mt5,2026-06-10 12:42:24 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,411,connected_mt5,2026-06-10 12:42:24 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,418,error,2026-06-10 12:42:25 [ERROR] __main__: Live readiness ERROR [winner_ledger_artifact_drift]: winner ledger artifacts do not match the current optimization/cost contract: XAUUSD
+logs/production_live/pm_20260610.log,419,error,2026-06-10 12:42:25 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260610.log,453,connected_mt5,2026-06-10 13:30:30 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,454,connected_mt5,2026-06-10 13:30:30 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,464,trading_enabled,2026-06-10 13:30:32 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260610.log,750,connected_mt5,2026-06-10 14:51:38 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,751,connected_mt5,2026-06-10 14:51:38 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,761,trading_enabled,2026-06-10 14:51:39 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260610.log,1071,connected_mt5,2026-06-10 16:05:07 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,1477,connected_mt5,2026-06-10 20:44:13 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,1478,connected_mt5,2026-06-10 20:44:13 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,1485,error,2026-06-10 20:44:14 [ERROR] __main__: Live readiness ERROR [supervisor_latched_from_previous_run]: institutional supervisor is latched (reasons: existing_open_risk 40.57% >= 40.00%); reset before live trading
+logs/production_live/pm_20260610.log,1486,error,2026-06-10 20:44:14 [ERROR] __main__: Live readiness failed; refusing to start live trading.
+logs/production_live/pm_20260610.log,1506,connected_mt5,2026-06-10 20:55:21 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260610.log,1507,connected_mt5,2026-06-10 20:55:21 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260610.log,1517,trading_enabled,2026-06-10 20:55:22 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260611.log,17,connected_mt5,2026-06-11 08:39:15 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260611.log,18,connected_mt5,2026-06-11 08:39:15 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260611.log,28,trading_enabled,2026-06-11 08:39:16 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260611.log,320,connected_mt5,2026-06-11 10:12:53 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260611.log,321,connected_mt5,2026-06-11 10:12:53 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260611.log,331,trading_enabled,2026-06-11 10:12:54 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260614.log,17,connected_mt5,2026-06-14 23:40:51 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260614.log,18,connected_mt5,2026-06-14 23:40:51 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260614.log,28,trading_enabled,2026-06-14 23:40:53 [INFO] __main__: Trading enabled: True
+logs/production_live/pm_20260614.log,1426,connected_mt5,2026-06-16 00:21:17 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260617.log,17,connected_mt5,2026-06-17 12:44:02 [INFO] pm_mt5: Connected to MT5 (using existing session)
+logs/production_live/pm_20260617.log,18,connected_mt5,2026-06-17 12:44:02 [INFO] __main__: [OK] Connected to MT5
+logs/production_live/pm_20260617.log,28,trading_enabled,2026-06-17 12:44:03 [INFO] __main__: Trading enabled: True
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,17,connected_mt5,00:57:36 [INFO] Connected to MT5 (using existing session)
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,18,connected_mt5,00:57:36 [INFO] [OK] Connected to MT5
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,151,error,01:01:04 [ERROR] Application error: [Errno 22] Invalid argument: 'data\\TRXUSD_M5.csv'
+logs/production_live/bleeding_edge_retrain_20260609_005716.err.log,152,error,Traceback (most recent call last):
+logs/production_live/bleeding_edge_retrain_20260609_010116.err.log,17,connected_mt5,01:04:54 [INFO] Connected to MT5 (using existing session)
+logs/production_live/bleeding_edge_retrain_20260609_010116.err.log,18,connected_mt5,01:04:54 [INFO] [OK] Connected to MT5
+logs/production_live/bleeding_edge_retrain_20260609_012215.err.log,17,connected_mt5,01:22:23 [INFO] Connected to MT5 (using existing session)

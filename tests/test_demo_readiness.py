@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from pm_regime import RegimeParams, detector_code_sha256
 
 
 SHA = "a" * 64
+VALID_UNTIL = "2099-01-01T00:00:00+00:00"
 
 
 def _config():
@@ -104,6 +106,7 @@ def _ledger():
     return {
         "EURUSD": {
             "symbol": "EURUSD",
+            "valid_until": VALID_UNTIL,
             "strategy_name": "LegacyFallback",
             "timeframe": "M5",
             "parameters": {"legacy": True},
@@ -120,11 +123,33 @@ def _ledger():
                         "parameters": {},
                         "promotion_status": "PROCESS_VALIDATED_CURRENT_REFIT",
                         "artifact_meta": {"current_refit_binding": binding},
+                        "valid_until": VALID_UNTIL,
                     }
                 }
             },
         }
     }
+
+
+@pytest.mark.parametrize("mutation", ["missing", "mismatch", "naive"])
+def test_live_expiry_rejects_selected_cell_deadline_defects(mutation):
+    ledger = _ledger()
+    cell = ledger["EURUSD"]["regime_configs"]["H1"]["TREND"]
+    if mutation == "missing":
+        cell.pop("valid_until")
+        expected = "no expiry date"
+    elif mutation == "mismatch":
+        cell["valid_until"] = "2098-01-01T00:00:00+00:00"
+        expected = "does not match symbol deadline"
+    else:
+        cell["valid_until"] = "2099-01-01T00:00:00"
+        expected = "not aware UTC"
+
+    issues = live._ledger_live_expiry_issues(  # noqa: SLF001
+        ledger, datetime(2026, 7, 22, tzinfo=timezone.utc)
+    )
+
+    assert any(expected in issue for issue in issues)
 
 
 def _write_manifest(root: Path, ledger_path: Path):
@@ -170,6 +195,7 @@ def _authority_result(ledger_path: Path):
         "source_unavailable_cell_ids": [],
         "regime_unobserved_cell_ids": sorted(unobserved),
         "no_local_winner_cell_ids": sorted(possible - selected - unobserved),
+        "insufficient_evidence_cell_ids": [],
         "technical_cell_ids": [],
         "unsearched_cell_ids": [],
         "missing_observed_cell_ids": [],
@@ -192,7 +218,7 @@ def _authority_result(ledger_path: Path):
     }
 
 
-def _verify(tmp_path, monkeypatch, result):
+def _verify(tmp_path, monkeypatch, result, *, terminal_timeframes=()):
     ledger = _ledger()
     ledger_path = tmp_path / "probation.json"
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
@@ -209,6 +235,9 @@ def _verify(tmp_path, monkeypatch, result):
         activation_id="activation-1",
         activation_manifest_sha256=SHA,
         entries={"EURUSD": {"H1": {"bars_sha256": SHA}}},
+        cell_status=lambda _symbol, timeframe: (
+            "technical_error" if timeframe in terminal_timeframes else "active"
+        ),
     )
     verified, errors = demo.verify_demo_probation_authority(
         config=_config(),
@@ -344,6 +373,53 @@ def test_demo_authority_rejects_incomplete_slot_partition(tmp_path, monkeypatch)
     assert "DEMO_AUTHORITY_CELL_PARTITION_INCOMPLETE" in errors
 
 
+def test_demo_authority_accepts_explicit_insufficient_evidence_abstention(
+    tmp_path, monkeypatch
+):
+    ledger_path = tmp_path / "probation.json"
+    ledger_path.write_text(json.dumps(_ledger()), encoding="utf-8")
+    result = _authority_result(ledger_path)
+    cell = result["no_local_winner_cell_ids"].pop()
+    result["insufficient_evidence_cell_ids"] = [cell]
+    _verified, errors, _calls = _verify(tmp_path, monkeypatch, result)
+    assert errors == []
+
+
+def test_demo_authority_accepts_authenticated_terminal_technical_abstention(
+    tmp_path, monkeypatch
+):
+    ledger_path = tmp_path / "probation.json"
+    ledger_path.write_text(json.dumps(_ledger()), encoding="utf-8")
+    result = _authority_result(ledger_path)
+    terminal_cells = {
+        f"EURUSD|M5|{regime}" for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
+    }
+    result["no_local_winner_cell_ids"] = sorted(
+        set(result["no_local_winner_cell_ids"]) - terminal_cells
+    )
+    result["technical_cell_ids"] = sorted(terminal_cells)
+    verified, errors, _calls = _verify(
+        tmp_path,
+        monkeypatch,
+        result,
+        terminal_timeframes={"M5"},
+    )
+    assert verified is not None
+    assert errors == []
+
+
+def test_demo_authority_rejects_unmatched_terminal_technical_roster(
+    tmp_path, monkeypatch
+):
+    ledger_path = tmp_path / "probation.json"
+    ledger_path.write_text(json.dumps(_ledger()), encoding="utf-8")
+    result = _authority_result(ledger_path)
+    cell = result["no_local_winner_cell_ids"].pop()
+    result["technical_cell_ids"] = [cell]
+    _verified, errors, _calls = _verify(tmp_path, monkeypatch, result)
+    assert "DEMO_AUTHORITY_NATIVE_TERMINAL_TECHNICAL_ROSTER_MISMATCH" in errors
+
+
 def test_demo_authority_rejects_unverified_cap_enforcement(tmp_path, monkeypatch):
     ledger_path = tmp_path / "probation.json"
     ledger_path.write_text(json.dumps(_ledger()), encoding="utf-8")
@@ -377,9 +453,7 @@ def test_broker_demo_hedging_account_is_required():
         ("trade_mode", 2, "DEMO_ACCOUNT_NOT_BROKER_DEMO"),
     ],
 )
-def test_demo_account_requires_exact_authorized_identity(
-    field, value, expected_error
-):
+def test_demo_account_requires_exact_authorized_identity(field, value, expected_error):
     account = _demo_account()
     setattr(account, field, value)
     assert expected_error in demo.demo_account_errors(account)
@@ -482,6 +556,13 @@ def test_end_to_end_demo_readiness_accepts_only_demo_account(tmp_path, monkeypat
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
     _write_manifest(tmp_path, ledger_path)
     result = _authority_result(ledger_path)
+    terminal_cells = {
+        f"EURUSD|M5|{regime}" for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
+    }
+    result["no_local_winner_cell_ids"] = sorted(
+        set(result["no_local_winner_cell_ids"]) - terminal_cells
+    )
+    result["technical_cell_ids"] = sorted(terminal_cells)
     monkeypatch.setitem(
         sys.modules,
         "pm_optimization_authority",
@@ -494,7 +575,9 @@ def test_end_to_end_demo_readiness_accepts_only_demo_account(tmp_path, monkeypat
         activation_id="activation-1",
         activation_manifest_sha256=SHA,
         entries={"EURUSD": {"H1": {"bars_sha256": SHA}}},
-        cell_status=lambda _symbol, _timeframe: "active",
+        cell_status=lambda _symbol, timeframe: (
+            "technical_error" if timeframe == "M5" else "active"
+        ),
     )
     monkeypatch.setitem(
         sys.modules,

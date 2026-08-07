@@ -1,4 +1,5 @@
 import unittest
+import hashlib
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from pm_optuna import OptunaConfig, OptunaTPEOptimizer
 from pm_pipeline import RegimeOptimizer
 from pm_search_outcomes import SearchOutcomeKind
 from pm_trade_power import (
+    REQUIRED_TRADE_RECORD_SCHEMA,
     TradePowerDecision,
     TradePowerPolicy,
     build_numerical_execution_cost_attestation,
@@ -16,16 +18,19 @@ from pm_trade_power import (
 )
 
 
-def _with_authenticated_trade_evidence(payload):
+def _with_authenticated_trade_evidence(payload, *, start_utc="2024-01-01"):
     result = dict(payload)
-    start = pd.Timestamp("2024-01-01", tz="UTC")
+    start = pd.Timestamp(start_utc, tz="UTC")
     result["trades"] = [
         {
+            "position_id": f"fixture-position-{index:04d}",
+            "entry_event_order": index * 2,
+            "exit_event_order": index * 2 + 1,
             "pnl_dollars": 100.0 if index % 2 else -50.0,
             "risk_amount": 100.0,
             "entry_time": start + pd.Timedelta(hours=2 * index),
             "exit_time": start + pd.Timedelta(hours=2 * index + 1),
-            "trade_record_schema_version": "2026-06-18-mae-mfe-v1",
+            "trade_record_schema_version": REQUIRED_TRADE_RECORD_SCHEMA,
         }
         for index in range(320)
     ]
@@ -64,13 +69,16 @@ def _with_authenticated_trade_evidence(payload):
         "target_bars_sha256": "5" * 64,
         "target_sidecar_sha256": "6" * 64,
         "projection_contract": "fxpm-swap-preopen-close-projection-v1",
-        "projection_sha256": "a" * 64,
+        "projection_sha256": hashlib.sha256(
+            f"regime-gate:{start.isoformat()}".encode("ascii")
+        ).hexdigest(),
     }
     return result
 
 
 def _power_callbacks():
     evaluator = RegimeOptimizer.__new__(RegimeOptimizer)
+    evaluator._trade_power_multiplicity_cache = {}
     return (
         evaluator._calibrate_train_power_result,
         evaluator._evaluate_partition_power_result,
@@ -246,17 +254,26 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             def run(self, features, signals, symbol, strategy, **kwargs):
                 active = features.loc[signals.ne(0), "REGIME_LIVE"]
                 self.calls.append(set(active.tolist()))
-                return _with_authenticated_trade_evidence({
-                    "total_trades": int(signals.ne(0).sum()),
-                    "max_drawdown_pct": 1.0,
-                    "profit_factor": 1.2,
-                    "total_return_pct": 1.0,
-                    "trades": [],
-                })
+                return _with_authenticated_trade_evidence(
+                    {
+                        "total_trades": int(signals.ne(0).sum()),
+                        "max_drawdown_pct": 1.0,
+                        "profit_factor": 1.2,
+                        "total_return_pct": 1.0,
+                        "trades": [],
+                    },
+                    start_utc=(
+                        "2024-01-01"
+                        if features.attrs["surface"] == "train"
+                        else "2024-06-01"
+                    ),
+                )
 
         regimes = (["TREND", "RANGE"] * 30)
         train = pd.DataFrame({"Close": range(60), "REGIME_LIVE": regimes})
         val = pd.DataFrame({"Close": range(60), "REGIME_LIVE": regimes})
+        train.attrs["surface"] = "train"
+        val.attrs["surface"] = "validation"
         backtester = Backtester()
         optimizer = OptunaTPEOptimizer(
             OptunaConfig(n_trials=1),
@@ -316,13 +333,20 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             def run(self, features, signals, symbol, strategy, **kwargs):
                 active = set(features.loc[signals.ne(0), "REGIME_LIVE"].tolist())
                 self.events.append((features.attrs["surface"], active))
-                return _with_authenticated_trade_evidence({
-                    "total_trades": int(signals.ne(0).sum()),
-                    "max_drawdown_pct": 1.0,
-                    "profit_factor": 1.2,
-                    "total_return_pct": 1.0,
-                    "trades": [],
-                })
+                return _with_authenticated_trade_evidence(
+                    {
+                        "total_trades": int(signals.ne(0).sum()),
+                        "max_drawdown_pct": 1.0,
+                        "profit_factor": 1.2,
+                        "total_return_pct": 1.0,
+                        "trades": [],
+                    },
+                    start_utc=(
+                        "2024-01-01"
+                        if features.attrs["surface"] == "train"
+                        else "2024-06-01"
+                    ),
+                )
 
         regime_values = ["TREND", "RANGE", "BREAKOUT", "CHOP"] * 20
         train = pd.DataFrame({"Close": range(80), "REGIME_LIVE": regime_values})

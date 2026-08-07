@@ -26,18 +26,45 @@ _PROCESS_FILE_LOCK = threading.RLock()
 
 
 @contextmanager
-def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
+def _exclusive_file_lock(
+    lock_path: Path,
+    *,
+    timeout_seconds: Optional[float] = None,
+) -> Iterator[None]:
     """Serialize a file transaction across threads and OS processes.
 
     POSIX advisory locks are process-scoped, so the process-local RLock is
     required as well as the OS lock.  The one-byte lock file is persistent and
     bounded; the kernel releases its lock automatically if a writer exits.
     """
+    if timeout_seconds is None:
+        deadline = None
+    else:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or float(timeout_seconds) < 0.0
+        ):
+            raise ValueError("FILE_LOCK_TIMEOUT_INVALID")
+        deadline = time.monotonic() + float(timeout_seconds)
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     # A single process-local lock is intentionally constant-space.  Per-path
     # lock registries grow forever as monthly ledgers roll over.
-    with _PROCESS_FILE_LOCK:
+    if deadline is None:
+        process_lock_acquired = _PROCESS_FILE_LOCK.acquire()
+    else:
+        process_lock_acquired = _PROCESS_FILE_LOCK.acquire(
+            blocking=False
+        )
+        if not process_lock_acquired and deadline > time.monotonic():
+            process_lock_acquired = _PROCESS_FILE_LOCK.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+    if not process_lock_acquired:
+        raise TimeoutError(f"FXPM_FILE_LOCK_TIMEOUT:{lock_path}")
+    try:
         with open(lock_path, "a+b") as handle:
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
@@ -50,10 +77,21 @@ def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
 
                 while True:
                     try:
+                        handle.seek(0)
                         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                         break
                     except OSError:
-                        time.sleep(0.01)
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"FXPM_FILE_LOCK_TIMEOUT:{lock_path}"
+                            )
+                        wait_seconds = 0.01
+                        if deadline is not None:
+                            wait_seconds = min(
+                                wait_seconds,
+                                max(0.0, deadline - time.monotonic()),
+                            )
+                        time.sleep(wait_seconds)
                 try:
                     yield
                 finally:
@@ -62,11 +100,33 @@ def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
             else:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                if deadline is None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                else:
+                    while True:
+                        try:
+                            fcntl.flock(
+                                handle.fileno(),
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    f"FXPM_FILE_LOCK_TIMEOUT:{lock_path}"
+                                )
+                            time.sleep(
+                                min(
+                                    0.01,
+                                    max(0.0, deadline - time.monotonic()),
+                                )
+                            )
                 try:
                     yield
                 finally:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        _PROCESS_FILE_LOCK.release()
 
 
 def _now() -> datetime:

@@ -124,7 +124,13 @@ BACKTEST_WINNER_DAILY_R_MAX_MARKS = 5_000_000
 BACKTEST_WINNER_R_DECIMAL_PLACES = 12
 _BACKTEST_WINNER_R_QUANTUM = Decimal("0.000000000001")
 BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION = (
-    "fxpm.backtester-frozen-path-cost-stress.v1"
+    "fxpm.backtester-frozen-path-cost-stress.v2"
+)
+BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT = (
+    "ADVERSE"
+)
+BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT = (
+    "NO_NUMERICAL_SHOCK"
 )
 BACKTEST_CLOSED_PARTITION_SPREAD_STRESS_SCHEMA_VERSION = (
     "fxpm.closed-partition-observed-spread-stress.v1"
@@ -1411,14 +1417,14 @@ class PipelineConfig:
     # Optimization settings
     max_param_combos: int = 150
     min_trades: int = 25
-    optimization_max_workers: int = 1  # 1 = sequential
+    optimization_max_workers: int = 0  # <= 0 uses all OS logical CPUs
     feature_cache_max_entries: int = 24  # 0 disables in-memory feature-frame caching
     feature_disk_cache_enabled: bool = False
     feature_disk_cache_dir: str = ""
     feature_disk_cache_max_gb: float = 0.0
     feature_disk_cache_min_free_gb: float = 4.0
     feature_disk_cache_precompute_enabled: bool = False
-    feature_disk_cache_precompute_workers: int = 1
+    feature_disk_cache_precompute_workers: int = 0  # <= 0 uses all OS logical CPUs
     screening_atr_anchor_enabled: bool = False
     screening_atr_anchor_multipliers: List[float] = field(default_factory=lambda: [2.0])
 
@@ -1851,11 +1857,14 @@ class PipelineConfig:
         self.margin_entry_block_level = margin_block
         self.margin_recovery_start_level = margin_recovery
         self.margin_panic_level = margin_panic
-        # Clamp workers to sane minimum
+        logical_cpus = max(1, int(os.cpu_count() or 1))
         try:
-            self.optimization_max_workers = max(1, int(self.optimization_max_workers))
+            configured_workers = int(self.optimization_max_workers)
         except (TypeError, ValueError, OverflowError):
-            self.optimization_max_workers = 1
+            configured_workers = 0
+        self.optimization_max_workers = (
+            configured_workers if configured_workers > 0 else logical_cpus
+        )
         try:
             self.feature_cache_max_entries = max(0, int(self.feature_cache_max_entries))
         except (TypeError, ValueError, OverflowError):
@@ -1872,9 +1881,16 @@ class PipelineConfig:
             self.feature_disk_cache_min_free_gb = 4.0
         self.feature_disk_cache_precompute_enabled = bool(self.feature_disk_cache_precompute_enabled)
         try:
-            self.feature_disk_cache_precompute_workers = max(1, int(self.feature_disk_cache_precompute_workers))
+            configured_precompute_workers = int(
+                self.feature_disk_cache_precompute_workers
+            )
         except (TypeError, ValueError, OverflowError):
-            self.feature_disk_cache_precompute_workers = 1
+            configured_precompute_workers = 0
+        self.feature_disk_cache_precompute_workers = (
+            configured_precompute_workers
+            if configured_precompute_workers > 0
+            else logical_cpus
+        )
         try:
             anchors = []
             for value in self.screening_atr_anchor_multipliers or []:
@@ -3002,6 +3018,31 @@ class PipelineConfig:
         """
         probe = from_dt or datetime.now()
         anchor = self.get_retrain_anchor_datetime()
+        interval = self.retrain_interval
+        if probe < anchor:
+            return anchor
+        elapsed = probe - anchor
+        steps = int(elapsed // interval) + 1
+        return anchor + (interval * steps)
+
+    def get_next_retrain_at_utc(
+        self, from_utc: Optional[datetime] = None
+    ) -> datetime:
+        """Return the next fixed-schedule slot as an aware UTC datetime.
+
+        This is the production-artifact boundary.  The legacy
+        :meth:`get_next_retrain_at` API intentionally remains naive for callers
+        that still operate on the host-local schedule representation.
+        """
+        probe = from_utc if from_utc is not None else datetime.now(timezone.utc)
+        if (
+            not isinstance(probe, datetime)
+            or probe.tzinfo is None
+            or probe.utcoffset() is None
+        ):
+            raise ValueError("from_utc must be an aware datetime")
+        probe = probe.astimezone(timezone.utc)
+        anchor = self.get_retrain_anchor_datetime().replace(tzinfo=timezone.utc)
         interval = self.retrain_interval
         if probe < anchor:
             return anchor
@@ -7266,6 +7307,20 @@ class Backtester:
         resolved = self._swap_contract_cache.get(key)
         if resolved is None:
             resolved = resolve_active_swap_contract(native_root, canonical, tf)
+            resolved_pointer_sha = str(
+                resolved.get("terms_active_pointer_sha256") or ""
+            ).strip().lower()
+            if (
+                len(resolved_pointer_sha) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in resolved_pointer_sha
+                )
+                or resolved_pointer_sha != pointer_sha
+            ):
+                raise BrokerTermsError(
+                    "broker terms activation changed during swap contract resolution"
+                )
             if len(self._swap_contract_cache) >= self._swap_contract_cache_max:
                 oldest_key = next(iter(self._swap_contract_cache))
                 self._swap_contract_cache.pop(oldest_key, None)
@@ -8103,7 +8158,10 @@ class Backtester:
         The returned object is a normal decision-relevant Backtester lane plus
         a method receipt.  It fails closed if the stress arrays are not
         pointwise adverse, the base lane cannot be reproduced, position
-        identities change, or any stressed daily/trade R improves.
+        identities change, or any stressed daily/trade R improves.  A fully
+        evaluated lane with no strict realized degradation is returned with an
+        authenticated insufficiency status so the evidence consumer can keep
+        its genuine PBO fold while excluding the attempt from Winner.
         """
 
         normalized_stress_mode = str(stress_mode or "").strip().lower()
@@ -8510,15 +8568,14 @@ class Backtester:
         ):
             raise ValueError("frozen-path stress daily MTM improves or is unavailable")
 
-        # A different policy label or spread-column preference is not cost
-        # stress evidence.  For a trade-bearing lane, at least one exact net
-        # trade or exact daily MTM observation must be strictly worse.  Native
-        # prefixes containing only a generic Spread column therefore fail
-        # closed when every requested stress mode resolves to the base arrays;
-        # the remedy is genuine percentile/max spread acquisition (or a
-        # separately preregistered numerical stress policy), not invented
-        # degradation after the evidence is visible.
-        leg_strictly_worse = any(
+        # A different policy label or spread-column preference is not proof of
+        # realized cost-stress survival.  Record whether at least one exact net
+        # trade or exact daily MTM observation is strictly worse.  A completely
+        # replayed path with no strict degradation is valid evaluated evidence,
+        # but it is an insufficiency rather than winner-eligible stress
+        # evidence.  The consumer independently recomputes this status from the
+        # paired lanes.
+        strictly_worse_trade_count = sum(
             Decimal(str(stressed["pnl_dollars"]))
             < Decimal(str(baseline["pnl_dollars"]))
             for baseline, stressed in zip(
@@ -8527,7 +8584,7 @@ class Backtester:
                 strict=True,
             )
         )
-        daily_strictly_worse = any(
+        strictly_worse_daily_observation_count = sum(
             Decimal(str(stress_value)) < Decimal(str(base_value))
             for base_value, stress_value in zip(
                 base_daily,
@@ -8535,17 +8592,42 @@ class Backtester:
                 strict=True,
             )
         )
-        if rebuilt_base_events and not (
-            leg_strictly_worse or daily_strictly_worse
-        ):
+        base_spread_values_sha256 = str(
+            rebuilt_base_attestation.get("spread_values_sha256") or ""
+        )
+        stress_spread_values_sha256 = str(
+            stress_attestation.get("spread_values_sha256") or ""
+        )
+        vector_changed = (
+            base_spread_values_sha256 != stress_spread_values_sha256
+        )
+        strict_realized_degradation = bool(
+            strictly_worse_trade_count
+            or strictly_worse_daily_observation_count
+        )
+        if vector_changed and not strict_realized_degradation:
             raise FrozenPathCostStressError(
-                "STRESS_NOT_NUMERICALLY_ADVERSE",
+                "STRESS_VECTOR_CHANGED_WITHOUT_REALIZED_DEGRADATION",
                 (
                     normalized_stress_mode,
-                    "genuine SpreadP90/SpreadP95/SpreadMax evidence or an "
-                    "independently preregistered numerical stress is required",
+                    base_spread_values_sha256,
+                    stress_spread_values_sha256,
                 ),
             )
+        if strict_realized_degradation and not vector_changed:
+            raise FrozenPathCostStressError(
+                "STRESS_REALIZED_DEGRADATION_WITHOUT_VECTOR_CHANGE",
+                (
+                    normalized_stress_mode,
+                    str(strictly_worse_trade_count),
+                    str(strictly_worse_daily_observation_count),
+                ),
+            )
+        realized_adversity_status = (
+            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
+            if strict_realized_degradation
+            else BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+        )
 
         signal_bytes = np.asarray(signal_numeric, dtype="<i4").tobytes(order="C")
         receipt_body = {
@@ -8565,6 +8647,8 @@ class Backtester:
             "stress_cost_attestation_sha256": stress_attestation[
                 "attestation_sha256"
             ],
+            "base_spread_values_sha256": base_spread_values_sha256,
+            "stress_spread_values_sha256": stress_spread_values_sha256,
             "base_position_roster_sha256": self._cost_attestation_json_sha256(
                 {"position_events": rebuilt_base_events}
             ),
@@ -8575,6 +8659,11 @@ class Backtester:
             "daily_observation_count": len(stress_daily),
             "path_identity_preserved": True,
             "stress_never_improves": True,
+            "strictly_worse_trade_count": strictly_worse_trade_count,
+            "strictly_worse_daily_observation_count": (
+                strictly_worse_daily_observation_count
+            ),
+            "realized_adversity_status": realized_adversity_status,
         }
         receipt = {
             **receipt_body,

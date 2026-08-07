@@ -16,6 +16,11 @@ from pm_position import TradeTagEncoder
 from pm_regime import RegimeParams, detector_code_sha256, regime_params_sha256
 
 
+FUTURE_VALID_UNTIL = (
+    datetime.now(timezone.utc) + timedelta(days=1)
+).isoformat()
+
+
 def _binding(seed: str = "a", detector_seed: str | None = None):
     detector_seed = detector_seed or seed
     binding = {
@@ -47,7 +52,7 @@ def _cell(
         "artifact_meta": {
             "current_refit_binding": _binding(seed, detector_seed)
         },
-        "valid_until": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "valid_until": FUTURE_VALID_UNTIL,
     }
 
 
@@ -55,14 +60,14 @@ def _projection(*, two_symbols=False):
     result = {
         "EURUSD": {
             "symbol": "EURUSD",
-            "valid_until": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+            "valid_until": FUTURE_VALID_UNTIL,
             "regime_configs": {"H1": {"TREND": _cell("a")}},
         }
     }
     if two_symbols:
         result["GBPUSD"] = {
             "symbol": "GBPUSD",
-            "valid_until": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+            "valid_until": FUTURE_VALID_UNTIL,
             "regime_configs": {"M15": {"RANGE": _cell("b")}},
         }
     return result
@@ -172,6 +177,25 @@ def test_projection_rejects_non_current_refit_status(status):
     projection = _projection()
     projection["EURUSD"]["regime_configs"]["H1"]["TREND"]["promotion_status"] = status
     with pytest.raises(ValueError, match="not executable"):
+        pm_main.LiveTrader._parse_current_refit_demo_projection(projection)
+
+
+@pytest.mark.parametrize("target", ["symbol", "cell", "mismatch"])
+def test_projection_rejects_missing_or_mismatched_deadline(target):
+    projection = _projection()
+    cell = projection["EURUSD"]["regime_configs"]["H1"]["TREND"]
+    if target == "symbol":
+        projection["EURUSD"].pop("valid_until")
+        expected = "symbol deadline"
+    elif target == "cell":
+        cell.pop("valid_until")
+        expected = "cell deadline mismatch"
+    else:
+        cell["valid_until"] = (
+            datetime.now(timezone.utc) + timedelta(days=2)
+        ).isoformat()
+        expected = "cell deadline mismatch"
+    with pytest.raises(ValueError, match=expected):
         pm_main.LiveTrader._parse_current_refit_demo_projection(projection)
 
 
@@ -303,6 +327,18 @@ def test_expiry_blocks_entries_but_preserves_management_projection():
     ) - timedelta(seconds=1)
     assert trader._get_live_configs() == {}
     assert set(trader._get_management_configs()) == {"EURUSD"}
+
+
+def test_missing_or_non_datetime_deadline_is_expired_fail_closed():
+    assert pm_main.LiveTrader._deadline_expired(None)
+    assert pm_main.LiveTrader._deadline_expired("2099-01-01T00:00:00+00:00")
+
+
+def test_runtime_symbol_cell_deadline_mismatch_blocks_entry_projection():
+    trader = _isolated_trader()
+    trader._current_refit_demo_configs["EURUSD"].valid_until += timedelta(hours=1)
+
+    assert trader._get_live_configs() == {}
 
 
 def test_current_refit_comment_and_magic_are_disjoint():

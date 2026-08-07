@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import pm_portfolio_replay as replay
 from agent_audit.performance.scripts.run_synchronized_portfolio_replay import (
     _final_lockbox_pair,
     _native_replay_frame,
@@ -23,6 +25,7 @@ from pm_portfolio_replay import (
     build_book_possible_slot_accounting,
     build_current_refit_replay_roster,
     build_ledger_cell_roster,
+    canonical_json_sha256,
     seal_portfolio_replay_evidence,
     portfolio_mark_cost_contract,
     validate_causal_process_authority,
@@ -39,6 +42,77 @@ from pm_two_phase_lockbox import (
     validate_prelockbox_roster_artifact,
     validate_released_ledger_against_prelockbox,
 )
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_candidate_and_sparse_ledger_preserve_exact_mt5_symbol(symbol: str) -> None:
+    candidate = replay.CandidateTrade(
+        candidate_id="candidate-1",
+        cell_id=f"{symbol}|H4|TREND",
+        symbol=symbol,
+        timeframe="H4",
+        regime="TREND",
+        strategy_name="EMACrossoverStrategy",
+        promotion_status="PROCESS_VALIDATED_CURRENT_REFIT",
+        asset_class="metal",
+        risk_groups=(),
+        entry_time="2026-01-01T00:00:00Z",
+        direction=1,
+        stop_risk_per_lot=100.0,
+        margin_per_lot=1_000.0,
+        volume_min=0.01,
+        volume_max=10.0,
+        volume_step=0.01,
+        priority_score=1.0,
+        legs=(
+            replay.ExitLeg(
+                exit_time="2026-01-02T00:00:00Z",
+                fraction=1.0,
+                net_pnl_per_entry_lot=25.0,
+            ),
+        ),
+    ).normalized()
+    projection, errors = replay._sparse_physical_winner_rows(  # noqa: SLF001
+        {
+            symbol: {
+                "symbol": symbol,
+                "regime_configs": {
+                    "H4": {
+                        "TREND": {
+                            "strategy_name": "EMACrossoverStrategy",
+                            "promotion_status": "PROMOTED",
+                            "artifact_meta": {},
+                        }
+                    }
+                },
+            }
+        },
+        (symbol,),
+    )
+
+    assert candidate.symbol == symbol
+    assert errors == []
+    assert projection["symbols"] == [symbol]
+    assert projection["tradeable_cell_ids"] == [f"{symbol}|H4|TREND"]
+
+
+@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
+def test_sparse_ledger_rejects_wrong_case_mt5_key(wrong_case: str) -> None:
+    projection, errors = replay._sparse_physical_winner_rows(  # noqa: SLF001
+        {
+            wrong_case: {
+                "symbol": "Platinum",
+                "regime_configs": {},
+            }
+        },
+        ("Platinum",),
+    )
+
+    assert projection["tradeable_cell_ids"] == []
+    assert (
+        f"LEDGER_SYMBOL_IDENTITY_MISMATCH:{wrong_case}:Platinum"
+        in errors
+    )
 
 
 def _ledger() -> dict:
@@ -425,11 +499,12 @@ def test_current_refit_roster_stops_at_invalid_book_decision() -> None:
     ]
 
 
-def test_book_decision_is_replayed_and_source_absence_needs_activation_binding(
+def test_book_decision_replays_complete_sparse_non_economic_states(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import pm_book_multiplicity as book
     import pm_winner_selection as winner
+    from tests import test_book_multiplicity as book_fixture
     from tests.test_book_multiplicity import (
         _available_group_with_counts,
         _family,
@@ -446,8 +521,38 @@ def test_book_decision_is_replayed_and_source_absence_needs_activation_binding(
         expected,
         evidence_family=expected_family,
     )
-    assert errors == ["BOOK_SOURCE_UNAVAILABLE_ACTIVATION_BINDING_REQUIRED"]
+    assert errors == []
     assert len(accounting["source_unavailable_slot_ids"]) == 2_400
+    assert accounting["insufficient_evidence_slot_ids"] == []
+    assert accounting["terminal_technical_slot_ids"] == []
+
+    technical_family = _family(
+        overrides={
+            ordinal: book_fixture._technical_terminal_cell(ordinal)  # noqa: SLF001
+            for ordinal in range(len(book.REGIME_ORDER))
+        }
+    )
+    technical = book.evaluate_historical_book_multiplicity(technical_family)
+    accounting, errors = build_book_possible_slot_accounting(
+        technical,
+        evidence_family=technical_family,
+    )
+    assert errors == []
+    assert len(accounting["terminal_technical_slot_ids"]) == 4
+
+    insufficient_family = _family(
+        overrides=book_fixture._insufficient_group(  # noqa: SLF001
+            postsearch=False,
+            sibling_winner=False,
+        )
+    )
+    insufficient = book.evaluate_historical_book_multiplicity(insufficient_family)
+    accounting, errors = build_book_possible_slot_accounting(
+        insufficient,
+        evidence_family=insufficient_family,
+    )
+    assert errors == []
+    assert len(accounting["insufficient_evidence_slot_ids"]) == 1
 
     alternate_family = _family(overrides=_available_group_with_counts(0, (1, 0, 0, 0)))
     forged = book.evaluate_historical_book_multiplicity(alternate_family)
@@ -675,7 +780,7 @@ def test_active_native_contract_rejects_non_authoritative_partial_fixture(
         "source_unavailable": 0,
         "symbols_with_evidence_candidates": 0,
         "technical_error": 6,
-        "terminal": 0,
+        "terminal": 6,
         "total": 6,
     }
     assert not (native / "ACTIVE.json").exists()
@@ -683,6 +788,207 @@ def test_active_native_contract_rejects_non_authoritative_partial_fixture(
     contract, errors = active_native_portfolio_contract(tmp_path / "data", ["EURUSD"])
     assert contract["symbols"] == ["EURUSD"]
     assert errors == ["NATIVE_ACTIVE_POINTER_UNREADABLE:FileNotFoundError"]
+
+
+def test_active_native_contract_binds_v5_terminal_cells_without_laundering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pm_native_activation import (
+        ACTIVE_POINTER_SCHEMA,
+        ACTIVATION_MANIFEST_SCHEMA,
+        NATIVE_EVIDENCE_CANDIDATE,
+        NATIVE_SOURCE_UNAVAILABLE,
+        NATIVE_TECHNICAL_ERROR,
+        UNIVERSE_AUTHENTICITY_SCHEMA,
+    )
+
+    native = tmp_path / "data" / "native"
+    activation_id = "v5-terminal-contract"
+    manifest_path = native / "activations" / f"{activation_id}.json"
+    manifest_path.parent.mkdir(parents=True)
+    entries = {
+        "EURUSD": {
+            "M5": {
+                "status": NATIVE_EVIDENCE_CANDIDATE,
+                "symbol": "EURUSD",
+                "timeframe": "M5",
+                "bars_sha256": "1" * 64,
+                "sidecar_sha256": "2" * 64,
+                "reason_codes": [],
+            },
+            "M15": {
+                "status": NATIVE_TECHNICAL_ERROR,
+                "symbol": "EURUSD",
+                "timeframe": "M15",
+                "bars_sha256": None,
+                "sidecar_sha256": "3" * 64,
+                "reason_codes": ["SOURCE_TERMINAL_TECHNICAL:HISTORY_GAP"],
+            },
+            "M30": {
+                "status": NATIVE_SOURCE_UNAVAILABLE,
+                "symbol": "EURUSD",
+                "timeframe": "M30",
+                "bars_sha256": None,
+                "sidecar_sha256": "4" * 64,
+                "reason_codes": ["SOURCE_UNAVAILABLE:SYMBOL_NOT_OFFERED"],
+            },
+        }
+    }
+    manifest = {
+        "schema_version": ACTIVATION_MANIFEST_SCHEMA,
+        "status": "active",
+        "activation_id": activation_id,
+        "entries": entries,
+    }
+    manifest_raw = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    manifest_path.write_bytes(manifest_raw)
+    (native / "ACTIVE.json").write_text(
+        json.dumps(
+            {
+                "schema_version": ACTIVE_POINTER_SCHEMA,
+                "activation_id": activation_id,
+                "manifest_relative_path": f"activations/{activation_id}.json",
+                "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Universe:
+        errors: list[str] = []
+        eligible_symbols = ("EURUSD",)
+        excluded_symbols: dict[str, dict] = {}
+        eligibility_schema = UNIVERSE_AUTHENTICITY_SCHEMA
+        explicit_contract = True
+        exact_symbol_identity = True
+
+        @staticmethod
+        def cell_status(symbol: str, timeframe: str) -> str:
+            return str(entries[symbol][timeframe]["status"])
+
+    monkeypatch.setattr(
+        "pm_native_activation.resolve_active_native_universe",
+        lambda *_args, **_kwargs: Universe(),
+    )
+    contract, errors = active_native_portfolio_contract(
+        tmp_path / "data",
+        ["EURUSD"],
+        timeframes=("M5", "M15", "M30"),
+    )
+
+    assert errors == []
+    assert contract["activation_entry_count"] == 3
+    assert contract["bars_sha256_by_source"] == {"EURUSD|M5": "1" * 64}
+    assert contract["sidecar_sha256_by_source"] == {"EURUSD|M5": "2" * 64}
+    expected_rows = [
+        {
+            "cell_id": "EURUSD|M5",
+            "status": NATIVE_EVIDENCE_CANDIDATE,
+            "bars_sha256": "1" * 64,
+            "sidecar_sha256": "2" * 64,
+            "reason_codes": [],
+        },
+        {
+            "cell_id": "EURUSD|M15",
+            "status": NATIVE_TECHNICAL_ERROR,
+            "bars_sha256": "",
+            "sidecar_sha256": "3" * 64,
+            "reason_codes": ["SOURCE_TERMINAL_TECHNICAL:HISTORY_GAP"],
+        },
+        {
+            "cell_id": "EURUSD|M30",
+            "status": NATIVE_SOURCE_UNAVAILABLE,
+            "bars_sha256": "",
+            "sidecar_sha256": "4" * 64,
+            "reason_codes": ["SOURCE_UNAVAILABLE:SYMBOL_NOT_OFFERED"],
+        },
+    ]
+    assert contract["activation_roster_sha256"] == canonical_json_sha256(
+        sorted(expected_rows, key=lambda row: row["cell_id"])
+    )
+
+
+def test_active_native_contract_preserves_v5_symbol_order_and_broker_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pm_native_activation import (
+        ACTIVE_POINTER_SCHEMA,
+        ACTIVATION_MANIFEST_SCHEMA,
+        NATIVE_EVIDENCE_CANDIDATE,
+        UNIVERSE_AUTHENTICITY_SCHEMA,
+    )
+
+    activation_id = "v5-exact-symbol-identity"
+    native = tmp_path / "data" / "native"
+    manifest_path = native / "activations" / f"{activation_id}.json"
+    manifest_path.parent.mkdir(parents=True)
+    configured = ("EURUSD", "Platinum")
+    entries = {
+        symbol: {
+            "D1": {
+                "status": NATIVE_EVIDENCE_CANDIDATE,
+                "symbol": symbol,
+                "timeframe": "D1",
+                "bars_sha256": str(offset) * 64,
+                "sidecar_sha256": str(offset + 2) * 64,
+                "reason_codes": [],
+            }
+        }
+        for offset, symbol in enumerate(configured, start=1)
+    }
+    manifest = {
+        "schema_version": ACTIVATION_MANIFEST_SCHEMA,
+        "status": "active",
+        "activation_id": activation_id,
+        "entries": entries,
+    }
+    manifest_raw = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    manifest_path.write_bytes(manifest_raw)
+    (native / "ACTIVE.json").write_text(
+        json.dumps(
+            {
+                "schema_version": ACTIVE_POINTER_SCHEMA,
+                "activation_id": activation_id,
+                "manifest_relative_path": f"activations/{activation_id}.json",
+                "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, tuple[str, ...]] = {}
+
+    class Universe:
+        errors: list[str] = []
+        eligible_symbols = configured
+        excluded_symbols: dict[str, dict] = {}
+        eligibility_schema = UNIVERSE_AUTHENTICITY_SCHEMA
+        explicit_contract = True
+        exact_symbol_identity = True
+
+        @staticmethod
+        def cell_status(symbol: str, timeframe: str) -> str:
+            return str(entries[symbol][timeframe]["status"])
+
+    def resolve(_data_dir: Path, symbols: list[str], **_kwargs: object) -> Universe:
+        captured["symbols"] = tuple(symbols)
+        return Universe()
+
+    monkeypatch.setattr("pm_native_activation.resolve_active_native_universe", resolve)
+    contract, errors = active_native_portfolio_contract(
+        tmp_path / "data",
+        configured,
+        timeframes=("D1",),
+    )
+
+    assert errors == []
+    assert captured["symbols"] == configured
+    assert contract["symbols"] == list(configured)
+    assert set(contract["bars_sha256_by_source"]) == {
+        "EURUSD|D1",
+        "Platinum|D1",
+    }
 
 
 def test_synchronized_generator_accepts_only_exact_activated_native_source() -> None:

@@ -8,6 +8,10 @@ _test_tmp/
 .tmp_test/
 *.tmp.*
 .pm_configs.json.*.tmp
+# Winner-ledger generation locks and last-failure markers are host-local
+# mutable state; committing them makes a stale lock travel between machines.
+.pm_configs.json.*.lock
+.pm_configs.json.generation.last-failure.json
 
 # Local bounded Claude/Codex coordination ledger runtime. The protocol and
 # CLI are tracked; hash-chain segments/locks are host-local operational state.
@@ -49,3 +53,35 @@ pm_outputs/experiments/
 
 # Large static reference docs (kept locally, not in git history)
 *.pdf
+
+# Test scratch. pytest.ini pins --basetemp here; nothing else should create
+# scratch at the repo root. The remaining patterns catch the ad-hoc basetemps
+# agents used before that policy existed.
+.pytest-scratch/
+.agent-test-tmp/
+.codex-test-tmp*/
+.codex-runfailure-*/
+.root-test-tmp-*/
+.pytest-tmp*/
+.pytest_tmp_*/
+.test-tmp*/
+.tmp-terminal-*/
+.hostile-*/
+.final-gap-calendar-*/
+.tmp/
+pytest_anchor_plan_*/
+pytest_reuse_*/
+
+# Production run artifacts: large, regenerable, and content-addressed.
+fxpm-production-runs/
+
+# Supervisor lock/owner state is host-local, never shared.
+.fxpm-production-generation-supervisor/
+
+# Stray shell-redirect and crash residue. These are accidents, not outputs;
+# the patterns keep them from being committed if they recur.
+=*
+fail
+*.stackdump
+.rev_diff_tmp.txt
+canon_*.log

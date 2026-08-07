@@ -60,7 +60,7 @@ def _install_success_chain(
     wrong_ledger_sha: bool = False,
 ) -> dict[str, object]:
     state: dict[str, object] = {
-        "native_calls": [],
+        "symbol_scheduler": None,
         "coordinator_calls": 0,
         "materialized_configs": [],
     }
@@ -215,28 +215,22 @@ def _install_success_chain(
     def preplan(**kwargs: object) -> object:
         events.append("historical-preplan")
         state["historical_config"] = kwargs["config"]
+        scheduler = kwargs["symbol_scheduler"]
+        assert (
+            type(scheduler)
+            is runner.historical_search.HistoricalSymbolSchedulerInputs
+        )
+        assert scheduler.active_config_path.name == "config.json"
+        assert (
+            scheduler.requested_workers
+            == kwargs["config"].optimization_max_workers
+        )
+        state["historical_symbol_scheduler"] = scheduler
         return preplanned
 
     def causal_factory(**_kwargs: object) -> object:
         events.append("causal-factory")
         return SimpleNamespace()
-
-    def produce_native(**kwargs: object) -> object:
-        if not events or events[-1] == "capital-bootstrap":
-            raise AssertionError("current evidence accessed before coordinator")
-        calls = state["native_calls"]
-        assert isinstance(calls, list)
-        calls.append(
-            (
-                kwargs["symbol"],
-                kwargs["timeframe"],
-                kwargs["cutoff_utc"],
-                kwargs["production_contract_required"],
-            )
-        )
-        if len(calls) == 1:
-            events.append("current-native")
-        return SimpleNamespace(source_state="AVAILABLE", native_prefix={})
 
     current_product = object()
 
@@ -248,17 +242,21 @@ def _install_success_chain(
             "symbols": list(book.PINNED_SYMBOL_ORDER),
             "pipeline": {"timeframes": list(book.TIMEFRAME_ORDER)},
         }
-        assert list(inputs.native_products) == [
-            f"{symbol}|{timeframe}"
-            for symbol in book.PINNED_SYMBOL_ORDER
-            for timeframe in book.TIMEFRAME_ORDER
-        ]
+        assert inputs.native_products == {}
+        scheduler = inputs.symbol_scheduler
+        assert type(scheduler) is runner.current_refit.CurrentRefitSymbolSchedulerInputs
+        assert scheduler.cutoff_utc == "2026-01-01T00:00:00Z"
+        assert scheduler.data_dir == Path(inputs.pipeline_config.data_dir)
+        assert (
+            scheduler.requested_workers
+            == inputs.pipeline_config.optimization_max_workers
+        )
+        state["symbol_scheduler"] = scheduler
         return lambda _request: current_product
 
     def coordinate(**kwargs: object) -> coordinator.ProductionAuthorityRun:
         state["coordinator_calls"] = int(state["coordinator_calls"]) + 1
         events.append("coordinator-enter")
-        assert state["native_calls"] == []
         assert (
             kwargs["current_refit_factory"](coordinator.CurrentRefitRequest(b"{}"))
             is current_product
@@ -355,11 +353,6 @@ def _install_success_chain(
         causal_factory,
     )
     monkeypatch.setattr(
-        runner.native_prefix,
-        "produce_activated_native_prefix",
-        produce_native,
-    )
-    monkeypatch.setattr(
         runner.current_refit,
         "build_current_refit_search_producer",
         build_current,
@@ -379,24 +372,26 @@ def test_runner_orders_full_chain_and_returns_exact_pre_cas_bytes(
     last_good = tmp_path / "pm_configs.json"
     last_good.write_bytes(b'{"last":"good"}')
 
-    result = runner.run_production_optimization(
-        _request(tmp_path, generation_id="generation-success")
-    )
+    request = _request(tmp_path, generation_id="generation-success")
+    result = runner.run_production_optimization(request)
 
     assert state["coordinator_calls"] == 1
     assert events.index("generation-context") < events.index("config-binding")
     assert events.index("config-binding") < events.index("anchor-plan")
     assert events.index("capital-bootstrap") < events.index("historical-preplan")
     assert events.index("historical-preplan") < events.index("coordinator-enter")
-    assert events.index("coordinator-enter") < events.index("current-native")
-    calls = state["native_calls"]
-    assert isinstance(calls, list)
-    assert calls == [
-        (symbol, timeframe, "2026-01-01T00:00:00Z", True)
-        for symbol in book.PINNED_SYMBOL_ORDER
-        for timeframe in book.TIMEFRAME_ORDER
-    ]
-    assert len(calls) == 100 * 6
+    assert events.index("coordinator-enter") < events.index("current-producer")
+    scheduler = state["symbol_scheduler"]
+    assert type(scheduler) is runner.current_refit.CurrentRefitSymbolSchedulerInputs
+    assert (
+        scheduler.requested_workers
+        == state["current_config"].optimization_max_workers
+    )
+    historical_scheduler = state["historical_symbol_scheduler"]
+    assert (
+        historical_scheduler.requested_workers
+        == state["historical_config"].optimization_max_workers
+    )
     materialized_configs = state["materialized_configs"]
     assert isinstance(materialized_configs, list)
     assert len(materialized_configs) == 3
@@ -505,6 +500,59 @@ def test_runner_orders_full_chain_and_returns_exact_pre_cas_bytes(
     assert not result.authority_assembly_path.exists()
 
 
+def test_exact_empty_current_refit_is_typed_and_cleans_owned_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _install_success_chain(monkeypatch, events=events)
+
+    upstream = runner.current_refit.CurrentRefitSearchNotPromotable(
+        "CURRENT_BOOK_HAS_NO_ELIGIBLE_WINNERS",
+        ("NO_LOCAL_WINNERS", "COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS"),
+    )
+
+    def build_current(_inputs):
+        def produce(_request):
+            raise upstream
+
+        return produce
+
+    def coordinate(**kwargs):
+        kwargs["current_refit_factory"](coordinator.CurrentRefitRequest(b"{}"))
+        raise AssertionError("typed current-refit outcome did not escape")
+
+    monkeypatch.setattr(
+        runner.current_refit,
+        "build_current_refit_search_producer",
+        build_current,
+    )
+    monkeypatch.setattr(
+        runner.coordinator,
+        "coordinate_production_authority",
+        coordinate,
+    )
+
+    request = _request(tmp_path, generation_id="generation-not-promotable")
+    original_config = request.active_config_path.read_bytes()
+    with pytest.raises(runner.ProductionOptimizationNotPromotable) as caught:
+        runner.run_production_optimization(request)
+
+    assert caught.value.code == "CURRENT_REFIT_NOT_PROMOTABLE"
+    assert caught.value.details == (
+        "CURRENT_BOOK_HAS_NO_ELIGIBLE_WINNERS",
+        "NO_LOCAL_WINNERS",
+        "COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS",
+    )
+    assert caught.value.__cause__ is upstream
+    assert not isinstance(caught.value, runner.ProductionOptimizationRunnerError)
+    assert request.active_config_path.read_bytes() == original_config
+    run_parent = tmp_path / "fxpm-production-runs"
+    assert run_parent.is_dir()
+    assert list(run_parent.iterdir()) == []
+    assert list(tmp_path.glob("fxpm-authority-*")) == []
+
+
 def test_runner_rejects_partial_symbol_roster_before_authority_access(
     tmp_path: Path,
 ) -> None:
@@ -525,6 +573,58 @@ def test_runner_rejects_partial_symbol_roster_before_authority_access(
         runner.run_production_optimization(request)
 
     assert not (tmp_path / "fxpm-production-runs").exists()
+
+
+def test_spool_budget_uses_live_free_space_and_cannot_weaken_configured_reserve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    config = PipelineConfig(storage_critical_free_gb=10.0)
+    requested = runner.authority_spool.SpoolLimits(
+        max_artifact_bytes=5 * gib,
+        max_symbol_bytes=5 * gib,
+        max_generation_bytes=5 * gib,
+        min_free_bytes=1 * gib,
+    )
+    monkeypatch.setattr(
+        runner.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=20 * gib,
+            used=6 * gib,
+            free=14 * gib,
+        ),
+    )
+
+    effective = runner._effective_spool_limits(  # noqa: SLF001
+        config=config,
+        deployment_root=tmp_path,
+        requested=requested,
+    )
+    assert effective.min_free_bytes == 10 * gib
+    assert effective.max_generation_bytes == 4 * gib
+    assert effective.max_artifact_bytes == 4 * gib
+    assert effective.max_symbol_bytes == 4 * gib
+
+    monkeypatch.setattr(
+        runner.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=20 * gib,
+            used=10 * gib,
+            free=10 * gib,
+        ),
+    )
+    with pytest.raises(
+        runner.ProductionOptimizationRunnerError,
+        match="PRODUCTION_SPOOL_FREE_SPACE_RESERVE_UNAVAILABLE",
+    ):
+        runner._effective_spool_limits(  # noqa: SLF001
+            config=config,
+            deployment_root=tmp_path,
+            requested=requested,
+        )
 
 
 def test_runner_does_not_sleep_or_access_evidence_before_not_before(
@@ -594,23 +694,65 @@ def test_runner_rejects_coordinator_ledger_byte_substitution(
     assert list(tmp_path.glob("fxpm-authority-*")) == []
 
 
-def test_lazy_current_technical_failure_is_not_a_market_verdict(
+def test_lazy_current_defers_native_access_to_bounded_scheduler_and_is_one_shot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    build_calls: list[object] = []
-    monkeypatch.setattr(
-        runner.native_prefix,
-        "produce_activated_native_prefix",
-        lambda **_kwargs: SimpleNamespace(
-            source_state=runner.native_prefix.TECHNICAL_FAILURE,
-            native_prefix={"source_reason": "BROKER_OR_ARTIFACT_FAILURE"},
-        ),
-    )
+    build_calls = []
+
+    def build(inputs):
+        build_calls.append(inputs)
+        return lambda _request: "scheduled-current"
+
     monkeypatch.setattr(
         runner.current_refit,
         "build_current_refit_search_producer",
-        lambda inputs: build_calls.append(inputs),
+        build,
+    )
+    config = PipelineConfig(optimization_max_workers=99)
+    producer = runner._LazyCurrentRefitProducer(  # noqa: SLF001
+        context=SimpleNamespace(),
+        active_config_path=tmp_path / "config.json",
+        config_payload={},
+        data_dir=tmp_path,
+        cutoff_utc="2026-01-01T00:00:00Z",
+        current_selection_window={
+            "start_date": "2025-01-01",
+            "end_date": "2026-01-01",
+        },
+        search_process=SimpleNamespace(),
+        pipeline_config=config,
+        output_root=tmp_path,
+    )
+
+    assert producer(coordinator.CurrentRefitRequest(b"{}")) == "scheduled-current"
+    assert len(build_calls) == 1
+    supplied = build_calls[0]
+    assert supplied.native_products == {}
+    assert supplied.symbol_scheduler.requested_workers == 99
+    assert supplied.symbol_scheduler.data_dir == tmp_path
+    assert supplied.symbol_scheduler.cutoff_utc == "2026-01-01T00:00:00Z"
+    with pytest.raises(
+        runner.ProductionOptimizationRunnerError,
+        match="CURRENT_REFIT_FACTORY_ALREADY_CONSUMED",
+    ):
+        producer(coordinator.CurrentRefitRequest(b"{}"))
+
+
+def test_lazy_current_scheduler_timestamp_is_fixed_before_worker_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = []
+
+    def build(inputs):
+        captured.append(inputs)
+        return lambda _request: "current-book"
+
+    monkeypatch.setattr(
+        runner.current_refit,
+        "build_current_refit_search_producer",
+        build,
     )
     producer = runner._LazyCurrentRefitProducer(  # noqa: SLF001
         context=SimpleNamespace(),
@@ -627,17 +769,13 @@ def test_lazy_current_technical_failure_is_not_a_market_verdict(
         output_root=tmp_path,
     )
 
-    with pytest.raises(
-        runner.ProductionOptimizationRunnerError,
-        match=r"CURRENT_NATIVE_PREFIX_TECHNICAL_FAILURE:AUDUSD\|M5",
-    ):
-        producer(coordinator.CurrentRefitRequest(b"{}"))
-    assert build_calls == []
-    with pytest.raises(
-        runner.ProductionOptimizationRunnerError,
-        match="CURRENT_REFIT_FACTORY_ALREADY_CONSUMED",
-    ):
-        producer(coordinator.CurrentRefitRequest(b"{}"))
+    assert producer(coordinator.CurrentRefitRequest(b"{}")) == "current-book"
+    scheduler = captured[0].symbol_scheduler
+    assert scheduler.source_accessed_at_utc.endswith("Z")
+    assert runner._parse_utc(  # noqa: SLF001
+        scheduler.source_accessed_at_utc,
+        "TEST_TIMESTAMP_INVALID",
+    ).tzinfo is not None
 
 
 def test_lazy_current_binds_the_frozen_anchor_plan_current_window(
@@ -647,14 +785,6 @@ def test_lazy_current_binds_the_frozen_anchor_plan_current_window(
     captured = []
     monkeypatch.setattr(runner.book, "PINNED_SYMBOL_ORDER", ("EURUSD",))
     monkeypatch.setattr(runner.book, "TIMEFRAME_ORDER", ("H1",))
-    monkeypatch.setattr(
-        runner.native_prefix,
-        "produce_activated_native_prefix",
-        lambda **_kwargs: SimpleNamespace(
-            source_state=runner.native_prefix.AVAILABLE,
-            native_prefix={},
-        ),
-    )
 
     def build(inputs):
         captured.append(inputs)

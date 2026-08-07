@@ -140,6 +140,28 @@ def _install_resolver(
     return calls
 
 
+def test_universe_keeps_valid_sibling_when_one_cell_is_terminal_technical(
+    tmp_path: Path,
+) -> None:
+    _data_dir, universe, _common = _fixture(tmp_path)
+    universe.cell_statuses["AUDUSD"]["M5"] = native.NATIVE_TECHNICAL_ERROR
+
+    assert anchor_plan._validate_universe(universe) is universe
+
+
+def test_universe_excludes_only_a_technical_only_symbol_from_candidates(
+    tmp_path: Path,
+) -> None:
+    _data_dir, universe, _common = _fixture(tmp_path)
+    for timeframe in PRODUCTION_TIMEFRAME_ORDER:
+        universe.cell_statuses["AUDUSD"][timeframe] = native.NATIVE_TECHNICAL_ERROR
+    expected = tuple(symbol for symbol in PRODUCTION_SYMBOL_ORDER if symbol != "AUDUSD")
+    universe.eligible_symbols = expected
+    universe.symbols_with_active_cells = expected
+
+    assert anchor_plan._validate_universe(universe) is universe
+
+
 def test_factory_resolves_exact_production_universe_and_derives_causal_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -394,17 +416,17 @@ def test_legacy_native_calendar_schema_is_not_anchor_authority(
         anchor_plan.derive_production_anchor_plan(data_dir)
 
 
-def test_insufficient_authenticated_history_is_typed_and_not_no_trade(
+def test_fixed_window_history_shortfall_is_diagnostic_and_not_global_veto(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     short_common = build_v5_request_contract(requested_information_cutoff_utc=CUTOFF)
     data_dir, universe, _common = _fixture(tmp_path, common=short_common)
     _install_resolver(monkeypatch, universe)
 
-    with pytest.raises(anchor_plan.ProductionAnchorPlanInsufficientHistory) as caught:
-        anchor_plan.derive_production_anchor_plan(data_dir)
-    assert caught.value.code == "INSUFFICIENT_AUTHENTICATED_OPTIMIZER_TRAIN_HISTORY"
-    assert caught.value.minimum_additional_history_calendar_days_by_timeframe == {
+    receipt = anchor_plan.derive_production_anchor_plan(data_dir)
+    verified = anchor_plan.verify_production_anchor_plan_receipt(data_dir, receipt)
+
+    assert verified["minimum_additional_history_calendar_days_by_timeframe"] == {
         "M5": 81,
         "M15": 81,
         "M30": 81,
@@ -412,8 +434,15 @@ def test_insufficient_authenticated_history_is_typed_and_not_no_trade(
         "H4": 80,
         "D1": 78,
     }
-    assert caught.value.details[0] == "M5=81"
-    assert "NO_TRADE" not in str(caught.value)
+    assert all(
+        proof["authenticated_optimizer_train_depth_retained"] is False
+        for proof in verified["optimizer_train_history_proof_by_timeframe"].values()
+    )
+    flag = (
+        "confers_search_process_current_refit_capital_readiness_publication_"
+        "or_trading_authority"
+    )
+    assert verified[flag] is False
 
 
 def test_rehashed_native_end_splice_is_rejected_by_v5_semantics(

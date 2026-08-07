@@ -1,6 +1,7 @@
 import hashlib
 import json
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pm_current_refit_production as production
 import pm_pipeline as pipeline
 import pm_portfolio_replay as replay
 from pm_current_refit_artifacts import spool_current_refit_search_attempt_v2
+from pm_core import PipelineConfig
 from pm_strategies import StrategyRegistry
 from tests.test_pipeline_current_refit_executor import _production_fixture
 
@@ -146,6 +148,36 @@ def _physical_fixture(tmp_path: Path) -> tuple[dict, dict, dict, Path, Path]:
     return book_body, accepted, receipt, manifest_path, artifact_root
 
 
+def _scheduled_deadline(receipt: dict) -> datetime:
+    payload, _ = production.open_typed_receipt(
+        receipt,
+        expected_receipt_type=production.CURRENT_REFIT_EXECUTION_RECEIPT_TYPE,
+    )
+    completed_at = datetime.fromisoformat(
+        str(payload["execution"]["completed_at_utc"]).replace("Z", "+00:00")
+    )
+    return PipelineConfig().get_next_retrain_at_utc(completed_at)
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_selected_book_cells_preserve_exact_mt5_symbol(symbol: str) -> None:
+    selected = production._selected_book_cells(  # noqa: SLF001
+        {
+            "cells": [
+                {
+                    "symbol": symbol,
+                    "timeframe": "H4",
+                    "regime": "TREND",
+                    "historical_state": "WINNER",
+                }
+            ]
+        }
+    )
+
+    assert set(selected) == {f"{symbol}|H4|TREND"}
+    assert selected[f"{symbol}|H4|TREND"]["symbol"] == symbol
+
+
 def test_physical_current_ledger_is_derived_from_raw_selected_entries_only(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -161,6 +193,7 @@ def test_physical_current_ledger_is_derived_from_raw_selected_entries_only(
         raw_manifest_path=manifest_path,
         artifact_root=artifact_root,
         output_root=tmp_path / "derived",
+        required_valid_until_utc=_scheduled_deadline(receipt),
     )
 
     assert derived.path.name == (
@@ -172,7 +205,17 @@ def test_physical_current_ledger_is_derived_from_raw_selected_entries_only(
     assert replay.canonical_json_sha256(derived.payload) == (
         derived.physical_ledger_sha256
     )
-    cells = derived.payload["EURUSD"]["regime_configs"]
+    symbol_payload = derived.payload["EURUSD"]
+    expected_deadline = _scheduled_deadline(receipt).isoformat()
+    assert symbol_payload["valid_until"] == expected_deadline
+    assert symbol_payload["artifact_meta"]["valid_until_basis"] == (
+        production.SCHEDULE_DEFAULT_VALIDITY_BASIS
+    )
+    assert (
+        symbol_payload["artifact_meta"]["evidence_led_validity_horizon_claimed"]
+        is False
+    )
+    cells = symbol_payload["regime_configs"]
     assert set(cells) == {"M5", "D1"}
     assert {next(iter(regimes)) for regimes in cells.values()} == {"TREND"}
     for regimes in cells.values():
@@ -186,6 +229,11 @@ def test_physical_current_ledger_is_derived_from_raw_selected_entries_only(
         binding = cell["artifact_meta"]["current_refit_binding"]
         assert set(binding) == set(production._CURRENT_REFIT_BINDING_FIELDS)
         assert cell["artifact_meta"]["winner_process_candidate_id"]
+        assert cell["valid_until"] == expected_deadline
+        assert cell["artifact_meta"]["valid_until_basis"] == (
+            production.SCHEDULE_DEFAULT_VALIDITY_BASIS
+        )
+        assert cell["artifact_meta"]["evidence_led_validity_horizon_claimed"] is False
         assert cell["validation_evidence"]["authority_scope"] == ("DEMO_PROBATION_ONLY")
 
 
@@ -215,6 +263,38 @@ def test_physical_current_ledger_rejects_selected_roster_attacks(
             raw_manifest_path=manifest_path,
             artifact_root=artifact_root,
             output_root=tmp_path / "derived-attack",
+            required_valid_until_utc=_scheduled_deadline(receipt),
+        )
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [datetime(2099, 1, 1), datetime(2000, 1, 1, tzinfo=timezone.utc)],
+)
+def test_physical_current_ledger_rejects_invalid_required_deadline(
+    tmp_path: Path, monkeypatch, deadline: datetime
+) -> None:
+    book_body, accepted, receipt, manifest_path, artifact_root = _physical_fixture(
+        tmp_path
+    )
+    monkeypatch.setattr(production, "_owned_book", lambda _value: book_body)
+
+    with pytest.raises(
+        production.CurrentRefitProductionCaptureError,
+        match=(
+            "PHYSICAL_LEDGER_VALID_UNTIL_NOT_AWARE_UTC"
+            if deadline.tzinfo is None
+            else "PHYSICAL_LEDGER_VALID_UNTIL_NOT_AFTER_REFIT"
+        ),
+    ):
+        production.derive_physical_current_refit_ledger(
+            current_book_decision=book_body,
+            accepted_book_generation_receipt=accepted,
+            current_refit_receipt=receipt,
+            raw_manifest_path=manifest_path,
+            artifact_root=artifact_root,
+            output_root=tmp_path / "derived-invalid-deadline",
+            required_valid_until_utc=deadline,
         )
 
 
@@ -228,7 +308,11 @@ def test_current_search_spool_is_explicitly_insufficient_for_production(
         native_universe_sha256=_sha("a"),
         config_sha256=_sha("b"),
     )
-    sink = spool.open_symbol_sink(context, "EURUSD")
+    sink = spool.open_symbol_sink(
+        context,
+        "EURUSD",
+        manifest_domain=spool.CURRENT_REFIT_MANIFEST_DOMAIN,
+    )
     strategy = StrategyRegistry.get("EMACrossoverStrategy")
     spool_current_refit_search_attempt_v2(
         sink,
@@ -255,6 +339,7 @@ def test_current_search_spool_is_explicitly_insufficient_for_production(
             generation_id="generation-1",
             native_universe_sha256=_sha("a"),
             config_sha256=_sha("b"),
+            required_valid_until_utc=datetime(2099, 1, 1, tzinfo=timezone.utc),
         )
     )
     with pytest.raises(production.CurrentRefitProductionCaptureError) as captured:
@@ -276,6 +361,41 @@ def test_current_search_spool_is_explicitly_insufficient_for_production(
     assert production.ART_PORTFOLIO_SOURCE_LEDGER in captured.value.details
 
 
+def test_current_capture_rejects_a_general_domain_symbol_receipt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "spool"
+    context = spool.freeze_generation_context(
+        root,
+        generation_id="generation-domain-splice",
+        native_universe_sha256=_sha("a"),
+        config_sha256=_sha("b"),
+    )
+    general_sink = spool.open_symbol_sink(context, "EURUSD")
+    general_sink.put_json("cell", "unrelated", {"domain": "GENERAL"})
+    receipt = general_sink.seal()
+    inputs = production.ProductionCaptureInputs(
+        spool_root=root,
+        compact_symbol_receipts={"EURUSD": receipt},
+        output_root=tmp_path / "out",
+        generation_id="generation-domain-splice",
+        native_universe_sha256=_sha("a"),
+        config_sha256=_sha("b"),
+        required_valid_until_utc=datetime(2099, 1, 1, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(
+        production.CurrentRefitProductionCaptureError,
+        match="CAPTURE_SYMBOL_RECEIPT_INVALID",
+    ) as captured:
+        production._verified_artifacts(inputs)  # noqa: SLF001
+
+    assert captured.value.details == (
+        "EURUSD",
+        "COMPACT_RECEIPT_MANIFEST_DOMAIN_MISMATCH",
+    )
+
+
 def test_adapter_construction_is_lazy_and_does_not_access_current_evidence(
     tmp_path: Path,
 ) -> None:
@@ -287,6 +407,7 @@ def test_adapter_construction_is_lazy_and_does_not_access_current_evidence(
             generation_id="generation-lazy",
             native_universe_sha256=_sha("a"),
             config_sha256=_sha("b"),
+            required_valid_until_utc=datetime(2099, 1, 1, tzinfo=timezone.utc),
         )
     )
 

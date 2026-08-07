@@ -1,0 +1,8 @@
+cap_pct,executed_with_actual_risk,would_block_count,would_block_pct,would_allow_count
+3,67,45,67.164,22
+5,67,35,52.239,32
+8,67,26,38.806,41
+10,67,19,28.358,48
+15,67,12,17.91,55
+20,67,6,8.955,61
+25,67,0,0.0,67

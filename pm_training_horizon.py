@@ -63,7 +63,10 @@ _FOLD_ROLES = frozenset((_CAUSAL_ROLE, _INTERPOLATION_ROLE))
 _AVAILABLE = "AVAILABLE"
 _SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
 _TECHNICAL_FAILURE = "TECHNICAL_FAILURE"
-_SOURCE_STATES = frozenset((_AVAILABLE, _SOURCE_UNAVAILABLE, _TECHNICAL_FAILURE))
+_TECHNICAL_TERMINAL = "TECHNICAL_TERMINAL"
+_SOURCE_STATES = frozenset(
+    (_AVAILABLE, _SOURCE_UNAVAILABLE, _TECHNICAL_FAILURE, _TECHNICAL_TERMINAL)
+)
 _INTERNAL_STATES = frozenset(
     ("CONTINUOUS", "EXPECTED_AUTHENTICATED_DISCONTINUITIES", "UNEXPLAINED")
 )
@@ -74,7 +77,6 @@ _PROCESS_REJECTED = "PROCESS_REJECTED"
 _TECHNICAL_SHARD = "TECHNICAL_FAILURE"
 _TECHNICAL_REASONS = frozenset(
     (
-        "EVALUATOR_TIMEOUT",
         "EVALUATOR_OOM",
         "SOURCE_INTEGRITY_FAILURE",
         "EVALUATOR_EXCEPTION",
@@ -82,6 +84,10 @@ _TECHNICAL_REASONS = frozenset(
 )
 _PROCESS_SCREEN_REASON = "PREREGISTERED_PROCESS_SCREEN_REJECTED"
 _BOUNDARY_REASON = "SOURCE_BOUNDARY_SHORTFALL"
+_STATE_CONTEXT_BOUNDARY_REASON = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+_STATE_CONTEXT_DISPOSITION_SCHEMA = (
+    "fxpm.production-trial-state-context-disposition.v1"
+)
 
 # These are transport/resource ceilings, never statistical acceptance rules.
 _MAX_REQUEST_BYTES = 32 * 1024 * 1024
@@ -98,7 +104,6 @@ _MAX_FOLDS_PER_CANDIDATE = 256
 _MAX_ATTEMPTS = 100_000
 _MAX_EXPECTED_EVALUATIONS = 100_000
 _MAX_VECTOR_POINTS = 2_000_000
-_WORKER_TIMEOUT_SECONDS = 30
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", re.ASCII)
@@ -612,7 +617,7 @@ def _normalize_regime_support_binding(
         "regime support label order mismatch",
     )
     eligible_rows = _integer(
-        support["eligible_rows"], "regime support eligible rows", 1, 10_000_000_000
+        support["eligible_rows"], "regime support eligible rows", 0, 10_000_000_000
     )
     _require(
         eligible_rows <= prefix["prefix_rows"],
@@ -653,33 +658,43 @@ def _normalize_regime_support_binding(
         "observed regime cannot use the zero-attempt horizon path",
     )
 
-    for name in ("first_ts", "last_ts"):
+    if eligible_rows == 0:
         _require(
-            type(support[name]) is str and 0 < len(support[name]) <= 128,
-            f"invalid regime support {name}",
+            support["first_ts"] is None and support["last_ts"] is None,
+            "empty regime support must not claim a label time range",
         )
-    try:
-        first_ts = datetime.fromisoformat(support["first_ts"].replace("Z", "+00:00"))
-        last_ts = datetime.fromisoformat(support["last_ts"].replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise _HorizonContractError("invalid regime support time range") from exc
-    _require(
-        first_ts.tzinfo is not None
-        and first_ts.utcoffset() is not None
-        and last_ts.tzinfo is not None
-        and last_ts.utcoffset() is not None
-        and first_ts <= last_ts,
-        "invalid regime support time range",
-    )
-    prefix_start = _utc(prefix["prefix_start_utc"], "prefix start")
-    prefix_end = _utc(prefix["prefix_end_exclusive_utc"], "prefix end")
-    _require(
-        prefix_start
-        <= first_ts.astimezone(timezone.utc)
-        <= last_ts.astimezone(timezone.utc)
-        < prefix_end,
-        "regime support time range lies outside native prefix",
-    )
+    else:
+        for name in ("first_ts", "last_ts"):
+            _require(
+                type(support[name]) is str and 0 < len(support[name]) <= 128,
+                f"invalid regime support {name}",
+            )
+        try:
+            first_ts = datetime.fromisoformat(
+                support["first_ts"].replace("Z", "+00:00")
+            )
+            last_ts = datetime.fromisoformat(
+                support["last_ts"].replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise _HorizonContractError("invalid regime support time range") from exc
+        _require(
+            first_ts.tzinfo is not None
+            and first_ts.utcoffset() is not None
+            and last_ts.tzinfo is not None
+            and last_ts.utcoffset() is not None
+            and first_ts <= last_ts,
+            "invalid regime support time range",
+        )
+        prefix_start = _utc(prefix["prefix_start_utc"], "prefix start")
+        prefix_end = _utc(prefix["prefix_end_exclusive_utc"], "prefix end")
+        _require(
+            prefix_start
+            <= first_ts.astimezone(timezone.utc)
+            <= last_ts.astimezone(timezone.utc)
+            < prefix_end,
+            "regime support time range lies outside native prefix",
+        )
     _require(
         support["vector_encoding"] == _REGIME_TRAIN_SUPPORT_VECTOR_ENCODING,
         "regime support vector encoding mismatch",
@@ -928,7 +943,7 @@ def _derived_geometry(
         dependency_payload["max_holding_bars"] * seconds,
         max_holding_seconds,
     )
-    return {
+    context = {
         **derived_bars,
         "timeframe_seconds": seconds,
         "warmup_seconds": derived_bars["warmup_bars"] * seconds,
@@ -941,6 +956,7 @@ def _derived_geometry(
             delayed_holding_seconds,
         ),
     }
+    return context
 
 
 def _normalize_fold(
@@ -1166,22 +1182,92 @@ def _normalize_candidate(
     return candidate, False
 
 
-def _normalize_trial(value: Any) -> dict[str, Any]:
-    trial = _exact_keys(
+def _normalize_state_context_disposition(value: Any) -> dict[str, Any]:
+    disposition = _exact_keys(
         value,
         (
-            "trial_id",
-            "strategy_id",
-            "strategy_release_sha256",
-            "parameter_set_sha256",
-            "trial_definition_sha256",
+            "schema_version",
+            "candidate_id",
+            "candidate_definition_sha256",
+            "state_requirement_sha256",
+            "required_context_bars",
+            "selected_context_bars",
+            "status",
+            "reason_code",
+            "disposition_sha256",
         ),
-        "trial",
+        "state context disposition",
     )
+    _require(
+        disposition["schema_version"] == _STATE_CONTEXT_DISPOSITION_SCHEMA,
+        "state context disposition schema mismatch",
+    )
+    _safe_id(disposition["candidate_id"], "state context candidate id")
+    _digest(
+        disposition["candidate_definition_sha256"],
+        "state context candidate definition",
+    )
+    _digest(disposition["state_requirement_sha256"], "state requirement")
+    for name in ("required_context_bars", "selected_context_bars"):
+        _require(
+            type(disposition[name]) is int and disposition[name] >= 0,
+            f"{name} must be a nonnegative integer",
+        )
+    _require(
+        disposition["selected_context_bars"] >= 1,
+        "selected context must be positive",
+    )
+    within = (
+        disposition["required_context_bars"]
+        <= disposition["selected_context_bars"]
+    )
+    expected_status = "PLANNED" if within else _PROCESS_REJECTED
+    expected_reason = None if within else _STATE_CONTEXT_BOUNDARY_REASON
+    _require(
+        disposition["status"] == expected_status
+        and disposition["reason_code"] == expected_reason,
+        "state context disposition inequality mismatch",
+    )
+    body = {
+        key: disposition[key]
+        for key in disposition
+        if key != "disposition_sha256"
+    }
+    _require(
+        disposition["disposition_sha256"] == _sha256_json(body),
+        "state context disposition digest mismatch",
+    )
+    return disposition
+
+
+def _normalize_trial(value: Any) -> dict[str, Any]:
+    base_keys = (
+        "trial_id",
+        "strategy_id",
+        "strategy_release_sha256",
+        "parameter_set_sha256",
+        "trial_definition_sha256",
+    )
+    extended_keys = (*base_keys[:-1], "state_context_disposition", base_keys[-1])
+    if type(value) is not dict:
+        _fail("trial must be an exact mapping")
+    if set(value) == set(base_keys):
+        keys = base_keys
+    elif set(value) == set(extended_keys):
+        keys = extended_keys
+    else:
+        _fail("trial fields mismatch")
+    trial = _exact_keys(value, keys, "trial")
     _safe_id(trial["trial_id"], "trial id")
     _safe_id(trial["strategy_id"], "strategy id")
     _digest(trial["strategy_release_sha256"], "strategy release")
     _digest(trial["parameter_set_sha256"], "parameter set")
+    if "state_context_disposition" in trial:
+        trial["state_context_disposition"] = (
+            _normalize_state_context_disposition(
+                trial["state_context_disposition"]
+            )
+        )
     _digest(trial["trial_definition_sha256"], "trial definition")
     definition = {key: trial[key] for key in trial if key != "trial_definition_sha256"}
     _require(
@@ -1332,16 +1418,48 @@ def _normalize_request(request: Any) -> dict[str, Any]:
             )
             trial_identities.add(trial_identity)
             trials.append(trial)
+        extended_trials = [
+            trial for trial in trials if "state_context_disposition" in trial
+        ]
+        _require(
+            not extended_trials or len(extended_trials) == len(trials),
+            "state context dispositions must cover the exact trial roster",
+        )
+        if extended_trials:
+            _require(
+                len(candidates) == 1,
+                "state context dispositions require exactly one candidate",
+            )
+            candidate = candidates[0]
+            selected_context = dependency["payload"]["feature_lookback_bars"]
+            for trial in extended_trials:
+                disposition = trial["state_context_disposition"]
+                _require(
+                    disposition["candidate_id"] == candidate["candidate_id"]
+                    and disposition["candidate_definition_sha256"]
+                    == candidate["candidate_definition_sha256"]
+                    and disposition["selected_context_bars"] == selected_context,
+                    "state context disposition candidate or dependency mismatch",
+                )
         _paired_fold_axes(candidates, boundary_ids)
         _require(
             len(candidates) * len(trials) <= _MAX_ATTEMPTS, "attempt ceiling exceeded"
         )
         evaluation_axes = sum(
-            1 if candidate["candidate_id"] in boundary_ids else len(candidate["folds"])
+            1
+            if candidate["candidate_id"] in boundary_ids
+            or (
+                len(candidates) == 1
+                and extended_trials
+                and trial["state_context_disposition"]["status"]
+                == _PROCESS_REJECTED
+            )
+            else len(candidate["folds"])
             for candidate in candidates
+            for trial in trials
         )
         _require(
-            evaluation_axes * len(trials) <= _MAX_EXPECTED_EVALUATIONS,
+            evaluation_axes <= _MAX_EXPECTED_EVALUATIONS,
             "expected evaluation ceiling exceeded",
         )
     else:
@@ -1444,7 +1562,7 @@ def _evaluation_context(
             "validation_end_exclusive_utc": fold["validation_end_exclusive_utc"],
             "final_oos_authority": False,
         }
-    return {
+    context = {
         "authority_scope": _AUTHORITY_SCOPE,
         "attempt_id": attempt_id,
         "anchor_id": request["anchor"]["anchor_id"],
@@ -1484,6 +1602,12 @@ def _evaluation_context(
             "cost_stress_contract_sha256"
         ],
     }
+    disposition = trial.get("state_context_disposition")
+    if type(disposition) is dict:
+        context["state_context_disposition_sha256"] = disposition[
+            "disposition_sha256"
+        ]
+    return context
 
 
 def _build_plan_body(request: Any) -> dict[str, Any]:
@@ -1507,12 +1631,29 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
             for trial in trials:
                 attempt_id = _attempt_id(normalized, candidate, trial)
                 boundary = candidate["candidate_id"] in boundary_ids
+                disposition = trial.get("state_context_disposition")
+                state_context_rejected = (
+                    type(disposition) is dict
+                    and disposition["status"] == _PROCESS_REJECTED
+                )
                 if source_integrity_blocked:
                     attempt_status = "TECHNICAL_INCOMPLETE"
                     attempt_reason = "SOURCE_INTEGRITY_FAILURE"
                 else:
-                    attempt_status = "PROCESS_REJECTED" if boundary else "PLANNED"
-                    attempt_reason = _BOUNDARY_REASON if boundary else None
+                    attempt_status = (
+                        _PROCESS_REJECTED
+                        if boundary or state_context_rejected
+                        else "PLANNED"
+                    )
+                    attempt_reason = (
+                        _BOUNDARY_REASON
+                        if boundary
+                        else (
+                            _STATE_CONTEXT_BOUNDARY_REASON
+                            if state_context_rejected
+                            else None
+                        )
+                    )
                 attempt = {
                     "attempt_id": attempt_id,
                     "candidate_id": candidate["candidate_id"],
@@ -1527,11 +1668,16 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
                     "status": attempt_status,
                     "reason_code": attempt_reason,
                 }
+                if type(disposition) is dict:
+                    attempt["state_context_disposition_sha256"] = disposition[
+                        "disposition_sha256"
+                    ]
                 attempts.append(attempt)
                 if source_integrity_blocked:
                     continue
+                terminal_rejection = boundary or state_context_rejected
                 folds: list[dict[str, Any] | None] = (
-                    [None] if boundary else list(candidate["folds"])
+                    [None] if terminal_rejection else list(candidate["folds"])
                 )
                 for fold in folds:
                     context = _evaluation_context(
@@ -1550,10 +1696,10 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
                             if fold is None
                             else fold["validation_end_exclusive_utc"],
                             "expected_status": _PROCESS_REJECTED
-                            if boundary
+                            if terminal_rejection
                             else "EVALUATION_REQUIRED",
-                            "expected_reason_code": _BOUNDARY_REASON
-                            if boundary
+                            "expected_reason_code": attempt_reason
+                            if terminal_rejection
                             else None,
                             "downstream_causal_eligible": False
                             if fold is None
@@ -1571,20 +1717,26 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
         }
         for item in candidates
     ]
-    trial_registry = [
-        {
+    trial_registry = []
+    for item in trials:
+        registry_item = {
             "trial_id": item["trial_id"],
             "strategy_id": item["strategy_id"],
             "strategy_release_sha256": item["strategy_release_sha256"],
             "parameter_set_sha256": item["parameter_set_sha256"],
             "trial_definition_sha256": item["trial_definition_sha256"],
         }
-        for item in trials
-    ]
+        if "state_context_disposition" in item:
+            registry_item["state_context_disposition_sha256"] = item[
+                "state_context_disposition"
+            ]["disposition_sha256"]
+        trial_registry.append(registry_item)
     if unobserved_request:
         plan_status = "HISTORICAL_REGIME_UNOBSERVED"
     elif prefix["source_state"] == _SOURCE_UNAVAILABLE:
         plan_status = "HISTORICAL_SOURCE_UNAVAILABLE"
+    elif prefix["source_state"] == _TECHNICAL_TERMINAL:
+        plan_status = "HISTORICAL_TERMINAL_TECHNICAL"
     elif (
         prefix["source_state"] == _TECHNICAL_FAILURE
         or prefix["internal_status"] == "UNEXPLAINED"
@@ -1632,7 +1784,6 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
             "output_byte_ceiling": _MAX_OUTPUT_BYTES,
             "vector_point_ceiling": _MAX_VECTOR_POINTS,
             "expected_evaluation_ceiling": _MAX_EXPECTED_EVALUATIONS,
-            "worker_timeout_seconds": _WORKER_TIMEOUT_SECONDS,
             "tabular_object_transport": False,
             "lossless_exact_shards": True,
             "persistent_storage_written": False,
@@ -1770,11 +1921,11 @@ def _normalize_shard(
     if expected["expected_status"] == _PROCESS_REJECTED:
         _require(
             shard["status"] == _PROCESS_REJECTED,
-            "boundary terminal cannot be reclassified",
+            "presearch terminal cannot be reclassified",
         )
         _require(
-            shard["reason_code"] == _BOUNDARY_REASON,
-            "boundary terminal reason mismatch",
+            shard["reason_code"] == expected["expected_reason_code"],
+            "presearch terminal reason mismatch",
         )
         _require(
             _empty_vectors(shard), "mechanical rejection cannot carry observations"
@@ -1871,6 +2022,7 @@ def _evidence_body(plan_body: dict[str, Any], raw_shards: Any) -> dict[str, Any]
     plan_status = plan_body["plan_status"]
     if plan_status in (
         "HISTORICAL_SOURCE_UNAVAILABLE",
+        "HISTORICAL_TERMINAL_TECHNICAL",
         "HISTORICAL_TECHNICAL_INCOMPLETE",
         "HISTORICAL_REGIME_UNOBSERVED",
     ):
@@ -1917,6 +2069,8 @@ def _evidence_body(plan_body: dict[str, Any], raw_shards: Any) -> dict[str, Any]
 
     if plan_status == "HISTORICAL_SOURCE_UNAVAILABLE":
         evidence_status = "HISTORICAL_SOURCE_UNAVAILABLE"
+    elif plan_status == "HISTORICAL_TERMINAL_TECHNICAL":
+        evidence_status = "HISTORICAL_TERMINAL_TECHNICAL"
     elif plan_status == "HISTORICAL_REGIME_UNOBSERVED":
         evidence_status = "HISTORICAL_REGIME_UNOBSERVED"
     elif plan_status == "HISTORICAL_TECHNICAL_INCOMPLETE" or technical_count > 0:
@@ -2023,10 +2177,6 @@ def _evaluate_plan(plan: Any, evidence_shards: Any) -> _HistoricalHorizonEvidenc
     try:
         process.start()
         send_connection.close()
-        if not receive_connection.poll(_WORKER_TIMEOUT_SECONDS):
-            process.terminate()
-            process.join(5)
-            _fail("bounded historical evidence worker timed out")
         response = receive_connection.recv_bytes(_MAX_OUTPUT_BYTES + 1)
         process.join(5)
         _require(not process.is_alive(), "historical evidence worker failed to stop")
@@ -2158,6 +2308,7 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         ("_AVAILABLE", _AVAILABLE),
         ("_SOURCE_UNAVAILABLE", _SOURCE_UNAVAILABLE),
         ("_TECHNICAL_FAILURE", _TECHNICAL_FAILURE),
+        ("_TECHNICAL_TERMINAL", _TECHNICAL_TERMINAL),
         ("_SOURCE_STATES", _SOURCE_STATES),
         ("_INTERNAL_STATES", _INTERNAL_STATES),
         ("_BOUNDARY_STATES", _BOUNDARY_STATES),
@@ -2181,7 +2332,6 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         ("_MAX_ATTEMPTS", _MAX_ATTEMPTS),
         ("_MAX_EXPECTED_EVALUATIONS", _MAX_EXPECTED_EVALUATIONS),
         ("_MAX_VECTOR_POINTS", _MAX_VECTOR_POINTS),
-        ("_WORKER_TIMEOUT_SECONDS", _WORKER_TIMEOUT_SECONDS),
         ("__all__", __all__),
     )
     identity_globals = (

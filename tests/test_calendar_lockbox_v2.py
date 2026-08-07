@@ -132,11 +132,13 @@ def test_calendar_loader_does_not_apply_legacy_max_bars_tail():
         with mock.patch.object(
             pipeline.data_loader,
             "load_native_timeframe",
-            return_value=(frame.copy(), dict(meta)),
+            side_effect=lambda *_args: (frame.copy(), dict(meta)),
         ):
             by_tf, window_meta = pipeline._load_symbol_timeframe_data("EURUSD")
+            assert set(by_tf) == {"M5"}
+            loaded_m5 = by_tf.pop("M5")
 
-        assert len(by_tf["M5"]) == 4000
+        assert len(loaded_m5) == 4000
         assert not window_meta["max_bars_applied"]
         assert window_meta["windows"]["workflow_window"]["rows"] == 4000
 

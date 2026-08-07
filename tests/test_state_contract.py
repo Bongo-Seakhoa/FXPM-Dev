@@ -79,6 +79,112 @@ def test_every_registered_default_cell_resolves_with_all_required_state_evidence
         assert result.admissible, (name, result.reason_codes)
 
 
+def test_every_registered_grid_axis_feature_request_resolves() -> None:
+    """Every value admitted by a strategy grid has state-history authority."""
+
+    evidence = {
+        name: _evidence(DEFAULT_AUTHORITY, name)
+        for name, contract in DEFAULT_AUTHORITY._contracts.items()
+        if contract.kind == StateKind.PATH_STATE
+    }
+    evaluated = 0
+    for name in StrategyRegistry.list_all():
+        registered = StrategyRegistry.get(name)
+        defaults = registered.get_default_params()
+        parameter_points = [defaults]
+        for axis, choices in registered.get_param_grid().items():
+            for choice in choices:
+                parameters = dict(defaults)
+                parameters[axis] = choice
+                parameter_points.append(parameters)
+
+        for parameters in parameter_points:
+            strategy = StrategyRegistry.get(name, **parameters)
+            requested = sorted(strategy.get_feature_request())
+            result = DEFAULT_AUTHORITY.resolve_cell(
+                name,
+                parameters=strategy.get_params(),
+                requested_features=requested,
+                timeframe="M5",
+                include_regime_controller=False,
+                initial_error_bound=100.0,
+                tolerance=0.000005,
+                state_evidence=evidence,
+            )
+            assert result.admissible, (
+                name,
+                parameters,
+                requested,
+                result.reason_codes,
+            )
+            evaluated += 1
+
+    assert evaluated == 2974
+
+
+def test_newly_admitted_dynamic_contracts_match_existing_formula_templates() -> None:
+    ema_periods = (15, 25, 26, 35, 40, 150)
+    rsi_periods = (3, 4)
+
+    for period in ema_periods:
+        name = f"feature:EMA_{period}"
+        contract = DEFAULT_AUTHORITY._contracts[name]
+        resolved = DEFAULT_AUTHORITY.resolve(
+            (name,),
+            timeframe="D1",
+            initial_error_bound=100.0,
+            tolerance=0.000005,
+        )
+        node = next(item for item in resolved.nodes if item.name == name)
+        assert contract.kind == StateKind.RECURSIVE_CONTRACTIVE
+        assert contract.dependencies == ("feature:OHLCV",)
+        assert node.contraction_coefficients == ((period - 1) / (period + 1),)
+
+    for period in rsi_periods:
+        name = f"feature:RSI_{period}"
+        contract = DEFAULT_AUTHORITY._contracts[name]
+        resolved = DEFAULT_AUTHORITY.resolve(
+            (name,),
+            timeframe="D1",
+            initial_error_bound=100.0,
+            tolerance=0.000005,
+        )
+        node = next(item for item in resolved.nodes if item.name == name)
+        assert contract.kind == StateKind.RECURSIVE_CONTRACTIVE
+        assert contract.dependencies == ("feature:OHLCV",)
+        assert contract.finite_rule == FiniteWindowRule(period + 1)
+        assert node.contraction_coefficients == (1.0 - 1.0 / period,)
+
+    for period in ema_periods:
+        assert f"feature:SMA_{period}" not in DEFAULT_AUTHORITY.contract_names
+
+
+def test_exact_eurusd_d1_canary_ema_40_design_is_admissible() -> None:
+    parameters = StrategyRegistry.get("EMACrossoverStrategy").get_default_params()
+    parameters.update(
+        {
+            "fast_period": 13,
+            "slow_period": 40,
+            "sl_atr_mult": 2.5,
+            "tp_atr_mult": 4.0,
+            "use_structural_sl": False,
+        }
+    )
+    strategy = StrategyRegistry.get("EMACrossoverStrategy", **parameters)
+    result = DEFAULT_AUTHORITY.resolve_cell(
+        "EMACrossoverStrategy",
+        parameters=strategy.get_params(),
+        requested_features=sorted(strategy.get_feature_request()),
+        timeframe="D1",
+        include_regime_controller=False,
+        initial_error_bound=100.0,
+        tolerance=0.00001,
+    )
+
+    assert result.admissible, result.reason_codes
+    assert "feature:EMA_40" in result.roots
+
+
 def test_registry_hash_is_deterministic_and_order_independent() -> None:
     contracts = (
         StateContract("b", StateKind.FINITE_WINDOW, finite_rule=FiniteWindowRule(2)),

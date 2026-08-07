@@ -239,6 +239,21 @@ def _derive_pipeline_config(payload: Mapping[str, Any], path: Path) -> PipelineC
     return result
 
 
+def load_effective_pipeline_config(
+    active_config_path: Path,
+) -> tuple[dict[str, Any], PipelineConfig]:
+    """Read one deployment file and reproduce ``pm_main``'s optimizer view.
+
+    Thin production entrants must not reconstruct ``PipelineConfig`` from only
+    the raw ``pipeline`` section.  This keeps storage projection,
+    config-relative paths, PositionConfig TP multipliers, and the exact symbol
+    count used by multiplicity control identical to the full runner.
+    """
+
+    payload, path = _read_config(active_config_path)
+    return payload, _derive_pipeline_config(payload, path)
+
+
 def _verify_context(
     context: authority_spool.GenerationSpoolContext,
     config_sha256: str,
@@ -389,4 +404,5 @@ __all__ = [
     "FrozenProductionPipelineConfig",
     "ProductionConfigBindingError",
     "freeze_production_pipeline_config",
+    "load_effective_pipeline_config",
 ]

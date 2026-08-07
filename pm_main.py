@@ -57,6 +57,9 @@ _MAX_RUNTIME_OBSERVABILITY_RECORDS = 100 * 6 * 4
 _MAX_RUNTIME_OBSERVABILITY_RECORD_BYTES = 64 * 1024
 _MAX_RUNTIME_OBSERVABILITY_FILE_BYTES = 32 * 1024 * 1024
 _DEMO_PREFLIGHT_MAX_MT5_TIMEOUT_MS = 60_000
+_PRODUCTION_NATIVE_AUTHORITY_SCOPE_SCHEMA_VERSION = (
+    "fxpm.production_native_authority_verification_scope.v1"
+)
 
 
 def _stream_sha256(path: Path) -> str:
@@ -1513,6 +1516,14 @@ class LiveTrader:
                 raise ValueError(f"current-refit fallback parsed: {symbol}")
             if not config.regime_configs:
                 raise ValueError(f"current-refit symbol has no selected cells: {symbol}")
+            if (
+                not isinstance(config.valid_until, datetime)
+                or config.valid_until.tzinfo is None
+                or config.valid_until.utcoffset() != timedelta(0)
+            ):
+                raise ValueError(
+                    f"current-refit symbol deadline is not aware UTC: {symbol}"
+                )
             for timeframe, regimes in config.regime_configs.items():
                 if not regimes:
                     raise ValueError(f"current-refit timeframe is empty: {symbol}|{timeframe}")
@@ -1525,6 +1536,15 @@ class LiveTrader:
                         != PROCESS_VALIDATED_CURRENT_REFIT_ROLE
                     ):
                         raise ValueError(f"current-refit cell is not executable: {cell_id}")
+                    if (
+                        not isinstance(cell.valid_until, datetime)
+                        or cell.valid_until.tzinfo is None
+                        or cell.valid_until.utcoffset() != timedelta(0)
+                        or cell.valid_until != config.valid_until
+                    ):
+                        raise ValueError(
+                            f"current-refit cell deadline mismatch: {cell_id}"
+                        )
                     binding = dict((cell.artifact_meta or {}).get("current_refit_binding") or {})
                     if set(binding) != cls._CURRENT_REFIT_BINDING_FIELDS:
                         raise ValueError(f"current-refit binding invalid: {cell_id}")
@@ -2457,7 +2477,7 @@ class LiveTrader:
     @staticmethod
     def _deadline_expired(deadline: Any, *, grace_minutes: int = 0) -> bool:
         if not isinstance(deadline, datetime):
-            return False
+            return True
         probe = datetime.now(timezone.utc)
         value = deadline
         if value.tzinfo is None:
@@ -2543,6 +2563,13 @@ class LiveTrader:
                     continue
                 for regime, cell in regimes.items():
                     if self._deadline_expired(cell.valid_until, grace_minutes=grace):
+                        continue
+                    if cell.valid_until != config.valid_until:
+                        if log := getattr(self, "logger", None):
+                            log.error(
+                                "current-refit cell deadline changed: "
+                                f"{symbol}|{str(timeframe).upper()}|{str(regime).upper()}"
+                            )
                         continue
                     reason = self._current_refit_cell_integrity_reason(
                         symbol, timeframe, regime, cell
@@ -10402,6 +10429,10 @@ class FXPortfolioManagerApp:
             active_symbols=self.symbols,
         )
         self._last_retrain_schedule_notice: str = ""
+        self._last_demo_refit_expiry_notice_state: Optional[
+            Tuple[Tuple[str, ...], Tuple[str, ...]]
+        ] = None
+        self._skip_storage_shutdown_housekeeping = False
 
         self.logger = logging.getLogger(__name__)
 
@@ -10411,8 +10442,22 @@ class FXPortfolioManagerApp:
         self.logger.info("FX PORTFOLIO MANAGER v3.1")
         self.logger.info("=" * 60)
 
+        optimize_only_native = bool(
+            getattr(self.pipeline_config, "_optimization_only_entrypoint", False)
+        ) and (
+            str(getattr(self.pipeline_config, "production_split_mode", "") or "")
+            .strip()
+            .lower()
+            == "calendar_lockbox_v2"
+        )
+        # Production optimization consumes only the frozen native authority.
+        # Avoid an unused terminal connection.
+        if optimize_only_native:
+            self.logger.info(
+                "Optimize-only calendar run: skipping unused MT5 connection"
+            )
         # Check MT5 availability
-        if not MT5_AVAILABLE:
+        elif not MT5_AVAILABLE:
             self.logger.warning("MetaTrader5 package not available")
             self.logger.warning("Running in offline/optimization-only mode")
         else:
@@ -10446,7 +10491,10 @@ class FXPortfolioManagerApp:
 
         return True
 
-    def run_optimization(self, overwrite: bool = False) -> bool:
+    def run_optimization(
+        self,
+        overwrite: bool = False,
+    ) -> bool:
         """
         Run optimization for all symbols with stateful skip/resume support.
 
@@ -10562,7 +10610,12 @@ class FXPortfolioManagerApp:
         optimization_error = None
         try:
             try:
-                results = self.portfolio_manager.initial_optimization(overwrite=overwrite)
+                self.portfolio_manager._supervised_generation_id = (  # noqa: SLF001
+                    getattr(self, "_supervised_generation_id", None)
+                )
+                results = self.portfolio_manager.initial_optimization(
+                    overwrite=overwrite
+                )
             except Exception as exc:
                 optimization_error = exc
         finally:
@@ -10735,6 +10788,86 @@ class FXPortfolioManagerApp:
             self.logger.warning(
                 "Scheduled retraining did not promote a new ledger generation; "
                 "runtime caches and storage completion hooks were left untouched"
+            )
+
+    def _check_demo_refit_expiry_notice(
+        self,
+        *,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Notify once per fixed demo-projection expiry transition.
+
+        This observer never calls a retrain path and never replaces the demo
+        projection.  Entry filtering and open-position management remain the
+        separately enforced responsibilities of ``LiveTrader``.
+        """
+
+        trader = self.trader
+        if trader is None or not bool(
+            getattr(trader, "_is_current_refit_demo", False)
+        ):
+            return
+        projection = getattr(trader, "_current_refit_demo_configs", None)
+        if not isinstance(projection, dict) or not projection:
+            return
+        probe = now or datetime.now(timezone.utc)
+        if probe.tzinfo is None:
+            probe = probe.replace(tzinfo=timezone.utc)
+        else:
+            probe = probe.astimezone(timezone.utc)
+        grace = max(
+            0,
+            int(
+                getattr(
+                    self.pipeline_config,
+                    "live_config_expiry_grace_minutes",
+                    0,
+                )
+                or 0
+            ),
+        )
+        expired: List[str] = []
+        active: List[str] = []
+        for raw_symbol, config in sorted(projection.items()):
+            symbol = str(raw_symbol or "").strip().upper()
+            deadline = getattr(config, "valid_until", None)
+            if isinstance(deadline, datetime):
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                else:
+                    deadline = deadline.astimezone(timezone.utc)
+                is_expired = probe >= deadline + timedelta(minutes=grace)
+            else:
+                is_expired = True
+            (expired if is_expired else active).append(symbol)
+        state = (tuple(expired), tuple(active))
+        if not expired:
+            self._last_demo_refit_expiry_notice_state = None
+            return
+        if state == self._last_demo_refit_expiry_notice_state:
+            return
+        self._last_demo_refit_expiry_notice_state = state
+        command = (
+            "python pm_main.py --config "
+            f"{os.environ.get('PM_CONFIG_PATH', 'config.json')} --optimize"
+        )
+        if active:
+            self.logger.warning(
+                "DEMO_REFIT_PARTIAL_EXPIRY expired_symbols=%s "
+                "active_symbols=%s; expired symbols are blocked from new "
+                "entries while existing positions remain managed. Run `%s`, "
+                "then restart demo forward testing.",
+                ",".join(expired),
+                ",".join(active),
+                command,
+            )
+        else:
+            self.logger.warning(
+                "DEMO_REFIT_ALL_EXPIRED symbols=%s; demo is now "
+                "management-only and cannot add risk. Run `%s`, then restart "
+                "demo forward testing.",
+                ",".join(expired),
+                command,
             )
 
     def _get_active_live_timeframes(self) -> List[str]:
@@ -11038,9 +11171,7 @@ class FXPortfolioManagerApp:
             )
         )
 
-        next_retrain_check_at = (
-            datetime.max if is_current_refit_demo else datetime.now()
-        )
+        next_retrain_check_at = datetime.now()
         next_sweep_at = datetime.now()
         reconnect_state: Dict[str, Any] = {
             "attempts": 0,
@@ -11060,6 +11191,17 @@ class FXPortfolioManagerApp:
         try:
             while not shutdown_event.is_set():
                 now = datetime.now()
+                if is_current_refit_demo and now >= next_retrain_check_at:
+                    # Expiry is wall-clock UTC authority, while reconnect and
+                    # sweep scheduling below intentionally use naive local
+                    # datetimes.  Keep the two clocks explicit, and keep this
+                    # read-only alert live during an ordinary broker outage.
+                    self._check_demo_refit_expiry_notice(
+                        now=datetime.now(timezone.utc)
+                    )
+                    next_retrain_check_at = (
+                        datetime.now() + retrain_check_interval
+                    )
                 if not self.mt5.is_connected():
                     self._attempt_reconnect(reconnect_state, now=now)
                     self._wait_for_next_due(
@@ -11074,7 +11216,10 @@ class FXPortfolioManagerApp:
                 reconnect_state["attempts"] = 0
                 reconnect_state["next_attempt_at"] = now
 
-                if not is_current_refit_demo and now >= next_retrain_check_at:
+                if (
+                    not is_current_refit_demo
+                    and now >= next_retrain_check_at
+                ):
                     self._check_production_retrain_schedule()
                     next_retrain_check_at = datetime.now() + retrain_check_interval
 
@@ -11569,7 +11714,13 @@ class FXPortfolioManagerApp:
                 / f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             )
             self.trader.save_trade_log(str(log_path))
-        if self.storage_manager:
+        if self.storage_manager and not bool(
+            getattr(
+                self,
+                "_skip_storage_shutdown_housekeeping",
+                False,
+            )
+        ):
             self.storage_manager.on_shutdown()
 
         if self.mt5:
@@ -11699,7 +11850,90 @@ def _run_bounded_demo_preflight(
 # =============================================================================
 
 
-def main():
+def _production_native_optimization_scope_errors(stats: Any) -> List[str]:
+    """Return fail-closed CLI errors for the bounded production optimize scope."""
+    if type(stats) is not dict:
+        return ["PRODUCTION_NATIVE_AUTHORITY_SCOPE_STATS_NOT_OBJECT"]
+
+    errors: List[str] = []
+    if stats.get("schema_version") != _PRODUCTION_NATIVE_AUTHORITY_SCOPE_SCHEMA_VERSION:
+        errors.append("PRODUCTION_NATIVE_AUTHORITY_SCOPE_SCHEMA_MISMATCH")
+
+    expected_counts = {
+        "full_verification_count": 1,
+        "identity_revalidation_attempt_count": 13,
+        "identity_revalidation_count": 13,
+        "identity_revalidation_failure_count": 0,
+    }
+    for key, expected in expected_counts.items():
+        actual = stats.get(key)
+        if type(actual) is not int or actual != expected:
+            errors.append(
+                "PRODUCTION_NATIVE_AUTHORITY_SCOPE_COUNT_MISMATCH:"
+                f"{key}:expected={expected}:actual={actual!r}"
+            )
+    if stats.get("closed") is not True:
+        errors.append("PRODUCTION_NATIVE_AUTHORITY_SCOPE_NOT_CLOSED")
+    if stats.get("poisoned") is not False:
+        errors.append("PRODUCTION_NATIVE_AUTHORITY_SCOPE_POISONED")
+    return errors
+
+
+def _log_production_native_authority_scope_stats(
+    logger: logging.Logger,
+    scope: Any,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Log post-close scope statistics without masking an optimizer exception."""
+    try:
+        stats = scope.stats()
+        canonical_stats = json.dumps(
+            stats,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except Exception as exc:
+        error = (
+            "PRODUCTION_NATIVE_AUTHORITY_SCOPE_STATS_UNAVAILABLE:"
+            f"{type(exc).__name__}:{exc}"
+        )
+        logger.error(error)
+        return None, error
+    logger.info(
+        "PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_STATS %s",
+        canonical_stats,
+    )
+    return stats, None
+
+
+def _production_hard_supervision_required(
+    args: Any,
+    pipeline_config: PipelineConfig,
+    *,
+    supervised_generation_id: Optional[str],
+) -> bool:
+    """Return the code-owned optimize-only production supervision decision."""
+
+    return bool(
+        supervised_generation_id is None
+        and bool(getattr(args, "optimize", False))
+        and not bool(getattr(args, "trade", False))
+        and not bool(getattr(args, "paper", False))
+        and not bool(getattr(args, "preflight", False))
+        and not bool(getattr(args, "status", False))
+        and str(
+            getattr(pipeline_config, "production_split_mode", "") or ""
+        ).strip().lower()
+        == "calendar_lockbox_v2"
+    )
+
+
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    _supervised_generation_id: Optional[str] = None,
+):
     """Main entry point."""
     global _app_instance
 
@@ -11780,8 +12014,17 @@ def main():
         ),
     )
 
-    args = parser.parse_args()
-
+    cli_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(cli_argv)
+    supervised_child = _supervised_generation_id is not None
+    if supervised_child and (
+        not args.optimize
+        or args.trade
+        or args.paper
+        or args.preflight
+        or args.status
+    ):
+        raise ValueError("PRODUCTION_SUPERVISOR_CHILD_SCOPE_INVALID")
     # Load runtime configuration before logger setup so config paths remain authoritative.
     resolved_config_path = Path(args.config).resolve()
     config_data = load_config_json(str(resolved_config_path))
@@ -11853,6 +12096,13 @@ def main():
     # research runs remain usable, while a funded entry can never fall back to
     # a mutable ledger status or the legacy review files.
     pipeline_config._funded_live_execution = bool(args.trade and not args.paper)
+    pipeline_config._optimization_only_entrypoint = bool(
+        args.optimize
+        and not args.trade
+        and not args.paper
+        and not args.preflight
+        and not args.status
+    )
     if (
         bool(getattr(pipeline_config, "false_discovery_control_enabled", False))
         and int(getattr(pipeline_config, "false_discovery_symbol_count", 0) or 0) <= 0
@@ -11943,8 +12193,45 @@ def main():
             getattr(pipeline_config, "winner_ledger_path", "pm_configs.json")
         ),
     )
+    _app_instance._supervised_generation_id = (  # noqa: SLF001
+        _supervised_generation_id
+    )
+    hard_supervision_required = _production_hard_supervision_required(
+        args,
+        pipeline_config,
+        supervised_generation_id=_supervised_generation_id,
+    )
+    _app_instance._skip_storage_shutdown_housekeeping = bool(  # noqa: SLF001
+        hard_supervision_required
+    )
+    production_run_lease_context = None
+    production_run_lease = None
+    production_supervised_ledger_path = None
 
     try:
+        if hard_supervision_required:
+            from pm_production_generation_entrypoint import (
+                production_optimization_run_lease,
+            )
+
+            production_supervised_ledger_path = Path(
+                _app_instance.config_file
+            )
+            if not production_supervised_ledger_path.is_absolute():
+                production_supervised_ledger_path = (
+                    Path.cwd() / production_supervised_ledger_path
+                )
+            production_supervised_ledger_path = (
+                production_supervised_ledger_path.resolve()
+            )
+            production_run_lease_context = (
+                production_optimization_run_lease(
+                    production_supervised_ledger_path
+                )
+            )
+            production_run_lease = (
+                production_run_lease_context.__enter__()
+            )
         # Initialize
         if not _app_instance.initialize():
             logger.error("Initialization failed")
@@ -11985,7 +12272,114 @@ def main():
 
         # Run optimization
         if args.optimize:
-            if not _app_instance.run_optimization(overwrite=args.overwrite):
+            production_native_optimization = (
+                str(getattr(pipeline_config, "production_split_mode", "") or "")
+                .strip()
+                .lower()
+                == "calendar_lockbox_v2"
+            )
+            if hard_supervision_required:
+                from pm_production_generation_entrypoint import (
+                    run_supervised_optimization_cli,
+                )
+
+                supervised = run_supervised_optimization_cli(
+                    argv=cli_argv,
+                    active_config_path=resolved_config_path,
+                    winner_ledger_path=(
+                        production_supervised_ledger_path
+                    ),
+                    recovery_callback=lambda generation_id: (
+                        _app_instance.portfolio_manager
+                        ._recover_abandoned_supervised_generation(  # noqa: SLF001
+                            generation_id,
+                            lock_timeout_seconds=0.0,
+                        )
+                    ),
+                    run_lease=production_run_lease,
+                )
+                if supervised.succeeded:
+                    logger.info(
+                        "Production optimization completed inside hard "
+                        "process-tree supervisor generation=%s recovery=%s "
+                        "prior_recovery=%s",
+                        supervised.generation_id,
+                        supervised.generation_recovery_status,
+                        supervised.stale_recovery_status,
+                    )
+                    return 0
+                if supervised.safe_to_reconcile:
+                    logger.warning(
+                        "Supervised production optimization failed "
+                        "generation=%s status=%s cli_exit=%s recovery=%s "
+                        "prior_recovery=%s",
+                        supervised.generation_id,
+                        supervised.supervisor.status,
+                        supervised.cli_exit_code,
+                        supervised.generation_recovery_status,
+                        supervised.stale_recovery_status,
+                    )
+                else:
+                    logger.error(
+                        "Supervised production process tree could not be "
+                        "proven empty; promotion reconciliation was not "
+                        "attempted generation=%s retained_request=%s "
+                        "result=%s",
+                        supervised.generation_id,
+                        supervised.request_directory_retained,
+                        supervised.supervisor.result_path,
+                    )
+                if (
+                    supervised.supervisor.succeeded
+                    and supervised.cli_exit_code in {1, 2}
+                ):
+                    return int(supervised.cli_exit_code)
+                return 2
+            optimization_succeeded = False
+            if production_native_optimization:
+                from pm_native_activation import (
+                    production_native_authority_verification_scope,
+                )
+
+                authority_scope = None
+                authority_stats = None
+                authority_stats_error = None
+                try:
+                    with (
+                        production_native_authority_verification_scope() as authority_scope
+                    ):
+                        optimization_succeeded = _app_instance.run_optimization(
+                            overwrite=args.overwrite,
+                        )
+                finally:
+                    if authority_scope is not None:
+                        authority_stats, authority_stats_error = (
+                            _log_production_native_authority_scope_stats(
+                                logger,
+                                authority_scope,
+                            )
+                        )
+                if optimization_succeeded:
+                    authority_errors = (
+                        [authority_stats_error]
+                        if authority_stats_error is not None
+                        else _production_native_optimization_scope_errors(
+                            authority_stats
+                        )
+                    )
+                    if authority_errors:
+                        logger.error(
+                            "PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_"
+                            "CONTRACT_REJECTED %s",
+                            ",".join(authority_errors),
+                        )
+                        optimization_succeeded = False
+            else:
+                optimization_succeeded = _app_instance.run_optimization(
+                    overwrite=args.overwrite,
+                )
+
+            if not optimization_succeeded:
                 logger.error(
                     "Optimization generation did not complete and promote; "
                     "refusing a success exit status or subsequent trading startup"
@@ -12076,8 +12470,16 @@ def main():
         logger.exception(f"Application error: {e}")
         return 1
     finally:
-        if _app_instance:
-            _app_instance.shutdown()
+        try:
+            if _app_instance:
+                _app_instance.shutdown()
+        finally:
+            if production_run_lease_context is not None:
+                production_run_lease_context.__exit__(
+                    None,
+                    None,
+                    None,
+                )
 
 
 if __name__ == "__main__":

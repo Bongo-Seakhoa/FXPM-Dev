@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import copy
 import csv
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
 import struct
 
+import pandas as pd
 import pytest
 
 import pm_authority_spool as spool
+import pm_authoritative_search_execution as search_execution
 import pm_book_multiplicity as book
 import pm_causal_process as causal
 import pm_current_refit_artifacts as current_refit
@@ -19,7 +21,8 @@ import pm_historical_anchor_orchestration as orchestration
 import pm_historical_production_adapter as adapter
 import pm_native_prefix_production as native_prefix
 import pm_training_horizon as training_horizon
-from pm_core import Backtester, InstrumentSpec
+from pm_core import Backtester, InstrumentSpec, PipelineConfig
+from pm_native_activation import ActiveNativeResolution
 from pm_native_request_contract import PRODUCTION_ARTIFACT_COLUMNS, TIMEFRAME_SECONDS
 from pm_strategies import StrategyRegistry
 from pm_trade_power import (
@@ -65,8 +68,431 @@ def test_precommitted_evidence_roles_come_only_from_horizon_status() -> None:
         adapter.HistoricalProductionAdapterError,
         match="PRECOMMITTED_EVIDENCE_ROLE_ROSTER_INVALID",
     ):
-        adapter._precommitted_evidence_roles(
-            {"attempts": [{"status": "PLANNED"}]}, 2
+        adapter._precommitted_evidence_roles({"attempts": [{"status": "PLANNED"}]}, 2)
+
+
+def _state_context_admission_inputs(
+    *,
+    candidate_boundary_limited: bool = False,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    registry_order = ["StrategyA", "StrategyB", "StrategyC"]
+    attempt_policy = {
+        "one_full_default_per_strategy": True,
+        "default_attempt_count": 3,
+        "additional_nondefault_attempt_count": 1,
+        "attempt_count_per_observed_cell": 4,
+    }
+    semantics = {
+        "registry_order": registry_order,
+        "registry_order_sha256": _sha(registry_order),
+        "strategy_domain_count": len(registry_order),
+        "attempt_policy": attempt_policy,
+    }
+    process = {
+        "schema_version": "test-production-search-process",
+        "semantics": semantics,
+        "process_semantics_sha256": _sha(semantics),
+    }
+    process_sha256 = _sha(process)
+    candidate = {
+        "candidate_id": "candidate-1",
+        "candidate_definition_sha256": "c" * 64,
+        "folds": [] if candidate_boundary_limited else [{"fold_id": "fold-1"}],
+    }
+    selected_context = 5
+    strategy_ids = ["StrategyA", "StrategyB", "StrategyC", "StrategyA"]
+    required_contexts = [3, 4, 7, 6]
+    trials = []
+    trial_registry = []
+    attempts = []
+    disposition_hashes = []
+    for ordinal, (strategy_id, required_context) in enumerate(
+        zip(strategy_ids, required_contexts, strict=True)
+    ):
+        admitted = required_context <= selected_context
+        disposition_body = {
+            "schema_version": "fxpm.production-trial-state-context-disposition.v1",
+            "candidate_id": candidate["candidate_id"],
+            "candidate_definition_sha256": candidate["candidate_definition_sha256"],
+            "state_requirement_sha256": _sha({"requirement": ordinal}),
+            "required_context_bars": required_context,
+            "selected_context_bars": selected_context,
+            "status": "PLANNED" if admitted else "PROCESS_REJECTED",
+            "reason_code": (
+                None if admitted else "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+            ),
+        }
+        disposition = {
+            **disposition_body,
+            "disposition_sha256": _sha(disposition_body),
+        }
+        disposition_hashes.append(disposition["disposition_sha256"])
+        trial_id = f"trial-{ordinal}"
+        strategy_release_sha256 = _sha({"strategy_release": strategy_id})
+        parameter_set_sha256 = _sha({"parameters": ordinal})
+        trial_definition_sha256 = _sha({"trial_definition": ordinal})
+        trials.append(
+            {
+                "trial_id": trial_id,
+                "strategy_id": strategy_id,
+                "strategy_release_sha256": strategy_release_sha256,
+                "parameter_set_sha256": parameter_set_sha256,
+                "trial_definition_sha256": trial_definition_sha256,
+                "state_context_disposition": disposition,
+            }
+        )
+        trial_registry.append(
+            {
+                "trial_id": trial_id,
+                "strategy_id": strategy_id,
+                "strategy_release_sha256": strategy_release_sha256,
+                "parameter_set_sha256": parameter_set_sha256,
+                "trial_definition_sha256": trial_definition_sha256,
+                "state_context_disposition_sha256": disposition["disposition_sha256"],
+            }
+        )
+        if candidate_boundary_limited:
+            execution_status = "PROCESS_REJECTED"
+            execution_reason = "SOURCE_BOUNDARY_SHORTFALL"
+        else:
+            execution_status = disposition["status"]
+            execution_reason = disposition["reason_code"]
+        attempts.append(
+            {
+                "attempt_id": _sha({"attempt": ordinal}),
+                "trial_id": trial_id,
+                "trial_definition_sha256": trial_definition_sha256,
+                "strategy_id": strategy_id,
+                "strategy_release_sha256": strategy_release_sha256,
+                "parameter_set_sha256": parameter_set_sha256,
+                "candidate_id": candidate["candidate_id"],
+                "candidate_definition_sha256": candidate["candidate_definition_sha256"],
+                "state_context_disposition_sha256": disposition["disposition_sha256"],
+                "status": execution_status,
+                "reason_code": execution_reason,
+            }
+        )
+    selection_body = {
+        "schema_version": "fxpm.production-cell-state-context-selection.v1",
+        "selection_rule": (
+            "LARGEST_SOURCE_GEOMETRY_FEASIBLE_COMMON_CONTEXT_DESCENDING"
+        ),
+        "selected_common_context_bars": selected_context,
+        "candidate_boundary_limited": candidate_boundary_limited,
+        "required_context_roster_sha256": _sha(required_contexts),
+        "disposition_sha256": disposition_hashes,
+        "disposition_roster_sha256": _sha(disposition_hashes),
+        "within_selected_context_count": 2,
+        "exceeds_selected_context_count": 2,
+    }
+    selection = {
+        **selection_body,
+        "receipt_sha256": _sha(selection_body),
+    }
+    cell_identity = {
+        "symbol": "EURUSD",
+        "timeframe": "D1",
+        "regime": "TREND",
+    }
+    horizon = {
+        "cell": cell_identity,
+        "candidates": [candidate],
+        "trials": trials,
+        "trial_registry": trial_registry,
+        "trial_registry_sha256": _sha(trial_registry),
+        "attempts": attempts,
+        "attempt_roster_sha256": _sha(attempts),
+        "plan_status": (
+            "HISTORICAL_BOUNDARY_LIMITED"
+            if candidate_boundary_limited
+            else "READY_FOR_HISTORICAL_EVIDENCE"
+        ),
+    }
+    horizon_receipt_sha256 = _sha(horizon)
+    cell_body = {
+        "schema_version": "fxpm.production-search-cell-plan-receipt.v1",
+        "mode": "BOUNDED_RAW_WINNER_CANARY",
+        "search_process_receipt_sha256": process_sha256,
+        "attempt_count": len(attempts),
+        "cell": cell_identity,
+        "boundary_limited": candidate_boundary_limited,
+        "dependency_payload": {"feature_lookback_bars": selected_context},
+        "state_context_selection": selection,
+        "horizon_plan_binding": {
+            "cell": cell_identity,
+            "plan_receipt_sha256": horizon_receipt_sha256,
+            "trial_registry_sha256": horizon["trial_registry_sha256"],
+            "attempt_roster_sha256": horizon["attempt_roster_sha256"],
+        },
+    }
+    cell_receipt = {**cell_body, "receipt_sha256": _sha(cell_body)}
+    return process, cell_receipt, horizon
+
+
+def test_canary_state_context_admission_reports_defaults_and_variants() -> None:
+    process, cell_receipt, horizon = _state_context_admission_inputs()
+
+    summary = adapter._build_canary_state_context_admission_summary(
+        process_body=process,
+        cell_receipt=cell_receipt,
+        horizon_plan_body=horizon,
+    )
+
+    assert summary["attempt_count_exact"] == 4
+    assert summary["state_context_admitted_attempt_count"] == 2
+    assert summary["state_context_shortfall_attempt_count"] == 2
+    assert summary["registry_default_strategy_count_exact"] == 3
+    assert summary["registry_default_state_context_admitted_count"] == 2
+    assert summary["registry_default_state_context_shortfall_count"] == 1
+    assert summary["strategy_with_any_state_context_admitted_count"] == 2
+    assert summary["strategy_fully_state_context_admitted_count"] == 1
+    assert summary["strategy_partially_state_context_admitted_count"] == 1
+    assert summary["strategy_fully_state_context_shortfall_count"] == 1
+    assert (
+        adapter._verified_canary_state_context_admission_summary(
+            summary,
+            cell_receipt=cell_receipt,
+        )
+        == summary
+    )
+
+
+def test_canary_state_context_admission_rejects_coherent_status_swap() -> None:
+    process, cell_receipt, horizon = _state_context_admission_inputs()
+    summary = adapter._build_canary_state_context_admission_summary(
+        process_body=process,
+        cell_receipt=cell_receipt,
+        horizon_plan_body=horizon,
+    )
+    tampered = copy.deepcopy(summary)
+    for ordinal, state_status, execution_status, execution_reason in (
+        (
+            1,
+            "PROCESS_REJECTED",
+            "PROCESS_REJECTED",
+            "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL",
+        ),
+        (3, "PLANNED", "PLANNED", None),
+    ):
+        row = tampered["attempt_classification_roster"][ordinal]
+        row["state_context_status"] = state_status
+        row["execution_status"] = execution_status
+        row["execution_reason_code"] = execution_reason
+    tampered["registry_default_state_context_admitted_count"] = 1
+    tampered["registry_default_state_context_shortfall_count"] = 2
+    tampered["strategy_with_any_state_context_admitted_count"] = 1
+    tampered["strategy_fully_state_context_admitted_count"] = 1
+    tampered["strategy_partially_state_context_admitted_count"] = 0
+    tampered["strategy_fully_state_context_shortfall_count"] = 2
+    tampered["attempt_classification_roster_sha256"] = _sha(
+        tampered["attempt_classification_roster"]
+    )
+    tampered_body = dict(tampered)
+    tampered_body.pop("receipt_sha256")
+    tampered["receipt_sha256"] = _sha(tampered_body)
+
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="CANARY_STATE_CONTEXT_CLASSIFICATION_CHANGED",
+    ):
+        adapter._verified_canary_state_context_admission_summary(
+            tampered,
+            cell_receipt=cell_receipt,
+        )
+
+
+def test_canary_state_context_admission_rejects_coherent_variant_owner_swap() -> None:
+    process, cell_receipt, horizon = _state_context_admission_inputs()
+    summary = adapter._build_canary_state_context_admission_summary(
+        process_body=process,
+        cell_receipt=cell_receipt,
+        horizon_plan_body=horizon,
+    )
+    tampered = copy.deepcopy(summary)
+    tampered["horizon_trial_registry"][3]["strategy_id"] = "StrategyB"
+    tampered["horizon_attempt_roster"][3]["strategy_id"] = "StrategyB"
+    tampered["attempt_classification_roster"][3]["strategy_id"] = "StrategyB"
+    tampered["horizon_trial_registry_sha256"] = _sha(tampered["horizon_trial_registry"])
+    tampered["horizon_attempt_roster_sha256"] = _sha(tampered["horizon_attempt_roster"])
+    tampered["attempt_classification_roster_sha256"] = _sha(
+        tampered["attempt_classification_roster"]
+    )
+    tampered_body = dict(tampered)
+    tampered_body.pop("receipt_sha256")
+    tampered["receipt_sha256"] = _sha(tampered_body)
+
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="CANARY_STATE_CONTEXT_ADMISSION_BINDING_INVALID",
+    ):
+        adapter._verified_canary_state_context_admission_summary(
+            tampered,
+            cell_receipt=cell_receipt,
+        )
+
+
+def test_canary_state_context_admission_keeps_source_boundary_separate() -> None:
+    process, cell_receipt, horizon = _state_context_admission_inputs(
+        candidate_boundary_limited=True
+    )
+
+    summary = adapter._build_canary_state_context_admission_summary(
+        process_body=process,
+        cell_receipt=cell_receipt,
+        horizon_plan_body=horizon,
+    )
+
+    assert summary["state_context_admitted_attempt_count"] == 2
+    assert summary["state_context_shortfall_attempt_count"] == 2
+    assert summary["execution_planned_attempt_count"] == 0
+    assert summary["execution_state_context_rejected_attempt_count"] == 0
+    assert summary["execution_source_boundary_rejected_attempt_count"] == 4
+    assert (
+        adapter._verified_canary_state_context_admission_summary(
+            summary,
+            cell_receipt=cell_receipt,
+        )
+        == summary
+    )
+
+
+def _canary_failure_body(*, schema_version: str) -> dict[str, object]:
+    body: dict[str, object] = {
+        "schema_version": schema_version,
+        "authority_scope": orchestration.BOUNDED_RAW_WINNER_CANARY_SCOPE,
+        "request_sha256": "1" * 64,
+        "anchor_id": "canary-anchor",
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "regime": "TREND",
+        "failure_code": "FROZEN_PATH_COST_STRESS_FAILED",
+        "attempted_trials_exact": 128,
+        "frozen_receipt_sha256": "2" * 64,
+        "search_outcome": None,
+        "economic_no_trade_or_no_winner": False,
+        "downstream_authority": False,
+    }
+    if schema_version == adapter.BOUNDED_RAW_WINNER_CANARY_FAILURE_SCHEMA:
+        body.update(
+            {
+                "exception_type": "FrozenPathCostStressError",
+                "failure_details": [
+                    "STRESS_NOT_NUMERICALLY_ADVERSE",
+                    "stress_p95",
+                    (
+                        "genuine SpreadP90/SpreadP95/SpreadMax evidence or an "
+                        "independently preregistered numerical stress is required"
+                    ),
+                ],
+                "attempt_ordinal": 0,
+                "fold_ordinal": 0,
+            }
+        )
+    return body
+
+
+def _verify_canary_failure_body(body: dict[str, object]) -> dict[str, object]:
+    return adapter._verified_canary_failure_body(
+        body,
+        request_sha256="1" * 64,
+        anchor_id="canary-anchor",
+        symbol="EURUSD",
+        timeframe="H1",
+        regime="TREND",
+        failure_code="FROZEN_PATH_COST_STRESS_FAILED",
+        attempted_trials_exact=128,
+        frozen_receipt_sha256="2" * 64,
+    )
+
+
+def test_canary_failure_v2_seals_exact_bounded_diagnostic() -> None:
+    body = _canary_failure_body(
+        schema_version=adapter.BOUNDED_RAW_WINNER_CANARY_FAILURE_SCHEMA
+    )
+
+    reopened = _verify_canary_failure_body(body)
+
+    assert reopened == body
+    assert reopened["exception_type"] == "FrozenPathCostStressError"
+    assert reopened["attempt_ordinal"] == 0
+    assert reopened["fold_ordinal"] == 0
+    assert reopened["failure_details"] == body["failure_details"]
+
+    with_extra_field = {**body, "unsealed_diagnostic": "forged"}
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="CANARY_TECHNICAL_FAILURE_FIELDS_INVALID",
+    ):
+        _verify_canary_failure_body(with_extra_field)
+
+
+def test_canary_failure_v1_artifact_remains_verifiable() -> None:
+    body = _canary_failure_body(
+        schema_version="fxpm.bounded-raw-winner-canary-failure.v1"
+    )
+
+    assert _verify_canary_failure_body(body) == body
+
+    with_v2_field = {**body, "exception_type": "CoherentReseal"}
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="CANARY_TECHNICAL_FAILURE_FIELDS_INVALID",
+    ):
+        _verify_canary_failure_body(with_v2_field)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_code"),
+    [
+        (
+            {
+                "failure_details": ["detail"]
+                * (adapter.BOUNDED_RAW_WINNER_CANARY_FAILURE_DETAIL_LIMIT + 1)
+            },
+            "CANARY_FAILURE_DETAILS_INVALID",
+        ),
+        (
+            {
+                "failure_details": [
+                    "x" * (adapter.BOUNDED_RAW_WINNER_CANARY_FAILURE_DETAIL_BYTES + 1)
+                ]
+            },
+            "CANARY_FAILURE_DETAILS_INVALID",
+        ),
+        (
+            {
+                "exception_type": "X"
+                * (adapter.BOUNDED_RAW_WINNER_CANARY_EXCEPTION_TYPE_BYTES + 1)
+            },
+            "CANARY_FAILURE_EXCEPTION_TYPE_INVALID",
+        ),
+        ({"attempt_ordinal": 128}, "CANARY_FAILURE_ATTEMPT_ORDINAL_INVALID"),
+        (
+            {"attempt_ordinal": None, "fold_ordinal": 0},
+            "CANARY_FAILURE_FOLD_ORDINAL_INVALID",
+        ),
+        (
+            {"attempt_ordinal": 0, "fold_ordinal": 12},
+            "CANARY_FAILURE_FOLD_ORDINAL_INVALID",
+        ),
+    ],
+)
+def test_canary_failure_diagnostic_rejects_unbounded_or_unbound_values(
+    overrides: dict[str, object],
+    expected_code: str,
+) -> None:
+    diagnostic = {
+        "exception_type": "FrozenPathCostStressError",
+        "failure_details": ["STRESS_NOT_NUMERICALLY_ADVERSE"],
+        "attempt_ordinal": 0,
+        "fold_ordinal": 0,
+        **overrides,
+    }
+
+    with pytest.raises(adapter.HistoricalProductionAdapterError, match=expected_code):
+        adapter._bounded_canary_failure_diagnostic(
+            **diagnostic,
+            attempted_trials_exact=128,
         )
 
 
@@ -317,6 +743,108 @@ def _terminal_authority(anchor_id, symbol, timeframe):
     return source, fit
 
 
+def _terminal_technical_authority(product):
+    return search_execution.fit_terminal_native_timeframe(
+        product=product,
+        config=PipelineConfig(),
+    )
+
+
+def _terminal_technical_plans(
+    anchor,
+    symbol,
+    timeframe,
+    *,
+    native_product,
+    activation_id=None,
+):
+    plans = []
+    for regime in book.REGIME_ORDER:
+        request = horizon_fixture._terminal_source_request("TECHNICAL_TERMINAL")
+        request["run_id"] = "historical-run-001"
+        request["anchor"] = {
+            "anchor_id": anchor["anchor_id"],
+            "ordinal": int(anchor["anchor_id"].rsplit("-", 1)[-1]),
+            "selection_cutoff_utc": anchor["selection_cutoff_utc"],
+            "forward_start_utc": f"{anchor['forward_start_date']}T00:00:00Z",
+            "forward_end_exclusive_utc": (f"{anchor['forward_end_date']}T00:00:00Z"),
+            "evidence_accessed_at_utc": "2026-07-13T12:00:00Z",
+            "process_precommit_receipt_sha256": PROCESS_PRECOMMIT,
+        }
+        request["cell"] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "regime": regime,
+        }
+        request["native_prefix"] = dict(native_product.native_prefix)
+        if activation_id is not None:
+            request["native_prefix"]["activation_id"] = activation_id
+        plans.append(training_horizon.build_historical_horizon_plan(request))
+    return plans
+
+
+def _genuine_terminal_technical_products(
+    tmp_path,
+    context,
+    anchor,
+    symbol,
+    monkeypatch,
+):
+    data_dir = (tmp_path / "terminal-native-data").resolve()
+    manifest_path = data_dir / "native" / "activations" / "terminal.json"
+    manifest_path.parent.mkdir(parents=True)
+    entries = {
+        timeframe: {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "status": "technical_error",
+            "source_provenance_sha256": _sha(f"terminal:{timeframe}:provenance"),
+        }
+        for timeframe in book.TIMEFRAME_ORDER
+    }
+    manifest = {
+        "activation_id": "terminal-activation-genuine",
+        "entries": {symbol: entries},
+        "run_manifest_relative_path": "runs/terminal/run_manifest.json",
+        "run_manifest_sha256": _sha("terminal-run-manifest"),
+    }
+    manifest_path.write_bytes(_canonical(manifest))
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    def terminal_resolution(_data_dir, requested_symbol, timeframe, **_kwargs):
+        assert requested_symbol == symbol
+        assert timeframe in book.TIMEFRAME_ORDER
+        return ActiveNativeResolution(
+            symbol=requested_symbol,
+            timeframe=timeframe,
+            activation_id=manifest["activation_id"],
+            activation_manifest_path=manifest_path,
+            activation_manifest_sha256=manifest_sha256,
+            errors=["NATIVE_ACTIVE_CELL_TERMINAL_TECHNICAL"],
+        )
+
+    monkeypatch.setattr(
+        native_prefix,
+        "resolve_active_native_artifact",
+        terminal_resolution,
+    )
+    products = {}
+    for timeframe in book.TIMEFRAME_ORDER:
+        product = native_prefix.produce_activated_native_prefix(
+            data_dir=data_dir,
+            context=context,
+            symbol=symbol,
+            timeframe=timeframe,
+            cutoff_utc=anchor["selection_cutoff_utc"],
+            source_accessed_at_utc="2026-07-13T12:00:00Z",
+            production_contract_required=False,
+        )
+        assert product.source_state == native_prefix.TECHNICAL_TERMINAL
+        assert product._data_dir == data_dir
+        products[timeframe] = product
+    return products
+
+
 def _request(context, anchor, *, bind_sinks=True):
     body = {
         "schema_version": orchestration.PRODUCER_REQUEST_SCHEMA,
@@ -378,6 +906,25 @@ def _bind_terminal_symbol(capture, anchor):
             ),
             source_group_decision=source,
             regime_fit_decision=fit,
+        )
+
+
+def _bind_terminal_technical_symbol(capture, anchor, products):
+    for timeframe in book.TIMEFRAME_ORDER:
+        native_product = products[timeframe]
+        plans = _terminal_technical_plans(
+            anchor,
+            capture.symbol,
+            timeframe,
+            native_product=native_product,
+        )
+        authority = _terminal_technical_authority(native_product)
+        capture.bind_timeframe(
+            timeframe,
+            horizon_plans=plans,
+            source_group_decision=authority.source_group_decision,
+            regime_fit_decision=authority.regime_fit_decision,
+            terminal_native_timeframe=authority,
         )
 
 
@@ -553,6 +1100,16 @@ def _bind_single_observed_capture(
         )
 
 
+def _finish_through_worker_bridge(context, anchor, capture):
+    descriptor = adapter.spool_historical_symbol_worker_bundle(capture)
+    parent_request = _request(context, anchor)
+    return adapter.reopen_historical_symbol_worker_bundle(
+        context,
+        parent_request,
+        descriptor,
+    )
+
+
 TEST_INSTRUMENT_SPEC = InstrumentSpec(
     symbol=book.PINNED_SYMBOL_ORDER[0],
     pip_position=4,
@@ -701,7 +1258,15 @@ def _partition_cost_attestation(policy_seed, namespace):
     )
 
 
-def _result(start, end, namespace, *, cost=BASE_COST, values=None):
+def _result(
+    start,
+    end,
+    namespace,
+    *,
+    cost=BASE_COST,
+    cost_namespace=None,
+    values=None,
+):
     events = _events(start, namespace, values)
     surface = raw_winner.build_flat_daily_r_surface(
         events,
@@ -732,7 +1297,7 @@ def _result(start, end, namespace, *, cost=BASE_COST, values=None):
             "swap_accrual": "causal_swap_accrual_v1",
         },
         "numerical_execution_cost_attestation": _partition_cost_attestation(
-            cost, namespace
+            cost, namespace if cost_namespace is None else cost_namespace
         ),
         "swap_accrual_contract": _swap(f"{namespace}:projection"),
     }
@@ -744,17 +1309,45 @@ def _attempt_artifact(
     regime="TREND",
     *,
     native_prefix_product,
-    lookback_kind="ACTIVE_SESSIONS",
-    lookback_value=50,
+    lookback_kind="CALENDAR_INTERVAL",
+    lookback_value=120,
+    fit_start_utc=None,
     declared_source_bar_count=None,
 ):
     strategy_id = "EMACrossoverStrategy"
     prefix = native_prefix_product.native_prefix
+    frame = native_prefix.open_verified_prefix_frame(native_prefix_product)
+    opens = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="coerce"))
+    closes = pd.DatetimeIndex(
+        pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+    )
+    expected_start, expected_count = search_execution._realize_cutoff_refit_window(
+        opens=opens,
+        closes=closes,
+        fit_end=pd.Timestamp(prefix["prefix_end_exclusive_utc"]),
+        lookback_kind=lookback_kind,
+        lookback_value=lookback_value,
+        state_context_bars=0,
+        boundary_limited=True,
+    )
+    artifact_start = (
+        expected_start
+        if fit_start_utc is None
+        else pd.Timestamp(fit_start_utc).tz_convert("UTC")
+    )
+    artifact_count = int(
+        (
+            (opens >= artifact_start)
+            & (opens < pd.Timestamp(prefix["prefix_end_exclusive_utc"]))
+            & (closes <= pd.Timestamp(prefix["prefix_end_exclusive_utc"]))
+        ).sum()
+    )
     source_bar_count = (
-        int(prefix["prefix_rows"])
+        artifact_count
         if declared_source_bar_count is None
         else declared_source_bar_count
     )
+    assert expected_count >= 2
     artifacts = current_refit.build_current_refit_search_artifacts_v2(
         symbol=symbol,
         timeframe=timeframe,
@@ -763,7 +1356,7 @@ def _attempt_artifact(
         parameters=StrategyRegistry.get(strategy_id).get_params(),
         lookback_kind=lookback_kind,
         lookback_value=lookback_value,
-        fit_start_utc=prefix["prefix_start_utc"],
+        fit_start_utc=artifact_start.isoformat(),
         fit_end_utc=prefix["prefix_end_exclusive_utc"],
         latest_closed_bar_utc=prefix["prefix_last_close_utc"],
         source_snapshot_sha256=prefix["prefix_content_sha256"],
@@ -810,7 +1403,9 @@ def _real_horizon_plan(
     candidates = []
     for artifact in artifact_roster:
         horizon_process = artifact["horizon_process"]
-        fit_start_utc = horizon_process["fit_start_utc"].replace("+00:00", "Z")
+        discovery_start_utc = native_prefix_product.native_prefix[
+            "prefix_start_utc"
+        ].replace("+00:00", "Z")
         folds = []
         for ordinal, planned in enumerate(() if boundary_limited else fold_plan):
             validation_start = date.fromisoformat(planned["oos_start_date_utc"])
@@ -821,7 +1416,7 @@ def _real_horizon_plan(
             value = horizon_fixture._fold(
                 f"ROLL-{ordinal + 1:03d}",
                 "CAUSAL_ROLLING_ORIGIN_INNER",
-                fit_start_utc,
+                discovery_start_utc,
                 f"{fit_end.isoformat()}T00:00:00Z",
                 f"{(validation_start - timedelta(days=5)).isoformat()}T00:00:00Z",
                 f"{validation_start.isoformat()}T00:00:00Z",
@@ -832,11 +1427,11 @@ def _real_horizon_plan(
             value.pop("fold_definition_sha256")
             value["fold_definition_sha256"] = _sha(value)
             folds.append(value)
-        realized_start_utc = fit_start_utc
+        realized_start_utc = discovery_start_utc
         if boundary_limited:
             realized_start_utc = (
                 (
-                    datetime.fromisoformat(fit_start_utc.replace("Z", "+00:00"))
+                    datetime.fromisoformat(discovery_start_utc.replace("Z", "+00:00"))
                     - timedelta(days=1)
                 )
                 .isoformat(timespec="seconds")
@@ -944,6 +1539,72 @@ def _fold_plan():
     ]
 
 
+def _cost_stress_adversity_plan(
+    *,
+    horizon_plan,
+    fold_plan,
+    symbol: str = "EURUSD",
+    timeframe: str = OBSERVED_TIMEFRAME,
+    regime: str = "TREND",
+):
+    folds, _latest = raw_winner._normalize_fold_plan(
+        fold_plan,
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=regime,
+    )
+    horizon_attempts = horizon_plan.to_dict()["attempts"]
+    fold_receipts = []
+    for fold_ordinal, planned in enumerate(fold_plan):
+        lanes = _raw_fold(fold_ordinal, planned)["lanes"]
+        geometry = _partition_geometry(fold_ordinal, lanes)
+        base_cost = lanes["final_lockbox_base"]["numerical_execution_cost_attestation"]
+        stress_cost = lanes["final_lockbox_stress"][
+            "numerical_execution_cost_attestation"
+        ]
+        fold_receipts.append((geometry[2], base_cost, stress_cost))
+    rows = [
+        {
+            "attempt_ordinal": attempt_ordinal,
+            "horizon_attempt_id": horizon_attempts[attempt_ordinal]["attempt_id"],
+            "fold_ordinal": fold["fold_ordinal"],
+            "fold_id": fold["fold_id"],
+            "final_partition_geometry_receipt_sha256": fold_receipts[
+                fold["fold_ordinal"]
+            ][0]["receipt_sha256"],
+            "final_partition_frame_sha256": fold_receipts[fold["fold_ordinal"]][0][
+                "frame_sha256"
+            ],
+            "base_cost_attestation_sha256": fold_receipts[fold["fold_ordinal"]][1][
+                "attestation_sha256"
+            ],
+            "stress_cost_attestation_sha256": fold_receipts[fold["fold_ordinal"]][2][
+                "attestation_sha256"
+            ],
+            "base_spread_values_sha256": fold_receipts[fold["fold_ordinal"]][1][
+                "spread_values_sha256"
+            ],
+            "stress_spread_values_sha256": fold_receipts[fold["fold_ordinal"]][2][
+                "spread_values_sha256"
+            ],
+            "expected_adversity_status": (
+                raw_winner.COST_STRESS_ADVERSITY_EXPECTED_STRICT
+            ),
+        }
+        for attempt_ordinal in range(len(horizon_attempts))
+        for fold in folds
+    ]
+    return {
+        "schema_version": raw_winner.COST_STRESS_ADVERSITY_PLAN_SCHEMA,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "regime": regime,
+        "row_count": len(rows),
+        "rows_sha256": _sha(rows),
+        "rows": rows,
+    }
+
+
 def _provenance_receipt(role, common, **specific):
     body = {
         "schema_version": "fxpm.authoritative-search-provenance.v1",
@@ -1023,6 +1684,7 @@ def _raw_fold(fold_ordinal, planned, handle=None):
         final_end,
         f"{prefix}:final",
         cost=STRESS_COST,
+        cost_namespace=f"{prefix}:final:stress",
         values=stress_values,
     )
     lanes = {
@@ -1074,7 +1736,7 @@ def _raw_fold(fold_ordinal, planned, handle=None):
             "confers_final_oos_or_trading_authority": False,
         }
         stress_body = {
-            "schema_version": "fxpm.backtester-frozen-path-cost-stress.v1",
+            "schema_version": raw_winner.FROZEN_PATH_COST_STRESS_SCHEMA,
             "symbol": frozen.symbol,
             "timeframe": frozen.timeframe,
             "strategy_name": artifacts["winner_process"]["strategy_id"],
@@ -1090,6 +1752,12 @@ def _raw_fold(fold_ordinal, planned, handle=None):
             "stress_cost_attestation_sha256": stress[
                 "numerical_execution_cost_attestation"
             ]["attestation_sha256"],
+            "base_spread_values_sha256": final["numerical_execution_cost_attestation"][
+                "spread_values_sha256"
+            ],
+            "stress_spread_values_sha256": stress[
+                "numerical_execution_cost_attestation"
+            ]["spread_values_sha256"],
             "base_position_roster_sha256": Backtester._cost_attestation_json_sha256(
                 {"position_events": final["position_events"]}
             ),
@@ -1102,6 +1770,18 @@ def _raw_fold(fold_ordinal, planned, handle=None):
             ),
             "path_identity_preserved": True,
             "stress_never_improves": True,
+            "strictly_worse_trade_count": len(stress["position_events"]),
+            "strictly_worse_daily_observation_count": sum(
+                right < left
+                for left, right in zip(
+                    final["winner_daily_r_surface"]["daily_net_mtm_r"],
+                    stress["winner_daily_r_surface"]["daily_net_mtm_r"],
+                    strict=True,
+                )
+            ),
+            "realized_adversity_status": (
+                raw_winner.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
+            ),
         }
         stress_receipt = {**stress_body, "receipt_sha256": _sha(stress_body)}
         source_binding = frozen.source_contract_seed["source_binding"]
@@ -1267,13 +1947,21 @@ def test_symbol_capture_uses_raw_winner_and_empirical_unobserved_states(
         source_contract_seed=source_seed,
         base_cost_contract=BASE_COST_POLICY,
         stress_cost_contract=STRESS_COST_POLICY,
+        cost_stress_adversity_plan=_cost_stress_adversity_plan(
+            horizon_plan=real_horizon_plan,
+            fold_plan=fold_plan,
+            symbol=symbol,
+        ),
         risk_unit_contract=RISK_CONTRACT,
     )
+    plan_candidate = real_horizon_plan.to_dict()["candidates"][0]
+    horizon_process = attempt_artifacts[0]["horizon_process"]
+    assert plan_candidate["realized_start_utc"] != horizon_process["fit_start_utc"]
     assert handle._horizon_execution_contracts == (
         {
-            "lookback_kind": "ACTIVE_SESSIONS",
-            "lookback_value": 50,
-            "source_bar_count": 500,
+            "lookback_kind": "CALENDAR_INTERVAL",
+            "lookback_value": 120,
+            "source_bar_count": 120,
         },
     )
     source_count_receipt = handle._source_count_receipts[0]
@@ -1282,6 +1970,10 @@ def test_symbol_capture_uses_raw_winner_and_empirical_unobserved_states(
     assert source_count_receipt["native_prefix_index_sha256"] == (
         observed_native_prefix.index_sha256
     )
+    assert source_count_receipt["fit_start_utc"] == horizon_process[
+        "fit_start_utc"
+    ].replace("+00:00", "Z")
+    assert source_count_receipt["fit_start_utc"] != plan_candidate["realized_start_utc"]
     assert (
         source_count_receipt["fit_frame_sha256"]
         != (observed_native_prefix.native_prefix["prefix_content_sha256"])
@@ -1301,7 +1993,7 @@ def test_symbol_capture_uses_raw_winner_and_empirical_unobserved_states(
         evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
     )
     assert production.request.precommitment.to_dict()["regime"] == "TREND"
-    product = capture.finish()
+    product = _finish_through_worker_bridge(context, anchor, capture)
     returned_plans = list(product.horizon_plans)
     assert len(returned_plans) == 24
     assert all(training_horizon._valid_plan(plan) for plan in returned_plans)
@@ -1356,7 +2048,8 @@ def test_symbol_capture_uses_raw_winner_and_empirical_unobserved_states(
     cells = list(product.book_evidence)
     assert len(cells) == 24
     observed = [cell for cell in cells if cell.timeframe == OBSERVED_TIMEFRAME]
-    assert observed[0].winner_decision is production.decision
+    assert observed[0].winner_decision is not production.decision
+    assert observed[0].winner_decision.to_dict() == production.decision.to_dict()
     assert [cell.process_state_decision.state_kind for cell in observed[1:]] == [
         book.REGIME_UNOBSERVED,
         book.REGIME_UNOBSERVED,
@@ -1448,7 +2141,7 @@ def test_boundary_limited_observed_cell_becomes_bound_insufficient_evidence(
             source_group_decision=source,
             regime_fit_decision=fit,
         )
-    product = capture.finish()
+    product = _finish_through_worker_bridge(context, anchor, capture)
     trend = next(
         cell
         for cell in product.book_evidence
@@ -1507,6 +2200,11 @@ def test_all_process_rejected_raw_winner_becomes_bound_insufficient_evidence(
         source_contract_seed=source_seed,
         base_cost_contract=BASE_COST_POLICY,
         stress_cost_contract=STRESS_COST_POLICY,
+        cost_stress_adversity_plan=_cost_stress_adversity_plan(
+            horizon_plan=plan,
+            fold_plan=fold_plan,
+            symbol=symbol,
+        ),
         risk_unit_contract=RISK_CONTRACT,
     )
     attempt = {
@@ -1546,7 +2244,7 @@ def test_all_process_rejected_raw_winner_becomes_bound_insufficient_evidence(
         evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
     )
     assert production.decision.status == "NO_PROCESS_WINNER"
-    product = capture.finish()
+    product = _finish_through_worker_bridge(context, anchor, capture)
     trend = next(
         cell
         for cell in product.book_evidence
@@ -1636,6 +2334,201 @@ def test_missing_observed_cell_cannot_be_defaulted(tmp_path):
         capture.finish()
 
 
+def test_authenticated_terminal_technical_timeframes_finish_as_complete_abstentions(
+    tmp_path,
+    monkeypatch,
+):
+    context = _context(tmp_path)
+    anchor = _anchor()
+    request = _request(context, anchor)
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    products = _genuine_terminal_technical_products(
+        tmp_path, context, anchor, symbol, monkeypatch
+    )
+    capture = adapter.open_historical_symbol_capture(context, request, symbol)
+
+    _bind_terminal_technical_symbol(capture, anchor, products)
+    product = capture.finish()
+
+    assert product.optimizer_payload["cell_count"] == 24
+    assert product.optimizer_payload["state_counts"] == {book.TERMINAL_TECHNICAL: 24}
+    assert all(
+        cell.process_state_decision.state_kind == book.TERMINAL_TECHNICAL
+        and cell.process_state_decision.to_dict()["terminal"] is True
+        and cell.process_state_decision.to_dict()["complete"] is True
+        and cell.process_state_decision.to_dict()["attempted_trials_exact"] == 0
+        for cell in product.book_evidence
+    )
+
+
+def test_terminal_technical_rejects_spliced_activation_and_arbitrary_reason(
+    tmp_path,
+    monkeypatch,
+):
+    context = _context(tmp_path)
+    anchor = _anchor()
+    request = _request(context, anchor)
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    products = _genuine_terminal_technical_products(
+        tmp_path, context, anchor, symbol, monkeypatch
+    )
+    timeframe = book.TIMEFRAME_ORDER[0]
+    native_product = products[timeframe]
+    plans = _terminal_technical_plans(
+        anchor,
+        symbol,
+        timeframe,
+        native_product=native_product,
+    )
+    authority = _terminal_technical_authority(native_product)
+
+    unbound_product = replace(native_product, _data_dir=None)
+    unbound_authority = replace(authority, product=unbound_product)
+    unbound_capture = adapter.open_historical_symbol_capture(context, request, symbol)
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="TERMINAL_TECHNICAL_AUTHORITY_REVERIFY_FAILED",
+    ):
+        unbound_capture.bind_timeframe(
+            timeframe,
+            horizon_plans=plans,
+            source_group_decision=authority.source_group_decision,
+            regime_fit_decision=authority.regime_fit_decision,
+            terminal_native_timeframe=unbound_authority,
+        )
+
+    activation_splice = adapter.open_historical_symbol_capture(context, request, symbol)
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="TERMINAL_TECHNICAL_AUTHORITY_BINDING_MISMATCH",
+    ):
+        activation_splice.bind_timeframe(
+            timeframe,
+            horizon_plans=_terminal_technical_plans(
+                anchor,
+                symbol,
+                timeframe,
+                native_product=native_product,
+                activation_id="spliced-activation",
+            ),
+            source_group_decision=authority.source_group_decision,
+            regime_fit_decision=authority.regime_fit_decision,
+            terminal_native_timeframe=authority,
+        )
+
+    source_body = authority.source_group_decision.to_dict()
+    forged_source = book.create_historical_source_group_decision(
+        symbol=symbol,
+        timeframe=timeframe,
+        availability=book.TERMINAL_TECHNICAL,
+        reason_code="SPLICED_ACTIVATION",
+        source_contract_sha256=source_body["source_contract_sha256"],
+        source_group_evidence_sha256=source_body["source_group_evidence_sha256"],
+        acquisition_attempts_exact=source_body["acquisition_attempts_exact"],
+        activation_id=source_body["activation_id"],
+        activation_manifest_sha256=source_body["activation_manifest_sha256"],
+        activation_entry_sha256=source_body["activation_entry_sha256"],
+        terminal_proof_sha256=source_body["terminal_proof_sha256"],
+    )
+    assert forged_source is not None
+    forged_fit = book.create_regime_fit_decision(
+        source_group_decision=forged_source,
+        fit_state=book.REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
+        reason_code="SPLICED_ACTIVATION",
+        regime_fit_policy_sha256=(
+            authority.regime_fit_decision.to_dict()["regime_fit_policy_sha256"]
+        ),
+    )
+    assert forged_fit is not None
+    reason_splice = adapter.open_historical_symbol_capture(context, request, symbol)
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="TERMINAL_TECHNICAL_AUTHORITY_BINDING_MISMATCH",
+    ):
+        reason_splice.bind_timeframe(
+            timeframe,
+            horizon_plans=plans,
+            source_group_decision=forged_source,
+            regime_fit_decision=forged_fit,
+            terminal_native_timeframe=replace(
+                authority,
+                source_group_decision=forged_source,
+                regime_fit_decision=forged_fit,
+            ),
+        )
+
+
+def test_terminal_technical_persisted_adapter_graph_replays_exact_cell_bijection(
+    tmp_path,
+    monkeypatch,
+):
+    context = _context(tmp_path)
+    anchor = _anchor()
+    request = _request(context, anchor)
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    products = _genuine_terminal_technical_products(
+        tmp_path, context, anchor, symbol, monkeypatch
+    )
+    capture = adapter.open_historical_symbol_capture(context, request, symbol)
+    _bind_terminal_technical_symbol(capture, anchor, products)
+    product = capture.finish()
+    sink = request.symbol_sink(symbol)
+    manifest = spool.verify_symbol_receipt(
+        context.root,
+        sink.seal(),
+        expected_generation_id=context.generation_id,
+        expected_symbol=symbol,
+        expected_native_universe_sha256=context.native_universe_sha256,
+        expected_config_sha256=context.config_sha256,
+    )
+    artifacts = {entry["artifact_id"]: entry for entry in manifest["artifacts"]}
+    bindings = [
+        orchestration.historical_horizon_plan_binding(plan)
+        for plan in product.horizon_plans
+    ]
+    precommit_body = {
+        "run_id": "historical-run-001",
+        "optimizer_producer_release_sha256": (
+            adapter.HISTORICAL_PRODUCER_RELEASE_SHA256
+        ),
+        "process_precommit_receipt_sha256": PROCESS_PRECOMMIT,
+    }
+    referenced = orchestration._verify_adapter_manifest_graph(
+        context,
+        artifacts,
+        product.optimizer_payload,
+        precommit_body=precommit_body,
+        anchor=anchor,
+        symbol=symbol,
+        producer_request_sha256=request.receipt_sha256,
+        horizon_bindings=bindings,
+    )
+    assert referenced == set(artifacts)
+
+    hostile_payload = copy.deepcopy(product.optimizer_payload)
+    hostile_artifacts = copy.deepcopy(artifacts)
+    index_id = f"{anchor['anchor_id']}/adapter/production-index"
+    hostile_index = _read_descriptor_json(context, hostile_payload["production_index"])
+    hostile_index["cell_records"][0]["historical_state"] = book.TERMINAL_SOURCE_ABSENCE
+    hostile_descriptor = spool.write_canonical_json_artifact(context, hostile_index)
+    hostile_payload["production_index"] = hostile_descriptor
+    hostile_artifacts[index_id]["descriptor"] = hostile_descriptor
+    with pytest.raises(
+        orchestration.HistoricalAnchorOrchestrationError,
+        match="ADAPTER_TERMINAL_TECHNICAL_BIJECTION_INVALID",
+    ):
+        orchestration._verify_adapter_manifest_graph(
+            context,
+            hostile_artifacts,
+            hostile_payload,
+            precommit_body=precommit_body,
+            anchor=anchor,
+            symbol=symbol,
+            producer_request_sha256=request.receipt_sha256,
+            horizon_bindings=bindings,
+        )
+
+
 def _anchor_inputs():
     anchors = []
     plans = {}
@@ -1697,7 +2590,11 @@ def test_orchestration_consumes_exact_100_by_6_by_4_adapter_stream(tmp_path):
 
         producers[anchor_id] = producer
 
-    receipt = orchestration.execute_historical_anchor_run(context, precommit, producers)
+    receipt = orchestration.execute_historical_anchor_run(
+        context,
+        precommit,
+        producers,
+    )
     assert orchestration.verify_historical_anchor_run_receipt(
         context, precommit, receipt
     )
@@ -1813,6 +2710,11 @@ def test_incomplete_executable_artifact_fails_before_raw_freeze(
             source_contract_seed=source_seed,
             base_cost_contract=BASE_COST_POLICY,
             stress_cost_contract=STRESS_COST_POLICY,
+            cost_stress_adversity_plan=_cost_stress_adversity_plan(
+                horizon_plan=plan,
+                fold_plan=fold_plan,
+                symbol=symbol,
+            ),
             risk_unit_contract=RISK_CONTRACT,
         )
     assert not called
@@ -1864,7 +2766,7 @@ def test_attempt_source_count_is_recomputed_from_sealed_prefix(
     monkeypatch.setattr(raw_winner, "freeze_winner_search_plan_v3", forbidden)
     with pytest.raises(
         adapter.HistoricalProductionAdapterError,
-        match="ATTEMPT_0000_EXECUTABLE_ARTIFACT_INVALID",
+        match="ATTEMPT_SOURCE_CUTOFF_REFIT_WINDOW_INVALID",
     ):
         capture.freeze_observed_cell(
             OBSERVED_TIMEFRAME,
@@ -1877,9 +2779,182 @@ def test_attempt_source_count_is_recomputed_from_sealed_prefix(
             source_contract_seed=source_seed,
             base_cost_contract=BASE_COST_POLICY,
             stress_cost_contract=STRESS_COST_POLICY,
+            cost_stress_adversity_plan=_cost_stress_adversity_plan(
+                horizon_plan=plan,
+                fold_plan=fold_plan,
+                symbol=symbol,
+            ),
             risk_unit_contract=RISK_CONTRACT,
         )
     assert not raw_called
+
+
+def test_coherent_cutoff_window_splice_fails_against_authenticated_prefix(
+    observed_native_prefix,
+):
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    anchor = _anchor()
+    fold_plan = _fold_plan()
+    valid = _attempt_artifact(
+        symbol,
+        native_prefix_product=observed_native_prefix,
+    )
+    valid_start = pd.Timestamp(valid["horizon_process"]["fit_start_utc"])
+    spliced = _attempt_artifact(
+        symbol,
+        native_prefix_product=observed_native_prefix,
+        fit_start_utc=(valid_start + pd.Timedelta(days=1)).isoformat(),
+    )
+    assert (
+        spliced["horizon_process"]["source_bar_count"]
+        == valid["horizon_process"]["source_bar_count"] - 1
+    )
+    plan = _real_horizon_plan(
+        anchor,
+        symbol,
+        "TREND",
+        native_prefix_product=observed_native_prefix,
+        attempt_artifact=spliced,
+        fold_plan=fold_plan,
+    )
+
+    with pytest.raises(
+        adapter.HistoricalProductionAdapterError,
+        match="ATTEMPT_SOURCE_CUTOFF_REFIT_WINDOW_INVALID",
+    ):
+        adapter._strict_attempt_artifacts(
+            [spliced],
+            symbol=symbol,
+            timeframe=OBSERVED_TIMEFRAME,
+            regime="TREND",
+            plan_body=plan.to_dict(),
+            plan_receipt_sha256=plan.receipt_sha256,
+            native_prefix_product=observed_native_prefix,
+        )
+
+
+def test_128_attempts_hash_one_current_window_per_candidate(
+    monkeypatch,
+    observed_native_prefix,
+):
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    base = _attempt_artifact(
+        symbol,
+        native_prefix_product=observed_native_prefix,
+    )
+    process = base["winner_process"]
+    horizon_process = base["horizon_process"]
+    prefix = dict(observed_native_prefix.native_prefix)
+    candidate_definition = {
+        "candidate_id": "CALENDAR-120",
+        "lookback_kind": horizon_process["lookback_kind"],
+        "lookback_value": horizon_process["lookback_value"],
+        "realized_start_utc": prefix["prefix_start_utc"],
+    }
+    candidate = {
+        **candidate_definition,
+        "candidate_definition_sha256": _sha(candidate_definition),
+        "folds": [],
+    }
+    trials = []
+    planned_attempts = []
+    raw_attempts = []
+    for ordinal in range(128):
+        parameters = {"test_ordinal": ordinal}
+        trial_definition = {
+            **base["trial_definition"],
+            "parameters": parameters,
+            "parameter_count": 1,
+        }
+        trial_definition["horizon_process_sha256"] = _sha(horizon_process)
+        trial_definition["process_sha256"] = _sha(process)
+        trial = {
+            "trial_id": f"TRIAL-{ordinal:03d}",
+            "strategy_id": process["strategy_id"],
+            "strategy_release_sha256": process["strategy_code_sha256"],
+            "parameter_set_sha256": _sha(parameters),
+        }
+        trials.append(
+            {
+                **trial,
+                "trial_definition_sha256": _sha(trial),
+            }
+        )
+        planned_attempts.append(
+            {
+                "attempt_id": f"ATTEMPT-{ordinal:03d}",
+                "candidate_id": candidate["candidate_id"],
+                "trial_id": trial["trial_id"],
+                "strategy_id": process["strategy_id"],
+                "status": "PLANNED",
+            }
+        )
+        raw_attempts.append(
+            {
+                "winner_process": copy.deepcopy(process),
+                "horizon_process": copy.deepcopy(horizon_process),
+                "trial_definition": trial_definition,
+                "refit_recipe": copy.deepcopy(base["refit_recipe"]),
+            }
+        )
+    plan_body = {
+        "anchor": {"anchor_id": "anchor-128-attempt-window-cache"},
+        "cell": {
+            "symbol": symbol,
+            "timeframe": OBSERVED_TIMEFRAME,
+            "regime": "TREND",
+        },
+        "native_prefix": prefix,
+        "candidates": [candidate],
+        "trials": trials,
+        "attempts": planned_attempts,
+    }
+
+    def accepted_artifacts(**kwargs):
+        bodies = {
+            "winner_process": json.loads(kwargs["winner_process_bytes"]),
+            "horizon_process": json.loads(kwargs["horizon_process_bytes"]),
+            "trial_definition": json.loads(kwargs["trial_definition_bytes"]),
+            "refit_recipe": json.loads(kwargs["refit_recipe_bytes"]),
+        }
+        return current_refit.CurrentRefitSearchArtifacts(
+            process_candidate_id=bodies["winner_process"]["process_candidate_id"],
+            winner_process=bodies["winner_process"],
+            winner_process_sha256=_sha(bodies["winner_process"]),
+            horizon_process=bodies["horizon_process"],
+            horizon_process_sha256=_sha(bodies["horizon_process"]),
+            trial_definition=bodies["trial_definition"],
+            trial_definition_sha256=_sha(bodies["trial_definition"]),
+            refit_recipe=bodies["refit_recipe"],
+            refit_recipe_sha256=_sha(bodies["refit_recipe"]),
+        )
+
+    monkeypatch.setattr(
+        current_refit,
+        "verify_current_refit_search_artifacts_bytes_v2",
+        accepted_artifacts,
+    )
+    frame_hash_calls = []
+    original_frame_sha256 = adapter._frame_sha256
+
+    def counted_frame_sha256(frame):
+        frame_hash_calls.append(len(frame))
+        return original_frame_sha256(frame)
+
+    monkeypatch.setattr(adapter, "_frame_sha256", counted_frame_sha256)
+    normalized, contracts, receipts = adapter._strict_attempt_artifacts(
+        raw_attempts,
+        symbol=symbol,
+        timeframe=OBSERVED_TIMEFRAME,
+        regime="TREND",
+        plan_body=plan_body,
+        plan_receipt_sha256=_sha("128-attempt-plan"),
+        native_prefix_product=observed_native_prefix,
+    )
+
+    assert len(normalized) == len(contracts) == len(receipts) == 128
+    assert frame_hash_calls == [horizon_process["source_bar_count"]]
+    assert len({receipt["fit_frame_sha256"] for receipt in receipts}) == 1
 
 
 def test_duplicate_depth_same_trial_is_distinct_when_identity_is_horizon_bound(
@@ -1903,8 +2978,8 @@ def test_duplicate_depth_same_trial_is_distinct_when_identity_is_horizon_bound(
         _attempt_artifact(
             symbol,
             native_prefix_product=observed_native_prefix,
-            lookback_kind="ACTIVE_SESSIONS",
-            lookback_value=50,
+            lookback_kind="CALENDAR_INTERVAL",
+            lookback_value=500,
         ),
         _attempt_artifact(
             symbol,
@@ -1946,6 +3021,11 @@ def test_duplicate_depth_same_trial_is_distinct_when_identity_is_horizon_bound(
         source_contract_seed=source_seed,
         base_cost_contract=BASE_COST_POLICY,
         stress_cost_contract=STRESS_COST_POLICY,
+        cost_stress_adversity_plan=_cost_stress_adversity_plan(
+            horizon_plan=plan,
+            fold_plan=fold_plan,
+            symbol=symbol,
+        ),
         risk_unit_contract=RISK_CONTRACT,
     )
     frozen_attempts = handle.frozen.attempt_ledger["attempts"]
@@ -2056,18 +3136,19 @@ def test_cross_anchor_raw_artifacts_share_sink_without_id_collision(
         attempt_artifact = _attempt_artifact(
             symbol, native_prefix_product=observed_native_prefix
         )
+        observed_plan = _real_horizon_plan(
+            anchor,
+            symbol,
+            "TREND",
+            native_prefix_product=observed_native_prefix,
+            attempt_artifact=attempt_artifact,
+            fold_plan=fold_plan,
+        )
         _bind_single_observed_capture(
             capture,
             anchor,
             source_sha,
-            observed_plan=_real_horizon_plan(
-                anchor,
-                symbol,
-                "TREND",
-                native_prefix_product=observed_native_prefix,
-                attempt_artifact=attempt_artifact,
-                fold_plan=fold_plan,
-            ),
+            observed_plan=observed_plan,
         )
         handles.append(
             capture.freeze_observed_cell(
@@ -2081,6 +3162,11 @@ def test_cross_anchor_raw_artifacts_share_sink_without_id_collision(
                 source_contract_seed=source_seed,
                 base_cost_contract=BASE_COST_POLICY,
                 stress_cost_contract=STRESS_COST_POLICY,
+                cost_stress_adversity_plan=_cost_stress_adversity_plan(
+                    horizon_plan=observed_plan,
+                    fold_plan=fold_plan,
+                    symbol=symbol,
+                ),
                 risk_unit_contract=RISK_CONTRACT,
             )
         )
@@ -2104,3 +3190,168 @@ def test_cross_anchor_raw_artifacts_share_sink_without_id_collision(
         "historical-anchor/historical-run-001/anchor-02/"
         f"winner-search/{OBSERVED_TIMEFRAME}/TREND/frozen/precommitment"
     ) in ids
+
+
+def _worker_bridge_product_surface(product):
+    def sealed(value):
+        if value is None:
+            return None
+        return {
+            "body": value.to_dict(),
+            "receipt_sha256": getattr(
+                value,
+                "receipt_sha256",
+                getattr(value, "request_sha256", None),
+            ),
+        }
+
+    plans = list(product.horizon_plans)
+    cells = list(product.book_evidence)
+    return {
+        "plans": [sealed(plan) for plan in plans],
+        "cells": [
+            {
+                "identity": (cell.symbol, cell.timeframe, cell.regime),
+                "source": sealed(cell.source_group_decision),
+                "fit": sealed(cell.regime_fit_decision),
+                "winner_request": sealed(cell.winner_request),
+                "winner_decision": sealed(cell.winner_decision),
+                "process_state": sealed(cell.process_state_decision),
+                "insufficient_horizon": sealed(cell.insufficient_horizon_plan),
+                "insufficient_rejection_request": sealed(
+                    cell.insufficient_process_rejection_request
+                ),
+                "insufficient_rejection_decision": sealed(
+                    cell.insufficient_process_rejection_decision
+                ),
+                "insufficient_cross_binding": (
+                    cell.insufficient_horizon_winner_cross_binding_bytes
+                ),
+                "insufficient_raw_receipt": (
+                    cell.insufficient_winner_raw_production_receipt_bytes
+                ),
+            }
+            for cell in cells
+        ],
+        "optimizer_payload": product.optimizer_payload,
+    }
+
+
+def _spool_terminal_worker_bundle(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    anchor = _anchor()
+    worker_request = _request(context, anchor)
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    capture = adapter.open_historical_symbol_capture(context, worker_request, symbol)
+    _bind_terminal_symbol(capture, anchor)
+
+    finished_products = []
+    original_finish = adapter.HistoricalSymbolSearchCapture.finish
+
+    def finish_spy(self):
+        product = original_finish(self)
+        finished_products.append(product)
+        return product
+
+    monkeypatch.setattr(
+        adapter.HistoricalSymbolSearchCapture,
+        "finish",
+        finish_spy,
+    )
+    descriptor = adapter.spool_historical_symbol_worker_bundle(capture)
+    assert len(finished_products) == 1
+    return (
+        context,
+        anchor,
+        worker_request,
+        symbol,
+        descriptor,
+        finished_products[0],
+    )
+
+
+def test_symbol_worker_bundle_reopens_parent_local_exact_product_and_roster(
+    tmp_path,
+    monkeypatch,
+):
+    (
+        context,
+        anchor,
+        worker_request,
+        symbol,
+        descriptor,
+        worker_product,
+    ) = _spool_terminal_worker_bundle(tmp_path, monkeypatch)
+    worker_roster = worker_request.symbol_sink(symbol).artifact_roster()
+    assert worker_roster
+    assert all(entry["descriptor"] != descriptor for entry in worker_roster)
+
+    parent_request = _request(context, anchor)
+    parent_sink = parent_request.symbol_sink(symbol)
+    assert parent_sink.artifact_roster() == []
+    reopened = adapter.reopen_historical_symbol_worker_bundle(
+        context,
+        parent_request,
+        descriptor,
+    )
+
+    assert reopened.symbol == symbol
+    assert _worker_bridge_product_surface(reopened) == (
+        _worker_bridge_product_surface(worker_product)
+    )
+    assert parent_sink.artifact_roster() == worker_roster
+    worker_plans = list(worker_product.horizon_plans)
+    reopened_plans = list(reopened.horizon_plans)
+    worker_cells = list(worker_product.book_evidence)
+    reopened_cells = list(reopened.book_evidence)
+    assert (
+        len(reopened_plans)
+        == len(worker_plans)
+        == book.FAMILY_SIZE // len(book.PINNED_SYMBOL_ORDER)
+    )
+    assert len(reopened_cells) == len(worker_cells) == len(reopened_plans)
+    assert all(training_horizon._valid_plan(plan) for plan in reopened_plans)
+    assert all(
+        reopened_plan is not worker_plan
+        for reopened_plan, worker_plan in zip(
+            reopened_plans,
+            worker_plans,
+            strict=True,
+        )
+    )
+    assert all(
+        reopened_cell.process_state_decision is not worker_cell.process_state_decision
+        for reopened_cell, worker_cell in zip(
+            reopened_cells,
+            worker_cells,
+            strict=True,
+        )
+    )
+
+
+def test_symbol_worker_bundle_coherent_symbol_tamper_fails_before_registration(
+    tmp_path,
+    monkeypatch,
+):
+    (
+        context,
+        anchor,
+        _worker_request,
+        symbol,
+        descriptor,
+        _worker_product,
+    ) = _spool_terminal_worker_bundle(tmp_path, monkeypatch)
+    bundle = _read_descriptor_json(context, descriptor)
+    assert bundle["symbol"] == symbol
+    bundle["symbol"] = book.PINNED_SYMBOL_ORDER[1]
+    coherently_resealed = spool.write_canonical_json_artifact(context, bundle)
+
+    parent_request = _request(context, anchor)
+    parent_sink = parent_request.symbol_sink(symbol)
+    with pytest.raises(adapter.HistoricalProductionAdapterError):
+        adapter.reopen_historical_symbol_worker_bundle(
+            context,
+            parent_request,
+            coherently_resealed,
+        )
+    assert parent_sink.artifact_roster() == []

@@ -1,0 +1,63 @@
+symbol,timeframe,regime,strategy,verdict,reasons,net_profit,return_pct,profit_factor,max_drawdown_pct,total_trades,expectancy_pips
+AIG,D1,TREND,StochasticReversalStrategy,PASS,,1665.78,16.66,1.45,7.46,134,44.8
+AIG,H4,TREND,DoubleTopBottomReversalStrategy,PASS,,8256.53,82.57,2.28,8.75,129,138.6
+AIG,M15,CHOP,ATRPercentileBreakoutStrategy,PASS,,2027.7,20.28,1.32,7.47,113,22.74
+ALIBABA,D1,CHOP,DayOfWeekBiasStrategy,FAIL,full_sample_pf 1.04 < 1.05,256.42,2.56,1.04,8.36,135,19.18
+ALIBABA,H1,CHOP,ADRExpansionBreakoutStrategy,PASS,,5499.67,55.0,1.29,8.13,301,113.44
+ALIBABA,H4,CHOP,FractalChannelBreakoutStrategy,PASS,,2904.78,29.05,1.35,12.14,170,157.08
+ALIBABA,H4,TREND,ChoppinessCompressionBreakoutStrategy,PASS,,6370.64,63.71,2.11,5.68,108,286.49
+ALIBABA,M30,CHOP,TriangleCompressionBreakoutStrategy,PASS,,9831.54,98.32,2.19,6.35,147,122.35
+ALIBABA,M30,TREND,ChoppinessCompressionBreakoutStrategy,PASS,,5033.65,50.34,1.37,10.18,234,62.87
+BTCUSD,D1,CHOP,ADRExpansionBreakoutStrategy,PASS,,2178.38,21.78,1.34,6.33,147,33656.5
+BTCUSD,H1,RANGE,EMAPullbackContinuationStrategy,PASS,,4548.26,45.48,1.25,11.56,515,9333.84
+BTCUSD,H4,CHOP,VolatilityBreakoutStrategy,PASS,,2871.19,28.71,1.24,11.84,261,26447.46
+BTCUSD,H4,TREND,FlagPullbackContinuationStrategy,PASS,,2150.73,21.51,1.53,7.16,99,24621.52
+BTCUSD,M30,TREND,DayOfWeekBiasStrategy,PASS,,1969.49,19.69,1.29,10.36,231,15357.6
+BTCUSD,M5,TREND,DayOfWeekBiasStrategy,PASS,,6562.56,65.63,1.28,14.68,702,5318.74
+DE30,H4,TREND,DayOfWeekBiasStrategy,PASS,,1597.92,15.98,1.34,6.6,179,2685.07
+DE30,M30,RANGE,DayOfWeekBiasStrategy,FAIL,full_sample_pf 0.97 < 1.05,-201.93,-2.02,0.97,13.88,197,-31.8
+ETHUSD,H4,TREND,VolatilityBreakoutStrategy,PASS,,1546.11,15.46,1.18,8.35,292,738.02
+ETHUSD,M30,RANGE,TriangleCompressionBreakoutStrategy,PASS,,2450.7,24.51,1.48,3.76,189,1214.94
+ETHUSD,M30,TREND,PreviousWeekRangeBreakoutStrategy,PASS,,3074.71,30.75,1.93,7.85,87,1800.67
+EURJPY,H1,TREND,EMAPullbackContinuationStrategy,FAIL,full_sample_pf 1.04 < 1.05,573.35,5.73,1.04,16.37,354,5.04
+EURUSD,D1,CHOP,VWAPTrendContinuationStrategy,PASS,,2447.8,24.48,1.37,7.65,117,18.32
+GBPCAD,H4,CHOP,TimeOfDayMomentumStrategy,PASS,,2106.9,21.07,1.19,18.23,201,18.08
+GBPUSD,H1,CHOP,VolumeClimaxReversalStrategy,PASS,,2453.74,24.54,1.48,8.76,79,12.95
+GBPUSD,H4,TREND,EMAPullbackContinuationStrategy,PASS,,1244.13,12.44,1.17,6.2,275,7.04
+IBM,H4,TREND,TimeOfDayMomentumStrategy,PASS,,1463.89,14.64,1.16,10.27,185,33.83
+JP225,H4,RANGE,TimeOfDayMomentumStrategy,PASS,,2065.42,20.65,1.32,7.58,142,1313405.23
+JP225,H4,TREND,EMAPullbackContinuationStrategy,PASS,,752.64,7.53,1.08,9.97,151,949403.72
+JPM,D1,CHOP,MACDTrendStrategy,PASS,,766.14,7.66,1.15,9.72,111,115.48
+MCDONALDS,D1,CHOP,VolatilityBreakoutStrategy,PASS,,954.78,9.55,1.2,7.88,141,33.78
+PFIZER,D1,CHOP,StochasticReversalStrategy,FAIL,full_sample_pf 0.85 < 1.05,-1240.39,-12.4,0.85,20.52,114,4.68
+TESLA,H1,CHOP,DarvasBoxBreakoutStrategy,FAIL,full_sample_pf 0.93 < 1.05,-747.74,-7.48,0.93,18.42,197,-35.9
+TESLA,H1,TREND,TriangleCompressionBreakoutStrategy,PASS,,2241.72,22.42,1.29,7.12,172,-67.13
+TESLA,H4,CHOP,DarvasBoxBreakoutStrategy,PASS,,3313.25,33.13,1.95,3.86,107,274.37
+TESLA,H4,TREND,KeltnerBreakoutStrategy,PASS,,2338.12,23.38,1.61,5.96,106,-173.97
+TESLA,M30,TREND,FisherTransformMRStrategy,PASS,,492.16,4.92,1.06,13.98,116,64.54
+US100,H4,CHOP,SessionVWAPReversionStrategy,PASS,,1454.62,14.55,1.43,5.37,104,3547.68
+US100,M15,CHOP,DayOfWeekBiasStrategy,PASS,,5695.23,56.95,1.15,14.05,927,646.48
+US100,M30,RANGE,DayOfWeekBiasStrategy,PASS,,1844.78,18.45,1.52,4.52,213,1645.21
+US100,M30,TREND,DayOfWeekBiasStrategy,PASS,,1279.78,12.8,1.07,11.22,880,512.78
+US100,M5,TREND,ChoppinessCompressionBreakoutStrategy,PASS,,991.14,9.91,1.24,7.8,78,807.58
+US30,H4,CHOP,TriangleCompressionBreakoutStrategy,PASS,,1821.27,18.21,1.28,6.71,120,2972.54
+US30,M30,RANGE,TimeOfDayMomentumStrategy,FAIL,full_sample_pf 0.93 < 1.05,-1067.21,-10.67,0.93,25.28,316,-709.91
+US30,M30,TREND,DayOfWeekBiasStrategy,PASS,,2559.55,25.6,1.11,13.81,538,534.72
+US500,H1,CHOP,DayOfWeekBiasStrategy,PASS,,3281.06,32.81,1.26,12.52,282,518.42
+US500,H1,TREND,DayOfWeekBiasStrategy,PASS,,2559.17,25.59,1.21,9.32,238,967.12
+US500,H4,CHOP,VWAPTrendContinuationStrategy,PASS,,296.27,2.96,1.06,10.73,153,392.94
+US500,H4,TREND,RSI2TrendPullbackStrategy,PASS,,1655.28,16.55,1.32,10.05,97,482.67
+US500,M30,CHOP,DayOfWeekBiasStrategy,FAIL,full_sample_pf 0.95 < 1.05,-1040.71,-10.41,0.95,27.34,656,-49.37
+US500,M30,RANGE,EMAPullbackContinuationStrategy,FAIL,full_sample_pf 0.90 < 1.05,-1915.69,-19.16,0.9,29.36,660,-15.92
+US500,M30,TREND,DayOfWeekBiasStrategy,PASS,,1504.44,15.04,1.09,11.58,798,46.07
+USDJPY,H4,CHOP,ThreeSoldiersCrowsStrategy,PASS,,2285.08,22.85,1.99,3.35,79,60.42
+XAUAUD,H1,TREND,FlagPullbackContinuationStrategy,PASS,,2122.08,21.22,1.45,5.42,153,885.42
+XAUEUR,H1,CHOP,MomentumBurstStrategy,PASS,,1766.57,17.67,1.25,7.52,160,682.88
+XAUGBP,H4,TREND,TimeOfDayMomentumStrategy,PASS,,1420.44,14.2,1.16,9.57,245,379.92
+XAUGBP,M30,CHOP,EMAPullbackContinuationStrategy,FAIL,full_sample_pf 0.85 < 1.05; full_sample_max_dd 57.1% > 30.0%,-3912.37,-39.12,0.85,57.11,618,51.9
+XAUUSD,H1,TREND,RSITrendFilteredMRStrategy,PASS,,1380.75,13.81,1.75,3.38,118,260.9
+XAUUSD,H4,CHOP,EMAPullbackContinuationStrategy,PASS,,5309.23,53.09,1.82,4.91,237,1033.48
+XAUUSD,H4,TREND,MarubozuMomentumStrategy,PASS,,1961.45,19.62,1.41,9.35,160,1015.91
+XAUUSD,M15,CHOP,EMAPullbackContinuationStrategy,PASS,,76881.06,768.82,1.34,21.31,3832,148.72
+XAUUSD,M30,CHOP,PiercingDarkCloudStrategy,PASS,,2099.45,21.0,1.17,14.98,244,109.78
+XTIUSD,H1,CHOP,DayOfWeekBiasStrategy,PASS,,1961.59,19.62,1.18,7.44,301,10.72

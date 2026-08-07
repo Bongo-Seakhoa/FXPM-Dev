@@ -5,6 +5,7 @@ import json
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -423,18 +424,33 @@ def _production_cutover_manager(tmp_path: Path) -> tuple[PortfolioManager, Path]
     return manager, ledger_path
 
 
-def _sparse_current_ledger(period: int = 10) -> bytes:
-    symbol = book.PINNED_SYMBOL_ORDER[0]
+def _sparse_current_ledger(
+    period: int = 10,
+    *,
+    symbol: str | None = None,
+) -> bytes:
+    symbol = symbol or book.PINNED_SYMBOL_ORDER[0]
+    schedule = PipelineConfig()
+    # Keep promotion fixtures well clear of a live retrain boundary.  Tests that
+    # exercise the boundary itself pass an explicit validation clock below.
+    optimized_at = (
+        datetime.now(timezone.utc).replace(microsecond=0) + schedule.retrain_interval
+    )
+    valid_until = schedule.get_next_retrain_at_utc(optimized_at)
     candidate = RegimeConfig(
         strategy_name="TestStrategy",
         parameters={"period": period},
         quality_score=0.0,
+        trained_at=optimized_at,
+        valid_until=valid_until,
         promotion_status="PROCESS_VALIDATED_CURRENT_REFIT",
         artifact_meta={"book_role": "PROCESS_VALIDATED_CURRENT_REFIT"},
     )
     config = SymbolConfig(
         symbol=symbol,
         is_validated=True,
+        optimized_at=optimized_at,
+        valid_until=valid_until,
         regime_configs={book.TIMEFRAME_ORDER[0]: {book.REGIME_ORDER[0]: candidate}},
     )
     return json.dumps(
@@ -445,6 +461,181 @@ def _sparse_current_ledger(period: int = 10) -> bytes:
         sort_keys=True,
         default=str,
     ).encode("ascii")
+
+
+def test_sparse_current_ledger_requires_exact_future_utc_expiry(tmp_path: Path) -> None:
+    manager, _ledger_path = _production_cutover_manager(tmp_path)
+    raw = _sparse_current_ledger()
+    payload = json.loads(raw)
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    timeframe = book.TIMEFRAME_ORDER[0]
+    regime = book.REGIME_ORDER[0]
+    deadline = datetime.fromisoformat(payload[symbol]["valid_until"])
+
+    parsed, count = manager._validated_sparse_current_ledger(  # noqa: SLF001
+        raw,
+        validation_time_utc=deadline - timedelta(seconds=1),
+    )
+    assert set(parsed) == {symbol}
+    assert count == 1
+
+    def encoded(value):
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+
+    missing_cell_deadline = json.loads(raw)
+    missing_cell_deadline[symbol]["regime_configs"][timeframe][regime][
+        "valid_until"
+    ] = None
+    with pytest.raises(
+        RuntimeError,
+        match="PRODUCTION_AUTHORITY_LEDGER_CELL_VALID_UNTIL_MISMATCH",
+    ):
+        manager._validated_sparse_current_ledger(  # noqa: SLF001
+            encoded(missing_cell_deadline),
+            validation_time_utc=deadline - timedelta(seconds=1),
+        )
+
+    wrong_slot = json.loads(raw)
+    wrong_slot[symbol]["valid_until"] = (
+        deadline + manager.config.retrain_interval
+    ).isoformat()
+    with pytest.raises(
+        RuntimeError,
+        match="PRODUCTION_AUTHORITY_LEDGER_VALID_UNTIL_MISMATCH",
+    ):
+        manager._validated_sparse_current_ledger(  # noqa: SLF001
+            encoded(wrong_slot),
+            validation_time_utc=deadline - timedelta(seconds=1),
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="PRODUCTION_AUTHORITY_LEDGER_VALID_UNTIL_EXPIRED",
+    ):
+        manager._validated_sparse_current_ledger(  # noqa: SLF001
+            raw,
+            validation_time_utc=deadline,
+        )
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_sparse_current_ledger_preserves_exact_mt5_symbol(
+    tmp_path: Path,
+    symbol: str,
+) -> None:
+    manager, _ledger_path = _production_cutover_manager(tmp_path)
+    raw = _sparse_current_ledger(symbol=symbol)
+    deadline = datetime.fromisoformat(json.loads(raw)[symbol]["valid_until"])
+
+    parsed, count = manager._validated_sparse_current_ledger(  # noqa: SLF001
+        raw,
+        validation_time_utc=deadline - timedelta(seconds=1),
+    )
+
+    assert set(parsed) == {symbol}
+    assert parsed[symbol].symbol == symbol
+    assert count == 1
+
+
+@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
+def test_sparse_current_ledger_rejects_wrong_case_mt5_symbol(
+    tmp_path: Path,
+    wrong_case: str,
+) -> None:
+    manager, _ledger_path = _production_cutover_manager(tmp_path)
+    payload = json.loads(_sparse_current_ledger(symbol="Platinum"))
+    payload[wrong_case] = payload.pop("Platinum")
+    payload[wrong_case]["symbol"] = wrong_case
+
+    with pytest.raises(
+        RuntimeError,
+        match="PRODUCTION_AUTHORITY_LEDGER_SYMBOL_OUTSIDE_UNIVERSE",
+    ):
+        manager._validated_sparse_current_ledger(  # noqa: SLF001
+            json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii"),
+            validation_time_utc=datetime.fromisoformat(
+                payload[wrong_case]["valid_until"]
+            )
+            - timedelta(seconds=1),
+        )
+
+
+@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
+def test_production_generation_rejects_wrong_case_mt5_target(
+    tmp_path: Path,
+    wrong_case: str,
+) -> None:
+    manager, _ledger_path = _production_cutover_manager(tmp_path)
+    manager._reconcile_interrupted_promotion = lambda **_kwargs: None  # noqa: SLF001
+
+    with pytest.raises(
+        ValueError,
+        match=f"OPTIMIZATION_GENERATION_TARGET_UNKNOWN:{wrong_case}",
+    ):
+        manager._run_production_authority_generation(  # noqa: SLF001
+            OptimizationGenerationRequest(
+                kind="INITIAL",
+                target_symbols=(wrong_case,),
+            )
+        )
+
+
+def test_promotion_revalidates_expiry_after_raw_verify_before_publication(
+    tmp_path: Path,
+) -> None:
+    (
+        manager,
+        ledger_path,
+        stage_path,
+        stage_manifest_path,
+        manifest,
+        prior,
+        candidate,
+    ) = _deployment_manager(
+        tmp_path,
+        split_mode="production",
+        research_mode=False,
+    )
+    events: list[str] = []
+
+    def raw_verify(*args, **kwargs) -> None:
+        del args, kwargs
+        events.append("raw")
+
+    def expiry_verify(raw: bytes, *, validation_time_utc: datetime):
+        assert raw == candidate
+        assert validation_time_utc.tzinfo is not None
+        assert validation_time_utc.utcoffset() == timedelta(0)
+        events.append("expiry")
+        raise RuntimeError("TEST_EXPIRY_REJECTED")
+
+    manager._verify_staged_authority_before_cas = raw_verify  # noqa: SLF001
+    manager._validated_sparse_current_ledger = expiry_verify  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="TEST_EXPIRY_REJECTED"):
+        manager._promote_staged_generation(  # noqa: SLF001
+            stage_path,
+            stage_manifest_path,
+            manifest,
+            universe=SimpleNamespace(),
+        )
+
+    assert events == ["raw", "expiry"]
+    assert ledger_path.read_bytes() == prior
+    assert stage_path.read_bytes() == candidate
+    assert not manager._optimization_promotion_journal_path().exists()  # noqa: SLF001
 
 
 def _fake_production_result(request, raw: bytes):
@@ -925,6 +1116,118 @@ def test_production_cutover_failure_preserves_last_good(
         "PRODUCTION_AUTHORITY_RUN_FAILED"
         in outcome.technical_failures["__GENERATION__"]
     )
+
+
+def test_production_inner_recovery_uses_fail_fast_lock(
+    tmp_path: Path,
+) -> None:
+    manager, _ledger_path = _production_cutover_manager(tmp_path)
+    observed: dict[str, object] = {}
+
+    def stop_after_recovery(**kwargs):
+        observed.update(kwargs)
+        raise RuntimeError("stop-after-recovery")
+
+    manager._reconcile_interrupted_promotion = stop_after_recovery  # type: ignore[method-assign]  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="stop-after-recovery"):
+        manager._run_production_authority_generation(  # noqa: SLF001
+            OptimizationGenerationRequest(
+                kind="INITIAL",
+                target_symbols=tuple(book.PINNED_SYMBOL_ORDER),
+            )
+        )
+
+    assert observed == {"lock_timeout_seconds": 0.0}
+
+
+def test_supervisor_generation_identity_reaches_exact_runner_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manager, _ledger_path = _production_cutover_manager(tmp_path)
+    generation_id = "9" * 64
+    observed = {}
+
+    def stop_after_capture(request):
+        observed["generation_id"] = request.generation_id
+        raise production_runner.ProductionOptimizationNotPromotable(
+            "CURRENT_REFIT_NOT_PROMOTABLE",
+            ("TEST_CAPTURE_ONLY",),
+        )
+
+    monkeypatch.setattr(
+        production_runner,
+        "run_production_optimization",
+        stop_after_capture,
+    )
+    outcome = manager._run_governed_symbol_generation(  # noqa: SLF001
+        OptimizationGenerationRequest(
+            kind="INITIAL",
+            target_symbols=tuple(book.PINNED_SYMBOL_ORDER),
+            supervised_generation_id=generation_id,
+        )
+    )
+
+    assert observed["generation_id"] == generation_id
+    assert outcome.generation_id == generation_id
+    assert outcome.status == "NOT_PROMOTABLE"
+
+
+def test_production_non_promotable_is_not_a_technical_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, ledger_path = _production_cutover_manager(tmp_path)
+    prior = ledger_path.read_bytes()
+    active_manifest_path = manager._optimization_generation_paths()[2]  # noqa: SLF001
+    prior_active = (
+        active_manifest_path.read_bytes() if active_manifest_path.exists() else b""
+    )
+    promoted = []
+    monkeypatch.setattr(
+        production_runner,
+        "run_production_optimization",
+        lambda request: (_ for _ in ()).throw(
+            production_runner.ProductionOptimizationNotPromotable(
+                "CURRENT_REFIT_NOT_PROMOTABLE",
+                (
+                    "CURRENT_BOOK_HAS_NO_ELIGIBLE_WINNERS",
+                    "NO_LOCAL_WINNERS",
+                ),
+            )
+        ),
+    )
+    manager._promote_staged_generation = lambda *args: promoted.append(args)  # noqa: SLF001
+
+    outcome = manager._run_governed_symbol_generation(  # noqa: SLF001
+        OptimizationGenerationRequest(
+            kind="INITIAL",
+            target_symbols=tuple(book.PINNED_SYMBOL_ORDER),
+        )
+    )
+
+    assert outcome.status == "NOT_PROMOTABLE"
+    assert outcome.technical_failures == {}
+    assert outcome.non_promotable == {
+        "code": "CURRENT_REFIT_NOT_PROMOTABLE",
+        "details": [
+            "CURRENT_BOOK_HAS_NO_ELIGIBLE_WINNERS",
+            "NO_LOCAL_WINNERS",
+        ],
+        "preserved_last_good_ledger": True,
+        "confers_publication_or_trading_authority": False,
+    }
+    assert promoted == []
+    assert outcome.promoted is False
+    assert outcome.ledger_changed is False
+    assert ledger_path.read_bytes() == prior
+    assert (
+        active_manifest_path.read_bytes() if active_manifest_path.exists() else b""
+    ) == prior_active
+    manifest = json.loads(Path(outcome.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["generation_status"] == "NOT_PROMOTABLE"
+    assert manifest["technical_failures"] == {}
+    assert manifest["non_promotable"] == outcome.non_promotable
 
 
 def test_post_run_verification_failure_is_typed_and_discards_artifacts(

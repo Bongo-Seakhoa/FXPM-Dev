@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -12,17 +13,25 @@ import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
+
+import pm_authority_spool_quota as spool_quota
 
 
-GENERATION_CONTEXT_SCHEMA = "fxpm.authority-spool-generation-context.v1"
+LEGACY_GENERATION_CONTEXT_SCHEMA = "fxpm.authority-spool-generation-context.v1"
+GENERATION_CONTEXT_SCHEMA = "fxpm.authority-spool-generation-context.v2"
 ARTIFACT_DESCRIPTOR_SCHEMA = "fxpm.authority-spool-artifact-descriptor.v1"
-SYMBOL_MANIFEST_SCHEMA = "fxpm.authority-spool-symbol-manifest.v1"
-COMPACT_RECEIPT_SCHEMA = "fxpm.optimizer-authority-spool-receipt.v2"
+SYMBOL_MANIFEST_SCHEMA = "fxpm.authority-spool-symbol-manifest.v2"
+COMPACT_RECEIPT_SCHEMA = "fxpm.optimizer-authority-spool-receipt.v3"
+
+GENERAL_MANIFEST_DOMAIN = "GENERAL"
+HISTORICAL_ANCHOR_MANIFEST_DOMAIN = "HISTORICAL_ANCHOR"
+CURRENT_REFIT_MANIFEST_DOMAIN = "CURRENT_REFIT"
 
 CANONICAL_JSON_FORMAT = "canonical-json"
 CONTEXT_RELATIVE_PATH = "generation-context.json"
 DEFAULT_STREAM_CHUNK_BYTES = 1024 * 1024
+_RESERVATION_WINDOW_BYTES = 16 * DEFAULT_STREAM_CHUNK_BYTES
 MAX_CONTEXT_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 64
@@ -31,6 +40,13 @@ MAX_JSON_STRING_BYTES = 4 * 1024 * 1024
 
 _HEX = frozenset("0123456789abcdef")
 _FORMAT = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
+_MANIFEST_DOMAINS = frozenset(
+    {
+        GENERAL_MANIFEST_DOMAIN,
+        HISTORICAL_ANCHOR_MANIFEST_DOMAIN,
+        CURRENT_REFIT_MANIFEST_DOMAIN,
+    }
+)
 _DESCRIPTOR_FIELDS = frozenset(
     {"schema_version", "relative_path", "sha256", "size_bytes", "format"}
 )
@@ -43,7 +59,7 @@ _CONTEXT_FIELDS = frozenset(
         "limits",
     }
 )
-_LIMIT_FIELDS = frozenset(
+_LEGACY_LIMIT_FIELDS = frozenset(
     {
         "max_artifact_bytes",
         "max_symbol_bytes",
@@ -53,11 +69,15 @@ _LIMIT_FIELDS = frozenset(
         "stream_chunk_bytes",
     }
 )
+_LIMIT_FIELDS = frozenset(
+    {*_LEGACY_LIMIT_FIELDS, "max_generation_bytes", "min_free_bytes"}
+)
 _MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
         "generation_id",
         "symbol",
+        "manifest_domain",
         "native_universe_sha256",
         "config_sha256",
         "generation_context_sha256",
@@ -73,6 +93,7 @@ _RECEIPT_FIELDS = frozenset(
         "schema_version",
         "generation_id",
         "symbol",
+        "manifest_domain",
         "native_universe_sha256",
         "config_sha256",
         "generation_context_sha256",
@@ -93,6 +114,8 @@ class SpoolLimits:
     max_manifest_bytes: int = 128 * 1024**2
     max_json_bytes: int = 64 * 1024**2
     stream_chunk_bytes: int = DEFAULT_STREAM_CHUNK_BYTES
+    max_generation_bytes: int = 512 * 1024**3
+    min_free_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -103,6 +126,7 @@ class GenerationSpoolContext:
     config_sha256: str
     context_sha256: str
     limits: SpoolLimits
+    writable: bool
 
 
 def _fail(code: str) -> None:
@@ -115,6 +139,12 @@ def _is_sha256(value: Any) -> bool:
         and len(value) == 64
         and all(char in _HEX for char in value)
     )
+
+
+def _manifest_domain(value: Any, name: str = "MANIFEST_DOMAIN") -> str:
+    if type(value) is not str or value not in _MANIFEST_DOMAINS:
+        _fail(f"{name}_INVALID")
+    return value
 
 
 def _identity(value: Any, name: str, *, maximum_bytes: int = 512) -> str:
@@ -140,19 +170,38 @@ def _positive_int(value: Any, name: str) -> int:
     return value
 
 
+def _nonnegative_int(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        _fail(f"{name}_INVALID")
+    return value
+
+
 def _validate_limits(limits: SpoolLimits) -> SpoolLimits:
     if type(limits) is not SpoolLimits:
         _fail("SPOOL_LIMITS_INVALID")
     values = asdict(limits)
     for name, value in values.items():
-        _positive_int(value, name.upper())
+        if name == "min_free_bytes":
+            _nonnegative_int(value, name.upper())
+        else:
+            _positive_int(value, name.upper())
     if limits.max_json_bytes > limits.max_artifact_bytes:
         _fail("MAX_JSON_BYTES_EXCEEDS_ARTIFACT_BOUND")
     if limits.max_manifest_bytes > limits.max_artifact_bytes:
         _fail("MAX_MANIFEST_BYTES_EXCEEDS_ARTIFACT_BOUND")
     if limits.stream_chunk_bytes > limits.max_artifact_bytes:
         _fail("STREAM_CHUNK_BYTES_EXCEEDS_ARTIFACT_BOUND")
+    if limits.max_artifact_bytes > limits.max_generation_bytes:
+        _fail("MAX_ARTIFACT_BYTES_EXCEEDS_GENERATION_BOUND")
+    if limits.max_symbol_bytes > limits.max_generation_bytes:
+        _fail("MAX_SYMBOL_BYTES_EXCEEDS_GENERATION_BOUND")
     return limits
+
+
+def validate_spool_limits(limits: SpoolLimits) -> SpoolLimits:
+    """Public exact-type validator used before production derives tighter limits."""
+
+    return _validate_limits(limits)
 
 
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -446,6 +495,37 @@ def _temporary_path(root: Path) -> Path:
     return directory / f"{uuid.uuid4().hex}.part"
 
 
+def _cancel_clean_reservation(
+    lease: spool_quota.PublicationLease,
+    *,
+    temp: Optional[Path],
+    target: Optional[Path],
+    target_linked: bool,
+) -> None:
+    """Release only when cleanup proves no transaction-owned inode remains."""
+
+    published = target_linked
+    if not published and temp is not None and target is not None:
+        try:
+            published = os.path.samefile(temp, target)
+        except OSError:
+            pass
+    cleaned = temp is None
+    if temp is not None:
+        try:
+            temp.unlink(missing_ok=True)
+            cleaned = not temp.exists()
+        except OSError:
+            cleaned = False
+    if cleaned and not published:
+        try:
+            lease.cancel_after_cleanup()
+        except spool_quota.AuthoritySpoolQuotaError:
+            # The durable reservation remains fail-closed if cancellation
+            # itself cannot be persisted; preserve the publication root cause.
+            pass
+
+
 def _write_streamed_object(
     context: GenerationSpoolContext,
     chunks: Iterable[bytes],
@@ -454,67 +534,160 @@ def _write_streamed_object(
 ) -> dict[str, Any]:
     _validate_format(format_name)
     _assert_context_current(context)
-    temp = _temporary_path(context.root)
-    descriptor = _open_exclusive(temp)
-    digest = hashlib.sha256()
-    total = 0
+    if context.writable is not True:
+        _fail("GENERATION_CONTEXT_READ_ONLY")
     try:
-        try:
-            for raw in chunks:
-                if type(raw) not in {bytes, bytearray, memoryview}:
-                    _fail("ARTIFACT_CHUNK_TYPE_INVALID")
-                view = memoryview(raw)
-                offset = 0
-                while offset < len(view):
-                    piece = view[
-                        offset : offset + context.limits.stream_chunk_bytes
-                    ]
-                    total += len(piece)
-                    if total > context.limits.max_artifact_bytes:
-                        _fail("ARTIFACT_SIZE_BOUND_EXCEEDED")
-                    _write_all(descriptor, piece)
-                    digest.update(piece)
-                    offset += len(piece)
-            if total <= 0:
-                _fail("ARTIFACT_EMPTY")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        content_hash = digest.hexdigest()
-        relative_path = _content_relative_path(content_hash, format_name)
-        if _local_path(context.root, relative_path).exists():
-            if not _files_match(
-                context.root,
-                relative_path,
-                content_hash,
-                total,
+        with spool_quota.publication_lease(
+            context.root,
+            max_generation_bytes=context.limits.max_generation_bytes,
+            min_free_bytes=context.limits.min_free_bytes,
+        ) as lease:
+            temp = _temporary_path(context.root)
+            descriptor = _open_exclusive(temp)
+            digest = hashlib.sha256()
+            total = 0
+            pending = bytearray()
+            target: Optional[Path] = None
+            target_linked = False
+            reserved_available = 0
+            unreported_materialized = 0
+            buffer_limit = min(
                 context.limits.stream_chunk_bytes,
-            ):
-                _fail("CONTENT_ADDRESS_CONFLICT")
-        else:
+                DEFAULT_STREAM_CHUNK_BYTES,
+            )
+
+            def flush_pending() -> None:
+                nonlocal reserved_available, unreported_materialized
+                if not pending:
+                    return
+                encoded = bytes(pending)
+                needed = max(0, len(encoded) - reserved_available)
+                if needed:
+                    remaining = (
+                        context.limits.max_artifact_bytes
+                        - lease.in_progress_bytes
+                    )
+                    requested = min(
+                        remaining,
+                        max(needed, _RESERVATION_WINDOW_BYTES),
+                    )
+                    try:
+                        lease.consume(requested)
+                    except spool_quota.AuthoritySpoolQuotaError as exc:
+                        if (
+                            requested == needed
+                            or exc.code
+                            not in {
+                                "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
+                                "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
+                            }
+                        ):
+                            raise
+                        lease.consume(needed)
+                        requested = needed
+                    reserved_available += requested
+                _write_all(descriptor, memoryview(encoded))
+                reserved_available -= len(encoded)
+                unreported_materialized += len(encoded)
+                if unreported_materialized >= _RESERVATION_WINDOW_BYTES:
+                    lease.materialize(unreported_materialized)
+                    unreported_materialized = 0
+                pending.clear()
+
             try:
-                _publish_temp_exclusive(context.root, temp, relative_path)
-            except FileExistsError:
-                if not _files_match(
-                    context.root,
-                    relative_path,
-                    content_hash,
-                    total,
-                    context.limits.stream_chunk_bytes,
-                ):
-                    _fail("CONTENT_ADDRESS_CONFLICT")
-        return {
-            "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
-            "relative_path": relative_path,
-            "sha256": content_hash,
-            "size_bytes": total,
-            "format": format_name,
-        }
-    finally:
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
+                try:
+                    for raw in chunks:
+                        if type(raw) not in {bytes, bytearray, memoryview}:
+                            _fail("ARTIFACT_CHUNK_TYPE_INVALID")
+                        view = memoryview(raw)
+                        offset = 0
+                        while offset < len(view):
+                            available = (
+                                buffer_limit - len(pending)
+                            )
+                            piece = view[
+                                offset : offset + available
+                            ]
+                            projected = total + len(piece)
+                            if projected > context.limits.max_artifact_bytes:
+                                _fail("ARTIFACT_SIZE_BOUND_EXCEEDED")
+                            pending.extend(piece)
+                            digest.update(piece)
+                            total = projected
+                            offset += len(piece)
+                            if (
+                                len(pending) == buffer_limit
+                            ):
+                                flush_pending()
+                    flush_pending()
+                    if total <= 0:
+                        _fail("ARTIFACT_EMPTY")
+                    if unreported_materialized:
+                        lease.materialize(unreported_materialized)
+                        unreported_materialized = 0
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                content_hash = digest.hexdigest()
+                relative_path = _content_relative_path(
+                    content_hash, format_name
+                )
+                target = _local_path(context.root, relative_path)
+                new_unique_bytes = 0
+                if target.exists():
+                    if not _files_match(
+                        context.root,
+                        relative_path,
+                        content_hash,
+                        total,
+                        context.limits.stream_chunk_bytes,
+                    ):
+                        _fail("CONTENT_ADDRESS_CONFLICT")
+                else:
+                    try:
+                        _publish_temp_exclusive(
+                            context.root, temp, relative_path
+                        )
+                        target_linked = True
+                        new_unique_bytes = total
+                    except FileExistsError:
+                        if not _files_match(
+                            context.root,
+                            relative_path,
+                            content_hash,
+                            total,
+                            context.limits.stream_chunk_bytes,
+                        ):
+                            _fail("CONTENT_ADDRESS_CONFLICT")
+                try:
+                    temp.unlink()
+                except OSError as exc:
+                    raise AuthoritySpoolError(
+                        "TEMPORARY_FILE_CLEANUP_FAILED"
+                    ) from exc
+                lease.commit(new_unique_bytes)
+                return {
+                    "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
+                    "relative_path": relative_path,
+                    "sha256": content_hash,
+                    "size_bytes": total,
+                    "format": format_name,
+                }
+            except BaseException:
+                _cancel_clean_reservation(
+                    lease,
+                    temp=temp,
+                    target=target,
+                    target_linked=target_linked,
+                )
+                raise
+            finally:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except spool_quota.AuthoritySpoolQuotaError as exc:
+        raise AuthoritySpoolError(str(exc)) from exc
 
 
 def _publish_exact_json(
@@ -523,50 +696,92 @@ def _publish_exact_json(
     value: Any,
     maximum_bytes: int,
 ) -> dict[str, Any]:
+    if (
+        type(context) is not GenerationSpoolContext
+        or context.writable is not True
+    ):
+        _fail("GENERATION_CONTEXT_READ_ONLY")
     encoded = _canonical_json_bytes(value, maximum_bytes)
     digest = hashlib.sha256(encoded).hexdigest()
     target = _local_path(context.root, relative_path)
-    if target.exists():
-        observed_hash, observed_size, observed = _stream_file(
+    try:
+        with spool_quota.publication_lease(
             context.root,
-            relative_path,
-            maximum_bytes=maximum_bytes,
-            collect=True,
-            chunk_bytes=context.limits.stream_chunk_bytes,
-        )
-        if observed_hash != digest or observed_size != len(encoded) or observed != encoded:
-            _fail("IMMUTABLE_FILE_CONFLICT")
-    else:
-        temp = _temporary_path(context.root)
-        descriptor = _open_exclusive(temp)
-        try:
+            max_generation_bytes=context.limits.max_generation_bytes,
+            min_free_bytes=context.limits.min_free_bytes,
+        ) as lease:
+            temp: Optional[Path] = None
+            target_linked = False
             try:
-                _write_all(descriptor, memoryview(encoded))
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            try:
-                _publish_temp_exclusive(context.root, temp, relative_path)
-            except FileExistsError:
-                observed_hash, observed_size, observed = _stream_file(
-                    context.root,
-                    relative_path,
-                    maximum_bytes=maximum_bytes,
-                    expected_size=len(encoded),
-                    collect=True,
-                    chunk_bytes=context.limits.stream_chunk_bytes,
+                new_unique_bytes = 0
+                if target.exists():
+                    observed_hash, observed_size, observed = _stream_file(
+                        context.root,
+                        relative_path,
+                        maximum_bytes=maximum_bytes,
+                        collect=True,
+                        chunk_bytes=context.limits.stream_chunk_bytes,
+                    )
+                    if (
+                        observed_hash != digest
+                        or observed_size != len(encoded)
+                        or observed != encoded
+                    ):
+                        _fail("IMMUTABLE_FILE_CONFLICT")
+                else:
+                    lease.consume(len(encoded))
+                    temp = _temporary_path(context.root)
+                    descriptor = _open_exclusive(temp)
+                    try:
+                        _write_all(descriptor, memoryview(encoded))
+                        lease.materialize(len(encoded))
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    try:
+                        _publish_temp_exclusive(
+                            context.root, temp, relative_path
+                        )
+                        target_linked = True
+                        new_unique_bytes = len(encoded)
+                    except FileExistsError:
+                        observed_hash, observed_size, observed = _stream_file(
+                            context.root,
+                            relative_path,
+                            maximum_bytes=maximum_bytes,
+                            expected_size=len(encoded),
+                            collect=True,
+                            chunk_bytes=context.limits.stream_chunk_bytes,
+                        )
+                        if (
+                            observed_hash != digest
+                            or observed_size != len(encoded)
+                            or observed != encoded
+                        ):
+                            _fail("IMMUTABLE_FILE_CONFLICT")
+                    try:
+                        temp.unlink()
+                    except OSError as exc:
+                        raise AuthoritySpoolError(
+                            "TEMPORARY_FILE_CLEANUP_FAILED"
+                        ) from exc
+                lease.commit(new_unique_bytes)
+            except BaseException:
+                _cancel_clean_reservation(
+                    lease,
+                    temp=temp,
+                    target=target,
+                    target_linked=target_linked,
                 )
-                if (
-                    observed_hash != digest
-                    or observed_size != len(encoded)
-                    or observed != encoded
-                ):
-                    _fail("IMMUTABLE_FILE_CONFLICT")
-        finally:
-            try:
-                temp.unlink(missing_ok=True)
-            except OSError:
-                pass
+                raise
+            finally:
+                if temp is not None:
+                    try:
+                        temp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    except spool_quota.AuthoritySpoolQuotaError as exc:
+        raise AuthoritySpoolError(str(exc)) from exc
     return {
         "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
         "relative_path": relative_path,
@@ -588,9 +803,11 @@ def _content_relative_path(digest: str, format_name: str) -> str:
     return f"objects/sha256/{digest[:2]}/{digest}.{format_name}"
 
 
-def _manifest_relative_path(symbol: str) -> str:
+def _manifest_relative_path(symbol: str, manifest_domain: str) -> str:
+    domain = _manifest_domain(manifest_domain)
     key = hashlib.sha256(symbol.encode("utf-8")).hexdigest()
-    return f"symbols/{key}/manifest.json"
+    domain_key = hashlib.sha256(domain.encode("ascii")).hexdigest()
+    return f"symbols/{key}/domains/{domain_key}/manifest.json"
 
 
 def _validate_descriptor(
@@ -621,11 +838,26 @@ def _validate_descriptor(
     }
 
 
-def _limits_from_payload(value: Any) -> SpoolLimits:
-    if type(value) is not dict or set(value) != _LIMIT_FIELDS:
+def _limits_from_payload(
+    value: Any,
+    *,
+    legacy: bool,
+) -> SpoolLimits:
+    expected_fields = _LEGACY_LIMIT_FIELDS if legacy else _LIMIT_FIELDS
+    if type(value) is not dict or set(value) != expected_fields:
         _fail("SPOOL_LIMIT_FIELDS_INVALID")
     try:
-        limits = SpoolLimits(**value)
+        limits = SpoolLimits(
+            **value,
+            **(
+                {
+                    "max_generation_bytes": SpoolLimits().max_generation_bytes,
+                    "min_free_bytes": 0,
+                }
+                if legacy
+                else {}
+            ),
+        )
     except TypeError as exc:
         raise AuthoritySpoolError("SPOOL_LIMITS_INVALID") from exc
     return _validate_limits(limits)
@@ -661,6 +893,7 @@ def freeze_generation_context(
         config_sha256=config_hash,
         context_sha256=hashlib.sha256(encoded).hexdigest(),
         limits=active_limits,
+        writable=True,
     )
     _publish_exact_json(bootstrap, CONTEXT_RELATIVE_PATH, payload, MAX_CONTEXT_BYTES)
     return reopen_generation_context(
@@ -691,14 +924,22 @@ def reopen_generation_context(
     payload = _strict_json_bytes(encoded, MAX_CONTEXT_BYTES)
     if type(payload) is not dict or set(payload) != _CONTEXT_FIELDS:
         _fail("GENERATION_CONTEXT_FIELDS_INVALID")
-    if payload.get("schema_version") != GENERATION_CONTEXT_SCHEMA:
+    schema_version = payload.get("schema_version")
+    if schema_version not in {
+        LEGACY_GENERATION_CONTEXT_SCHEMA,
+        GENERATION_CONTEXT_SCHEMA,
+    }:
         _fail("GENERATION_CONTEXT_SCHEMA_INVALID")
     generation = _identity(payload.get("generation_id"), "GENERATION_ID")
     native_hash = _sha256(
         payload.get("native_universe_sha256"), "NATIVE_UNIVERSE_SHA256"
     )
     config_hash = _sha256(payload.get("config_sha256"), "CONFIG_SHA256")
-    active_limits = _limits_from_payload(payload.get("limits"))
+    legacy = schema_version == LEGACY_GENERATION_CONTEXT_SCHEMA
+    active_limits = _limits_from_payload(
+        payload.get("limits"),
+        legacy=legacy,
+    )
     if expected_generation_id is not None and generation != expected_generation_id:
         _fail("GENERATION_CONTEXT_IDENTITY_MISMATCH")
     if (
@@ -715,6 +956,7 @@ def reopen_generation_context(
         config_sha256=config_hash,
         context_sha256=digest,
         limits=active_limits,
+        writable=not legacy,
     )
 
 
@@ -727,7 +969,11 @@ def _assert_context_current(context: GenerationSpoolContext) -> None:
         expected_native_universe_sha256=context.native_universe_sha256,
         expected_config_sha256=context.config_sha256,
     )
-    if observed.context_sha256 != context.context_sha256 or observed.limits != context.limits:
+    if (
+        observed.context_sha256 != context.context_sha256
+        or observed.limits != context.limits
+        or observed.writable is not context.writable
+    ):
         _fail("GENERATION_CONTEXT_CHANGED")
 
 
@@ -759,13 +1005,45 @@ def write_opaque_artifact(
     return _write_streamed_object(context, chunks, format_name=format_name)
 
 
+@contextmanager
+def reserve_transient_publication(
+    context: GenerationSpoolContext,
+) -> Iterator[spool_quota.PublicationLease]:
+    """Open one governed multi-temp transaction for a future batch publisher.
+
+    Call ``consume`` before each physical write and ``materialize`` after it.
+    Finish with ``commit`` after content-address publication, or remove every
+    transaction-owned byte before ``cancel_after_cleanup``.
+    """
+
+    _assert_context_current(context)
+    if context.writable is not True:
+        _fail("GENERATION_CONTEXT_READ_ONLY")
+    try:
+        with spool_quota.publication_lease(
+            context.root,
+            max_generation_bytes=context.limits.max_generation_bytes,
+            min_free_bytes=context.limits.min_free_bytes,
+        ) as reservation:
+            yield reservation
+    except spool_quota.AuthoritySpoolQuotaError as exc:
+        raise AuthoritySpoolError(str(exc)) from exc
+
+
 class SymbolAuthoritySink:
     """Bounded per-symbol artifact roster."""
 
-    def __init__(self, context: GenerationSpoolContext, symbol: str) -> None:
+    def __init__(
+        self,
+        context: GenerationSpoolContext,
+        symbol: str,
+        *,
+        manifest_domain: str = GENERAL_MANIFEST_DOMAIN,
+    ) -> None:
         _assert_context_current(context)
         self.context = context
         self.symbol = _identity(symbol, "SYMBOL", maximum_bytes=256)
+        self.manifest_domain = _manifest_domain(manifest_domain)
         self._artifacts: dict[str, dict[str, Any]] = {}
         self._total_bytes = 0
 
@@ -822,6 +1100,32 @@ class SymbolAuthoritySink:
         descriptor = write_opaque_artifact(self.context, chunks, format=format)
         return self.register_artifact(artifact_id, artifact_type, descriptor)
 
+    def artifact_roster(self) -> list[dict[str, Any]]:
+        """Return a bounded canonical copy without publishing a manifest."""
+
+        _assert_context_current(self.context)
+        roster = [self._artifacts[key] for key in sorted(self._artifacts)]
+        encoded = _canonical_json_bytes(
+            roster,
+            self.context.limits.max_manifest_bytes,
+        )
+        reopened = _strict_json_bytes(
+            encoded,
+            self.context.limits.max_manifest_bytes,
+        )
+        if (
+            type(reopened) is not list
+            or len(reopened) != len(roster)
+            or sum(
+                int(item.get("descriptor", {}).get("size_bytes", -1))
+                for item in reopened
+                if type(item) is dict
+            )
+            != self._total_bytes
+        ):
+            _fail("UNSEALED_ARTIFACT_ROSTER_INVALID")
+        return reopened
+
     def seal(self) -> dict[str, Any]:
         _assert_context_current(self.context)
         roster = [self._artifacts[key] for key in sorted(self._artifacts)]
@@ -832,6 +1136,7 @@ class SymbolAuthoritySink:
             "schema_version": SYMBOL_MANIFEST_SCHEMA,
             "generation_id": self.context.generation_id,
             "symbol": self.symbol,
+            "manifest_domain": self.manifest_domain,
             "native_universe_sha256": self.context.native_universe_sha256,
             "config_sha256": self.context.config_sha256,
             "generation_context_sha256": self.context.context_sha256,
@@ -842,7 +1147,7 @@ class SymbolAuthoritySink:
         }
         manifest_descriptor = _publish_exact_json(
             self.context,
-            _manifest_relative_path(self.symbol),
+            _manifest_relative_path(self.symbol, self.manifest_domain),
             manifest,
             self.context.limits.max_manifest_bytes,
         )
@@ -850,6 +1155,7 @@ class SymbolAuthoritySink:
             "schema_version": COMPACT_RECEIPT_SCHEMA,
             "generation_id": self.context.generation_id,
             "symbol": self.symbol,
+            "manifest_domain": self.manifest_domain,
             "native_universe_sha256": self.context.native_universe_sha256,
             "config_sha256": self.context.config_sha256,
             "generation_context_sha256": self.context.context_sha256,
@@ -860,10 +1166,16 @@ class SymbolAuthoritySink:
 def open_symbol_sink(
     context: GenerationSpoolContext,
     symbol: str,
+    *,
+    manifest_domain: str = GENERAL_MANIFEST_DOMAIN,
 ) -> SymbolAuthoritySink:
     """Open a worker sink bound to one exact symbol and generation."""
 
-    return SymbolAuthoritySink(context, symbol)
+    return SymbolAuthoritySink(
+        context,
+        symbol,
+        manifest_domain=manifest_domain,
+    )
 
 
 def _verify_artifact_file(
@@ -916,6 +1228,7 @@ def verify_symbol_receipt(
     expected_symbol: str,
     expected_native_universe_sha256: str,
     expected_config_sha256: str,
+    expected_manifest_domain: Optional[str] = None,
 ) -> dict[str, Any]:
     """Reopen and verify a compact worker receipt and every roster artifact."""
 
@@ -926,10 +1239,18 @@ def verify_symbol_receipt(
     )
     config_hash = _sha256(expected_config_sha256, "EXPECTED_CONFIG_SHA256")
     value = _receipt_payload(receipt)
+    receipt_domain = _manifest_domain(value.get("manifest_domain"))
+    manifest_domain = (
+        receipt_domain
+        if expected_manifest_domain is None
+        else _manifest_domain(expected_manifest_domain, "EXPECTED_MANIFEST_DOMAIN")
+    )
     if value.get("generation_id") != generation:
         _fail("COMPACT_RECEIPT_GENERATION_MISMATCH")
     if value.get("symbol") != symbol:
         _fail("COMPACT_RECEIPT_SYMBOL_MISMATCH")
+    if receipt_domain != manifest_domain:
+        _fail("COMPACT_RECEIPT_MANIFEST_DOMAIN_MISMATCH")
     if value.get("native_universe_sha256") != native_hash:
         _fail("COMPACT_RECEIPT_NATIVE_MISMATCH")
     if value.get("config_sha256") != config_hash:
@@ -944,7 +1265,7 @@ def verify_symbol_receipt(
         _fail("COMPACT_RECEIPT_CONTEXT_MISMATCH")
     manifest_descriptor = _validate_descriptor(
         value.get("symbol_manifest"),
-        expected_path=_manifest_relative_path(symbol),
+        expected_path=_manifest_relative_path(symbol, manifest_domain),
         content_addressed=False,
     )
     if manifest_descriptor["format"] != CANONICAL_JSON_FORMAT:
@@ -967,6 +1288,9 @@ def verify_symbol_receipt(
         _fail("SYMBOL_MANIFEST_FIELDS_INVALID")
     if manifest.get("schema_version") != SYMBOL_MANIFEST_SCHEMA:
         _fail("SYMBOL_MANIFEST_SCHEMA_INVALID")
+    observed_manifest_domain = _manifest_domain(manifest.get("manifest_domain"))
+    if observed_manifest_domain != manifest_domain:
+        _fail("SYMBOL_MANIFEST_DOMAIN_MISMATCH")
     expected_identities = {
         "generation_id": generation,
         "symbol": symbol,
@@ -1016,14 +1340,20 @@ __all__ = [
     "AuthoritySpoolError",
     "CANONICAL_JSON_FORMAT",
     "COMPACT_RECEIPT_SCHEMA",
+    "CURRENT_REFIT_MANIFEST_DOMAIN",
     "GENERATION_CONTEXT_SCHEMA",
+    "GENERAL_MANIFEST_DOMAIN",
     "GenerationSpoolContext",
+    "HISTORICAL_ANCHOR_MANIFEST_DOMAIN",
+    "LEGACY_GENERATION_CONTEXT_SCHEMA",
     "SYMBOL_MANIFEST_SCHEMA",
     "SpoolLimits",
     "SymbolAuthoritySink",
     "freeze_generation_context",
     "open_symbol_sink",
     "reopen_generation_context",
+    "reserve_transient_publication",
+    "validate_spool_limits",
     "verify_symbol_receipt",
     "write_canonical_json_artifact",
     "write_opaque_artifact",

@@ -1,0 +1,89 @@
+# Audit Locks
+
+Use this file before editing shared output files or source files.
+
+## Active Locks
+
+- None.
+
+## Released Locks
+- RELEASED: `AGENT_COMMS.md`, `agent_audit/LOCKS.md`, `agent_audit/TASKS.md`, `agent_audit/STATUS.md`, `agent_audit/agents/Codex.md`, `agent_audit/scripts/watch_comms.ps1`, `agent_audit/comms_alerts.log`, `agent_audit/comms/CHANNEL.md`, `pm_core.py`, `pm_pipeline.py`, `tests/test_instrument_specs.py`, `tests/test_pipeline_replay_audit_integration.py`, `agent_audit/performance/data/*`
+  - Owner: Codex
+  - Started: 2026-07-07T01:44:00+02:00
+  - Ended: 2026-07-07T02:12:00+02:00
+  - Summary: Joined the multi-agent comms workflow, installed/used the comms watcher, implemented case/alias-insensitive broker-spec lookup, real-spec replayed `PALLADIUM` and confirmed it still fails, wired Claude's replay audit into post-optimization pipeline enforcement without editing Claude-owned audit files or `pm_configs.json`, added opt-in timeframe validation floors, refreshed the 62-cell survivor replay/audit evidence, and validated with focused plus broad non-integrity test runs.
+- RELEASED: `agent_audit/performance/data/*`, `agent_audit/performance/*`, `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/LOCKS.md`
+  - Owner: Codex
+  - Started: 2026-06-19T23:57:21+02:00
+  - Ended: 2026-06-20T00:03:26+02:00
+  - Summary: Post-optimization current-book inventory and replay after operator confirmed optimization complete; listed and replayed 117 logical promoted cells, refreshed shadow audit/evidence manifest/HTML, and documented deployment caveats including missing `PALLADIUM` instrument spec and 38 PF<1 replay-negative cells.
+- RELEASED: `agent_audit/performance/scripts/run_promoted_cell_replay.py`, `agent_audit/performance/scripts/shadow_selection_audit.py`, `agent_audit/performance/scripts/build_performance_evidence.py`, `agent_audit/performance/scripts/claude_replay_all_promoted.py`, `agent_audit/performance/data/*`, `agent_audit/performance/*`, `tests/test_performance_replay_tools.py`, `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/LOCKS.md`
+  - Owner: Codex
+  - Started: 2026-06-18T17:26:03+02:00
+  - Ended: 2026-06-18T17:41:02+02:00
+  - Summary: Incorporated Claude decisive replay finding, fixed symbol-level promoted-winner enumeration, regenerated current-ledger evidence, marked stale 157-cell evidence as historical, rendered HTML, and validated with 78 focused tests plus replay-tool regression tests.
+- RELEASED: `pm_metrics.py`, `pm_core.py`, `pm_dashboard/analytics.py`, `pm_live_readiness.py`, `pm_main.py`, `pm_pipeline.py`, `tools/benchmark.py`, `agent_audit/performance/scripts/*`, `agent_audit/performance/data/*`, `tests/*`, `agent_audit/performance/*`, `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/LOCKS.md`
+  - Owner: Codex
+  - Started: 2026-06-18T15:16:15+02:00
+  - Ended: 2026-06-18T15:39:00+02:00
+  - Summary: Implemented aligned fixes PERF-FIX-005/006/007: canonical metric contract, live-readiness min-lot tradeability/preflight, bounded replay and shadow-selection tooling; generated one-cell USD 10k replay evidence; ran 274 focused tests plus 11 subtests; regenerated evidence and HTML.
+- RELEASED: `pm_core.py`, `pm_main.py`, `tests/test_backtester.py`, `tests/test_config_source_of_truth.py`, `agent_audit/performance/*`, `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/LOCKS.md`
+  - Owner: Codex
+  - Started: 2026-06-18T14:58:14+02:00
+  - Ended: 2026-06-18T15:14:00+02:00
+  - Summary: Redid `prompt.md` performance deliverables after comms check; implemented PERF-FIX-004 schema-version metadata, synced Claude review status, rewrote final report with required sections, regenerated required-column comparison CSV, rebuilt strategy anatomy files, reran bounded validation, and rendered HTML.
+- RELEASED: `agent_audit/performance/scripts/build_performance_evidence.py`, `agent_audit/performance/evidence_manifest.json`, `agent_audit/performance/baseline_10000_summary.json`, `agent_audit/performance/strategy_anatomy/*`, `agent_audit/COMMAND_LOG.md`, `agent_audit/LOCKS.md`
+  - Owner: Codex
+  - Started: 2026-06-18T13:59:00+02:00
+  - Ended: 2026-06-18T13:59:20+02:00
+  - Summary: Added final performance docs to the evidence fingerprint list, regenerated read-only evidence artifacts, and logged the command.
+- RELEASED: `pm_core.py`, `pm_main.py`, `pm_dashboard/analytics.py`, `tests/*`, `agent_audit/performance/*`, `agent_audit/scripts/render_audit_html.py`, `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/LOCKS.md`
+  - Owner: Codex
+  - Started: 2026-06-18T13:45:00+02:00
+  - Ended: 2026-06-18T13:58:00+02:00
+  - Summary: Executed `prompt.md` performance-first pass: added MAE/MFE backtest instrumentation, live entry slippage attribution, dashboard PF sentinel correction, tests, evidence builder, strategy anatomy, final performance docs, and rendered HTML. Partner review pending.
+- RELEASED: `agent_audit/scripts/render_audit_html.py`, `agent_audit/reports/*.html`, `agent_audit/COMMAND_LOG.md`
+  - Owner: Codex
+  - Started: 2026-06-17T18:26:45+02:00
+  - Ended: 2026-06-17T18:27:15+02:00
+  - Summary: Replaced preformatted Markdown wrapper with real Markdown-to-HTML rendering and regenerated all report HTML files.
+- RELEASED: `agent_audit/QUESTIONS.md`, `agent_audit/reports/*`, `agent_audit/COMMAND_LOG.md`
+  - Owner: Codex
+  - Started: 2026-06-17T14:31:45+02:00
+  - Ended: 2026-06-17T14:32:05+02:00
+  - Summary: Incorporated operator answers into resolved audit decisions and regenerated HTML reports.
+- RELEASED: `agent_audit/COMMAND_LOG.md`
+  - Owner: Codex
+  - Started: 2026-06-17T14:13:00+02:00
+  - Ended: 2026-06-17T14:13:06+02:00
+  - Summary: Logged final sanity checks before handoff.
+- RELEASED: `agent_audit/TASKS.md`, `agent_audit/QUESTIONS.md`, `agent_audit/agents/Codex.md`, `agent_audit/reports/*`, `agent_audit/COMMAND_LOG.md`
+  - Owner: Codex
+  - Started: 2026-06-17T14:12:00+02:00
+  - Ended: 2026-06-17T14:12:13+02:00
+  - Summary: Reconciled Claude Code's F005 agreement across bookkeeping and regenerated HTML reports.
+- RELEASED: `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/ASSUMPTIONS.md`, `agent_audit/QUESTIONS.md`, `agent_audit/FINDINGS_INDEX.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/agents/Codex.md`, `agent_audit/findings/*`, `agent_audit/reports/*`, `agent_audit/scripts/*`, `agent_audit/data/*`
+  - Owner: Codex
+  - Started: 2026-06-17T14:05:10+02:00
+  - Ended: 2026-06-17T14:10:56+02:00
+  - Summary: Completed corrective second-pass audit, added F005, reviewed F110-F113, generated deep evidence files, rewrote technical/strategic reports, and regenerated HTML report copies.
+- RELEASED: `agent_audit/findings/*`, `agent_audit/reports/*`, `agent_audit/FINDINGS_INDEX.md`, `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/agents/Codex.md`
+  - Owner: Codex
+  - Started: 2026-06-17T14:05:00+02:00
+  - Ended: 2026-06-17T14:16:00+02:00
+  - Summary: Added Codex findings/reports, cross-reviewed Claude findings, logged commands, and finalized audit handoff.
+- RELEASED: `agent_audit/STATUS.md`, `agent_audit/TASKS.md`, `agent_audit/FINDINGS_INDEX.md`, `agent_audit/QUESTIONS.md`, `agent_audit/ASSUMPTIONS.md`, `agent_audit/COMMAND_LOG.md`, `agent_audit/LOCKS.md`, `agent_audit/agents/Codex.md`
+  - Owner: Codex
+  - Started: 2026-06-17T13:15:00+02:00
+  - Ended: 2026-06-17T13:16:00+02:00
+  - Summary: Bootstrapped coordination files and Codex agent profile.
+- RELEASED: `agent_audit/scripts/collect_audit_evidence.py`, `agent_audit/COMMAND_LOG.md`
+  - Owner: Codex
+  - Started: 2026-06-17T13:16:30+02:00
+  - Ended: 2026-06-17T13:19:00+02:00
+  - Summary: Added and ran the read-only evidence collector.
+- RELEASED: `agent_audit/scripts/collect_audit_evidence.py`, `agent_audit/COMMAND_LOG.md`
+  - Owner: Codex
+  - Started: 2026-06-17T13:20:00+02:00
+  - Ended: 2026-06-17T13:21:30+02:00
+  - Summary: Excluded audit workspace from Toronto search and regenerated evidence.

@@ -1,12 +1,15 @@
 import hashlib
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 import pm_main
+import pm_native_activation
 from pm_main import FXPortfolioManagerApp, _governed_generation_cli_verdict
 
 
@@ -152,9 +155,26 @@ class _Logger:
 class _Storage:
     def __init__(self):
         self.completions = 0
+        self.shutdowns = 0
 
     def on_optimization_complete(self):
         self.completions += 1
+
+    def on_shutdown(self):
+        self.shutdowns += 1
+
+
+def test_supervisor_parent_shutdown_skips_duplicate_storage_tree_scan() -> None:
+    app = FXPortfolioManagerApp.__new__(FXPortfolioManagerApp)
+    app.logger = _Logger()
+    app.trader = None
+    app.storage_manager = _Storage()
+    app.mt5 = None
+    app._skip_storage_shutdown_housekeeping = True
+
+    app.shutdown()
+
+    assert app.storage_manager.shutdowns == 0
 
 
 class _FailedManager:
@@ -485,3 +505,487 @@ def test_stale_recovery_snapshot_blocks_when_target_is_absent(tmp_path: Path):
     assert not app.run_optimization(overwrite=True)
     assert not ledger_path.exists()
     assert stale.read_bytes() == b"operator recovery evidence"
+
+
+def _production_scope_stats(**overrides):
+    stats = {
+        "schema_version": "fxpm.production_native_authority_verification_scope.v1",
+        "scope": "optimization",
+        "full_verification_count": 1,
+        "identity_revalidation_attempt_count": 13,
+        "identity_revalidation_count": 13,
+        "identity_revalidation_failure_count": 0,
+        "active_pointer_sha256": "a" * 64,
+        "activation_manifest_sha256": "b" * 64,
+        "closed": False,
+        "poisoned": False,
+        "pid": 1234,
+        "thread_id": 5678,
+        "poison_reason": None,
+    }
+    stats.update(overrides)
+    return stats
+
+
+class _FakeProductionAuthorityScope:
+    def __init__(self, stats, events):
+        self._stats = stats
+        self._events = events
+        self.active = False
+
+    def __enter__(self):
+        assert not self.active
+        self.active = True
+        self._events.append("scope_enter")
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        assert self.active
+        self.active = False
+        self._stats["closed"] = True
+        self._events.append("scope_exit")
+        return False
+
+    def stats(self):
+        assert not self.active
+        self._events.append("scope_stats")
+        return dict(self._stats)
+
+
+def _install_optimization_main_harness(
+    tmp_path,
+    monkeypatch,
+    *,
+    production_mode=True,
+    optimize_result=True,
+    optimize_exception=None,
+    trade=False,
+    stats=None,
+):
+    events = []
+    observed = {}
+    scope = _FakeProductionAuthorityScope(
+        stats if stats is not None else _production_scope_stats(),
+        events,
+    )
+
+    class _App:
+        def __init__(self, **kwargs):
+            observed["init"] = kwargs
+            self.mt5 = None
+            self.config_file = kwargs["config_file"]
+            self.portfolio_manager = SimpleNamespace(
+                _reconcile_interrupted_promotion=lambda **_kwargs: (
+                    events.append("reconcile") or "NONE"
+                ),
+                _recover_abandoned_supervised_generation=(
+                    lambda _generation_id, **_kwargs: (
+                        events.append("recover") or "RECOVERED"
+                    )
+                ),
+            )
+
+        def initialize(self):
+            events.append("initialize")
+            return True
+
+        def run_optimization(self, *, overwrite=False):
+            events.append("optimize")
+            observed["overwrite"] = overwrite
+            assert scope.active is production_mode
+            if optimize_exception is not None:
+                raise optimize_exception
+            return optimize_result
+
+        def run_trading(self, **kwargs):
+            assert not scope.active
+            events.append("trade")
+            observed["trade"] = kwargs
+            return True
+
+        def shutdown(self):
+            assert not scope.active
+            events.append("shutdown")
+
+    def _scope_factory():
+        events.append("scope_factory")
+        return scope
+
+    mode = "calendar_lockbox_v2" if production_mode else "research_clean_holdout"
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(
+        pm_main,
+        "load_config_json",
+        lambda _path: {
+            "symbols": ["EURUSD"],
+            "pipeline": {
+                "production_split_mode": mode,
+                "research_mode": not production_mode,
+                "data_dir": str(tmp_path / "data"),
+                "output_dir": str(tmp_path / "out"),
+                "log_dir": str(tmp_path / "logs"),
+                "winner_ledger_path": str(tmp_path / "pm_configs.json"),
+            },
+        },
+    )
+    monkeypatch.setattr(pm_main, "setup_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(pm_main, "log_resolved_config_summary", lambda *_args: None)
+    monkeypatch.setattr(pm_main.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(pm_main, "set_instrument_specs", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        pm_main,
+        "_production_hard_supervision_required",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(pm_main, "FXPortfolioManagerApp", _App)
+    monkeypatch.setattr(
+        pm_native_activation,
+        "production_native_authority_verification_scope",
+        _scope_factory,
+        raising=False,
+    )
+    argv = [
+        "pm_main.py",
+        "--config",
+        str(config_path),
+        "--optimize",
+        "--overwrite",
+    ]
+    if trade:
+        argv.extend(["--trade", "--paper"])
+    monkeypatch.setattr(sys, "argv", argv)
+    return events, observed, scope
+
+
+def test_calendar_optimize_requires_exact_closed_scope_and_trades_after_exit(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    stats = _production_scope_stats()
+    events, observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+        stats=stats,
+        trade=True,
+    )
+    caplog.set_level(logging.INFO, logger=pm_main.__name__)
+
+    assert pm_main.main() == 0
+
+    assert observed["overwrite"] is True
+    assert events.index("scope_enter") < events.index("optimize")
+    assert events.index("optimize") < events.index("scope_exit")
+    assert events.index("scope_exit") < events.index("scope_stats")
+    assert events.index("scope_stats") < events.index("trade")
+    assert events.index("trade") < events.index("shutdown")
+    expected = json.dumps(
+        {**stats, "closed": True},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    assert (
+        "PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_STATS " + expected
+        in caplog.messages
+    )
+
+
+def test_optimize_only_calendar_initialization_never_connects_unused_mt5(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = pm_main.PipelineConfig(
+        production_split_mode="calendar_lockbox_v2",
+        data_dir=tmp_path / "data",
+        output_dir=tmp_path / "out",
+        log_dir=tmp_path / "logs",
+        winner_ledger_path=str(tmp_path / "pm_configs.json"),
+    )
+    config._optimization_only_entrypoint = True
+    app = pm_main.FXPortfolioManagerApp(
+        symbols=["EURUSD"],
+        pipeline_config=config,
+        config_file=str(tmp_path / "pm_configs.json"),
+    )
+    monkeypatch.setattr(pm_main, "MT5_AVAILABLE", True)
+    monkeypatch.setattr(
+        pm_main,
+        "MT5Connector",
+        lambda *_args, **_kwargs: pytest.fail("MT5 must not be constructed"),
+    )
+    observed: dict[str, object] = {}
+
+    def portfolio_manager(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(symbol_configs={})
+
+    monkeypatch.setattr(
+        pm_main,
+        "PortfolioManager",
+        portfolio_manager,
+    )
+
+    assert app.initialize() is True
+    assert app.mt5 is None
+
+
+def test_successful_calendar_optimize_fails_on_scope_counter_mismatch(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    events, _observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+        stats=_production_scope_stats(identity_revalidation_count=12),
+    )
+    caplog.set_level(logging.INFO, logger=pm_main.__name__)
+
+    assert pm_main.main() == 2
+
+    assert "scope_exit" in events
+    assert "trade" not in events
+    assert any(
+        "PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_CONTRACT_REJECTED" in message
+        and "identity_revalidation_count:expected=13:actual=12" in message
+        for message in caplog.messages
+    )
+
+
+def test_optimize_only_calendar_uses_hard_supervisor_without_run_limit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import pm_production_generation_entrypoint as generation_entrypoint
+
+    events, _observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+    )
+    captured = {}
+    lease = object()
+
+    class _LeaseContext:
+        def __enter__(self):
+            events.append("run_lease_enter")
+            return lease
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            events.append("run_lease_exit")
+            return False
+
+    def fake_supervised(**kwargs):
+        events.append("supervised")
+        captured.update(kwargs)
+        recovery = kwargs["recovery_callback"]("a" * 64)
+        return SimpleNamespace(
+            generation_id="a" * 64,
+            succeeded=True,
+            safe_to_reconcile=True,
+            cli_exit_code=0,
+            generation_recovery_status=recovery,
+            stale_recovery_status=None,
+            request_directory_retained=False,
+            supervisor=SimpleNamespace(
+                status="SUCCEEDED",
+                succeeded=True,
+                result_path=tmp_path / "supervisor-result.json",
+            ),
+        )
+
+    monkeypatch.setattr(
+        pm_main,
+        "_production_hard_supervision_required",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        generation_entrypoint,
+        "production_optimization_run_lease",
+        lambda _path: _LeaseContext(),
+    )
+    monkeypatch.setattr(
+        generation_entrypoint,
+        "run_supervised_optimization_cli",
+        fake_supervised,
+    )
+
+    assert pm_main.main() == 0
+
+    assert captured["argv"] == sys.argv[1:]
+    assert captured["run_lease"] is lease
+    assert events.index("run_lease_enter") < events.index("initialize")
+    assert events.index("initialize") < events.index("supervised")
+    assert events.index("shutdown") < events.index("run_lease_exit")
+    assert "optimize" not in events
+    assert "scope_factory" not in events
+    assert events[-1] == "run_lease_exit"
+
+
+def test_supervised_failure_reconciles_only_after_tree_empty(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import pm_production_generation_entrypoint as generation_entrypoint
+
+    events, _observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        pm_main,
+        "_production_hard_supervision_required",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        generation_entrypoint,
+        "run_supervised_optimization_cli",
+        lambda **kwargs: SimpleNamespace(
+            generation_id="b" * 64,
+            succeeded=False,
+            safe_to_reconcile=True,
+            cli_exit_code=None,
+            generation_recovery_status=kwargs["recovery_callback"](
+                "b" * 64
+            ),
+            stale_recovery_status=None,
+            request_directory_retained=False,
+            supervisor=SimpleNamespace(
+                status="FAILED",
+                succeeded=False,
+                result_path=tmp_path / "failed-result.json",
+            ),
+        ),
+    )
+
+    assert pm_main.main() == 2
+
+    assert "recover" in events
+    assert "optimize" not in events
+    assert "scope_factory" not in events
+
+
+def test_supervised_unproved_tree_shutdown_never_reconciles(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import pm_production_generation_entrypoint as generation_entrypoint
+
+    events, _observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        pm_main,
+        "_production_hard_supervision_required",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        generation_entrypoint,
+        "run_supervised_optimization_cli",
+        lambda **_kwargs: SimpleNamespace(
+            generation_id="c" * 64,
+            succeeded=False,
+            safe_to_reconcile=False,
+            cli_exit_code=None,
+            generation_recovery_status=None,
+            stale_recovery_status=None,
+            request_directory_retained=True,
+            supervisor=SimpleNamespace(
+                status="TERMINATION_FAILED",
+                succeeded=False,
+                result_path=tmp_path / "unsafe-result.json",
+            ),
+        ),
+    )
+
+    assert pm_main.main() == 2
+
+    assert "reconcile" not in events
+    assert "optimize" not in events
+
+
+def test_failed_calendar_optimize_logs_partial_scope_before_existing_failure(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    events, _observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+        optimize_result=False,
+        stats=_production_scope_stats(
+            full_verification_count=1,
+            identity_revalidation_attempt_count=4,
+            identity_revalidation_count=3,
+            identity_revalidation_failure_count=1,
+            poisoned=True,
+            poison_reason="ACTIVE_POINTER_IDENTITY_MISMATCH",
+        ),
+    )
+    caplog.set_level(logging.INFO, logger=pm_main.__name__)
+
+    assert pm_main.main() == 2
+
+    assert events.index("scope_exit") < events.index("scope_stats")
+    assert any(
+        message.startswith("PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_STATS ")
+        and '"identity_revalidation_attempt_count":4' in message
+        for message in caplog.messages
+    )
+    assert any(
+        "Optimization generation did not complete and promote" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.parametrize("exception_type", [RuntimeError, SystemExit])
+def test_calendar_optimize_exception_still_closes_and_reports_scope(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    exception_type,
+):
+    events, _observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+        optimize_exception=exception_type("optimizer stopped"),
+        stats=_production_scope_stats(
+            full_verification_count=0,
+            identity_revalidation_attempt_count=2,
+            identity_revalidation_count=2,
+        ),
+    )
+    caplog.set_level(logging.INFO, logger=pm_main.__name__)
+
+    if exception_type is SystemExit:
+        with pytest.raises(SystemExit, match="optimizer stopped"):
+            pm_main.main()
+    else:
+        assert pm_main.main() == 1
+
+    assert events.index("optimize") < events.index("scope_exit")
+    assert events.index("scope_exit") < events.index("scope_stats")
+    assert events.index("scope_stats") < events.index("shutdown")
+    assert any(
+        message.startswith("PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_STATS ")
+        for message in caplog.messages
+    )
+
+
+def test_non_calendar_optimize_does_not_create_production_authority_scope(
+    tmp_path,
+    monkeypatch,
+):
+    events, observed, _scope = _install_optimization_main_harness(
+        tmp_path,
+        monkeypatch,
+        production_mode=False,
+    )
+
+    assert pm_main.main() == 0
+
+    assert observed["overwrite"] is True
+    assert "scope_factory" not in events
+    assert events.index("optimize") < events.index("shutdown")

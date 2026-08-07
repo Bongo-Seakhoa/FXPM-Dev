@@ -1,0 +1,884 @@
+{
+  "as_of_utc": "2026-07-13T11:35:34.599536Z",
+  "boundary_tolerance_days": 7.0,
+  "embargo_days": 7.0,
+  "horizon_years": 10,
+  "max_new_cells": null,
+  "max_runtime_seconds": null,
+  "mode": "execute",
+  "output_root": "C:\\Users\\Bongo\\OneDrive\\Desktop\\FxPM-Dev\\data\\native",
+  "production_authoritative": false,
+  "resume": false,
+  "reusable_cells_discovered": 0,
+  "run_id": "v5r1-es35-broker-union-canary-20260714",
+  "safety_days": 14.0,
+  "symbols": [
+    "ES35"
+  ],
+  "timeframe_window_years": {
+    "D1": {
+      "final_lockbox": 2,
+      "optimizer_train": 12,
+      "tuning_validation": 2
+    },
+    "H1": {
+      "final_lockbox": 2,
+      "optimizer_train": 7,
+      "tuning_validation": 2
+    },
+    "H4": {
+      "final_lockbox": 2,
+      "optimizer_train": 8,
+      "tuning_validation": 2
+    },
+    "M15": {
+      "final_lockbox": 2,
+      "optimizer_train": 5,
+      "tuning_validation": 2
+    },
+    "M30": {
+      "final_lockbox": 2,
+      "optimizer_train": 6,
+      "tuning_validation": 2
+    },
+    "M5": {
+      "final_lockbox": 2,
+      "optimizer_train": 5,
+      "tuning_validation": 2
+    }
+  },
+  "timeframes": [
+    "M5",
+    "M15",
+    "M30",
+    "H1",
+    "H4",
+    "D1"
+  ],
+  "warmup_days": 400.0,
+  "window_contract_version": "fxpm-timeframe-evidence-v3",
+  "window_years": {
+    "final_lockbox": 2,
+    "optimizer_train": 5,
+    "tuning_validation": 2
+  }
+}
+{
+  "acquisition_completed_utc": "2026-07-14T00:18:19.389701Z",
+  "acquisition_started_utc": "2026-07-14T00:16:03.403484Z",
+  "complete": true,
+  "counts": {
+    "failed": 0,
+    "partial": 3,
+    "success": 3,
+    "total": 6
+  },
+  "immutable_record": true,
+  "manifest_path": "C:\\Users\\Bongo\\OneDrive\\Desktop\\FxPM-Dev\\data\\native\\runs\\v5r1-es35-broker-union-canary-20260714\\run_manifest.json",
+  "request": {
+    "boundary_tolerance_days": 7.0,
+    "closed_bar_slack_seconds": 86400,
+    "common_as_of_utc": "2026-07-13T11:35:00Z",
+    "common_calendar_boundaries": {
+      "final_lockbox": {
+        "end_ts": "2026-07-13T11:35:00Z",
+        "start_ts": "2024-07-13T11:35:00Z"
+      },
+      "optimizer_train": {
+        "end_ts": "2022-06-29T11:35:00Z",
+        "start_ts": "2017-06-29T11:35:00Z"
+      },
+      "tuning_validation": {
+        "end_ts": "2024-07-06T11:35:00Z",
+        "start_ts": "2022-07-06T11:35:00Z"
+      }
+    },
+    "common_requested_start_utc": "2009-05-10T11:35:00Z",
+    "embargo_days": 7.0,
+    "horizon_years": 10,
+    "requested_horizon_start_utc": "2016-07-13T11:35:00Z",
+    "requested_information_cutoff_utc": "2026-07-13T11:35:34.599536Z",
+    "required_evidence_lead_start_utc": "2009-05-10T11:35:00Z",
+    "retries": 3,
+    "safety_days": 14.0,
+    "symbols": [
+      "ES35"
+    ],
+    "timeframe_audit_consumer_map": {
+      "D1": [
+        "H4"
+      ],
+      "H1": [
+        "M30",
+        "H4",
+        "D1"
+      ],
+      "H4": [
+        "H1",
+        "D1"
+      ],
+      "M15": [
+        "M5",
+        "M30"
+      ],
+      "M30": [
+        "M5",
+        "M15",
+        "H1"
+      ],
+      "M5": [
+        "M15"
+      ]
+    },
+    "timeframe_audit_only_intervals": {
+      "D1": [],
+      "H1": [
+        {
+          "audit_window": "strategy_full_context",
+          "consumer_target_timeframe": "H4",
+          "end_exclusive_utc": "2014-05-11T10:00:00Z",
+          "role": "audit_only_reference",
+          "start_utc": "2013-05-11T07:00:00Z"
+        },
+        {
+          "audit_window": "strategy_full_context",
+          "consumer_target_timeframe": "D1",
+          "end_exclusive_utc": "2014-05-11T10:00:00Z",
+          "role": "audit_only_reference",
+          "start_utc": "2009-05-10T11:00:00Z"
+        }
+      ],
+      "H4": [
+        {
+          "audit_window": "strategy_full_context",
+          "consumer_target_timeframe": "D1",
+          "end_exclusive_utc": "2013-05-11T03:35:00Z",
+          "role": "audit_only_reference",
+          "start_utc": "2009-05-10T07:35:00Z"
+        }
+      ],
+      "M15": [
+        {
+          "audit_window": "strategy_full_context",
+          "consumer_target_timeframe": "M30",
+          "end_exclusive_utc": "2016-05-11T11:15:00Z",
+          "role": "audit_only_reference",
+          "start_utc": "2015-05-12T11:00:00Z"
+        }
+      ],
+      "M30": [
+        {
+          "audit_window": "strategy_full_context",
+          "consumer_target_timeframe": "H1",
+          "end_exclusive_utc": "2015-05-12T11:00:00Z",
+          "role": "audit_only_reference",
+          "start_utc": "2014-05-11T10:30:00Z"
+        }
+      ],
+      "M5": [
+        {
+          "audit_window": "strategy_full_context",
+          "consumer_target_timeframe": "M15",
+          "end_exclusive_utc": "2016-05-11T11:30:00Z",
+          "role": "audit_only_reference",
+          "start_utc": "2016-05-11T11:20:00Z"
+        }
+      ]
+    },
+    "timeframe_audit_reference_intervals": {
+      "D1": {
+        "H1": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:00:00Z",
+            "start_utc": "2024-07-13T11:00:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:00:00Z",
+            "start_utc": "2010-06-29T11:00:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:00:00Z",
+            "start_utc": "2009-05-10T11:00:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:00:00Z",
+            "start_utc": "2022-07-06T11:00:00Z"
+          }
+        },
+        "H4": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:35:01Z",
+            "start_utc": "2024-07-13T07:35:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:35:01Z",
+            "start_utc": "2010-06-29T07:35:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:35:01Z",
+            "start_utc": "2009-05-10T07:35:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:35:01Z",
+            "start_utc": "2022-07-06T07:35:00Z"
+          }
+        }
+      },
+      "H1": {
+        "H4": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:35:01Z",
+            "start_utc": "2024-07-13T07:35:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:35:01Z",
+            "start_utc": "2015-06-29T07:35:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:35:01Z",
+            "start_utc": "2014-05-11T06:35:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:35:01Z",
+            "start_utc": "2022-07-06T07:35:00Z"
+          }
+        },
+        "M30": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2024-07-13T11:30:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:30:00Z",
+            "start_utc": "2015-06-29T11:30:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2014-05-11T10:30:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:30:00Z",
+            "start_utc": "2022-07-06T11:30:00Z"
+          }
+        }
+      },
+      "H4": {
+        "D1": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:35:01Z",
+            "start_utc": "2024-07-12T11:35:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:35:01Z",
+            "start_utc": "2014-06-28T11:35:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:35:01Z",
+            "start_utc": "2013-05-10T07:35:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:35:01Z",
+            "start_utc": "2022-07-05T11:35:00Z"
+          }
+        },
+        "H1": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:00:00Z",
+            "start_utc": "2024-07-13T11:00:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:00:00Z",
+            "start_utc": "2014-06-29T11:00:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:00:00Z",
+            "start_utc": "2013-05-11T07:00:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:00:00Z",
+            "start_utc": "2022-07-06T11:00:00Z"
+          }
+        }
+      },
+      "M15": {
+        "M30": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2024-07-13T11:30:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:30:00Z",
+            "start_utc": "2017-06-29T11:30:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2016-05-11T11:00:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:30:00Z",
+            "start_utc": "2022-07-06T11:30:00Z"
+          }
+        },
+        "M5": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:35:00Z",
+            "start_utc": "2024-07-13T11:35:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:35:00Z",
+            "start_utc": "2017-06-29T11:35:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:35:00Z",
+            "start_utc": "2016-05-11T11:20:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:35:00Z",
+            "start_utc": "2022-07-06T11:35:00Z"
+          }
+        }
+      },
+      "M30": {
+        "H1": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:00:00Z",
+            "start_utc": "2024-07-13T11:00:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:00:00Z",
+            "start_utc": "2016-06-29T11:00:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:00:00Z",
+            "start_utc": "2015-05-12T11:00:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:00:00Z",
+            "start_utc": "2022-07-06T11:00:00Z"
+          }
+        },
+        "M15": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2024-07-13T11:30:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:30:00Z",
+            "start_utc": "2016-06-29T11:30:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2015-05-12T11:00:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:30:00Z",
+            "start_utc": "2022-07-06T11:30:00Z"
+          }
+        }
+      },
+      "M5": {
+        "M15": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2024-07-13T11:30:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:30:00Z",
+            "start_utc": "2017-06-29T11:30:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2016-05-11T11:30:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:30:00Z",
+            "start_utc": "2022-07-06T11:30:00Z"
+          }
+        },
+        "M30": {
+          "final_lockbox": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2024-07-13T11:30:00Z"
+          },
+          "optimizer_train": {
+            "end_exclusive_utc": "2022-06-29T11:30:00Z",
+            "start_utc": "2017-06-29T11:30:00Z"
+          },
+          "strategy_full_context": {
+            "end_exclusive_utc": "2026-07-13T11:30:00Z",
+            "start_utc": "2016-05-11T11:30:00Z"
+          },
+          "tuning_validation": {
+            "end_exclusive_utc": "2024-07-06T11:30:00Z",
+            "start_utc": "2022-07-06T11:30:00Z"
+          }
+        }
+      }
+    },
+    "timeframe_audit_reference_map": {
+      "D1": [
+        "H4",
+        "H1"
+      ],
+      "H1": [
+        "M30",
+        "H4"
+      ],
+      "H4": [
+        "H1",
+        "D1"
+      ],
+      "M15": [
+        "M5",
+        "M30"
+      ],
+      "M30": [
+        "M15",
+        "H1"
+      ],
+      "M5": [
+        "M15",
+        "M30"
+      ]
+    },
+    "timeframe_audit_windows": {
+      "D1": {
+        "final_lockbox": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_exclusive_utc": "2022-06-29T11:35:00Z",
+          "start_utc": "2010-06-29T11:35:00Z"
+        },
+        "strategy_full_context": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2009-05-10T11:35:00Z"
+        },
+        "tuning_validation": {
+          "end_exclusive_utc": "2024-07-06T11:35:00Z",
+          "start_utc": "2022-07-06T11:35:00Z"
+        }
+      },
+      "H1": {
+        "final_lockbox": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_exclusive_utc": "2022-06-29T11:35:00Z",
+          "start_utc": "2015-06-29T11:35:00Z"
+        },
+        "strategy_full_context": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2014-05-11T10:35:00Z"
+        },
+        "tuning_validation": {
+          "end_exclusive_utc": "2024-07-06T11:35:00Z",
+          "start_utc": "2022-07-06T11:35:00Z"
+        }
+      },
+      "H4": {
+        "final_lockbox": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_exclusive_utc": "2022-06-29T11:35:00Z",
+          "start_utc": "2014-06-29T11:35:00Z"
+        },
+        "strategy_full_context": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2013-05-11T07:35:00Z"
+        },
+        "tuning_validation": {
+          "end_exclusive_utc": "2024-07-06T11:35:00Z",
+          "start_utc": "2022-07-06T11:35:00Z"
+        }
+      },
+      "M15": {
+        "final_lockbox": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_exclusive_utc": "2022-06-29T11:35:00Z",
+          "start_utc": "2017-06-29T11:35:00Z"
+        },
+        "strategy_full_context": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2016-05-11T11:20:00Z"
+        },
+        "tuning_validation": {
+          "end_exclusive_utc": "2024-07-06T11:35:00Z",
+          "start_utc": "2022-07-06T11:35:00Z"
+        }
+      },
+      "M30": {
+        "final_lockbox": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_exclusive_utc": "2022-06-29T11:35:00Z",
+          "start_utc": "2016-06-29T11:35:00Z"
+        },
+        "strategy_full_context": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2015-05-12T11:05:00Z"
+        },
+        "tuning_validation": {
+          "end_exclusive_utc": "2024-07-06T11:35:00Z",
+          "start_utc": "2022-07-06T11:35:00Z"
+        }
+      },
+      "M5": {
+        "final_lockbox": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_exclusive_utc": "2022-06-29T11:35:00Z",
+          "start_utc": "2017-06-29T11:35:00Z"
+        },
+        "strategy_full_context": {
+          "end_exclusive_utc": "2026-07-13T11:35:00Z",
+          "start_utc": "2016-05-11T11:30:00Z"
+        },
+        "tuning_validation": {
+          "end_exclusive_utc": "2024-07-06T11:35:00Z",
+          "start_utc": "2022-07-06T11:35:00Z"
+        }
+      }
+    },
+    "timeframe_calendar_boundaries": {
+      "D1": {
+        "final_lockbox": {
+          "end_ts": "2026-07-13T11:35:00Z",
+          "start_ts": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_ts": "2022-06-29T11:35:00Z",
+          "start_ts": "2010-06-29T11:35:00Z"
+        },
+        "tuning_validation": {
+          "end_ts": "2024-07-06T11:35:00Z",
+          "start_ts": "2022-07-06T11:35:00Z"
+        }
+      },
+      "H1": {
+        "final_lockbox": {
+          "end_ts": "2026-07-13T11:35:00Z",
+          "start_ts": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_ts": "2022-06-29T11:35:00Z",
+          "start_ts": "2015-06-29T11:35:00Z"
+        },
+        "tuning_validation": {
+          "end_ts": "2024-07-06T11:35:00Z",
+          "start_ts": "2022-07-06T11:35:00Z"
+        }
+      },
+      "H4": {
+        "final_lockbox": {
+          "end_ts": "2026-07-13T11:35:00Z",
+          "start_ts": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_ts": "2022-06-29T11:35:00Z",
+          "start_ts": "2014-06-29T11:35:00Z"
+        },
+        "tuning_validation": {
+          "end_ts": "2024-07-06T11:35:00Z",
+          "start_ts": "2022-07-06T11:35:00Z"
+        }
+      },
+      "M15": {
+        "final_lockbox": {
+          "end_ts": "2026-07-13T11:35:00Z",
+          "start_ts": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_ts": "2022-06-29T11:35:00Z",
+          "start_ts": "2017-06-29T11:35:00Z"
+        },
+        "tuning_validation": {
+          "end_ts": "2024-07-06T11:35:00Z",
+          "start_ts": "2022-07-06T11:35:00Z"
+        }
+      },
+      "M30": {
+        "final_lockbox": {
+          "end_ts": "2026-07-13T11:35:00Z",
+          "start_ts": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_ts": "2022-06-29T11:35:00Z",
+          "start_ts": "2016-06-29T11:35:00Z"
+        },
+        "tuning_validation": {
+          "end_ts": "2024-07-06T11:35:00Z",
+          "start_ts": "2022-07-06T11:35:00Z"
+        }
+      },
+      "M5": {
+        "final_lockbox": {
+          "end_ts": "2026-07-13T11:35:00Z",
+          "start_ts": "2024-07-13T11:35:00Z"
+        },
+        "optimizer_train": {
+          "end_ts": "2022-06-29T11:35:00Z",
+          "start_ts": "2017-06-29T11:35:00Z"
+        },
+        "tuning_validation": {
+          "end_ts": "2024-07-06T11:35:00Z",
+          "start_ts": "2022-07-06T11:35:00Z"
+        }
+      }
+    },
+    "timeframe_calendar_boundaries_sha256": "4f80ec9594b105f76f2069409586a58827b62e3176a837e275858632474e954b",
+    "timeframe_consensus_policy": {
+      "evaluate_all_references": true,
+      "fault_model": "one_non_common_native_resolution_fault",
+      "integrity_error_dominates": true,
+      "minimum_passing_references_per_window": 1,
+      "required_reference_count": 2,
+      "schema_version": "fxpm-native-consensus-policy-v1",
+      "window_aggregation_precedence": [
+        "ERROR",
+        "FAIL",
+        "PENDING",
+        "PASS"
+      ]
+    },
+    "timeframe_request_map_schema_version": "fxpm.native_history.timeframe_request_map.v5",
+    "timeframe_request_map_sha256": "1e749b6011203e0389d01b9629f46b6d68ed6ab5d3147f1bd8afac53f8f0144f",
+    "timeframe_required_evidence_lead_start_utc": {
+      "D1": "2009-05-10T11:35:00Z",
+      "H1": "2014-05-11T10:35:00Z",
+      "H4": "2013-05-11T07:35:00Z",
+      "M15": "2016-05-11T11:20:00Z",
+      "M30": "2015-05-12T11:05:00Z",
+      "M5": "2016-05-11T11:30:00Z"
+    },
+    "timeframe_source_request_intervals": {
+      "D1": {
+        "end_exclusive_utc": "2026-07-13T11:35:01Z",
+        "start_utc": "2009-05-09T11:35:00Z"
+      },
+      "H1": {
+        "end_exclusive_utc": "2026-07-13T11:00:00Z",
+        "start_utc": "2009-05-10T11:00:00Z"
+      },
+      "H4": {
+        "end_exclusive_utc": "2026-07-13T11:35:01Z",
+        "start_utc": "2009-05-10T07:35:00Z"
+      },
+      "M15": {
+        "end_exclusive_utc": "2026-07-13T11:30:00Z",
+        "start_utc": "2015-05-12T11:00:00Z"
+      },
+      "M30": {
+        "end_exclusive_utc": "2026-07-13T11:30:00Z",
+        "start_utc": "2014-05-11T10:30:00Z"
+      },
+      "M5": {
+        "end_exclusive_utc": "2026-07-13T11:35:00Z",
+        "start_utc": "2016-05-11T11:20:00Z"
+      }
+    },
+    "timeframe_strategy_evidence_intervals": {
+      "D1": {
+        "end_exclusive_utc": "2026-07-13T11:35:01Z",
+        "start_utc": "2009-05-09T11:35:00Z"
+      },
+      "H1": {
+        "end_exclusive_utc": "2026-07-13T11:00:00Z",
+        "start_utc": "2014-05-11T10:00:00Z"
+      },
+      "H4": {
+        "end_exclusive_utc": "2026-07-13T11:35:01Z",
+        "start_utc": "2013-05-11T03:35:00Z"
+      },
+      "M15": {
+        "end_exclusive_utc": "2026-07-13T11:30:00Z",
+        "start_utc": "2016-05-11T11:15:00Z"
+      },
+      "M30": {
+        "end_exclusive_utc": "2026-07-13T11:30:00Z",
+        "start_utc": "2015-05-12T11:00:00Z"
+      },
+      "M5": {
+        "end_exclusive_utc": "2026-07-13T11:35:00Z",
+        "start_utc": "2016-05-11T11:30:00Z"
+      }
+    },
+    "timeframe_window_years": {
+      "D1": {
+        "final_lockbox": 2,
+        "optimizer_train": 12,
+        "tuning_validation": 2
+      },
+      "H1": {
+        "final_lockbox": 2,
+        "optimizer_train": 7,
+        "tuning_validation": 2
+      },
+      "H4": {
+        "final_lockbox": 2,
+        "optimizer_train": 8,
+        "tuning_validation": 2
+      },
+      "M15": {
+        "final_lockbox": 2,
+        "optimizer_train": 5,
+        "tuning_validation": 2
+      },
+      "M30": {
+        "final_lockbox": 2,
+        "optimizer_train": 6,
+        "tuning_validation": 2
+      },
+      "M5": {
+        "final_lockbox": 2,
+        "optimizer_train": 5,
+        "tuning_validation": 2
+      }
+    },
+    "timeframes": [
+      "M5",
+      "M15",
+      "M30",
+      "H1",
+      "H4",
+      "D1"
+    ],
+    "warmup_days": 400.0,
+    "window_contract_version": "fxpm-timeframe-evidence-v3",
+    "window_years": {
+      "final_lockbox": 2,
+      "optimizer_train": 5,
+      "tuning_validation": 2
+    }
+  },
+  "results": [
+    {
+      "eligible_for_downstream_validation": true,
+      "eligible_for_optimization": false,
+      "failure_status": null,
+      "relative_leaf": "ES35/M5",
+      "resume_disposition": "newly_acquired",
+      "rows": 269803,
+      "sha256": "ce5588dfe40a8763c8bce4baa33e0008614d076daaca8c82cd933e159b4aab8d",
+      "status": "success",
+      "symbol": "ES35",
+      "timeframe": "M5"
+    },
+    {
+      "eligible_for_downstream_validation": true,
+      "eligible_for_optimization": false,
+      "failure_status": null,
+      "relative_leaf": "ES35/M15",
+      "resume_disposition": "newly_acquired",
+      "rows": 92592,
+      "sha256": "9ae3169a2246a61ff1d089d7f3eed9e3dcdb1cf3426d3ff5befd34d55978ad05",
+      "status": "success",
+      "symbol": "ES35",
+      "timeframe": "M15"
+    },
+    {
+      "eligible_for_downstream_validation": true,
+      "eligible_for_optimization": false,
+      "failure_status": null,
+      "relative_leaf": "ES35/M30",
+      "resume_disposition": "newly_acquired",
+      "rows": 48441,
+      "sha256": "9b1882e062458b8a51c95fbb16a2175de62ea0eb87331ef6d705dbdd6b8775b1",
+      "status": "success",
+      "symbol": "ES35",
+      "timeframe": "M30"
+    },
+    {
+      "eligible_for_downstream_validation": false,
+      "eligible_for_optimization": false,
+      "failure_status": "boundary_history_shortfall",
+      "relative_leaf": "ES35/H1",
+      "resume_disposition": "newly_acquired",
+      "rows": 26544,
+      "sha256": "704a287fe98391b2ae91f3e39845ccbf9c0d034c5a9c37a8fb79194b357613ba",
+      "status": "partial",
+      "symbol": "ES35",
+      "timeframe": "H1"
+    },
+    {
+      "eligible_for_downstream_validation": false,
+      "eligible_for_optimization": false,
+      "failure_status": "boundary_history_shortfall",
+      "relative_leaf": "ES35/H4",
+      "resume_disposition": "newly_acquired",
+      "rows": 10099,
+      "sha256": "accc406f20bc0d85a90bf323dc296523abb8eaecca3a785202d535e2bf1ede77",
+      "status": "partial",
+      "symbol": "ES35",
+      "timeframe": "H4"
+    },
+    {
+      "eligible_for_downstream_validation": false,
+      "eligible_for_optimization": false,
+      "failure_status": "boundary_history_shortfall",
+      "relative_leaf": "ES35/D1",
+      "resume_disposition": "newly_acquired",
+      "rows": 3432,
+      "sha256": "e42e0e762b1e7e21f7e5606652ddaded92a18b47453e4adf165d47d636acc66f",
+      "status": "partial",
+      "symbol": "ES35",
+      "timeframe": "D1"
+    }
+  ],
+  "resume": {
+    "enabled": false,
+    "newly_acquired_cells": 6,
+    "reused_cells": 0,
+    "stale_staging_removed": 0
+  },
+  "run_id": "v5r1-es35-broker-union-canary-20260714",
+  "schema_version": "fxpm.native_history_run_manifest.v1",
+  "source_environment": {
+    "account": {
+      "company": "FBS Markets Inc.",
+      "currency": "USD",
+      "leverage": 500,
+      "login": 28829971,
+      "server": "FBS-Real",
+      "trade_allowed": true,
+      "trade_expert": true
+    },
+    "configured_connection": {
+      "expected_currency": "USD",
+      "expected_login": 28829971,
+      "expected_server": "FBS-Real",
+      "server": null,
+      "terminal_path": null
+    },
+    "metadata_status": "available",
+    "terminal": {
+      "build": 5833,
+      "commondata_path": "C:\\Users\\Bongo\\AppData\\Roaming\\MetaQuotes\\Terminal\\Common",
+      "company": "MetaQuotes Ltd.",
+      "connected": true,
+      "data_path": "C:\\Users\\Bongo\\AppData\\Roaming\\MetaQuotes\\Terminal\\D0E8209F77C8CF37AD8BF550E51FF075",
+      "dlls_allowed": false,
+      "max_bars": 100000000,
+      "name": "MetaTrader 5",
+      "path": "C:\\Program Files\\MetaTrader 5",
+      "trade_allowed": true,
+      "tradeapi_disabled": false,
+      "version": [
+        500,
+        5833,
+        "25 Apr 2026"
+      ]
+    }
+  }
+}

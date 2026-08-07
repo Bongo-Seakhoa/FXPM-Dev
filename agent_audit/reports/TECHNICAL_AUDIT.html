@@ -1,0 +1,1047 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Technical Audit - Corrective Deep Pass</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --paper: #ffffff;
+  --ink: #111827;
+  --muted: #4b5563;
+  --line: #d9dee8;
+  --soft: #f8fafc;
+  --accent: #1f6feb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", Inter, Arial, sans-serif;
+  line-height: 1.58;
+}
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+article {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 34px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: auto;
+}
+h1, h2, h3, h4 {
+  line-height: 1.22;
+  margin: 1.5em 0 0.55em;
+}
+h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.1em;
+  font-size: 1.45rem;
+}
+h3 {
+  font-size: 1.13rem;
+}
+p {
+  margin: 0.75em 0;
+}
+ul, ol {
+  padding-left: 1.45rem;
+}
+li + li {
+  margin-top: 0.25rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.35rem;
+  font-size: 0.91rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #eef3f8;
+  font-weight: 650;
+}
+tr:nth-child(even) td {
+  background: var(--soft);
+}
+code {
+  background: #edf2f7;
+  border: 1px solid #d8e0ea;
+  border-radius: 4px;
+  padding: 0.08rem 0.28rem;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.92em;
+}
+pre {
+  overflow-x: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+a {
+  color: var(--accent);
+}
+blockquote {
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+</style>
+</head>
+<body>
+<main>
+<article>
+<h1>Technical Audit - Corrective Deep Pass</h1>
+<p>Date: 2026-06-17<br>
+Agent: Codex<br>
+Partner agent: Claude Code<br>
+Mode: bounded read-only audit, no live trades, no full optimization</p>
+<h2>Scale-Aware Risk Framing</h2>
+<p>The live account is approximately USD 22. The audit treats the current aggressive profile as an intentional micro-account growth mode, not as an automatic defect. High percentage risk is acceptable only if it is implemented correctly, measured correctly, and compensated by expected upside. The audit still flags anything that distorts backtest/live results, hides ruin or margin risk, misreports drawdown/recovery, creates execution leakage, or prevents a clean transition toward larger-account controls.</p>
+<p>The core technical conclusion is not "the bot is aggressive." The core conclusion is that several important code paths do not measure the same reality: winner selection is tested at USD 10k / 1% discovery sizing without live cap/block semantics, while current live execution is USD 22 / 0.5% target / 25% hard cap / min-lot dominated. That is the main internal-consistency problem.</p>
+<h2>Evidence Base</h2>
+<h3>Exact Files Inspected</h3>
+<ul>
+<li><code>config.json</code></li>
+<li><code>pm_configs.json</code></li>
+<li><code>pm_core.py</code></li>
+<li><code>pm_pipeline.py</code></li>
+<li><code>pm_optuna.py</code></li>
+<li><code>pm_main.py</code></li>
+<li><code>pm_position.py</code></li>
+<li><code>pm_mt5.py</code></li>
+<li><code>pm_live_readiness.py</code></li>
+<li><code>pm_dashboard/analytics.py</code></li>
+<li><code>tools/benchmark.py</code></li>
+<li><code>tests/test_data_splitter.py</code></li>
+<li><code>tests/test_optimizer_hardening.py</code></li>
+<li><code>tests/test_backtester.py</code></li>
+<li><code>tests/test_position_sizing_edge_cases.py</code></li>
+<li><code>tests/test_margin_protection.py</code></li>
+<li><code>tests/test_dashboard_trade_enrichment.py</code></li>
+<li><code>tests/test_profitability_readiness_blueprint.py</code></li>
+<li><code>agent_audit/findings/F001-F005</code></li>
+<li><code>agent_audit/findings/F101-F113</code></li>
+<li><code>agent_audit/agents/claude_code.md</code></li>
+<li><code>agent_audit/agents/Codex.md</code></li>
+</ul>
+<h3>Exact Functions and Classes Inspected</h3>
+<ul>
+<li><code>pm_core.PipelineConfig</code></li>
+<li><code>pm_core.DataSplitter.get_workflow_indices</code></li>
+<li><code>pm_core.Backtester.run</code></li>
+<li><code>pm_core.Backtester._run_python_loop</code></li>
+<li><code>pm_core.Backtester._calculate_metrics</code></li>
+<li><code>pm_core.Backtester._empty_result</code></li>
+<li><code>pm_core._round_volume_numba</code></li>
+<li><code>pm_core.InstrumentSpec.__post_init__</code></li>
+<li><code>pm_core.InstrumentSpec.calculate_tick_profit</code></li>
+<li><code>pm_core.InstrumentSpec.calculate_loss_at_stop</code></li>
+<li><code>pm_core.InstrumentSpec.round_volume</code></li>
+<li><code>pm_pipeline.RegimeOptimizer.optimize_symbol</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._compute_bucket_metrics</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._build_purged_kfold_ranges</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._aggregate_purged_kfold_metrics</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._deflated_sharpe_ratio</code></li>
+<li><code>pm_pipeline.RegimeOptimizer._build_false_discovery_evidence</code></li>
+<li><code>pm_pipeline.ProductionPipeline.run_for_symbol</code></li>
+<li><code>pm_optuna.HyperparameterOptimizer.optimize</code></li>
+<li><code>pm_optuna.HyperparameterOptimizer._fallback_random_search</code></li>
+<li><code>pm_main.ProductionLiveTrader._execute_entry</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_stop_loss_amount</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_position_risk_pct</code></li>
+<li><code>pm_main.ProductionLiveTrader._check_symbol_combined_risk_cap</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_open_drawdown_pct</code></li>
+<li><code>pm_main.ProductionLiveTrader._estimate_realized_loss_pct</code></li>
+<li><code>pm_position.PositionCalculator.calculate_position_size</code></li>
+<li><code>pm_mt5.MT5Connector.order_calc_profit</code></li>
+<li><code>pm_mt5.MT5Connector.calc_loss_amount</code></li>
+<li><code>pm_mt5.MT5Connector.order_calc_margin</code></li>
+<li><code>pm_mt5.MT5Connector.send_market_order</code></li>
+<li><code>pm_dashboard.analytics.compute_equity_curve</code></li>
+<li><code>pm_dashboard.analytics.compute_drawdown_curve</code></li>
+<li><code>pm_dashboard.analytics.compute_performance_metrics</code></li>
+<li><code>tools.benchmark.path_dependent_dd</code></li>
+<li><code>tools.benchmark.evaluate_winner</code></li>
+</ul>
+<h3>Historical Result Files and Logs Reviewed</h3>
+<ul>
+<li><code>pm_outputs/production_live/optimization_summary.csv</code></li>
+<li><code>pm_outputs/production_live/signal_ledger_202606.jsonl</code></li>
+<li><code>pm_outputs/production_live/oos_evidence/*.json</code> via <code>agent_audit/data/oos_manifest_summary.csv</code> and direct script inventory</li>
+<li><code>pm_outputs/production_live/storage_state.json</code></li>
+<li><code>last_trade_log.json</code></li>
+<li><code>last_actionable_log.json</code></li>
+<li><code>logs/production_live/cycle_drift_state.json</code></li>
+<li><code>logs/institutional_supervisor_state.json</code></li>
+<li><code>logs/production_live/pm_20260607.log</code></li>
+<li><code>logs/production_live/pm_20260608.log</code></li>
+<li><code>logs/production_live/pm_20260609.log</code></li>
+<li><code>logs/production_live/pm_20260610.log</code></li>
+<li><code>logs/production_live/pm_20260611.log</code></li>
+<li><code>logs/production_live/pm_20260614.log</code></li>
+<li><code>logs/production_live/pm_20260617.log</code></li>
+<li><code>logs/production_live/live_trade_20260608_*.out.log</code></li>
+<li><code>logs/production_live/live_trade_20260608_*.err.log</code></li>
+<li><code>logs/production_live/bleeding_edge_retrain_20260609_*.out.log</code></li>
+<li><code>logs/production_live/bleeding_edge_retrain_20260609_*.err.log</code></li>
+</ul>
+<h3>Derived Evidence Files</h3>
+<ul>
+<li><code>agent_audit/data/audit_evidence_summary.json</code></li>
+<li><code>agent_audit/data/ledger_tradeable_cells.csv</code></li>
+<li><code>agent_audit/data/ledger_symbol_summary.csv</code></li>
+<li><code>agent_audit/data/signal_risk_events.csv</code></li>
+<li><code>agent_audit/data/signal_risk_action_summary.csv</code></li>
+<li><code>agent_audit/data/signal_risk_symbol_action_summary.csv</code></li>
+<li><code>agent_audit/data/risk_cap_sensitivity.csv</code></li>
+<li><code>agent_audit/data/oos_manifest_summary.csv</code></li>
+<li><code>agent_audit/data/log_notable_events.csv</code></li>
+<li><code>agent_audit/data/deep_consistency_summary.json</code></li>
+<li><code>agent_audit/data/deep_split_geometry.csv</code></li>
+<li><code>agent_audit/data/deep_metric_definition_mismatches.csv</code></li>
+<li><code>agent_audit/data/deep_risk_symbol_actions.csv</code></li>
+</ul>
+<h3>Commands Run</h3>
+<p>Full command history is in <code>agent_audit/COMMAND_LOG.md</code>. The key validation commands were:</p>
+<ul>
+<li><code>python agent_audit\scripts\collect_audit_evidence.py</code></li>
+<li><code>python agent_audit\scripts\deep_consistency_audit.py</code></li>
+<li>JSON parsing checks for <code>config.json</code>, <code>pm_configs.json</code>, and <code>pm_outputs/production_live/signal_ledger_202606.jsonl</code></li>
+<li><code>python -m pytest tests\test_backtester.py ... tests\test_profitability_readiness_blueprint.py -q</code> -&gt; 245 passed, 11 subtests passed</li>
+<li><code>python -m pytest tests\test_data_splitter.py tests\test_position_sizing_edge_cases.py tests\test_dashboard_trade_enrichment.py -q</code> -&gt; 35 passed</li>
+<li><code>python -m pytest tests\test_optimizer_hardening.py -q</code> -&gt; 75 passed, 2 Optuna experimental warnings</li>
+</ul>
+<p>No full optimization sweep was run. No <code>pm_main.py --trade</code> command was run. No live trades were placed.</p>
+<h2>Confirmed Findings vs Hypotheses</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Finding</th>
+<th>Evidence</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Confirmed</td>
+<td>Live account switch pins expected account identity, not credentials</td>
+<td><code>config.json</code> MT5 expected login/server/currency; readiness checks in <code>pm_live_readiness.py</code>; F001</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Confirmed</td>
+<td>Current promoted validation evidence is fragile</td>
+<td>157 tradeable cells, 75 with &lt;20 validation trades, 147 with validation Sharpe &gt;10, all <code>pbo_status=not_available</code>; F002/F111</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Confirmed</td>
+<td>Bleeding-edge split geometry is implemented correctly</td>
+<td><code>DataSplitter.get_workflow_indices</code>; <code>tests/test_data_splitter.py</code>; <code>deep_split_geometry.csv</code></td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Confirmed</td>
+<td>50k validation is used as a selection surface, not a pristine post-selection holdout</td>
+<td><code>pm_pipeline.py:6593-6602</code>, <code>pm_optuna.py:545-567</code>, <code>config.json:111</code>; F111</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Confirmed</td>
+<td>Backtest/live sizing semantics diverge materially at USD 22</td>
+<td><code>pm_core._round_volume_numba</code>, <code>InstrumentSpec.round_volume</code>, <code>pm_position.PositionCalculator</code>, <code>pm_main._execute_entry</code>; F110</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Confirmed</td>
+<td>Dashboard and engine same-name metrics use different formulas</td>
+<td><code>pm_core._calculate_metrics</code>, <code>pm_dashboard.analytics.compute_performance_metrics</code>; F112</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Confirmed</td>
+<td>No per-trade MAE/MFE exists</td>
+<td><code>rg mae/mfe/excursion</code> and trade record fields in <code>pm_core.py:5789-5800</code>; F107</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Confirmed</td>
+<td>Execution slippage attribution is incomplete</td>
+<td><code>pm_core.py:4776</code>, <code>pm_core.py:276-295</code>, <code>pm_main.py:5428-5476</code>; F005</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>Hypothesis</td>
+<td>Some high-drawdown trades are profitable pain worth keeping</td>
+<td>Cannot classify without MAE/MFE and per-trade profit contribution</td>
+<td>Needs instrumentation</td>
+</tr>
+<tr>
+<td>Hypothesis</td>
+<td>Some symbols leak value via poor entry timing/session spread</td>
+<td>Supported by slippage/spread modeling gap, but not proven per trade</td>
+<td>Needs slippage/session attribution</td>
+</tr>
+<tr>
+<td>Hypothesis</td>
+<td>Account-size regimes improve scaling without killing edge</td>
+<td>Supported by static config and micro-account block rates, but requires replay</td>
+<td>Needs bounded replay</td>
+</tr>
+</tbody>
+</table>
+<h2>Deep Internal Consistency Review</h2>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Intended Behavior</th>
+<th>Actual Code Behavior</th>
+<th>Evidence</th>
+<th>Consistent?</th>
+<th>Impact</th>
+<th>Required Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data loading</td>
+<td>Load one recent base-M5 workflow and derive higher timeframes from the same boundary</td>
+<td><code>run_for_symbol</code> calls <code>_load_symbol_timeframe_data</code> and derives timeframes from the shared workflow</td>
+<td><code>pm_pipeline.py:6465-6468</code></td>
+<td>Mostly yes</td>
+<td>Good calendar consistency across timeframes</td>
+<td>Keep; add window fingerprint to every promoted cell</td>
+</tr>
+<tr>
+<td>Data splitting</td>
+<td>Use newest active/audit slice; latest half for optimization; 50k bars before cutoff for validation</td>
+<td>Implemented as active 250k, optimization last 125k, WFV 50k before 300-bar embargo, audit oldest 50k</td>
+<td><code>pm_core.py:4677-4721</code>; <code>deep_split_geometry.csv</code></td>
+<td>Yes for geometry</td>
+<td>No off-by-one found in split math</td>
+<td>Preserve tests; add report badge that geometry is verified</td>
+</tr>
+<tr>
+<td>Strategy design</td>
+<td>Candidate strategy designs should not see future bars</td>
+<td>Optuna objective trains on optimization train and evaluates validation separately</td>
+<td><code>pm_optuna.py:514-560</code></td>
+<td>Mostly yes</td>
+<td>No direct forward leakage into trial training found</td>
+<td>Keep; document validation as selection evidence</td>
+</tr>
+<tr>
+<td>Optimization</td>
+<td>Select winners close to recent market conditions</td>
+<td>Train features are latest-half optimization window</td>
+<td><code>pm_pipeline.py:6560</code>, <code>train_features_by_tf</code> at <code>6574</code></td>
+<td>Yes</td>
+<td>Matches bleeding-edge philosophy</td>
+<td>Keep recency design</td>
+</tr>
+<tr>
+<td>Validation</td>
+<td>50k pre-cutoff section should mitigate blind latest-half fitting</td>
+<td>WFV is non-overlapping and embargoed, but it is also selection/validation evidence</td>
+<td><code>pm_pipeline.py:6593-6602</code>, <code>pm_optuna.py:545-567</code></td>
+<td>Partially</td>
+<td>Stored validation metrics are selection-biased</td>
+<td>Add post-selection audit or deflated validation gate</td>
+</tr>
+<tr>
+<td>Backtesting</td>
+<td>Backtest should represent the risk/execution regime being selected for</td>
+<td>Discovery backtest uses USD 10k and 1% discovery risk; min lot clamps without live max-risk block</td>
+<td><code>config.json:20-22</code>; <code>pm_core.py:80-103</code>, <code>5704</code>; F110</td>
+<td>No for USD 22 live</td>
+<td>Winner metrics do not model current live tradeability</td>
+<td>Add min-lot/cap-aware replay mode</td>
+</tr>
+<tr>
+<td>Demo/live execution</td>
+<td>Live should fail closed on wrong account and log order results</td>
+<td>Expected account pins exist; market order result and ambiguous retcodes handled</td>
+<td><code>config.json:318</code>; <code>pm_live_readiness.py</code>; <code>pm_main.py:5428-5564</code></td>
+<td>Mostly yes</td>
+<td>Safer than a blind live switch</td>
+<td>Keep; still require terminal account verification before trading</td>
+</tr>
+<tr>
+<td>Risk sizing</td>
+<td>Risk target, actual risk, min-lot clamp, and cap should be coherent</td>
+<td>Live path computes target/actual risk and blocks above hard cap; backtest path always clamps to min</td>
+<td><code>pm_position.py:439-467</code>; <code>pm_main.py:4933-4987</code>; <code>pm_core.py:101-102</code></td>
+<td>No across modules</td>
+<td>Current live behavior differs from selected backtest behavior</td>
+<td>Centralize sizing semantics or add explicit backtest mode</td>
+</tr>
+<tr>
+<td>Trade filtering</td>
+<td>Low-quality or untradeable contexts should be excluded or derated</td>
+<td>Live blocks 83 min-lot-cap events and one symbol-risk cap in risk events; cycle drift/supervisor also present in ledger evidence</td>
+<td><code>deep_consistency_summary.json</code>; <code>signal_ledger_202606.jsonl</code></td>
+<td>Partially</td>
+<td>Some untradeable symbols remain in promoted universe</td>
+<td>Add current-balance tradeability flags and symbol tiers</td>
+</tr>
+<tr>
+<td>Metric calculation</td>
+<td>Same metric names should mean same formula</td>
+<td>Engine, dashboard, pipeline buckets, and tools differ on PF, Sharpe, expectancy, drawdown, recovery</td>
+<td><code>pm_core.py:5924-5999</code>; <code>pm_dashboard/analytics.py:626-665</code>; F112</td>
+<td>No</td>
+<td>Operator/reporting decisions can compare unlike numbers</td>
+<td>Create canonical metric contract</td>
+</tr>
+<tr>
+<td>Reporting</td>
+<td>Reports should reflect selection-engine reality and live reality</td>
+<td>Existing reports mix validation metrics, dashboard metrics, OOS summaries, and live action logs</td>
+<td><code>agent_audit/data/*</code>; F112</td>
+<td>Partially</td>
+<td>Can overstate confidence or misclassify risk</td>
+<td>Label metric source and basis in every report</td>
+</tr>
+<tr>
+<td>Logging</td>
+<td>Live logs should allow root-cause analysis</td>
+<td>Actionable logs capture action/risk, but no MAE/MFE and no expected-vs-fill slippage fields</td>
+<td><code>last_actionable_log.json</code>; <code>pm_main.py:5468-5476</code>; F005/F107</td>
+<td>Partially</td>
+<td>Cannot fully explain high-drawdown trades</td>
+<td>Add MAE/MFE and fill-slippage fields</td>
+</tr>
+<tr>
+<td>Parameter selection</td>
+<td>Final selected parameters should be defensible after multiple testing</td>
+<td>DSR code exists, but current cells show <code>pbo_status=not_available</code>; validation surface drives selection</td>
+<td><code>pm_pipeline.py:3812-3892</code>; <code>ledger_tradeable_cells.csv</code></td>
+<td>Partially</td>
+<td>Elevated false-discovery risk</td>
+<td>Enforce trade-count/DSR/PBO or post-selection audit floors</td>
+</tr>
+<tr>
+<td>Symbol/timeframe handling</td>
+<td>Only trade symbols/timeframes that are feasible for the active account</td>
+<td>45 symbols and 157 tradeable cells promoted; live min-lot blocks cluster in XAUGBP, US100, DE30</td>
+<td><code>deep_risk_symbol_actions.csv</code></td>
+<td>No at USD 22</td>
+<td>Actionable universe includes many currently impractical cells</td>
+<td>Add equity-tiered universe gates</td>
+</tr>
+<tr>
+<td>Balance/equity accounting</td>
+<td>Backtest/live should distinguish balance and equity consistently</td>
+<td>Backtest uses floating equity at bar close; live open DD uses balance-equity; dashboard uses closed-trade curve</td>
+<td><code>pm_core.py:5803-5816</code>; <code>pm_main.py:2824-2831</code>; <code>pm_dashboard/analytics.py:433-504</code></td>
+<td>Partially</td>
+<td>Drawdown/recovery numbers can differ by context</td>
+<td>Label balance vs equity drawdown separately</td>
+</tr>
+<tr>
+<td>Drawdown accounting</td>
+<td>Drawdown should capture account and per-trade pain</td>
+<td>Account-level backtest DD is floating-aware; per-trade MAE/MFE absent; dashboard is realized-only</td>
+<td><code>pm_core.py:5803-5816</code>; F107/F112</td>
+<td>Partially</td>
+<td>Cannot separate profitable pain from bad risk</td>
+<td>Add MAE/MFE and intratrade path exports</td>
+</tr>
+<tr>
+<td>Recovery accounting</td>
+<td>Recovery should be measured after drawdown and across regimes</td>
+<td>Dashboard/tools compute recovery factors differently; engine lacks canonical recovery factor</td>
+<td><code>pm_dashboard/analytics.py:660-661</code>; <code>tools/benchmark.py:61-87</code></td>
+<td>No</td>
+<td>Recovery comparisons are inconsistent</td>
+<td>Add canonical recovery factor and recovery duration definitions</td>
+</tr>
+</tbody>
+</table>
+<h2>Calculation Correctness Audit</h2>
+<table>
+<thead>
+<tr>
+<th>Calculation</th>
+<th>File/Function</th>
+<th>Formula Used</th>
+<th>Expected Formula</th>
+<th>Correct?</th>
+<th>Impact If Wrong</th>
+<th>Evidence</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Net profit</td>
+<td><code>pm_core.Backtester._calculate_metrics</code></td>
+<td><code>sum(pnl_dollars)</code></td>
+<td>Sum of closed trade net PnL after spread, commission, swap/slippage model</td>
+<td>Mostly</td>
+<td>Profitability overstated/understated if costs missing</td>
+<td><code>pm_core.py:5916</code>; swap applied separately</td>
+<td>Keep, but label cost assumptions</td>
+</tr>
+<tr>
+<td>Gross profit/loss</td>
+<td><code>pm_core.Backtester._calculate_metrics</code></td>
+<td>Sum positive PnL; absolute sum negative PnL</td>
+<td>Same</td>
+<td>Yes</td>
+<td>Profit factor wrong if signs mishandled</td>
+<td><code>pm_core.py:5917-5918</code></td>
+<td>Keep</td>
+</tr>
+<tr>
+<td>Win rate</td>
+<td><code>pm_core.Backtester._calculate_metrics</code></td>
+<td>Wins / total trades * 100; breakevens remain in denominator</td>
+<td>Acceptable if convention documented</td>
+<td>Yes</td>
+<td>Inflated if breakevens excluded silently</td>
+<td><code>pm_core.py:5910-5921</code></td>
+<td>Document convention</td>
+</tr>
+<tr>
+<td>Profit factor</td>
+<td>Engine vs dashboard</td>
+<td>Engine: <code>gross_profit/gross_loss</code>, <code>inf</code> if no losses and gross profit; dashboard: <code>0.0</code> if no losses</td>
+<td>Engine formula is correct; dashboard should not report 0 for no-loss profitable sample</td>
+<td>Engine yes, dashboard no</td>
+<td>A no-loss system can look worst in dashboard</td>
+<td><code>pm_core.py:5924</code>; <code>pm_dashboard/analytics.py:626</code>; F112</td>
+<td>Fix dashboard sentinel to <code>inf</code>/<code>None</code> and label capped PF where used</td>
+</tr>
+<tr>
+<td>Expectancy</td>
+<td>Engine vs dashboard</td>
+<td>Engine: expected pips per trade; dashboard: average dollars per trade</td>
+<td>Store pips, dollars, and R expectancy under distinct names</td>
+<td>Inconsistent</td>
+<td>Cross-symbol expectancy comparison is misleading</td>
+<td><code>pm_core.py:5935-5939</code>; <code>pm_dashboard/analytics.py:663-665</code></td>
+<td>Add <code>expectancy_pips</code>, <code>expectancy_dollars</code>, <code>expectancy_r</code></td>
+</tr>
+<tr>
+<td>Sharpe</td>
+<td>Engine vs dashboard</td>
+<td>Engine: per-bar equity returns annualized by timeframe; dashboard: per-trade PnL * sqrt(252)</td>
+<td>A single canonical basis or explicit separate labels</td>
+<td>Partially</td>
+<td>Extreme Sharpe can inflate confidence</td>
+<td><code>pm_core.py:5950-5981</code>; <code>pm_dashboard/analytics.py:641-644</code>; F106/F112</td>
+<td>Label <code>sharpe_equity_bar</code> vs <code>sharpe_trade</code>; require min trades</td>
+</tr>
+<tr>
+<td>Sortino</td>
+<td>Engine vs dashboard</td>
+<td>Engine: per-bar downside returns; dashboard: per-trade downside PnL</td>
+<td>Same basis issue as Sharpe</td>
+<td>Partially</td>
+<td>Downside risk can be misread</td>
+<td><code>pm_core.py:5983-5999</code>; <code>pm_dashboard/analytics.py:648-653</code></td>
+<td>Label and canonicalize</td>
+</tr>
+<tr>
+<td>Recovery factor</td>
+<td>Dashboard/tools</td>
+<td>Dashboard: <code>total_pnl/max_dd_abs</code>; tools: <code>total_return_pct/max_dd_pct</code>; engine main metrics absent</td>
+<td>Choose one canonical metric, usually net profit / max drawdown in same currency, plus return/DD ratio separately</td>
+<td>No</td>
+<td>Recovery comparisons are not portable</td>
+<td><code>pm_dashboard/analytics.py:660-661</code>; <code>tools/benchmark.py:61-87</code>; engine metrics omit</td>
+<td>Add canonical <code>recovery_factor</code> to engine</td>
+</tr>
+<tr>
+<td>Max drawdown</td>
+<td>Engine backtester</td>
+<td>Floating equity drawdown at bar close</td>
+<td>Peak-to-trough equity drawdown; intrabar if available</td>
+<td>Mostly</td>
+<td>DD understated if intrabar lows matter</td>
+<td><code>pm_core.py:5803-5816</code></td>
+<td>Keep; add per-trade MAE and optional intrabar stress</td>
+</tr>
+<tr>
+<td>Relative drawdown</td>
+<td>Engine</td>
+<td><code>max_drawdown_pct</code> from equity curve</td>
+<td>Percent drawdown from peak equity</td>
+<td>Mostly</td>
+<td>Reporting ambiguity with balance DD</td>
+<td><code>pm_core.py:5814-5816</code></td>
+<td>Rename/report <code>max_equity_drawdown_pct</code></td>
+</tr>
+<tr>
+<td>Equity drawdown</td>
+<td>Live</td>
+<td><code>(balance - equity) / balance * 100</code> when equity below balance</td>
+<td>Acceptable live open-DD proxy</td>
+<td>Partially</td>
+<td>Not same as peak-to-trough equity DD</td>
+<td><code>pm_main.py:2824-2831</code></td>
+<td>Store both open DD and peak equity DD</td>
+</tr>
+<tr>
+<td>Balance drawdown</td>
+<td>Live/dashboard</td>
+<td>Realized loss percent over windows; dashboard closed-trade equity curve</td>
+<td>Balance peak-to-trough should be explicit</td>
+<td>Partial</td>
+<td>Balance recovery can be misread</td>
+<td><code>pm_main.py:2833-2884</code>; <code>pm_dashboard/analytics.py:433-504</code></td>
+<td>Add balance curve and realized DD fields</td>
+</tr>
+<tr>
+<td>Trade frequency</td>
+<td>Engine/ledger</td>
+<td>Raw trade count; OOS manifests contain total trades</td>
+<td>Trades per scored bar/day and quality-adjusted trade rate</td>
+<td>Partial</td>
+<td>High-frequency low-edge churn can hide</td>
+<td><code>pm_core.py:5910</code>; <code>oos_manifest_summary.csv</code></td>
+<td>Add trades/year and edge-per-trade filters</td>
+</tr>
+<tr>
+<td>Lot size</td>
+<td>Backtester/live</td>
+<td>Backtester floors then clamps to min; live can clamp then block if hard cap exceeded</td>
+<td>Same semantics when testing live account</td>
+<td>No for current live</td>
+<td>Backtest can take trades live blocks</td>
+<td><code>pm_core.py:80-103</code>, <code>2131-2149</code>; <code>pm_main.py:4933-4987</code>; F110</td>
+<td>Add cap-aware replay/backtest mode</td>
+</tr>
+<tr>
+<td>Pip value</td>
+<td><code>InstrumentSpec</code>, live MT5</td>
+<td>Static pip value with tick-value derivation; live prefers MT5 <code>order_calc_profit</code> for risk</td>
+<td>MT5/account-currency tick/profit math, fallback visibly warned</td>
+<td>Mostly</td>
+<td>Non-FX or non-USD fallback can mis-size</td>
+<td><code>pm_core.py:1990-2043</code>; <code>pm_mt5.py:1633-1648</code></td>
+<td>Add broker-spec parity report</td>
+</tr>
+<tr>
+<td>Tick value</td>
+<td><code>InstrumentSpec.calculate_tick_profit</code></td>
+<td><code>(exit-entry)*direction/tick_size*tick_value*volume</code></td>
+<td>MT5 tick-value math in deposit currency</td>
+<td>Yes if tick values current</td>
+<td>Wrong tick specs distort all PnL/risk</td>
+<td><code>pm_core.py:2082-2112</code></td>
+<td>Keep syncing broker specs</td>
+</tr>
+<tr>
+<td>Spread cost</td>
+<td>Backtester</td>
+<td>Half-spread entry/exit model; historical modes supported</td>
+<td>Bid/ask-aware spread by symbol/session</td>
+<td>Mostly</td>
+<td>Thin edges overstate profit if spread stale</td>
+<td><code>pm_core.InstrumentSpec.get_entry_price/get_exit_price</code>; benchmark spread fields</td>
+<td>Keep; validate provenance per symbol</td>
+</tr>
+<tr>
+<td>Commission</td>
+<td>Backtester</td>
+<td>Deducts <code>commission_per_lot * volume</code> once per closed trade</td>
+<td>Match broker round-trip or two one-way deals exactly</td>
+<td>Partial</td>
+<td>PnL and risk can be off by commission convention</td>
+<td><code>pm_core.py:2007</code>, exit code deducts once</td>
+<td>Confirm broker commission convention for FBS real</td>
+</tr>
+<tr>
+<td>Swap</td>
+<td>Backtester</td>
+<td>Swap model applied after run</td>
+<td>Account-currency swap matching broker rollover rules</td>
+<td>Mostly</td>
+<td>Longer holds can misstate net PnL</td>
+<td><code>pm_core._apply_swap_model</code>; tests in readiness blueprint</td>
+<td>Reconcile with live deal swap</td>
+</tr>
+<tr>
+<td>Slippage</td>
+<td>Backtester/live</td>
+<td>Backtest slippage only on stop exits; live logs result price but no slippage metric</td>
+<td>Entry, stop, TP, and market close slippage attribution</td>
+<td>No</td>
+<td>Profit leakage hidden; TP/entry optimism</td>
+<td><code>pm_core.py:4776</code>, <code>276-295</code>; <code>pm_main.py:5428-5476</code>; F005</td>
+<td>Add expected-vs-fill fields and observed slippage stress</td>
+</tr>
+<tr>
+<td>Risk per trade</td>
+<td>Config/live/backtest</td>
+<td>Pipeline risk 1.5%, discovery risk 1.0%, live target 0.5%, hard cap 25%</td>
+<td>Explicit named regimes and consistent replay basis</td>
+<td>No</td>
+<td>Results can be interpreted under wrong risk basis</td>
+<td><code>config.json:20-22</code>, <code>281-285</code>; F110/F113</td>
+<td>Add account-size regime config</td>
+</tr>
+<tr>
+<td>Exposure</td>
+<td>Live</td>
+<td>Same-symbol cap plus institutional total-open-risk logic</td>
+<td>Portfolio exposure by symbol/correlation/account regime</td>
+<td>Partial</td>
+<td>Correlated positions can stack risk</td>
+<td><code>config.json:149-161</code>; <code>pm_main._check_symbol_combined_risk_cap</code></td>
+<td>Add portfolio replay and correlation caps</td>
+</tr>
+<tr>
+<td>Margin</td>
+<td>Live/backtest</td>
+<td>Live margin-level gates and <code>order_calc_margin</code>; backtest no margin/stopout simulation</td>
+<td>Backtest/replay should simulate margin availability and stopout risk for micro-account mode</td>
+<td>Partial</td>
+<td>USD 22 path may be unvalidated under margin stress</td>
+<td><code>pm_mt5.py:1656-1666</code>; <code>pm_main</code> margin protection</td>
+<td>Add margin-aware replay for USD 22/USD 1k/USD 10k</td>
+</tr>
+<tr>
+<td>Currency conversion</td>
+<td>MT5/account</td>
+<td>Tick value and <code>order_calc_profit</code> return deposit currency; account currency pinned USD</td>
+<td>Explicit currency conversion or validated broker tick values</td>
+<td>Mostly for USD account, partial offline</td>
+<td>Non-USD account or stale broker specs can mis-size</td>
+<td><code>pm_core.py:2015</code>; <code>pm_live_readiness.py:306-339</code>; <code>pm_mt5.py:1633-1648</code></td>
+<td>Keep USD pin; warn loudly on fallback</td>
+</tr>
+</tbody>
+</table>
+<h2>High-Drawdown Trade Root Cause Review</h2>
+<p>The current data is not sufficient to label individual high-drawdown trades with confidence because per-trade MAE/MFE is absent. This is itself a finding, not an excuse. Account drawdown is floating-aware in the backtester, but the trade record does not retain each trade's worst adverse excursion.</p>
+<table>
+<thead>
+<tr>
+<th>Bucket</th>
+<th>Description</th>
+<th>Evidence Found</th>
+<th>Profit Contribution</th>
+<th>Drawdown Contribution</th>
+<th>Keep / Modify / Remove / Needs Test</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Profitable pain worth keeping</td>
+<td>Trades that go deeply underwater but recover and produce the edge</td>
+<td>Not directly measurable; no <code>mae_pips</code>, <code>mae_r</code>, <code>mfe_r</code> fields</td>
+<td>Unknown</td>
+<td>Unknown</td>
+<td>Needs Test</td>
+</tr>
+<tr>
+<td>Bad risk worth filtering</td>
+<td>Trades with high adverse excursion and poor expectancy</td>
+<td>Min-lot cap blocks show very high theoretical risk; no paired outcome data for blocked trades</td>
+<td>Unknown</td>
+<td>Live blocked-risk median 37.86%, max 362.06% in <code>deep_consistency_summary.json</code></td>
+<td>Needs Test</td>
+</tr>
+<tr>
+<td>Oversized but valid signal</td>
+<td>Valid signal where min-lot floor makes actual risk much larger than target</td>
+<td>67 executed live risk events; median actual risk 5.35%, p95 20.93%, max 24.67%</td>
+<td>Unknown until closed-trade EV by risk bucket is computed</td>
+<td>Potentially large, especially at USD 22</td>
+<td>Modify</td>
+</tr>
+<tr>
+<td>Poor entry timing</td>
+<td>Entries that immediately suffer adverse movement</td>
+<td>No expected-vs-fill slippage or MAE fields</td>
+<td>Unknown</td>
+<td>Unknown</td>
+<td>Needs Test</td>
+</tr>
+<tr>
+<td>Poor exit management</td>
+<td>Winners that give back MFE or losers held beyond useful signal</td>
+<td>Exit reason exists; MFE not captured</td>
+<td>Unknown</td>
+<td>Unknown</td>
+<td>Needs Test</td>
+</tr>
+<tr>
+<td>Regime mismatch</td>
+<td>Strategy traded in a market regime where its edge decays</td>
+<td>Cycle drift and supervisor block actions exist in ledger/log evidence, but not paired to MAE/MFE</td>
+<td>Unknown</td>
+<td>Possible</td>
+<td>Needs Test</td>
+</tr>
+<tr>
+<td>Spread/slippage/session problem</td>
+<td>Losses caused by high spread, fill slippage, or session liquidity</td>
+<td>F005 confirms entry/TP slippage attribution gap; spread model exists</td>
+<td>Unknown</td>
+<td>Possible</td>
+<td>Needs Test</td>
+</tr>
+<tr>
+<td>Correlation/exposure stacking problem</td>
+<td>Multiple positions share risk factor and deepen DD together</td>
+<td>Same-symbol and total-risk gates exist live; backtest lacks portfolio exposure path</td>
+<td>Unknown</td>
+<td>Possible</td>
+<td>Modify</td>
+</tr>
+<tr>
+<td>Data or reporting artifact</td>
+<td>Drawdown appears different because reports use different equity definitions</td>
+<td>Dashboard uses realized-trade curve; engine uses floating bar-close equity</td>
+<td>Can misstate</td>
+<td>Can hide open pain</td>
+<td>Modify</td>
+</tr>
+<tr>
+<td>Insufficient evidence</td>
+<td>Root cause cannot be classified honestly</td>
+<td>No MAE/MFE, no fill slippage metric, no canonical recovery metric</td>
+<td>Unknown</td>
+<td>Unknown</td>
+<td>Needs Test</td>
+</tr>
+</tbody>
+</table>
+<h3>Proposed Drawdown Controls</h3>
+<table>
+<thead>
+<tr>
+<th>Control</th>
+<th>What It Does</th>
+<th>Why It Might Help</th>
+<th>What It Might Break</th>
+<th>How To Test</th>
+<th>Priority</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Add MAE/MFE capture</td>
+<td>Stores <code>mae_pips</code>, <code>mae_r</code>, <code>mfe_pips</code>, <code>mfe_r</code> per trade</td>
+<td>Separates profitable pain from bad risk</td>
+<td>Larger logs; minor runtime cost</td>
+<td>Backtest EURUSD/US100 sample and bucket trades by MAE vs final PnL</td>
+<td>P0</td>
+</tr>
+<tr>
+<td>Add expected-vs-fill slippage fields</td>
+<td>Logs expected and filled price at entry/exit</td>
+<td>Identifies execution leakage and session issues</td>
+<td>Requires deal reconciliation</td>
+<td>Compare live/actionable fills to quote at decision time</td>
+<td>P0</td>
+</tr>
+<tr>
+<td>Add live-account replay mode</td>
+<td>Replays promoted signals with equity, min-lot, hard cap, and blocked trades</td>
+<td>Tests current USD 22 reality without trading</td>
+<td>May reject cells that are good at USD 10k</td>
+<td>Replay ledger at USD 22, USD 1k, USD 5k, USD 10k</td>
+<td>P0</td>
+</tr>
+<tr>
+<td>Add equity-tier universe filter</td>
+<td>Suppresses symbols whose min-lot risk is structurally above tier cap</td>
+<td>Avoids untradeable high-notional churn</td>
+<td>Could delay profitable high-beta symbols</td>
+<td>Compare blocked-rate and opportunity cost by symbol</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Add canonical recovery factor</td>
+<td>Computes net profit / max equity DD plus recovery duration</td>
+<td>Makes recovery comparable across reports</td>
+<td>Requires migration of dashboards</td>
+<td>Unit tests with known equity curves</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Add validation trade-count floor</td>
+<td>Requires enough validation trades before promotion/selection</td>
+<td>Reduces noisy false positives</td>
+<td>May reduce trade frequency</td>
+<td>Re-score current 157 cells with &gt;=20/30 trade floors</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Add post-selection audit slice</td>
+<td>Measures selected winner after selection without using it to choose</td>
+<td>Quantifies decay and selection bias</td>
+<td>Less fresh data available if used as hard gate</td>
+<td>Run as non-gating report first</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Add account-size regimes</td>
+<td>Micro, intermediate, full safety, preservation, recovery modes</td>
+<td>Preserves intentional USD 22 aggression while automating scaling</td>
+<td>Needs careful transition testing</td>
+<td>Replay signal ledger across tier balances</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Add observed slippage stress</td>
+<td>Re-scores cells under p50/p90/p95 live slippage</td>
+<td>Finds thin-edge execution-sensitive cells</td>
+<td>Could over-penalize if sparse data</td>
+<td>Apply to EURUSD, XAUUSD, US100, DE30 sample</td>
+<td>P2</td>
+</tr>
+</tbody>
+</table>
+<h2>Partner-Agent Review Status</h2>
+<table>
+<thead>
+<tr>
+<th>Finding</th>
+<th>Found By</th>
+<th>Codex Review</th>
+<th>Partner Review</th>
+<th>Final Position</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>F001</td>
+<td>Codex</td>
+<td>Confirmed</td>
+<td>Agreed by Claude</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F002</td>
+<td>Codex</td>
+<td>Confirmed</td>
+<td>Agreed by Claude</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F003</td>
+<td>Codex</td>
+<td>Confirmed</td>
+<td>Agreed by Claude</td>
+<td>Confirmed, but scale-aware</td>
+</tr>
+<tr>
+<td>F004</td>
+<td>Codex</td>
+<td>Confirmed</td>
+<td>Agreed by Claude</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F005</td>
+<td>Codex</td>
+<td>Confirmed</td>
+<td>Agreed by Claude</td>
+<td>Confirmed; Claude agrees — execution-cost sibling of F110/F107</td>
+</tr>
+<tr>
+<td>F101-F109</td>
+<td>Claude Code</td>
+<td>Agreed by Codex</td>
+<td>Authored by Claude</td>
+<td>Confirmed with scale-aware reframing</td>
+</tr>
+<tr>
+<td>F110</td>
+<td>Claude Code</td>
+<td>Agreed by Codex</td>
+<td>Authored by Claude</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F111</td>
+<td>Claude Code</td>
+<td>Agreed by Codex</td>
+<td>Authored by Claude</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F112</td>
+<td>Claude Code</td>
+<td>Agreed by Codex</td>
+<td>Authored by Claude</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>F113</td>
+<td>Claude Code</td>
+<td>Agreed by Codex</td>
+<td>Authored by Claude</td>
+<td>Confirmed</td>
+</tr>
+</tbody>
+</table>
+<h2>Prioritized Recommendations</h2>
+<ol>
+<li>Add a live-account replay mode that models equity, min lot, hard cap, blocked trades, spread, commission, swap, and margin. This is the highest-value correction because it answers whether USD 22 aggression is implemented profitably rather than merely aggressively.</li>
+<li>Add per-trade MAE/MFE and expected-vs-fill slippage fields. Without these, high-drawdown root cause analysis remains mostly hypothetical.</li>
+<li>Canonicalize metric definitions across engine, dashboard, pipeline bucket metrics, tools, and reports. Fix dashboard profit factor no-loss behavior immediately.</li>
+<li>Keep the bleeding-edge split, but label the 50k window as selection validation, not pristine OOS. Add a post-selection audit measurement or selection-bias penalty.</li>
+<li>Add explicit account-size regimes: micro-account growth, intermediate account, full safety, capital preservation, and drawdown recovery. Do not manually rely on remembering to retune at USD 1k/USD 10k.</li>
+<li>Add symbol/timeframe tradeability flags by balance tier. At USD 22, many high-notional cells are not currently tradeable under the live cap even if they are valid at USD 10k.</li>
+<li>Add broker-spec parity checks comparing offline tick/pip calculations against MT5 <code>order_calc_profit</code> and <code>order_calc_margin</code> in read-only mode.</li>
+</ol>
+<h2>Assumptions</h2>
+<ul>
+<li><code>config.json</code> and <code>pm_configs.json</code> were already modified before Codex touched the audit workspace; they were not reverted.</li>
+<li>The USD 22 account profile is intentionally aggressive.</li>
+<li>Current task scope is audit documentation plus read-only evidence scripts, not production behavior changes.</li>
+<li>The MT5 terminal was not intentionally connected or used for live trading during this audit.</li>
+<li>Historical demo performance may be real, but it must not be assumed to transfer to the USD 22 live account until replayed with live sizing/cap semantics.</li>
+</ul>
+<h2>Resolved Operator Decisions</h2>
+<p>The open audit questions were answered in <code>agent_audit/QUESTIONS.md</code>. Implementation should now assume:</p>
+<ul>
+<li>The USD 22 account remains in aggressive micro-account growth mode.</li>
+<li>The live hard cap stays at 25%.</li>
+<li>All 100 configured symbols remain eligible if they have valid trading parameters.</li>
+<li>FBS demo specs are treated as matching real live specs unless later read-only parity checks show drift.</li>
+<li>Use the latest completed demo/evaluation run before the current run as the main performance source for risk-bucket analysis.</li>
+<li>Use timeframe-aware validation trade-count floors rather than one universal number.</li>
+<li>Use a composite drawdown promotion control after MAE/MFE exists: MAE/R plus recovery/time-underwater plus expectancy/PF/R-multiple.</li>
+<li>Add post-selection audit as a hard gate only after replay proves that it improves actual trading outcomes.</li>
+</ul>
+</article>
+</main>
+</body>
+</html>

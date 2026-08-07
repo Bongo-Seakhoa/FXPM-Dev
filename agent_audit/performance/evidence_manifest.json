@@ -1,0 +1,336 @@
+{
+  "created_at": "2026-06-20T00:03:07.782876",
+  "files": [
+    {
+      "exists": true,
+      "modified": "2026-06-18T13:38:15.267686",
+      "path": "prompt.md",
+      "sha256": "50b56e2028a8dab0f234420f5ef982f9c325e87d5f227e1f815cf417d3da17b5",
+      "size_bytes": 44531
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T11:15:14.509443",
+      "path": "config.json",
+      "sha256": "6b57106d7a88f7b9353d3ad24b842125820d9e704edf85c23baa663c52417db1",
+      "size_bytes": 26941
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-19T21:59:03.842850",
+      "path": "pm_configs.json",
+      "sha256": "4daeea906ac979e2d6eca8b7670b0acea9a0b8a84c1fcd95293279e6dc88e58e",
+      "size_bytes": 24046836
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-19T21:59:03.961041",
+      "path": "regime_params.json",
+      "sha256": "23d40107cc92ab70da018c4c6c67b6bbcbb5ba5e2665ccf5ab573b27454c54d8",
+      "size_bytes": 109122
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:19:23.475263",
+      "path": "pm_core.py",
+      "sha256": "812f3ee5a11a62e2ac5060ce8e379ebb164b213187c3f8cafb50ea63379b2544",
+      "size_bytes": 317761
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:17:36.282570",
+      "path": "pm_metrics.py",
+      "sha256": "cbbc671079f6b0b764be4599458fd0b35b40f6b21317180f3fa317b2d2c4cf35",
+      "size_bytes": 6222
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:20:31.879513",
+      "path": "pm_pipeline.py",
+      "sha256": "3c13537aa8dade3f88b171b9f5ef4ff34a238b5845268879b12c313ebe6c1049",
+      "size_bytes": 385452
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-09T20:06:33.249564",
+      "path": "pm_optuna.py",
+      "sha256": "13090cedcfe387d41d43fb43813709ee4a33e2df9443b46a3d9fa46ff0eb3150",
+      "size_bytes": 61633
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:21:51.807866",
+      "path": "pm_main.py",
+      "sha256": "2613f65f5db980119a225f15f35cbb5c473769d68c1f0b04495f660257117c63",
+      "size_bytes": 321489
+    },
+    {
+      "exists": true,
+      "modified": "2026-04-29T00:41:57.562750",
+      "path": "pm_position.py",
+      "sha256": "2725a27324d4d372826d5717b5131a972d80dc66240b619a3630a99986a9012c",
+      "size_bytes": 40517
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-09T16:24:39.666039",
+      "path": "pm_mt5.py",
+      "sha256": "e306008ea0710ab6a3365bdbaeb7171c4bf7e76e271db49b562bd4cf3b40196c",
+      "size_bytes": 73085
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:21:35.523496",
+      "path": "pm_live_readiness.py",
+      "sha256": "a19b79550e6a973c583f8bf700deb224dbd792e420e6e7aa1f9701eef71b4d3c",
+      "size_bytes": 42489
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:19:52.781182",
+      "path": "pm_dashboard/analytics.py",
+      "sha256": "60cd1e77957ff36d720ce38cd1b9a675d879ac0de87c3d2129742df5ae137beb",
+      "size_bytes": 46541
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:20:14.252450",
+      "path": "tools/benchmark.py",
+      "sha256": "dcc800af53fff0cd5af847952c461e6047d9a624d8965e6946d0c68ccb18c54b",
+      "size_bytes": 23273
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:27:19.700890",
+      "path": "agent_audit/performance/scripts/run_promoted_cell_replay.py",
+      "sha256": "d1abc40340ec8e4e6fcbd3f3bb34b64aa42c576313d6be942f24042bd9bde58c",
+      "size_bytes": 9836
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:30:25.156714",
+      "path": "agent_audit/performance/scripts/shadow_selection_audit.py",
+      "sha256": "c74413daf02c81f61b9d090f5784df1168ac62b90b859d35be93040d709856d0",
+      "size_bytes": 8008
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:29:59.910910",
+      "path": "agent_audit/performance/scripts/claude_replay_all_promoted.py",
+      "sha256": "8410608b19a34f2f56e5b48715627d2ca5b3458b7680ce565f50715c6cab9de2",
+      "size_bytes": 1919
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-03T08:00:59.490547",
+      "path": "pm_strategies.py",
+      "sha256": "3cbeb5a6fc04743ed21606a52c3a5aae242d9df2fbea00349a1d64bc9db98aa3",
+      "size_bytes": 303465
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:24:02.075418",
+      "path": "tests/test_metric_contract.py",
+      "sha256": "08bd91b269f05e37697479526bee7307f906c5cc903308c4c005128e5c45a581",
+      "size_bytes": 2402
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:00:33.024027",
+      "path": "tests/test_backtester.py",
+      "sha256": "c0711b021d4434e3712dcc28d847c8f2ae7d1daf312f34ee535a3602d99d9c34",
+      "size_bytes": 23333
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T13:48:54.215927",
+      "path": "tests/test_dashboard_trade_enrichment.py",
+      "sha256": "3d130733ad85b36aa4dbe2a6f8862bba56df7cf8098a25d4cab00e5fb12f79b1",
+      "size_bytes": 13102
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:00:26.484829",
+      "path": "tests/test_config_source_of_truth.py",
+      "sha256": "6a54b2aff063565ca063634302657322fdef656fe7526e1fe9c50f691bbd37e4",
+      "size_bytes": 40324
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T15:24:27.739962",
+      "path": "tests/test_profitability_readiness_blueprint.py",
+      "sha256": "deaa95d6a63e67047520a33500994e3e540eff50488b9dd3e7aa5f348446e150",
+      "size_bytes": 64133
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-17T14:31:26.251926",
+      "path": "agent_audit/reports/TECHNICAL_AUDIT.md",
+      "sha256": "9bc979574203d5364dcf7b5a44aec9e055989e39ee50f91b1ffdb1eaa2825fe0",
+      "size_bytes": 30401
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-17T14:31:41.966761",
+      "path": "agent_audit/reports/STRATEGIC_AUDIT.md",
+      "sha256": "5db92015c920baf4318fec39012b3d3de9b222ed31d1072c7fdbee02fab03cb6",
+      "size_bytes": 23826
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-17T13:30:46.024738",
+      "path": "agent_audit/data/ledger_tradeable_cells.csv",
+      "sha256": "6b8954196f1d0c74e3bad5f3cb84e79afffd33ff3171828ae699e5275b55fe92",
+      "size_bytes": 48720
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-17T13:30:46.028740",
+      "path": "agent_audit/data/ledger_symbol_summary.csv",
+      "sha256": "fdc5a813d5bfc98b9370e3b79d589d1209889f84485bbd3fa9b5eb63cea2c5fb",
+      "size_bytes": 24607
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-17T13:30:46.042747",
+      "path": "agent_audit/data/oos_manifest_summary.csv",
+      "sha256": "39daa92b61fccc7aa9be6576c42a9e418f5b96d9c12404482bcd3ede4cd63382",
+      "size_bytes": 66656
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-17T14:00:20.504742",
+      "path": "agent_audit/data/deep_split_geometry.csv",
+      "sha256": "4a407d90b633ca645cf0dfeec0db4f8f98a8a0298d41604d23cdeae3c67270c8",
+      "size_bytes": 1446
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-17T14:00:20.505742",
+      "path": "agent_audit/data/deep_metric_definition_mismatches.csv",
+      "sha256": "13f28b487107a77f4a82b671af3d4b71a021fdbbbf06b576a9aa2fa598209685",
+      "size_bytes": 593
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:02:30.278727",
+      "path": "agent_audit/performance/FINAL_PERFORMANCE_REPORT.md",
+      "sha256": "bd618024fea6fef0463ccea1928a05b581f3c18effc9112bc02a7b0ed3d333a1",
+      "size_bytes": 19873
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:38:59.510754",
+      "path": "agent_audit/performance/BASELINE_10000.md",
+      "sha256": "42433bef5ef3e95e91e5647fa09c3c1fa8c2a5e7c777757c811f0ec94e4968e6",
+      "size_bytes": 2900
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:38:04.997188",
+      "path": "agent_audit/performance/RECOMMENDATION_TRIAGE.md",
+      "sha256": "d0c031975fde524b3c01029a133002c37b975bc08bc7bbec224cf153dd893144",
+      "size_bytes": 7888
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:38:10.980794",
+      "path": "agent_audit/performance/OPTUNA_NUMBA_COMPATIBILITY.md",
+      "sha256": "a6de0edfc098090aaebcf5f123b01e5b36194c85f5cf512d15cc656319117b0e",
+      "size_bytes": 5622
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:36:40.696384",
+      "path": "agent_audit/performance/FIX_REGISTER.md",
+      "sha256": "ab4ce7225809689d54100c30965256de8f8d93a16c3bb5942333c7d4c5f00b6f",
+      "size_bytes": 14390
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:03:07.695265",
+      "path": "agent_audit/performance/PERFORMANCE_COMPARISONS.csv",
+      "sha256": "87ff8a7fe01935ce821bf53b61b5af40b3cedfd7c6895b0cc30ab7bfa6505c79",
+      "size_bytes": 5377
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:38:18.534522",
+      "path": "agent_audit/performance/COMMUNICATIONS_CHECK.md",
+      "sha256": "bdcc20f68aab72160d64eea8b2a37aa4da422c6eca3fee974b45f9ebdd28264c",
+      "size_bytes": 2383
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:34:09.720344",
+      "path": "agent_audit/performance/PARTNER_REVIEW.md",
+      "sha256": "795a138e7a9a149e570b3bdae8f1f34631cb6a28f55f918fe99108bda82eb39e",
+      "size_bytes": 7052
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:36:55.348343",
+      "path": "agent_audit/performance/ACCEPTED_FIXES.md",
+      "sha256": "8c7acc903bfe13956184e234aeace0a420558e932d21687894de795b1a5dce7f",
+      "size_bytes": 2387
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:37:06.396021",
+      "path": "agent_audit/performance/OPEN_QUESTIONS.md",
+      "sha256": "c801d67689a00600b53284a2a930cd1e268728d6b97242e45d1d153a2939cbc9",
+      "size_bytes": 2081
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:01:44.231010",
+      "path": "agent_audit/performance/CLAUDE_DECISIVE_REPLAY_FINDING.md",
+      "sha256": "b6a4921761d4727043df13a14fd222119b1abe8d5438d8229a3fe607295c2c87",
+      "size_bytes": 9122
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:03:06.771790",
+      "path": "agent_audit/performance/data/current_ledger_inventory.json",
+      "sha256": "cdeb1f0947165a50baefbb026af44a61894cd8af89d9a6d0893ef8afcdbdf4b6",
+      "size_bytes": 40199
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:03:06.727786",
+      "path": "agent_audit/performance/data/current_promoted_cells.csv",
+      "sha256": "5c8c8f85d1e544d324dca8515af98de3c3b18d8f625e177d9f620254fb1a4895",
+      "size_bytes": 11494
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-18T17:39:43.278466",
+      "path": "agent_audit/performance/data/promoted_cell_replay_10000.csv",
+      "sha256": "40c8d0ef03376ebbf88fab321c9edfa17bb350de1a315eaf44f8fc53f2b8bc9b",
+      "size_bytes": 1944
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:00:30.749202",
+      "path": "agent_audit/performance/data/promoted_winner_replay_all_10000.csv",
+      "sha256": "b603008e8b599e89ecff473736c2c48804d49ccf00c9e3058955aad76b8d2329",
+      "size_bytes": 242272
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:00:50.896288",
+      "path": "agent_audit/performance/data/shadow_selection_audit.csv",
+      "sha256": "433fea8e5070fb3508daef35e268b5bcbb34afdda68e8bd0ca36b62b461f3f38",
+      "size_bytes": 17252
+    },
+    {
+      "exists": true,
+      "modified": "2026-06-20T00:00:50.897285",
+      "path": "agent_audit/performance/data/shadow_selection_audit.summary.json",
+      "sha256": "0d76eb9708adfe9e100567cfa379ef89419e98047bc52c6d11e42ef59d08cf12",
+      "size_bytes": 111
+    }
+  ],
+  "git_head": null,
+  "git_status_short": null
+}

@@ -1,0 +1,485 @@
+{
+  "deterministic_stress": [
+    {
+      "initial_stop_risk_pct": 3.0,
+      "loss_at_1.5x_pct": 4.5,
+      "loss_at_1x_pct": 3.0,
+      "loss_at_2.5x_pct": 7.5,
+      "loss_at_2x_pct": 6.0,
+      "loss_at_3x_pct": 9.0
+    },
+    {
+      "initial_stop_risk_pct": 5.0,
+      "loss_at_1.5x_pct": 7.5,
+      "loss_at_1x_pct": 5.0,
+      "loss_at_2.5x_pct": 12.5,
+      "loss_at_2x_pct": 10.0,
+      "loss_at_3x_pct": 15.0
+    },
+    {
+      "initial_stop_risk_pct": 8.0,
+      "loss_at_1.5x_pct": 12.0,
+      "loss_at_1x_pct": 8.0,
+      "loss_at_2.5x_pct": 20.0,
+      "loss_at_2x_pct": 16.0,
+      "loss_at_3x_pct": 24.0
+    },
+    {
+      "initial_stop_risk_pct": 10.0,
+      "loss_at_1.5x_pct": 15.0,
+      "loss_at_1x_pct": 10.0,
+      "loss_at_2.5x_pct": 25.0,
+      "loss_at_2x_pct": 20.0,
+      "loss_at_3x_pct": 30.0
+    },
+    {
+      "initial_stop_risk_pct": 12.0,
+      "loss_at_1.5x_pct": 18.0,
+      "loss_at_1x_pct": 12.0,
+      "loss_at_2.5x_pct": 30.0,
+      "loss_at_2x_pct": 24.0,
+      "loss_at_3x_pct": 36.0
+    },
+    {
+      "initial_stop_risk_pct": 20.0,
+      "loss_at_1.5x_pct": 30.0,
+      "loss_at_1x_pct": 20.0,
+      "loss_at_2.5x_pct": 50.0,
+      "loss_at_2x_pct": 40.0,
+      "loss_at_3x_pct": 60.0
+    },
+    {
+      "initial_stop_risk_pct": 33.25,
+      "loss_at_1.5x_pct": 49.875,
+      "loss_at_1x_pct": 33.25,
+      "loss_at_2.5x_pct": 83.125,
+      "loss_at_2x_pct": 66.5,
+      "loss_at_3x_pct": 99.75
+    },
+    {
+      "initial_stop_risk_pct": 50.0,
+      "loss_at_1.5x_pct": 75.0,
+      "loss_at_1x_pct": 50.0,
+      "loss_at_2.5x_pct": 125.0,
+      "loss_at_2x_pct": 100.0,
+      "loss_at_3x_pct": 150.0
+    },
+    {
+      "initial_stop_risk_pct": 75.0,
+      "loss_at_1.5x_pct": 112.5,
+      "loss_at_1x_pct": 75.0,
+      "loss_at_2.5x_pct": 187.5,
+      "loss_at_2x_pct": 150.0,
+      "loss_at_3x_pct": 225.0
+    },
+    {
+      "initial_stop_risk_pct": 90.0,
+      "loss_at_1.5x_pct": 135.0,
+      "loss_at_1x_pct": 90.0,
+      "loss_at_2.5x_pct": 225.0,
+      "loss_at_2x_pct": 180.0,
+      "loss_at_3x_pct": 270.0
+    }
+  ],
+  "profitability_guarantee": false,
+  "provisional_envelope": {
+    "factor_gap_stress_multiple": 2.5,
+    "factor_group_initial_stop_risk_ceiling_pct": 2.0,
+    "factor_stressed_loss_budget_pct": 5.0,
+    "full_size_position_capacity": 32,
+    "full_size_positions_per_factor": 8,
+    "margin_level_entry_block_pct": 200.0,
+    "margin_level_reopen_pct": 300.0000000003,
+    "margin_utilization_ceiling_pct": 50.0,
+    "margin_utilization_operating_floor_pct": 33.3333333333,
+    "per_trade_initial_stop_risk_pct": 0.25,
+    "portfolio_gap_stress_multiple": 2.5,
+    "portfolio_stressed_loss_budget_pct": 20.0,
+    "same_symbol_initial_stop_risk_ceiling_pct": 1.0,
+    "total_initial_stop_risk_ceiling_pct": 8.0
+  },
+  "purpose": "offline sensitivity and provisional survivability calibration",
+  "scenarios": {
+    "stronger_edge_hierarchical_sensitivity": [
+      {
+        "cap_pct": 3.0,
+        "factor_groups": 2,
+        "full_size_positions": 12,
+        "median_max_drawdown_pct": 8.850213717203676,
+        "median_terminal_equity_multiple": 2.1047611921926954,
+        "p05_terminal_equity_multiple": 1.4635630853315185,
+        "p95_max_drawdown_pct": 15.385224494036882,
+        "probability_max_drawdown_above_20_pct": 0.006333333333333333,
+        "probability_max_drawdown_above_30_pct": 0.0,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 5.0,
+        "factor_groups": 3,
+        "full_size_positions": 20,
+        "median_max_drawdown_pct": 10.35473375175765,
+        "median_terminal_equity_multiple": 3.411620038761245,
+        "p05_terminal_equity_multiple": 2.1054281329349442,
+        "p95_max_drawdown_pct": 17.53099449225013,
+        "probability_max_drawdown_above_20_pct": 0.020666666666666667,
+        "probability_max_drawdown_above_30_pct": 0.0,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 8.0,
+        "factor_groups": 4,
+        "full_size_positions": 32,
+        "median_max_drawdown_pct": 11.791812484437298,
+        "median_terminal_equity_multiple": 7.1270461671760765,
+        "p05_terminal_equity_multiple": 3.769785234765248,
+        "p95_max_drawdown_pct": 19.51652093063346,
+        "probability_max_drawdown_above_20_pct": 0.042,
+        "probability_max_drawdown_above_30_pct": 0.001,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 10.0,
+        "factor_groups": 5,
+        "full_size_positions": 40,
+        "median_max_drawdown_pct": 12.1404583972,
+        "median_terminal_equity_multiple": 11.70688428875379,
+        "p05_terminal_equity_multiple": 5.6097742262356425,
+        "p95_max_drawdown_pct": 19.92476403739544,
+        "probability_max_drawdown_above_20_pct": 0.04933333333333333,
+        "probability_max_drawdown_above_30_pct": 0.0006666666666666666,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 12.0,
+        "factor_groups": 6,
+        "full_size_positions": 48,
+        "median_max_drawdown_pct": 12.272221640625002,
+        "median_terminal_equity_multiple": 18.918227134683967,
+        "p05_terminal_equity_multiple": 8.734855565079084,
+        "p95_max_drawdown_pct": 20.642107013106443,
+        "probability_max_drawdown_above_20_pct": 0.06166666666666667,
+        "probability_max_drawdown_above_30_pct": 0.003,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 20.0,
+        "factor_groups": 10,
+        "full_size_positions": 80,
+        "median_max_drawdown_pct": 12.890270546875,
+        "median_terminal_equity_multiple": 129.52335421867537,
+        "p05_terminal_equity_multiple": 47.65861790761521,
+        "p95_max_drawdown_pct": 25.0,
+        "probability_max_drawdown_above_20_pct": 0.107,
+        "probability_max_drawdown_above_30_pct": 0.009666666666666667,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 33.25,
+        "factor_groups": 17,
+        "full_size_positions": 133,
+        "median_max_drawdown_pct": 13.0,
+        "median_terminal_equity_multiple": 2980.4417271290085,
+        "p05_terminal_equity_multiple": 833.2720481922754,
+        "p95_max_drawdown_pct": 41.5625,
+        "probability_max_drawdown_above_20_pct": 0.12,
+        "probability_max_drawdown_above_30_pct": 0.06966666666666667,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 50.0,
+        "factor_groups": 25,
+        "full_size_positions": 200,
+        "median_max_drawdown_pct": 13.250000000000007,
+        "median_terminal_equity_multiple": 144890.84467671672,
+        "p05_terminal_equity_multiple": 26722.858423725433,
+        "p95_max_drawdown_pct": 62.5,
+        "probability_max_drawdown_above_20_pct": 0.11833333333333333,
+        "probability_max_drawdown_above_30_pct": 0.06666666666666667,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 75.0,
+        "factor_groups": 38,
+        "full_size_positions": 300,
+        "median_max_drawdown_pct": 12.0,
+        "median_terminal_equity_multiple": 37788509.68310503,
+        "p05_terminal_equity_multiple": 3521885.4380142144,
+        "p95_max_drawdown_pct": 93.75,
+        "probability_max_drawdown_above_20_pct": 0.11333333333333333,
+        "probability_max_drawdown_above_30_pct": 0.052333333333333336,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 90.0,
+        "factor_groups": 45,
+        "full_size_positions": 360,
+        "median_max_drawdown_pct": 12.0,
+        "median_terminal_equity_multiple": 906978861.0999942,
+        "p05_terminal_equity_multiple": 0.0,
+        "p95_max_drawdown_pct": 100.0,
+        "probability_max_drawdown_above_20_pct": 0.12266666666666666,
+        "probability_max_drawdown_above_30_pct": 0.06366666666666666,
+        "probability_terminal_equity_below_50_pct": 0.062
+      }
+    ],
+    "thin_edge_concentrated_sensitivity": [
+      {
+        "cap_pct": 3.0,
+        "factor_groups": 1,
+        "full_size_positions": 12,
+        "median_max_drawdown_pct": 27.981029649121247,
+        "median_terminal_equity_multiple": 1.1260522287069645,
+        "p05_terminal_equity_multiple": 0.6405731172974994,
+        "p95_max_drawdown_pct": 48.55229540471503,
+        "probability_max_drawdown_above_20_pct": 0.845,
+        "probability_max_drawdown_above_30_pct": 0.42433333333333334,
+        "probability_terminal_equity_below_50_pct": 0.008666666666666666
+      },
+      {
+        "cap_pct": 5.0,
+        "factor_groups": 1,
+        "full_size_positions": 20,
+        "median_max_drawdown_pct": 43.89979843113641,
+        "median_terminal_equity_multiple": 1.1095904110953345,
+        "p05_terminal_equity_multiple": 0.4501878546001586,
+        "p95_max_drawdown_pct": 67.30171072434797,
+        "probability_max_drawdown_above_20_pct": 0.993,
+        "probability_max_drawdown_above_30_pct": 0.879,
+        "probability_terminal_equity_below_50_pct": 0.068
+      },
+      {
+        "cap_pct": 8.0,
+        "factor_groups": 1,
+        "full_size_positions": 32,
+        "median_max_drawdown_pct": 61.69298120325156,
+        "median_terminal_equity_multiple": 1.0307587402567633,
+        "p05_terminal_equity_multiple": 0.23509635575647314,
+        "p95_max_drawdown_pct": 85.4263466900664,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 0.9946666666666667,
+        "probability_terminal_equity_below_50_pct": 0.21533333333333332
+      },
+      {
+        "cap_pct": 10.0,
+        "factor_groups": 1,
+        "full_size_positions": 40,
+        "median_max_drawdown_pct": 71.19492029867413,
+        "median_terminal_equity_multiple": 0.9347406721777101,
+        "p05_terminal_equity_multiple": 0.16092888777384431,
+        "p95_max_drawdown_pct": 91.17309246691508,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 1.0,
+        "probability_terminal_equity_below_50_pct": 0.2803333333333333
+      },
+      {
+        "cap_pct": 12.0,
+        "factor_groups": 1,
+        "full_size_positions": 48,
+        "median_max_drawdown_pct": 78.46446903881768,
+        "median_terminal_equity_multiple": 0.7930226752239351,
+        "p05_terminal_equity_multiple": 0.08837144976955627,
+        "p95_max_drawdown_pct": 95.2860183918489,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 1.0,
+        "probability_terminal_equity_below_50_pct": 0.35933333333333334
+      },
+      {
+        "cap_pct": 20.0,
+        "factor_groups": 1,
+        "full_size_positions": 80,
+        "median_max_drawdown_pct": 95.1116213233594,
+        "median_terminal_equity_multiple": 0.2522996313145323,
+        "p05_terminal_equity_multiple": 0.006634645374300796,
+        "p95_max_drawdown_pct": 99.71730041245674,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 1.0,
+        "probability_terminal_equity_below_50_pct": 0.6213333333333333
+      },
+      {
+        "cap_pct": 33.25,
+        "factor_groups": 1,
+        "full_size_positions": 133,
+        "median_max_drawdown_pct": 99.88283268393734,
+        "median_terminal_equity_multiple": 0.007134882577203336,
+        "p05_terminal_equity_multiple": 2.2253205438287342e-05,
+        "p95_max_drawdown_pct": 99.99919491859772,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 1.0,
+        "probability_terminal_equity_below_50_pct": 0.8783333333333333
+      },
+      {
+        "cap_pct": 50.0,
+        "factor_groups": 1,
+        "full_size_positions": 200,
+        "median_max_drawdown_pct": 99.99995767994655,
+        "median_terminal_equity_multiple": 2.6048745891327016e-06,
+        "p05_terminal_equity_multiple": 2.235112985862753e-10,
+        "p95_max_drawdown_pct": 99.99999999264062,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 1.0,
+        "probability_terminal_equity_below_50_pct": 0.983
+      },
+      {
+        "cap_pct": 75.0,
+        "factor_groups": 1,
+        "full_size_positions": 300,
+        "median_max_drawdown_pct": 100.0,
+        "median_terminal_equity_multiple": 1.7179408838940989e-16,
+        "p05_terminal_equity_multiple": 2.8299511524781156e-23,
+        "p95_max_drawdown_pct": 100.0,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 1.0,
+        "probability_terminal_equity_below_50_pct": 0.9996666666666667
+      },
+      {
+        "cap_pct": 90.0,
+        "factor_groups": 1,
+        "full_size_positions": 360,
+        "median_max_drawdown_pct": 100.0,
+        "median_terminal_equity_multiple": 1.3878870314182352e-33,
+        "p05_terminal_equity_multiple": 0.0,
+        "p95_max_drawdown_pct": 100.0,
+        "probability_max_drawdown_above_20_pct": 1.0,
+        "probability_max_drawdown_above_30_pct": 1.0,
+        "probability_terminal_equity_below_50_pct": 1.0
+      }
+    ],
+    "thin_edge_hierarchical": [
+      {
+        "cap_pct": 3.0,
+        "factor_groups": 2,
+        "full_size_positions": 12,
+        "median_max_drawdown_pct": 15.87663364060608,
+        "median_terminal_equity_multiple": 1.1808477769283334,
+        "p05_terminal_equity_multiple": 0.8066102889224911,
+        "p95_max_drawdown_pct": 30.259844539553733,
+        "probability_max_drawdown_above_20_pct": 0.2906666666666667,
+        "probability_max_drawdown_above_30_pct": 0.051,
+        "probability_terminal_equity_below_50_pct": 0.0
+      },
+      {
+        "cap_pct": 5.0,
+        "factor_groups": 3,
+        "full_size_positions": 20,
+        "median_max_drawdown_pct": 19.873521412461887,
+        "median_terminal_equity_multiple": 1.3144107083826029,
+        "p05_terminal_equity_multiple": 0.8185690988168344,
+        "p95_max_drawdown_pct": 36.245127031917384,
+        "probability_max_drawdown_above_20_pct": 0.494,
+        "probability_max_drawdown_above_30_pct": 0.13233333333333333,
+        "probability_terminal_equity_below_50_pct": 0.0006666666666666666
+      },
+      {
+        "cap_pct": 8.0,
+        "factor_groups": 4,
+        "full_size_positions": 32,
+        "median_max_drawdown_pct": 24.037608077013317,
+        "median_terminal_equity_multiple": 1.5315870602549586,
+        "p05_terminal_equity_multiple": 0.8188571627571553,
+        "p95_max_drawdown_pct": 42.09117316185846,
+        "probability_max_drawdown_above_20_pct": 0.705,
+        "probability_max_drawdown_above_30_pct": 0.2633333333333333,
+        "probability_terminal_equity_below_50_pct": 0.0016666666666666668
+      },
+      {
+        "cap_pct": 10.0,
+        "factor_groups": 5,
+        "full_size_positions": 40,
+        "median_max_drawdown_pct": 25.538109237943424,
+        "median_terminal_equity_multiple": 1.707783129922598,
+        "p05_terminal_equity_multiple": 0.8447733499996389,
+        "p95_max_drawdown_pct": 43.84340888331789,
+        "probability_max_drawdown_above_20_pct": 0.7696666666666667,
+        "probability_max_drawdown_above_30_pct": 0.31866666666666665,
+        "probability_terminal_equity_below_50_pct": 0.0016666666666666668
+      },
+      {
+        "cap_pct": 12.0,
+        "factor_groups": 6,
+        "full_size_positions": 48,
+        "median_max_drawdown_pct": 26.951549428722032,
+        "median_terminal_equity_multiple": 1.8679253406540965,
+        "p05_terminal_equity_multiple": 0.8495256257202451,
+        "p95_max_drawdown_pct": 46.86600951151791,
+        "probability_max_drawdown_above_20_pct": 0.817,
+        "probability_max_drawdown_above_30_pct": 0.37333333333333335,
+        "probability_terminal_equity_below_50_pct": 0.003
+      },
+      {
+        "cap_pct": 20.0,
+        "factor_groups": 10,
+        "full_size_positions": 80,
+        "median_max_drawdown_pct": 30.39312638840512,
+        "median_terminal_equity_multiple": 3.0518000149003957,
+        "p05_terminal_equity_multiple": 1.0871433783710256,
+        "p95_max_drawdown_pct": 50.89559461168866,
+        "probability_max_drawdown_above_20_pct": 0.9223333333333333,
+        "probability_max_drawdown_above_30_pct": 0.5173333333333333,
+        "probability_terminal_equity_below_50_pct": 0.0016666666666666668
+      },
+      {
+        "cap_pct": 33.25,
+        "factor_groups": 17,
+        "full_size_positions": 133,
+        "median_max_drawdown_pct": 34.60656985567428,
+        "median_terminal_equity_multiple": 5.801202958472086,
+        "p05_terminal_equity_multiple": 1.622835808175713,
+        "p95_max_drawdown_pct": 56.973560078483274,
+        "probability_max_drawdown_above_20_pct": 0.974,
+        "probability_max_drawdown_above_30_pct": 0.676,
+        "probability_terminal_equity_below_50_pct": 0.001
+      },
+      {
+        "cap_pct": 50.0,
+        "factor_groups": 25,
+        "full_size_positions": 200,
+        "median_max_drawdown_pct": 37.2562192216398,
+        "median_terminal_equity_multiple": 14.028729579226443,
+        "p05_terminal_equity_multiple": 2.675224199038665,
+        "p95_max_drawdown_pct": 67.53413789178654,
+        "probability_max_drawdown_above_20_pct": 0.9896666666666667,
+        "probability_max_drawdown_above_30_pct": 0.781,
+        "probability_terminal_equity_below_50_pct": 0.0006666666666666666
+      },
+      {
+        "cap_pct": 75.0,
+        "factor_groups": 38,
+        "full_size_positions": 300,
+        "median_max_drawdown_pct": 39.64183855518091,
+        "median_terminal_equity_multiple": 49.518918832452,
+        "p05_terminal_equity_multiple": 4.018666379550553,
+        "p95_max_drawdown_pct": 94.21115624999999,
+        "probability_max_drawdown_above_20_pct": 0.9966666666666667,
+        "probability_max_drawdown_above_30_pct": 0.862,
+        "probability_terminal_equity_below_50_pct": 0.003
+      },
+      {
+        "cap_pct": 90.0,
+        "factor_groups": 45,
+        "full_size_positions": 360,
+        "median_max_drawdown_pct": 41.30059445789064,
+        "median_terminal_equity_multiple": 110.8041574041749,
+        "p05_terminal_equity_multiple": 0.0,
+        "p95_max_drawdown_pct": 100.0,
+        "probability_max_drawdown_above_20_pct": 0.9976666666666667,
+        "probability_max_drawdown_above_30_pct": 0.8946666666666667,
+        "probability_terminal_equity_below_50_pct": 0.06366666666666666
+      }
+    ]
+  },
+  "schema_version": "2026-07-11-capital-envelope-v1",
+  "selection_rule": "largest 0.25%-aligned total and factor ceilings whose deterministic 2.5x gap losses do not exceed 20% portfolio and 5% factor budgets",
+  "simulation_contract": {
+    "batches": 130,
+    "note": "Sensitivity only. Production cap must be frozen on tuning evidence and pass one-shot synchronized final-lockbox replay.",
+    "paths": 3000,
+    "seed": 20260711
+  },
+  "thin_edge_trade_math": {
+    "binary_kelly_fraction": 0.024999999999999967,
+    "break_even_win_probability": 0.3333333333333333,
+    "gross_expectancy_r": 0.04999999999999993,
+    "payoff_r": 2.0,
+    "win_probability": 0.35
+  }
+}

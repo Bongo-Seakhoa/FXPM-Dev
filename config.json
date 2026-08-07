@@ -54,7 +54,7 @@
       "H4": {"optimizer_train": 2500, "tuning_validation": 1000, "final_lockbox": 1000},
       "D1": {"optimizer_train": 1260, "tuning_validation": 500, "final_lockbox": 500}
     },
-    "optimization_max_workers": 1,
+    "optimization_max_workers": 0,
     "feature_cache_max_entries": 0,
     "feature_disk_cache_enabled": true,
     "feature_disk_cache_dir": "./pm_outputs/production_live/feature_cache",
@@ -244,7 +244,7 @@
     "production_retrain_weekday": "sunday",
     "production_retrain_time": "00:01",
     "production_retrain_anchor_date": "2026-06-07",
-    "manual_new_entries_enabled": false,
+    "manual_new_entries_enabled": true,
     "manual_kill_switch_path": "runtime/manual_new_entries_enabled.flag",
     "storage_pause_entries_below_free_gb": null,
     "max_total_open_risk_pct": 8.0,

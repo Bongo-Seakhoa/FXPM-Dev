@@ -76,6 +76,10 @@ REGIME_FIT_EVIDENCE_VERSION: Final = "fxpm.historical-regime-fit-evidence.v1"
 PARTITION_GEOMETRY_VERSION: Final = "fxpm.winner-partition-geometry.v1"
 SIGNAL_VECTOR_VERSION: Final = "fxpm.authoritative-search-signal-vector.v1"
 PROVENANCE_RECEIPT_VERSION: Final = "fxpm.authoritative-search-provenance.v1"
+STATE_CONTEXT_DISPOSITION_SCHEMA: Final = (
+    "fxpm.production-trial-state-context-disposition.v1"
+)
+STATE_CONTEXT_BOUNDARY_REASON: Final = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
 MAX_PREFIX_ROWS: Final = 10_000_000
 MAX_ATTEMPTS: Final = winner_v11.MAX_ATTEMPTS
 MAX_FOLDS: Final = winner_v11.MAX_FOLDS
@@ -89,10 +93,11 @@ MAX_DEPLOYMENT_CONFIG_BYTES: Final = 32 * 1024**2
 MAX_BROKER_SPECS_BYTES: Final = 64 * 1024**2
 EXECUTION_SPEC_RECEIPT_SCHEMA: Final = "fxpm.execution-instrument-spec-receipt.v1"
 TERMINAL_SOURCE_CONTRACT_SCHEMA: Final = (
-    "fxpm.terminal-source-non-evaluation-contract.v1"
+    "fxpm.terminal-source-non-evaluation-contract.v2"
 )
-TERMINAL_REGIME_FIT_POLICY_SCHEMA: Final = "fxpm.terminal-regime-fit-policy.v1"
+TERMINAL_REGIME_FIT_POLICY_SCHEMA: Final = "fxpm.terminal-regime-fit-policy.v2"
 TERMINAL_SOURCE_REASON_CODE: Final = "AUTHENTICATED_NATIVE_PREFIX_SOURCE_UNAVAILABLE"
+TERMINAL_TECHNICAL_REASON_CODE: Final = "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
 _SHA: Final = frozenset("0123456789abcdef")
 _REGIME_COLUMNS: Final = (
     "TREND_SCORE",
@@ -212,9 +217,10 @@ class _BoundedRawWinnerCanaryCapturePermit:
 class TerminalNativeTimeframe:
     """A reverified terminal (non-searchable) native cell and its Book facts.
 
-    Only ``SOURCE_UNAVAILABLE`` yields Book decisions; a native
-    ``TECHNICAL_FAILURE`` never reaches this object because
-    :func:`fit_terminal_native_timeframe` raises before construction.
+    Authenticated ``SOURCE_UNAVAILABLE`` and ``TECHNICAL_TERMINAL`` products
+    yield distinct complete Book abstentions.  Ordinary ``TECHNICAL_FAILURE``
+    never reaches this object because :func:`fit_terminal_native_timeframe`
+    raises before construction.
     """
 
     product: native_prefix.NativePrefixProduct
@@ -266,6 +272,14 @@ class _PartitionSlice:
     scored_start_utc: str
     end_exclusive_utc: str
     geometry_receipt: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _FullPrefixStrategySurface:
+    """One causal feature/signal replay reused by every partition of an attempt."""
+
+    features: pd.DataFrame
+    raw_signals: pd.Series
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +351,37 @@ def _utc(value: Any, code: str) -> str:
     return parsed.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _book_canonical_utc(value: Any, code: str) -> str:
+    """Bridge canonical native ``Z`` time to the Book's aware-UTC spelling."""
+
+    normalized = _utc(value, code)
+    return normalized[:-1] + "+00:00"
+
+
+def _canary_native_prefix_matches_request(
+    native: Mapping[str, Any],
+    *,
+    index: Mapping[str, Any],
+    request_body: Mapping[str, Any],
+    source_accessed_at_utc: str,
+) -> bool:
+    """Bind the prefix product to its request without requiring a bar at cutoff."""
+
+    anchor = request_body.get("anchor")
+    return bool(
+        isinstance(anchor, Mapping)
+        and native.get("source_accessed_at_utc") == source_accessed_at_utc
+        and native.get("symbol") == request_body.get("symbol")
+        and native.get("timeframe") == request_body.get("timeframe")
+        # The authenticated index binds the exact producer input. The observed
+        # prefix end can be earlier across a weekend or another closed session.
+        and index.get("cutoff_utc") == anchor.get("selection_cutoff_utc")
+        and native.get("activation_id") == request_body.get("activation_id")
+        and native.get("activation_manifest_sha256")
+        == request_body.get("activation_manifest_sha256")
+    )
+
+
 def _now_utc_seconds() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -378,7 +423,7 @@ def _source_identity(source_contract: Mapping[str, Any]) -> str:
     sample = trade_power.build_trade_sample_evidence(
         [],
         source_contract=dict(source_contract),
-        minimum_observations=trade_power.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
+        minimum_observations=raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
     )
     if sample.source_contract is None:
         _fail("TRADE_POWER_SOURCE_CONTRACT_INVALID", *sample.reason_codes)
@@ -444,8 +489,8 @@ def _build_train_regime_support(
     warmup = warmup.astype(bool)
     eligible = (~warmup) & (~warmup.shift(1, fill_value=True))
     labels = surface.loc[eligible, "REGIME_LIVE"]
-    if labels.empty or labels.isna().any():
-        _fail("REGIME_SUPPORT_EMPTY")
+    if labels.isna().any():
+        _fail("REGIME_SUPPORT_LABEL_MISSING")
     counts = {label: 0 for label in book.REGIME_ORDER}
     vector = hashlib.sha256()
     vector.update(b"fxpm.regime-live-labels-nul/v1\x00")
@@ -483,8 +528,12 @@ def _build_train_regime_support(
             label: ("EMPIRICALLY_OBSERVED" if counts[label] > 0 else "UNOBSERVED")
             for label in book.REGIME_ORDER
         },
-        "first_ts": pd.Timestamp(labels.index[0]).isoformat(),
-        "last_ts": pd.Timestamp(labels.index[-1]).isoformat(),
+        "first_ts": (
+            None if labels.empty else pd.Timestamp(labels.index[0]).isoformat()
+        ),
+        "last_ts": (
+            None if labels.empty else pd.Timestamp(labels.index[-1]).isoformat()
+        ),
         "vector_encoding": book.REGIME_TRAIN_SUPPORT_VECTOR_ENCODING,
         "vector_sha256": vector.hexdigest(),
         "bindings": {
@@ -646,7 +695,7 @@ def _freeze_bound_execution_spec(
     """Derive execution economics from pre-search authenticated file bytes."""
 
     native = dict(product.native_prefix)
-    symbol = str(native.get("symbol") or "").upper()
+    symbol = str(native.get("symbol") or "")
     instrument = dict(product.instrument_snapshot or {})
     if instrument != dict(product.index["source"].get("instrument_snapshot") or {}):
         _fail("EXECUTION_SPEC_NATIVE_INSTRUMENT_BINDING_INVALID")
@@ -683,46 +732,59 @@ def _freeze_bound_execution_spec(
     )
     configured, configured_sha = _merged_config_instrument_record(config_body, symbol)
 
-    if (
-        _normalized_symbol(instrument.get("symbol")) != _normalized_symbol(symbol)
-        or _normalized_symbol(broker.get("symbol") or broker_key)
-        != _normalized_symbol(symbol)
-        or str(instrument.get("path")) != str(broker.get("path"))
-        or instrument.get("digits") != broker.get("digits")
+    if _normalized_symbol(instrument.get("symbol")) != _normalized_symbol(
+        symbol
+    ) or _normalized_symbol(broker.get("symbol") or broker_key) != _normalized_symbol(
+        symbol
     ):
         _fail("EXECUTION_SPEC_NATIVE_BROKER_IDENTITY_MISMATCH")
-    structural = (
-        ("point", "point"),
-        ("trade_tick_size", "tick_size"),
-        ("trade_contract_size", "contract_size"),
-    )
-    for native_name, broker_name in structural:
-        observed = _finite_number(
-            instrument.get(native_name),
-            f"EXECUTION_SPEC_NATIVE_{native_name.upper()}_INVALID",
-        )
-        expected = _finite_number(
-            broker.get(broker_name),
-            f"EXECUTION_SPEC_BROKER_{broker_name.upper()}_INVALID",
-        )
-        if not math.isclose(observed, expected, rel_tol=1e-12, abs_tol=1e-15):
-            _fail("EXECUTION_SPEC_NATIVE_BROKER_STRUCTURAL_MISMATCH", native_name)
 
     digits = int(instrument["digits"])
     point = _finite_number(instrument["point"], "EXECUTION_SPEC_POINT_INVALID")
     tick_size = _finite_number(
         instrument["trade_tick_size"], "EXECUTION_SPEC_TICK_SIZE_INVALID"
     )
-    tick_value = _finite_number(
-        instrument["trade_tick_value"], "EXECUTION_SPEC_TICK_VALUE_INVALID"
+    native_tick_value = _finite_number(
+        instrument["trade_tick_value"],
+        "EXECUTION_SPEC_TICK_VALUE_INVALID",
+        allow_zero=True,
     )
-    _finite_number(broker.get("tick_value"), "EXECUTION_SPEC_BROKER_TICK_VALUE_INVALID")
     contract_size = _finite_number(
         instrument["trade_contract_size"], "EXECUTION_SPEC_CONTRACT_SIZE_INVALID"
     )
+    if native_tick_value == 0.0:
+        if instrument.get("digits") != broker.get("digits"):
+            _fail("EXECUTION_SPEC_NATIVE_BROKER_IDENTITY_MISMATCH")
+        structural = (
+            ("point", "point"),
+            ("trade_tick_size", "tick_size"),
+            ("trade_contract_size", "contract_size"),
+        )
+        for native_name, broker_name in structural:
+            observed = _finite_number(
+                instrument.get(native_name),
+                f"EXECUTION_SPEC_NATIVE_{native_name.upper()}_INVALID",
+            )
+            expected = _finite_number(
+                broker.get(broker_name),
+                f"EXECUTION_SPEC_BROKER_{broker_name.upper()}_INVALID",
+            )
+            if not math.isclose(observed, expected, rel_tol=1e-12, abs_tol=1e-15):
+                _fail(
+                    "EXECUTION_SPEC_NATIVE_BROKER_STRUCTURAL_MISMATCH",
+                    native_name,
+                )
+        broker_tick_value = _finite_number(
+            broker.get("tick_value"), "EXECUTION_SPEC_BROKER_TICK_VALUE_INVALID"
+        )
+        tick_value = broker_tick_value
+        tick_value_source = "FROZEN_BROKER_SPECS_RECORD_NATIVE_ZERO_UNAVAILABLE"
+    else:
+        tick_value = native_tick_value
+        tick_value_source = "ACTIVATED_ACQUISITION_INSTRUMENT_SNAPSHOT"
     pip_position = digits - 1 if digits in {3, 5} else digits
     pip_size = _finite_number(
-        broker.get("pip_size") or (point * 10.0 if digits in {3, 5} else point),
+        point * 10.0 if digits in {3, 5} else point,
         "EXECUTION_SPEC_PIP_SIZE_INVALID",
     )
     commission = _finite_number(
@@ -783,7 +845,7 @@ def _freeze_bound_execution_spec(
             "native_prefix_index_sha256": product.index_sha256,
             "native_provenance_sha256": native["provenance_sha256"],
             "native_instrument_snapshot_sha256": _sha256(instrument),
-            "tick_value_source": "ACTIVATED_ACQUISITION_INSTRUMENT_SNAPSHOT",
+            "tick_value_source": tick_value_source,
             "commission_source": "FROZEN_DEPLOYMENT_CONFIG_INSTRUMENT_SURFACE",
             "volume_source": "FROZEN_BROKER_SPECS_RECORD",
             "instrument_spec": spec_body,
@@ -829,7 +891,7 @@ def fit_native_timeframe_for_search(
             (type(exc).__name__, str(exc)),
         ) from exc
     native = dict(product.native_prefix)
-    symbol = str(native.get("symbol") or "").upper()
+    symbol = str(native.get("symbol") or "")
     timeframe = str(native.get("timeframe") or "").upper()
     if (
         symbol not in book.PINNED_SYMBOL_ORDER
@@ -888,6 +950,7 @@ def fit_native_timeframe_for_search(
         acquisition_attempts_exact=acquisition_attempts_exact,
         activation_id=native["activation_id"],
         activation_manifest_sha256=native["activation_manifest_sha256"],
+        activation_entry_sha256=native["activation_entry_sha256"],
         native_source_sha256=native["artifact_sha256"],
     )
     if source is None:
@@ -919,7 +982,10 @@ def fit_native_timeframe_for_search(
     )
     detector_record = book.create_regime_detector_record(
         source_group_decision=source,
-        fit_cutoff_utc=native["prefix_end_exclusive_utc"],
+        fit_cutoff_utc=_book_canonical_utc(
+            native["prefix_end_exclusive_utc"],
+            "REGIME_DETECTOR_CUTOFF_INVALID",
+        ),
         detector_version=REGIME_FIT_POLICY_VERSION,
         detector_code_sha256=detector_code_sha256,
         parameters=parameters,
@@ -1000,12 +1066,10 @@ def fit_terminal_native_timeframe(
 ) -> TerminalNativeTimeframe:
     """Derive Book source/regime facts for a reverified terminal native cell.
 
-    ``SOURCE_UNAVAILABLE`` yields a ``TERMINAL_UNAVAILABLE`` source-group
-    decision plus a ``REGIME_NOT_APPLICABLE`` regime-fit decision, both bound
-    to a freshly derived non-evaluation contract (never caller hashes, never
-    the AVAILABLE activation fields).  A native ``TECHNICAL_FAILURE`` is
-    reverified and then raised typed: infrastructure failure aborts the
-    generation and never becomes a market/no-trade state (seq1386/seq1468).
+    ``SOURCE_UNAVAILABLE`` and the exact authenticated
+    ``TECHNICAL_TERMINAL`` state yield different complete non-evaluation
+    decisions.  Ordinary ``TECHNICAL_FAILURE`` remains an abort and can never
+    be laundered into either terminal state or a market/no-trade verdict.
     """
 
     if type(product) is not native_prefix.NativePrefixProduct:
@@ -1015,12 +1079,16 @@ def fit_terminal_native_timeframe(
     if not isinstance(config, PipelineConfig):
         _fail("PIPELINE_CONFIG_INVALID")
     state = product.source_state
-    if state not in {native_prefix.SOURCE_UNAVAILABLE, native_prefix.TECHNICAL_FAILURE}:
+    if state not in {
+        native_prefix.SOURCE_UNAVAILABLE,
+        native_prefix.TECHNICAL_TERMINAL,
+        native_prefix.TECHNICAL_FAILURE,
+    }:
         _fail("TERMINAL_NATIVE_PRODUCT_NOT_TERMINAL", state)
     native = dict(product.native_prefix)
     if native.get("source_state") != state:
         _fail("TERMINAL_NATIVE_STATE_MISMATCH")
-    symbol = str(_terminal_field(native, "symbol", "TERMINAL_SYMBOL_INVALID")).upper()
+    symbol = str(_terminal_field(native, "symbol", "TERMINAL_SYMBOL_INVALID"))
     timeframe = str(
         _terminal_field(native, "timeframe", "TERMINAL_TIMEFRAME_INVALID")
     ).upper()
@@ -1048,8 +1116,9 @@ def fit_terminal_native_timeframe(
             (symbol, timeframe, source_reason, terminal_receipt_sha),
         )
 
-    # SOURCE_UNAVAILABLE: derive the exact non-evaluation contract from the
-    # reverified terminal product bytes.
+    # Derive the exact non-evaluation contract from the reverified terminal
+    # product bytes.  The authenticated technical terminal additionally binds
+    # the real activation manifest and cell entry; no bar artifact is asserted.
     source_identity_sha = _hex64(
         _terminal_field(
             native, "source_identity_sha256", "TERMINAL_SOURCE_IDENTITY_MISSING"
@@ -1076,7 +1145,7 @@ def fit_terminal_native_timeframe(
         "schema_version": TERMINAL_SOURCE_CONTRACT_SCHEMA,
         "symbol": symbol,
         "timeframe": timeframe,
-        "source_state": native_prefix.SOURCE_UNAVAILABLE,
+        "source_state": state,
         "source_reason": source_reason,
         "native_prefix_index_sha256": _hex64(
             product.index_sha256, "TERMINAL_INDEX_SHA_INVALID"
@@ -1090,16 +1159,52 @@ def fit_terminal_native_timeframe(
         "economic_evaluation": "NOT_APPLICABLE",
         "exact_source_group_resolution_attempts": 1,
     }
+    if state == native_prefix.TECHNICAL_TERMINAL:
+        contract.update(
+            {
+                "activation_id": _terminal_field(
+                    native, "activation_id", "TERMINAL_ACTIVATION_ID_MISSING"
+                ),
+                "activation_manifest_sha256": _hex64(
+                    _terminal_field(
+                        native,
+                        "activation_manifest_sha256",
+                        "TERMINAL_ACTIVATION_MANIFEST_MISSING",
+                    ),
+                    "TERMINAL_ACTIVATION_MANIFEST_INVALID",
+                ),
+                "activation_entry_sha256": _hex64(
+                    _terminal_field(
+                        native,
+                        "activation_entry_sha256",
+                        "TERMINAL_ACTIVATION_ENTRY_MISSING",
+                    ),
+                    "TERMINAL_ACTIVATION_ENTRY_INVALID",
+                ),
+            }
+        )
     contract_sha = _sha256(contract)
+
+    technical_terminal = state == native_prefix.TECHNICAL_TERMINAL
+    reason_code = (
+        TERMINAL_TECHNICAL_REASON_CODE
+        if technical_terminal
+        else TERMINAL_SOURCE_REASON_CODE
+    )
 
     source = book.create_historical_source_group_decision(
         symbol=symbol,
         timeframe=timeframe,
-        availability=book.TERMINAL_UNAVAILABLE,
-        reason_code=TERMINAL_SOURCE_REASON_CODE,
+        availability=(
+            book.TERMINAL_TECHNICAL if technical_terminal else book.TERMINAL_UNAVAILABLE
+        ),
+        reason_code=reason_code,
         source_contract_sha256=contract_sha,
         source_group_evidence_sha256=product.index_sha256,
         acquisition_attempts_exact=1,
+        activation_id=contract.get("activation_id"),
+        activation_manifest_sha256=contract.get("activation_manifest_sha256"),
+        activation_entry_sha256=contract.get("activation_entry_sha256"),
         terminal_proof_sha256=terminal_receipt_sha,
     )
     if source is None:
@@ -1113,13 +1218,17 @@ def fit_terminal_native_timeframe(
         "source_terminal_receipt_sha256": terminal_receipt_sha,
         "timeframe": timeframe,
         "label_order": list(book.REGIME_ORDER),
-        "fit_state": book.REGIME_NOT_APPLICABLE,
+        "fit_state": (
+            book.REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL
+            if technical_terminal
+            else book.REGIME_NOT_APPLICABLE
+        ),
         "detector_execution": "FORBIDDEN",
     }
     fit = book.create_regime_fit_decision(
         source_group_decision=source,
-        fit_state=book.REGIME_NOT_APPLICABLE,
-        reason_code=TERMINAL_SOURCE_REASON_CODE,
+        fit_state=policy["fit_state"],
+        reason_code=reason_code,
         regime_fit_policy_sha256=_sha256(policy),
     )
     if fit is None:
@@ -1133,6 +1242,132 @@ def fit_terminal_native_timeframe(
         terminal_source_contract_sha256=contract_sha,
         terminal_regime_fit_policy=json.loads(_canonical_bytes(policy).decode("ascii")),
     )
+
+
+def _realize_cutoff_refit_window(
+    *,
+    opens: pd.DatetimeIndex,
+    closes: pd.DatetimeIndex,
+    fit_end: pd.Timestamp,
+    lookback_kind: str,
+    lookback_value: int,
+    state_context_bars: int,
+    boundary_limited: bool,
+) -> tuple[pd.Timestamp, int]:
+    """Realize one authenticated lookback at the latest closed prefix."""
+
+    if (
+        type(opens) is not pd.DatetimeIndex
+        or type(closes) is not pd.DatetimeIndex
+        or len(opens) != len(closes)
+        or len(opens) == 0
+        or opens.hasnans
+        or closes.hasnans
+        or not opens.is_monotonic_increasing
+        or opens.has_duplicates
+        or not isinstance(fit_end, pd.Timestamp)
+        or fit_end.tzinfo is None
+        or type(lookback_kind) is not str
+        or lookback_kind not in {"CALENDAR_INTERVAL", "NATIVE_OBSERVATIONS"}
+        or type(lookback_value) is not int
+        or lookback_value <= 0
+        or type(state_context_bars) is not int
+        or state_context_bars < 0
+        or type(boundary_limited) is not bool
+    ):
+        _fail("CURRENT_REFIT_WINDOW_GEOMETRY_INVALID")
+    eligible_opens = opens[opens < fit_end]
+    if lookback_kind == "CALENDAR_INTERVAL":
+        target = fit_end - pd.Timedelta(days=lookback_value)
+        eligible_opens = eligible_opens[eligible_opens >= target]
+        fit_start = None if eligible_opens.empty else pd.Timestamp(eligible_opens[0])
+    else:
+        fit_start = (
+            None
+            if len(eligible_opens) < lookback_value
+            else pd.Timestamp(eligible_opens[-lookback_value])
+        )
+    if fit_start is None or fit_start >= fit_end:
+        _fail("CURRENT_REFIT_WINDOW_UNAVAILABLE")
+    fit_start_index = int(opens.get_indexer([fit_start])[0])
+    if not boundary_limited and fit_start_index < state_context_bars:
+        _fail("CURRENT_REFIT_STATE_CONTEXT_UNAVAILABLE")
+    source_count = int(
+        ((opens >= fit_start) & (opens < fit_end) & (closes <= fit_end)).sum()
+    )
+    return fit_start, source_count
+
+
+def _verify_trial_state_context_disposition(
+    *,
+    plan_body: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    trial: Mapping[str, Any],
+    planned: Mapping[str, Any],
+    ordinal: int,
+) -> None:
+    disposition = trial.get("state_context_disposition")
+    if disposition is None:
+        return
+    expected_fields = {
+        "schema_version",
+        "candidate_id",
+        "candidate_definition_sha256",
+        "state_requirement_sha256",
+        "required_context_bars",
+        "selected_context_bars",
+        "status",
+        "reason_code",
+        "disposition_sha256",
+    }
+    dependency_policy = plan_body.get("dependency_policy")
+    payload = (
+        dependency_policy.get("payload") if type(dependency_policy) is dict else None
+    )
+    geometry = plan_body.get("derived_dependency_geometry")
+    if (
+        type(disposition) is not dict
+        or set(disposition) != expected_fields
+        or type(payload) is not dict
+        or type(geometry) is not dict
+    ):
+        _fail("STATE_CONTEXT_DISPOSITION_INVALID", ordinal)
+    required = disposition["required_context_bars"]
+    selected = disposition["selected_context_bars"]
+    within = (
+        type(required) is int
+        and required >= 0
+        and type(selected) is int
+        and selected >= 1
+        and required <= selected
+    )
+    expected_status = "PLANNED" if within else "PROCESS_REJECTED"
+    expected_reason = None if within else STATE_CONTEXT_BOUNDARY_REASON
+    body = {
+        key: value for key, value in disposition.items() if key != "disposition_sha256"
+    }
+    if (
+        disposition["schema_version"] != STATE_CONTEXT_DISPOSITION_SCHEMA
+        or disposition["candidate_id"] != candidate.get("candidate_id")
+        or disposition["candidate_definition_sha256"]
+        != candidate.get("candidate_definition_sha256")
+        or disposition["status"] != expected_status
+        or disposition["reason_code"] != expected_reason
+        or disposition["disposition_sha256"] != _sha256(body)
+        or selected != payload.get("feature_lookback_bars")
+        or geometry.get("warmup_bars", -1) < selected
+        or planned.get("state_context_disposition_sha256")
+        != disposition["disposition_sha256"]
+    ):
+        _fail("STATE_CONTEXT_DISPOSITION_BINDING_INVALID", ordinal)
+    boundary = not bool(candidate.get("folds"))
+    final_status = "PROCESS_REJECTED" if boundary else expected_status
+    final_reason = "SOURCE_BOUNDARY_SHORTFALL" if boundary else expected_reason
+    if (
+        planned.get("status") != final_status
+        or planned.get("reason_code") != final_reason
+    ):
+        _fail("STATE_CONTEXT_DISPOSITION_STATUS_INVALID", ordinal)
 
 
 def _verify_attempt_roster(
@@ -1219,6 +1454,55 @@ def _verify_attempt_roster(
     ):
         _fail("HORIZON_COST_POLICY_BINDING_INVALID")
 
+    frame_opens = pd.DatetimeIndex(
+        pd.to_datetime(fitted._frame.index, utc=True, errors="coerce")
+    )
+    if (
+        frame_opens.hasnans
+        or not frame_opens.is_monotonic_increasing
+        or frame_opens.has_duplicates
+    ):
+        _fail("ATTEMPT_CUTOFF_REFIT_FRAME_INVALID")
+    prefix_fit_end = pd.Timestamp(
+        _utc(prefix["prefix_end_exclusive_utc"], "PREFIX_END_INVALID")
+    )
+    frame_closes = pd.DatetimeIndex(
+        pd.to_datetime(
+            fitted._frame["_BAR_CLOSE_TS"],
+            utc=True,
+            errors="coerce",
+        )
+    )
+    candidate_windows: dict[
+        tuple[str, int], tuple[dict[str, Any], pd.Timestamp, int]
+    ] = {}
+    for candidate in candidates:
+        if type(candidate) is not dict:
+            _fail("HORIZON_CANDIDATE_SEMANTIC_IDENTITY_INVALID")
+        identity = (candidate.get("lookback_kind"), candidate.get("lookback_value"))
+        if (
+            type(identity[0]) is not str
+            or type(identity[1]) is not int
+            or identity in candidate_windows
+        ):
+            _fail("HORIZON_CANDIDATE_SEMANTIC_IDENTITY_INVALID")
+        try:
+            expected_start, expected_count = _realize_cutoff_refit_window(
+                opens=frame_opens,
+                closes=frame_closes,
+                fit_end=prefix_fit_end,
+                lookback_kind=identity[0],
+                lookback_value=identity[1],
+                state_context_bars=0,
+                boundary_limited=True,
+            )
+        except AuthoritativeSearchExecutionError as exc:
+            raise AuthoritativeSearchExecutionError(
+                "ATTEMPT_CUTOFF_REFIT_WINDOW_INVALID",
+                (candidate.get("candidate_id"), exc.code),
+            ) from exc
+        candidate_windows[identity] = (candidate, expected_start, expected_count)
+
     verified_attempts: list[_VerifiedAttempt] = []
     mapped_plan_ids: list[str] = []
     for ordinal, raw in enumerate(attempt_artifacts):
@@ -1229,29 +1513,25 @@ def _verify_attempt_roster(
         process = raw["winner_process"]
         horizon_process = raw["horizon_process"]
         recipe = raw["refit_recipe"]
-        candidate_matches = [
-            item
-            for item in candidates
-            if item.get("lookback_kind") == horizon_process.get("lookback_kind")
-            and item.get("lookback_value") == horizon_process.get("lookback_value")
-            and _utc(item.get("realized_start_utc"), "CANDIDATE_START_INVALID")
-            == _utc(horizon_process.get("fit_start_utc"), "ATTEMPT_FIT_START_INVALID")
-        ]
-        if len(candidate_matches) != 1:
+        candidate_window = candidate_windows.get(
+            (
+                horizon_process.get("lookback_kind"),
+                horizon_process.get("lookback_value"),
+            )
+        )
+        if candidate_window is None:
             _fail("ATTEMPT_HORIZON_SEMANTIC_MAPPING_INVALID", ordinal)
-        candidate = candidate_matches[0]
+        candidate, expected_fit_start, source_bar_count = candidate_window
         fit_start = pd.Timestamp(
             _utc(horizon_process.get("fit_start_utc"), "ATTEMPT_FIT_START_INVALID")
         )
-        fit_end = pd.Timestamp(
-            _utc(horizon_process.get("fit_end_utc"), "ATTEMPT_FIT_END_INVALID")
-        )
-        frame_opens = pd.DatetimeIndex(
-            pd.to_datetime(fitted._frame.index, utc=True, errors="coerce")
-        )
-        source_bar_count = int(
-            ((frame_opens >= fit_start) & (frame_opens < fit_end)).sum()
-        )
+        _utc(horizon_process.get("fit_end_utc"), "ATTEMPT_FIT_END_INVALID")
+        # ``candidate.realized_start_utc`` is historical-fold geometry (or a
+        # pre-prefix boundary sentinel).  Current-refit artifacts instead use
+        # the lookback realized once at the latest cutoff.  Bind that distinct
+        # timestamp independently to the authenticated frame and prefix.
+        if fit_start != expected_fit_start:
+            _fail("ATTEMPT_CUTOFF_REFIT_WINDOW_INVALID", ordinal)
         if source_bar_count < 2:
             _fail("ATTEMPT_REALIZED_SOURCE_COUNT_INVALID", ordinal)
         try:
@@ -1310,6 +1590,13 @@ def _verify_attempt_roster(
             or planned.get("status") not in {"PLANNED", "PROCESS_REJECTED"}
         ):
             _fail("ATTEMPT_HORIZON_PLAN_MAPPING_INVALID", ordinal)
+        _verify_trial_state_context_disposition(
+            plan_body=plan_body,
+            candidate=candidate,
+            trial=trial,
+            planned=planned,
+            ordinal=ordinal,
+        )
         mapped_plan_ids.append(planned["attempt_id"])
         verified_attempts.append(
             _VerifiedAttempt(
@@ -1485,6 +1772,23 @@ def _partition_slice(
     )
 
 
+def minimum_fold_fit_rows(
+    *,
+    recipe_warmup_bars: int,
+    dependency_warmup_bars: int,
+) -> int:
+    """Return the shared train-plus-tuning fit-adequacy floor."""
+
+    if type(recipe_warmup_bars) is not int or recipe_warmup_bars < 0:
+        _fail("RECIPE_WARMUP_INVALID")
+    if type(dependency_warmup_bars) is not int or dependency_warmup_bars < 0:
+        _fail("DEPENDENCY_WARMUP_INVALID")
+    return (
+        2 * max(recipe_warmup_bars, dependency_warmup_bars)
+        + 2 * MIN_PARTITION_SCORED_BARS
+    )
+
+
 def _fold_partitions(
     *,
     frame: pd.DataFrame,
@@ -1508,7 +1812,10 @@ def _fold_partitions(
         _fail("DEPENDENCY_WARMUP_INVALID", attempt.ordinal)
     minimum_warmup = max(recipe_warmup, dependency_warmup_bars)
     row_count = len(fit_frame)
-    minimum_required = 2 * minimum_warmup + 2 * MIN_PARTITION_SCORED_BARS
+    minimum_required = minimum_fold_fit_rows(
+        recipe_warmup_bars=recipe_warmup,
+        dependency_warmup_bars=dependency_warmup_bars,
+    )
     if row_count < minimum_required:
         _fail("FIT_WINDOW_TOO_SHORT_FOR_TRAIN_TUNING", attempt.ordinal)
     tuning_scored = max(MIN_PARTITION_SCORED_BARS, int(math.ceil(row_count * 0.25)))
@@ -1551,6 +1858,313 @@ def _fold_partitions(
         minimum_warmup_bars=minimum_warmup,
     )
     return train, tuning, final
+
+
+def _winner_fold_identity(
+    *,
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    fold_ordinal: int,
+    fold: Mapping[str, Any],
+) -> str:
+    """Reproduce the frozen Winner fold identity before raw evaluation."""
+
+    anchor = _utc(fold.get("anchor_as_of_utc"), "FOLD_ANCHOR_INVALID")
+    start = datetime.fromisoformat(
+        _utc(
+            f"{fold.get('oos_start_date_utc')}T00:00:00Z",
+            "FOLD_START_INVALID",
+        ).replace("Z", "+00:00")
+    ).date()
+    end = datetime.fromisoformat(
+        _utc(
+            f"{fold.get('oos_end_date_utc')}T00:00:00Z",
+            "FOLD_END_INVALID",
+        ).replace("Z", "+00:00")
+    ).date()
+    body = {
+        "schema_version": "fxpm.winner-fold-identity.v1",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "regime": regime,
+        "fold_ordinal": fold_ordinal,
+        "anchor_as_of_utc": anchor,
+        "oos_start_date_utc": start.isoformat(),
+        "oos_end_date_utc": end.isoformat(),
+    }
+    return hashlib.sha1(_canonical_bytes(body), usedforsecurity=False).hexdigest()
+
+
+def _partition_cost_attestation(
+    *,
+    backtester: Backtester,
+    frame: pd.DataFrame,
+    spec: InstrumentSpec,
+) -> dict[str, Any]:
+    """Derive the exact execution-cost attestation without running a strategy."""
+
+    try:
+        entry, intrabar, meta = backtester._build_half_spread_arrays(frame, spec)
+        slippage_price = (
+            spec.pips_to_price(backtester.config.slippage_pips)
+            if backtester.config.use_slippage
+            else 0.0
+        )
+        attestation = backtester._numerical_execution_cost_attestation(
+            entry_half_spread=entry,
+            intrabar_half_spread=intrabar,
+            spread_meta=meta,
+            slippage_price=slippage_price,
+            spec=spec,
+        )
+    except Exception as exc:
+        raise AuthoritativeSearchExecutionError(
+            "COST_STRESS_ADVERSITY_PRECOMMIT_FAILED",
+            (type(exc).__name__, str(exc)),
+        ) from exc
+    if not isinstance(attestation, Mapping):
+        _fail("COST_STRESS_ADVERSITY_ATTESTATION_INVALID")
+    normalized = json.loads(_canonical_bytes(dict(attestation)).decode("ascii"))
+    _hex64(
+        normalized.get("attestation_sha256"),
+        "COST_STRESS_ADVERSITY_ATTESTATION_SHA256_INVALID",
+    )
+    _hex64(
+        normalized.get("spread_values_sha256"),
+        "COST_STRESS_ADVERSITY_VECTOR_SHA256_INVALID",
+    )
+    return normalized
+
+
+def _build_cost_stress_adversity_plan(
+    *,
+    attempts: Sequence[_VerifiedAttempt],
+    fold_plan: Sequence[Mapping[str, Any]],
+    plan_body: Mapping[str, Any],
+    fitted: FittedNativeSearchTimeframe,
+    config: PipelineConfig,
+) -> dict[str, Any]:
+    """Freeze expected BASE/STRESS vectors before the first strategy run.
+
+    Final-fold source partitions and their execution-cost vectors do not depend
+    on the strategy parameters.  Cache each distinct partition so a 128-attempt
+    roster hashes the four genuine folds once, while retaining one explicit
+    attempt/fold row in the immutable Winner plan.
+    """
+
+    cell = plan_body.get("cell")
+    geometry = plan_body.get("derived_dependency_geometry")
+    if not isinstance(cell, Mapping) or not isinstance(geometry, Mapping):
+        _fail("COST_STRESS_ADVERSITY_PLAN_CONTEXT_INVALID")
+    symbol = str(cell.get("symbol") or "")
+    timeframe = str(cell.get("timeframe") or "").upper()
+    regime = str(cell.get("regime") or "").upper()
+    dependency_warmup_bars = geometry.get("warmup_bars")
+    if type(dependency_warmup_bars) is not int or dependency_warmup_bars < 0:
+        _fail("DEPENDENCY_WARMUP_INVALID")
+    stress_mode = str(config.oos_evidence_execution_stress_mode).strip().lower()
+    if stress_mode not in {"stress_p90", "stress_p95", "stress_max"}:
+        _fail("COST_STRESS_MODE_INVALID", stress_mode)
+    base_backtester = Backtester(config)
+    stress_backtester = Backtester(replace(config, backtest_spread_mode=stress_mode))
+    partition_cache: dict[tuple[str, str, str], _PartitionSlice] = {}
+    attestation_cache: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    rows: list[dict[str, Any]] = []
+
+    for attempt in attempts:
+        if attempt.plan_attempt.get("status") != "PLANNED":
+            continue
+        causal_folds = _causal_folds(attempt)
+        if len(causal_folds) != len(fold_plan):
+            _fail("COST_STRESS_ADVERSITY_FOLD_ROSTER_INVALID", attempt.ordinal)
+        recipe_warmup = int(
+            attempt.artifacts.refit_recipe["data_requirements"]["warmup_bars"]
+        )
+        minimum_warmup = max(recipe_warmup, dependency_warmup_bars)
+        for fold_ordinal, (fold, winner_fold) in enumerate(
+            zip(causal_folds, fold_plan, strict=True)
+        ):
+            validation_start = _utc(
+                fold.get("validation_start_utc"),
+                "FOLD_START_INVALID",
+            )
+            validation_end = _utc(
+                fold.get("validation_end_exclusive_utc"),
+                "FOLD_END_INVALID",
+            )
+            expected_start = _utc(
+                winner_fold.get("anchor_as_of_utc"),
+                "FOLD_ANCHOR_INVALID",
+            )
+            expected_end = _utc(
+                (
+                    datetime.fromisoformat(
+                        f"{winner_fold.get('oos_end_date_utc')}T00:00:00+00:00"
+                    )
+                    + timedelta(days=1)
+                ).isoformat(),
+                "FOLD_END_INVALID",
+            )
+            if validation_start != expected_start or validation_end != expected_end:
+                _fail(
+                    "COST_STRESS_ADVERSITY_FOLD_AXIS_MISMATCH",
+                    attempt.ordinal,
+                    fold_ordinal,
+                )
+            key = (
+                _utc(
+                    fold.get("validation_warmup_start_utc"),
+                    "PARTITION_FRAME_START_INVALID",
+                ),
+                validation_start,
+                validation_end,
+            )
+            final = partition_cache.get(key)
+            if final is None:
+                final = _partition_slice(
+                    fitted._frame,
+                    role="final_lockbox",
+                    frame_start_utc=key[0],
+                    scored_start_utc=key[1],
+                    end_exclusive_utc=key[2],
+                    minimum_warmup_bars=minimum_warmup,
+                )
+                partition_cache[key] = final
+            elif final.warmup_bars < minimum_warmup:
+                _fail(
+                    "PARTITION_AXIS_NOT_EXACTLY_BACKED",
+                    "final_lockbox",
+                    attempt.ordinal,
+                )
+
+            geometry_sha = _hex64(
+                final.geometry_receipt.get("receipt_sha256"),
+                "PARTITION_GEOMETRY_RECEIPT_INVALID",
+            )
+            pair = attestation_cache.get(geometry_sha)
+            if pair is None:
+                pair = (
+                    _partition_cost_attestation(
+                        backtester=base_backtester,
+                        frame=final.frame,
+                        spec=fitted.instrument_spec,
+                    ),
+                    _partition_cost_attestation(
+                        backtester=stress_backtester,
+                        frame=final.frame,
+                        spec=fitted.instrument_spec,
+                    ),
+                )
+                attestation_cache[geometry_sha] = pair
+            base_attestation, stress_attestation = pair
+            base_vector_sha = base_attestation["spread_values_sha256"]
+            stress_vector_sha = stress_attestation["spread_values_sha256"]
+            expected_status = (
+                raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
+                if base_vector_sha == stress_vector_sha
+                else raw_winner.COST_STRESS_ADVERSITY_EXPECTED_STRICT
+            )
+            rows.append(
+                {
+                    "attempt_ordinal": attempt.ordinal,
+                    "horizon_attempt_id": attempt.plan_attempt["attempt_id"],
+                    "fold_ordinal": fold_ordinal,
+                    "fold_id": _winner_fold_identity(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=regime,
+                        fold_ordinal=fold_ordinal,
+                        fold=winner_fold,
+                    ),
+                    "final_partition_geometry_receipt_sha256": geometry_sha,
+                    "final_partition_frame_sha256": _hex64(
+                        final.geometry_receipt.get("frame_sha256"),
+                        "PARTITION_FRAME_SHA256_INVALID",
+                    ),
+                    "base_cost_attestation_sha256": base_attestation[
+                        "attestation_sha256"
+                    ],
+                    "stress_cost_attestation_sha256": stress_attestation[
+                        "attestation_sha256"
+                    ],
+                    "base_spread_values_sha256": base_vector_sha,
+                    "stress_spread_values_sha256": stress_vector_sha,
+                    "expected_adversity_status": expected_status,
+                }
+            )
+    return {
+        "schema_version": raw_winner.COST_STRESS_ADVERSITY_PLAN_SCHEMA,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "regime": regime,
+        "row_count": len(rows),
+        "rows_sha256": _sha256(rows),
+        "rows": rows,
+    }
+
+
+def _expected_cost_stress_adversity_row(
+    *,
+    plan: Mapping[str, Any],
+    attempt: _VerifiedAttempt,
+    fold_ordinal: int,
+) -> dict[str, Any]:
+    rows = plan.get("rows") if isinstance(plan, Mapping) else None
+    if type(rows) is not list:
+        _fail("COST_STRESS_ADVERSITY_PLAN_INVALID")
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("attempt_ordinal") == attempt.ordinal
+        and row.get("fold_ordinal") == fold_ordinal
+    ]
+    if len(matches) != 1:
+        _fail(
+            "COST_STRESS_ADVERSITY_PLAN_ROW_MISSING",
+            attempt.ordinal,
+            fold_ordinal,
+        )
+    return dict(matches[0])
+
+
+def _verify_realized_cost_stress_adversity(
+    *,
+    expected: Mapping[str, Any],
+    attempt: _VerifiedAttempt,
+    fold_ordinal: int,
+    final: _PartitionSlice,
+    receipt: Mapping[str, Any],
+) -> None:
+    expected_realized_status = (
+        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+        if expected.get("expected_adversity_status")
+        == raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
+        else pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
+    )
+    comparisons = {
+        "attempt_ordinal": attempt.ordinal,
+        "horizon_attempt_id": attempt.plan_attempt.get("attempt_id"),
+        "fold_ordinal": fold_ordinal,
+        "final_partition_geometry_receipt_sha256": (
+            final.geometry_receipt.get("receipt_sha256")
+        ),
+        "final_partition_frame_sha256": final.geometry_receipt.get("frame_sha256"),
+        "base_cost_attestation_sha256": receipt.get("base_cost_attestation_sha256"),
+        "stress_cost_attestation_sha256": receipt.get("stress_cost_attestation_sha256"),
+        "base_spread_values_sha256": receipt.get("base_spread_values_sha256"),
+        "stress_spread_values_sha256": receipt.get("stress_spread_values_sha256"),
+    }
+    if (
+        any(expected.get(name) != value for name, value in comparisons.items())
+        or receipt.get("realized_adversity_status") != expected_realized_status
+    ):
+        _fail(
+            "FROZEN_COST_STRESS_ADVERSITY_PLAN_MISMATCH",
+            attempt.ordinal,
+            fold_ordinal,
+        )
 
 
 def _runtime_strategy(
@@ -1619,9 +2233,85 @@ def _decision_relevant_result(result: Mapping[str, Any], role: str) -> dict[str,
     return json.loads(_canonical_bytes(body).decode("ascii"))
 
 
+def _build_full_prefix_strategy_surface(
+    *,
+    frame: pd.DataFrame,
+    strategy: Any,
+    symbol: str,
+    timeframe: str,
+) -> _FullPrefixStrategySurface:
+    """Replay path state once over the authenticated prefix before slicing."""
+
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        _fail("FULL_PREFIX_FRAME_INVALID")
+    try:
+        features = FeatureComputer.compute_for_strategy(
+            frame,
+            strategy,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        if (
+            not isinstance(features, pd.DataFrame)
+            or not features.index.equals(frame.index)
+            or not set(frame.columns).issubset(features.columns)
+            or not features.loc[:, list(frame.columns)].equals(frame)
+        ):
+            _fail("FULL_PREFIX_FEATURE_AXIS_CHANGED")
+        raw_signals = strategy.generate_signals(features, symbol)
+        if not isinstance(raw_signals, pd.Series) or not raw_signals.index.equals(
+            features.index
+        ):
+            _fail("FULL_PREFIX_SIGNAL_AXIS_INVALID")
+        numeric = pd.to_numeric(raw_signals, errors="coerce")
+        if numeric.isna().any() or bool((~numeric.isin([-1, 0, 1])).any()):
+            _fail("FULL_PREFIX_SIGNAL_VALUES_INVALID")
+    except AuthoritativeSearchExecutionError:
+        raise
+    except Exception as exc:
+        raise AuthoritativeSearchExecutionError(
+            "FULL_PREFIX_STATE_REPLAY_FAILED",
+            (type(exc).__name__, str(exc)),
+        ) from exc
+    return _FullPrefixStrategySurface(
+        features=features,
+        raw_signals=numeric.astype(np.int32),
+    )
+
+
+def _slice_full_prefix_strategy_surface(
+    *,
+    partition: _PartitionSlice,
+    full_prefix_surface: _FullPrefixStrategySurface,
+) -> tuple[pd.DataFrame, pd.Series]:
+    if type(full_prefix_surface) is not _FullPrefixStrategySurface:
+        _fail("FULL_PREFIX_SURFACE_INVALID", partition.role)
+    try:
+        features = full_prefix_surface.features.loc[partition.frame.index].copy(
+            deep=True
+        )
+        raw_signals = full_prefix_surface.raw_signals.loc[partition.frame.index].copy(
+            deep=True
+        )
+    except Exception as exc:
+        raise AuthoritativeSearchExecutionError(
+            "FULL_PREFIX_PARTITION_SLICE_INVALID",
+            (partition.role, type(exc).__name__, str(exc)),
+        ) from exc
+    if (
+        not features.index.equals(partition.frame.index)
+        or not raw_signals.index.equals(partition.frame.index)
+        or not set(partition.frame.columns).issubset(features.columns)
+        or not features.loc[:, list(partition.frame.columns)].equals(partition.frame)
+    ):
+        _fail("FULL_PREFIX_PARTITION_SLICE_INVALID", partition.role)
+    return features, raw_signals
+
+
 def _run_base_partition(
     *,
     partition: _PartitionSlice,
+    full_prefix_surface: _FullPrefixStrategySurface,
     strategy: Any,
     symbol: str,
     timeframe: str,
@@ -1631,26 +2321,14 @@ def _run_base_partition(
     expected_source_contract_sha256: str,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.Series, Backtester]:
     try:
-        features = FeatureComputer.compute_for_strategy(
-            partition.frame,
-            strategy,
-            symbol=symbol,
-            timeframe=timeframe,
+        features, raw_signals = _slice_full_prefix_strategy_surface(
+            partition=partition,
+            full_prefix_surface=full_prefix_surface,
         )
-        if not features.index.equals(partition.frame.index):
-            _fail("FEATURE_AXIS_CHANGED", partition.role)
-        raw_signals = strategy.generate_signals(features, symbol)
-        if not isinstance(raw_signals, pd.Series) or not raw_signals.index.equals(
-            features.index
-        ):
-            _fail("STRATEGY_SIGNAL_AXIS_INVALID", partition.role)
-        numeric = pd.to_numeric(raw_signals, errors="coerce")
-        if numeric.isna().any() or bool((~numeric.isin([-1, 0, 1])).any()):
-            _fail("STRATEGY_SIGNAL_VALUES_INVALID", partition.role)
         labels = features["REGIME_LIVE"]
         if labels.isna().iloc[partition.warmup_bars :].any():
             _fail("REGIME_SIGNAL_SURFACE_MISSING", partition.role)
-        signals = numeric.astype(np.int32).where(labels == regime, 0).astype(np.int32)
+        signals = raw_signals.where(labels == regime, 0).astype(np.int32)
         backtester = Backtester(config)
         result = backtester.run(
             features,
@@ -1872,6 +2550,7 @@ def _build_planned_attempt_evidence(
     plan_receipt_sha256: str,
     fitted: FittedNativeSearchTimeframe,
     config: PipelineConfig,
+    cost_stress_adversity_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
     strategy, _parameters = _runtime_strategy(attempt)
     frame = fitted._frame
@@ -1886,6 +2565,12 @@ def _build_planned_attempt_evidence(
     dependency_warmup_bars = geometry.get("warmup_bars")
     if type(dependency_warmup_bars) is not int or dependency_warmup_bars < 0:
         _fail("DEPENDENCY_WARMUP_INVALID")
+    full_prefix_surface = _build_full_prefix_strategy_surface(
+        frame=frame,
+        strategy=strategy,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
     folds: list[dict[str, Any]] = []
     for fold_ordinal, fold in enumerate(_causal_folds(attempt)):
         train, tuning, final = _fold_partitions(
@@ -1897,6 +2582,7 @@ def _build_planned_attempt_evidence(
         train_result, _train_features, _train_signals, _train_backtester = (
             _run_base_partition(
                 partition=train,
+                full_prefix_surface=full_prefix_surface,
                 strategy=strategy,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -1909,6 +2595,7 @@ def _build_planned_attempt_evidence(
         tuning_result, _tuning_features, _tuning_signals, _tuning_backtester = (
             _run_base_partition(
                 partition=tuning,
+                full_prefix_surface=full_prefix_surface,
                 strategy=strategy,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -1921,6 +2608,7 @@ def _build_planned_attempt_evidence(
         final_result, final_features, final_signals, final_backtester = (
             _run_base_partition(
                 partition=final,
+                full_prefix_surface=full_prefix_surface,
                 strategy=strategy,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -1947,6 +2635,17 @@ def _build_planned_attempt_evidence(
                 "FROZEN_PATH_COST_STRESS_FAILED",
                 (str(attempt.ordinal), str(fold_ordinal), type(exc).__name__, str(exc)),
             ) from exc
+        _verify_realized_cost_stress_adversity(
+            expected=_expected_cost_stress_adversity_row(
+                plan=cost_stress_adversity_plan,
+                attempt=attempt,
+                fold_ordinal=fold_ordinal,
+            ),
+            attempt=attempt,
+            fold_ordinal=fold_ordinal,
+            final=final,
+            receipt=stress_result["cost_stress_frozen_path_receipt"],
+        )
         for result, producing_backtester, producing_features in (
             (train_result, _train_backtester, _train_features),
             (tuning_result, _tuning_backtester, _tuning_features),
@@ -2055,6 +2754,22 @@ def _process_rejection_outcome(
     reason_code = attempt.plan_attempt.get("reason_code")
     if type(reason_code) is not str or not reason_code:
         _fail("PROCESS_REJECTION_REASON_INVALID", attempt.ordinal)
+    disposition = attempt.trial.get("state_context_disposition")
+    evidence = {
+        "horizon_attempt_id": attempt.plan_attempt["attempt_id"],
+        "candidate_id": attempt.candidate["candidate_id"],
+        "trial_id": attempt.trial["trial_id"],
+        "decision_was_pre_search": True,
+    }
+    if type(disposition) is dict:
+        evidence.update(
+            {
+                "state_context_disposition_sha256": disposition["disposition_sha256"],
+                "state_requirement_sha256": disposition["state_requirement_sha256"],
+                "required_context_bars": disposition["required_context_bars"],
+                "selected_context_bars": disposition["selected_context_bars"],
+            }
+        )
     return TrialOutcome(
         kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
         stage=SearchStage.FROZEN_VALIDATION,
@@ -2065,12 +2780,7 @@ def _process_rejection_outcome(
         regime=regime,
         strategy_family=attempt.artifacts.winner_process["strategy_family"],
         parameter_hash=attempt.trial["parameter_set_sha256"],
-        evidence={
-            "horizon_attempt_id": attempt.plan_attempt["attempt_id"],
-            "candidate_id": attempt.candidate["candidate_id"],
-            "trial_id": attempt.trial["trial_id"],
-            "decision_was_pre_search": True,
-        },
+        evidence=evidence,
     )
 
 
@@ -2441,6 +3151,76 @@ def _technical_failure_code(value: Any) -> str:
     return "AUTHORITATIVE_SEARCH_EXECUTION_FAILED"
 
 
+def _bounded_canary_failure_diagnostic(
+    exc: BaseException,
+    *,
+    attempted_trials_exact: int,
+) -> dict[str, Any]:
+    """Preserve the exact useful failure tuple without risking artifact bounds."""
+
+    raw_details: tuple[str, ...]
+    exception_type = type(exc).__name__
+    attempt_ordinal: int | None = None
+    fold_ordinal: int | None = None
+    if isinstance(exc, AuthoritativeSearchExecutionError):
+        raw_details = tuple(str(value) for value in exc.details)
+        if (
+            exc.code
+            in {
+                "FROZEN_PATH_COST_STRESS_FAILED",
+                "FROZEN_COST_STRESS_ADVERSITY_PLAN_MISMATCH",
+            }
+            and len(raw_details) >= 2
+        ):
+            try:
+                parsed_attempt = int(raw_details[0])
+                parsed_fold = int(raw_details[1])
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if 0 <= parsed_attempt < attempted_trials_exact:
+                    attempt_ordinal = parsed_attempt
+                    if 0 <= parsed_fold < winner_v11.MAX_FOLDS:
+                        fold_ordinal = parsed_fold
+            if exc.code == "FROZEN_PATH_COST_STRESS_FAILED" and len(raw_details) >= 3:
+                candidate_type = raw_details[2].strip()
+                if candidate_type:
+                    exception_type = candidate_type
+    else:
+        raw_details = (str(exc),)
+
+    maximum_details = historical_adapter.BOUNDED_RAW_WINNER_CANARY_FAILURE_DETAIL_LIMIT
+    maximum_bytes = historical_adapter.BOUNDED_RAW_WINNER_CANARY_FAILURE_DETAIL_BYTES
+
+    def bounded(value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            text = type(exc).__name__
+        if not all(character.isprintable() for character in text):
+            text = repr(text)
+        encoded = text.encode("utf-8")
+        if len(encoded) <= maximum_bytes:
+            return text
+        digest = hashlib.sha256(encoded).hexdigest()
+        suffix = f"...[sha256={digest}]"
+        prefix = text
+        while prefix and len((prefix + suffix).encode("utf-8")) > maximum_bytes:
+            prefix = prefix[:-1]
+        return (prefix + suffix) if prefix else f"sha256={digest}"
+
+    details = tuple(
+        bounded(value) for value in raw_details[:maximum_details] if str(value).strip()
+    )
+    return {
+        "exception_type": bounded(exception_type)[
+            : historical_adapter.BOUNDED_RAW_WINNER_CANARY_EXCEPTION_TYPE_BYTES
+        ],
+        "failure_details": details,
+        "attempt_ordinal": attempt_ordinal,
+        "fold_ordinal": fold_ordinal,
+    }
+
+
 def _verified_current_observed_inputs(
     *,
     process: Any,
@@ -2677,6 +3457,13 @@ def execute_current_observed_cell(
                 native_prefix_product=refreshed.product,
             )
         )
+        cost_stress_adversity_plan = _build_cost_stress_adversity_plan(
+            attempts=attempts,
+            fold_plan=fold_plan,
+            plan_body=plan_body,
+            fitted=refreshed,
+            config=config,
+        )
         precommitted_at = _now_utc_seconds()
         attempts_frozen_at = _next_observed_utc_second(precommitted_at)
         frozen = raw_winner.freeze_winner_search_plan_v3(
@@ -2694,6 +3481,7 @@ def execute_current_observed_cell(
             base_cost_contract=refreshed.base_cost_policy,
             stress_cost_contract=refreshed.stress_cost_policy,
             risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
+            cost_stress_adversity_plan=cost_stress_adversity_plan,
             artifact_namespace=receipt["artifact_namespace"],
         )
         raw_ids = _raw_attempt_ids(frozen, attempts)
@@ -2760,6 +3548,7 @@ def execute_current_observed_cell(
                 plan_receipt_sha256=horizon_plan_receipt_sha256,
                 fitted=refreshed,
                 config=config,
+                cost_stress_adversity_plan=frozen.cost_stress_adversity_plan,
             )
             row = _write_staged_attempt(
                 stage=stage,
@@ -2858,6 +3647,86 @@ def execute_current_observed_cell(
             raise
 
 
+def _verify_capture_horizon_plan_identity(
+    capture: Any,
+    *,
+    timeframe: str,
+    regime: str,
+    horizon_plan: Any,
+) -> None:
+    """Bind execution to the exact Horizon capability frozen in the capture."""
+
+    key = (timeframe, regime)
+    try:
+        bound_plan = capture._horizon_plans.get(key)
+        bound_body = capture._horizon_plan_bodies.get(key)
+        bound_binding = capture._bindings.get(key)
+        received_body = horizon_plan.to_dict()
+        received_binding = historical.historical_horizon_plan_binding(horizon_plan)
+    except Exception as exc:
+        raise AuthoritativeSearchExecutionError(
+            "HISTORICAL_CAPTURE_HORIZON_PLAN_BINDING_INVALID",
+            (type(exc).__name__, str(exc)),
+        ) from exc
+    if (
+        bound_plan is not horizon_plan
+        or type(received_body) is not dict
+        or bound_body != received_body
+        or bound_binding != received_binding
+    ):
+        _fail("HISTORICAL_CAPTURE_HORIZON_PLAN_SUBSTITUTION")
+
+
+def _verified_historical_cell_plan_inputs(
+    capture: Any,
+    *,
+    search_process: Any,
+    cell_plan: Any,
+    symbol: str,
+    timeframe: str,
+    regime: str,
+) -> tuple[Any, tuple[dict[str, Any], ...]]:
+    """Reopen the planner authority before accepting its execution roster."""
+
+    try:
+        import pm_production_search_planner as production_planner
+
+        verified = production_planner.verify_production_cell_search_plan(
+            capture.context,
+            process=search_process,
+            sink=capture.sink,
+            plan=cell_plan,
+        )
+        horizon_plan = cell_plan.horizon_plan
+        attempt_artifacts = cell_plan.attempt_artifacts()
+        process_receipt = search_process.receipt_sha256
+        request_body = capture.request_body
+    except Exception as exc:
+        raise AuthoritativeSearchExecutionError(
+            "HISTORICAL_CELL_PLAN_VERIFICATION_FAILED",
+            (type(exc).__name__, str(exc)),
+        ) from exc
+    expected_mode = (
+        "BOUNDED_RAW_WINNER_CANARY"
+        if type(capture) is historical_adapter.BoundedRawWinnerCanaryCapture
+        else "HISTORICAL_ANCHOR"
+    )
+    if (
+        verified is not True
+        or cell_plan.mode != expected_mode
+        or cell_plan.symbol != symbol
+        or cell_plan.timeframe != timeframe
+        or cell_plan.regime != regime
+        or cell_plan.search_process_receipt_sha256 != process_receipt
+        or type(request_body) is not dict
+        or request_body.get("search_process_receipt_sha256") != process_receipt
+        or type(attempt_artifacts) is not tuple
+        or not attempt_artifacts
+    ):
+        _fail("HISTORICAL_CELL_PLAN_EXECUTION_BINDING_INVALID")
+    return horizon_plan, attempt_artifacts
+
+
 def execute_historical_observed_cell(
     *,
     capture: (
@@ -2866,8 +3735,8 @@ def execute_historical_observed_cell(
     ),
     fitted: FittedNativeSearchTimeframe,
     regime: str,
-    horizon_plan: Any,
-    attempt_artifacts: Sequence[Mapping[str, Any]],
+    search_process: Any,
+    cell_plan: Any,
     config: PipelineConfig,
 ) -> HistoricalObservedCellExecution:
     """Run one observed historical cell through genuine raw Winner evidence.
@@ -2885,16 +3754,10 @@ def execute_historical_observed_cell(
         _fail("HISTORICAL_CAPTURE_INVALID")
     if not isinstance(config, PipelineConfig):
         _fail("PIPELINE_CONFIG_INVALID")
-    if (
-        type(capture)
-        is historical_adapter.BoundedRawWinnerCanaryCapture
-        and (
-            not historical_adapter._verify_bounded_raw_winner_canary_capture(
-                capture
-            )
-            or fitted is not capture.verified_fitted_timeframe
-            or config is not capture.verified_pipeline_config
-        )
+    if type(capture) is historical_adapter.BoundedRawWinnerCanaryCapture and (
+        not historical_adapter._verify_bounded_raw_winner_canary_capture(capture)
+        or fitted is not capture.verified_fitted_timeframe
+        or config is not capture.verified_pipeline_config
     ):
         _fail("CANARY_EXECUTION_IDENTITY_SUBSTITUTION")
     normalized_regime = str(regime or "").strip().upper()
@@ -2903,6 +3766,20 @@ def execute_historical_observed_cell(
     source = fitted.source_group_decision.to_dict()
     symbol = str(source.get("symbol") or "")
     timeframe = str(source.get("timeframe") or "")
+    horizon_plan, attempt_artifacts = _verified_historical_cell_plan_inputs(
+        capture,
+        search_process=search_process,
+        cell_plan=cell_plan,
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=normalized_regime,
+    )
+    _verify_capture_horizon_plan_identity(
+        capture,
+        timeframe=timeframe,
+        regime=normalized_regime,
+        horizon_plan=horizon_plan,
+    )
     attempted_exact = (
         len(attempt_artifacts) if isinstance(attempt_artifacts, Sequence) else 0
     )
@@ -2941,6 +3818,13 @@ def execute_historical_observed_cell(
         minimum_folds = int(winner_v11.PINNED_SELECTION_POLICY["min_causal_folds"])
         if len(fold_plan) < minimum_folds:
             _fail("WINNER_FOLD_PLAN_BELOW_EVIDENCE_FLOOR")
+        cost_stress_adversity_plan = _build_cost_stress_adversity_plan(
+            attempts=attempts,
+            fold_plan=fold_plan,
+            plan_body=plan_body,
+            fitted=refreshed,
+            config=config,
+        )
         precommitted_at = _now_utc_seconds()
         attempts_frozen_at = _next_observed_utc_second(precommitted_at)
         handle = capture.freeze_observed_cell(
@@ -2955,6 +3839,7 @@ def execute_historical_observed_cell(
             base_cost_contract=refreshed.base_cost_policy,
             stress_cost_contract=refreshed.stress_cost_policy,
             risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
+            cost_stress_adversity_plan=cost_stress_adversity_plan,
         )
         raw_ids = _raw_attempt_ids(handle.frozen, attempts)
         latest_boundary = _utc(
@@ -2999,6 +3884,7 @@ def execute_historical_observed_cell(
                 plan_receipt_sha256=plan_receipt_sha256,
                 fitted=refreshed,
                 config=config,
+                cost_stress_adversity_plan=handle.frozen.cost_stress_adversity_plan,
             )
             row = _write_staged_attempt(
                 stage=stage,
@@ -3056,7 +3942,14 @@ def execute_historical_observed_cell(
         primary_error = exc
         if handle is None:
             raise
-        capture.record_raw_evidence_failure(handle, exc)
+        capture.record_raw_evidence_failure(
+            handle,
+            exc,
+            **_bounded_canary_failure_diagnostic(
+                exc,
+                attempted_trials_exact=attempted_exact,
+            ),
+        )
         handle = None
         result = HistoricalObservedCellExecution(
             status="TECHNICAL_FAILURE",
@@ -3081,7 +3974,14 @@ def execute_historical_observed_cell(
                 code,
                 type(exc).__name__,
             )
-            capture.record_raw_evidence_failure(handle, failure)
+            capture.record_raw_evidence_failure(
+                handle,
+                failure,
+                **_bounded_canary_failure_diagnostic(
+                    exc,
+                    attempted_trials_exact=attempted_exact,
+                ),
+            )
             handle = None
             result = HistoricalObservedCellExecution(
                 status="TECHNICAL_FAILURE",
@@ -3134,7 +4034,9 @@ def _make_bounded_raw_winner_canary_executor():
     capture_key = secrets.token_bytes(32)
     states: dict[str, dict[str, Any]] = {}
 
-    def _tag(key: bytes, schema: str, body_json: bytes, bindings: Mapping[str, Any]) -> str:
+    def _tag(
+        key: bytes, schema: str, body_json: bytes, bindings: Mapping[str, Any]
+    ) -> str:
         payload = _canonical_bytes(
             {
                 "schema_version": schema,
@@ -3151,9 +4053,7 @@ def _make_bounded_raw_winner_canary_executor():
             "fitted_identity": id(value._fitted),
             "pipeline_config_identity": id(value._pipeline_config),
             "frozen_pipeline_config_identity": id(value._frozen_pipeline_config),
-            "spool_entry_sha256": hashlib.sha256(
-                value._spool_entry_json
-            ).hexdigest(),
+            "spool_entry_sha256": hashlib.sha256(value._spool_entry_json).hexdigest(),
         }
 
     def _permit_bindings(value: Any) -> dict[str, Any]:
@@ -3205,8 +4105,7 @@ def _make_bounded_raw_winner_canary_executor():
             != "fxpm.bounded-raw-winner-canary-source-session.v1"
             or source_body.get("request_sha256") != request.receipt_sha256
             or source_body.get("request_nonce") != request_body["request_nonce"]
-            or source_body.get("generation_context_sha256")
-            != context.context_sha256
+            or source_body.get("generation_context_sha256") != context.context_sha256
             or source_session.receipt_sha256
             != state.get("source_session_receipt_sha256")
             or state.get("source_session_identity") != id(source_session)
@@ -3263,7 +4162,9 @@ def _make_bounded_raw_winner_canary_executor():
         source_session: Any,
         plan_permit: Any,
         consume: bool,
-    ) -> tuple[dict[str, Any], BoundedRawWinnerCanarySourceSession, PipelineConfig, Any]:
+    ) -> tuple[
+        dict[str, Any], BoundedRawWinnerCanarySourceSession, PipelineConfig, Any
+    ]:
         request_body, source_body, state = _verify_source_session(
             context, request, source_session
         )
@@ -3305,10 +4206,8 @@ def _make_bounded_raw_winner_canary_executor():
             != source_session.receipt_sha256
             or permit_body.get("search_process_receipt_sha256")
             != process.receipt_sha256
-            or permit_body.get("generation_context_sha256")
-            != context.context_sha256
-            or state.get("plan_permit_receipt_sha256")
-            != plan_permit.receipt_sha256
+            or permit_body.get("generation_context_sha256") != context.context_sha256
+            or state.get("plan_permit_receipt_sha256") != plan_permit.receipt_sha256
             or state.get("plan_permit_identity") != id(plan_permit)
             or state.get("state") not in valid_states
         ):
@@ -3331,7 +4230,9 @@ def _make_bounded_raw_winner_canary_executor():
         process: Any,
         source_session: Any,
         plan_permit: Any,
-    ) -> tuple[dict[str, Any], BoundedRawWinnerCanarySourceSession, PipelineConfig, Any]:
+    ) -> tuple[
+        dict[str, Any], BoundedRawWinnerCanarySourceSession, PipelineConfig, Any
+    ]:
         return _verify_plan_permit(
             context,
             request=request,
@@ -3360,7 +4261,8 @@ def _make_bounded_raw_winner_canary_executor():
         )
         _, state = _request_state(context, request)
         if (
-            state.get("state") not in {
+            state.get("state")
+            not in {
                 "PLAN_CONSUMED",
                 "CAPTURE_READY",
                 "CAPTURE_CONSUMED",
@@ -3385,7 +4287,13 @@ def _make_bounded_raw_winner_canary_executor():
         plan: Any,
         capture_permit: Any,
         consume: bool,
-    ) -> tuple[dict[str, Any], authority_spool.SymbolAuthoritySink, BoundedRawWinnerCanarySourceSession, PipelineConfig, Any]:
+    ) -> tuple[
+        dict[str, Any],
+        authority_spool.SymbolAuthoritySink,
+        BoundedRawWinnerCanarySourceSession,
+        PipelineConfig,
+        Any,
+    ]:
         verify_plan_bindings(
             context,
             request=request,
@@ -3424,7 +4332,8 @@ def _make_bounded_raw_winner_canary_executor():
             or state.get("capture_permit_receipt_sha256")
             != capture_permit.receipt_sha256
             or state.get("capture_permit_identity") != id(capture_permit)
-            or allowed_state not in {
+            or allowed_state
+            not in {
                 "CAPTURE_READY",
                 "CAPTURE_CONSUMED",
                 "COMPLETE",
@@ -3446,7 +4355,13 @@ def _make_bounded_raw_winner_canary_executor():
     def consume_capture_permit(
         context: authority_spool.GenerationSpoolContext,
         **kwargs: Any,
-    ) -> tuple[dict[str, Any], authority_spool.SymbolAuthoritySink, BoundedRawWinnerCanarySourceSession, PipelineConfig, Any]:
+    ) -> tuple[
+        dict[str, Any],
+        authority_spool.SymbolAuthoritySink,
+        BoundedRawWinnerCanarySourceSession,
+        PipelineConfig,
+        Any,
+    ]:
         return _verify_capture_permit(context, consume=True, **kwargs)
 
     def verify_capture_bindings(
@@ -3466,8 +4381,8 @@ def _make_bounded_raw_winner_canary_executor():
     ) -> historical_adapter.BoundedRawWinnerCanaryReceipt:
         """Run one genuine latest-anchor raw-Winner canary and return its receipt."""
 
-        request_body = historical.verify_bounded_raw_winner_canary_request(
-            context, request
+        request_body, request_sink = (
+            historical.consume_bounded_raw_winner_canary_request(context, request)
         )
         request_sha = request.receipt_sha256
         if request_sha in states:
@@ -3483,22 +4398,20 @@ def _make_bounded_raw_winner_canary_executor():
             import pm_production_config_binding as config_binding
             import pm_production_search_planner as search_planner
 
-            if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+            if (
+                type(frozen_pipeline_config)
+                is not config_binding.FrozenProductionPipelineConfig
+            ):
                 _fail("CANARY_FROZEN_PIPELINE_CONFIG_REQUIRED")
             frozen_pipeline_config.verify_current(context)
             config = frozen_pipeline_config.materialize(context)
             source_accessed_at_utc = _now_utc_seconds()
-            if (
-                source_accessed_at_utc
-                < _utc(
-                    request_body["earliest_source_accessed_at_utc"],
-                    "CANARY_SOURCE_BOUNDARY_INVALID",
-                )
-                or source_accessed_at_utc
-                > _utc(
-                    request_body["causal_evidence_access_deadline_utc"],
-                    "CANARY_CAUSAL_DEADLINE_INVALID",
-                )
+            if source_accessed_at_utc < _utc(
+                request_body["earliest_source_accessed_at_utc"],
+                "CANARY_SOURCE_BOUNDARY_INVALID",
+            ) or source_accessed_at_utc > _utc(
+                request_body["causal_evidence_access_deadline_utc"],
+                "CANARY_CAUSAL_DEADLINE_INVALID",
             ):
                 _fail("CANARY_TRUSTED_SOURCE_ACCESS_OUTSIDE_WINDOW")
             product = native_prefix.produce_activated_native_prefix(
@@ -3518,15 +4431,11 @@ def _make_bounded_raw_winner_canary_executor():
                 acquisition_attempts_exact=1,
             )
             native = dict(product.native_prefix)
-            if (
-                native.get("source_accessed_at_utc") != source_accessed_at_utc
-                or native.get("symbol") != request_body["symbol"]
-                or native.get("timeframe") != request_body["timeframe"]
-                or native.get("prefix_end_exclusive_utc")
-                != request_body["anchor"]["selection_cutoff_utc"]
-                or native.get("activation_id") != request_body["activation_id"]
-                or native.get("activation_manifest_sha256")
-                != request_body["activation_manifest_sha256"]
+            if not _canary_native_prefix_matches_request(
+                native,
+                index=product.index,
+                request_body=request_body,
+                source_accessed_at_utc=source_accessed_at_utc,
             ):
                 _fail("CANARY_INTERNAL_NATIVE_PREFIX_BINDING_INVALID")
             source_body = {
@@ -3552,7 +4461,7 @@ def _make_bounded_raw_winner_canary_executor():
                 "confers_downstream_or_trading_authority": False,
             }
             source_json = _canonical_bytes(source_body)
-            source_entry = request.symbol_sink().put_json(
+            source_entry = request_sink.put_json(
                 f"{request_body['artifact_namespace']}/source-session",
                 "bounded_raw_winner_canary_source_session",
                 source_body,
@@ -3566,12 +4475,8 @@ def _make_bounded_raw_winner_canary_executor():
                     "product_identity": id(product),
                     "fitted_identity": id(fitted),
                     "pipeline_config_identity": id(config),
-                    "frozen_pipeline_config_identity": id(
-                        frozen_pipeline_config
-                    ),
-                    "spool_entry_sha256": hashlib.sha256(
-                        source_entry_json
-                    ).hexdigest(),
+                    "frozen_pipeline_config_identity": id(frozen_pipeline_config),
+                    "spool_entry_sha256": hashlib.sha256(source_entry_json).hexdigest(),
                 },
             )
             source_session = BoundedRawWinnerCanarySourceSession(
@@ -3637,9 +4542,7 @@ def _make_bounded_raw_winner_canary_executor():
                 "permit_nonce": secrets.token_hex(16),
             }
             capture_json = _canonical_bytes(capture_body)
-            unsigned_capture = _BoundedRawWinnerCanaryCapturePermit(
-                capture_json, ""
-            )
+            unsigned_capture = _BoundedRawWinnerCanaryCapturePermit(capture_json, "")
             capture_permit = _BoundedRawWinnerCanaryCapturePermit(
                 capture_json,
                 _tag(
@@ -3670,8 +4573,8 @@ def _make_bounded_raw_winner_canary_executor():
                 capture=capture,
                 fitted=fitted,
                 regime=plan.regime,
-                horizon_plan=plan.horizon_plan,
-                attempt_artifacts=plan.attempt_artifacts(),
+                search_process=process,
+                cell_plan=plan,
                 config=config,
             )
             receipt = capture.canary_receipt
@@ -3749,6 +4652,8 @@ __all__ = [
     "HistoricalObservedCellExecution",
     "TERMINAL_REGIME_FIT_POLICY_SCHEMA",
     "TERMINAL_SOURCE_CONTRACT_SCHEMA",
+    "TERMINAL_SOURCE_REASON_CODE",
+    "TERMINAL_TECHNICAL_REASON_CODE",
     "TerminalNativeTimeframe",
     "authoritative_search_execution_contract",
     "execute_current_observed_cell",
@@ -3756,5 +4661,6 @@ __all__ = [
     "execute_historical_observed_cell",
     "fit_native_timeframe_for_search",
     "fit_terminal_native_timeframe",
+    "minimum_fold_fit_rows",
     "reverify_fitted_native_timeframe_for_search",
 ]

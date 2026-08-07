@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import hashlib
+import json
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -50,6 +52,7 @@ from pm_native_request_contract import (
     validate_v5_manifest_request,
     validate_v5_production_cell,
     validate_v5_production_manifest,
+    validate_v5_terminal_technical_cell,
 )
 
 
@@ -1122,6 +1125,202 @@ def _technical_fixture() -> dict[str, Any]:
     return fixture
 
 
+def _terminal_technical_fixture() -> dict[str, Any]:
+    fixture = _technical_fixture()
+    source = fixture["provenance"]
+    attempt_fields = (
+        request_contract._FAILED_PROVENANCE_BASE_FIELDS
+        | request_contract._FAILED_PROVENANCE_FETCH_FIELDS
+    )
+    base_attempt = {
+        key: deepcopy(source[key]) for key in attempt_fields if key in source
+    }
+    base_attempt.update(
+        {
+            "status": "partial",
+            "failure_status": "technical_history_gap",
+            "eligible_for_optimization": False,
+            "eligible_for_downstream_validation": False,
+            "artifact": None,
+            "sha256": None,
+            "rows": 0,
+            "start_ts": None,
+            "end_ts": None,
+            "complete": False,
+            "instrument": {},
+            "acquisition_started_utc": fixture["manifest"]["acquisition_started_utc"],
+            "acquisition_completed_utc": fixture["manifest"][
+                "acquisition_completed_utc"
+            ],
+            "error": {
+                "type": "TechnicalHistoryGap",
+                "message": "source artifact is nonfinal: technical_history_gap",
+            },
+        }
+    )
+    base_attempt["request"]["last_fully_closed_bar_open_utc"] = None
+    empty_page = base_attempt["pagination"]["empty_pages"][0]
+    empty_page["copy_rates_range_attempts"] = 2
+    empty_page["connector_diagnostics"] = (
+        request_contract._fixture_mt5_v4_empty_diagnostics(
+            symbol="EURUSD",
+            timeframe="M5",
+            start=_dt(empty_page["start_utc"]),
+            end=_dt(empty_page["end_exclusive_utc"]),
+        )
+    )
+    for page in base_attempt["pagination"]["page_attempts"]:
+        if page["request_sequence"] == empty_page["request_sequence"]:
+            page.update(deepcopy(empty_page))
+            break
+    base_attempt["pagination"]["copy_rates_range_attempts_total"] += 1
+    base_attempt["output_storage_resource_snapshot"].update(
+        {"estimated_cell_bytes": 0, "sample_rows": 0}
+    )
+    descriptors = []
+    for index, token in enumerate(("1" * 32, "2" * 32), start=1):
+        record = deepcopy(base_attempt)
+        manifest_started = _dt(fixture["manifest"]["acquisition_started_utc"])
+        record["acquisition_started_utc"] = _iso(
+            manifest_started + timedelta(milliseconds=200 * (index - 1))
+        )
+        record["acquisition_completed_utc"] = _iso(
+            manifest_started + timedelta(milliseconds=200 * index - 100)
+        )
+        record["error"]["message"] += f":attempt-{index}"
+        full_bytes = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        envelope = {
+            "schema_version": (
+                request_contract.TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION
+            ),
+            "immutable_record": True,
+            "nonfinal": True,
+            "retryable": True,
+            "attempt_id": token,
+            "run_id": fixture["manifest"]["run_id"],
+            "symbol": "EURUSD",
+            "timeframe": "M5",
+            "retention_status": "full",
+            "full_record_sha256": hashlib.sha256(full_bytes).hexdigest(),
+            "full_record_bytes": len(full_bytes),
+            "record": record,
+        }
+        receipt_bytes = (
+            json.dumps(
+                envelope,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        descriptors.append(
+            {
+                "relative_path": f"_attempts/EURUSD/M5/attempt-{token}.json",
+                "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+                "bytes": len(receipt_bytes),
+                "envelope": envelope,
+            }
+        )
+    descriptors.sort(key=lambda value: (value["sha256"], value["relative_path"]))
+    evidence = {
+        "schema_version": request_contract.TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION,
+        "attempt_cap": request_contract.TERMINAL_TECHNICAL_ATTEMPT_CAP,
+        "accepted_failure_status": "technical_history_gap",
+        "receipts": descriptors,
+    }
+    latest = max(
+        descriptors,
+        key=lambda value: (
+            _dt(value["envelope"]["record"]["acquisition_completed_utc"]),
+            value["sha256"],
+        ),
+    )["envelope"]["record"]
+    provenance = {
+        **deepcopy(latest),
+        "status": "failed",
+        "terminal_technical_evidence": evidence,
+    }
+    evidence_bytes = canonical_json_bytes(evidence)
+    result = fixture["manifest_result"]
+    result.update(
+        {
+            "status": "failed",
+            "failure_status": "technical_history_gap",
+            "rows": 0,
+            "sha256": None,
+            "eligible_for_downstream_validation": False,
+            "resume_disposition": "terminal_technical",
+            "terminal_evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+            "terminal_evidence_bytes": len(evidence_bytes),
+        }
+    )
+    fixture["provenance"] = provenance
+    fixture["provenances"]["M5"] = provenance
+    fixture["manifest"]["resume"].update(
+        {
+            "newly_acquired_cells": 599,
+            "terminalized_technical_cells": 1,
+        }
+    )
+    _refresh_manifest_counts(fixture)
+    return fixture
+
+
+def _reseal_terminal_technical_fixture(fixture: dict[str, Any]) -> None:
+    evidence = fixture["provenance"]["terminal_technical_evidence"]
+    for descriptor in evidence["receipts"]:
+        envelope = descriptor["envelope"]
+        full_bytes = json.dumps(
+            envelope["record"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        envelope["full_record_sha256"] = hashlib.sha256(full_bytes).hexdigest()
+        envelope["full_record_bytes"] = len(full_bytes)
+        receipt_bytes = (
+            json.dumps(
+                envelope,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        descriptor["sha256"] = hashlib.sha256(receipt_bytes).hexdigest()
+        descriptor["bytes"] = len(receipt_bytes)
+    evidence["receipts"].sort(
+        key=lambda value: (value["sha256"], value["relative_path"])
+    )
+    latest = max(
+        evidence["receipts"],
+        key=lambda value: (
+            _dt(value["envelope"]["record"]["acquisition_completed_utc"]),
+            value["sha256"],
+        ),
+    )["envelope"]["record"]
+    provenance = {
+        **deepcopy(latest),
+        "status": "failed",
+        "terminal_technical_evidence": evidence,
+    }
+    fixture["provenance"] = provenance
+    fixture["provenances"]["M5"] = provenance
+    evidence_bytes = canonical_json_bytes(evidence)
+    fixture["manifest_result"].update(
+        {
+            "terminal_evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+            "terminal_evidence_bytes": len(evidence_bytes),
+        }
+    )
+
+
 def test_builder_matches_existing_production_common_request_builder(tmp_path) -> None:
     from tools.acquire_native_history import (
         DEFAULT_TIMEFRAMES,
@@ -1745,6 +1944,45 @@ def test_authenticated_available_boundary_inside_strategy_is_derived_not_asserte
         wrong_first,
         **_available_boundary_gate_kwargs(forged_artifact),
     )
+
+
+def test_in_strategy_terminal_prefix_is_publishable_error_but_valid_failed_evidence() -> (
+    None
+):
+    fixture = _terminal_prefix_tail_fixture(authenticated_inside_strategy=True)
+    pagination = fixture["provenance"]["pagination"]
+    pagination.pop("available_history_boundary")
+    common = fixture["common_request"]
+    kwargs = {
+        "expected_symbol": "EURUSD",
+        "expected_broker_symbol": "EURUSD",
+        "expected_source_environment": fixture["source_environment"],
+        "expected_retries": 1,
+        "expected_page_span_seconds": pagination["page_span_seconds"],
+        "boundary_tolerance_seconds": float(common["boundary_tolerance_days"] * 86_400),
+    }
+
+    publishable = request_contract._pagination_evidence(
+        pagination,
+        common["timeframe_source_request_intervals"]["H1"],
+        common["timeframe_strategy_evidence_intervals"]["H1"],
+        "H1",
+        evidence_mode="publishable",
+        **kwargs,
+    )
+    failed = request_contract._pagination_evidence(
+        pagination,
+        common["timeframe_source_request_intervals"]["H1"],
+        common["timeframe_strategy_evidence_intervals"]["H1"],
+        "H1",
+        evidence_mode="failed",
+        **kwargs,
+    )
+
+    assert "V5_TERMINAL_PREFIX_INTERSECTS_STRATEGY_INTERVAL" in publishable["errors"]
+    assert "V5_TERMINAL_PREFIX_INTERSECTS_STRATEGY_INTERVAL" not in failed["errors"]
+    assert failed["terminal_prefix_unresolved"] is True
+    assert failed["authenticated_available_history_boundary_utc"] is None
 
 
 def test_authenticated_available_boundary_before_strategy_is_source_fact() -> None:
@@ -2865,6 +3103,172 @@ def test_failed_empty_envelope_is_bound_and_cannot_be_downgraded_or_forged() -> 
     _assert_error("V5_REDACTED_SOURCE_ACCOUNT_INVALID", validate, fixture)
 
 
+def test_terminal_technical_cell_replays_exact_two_receipts() -> None:
+    fixture = _terminal_technical_fixture()
+
+    assert (
+        validate_v5_terminal_technical_cell(
+            fixture["provenance"],
+            fixture["manifest_result"],
+            fixture["common_request"],
+            symbol="EURUSD",
+            timeframe="M5",
+            run_id=fixture["manifest"]["run_id"],
+            manifest_source_environment=fixture["source_environment"],
+            expected_retries=1,
+            manifest_acquisition_started_utc=fixture["manifest"][
+                "acquisition_started_utc"
+            ],
+            manifest_acquisition_completed_utc=fixture["manifest"][
+                "acquisition_completed_utc"
+            ],
+        )
+        == "technical_history_gap"
+    )
+    validate_v5_production_manifest(fixture["manifest"], fixture["trusted_policy"])
+    assert (
+        validate_v5_production_cell(
+            manifest=fixture["manifest"],
+            provenance=fixture["provenance"],
+            manifest_result=fixture["manifest_result"],
+            artifact_observation=None,
+            trusted_policy=fixture["trusted_policy"],
+            symbol="EURUSD",
+            timeframe="M5",
+        )
+        == "technical_history_gap"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        (
+            lambda fixture: fixture["provenance"]["terminal_technical_evidence"][
+                "receipts"
+            ].pop(),
+            "V5_TERMINAL_TECHNICAL_RECEIPT_COUNT_INVALID",
+        ),
+        (
+            lambda fixture: fixture["provenance"]["terminal_technical_evidence"][
+                "receipts"
+            ][1]["envelope"].update({"retention_status": "summary_only"}),
+            "V5_TERMINAL_ATTEMPT_ENVELOPE_BINDING_INVALID:1",
+        ),
+        (
+            lambda fixture: fixture["provenance"]["terminal_technical_evidence"][
+                "receipts"
+            ][1].update(
+                deepcopy(
+                    fixture["provenance"]["terminal_technical_evidence"]["receipts"][0]
+                )
+            ),
+            "V5_TERMINAL_ATTEMPT_DUPLICATE_EVIDENCE",
+        ),
+        (
+            lambda fixture: fixture["provenance"]["terminal_technical_evidence"][
+                "receipts"
+            ][1].update(
+                {
+                    "relative_path": fixture["provenance"][
+                        "terminal_technical_evidence"
+                    ]["receipts"][0]["relative_path"]
+                }
+            ),
+            "V5_TERMINAL_ATTEMPT_DUPLICATE_PATH",
+        ),
+        (
+            lambda fixture: fixture["provenance"]["terminal_technical_evidence"][
+                "receipts"
+            ][1]["envelope"].update({"attempt_id": "f" * 32}),
+            "V5_TERMINAL_ATTEMPT_PATH_ID_MISMATCH:1",
+        ),
+        (
+            lambda fixture: fixture["provenance"]["terminal_technical_evidence"][
+                "receipts"
+            ][1]["envelope"]["record"].update({"broker_symbol": "FORGED.a"}),
+            "V5_TERMINAL_ATTEMPT_BROKER_SYMBOL_MISMATCH",
+        ),
+        (
+            lambda fixture: fixture["provenance"]["terminal_technical_evidence"][
+                "receipts"
+            ][1]["envelope"]["record"].update({"instrument": {"forged": True}}),
+            "V5_TERMINAL_ATTEMPT_INSTRUMENT_MISMATCH",
+        ),
+        (
+            lambda fixture: fixture["manifest_result"].update(
+                {"terminal_evidence_sha256": "f" * 64}
+            ),
+            "V5_TERMINAL_TECHNICAL_MANIFEST_EVIDENCE_MISMATCH",
+        ),
+    ],
+)
+def test_terminal_technical_receipt_forgery_fails_closed(
+    mutation: Callable[[dict[str, Any]], Any], code: str
+) -> None:
+    fixture = _terminal_technical_fixture()
+    mutation(fixture)
+    _assert_error(
+        code,
+        validate_v5_terminal_technical_cell,
+        fixture["provenance"],
+        fixture["manifest_result"],
+        fixture["common_request"],
+        symbol="EURUSD",
+        timeframe="M5",
+        run_id=fixture["manifest"]["run_id"],
+        manifest_source_environment=fixture["source_environment"],
+        expected_retries=1,
+        manifest_acquisition_started_utc=fixture["manifest"]["acquisition_started_utc"],
+        manifest_acquisition_completed_utc=fixture["manifest"][
+            "acquisition_completed_utc"
+        ],
+    )
+
+
+def test_terminal_technical_attempts_must_be_sequential_retries() -> None:
+    fixture = _terminal_technical_fixture()
+    receipts = fixture["provenance"]["terminal_technical_evidence"]["receipts"]
+    first = receipts[0]["envelope"]["record"]
+    second = receipts[1]["envelope"]["record"]
+    second["acquisition_started_utc"] = first["acquisition_started_utc"]
+    second["acquisition_completed_utc"] = first["acquisition_completed_utc"]
+    _reseal_terminal_technical_fixture(fixture)
+
+    _assert_error(
+        "V5_TERMINAL_ATTEMPT_SEQUENCE_INVALID",
+        validate_v5_terminal_technical_cell,
+        fixture["provenance"],
+        fixture["manifest_result"],
+        fixture["common_request"],
+        symbol="EURUSD",
+        timeframe="M5",
+        run_id=fixture["manifest"]["run_id"],
+        manifest_source_environment=fixture["source_environment"],
+        expected_retries=1,
+        manifest_acquisition_started_utc=fixture["manifest"]["acquisition_started_utc"],
+        manifest_acquisition_completed_utc=fixture["manifest"][
+            "acquisition_completed_utc"
+        ],
+    )
+
+
+def test_failed_nonterminal_cell_remains_forbidden_in_complete_manifest() -> None:
+    fixture = _terminal_technical_fixture()
+    fixture["manifest_result"].pop("terminal_evidence_sha256")
+    fixture["manifest_result"].pop("terminal_evidence_bytes")
+    fixture["manifest_result"]["resume_disposition"] = "newly_acquired"
+    fixture["manifest"]["resume"].pop("terminalized_technical_cells")
+    fixture["manifest"]["resume"]["newly_acquired_cells"] = 600
+
+    _assert_error(
+        "V5_MANIFEST_RESULT_STATUS_INVALID:EURUSD:M5",
+        validate_v5_production_manifest,
+        fixture["manifest"],
+        fixture["trusted_policy"],
+    )
+
+
 def test_production_cell_binds_exact_manifest_result_and_run_id() -> None:
     fixture = build_valid_v5_contract_fixture(requested_information_cutoff_utc=CUTOFF)
     detached = deepcopy(fixture["manifest_result"])
@@ -3026,6 +3430,7 @@ def test_extreme_per_timeframe_year_is_rejected_before_date_arithmetic() -> None
         ("OUTPUT_MAX_CELL_BYTES", 1),
         ("canonical_source_identity", lambda value: {"forged": value}),
         ("_mt5_v4_diagnostics_errors", lambda *args, **kwargs: []),
+        ("_terminal_attempt_receipt_payload", lambda envelope: b"forged\n"),
         ("_same", lambda left, right: True),
     ),
 )

@@ -11,6 +11,7 @@ import pytest
 
 from pm_current_refit_execution import (
     CURRENT_REGIME_PARAMS_BUNDLE_VERSION,
+    REGIME_FIT_RECEIPT_VERSION,
     RAW_CURRENT_REFIT_EXECUTOR_FUNCTION,
     RAW_CURRENT_REFIT_EXECUTOR_VERSION,
     build_raw_artifact_descriptor,
@@ -181,9 +182,7 @@ def _rewrite_regime_bundle(tmp_path: Path, manifest: dict, bundle: dict) -> None
         format_version=old["format_version"],
     )
     manifest["artifact_descriptors"][index] = replacement
-    manifest["bundle_artifact_ids"]["regime_params_bundle"] = replacement[
-        "artifact_id"
-    ]
+    manifest["bundle_artifact_ids"]["regime_params_bundle"] = replacement["artifact_id"]
     _refresh_manifest(manifest)
 
 
@@ -216,7 +215,8 @@ def test_bounded_raw_manifest_round_trips_all_input_bindings(tmp_path: Path) -> 
 
 
 def test_production_verifier_has_no_callback_and_blocks_missing_executor(
-    monkeypatch, tmp_path: Path,
+    monkeypatch,
+    tmp_path: Path,
 ) -> None:
     receipt, manifest = _raw_fixture(tmp_path)
     module = types.ModuleType("pm_pipeline")
@@ -329,9 +329,10 @@ def test_regime_bundle_rederives_fit_record_source_and_selected_cell_links(
 
     assert errors == []
     assert plan is not None
-    assert first["receipt_sha256"] == hashlib.sha256(
-        _canonical_ascii(first["payload"])
-    ).hexdigest()
+    assert (
+        first["receipt_sha256"]
+        == hashlib.sha256(_canonical_ascii(first["payload"])).hexdigest()
+    )
     record_body = dict(record)
     record_sha = record_body.pop("record_sha256")
     assert record_sha == hashlib.sha256(_canonical_ascii(record_body)).hexdigest()
@@ -363,13 +364,9 @@ def test_rehashed_detector_source_splice_cannot_launder_through_self_hashes(
     ).hexdigest()
     record_body = dict(record)
     record_body.pop("record_sha256")
-    record["record_sha256"] = hashlib.sha256(
-        _canonical_ascii(record_body)
-    ).hexdigest()
+    record["record_sha256"] = hashlib.sha256(_canonical_ascii(record_body)).hexdigest()
     fit["payload"]["regime_detector_record_sha256"] = record["record_sha256"]
-    fit["receipt_sha256"] = hashlib.sha256(
-        _canonical_ascii(fit["payload"])
-    ).hexdigest()
+    fit["receipt_sha256"] = hashlib.sha256(_canonical_ascii(fit["payload"])).hexdigest()
     _rewrite_regime_bundle(tmp_path, manifest, bundle)
 
     _plan, errors = validate_raw_current_refit_manifest(
@@ -399,3 +396,25 @@ def test_regime_bundle_fit_receipt_and_canonical_parameter_bytes_are_rederived(
     )
 
     assert any("REGIME_FIT_RECEIPT_SHA256_INVALID" in error for error in errors)
+
+
+def test_regime_bundle_requires_current_v4_fit_contract(tmp_path: Path) -> None:
+    assert REGIME_FIT_RECEIPT_VERSION == "fxpm.historical-regime-fit.v4"
+    receipt, manifest = _raw_fixture(tmp_path)
+    bundle_id = manifest["bundle_artifact_ids"]["regime_params_bundle"]
+    descriptor = next(
+        item
+        for item in manifest["artifact_descriptors"]
+        if item["artifact_id"] == bundle_id
+    )
+    bundle = json.loads((tmp_path / descriptor["relative_path"]).read_text())
+    fit = bundle["regime_fits"][0]
+    fit["payload"]["contract_version"] = "fxpm.historical-regime-fit.v3"
+    fit["receipt_sha256"] = hashlib.sha256(_canonical_ascii(fit["payload"])).hexdigest()
+    _rewrite_regime_bundle(tmp_path, manifest, bundle)
+
+    _plan, errors = validate_raw_current_refit_manifest(
+        receipt, manifest, artifact_root=tmp_path
+    )
+
+    assert any("REGIME_FIT_SEMANTICS_INVALID" in error for error in errors)

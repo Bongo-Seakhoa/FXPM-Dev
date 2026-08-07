@@ -1,0 +1,536 @@
+diff --git a/tests/test_native_consensus_activation.py b/tests/test_native_consensus_activation.py
+index df4f573..f5d9080 100644
+--- a/tests/test_native_consensus_activation.py
++++ b/tests/test_native_consensus_activation.py
+@@ -5,11 +5,15 @@ from pathlib import Path
+ import pytest
+ 
+ from pm_native_activation import (
++    NATIVE_EVIDENCE_CANDIDATE,
++    NATIVE_SOURCE_UNAVAILABLE,
++    NATIVE_TECHNICAL_ERROR,
+     resolve_active_native_artifact,
+     resolve_active_native_universe,
+     sha256_file,
+ )
+ from pm_native_consensus import canonical_sha256
++from pm_native_request_contract import PRODUCTION_SYMBOL_ORDER
+ from tools.acquire_native_history import (
+     DEFAULT_TIMEFRAMES,
+     cross_resolution_reference_map,
+@@ -109,40 +113,270 @@ def test_v5_all_twelve_edges_survive_sorted_json_and_production_recomputation(tm
+     native_root.mkdir(parents=True)
+     _write_v5_run(native_root, "run-clean")
+ 
++    # The compact fixture deliberately has a genuine leading broker-boundary
++    # shortfall.  Acquisition must not self-promote that fact into statistical
++    # eligibility, while activation must still preserve the nonempty,
++    # integrity-valid cell for the later horizon/ESS/trade-power authority.
++    run_manifest = json.loads(
++        (native_root / "runs" / "run-clean" / "run_manifest.json").read_text(
++            encoding="utf-8"
++        )
++    )
++    for result in run_manifest["results"]:
++        assert result["status"] == "partial"
++        assert result["failure_status"] == "boundary_history_shortfall"
++        assert result["rows"] > 0
++        assert result["eligible_for_optimization"] is False
++        assert result["eligible_for_downstream_validation"] is False
++
+     activated = _activate(native_root, "run-clean", "activation-clean")
+ 
+     assert activated["status"] == "active", activated
+-    assert activated["counts"]["active"] == 6
++    assert activated["counts"][NATIVE_EVIDENCE_CANDIDATE] == 6
++    assert activated["counts"][NATIVE_SOURCE_UNAVAILABLE] == 0
+     for timeframe in DEFAULT_TIMEFRAMES:
+         entry = activated["entries"][SYMBOL][timeframe]
++        assert entry["status"] == NATIVE_EVIDENCE_CANDIDATE
++        assert entry["tradeable"] is False
++        assert entry["statistical_sufficiency_receipt_required"] is True
+         report = json.loads(
+             (native_root / entry["parity_relative_path"]).read_text(encoding="utf-8")
+         )
+-        assert report["reference_timeframes"] == cross_resolution_reference_map(
+-            DEFAULT_TIMEFRAMES
+-        )[timeframe]
++        assert (
++            report["reference_timeframes"]
++            == cross_resolution_reference_map(DEFAULT_TIMEFRAMES)[timeframe]
++        )
+         assert set(report["edges"]) == set(report["reference_timeframes"])
+-        assert all(
+-            detail["status"] == "PASS" for detail in report["windows"].values()
++        assert report["windows"]["optimizer_train"]["status"] == "PENDING"
++        assert report["windows"]["strategy_full_context"]["status"] == "PASS"
++        assert report["windows"]["final_lockbox"]["status"] == "PASS"
++        assert report["windows"]["tuning_validation"]["status"] in {
++            "PASS",
++            "PENDING",
++        }
++    assert activated["audit_only"] is True
++    assert activated["production_authoritative"] is False
++    assert not activated["active_pointer_updated"]
++    assert not (native_root / "ACTIVE.json").exists()
++
++
++def test_v5_production_grid_accounts_for_all_600_cells(tmp_path):
++    data_dir = tmp_path / "data"
++    native_root = data_dir / "native"
++    native_root.mkdir(parents=True)
++    _write_v5_run(native_root, "run-production-grid", production_grid=True)
++
++    activated = _activate(
++        native_root,
++        "run-production-grid",
++        "activation-production-grid",
++    )
++
++    assert activated["status"] == "active", activated
++    assert (
++        tuple(activated["universe_eligibility"]["requested_symbols"])
++        == PRODUCTION_SYMBOL_ORDER
++    )
++    assert len(activated["entries"]) == 100
++    assert all(len(grid) == 6 for grid in activated["entries"].values())
++    assert activated["counts"][NATIVE_EVIDENCE_CANDIDATE] == 6
++    assert activated["counts"][NATIVE_SOURCE_UNAVAILABLE] == 594
++    assert activated["counts"]["total"] == 600
++    assert activated["counts"]["terminal"] == 600
++    assert activated["production_authoritative"] is True
++    assert activated["minimum_session_coverage"] is None
++    assert activated["coverage_activation_threshold_removed"] is True
++    authenticity = activated["universe_eligibility"]
++    assert authenticity["coverage_is_diagnostic_only"] is True
++    assert authenticity["fixed_coverage_activation_threshold"] is None
++    assert "minimum_session_coverage" not in authenticity
++    for entry in activated["entries"][SYMBOL].values():
++        assert entry["evidence_metadata"]["coverage_is_diagnostic_only"] is True
++        report = json.loads(
++            (native_root / entry["parity_relative_path"]).read_text(encoding="utf-8")
+         )
++        assert "minimum_session_coverage" not in report
++    pointer_path = native_root / "ACTIVE.json"
++    original_pointer = pointer_path.read_bytes()
++    assert json.loads(original_pointer)["production_authoritative"] is True
+     universe = resolve_active_native_universe(
+         data_dir,
+-        [SYMBOL],
++        PRODUCTION_SYMBOL_ORDER,
+         verify_exclusion_evidence=False,
+         production_contract_required=True,
+     )
+     assert universe.valid, universe.errors
+-    artifact = resolve_active_native_artifact(
++    assert universe.requested_symbols == PRODUCTION_SYMBOL_ORDER
++    assert tuple(activated["entries"]) == PRODUCTION_SYMBOL_ORDER
++    for broker_symbol in ("Platinum", "Palladium"):
++        assert broker_symbol in activated["entries"]
++        assert broker_symbol.upper() not in activated["entries"]
++        for timeframe in DEFAULT_TIMEFRAMES:
++            entry = activated["entries"][broker_symbol][timeframe]
++            assert f"/{broker_symbol}/{timeframe}/" in (
++                "/" + entry["bars_relative_path"]
++            )
++
++    wrong_case_config = tuple(
++        "PLATINUM" if symbol == "Platinum" else symbol
++        for symbol in PRODUCTION_SYMBOL_ORDER
++    )
++    wrong_config = resolve_active_native_universe(
++        data_dir,
++        wrong_case_config,
++        verify_exclusion_evidence=False,
++        production_contract_required=True,
++    )
++    assert not wrong_config.valid
++    assert "NATIVE_UNIVERSE_CONFIG_SYMBOL_ORDER_IDENTITY_MISMATCH" in (
++        wrong_config.errors
++    )
++
++    pointer = json.loads(original_pointer)
++    pointer["manifest_relative_path"] = pointer["manifest_relative_path"].replace(
++        "activations/", "Activations/", 1
++    )
++    pointer_path.write_text(
++        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    wrong_pointer = resolve_active_native_universe(
++        data_dir,
++        PRODUCTION_SYMBOL_ORDER,
++        verify_exclusion_evidence=False,
++        production_contract_required=True,
++    )
++    assert not wrong_pointer.valid
++    assert "NATIVE_ACTIVE_MANIFEST_PATH_IDENTITY_MISMATCH" in wrong_pointer.errors
++    pointer_path.write_bytes(original_pointer)
++
++    pointer = json.loads(original_pointer)
++    pointer["production_authoritative"] = False
++    pointer_path.write_text(
++        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    forged_authority = resolve_active_native_universe(
++        data_dir,
++        PRODUCTION_SYMBOL_ORDER,
++        verify_exclusion_evidence=False,
++        production_contract_required=True,
++    )
++    assert not forged_authority.valid
++    assert "NATIVE_ACTIVE_PRODUCTION_AUTHORITY_MARKER_MISMATCH" in (
++        forged_authority.errors
++    )
++    pointer_path.write_bytes(original_pointer)
++
++    manifest_path = Path(activated["manifest_path"])
++    original_manifest = manifest_path.read_bytes()
++    manifest = json.loads(original_manifest)
++    eurusd_m5 = manifest["entries"][SYMBOL]["M5"]
++    eurusd_m5["symbol"] = "eurusd"
++    eurusd_m5["bars_relative_path"] = eurusd_m5["bars_relative_path"].replace(
++        "/EURUSD/", "/eurusd/"
++    )
++    manifest_path.write_text(
++        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    pointer = json.loads(original_pointer)
++    pointer["manifest_sha256"] = sha256_file(manifest_path)
++    pointer_path.write_text(
++        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    wrong_path = resolve_active_native_artifact(
+         data_dir,
+         SYMBOL,
+-        "D1",
++        "M5",
+         production_contract_required=True,
+     )
+-    assert artifact.valid, artifact.errors
++    assert not wrong_path.valid
++    assert "NATIVE_ACTIVE_CELL_SYMBOL_MISMATCH" in wrong_path.errors
++    assert any("BARS_RELATIVE_PATH_IDENTITY_MISMATCH" in e for e in wrong_path.errors)
++    manifest_path.write_bytes(original_manifest)
++    pointer_path.write_bytes(original_pointer)
++
++    run_manifest_path = (
++        native_root / "runs" / "run-production-grid" / "run_manifest.json"
++    )
++    original_run_manifest = run_manifest_path.read_bytes()
++    run_manifest = json.loads(original_run_manifest)
++    run_manifest["request"]["timeframe_request_map_schema_version"] = (
++        "fxpm.native_history.timeframe_request_map.v4"
++    )
++    run_manifest_path.write_text(
++        json.dumps(run_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    manifest = json.loads(original_manifest)
++    manifest["run_manifest_sha256"] = sha256_file(run_manifest_path)
++    manifest_path.write_text(
++        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    pointer = json.loads(original_pointer)
++    pointer["manifest_sha256"] = sha256_file(manifest_path)
++    pointer_path.write_text(
++        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    downgraded = resolve_active_native_universe(
++        data_dir,
++        wrong_case_config,
++        verify_exclusion_evidence=False,
++        production_contract_required=False,
++    )
++    assert not downgraded.valid
++    assert "NATIVE_AUTHENTICITY_V5_REQUEST_IDENTITY_REQUIRED" in downgraded.errors
++    run_manifest_path.write_bytes(original_run_manifest)
++    manifest_path.write_bytes(original_manifest)
++    pointer_path.write_bytes(original_pointer)
++
++
++def test_v5_wrong_case_request_result_provenance_and_leaf_path_fail_closed(tmp_path):
++    native_root = tmp_path / "data" / "native"
++    native_root.mkdir(parents=True)
++    run_id = "run-wrong-case"
++    _write_v5_run(native_root, run_id)
++    manifest_path = native_root / "runs" / run_id / "run_manifest.json"
++    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++    manifest["request"]["symbols"] = ["eurusd"]
++    m5_result = next(item for item in manifest["results"] if item["timeframe"] == "M5")
++    m5_result["symbol"] = "eurusd"
++    m5_result["relative_leaf"] = "eurusd/m5"
++    manifest_path.write_text(
++        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++    provenance_path = native_root / "runs" / run_id / SYMBOL / "M5" / "provenance.json"
++    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
++    provenance["symbol"] = "eurusd"
++    provenance["canonical_symbol"] = "eurusd"
++    provenance_path.write_text(
++        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++    )
++
++    result = activation_tool.audit_and_activate(
++        native_root,
++        run_id=run_id,
++        symbols=[SYMBOL],
++        timeframes=DEFAULT_TIMEFRAMES,
++        activation_id="activation-wrong-case",
++        thresholds=activation_tool.ParityThresholds(min_compared_native_bars=20),
++        update_active_pointer=False,
++    )
++
++    assert result["status"] == "failed"
++    assert not result["active_pointer_updated"]
++    reasons = [
++        str(reason)
++        for entry in result["entries"][SYMBOL].values()
++        for reason in entry["reason_codes"]
++    ]
++    assert any("SYMBOL_ORDER_IDENTITY_MISMATCH" in reason for reason in reasons)
++    assert any("CELL_PATH_IDENTITY_MISMATCH" in reason for reason in reasons)
++    assert any("SOURCE_SYMBOL_MISMATCH" in reason for reason in reasons)
++    assert any("SOURCE_CANONICAL_SYMBOL_MISMATCH" in reason for reason in reasons)
+ 
+ 
+ @pytest.mark.parametrize("target", DEFAULT_TIMEFRAMES)
+-def test_v5_single_target_corruption_isolates_only_that_specialist(tmp_path, target):
++def test_v5_single_target_corruption_isolates_cell_and_blocks_publication(
++    tmp_path, target
++):
+     native_root = tmp_path / "data" / "native"
+     native_root.mkdir(parents=True)
+     _write_v5_run(native_root, f"run-corrupt-{target}", corrupt_timeframe=target)
+@@ -153,27 +387,33 @@ def test_v5_single_target_corruption_isolates_only_that_specialist(tmp_path, tar
+         f"activation-corrupt-{target}",
+     )
+ 
+-    assert activated["status"] == "active", activated
++    assert activated["status"] == "failed", activated
++    assert not activated["active_pointer_updated"]
+     statuses = {
+         timeframe: entry["status"]
+         for timeframe, entry in activated["entries"][SYMBOL].items()
+     }
+-    assert statuses[target] == "excluded_no_trade"
+-    assert {key for key, value in statuses.items() if value != "active"} == {target}
++    assert statuses[target] == NATIVE_TECHNICAL_ERROR
++    affected = {
++        key for key, value in statuses.items() if value != NATIVE_EVIDENCE_CANDIDATE
++    }
++    graph = cross_resolution_reference_map(DEFAULT_TIMEFRAMES)
++    possible_dependants = {
++        timeframe for timeframe, references in graph.items() if target in references
++    }
++    assert target in affected
++    assert affected <= ({target} | possible_dependants)
+     assert any(
+         entry["consensus_disagreement_count"] > 0
+         for timeframe, entry in activated["entries"][SYMBOL].items()
+         if timeframe != target
+     )
+-    universe = resolve_active_native_universe(
+-        tmp_path / "data",
+-        [SYMBOL],
+-        production_contract_required=True,
+-    )
+-    assert universe.valid, universe.errors
++    assert not (native_root / "ACTIVE.json").exists()
+ 
+ 
+-def test_v5_strategy_context_corruption_cannot_hide_outside_optimizer_partitions(tmp_path):
++def test_v5_strategy_context_corruption_cannot_hide_outside_optimizer_partitions(
++    tmp_path,
++):
+     native_root = tmp_path / "data" / "native"
+     native_root.mkdir(parents=True)
+     _write_v5_run(
+@@ -189,11 +429,14 @@ def test_v5_strategy_context_corruption_cannot_hide_outside_optimizer_partitions
+     report = json.loads(
+         (native_root / h1["parity_relative_path"]).read_text(encoding="utf-8")
+     )
+-    assert h1["status"] == "excluded_no_trade"
++    assert activated["status"] == "failed"
++    assert not activated["active_pointer_updated"]
++    assert h1["status"] == NATIVE_TECHNICAL_ERROR
+     assert report["windows"]["strategy_full_context"]["status"] == "FAIL"
++    assert report["windows"]["optimizer_train"]["status"] == "PENDING"
+     assert all(
+         report["windows"][partition]["status"] == "PASS"
+-        for partition in ("optimizer_train", "tuning_validation", "final_lockbox")
++        for partition in ("tuning_validation", "final_lockbox")
+     )
+ 
+ 
+@@ -211,18 +454,16 @@ def test_v5_one_terminal_reference_plus_one_exact_pass_remains_active(tmp_path):
+     )
+ 
+     assert activated["status"] == "active", activated
+-    assert activated["entries"][SYMBOL]["M15"]["status"] == "excluded_no_trade"
+-    assert activated["entries"][SYMBOL]["M5"]["status"] == "active"
++    assert activated["entries"][SYMBOL]["M15"]["status"] == NATIVE_SOURCE_UNAVAILABLE
++    assert activated["entries"][SYMBOL]["M5"]["status"] == NATIVE_EVIDENCE_CANDIDATE
+     assert activated["entries"][SYMBOL]["M5"]["consensus_disagreement_count"] == 4
+-    universe = resolve_active_native_universe(
+-        data_dir,
+-        [SYMBOL],
+-        production_contract_required=True,
+-    )
+-    assert universe.valid, universe.errors
++    assert activated["audit_only"] is True
++    assert not (native_root / "ACTIVE.json").exists()
+ 
+ 
+-def test_v5_both_terminal_references_form_semantic_cell_exclusion(tmp_path):
++def test_v5_both_unavailable_references_leave_target_unresolved_and_block_publish(
++    tmp_path,
++):
+     native_root = tmp_path / "data" / "native"
+     native_root.mkdir(parents=True)
+     _write_v5_run(native_root, "run-both-unavailable")
+@@ -235,18 +476,20 @@ def test_v5_both_terminal_references_form_semantic_cell_exclusion(tmp_path):
+         "activation-both-unavailable",
+     )
+ 
+-    assert activated["status"] == "active", activated
+-    assert activated["entries"][SYMBOL]["M5"]["status"] == "excluded_no_trade"
++    assert activated["status"] == "failed", activated
++    assert not activated["active_pointer_updated"]
++    assert activated["entries"][SYMBOL]["M5"]["status"] == NATIVE_TECHNICAL_ERROR
+     report_path = (
+-        native_root
+-        / activated["entries"][SYMBOL]["M5"]["parity_relative_path"]
++        native_root / activated["entries"][SYMBOL]["M5"]["parity_relative_path"]
+     )
+     report = json.loads(report_path.read_text(encoding="utf-8"))
+     assert report["status"] == "FAIL"
+     assert all(detail["status"] == "FAIL" for detail in report["windows"].values())
+ 
+ 
+-def test_v5_authenticated_all_unavailable_symbol_resolves_as_no_trade(tmp_path):
++def test_v5_authenticated_all_unavailable_symbol_remains_data_state_not_no_trade(
++    tmp_path,
++):
+     data_dir = tmp_path / "data"
+     native_root = data_dir / "native"
+     native_root.mkdir(parents=True)
+@@ -265,24 +508,21 @@ def test_v5_authenticated_all_unavailable_symbol_resolves_as_no_trade(tmp_path):
+     )
+ 
+     assert activated["status"] == "active", activated
+-    assert activated["counts"]["active"] == 0
+-    assert activated["counts"]["excluded_no_trade"] == 6
+-    universe = resolve_active_native_universe(
+-        data_dir,
+-        [SYMBOL],
+-        production_contract_required=True,
+-    )
+-    assert universe.valid, universe.errors
+-    assert universe.symbol_status(SYMBOL) == "excluded_no_trade"
+-    assert universe.active_timeframes(SYMBOL) == ()
+-    assert universe.excluded_timeframes(SYMBOL) == DEFAULT_TIMEFRAMES
++    assert activated["counts"][NATIVE_EVIDENCE_CANDIDATE] == 0
++    assert activated["counts"][NATIVE_SOURCE_UNAVAILABLE] == 6
++    contract = activated["universe_eligibility"]
++    assert contract["cell_statuses"][SYMBOL] == {
++        timeframe: NATIVE_SOURCE_UNAVAILABLE for timeframe in DEFAULT_TIMEFRAMES
++    }
++    assert contract["symbols_with_evidence_candidates"] == []
++    assert not (native_root / "ACTIVE.json").exists()
+ 
+ 
+ def test_v5_repinning_fabricated_consensus_does_not_defeat_raw_recomputation(tmp_path):
+     data_dir = tmp_path / "data"
+     native_root = data_dir / "native"
+     native_root.mkdir(parents=True)
+-    _write_v5_run(native_root, "run-repin")
++    _write_v5_run(native_root, "run-repin", production_grid=True)
+     activated = _activate(native_root, "run-repin", "activation-repin")
+     manifest_path = Path(activated["manifest_path"])
+     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+@@ -315,15 +555,14 @@ def test_v5_repinning_fabricated_consensus_does_not_defeat_raw_recomputation(tmp
+ 
+     universe = resolve_active_native_universe(
+         data_dir,
+-        [SYMBOL],
++        PRODUCTION_SYMBOL_ORDER,
+         verify_exclusion_evidence=False,
+         production_contract_required=True,
+     )
+ 
+     assert not universe.valid
+     assert any(
+-        "RAW_PAIR_RECOMPUTATION_MISMATCH" in error
+-        or "EDGE_PAIR_HASH_INVALID" in error
++        "RAW_PAIR_RECOMPUTATION_MISMATCH" in error or "EDGE_PAIR_HASH_INVALID" in error
+         for error in universe.errors
+     )
+     artifact = resolve_active_native_artifact(
+@@ -333,16 +572,13 @@ def test_v5_repinning_fabricated_consensus_does_not_defeat_raw_recomputation(tmp
+         production_contract_required=True,
+     )
+     assert not artifact.valid
+-    assert any(
+-        "RAW_PAIR_RECOMPUTATION_MISMATCH" in error
+-        for error in artifact.errors
+-    )
++    assert any("RAW_PAIR_RECOMPUTATION_MISMATCH" in error for error in artifact.errors)
+ 
+ 
+ def test_v5_failed_audit_never_advances_existing_active_pointer(tmp_path):
+     native_root = tmp_path / "data" / "native"
+     native_root.mkdir(parents=True)
+-    _write_v5_run(native_root, "run-first")
++    _write_v5_run(native_root, "run-first", production_grid=True)
+     first = _activate(native_root, "run-first", "activation-first")
+     pointer_path = native_root / "ACTIVE.json"
+     first_pointer = pointer_path.read_bytes()
+@@ -367,14 +603,7 @@ def test_v5_missing_pinned_source_is_integrity_error_not_semantic_exclusion(tmp_
+     native_root = tmp_path / "data" / "native"
+     native_root.mkdir(parents=True)
+     _write_v5_run(native_root, "run-missing-bars")
+-    (
+-        native_root
+-        / "runs"
+-        / "run-missing-bars"
+-        / SYMBOL
+-        / "H1"
+-        / "bars.csv"
+-    ).unlink()
++    (native_root / "runs" / "run-missing-bars" / SYMBOL / "H1" / "bars.csv").unlink()
+ 
+     result = _activate(
+         native_root,
+@@ -384,20 +613,20 @@ def test_v5_missing_pinned_source_is_integrity_error_not_semantic_exclusion(tmp_
+ 
+     assert result["status"] == "failed"
+     assert not result["active_pointer_updated"]
+-    assert result["entries"][SYMBOL]["H1"]["status"] == "failed"
++    assert result["entries"][SYMBOL]["H1"]["status"] == NATIVE_TECHNICAL_ERROR
+     assert any(
+         "SOURCE_BARS_MISSING" in reason
+         for reason in result["entries"][SYMBOL]["H1"]["reason_codes"]
+     )
+ 
+ 
+-def test_v5_fail_plus_pending_consensus_stays_pending_and_pointer_is_unchanged(
++def test_v5_fail_plus_pending_is_unresolved_technical_and_pointer_is_unchanged(
+     tmp_path,
+     monkeypatch,
+ ):
+     native_root = tmp_path / "data" / "native"
+     native_root.mkdir(parents=True)
+-    _write_v5_run(native_root, "run-pending-base")
++    _write_v5_run(native_root, "run-pending-base", production_grid=True)
+     base = _activate(
+         native_root,
+         "run-pending-base",
+@@ -436,7 +665,7 @@ def test_v5_fail_plus_pending_consensus_stays_pending_and_pointer_is_unchanged(
+     )
+ 
+     assert base["status"] == "active"
+-    assert candidate["status"] == "pending"
+-    assert candidate["entries"][SYMBOL]["H1"]["status"] == "pending"
++    assert candidate["status"] == "failed"
++    assert candidate["entries"][SYMBOL]["H1"]["status"] == NATIVE_TECHNICAL_ERROR
+     assert not candidate["active_pointer_updated"]
+     assert pointer_path.read_bytes() == original_pointer

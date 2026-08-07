@@ -71,6 +71,7 @@ AUDIT_WINDOWS = (
     "final_lockbox",
 )
 LIFECYCLE_AUTH_KEY = b"fxpm-composite-publication-test!!"
+BROKER_HIGHWATER_KEY = b"fxpm-composite-broker-highwater!!"
 LIFECYCLE_PROVISIONER = "pytest-native-composite-v1"
 
 
@@ -678,6 +679,7 @@ def _pin_composite(
         state_root=lifecycle_root / "state",
         limits=_lifecycle_limits(),
         auth_key=LIFECYCLE_AUTH_KEY,
+        broker_highwater_key=BROKER_HIGHWATER_KEY,
         provision=True,
         provisioning_identity=LIFECYCLE_PROVISIONER,
     )

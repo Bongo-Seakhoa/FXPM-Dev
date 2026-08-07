@@ -80,10 +80,15 @@ from pm_native_request_contract import (  # noqa: E402
     MAX_HORIZON_YEARS,
     MAX_PAGES_PER_CELL,
     MAX_PARTITION_YEARS,
+    MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES,
+    MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES,
     MAX_TOTAL_ARTIFACT_BYTES,
     NativeRequestContractError,
     PRODUCTION_ARTIFACT_COLUMNS,
     PRODUCTION_SYMBOL_ORDER,
+    TERMINAL_TECHNICAL_ATTEMPT_CAP,
+    TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+    TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION,
     build_v5_source_quality_omission,
     build_v5_cell_validation_context,
     build_trusted_v5_policy,
@@ -95,6 +100,7 @@ from pm_native_request_contract import (  # noqa: E402
     validate_mt5_v4_page_diagnostics,
     validate_v5_cell_status,
     validate_v5_production_manifest,
+    validate_v5_terminal_technical_cell,
 )
 from pm_native_csv_validation import (  # noqa: E402
     MAX_CSV_BYTES,
@@ -119,11 +125,11 @@ AVAILABLE_HISTORY_BOUNDARY_CONFIRMATION_METHOD = (
 MANIFEST_SCHEMA_VERSION = "fxpm.native_history_run_manifest.v1"
 RESUME_CONTRACT_VERSION = "fxpm.native_history_resume.v1"
 RESUME_SEED_SCHEMA_VERSION = "fxpm.native_history.resume_seed.v2"
-ATTEMPT_RECEIPT_SCHEMA_VERSION = "fxpm.native_history.retryable_attempt.v1"
+ATTEMPT_RECEIPT_SCHEMA_VERSION = TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION
 ATTEMPT_RECEIPTS_DIR = "_attempts"
 RESUME_SEED_FILENAME = "resume_contract.json"
-MAX_RETAINED_ATTEMPT_RECEIPTS_PER_CELL = 2
-MAX_ATTEMPT_RECEIPT_BYTES = 256 * 1024
+MAX_RETAINED_ATTEMPT_RECEIPTS_PER_CELL = TERMINAL_TECHNICAL_ATTEMPT_CAP
+MAX_ATTEMPT_RECEIPT_BYTES = MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES
 MAX_RETRYABLE_PROVENANCE_BYTES = 4 * 1024 * 1024
 MAX_OWNER_RECORD_BYTES = 64 * 1024
 MAX_CONNECTOR_DIAGNOSTIC_BYTES = 64 * 1024
@@ -1905,6 +1911,45 @@ class _NativeSpillPage:
     dtypes: Tuple[Any, ...]
 
 
+def _successor_aware_broker_close_ns(
+    index_ns: np.ndarray,
+    *,
+    nominal_ns: int,
+    next_successor_ns: Optional[int],
+) -> np.ndarray:
+    """Derive H4/D1 closes identically for page diagnostics and publication.
+
+    Broker-session bars normally close at the next broker-native open.  A
+    weekend/session break is not one multi-day bar, however, so a successor is
+    used only when it is within 0.5x..1.5x of the nominal interval.  The final
+    row may take its successor from the next newer spill page.
+    """
+
+    values = np.asarray(index_ns, dtype="int64")
+    if values.ndim != 1 or values.size == 0:
+        return np.asarray([], dtype="int64")
+    if nominal_ns <= 0:
+        raise ValueError("nominal broker-session interval must be positive")
+    closes = np.empty_like(values)
+    if values.size > 1:
+        successors = values[1:]
+        deltas = successors - values[:-1]
+        regular = (deltas >= nominal_ns * 0.5) & (deltas <= nominal_ns * 1.5)
+        closes[:-1] = np.where(regular, successors, values[:-1] + nominal_ns)
+    last_successor = (
+        int(next_successor_ns)
+        if next_successor_ns is not None
+        else int(values[-1] + nominal_ns)
+    )
+    last_delta = last_successor - int(values[-1])
+    closes[-1] = (
+        last_successor
+        if nominal_ns * 0.5 <= last_delta <= nominal_ns * 1.5
+        else int(values[-1] + nominal_ns)
+    )
+    return closes
+
+
 class _NativePageSpillAssembly:
     """Create-only internal page spill and one-page-at-a-time CSV finalizer."""
 
@@ -2274,26 +2319,10 @@ class _NativePageSpillAssembly:
                     index_ns = frame.index.asi8
                     nominal_ns = int(timeframe_seconds * 1_000_000_000)
                     if broker_session_aligned:
-                        close_ns = np.empty_like(index_ns)
-                        if len(index_ns) > 1:
-                            successors = index_ns[1:]
-                            deltas = successors - index_ns[:-1]
-                            regular = (deltas >= nominal_ns * 0.5) & (
-                                deltas <= nominal_ns * 1.5
-                            )
-                            close_ns[:-1] = np.where(
-                                regular, successors, index_ns[:-1] + nominal_ns
-                            )
-                        last_successor = (
-                            int(next_ns)
-                            if next_ns is not None
-                            else int(index_ns[-1] + nominal_ns)
-                        )
-                        last_delta = last_successor - int(index_ns[-1])
-                        close_ns[-1] = (
-                            last_successor
-                            if nominal_ns * 0.5 <= last_delta <= nominal_ns * 1.5
-                            else int(index_ns[-1] + nominal_ns)
+                        close_ns = _successor_aware_broker_close_ns(
+                            index_ns,
+                            nominal_ns=nominal_ns,
+                            next_successor_ns=next_ns,
                         )
                         in_range = (frame.index >= pd.Timestamp(native_start)) & (
                             close_ns <= pd.Timestamp(as_of_utc).value
@@ -4064,6 +4093,22 @@ def _discover_native_leaves(
     return leaves
 
 
+def _assert_exact_production_leaf_roster(
+    discovered: Mapping[Tuple[str, str], Path],
+) -> None:
+    """Require one physical final leaf for every production symbol/timeframe."""
+
+    expected = {
+        (symbol, timeframe)
+        for symbol in PRODUCTION_SYMBOL_ORDER
+        for timeframe in DEFAULT_TIMEFRAMES
+    }
+    if set(discovered) != expected:
+        raise ResumeValidationError(
+            "production V5 run does not contain the exact 600-cell artifact roster"
+        )
+
+
 def load_native_history_resume_contract(
     native_root: Path,
     run_id: str,
@@ -4990,6 +5035,7 @@ class NativeHistoryStore:
                         "immutable_record",
                         "nonfinal",
                         "retryable",
+                        "attempt_id",
                         "run_id",
                         "symbol",
                         "timeframe",
@@ -5009,6 +5055,8 @@ class NativeHistoryStore:
                         or envelope.get("immutable_record") is not True
                         or envelope.get("nonfinal") is not True
                         or envelope.get("retryable") is not True
+                        or envelope.get("attempt_id")
+                        != entry.name.removeprefix("attempt-").removesuffix(".json")
                         or envelope.get("run_id") != self.run_id
                         or envelope.get("symbol") != symbol
                         or envelope.get("timeframe") != timeframe
@@ -5363,6 +5411,8 @@ class NativeHistoryStore:
             "source_identity_sha256": canonical_sha256(attempt_source_identity),
         }
 
+        token = uuid.uuid4().hex
+
         def _envelope(
             retention_status: str, retained_record: Mapping[str, Any]
         ) -> Dict[str, Any]:
@@ -5371,6 +5421,7 @@ class NativeHistoryStore:
                 "immutable_record": True,
                 "nonfinal": True,
                 "retryable": True,
+                "attempt_id": token,
                 "run_id": self.run_id,
                 "symbol": _safe_name(symbol, "symbol"),
                 "timeframe": _safe_name(timeframe, "timeframe").upper(),
@@ -5388,6 +5439,15 @@ class NativeHistoryStore:
             ensure_ascii=False,
         ).encode("utf-8")
         if len(payload) + 1 > MAX_ATTEMPT_RECEIPT_BYTES:
+            if record.get("failure_status") == "technical_history_gap":
+                raise OutputStorageResourceLimitError(
+                    {
+                        "status": "limit_exceeded",
+                        "violations": ["full_attempt_receipt_byte_cap_exceeded"],
+                        "maximum_attempt_receipt_bytes": MAX_ATTEMPT_RECEIPT_BYTES,
+                        "observed_attempt_receipt_bytes": len(payload) + 1,
+                    }
+                )
             envelope = _envelope("summary_only", summary_record)
             payload = json.dumps(
                 envelope,
@@ -5452,7 +5512,6 @@ class NativeHistoryStore:
         if stale_entries:
             _fsync_directory(attempt_dir)
 
-        token = uuid.uuid4().hex
         receipt_path = attempt_dir / f"attempt-{token}.json"
         staging_path = attempt_dir / f".attempt-{token}.staging"
         publication_payload = payload + b"\n"
@@ -5473,6 +5532,407 @@ class NativeHistoryStore:
         finally:
             staging_path.unlink(missing_ok=True)
         return record
+
+    def _load_terminal_attempt_descriptors(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        expected_broker_symbol: str,
+    ) -> Optional[Tuple[List[Dict[str, Any]], Tuple[_PinnedNativeFileReceipt, ...]]]:
+        """Pin the exact two full retry receipts eligible for terminalization."""
+
+        safe_symbol = _safe_name(symbol, "symbol")
+        safe_timeframe = _safe_name(timeframe, "timeframe").upper()
+        attempt_dir = (
+            self.run_root / ATTEMPT_RECEIPTS_DIR / safe_symbol / safe_timeframe
+        )
+        try:
+            observed_dir = attempt_dir.lstat()
+        except FileNotFoundError:
+            return None
+        if _unsafe_native_file_attributes(observed_dir) or not stat.S_ISDIR(
+            observed_dir.st_mode
+        ):
+            raise ResumeValidationError(
+                f"terminal attempt directory is unsafe: {attempt_dir}"
+            )
+        entries = _bounded_directory_entries(
+            attempt_dir,
+            maximum_entries=TERMINAL_TECHNICAL_ATTEMPT_CAP,
+            context=f"terminal technical receipts {safe_symbol}/{safe_timeframe}",
+        )
+        if len(entries) < TERMINAL_TECHNICAL_ATTEMPT_CAP:
+            return None
+        descriptors: List[Dict[str, Any]] = []
+        pinned: List[_PinnedNativeFileReceipt] = []
+        for name in sorted(entries):
+            path = entries[name]
+            if re.fullmatch(r"attempt-[0-9a-f]{32}\.json", name) is None:
+                raise ResumeValidationError(
+                    f"terminal attempt receipt name is invalid: {path}"
+                )
+            with _open_pinned_native_file(
+                path,
+                run_root=self.run_root,
+                maximum_bytes=MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES,
+            ) as (handle, receipt):
+                raw = handle.read(MAX_TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_BYTES + 1)
+                if len(raw) != receipt.identity.size or handle.read(1):
+                    raise ResumeValidationError(
+                        f"terminal attempt receipt changed during read: {path}"
+                    )
+            try:
+                envelope = json.loads(
+                    raw.decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_native_json_pairs,
+                )
+                if not isinstance(envelope, dict):
+                    raise ValueError("attempt receipt is not an object")
+                canonical_json_bytes(envelope)
+                canonical_receipt = (
+                    json.dumps(
+                        envelope,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                NativeRequestContractError,
+                MemoryError,
+                OverflowError,
+                RecursionError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise ResumeValidationError(
+                    f"terminal attempt receipt is invalid: {path}"
+                ) from exc
+            record = envelope.get("record")
+            if (
+                raw != canonical_receipt
+                or envelope.get("schema_version")
+                != TERMINAL_TECHNICAL_ATTEMPT_RECEIPT_SCHEMA_VERSION
+                or envelope.get("immutable_record") is not True
+                or envelope.get("nonfinal") is not True
+                or envelope.get("retryable") is not True
+                or envelope.get("attempt_id")
+                != name.removeprefix("attempt-").removesuffix(".json")
+                or envelope.get("run_id") != self.run_id
+                or envelope.get("symbol") != safe_symbol
+                or envelope.get("timeframe") != safe_timeframe
+                or envelope.get("retention_status") != "full"
+                or not isinstance(record, Mapping)
+                or record.get("status") != "partial"
+                or record.get("failure_status") != "technical_history_gap"
+                or record.get("broker_symbol") != expected_broker_symbol
+            ):
+                raise ResumeValidationError(
+                    "terminalization requires two canonical full, independently "
+                    f"bound technical_history_gap receipts: {path}"
+                )
+            full_bytes = json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if (
+                envelope.get("full_record_bytes") != len(full_bytes)
+                or envelope.get("full_record_sha256")
+                != hashlib.sha256(full_bytes).hexdigest()
+            ):
+                raise ResumeValidationError(
+                    f"terminal attempt full-record binding is invalid: {path}"
+                )
+            descriptors.append(
+                {
+                    "relative_path": path.relative_to(self.run_root).as_posix(),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "bytes": len(raw),
+                    "envelope": envelope,
+                }
+            )
+            pinned.append(receipt)
+        descriptors.sort(key=lambda value: (value["sha256"], value["relative_path"]))
+        return descriptors, tuple(pinned)
+
+    @staticmethod
+    def _terminal_manifest_result(
+        symbol: str,
+        timeframe: str,
+        record: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        evidence = record.get("terminal_technical_evidence")
+        if not isinstance(evidence, Mapping):
+            raise ResumeValidationError(
+                "terminal technical provenance has no embedded evidence"
+            )
+        evidence_bytes = canonical_json_bytes(evidence)
+        if not 0 < len(evidence_bytes) <= MAX_TERMINAL_TECHNICAL_EVIDENCE_BYTES:
+            raise ResumeValidationError(
+                "terminal technical evidence exceeds the bounded contract"
+            )
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "status": "failed",
+            "failure_status": "technical_history_gap",
+            "eligible_for_optimization": False,
+            "eligible_for_downstream_validation": False,
+            "rows": 0,
+            "sha256": None,
+            "relative_leaf": f"{symbol}/{timeframe}",
+            "resume_disposition": "terminal_technical",
+            "terminal_evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+            "terminal_evidence_bytes": len(evidence_bytes),
+        }
+
+    def _validate_existing_terminal_technical_leaf(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        common_request: Mapping[str, Any],
+        source_environment: Mapping[str, Any],
+        expected_retries: int,
+        manifest_acquisition_started_utc: datetime | str,
+        manifest_acquisition_completed_utc: datetime | str,
+        expected_record: Optional[Mapping[str, Any]] = None,
+        receipts: Optional[List[_PinnedNativeFileReceipt]] = None,
+    ) -> Dict[str, Any]:
+        leaf = self.leaf_path(symbol, timeframe)
+        if not leaf.is_dir() or leaf.is_symlink():
+            raise ResumeValidationError(
+                f"terminal technical leaf is absent or unsafe: {leaf}"
+            )
+        entries = _bounded_directory_entries(
+            leaf,
+            maximum_entries=1,
+            context=f"terminal technical leaf {symbol}/{timeframe}",
+        )
+        if set(entries) != {"provenance.json"}:
+            raise ResumeValidationError(
+                f"terminal technical leaf has the wrong exact schema: {leaf}"
+            )
+        record, sidecar_receipt = _load_pinned_native_json_object(
+            leaf / "provenance.json",
+            run_root=self.run_root,
+            maximum_bytes=MAX_REUSABLE_PROVENANCE_BYTES,
+        )
+        if receipts is not None:
+            receipts.append(sidecar_receipt)
+        if expected_record is not None and record != dict(expected_record):
+            raise ResumeValidationError(
+                f"concurrent terminal technical leaf differs from this writer: {leaf}"
+            )
+        result = self._terminal_manifest_result(symbol, timeframe, record)
+        try:
+            validate_v5_terminal_technical_cell(
+                record,
+                result,
+                common_request,
+                symbol=symbol,
+                timeframe=timeframe,
+                run_id=self.run_id,
+                manifest_source_environment=source_environment,
+                expected_retries=expected_retries,
+                manifest_acquisition_started_utc=(manifest_acquisition_started_utc),
+                manifest_acquisition_completed_utc=(manifest_acquisition_completed_utc),
+            )
+        except NativeRequestContractError as exc:
+            raise ResumeValidationError(
+                "terminal technical leaf fails the production reader contract for "
+                f"{symbol}/{timeframe}: {';'.join(exc.errors)}"
+            ) from exc
+        return record
+
+    def commit_terminal_technical_leaf(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        expected_broker_symbol: str,
+        common_request: Mapping[str, Any],
+        source_environment: Mapping[str, Any],
+        expected_retries: int,
+        manifest_acquisition_started_utc: datetime,
+        manifest_acquisition_completed_utc: datetime,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically freeze two real gap attempts into one final typed leaf.
+
+        Fewer than two receipts means the cell remains retryable.  Any present
+        but malformed, summarized, duplicate, or differently bound evidence
+        fails closed.  The raw receipts are removed only after the immutable
+        provenance-only leaf has passed the standalone production validator.
+        """
+
+        self._assert_writer_lock()
+        self._assert_run_unsealed()
+        loaded = self._load_terminal_attempt_descriptors(
+            symbol,
+            timeframe,
+            expected_broker_symbol=expected_broker_symbol,
+        )
+        if loaded is None:
+            return None
+        descriptors, pinned_receipts = loaded
+        evidence = {
+            "schema_version": TERMINAL_TECHNICAL_EVIDENCE_SCHEMA_VERSION,
+            "attempt_cap": TERMINAL_TECHNICAL_ATTEMPT_CAP,
+            "accepted_failure_status": "technical_history_gap",
+            "receipts": descriptors,
+        }
+        latest_descriptor = max(
+            descriptors,
+            key=lambda value: (
+                parse_utc_datetime(
+                    str(value["envelope"]["record"]["acquisition_completed_utc"])
+                ),
+                value["sha256"],
+            ),
+        )
+        latest_record = latest_descriptor["envelope"]["record"]
+        record = {
+            **latest_record,
+            "status": "failed",
+            "terminal_technical_evidence": evidence,
+        }
+        record, sidecar_payload = self._bounded_json_publication_bytes(
+            record,
+            maximum_bytes=MAX_REUSABLE_PROVENANCE_BYTES,
+            context="terminal_technical_provenance",
+        )
+        result = self._terminal_manifest_result(symbol, timeframe, record)
+        try:
+            validate_v5_terminal_technical_cell(
+                record,
+                result,
+                common_request,
+                symbol=symbol,
+                timeframe=timeframe,
+                run_id=self.run_id,
+                manifest_source_environment=source_environment,
+                expected_retries=expected_retries,
+                manifest_acquisition_started_utc=(manifest_acquisition_started_utc),
+                manifest_acquisition_completed_utc=(manifest_acquisition_completed_utc),
+            )
+        except NativeRequestContractError as exc:
+            raise ResumeValidationError(
+                "terminal technical receipts fail the production reader contract "
+                f"for {symbol}/{timeframe}: {';'.join(exc.errors)}"
+            ) from exc
+        # Verify the source receipts immediately before the first authorized
+        # directory mutation.  The final record already embeds their exact
+        # canonical envelopes and hashes; creating the final symbol/staging
+        # directories necessarily changes the pinned run-root directory
+        # metadata, so those source-directory receipts cannot remain valid
+        # across publication by design.
+        for receipt in pinned_receipts:
+            _verify_pinned_native_file_receipt(receipt)
+        final_dir = self.leaf_path(symbol, timeframe)
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+        if final_dir.exists():
+            existing = self._validate_existing_terminal_technical_leaf(
+                symbol,
+                timeframe,
+                common_request=common_request,
+                source_environment=source_environment,
+                expected_retries=expected_retries,
+                manifest_acquisition_started_utc=(manifest_acquisition_started_utc),
+                manifest_acquisition_completed_utc=(manifest_acquisition_completed_utc),
+                expected_record=record,
+            )
+            self._clear_attempt_receipts_for_cell(symbol, timeframe)
+            return existing
+        staging = final_dir.parent / f".{timeframe}.{uuid.uuid4().hex}.staging"
+        staging.mkdir(parents=False, exist_ok=False)
+        try:
+            sidecar = staging / "provenance.json"
+            sidecar_identity = self._stage_publication_payload(
+                sidecar,
+                sidecar_payload,
+                maximum_bytes=MAX_REUSABLE_PROVENANCE_BYTES,
+            )
+            self._verify_publication_payload(
+                sidecar,
+                expected=sidecar_identity,
+                expected_payload=sidecar_payload,
+                links=1,
+            )
+            published = self._publish_terminal_leaf_directory(
+                staging,
+                final_dir,
+                symbol,
+                timeframe,
+                record=record,
+                common_request=common_request,
+                source_environment=source_environment,
+                expected_retries=expected_retries,
+                manifest_acquisition_started_utc=(manifest_acquisition_started_utc),
+                manifest_acquisition_completed_utc=(manifest_acquisition_completed_utc),
+            )
+            self._clear_attempt_receipts_for_cell(symbol, timeframe)
+            return published
+        finally:
+            _best_effort_bounded_flat_cleanup(staging, maximum_entries=2)
+
+    def _publish_terminal_leaf_directory(
+        self,
+        staging: Path,
+        final_dir: Path,
+        symbol: str,
+        timeframe: str,
+        *,
+        record: Mapping[str, Any],
+        common_request: Mapping[str, Any],
+        source_environment: Mapping[str, Any],
+        expected_retries: int,
+        manifest_acquisition_started_utc: datetime,
+        manifest_acquisition_completed_utc: datetime,
+    ) -> Dict[str, Any]:
+        def validate_final() -> Dict[str, Any]:
+            return self._validate_existing_terminal_technical_leaf(
+                symbol,
+                timeframe,
+                common_request=common_request,
+                source_environment=source_environment,
+                expected_retries=expected_retries,
+                manifest_acquisition_started_utc=(manifest_acquisition_started_utc),
+                manifest_acquisition_completed_utc=(manifest_acquisition_completed_utc),
+                expected_record=record,
+            )
+
+        if final_dir.exists():
+            return validate_final()
+        attempts = len(self._publish_retry_delays) + 1
+        last_error: Optional[BaseException] = None
+        for attempt in range(attempts):
+            try:
+                self._assert_run_unsealed()
+                self._replace_fn(staging, final_dir)
+                return validate_final()
+            except Exception as exc:
+                last_error = exc
+                if final_dir.exists():
+                    try:
+                        return validate_final()
+                    except Exception as validation_exc:
+                        raise ResumeValidationError(
+                            "final terminal leaf appeared during publish but is "
+                            f"not a valid immutable completion: {final_dir}"
+                        ) from validation_exc
+                if not self._retryable_publish_error(exc) or attempt >= attempts - 1:
+                    raise
+                self._sleep_fn(self._publish_retry_delays[attempt])
+        assert last_error is not None
+        raise last_error
 
     @staticmethod
     def _retryable_publish_error(exc: BaseException) -> bool:
@@ -6802,6 +7262,8 @@ class NativeHistoryAcquirer:
         leaf: Path,
         *,
         manifest_result: Optional[Mapping[str, Any]] = None,
+        manifest_acquisition_started_utc: Optional[datetime | str] = None,
+        manifest_acquisition_completed_utc: Optional[datetime | str] = None,
         receipts: Optional[List[_PinnedNativeFileReceipt]] = None,
     ) -> Dict[str, Any]:
         """Fully validate an existing immutable leaf before any broker fetch."""
@@ -6884,10 +7346,57 @@ class NativeHistoryAcquirer:
             )
 
         if status == "failed":
-            raise ResumeValidationError(
-                "failed acquisition leaves are nonfinal retryable states and cannot "
-                f"be reused as completed cells: {sidecar}"
+            if not (
+                exact_v5_identity
+                and record.get("failure_status") == "technical_history_gap"
+                and isinstance(record.get("terminal_technical_evidence"), Mapping)
+            ):
+                raise ResumeValidationError(
+                    "failed acquisition leaves are nonfinal retryable states unless "
+                    "they carry authenticated terminal technical evidence: "
+                    f"{sidecar}"
+                )
+            seed_started = (
+                self.store.resume_contract.acquisition_started_utc
+                if self.store.resume_contract is not None
+                else None
             )
+            validation_started = manifest_acquisition_started_utc or seed_started
+            validation_completed = manifest_acquisition_completed_utc or record.get(
+                "acquisition_completed_utc"
+            )
+            if validation_started is None or validation_completed is None:
+                raise ResumeValidationError(
+                    f"terminal technical validation bounds are absent: {sidecar}"
+                )
+            result = (
+                dict(manifest_result)
+                if manifest_result is not None
+                else self.store._terminal_manifest_result(
+                    symbol,
+                    timeframe,
+                    record,
+                )
+            )
+            try:
+                validate_v5_terminal_technical_cell(
+                    record,
+                    result,
+                    expected_request,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    run_id=self.store.run_id,
+                    manifest_source_environment=self.runtime_metadata,
+                    expected_retries=self.request.retries,
+                    manifest_acquisition_started_utc=validation_started,
+                    manifest_acquisition_completed_utc=validation_completed,
+                )
+            except NativeRequestContractError as exc:
+                raise ResumeValidationError(
+                    "reusable terminal technical leaf fails the production reader "
+                    f"contract for {symbol}/{timeframe}: {';'.join(exc.errors)}"
+                ) from exc
+            return record
         if status not in {"success", "partial"}:
             raise ResumeValidationError(f"reusable status is invalid: {sidecar}")
 
@@ -7075,15 +7584,27 @@ class NativeHistoryAcquirer:
         for key, leaf in discovered.items():
             record = self._validate_reusable_leaf(key[0], key[1], leaf)
             artifact = record.get("artifact")
-            if not isinstance(artifact, Mapping):
-                raise ResumeValidationError(
-                    f"reusable immutable leaf has no artifact binding: {leaf}"
-                )
-            self.store.register_artifact_bytes(
-                key[0],
-                key[1],
-                int(artifact.get("bytes", -1)),
+            terminal_technical = bool(
+                record.get("status") == "failed"
+                and record.get("failure_status") == "technical_history_gap"
+                and isinstance(record.get("terminal_technical_evidence"), Mapping)
             )
+            if terminal_technical:
+                artifact_summary: Optional[Dict[str, Any]] = None
+            else:
+                if not isinstance(artifact, Mapping):
+                    raise ResumeValidationError(
+                        f"reusable immutable leaf has no artifact binding: {leaf}"
+                    )
+                self.store.register_artifact_bytes(
+                    key[0],
+                    key[1],
+                    int(artifact.get("bytes", -1)),
+                )
+                artifact_summary = {
+                    "rows": int(artifact.get("rows", 0)),
+                    "sha256": artifact.get("sha256"),
+                }
             # Reconcile a crash that happened after the leaf's atomic publish
             # but before its nonfinal attempt receipt was removed.
             self.store._clear_attempt_receipts_for_cell(key[0], key[1])
@@ -7097,10 +7618,16 @@ class NativeHistoryAcquirer:
                     record.get("eligible_for_downstream_validation", False)
                 ),
                 "acquisition_started_utc": record.get("acquisition_started_utc"),
-                "artifact": {
-                    "rows": int(artifact.get("rows", 0)),
-                    "sha256": artifact.get("sha256"),
-                },
+                "artifact": artifact_summary,
+                **(
+                    {
+                        "terminal_technical_evidence": record[
+                            "terminal_technical_evidence"
+                        ]
+                    }
+                    if terminal_technical
+                    else {}
+                ),
             }
         return reusable
 
@@ -7909,6 +8436,10 @@ class NativeHistoryAcquirer:
         page_span = self._page_span(timeframe)
         cursor_end = fetch_end_exclusive
         assembly: Optional[_NativePageSpillAssembly] = None
+        # Pages are requested newest-to-oldest.  Retain only the first open of
+        # the immediately newer nonempty page so H4/D1 close derivation at a
+        # page boundary is identical to chronological finalization.
+        next_newer_open_ns: Optional[int] = None
         raw_rows = 0
         page_count = 0
         pages_with_data = 0
@@ -8139,26 +8670,49 @@ class NativeHistoryAcquirer:
                     except Exception:
                         _abort_assembly()
                         raise
-                    page_first = normalized.index.min().to_pydatetime()
-                    page_last = normalized.index.max().to_pydatetime()
-                    expected_last = page_end - timedelta(seconds=seconds)
-                    page_start_delay = max(timedelta(0), page_first - cursor)
-                    page_end_lag = max(timedelta(0), expected_last - page_last)
-                    if (
-                        page_start_delay > boundary_tolerance
-                        or page_end_lag > boundary_tolerance
-                    ):
-                        truncated_pages.append(
-                            {
-                                **page_identity,
-                                "actual_first_open_utc": _iso(page_first),
-                                "actual_last_open_utc": _iso(page_last),
-                                "start_delay_seconds": float(
-                                    page_start_delay.total_seconds()
-                                ),
-                                "end_lag_seconds": float(page_end_lag.total_seconds()),
-                            }
+                    # Truncation facts must re-derive from PUBLISHED rows: the
+                    # close<=as_of filter later removes the forming/sentinel
+                    # successor, so facts computed on the raw normalized page
+                    # (which deliberately includes it) fail the reader's exact
+                    # recomputation on every continuously-trading symbol.
+                    if broker_session_aligned:
+                        close_ns = _successor_aware_broker_close_ns(
+                            normalized.index.asi8,
+                            nominal_ns=int(seconds * 1_000_000_000),
+                            next_successor_ns=next_newer_open_ns,
                         )
+                        published_mask = close_ns <= pd.Timestamp(self.as_of_utc).value
+                    else:
+                        published_mask = (
+                            normalized.index + pd.Timedelta(seconds=seconds)
+                        ) <= pd.Timestamp(self.as_of_utc)
+                    published_view = normalized.loc[published_mask]
+                    next_newer_open_ns = int(normalized.index[0].value)
+                    if published_view.empty:
+                        empty_pages.append(page_identity)
+                    else:
+                        page_first = published_view.index.min().to_pydatetime()
+                        page_last = published_view.index.max().to_pydatetime()
+                        expected_last = page_end - timedelta(seconds=seconds)
+                        page_start_delay = max(timedelta(0), page_first - cursor)
+                        page_end_lag = max(timedelta(0), expected_last - page_last)
+                        if (
+                            page_start_delay > boundary_tolerance
+                            or page_end_lag > boundary_tolerance
+                        ):
+                            truncated_pages.append(
+                                {
+                                    **page_identity,
+                                    "actual_first_open_utc": _iso(page_first),
+                                    "actual_last_open_utc": _iso(page_last),
+                                    "start_delay_seconds": float(
+                                        page_start_delay.total_seconds()
+                                    ),
+                                    "end_lag_seconds": float(
+                                        page_end_lag.total_seconds()
+                                    ),
+                                }
+                            )
                 else:
                     empty_pages.append(page_identity)
                 del normalized
@@ -8608,11 +9162,13 @@ class NativeHistoryAcquirer:
         *,
         max_new_cells: Optional[int] = None,
         max_runtime_seconds: Optional[float] = None,
+        terminalize_technical_at_cap: bool = False,
     ) -> Dict[str, Any]:
         try:
             return self._acquire_impl(
                 max_new_cells=max_new_cells,
                 max_runtime_seconds=max_runtime_seconds,
+                terminalize_technical_at_cap=terminalize_technical_at_cap,
             )
         finally:
             self.store.close()
@@ -8622,6 +9178,7 @@ class NativeHistoryAcquirer:
         *,
         max_new_cells: Optional[int] = None,
         max_runtime_seconds: Optional[float] = None,
+        terminalize_technical_at_cap: bool = False,
     ) -> Dict[str, Any]:
         """Acquire missing cells, stopping only between atomic leaves when bounded.
 
@@ -8663,6 +9220,7 @@ class NativeHistoryAcquirer:
         )
         results: List[Dict[str, Any]] = []
         newly_acquired = 0
+        mutations_this_invocation = 0
         bounded_reason: Optional[str] = None
         stop = False
 
@@ -8676,16 +9234,27 @@ class NativeHistoryAcquirer:
             for timeframe in self.request.timeframes:
                 key = (symbol, timeframe)
                 if key in reusable:
+                    disposition = (
+                        "terminal_technical"
+                        if reusable[key].get("status") == "failed"
+                        and isinstance(
+                            reusable[key].get("terminal_technical_evidence"),
+                            Mapping,
+                        )
+                        else "reused"
+                    )
                     results.append(
                         self._manifest_result(
                             symbol,
                             timeframe,
                             reusable[key],
-                            disposition="reused",
+                            disposition=disposition,
                         )
                     )
                     continue
-                if max_new_cells is not None and newly_acquired >= int(max_new_cells):
+                if max_new_cells is not None and mutations_this_invocation >= int(
+                    max_new_cells
+                ):
                     bounded_reason = "max_new_cells"
                     stop = True
                     break
@@ -8726,6 +9295,33 @@ class NativeHistoryAcquirer:
                 self._assert_runtime_source_identity(
                     f"after-resolution:{symbol}:{timeframe}"
                 )
+                if (
+                    terminalize_technical_at_cap
+                    and not connection_preflight_failed
+                    and resolution_error is None
+                    and broker_symbol is not None
+                ):
+                    terminal_record = self.store.commit_terminal_technical_leaf(
+                        symbol,
+                        timeframe,
+                        expected_broker_symbol=broker_symbol,
+                        common_request=self._common_request_contract(),
+                        source_environment=self.runtime_metadata,
+                        expected_retries=self.request.retries,
+                        manifest_acquisition_started_utc=run_acquisition_started,
+                        manifest_acquisition_completed_utc=_utc(self.now_fn()),
+                    )
+                    if terminal_record is not None:
+                        mutations_this_invocation += 1
+                        results.append(
+                            self._manifest_result(
+                                symbol,
+                                timeframe,
+                                terminal_record,
+                                disposition="terminal_technical",
+                            )
+                        )
+                        continue
                 terminal_resource_limit_hit = False
                 output_resource_limit_hit = False
                 assembly_resource_limit_hit = False
@@ -9015,6 +9611,7 @@ class NativeHistoryAcquirer:
                             if isinstance(frame, _NativeCellCsvArtifact):
                                 frame.cleanup()
                 newly_acquired += 1
+                mutations_this_invocation += 1
                 results.append(
                     self._manifest_result(
                         symbol,
@@ -9067,12 +9664,21 @@ class NativeHistoryAcquirer:
                 for timeframe in self.request.timeframes:
                     key = (symbol, timeframe)
                     if key in reusable and key not in reported:
+                        disposition = (
+                            "terminal_technical"
+                            if reusable[key].get("status") == "failed"
+                            and isinstance(
+                                reusable[key].get("terminal_technical_evidence"),
+                                Mapping,
+                            )
+                            else "reused"
+                        )
                         results.append(
                             self._manifest_result(
                                 symbol,
                                 timeframe,
                                 reusable[key],
-                                disposition="reused",
+                                disposition=disposition,
                             )
                         )
 
@@ -9092,14 +9698,21 @@ class NativeHistoryAcquirer:
                 item.get("resume_disposition") == "retryable_attempt"
                 for item in results
             ),
+            "terminalized_technical_cells": sum(
+                item.get("resume_disposition") == "terminal_technical"
+                for item in results
+            ),
             "stale_staging_removed": int(self.store.stale_staging_removed),
         }
         expected_total = len(self.request.symbols) * len(self.request.timeframes)
         completed_cells = {
             (str(item["symbol"]), str(item["timeframe"]))
             for item in results
-            if item.get("status") in {"success", "partial"}
-            and item.get("resume_disposition") != "retryable_attempt"
+            if (
+                item.get("status") in {"success", "partial"}
+                and item.get("resume_disposition") != "retryable_attempt"
+            )
+            or item.get("resume_disposition") == "terminal_technical"
         }
         unresolved_attempts = [
             item
@@ -9261,20 +9874,17 @@ class NativeHistoryAcquirer:
                 raise ResumeValidationError(
                     "production V5 resume seed differs from the manifest authority"
                 )
-            expected_cells = {
-                (symbol, timeframe)
-                for symbol in PRODUCTION_SYMBOL_ORDER
-                for timeframe in DEFAULT_TIMEFRAMES
+            terminal_cells = {
+                (str(result.get("symbol")), str(result.get("timeframe")))
+                for result in manifest.get("results", [])
+                if result.get("resume_disposition") == "terminal_technical"
             }
             discovered = _discover_native_leaves(
                 self.store.run_root,
                 symbols=PRODUCTION_SYMBOL_ORDER,
                 timeframes=DEFAULT_TIMEFRAMES,
             )
-            if set(discovered) != expected_cells:
-                raise ResumeValidationError(
-                    "production V5 run does not contain the exact 600-cell artifact roster"
-                )
+            _assert_exact_production_leaf_roster(discovered)
             results_by_cell = bound["results_by_cell"]
             total_artifact_bytes = 0
             run_started = parse_utc_datetime(str(manifest["acquisition_started_utc"]))
@@ -9289,8 +9899,30 @@ class NativeHistoryAcquirer:
                         timeframe,
                         discovered[(symbol, timeframe)],
                         manifest_result=result,
+                        manifest_acquisition_started_utc=run_started,
+                        manifest_acquisition_completed_utc=run_completed,
                         receipts=receipts,
                     )
+                    cell_started = parse_utc_datetime(
+                        str(record["acquisition_started_utc"])
+                    )
+                    cell_completed = parse_utc_datetime(
+                        str(record["acquisition_completed_utc"])
+                    )
+                    if not (
+                        run_started <= cell_started <= cell_completed <= run_completed
+                    ):
+                        raise ResumeValidationError(
+                            "production V5 cell acquisition time lies outside the run: "
+                            f"{symbol}/{timeframe}"
+                        )
+                    if (symbol, timeframe) in terminal_cells:
+                        if record.get("artifact") is not None:
+                            raise ResumeValidationError(
+                                "terminal technical cell unexpectedly carries artifact "
+                                f"bytes: {symbol}/{timeframe}"
+                            )
+                        continue
                     artifact = record.get("artifact")
                     if not isinstance(artifact, Mapping):
                         raise ResumeValidationError(
@@ -9316,19 +9948,6 @@ class NativeHistoryAcquirer:
                                     MAX_TOTAL_ARTIFACT_BYTES
                                 ),
                             }
-                        )
-                    cell_started = parse_utc_datetime(
-                        str(record["acquisition_started_utc"])
-                    )
-                    cell_completed = parse_utc_datetime(
-                        str(record["acquisition_completed_utc"])
-                    )
-                    if not (
-                        run_started <= cell_started <= cell_completed <= run_completed
-                    ):
-                        raise ResumeValidationError(
-                            "production V5 cell acquisition time lies outside the run: "
-                            f"{symbol}/{timeframe}"
                         )
             self.store.assert_exact_artifact_total(total_artifact_bytes)
         except NativeRequestContractError as exc:
@@ -9369,7 +9988,7 @@ class NativeHistoryAcquirer:
         disposition: str = "newly_acquired",
     ) -> Dict[str, Any]:
         artifact = record.get("artifact") if isinstance(record, Mapping) else None
-        return {
+        result = {
             "symbol": symbol,
             "timeframe": timeframe,
             "status": record.get("status"),
@@ -9389,6 +10008,19 @@ class NativeHistoryAcquirer:
             "relative_leaf": f"{symbol}/{timeframe}",
             "resume_disposition": disposition,
         }
+        if disposition == "terminal_technical":
+            terminal = NativeHistoryStore._terminal_manifest_result(
+                symbol,
+                timeframe,
+                record,
+            )
+            result.update(
+                {
+                    "terminal_evidence_sha256": terminal["terminal_evidence_sha256"],
+                    "terminal_evidence_bytes": terminal["terminal_evidence_bytes"],
+                }
+            )
+        return result
 
 
 def default_run_id(now: Optional[datetime] = None) -> str:
@@ -9480,6 +10112,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="Actually open the configured MT5 terminal and acquire bars. Without this flag, print the plan only.",
+    )
+    parser.add_argument(
+        "--terminalize-technical-at-cap",
+        action="store_true",
+        help="Convert at-cap technical_history_gap retryable cells into final "
+        "typed failed results so a chronically gapped run can seal its "
+        "manifest. Activation retains a non-economic technical_error cell "
+        "while valid sibling timeframes remain eligible.",
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
@@ -10154,6 +10794,9 @@ def _main_with_args(
         ).acquire(
             max_new_cells=args.max_new_cells,
             max_runtime_seconds=args.max_runtime_seconds,
+            terminalize_technical_at_cap=bool(
+                getattr(args, "terminalize_technical_at_cap", False)
+            ),
         )
     finally:
         if connector is not None:

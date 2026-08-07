@@ -1,6 +1,10 @@
 import copy
 import inspect
+from datetime import datetime
 
+import pytest
+
+import pm_model_lifecycle as lifecycle
 from pm_core import PipelineConfig
 from pm_model_lifecycle import (
     ACCEPTED_BOOK_GENERATION_RECEIPT_VERSION,
@@ -617,6 +621,34 @@ def test_process_validated_current_refit_is_one_global_generation_with_independe
     assert "detached probation" in temporal_role_block_reason(
         {"temporal_lineage": lineage}
     )
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_current_refit_cell_preserves_exact_mt5_symbol(symbol: str) -> None:
+    _process, _book, receipt = _process_refit_receipts()
+    payload, _sha = open_typed_receipt(
+        receipt,
+        expected_receipt_type=CURRENT_REFIT_EXECUTION_RECEIPT_TYPE,
+    )
+    cell = copy.deepcopy(payload["execution"]["cell_executions"][0])
+    cell["symbol"] = symbol
+    identity = {
+        name: cell[name] for name in lifecycle._REFIT_CELL_IDENTITY_FIELDS
+    }
+    cell["current_refit_cell_id"] = compute_current_refit_cell_id(identity)
+
+    normalized = lifecycle._normalize_current_refit_cell(  # noqa: SLF001
+        cell,
+        process_decision_sha256=cell["historical_process_decision_sha256"],
+        book_receipt_sha256=cell[
+            "accepted_book_generation_receipt_sha256"
+        ],
+        current_cutoff=datetime.fromisoformat(
+            payload["execution"]["current_cutoff_utc"]
+        ),
+    )
+
+    assert normalized["symbol"] == symbol
 
 
 def test_full_current_search_may_select_new_strategy_and_horizon_then_refit_them():

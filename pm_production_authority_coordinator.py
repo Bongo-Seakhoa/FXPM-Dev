@@ -512,7 +512,9 @@ def _verified_book_decision(
     return body
 
 
-def _run_historical(inputs: HistoricalAuthorityInputs) -> _HistoricalState:
+def _run_historical(
+    inputs: HistoricalAuthorityInputs,
+) -> _HistoricalState:
     precommit_payload = _object(
         inputs.causal_precommit_payload, "CAUSAL_PRECOMMIT_NOT_OBJECT"
     )
@@ -529,11 +531,15 @@ def _run_historical(inputs: HistoricalAuthorityInputs) -> _HistoricalState:
         anchors=anchor_plan,
     )
     run_receipt = historical.execute_historical_anchor_run(
-        inputs.context, precommit, inputs.anchor_producers
+        inputs.context,
+        precommit,
+        inputs.anchor_producers,
     )
     if (
         historical.verify_historical_anchor_run_receipt(
-            inputs.context, precommit, run_receipt
+            inputs.context,
+            precommit,
+            run_receipt,
         )
         is not True
     ):
@@ -1269,11 +1275,12 @@ def derive_production_environment_authority(
     if runtime_data_path != configured_data_dir:
         raise ProductionAuthorityBlocked("PIPELINE_CONFIG_DATA_DIR_MISMATCH")
 
-    symbols = tuple(str(value).strip().upper() for value in requested_symbols)
+    symbols = tuple(str(value).strip() for value in requested_symbols)
+    symbol_identities = tuple(value.casefold() for value in symbols)
     if (
         not symbols
         or any(not value for value in symbols)
-        or len(symbols) != len(set(symbols))
+        or len(symbol_identities) != len(set(symbol_identities))
     ):
         raise ProductionAuthorityBlocked("PRODUCTION_SYMBOL_ROSTER_INVALID")
     contract, errors = replay.active_native_portfolio_contract(

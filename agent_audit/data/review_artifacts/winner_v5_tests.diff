@@ -1,0 +1,888 @@
+diff --git a/tests/test_winner_selection.py b/tests/test_winner_selection.py
+new file mode 100644
+index 0000000..8b63e09
+--- /dev/null
++++ b/tests/test_winner_selection.py
+@@ -0,0 +1,882 @@
++from __future__ import annotations
++
++from base64 import b64encode
++from copy import deepcopy
++from datetime import date, datetime, timedelta, timezone
++import hashlib
++import inspect
++import json
++import math
++import tracemalloc
++from typing import Any
++
++import pytest
++from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
++
++import pm_winner_selection as winner
++
++
++def _canonical(value: Any) -> bytes:
++    return json.dumps(
++        value,
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=True,
++        allow_nan=False,
++    ).encode("ascii")
++
++
++def _sha_json(value: Any) -> str:
++    return hashlib.sha256(_canonical(value)).hexdigest()
++
++
++def _sha(label: str) -> str:
++    return hashlib.sha256(label.encode("utf-8")).hexdigest()
++
++
++def _sha1(label: str) -> str:
++    return hashlib.sha1(label.encode("utf-8")).hexdigest()
++
++
++def _iso(moment: datetime) -> str:
++    return (
++        moment.astimezone(timezone.utc)
++        .isoformat(timespec="seconds")
++        .replace("+00:00", "Z")
++    )
++
++
++def _key_material() -> tuple[
++    dict[str, Ed25519PrivateKey], winner.WinnerSelectionTrustBundle
++]:
++    keys = {
++        "precommitment": Ed25519PrivateKey.generate(),
++        "attempt": Ed25519PrivateKey.generate(),
++        "evidence": Ed25519PrivateKey.generate(),
++    }
++    ids = {name: f"external-{name}-authority-v1" for name in keys}
++    public = {
++        name: b64encode(key.public_key().public_bytes_raw()).decode("ascii")
++        for name, key in keys.items()
++    }
++    trust = winner.create_trust_bundle(
++        precommitment_key_id=ids["precommitment"],
++        precommitment_public_key_base64=public["precommitment"],
++        attempt_key_id=ids["attempt"],
++        attempt_public_key_base64=public["attempt"],
++        evidence_key_id=ids["evidence"],
++        evidence_public_key_base64=public["evidence"],
++    )
++    assert trust is not None
++    return keys, trust
++
++
++def _sign(
++    payload: dict[str, Any],
++    private_key: Ed25519PrivateKey,
++    key_id: str,
++    domain: bytes,
++) -> dict[str, Any]:
++    owned = json.loads(_canonical(payload).decode("ascii"))
++    encoded = _canonical(owned)
++    return {
++        "key_id": key_id,
++        "payload": owned,
++        "payload_sha256": hashlib.sha256(encoded).hexdigest(),
++        "signature_base64": b64encode(private_key.sign(domain + encoded)).decode(
++            "ascii"
++        ),
++    }
++
++
++def _attempts() -> list[dict[str, Any]]:
++    definitions = [
++        ("complex-alpha", "trend", 7),
++        ("simple-beta", "trend", 3),
++        ("losing-gamma", "reversion", 2),
++    ]
++    return [
++        {
++            "ordinal": ordinal,
++            "attempt_id": _sha1(f"attempt:{name}"),
++            "process_candidate_id": _sha1(f"process-candidate:{name}"),
++            "strategy_family": family,
++            "strategy_id": name,
++            "parameter_count": parameter_count,
++            "process_sha256": _sha(f"process:{name}"),
++            "horizon_process_sha256": _sha(f"horizon:{name}"),
++            "trial_definition_sha256": _sha(f"trial-definition:{name}"),
++            "refit_recipe_sha256": _sha(f"refit-recipe:{name}"),
++            "source_contract_sha256": _sha("source-contract"),
++            "cost_contract_sha256": _sha("cost-contract"),
++            "cost_stress_contract_sha256": _sha("cost-stress-contract"),
++        }
++        for ordinal, (name, family, parameter_count) in enumerate(definitions)
++    ]
++
++
++def _process_registry(attempts: list[dict[str, Any]]) -> str:
++    return _sha_json(
++        {
++            "processes": [
++                {
++                    "attempt_id": value["attempt_id"],
++                    "process_candidate_id": value["process_candidate_id"],
++                    "process_sha256": value["process_sha256"],
++                    "strategy_family": value["strategy_family"],
++                    "strategy_id": value["strategy_id"],
++                }
++                for value in attempts
++            ]
++        }
++    )
++
++
++def _horizon_registry(attempts: list[dict[str, Any]]) -> str:
++    return _sha_json(
++        {
++            "horizons": [
++                {
++                    "attempt_id": value["attempt_id"],
++                    "horizon_process_sha256": value["horizon_process_sha256"],
++                    "refit_recipe_sha256": value["refit_recipe_sha256"],
++                }
++                for value in attempts
++            ]
++        }
++    )
++
++
++def _trial_registry(attempts: list[dict[str, Any]]) -> str:
++    return _sha_json(
++        {
++            "trials": [
++                {
++                    "attempt_id": value["attempt_id"],
++                    "trial_definition_sha256": value["trial_definition_sha256"],
++                    "parameter_count": value["parameter_count"],
++                }
++                for value in attempts
++            ]
++        }
++    )
++
++
++def _fold(candidate_index: int, fold_index: int) -> dict[str, Any]:
++    start = date(2021 + fold_index, 2, 1)
++    dates = [(start + timedelta(days=index)).isoformat() for index in range(63)]
++    base: list[float] = []
++    for index in range(63):
++        common = 0.055 * math.sin((index + fold_index * 7) * 1.70)
++        paired = 0.012 * math.sin((index + fold_index * 3) * 0.77)
++        if candidate_index == 0:
++            value = 0.105 + common + paired
++        elif candidate_index == 1:
++            value = 0.105 + common - paired
++        else:
++            value = -0.025 + common
++        base.append(round(value, 12))
++    stress = [round(value - 0.015, 12) for value in base]
++    trade_times = [
++        _iso(
++            datetime.combine(
++                start + timedelta(days=index * 6),
++                datetime.min.time(),
++                tzinfo=timezone.utc,
++            )
++            + timedelta(hours=12)
++        )
++        for index in range(10)
++    ]
++    trade_values = [
++        round((0.35 if index % 3 else -0.2) + candidate_index * -0.01, 12)
++        for index in range(10)
++    ]
++    end = start + timedelta(days=62)
++    daily_hash_body = {
++        "daily_dates_utc": dates,
++        "daily_net_mtm_r": base,
++        "daily_net_mtm_r_cost_stress": stress,
++    }
++    trade_hash_body = {
++        "completed_trade_close_utc": trade_times,
++        "completed_trade_net_mtm_r": trade_values,
++    }
++    return {
++        "fold_ordinal": fold_index,
++        "fold_id": _sha1(f"shared-fold:{fold_index}"),
++        "anchor_as_of_utc": _iso(
++            datetime(2021 + fold_index, 1, 31, 23, tzinfo=timezone.utc)
++        ),
++        "oos_start_date_utc": start.isoformat(),
++        "oos_end_date_utc": end.isoformat(),
++        "anchor_selection_receipt_sha256": _sha(
++            f"selection:{candidate_index}:{fold_index}"
++        ),
++        "anchor_horizon_decision_sha256": _sha(
++            f"horizon-decision:{candidate_index}:{fold_index}"
++        ),
++        "anchor_trial_ledger_sha256": _sha(
++            f"anchor-trials:{candidate_index}:{fold_index}"
++        ),
++        "anchor_selected_trial_sha256": _sha(
++            f"anchor-selected-trial:{candidate_index}:{fold_index}"
++        ),
++        "anchor_refit_receipt_sha256": _sha(
++            f"anchor-refit:{candidate_index}:{fold_index}"
++        ),
++        "oos_source_sha256": _sha(f"oos-source:{fold_index}"),
++        "cost_contract_sha256": _sha("cost-contract"),
++        "cost_stress_contract_sha256": _sha("cost-stress-contract"),
++        "daily_axis_kind": "COMPLETE_UTC_CALENDAR_DAY_AXIS",
++        "daily_evidence_kind": "POST_COST_NET_MTM",
++        "daily_unit": "INITIAL_STOP_R",
++        **daily_hash_body,
++        "daily_vector_sha256": _sha_json(daily_hash_body),
++        **trade_hash_body,
++        "trade_vector_sha256": _sha_json(trade_hash_body),
++    }
++
++
++def _base_payloads(
++    symbol: str = "AUDUSD",
++    timeframe: str = "M5",
++    regime: str = "TREND",
++) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
++    attempts = _attempts()
++    run_id = _sha(f"run:{symbol}:{timeframe}:{regime}")
++    cell_id = winner.compute_cell_id(symbol, timeframe, regime)
++    assert cell_id is not None
++    process_registry = _process_registry(attempts)
++    horizon_registry = _horizon_registry(attempts)
++    trial_registry = _trial_registry(attempts)
++    common = {
++        "cell_id": cell_id,
++        "symbol": symbol,
++        "timeframe": timeframe,
++        "regime": regime,
++        "source_contract_sha256": _sha("source-contract"),
++        "cost_contract_sha256": _sha("cost-contract"),
++        "cost_stress_contract_sha256": _sha("cost-stress-contract"),
++        "process_registry_sha256": process_registry,
++        "horizon_registry_sha256": horizon_registry,
++        "trial_registry_sha256": trial_registry,
++    }
++    policy = {
++        "contract_version": winner.PRECOMMITMENT_VERSION,
++        "run_id": run_id,
++        "precommitted_at_utc": "2020-01-01T00:00:00Z",
++        **common,
++        "selection_policy_sha256": winner.PINNED_SELECTION_POLICY_SHA256,
++        "planned_attempt_count": len(attempts),
++    }
++    policy_sha = _sha_json(policy)
++    attempt_ledger = {
++        "contract_version": winner.ATTEMPT_LEDGER_VERSION,
++        "run_id": run_id,
++        "frozen_at_utc": "2020-01-02T00:00:00Z",
++        "precommitment_payload_sha256": policy_sha,
++        **common,
++        "attempt_count": len(attempts),
++        "attempts_sha256": _sha_json(attempts),
++        "attempts": attempts,
++    }
++    attempt_sha = _sha_json(attempt_ledger)
++    entries: list[dict[str, Any]] = []
++    for ordinal, attempt in enumerate(attempts):
++        folds = [_fold(ordinal, fold_index) for fold_index in range(4)]
++        entries.append(
++            {
++                "ordinal": ordinal,
++                "attempt_id": attempt["attempt_id"],
++                "process_candidate_id": attempt["process_candidate_id"],
++                "process_sha256": attempt["process_sha256"],
++                "horizon_process_sha256": attempt["horizon_process_sha256"],
++                "trial_definition_sha256": attempt["trial_definition_sha256"],
++                "refit_recipe_sha256": attempt["refit_recipe_sha256"],
++                "source_contract_sha256": attempt["source_contract_sha256"],
++                "cost_contract_sha256": attempt["cost_contract_sha256"],
++                "cost_stress_contract_sha256": attempt["cost_stress_contract_sha256"],
++                "evidence_status": "AUTHENTICATED",
++                "status_reason": None,
++                "fold_count": len(folds),
++                "folds_sha256": _sha_json(folds),
++                "folds": folds,
++            }
++        )
++    evidence = {
++        "contract_version": winner.EVIDENCE_LEDGER_VERSION,
++        "run_id": run_id,
++        "generated_at_utc": "2025-01-01T00:00:00Z",
++        "precommitment_payload_sha256": policy_sha,
++        "attempt_ledger_payload_sha256": attempt_sha,
++        **common,
++        "attempt_count": len(attempts),
++        "entries_sha256": _sha_json(entries),
++        "entries": entries,
++        "evidence_scope": "PROCESS_LEVEL_ONLY",
++        "parameter_evidence_inherited": False,
++    }
++    return policy, attempt_ledger, evidence
++
++
++def _signed_request(
++    symbol: str = "AUDUSD",
++    timeframe: str = "M5",
++    regime: str = "TREND",
++    key_material: tuple[dict[str, Ed25519PrivateKey], winner.WinnerSelectionTrustBundle]
++    | None = None,
++) -> tuple[
++    dict[str, Any], winner.WinnerSelectionTrustBundle, dict[str, Ed25519PrivateKey]
++]:
++    keys, trust = key_material or _key_material()
++    policy, attempts, evidence = _base_payloads(symbol, timeframe, regime)
++    request = {
++        "precommitment_envelope": _sign(
++            policy,
++            keys["precommitment"],
++            trust.precommitment_key_id,
++            winner.PRECOMMITMENT_SIGNATURE_DOMAIN,
++        ),
++        "attempt_ledger_envelope": _sign(
++            attempts,
++            keys["attempt"],
++            trust.attempt_key_id,
++            winner.ATTEMPT_SIGNATURE_DOMAIN,
++        ),
++        "evidence_ledger_envelope": _sign(
++            evidence,
++            keys["evidence"],
++            trust.evidence_key_id,
++            winner.EVIDENCE_SIGNATURE_DOMAIN,
++        ),
++    }
++    return request, trust, keys
++
++
++def _resign_evidence(
++    request: dict[str, Any],
++    trust: winner.WinnerSelectionTrustBundle,
++    keys: dict[str, Ed25519PrivateKey],
++) -> None:
++    payload = request["evidence_ledger_envelope"]["payload"]
++    request["evidence_ledger_envelope"] = _sign(
++        payload,
++        keys["evidence"],
++        trust.evidence_key_id,
++        winner.EVIDENCE_SIGNATURE_DOMAIN,
++    )
++
++
++def test_valid_exact_evidence_selects_simplest_indistinguishable_process() -> None:
++    request, trust, _ = _signed_request()
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY", (
++        decision.reason_codes
++    )
++    assert (
++        decision.winner_process_candidate_id == _attempts()[1]["process_candidate_id"]
++    )
++    assert winner.verify_historical_cell_winner_decision(decision, trust)
++    body = decision.to_dict()
++    assert decision.selection_scope == "OFFLINE_BOOK_SELECTION"
++    assert body["selection_scope"] == winner.WINNER_SELECTION_SCOPE
++    assert body["live_authorized"] is False
++    assert body["capital_sizing_authorized"] is False
++    assert body["profitability_claimed"] is False
++    assert body["parameter_evidence_inherited"] is False
++    marginal = winner.historical_book_marginal_receipt(decision, trust)
++    assert marginal is not None
++    assert (
++        marginal["p_value_contract_sha256"]
++        == winner.PINNED_BOOK_P_VALUE_CONTRACT_SHA256
++    )
++    assert marginal["within_cell_attempted_trials_exact"] == 3
++    assert marginal["effective_trials"] == 3.0
++    assert marginal["within_cell_multiplicity_adjusted"] is True
++    assert marginal["parameter_evidence_inherited"] is False
++    assert 0.0 <= marginal["marginal_p_value"] <= 0.05
++    assert marginal["upstream_evidence_receipt_sha256"] == decision.receipt_sha256
++    forbidden = {
++        "current_refit_candidate_id",
++        "parameters_sha256",
++        "upstream_refit_receipt_sha256",
++        "refit_as_of_utc",
++    }
++    assert forbidden.isdisjoint(marginal)
++    assert "current_refit_envelope_sha256" not in body
++    assert set(body["authenticated_request"]) == {
++        "precommitment_envelope",
++        "attempt_ledger_envelope",
++        "evidence_ledger_envelope",
++    }
++
++
++def test_per_fold_hac_lcbs_are_diagnostics_not_hidden_admission_gates() -> None:
++    """A real moderate edge must not pass four extra significance tests.
++
++    Four 63-day folds with true mean 0.02R/day and sinusoidal 0.15R noise
++    clear the frozen overall attempt-aware DSR gate, every base/stress fold
++    mean is positive, but at least one individual fold HAC LCB is negative.
++    The old undeclared conjunction rejected this otherwise admissible process.
++    """
++
++    request, trust, keys = _signed_request()
++    evidence = request["evidence_ledger_envelope"]["payload"]
++    entries = evidence["entries"]
++    for fold_index, fold in enumerate(entries[0]["folds"]):
++        base = [
++            round(
++                0.02 + 0.15 * math.sin((index + fold_index * 7) * 1.70),
++                12,
++            )
++            for index in range(63)
++        ]
++        stress = [round(value - 0.005, 12) for value in base]
++        fold["daily_net_mtm_r"] = base
++        fold["daily_net_mtm_r_cost_stress"] = stress
++        fold["daily_vector_sha256"] = _sha_json(
++            {
++                "daily_dates_utc": fold["daily_dates_utc"],
++                "daily_net_mtm_r": base,
++                "daily_net_mtm_r_cost_stress": stress,
++            }
++        )
++    entries[0]["folds_sha256"] = _sha_json(entries[0]["folds"])
++    for entry in entries[1:]:
++        entry["evidence_status"] = "PROCESS_REJECTED"
++        entry["status_reason"] = "PREREGISTERED_PROCESS_SCREEN_REJECTED"
++        entry["fold_count"] = 0
++        entry["folds"] = []
++        entry["folds_sha256"] = _sha_json([])
++    evidence["entries_sha256"] = _sha_json(entries)
++    _resign_evidence(request, trust, keys)
++
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY", (
++        decision.reason_codes
++    )
++    summary = decision.to_dict()["candidate_summaries"][0]
++    assert summary["admissible"] is True
++    assert summary["within_cell_adjusted_p_value"] <= 0.05
++    assert summary["worst_fold_mean_daily_r"] > 0.0
++    assert summary["newest_fold_mean_daily_r"] > 0.0
++    assert summary["cost_stress_worst_fold_mean_daily_r"] > 0.0
++    assert summary["cost_stress_newest_fold_mean_daily_r"] > 0.0
++    assert summary["worst_fold_hac_lcb_daily_r"] < 0.0
++    assert summary["cost_stress_worst_fold_hac_lcb_daily_r"] < 0.0
++    assert not any("HAC_LCB" in code for code in summary["admissibility_failures"])
++
++
++def test_fold_lcb_false_negative_power_regression_is_pinned() -> None:
++    """Document the false-negative rate avoided by the V5 selector."""
++
++    def normal_cdf(value: float) -> float:
++        return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
++
++    def simultaneous_power(annual_sharpe: float, fold_days: int) -> float:
++        per_fold = normal_cdf(
++            annual_sharpe * math.sqrt(fold_days / 252.0) - 1.6448536269514722
++        )
++        return per_fold**4
++
++    assert simultaneous_power(1.0, 63) == pytest.approx(0.000253, abs=1e-6)
++    assert simultaneous_power(2.0, 63) == pytest.approx(0.004535, abs=1e-6)
++    assert simultaneous_power(1.0, 252) == pytest.approx(0.004535, abs=1e-6)
++    assert simultaneous_power(2.0, 252) == pytest.approx(0.166476, abs=1e-6)
++
++    policy = winner.pinned_policy_snapshot()
++    assert policy["per_fold_hac_lcb_gate"] is False
++    assert set(policy["diagnostic_only_fields"]) == {
++        "worst_fold_hac_lcb_daily_r",
++        "newest_fold_hac_lcb_daily_r",
++        "cost_stress_worst_fold_hac_lcb_daily_r",
++        "cost_stress_newest_fold_hac_lcb_daily_r",
++        "tail_cvar_daily_r",
++        "max_path_drawdown_r",
++        "cost_stress_tail_cvar_daily_r",
++        "cost_stress_max_path_drawdown_r",
++    }
++
++
++def test_risk_metrics_do_not_become_unauthenticated_numeric_admission_oracles() -> None:
++    request, trust, keys = _signed_request()
++    evidence = request["evidence_ledger_envelope"]["payload"]
++    entries = evidence["entries"]
++    for fold_index, fold in enumerate(entries[0]["folds"]):
++        base = [
++            round(2.0 + 0.1 * math.sin((index + fold_index * 7) * 1.70), 12)
++            for index in range(63)
++        ]
++        if fold_index == 0:
++            base[:13] = [-4.0] * 13
++        stress = [round(value - 0.01, 12) for value in base]
++        fold["daily_net_mtm_r"] = base
++        fold["daily_net_mtm_r_cost_stress"] = stress
++        fold["daily_vector_sha256"] = _sha_json(
++            {
++                "daily_dates_utc": fold["daily_dates_utc"],
++                "daily_net_mtm_r": base,
++                "daily_net_mtm_r_cost_stress": stress,
++            }
++        )
++    entries[0]["folds_sha256"] = _sha_json(entries[0]["folds"])
++    for entry in entries[1:]:
++        entry["evidence_status"] = "PROCESS_REJECTED"
++        entry["status_reason"] = "PREREGISTERED_PROCESS_SCREEN_REJECTED"
++        entry["fold_count"] = 0
++        entry["folds"] = []
++        entry["folds_sha256"] = _sha_json([])
++    evidence["entries_sha256"] = _sha_json(entries)
++    _resign_evidence(request, trust, keys)
++
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY", (
++        decision.reason_codes
++    )
++    summary = decision.to_dict()["candidate_summaries"][0]
++    assert summary["admissible"] is True
++    assert summary["tail_cvar_daily_r"] < -3.0
++    assert summary["max_path_drawdown_r"] > 20.0
++    assert summary["cost_stress_tail_cvar_daily_r"] < -3.0
++    assert summary["cost_stress_max_path_drawdown_r"] > 20.0
++    assert not any(
++        "TAIL_CVAR" in code or "DRAWDOWN" in code
++        for code in summary["admissibility_failures"]
++    )
++
++
++def test_positive_overall_edge_with_negative_newest_fold_still_fails() -> None:
++    """Restoring power must not erase the precommitted recency guard."""
++
++    request, trust, keys = _signed_request()
++    evidence = request["evidence_ledger_envelope"]["payload"]
++    entries = evidence["entries"]
++    fold_means = (0.08, 0.08, 0.08, -0.01)
++    for fold_index, fold in enumerate(entries[0]["folds"]):
++        base = [
++            round(
++                fold_means[fold_index]
++                + 0.05 * math.sin((index + fold_index * 7) * 1.70),
++                12,
++            )
++            for index in range(63)
++        ]
++        stress = [round(value - 0.005, 12) for value in base]
++        fold["daily_net_mtm_r"] = base
++        fold["daily_net_mtm_r_cost_stress"] = stress
++        fold["daily_vector_sha256"] = _sha_json(
++            {
++                "daily_dates_utc": fold["daily_dates_utc"],
++                "daily_net_mtm_r": base,
++                "daily_net_mtm_r_cost_stress": stress,
++            }
++        )
++    entries[0]["folds_sha256"] = _sha_json(entries[0]["folds"])
++    for entry in entries[1:]:
++        entry["evidence_status"] = "PROCESS_REJECTED"
++        entry["status_reason"] = "PREREGISTERED_PROCESS_SCREEN_REJECTED"
++        entry["fold_count"] = 0
++        entry["folds"] = []
++        entry["folds_sha256"] = _sha_json([])
++    evidence["entries_sha256"] = _sha_json(entries)
++    _resign_evidence(request, trust, keys)
++
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "NO_PROCESS_WINNER"
++    summary = decision.to_dict()["candidate_summaries"][0]
++    assert summary["mean_daily_r"] > 0.0
++    assert summary["within_cell_adjusted_p_value"] <= 0.05
++    assert summary["newest_fold_mean_daily_r"] < 0.0
++    assert "NONPOSITIVE_NEWEST_FOLD" in summary["admissibility_failures"]
++    assert "COST_STRESS_NONPOSITIVE_NEWEST_FOLD" in summary["admissibility_failures"]
++
++
++def test_decision_is_immutable_and_requires_exact_trust_bundle() -> None:
++    request, trust, _ = _signed_request()
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    with pytest.raises(AttributeError):
++        decision._body_json = b"{}"  # type: ignore[misc]
++    _, other_trust = _key_material()
++    assert not winner.verify_historical_cell_winner_decision(decision, other_trust)
++    assert winner.book_marginal_receipt(decision, other_trust) is None
++
++
++def test_scalar_metric_fabrication_is_not_an_accepted_evidence_language() -> None:
++    request, trust, keys = _signed_request()
++    fold = request["evidence_ledger_envelope"]["payload"]["entries"][0]["folds"][0]
++    fold["claimed_sharpe"] = 999.0
++    entries = request["evidence_ledger_envelope"]["payload"]["entries"]
++    entries[0]["folds_sha256"] = _sha_json(entries[0]["folds"])
++    request["evidence_ledger_envelope"]["payload"]["entries_sha256"] = _sha_json(
++        entries
++    )
++    _resign_evidence(request, trust, keys)
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "REJECTED"
++    assert "SCHEMA_INVALID" in decision.reason_codes[0]
++
++
++def test_authenticated_missing_attempt_cannot_hide_multiplicity() -> None:
++    request, trust, keys = _signed_request()
++    evidence = request["evidence_ledger_envelope"]["payload"]
++    evidence["entries"].pop()
++    evidence["entries_sha256"] = _sha_json(evidence["entries"])
++    _resign_evidence(request, trust, keys)
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "REJECTED"
++    assert decision.reason_codes == ("EVIDENCE_ATTEMPT_ROSTER_INCOMPLETE",)
++
++
++def test_historical_api_rejects_current_refit_and_is_deterministic() -> None:
++    request, trust, _ = _signed_request()
++    baseline = winner.evaluate_historical_cell_winner(request, trust)
++    replay = winner.evaluate_historical_cell_winner(deepcopy(request), trust)
++    assert replay.receipt_sha256 == baseline.receipt_sha256
++    assert replay.to_dict() == baseline.to_dict()
++
++    injected = deepcopy(request)
++    injected["current_refit_envelope"] = {"attacker": "current-state-bytes"}
++    rejected = winner.evaluate_historical_cell_winner(injected, trust)
++    assert rejected.status == "REJECTED"
++    assert rejected.reason_codes == ("REQUEST_SCHEMA_INVALID",)
++
++
++def test_legacy_noncausal_api_names_fail_closed() -> None:
++    request, trust, _ = _signed_request()
++    historical = winner.evaluate_historical_cell_winner(request, trust)
++    assert winner.verify_historical_cell_winner_decision(historical, trust)
++
++    legacy = winner.evaluate_cell_winner(request, trust)
++    assert legacy.status == "REJECTED"
++    assert legacy.reason_codes == ("LEGACY_NONCAUSAL_API_DISABLED",)
++    assert not winner.verify_winner_selection_decision(historical, trust)
++    assert not winner.verify_winner_selection_decision(legacy, trust)
++
++
++@pytest.mark.parametrize("distortion", ["unit", "horizon"])
++def test_authenticated_unit_or_horizon_distortion_fails_closed(distortion: str) -> None:
++    request, trust, keys = _signed_request()
++    evidence = request["evidence_ledger_envelope"]["payload"]
++    if distortion == "unit":
++        evidence["entries"][1]["folds"][0]["daily_unit"] = "PERCENT_RETURN"
++        evidence["entries"][1]["folds_sha256"] = _sha_json(
++            evidence["entries"][1]["folds"]
++        )
++    else:
++        evidence["entries"][1]["horizon_process_sha256"] = _sha("substituted-horizon")
++    evidence["entries_sha256"] = _sha_json(evidence["entries"])
++    _resign_evidence(request, trust, keys)
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "REJECTED"
++    assert any(
++        token in decision.reason_codes[0]
++        for token in ("DAILY_UNIT_INVALID", "HORIZON_PROCESS_SHA256_MISMATCH")
++    )
++
++
++def test_signature_splicing_and_unsigned_tampering_fail_closed() -> None:
++    request, trust, _ = _signed_request()
++    spliced = deepcopy(request)
++    spliced["evidence_ledger_envelope"] = deepcopy(spliced["attempt_ledger_envelope"])
++    assert winner.evaluate_historical_cell_winner(spliced, trust).status == "REJECTED"
++    tampered = deepcopy(request)
++    tampered["evidence_ledger_envelope"]["payload"]["entries"][0]["folds"][0][
++        "daily_net_mtm_r"
++    ][0] = 49.0
++    assert winner.evaluate_historical_cell_winner(tampered, trust).status == "REJECTED"
++
++
++def test_technical_failure_is_infrastructure_rejection_not_no_trade() -> None:
++    request, trust, keys = _signed_request()
++    evidence = request["evidence_ledger_envelope"]["payload"]
++    entry = evidence["entries"][2]
++    entry["evidence_status"] = "TECHNICAL_FAILURE"
++    entry["status_reason"] = "EVALUATOR_TECHNICAL_FAILURE"
++    entry["folds"] = []
++    entry["fold_count"] = 0
++    entry["folds_sha256"] = _sha_json([])
++    evidence["entries_sha256"] = _sha_json(evidence["entries"])
++    _resign_evidence(request, trust, keys)
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    assert decision.status == "REJECTED"
++    assert decision.reason_codes == ("ATTEMPT_EVIDENCE_INCOMPLETE_TECHNICAL_FAILURE",)
++
++
++def test_v5_public_offline_apis_have_no_dependency_injection_surface() -> None:
++    expected = {
++        "evaluate_historical_cell_winner": ("request", "trust_bundle"),
++        "verify_historical_cell_winner_decision": ("decision", "trust_bundle"),
++        "evaluate_cell_winner": ("request", "trust_bundle"),
++        "book_marginal_receipt": ("decision", "trust_bundle"),
++        "historical_book_marginal_receipt": ("decision", "trust_bundle"),
++    }
++    assert winner.WINNER_SELECTION_CONTRACT_VERSION == "fxpm.winner-selection.v5"
++    assert winner.WINNER_SELECTION_SCOPE == "OFFLINE_BOOK_SELECTION"
++    for name, parameter_names in expected.items():
++        function = getattr(winner, name)
++        signature = inspect.signature(function)
++        assert tuple(signature.parameters) == parameter_names
++        assert function.__defaults__ is None
++        assert function.__kwdefaults__ is None
++        assert all(
++            parameter.kind
++            in {
++                inspect.Parameter.POSITIONAL_ONLY,
++                inspect.Parameter.POSITIONAL_OR_KEYWORD,
++            }
++            for parameter in signature.parameters.values()
++        )
++
++
++def test_public_apis_reject_hidden_dependency_keywords() -> None:
++    request, trust, _ = _signed_request()
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    with pytest.raises(TypeError):
++        winner.evaluate_historical_cell_winner(request, trust, _impl=lambda: None)
++    with pytest.raises(TypeError):
++        winner.verify_historical_cell_winner_decision(
++            decision,
++            trust,
++            _impl=lambda: True,
++        )
++    with pytest.raises(TypeError):
++        winner.book_marginal_receipt(decision, trust, _impl=lambda: {})
++    with pytest.raises(TypeError):
++        winner.historical_book_marginal_receipt(decision, trust, _impl=lambda: {})
++    with pytest.raises(TypeError):
++        winner.evaluate_cell_winner(request, trust, _reject=lambda: None)
++
++
++def test_local_result_scope_documents_the_same_process_trust_boundary() -> None:
++    """Same-process code mutation is outside the isolated-user threat model.
++
++    The enforceable boundary here is semantic: this local result can feed the
++    historical Book, but contains no capital, funded-live, promotion, final
++    process, or profitability authorization.  Downstream gates own those
++    decisions.
++    """
++
++    request, trust, _ = _signed_request()
++    decision = winner.evaluate_historical_cell_winner(request, trust)
++    body = decision.to_dict()
++    assert decision.selection_scope == "OFFLINE_BOOK_SELECTION"
++    assert body["selection_scope"] == winner.WINNER_SELECTION_SCOPE
++    assert body["validated"] is True
++    assert body["live_authorized"] is False
++    assert body["capital_sizing_authorized"] is False
++    assert body["profitability_claimed"] is False
++    assert body["production_integrated"] is False
++    assert "authority_scope" not in body
++    assert "verified" not in body
++
++
++def test_no_output_signer_or_promotion_api_is_exposed() -> None:
++    forbidden = {
++        "sign_winner_selection_decision",
++        "issue_live_winner",
++        "authorize_capital",
++        "authorize_promotion",
++        "promote_winner",
++    }
++    assert forbidden.isdisjoint(set(winner.__all__))
++    assert all(not hasattr(winner, name) for name in forbidden)
++
++
++def test_attempt_multiplicity_penalizes_identical_statistical_evidence() -> None:
++    values = [0.03 + 0.08 * math.sin(index * 1.7) for index in range(4 * 63)]
++    effective = winner._fold_aware_inference(
++        [values[index : index + 63] for index in range(0, len(values), 63)]
++    )["ess"]
++    one_attempt = winner._one_sided_dsr_p(values, effective, 1)
++    many_attempts = winner._one_sided_dsr_p(values, effective, 128)
++    assert 0.0 <= one_attempt < many_attempts <= 1.0
++
++
++def test_pareto_rule_does_not_turn_metric_tradeoffs_into_a_score() -> None:
++    baseline = {
++        **{field: 1.0 for field in winner._PARETO_HIGHER_FIELDS},
++        **{field: 1.0 for field in winner._PARETO_LOWER_FIELDS},
++    }
++    true_dominator = deepcopy(baseline)
++    true_dominator[winner._PARETO_HIGHER_FIELDS[0]] = 1.1
++    assert winner._metric_pareto_better(true_dominator, baseline)
++
++    tradeoff = deepcopy(baseline)
++    tradeoff[winner._PARETO_HIGHER_FIELDS[0]] = 2.0
++    tradeoff[winner._PARETO_LOWER_FIELDS[0]] = 2.0
++    assert not winner._metric_pareto_better(tradeoff, baseline)
++    assert not winner._metric_pareto_better(baseline, tradeoff)
++
++
++@pytest.mark.parametrize("nonfinite", [math.nan, math.inf, -math.inf])
++def test_nonfinite_request_numbers_fail_before_evaluation(nonfinite: float) -> None:
++    _, trust, _ = _signed_request()
++    decision = winner.evaluate_historical_cell_winner({"value": nonfinite}, trust)
++    assert decision.status == "REJECTED"
++    assert decision.reason_codes == ("NON_FINITE_JSON_NUMBER",)
++
++
++def test_cyclic_deep_wide_and_huge_inputs_are_total_and_bounded() -> None:
++    _, trust, _ = _signed_request()
++    cyclic: dict[str, Any] = {}
++    cyclic["self"] = cyclic
++    deep: dict[str, Any] = {}
++    cursor = deep
++    for _ in range(40):
++        child: dict[str, Any] = {}
++        cursor["next"] = child
++        cursor = child
++    wide = {str(index): index for index in range(winner.MAX_CONTAINER_ITEMS + 1)}
++    huge = {"blob": "x" * (winner.MAX_STRING_CHARS + 1)}
++    tracemalloc.start()
++    try:
++        for hostile in (cyclic, deep, wide, huge):
++            decision = winner.evaluate_historical_cell_winner(hostile, trust)
++            assert decision.status == "REJECTED"
++            assert not winner.verify_historical_cell_winner_decision(decision, trust)
++        _, peak = tracemalloc.get_traced_memory()
++    finally:
++        tracemalloc.stop()
++    assert peak < 80 * 1024 * 1024
++
++
++def test_public_helpers_are_total_on_hostile_types() -> None:
++    assert winner.compute_cell_id([], "M5", "TREND") is None
++    assert (
++        winner.create_trust_bundle(
++            precommitment_key_id=[],
++            precommitment_public_key_base64="",
++            attempt_key_id="a",
++            attempt_public_key_base64="",
++            evidence_key_id="b",
++            evidence_public_key_base64="",
++            current_refit_key_id="c",
++            current_refit_public_key_base64="",
++        )
++        is None
++    )
++    request, trust, _ = _signed_request()
++    rejected = winner.evaluate_historical_cell_winner(object(), trust)
++    assert rejected.status == "REJECTED"
++    assert not winner.verify_historical_cell_winner_decision(object(), trust)
++    assert winner.book_marginal_receipt(object(), trust) is None
++
++    legacy = winner.evaluate_cell_winner(request, trust)
++    assert legacy.reason_codes == ("LEGACY_NONCAUSAL_API_DISABLED",)
++    assert not winner.verify_winner_selection_decision(object(), trust)
++
++
++@pytest.mark.parametrize(
++    "name",
++    [
++        "CurrentRefitBindingDecision",
++        "CurrentRefitBindingTrustBundle",
++        "bind_current_refits_after_book",
++        "create_current_refit_binding_trust_bundle",
++        "verify_current_refit_binding_decision",
++    ],
++)
++def test_post_book_refit_authority_is_not_exposed(name: str) -> None:
++    assert not hasattr(winner, name)
++    assert name not in winner.__all__

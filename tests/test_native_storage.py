@@ -659,9 +659,10 @@ def test_deterministic_selection_and_admission_retire_only_complete_runs(tmp_pat
         max_complete_hot_runs=1,
         max_inflight_runs=2,
     )
-    decision = admit_native_run(
+    reservation = admit_native_run(
         native,
         cold,
+        "next-run",
         expected_growth_bytes=1,
         expected_growth_files=1,
         policy=policy,
@@ -669,7 +670,9 @@ def test_deterministic_selection_and_admission_retire_only_complete_runs(tmp_pat
         max_retirements=1,
         filesystem_free_bytes=64 * 1024 * 1024,
     )
-    assert decision.allowed
+    assert reservation["run_id"] == "next-run"
+    assert reservation["expected_growth_bytes"] == 1
+    assert reservation["expected_growth_files"] == 1
     assert not (native / "runs" / "z-run").exists()
     assert incomplete.is_dir()
 

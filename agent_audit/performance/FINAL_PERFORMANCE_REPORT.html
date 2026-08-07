@@ -1,0 +1,759 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Final Performance Implementation Report</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --paper: #ffffff;
+  --ink: #111827;
+  --muted: #4b5563;
+  --line: #d9dee8;
+  --soft: #f8fafc;
+  --accent: #1f6feb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", Inter, Arial, sans-serif;
+  line-height: 1.58;
+}
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+article {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 34px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: auto;
+}
+h1, h2, h3, h4 {
+  line-height: 1.22;
+  margin: 1.5em 0 0.55em;
+}
+h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.1em;
+  font-size: 1.45rem;
+}
+h3 {
+  font-size: 1.13rem;
+}
+p {
+  margin: 0.75em 0;
+}
+ul, ol {
+  padding-left: 1.45rem;
+}
+li + li {
+  margin-top: 0.25rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.35rem;
+  font-size: 0.91rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #eef3f8;
+  font-weight: 650;
+}
+tr:nth-child(even) td {
+  background: var(--soft);
+}
+code {
+  background: #edf2f7;
+  border: 1px solid #d8e0ea;
+  border-radius: 4px;
+  padding: 0.08rem 0.28rem;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.92em;
+}
+pre {
+  overflow-x: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+a {
+  color: var(--accent);
+}
+blockquote {
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+</style>
+</head>
+<body>
+<main>
+<article>
+<h1>Final Performance Implementation Report</h1>
+<h2>Post-Optimization Update: 2026-06-19</h2>
+<p>The operator reported that optimization is complete. Codex reran the corrected current-book inventory, shadow-selection audit, and all-promoted replay.</p>
+<p>The current <code>pm_configs.json</code> now contains 117 logical promoted cells, not the prior one-cell interim ledger. The all-promoted USD 10,000 replay completed 117 rows:</p>
+<ul>
+<li>79 positive rows and 38 negative rows.</li>
+<li>38 rows have PF below 1.0.</li>
+<li>Aggregate net replay sum: <code>4,529,727.86</code>.</li>
+<li>Aggregate net replay sum excluding <code>PALLADIUM</code>: <code>2,443,636.25</code>.</li>
+<li>Median PF: <code>1.10</code>.</li>
+<li>Worst confirmed rows include <code>ETHUSD M5 TREND DayOfWeekBiasStrategy</code> at <code>-94.86%</code>, <code>EURJPY M30 RANGE ZScoreVWAPReversionStrategy</code> at <code>-91.58%</code>, and <code>USDJPY M30 TREND KeltnerFadeStrategy</code> at <code>-67.84%</code>.</li>
+<li><code>PALLADIUM H4 StochasticReversalStrategy</code> used a default instrument spec and must be replayed with broker specs before its large positive result is trusted.</li>
+</ul>
+<p>Deployment verdict: the completed book is materially better than the one-winner interim state, but it is still not cleanly live-ready. Before live use, verify missing instrument specs, decide whether <code>PROMOTE_SMALL</code> cells are eligible for live execution, quarantine replay-negative cells with PF below 1.0/severe drawdown, and run live readiness/preflight on the completed book.</p>
+<p>Detailed status: <code>agent_audit/performance/POST_OPTIMIZATION_STATUS.md</code>.</p>
+<h2>1. Executive Outcome</h2>
+<h3>What was implemented</h3>
+<ul>
+<li>PERF-FIX-001: per-trade MAE/MFE instrumentation in both <code>pm_core._backtest_loop_numba</code> and <code>pm_core.Backtester._run_python_loop</code>.</li>
+<li>PERF-FIX-002: expected-versus-filled live entry slippage attribution in <code>pm_main.LiveTrader._execute_entry</code>.</li>
+<li>PERF-FIX-003: dashboard no-loss profit factor sentinel fixed in <code>pm_dashboard.analytics.compute_performance_metrics</code>.</li>
+<li>PERF-FIX-004: schema-version metadata added to new backtest trade records and live actionable records.</li>
+<li>PERF-FIX-005: shared metric contract added for profit factor, return/drawdown, Calmar basis, annualized Calmar companion, and benchmark recovery factor.</li>
+<li>PERF-FIX-006: live-readiness min-lot tradeability checks and <code>--preflight</code> mode added.</li>
+<li>PERF-FIX-007: bounded promoted-cell replay and shadow-selection audit tooling added.</li>
+<li>PERF-FIX-007 correction: Claude found the replay enumerator could skip symbol-level promoted winners; Codex fixed it and added regression tests.</li>
+</ul>
+<h3>Superseded 2026-06-18 production-ledger conclusion</h3>
+<p>This section described the 2026-06-18 interim ledger before the operator reported optimization completion. It is preserved as audit history, not as the current book. The current book is summarized in the 2026-06-19 post-optimization update above.</p>
+<p>At that earlier point, <code>pm_configs.json</code> was not the same ledger that produced the "157 tradeable cells" evidence. Claude's decisive review and Codex's direct tally agreed:</p>
+<ul>
+<li>Symbol-level statuses: 96 <code>NO_TRADE</code>, 3 <code>BLOCKED</code>, 1 <code>PROMOTED</code>.</li>
+<li>Regime-leaf statuses: 2387 <code>NO_TRADE</code>, 12 <code>BLOCKED</code>, 1 <code>PROMOTED</code>.</li>
+<li>Logical promoted live book: exactly one winner, <code>FORD H4 CHOP DoubleEMATrendStrategy</code>.</li>
+<li>Corrected $10k replay: 166 trades, net <code>-2317.84</code>, return <code>-23.18%</code>, max DD <code>24.88%</code>, PF <code>0.66</code>, avg MAE <code>0.7394R</code>.</li>
+</ul>
+<p>Historical recommendation at that point: do not run live on that interim ledger. That condition has now been superseded by the completed 117-cell post-optimization replay.</p>
+<h3>What improved</h3>
+<ul>
+<li>The system can now distinguish high-MAE/high-recovery trades from high-MAE/bad-risk trades after replay.</li>
+<li>Live/actionable logs can now identify adverse entry slippage in pips and R.</li>
+<li>Profitable no-loss dashboard samples no longer display as PF <code>0.0</code>.</li>
+<li>New artifacts are versioned so old missing fields are not misread as zero MAE/MFE or zero slippage.</li>
+<li>Calmar-like reporting now states its basis instead of silently presenting cumulative return/DD as annualized Calmar.</li>
+<li>Live readiness can now warn when broker min-lot geometry exceeds target risk and block when it exceeds hard cap.</li>
+<li>Replay/shadow tooling now enumerates symbol-level and regime-leaf promoted winners consistently.</li>
+</ul>
+<h3>What did not improve yet</h3>
+<ul>
+<li>No strategy entry/exit behavior was changed.</li>
+<li>No optimizer objective was changed.</li>
+<li>No full optimization or balance sweep was run.</li>
+<li>No live trade was placed.</li>
+<li>Net profit was not improved by the implemented fixes; these are correctness, readiness, and evidence-generation changes that expose the current selection problem.</li>
+</ul>
+<h2>2. Canonical Baseline</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Starting balance</td>
+<td>USD 10,000</td>
+</tr>
+<tr>
+<td>Balance sweep</td>
+<td>Not run</td>
+</tr>
+<tr>
+<td>Full optimizer</td>
+<td>Not run</td>
+</tr>
+<tr>
+<td>Live trade</td>
+<td>Not placed</td>
+</tr>
+<tr>
+<td>Current ledger inventory</td>
+<td><code>agent_audit/performance/data/current_ledger_inventory.json</code></td>
+</tr>
+<tr>
+<td>Current promoted cells</td>
+<td><code>agent_audit/performance/data/current_promoted_cells.csv</code></td>
+</tr>
+<tr>
+<td>Config hash</td>
+<td>See <code>agent_audit/performance/baseline_10000_summary.json</code></td>
+</tr>
+<tr>
+<td>Costs</td>
+<td>Current config: spread on, slippage on, commission on, <code>backtest_spread_mode=conservative_max</code></td>
+</tr>
+<tr>
+<td>Risk</td>
+<td>Current config fingerprints recorded; no risk lowering was performed</td>
+</tr>
+<tr>
+<td>Current live book</td>
+<td>1 logical promoted winner, not 157</td>
+</tr>
+<tr>
+<td>Historical anatomy source</td>
+<td><code>agent_audit/data/ledger_tradeable_cells.csv</code>, 157 rows from the previous ledger state</td>
+</tr>
+<tr>
+<td>Optuna settings</td>
+<td>No Optuna run; no search-space or objective change</td>
+</tr>
+<tr>
+<td>Numba settings</td>
+<td>Compiled path preserved; legacy return indices 0-15 retained; MAE/MFE arrays appended 16-24</td>
+</tr>
+</tbody>
+</table>
+<p>Machine-readable baseline: <code>agent_audit/performance/baseline_10000_summary.json</code>.</p>
+<h2>3. Existing Recommendation Triage</h2>
+<p>Full triage is in <code>agent_audit/performance/RECOMMENDATION_TRIAGE.md</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Examples</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ALREADY IMPLEMENTED</td>
+<td>MAE/MFE capture; expected-vs-fill entry slippage; dashboard no-loss PF; canonical metric contract; live min-lot tradeability preflight; bounded replay/shadow tooling</td>
+</tr>
+<tr>
+<td>KEEP NOW</td>
+<td>Corrected current-ledger replay; validation trade-count floor study; objective de-biasing study</td>
+</tr>
+<tr>
+<td>KEEP BUT REFRAME</td>
+<td>High-risk/account-size guidance as performance/correctness evidence, not risk reduction for its own sake</td>
+</tr>
+<tr>
+<td>DEFER</td>
+<td>Account-size regimes, balance-tiered symbol suppression, broad capital-preservation mode</td>
+</tr>
+<tr>
+<td>REJECT</td>
+<td>Balance sweep, full optimization, live trading, production credential edits in this phase</td>
+</tr>
+<tr>
+<td>NEEDS EVIDENCE</td>
+<td>MAE/MFE gates, trailing exits, stability multiplier removal, strategy family TP/exit changes</td>
+</tr>
+</tbody>
+</table>
+<h2>4. Strategy Profit Anatomy</h2>
+<p>Generated files live under <code>agent_audit/performance/strategy_anatomy/</code>.</p>
+<p>Important caveat: the 42 strategy-family anatomy files are generated from <code>agent_audit/data/ledger_tradeable_cells.csv</code>, which is historical evidence from the previous ledger state. They remain useful for code/methodology review, but they are not the current production live book.</p>
+<p>The current production live book is represented by:</p>
+<ul>
+<li><code>agent_audit/performance/data/current_ledger_inventory.json</code></li>
+<li><code>agent_audit/performance/data/current_promoted_cells.csv</code></li>
+<li><code>agent_audit/performance/data/promoted_winner_replay_all_10000.csv</code></li>
+</ul>
+<p>Current promoted winner:</p>
+<table>
+<thead>
+<tr>
+<th>Symbol</th>
+<th>TF</th>
+<th>Regime</th>
+<th>Strategy</th>
+<th>Promotion Source</th>
+<th style="text-align: right;">Val Trades</th>
+<th style="text-align: right;">Val PF</th>
+<th style="text-align: right;">Replay Trades</th>
+<th style="text-align: right;">Replay PF</th>
+<th style="text-align: right;">Replay Return</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FORD</td>
+<td>H4</td>
+<td>CHOP</td>
+<td>DoubleEMATrendStrategy</td>
+<td>symbol_and_regime</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1.77</td>
+<td style="text-align: right;">166</td>
+<td style="text-align: right;">0.66</td>
+<td style="text-align: right;">-23.18%</td>
+</tr>
+</tbody>
+</table>
+<h2>5. High-Drawdown Trade Findings</h2>
+<table>
+<thead>
+<tr>
+<th>Bucket</th>
+<th>Current Evidence</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Profitable pain</td>
+<td>Now measurable via <code>mae_r</code>, <code>mfe_r</code>, final R, and time underwater</td>
+<td>Tooling implemented; broader clean-book replay needed</td>
+</tr>
+<tr>
+<td>Bad risk</td>
+<td>Now measurable via high <code>mae_r</code>, low <code>mfe_r</code>, poor final R</td>
+<td>Current FORD replay is bad-risk evidence, not profitable pain</td>
+</tr>
+<tr>
+<td>Poor entry timing</td>
+<td>First-bar/time-to-MAE available in new records</td>
+<td>Needs per-trade export review</td>
+</tr>
+<tr>
+<td>Poor exit management</td>
+<td>MFE retained/given back can now be measured</td>
+<td>FORD avg MFE giveback is roughly <code>0.80R</code>; needs trade-level cause review</td>
+</tr>
+<tr>
+<td>Execution problems</td>
+<td>Entry slippage pips/R now logged for executed/reconciled live entries</td>
+<td>Needs live fill sample; no live trades were placed</td>
+</tr>
+<tr>
+<td>Regime mismatch</td>
+<td>FORD is a trend strategy promoted in <code>CHOP</code></td>
+<td>Confirmed current mismatch; needs selection rule fix/test</td>
+</tr>
+<tr>
+<td>Reporting artifact</td>
+<td>Schema versions prevent old missing fields being treated as zero</td>
+<td>Implemented</td>
+</tr>
+<tr>
+<td>Selection artifact</td>
+<td>FORD promoted on 16 validation trades at PF 1.77 but full replay PF is 0.66</td>
+<td>Confirmed by Claude and Codex</td>
+</tr>
+</tbody>
+</table>
+<h2>6. Calculation And Metric Corrections</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Old Formula/Behavior</th>
+<th>New Formula/Behavior</th>
+<th>Trading/Selection Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dashboard profit factor</td>
+<td><code>gross_profit / gross_loss if gross_loss &gt; 0 else 0.0</code></td>
+<td><code>gross_profit / gross_loss if gross_loss &gt; 0 else inf if gross_profit &gt; 0 else 0.0</code></td>
+<td>Prevents profitable no-loss samples from being misreported as PF zero</td>
+</tr>
+<tr>
+<td>Backtest trade record schema</td>
+<td>No schema label for MAE/MFE additions</td>
+<td><code>trade_record_schema_version = 2026-06-18-mae-mfe-v1</code></td>
+<td>Prevents old missing fields from being interpreted as zero excursion</td>
+</tr>
+<tr>
+<td>Live actionable schema</td>
+<td>No schema label for slippage additions</td>
+<td><code>actionable_schema_version = 2026-06-18-entry-slippage-v1</code></td>
+<td>Prevents old missing fields from being interpreted as zero slippage</td>
+</tr>
+<tr>
+<td>MAE/MFE</td>
+<td>Not present</td>
+<td>Per-trade pips, R, timing, underwater bars, stop/target distance</td>
+<td>Enables paid/unpaid drawdown analysis</td>
+</tr>
+<tr>
+<td>Entry slippage</td>
+<td>Not persisted</td>
+<td>Expected/fill price, adverse pips, adverse R, direction</td>
+<td>Enables execution leakage analysis</td>
+</tr>
+<tr>
+<td>Calmar basis</td>
+<td>Same <code>calmar_ratio</code> key implied annualized Calmar in some reports</td>
+<td>Legacy key kept; <code>return_drawdown_ratio</code>, <code>calmar_ratio_annualized</code>, <code>annualized_return_pct</code>, and <code>calmar_ratio_basis</code> now emitted</td>
+<td>Prevents misreading cumulative return/DD as annualized Calmar</td>
+</tr>
+<tr>
+<td>Benchmark recovery factor</td>
+<td>Return/DD ratio under <code>recovery_factor</code> name</td>
+<td><code>recovery_factor = net_pnl / max_drawdown_abs</code>; return/DD emitted separately</td>
+<td>Aligns benchmark with dashboard/accounting definition</td>
+</tr>
+</tbody>
+</table>
+<h2>7. Implemented Changes</h2>
+<table>
+<thead>
+<tr>
+<th>Fix ID</th>
+<th>Files</th>
+<th>Mechanism</th>
+<th>Optuna Impact</th>
+<th>Numba Impact</th>
+<th>Result</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PERF-FIX-001</td>
+<td><code>pm_core.py</code>, <code>tests/test_backtester.py</code></td>
+<td>Add MAE/MFE and underwater timing to backtest trade records</td>
+<td>No objective/search change</td>
+<td>Kernel arrays appended; Python parity path added</td>
+<td>Focused tests passed</td>
+<td>Accepted by Claude</td>
+</tr>
+<tr>
+<td>PERF-FIX-002</td>
+<td><code>pm_main.py</code>, <code>tests/test_config_source_of_truth.py</code></td>
+<td>Add expected-vs-fill entry slippage fields</td>
+<td>None</td>
+<td>None</td>
+<td>Live/actionable payload compatibility tested</td>
+<td>Accepted by Claude</td>
+</tr>
+<tr>
+<td>PERF-FIX-003</td>
+<td><code>pm_dashboard/analytics.py</code>, <code>tests/test_dashboard_trade_enrichment.py</code></td>
+<td>Correct PF no-loss sentinel</td>
+<td>None</td>
+<td>None</td>
+<td>Dashboard focused tests passed</td>
+<td>Accepted by Claude</td>
+</tr>
+<tr>
+<td>PERF-FIX-004</td>
+<td><code>pm_core.py</code>, <code>pm_main.py</code>, tests</td>
+<td>Add schema-version metadata</td>
+<td>None</td>
+<td>No kernel change</td>
+<td>Focused tests passed</td>
+<td>Accepted by Claude</td>
+</tr>
+<tr>
+<td>PERF-FIX-005</td>
+<td><code>pm_metrics.py</code>, <code>pm_core.py</code>, <code>pm_dashboard/analytics.py</code>, <code>pm_pipeline.py</code>, <code>tools/benchmark.py</code>, tests</td>
+<td>Canonical metric helpers and explicit Calmar/recovery basis</td>
+<td>No objective/search change</td>
+<td>None</td>
+<td>Focused metric/dashboard/backtester tests passed</td>
+<td>Accepted by Claude</td>
+</tr>
+<tr>
+<td>PERF-FIX-006</td>
+<td><code>pm_live_readiness.py</code>, <code>pm_main.py</code>, tests</td>
+<td>Min-lot tradeability readiness and <code>--preflight</code></td>
+<td>None</td>
+<td>None</td>
+<td>Focused readiness tests passed</td>
+<td>Accepted by Claude</td>
+</tr>
+<tr>
+<td>PERF-FIX-007</td>
+<td><code>agent_audit/performance/scripts/*</code>, <code>tests/test_performance_replay_tools.py</code></td>
+<td>Bounded replay and shadow-selection tooling with fixed promoted-winner enumeration</td>
+<td>Shadow evidence only</td>
+<td>Existing backtester path</td>
+<td>Current live book replayed as one losing winner</td>
+<td>Accepted with enumerator fix applied</td>
+</tr>
+</tbody>
+</table>
+<h2>8. Performance Comparisons</h2>
+<p>Full machine-readable table: <code>agent_audit/performance/PERFORMANCE_COMPARISONS.csv</code>.</p>
+<p>This pass does not claim higher net profit from code changes. <code>PERFORMANCE_COMPARISONS.csv</code> includes FIX-005 through FIX-007. The decisive replay row shows the current logical live winner, <code>FORD H4 CHOP DoubleEMATrendStrategy</code>, losing <code>-2317.84</code> net PnL, <code>-23.18%</code> return, <code>24.88%</code> max DD, PF <code>0.66</code>, over 166 trades.</p>
+<h2>9. Optimization Quality</h2>
+<ul>
+<li>Current objective and winner selection were inspected but not changed.</li>
+<li>Shadow-selection tooling was added and run over the current logical promoted book.</li>
+<li>No Optuna parameter, sampler, pruner, trial budget, study storage, fallback random-search path, or winner export schema was changed.</li>
+<li>The current FORD result is concrete evidence that the existing selection surface can promote a sparse validation winner that inverts on fuller replay.</li>
+<li>Next optimization work should enforce or shadow-test validation trade-count floors, candidate-count deflation, regime/strategy compatibility checks, and canonical metric variants before changing objective weights.</li>
+</ul>
+<h2>10. Numba Quality And Performance</h2>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Python/Numba parity</td>
+<td>Deterministic MAE/MFE fixture compares Python and Numba outputs</td>
+</tr>
+<tr>
+<td>Compilation mode</td>
+<td><code>pm_core._backtest_loop_numba</code> remains nopython-compatible</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td>Unit-test scope only; no benchmark claim</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>Adds fixed per-trade arrays, not full path storage</td>
+</tr>
+<tr>
+<td>Recompilation behavior</td>
+<td>No new dynamic object types in kernel</td>
+</tr>
+<tr>
+<td>Remaining bottlenecks</td>
+<td>Not profiled in this pass; efficiency is P3 after profit/correctness</td>
+</tr>
+</tbody>
+</table>
+<h2>11. Accepted Fixes</h2>
+<p>See <code>agent_audit/performance/ACCEPTED_FIXES.md</code>.</p>
+<p>Accepted by Claude Code:</p>
+<ul>
+<li>PERF-FIX-001</li>
+<li>PERF-FIX-002</li>
+<li>PERF-FIX-003</li>
+<li>PERF-FIX-004</li>
+<li>PERF-FIX-005</li>
+<li>PERF-FIX-006</li>
+</ul>
+<p>Accepted with correction:</p>
+<ul>
+<li>PERF-FIX-007: per-cell replay accepted; enumeration bug fixed by Codex; re-check requested on fixed current-ledger evidence.</li>
+</ul>
+<h2>12. Rejected Fixes</h2>
+<p>See <code>agent_audit/performance/REJECTED_FIXES.md</code>.</p>
+<p>Rejected/deferred in this pass:</p>
+<ul>
+<li>balance sweep;</li>
+<li>full optimization;</li>
+<li>live trading;</li>
+<li>production credential/config edits;</li>
+<li>immediate MAE/MFE gating before replay evidence;</li>
+<li>risk reduction merely because the current posture is aggressive.</li>
+</ul>
+<h2>13. Next Highest-Value Experiments</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Experiment</th>
+<th>Why It Matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PEXP-000</td>
+<td>Confirm whether current <code>pm_configs.json</code> is complete or mid-reoptimization</td>
+<td>A one-winner losing book is not deployable; the next action depends on whether the ledger is final or interim</td>
+</tr>
+<tr>
+<td>PEXP-001</td>
+<td>Re-run corrected inventory and all-promoted-winner replay after clean optimization</td>
+<td>Prevents stale or sparse winners from reaching live mode</td>
+</tr>
+<tr>
+<td>CC-AB-4</td>
+<td>Canonical Sharpe/expectancy plus candidate-count deflation in shadow objective</td>
+<td>Current FORD result proves sparse validation optimism can invert</td>
+</tr>
+<tr>
+<td>Q4-FLOOR</td>
+<td>Strategy/timeframe-aware validation trade-count floors</td>
+<td>FORD was promoted on only 16 validation trades</td>
+</tr>
+<tr>
+<td>REGIME-COMPAT</td>
+<td>Penalize or block structural strategy/regime mismatches</td>
+<td>Current promoted trend strategy sits in <code>CHOP</code></td>
+</tr>
+<tr>
+<td>CC-AB-1</td>
+<td>EMAPullbackContinuation wider TP/trailing replay</td>
+<td>Tests whether trend winners are capped and MFE is given back, after a real winner book exists</td>
+</tr>
+<tr>
+<td>PEXP-003</td>
+<td>Entry and exit slippage by family/session/symbol</td>
+<td>Detects execution leakage before scaling</td>
+</tr>
+</tbody>
+</table>
+<h2>14. Partner Review</h2>
+<p>Claude Code reviewed the 2026-06-18 implementation. The current state is:</p>
+<ul>
+<li>PERF-FIX-001/002/003: accepted.</li>
+<li>PERF-FIX-004: accepted; consumer-side schema guard remains open.</li>
+<li>PERF-FIX-005: accepted.</li>
+<li>PERF-FIX-006: accepted.</li>
+<li>PERF-FIX-007: accepted after Codex fixed the symbol-level enumeration defect identified by Claude.</li>
+<li>Decisive current-ledger conclusion: Claude and Codex agree the current ledger is one promoted winner and the corrected $10k replay loses.</li>
+</ul>
+<h2>15. Exact Commands, Files, Configs, And Artifacts</h2>
+<h3>Source files changed</h3>
+<ul>
+<li><code>pm_core.py</code></li>
+<li><code>pm_metrics.py</code></li>
+<li><code>pm_main.py</code></li>
+<li><code>pm_live_readiness.py</code></li>
+<li><code>pm_pipeline.py</code></li>
+<li><code>pm_dashboard/analytics.py</code></li>
+<li><code>tools/benchmark.py</code></li>
+<li><code>tests/test_backtester.py</code></li>
+<li><code>tests/test_dashboard_trade_enrichment.py</code></li>
+<li><code>tests/test_config_source_of_truth.py</code></li>
+<li><code>tests/test_metric_contract.py</code></li>
+<li><code>tests/test_profitability_readiness_blueprint.py</code></li>
+<li><code>tests/test_performance_replay_tools.py</code></li>
+</ul>
+<h3>Audit artifacts changed</h3>
+<ul>
+<li><code>agent_audit/performance/*</code></li>
+<li><code>agent_audit/performance/scripts/*</code></li>
+<li><code>agent_audit/performance/data/*</code></li>
+<li><code>agent_audit/performance/strategy_anatomy/*</code></li>
+<li><code>agent_audit/scripts/render_audit_html.py</code></li>
+<li><code>agent_audit/STATUS.md</code></li>
+<li><code>agent_audit/TASKS.md</code></li>
+<li><code>agent_audit/COMMAND_LOG.md</code></li>
+<li><code>agent_audit/LOCKS.md</code></li>
+</ul>
+<h3>Validation commands</h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>python -m py_compile pm_core.py pm_main.py tests/test_backtester.py tests/test_config_source_of_truth.py</code></td>
+<td>Passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_backtester.py tests/test_config_source_of_truth.py -q</code></td>
+<td>37 passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_backtester.py tests/test_config_source_of_truth.py tests/test_dashboard_trade_enrichment.py -q</code></td>
+<td>47 passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_live_loop_integration.py tests/test_position_sizing_edge_cases.py tests/test_mt5_connector.py -q</code></td>
+<td>51 passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_scoring_audit.py tests/test_pipeline_artifacts.py tests/test_margin_protection.py -q</code></td>
+<td>102 passed, 11 subtests passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_profitability_readiness_blueprint.py -q</code></td>
+<td>47 passed</td>
+</tr>
+<tr>
+<td><code>python -m py_compile pm_metrics.py pm_core.py pm_dashboard/analytics.py pm_pipeline.py pm_live_readiness.py pm_main.py tools/benchmark.py agent_audit/performance/scripts/run_promoted_cell_replay.py agent_audit/performance/scripts/shadow_selection_audit.py</code></td>
+<td>Passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_metric_contract.py tests/test_dashboard_trade_enrichment.py tests/test_backtester.py -q</code></td>
+<td>28 passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_profitability_readiness_blueprint.py tests/test_config_source_of_truth.py -q</code></td>
+<td>72 passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_benchmark_gate.py tests/test_scoring_audit.py tests/test_pipeline_artifacts.py -q</code></td>
+<td>70 passed</td>
+</tr>
+<tr>
+<td><code>python -m py_compile agent_audit/performance/scripts/run_promoted_cell_replay.py agent_audit/performance/scripts/shadow_selection_audit.py agent_audit/performance/scripts/claude_replay_all_promoted.py agent_audit/performance/scripts/build_performance_evidence.py tests/test_performance_replay_tools.py</code></td>
+<td>Passed</td>
+</tr>
+<tr>
+<td><code>python -m pytest tests/test_performance_replay_tools.py -q</code></td>
+<td>2 passed</td>
+</tr>
+<tr>
+<td><code>python agent_audit/performance/scripts/run_promoted_cell_replay.py --max-cells 10 --list-only --out agent_audit/performance/data/promoted_cell_replay_list.json</code></td>
+<td>Listed 1 logical promoted cell</td>
+</tr>
+<tr>
+<td><code>python agent_audit/performance/scripts/run_promoted_cell_replay.py --max-cells 10 --out agent_audit/performance/data/promoted_cell_replay_10000.csv</code></td>
+<td>Replayed 1 logical promoted cell</td>
+</tr>
+<tr>
+<td><code>python agent_audit/performance/scripts/claude_replay_all_promoted.py</code></td>
+<td>Replayed all current logical promoted winners: 1 losing FORD cell</td>
+</tr>
+<tr>
+<td><code>python agent_audit/performance/scripts/shadow_selection_audit.py</code></td>
+<td>Wrote 1-row shadow audit and summary</td>
+</tr>
+<tr>
+<td><code>python agent_audit/performance/scripts/build_performance_evidence.py</code></td>
+<td>Regenerated manifest, current-ledger inventory, comparisons, and anatomy files</td>
+</tr>
+<tr>
+<td><code>python agent_audit/scripts/render_audit_html.py</code></td>
+<td>Regenerated HTML reports</td>
+</tr>
+</tbody>
+</table>
+<h3>Important artifacts</h3>
+<ul>
+<li><code>agent_audit/performance/data/current_ledger_inventory.json</code></li>
+<li><code>agent_audit/performance/data/current_promoted_cells.csv</code></li>
+<li><code>agent_audit/performance/data/promoted_cell_replay_10000.csv</code></li>
+<li><code>agent_audit/performance/data/promoted_winner_replay_all_10000.csv</code></li>
+<li><code>agent_audit/performance/data/shadow_selection_audit.csv</code></li>
+<li><code>agent_audit/performance/PERFORMANCE_COMPARISONS.csv</code></li>
+<li><code>agent_audit/performance/CLAUDE_DECISIVE_REPLAY_FINDING.md</code></li>
+<li><code>agent_audit/performance/PARTNER_REVIEW.md</code></li>
+<li><code>agent_audit/performance/FIX_REGISTER.md</code></li>
+<li><code>agent_audit/performance/evidence_manifest.json</code></li>
+<li><code>agent_audit/performance/baseline_10000_summary.json</code></li>
+</ul>
+</article>
+</main>
+</body>
+</html>

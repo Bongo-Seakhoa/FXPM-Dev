@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prioritized Recommendations</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --paper: #ffffff;
+  --ink: #111827;
+  --muted: #4b5563;
+  --line: #d9dee8;
+  --soft: #f8fafc;
+  --accent: #1f6feb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", Inter, Arial, sans-serif;
+  line-height: 1.58;
+}
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+article {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 34px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: auto;
+}
+h1, h2, h3, h4 {
+  line-height: 1.22;
+  margin: 1.5em 0 0.55em;
+}
+h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.1em;
+  font-size: 1.45rem;
+}
+h3 {
+  font-size: 1.13rem;
+}
+p {
+  margin: 0.75em 0;
+}
+ul, ol {
+  padding-left: 1.45rem;
+}
+li + li {
+  margin-top: 0.25rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.35rem;
+  font-size: 0.91rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #eef3f8;
+  font-weight: 650;
+}
+tr:nth-child(even) td {
+  background: var(--soft);
+}
+code {
+  background: #edf2f7;
+  border: 1px solid #d8e0ea;
+  border-radius: 4px;
+  padding: 0.08rem 0.28rem;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.92em;
+}
+pre {
+  overflow-x: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+a {
+  color: var(--accent);
+}
+blockquote {
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+</style>
+</head>
+<body>
+<main>
+<article>
+<h1>Prioritized Recommendations</h1>
+<h2>P0 - Decide and Protect</h2>
+<table>
+<thead>
+<tr>
+<th>Recommendation</th>
+<th>Why</th>
+<th>Evidence</th>
+<th>Effort</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Decide $22 mode: preservation, lottery, or fund-up</td>
+<td>The correct caps differ by intent</td>
+<td>F101-F104, F108</td>
+<td>Low</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Add a balance-aware live universe</td>
+<td>Removes symbols that are already untradeable at min-lot</td>
+<td>F103, signal risk summaries</td>
+<td>Small-Medium</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Add absolute-dollar breaker overlays</td>
+<td>Percent breakers are too wide for $22</td>
+<td>F102</td>
+<td>Small-Medium</td>
+<td>Medium, because trading may halt more</td>
+</tr>
+<tr>
+<td>Confirm terminal account before live mode</td>
+<td>Config pins identity but does not log in</td>
+<td>F001</td>
+<td>Small</td>
+<td>Low</td>
+</tr>
+</tbody>
+</table>
+<h2>P1 - Reduce Unrewarded Risk</h2>
+<table>
+<thead>
+<tr>
+<th>Recommendation</th>
+<th>Why</th>
+<th>Evidence</th>
+<th>Effort</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Test <code>max_risk_pct</code> at 8-10%</td>
+<td>10% cap keeps 48/67 executed rows while blocking the 19 riskiest</td>
+<td>F003</td>
+<td>Small</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Lower secondary/same-symbol risk caps</td>
+<td>Current 50% secondary cap is too high for a micro account</td>
+<td>F104</td>
+<td>Small</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Run bounded $22 replay/backtest on executable symbols</td>
+<td>Demo/backtest notional does not match live constraints</td>
+<td>F108</td>
+<td>Medium</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Add MAE/MFE capture</td>
+<td>Needed to classify high-drawdown trades</td>
+<td>F107</td>
+<td>Medium</td>
+<td>Low</td>
+</tr>
+</tbody>
+</table>
+<h2>P2 - Improve Robustness and Reporting</h2>
+<table>
+<thead>
+<tr>
+<th>Recommendation</th>
+<th>Why</th>
+<th>Evidence</th>
+<th>Effort</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Enable max-validation-Sharpe severe flag when PBO unavailable</td>
+<td>Extreme validation Sharpe is widespread</td>
+<td>F002</td>
+<td>Small</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Raise validation trade-count requirements for Sharpe override</td>
+<td>Low sample sizes create fragile winners</td>
+<td>F002</td>
+<td>Small-Medium</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Add pristine-OOS decay audit</td>
+<td>Bleeding-edge split favors freshness over clean holdout</td>
+<td>F109</td>
+<td>Medium</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Relabel or annualize Calmar</td>
+<td>Current value is cumulative return/maxDD</td>
+<td>F105</td>
+<td>Small</td>
+<td>Low-Medium</td>
+</tr>
+</tbody>
+</table>
+<h2>P3 - Monitoring and Productization</h2>
+<table>
+<thead>
+<tr>
+<th>Recommendation</th>
+<th>Why</th>
+<th>Evidence</th>
+<th>Effort</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Startup tradeability report</td>
+<td>Operator should see current equity, account pin, tradeable symbols, and breaker headroom</td>
+<td>F001-F103</td>
+<td>Small</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Weekly drift report</td>
+<td>Live-vs-validation drift should drive retraining and deactivation</td>
+<td>F002, F109</td>
+<td>Medium</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Define Toronto metric if needed</td>
+<td>No implementation exists</td>
+<td>F004</td>
+<td>Small</td>
+<td>Low</td>
+</tr>
+</tbody>
+</table>
+<h2>Suggested First Patch Set</h2>
+<ol>
+<li>Read-only startup/preflight account and tradeability summary.</li>
+<li>Config-only micro-account risk profile with 8-10% cap and lower secondary cap.</li>
+<li>Additive MAE/MFE instrumentation.</li>
+<li>Reporting-only Calmar relabel and validation-Sharpe/PBO warning.</li>
+</ol>
+</article>
+</main>
+</body>
+</html>

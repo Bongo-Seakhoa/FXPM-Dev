@@ -162,6 +162,15 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
             target_annual_vol=0.10,
             use_commission=False,
         )
+        trader._funded_capital_envelope = {
+            "max_total_stop_risk_pct": 8.0,
+            "max_factor_stop_risk_pct": 2.0,
+            "max_same_symbol_stop_risk_pct": 1.0,
+            "max_margin_utilization_pct": 50.0,
+            "min_margin_level_pct": 200.0,
+            "min_free_margin_pct": 50.0,
+            "gap_stress_multiple": 1.5,
+        }
         trader.position_calc = MagicMock()
         trader.position_calc.calculate_stop_prices.return_value = (1.1900, 1.2200)
         trader.enable_trading = True

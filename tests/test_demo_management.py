@@ -265,7 +265,7 @@ def _case(
     }
     raw = {name: True for name in management.RAW_COMPONENTS}
     authority = {
-        "schema_version": "fxpm.live-readiness-authority-result.v1",
+        "schema_version": "fxpm.live-readiness-authority-result.v2",
         "status": "DEMO_PROBATION_AUTHORIZED",
         "errors": [],
         "raw_reverification": raw,
@@ -274,6 +274,7 @@ def _case(
         "source_unavailable_cell_ids": [],
         "regime_unobserved_cell_ids": [],
         "no_local_winner_cell_ids": [],
+        "insufficient_evidence_cell_ids": [],
         "technical_cell_ids": [],
         "unsearched_cell_ids": [],
         "missing_observed_cell_ids": [],

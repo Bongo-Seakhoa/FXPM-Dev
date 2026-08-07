@@ -35,7 +35,7 @@ RAW_CURRENT_REFIT_VERIFICATION_VERSION = "fxpm.raw-current-refit-verification.v2
 RAW_CURRENT_REFIT_EXECUTOR_FUNCTION = "replay_current_refit_execution_from_raw_manifest"
 CURRENT_REGIME_PARAMS_BUNDLE_VERSION = "fxpm.current-regime-params-bundle.v1"
 REGIME_DETECTOR_RECORD_VERSION = "fxpm.regime-detector-record/v1"
-REGIME_FIT_RECEIPT_VERSION = "fxpm.historical-regime-fit.v3"
+REGIME_FIT_RECEIPT_VERSION = "fxpm.historical-regime-fit.v4"
 
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_COUNT = 16_384
@@ -379,10 +379,7 @@ def _normalize_detector_parameters(value: Any) -> Dict[str, int | float]:
         if name in _DETECTOR_INTEGER_PARAMETERS:
             if type(item) is not int or not 1 <= item <= _DETECTOR_INTEGER_MAX[name]:
                 raise ValueError("REGIME_DETECTOR_PARAMETERS_INVALID")
-        elif (
-            type(item) is not float
-            or not math.isfinite(item)
-        ):
+        elif type(item) is not float or not math.isfinite(item):
             raise ValueError("REGIME_DETECTOR_PARAMETERS_INVALID")
         normalized[name] = item
     unit_fields = {"gap_min"}
@@ -521,9 +518,7 @@ def _normalize_train_support(
         "symbol": detector_record["symbol"],
         "timeframe": detector_record["timeframe"],
         "activation_id": detector_record["activation_id"],
-        "activation_manifest_sha256": detector_record[
-            "activation_manifest_sha256"
-        ],
+        "activation_manifest_sha256": detector_record["activation_manifest_sha256"],
         "source_sha256": detector_record["native_source_sha256"],
         "train_window_sha256": bindings.get("train_window_sha256"),
         "params_sha256": detector_record["parameters_sha256"],
@@ -534,9 +529,10 @@ def _normalize_train_support(
     receipt_sha = support["receipt_sha256"]
     body = dict(support)
     body.pop("receipt_sha256")
-    if not _sha(receipt_sha) or hashlib.sha256(
-        _canonical_ascii_bytes(body)
-    ).hexdigest() != receipt_sha:
+    if (
+        not _sha(receipt_sha)
+        or hashlib.sha256(_canonical_ascii_bytes(body)).hexdigest() != receipt_sha
+    ):
         raise ValueError("REGIME_TRAIN_SUPPORT_RECEIPT_INVALID")
     return json.loads(_canonical_ascii_bytes(support).decode("ascii"))
 
@@ -553,9 +549,10 @@ def _normalize_regime_fit(
         envelope["payload"], _REGIME_FIT_FIELDS, "REGIME_FIT_FIELDS_INVALID"
     )
     receipt_sha = envelope["receipt_sha256"]
-    if not _sha(receipt_sha) or hashlib.sha256(
-        _canonical_ascii_bytes(payload)
-    ).hexdigest() != receipt_sha:
+    if (
+        not _sha(receipt_sha)
+        or hashlib.sha256(_canonical_ascii_bytes(payload)).hexdigest() != receipt_sha
+    ):
         raise ValueError("REGIME_FIT_RECEIPT_SHA256_INVALID")
     if (
         payload["contract_version"] != REGIME_FIT_RECEIPT_VERSION
@@ -590,9 +587,7 @@ def _normalize_regime_fit(
         or payload["regime_detector_record_sha256"] != record["record_sha256"]
     ):
         raise ValueError("REGIME_FIT_DETECTOR_SPLICE")
-    _normalize_train_support(
-        payload["train_regime_support"], detector_record=record
-    )
+    _normalize_train_support(payload["train_regime_support"], detector_record=record)
     return json.loads(_canonical_ascii_bytes(envelope).decode("ascii"))
 
 
@@ -602,19 +597,15 @@ def build_current_regime_params_bundle(
     regime_fits: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     """Build the selected current Book detector roster."""
-    cutoff = _canonical_utc(
-        current_cutoff_utc, "REGIME_PARAMS_BUNDLE_CUTOFF_INVALID"
-    )
-    if (
-        type(regime_fits) is not list
-        or not 1 <= len(regime_fits) <= 600
-    ):
+    cutoff = _canonical_utc(current_cutoff_utc, "REGIME_PARAMS_BUNDLE_CUTOFF_INVALID")
+    if type(regime_fits) is not list or not 1 <= len(regime_fits) <= 600:
         raise ValueError("REGIME_PARAMS_BUNDLE_ROSTER_INVALID")
     fits = [
-        _normalize_regime_fit(item, current_cutoff_utc=cutoff)
-        for item in regime_fits
+        _normalize_regime_fit(item, current_cutoff_utc=cutoff) for item in regime_fits
     ]
-    order = {name: index for index, name in enumerate(("M5", "M15", "M30", "H1", "H4", "D1"))}
+    order = {
+        name: index for index, name in enumerate(("M5", "M15", "M30", "H1", "H4", "D1"))
+    }
     try:
         canonical_order = sorted(
             fits,
@@ -628,8 +619,7 @@ def build_current_regime_params_bundle(
     if fits != canonical_order:
         raise ValueError("REGIME_PARAMS_BUNDLE_ORDER_INVALID")
     groups = [
-        (item["payload"]["symbol"], item["payload"]["timeframe"])
-        for item in fits
+        (item["payload"]["symbol"], item["payload"]["timeframe"]) for item in fits
     ]
     receipts = [item["receipt_sha256"] for item in fits]
     records = [item["payload"]["regime_detector_record_sha256"] for item in fits]
@@ -929,7 +919,9 @@ def _receipt_contract(
         group = (cell.get("symbol"), cell.get("timeframe"))
         binding = tuple(cell.get(name) for name in detector_fields)
         if detectors.setdefault(group, binding) != binding:
-            errors.append(f"CURRENT_REFIT_SIBLING_DETECTOR_MISMATCH:{group[0]}:{group[1]}")
+            errors.append(
+                f"CURRENT_REFIT_SIBLING_DETECTOR_MISMATCH:{group[0]}:{group[1]}"
+            )
         for digest, owners in ((binding[0], fit_owners), (binding[1], record_owners)):
             if owners.setdefault(digest, group) != group:
                 errors.append("CURRENT_REFIT_DETECTOR_IDENTITY_RELABELLED")
@@ -1126,8 +1118,7 @@ def validate_raw_current_refit_manifest(
                 != authorization.get("accepted_book_generation_receipt_sha256")
                 or declared_generation_sha
                 != authorization.get("accepted_book_generation_sha256")
-                or declared_generation_sha
-                != canonical_receipt_sha256(book_identity)
+                or declared_generation_sha != canonical_receipt_sha256(book_identity)
                 or book_payload.get("regime_params_sha256")
                 != authorization.get("regime_params_sha256")
                 or book_payload.get("current_cutoff_utc")
@@ -1162,13 +1153,10 @@ def validate_raw_current_refit_manifest(
                 current_cutoff_utc=contract["current_cutoff_utc"],
                 selected_cells=contract["cells"],
             )
-            derived_regime_sha = canonical_receipt_sha256(
-                normalized_regime_bundle
-            )
-            if (
-                derived_regime_sha != regime_descriptor["semantic_sha256"]
-                or derived_regime_sha != authorization.get("regime_params_sha256")
-            ):
+            derived_regime_sha = canonical_receipt_sha256(normalized_regime_bundle)
+            if derived_regime_sha != regime_descriptor[
+                "semantic_sha256"
+            ] or derived_regime_sha != authorization.get("regime_params_sha256"):
                 errors.append("RAW_CURRENT_REFIT_REGIME_PARAMS_SEMANTIC_MISMATCH")
         except (TypeError, ValueError, OverflowError) as exc:
             errors.append(f"RAW_CURRENT_REFIT_REGIME_PARAMS_INVALID:{exc}")

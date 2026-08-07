@@ -215,7 +215,7 @@ def _identity(value: Any, code: str, *, maximum: int = 128) -> str:
 
 
 def _cell_identity(symbol: Any, timeframe: Any, regime: Any) -> tuple[str, str, str]:
-    normalized_symbol = _identity(symbol, "SYMBOL_INVALID").upper()
+    normalized_symbol = _identity(symbol, "SYMBOL_INVALID")
     normalized_timeframe = _identity(timeframe, "TIMEFRAME_INVALID").upper()
     normalized_regime = _identity(regime, "REGIME_INVALID").upper()
     if normalized_timeframe not in _TIMEFRAMES:

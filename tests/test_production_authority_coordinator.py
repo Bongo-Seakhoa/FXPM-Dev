@@ -727,6 +727,58 @@ def test_environment_authority_derives_exact_native_broker_and_margin_terms(
     )
 
 
+def test_environment_authority_preserves_requested_symbol_spelling(
+    tmp_path: Path, monkeypatch
+) -> None:
+    environment, inputs = _derived_environment(tmp_path, monkeypatch)
+    observed: dict[str, object] = {}
+
+    def native_contract(data_dir, symbols, *, timeframes):
+        observed["data_dir"] = data_dir
+        observed["symbols"] = symbols
+        observed["timeframes"] = timeframes
+        return environment["native_contract"], []
+
+    monkeypatch.setattr(
+        coordinator.replay,
+        "active_native_portfolio_contract",
+        native_contract,
+    )
+    coordinator.derive_production_environment_authority(
+        **{
+            **inputs,
+            "requested_symbols": (" Platinum ", "Palladium"),
+        }
+    )
+
+    assert observed["symbols"] == ("Platinum", "Palladium")
+    assert observed["timeframes"] == (
+        coordinator.replay.PORTFOLIO_REPLAY_REQUIRED_TIMEFRAMES
+    )
+
+
+def test_environment_authority_rejects_casefold_duplicate_symbols(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, inputs = _derived_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        coordinator.replay,
+        "active_native_portfolio_contract",
+        lambda *_args, **_kwargs: pytest.fail("duplicate roster reached contract"),
+    )
+
+    with pytest.raises(
+        coordinator.ProductionAuthorityBlocked,
+        match="PRODUCTION_SYMBOL_ROSTER_INVALID",
+    ):
+        coordinator.derive_production_environment_authority(
+            **{
+                **inputs,
+                "requested_symbols": ("Platinum", "pLaTiNuM"),
+            }
+        )
+
+
 def test_environment_authority_rejects_runtime_data_root_not_declared_by_config(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1074,7 +1126,11 @@ def test_coordinator_returns_only_verified_pre_cas_assembly(
         trusted_replay_public_keys={},
         trusted_precommitment_public_keys={},
     )
-    monkeypatch.setattr(coordinator, "_run_historical", lambda _value: historical_state)
+    monkeypatch.setattr(
+        coordinator,
+        "_run_historical",
+        lambda _value, **_kwargs: historical_state,
+    )
     monkeypatch.setattr(coordinator, "_run_current", lambda *_args, **_kwargs: current)
     monkeypatch.setattr(
         coordinator, "_run_capital", lambda *_args, **_kwargs: capital_state
@@ -1242,7 +1298,7 @@ def test_causal_failure_in_top_level_never_invokes_current_or_capital(
     _stub_environment_reopen(monkeypatch)
     calls: list[str] = []
 
-    def fail(_inputs):
+    def fail(_inputs, **_kwargs):
         calls.append("historical")
         raise coordinator.ProductionAuthorityBlocked("CAUSAL_PROCESS_NOT_PASS")
 
@@ -1293,7 +1349,9 @@ def test_current_failure_in_top_level_never_invokes_capital_factory(
     _stub_environment_reopen(monkeypatch)
     calls: list[str] = []
     monkeypatch.setattr(
-        coordinator, "_run_historical", lambda _inputs: _historical_state()
+        coordinator,
+        "_run_historical",
+        lambda _inputs, **_kwargs: _historical_state(),
     )
     monkeypatch.setattr(
         current_execution,
@@ -1342,7 +1400,7 @@ def test_top_level_rejects_caller_authored_validation_time_before_work(
     monkeypatch.setattr(
         coordinator,
         "_run_historical",
-        lambda _inputs: calls.append("historical"),
+        lambda _inputs, **_kwargs: calls.append("historical"),
     )
     assembly = replace(
         _assembly_inputs(tmp_path), validation_time_utc=VALIDATION_TIME_UTC
@@ -1401,7 +1459,7 @@ def test_top_level_invokes_lazy_factories_in_causal_order_and_owns_authority_inp
         trusted_precommitment_public_keys={},
     )
 
-    def run_historical(_inputs):
+    def run_historical(_inputs, **_kwargs):
         events.append("historical_pass")
         return historical
 

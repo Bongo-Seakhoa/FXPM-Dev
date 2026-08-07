@@ -37,6 +37,7 @@ from pm_book_multiplicity import (
     PINNED_WINNER_TRADE_POWER_BINDING_VERSION,
     REGIME_FITTED,
     REGIME_NOT_APPLICABLE,
+    REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
     REGIME_ORDER,
     REGIME_UNOBSERVED,
     REGIME_UNOBSERVED_REASON,
@@ -46,6 +47,7 @@ from pm_book_multiplicity import (
     TARGET_FDR,
     TECHNICAL_FAILURE,
     TERMINAL_SOURCE_ABSENCE,
+    TERMINAL_TECHNICAL,
     TERMINAL_UNAVAILABLE,
     TIMEFRAME_ORDER,
     UNSEARCHED,
@@ -176,8 +178,12 @@ def _train_support(
             regime: ("EMPIRICALLY_OBSERVED" if count_map[regime] > 0 else "UNOBSERVED")
             for regime in REGIME_ORDER
         },
-        "first_ts": "2020-01-01T00:00:00+00:00",
-        "last_ts": "2024-12-31T23:55:00+00:00",
+        "first_ts": (
+            "2020-01-01T00:00:00+00:00" if sum(counts) > 0 else None
+        ),
+        "last_ts": (
+            "2024-12-31T23:55:00+00:00" if sum(counts) > 0 else None
+        ),
         "vector_encoding": "fxpm.regime-live-labels-nul/v1",
         "vector_sha256": _sha(f"support-vector:{symbol}:{timeframe}:{counts}:{tag}"),
         "bindings": {
@@ -234,64 +240,73 @@ def _source_and_fit(
     detector_sha256 = _sha(f"detector-process:{symbol}:{timeframe}")
     parameters = _detector_parameters()
     params_sha256 = hashlib.sha256(_canonical(parameters)).hexdigest()
+    available = availability == AVAILABLE
+    technical_terminal = availability == TERMINAL_TECHNICAL
     source = create_historical_source_group_decision(
         symbol=symbol,
         timeframe=timeframe,
         availability=availability,
         reason_code=(
             "ACTIVATED_NATIVE_SOURCE_AVAILABLE"
-            if availability == AVAILABLE
-            else "BROKER_HISTORY_TERMINALLY_UNAVAILABLE"
+            if available
+            else (
+                "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
+                if technical_terminal
+                else "BROKER_HISTORY_TERMINALLY_UNAVAILABLE"
+            )
         ),
         source_contract_sha256=_sha("source-contract"),
         source_group_evidence_sha256=_sha(
             f"source-group-evidence:{symbol}:{timeframe}:{availability}"
         ),
-        activation_id=(activation_id if availability == AVAILABLE else None),
+        activation_id=(activation_id if available or technical_terminal else None),
         activation_manifest_sha256=(
-            activation_manifest_sha256 if availability == AVAILABLE else None
+            activation_manifest_sha256 if available or technical_terminal else None
         ),
-        native_source_sha256=(
-            native_source_sha256 if availability == AVAILABLE else None
+        activation_entry_sha256=(
+            _sha(f"activation-entry:{symbol}:{timeframe}")
+            if technical_terminal
+            else None
         ),
+        native_source_sha256=(native_source_sha256 if available else None),
         acquisition_attempts_exact=3,
         terminal_proof_sha256=(
-            None
-            if availability == AVAILABLE
-            else _sha(f"terminal-proof:{symbol}:{timeframe}")
+            None if available else _sha(f"terminal-proof:{symbol}:{timeframe}")
         ),
     )
     assert source is not None
-    detector_record = (
-        _detector_record(source, detector_sha256) if availability == AVAILABLE else None
-    )
-    if availability == AVAILABLE:
+    detector_record = _detector_record(source, detector_sha256) if available else None
+    if available:
         assert detector_record is not None
     fit = create_regime_fit_decision(
         source_group_decision=source,
         fit_state=(
-            REGIME_FITTED if availability == AVAILABLE else REGIME_NOT_APPLICABLE
+            REGIME_FITTED
+            if available
+            else (
+                REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL
+                if technical_terminal
+                else REGIME_NOT_APPLICABLE
+            )
         ),
         reason_code=(
             "ANCHOR_LOCAL_SHARED_REGIME_FIT_COMPLETE"
-            if availability == AVAILABLE
-            else "SOURCE_UNAVAILABLE_REGIME_FIT_NOT_APPLICABLE"
+            if available
+            else (
+                "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
+                if technical_terminal
+                else "SOURCE_UNAVAILABLE_REGIME_FIT_NOT_APPLICABLE"
+            )
         ),
         regime_fit_policy_sha256=_sha("regime-fit-policy"),
-        detector_process_sha256=(
-            detector_sha256 if availability == AVAILABLE else None
-        ),
+        detector_process_sha256=(detector_sha256 if available else None),
         regime_fit_evidence_sha256=(
-            _sha(f"regime-fit-evidence:{symbol}:{timeframe}")
-            if availability == AVAILABLE
-            else None
+            _sha(f"regime-fit-evidence:{symbol}:{timeframe}") if available else None
         ),
         four_regime_mapping_sha256=(
-            _sha(f"four-regime-map:{symbol}:{timeframe}")
-            if availability == AVAILABLE
-            else None
+            _sha(f"four-regime-map:{symbol}:{timeframe}") if available else None
         ),
-        regime_params_sha256=(params_sha256 if availability == AVAILABLE else None),
+        regime_params_sha256=(params_sha256 if available else None),
         regime_detector_record=detector_record,
         train_regime_support=(
             _train_support(
@@ -304,7 +319,7 @@ def _source_and_fit(
                 params_sha256=params_sha256,
                 detector_code_sha256=detector_sha256,
             )
-            if availability == AVAILABLE
+            if available
             else None
         ),
     )
@@ -436,10 +451,16 @@ def _all_process_rejected_request_and_plan(
         winner_fold_plan=fold_plan,
         winner_attempts=attempts,
     )
+    _horizon_process, horizon_process_sha256 = _postsearch_horizon_process(
+        plan.to_dict()
+    )
+    for attempt in attempts:
+        attempt["horizon_process_sha256"] = horizon_process_sha256
     if splice_first_evidence_role:
         attempts[0]["precommitted_evidence_role"] = "PRESEARCH_PROCESS_REJECTED"
     entries = raw["evidence_ledger_payload"]["entries"]
     for attempt, entry in zip(attempts, entries, strict=True):
+        entry["horizon_process_sha256"] = attempt["horizon_process_sha256"]
         entry["evidence_status"] = "PROCESS_REJECTED"
         if attempt["precommitted_evidence_role"] == "EVALUATION_REQUIRED":
             entry["status_reason"] = "EVALUATED_OOS_PROCESS_REJECTED"
@@ -457,12 +478,14 @@ def _all_process_rejected_request_and_plan(
         entry["folds_sha256"] = fixture._sha_json([])
     trial_registry = fixture._trial_registry(attempts)
     process_registry = fixture._process_registry(attempts)
+    horizon_registry = fixture._horizon_registry(attempts)
     for payload in (
         raw["precommitment_payload"],
         raw["attempt_ledger_payload"],
         raw["evidence_ledger_payload"],
     ):
         payload["process_registry_sha256"] = process_registry
+        payload["horizon_registry_sha256"] = horizon_registry
         payload["trial_registry_sha256"] = trial_registry
     raw["attempt_ledger_payload"]["attempts_sha256"] = fixture._sha_json(attempts)
     precommit_sha = fixture._sha_json(raw["precommitment_payload"])
@@ -478,6 +501,24 @@ def _all_process_rejected_request_and_plan(
     assert decision.to_dict()["winner"] is None
     assert winner.verify_historical_cell_winner_decision(decision, request)
     return request, decision, plan
+
+
+def _postsearch_horizon_process(
+    plan_body: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    candidate = plan_body["candidates"][0]
+    prefix = plan_body["native_prefix"]
+    return book.current_refit.build_horizon_process_artifact_v2(
+        symbol=plan_body["cell"]["symbol"],
+        timeframe=plan_body["cell"]["timeframe"],
+        lookback_kind=candidate["lookback_kind"],
+        lookback_value=candidate["lookback_value"],
+        fit_start_utc="2024-06-01T00:00:00Z",
+        fit_end_utc=prefix["prefix_end_exclusive_utc"],
+        latest_closed_bar_utc=prefix["prefix_last_close_utc"],
+        source_snapshot_sha256=prefix["prefix_content_sha256"],
+        source_bar_count=400,
+    )
 
 
 def _postsearch_authority_bytes(
@@ -498,16 +539,27 @@ def _postsearch_authority_bytes(
         expected_by_attempt.setdefault(item["attempt_id"], []).append(item)
     mapping: list[dict[str, Any]] = []
     prefix = plan_body["native_prefix"]
+    horizon_process, horizon_process_sha256 = _postsearch_horizon_process(plan_body)
+
+    def utc_seconds(value: str) -> str:
+        return (
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            .astimezone(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+
     for ordinal, (planned, attempted) in enumerate(
         zip(plan_body["attempts"], attempt_ledger["attempts"], strict=True)
     ):
         candidate = candidates[planned["candidate_id"]]
         trial = trials[planned["trial_id"]]
         execution = {
-            "lookback_kind": candidate["lookback_kind"],
-            "lookback_value": candidate["lookback_value"],
-            "source_bar_count": 400,
+            "lookback_kind": horizon_process["lookback_kind"],
+            "lookback_value": horizon_process["lookback_value"],
+            "source_bar_count": horizon_process["source_bar_count"],
         }
+        assert attempted["horizon_process_sha256"] == horizon_process_sha256
         source_count = {
             "schema_version": "fxpm.historical-attempt-source-count.v1",
             "anchor_id": plan_body["anchor"]["anchor_id"],
@@ -523,9 +575,11 @@ def _postsearch_authority_bytes(
                 "candidate_definition_sha256"
             ],
             **execution,
-            "fit_start_utc": candidate["realized_start_utc"],
-            "fit_end_exclusive_utc": prefix["prefix_end_exclusive_utc"],
-            "latest_closed_bar_utc": prefix["prefix_last_close_utc"],
+            "fit_start_utc": utc_seconds(horizon_process["fit_start_utc"]),
+            "fit_end_exclusive_utc": utc_seconds(horizon_process["fit_end_utc"]),
+            "latest_closed_bar_utc": utc_seconds(
+                horizon_process["latest_closed_bar_utc"]
+            ),
             "fit_frame_sha256": _sha(f"fit-frame:{ordinal}"),
         }
         source_count["receipt_sha256"] = _sha_json(source_count)
@@ -568,9 +622,7 @@ def _postsearch_authority_bytes(
                     "candidate_definition_sha256"
                 ],
                 "horizon_trial_id": planned["trial_id"],
-                "horizon_trial_definition_sha256": trial[
-                    "trial_definition_sha256"
-                ],
+                "horizon_trial_definition_sha256": trial["trial_definition_sha256"],
                 "winner_attempt_id": attempted["attempt_id"],
                 "winner_process_candidate_id": attempted["process_candidate_id"],
                 "process_sha256": attempted["process_sha256"],
@@ -598,9 +650,7 @@ def _postsearch_authority_bytes(
         "artifact_namespace": "historical-anchor/anchor-sparse-evidence",
         "horizon_roster": {
             "plan_receipt_sha256": plan.receipt_sha256,
-            "source_prefix_receipt_sha256": plan_body[
-                "source_prefix_receipt_sha256"
-            ],
+            "source_prefix_receipt_sha256": plan_body["source_prefix_receipt_sha256"],
             "candidate_registry_sha256": plan_body["candidate_registry_sha256"],
             "trial_registry_sha256": plan_body["trial_registry_sha256"],
             "attempt_roster_sha256": plan_body["attempt_roster_sha256"],
@@ -617,9 +667,7 @@ def _postsearch_authority_bytes(
             "causal_fold_plan_sha256": precommitment["causal_fold_plan_sha256"],
             "source_contract_sha256": precommitment["source_contract_sha256"],
             "cost_contract_sha256": precommitment["cost_contract_sha256"],
-            "cost_stress_contract_sha256": precommitment[
-                "cost_stress_contract_sha256"
-            ],
+            "cost_stress_contract_sha256": precommitment["cost_stress_contract_sha256"],
         },
         "mapping_count": len(mapping),
         "mapping_sha256": _sha_json(mapping),
@@ -668,8 +716,8 @@ def _insufficient_cell(*, postsearch: bool) -> HistoricalBookCellEvidence:
     source, fit = _source_and_fit("AUDUSD", "M5", AVAILABLE)
     if postsearch:
         request, decision, plan = _all_process_rejected_request_and_plan(source)
-        cross_binding_bytes, raw_production_receipt_bytes = (
-            _postsearch_authority_bytes(source, fit, request, decision, plan)
+        cross_binding_bytes, raw_production_receipt_bytes = _postsearch_authority_bytes(
+            source, fit, request, decision, plan
         )
         reason = INSUFFICIENT_ALL_ATTEMPTS_REJECTED_REASON
         attempts = request.attempt_ledger.to_dict()["attempt_count"]
@@ -849,6 +897,30 @@ def _terminal_cell(ordinal: int) -> HistoricalBookCellEvidence:
         regime=regime,
         state_kind=TERMINAL_SOURCE_ABSENCE,
         reason_code="BROKER_HISTORY_TERMINALLY_UNAVAILABLE",
+        source_group_decision=source,
+        regime_fit_decision=fit,
+        attempted_trials_exact=0,
+    )
+    assert state is not None
+    evidence = process_state_cell_evidence(
+        process_state_decision=state,
+        source_group_decision=source,
+        regime_fit_decision=fit,
+    )
+    assert evidence is not None
+    return evidence
+
+
+@lru_cache(maxsize=FAMILY_SIZE)
+def _technical_terminal_cell(ordinal: int) -> HistoricalBookCellEvidence:
+    symbol, timeframe, regime = _cell_tuple(ordinal)
+    source, fit = _source_and_fit(symbol, timeframe, TERMINAL_TECHNICAL)
+    state = create_historical_process_state_decision(
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=regime,
+        state_kind=TERMINAL_TECHNICAL,
+        reason_code="AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL",
         source_group_decision=source,
         regime_fit_decision=fit,
         attempted_trials_exact=0,
@@ -1322,9 +1394,10 @@ def test_postsearch_all_process_rejected_binds_exact_count_without_winner_leaf()
     cross = json.loads(
         evidence.insufficient_horizon_winner_cross_binding_bytes.decode("ascii")
     )
-    assert cross["mapping"][0]["horizon_trial_definition_sha256"] != cross[
-        "mapping"
-    ][0]["trial_definition_sha256"]
+    assert (
+        cross["mapping"][0]["horizon_trial_definition_sha256"]
+        != cross["mapping"][0]["trial_definition_sha256"]
+    )
     assert cell["winner_request_sha256"] is None
     assert cell["winner_decision_sha256"] is None
     assert cell["historical_local_candidate_pending_causal"] is False
@@ -1362,6 +1435,10 @@ def test_postsearch_insufficiency_requires_exact_cross_binding_and_raw_receipt()
     assert create_historical_process_state_decision(**common) is None
 
     cross = json.loads(cross_bytes.decode("ascii"))
+    assert (
+        cross["mapping"][0]["source_count_receipt"]["fit_start_utc"]
+        != plan.to_dict()["candidates"][0]["realized_start_utc"]
+    )
     cross["mapping"][0]["horizon_trial_definition_sha256"] = cross["mapping"][0][
         "trial_definition_sha256"
     ]
@@ -1380,10 +1457,49 @@ def test_postsearch_insufficiency_requires_exact_cross_binding_and_raw_receipt()
         is None
     )
 
-    production = json.loads(production_bytes.decode("ascii"))
-    production["artifact_roster"]["winner-request"]["sha256"] = _sha(
-        "spliced-request"
+    cross = json.loads(cross_bytes.decode("ascii"))
+    source_count = cross["mapping"][0]["source_count_receipt"]
+    source_count["fit_start_utc"] = (
+        (
+            datetime.fromisoformat(source_count["fit_start_utc"].replace("Z", "+00:00"))
+            + timedelta(days=1)
+        )
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
     )
+    source_count["receipt_sha256"] = _sha_json(
+        {key: value for key, value in source_count.items() if key != "receipt_sha256"}
+    )
+    cross["mapping_sha256"] = _sha_json(cross["mapping"])
+    mutated_cross_bytes = _canonical(cross)
+    production = json.loads(production_bytes.decode("ascii"))
+    production["provenance_cross_binding_sha256"] = hashlib.sha256(
+        mutated_cross_bytes
+    ).hexdigest()
+    with pytest.raises(
+        book._BookError,
+        match="INSUFFICIENT_CROSS_BINDING_HORIZON_PROCESS_SPLICE",
+    ):
+        book._horizon_winner_cross_binding_identity(
+            mutated_cross_bytes,
+            plan_body=plan.to_dict(),
+            source_body=book._source_body(source),
+            fit_body=book._regime_fit_body(fit, source),
+            process_rejection_request=request,
+            process_rejection_decision=decision,
+            winner_raw_production_receipt_bytes=_canonical(production),
+        )
+    assert (
+        create_historical_process_state_decision(
+            **common,
+            horizon_winner_cross_binding_bytes=mutated_cross_bytes,
+            winner_raw_production_receipt_bytes=_canonical(production),
+        )
+        is None
+    )
+
+    production = json.loads(production_bytes.decode("ascii"))
+    production["artifact_roster"]["winner-request"]["sha256"] = _sha("spliced-request")
     assert (
         create_historical_process_state_decision(
             **common,
@@ -1643,6 +1759,7 @@ def test_terminal_source_decision_is_one_group_fact_for_all_four_regimes() -> No
     assert len({cell["regime_receipt_sha256"] for cell in siblings}) == 1
     assert body["source_group_counts"] == {
         AVAILABLE: 0,
+        TERMINAL_TECHNICAL: 0,
         TERMINAL_UNAVAILABLE: SOURCE_GROUP_SIZE,
     }
 
@@ -1671,6 +1788,40 @@ def test_technical_or_unsearched_cell_invalidates_candidate_book(kind: str) -> N
     )
 
 
+def test_authenticated_terminal_technical_group_is_complete_and_does_not_veto_winner() -> (
+    None
+):
+    overrides = {index: _technical_terminal_cell(index) for index in range(4, 8)}
+    overrides[0] = _verified_winner()
+    decision = evaluate_historical_book_multiplicity(
+        _family(available_groups=(0,), overrides=overrides)
+    )
+
+    assert decision.valid
+    assert decision.status == "HISTORICAL_LOCAL_CANDIDATES_AVAILABLE"
+    body = decision.to_dict()
+    assert body["optimization_run_complete"] is True
+    assert body["multiplicity_tested_family_size"] == FAMILY_SIZE - 4
+    assert body["multiplicity_excluded_terminal_technical_count"] == 4
+    tested_ids = [
+        cell["cell_id"]
+        for cell in body["cells"]
+        if cell["historical_state"] != TERMINAL_TECHNICAL
+    ]
+    assert body["multiplicity_tested_cell_ids_sha256"] == _sha_json(tested_ids)
+    assert {cell["historical_state"] for cell in body["cells"][4:8]} == {
+        TERMINAL_TECHNICAL
+    }
+    assert all(cell["marginal_p_value"] == 1.0 for cell in body["cells"][4:8])
+    assert all(cell["adjusted_q_value"] == 1.0 for cell in body["cells"][4:8])
+    assert all(
+        cell["within_cell_attempted_trials_exact"] == 0 for cell in body["cells"][4:8]
+    )
+    assert body["source_group_counts"][TERMINAL_TECHNICAL] == 1
+    assert body["regime_fit_counts"][REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL] == 1
+    assert body["historical_local_candidate_count"] == 1
+
+
 def test_hostile_technical_relabel_to_terminal_absence_fails_closed() -> None:
     technical = _available_state_cell(0, TECHNICAL_FAILURE, attempts=2)
     assert technical.process_state_decision is not None
@@ -1690,6 +1841,28 @@ def test_hostile_technical_relabel_to_terminal_absence_fails_closed() -> None:
             _family(available_groups=(0,), overrides={0: relabeled})
         ),
         "TERMINAL_PROCESS_PROVENANCE_INVALID",
+    )
+
+
+def test_hostile_generic_technical_cannot_relabel_to_terminal_technical() -> None:
+    technical = _available_state_cell(0, TECHNICAL_FAILURE, attempts=2)
+    assert technical.process_state_decision is not None
+    raw = technical.process_state_decision.to_dict()
+    raw.pop("receipt_sha256")
+    raw["state_kind"] = TERMINAL_TECHNICAL
+    raw["attempted_trials_exact"] = 0
+    raw["terminal"] = True
+    raw["complete"] = True
+    encoded = _canonical(raw)
+    forged = HistoricalProcessStateDecision(
+        encoded, hashlib.sha256(encoded).hexdigest()
+    )
+    relabeled = replace(technical, process_state_decision=forged)
+    _assert_rejected(
+        evaluate_historical_book_multiplicity(
+            _family(available_groups=(0,), overrides={0: relabeled})
+        ),
+        "TERMINAL_TECHNICAL_PROCESS_PROVENANCE_INVALID",
     )
 
 
@@ -2028,6 +2201,60 @@ def test_regime_fit_rejects_incomplete_or_inconsistent_support_counts() -> None:
         )
     ).hexdigest()
     assert create_regime_fit_decision(**common, train_regime_support=spliced) is None
+
+
+def test_regime_fit_accepts_authenticated_zero_label_support() -> None:
+    source, fit = _source_and_fit(
+        "XAUGBP",
+        "D1",
+        AVAILABLE,
+        counts=(0, 0, 0, 0),
+    )
+    support = fit.to_dict()["train_regime_support"]
+
+    assert support["eligible_rows"] == 0
+    assert support["observed_regimes"] == []
+    assert support["unobserved_regimes"] == list(REGIME_ORDER)
+    assert support["first_ts"] is None
+    assert support["last_ts"] is None
+    for regime in REGIME_ORDER:
+        state = create_historical_process_state_decision(
+            symbol="XAUGBP",
+            timeframe="D1",
+            regime=regime,
+            state_kind=REGIME_UNOBSERVED,
+            reason_code=REGIME_UNOBSERVED_REASON,
+            source_group_decision=source,
+            regime_fit_decision=fit,
+            attempted_trials_exact=0,
+        )
+        assert state is not None
+        assert state.to_dict()["state_kind"] == REGIME_UNOBSERVED
+
+    forged = deepcopy(support)
+    forged["first_ts"] = "2022-01-24T00:00:00+00:00"
+    forged["last_ts"] = "2022-01-24T00:00:00+00:00"
+    forged["receipt_sha256"] = hashlib.sha256(
+        _canonical(
+            {key: value for key, value in forged.items() if key != "receipt_sha256"}
+        )
+    ).hexdigest()
+    fit_body = fit.to_dict()
+    assert (
+        create_regime_fit_decision(
+            source_group_decision=source,
+            fit_state=fit_body["fit_state"],
+            reason_code=fit_body["reason_code"],
+            regime_fit_policy_sha256=fit_body["regime_fit_policy_sha256"],
+            detector_process_sha256=fit_body["detector_process_sha256"],
+            regime_fit_evidence_sha256=fit_body["regime_fit_evidence_sha256"],
+            four_regime_mapping_sha256=fit_body["four_regime_mapping_sha256"],
+            regime_params_sha256=fit_body["regime_params_sha256"],
+            regime_detector_record=fit_body["regime_detector_record"],
+            train_regime_support=forged,
+        )
+        is None
+    )
 
 
 def test_detector_record_rejects_omission_source_splice_cutoff_and_numeric_alias() -> (

@@ -221,9 +221,6 @@ class OptunaConfig:
     use_pruning: bool = False  # Disabled by default - full eval needed for trading
     pruning_warmup_steps: int = 5
     
-    # Timeout (optional)
-    timeout_seconds: Optional[float] = None
-
     # Early rejection thresholds (configurable)
     train_dd_multiplier: float = 1.25
     val_dd_multiplier: float = 1.0
@@ -965,7 +962,6 @@ class OptunaTPEOptimizer:
         study.optimize(
             objective,
             n_trials=n_trials,
-            timeout=self.config.timeout_seconds,
             show_progress_bar=False,
             catch=(Exception,),
         )
@@ -1363,7 +1359,6 @@ class OptunaTPEOptimizer:
             study.optimize(
                 objective,
                 n_trials=n_trials,
-                timeout=self.config.timeout_seconds,
                 show_progress_bar=False,
                 catch=(),
             )

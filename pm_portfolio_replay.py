@@ -56,7 +56,7 @@ PORTFOLIO_REPLAY_REQUIRED_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
 PORTFOLIO_REPLAY_REQUIRED_REGIMES = ("TREND", "RANGE", "BREAKOUT", "CHOP")
 PORTFOLIO_REPLAY_ROSTER_SCHEMA_VERSION = "fxpm.portfolio-replay-roster.v2"
 PORTFOLIO_REPLAY_BOOK_ACCOUNTING_SCHEMA_VERSION = (
-    "fxpm.portfolio-replay-book-accounting.v1"
+    "fxpm.portfolio-replay-book-accounting.v2"
 )
 CURRENT_REFIT_REPLAY_SUCCESSOR_SCHEMA_VERSION = (
     "fxpm.current-refit-synchronized-replay.v1"
@@ -190,7 +190,7 @@ def _sparse_physical_winner_rows(
 ) -> Tuple[Dict[str, Any], List[str]]:
     """Project only physical Winner leaves; possible slots live in Book."""
     requested = sorted(
-        {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+        {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
     )
     allowed = {str(status).strip().upper() for status in allowed_promotion_statuses}
     payload_by_symbol: Dict[str, Mapping[str, Any]] = {}
@@ -206,10 +206,16 @@ def _sparse_physical_winner_rows(
         for raw_symbol, raw_payload in ledger.items():
             if not isinstance(raw_payload, Mapping):
                 errors.append(
-                    f"LEDGER_SYMBOL_PAYLOAD_INVALID:{str(raw_symbol).upper()}"
+                    f"LEDGER_SYMBOL_PAYLOAD_INVALID:{str(raw_symbol)}"
                 )
                 continue
-            symbol = str(raw_payload.get("symbol") or raw_symbol).strip().upper()
+            ledger_symbol = str(raw_symbol).strip()
+            symbol = str(raw_payload.get("symbol") or ledger_symbol).strip()
+            if symbol != ledger_symbol:
+                errors.append(
+                    f"LEDGER_SYMBOL_IDENTITY_MISMATCH:{ledger_symbol}:{symbol}"
+                )
+                continue
             if symbol:
                 if symbol in payload_by_symbol:
                     errors.append(f"LEDGER_SYMBOL_DUPLICATE:{symbol}")
@@ -313,6 +319,12 @@ def build_book_possible_slot_accounting(
         "source_unavailable_binding_requirement": (
             "ACTIVE_NATIVE_DATA_STATE_TERMINAL_NON_SEARCH_V1"
         ),
+        "terminal_technical_binding_requirement": (
+            "ACTIVE_NATIVE_DATA_STATE_AUTHENTICATED_TERMINAL_TECHNICAL_V1"
+        ),
+        "source_unavailable_slot_ids": [],
+        "insufficient_evidence_slot_ids": [],
+        "terminal_technical_slot_ids": [],
         "state_counts": {},
     }
     try:
@@ -355,21 +367,33 @@ def build_book_possible_slot_accounting(
     ):
         errors.append("BOOK_POSSIBLE_SLOT_ACCOUNTING_INCOMPLETE")
 
-    accepted_states = {"WINNER", "NO_WINNER", book.REGIME_UNOBSERVED}
+    accepted_states = {
+        "WINNER",
+        "NO_WINNER",
+        book.REGIME_UNOBSERVED,
+        book.INSUFFICIENT_EVIDENCE,
+        book.TERMINAL_TECHNICAL,
+    }
     compact_rows: List[Dict[str, Any]] = []
     source_unavailable_ids: List[str] = []
+    insufficient_evidence_ids: List[str] = []
+    terminal_technical_ids: List[str] = []
     for cell in cells:
         if not isinstance(cell, Mapping):
             errors.append("BOOK_CELL_INVALID")
             continue
         slot_id = (
-            f"{str(cell.get('symbol') or '').upper()}|"
+            f"{str(cell.get('symbol') or '')}|"
             f"{str(cell.get('timeframe') or '').upper()}|"
             f"{str(cell.get('regime') or '').upper()}"
         )
         state = str(cell.get("historical_state") or "").upper()
         if state == "SOURCE_UNAVAILABLE":
             source_unavailable_ids.append(slot_id)
+        elif state == book.INSUFFICIENT_EVIDENCE:
+            insufficient_evidence_ids.append(slot_id)
+        elif state == book.TERMINAL_TECHNICAL:
+            terminal_technical_ids.append(slot_id)
         elif state not in accepted_states:
             errors.append(f"BOOK_CELL_NOT_TERMINAL:{slot_id}:{state or 'MISSING'}")
         compact_rows.append(
@@ -396,12 +420,12 @@ def build_book_possible_slot_accounting(
             "possible_cell_ids": possible_ids,
             "winner_slot_ids": winner_ids,
             "source_unavailable_slot_ids": source_unavailable_ids,
+            "insufficient_evidence_slot_ids": insufficient_evidence_ids,
+            "terminal_technical_slot_ids": terminal_technical_ids,
             "state_counts": state_counts,
             "cell_outcomes": compact_rows,
         }
     )
-    if source_unavailable_ids:
-        errors.append("BOOK_SOURCE_UNAVAILABLE_ACTIVATION_BINDING_REQUIRED")
     accounting["accounting_sha256"] = canonical_json_sha256(
         {
             "book_receipt_sha256": accounting.get("book_receipt_sha256"),
@@ -627,7 +651,7 @@ def build_current_refit_replay_roster(
 
     expected_symbols = sorted(
         {
-            str(slot).split("|", 1)[0].upper()
+            str(slot).split("|", 1)[0]
             for slot in accounting.get("possible_cell_ids", [])
         }
     )
@@ -644,7 +668,7 @@ def build_current_refit_replay_roster(
             errors.append("CURRENT_REFIT_CELL_INVALID")
             continue
         slot = (
-            f"{str(cell.get('symbol') or '').upper()}|"
+            f"{str(cell.get('symbol') or '')}|"
             f"{str(cell.get('timeframe') or '').upper()}|"
             f"{str(cell.get('regime') or '').upper()}"
         )
@@ -1296,7 +1320,7 @@ class CandidateTrade:
         return CandidateTrade(
             candidate_id=str(self.candidate_id),
             cell_id=str(self.cell_id),
-            symbol=str(self.symbol).upper(),
+            symbol=str(self.symbol),
             timeframe=str(self.timeframe).upper(),
             regime=str(self.regime).upper(),
             strategy_name=str(self.strategy_name),
@@ -1716,12 +1740,18 @@ def active_native_portfolio_contract(
     from pm_native_activation import (
         ACTIVE_POINTER_SCHEMA,
         ACTIVATION_MANIFEST_SCHEMA,
+        NATIVE_EVIDENCE_CANDIDATE,
+        NATIVE_SOURCE_UNAVAILABLE,
+        NATIVE_TECHNICAL_ERROR,
+        UNIVERSE_AUTHENTICITY_SCHEMA,
         resolve_active_native_universe,
         sha256_file,
     )
 
-    requested_symbols = sorted(
-        {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+    configured_symbols = list(
+        dict.fromkeys(
+            str(symbol).strip() for symbol in symbols if str(symbol).strip()
+        )
     )
     requested_timeframes = [
         str(timeframe).strip().upper()
@@ -1734,7 +1764,7 @@ def active_native_portfolio_contract(
     contract: Dict[str, Any] = {
         "pointer_schema": ACTIVE_POINTER_SCHEMA,
         "manifest_schema": ACTIVATION_MANIFEST_SCHEMA,
-        "symbols": requested_symbols,
+        "symbols": configured_symbols,
         "timeframes": requested_timeframes,
     }
     try:
@@ -1777,19 +1807,28 @@ def active_native_portfolio_contract(
     )
     universe = resolve_active_native_universe(
         Path(data_dir),
-        requested_symbols,
+        configured_symbols,
         required_timeframes=requested_timeframes,
         verify_exclusion_evidence=verify_exclusion_evidence,
         production_contract_required=True,
     )
     errors.extend(universe.errors)
+    requested_symbols = (
+        list(configured_symbols)
+        if universe.exact_symbol_identity
+        else sorted({value.upper() for value in configured_symbols})
+    )
+    contract["symbols"] = requested_symbols
     eligible_symbols = set(universe.eligible_symbols)
     excluded_symbols = dict(universe.excluded_symbols)
+    authenticity_contract = (
+        universe.eligibility_schema == UNIVERSE_AUTHENTICITY_SCHEMA
+    )
     entry_contract: List[Dict[str, Any]] = []
     bars_sha_by_source: Dict[str, str] = {}
     sidecar_sha_by_source: Dict[str, str] = {}
     for symbol in requested_symbols:
-        if symbol in excluded_symbols:
+        if not authenticity_contract and symbol in excluded_symbols:
             exclusion = excluded_symbols[symbol]
             entry_contract.append(
                 {
@@ -1800,7 +1839,7 @@ def active_native_portfolio_contract(
                 }
             )
             continue
-        if symbol not in eligible_symbols:
+        if not authenticity_contract and symbol not in eligible_symbols:
             errors.append(f"NATIVE_UNIVERSE_SYMBOL_NOT_ELIGIBLE_OR_EXCLUDED:{symbol}")
             continue
         symbol_entries = (
@@ -1815,24 +1854,60 @@ def active_native_portfolio_contract(
             status = str(entry.get("status") or "").lower()
             bars_sha = str(entry.get("bars_sha256") or "").lower()
             sidecar_sha = str(entry.get("sidecar_sha256") or "").lower()
-            if status != "active":
+            if authenticity_contract:
+                resolved_status = universe.cell_status(symbol, timeframe)
+                if status != resolved_status:
+                    errors.append(f"NATIVE_ACTIVE_CELL_STATUS_MISMATCH:{cell_id}")
+                if status not in {
+                    NATIVE_EVIDENCE_CANDIDATE,
+                    NATIVE_SOURCE_UNAVAILABLE,
+                    NATIVE_TECHNICAL_ERROR,
+                }:
+                    errors.append(
+                        f"NATIVE_ACTIVE_CELL_NOT_TERMINAL_AUTHENTICITY:{cell_id}:{status}"
+                    )
+            elif status != "active":
                 errors.append(f"NATIVE_ACTIVE_CELL_NOT_ACTIVE:{cell_id}")
-            if str(entry.get("symbol") or "").upper() != symbol:
+            entry_symbol = str(entry.get("symbol") or "")
+            if (
+                entry_symbol != symbol
+                if universe.exact_symbol_identity
+                else entry_symbol.upper() != symbol
+            ):
                 errors.append(f"NATIVE_ACTIVE_CELL_SYMBOL_MISMATCH:{cell_id}")
             if str(entry.get("timeframe") or "").upper() != timeframe:
                 errors.append(f"NATIVE_ACTIVE_CELL_TIMEFRAME_MISMATCH:{cell_id}")
-            if len(bars_sha) != 64 or len(sidecar_sha) != 64:
-                errors.append(f"NATIVE_ACTIVE_CELL_HASH_MISSING:{cell_id}")
-            entry_contract.append(
-                {
-                    "cell_id": cell_id,
-                    "status": status,
-                    "bars_sha256": bars_sha,
-                    "sidecar_sha256": sidecar_sha,
-                }
+            requires_loadable_source = (
+                status == NATIVE_EVIDENCE_CANDIDATE
+                if authenticity_contract
+                else status == "active"
             )
-            bars_sha_by_source[cell_id] = bars_sha
-            sidecar_sha_by_source[cell_id] = sidecar_sha
+            if requires_loadable_source and (
+                len(bars_sha) != 64 or len(sidecar_sha) != 64
+            ):
+                errors.append(f"NATIVE_ACTIVE_CELL_HASH_MISSING:{cell_id}")
+            if authenticity_contract:
+                entry_contract.append(
+                    {
+                        "cell_id": cell_id,
+                        "status": status,
+                        "bars_sha256": bars_sha,
+                        "sidecar_sha256": sidecar_sha,
+                        "reason_codes": list(entry.get("reason_codes") or []),
+                    }
+                )
+            else:
+                entry_contract.append(
+                    {
+                        "cell_id": cell_id,
+                        "status": status,
+                        "bars_sha256": bars_sha,
+                        "sidecar_sha256": sidecar_sha,
+                    }
+                )
+            if requires_loadable_source:
+                bars_sha_by_source[cell_id] = bars_sha
+                sidecar_sha_by_source[cell_id] = sidecar_sha
     contract.update(
         {
             "activation_id": activation_id,
@@ -2274,45 +2349,45 @@ def validate_funded_portfolio_replay_evidence(
     sidecars_by_source = expected_lineage.get("native_sidecar_sha256_by_source")
     valuation_symbols = sorted(
         {
-            str(cell_id).split("|", 1)[0].upper()
+            str(cell_id).split("|", 1)[0]
             for cell_id in (expected_roster.get("tradeable_cell_ids") or [])
             if str(cell_id).strip()
         }
     )
     for symbol in valuation_symbols:
-        canonical_symbol = str(symbol).upper()
-        source_id = f"{canonical_symbol}|M5"
-        source = valuation_sources.get(canonical_symbol)
+        exact_symbol = str(symbol)
+        source_id = f"{exact_symbol}|M5"
+        source = valuation_sources.get(exact_symbol)
         if not isinstance(source, Mapping):
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_SOURCE_MISSING:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_SOURCE_MISSING:{exact_symbol}"
             )
             continue
         if (
             str(source.get("source_kind") or "").lower() != "broker_native"
-            or str(source.get("symbol") or "").upper() != canonical_symbol
+            or str(source.get("symbol") or "") != exact_symbol
             or str(source.get("timeframe") or "").upper() != "M5"
         ):
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_SOURCE_INVALID:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_SOURCE_INVALID:{exact_symbol}"
             )
         if not bool(source.get("provenance_valid")):
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_PROVENANCE_INVALID:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_PROVENANCE_INVALID:{exact_symbol}"
             )
         if str(source.get("timestamp_semantics") or "").lower() != "bar_open_utc":
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_TIMESTAMP_INVALID:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_TIMESTAMP_INVALID:{exact_symbol}"
             )
         if source.get("activation_id") != expected_lineage.get("native_activation_id"):
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_ACTIVATION_MISMATCH:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_ACTIVATION_MISMATCH:{exact_symbol}"
             )
         if source.get("activation_manifest_sha256") != expected_lineage.get(
             "native_activation_manifest_sha256"
         ):
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_MANIFEST_MISMATCH:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_MANIFEST_MISMATCH:{exact_symbol}"
             )
         expected_bars_sha = (
             bars_by_source.get(source_id)
@@ -2326,11 +2401,11 @@ def validate_funded_portfolio_replay_evidence(
         )
         if source.get("source_sha256") != expected_bars_sha:
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_BARS_HASH_MISMATCH:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_BARS_HASH_MISMATCH:{exact_symbol}"
             )
         if source.get("sidecar_sha256") != expected_sidecar_sha:
             errors.append(
-                f"PORTFOLIO_EVIDENCE_VALUATION_SIDECAR_HASH_MISMATCH:{canonical_symbol}"
+                f"PORTFOLIO_EVIDENCE_VALUATION_SIDECAR_HASH_MISMATCH:{exact_symbol}"
             )
 
     scenarios = (

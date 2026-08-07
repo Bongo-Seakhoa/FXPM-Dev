@@ -23,6 +23,7 @@ from pm_main import (
     _resolve_config_relative_path,
     _validate_funded_config_schema,
 )
+from pm_demo_readiness import AUTHORIZED_DEMO_ACCOUNT_IDENTITY
 from pm_position import PositionConfig, TradeTagEncoder
 from pm_live_outcomes import LiveOutcomeError
 
@@ -1392,6 +1393,11 @@ class LiveRiskIntentTests(unittest.TestCase):
         account.trade_mode = 0
         account.margin_mode = 2
         account.hedge_allowed = True
+        # Pre-send identity enforcement requires the exact authorized Demo
+        # account before the management-authority gate can be reached.
+        account.login = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.login
+        account.server = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.server
+        account.currency = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.currency
         trader._promotion_authorization_block_reason = MagicMock(return_value=None)
         trader._current_refit_demo_position_block_reason = MagicMock(
             return_value=None

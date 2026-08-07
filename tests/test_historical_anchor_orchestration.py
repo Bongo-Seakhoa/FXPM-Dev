@@ -5,6 +5,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ import pm_book_multiplicity as book
 import pm_causal_process as causal
 import pm_causal_evidence_producer as causal_producer
 import pm_historical_anchor_orchestration as orchestration
+import pm_portfolio_replay as portfolio_replay
 import pm_production_search_planner as search_planner
 import pm_training_horizon as training_horizon
 from tests import test_training_horizon as horizon_fixture
@@ -116,10 +118,23 @@ def _precommit(tmp_path: Path):
 
 def _canary_prerequisites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     generation_id = "raw-winner-canary-nonauthorizing-test"
+    # The issuer independently reopens the ACTIVE native contract and proves
+    # its canonical sha equals the frozen context's native_universe_sha256, so
+    # the fixture must freeze the context against the exact contract it fakes.
+    native_contract = {
+        "activation_id": "production-activation",
+        "activation_manifest_sha256": "2" * 64,
+        "symbols": list(book.PINNED_SYMBOL_ORDER),
+        "timeframes": list(book.TIMEFRAME_ORDER),
+    }
+    monkeypatch.setattr(
+        "pm_portfolio_replay.active_native_portfolio_contract",
+        lambda _data_dir, _symbols, **_kwargs: (dict(native_contract), []),
+    )
     context = spool.freeze_generation_context(
         tmp_path / "canary-spool",
         generation_id=generation_id,
-        native_universe_sha256="c" * 64,
+        native_universe_sha256=portfolio_replay.canonical_json_sha256(native_contract),
         config_sha256="d" * 64,
     )
     process = search_planner.freeze_production_search_process(
@@ -168,6 +183,7 @@ def _canary_prerequisites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_bounded_canary_request_is_issuer_sealed_latest_anchor_and_one_shot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    assert list(book.PINNED_SYMBOL_ORDER) != sorted(book.PINNED_SYMBOL_ORDER)
     context, process, causal_precommit, plan = _canary_prerequisites(
         tmp_path, monkeypatch
     )
@@ -180,9 +196,7 @@ def test_bounded_canary_request_is_issuer_sealed_latest_anchor_and_one_shot(
         symbol=book.PINNED_SYMBOL_ORDER[0],
         timeframe=book.TIMEFRAME_ORDER[0],
     )
-    body = orchestration.verify_bounded_raw_winner_canary_request(
-        context, request
-    )
+    body = orchestration.verify_bounded_raw_winner_canary_request(context, request)
 
     assert body["anchor"] == plan["anchor_plan"][-1]
     assert body["production_symbols"] == list(book.PINNED_SYMBOL_ORDER)
@@ -192,6 +206,7 @@ def test_bounded_canary_request_is_issuer_sealed_latest_anchor_and_one_shot(
     )
     assert "regime" not in body
     assert body["attempt_count_exact"] == 128
+    assert body["native_authority_verification"] is None
     assert all(
         body[name] is False
         for name in (
@@ -227,9 +242,7 @@ def test_bounded_canary_request_is_issuer_sealed_latest_anchor_and_one_shot(
         orchestration.HistoricalAnchorOrchestrationError,
         match="CANARY_REQUEST_ISSUANCE_INVALID",
     ):
-        orchestration.verify_bounded_raw_winner_canary_request(
-            context, copied_tag
-        )
+        orchestration.verify_bounded_raw_winner_canary_request(context, copied_tag)
 
     consumed, sink = orchestration.consume_bounded_raw_winner_canary_request(
         context, request
@@ -241,6 +254,53 @@ def test_bounded_canary_request_is_issuer_sealed_latest_anchor_and_one_shot(
         match="CANARY_REQUEST_ALREADY_CONSUMED",
     ):
         orchestration.consume_bounded_raw_winner_canary_request(context, request)
+
+
+def test_bounded_canary_native_authority_metrics_are_exact_and_tamper_evident() -> None:
+    metrics = {
+        "schema_version": "fxpm.production_native_authority_verification_scope.v1",
+        "scope": "9" * 64,
+        "full_verification_count": 1,
+        "identity_revalidation_attempt_count": 5,
+        "identity_revalidation_count": 5,
+        "identity_revalidation_failure_count": 0,
+        "active_pointer_sha256": "8" * 64,
+        "activation_manifest_sha256": "2" * 64,
+        "pid": 1234,
+        "thread_id": 5678,
+        "poison_reason": None,
+        "closed": True,
+        "poisoned": False,
+    }
+    assert orchestration._normalized_native_authority_verification(
+        metrics,
+        expected_activation_manifest_sha256="2" * 64,
+        allow_none=False,
+    ) == metrics
+
+    for field, value in (
+        ("full_verification_count", 2),
+        ("identity_revalidation_attempt_count", 4),
+        ("identity_revalidation_count", 4),
+        ("identity_revalidation_failure_count", 1),
+        ("activation_manifest_sha256", "7" * 64),
+        ("pid", 0),
+        ("thread_id", 0),
+        ("poison_reason", "ACTIVE_POINTER_CHANGED"),
+        ("closed", False),
+        ("poisoned", True),
+    ):
+        tampered = dict(metrics)
+        tampered[field] = value
+        with pytest.raises(
+            orchestration.HistoricalAnchorOrchestrationError,
+            match="CANARY_NATIVE_AUTHORITY",
+        ):
+            orchestration._normalized_native_authority_verification(
+                tampered,
+                expected_activation_manifest_sha256="2" * 64,
+                allow_none=False,
+            )
 
 
 def test_bounded_canary_issuance_rejects_nonproduction_grid(
@@ -301,15 +361,13 @@ def test_pre_evidence_planning_request_has_no_fabricated_historical_precommit(
     )
     assert "precommit_receipt_sha256" not in body
     assert body["historical_anchor_precommit_pending"] is True
-    assert (
-        body["planning_access_limited_to_native_prefix_and_process_design"]
-        is True
-    )
+    assert body["planning_access_limited_to_native_prefix_and_process_design"] is True
     assert body["return_or_winner_evidence_access_authorized"] is False
     assert body["confers_causal_or_current_authority"] is False
-    assert request.symbol_sink(book.PINNED_SYMBOL_ORDER[0]) is sinks[
-        book.PINNED_SYMBOL_ORDER[0]
-    ]
+    assert (
+        request.symbol_sink(book.PINNED_SYMBOL_ORDER[0])
+        is sinks[book.PINNED_SYMBOL_ORDER[0]]
+    )
 
     incomplete_sinks = dict(sinks)
     incomplete_sinks.pop(book.PINNED_SYMBOL_ORDER[-1])
@@ -370,6 +428,41 @@ def _terminal_plan(
     return training_horizon.build_historical_horizon_plan(request)
 
 
+def _terminal_technical_plan(
+    *,
+    anchor_id: str,
+    cutoff: str,
+    forward_start_date: str,
+    forward_end_date: str,
+    cell: tuple[str, str, str],
+):
+    request = horizon_fixture._terminal_source_request("TECHNICAL_TERMINAL")
+    request["run_id"] = "historical-run-001"
+    request["anchor"] = {
+        "anchor_id": anchor_id,
+        "ordinal": int(anchor_id.rsplit("-", 1)[-1]),
+        "selection_cutoff_utc": cutoff,
+        "forward_start_utc": f"{forward_start_date}T00:00:00Z",
+        "forward_end_exclusive_utc": f"{forward_end_date}T00:00:00Z",
+        "evidence_accessed_at_utc": "2026-07-13T12:00:00Z",
+        "process_precommit_receipt_sha256": PROCESS_PRECOMMIT,
+    }
+    request["cell"] = {
+        "symbol": cell[0],
+        "timeframe": cell[1],
+        "regime": cell[2],
+    }
+    request["native_prefix"].update(
+        {
+            "symbol": cell[0],
+            "timeframe": cell[1],
+            "source_reason": "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL",
+            "source_terminal_receipt_sha256": _sha(":".join(cell)),
+        }
+    )
+    return training_horizon.build_historical_horizon_plan(request)
+
+
 def _symbol_evidence(anchor_id: str, symbol: str):
     evidence = []
     for timeframe in book.TIMEFRAME_ORDER:
@@ -411,6 +504,49 @@ def _symbol_evidence(anchor_id: str, symbol: str):
             )
             assert cell is not None
             evidence.append(cell)
+    return evidence
+
+
+def _terminal_technical_evidence(symbol: str, timeframe: str, regime: str):
+    tag = f"terminal-technical:{symbol}:{timeframe}"
+    source = book.create_historical_source_group_decision(
+        symbol=symbol,
+        timeframe=timeframe,
+        availability=book.TERMINAL_TECHNICAL,
+        reason_code="AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL",
+        source_contract_sha256=_sha(f"{tag}:source-contract"),
+        source_group_evidence_sha256=_sha(f"{tag}:source-evidence"),
+        acquisition_attempts_exact=1,
+        activation_id="native-activation-001",
+        activation_manifest_sha256="3" * 64,
+        activation_entry_sha256="4" * 64,
+        terminal_proof_sha256=_sha(":".join((symbol, timeframe, regime))),
+    )
+    assert source is not None
+    fit = book.create_regime_fit_decision(
+        source_group_decision=source,
+        fit_state=book.REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
+        reason_code="AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL",
+        regime_fit_policy_sha256=_sha(f"{tag}:regime-policy"),
+    )
+    assert fit is not None
+    state = book.create_historical_process_state_decision(
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=regime,
+        state_kind=book.TERMINAL_TECHNICAL,
+        reason_code="AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL",
+        source_group_decision=source,
+        regime_fit_decision=fit,
+        attempted_trials_exact=0,
+    )
+    assert state is not None
+    evidence = book.process_state_cell_evidence(
+        process_state_decision=state,
+        source_group_decision=source,
+        regime_fit_decision=fit,
+    )
+    assert evidence is not None
     return evidence
 
 
@@ -481,6 +617,28 @@ def test_horizon_status_is_bound_to_exact_book_cell_state() -> None:
         match="HORIZON_TECHNICAL_INCOMPLETE_BLOCKS_ANCHOR",
     ):
         orchestration._assert_horizon_evidence_consistency(technical, evidence)
+
+    terminal_technical_plan = _terminal_technical_plan(
+        anchor_id="anchor-01",
+        cutoff="2015-01-01T00:00:00Z",
+        forward_start_date="2015-02-05",
+        forward_end_date="2016-02-04",
+        cell=cell,
+    )
+    terminal_technical_binding = orchestration.historical_horizon_plan_binding(
+        terminal_technical_plan
+    )
+    terminal_technical = _terminal_technical_evidence(*cell)
+    orchestration._assert_horizon_evidence_consistency(
+        terminal_technical_binding, terminal_technical
+    )
+    with pytest.raises(
+        orchestration.HistoricalAnchorOrchestrationError,
+        match="HORIZON_TERMINAL_TECHNICAL_EVIDENCE_MISMATCH",
+    ):
+        orchestration._assert_horizon_evidence_consistency(
+            terminal_technical_binding, evidence
+        )
 
 
 def test_forged_insufficient_registry_or_status_is_rejected() -> None:
@@ -599,6 +757,62 @@ def test_persisted_book_is_replayed_by_exact_v11_semantic_authority() -> None:
         orchestration._reopen_verified_book_decision(forged)
 
 
+def test_worker_request_reopens_exact_bytes_with_only_its_sealed_symbol_sink(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+    sink = spool.open_symbol_sink(
+        context,
+        symbol,
+        manifest_domain=spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN,
+    )
+    body = {
+        "schema_version": orchestration.PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA,
+        "authority_scope": orchestration.AUTHORITY_SCOPE,
+        "run_id": "historical-worker-test",
+        "generation_id": context.generation_id,
+        "native_universe_sha256": context.native_universe_sha256,
+        "config_sha256": context.config_sha256,
+        "generation_context_sha256": context.context_sha256,
+        "historical_anchor_precommit_pending": True,
+        "process_precommit_receipt_sha256": "a" * 64,
+        "optimizer_producer_release_sha256": "b" * 64,
+        "anchor": {
+            "anchor_id": "A1",
+            "selection_cutoff_utc": "2024-01-01T00:00:00Z",
+            "forward_start_date": "2024-02-05",
+            "forward_end_date": "2025-02-03",
+            "purge_calendar_days": 35,
+        },
+        "symbols": list(book.PINNED_SYMBOL_ORDER),
+        "timeframes": list(book.TIMEFRAME_ORDER),
+        "regimes": list(book.REGIME_ORDER),
+        "requires_exact_sparse_state_roster": True,
+        "possible_regime_slots_are_forced_observations": False,
+        "planning_access_limited_to_native_prefix_and_process_design": True,
+        "return_or_winner_evidence_access_authorized": False,
+        "confers_causal_or_current_authority": False,
+    }
+    raw = _canonical(body)
+    request = orchestration.reopen_anchor_producer_request_for_symbol(
+        context,
+        request_body_bytes=raw,
+        expected_receipt_sha256=hashlib.sha256(raw).hexdigest(),
+        symbol=symbol,
+        sink=sink,
+    )
+    assert request.to_dict() == body
+    assert request.symbol_sink(symbol) is sink
+
+    forged = orchestration.AnchorProducerRequest(raw, {symbol: sink}, symbol, object())
+    with pytest.raises(
+        orchestration.HistoricalAnchorOrchestrationError,
+        match="PRODUCER_REQUEST_SYMBOL_SINKS_UNAVAILABLE",
+    ):
+        forged.symbol_sink(symbol)
+
+
 def test_anchor_producer_callback_is_invoked_exactly_once(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -685,6 +899,69 @@ def test_anchor_producer_callback_is_invoked_exactly_once(
     assert calls == 1
 
 
+def test_historical_run_seals_and_reopens_the_historical_manifest_domain(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context, anchors, _, precommit = _precommit(tmp_path)
+    symbol = book.PINNED_SYMBOL_ORDER[0]
+
+    def anchor_book(**kwargs):
+        anchor_id = kwargs["anchor"]["anchor_id"]
+        body = {
+            "valid": True,
+            "optimization_run_complete": True,
+            "source_group_size": 1,
+            "family_size": 1,
+            "counts": {"SOURCE_UNAVAILABLE": 1},
+        }
+        return (
+            SimpleNamespace(
+                receipt_sha256=_sha(f"decision:{anchor_id}"),
+                book_generation_sha256=_sha(f"book:{anchor_id}"),
+                status="NO_LOCAL_WINNERS",
+                to_dict=lambda body=body: dict(body),
+            ),
+            [],
+        )
+
+    observed: dict[str, object] = {}
+
+    def verify_run(_context, _precommit, candidate):
+        symbol_receipt = candidate.to_dict()["symbol_receipts"][0]
+        observed["receipt"] = symbol_receipt
+        observed["manifest"] = spool.verify_symbol_receipt(
+            context.root,
+            symbol_receipt,
+            expected_generation_id=context.generation_id,
+            expected_symbol=symbol,
+            expected_native_universe_sha256=context.native_universe_sha256,
+            expected_config_sha256=context.config_sha256,
+            expected_manifest_domain=spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN,
+        )
+        return True
+
+    monkeypatch.setattr(orchestration, "_anchor_book", anchor_book)
+    monkeypatch.setattr(
+        orchestration,
+        "verify_historical_anchor_run_receipt",
+        verify_run,
+    )
+    producers = {anchor["anchor_id"]: (lambda _request: ()) for anchor in anchors}
+
+    orchestration.execute_historical_anchor_run(
+        context,
+        precommit,
+        producers,
+    )
+
+    assert observed["receipt"]["manifest_domain"] == (
+        spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN
+    )
+    assert observed["manifest"]["manifest_domain"] == (
+        spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN
+    )
+
 def test_exact_callback_roster_and_causal_anchor_geometry_are_mandatory(
     tmp_path: Path,
 ) -> None:
@@ -695,7 +972,11 @@ def test_exact_callback_roster_and_causal_anchor_geometry_are_mandatory(
         orchestration.HistoricalAnchorOrchestrationError,
         match="EXACT_PER_ANCHOR_PRODUCER_CALLBACKS_REQUIRED",
     ):
-        orchestration.execute_historical_anchor_run(context, precommit, producers)
+        orchestration.execute_historical_anchor_run(
+            context,
+            precommit,
+            producers,
+        )
 
     with pytest.raises(
         orchestration.HistoricalAnchorOrchestrationError,

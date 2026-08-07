@@ -338,6 +338,10 @@ class _WriterFailureConnector:
     def get_last_error() -> tuple[int, str]:
         return (1, "Success")
 
+    @staticmethod
+    def get_runtime_metadata() -> dict[str, Any]:
+        return copy.deepcopy(_writer_source_environment())
+
     def get_last_history_range_diagnostics(self) -> dict[str, Any]:
         return copy.deepcopy(self.diagnostics)
 
@@ -641,7 +645,7 @@ def _actual_writer_record(
         store.close()
     expected_failure = {
         "fetch_failed": "unexpected_acquisition_failure",
-        "partial_terminal_prefix": "terminal_prefix_unresolved",
+        "partial_terminal_prefix": "technical_history_gap",
     }.get(mode, mode)
     assert outcome["complete"] is False
     assert outcome["manifest_path"] is None
@@ -920,7 +924,7 @@ def test_actual_writer_technical_partial_remains_nonfinal_and_retryable(
     assert receipt is not None
     record = receipt["record"]
     assert record["status"] == "partial"
-    assert record["failure_status"] == "terminal_prefix_unresolved"
+    assert record["failure_status"] == "technical_history_gap"
     if receipt["retention_status"] == "full":
         assert record["artifact"] is None
         assert record["rows"] == 0

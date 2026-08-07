@@ -933,7 +933,7 @@ def _normalize_current_refit_cell(
     current_cutoff: datetime,
 ) -> Dict[str, Any]:
     cell = _exact_keys(raw, _REFIT_CELL_FIELDS, name="current refit cell")
-    symbol = _required_text(cell.get("symbol"), name="symbol", maximum=64).upper()
+    symbol = _required_text(cell.get("symbol"), name="symbol", maximum=64)
     timeframe = _required_text(
         cell.get("timeframe"), name="timeframe", maximum=8
     ).upper()

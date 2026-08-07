@@ -66,6 +66,13 @@ PROCESS_ARTIFACT_ID: Final = "production-search-process-precommit"
 PROCESS_ARTIFACT_TYPE: Final = "production_search_process_precommit"
 CELL_PLAN_SCHEMA: Final = "fxpm.production-search-cell-plan-receipt.v1"
 CELL_PLAN_ARTIFACT_TYPE: Final = "production_search_cell_plan_receipt"
+STATE_CONTEXT_DISPOSITION_SCHEMA: Final = (
+    "fxpm.production-trial-state-context-disposition.v1"
+)
+STATE_CONTEXT_SELECTION_SCHEMA: Final = (
+    "fxpm.production-cell-state-context-selection.v1"
+)
+STATE_CONTEXT_BOUNDARY_REASON: Final = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
 CURRENT_SOURCE_CAPTURE_SCHEMA: Final = "fxpm.production-current-source-capture.v1"
 CURRENT_SOURCE_SNAPSHOT_SCHEMA: Final = "fxpm.current-refit-source-snapshot.v1"
 CURRENT_BAR_FILE_SCHEMA: Final = "fxpm.current-refit-bars.csv.v1"
@@ -300,12 +307,8 @@ def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
         "strategy_module": type(strategy).__module__,
         "strategy_class": type(strategy).__name__,
         "strategy_source_sha256": _source_sha256(type(strategy)),
-        "entry_rule_identity_sha256": _callable_sha256(
-            type(strategy).generate_signals
-        ),
-        "exit_rule_identity_sha256": _callable_sha256(
-            type(strategy).calculate_stops
-        ),
+        "entry_rule_identity_sha256": _callable_sha256(type(strategy).generate_signals),
+        "exit_rule_identity_sha256": _callable_sha256(type(strategy).calculate_stops),
         "minimum_bars": int(strategy.MIN_BARS),
         "required_features": sorted(strategy.get_feature_request()),
         "defaults": defaults,
@@ -413,6 +416,10 @@ def _derived_dependency_geometry(
         int(payload["regime_warmup_bars"]),
         int(payload["cost_lookback_bars"]),
     )
+    left_purge_bars = max(
+        int(payload["label_lookahead_bars"]),
+        int(payload["execution_delay_bars"]) + int(payload["max_holding_bars"]),
+    )
     delayed_holding_seconds = int(payload["execution_delay_bars"]) * seconds + max(
         int(payload["max_holding_bars"]) * seconds,
         int(payload["max_holding_seconds"]),
@@ -432,11 +439,10 @@ def _derived_dependency_geometry(
         "timeframe_seconds": seconds,
         "warmup_bars": warmup_bars,
         "warmup_seconds": warmup_bars * seconds,
+        "left_purge_bars": left_purge_bars,
         "left_purge_seconds": left_purge_seconds,
         "right_purge_bars": right_purge_bars,
-        "right_purge_seconds": max(
-            right_purge_bars * seconds, delayed_holding_seconds
-        ),
+        "right_purge_seconds": max(right_purge_bars * seconds, delayed_holding_seconds),
     }
 
 
@@ -445,9 +451,7 @@ def _process_semantics(domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     horizon_policy = {
         timeframe: {
             "lookback_kind": "CALENDAR_INTERVAL",
-            "precommitted_depth_ladder_days": list(
-                FIT_CALENDAR_DAY_LADDERS[timeframe]
-            ),
+            "precommitted_depth_ladder_days": list(FIT_CALENDAR_DAY_LADDERS[timeframe]),
             "selection_rule": (
                 "LARGEST_FEASIBLE_BY_AUTHENTICATED_SOURCE_GEOMETRY_ONLY"
             ),
@@ -461,9 +465,7 @@ def _process_semantics(domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "schema_version": PROCESS_SEMANTICS_SCHEMA,
         "registry_order": [item["strategy_id"] for item in domain_roster],
-        "registry_order_sha256": _sha(
-            [item["strategy_id"] for item in domain_roster]
-        ),
+        "registry_order_sha256": _sha([item["strategy_id"] for item in domain_roster]),
         "strategy_domain_count": len(domain_roster),
         "strategy_domains": domain_roster,
         "strategy_domain_roster_sha256": _sha(domain_roster),
@@ -613,7 +615,9 @@ class ProductionCellSearchPlan:
     _bounded_canary_plan_permit: Any = None
 
     def attempt_artifacts(self) -> tuple[dict[str, Any], ...]:
-        return tuple(json.loads(value.decode("ascii")) for value in self._attempt_artifacts_json)
+        return tuple(
+            json.loads(value.decode("ascii")) for value in self._attempt_artifacts_json
+        )
 
     @property
     def attempt_count(self) -> int:
@@ -621,8 +625,7 @@ class ProductionCellSearchPlan:
 
     def state_requirements(self) -> tuple[dict[str, Any], ...]:
         return tuple(
-            json.loads(value.decode("ascii"))
-            for value in self._state_requirements_json
+            json.loads(value.decode("ascii")) for value in self._state_requirements_json
         )
 
     def current_refit_source_capture(self) -> dict[str, Any] | None:
@@ -735,9 +738,7 @@ def freeze_current_search_authorization(
     ):
         if not isinstance(value, Mapping):
             _fail(code)
-        values.append(
-            json.loads(_canonical_bytes(dict(value)).decode("ascii"))
-        )
+        values.append(json.loads(_canonical_bytes(dict(value)).decode("ascii")))
     precommit, evidence, reconciliation = values
     try:
         decision = causal.evaluate_historical_process(
@@ -854,18 +855,12 @@ def verify_current_search_authorization(
 def _artifact_namespace(value: str) -> str:
     raw = _identity(value, "ARTIFACT_NAMESPACE_INVALID", maximum=512)
     parts = raw.split("/")
-    if (
-        not 1 <= len(parts) <= 12
-        or any(
-            not part
-            or len(part) > 96
-            or not part[0].isalnum()
-            or any(
-                not (character.isalnum() or character in "._:-")
-                for character in part
-            )
-            for part in parts
-        )
+    if not 1 <= len(parts) <= 12 or any(
+        not part
+        or len(part) > 96
+        or not part[0].isalnum()
+        or any(not (character.isalnum() or character in "._:-") for character in part)
+        for part in parts
     ):
         _fail("ARTIFACT_NAMESPACE_INVALID")
     return "/".join(parts)
@@ -880,7 +875,10 @@ def _reverify_terminal_product(
     if (
         type(product) is not native_prefix.NativePrefixProduct
         or product.source_state
-        not in {native_prefix.SOURCE_UNAVAILABLE, native_prefix.TECHNICAL_FAILURE}
+        not in {
+            native_prefix.SOURCE_UNAVAILABLE,
+            native_prefix.TECHNICAL_TERMINAL,
+        }
         or type(product.index) is not dict
         or type(product.native_prefix) is not dict
         or type(product.index_descriptor) is not dict
@@ -939,9 +937,7 @@ def _terminal_dependency_and_policy(
         "schema_version": "fxpm.terminal-search-non-evaluation-contract.v1",
         "source_state": product.source_state,
         "native_prefix_index_sha256": product.index_sha256,
-        "source_terminal_receipt_sha256": native[
-            "source_terminal_receipt_sha256"
-        ],
+        "source_terminal_receipt_sha256": native["source_terminal_receipt_sha256"],
         "economic_evaluation": "NOT_APPLICABLE",
     }
     dependency_receipt = _sha(
@@ -968,9 +964,7 @@ def _terminal_dependency_and_policy(
         "policy_id": f"fxpm-production-terminal-{timeframe}-v1",
         "policy_release_sha256": PRODUCTION_SEARCH_PLANNER_RELEASE_SHA256,
         "cost_contract_sha256": _sha({**terminal_contract, "role": "BASE"}),
-        "cost_stress_contract_sha256": _sha(
-            {**terminal_contract, "role": "STRESS"}
-        ),
+        "cost_stress_contract_sha256": _sha({**terminal_contract, "role": "STRESS"}),
         "evaluator_release_sha256": (
             search_execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
         ),
@@ -1003,9 +997,7 @@ def _seal_terminal_cell_plan(
         "index_descriptor": dict(product.index_descriptor),
         "activation_manifest_sha256": native["activation_manifest_sha256"],
         "activation_entry_sha256": native["activation_entry_sha256"],
-        "source_terminal_receipt_sha256": native[
-            "source_terminal_receipt_sha256"
-        ],
+        "source_terminal_receipt_sha256": native["source_terminal_receipt_sha256"],
         "source_reason": native["source_reason"],
         "source_accessed_at_utc": native["source_accessed_at_utc"],
     }
@@ -1084,13 +1076,9 @@ def _regime_support_binding(
         _fail("UNOBSERVED_REGIME_SUPPORT_BINDING_INVALID")
     body = {
         "schema_version": "fxpm.historical-horizon-regime-support-binding.v1",
-        "source_group_decision_sha256": (
-            fitted.source_group_decision.receipt_sha256
-        ),
+        "source_group_decision_sha256": (fitted.source_group_decision.receipt_sha256),
         "regime_fit_decision_sha256": fitted.regime_fit_decision.receipt_sha256,
-        "regime_detector_record_sha256": fit_body[
-            "regime_detector_record_sha256"
-        ],
+        "regime_detector_record_sha256": fit_body["regime_detector_record_sha256"],
         "train_regime_support_receipt_sha256": support["receipt_sha256"],
         "target_regime": regime,
         "target_regime_count": 0,
@@ -1149,13 +1137,9 @@ def _seal_unobserved_cell_plan(
             "last_close_utc": native["prefix_last_close_utc"],
             "rows": native["prefix_rows"],
         },
-        "source_group_decision_sha256": (
-            fitted.source_group_decision.receipt_sha256
-        ),
+        "source_group_decision_sha256": (fitted.source_group_decision.receipt_sha256),
         "regime_fit_decision_sha256": fitted.regime_fit_decision.receipt_sha256,
-        "train_regime_support_sha256": fitted.train_regime_support[
-            "receipt_sha256"
-        ],
+        "train_regime_support_sha256": fitted.train_regime_support["receipt_sha256"],
         "regime_support_binding": dict(support_binding),
         "candidate": None,
         "boundary_limited": False,
@@ -1202,6 +1186,7 @@ def _seal_cell_plan(
     dependency_geometry: Mapping[str, Any],
     attempt_artifacts: Sequence[Mapping[str, Any]],
     state_requirements: Sequence[Mapping[str, Any]],
+    state_context_selection: Mapping[str, Any],
     boundary_limited: bool,
     current_refit_source_capture_sha256: str | None = None,
     bounded_canary_request: Any = None,
@@ -1228,8 +1213,7 @@ def _seal_cell_plan(
         source_capture_sha256 = None
     if normalized_mode == "BOUNDED_RAW_WINNER_CANARY":
         if (
-            type(bounded_canary_request)
-            is not historical.BoundedRawWinnerCanaryRequest
+            type(bounded_canary_request) is not historical.BoundedRawWinnerCanaryRequest
             or type(bounded_canary_source_session)
             is not search_execution.BoundedRawWinnerCanarySourceSession
             or bounded_canary_plan_permit is None
@@ -1300,6 +1284,7 @@ def _seal_cell_plan(
         "attempt_roster_sha256": _sha(attempt_hashes),
         "state_requirement_sha256": state_hashes,
         "state_requirement_roster_sha256": _sha(state_hashes),
+        "state_context_selection": dict(state_context_selection),
         "current_refit_source_capture_sha256": source_capture_sha256,
         "attempts_frozen_before_search": True,
         "state_replay_required_before_scored_partition": True,
@@ -1320,9 +1305,7 @@ def _seal_cell_plan(
             }
         )
     receipt_body = {**body, "receipt_sha256": _sha(body)}
-    artifact_id = (
-        f"{normalized_namespace}/search-cell-plan/{timeframe}/{regime}"
-    )
+    artifact_id = f"{normalized_namespace}/search-cell-plan/{timeframe}/{regime}"
     entry = sink.put_json(artifact_id, CELL_PLAN_ARTIFACT_TYPE, receipt_body)
     encoded = _canonical_bytes(receipt_body)
     descriptor = entry.get("descriptor")
@@ -1361,19 +1344,23 @@ def _verify_current_refit_source_capture(
         _fail("CURRENT_SOURCE_CAPTURE_SEMANTICS_INVALID")
     source = capture["source_snapshot"]
     selection_prefix = capture["selection_prefix_receipt"]
-    if type(source) is not dict or type(selection_prefix) is not dict or set(selection_prefix) != {
-        "schema_version",
-        "fit_start_utc",
-        "fit_end_exclusive_utc",
-        "latest_closed_bar_utc",
-        "source_bar_count",
-        "fit_frame_sha256",
-        "native_prefix_content_sha256",
-    }:
+    if (
+        type(source) is not dict
+        or type(selection_prefix) is not dict
+        or set(selection_prefix)
+        != {
+            "schema_version",
+            "fit_start_utc",
+            "fit_end_exclusive_utc",
+            "latest_closed_bar_utc",
+            "source_bar_count",
+            "fit_frame_sha256",
+            "native_prefix_content_sha256",
+        }
+    ):
         _fail("CURRENT_SELECTION_PREFIX_RECEIPT_INVALID")
     if (
-        selection_prefix["schema_version"]
-        != "fxpm.current-selection-prefix-receipt.v1"
+        selection_prefix["schema_version"] != "fxpm.current-selection-prefix-receipt.v1"
         or selection_prefix["source_bar_count"] != source.get("bar_count")
         or selection_prefix["latest_closed_bar_utc"]
         != source.get("latest_closed_bar_utc")
@@ -1434,7 +1421,10 @@ def _verify_current_refit_source_capture(
     bars_raw = capture["bars_raw_descriptor"]
     source_entry = capture["source_spool_entry"]
     bars_entry = capture["bars_spool_entry"]
-    if any(type(value) is not dict for value in (source_raw, bars_raw, source_entry, bars_entry)):
+    if any(
+        type(value) is not dict
+        for value in (source_raw, bars_raw, source_entry, bars_entry)
+    ):
         _fail("CURRENT_SOURCE_CAPTURE_DESCRIPTOR_INVALID")
     expected_source_raw = _raw_descriptor_from_spool(
         source_entry.get("descriptor", {}),
@@ -1497,6 +1487,160 @@ def _verify_current_refit_source_capture(
     if source_path.read_bytes() != current_refit.canonical_artifact_bytes(source):
         _fail("CURRENT_SOURCE_CAPTURE_JSON_CHANGED")
     return dict(source), source_sha256
+
+
+def _verify_state_context_plan_binding(
+    *,
+    receipt: Mapping[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+    states: Sequence[Mapping[str, Any]],
+    horizon_plan: Any,
+    boundary_limited: bool,
+    timeframe: str,
+) -> None:
+    """Recompute the full state-requirement -> Horizon disposition chain."""
+
+    try:
+        plan_body = horizon_plan.to_dict()
+    except Exception as exc:
+        raise ProductionSearchPlannerError(
+            "STATE_CONTEXT_HORIZON_PLAN_INVALID",
+            (type(exc).__name__, str(exc)),
+        ) from exc
+    payload = receipt.get("dependency_payload")
+    geometry = receipt.get("dependency_geometry")
+    candidates = plan_body.get("candidates")
+    trials = plan_body.get("trials")
+    plan_attempts = plan_body.get("attempts")
+    dependency_policy = plan_body.get("dependency_policy")
+    if (
+        type(payload) is not dict
+        or type(geometry) is not dict
+        or type(candidates) is not list
+        or len(candidates) != 1
+        or type(trials) is not list
+        or type(plan_attempts) is not list
+        or type(dependency_policy) is not dict
+        or len(attempts) != len(states)
+        or not states
+        or len(trials) != len(states)
+        or len(plan_attempts) != len(states)
+    ):
+        _fail("STATE_CONTEXT_PLAN_ROSTER_INVALID")
+    candidate = candidates[0]
+    selected = payload.get("feature_lookback_bars")
+    if (
+        type(candidate) is not dict
+        or candidate != receipt.get("candidate")
+        or type(selected) is not int
+        or selected < 1
+        or geometry != _derived_dependency_geometry(timeframe, payload)
+        or geometry.get("warmup_bars", -1) < selected
+        or plan_body.get("derived_dependency_geometry") != geometry
+        or dependency_policy.get("payload") != payload
+        or (not candidate.get("folds")) is not boundary_limited
+    ):
+        _fail("STATE_CONTEXT_GEOMETRY_BINDING_INVALID")
+
+    for state in states:
+        if type(state) is not dict:
+            _fail("STATE_REQUIREMENT_BODY_INVALID")
+        requirement_sha256 = _hex64(
+            state.get("requirement_sha256"),
+            "STATE_REQUIREMENT_HASH_INVALID",
+        )
+        requirement_body = {
+            key: value for key, value in state.items() if key != "requirement_sha256"
+        }
+        state_evidence = state.get("state_evidence")
+        if (
+            requirement_sha256 != _sha(requirement_body)
+            or state.get("execution_rule")
+            != "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
+            or type(state_evidence) is not list
+            or any(
+                type(value) is not dict
+                or value.get("schema_version")
+                != "fxpm.production-full-prefix-state-replay.v1"
+                or value.get(
+                    "requires_executor_full_prefix_replay_before_any_scored_slice"
+                )
+                is not True
+                for value in state_evidence
+            )
+        ):
+            _fail("STATE_REQUIREMENT_REPLAY_INVALID")
+
+    expected_dispositions = _state_context_dispositions(
+        states,
+        candidate=candidate,
+        selected_common_context_bars=selected,
+    )
+    expected_selection = _state_context_selection_receipt(
+        states,
+        expected_dispositions,
+        selected_common_context_bars=selected,
+        boundary_limited=boundary_limited,
+    )
+    if receipt.get("state_context_selection") != expected_selection:
+        _fail("STATE_CONTEXT_SELECTION_RECEIPT_INVALID")
+
+    for ordinal, (artifact, state, trial, disposition, plan_attempt) in enumerate(
+        zip(
+            attempts,
+            states,
+            trials,
+            expected_dispositions,
+            plan_attempts,
+            strict=True,
+        )
+    ):
+        process = artifact.get("winner_process") if type(artifact) is dict else None
+        trial_definition = (
+            artifact.get("trial_definition") if type(artifact) is dict else None
+        )
+        parameters = (
+            trial_definition.get("parameters")
+            if type(trial_definition) is dict
+            else None
+        )
+        if (
+            type(process) is not dict
+            or type(parameters) is not dict
+            or type(trial) is not dict
+            or type(plan_attempt) is not dict
+            or state.get("strategy_id") != process.get("strategy_id")
+            or state.get("parameters_sha256") != _sha(parameters)
+            or trial.get("strategy_id") != process.get("strategy_id")
+            or trial.get("parameter_set_sha256") != _sha(parameters)
+            or trial.get("state_context_disposition") != disposition
+            or trial.get("trial_definition_sha256")
+            != _sha(
+                {
+                    key: value
+                    for key, value in trial.items()
+                    if key != "trial_definition_sha256"
+                }
+            )
+            or plan_attempt.get("trial_id") != trial.get("trial_id")
+            or plan_attempt.get("candidate_id") != candidate.get("candidate_id")
+            or plan_attempt.get("state_context_disposition_sha256")
+            != disposition["disposition_sha256"]
+        ):
+            _fail("STATE_CONTEXT_ATTEMPT_BINDING_INVALID", ordinal)
+        expected_status = (
+            "PROCESS_REJECTED" if boundary_limited else disposition["status"]
+        )
+        expected_reason = (
+            "SOURCE_BOUNDARY_SHORTFALL"
+            if boundary_limited
+            else disposition["reason_code"]
+        )
+        if (
+            plan_attempt.get("status") != expected_status
+            or plan_attempt.get("reason_code") != expected_reason
+        ):
+            _fail("STATE_CONTEXT_ATTEMPT_STATUS_INVALID", ordinal)
 
 
 def verify_production_cell_search_plan(
@@ -1572,33 +1716,25 @@ def verify_production_cell_search_plan(
     if plan.mode == "CURRENT_REFIT":
         if source_capture is None:
             _fail("CURRENT_SOURCE_CAPTURE_MISSING")
-        source_snapshot, source_snapshot_sha256 = (
-            _verify_current_refit_source_capture(
-                context,
-                sink=sink,
-                capture=source_capture,
-            )
+        source_snapshot, source_snapshot_sha256 = _verify_current_refit_source_capture(
+            context,
+            sink=sink,
+            capture=source_capture,
         )
-        if (
-            receipt.get("current_refit_source_capture_sha256")
-            != _sha(source_capture)
-            or any(
-                artifact.get("horizon_process", {}).get(
-                    "source_snapshot_sha256"
-                )
-                != source_snapshot_sha256
-                or artifact.get("horizon_process", {}).get("source_bar_count")
-                != source_snapshot["bar_count"]
-                or artifact.get("horizon_process", {}).get("fit_start_utc")
-                != source_snapshot["fit_start_utc"]
-                or artifact.get("horizon_process", {}).get("fit_end_utc")
-                != source_snapshot["fit_end_utc"]
-                or artifact.get("horizon_process", {}).get(
-                    "latest_closed_bar_utc"
-                )
-                != source_snapshot["latest_closed_bar_utc"]
-                for artifact in attempts
-            )
+        if receipt.get("current_refit_source_capture_sha256") != _sha(
+            source_capture
+        ) or any(
+            artifact.get("horizon_process", {}).get("source_snapshot_sha256")
+            != source_snapshot_sha256
+            or artifact.get("horizon_process", {}).get("source_bar_count")
+            != source_snapshot["bar_count"]
+            or artifact.get("horizon_process", {}).get("fit_start_utc")
+            != source_snapshot["fit_start_utc"]
+            or artifact.get("horizon_process", {}).get("fit_end_utc")
+            != source_snapshot["fit_end_utc"]
+            or artifact.get("horizon_process", {}).get("latest_closed_bar_utc")
+            != source_snapshot["latest_closed_bar_utc"]
+            for artifact in attempts
         ):
             _fail("CURRENT_SOURCE_CAPTURE_ATTEMPT_BINDING_INVALID")
     elif (
@@ -1606,15 +1742,12 @@ def verify_production_cell_search_plan(
         or receipt.get("current_refit_source_capture_sha256") is not None
     ):
         _fail("NONCURRENT_SOURCE_CAPTURE_FORBIDDEN")
-    if (
-        any(
-            _canonical_bytes(value) != encoded
-            for value, encoded in zip(attempts, plan._attempt_artifacts_json)
-        )
-        or any(
-            _canonical_bytes(value) != encoded
-            for value, encoded in zip(states, plan._state_requirements_json)
-        )
+    if any(
+        _canonical_bytes(value) != encoded
+        for value, encoded in zip(attempts, plan._attempt_artifacts_json)
+    ) or any(
+        _canonical_bytes(value) != encoded
+        for value, encoded in zip(states, plan._state_requirements_json)
     ):
         _fail("CELL_PLAN_CARRIED_BYTES_NONCANONICAL")
     attempt_hashes = [_sha(value) for value in attempts]
@@ -1640,6 +1773,15 @@ def verify_production_cell_search_plan(
         != historical.historical_horizon_plan_binding(plan.horizon_plan)
     ):
         _fail("CELL_PLAN_ROSTER_REPLAY_INVALID")
+    if not terminal and not unobserved:
+        _verify_state_context_plan_binding(
+            receipt=receipt,
+            attempts=attempts,
+            states=states,
+            horizon_plan=plan.horizon_plan,
+            boundary_limited=plan.boundary_limited,
+            timeframe=plan.timeframe,
+        )
     if terminal:
         product = plan.native_prefix_product
         try:
@@ -1662,16 +1804,14 @@ def verify_production_cell_search_plan(
             "index_descriptor": dict(reopened.index_descriptor),
             "activation_manifest_sha256": native["activation_manifest_sha256"],
             "activation_entry_sha256": native["activation_entry_sha256"],
-            "source_terminal_receipt_sha256": native[
-                "source_terminal_receipt_sha256"
-            ],
+            "source_terminal_receipt_sha256": native["source_terminal_receipt_sha256"],
             "source_reason": native["source_reason"],
             "source_accessed_at_utc": native["source_accessed_at_utc"],
         }
         expected_status = (
             "HISTORICAL_SOURCE_UNAVAILABLE"
             if reopened.source_state == native_prefix.SOURCE_UNAVAILABLE
-            else "HISTORICAL_TECHNICAL_INCOMPLETE"
+            else "HISTORICAL_TERMINAL_TECHNICAL"
         )
         if (
             receipt.get("native_prefix") != expected_native
@@ -1751,14 +1891,11 @@ def verify_production_cell_search_plan(
     ):
         _fail("CELL_PLAN_MODE_INVALID")
     namespace = _artifact_namespace(receipt.get("artifact_namespace"))
-    artifact_id = (
-        f"{namespace}/search-cell-plan/{plan.timeframe}/{plan.regime}"
-    )
+    artifact_id = f"{namespace}/search-cell-plan/{plan.timeframe}/{plan.regime}"
     expected_entry = sink.put_json(artifact_id, CELL_PLAN_ARTIFACT_TYPE, receipt)
     observed_entry = plan.spool_entry
     if (
-        _canonical_bytes(observed_entry, maximum=256 * 1024)
-        != plan._spool_entry_json
+        _canonical_bytes(observed_entry, maximum=256 * 1024) != plan._spool_entry_json
         or expected_entry != observed_entry
         or observed_entry.get("artifact_id") != artifact_id
         or observed_entry.get("artifact_type") != CELL_PLAN_ARTIFACT_TYPE
@@ -1773,9 +1910,9 @@ def verify_production_cell_search_plan(
 
 def _cell_hash(symbol: str, timeframe: str, regime: str, *parts: str) -> str:
     return hashlib.sha256(
-        "\x00".join(
-            (PARAMETER_DESIGN_SEED, symbol, timeframe, regime, *parts)
-        ).encode("ascii")
+        "\x00".join((PARAMETER_DESIGN_SEED, symbol, timeframe, regime, *parts)).encode(
+            "ascii"
+        )
     ).hexdigest()
 
 
@@ -1913,9 +2050,7 @@ def _attempt_designs(
         )
     if len(designs) != ATTEMPT_COUNT or ATTEMPT_COUNT != search_execution.MAX_ATTEMPTS:
         _fail("ATTEMPT_COUNT_NOT_EXACT_WINNER_BOUND")
-    identities = [
-        (item["strategy_id"], _sha(item["parameters"])) for item in designs
-    ]
+    identities = [(item["strategy_id"], _sha(item["parameters"])) for item in designs]
     if len(identities) != len(set(identities)):
         _fail("ATTEMPT_PARAMETER_IDENTITY_DUPLICATED")
     return designs
@@ -1963,9 +2098,7 @@ def _validated_frame(
         or _utc_text(opens[0]) != native.get("prefix_first_open_utc")
         or _utc_text(opens[-1]) != native.get("prefix_last_open_utc")
         or _utc_text(closes[-1]) != native.get("prefix_last_close_utc")
-        or _utc(
-            native.get("prefix_last_close_utc"), "PREFIX_LAST_CLOSE_INVALID"
-        )
+        or _utc(native.get("prefix_last_close_utc"), "PREFIX_LAST_CLOSE_INVALID")
         > _utc(native.get("prefix_end_exclusive_utc"), "PREFIX_END_INVALID")
     ):
         _fail("FITTED_FRAME_GEOMETRY_INVALID")
@@ -1977,6 +2110,42 @@ def _validated_frame(
     if receipt != _sha(body):
         _fail("REGIME_SUPPORT_RECEIPT_INVALID")
     return frame, native, opens, closes
+
+
+def _available_prefix_requested_cutoff(prefix_index: Mapping[str, Any]) -> Any:
+    if type(prefix_index) is not dict:
+        _fail("NATIVE_PREFIX_INDEX_INVALID")
+    return prefix_index.get("cutoff_utc")
+
+
+def _validate_available_prefix_anchor_binding(
+    *,
+    native: Mapping[str, Any],
+    prefix_index: Mapping[str, Any],
+    anchor: Any,
+    canary_request_body: Mapping[str, Any] | None,
+) -> None:
+    """Bind the requested cutoff without requiring a bar at that instant."""
+
+    if type(anchor) is not dict:
+        _fail("CELL_PLAN_ANCHOR_INVALID")
+    requested_cutoff = _available_prefix_requested_cutoff(prefix_index)
+    if canary_request_body is not None:
+        request_anchor = canary_request_body.get("anchor")
+        if (
+            type(request_anchor) is not dict
+            or native.get("symbol") != canary_request_body.get("symbol")
+            or native.get("timeframe") != canary_request_body.get("timeframe")
+            or native.get("activation_id") != canary_request_body.get("activation_id")
+            or native.get("activation_manifest_sha256")
+            != canary_request_body.get("activation_manifest_sha256")
+            or requested_cutoff != request_anchor.get("selection_cutoff_utc")
+        ):
+            _fail("CANARY_NATIVE_PREFIX_BINDING_INVALID")
+    if requested_cutoff != anchor.get("selection_cutoff_utc") or _utc(
+        native.get("source_accessed_at_utc"), "SOURCE_ACCESS_TIME_INVALID"
+    ) > _utc(anchor.get("evidence_accessed_at_utc"), "EVIDENCE_ACCESS_TIME_INVALID"):
+        _fail("NATIVE_PREFIX_NOT_EXACT_ANCHOR_CUTOFF")
 
 
 def _state_error_and_tolerance(
@@ -2134,7 +2303,7 @@ def _state_requirements(
     frame: pd.DataFrame,
     native: Mapping[str, Any],
     designs: Sequence[Mapping[str, Any]],
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int]:
     initial_error, tolerance = _state_error_and_tolerance(frame, fitted)
     requirements = [
         _state_replay_requirement(
@@ -2147,7 +2316,6 @@ def _state_requirements(
         )
         for design in designs
     ]
-    maximum = max(int(value["bounded_context_bars"]) for value in requirements)
     warmup_surface = frame.get("REGIME_WARMUP")
     if not isinstance(warmup_surface, pd.Series) or warmup_surface.empty:
         _fail("REGIME_WARMUP_SURFACE_MISSING")
@@ -2160,19 +2328,23 @@ def _state_requirements(
     leading = false_positions[0]
     if any(flags[leading:]):
         _fail("REGIME_WARMUP_SURFACE_NONPREFIX")
-    return requirements, max(1, maximum), max(1, leading)
+    return requirements, max(1, leading)
 
 
 def _midnight(value: pd.Timestamp) -> bool:
     return value.time() == datetime_time.min
 
 
-def _latest(values: pd.DatetimeIndex, *, at_or_before: pd.Timestamp) -> pd.Timestamp | None:
+def _latest(
+    values: pd.DatetimeIndex, *, at_or_before: pd.Timestamp
+) -> pd.Timestamp | None:
     eligible = values[values <= at_or_before]
     return None if eligible.empty else pd.Timestamp(eligible[-1])
 
 
-def _earliest(values: pd.DatetimeIndex, *, at_or_after: pd.Timestamp) -> pd.Timestamp | None:
+def _earliest(
+    values: pd.DatetimeIndex, *, at_or_after: pd.Timestamp
+) -> pd.Timestamp | None:
     eligible = values[values >= at_or_after]
     return None if eligible.empty else pd.Timestamp(eligible[0])
 
@@ -2184,27 +2356,29 @@ def _cutoff_anchored_refit_window(
     fit_end: pd.Timestamp,
     depth_days: int,
     state_context_bars: int,
+    boundary_limited: bool,
 ) -> tuple[pd.Timestamp, int]:
-    """Realize the tested rolling lookback once at the deployment cutoff."""
+    """Realize the tested rolling lookback once at the deployment cutoff.
 
-    if (
-        type(depth_days) is not int
-        or depth_days <= 0
-        or type(state_context_bars) is not int
-        or state_context_bars < 0
-    ):
-        _fail("CURRENT_REFIT_WINDOW_GEOMETRY_INVALID")
-    target = fit_end - pd.Timedelta(days=depth_days)
-    fit_start = _earliest(opens, at_or_after=target)
-    if fit_start is None or fit_start >= fit_end:
-        _fail("CURRENT_REFIT_WINDOW_UNAVAILABLE")
-    fit_start_index = int(opens.get_indexer([fit_start])[0])
-    if fit_start_index < state_context_bars:
-        _fail("CURRENT_REFIT_STATE_CONTEXT_UNAVAILABLE")
-    source_count = int(
-        ((opens >= fit_start) & (opens < fit_end) & (closes <= fit_end)).sum()
-    )
-    return fit_start, source_count
+    A boundary-limited candidate has no folds and Horizon deterministically
+    records every attempt as ``PROCESS_REJECTED/SOURCE_BOUNDARY_SHORTFALL``.
+    Its authenticated source metadata is still frozen, but no strategy state
+    is evaluated, so unavailable evaluation warmup cannot turn that terminal
+    statistical outcome into a technical planner failure.
+    """
+
+    try:
+        return search_execution._realize_cutoff_refit_window(
+            opens=opens,
+            closes=closes,
+            fit_end=fit_end,
+            lookback_kind="CALENDAR_INTERVAL",
+            lookback_value=depth_days,
+            state_context_bars=state_context_bars,
+            boundary_limited=boundary_limited,
+        )
+    except search_execution.AuthoritativeSearchExecutionError as exc:
+        _fail(exc.code)
 
 
 def _current_refit_utc_text(value: Any, code: str) -> str:
@@ -2351,7 +2525,9 @@ def _write_current_refit_source_capture(
     try:
         bar_bytes = output.getvalue().encode("ascii")
     except UnicodeError as exc:
-        raise ProductionSearchPlannerError("CURRENT_SOURCE_BAR_ENCODING_INVALID") from exc
+        raise ProductionSearchPlannerError(
+            "CURRENT_SOURCE_BAR_ENCODING_INVALID"
+        ) from exc
     bar_content_sha256 = hashlib.sha256(bar_bytes).hexdigest()
     symbol = str(native["symbol"])
     timeframe = str(native["timeframe"])
@@ -2450,7 +2626,9 @@ def _try_causal_folds(
     geometry: Mapping[str, int],
     state_context_bars: int,
 ) -> tuple[pd.Timestamp, list[dict[str, Any]]] | None:
-    prefix_end = pd.Timestamp(_utc(native["prefix_end_exclusive_utc"], "PREFIX_END_INVALID"))
+    prefix_end = pd.Timestamp(
+        _utc(native["prefix_end_exclusive_utc"], "PREFIX_END_INVALID")
+    )
     midnight_opens = pd.DatetimeIndex([value for value in opens if _midnight(value)])
     midnight_closes = pd.DatetimeIndex([value for value in closes if _midnight(value)])
     current_end = _latest(midnight_closes, at_or_before=prefix_end)
@@ -2495,10 +2673,13 @@ def _try_causal_folds(
         )
         fit_rows = int(fit_mask.sum())
         validation_rows = int(validation_mask.sum())
-        minimum_fit_rows = 2 * max(
-            int(strategy.MIN_BARS)
-            for strategy in StrategyRegistry.get_all_instances()
-        ) + 4
+        minimum_fit_rows = search_execution.minimum_fold_fit_rows(
+            recipe_warmup_bars=max(
+                int(strategy.MIN_BARS)
+                for strategy in StrategyRegistry.get_all_instances()
+            ),
+            dependency_warmup_bars=warmup_bars,
+        )
         if fit_rows < minimum_fit_rows or validation_rows < 2:
             failure = True
             break
@@ -2535,9 +2716,7 @@ def _try_causal_folds(
             "fit_end_exclusive_utc": item["fit_end_exclusive_utc"],
             "validation_warmup_start_utc": item["validation_warmup_start_utc"],
             "validation_start_utc": item["validation_start_utc"],
-            "validation_end_exclusive_utc": item[
-                "validation_end_exclusive_utc"
-            ],
+            "validation_end_exclusive_utc": item["validation_end_exclusive_utc"],
             "right_fit_start_utc": None,
             "right_fit_end_exclusive_utc": None,
             "fit_rows": item["fit_rows"],
@@ -2597,6 +2776,158 @@ def _build_causal_folds(
     return ladder[0], unavailable_start, [], True
 
 
+def _select_feasible_common_state_context(
+    *,
+    frame: pd.DataFrame,
+    native: Mapping[str, Any],
+    opens: pd.DatetimeIndex,
+    closes: pd.DatetimeIndex,
+    timeframe: str,
+    state_requirements: Sequence[Mapping[str, Any]],
+    regime_warmup_bars: int,
+) -> dict[str, Any]:
+    """Select the largest common state context backed by genuine fold geometry.
+
+    Winner comparisons require one paired fold axis.  A single extreme strategy
+    must not veto lower-context siblings, so source geometry is tested at each
+    exact frozen requirement from largest to smallest.  Requirements above the
+    selected value remain in the multiplicity roster and are typed separately
+    before evaluation.
+    """
+
+    if (
+        not state_requirements
+        or type(regime_warmup_bars) is not int
+        or regime_warmup_bars < 1
+    ):
+        _fail("STATE_CONTEXT_SELECTION_INPUT_INVALID")
+    contexts: list[int] = []
+    for requirement in state_requirements:
+        bounded = requirement.get("bounded_context_bars")
+        if type(bounded) is not int or bounded < 0:
+            _fail("STATE_CONTEXT_REQUIREMENT_INVALID")
+        contexts.append(max(1, bounded))
+    unique_descending = sorted(set(contexts), reverse=True)
+    selected: dict[str, Any] | None = None
+    for state_context_bars in unique_descending:
+        payload = _dependency_payload(
+            timeframe,
+            feature_lookback_bars=state_context_bars,
+            regime_warmup_bars=regime_warmup_bars,
+        )
+        geometry = _derived_dependency_geometry(timeframe, payload)
+        depth_days, candidate_start, folds, boundary_limited = _build_causal_folds(
+            frame=frame,
+            native=native,
+            opens=opens,
+            closes=closes,
+            timeframe=timeframe,
+            geometry=geometry,
+            state_context_bars=state_context_bars,
+        )
+        selected = {
+            "selected_common_context_bars": state_context_bars,
+            "dependency_payload": payload,
+            "dependency_geometry": geometry,
+            "depth_days": depth_days,
+            "candidate_start": candidate_start,
+            "folds": folds,
+            "boundary_limited": boundary_limited,
+        }
+        if not boundary_limited:
+            break
+    if selected is None:
+        _fail("STATE_CONTEXT_SELECTION_EMPTY")
+    return selected
+
+
+def _state_context_dispositions(
+    state_requirements: Sequence[Mapping[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    selected_common_context_bars: int,
+) -> list[dict[str, Any]]:
+    if (
+        not state_requirements
+        or type(selected_common_context_bars) is not int
+        or selected_common_context_bars < 1
+    ):
+        _fail("STATE_CONTEXT_DISPOSITION_INPUT_INVALID")
+    candidate_id = _identity(
+        candidate.get("candidate_id"),
+        "STATE_CONTEXT_CANDIDATE_ID_INVALID",
+    )
+    candidate_sha256 = _hex64(
+        candidate.get("candidate_definition_sha256"),
+        "STATE_CONTEXT_CANDIDATE_SHA256_INVALID",
+    )
+    dispositions: list[dict[str, Any]] = []
+    for requirement in state_requirements:
+        requirement_sha256 = _hex64(
+            requirement.get("requirement_sha256"),
+            "STATE_REQUIREMENT_HASH_INVALID",
+        )
+        required = requirement.get("bounded_context_bars")
+        if type(required) is not int or required < 0:
+            _fail("STATE_CONTEXT_REQUIREMENT_INVALID")
+        within = required <= selected_common_context_bars
+        body = {
+            "schema_version": STATE_CONTEXT_DISPOSITION_SCHEMA,
+            "candidate_id": candidate_id,
+            "candidate_definition_sha256": candidate_sha256,
+            "state_requirement_sha256": requirement_sha256,
+            "required_context_bars": required,
+            "selected_context_bars": selected_common_context_bars,
+            "status": "PLANNED" if within else "PROCESS_REJECTED",
+            "reason_code": None if within else STATE_CONTEXT_BOUNDARY_REASON,
+        }
+        dispositions.append({**body, "disposition_sha256": _sha(body)})
+    return dispositions
+
+
+def _state_context_selection_receipt(
+    state_requirements: Sequence[Mapping[str, Any]],
+    dispositions: Sequence[Mapping[str, Any]],
+    *,
+    selected_common_context_bars: int,
+    boundary_limited: bool,
+) -> dict[str, Any]:
+    if (
+        len(state_requirements) != len(dispositions)
+        or type(boundary_limited) is not bool
+    ):
+        _fail("STATE_CONTEXT_SELECTION_ROSTER_INVALID")
+    disposition_hashes = [
+        _hex64(
+            value.get("disposition_sha256"),
+            "STATE_CONTEXT_DISPOSITION_HASH_INVALID",
+        )
+        for value in dispositions
+    ]
+    within_count = sum(value.get("status") == "PLANNED" for value in dispositions)
+    exceeds_count = sum(
+        value.get("status") == "PROCESS_REJECTED" for value in dispositions
+    )
+    if within_count + exceeds_count != len(dispositions):
+        _fail("STATE_CONTEXT_SELECTION_RELATION_INVALID")
+    body = {
+        "schema_version": STATE_CONTEXT_SELECTION_SCHEMA,
+        "selection_rule": (
+            "LARGEST_SOURCE_GEOMETRY_FEASIBLE_COMMON_CONTEXT_DESCENDING"
+        ),
+        "selected_common_context_bars": selected_common_context_bars,
+        "candidate_boundary_limited": boundary_limited,
+        "required_context_roster_sha256": _sha(
+            [value.get("bounded_context_bars") for value in state_requirements]
+        ),
+        "disposition_sha256": disposition_hashes,
+        "disposition_roster_sha256": _sha(disposition_hashes),
+        "within_selected_context_count": within_count,
+        "exceeds_selected_context_count": exceeds_count,
+    }
+    return {**body, "receipt_sha256": _sha(body)}
+
+
 def _candidate(
     *,
     symbol: str,
@@ -2644,9 +2975,9 @@ def _anchor_body(
         "anchor_id": anchor["anchor_id"],
         "ordinal": ordinal,
         "selection_cutoff_utc": anchor["selection_cutoff_utc"],
-        "forward_start_utc": datetime.combine(
-            start, datetime_time.min, UTC
-        ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "forward_start_utc": datetime.combine(start, datetime_time.min, UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
         "forward_end_exclusive_utc": datetime.combine(
             end, datetime_time.min, UTC
         ).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -2683,9 +3014,7 @@ def _validate_request(
     policies = definition.get("policy_identities") if type(definition) is dict else None
     causal_sha256 = causal.canonical_sha256(precommit)
     request_schema = body.get("schema_version")
-    planning_only = (
-        request_schema == historical.PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA
-    )
+    planning_only = request_schema == historical.PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA
     if request_schema not in {
         historical.PRODUCER_REQUEST_SCHEMA,
         historical.PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA,
@@ -2715,14 +3044,11 @@ def _validate_request(
         }
         if (
             set(body) != expected_fields
-            or body.get("native_universe_sha256")
-            != context.native_universe_sha256
+            or body.get("native_universe_sha256") != context.native_universe_sha256
             or body.get("config_sha256") != context.config_sha256
             or body.get("generation_context_sha256") != context.context_sha256
             or body.get("historical_anchor_precommit_pending") is not True
-            or body.get(
-                "planning_access_limited_to_native_prefix_and_process_design"
-            )
+            or body.get("planning_access_limited_to_native_prefix_and_process_design")
             is not True
             or body.get("return_or_winner_evidence_access_authorized") is not False
             or "precommit_receipt_sha256" in body
@@ -2763,8 +3089,7 @@ def _validate_request(
                 and value.get("anchor_id") == anchor.get("anchor_id")
                 and value.get("selection_cutoff_utc")
                 == anchor.get("selection_cutoff_utc")
-                and value.get("forward_start_date")
-                == anchor.get("forward_start_date")
+                and value.get("forward_start_date") == anchor.get("forward_start_date")
                 and value.get("forward_end_date") == anchor.get("forward_end_date")
             ]
         )
@@ -2827,7 +3152,7 @@ def _build_terminal_cell_plan(
     expected_status = (
         "HISTORICAL_SOURCE_UNAVAILABLE"
         if reopened.source_state == native_prefix.SOURCE_UNAVAILABLE
-        else "HISTORICAL_TECHNICAL_INCOMPLETE"
+        else "HISTORICAL_TERMINAL_TECHNICAL"
     )
     if (
         plan_body.get("plan_status") != expected_status
@@ -2836,9 +3161,7 @@ def _build_terminal_cell_plan(
         or plan_body.get("trials") != []
         or plan_body.get("attempts") != []
         or plan_body.get("expected_evaluations") != []
-        or plan_body.get("anchor", {}).get(
-            "process_precommit_receipt_sha256"
-        )
+        or plan_body.get("anchor", {}).get("process_precommit_receipt_sha256")
         != causal_precommit_receipt_sha256
     ):
         _fail("TERMINAL_HORIZON_PLAN_OUTPUT_BINDING_INVALID")
@@ -2972,16 +3295,13 @@ def _build_unobserved_cell_plan(
     timeframe = str(native.get("timeframe") or "")
     if symbol not in book.PINNED_SYMBOL_ORDER or timeframe not in TIMEFRAMES:
         _fail("CELL_OUTSIDE_PINNED_ROSTER")
-    if (
-        native.get("prefix_end_exclusive_utc")
-        != anchor.get("selection_cutoff_utc")
-        or _utc(native.get("source_accessed_at_utc"), "SOURCE_ACCESS_TIME_INVALID")
-        > _utc(anchor.get("evidence_accessed_at_utc"), "EVIDENCE_ACCESS_TIME_INVALID")
-    ):
-        _fail("NATIVE_PREFIX_NOT_EXACT_ANCHOR_CUTOFF")
-    support_binding = _regime_support_binding(
-        fitted, regime=normalized_regime
+    _validate_available_prefix_anchor_binding(
+        native=native,
+        prefix_index=fitted.product.index,
+        anchor=anchor,
+        canary_request_body=None,
     )
+    support_binding = _regime_support_binding(fitted, regime=normalized_regime)
     payload = _dependency_payload(
         timeframe,
         feature_lookback_bars=1,
@@ -3084,9 +3404,7 @@ def _build_unobserved_cell_plan(
         native_prefix_product=fitted.product,
         fitted_timeframe=fitted,
     )
-    verify_production_cell_search_plan(
-        context, process=process, sink=sink, plan=result
-    )
+    verify_production_cell_search_plan(context, process=process, sink=sink, plan=result)
     return result
 
 
@@ -3197,9 +3515,7 @@ def build_bounded_raw_winner_canary_observed_cell_plan(
     """Freeze the one raw-only cell from executor-authenticated source state."""
 
     verify_frozen_production_search_process(context, process)
-    request_body = historical.verify_bounded_raw_winner_canary_request(
-        context, request
-    )
+    request_body = historical.verify_bounded_raw_winner_canary_request(context, request)
     if not isinstance(causal_precommit_payload, Mapping):
         _fail("CANARY_CAUSAL_PRECOMMIT_NOT_OBJECT")
     precommit = json.loads(
@@ -3213,20 +3529,14 @@ def build_bounded_raw_winner_canary_observed_cell_plan(
             (type(exc).__name__, str(exc)),
         ) from exc
     definition = precommit.get("process_definition")
-    policies = (
-        definition.get("policy_identities")
-        if type(definition) is dict
-        else None
-    )
+    policies = definition.get("policy_identities") if type(definition) is dict else None
     anchors = definition.get("anchor_plan") if type(definition) is dict else None
     if (
         causal.canonical_sha256(precommit)
         != request_body["causal_precommit_receipt_sha256"]
-        or request_body["search_process_receipt_sha256"]
-        != process.receipt_sha256
+        or request_body["search_process_receipt_sha256"] != process.receipt_sha256
         or type(policies) is not dict
-        or policies.get("trial_registry_policy_sha256")
-        != process.receipt_sha256
+        or policies.get("trial_registry_policy_sha256") != process.receipt_sha256
         or type(anchors) is not list
         or len(anchors) != request_body["anchor_count"]
         or not anchors
@@ -3250,9 +3560,7 @@ def build_bounded_raw_winner_canary_observed_cell_plan(
     anchor = _anchor_body(
         anchor_request,
         ordinal=request_body["anchor_count"] - 1,
-        evidence_accessed_at_utc=request_body[
-            "causal_evidence_access_deadline_utc"
-        ],
+        evidence_accessed_at_utc=request_body["causal_evidence_access_deadline_utc"],
     )
     result = _build_observed_cell_plan(
         context,
@@ -3261,9 +3569,7 @@ def build_bounded_raw_winner_canary_observed_cell_plan(
         regime=None,
         anchor=anchor,
         run_id=request_body["run_id"],
-        causal_precommit_receipt_sha256=request_body[
-            "causal_precommit_receipt_sha256"
-        ],
+        causal_precommit_receipt_sha256=request_body["causal_precommit_receipt_sha256"],
         mode="BOUNDED_RAW_WINNER_CANARY",
         namespace=request_body["artifact_namespace"],
         sink=request.symbol_sink(),
@@ -3299,7 +3605,10 @@ def build_current_observed_cell_plan(
         _fail("CURRENT_CELL_SINK_INVALID")
     auth = authorization.to_dict()
     native = dict(fitted.product.native_prefix)
-    if native.get("prefix_end_exclusive_utc") != auth["current_cutoff_utc"]:
+    if (
+        _available_prefix_requested_cutoff(fitted.product.index)
+        != auth["current_cutoff_utc"]
+    ):
         _fail("CURRENT_PREFIX_CUTOFF_MISMATCH")
     cutoff = _utc(auth["current_cutoff_utc"], "CURRENT_CUTOFF_INVALID")
     first_forward_date = cutoff.date() + timedelta(days=1)
@@ -3315,9 +3624,7 @@ def build_current_observed_cell_plan(
         "forward_start_utc": forward_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "forward_end_exclusive_utc": forward_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "evidence_accessed_at_utc": native["source_accessed_at_utc"],
-        "process_precommit_receipt_sha256": auth[
-            "causal_precommit_receipt_sha256"
-        ],
+        "process_precommit_receipt_sha256": auth["causal_precommit_receipt_sha256"],
     }
     namespace = f"current-refit/{auth['run_id']}/{compact_cutoff}"
     return _build_observed_cell_plan(
@@ -3327,9 +3634,7 @@ def build_current_observed_cell_plan(
         regime=regime,
         anchor=anchor,
         run_id=auth["run_id"],
-        causal_precommit_receipt_sha256=auth[
-            "causal_precommit_receipt_sha256"
-        ],
+        causal_precommit_receipt_sha256=auth["causal_precommit_receipt_sha256"],
         mode="CURRENT_REFIT",
         namespace=namespace,
         sink=sink,
@@ -3372,13 +3677,9 @@ def build_current_terminal_cell_plan(
         "ordinal": 1_000_000,
         "selection_cutoff_utc": auth["current_cutoff_utc"],
         "forward_start_utc": forward_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "forward_end_exclusive_utc": forward_end.strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        ),
+        "forward_end_exclusive_utc": forward_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "evidence_accessed_at_utc": native["source_accessed_at_utc"],
-        "process_precommit_receipt_sha256": auth[
-            "causal_precommit_receipt_sha256"
-        ],
+        "process_precommit_receipt_sha256": auth["causal_precommit_receipt_sha256"],
     }
     namespace = f"current-refit/{auth['run_id']}/{compact_cutoff}"
     return _build_terminal_cell_plan(
@@ -3388,9 +3689,7 @@ def build_current_terminal_cell_plan(
         regime=regime,
         anchor=anchor,
         run_id=auth["run_id"],
-        causal_precommit_receipt_sha256=auth[
-            "causal_precommit_receipt_sha256"
-        ],
+        causal_precommit_receipt_sha256=auth["causal_precommit_receipt_sha256"],
         namespace=namespace,
         sink=sink,
     )
@@ -3414,7 +3713,10 @@ def build_current_unobserved_cell_plan(
         _fail("CURRENT_CELL_SINK_INVALID")
     auth = authorization.to_dict()
     native = dict(fitted.product.native_prefix)
-    if native.get("prefix_end_exclusive_utc") != auth["current_cutoff_utc"]:
+    if (
+        _available_prefix_requested_cutoff(fitted.product.index)
+        != auth["current_cutoff_utc"]
+    ):
         _fail("CURRENT_PREFIX_CUTOFF_MISMATCH")
     cutoff = _utc(auth["current_cutoff_utc"], "CURRENT_CUTOFF_INVALID")
     first_forward_date = cutoff.date() + timedelta(days=1)
@@ -3428,13 +3730,9 @@ def build_current_unobserved_cell_plan(
         "ordinal": 1_000_000,
         "selection_cutoff_utc": auth["current_cutoff_utc"],
         "forward_start_utc": forward_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "forward_end_exclusive_utc": forward_end.strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        ),
+        "forward_end_exclusive_utc": forward_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "evidence_accessed_at_utc": native["source_accessed_at_utc"],
-        "process_precommit_receipt_sha256": auth[
-            "causal_precommit_receipt_sha256"
-        ],
+        "process_precommit_receipt_sha256": auth["causal_precommit_receipt_sha256"],
     }
     namespace = f"current-refit/{auth['run_id']}/{compact_cutoff}"
     return _build_unobserved_cell_plan(
@@ -3444,9 +3742,7 @@ def build_current_unobserved_cell_plan(
         regime=regime,
         anchor=anchor,
         run_id=auth["run_id"],
-        causal_precommit_receipt_sha256=auth[
-            "causal_precommit_receipt_sha256"
-        ],
+        causal_precommit_receipt_sha256=auth["causal_precommit_receipt_sha256"],
         mode="CURRENT_REGIME_UNOBSERVED",
         namespace=namespace,
         sink=sink,
@@ -3535,33 +3831,17 @@ def _build_observed_cell_plan(
     frame, native, opens, closes = _validated_frame(fitted)
     symbol = str(native.get("symbol") or "")
     timeframe = str(native.get("timeframe") or "")
-    if (
-        symbol not in book.PINNED_SYMBOL_ORDER
-        or timeframe not in TIMEFRAMES
-    ):
+    if symbol not in book.PINNED_SYMBOL_ORDER or timeframe not in TIMEFRAMES:
         _fail("CELL_OUTSIDE_PINNED_ROSTER")
-    if canary_request_body is not None and (
-        symbol != canary_request_body["symbol"]
-        or timeframe != canary_request_body["timeframe"]
-        or native.get("activation_id") != canary_request_body["activation_id"]
-        or native.get("activation_manifest_sha256")
-        != canary_request_body["activation_manifest_sha256"]
-        or native.get("prefix_end_exclusive_utc")
-        != canary_request_body["anchor"]["selection_cutoff_utc"]
-    ):
-        _fail("CANARY_NATIVE_PREFIX_BINDING_INVALID")
+    _validate_available_prefix_anchor_binding(
+        native=native,
+        prefix_index=fitted.product.index,
+        anchor=anchor,
+        canary_request_body=canary_request_body,
+    )
     support = fitted.train_regime_support
     if normalized_regime not in support.get("observed_regimes", []):
         _fail("REGIME_NOT_EMPIRICALLY_OBSERVED_USE_TERMINAL_PATH")
-    if type(anchor) is not dict:
-        _fail("CELL_PLAN_ANCHOR_INVALID")
-    if (
-        native.get("prefix_end_exclusive_utc")
-        != anchor["selection_cutoff_utc"]
-        or _utc(native["source_accessed_at_utc"], "SOURCE_ACCESS_TIME_INVALID")
-        > _utc(anchor["evidence_accessed_at_utc"], "EVIDENCE_ACCESS_TIME_INVALID")
-    ):
-        _fail("NATIVE_PREFIX_NOT_EXACT_ANCHOR_CUTOFF")
 
     process_body = process.to_dict()
     designs = _attempt_designs(
@@ -3570,29 +3850,28 @@ def _build_observed_cell_plan(
         timeframe=timeframe,
         regime=normalized_regime,
     )
-    state_requirements, state_context_bars, regime_warmup_bars = (
-        _state_requirements(
-            fitted=fitted,
-            frame=frame,
-            native=native,
-            designs=designs,
-        )
+    state_requirements, regime_warmup_bars = _state_requirements(
+        fitted=fitted,
+        frame=frame,
+        native=native,
+        designs=designs,
     )
-    payload = _dependency_payload(
-        timeframe,
-        feature_lookback_bars=state_context_bars,
-        regime_warmup_bars=regime_warmup_bars,
-    )
-    dependency_geometry = _derived_dependency_geometry(timeframe, payload)
-    depth_days, candidate_start, folds, boundary_limited = _build_causal_folds(
+    state_selection = _select_feasible_common_state_context(
         frame=frame,
         native=native,
         opens=opens,
         closes=closes,
         timeframe=timeframe,
-        geometry=dependency_geometry,
-        state_context_bars=state_context_bars,
+        state_requirements=state_requirements,
+        regime_warmup_bars=regime_warmup_bars,
     )
+    state_context_bars = state_selection["selected_common_context_bars"]
+    payload = state_selection["dependency_payload"]
+    dependency_geometry = state_selection["dependency_geometry"]
+    depth_days = state_selection["depth_days"]
+    candidate_start = state_selection["candidate_start"]
+    folds = state_selection["folds"]
+    boundary_limited = state_selection["boundary_limited"]
     candidate = _candidate(
         symbol=symbol,
         timeframe=timeframe,
@@ -3600,6 +3879,17 @@ def _build_observed_cell_plan(
         depth_days=depth_days,
         candidate_start=candidate_start,
         folds=folds,
+    )
+    state_dispositions = _state_context_dispositions(
+        state_requirements,
+        candidate=candidate,
+        selected_common_context_bars=state_context_bars,
+    )
+    state_context_selection = _state_context_selection_receipt(
+        state_requirements,
+        state_dispositions,
+        selected_common_context_bars=state_context_bars,
+        boundary_limited=boundary_limited,
     )
     fit_end = pd.Timestamp(
         _utc(native["prefix_end_exclusive_utc"], "PREFIX_END_INVALID")
@@ -3610,8 +3900,14 @@ def _build_observed_cell_plan(
         fit_end=fit_end,
         depth_days=depth_days,
         state_context_bars=state_context_bars,
+        boundary_limited=boundary_limited,
     )
-    if source_count < max(2, max(StrategyRegistry.get(name).MIN_BARS for name in StrategyRegistry.list_all())):
+    if source_count < max(
+        2,
+        max(
+            StrategyRegistry.get(name).MIN_BARS for name in StrategyRegistry.list_all()
+        ),
+    ):
         _fail("ATTEMPT_SOURCE_PREFIX_TOO_SHORT")
 
     current_source_capture: dict[str, Any] | None = None
@@ -3634,18 +3930,16 @@ def _build_observed_cell_plan(
             expected_source_count=source_count,
         )
         current_source = current_source_capture["source_snapshot"]
-        artifact_source_sha256 = current_refit.canonical_artifact_sha256(
-            current_source
-        )
+        artifact_source_sha256 = current_refit.canonical_artifact_sha256(current_source)
         artifact_fit_start_utc = current_source["fit_start_utc"]
         artifact_fit_end_utc = current_source["fit_end_utc"]
-        artifact_latest_closed_bar_utc = current_source[
-            "latest_closed_bar_utc"
-        ]
+        artifact_latest_closed_bar_utc = current_source["latest_closed_bar_utc"]
 
     artifacts: list[dict[str, Any]] = []
     trials: list[dict[str, Any]] = []
-    for ordinal, design in enumerate(designs):
+    for ordinal, (design, state_disposition) in enumerate(
+        zip(designs, state_dispositions, strict=True)
+    ):
         seed_digest = _cell_hash(
             symbol,
             timeframe,
@@ -3681,10 +3975,9 @@ def _build_observed_cell_plan(
         trial_identity = {
             "trial_id": f"TRIAL-{ordinal:03d}-{parameter_sha[:16]}",
             "strategy_id": design["strategy_id"],
-            "strategy_release_sha256": built.winner_process[
-                "strategy_code_sha256"
-            ],
+            "strategy_release_sha256": built.winner_process["strategy_code_sha256"],
             "parameter_set_sha256": parameter_sha,
+            "state_context_disposition": dict(state_disposition),
         }
         trials.append(
             {
@@ -3770,11 +4063,10 @@ def _build_observed_cell_plan(
         dependency_geometry=dependency_geometry,
         attempt_artifacts=artifacts,
         state_requirements=state_requirements,
+        state_context_selection=state_context_selection,
         boundary_limited=boundary_limited,
         current_refit_source_capture_sha256=(
-            _sha(current_source_capture)
-            if current_source_capture is not None
-            else None
+            _sha(current_source_capture) if current_source_capture is not None else None
         ),
         bounded_canary_request=bounded_canary_request,
         bounded_canary_source_session=bounded_canary_source_session,

@@ -1271,6 +1271,92 @@ def test_cross_resolution_nonaligned_boundaries_follow_target_bar_containment():
     assert coarse_target["status"] == "PASS", coarse_target["reason_codes"]
 
 
+def test_fine_target_defers_only_the_trailing_incomplete_coarse_interval():
+    origin = pd.Timestamp("2025-01-01T00:00:00Z")
+    fine = _m5_history(start=str(origin), days=2).iloc[:289].copy()
+    cutoff = origin + pd.Timedelta(days=1, minutes=5)
+    # The final target M5 bar [00:00, 00:05) is closed at the common cutoff,
+    # but its native M15 reference [00:00, 00:15) cannot be closed yet.
+    coarse = _resample(fine.iloc[:-1], "15min")
+
+    report = audit_native_cross_resolution(
+        fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M5",
+        tick_tolerance=0.0001,
+        partition_windows={"final_lockbox": (origin, cutoff)},
+        thresholds=ParityThresholds(min_compared_native_bars=1),
+    )
+
+    assert report["status"] == "PASS", report["reason_codes"]
+    final = report["partitions"]["final_lockbox"]
+    assert final["fine_rows"] == 288
+    assert final["assigned_fine_rows"] == 288
+    assert final["unassigned_fine_rows"] == 0
+    assert final["trailing_incomplete_coarse_fine_rows_deferred"] == 1
+    assert final["trailing_incomplete_coarse_interval"] == {
+        "open_utc": "2025-01-02T00:00:00+00:00",
+        "close_exclusive_utc": "2025-01-02T00:15:00+00:00",
+        "evidence_cutoff_utc": "2025-01-02T00:05:00+00:00",
+    }
+
+
+def test_fine_target_still_fails_a_missing_coarse_interval_closed_at_cutoff():
+    origin = pd.Timestamp("2025-01-01T00:00:00Z")
+    fine = _m5_history(start=str(origin), days=2).iloc[:291].copy()
+    cutoff = origin + pd.Timedelta(days=1, minutes=15)
+    # The M15 interval ending exactly at the cutoff is no longer partial.  If
+    # its native bar is absent, all three M5 members must remain hard failures.
+    coarse = _resample(fine.iloc[:288], "15min")
+
+    report = audit_native_cross_resolution(
+        fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M5",
+        tick_tolerance=0.0001,
+        partition_windows={"final_lockbox": (origin, cutoff)},
+        thresholds=ParityThresholds(min_compared_native_bars=1),
+    )
+
+    assert report["status"] == "FAIL"
+    final = report["partitions"]["final_lockbox"]
+    assert final["trailing_incomplete_coarse_fine_rows_deferred"] == 0
+    assert final["trailing_incomplete_coarse_interval"] is None
+    assert final["unassigned_fine_rows"] == 3
+    assert "UNASSIGNED_FINE_ROWS:final_lockbox:3" in final["reason_codes"]
+
+
+def test_fine_target_still_fails_an_internal_missing_coarse_interval():
+    fine = _m5_history(days=1)
+    coarse = _resample(fine, "15min").drop(index=fine.index[12])
+
+    report = audit_native_cross_resolution(
+        fine,
+        coarse,
+        symbol="EURUSD",
+        fine_timeframe="M5",
+        coarse_timeframe="M15",
+        activation_target_timeframe="M5",
+        tick_tolerance=0.0001,
+        partition_windows={
+            "optimizer_train": (fine.index[0], fine.index[-1] + pd.Timedelta(minutes=5))
+        },
+        thresholds=ParityThresholds(min_compared_native_bars=1),
+    )
+
+    assert report["status"] == "FAIL"
+    train = report["partitions"]["optimizer_train"]
+    assert train["trailing_incomplete_coarse_fine_rows_deferred"] == 0
+    assert train["unassigned_fine_rows"] == 3
+    assert "UNASSIGNED_FINE_ROWS:optimizer_train:3" in train["reason_codes"]
+
+
 def test_cross_resolution_fine_target_detects_wholly_missing_fine_group():
     complete_fine = _m5_history(days=6)
     coarse = _resample(complete_fine, "15min")

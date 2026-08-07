@@ -1,0 +1,172 @@
+{
+  "metric_definition_mismatch_rows": 4,
+  "oos_manifests": {
+    "manifest_count": 93,
+    "metric_key_manifest_presence": {
+      "calmar_ratio": 93,
+      "expectancy_pips": 93,
+      "max_drawdown_pct": 93,
+      "mean_r": 93,
+      "median_r": 93,
+      "profit_factor": 93,
+      "sharpe_approx": 93,
+      "sharpe_ratio": 93,
+      "sortino_approx": 93,
+      "sortino_ratio": 93,
+      "total_pnl": 93,
+      "total_return_pct": 93,
+      "total_trades": 93,
+      "win_rate": 93,
+      "worst_5pct_r": 93
+    },
+    "size_bytes_median": 3734382,
+    "size_bytes_total": 430292960,
+    "status": "ok"
+  },
+  "signal_risk": {
+    "action_counts": {
+      "BLOCKED_MIN_LOT_EXCEEDS_CAP": 83,
+      "BLOCKED_SYMBOL_RISK_CAP": 1,
+      "EXECUTED": 67
+    },
+    "blocked_actual_risk_pct": {
+      "count": 84,
+      "max": 362.05962059620595,
+      "median": 37.864309051106645,
+      "min": 22.42524916943522,
+      "p95": 147.04850964348333
+    },
+    "executed_actual_risk_pct": {
+      "count": 67,
+      "max": 24.667885435709934,
+      "median": 5.348893751519572,
+      "min": 0.45524536386155184,
+      "p95": 20.930031174229306
+    },
+    "rows": 151,
+    "status": "ok",
+    "top_symbols_by_min_lot_blocks": [
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 35,
+        "blocked_supervisor": 0,
+        "executed": 1,
+        "symbol": "XAUGBP",
+        "total": 36
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 23,
+        "blocked_supervisor": 0,
+        "executed": 14,
+        "symbol": "US100",
+        "total": 37
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 12,
+        "blocked_supervisor": 0,
+        "executed": 2,
+        "symbol": "DE30",
+        "total": 14
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 3,
+        "blocked_supervisor": 0,
+        "executed": 2,
+        "symbol": "US30",
+        "total": 5
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 2,
+        "blocked_supervisor": 0,
+        "executed": 4,
+        "symbol": "GBPUSD",
+        "total": 7
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 2,
+        "blocked_supervisor": 0,
+        "executed": 3,
+        "symbol": "EURAUD",
+        "total": 5
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 2,
+        "blocked_supervisor": 0,
+        "executed": 0,
+        "symbol": "PLATINUM",
+        "total": 2
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 2,
+        "blocked_supervisor": 0,
+        "executed": 0,
+        "symbol": "XAUEUR",
+        "total": 2
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 1,
+        "blocked_supervisor": 0,
+        "executed": 0,
+        "symbol": "TESLA",
+        "total": 1
+      },
+      {
+        "blocked_cycle_drift": 0,
+        "blocked_min_lot": 1,
+        "blocked_supervisor": 0,
+        "executed": 0,
+        "symbol": "XAUUSD",
+        "total": 1
+      }
+    ]
+  },
+  "split_geometry": {
+    "config": {
+      "active_stage2_pct": 50.0,
+      "active_universe_bars": 250000,
+      "clean_holdout_pct": 0.0,
+      "historical_stress_audit_bars": 50000,
+      "max_bars": 300000,
+      "oos_embargo_bars": 300,
+      "production_split_mode": "bleeding_edge",
+      "threadspark_selection_surface": "validation",
+      "walk_forward_validation_bars": 50000
+    },
+    "rows_written": 30
+  },
+  "tradeable_cells": {
+    "high_validation_sharpe_cells_gt_10": 147,
+    "low_validation_trade_cells_lt_20": 75,
+    "pbo_status_counts": {
+      "not_available": 157
+    },
+    "rows": 157,
+    "status": "ok",
+    "symbols": 45,
+    "top_symbols_by_cells": {
+      "ALIBABA": 8,
+      "BTCUSD": 11,
+      "DE30": 4,
+      "ETHUSD": 9,
+      "EURUSD": 5,
+      "IBM": 6,
+      "US100": 13,
+      "US30": 7,
+      "US500": 10,
+      "XAUEUR": 5
+    },
+    "val_sharpe_max": 208.97,
+    "val_sharpe_median": 38.23,
+    "val_trades_max": 140,
+    "val_trades_median": 21,
+    "val_trades_min": 15
+  }
+}

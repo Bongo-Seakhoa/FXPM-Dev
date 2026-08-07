@@ -18,6 +18,14 @@ import pandas as pd
 
 PARITY_SCHEMA_VERSION = "fxpm-native-m5-parity-v1"
 CROSS_RESOLUTION_PARITY_SCHEMA_VERSION = "fxpm-native-cross-resolution-parity-v2"
+CROSS_RESOLUTION_COMPATIBILITY_CURRENT = "current"
+CROSS_RESOLUTION_COMPATIBILITY_FROZEN_PRE_SEQ2307 = "frozen_pre_seq2307"
+_CROSS_RESOLUTION_COMPATIBILITY_PROFILES = frozenset(
+    {
+        CROSS_RESOLUTION_COMPATIBILITY_CURRENT,
+        CROSS_RESOLUTION_COMPATIBILITY_FROZEN_PRE_SEQ2307,
+    }
+)
 TIMEFRAME_SECONDS: Dict[str, int] = {
     "M5": 300,
     "M15": 900,
@@ -35,6 +43,11 @@ class ParityThresholds:
     max_ohlc_mismatch_ratio: float = 0.0
     max_unassigned_m5_ratio: float = 0.01
     min_compared_native_bars: int = 20
+
+
+@dataclass(frozen=True)
+class _NormalizedOHLCFrame:
+    frame: pd.DataFrame
 
 
 def normalize_ohlc_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -73,6 +86,43 @@ def normalize_ohlc_frame(frame: pd.DataFrame) -> pd.DataFrame:
         if column in local.columns:
             local[column] = pd.to_numeric(local[column], errors="coerce")
     return local
+
+
+def _is_normalized_ohlc_frame(frame: Any) -> bool:
+    """Cheap contract check for the activation reader's normalized output."""
+
+    if not (
+        isinstance(frame, pd.DataFrame)
+        and frame.columns.is_unique
+        and isinstance(frame.index, pd.DatetimeIndex)
+        and str(frame.index.tz) == "UTC"
+        and not frame.index.hasnans
+        and frame.index.is_unique
+        and frame.index.is_monotonic_increasing
+        and all(column in frame.columns for column in OHLC)
+        and all(
+            sum(
+                str(column).lower() == canonical.lower()
+                for column in frame.columns
+            )
+            == 1
+            for canonical in OHLC
+        )
+        and all(pd.api.types.is_numeric_dtype(frame[column]) for column in OHLC)
+    ):
+        return False
+    aliases = {str(column).lower(): column for column in frame.columns}
+    for canonical, candidates in (
+        ("Volume", ("volume", "tick_volume")),
+        ("RealVolume", ("realvolume", "real_volume")),
+    ):
+        if canonical in frame.columns:
+            if not pd.api.types.is_numeric_dtype(frame[canonical]):
+                return False
+            continue
+        if any(aliases.get(candidate) is not None for candidate in candidates):
+            return False
+    return True
 
 
 def _normalized_partition_windows(
@@ -225,6 +275,7 @@ def audit_native_cross_resolution(
     tick_tolerance: Optional[float],
     partition_windows: Optional[Mapping[str, Tuple[Any, Any]]] = None,
     thresholds: Optional[ParityThresholds] = None,
+    compatibility_profile: str = CROSS_RESOLUTION_COMPATIBILITY_CURRENT,
 ) -> Dict[str, Any]:
     """Deterministically reconcile one native fine/coarse timeframe pair.
 
@@ -239,6 +290,15 @@ def audit_native_cross_resolution(
     omitted identically by both broker series remains observationally invisible.
     """
 
+    if compatibility_profile not in _CROSS_RESOLUTION_COMPATIBILITY_PROFILES:
+        raise ValueError(
+            "unsupported cross-resolution compatibility profile: "
+            f"{compatibility_profile!r}"
+        )
+    frozen_pre_seq2307 = (
+        compatibility_profile
+        == CROSS_RESOLUTION_COMPATIBILITY_FROZEN_PRE_SEQ2307
+    )
     thresholds = thresholds or ParityThresholds()
     fine_tf = str(fine_timeframe or "").strip().upper()
     coarse_tf = str(coarse_timeframe or "").strip().upper()
@@ -252,7 +312,7 @@ def audit_native_cross_resolution(
         partitions: Optional[Mapping[str, Any]] = None,
         diagnostics: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return {
+        report = {
             "schema_version": CROSS_RESOLUTION_PARITY_SCHEMA_VERSION,
             "symbol": str(symbol).upper(),
             "timeframe": target_tf,
@@ -277,6 +337,15 @@ def audit_native_cross_resolution(
             "partitions": dict(partitions or {}),
             "diagnostics": dict(diagnostics or {}),
         }
+        if frozen_pre_seq2307:
+            for partition in report["partitions"].values():
+                if isinstance(partition, dict):
+                    partition.pop(
+                        "trailing_incomplete_coarse_fine_rows_deferred", None
+                    )
+                    partition.pop("trailing_incomplete_coarse_interval", None)
+            report["diagnostics"].pop("trailing_incomplete_coarse_policy", None)
+        return report
 
     if fine_tf not in TIMEFRAME_SECONDS or coarse_tf not in TIMEFRAME_SECONDS:
         return _report("PENDING", ["UNSUPPORTED_TIMEFRAME_PAIR"])
@@ -287,8 +356,16 @@ def audit_native_cross_resolution(
     if fine_seconds >= coarse_seconds or coarse_seconds % fine_seconds:
         return _report("PENDING", ["INVALID_TIMEFRAME_ORDER"])
     try:
-        fine = normalize_ohlc_frame(fine_frame)
-        coarse = normalize_ohlc_frame(coarse_frame)
+        fine = (
+            fine_frame.frame
+            if isinstance(fine_frame, _NormalizedOHLCFrame)
+            else normalize_ohlc_frame(fine_frame)
+        )
+        coarse = (
+            coarse_frame.frame
+            if isinstance(coarse_frame, _NormalizedOHLCFrame)
+            else normalize_ohlc_frame(coarse_frame)
+        )
     except Exception as exc:
         return _report(
             "PENDING",
@@ -495,6 +572,8 @@ def audit_native_cross_resolution(
     for name, (start, end) in windows.items():
         start_ns = int(start.value)
         end_ns = int(end.value)
+        trailing_partial_positions = np.empty(0, dtype=np.int64)
+        trailing_partial_interval: Optional[Dict[str, str]] = None
         if target_tf == fine_tf:
             # The optimizer scores fully-contained target fine bars. Reconcile
             # every coarse reference interval containing one of those bars,
@@ -502,6 +581,44 @@ def audit_native_cross_resolution(
             fine_positions = np.flatnonzero(
                 (fine_ns >= start_ns) & (fine_ends_ns <= end_ns)
             )
+            if (
+                not frozen_pre_seq2307
+                and coarse_tf in {"M15", "M30", "H1"}
+                and fine_positions.size
+            ):
+                # A common cutoff can close a target fine bar before the
+                # containing native coarse bar is eligible to exist.  Such a
+                # row is not evidence of a missing coarse bar: the reference
+                # interval is still open.  Defer only unassigned rows in the
+                # unique fixed-grid interval that straddles the trailing
+                # cutoff and begins at or after the last authenticated coarse
+                # close.  Internal gaps and any interval whose close is at or
+                # before the cutoff remain in the comparison and fail closed.
+                coarse_step_ns = int(coarse_seconds * 1_000_000_000)
+                selected_bucket_open = (
+                    fine_ns[fine_positions] // coarse_step_ns
+                ) * coarse_step_ns
+                selected_bucket_close = selected_bucket_open + coarse_step_ns
+                defer_trailing_partial = (
+                    (assigned_coarse[fine_positions] < 0)
+                    & (selected_bucket_open < end_ns)
+                    & (selected_bucket_close > end_ns)
+                    & (selected_bucket_open >= int(coarse_ends_ns[-1]))
+                )
+                trailing_partial_positions = fine_positions[defer_trailing_partial]
+                if trailing_partial_positions.size:
+                    partial_open_ns = int(
+                        selected_bucket_open[defer_trailing_partial][0]
+                    )
+                    partial_close_ns = partial_open_ns + coarse_step_ns
+                    trailing_partial_interval = {
+                        "open_utc": pd.Timestamp(partial_open_ns, tz="UTC").isoformat(),
+                        "close_exclusive_utc": pd.Timestamp(
+                            partial_close_ns, tz="UTC"
+                        ).isoformat(),
+                        "evidence_cutoff_utc": end.isoformat(),
+                    }
+                    fine_positions = fine_positions[~defer_trailing_partial]
             fine_step_ns = int(fine_seconds * 1_000_000_000)
             first_slot_offset = np.maximum(0, start_ns - coarse_ns)
             first_slot_index = (
@@ -710,6 +827,10 @@ def audit_native_cross_resolution(
             "fine_rows": fine_count,
             "assigned_fine_rows": assigned_count,
             "unassigned_fine_rows": unassigned_count,
+            "trailing_incomplete_coarse_fine_rows_deferred": int(
+                trailing_partial_positions.size
+            ),
+            "trailing_incomplete_coarse_interval": trailing_partial_interval,
             "fine_assignment_ratio": fine_assignment_ratio,
             "unassigned_fine_ratio": unassigned_ratio,
             "coarse_bars": coarse_count,
@@ -754,6 +875,12 @@ def audit_native_cross_resolution(
             "coarse_interval_method": interval_method,
             "invalid_authenticated_close_rows": invalid_close_rows,
             "interval_membership": "[coarse_open, authenticated_or_inferred_coarse_close)",
+            "trailing_incomplete_coarse_policy": (
+                "Defer only unassigned target-fine rows in a fixed-grid coarse "
+                "interval whose close is after the evidence cutoff and whose "
+                "open is at or after the last authenticated coarse close; "
+                "internal and fully closed missing intervals remain failures."
+            ),
             "ohlc_mismatch_samples": mismatch_samples,
             "volume_mismatch_samples": volume_mismatch_samples,
             "common_omission_caveat": (
@@ -761,6 +888,47 @@ def audit_native_cross_resolution(
                 "detected without an independent history or authenticated historical calendar."
             ),
         },
+    )
+
+
+def audit_normalized_native_cross_resolution(
+    fine_frame: pd.DataFrame,
+    coarse_frame: pd.DataFrame,
+    *,
+    symbol: str,
+    fine_timeframe: str,
+    coarse_timeframe: str,
+    activation_target_timeframe: str,
+    tick_tolerance: Optional[float],
+    partition_windows: Optional[Mapping[str, Tuple[Any, Any]]] = None,
+    thresholds: Optional[ParityThresholds] = None,
+    compatibility_profile: str = CROSS_RESOLUTION_COMPATIBILITY_CURRENT,
+) -> Dict[str, Any]:
+    """Audit frames already normalized by the authenticated activation reader.
+
+    A caller that does not meet the exact normalized-frame contract falls back
+    to the public defensive path, preserving its validation semantics.
+    """
+
+    arguments = {
+        "symbol": symbol,
+        "fine_timeframe": fine_timeframe,
+        "coarse_timeframe": coarse_timeframe,
+        "activation_target_timeframe": activation_target_timeframe,
+        "tick_tolerance": tick_tolerance,
+        "partition_windows": partition_windows,
+        "thresholds": thresholds,
+        "compatibility_profile": compatibility_profile,
+    }
+    if not (
+        _is_normalized_ohlc_frame(fine_frame)
+        and _is_normalized_ohlc_frame(coarse_frame)
+    ):
+        return audit_native_cross_resolution(fine_frame, coarse_frame, **arguments)
+    return audit_native_cross_resolution(
+        _NormalizedOHLCFrame(fine_frame),
+        _NormalizedOHLCFrame(coarse_frame),
+        **arguments,
     )
 
 

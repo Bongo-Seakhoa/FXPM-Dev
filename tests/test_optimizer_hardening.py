@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -99,6 +100,11 @@ def _power_callbacks():
 
 
 class OptimizerHardeningTests(unittest.TestCase):
+    def test_optuna_config_contains_no_elapsed_ceiling(self):
+        parameters = inspect.signature(OptunaConfig).parameters
+        self.assertNotIn("timeout_seconds", parameters)
+        self.assertFalse(hasattr(OptunaConfig(), "timeout_seconds"))
+
     @staticmethod
     def _walk_forward_audit(
         returns,

@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
-RESULT_SCHEMA = "fxpm.live-readiness-authority-result.v1"
+RESULT_SCHEMA = "fxpm.live-readiness-authority-result.v2"
 CHAIN_RECEIPT_SCHEMA = "fxpm.optimization-authority-chain-receipt.v1"
 GENERATION_SCHEMA = "fxpm.optimization-generation.v2"
 TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
@@ -29,8 +29,7 @@ ARTIFACTS = (
     "capital_calibration",
 )
 INDEX_SCHEMAS = {
-    name: f"fxpm.{name.replace('_', '-')}-authority-index.v1"
-    for name in ARTIFACTS
+    name: f"fxpm.{name.replace('_', '-')}-authority-index.v1" for name in ARTIFACTS
 }
 RAW_COMPONENTS = ("native_data_state", *ARTIFACTS)
 MANAGEMENT_CONTEXT_SCHEMA = "fxpm.demo-management-only-context.v1"
@@ -122,6 +121,7 @@ _RESULT_FIELDS = frozenset(
         "source_unavailable_cell_ids",
         "regime_unobserved_cell_ids",
         "no_local_winner_cell_ids",
+        "insufficient_evidence_cell_ids",
         "technical_cell_ids",
         "unsearched_cell_ids",
         "missing_observed_cell_ids",
@@ -142,8 +142,7 @@ def _valid_requested_symbol(value: Any) -> bool:
     if not 1 <= len(value.encode("utf-8")) <= 128:
         return False
     return all(
-        character.isascii()
-        and (character.isalnum() or character in {"-", ".", "_"})
+        character.isascii() and (character.isalnum() or character in {"-", ".", "_"})
         for character in value
     )
 
@@ -154,9 +153,7 @@ class _Invalid(ValueError):
 
 def _is_sha(value: Any) -> bool:
     return (
-        type(value) is str
-        and len(value) == 64
-        and all(char in _HEX for char in value)
+        type(value) is str and len(value) == 64 and all(char in _HEX for char in value)
     )
 
 
@@ -331,7 +328,9 @@ def _error(errors: list[str], code: str, detail: Any = None) -> None:
     errors.append(code if detail in (None, "") else f"{code}:{detail}")
 
 
-def _relative_path(root: Path, value: Any, label: str, *, directory: bool = False) -> Path:
+def _relative_path(
+    root: Path, value: Any, label: str, *, directory: bool = False
+) -> Path:
     if type(value) is not str or not value:
         raise _Invalid(f"{label}_PATH_INVALID")
     relative = Path(value)
@@ -442,7 +441,9 @@ class _ManagementClosure:
             if key in self.by_role_path:
                 raise _Invalid("MANAGEMENT_EXTERNAL_CLOSURE_ROLE_PATH_DUPLICATE")
             first_path_use = logical not in identities
-            previous = identities.setdefault(logical, (item["size_bytes"], item["sha256"]))
+            previous = identities.setdefault(
+                logical, (item["size_bytes"], item["sha256"])
+            )
             if previous != (item["size_bytes"], item["sha256"]):
                 raise _Invalid("MANAGEMENT_EXTERNAL_CLOSURE_PATH_CONFLICT")
             if first_path_use:
@@ -460,9 +461,7 @@ class _ManagementClosure:
                 self.source_root,
                 self.source_root / Path(item["logical_relative_path"]),
             )
-            size, digest = _stream_fingerprint(
-                path, MAX_MANAGEMENT_EXTERNAL_FILE_BYTES
-            )
+            size, digest = _stream_fingerprint(path, MAX_MANAGEMENT_EXTERNAL_FILE_BYTES)
             if size != item["size_bytes"] or digest != item["sha256"]:
                 raise _Invalid("MANAGEMENT_EXTERNAL_CLOSURE_HASH_MISMATCH")
 
@@ -502,8 +501,7 @@ class _ManagementClosure:
         expected = {
             item["logical_relative_path"]
             for item in self.descriptors.values()
-            if item["role"] == role
-            and item["logical_relative_path"].startswith(prefix)
+            if item["role"] == role and item["logical_relative_path"].startswith(prefix)
         }
         if required_logicals is not None and expected != required_logicals:
             raise _Invalid("MANAGEMENT_EXTERNAL_CLOSURE_DECLARED_ROSTER_MISMATCH")
@@ -568,8 +566,7 @@ def _management_context(
         capsule_body.pop("capsule_id")
         if (
             _canonical_sha(capsule_body) != capsule_id
-            or capsule.get("schema_version")
-            != "fxpm.demo-management-authority.v1"
+            or capsule.get("schema_version") != "fxpm.demo-management-authority.v1"
             or capsule.get("generation_id") != value["generation_id"]
             or capsule.get("source_root") != source_raw
             or capsule.get("requested_symbols") != list(requested_symbols)
@@ -591,11 +588,9 @@ def _management_context(
             }
             for closure_id, item in value["external_closure"].items()
         }
-        if (
-            capsule.get("external_closure") != persisted_closure
-            or capsule.get("external_closure_sha256")
-            != _canonical_sha(persisted_closure)
-        ):
+        if capsule.get("external_closure") != persisted_closure or capsule.get(
+            "external_closure_sha256"
+        ) != _canonical_sha(persisted_closure):
             raise _Invalid("MANAGEMENT_CAPSULE_CLOSURE_BINDING_INVALID")
         native_bindings = value.get("selected_native_source_bindings")
         if type(native_bindings) is not dict or not native_bindings:
@@ -619,11 +614,11 @@ def _management_context(
                 raise _Invalid("MANAGEMENT_NATIVE_BINDING_INVALID")
             _logical_relative(binding["bars_logical_relative_path"])
             _logical_relative(binding["sidecar_logical_relative_path"])
-        if (
-            capsule.get("selected_native_source_bindings") != native_bindings
-            or capsule.get("selected_native_source_bindings_sha256")
-            != _canonical_sha(native_bindings)
-        ):
+        if capsule.get(
+            "selected_native_source_bindings"
+        ) != native_bindings or capsule.get(
+            "selected_native_source_bindings_sha256"
+        ) != _canonical_sha(native_bindings):
             raise _Invalid("MANAGEMENT_CAPSULE_NATIVE_BINDING_INVALID")
         activation_raw = value.get("captured_activation_manifest_path")
         if type(activation_raw) is not str or not Path(activation_raw).is_absolute():
@@ -747,7 +742,9 @@ def _load_indexes(
                 expected_path, MAX_INDEX_BYTES, root=root
             )
         except Exception as exc:
-            _error(errors, "AUTHORITY_ARTIFACT_UNREADABLE", f"{name}:{type(exc).__name__}")
+            _error(
+                errors, "AUTHORITY_ARTIFACT_UNREADABLE", f"{name}:{type(exc).__name__}"
+            )
             continue
         declared_size = descriptor.get("size_bytes")
         declared_sha = descriptor.get("sha256")
@@ -789,10 +786,10 @@ def _native_reverify(
         )
         if not universe.valid or not universe.explicit_contract:
             errors.extend(str(value) for value in universe.errors)
-        if (
-            universe.activation_id != getattr(supplied_universe, "activation_id", None)
-            or universe.activation_manifest_sha256
-            != getattr(supplied_universe, "activation_manifest_sha256", None)
+        if universe.activation_id != getattr(
+            supplied_universe, "activation_id", None
+        ) or universe.activation_manifest_sha256 != getattr(
+            supplied_universe, "activation_manifest_sha256", None
         ):
             errors.append("NATIVE_UNIVERSE_CALLER_SNAPSHOT_MISMATCH")
         for symbol in requested_symbols:
@@ -800,7 +797,9 @@ def _native_reverify(
                 if universe.cell_status(symbol, timeframe) != getattr(
                     supplied_universe, "cell_status", lambda *_: "unbound"
                 )(symbol, timeframe):
-                    errors.append(f"NATIVE_CELL_CALLER_SNAPSHOT_MISMATCH:{symbol}|{timeframe}")
+                    errors.append(
+                        f"NATIVE_CELL_CALLER_SNAPSHOT_MISMATCH:{symbol}|{timeframe}"
+                    )
         manifest_path = Path(universe.activation_manifest_path)
         manifest, manifest_sha, _, _ = _snapshot(
             manifest_path, MAX_INDEX_BYTES, root=manifest_path.parent
@@ -891,6 +890,17 @@ def _management_native_reverify(
             "statistical_sufficiency_authority",
         }:
             raise _Invalid("MANAGEMENT_ACTIVATION_AUTHENTICITY_FIELDS_INVALID")
+        declared_terminal_states = list(contract.get("terminal_states") or [])
+        declared_nonterminal_states = list(contract.get("nonterminal_states") or [])
+        legacy_terminal_states = [
+            NATIVE_EVIDENCE_CANDIDATE,
+            NATIVE_SOURCE_UNAVAILABLE,
+        ]
+        current_terminal_states = [
+            NATIVE_EVIDENCE_CANDIDATE,
+            NATIVE_SOURCE_UNAVAILABLE,
+            NATIVE_TECHNICAL_ERROR,
+        ]
         if (
             contract.get("decision_basis") != NATIVE_AUTHENTICITY_DECISION_BASIS
             or contract.get("performance_inputs_used") is not False
@@ -900,10 +910,17 @@ def _management_native_reverify(
             or contract.get("session_coverage_method") != NATIVE_SESSION_COVERAGE_METHOD
             or list(contract.get("session_coverage_partitions") or [])
             != list(NATIVE_EVIDENCE_PARTITIONS)
-            or list(contract.get("terminal_states") or [])
-            != [NATIVE_EVIDENCE_CANDIDATE, NATIVE_SOURCE_UNAVAILABLE]
-            or list(contract.get("nonterminal_states") or [])
-            != [NATIVE_TECHNICAL_ERROR, NATIVE_PENDING]
+            or tuple(declared_terminal_states)
+            not in {tuple(legacy_terminal_states), tuple(current_terminal_states)}
+            or (
+                declared_terminal_states == legacy_terminal_states
+                and declared_nonterminal_states
+                != [NATIVE_TECHNICAL_ERROR, NATIVE_PENDING]
+            )
+            or (
+                declared_terminal_states == current_terminal_states
+                and declared_nonterminal_states != [NATIVE_PENDING]
+            )
             or contract.get("excluded_symbols") != {}
             or contract.get("statistical_sufficiency_authority")
             != "authenticated_horizon_ess_trade_power_and_multiplicity_v1"
@@ -918,7 +935,9 @@ def _management_native_reverify(
         ):
             raise _Invalid("MANAGEMENT_ACTIVATION_ROSTER_INVALID")
         raw_statuses = contract.get("cell_statuses")
-        if type(raw_statuses) is not dict or set(raw_statuses) != set(requested_symbols):
+        if type(raw_statuses) is not dict or set(raw_statuses) != set(
+            requested_symbols
+        ):
             raise _Invalid("MANAGEMENT_ACTIVATION_STATUS_ROSTER_INVALID")
         statuses: dict[str, dict[str, str]] = {}
         candidate_projection: dict[str, list[str]] = {}
@@ -941,7 +960,7 @@ def _management_native_reverify(
                 status = str(raw_grid.get(timeframe) or "").lower()
                 if (
                     type(cell) is not dict
-                    or status not in {NATIVE_EVIDENCE_CANDIDATE, NATIVE_SOURCE_UNAVAILABLE}
+                    or status not in set(declared_terminal_states)
                     or str(cell.get("status") or "").lower() != status
                     or cell.get("symbol") != symbol
                     or cell.get("timeframe") != timeframe
@@ -961,8 +980,21 @@ def _management_native_reverify(
                         or type(cell.get("sidecar_relative_path")) is not str
                     ):
                         raise _Invalid("MANAGEMENT_ACTIVATION_SOURCE_BINDING_INVALID")
-                else:
+                elif status == NATIVE_SOURCE_UNAVAILABLE:
                     unavailable_projection[symbol].append(timeframe)
+                else:
+                    if (
+                        cell.get("audit_status") != "PASS"
+                        or cell.get("bars_sha256") is not None
+                        or not _is_sha(cell.get("sidecar_sha256"))
+                        or type(cell.get("bars_relative_path")) is not str
+                        or type(cell.get("sidecar_relative_path")) is not str
+                        or str(cell.get("consensus_status") or "").upper() != "PENDING"
+                        or str(cell.get("resolution_status") or "").upper() != "PENDING"
+                    ):
+                        raise _Invalid(
+                            "MANAGEMENT_ACTIVATION_TERMINAL_TECHNICAL_BINDING_INVALID"
+                        )
         candidate_symbols = [
             symbol for symbol in requested_symbols if candidate_projection[symbol]
         ]
@@ -1064,7 +1096,14 @@ def _management_native_reverify(
 def _book_partition(
     body: Mapping[str, Any], requested_symbols: Sequence[str]
 ) -> tuple[dict[str, set[str]], list[str]]:
+    import pm_book_multiplicity as book
+
     errors: list[str] = []
+    if (
+        body.get("valid") is not True
+        or body.get("optimization_run_complete") is not True
+    ):
+        errors.append("CURRENT_BOOK_NOT_COMPLETE_VALID")
     possible = {
         f"{symbol}|{timeframe}|{regime}"
         for symbol in requested_symbols
@@ -1076,6 +1115,7 @@ def _book_partition(
         "source_unavailable_cell_ids": set(),
         "regime_unobserved_cell_ids": set(),
         "no_local_winner_cell_ids": set(),
+        "insufficient_evidence_cell_ids": set(),
         "technical_cell_ids": set(),
         "unsearched_cell_ids": set(),
         "missing_observed_cell_ids": set(),
@@ -1085,7 +1125,8 @@ def _book_partition(
         "SOURCE_UNAVAILABLE": "source_unavailable_cell_ids",
         "REGIME_UNOBSERVED": "regime_unobserved_cell_ids",
         "NO_WINNER": "no_local_winner_cell_ids",
-        "TECHNICAL_FAILURE": "technical_cell_ids",
+        "INSUFFICIENT_EVIDENCE": "insufficient_evidence_cell_ids",
+        book.TERMINAL_TECHNICAL: "technical_cell_ids",
         "UNSEARCHED": "unsearched_cell_ids",
     }
     seen: set[str] = set()
@@ -1117,6 +1158,8 @@ def _book_partition(
     rosters["missing_observed_cell_ids"].update(missing)
     if missing:
         errors.append("CURRENT_BOOK_POSSIBLE_SLOT_ROSTER_INCOMPLETE")
+    if rosters["unsearched_cell_ids"]:
+        errors.append("CURRENT_BOOK_UNSEARCHED_CELLS_PRESENT")
     return rosters, _unique(errors)
 
 
@@ -1186,7 +1229,9 @@ def _validate_detector_ledger_record(
             or record["regime_fit_contract_version"] != book.REGIME_FIT_CONTRACT_VERSION
             or record["regime_fit_receipt_sha256"] != fit.get("receipt_sha256")
         ):
-            errors.append(f"REGIME_DETECTOR_LEDGER_CONTRACT_INVALID:{symbol}|{timeframe}")
+            errors.append(
+                f"REGIME_DETECTOR_LEDGER_CONTRACT_INVALID:{symbol}|{timeframe}"
+            )
         detector = record.get("detector_record")
         fit_payload = fit.get("payload") if type(fit.get("payload")) is dict else {}
         embedded = fit_payload.get("regime_detector_record")
@@ -1200,10 +1245,11 @@ def _validate_detector_ledger_record(
             or detector.get("symbol") != symbol
             or detector.get("timeframe") != timeframe
             or detector.get("activation_id") != activation_id
-            or detector.get("activation_manifest_sha256")
-            != activation_manifest_sha256
+            or detector.get("activation_manifest_sha256") != activation_manifest_sha256
         ):
-            errors.append(f"REGIME_DETECTOR_RECORD_IDENTITY_INVALID:{symbol}|{timeframe}")
+            errors.append(
+                f"REGIME_DETECTOR_RECORD_IDENTITY_INVALID:{symbol}|{timeframe}"
+            )
         for field in (
             "source_group_decision_sha256",
             "source_contract_sha256",
@@ -1231,9 +1277,9 @@ def _validate_detector_ledger_record(
                 errors.append(
                     f"REGIME_DETECTOR_PARAMETERS_NONCANONICAL:{symbol}|{timeframe}"
                 )
-            if hashlib.sha256(parameters_text.encode("ascii")).hexdigest() != detector.get(
-                "parameters_sha256"
-            ):
+            if hashlib.sha256(
+                parameters_text.encode("ascii")
+            ).hexdigest() != detector.get("parameters_sha256"):
                 errors.append(
                     f"REGIME_DETECTOR_PARAMETERS_HASH_MISMATCH:{symbol}|{timeframe}"
                 )
@@ -1249,7 +1295,9 @@ def _validate_detector_ledger_record(
             errors.append(f"REGIME_DETECTOR_LEDGER_HASH_MISMATCH:{symbol}|{timeframe}")
         bars_sha = native_entry.get("bars_sha256")
         if _is_sha(bars_sha) and detector.get("native_source_sha256") != bars_sha:
-            errors.append(f"REGIME_DETECTOR_NATIVE_SOURCE_MISMATCH:{symbol}|{timeframe}")
+            errors.append(
+                f"REGIME_DETECTOR_NATIVE_SOURCE_MISMATCH:{symbol}|{timeframe}"
+            )
     except Exception as exc:
         _error(
             errors,
@@ -1274,21 +1322,22 @@ def _regime_support_reverify(
         "native_activation_manifest_sha256",
         "detector_ledger_records",
     }
-    index, errors = _index(
-        {"regime_support": index_value}, "regime_support", exact
-    )
+    index, errors = _index({"regime_support": index_value}, "regime_support", exact)
     bindings: dict[str, dict[str, str]] = {}
     if index is None:
         return bindings, errors
     if (
         index["current_book_multiplicity_receipt_sha256"] != current_book_receipt
-        or index["native_activation_id"] != getattr(native_universe, "activation_id", None)
+        or index["native_activation_id"]
+        != getattr(native_universe, "activation_id", None)
         or index["native_activation_manifest_sha256"]
         != getattr(native_universe, "activation_manifest_sha256", None)
     ):
         errors.append("REGIME_SUPPORT_AUTHORITY_BINDING_MISMATCH")
     records = index.get("detector_ledger_records")
-    if type(records) is not list or len(records) > len(requested_symbols) * len(TIMEFRAMES):
+    if type(records) is not list or len(records) > len(requested_symbols) * len(
+        TIMEFRAMES
+    ):
         return bindings, _unique(errors + ["REGIME_DETECTOR_LEDGER_ROSTER_INVALID"])
     fit_map = _fit_by_group(current_book_body)
     seen: set[tuple[str, str]] = set()
@@ -1304,14 +1353,24 @@ def _regime_support_reverify(
         symbol = row.get("symbol")
         timeframe = row.get("timeframe")
         key = (symbol, timeframe)
-        if symbol not in requested_symbols or timeframe not in TIMEFRAMES or key in seen:
-            _error(errors, "REGIME_DETECTOR_LEDGER_IDENTITY_INVALID", f"{symbol}|{timeframe}")
+        if (
+            symbol not in requested_symbols
+            or timeframe not in TIMEFRAMES
+            or key in seen
+        ):
+            _error(
+                errors,
+                "REGIME_DETECTOR_LEDGER_IDENTITY_INVALID",
+                f"{symbol}|{timeframe}",
+            )
             continue
         seen.add(key)
         fit = fit_map.get(key)
         fit_payload = fit.get("payload") if type(fit) is dict else {}
         support = row.get("train_regime_support")
-        if type(support) is not dict or support != fit_payload.get("train_regime_support"):
+        if type(support) is not dict or support != fit_payload.get(
+            "train_regime_support"
+        ):
             _error(errors, "REGIME_TRAIN_SUPPORT_BOOK_SPLICE", f"{symbol}|{timeframe}")
             continue
         entries = getattr(native_universe, "entries", {}) or {}
@@ -1363,7 +1422,7 @@ def _regime_support_reverify(
         if getattr(native_universe, "cell_status", lambda *_: "unbound")(
             symbol, timeframe
         )
-        not in {"source_unavailable", "excluded_no_trade"}
+        not in {"source_unavailable", "excluded_no_trade", "technical_error"}
     }
     if seen != required_groups:
         errors.append("REGIME_DETECTOR_LEDGER_ROSTER_INCOMPLETE")
@@ -1399,7 +1458,9 @@ def _causal_reverify(index_value: Any) -> tuple[Optional[dict[str, Any]], list[s
         if decision.get("decision") != "OFFLINE_PROCESS_VALIDATION_PASS":
             errors.append("CAUSAL_PROCESS_DECISION_NOT_PASS")
     except Exception as exc:
-        _error(errors, "CAUSAL_PROCESS_DECISION_RAW_REVERIFY_FAILED", type(exc).__name__)
+        _error(
+            errors, "CAUSAL_PROCESS_DECISION_RAW_REVERIFY_FAILED", type(exc).__name__
+        )
     return decision, _unique(errors)
 
 
@@ -1432,6 +1493,11 @@ def _current_book_reverify(
         return None, {}, None, errors
     decision, body, book_errors = _book_decision(index.get("current_book_decision"))
     errors.extend(book_errors)
+    if body and (
+        body.get("valid") is not True
+        or body.get("optimization_run_complete") is not True
+    ):
+        errors.append("CURRENT_BOOK_NOT_COMPLETE_VALID")
     accepted = index.get("accepted_book_generation_receipt")
     payload: Optional[dict[str, Any]] = None
     try:
@@ -1505,7 +1571,9 @@ def _current_refit_reverify(
             root, index.get("raw_manifest_relative_path"), "CURRENT_REFIT_RAW_MANIFEST"
         )
         artifact_root = artifact_root_override or _relative_path(
-            root, index.get("artifact_root_relative_path"), "CURRENT_REFIT_ARTIFACT_ROOT",
+            root,
+            index.get("artifact_root_relative_path"),
+            "CURRENT_REFIT_ARTIFACT_ROOT",
             directory=True,
         )
         raw_manifest, _, _, _ = _snapshot(
@@ -1531,7 +1599,9 @@ def _current_refit_reverify(
             )
             errors.extend(str(value) for value in reported)
     except Exception as exc:
-        _error(errors, "CURRENT_REFIT_EXECUTION_RAW_REVERIFY_FAILED", type(exc).__name__)
+        _error(
+            errors, "CURRENT_REFIT_EXECUTION_RAW_REVERIFY_FAILED", type(exc).__name__
+        )
     try:
         from pm_model_lifecycle import build_process_validated_current_refit_lineage
 
@@ -1564,9 +1634,7 @@ def _management_refit_roots(
     try:
         if type(index_value) is not dict:
             raise _Invalid("MANAGEMENT_CURRENT_REFIT_INDEX_INVALID")
-        raw_logical = _logical_relative(
-            index_value.get("raw_manifest_relative_path")
-        )
+        raw_logical = _logical_relative(index_value.get("raw_manifest_relative_path"))
         raw_path = state["closure"].consume_file(
             "current_refit_artifact",
             raw_logical,
@@ -1651,8 +1719,7 @@ def _management_capital_root(
                 size = descriptor.get("byte_size")
                 if (
                     descriptor.get("shard_index") != index
-                    or relative
-                    != f"attempt_shards/attempts_{index:04d}_{digest}.json"
+                    or relative != f"attempt_shards/attempts_{index:04d}_{digest}.json"
                     or not _is_sha(digest)
                     or type(size) is not int
                     or size <= 0
@@ -1688,7 +1755,9 @@ def _ledger_selected(ledger: Mapping[str, Any]) -> tuple[set[str], list[str]]:
     try:
         from pm_live_readiness import _sparse_current_refit_projection
 
-        symbols = ledger.get("symbols") if type(ledger.get("symbols")) is dict else ledger
+        symbols = (
+            ledger.get("symbols") if type(ledger.get("symbols")) is dict else ledger
+        )
         requested = []
         if type(symbols) is dict:
             for raw_symbol, payload in symbols.items():
@@ -1791,17 +1860,29 @@ def _selected_binding_errors(
         )
         for name in refit_binding_fields[-4:]:
             if refit.get(name) != binding.get(name):
-                _error(errors, "CURRENT_REFIT_REGIME_DETECTOR_BINDING_MISMATCH", f"{slot}:{name}")
+                _error(
+                    errors,
+                    "CURRENT_REFIT_REGIME_DETECTOR_BINDING_MISMATCH",
+                    f"{slot}:{name}",
+                )
         symbol_payload = ledger_by_symbol.get(symbol)
-        grid = symbol_payload.get("regime_configs") if type(symbol_payload) is dict else None
+        grid = (
+            symbol_payload.get("regime_configs")
+            if type(symbol_payload) is dict
+            else None
+        )
         timeframe_payload = grid.get(timeframe) if type(grid) is dict else None
-        cell = timeframe_payload.get(regime) if type(timeframe_payload) is dict else None
+        cell = (
+            timeframe_payload.get(regime) if type(timeframe_payload) is dict else None
+        )
         artifact = cell.get("artifact_meta") if type(cell) is dict else None
         physical_binding = (
             artifact.get("current_refit_binding") if type(artifact) is dict else None
         )
         expected = {name: refit.get(name) for name in refit_binding_fields}
-        if type(cell) is not dict or cell.get("strategy_name") != refit.get("strategy_id"):
+        if type(cell) is not dict or cell.get("strategy_name") != refit.get(
+            "strategy_id"
+        ):
             _error(errors, "PHYSICAL_LEDGER_CURRENT_REFIT_STRATEGY_MISMATCH", slot)
         if type(physical_binding) is not dict or physical_binding != expected:
             _error(errors, "PHYSICAL_LEDGER_CURRENT_REFIT_BINDING_MISMATCH", slot)
@@ -1846,9 +1927,7 @@ def _management_native_portfolio_contract(
                 if not _is_sha(entry.get("bars_sha256")) or not _is_sha(
                     entry.get("sidecar_sha256")
                 ):
-                    errors.append(
-                        f"MANAGEMENT_PORTFOLIO_NATIVE_HASH_INVALID:{cell_id}"
-                    )
+                    errors.append(f"MANAGEMENT_PORTFOLIO_NATIVE_HASH_INVALID:{cell_id}")
                 else:
                     bars[cell_id] = entry["bars_sha256"]
                     sidecars[cell_id] = entry["sidecar_sha256"]
@@ -1994,7 +2073,11 @@ def _replay_reverify(
             for key, policy in raw_policies.items():
                 try:
                     balance = float(key)
-                    if not math.isfinite(balance) or balance <= 0.0 or balance in expected_policies:
+                    if (
+                        not math.isfinite(balance)
+                        or balance <= 0.0
+                        or balance in expected_policies
+                    ):
                         raise ValueError
                     derived = asdict(
                         portfolio_policy_from_config_payload(config_payload, balance)
@@ -2041,7 +2124,9 @@ def _replay_reverify(
         }
         for name, expected in config_policy.items():
             if policy.get(name) != expected:
-                _error(errors, "PORTFOLIO_REPLAY_VALIDATION_POLICY_CONFIG_MISMATCH", name)
+                _error(
+                    errors, "PORTFOLIO_REPLAY_VALIDATION_POLICY_CONFIG_MISMATCH", name
+                )
         evidence_errors = validate_funded_portfolio_replay_evidence(
             index.get("evidence"),
             expected_lineage=expected_lineage,
@@ -2397,6 +2482,7 @@ def _empty_result(
         "source_unavailable_cell_ids": [],
         "regime_unobserved_cell_ids": [],
         "no_local_winner_cell_ids": [],
+        "insufficient_evidence_cell_ids": [],
         "technical_cell_ids": [],
         "unsearched_cell_ids": [],
         "missing_observed_cell_ids": possible,
@@ -2433,10 +2519,7 @@ def verify_live_readiness_authority_chain(
     if (
         not isinstance(requested_symbols, (tuple, list))
         or not 1 <= len(requested_symbols) <= MAX_SYMBOLS
-        or any(
-            not _valid_requested_symbol(symbol)
-            for symbol in requested_symbols
-        )
+        or any(not _valid_requested_symbol(symbol) for symbol in requested_symbols)
         or len(set(requested_symbols)) != len(requested_symbols)
         or len({symbol.casefold() for symbol in requested_symbols})
         != len(requested_symbols)
@@ -2448,9 +2531,7 @@ def verify_live_readiness_authority_chain(
     result = _empty_result(
         symbols,
         activation_id=getattr(native_universe, "activation_id", None),
-        activation_sha256=getattr(
-            native_universe, "activation_manifest_sha256", None
-        ),
+        activation_sha256=getattr(native_universe, "activation_manifest_sha256", None),
     )
     try:
         validation_time = (
@@ -2533,7 +2614,9 @@ def verify_live_readiness_authority_chain(
         ):
             errors.append("AUTHORITY_CHAIN_RECEIPT_HASH_OR_SCHEMA_INVALID")
             receipt_valid = False
-        expected_scope = "FUNDED_LIVE" if require_funded_authorization else "DEMO_PROBATION"
+        expected_scope = (
+            "FUNDED_LIVE" if require_funded_authorization else "DEMO_PROBATION"
+        )
         if receipt.get("authorization_scope") != expected_scope:
             errors.append("AUTHORITY_CHAIN_RECEIPT_SCOPE_MISMATCH")
             receipt_valid = False
@@ -2562,7 +2645,9 @@ def verify_live_readiness_authority_chain(
                 config_value, config_sha, _, _ = _snapshot(
                     expected_config, MAX_CONFIG_BYTES, root=root
                 )
-                if type(config_value) is not dict or config_value != dict(config_payload):
+                if type(config_value) is not dict or config_value != dict(
+                    config_payload
+                ):
                     errors.append("AUTHORITY_CONFIG_CALLER_SNAPSHOT_MISMATCH")
                     receipt_valid = False
                 if receipt.get("config_sha256") != config_sha:
@@ -2611,9 +2696,10 @@ def verify_live_readiness_authority_chain(
 
     if management_requested:
         if management_state is None:
-            verified_native, native_errors = None, [
-                "MANAGEMENT_NATIVE_CONTEXT_UNAVAILABLE"
-            ]
+            verified_native, native_errors = (
+                None,
+                ["MANAGEMENT_NATIVE_CONTEXT_UNAVAILABLE"],
+            )
         else:
             verified_native, native_errors = _management_native_reverify(
                 state=management_state,
@@ -2641,8 +2727,8 @@ def verify_live_readiness_authority_chain(
             verified_native.activation_manifest_sha256
         )
 
-    historical_decision, historical_body, historical_errors = (
-        _historical_book_reverify(indexes.get("historical_book"))
+    historical_decision, historical_body, historical_errors = _historical_book_reverify(
+        indexes.get("historical_book")
     )
     if historical_body and (
         historical_body.get("valid") is not True
@@ -2687,19 +2773,24 @@ def verify_live_readiness_authority_chain(
                 "source_unavailable_cell_ids",
                 "regime_unobserved_cell_ids",
                 "no_local_winner_cell_ids",
+                "insufficient_evidence_cell_ids",
                 "technical_cell_ids",
                 "unsearched_cell_ids",
                 "missing_observed_cell_ids",
             )
         }
 
-    detector_bindings, regime_errors = _regime_support_reverify(
-        index_value=indexes.get("regime_support"),
-        current_book_body=current_body,
-        current_book_receipt=getattr(current_decision, "receipt_sha256", None),
-        requested_symbols=symbols,
-        native_universe=verified_native,
-    ) if verified_native is not None else ({}, ["REGIME_SUPPORT_NATIVE_AUTHORITY_MISSING"])
+    detector_bindings, regime_errors = (
+        _regime_support_reverify(
+            index_value=indexes.get("regime_support"),
+            current_book_body=current_body,
+            current_book_receipt=getattr(current_decision, "receipt_sha256", None),
+            requested_symbols=symbols,
+            native_universe=verified_native,
+        )
+        if verified_native is not None
+        else ({}, ["REGIME_SUPPORT_NATIVE_AUTHORITY_MISSING"])
+    )
     errors.extend(regime_errors)
 
     refit_index = (
@@ -2707,7 +2798,9 @@ def verify_live_readiness_authority_chain(
         if type(indexes.get("current_refit_execution")) is dict
         else None
     )
-    current_cutoff = accepted_payload.get("current_cutoff_utc") if accepted_payload else None
+    current_cutoff = (
+        accepted_payload.get("current_cutoff_utc") if accepted_payload else None
+    )
     refit_raw_override: Optional[Path] = None
     refit_root_override: Optional[Path] = None
     refit_closure_errors: list[str] = []
@@ -2724,10 +2817,14 @@ def verify_live_readiness_authority_chain(
         or refit_raw_override is None
         or refit_root_override is None
     ):
-        refit_receipt, current_lineage, refit_errors = None, None, [
-            *refit_closure_errors,
-            "MANAGEMENT_CURRENT_REFIT_RAW_CLOSURE_UNAVAILABLE",
-        ]
+        refit_receipt, current_lineage, refit_errors = (
+            None,
+            None,
+            [
+                *refit_closure_errors,
+                "MANAGEMENT_CURRENT_REFIT_RAW_CLOSURE_UNAVAILABLE",
+            ],
+        )
     else:
         refit_receipt, current_lineage, refit_errors = _current_refit_reverify(
             indexes.get("current_refit_execution"),
@@ -2759,6 +2856,15 @@ def verify_live_readiness_authority_chain(
         }
         if partition.get("source_unavailable_cell_ids", set()) != native_unavailable:
             errors.append("CURRENT_BOOK_NATIVE_SOURCE_AVAILABILITY_MISMATCH")
+        native_technical = {
+            f"{symbol}|{timeframe}|{regime}"
+            for symbol in symbols
+            for timeframe in TIMEFRAMES
+            if verified_native.cell_status(symbol, timeframe) == "technical_error"
+            for regime in REGIMES
+        }
+        if partition.get("technical_cell_ids", set()) != native_technical:
+            errors.append("CURRENT_BOOK_NATIVE_TECHNICAL_AVAILABILITY_MISMATCH")
 
     config_data_dir = Path(getattr(config, "data_dir", "data"))
     if not config_data_dir.is_absolute():
@@ -2768,9 +2874,11 @@ def verify_live_readiness_authority_chain(
         or refit_raw_override is None
         or refit_root_override is None
     ):
-        replay_evidence, replay_roster, replay_errors = None, None, [
-            "MANAGEMENT_PORTFOLIO_REPLAY_RAW_CLOSURE_UNAVAILABLE"
-        ]
+        replay_evidence, replay_roster, replay_errors = (
+            None,
+            None,
+            ["MANAGEMENT_PORTFOLIO_REPLAY_RAW_CLOSURE_UNAVAILABLE"],
+        )
     else:
         replay_evidence, replay_roster, replay_errors = _replay_reverify(
             indexes.get("synchronized_portfolio_replay"),
@@ -2805,10 +2913,13 @@ def verify_live_readiness_authority_chain(
     if management_requested and (
         management_state is None or capital_root_override is None
     ):
-        envelope, capital_errors = None, [
-            *capital_closure_errors,
-            "MANAGEMENT_CAPITAL_RAW_CLOSURE_UNAVAILABLE",
-        ]
+        envelope, capital_errors = (
+            None,
+            [
+                *capital_closure_errors,
+                "MANAGEMENT_CAPITAL_RAW_CLOSURE_UNAVAILABLE",
+            ],
+        )
     else:
         _, envelope, capital_errors = _capital_reverify(
             indexes.get("capital_calibration"),
@@ -2848,7 +2959,11 @@ def verify_live_readiness_authority_chain(
         "causal_process": causal_errors,
         "current_process_book": [
             *current_errors,
-            *([] if type(current_lineage) is dict else ["CURRENT_PROCESS_LINEAGE_INVALID"]),
+            *(
+                []
+                if type(current_lineage) is dict
+                else ["CURRENT_PROCESS_LINEAGE_INVALID"]
+            ),
         ],
         "regime_support": regime_errors,
         "current_refit_execution": refit_errors,
@@ -2863,7 +2978,9 @@ def verify_live_readiness_authority_chain(
     for name, values in partition.items():
         result[name] = sorted(values)
     result["selected_capital_envelope"] = dict(envelope or {})
-    result["capital_config_matches"] = not config_capital_errors and envelope is not None
+    result["capital_config_matches"] = (
+        not config_capital_errors and envelope is not None
+    )
     result["capital_execution_enforcement_reverified"] = (
         not execution_capital_errors and envelope is not None
     )
@@ -2891,7 +3008,9 @@ def _pipeline_config(config_payload: Mapping[str, Any], config_path: Path) -> An
     if type(pipeline) is not dict:
         raise _Invalid("CONFIG_PIPELINE_NOT_OBJECT")
     allowed = {item.name for item in fields(PipelineConfig)}
-    config = PipelineConfig(**{key: value for key, value in pipeline.items() if key in allowed})
+    config = PipelineConfig(
+        **{key: value for key, value in pipeline.items() if key in allowed}
+    )
     setattr(config, "_deployment_config_path", str(config_path))
     return config
 
@@ -2921,7 +3040,9 @@ def verify_optimization_authority_chain(
         config_payload, config_sha, _, _ = _snapshot(
             config_path, MAX_CONFIG_BYTES, root=root
         )
-        if type(config_payload) is not dict or config_sha != receipt.get("config_sha256"):
+        if type(config_payload) is not dict or config_sha != receipt.get(
+            "config_sha256"
+        ):
             return ["OPTIMIZATION_AUTHORITY_CONFIG_SNAPSHOT_INVALID"]
         ledger, ledger_sha, _, resolved_ledger = _snapshot(
             Path(ledger_path), MAX_LEDGER_BYTES, root=root
@@ -2972,7 +3093,9 @@ def verify_optimization_authority_chain(
             require_funded_authorization=require_funded,
         )
         errors.extend(result.get("errors") or [])
-        expected_status = "FUNDED_AUTHORIZED" if require_funded else "DEMO_PROBATION_AUTHORIZED"
+        expected_status = (
+            "FUNDED_AUTHORIZED" if require_funded else "DEMO_PROBATION_AUTHORIZED"
+        )
         if result.get("status") != expected_status:
             errors.append("OPTIMIZATION_AUTHORITY_CHAIN_NOT_AUTHORIZED")
         if str(getattr(outcome, "generation_id", "") or "") != str(
@@ -2980,7 +3103,9 @@ def verify_optimization_authority_chain(
         ):
             errors.append("OPTIMIZATION_AUTHORITY_OUTCOME_GENERATION_MISMATCH")
     except Exception as exc:
-        _error(errors, "OPTIMIZATION_AUTHORITY_CHAIN_REVERIFY_FAILED", type(exc).__name__)
+        _error(
+            errors, "OPTIMIZATION_AUTHORITY_CHAIN_REVERIFY_FAILED", type(exc).__name__
+        )
     return _unique(errors)
 
 

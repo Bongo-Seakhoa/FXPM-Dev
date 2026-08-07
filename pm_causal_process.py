@@ -38,18 +38,12 @@ PRECOMMIT_SCHEMA: Final = "fxpm-historical-process-precommit-v8"
 EVIDENCE_SCHEMA: Final = "fxpm-historical-process-evidence-v8"
 RECONCILIATION_SCHEMA: Final = "fxpm-historical-process-reconciliation-v8"
 DECISION_SCHEMA: Final = "fxpm-offline-process-validation-decision-v8"
-FORWARD_OOS_REPLAY_LINEAGE_SCHEMA: Final = (
-    "fxpm.causal-forward-oos-replay-lineage.v1"
-)
-FORWARD_OOS_ANCHOR_LINEAGE_SCHEMA: Final = (
-    "fxpm.causal-forward-oos-anchor-lineage.v1"
-)
+FORWARD_OOS_REPLAY_LINEAGE_SCHEMA: Final = "fxpm.causal-forward-oos-replay-lineage.v1"
+FORWARD_OOS_ANCHOR_LINEAGE_SCHEMA: Final = "fxpm.causal-forward-oos-anchor-lineage.v1"
 PINNED_FORWARD_OOS_PRODUCTION_CONTRACT_VERSION: Final = (
     "fxpm.forward-oos-replay-producer.v3"
 )
-PINNED_FORWARD_OOS_PRECOMMIT_SCHEMA: Final = (
-    "fxpm.forward-oos-replay-precommit.v3"
-)
+PINNED_FORWARD_OOS_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v3"
 PINNED_FORWARD_OOS_PRODUCER_RECEIPT_SCHEMA: Final = (
     "fxpm.forward-oos-replay-producer-receipt.v3"
 )
@@ -166,10 +160,13 @@ CELL_COUNT: Final = 100 * 6 * 4
 REGIME_UNOBSERVED: Final = "REGIME_UNOBSERVED"
 INSUFFICIENT_EVIDENCE: Final = "INSUFFICIENT_EVIDENCE"
 NO_LOCAL_WINNER: Final = "NO_LOCAL_WINNER"
-PINNED_BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v12"
+TERMINAL_TECHNICAL: Final = "TERMINAL_TECHNICAL"
+TERMINAL_TECHNICAL_SOURCE_STATE: Final = "AUTHENTIC_TERMINAL_TECHNICAL"
+TERMINAL_TECHNICAL_REASON: Final = "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
+PINNED_BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v13"
 PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = "fxpm.winner-selection.v13"
 PINNED_WINNER_EVIDENCE_LEDGER_VERSION: Final = "fxpm.winner-evidence-ledger.v4"
-PINNED_REGIME_FIT_CONTRACT_VERSION: Final = "fxpm.historical-regime-fit.v3"
+PINNED_REGIME_FIT_CONTRACT_VERSION: Final = "fxpm.historical-regime-fit.v4"
 REGIME_DETECTOR_RECORD_SCHEMA_VERSION: Final = "fxpm.regime-detector-record/v1"
 REGIME_DETECTOR_LEDGER_RECORD_SCHEMA_VERSION: Final = (
     "fxpm.regime-detector-ledger-record/v1"
@@ -439,9 +436,7 @@ _PINNED_POLICY: Final = {
         PINNED_FORWARD_OOS_PRODUCTION_CONTRACT_VERSION
     ),
     "forward_oos_precommit_schema": PINNED_FORWARD_OOS_PRECOMMIT_SCHEMA,
-    "forward_oos_producer_receipt_schema": (
-        PINNED_FORWARD_OOS_PRODUCER_RECEIPT_SCHEMA
-    ),
+    "forward_oos_producer_receipt_schema": (PINNED_FORWARD_OOS_PRODUCER_RECEIPT_SCHEMA),
     "forward_oos_issuer_authenticated_products_required": True,
     "forward_oos_exact_six_role_descriptor_lineage_required": True,
     "regime_fit_contract_version": PINNED_REGIME_FIT_CONTRACT_VERSION,
@@ -951,11 +946,7 @@ def _validate_forward_oos_replay_lineage(
     ):
         raise ProcessVerificationError("forward OOS replay lineage semantics mismatch")
     generation_id = value["generation_id"]
-    if (
-        type(generation_id) is not str
-        or not generation_id
-        or len(generation_id) > 256
-    ):
+    if type(generation_id) is not str or not generation_id or len(generation_id) > 256:
         raise ProcessVerificationError("forward OOS generation identity invalid")
     for key in (
         "producer_receipt_sha256",
@@ -976,20 +967,16 @@ def _validate_forward_oos_replay_lineage(
     ):
         _require_hex(value[key], f"forward OOS replay lineage.{key}")
     if (
-        value["producer_receipt_descriptor_sha256"]
-        != value["producer_receipt_sha256"]
+        value["producer_receipt_descriptor_sha256"] != value["producer_receipt_sha256"]
         or value["forward_precommit_descriptor_sha256"]
         != value["forward_precommit_receipt_sha256"]
-        or value["causal_precommit_payload_sha256"]
-        != precommit_payload_sha256
+        or value["causal_precommit_payload_sha256"] != precommit_payload_sha256
     ):
         raise ProcessVerificationError(
             "forward OOS replay lineage receipt binding mismatch"
         )
     forward_clocks = [
-        _parse_utc(
-            value[key], f"forward OOS replay lineage.{key}"
-        )
+        _parse_utc(value[key], f"forward OOS replay lineage.{key}")
         for key in (
             "evidence_access_started_at_utc",
             "execution_started_at_utc",
@@ -1643,7 +1630,7 @@ def _validate_train_regime_support(
     if (
         type(eligible) is not int
         or type(eligible) is bool
-        or not 1 <= eligible <= 10_000_000
+        or not 0 <= eligible <= 10_000_000
         or sum(counts.values()) != eligible
     ):
         raise ProcessVerificationError("train regime support rows do not reconcile")
@@ -1659,15 +1646,25 @@ def _validate_train_regime_support(
         or value["support_state_by_regime"] != states
     ):
         raise ProcessVerificationError("train regime support partition is invalid")
-    try:
-        first = datetime.fromisoformat(str(value["first_ts"]).replace("Z", "+00:00"))
-        last = datetime.fromisoformat(str(value["last_ts"]).replace("Z", "+00:00"))
-        if first > last:
-            raise ValueError
-    except Exception as exc:
-        raise ProcessVerificationError(
-            "train regime support timestamps are invalid"
-        ) from exc
+    if eligible == 0:
+        if value["first_ts"] is not None or value["last_ts"] is not None:
+            raise ProcessVerificationError(
+                "empty train regime support timestamps are invalid"
+            )
+    else:
+        try:
+            first = datetime.fromisoformat(
+                str(value["first_ts"]).replace("Z", "+00:00")
+            )
+            last = datetime.fromisoformat(
+                str(value["last_ts"]).replace("Z", "+00:00")
+            )
+            if first > last:
+                raise ValueError
+        except Exception as exc:
+            raise ProcessVerificationError(
+                "train regime support timestamps are invalid"
+            ) from exc
     _require_hex(value["vector_sha256"], "train regime support vector")
     bindings = value["bindings"]
     if type(bindings) is not dict:
@@ -1979,7 +1976,7 @@ def _validate_cell_book(
             ),
             "anchor-local cell decision",
         )
-        if decision["schema"] != "fxpm-anchor-local-cell-decision-v5":
+        if decision["schema"] != "fxpm-anchor-local-cell-decision-v6":
             raise ProcessVerificationError("anchor-local cell decision schema mismatch")
         if (
             decision["anchor_id"] != anchor_id
@@ -2009,7 +2006,7 @@ def _validate_cell_book(
         )
         support = supports[index // len(REGIMES)]
         detector_record = detector_records[index // len(REGIMES)]
-        if status == "SOURCE_UNAVAILABLE":
+        if status in {"SOURCE_UNAVAILABLE", TERMINAL_TECHNICAL}:
             if (
                 support is not None
                 or detector_record is not None
@@ -2304,6 +2301,47 @@ def _validate_cell_book(
                 raise ProcessVerificationError(
                     "source-unavailable cell carries a Winner contract"
                 )
+        elif status == TERMINAL_TECHNICAL:
+            if (
+                unavailable is not False
+                or count != 0
+                or source_state != TERMINAL_TECHNICAL_SOURCE_STATE
+                or source_terminal_reason != TERMINAL_TECHNICAL_REASON
+                or market_data_end_text is not None
+                or feature_end_text is not None
+                or label_end_text is not None
+                or refit_end_text is not None
+                or insufficient_binding is not None
+            ):
+                raise ProcessVerificationError(
+                    "terminal-technical cell is not an authenticated final abstention"
+                )
+            _require_hex(
+                decision["regime_receipt_sha256"],
+                "terminal-technical shared regime-fit decision receipt",
+            )
+            for key in (
+                "horizon_receipt_sha256",
+                "full_attempt_ledger_sha256",
+                "strategy_code_sha256",
+                "trial_definition_sha256",
+                "parameters_sha256",
+                "winner_request_sha256",
+                "winner_evidence_ledger_payload_sha256",
+                "winner_decision_receipt_sha256",
+                "anchor_refit_receipt_sha256",
+            ):
+                if (
+                    _optional_hex(decision[key], f"terminal-technical decision {key}")
+                    is not None
+                ):
+                    raise ProcessVerificationError(
+                        "terminal-technical cell carries a downstream identity"
+                    )
+            if winner_contract is not None or winner_ledger_contract is not None:
+                raise ProcessVerificationError(
+                    "terminal-technical cell carries a Winner contract"
+                )
         else:
             raise ProcessVerificationError(
                 "book cell has a non-terminal or technical status"
@@ -2438,6 +2476,9 @@ def _validate_cell_book(
         unavailable_statuses = {
             cell["status"] == "SOURCE_UNAVAILABLE" for cell in group
         }
+        technical_terminal_statuses = {
+            cell["status"] == TERMINAL_TECHNICAL for cell in group
+        }
         if source_state == "AUTHENTIC_TERMINAL_UNAVAILABLE":
             if detector_record is not None:
                 raise ProcessVerificationError(
@@ -2447,9 +2488,22 @@ def _validate_cell_book(
                 raise ProcessVerificationError(
                     "terminal source absence is inconsistent across four regimes"
                 )
-        elif unavailable_statuses != {False}:
+            if technical_terminal_statuses != {False}:
+                raise ProcessVerificationError(
+                    "terminal source absence contains a terminal-technical regime"
+                )
+        elif source_state == TERMINAL_TECHNICAL_SOURCE_STATE:
+            if detector_record is not None:
+                raise ProcessVerificationError(
+                    "terminal-technical source carries a detector record"
+                )
+            if technical_terminal_statuses != {True} or unavailable_statuses != {False}:
+                raise ProcessVerificationError(
+                    "terminal-technical source is inconsistent across four regimes"
+                )
+        elif unavailable_statuses != {False} or technical_terminal_statuses != {False}:
             raise ProcessVerificationError(
-                "available source group contains a source-unavailable regime"
+                "available source group contains a terminal source regime"
             )
     return _sha256(
         {
@@ -4888,15 +4942,15 @@ def _evaluate_impl(
         )
     for anchor_id in forward_oos_replay_lineage["ordered_anchor_ids"]:
         identity_registry.register(
-            forward_oos_replay_lineage[
-                "anchor_descriptor_roster_sha256_by_id"
-            ][anchor_id],
+            forward_oos_replay_lineage["anchor_descriptor_roster_sha256_by_id"][
+                anchor_id
+            ],
             f"{anchor_id} forward OOS descriptor roster",
         )
         identity_registry.register(
-            forward_oos_replay_lineage[
-                "anchor_production_metadata_sha256_by_id"
-            ][anchor_id],
+            forward_oos_replay_lineage["anchor_production_metadata_sha256_by_id"][
+                anchor_id
+            ],
             f"{anchor_id} forward OOS production metadata",
         )
     access_started = _parse_utc(
@@ -5149,6 +5203,9 @@ __all__ = [
     "REGIME_DETECTOR_RECORD_SCHEMA_VERSION",
     "REGIME_DETECTOR_WEIGHT_GROUPS",
     "REGIME_UNOBSERVED",
+    "TERMINAL_TECHNICAL",
+    "TERMINAL_TECHNICAL_REASON",
+    "TERMINAL_TECHNICAL_SOURCE_STATE",
     "REGIME_TRAIN_SUPPORT_SCHEMA_VERSION",
     "REGIME_TRAIN_SUPPORT_VECTOR_ENCODING",
     "REGIME_TRAIN_SUPPORT_WARMUP_POLICY",

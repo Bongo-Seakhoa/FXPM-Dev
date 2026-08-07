@@ -1,11 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from pm_core import PipelineConfig
 from pm_main import load_config_json
 from pm_position import PositionConfig
+from pm_production_config_binding import load_effective_pipeline_config
 from pm_regime import has_tuned_regime_params
 
 
@@ -69,7 +70,7 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
     def test_tracked_config_pins_validated_legacy_scoring_flags(self) -> None:
         data = json.loads((self.repo_root / "config.json").read_text(encoding="utf-8"))
         pipeline = data["pipeline"]
-        resolved = PipelineConfig(**pipeline)
+        _, resolved = load_effective_pipeline_config(self.repo_root / "config.json")
 
         self.assertEqual(pipeline["regime_scoring_model"], "legacy")
         self.assertNotIn("scoring_use_trade_frequency_bonus", pipeline)
@@ -85,6 +86,10 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertTrue(pipeline["live_require_tuned_regime_params"])
         self.assertEqual(pipeline["production_retrain_mode"], "notify")
         self.assertEqual(pipeline["production_retrain_interval_weeks"], 4)
+        self.assertEqual(
+            resolved.optimization_max_workers,
+            max(1, int(os.cpu_count() or 1)),
+        )
         self.assertIsNone(pipeline["storage_pause_entries_below_free_gb"])
         self.assertGreater(pipeline["daily_loss_hard_block_pct"], 0.0)
         self.assertGreater(pipeline["session_loss_hard_block_pct"], 0.0)
@@ -94,7 +99,7 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
     def test_universal_config_requires_institutional_lockbox_and_live_safety_gate(self) -> None:
         data = json.loads((self.repo_root / "config.json").read_text(encoding="utf-8"))
         pipeline = data["pipeline"]
-        resolved = PipelineConfig(**pipeline)
+        _, resolved = load_effective_pipeline_config(self.repo_root / "config.json")
         resolved_position = PositionConfig(**data["position"])
 
         self.assertEqual(pipeline["regime_scoring_model"], "legacy")
@@ -187,7 +192,7 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertEqual(pipeline["production_retrain_mode"], "notify")
         self.assertEqual(pipeline["production_retrain_interval_weeks"], 4)
         self.assertIsNone(pipeline["storage_pause_entries_below_free_gb"])
-        self.assertFalse(pipeline["manual_new_entries_enabled"])
+        self.assertTrue(pipeline["manual_new_entries_enabled"])
         self.assertEqual(pipeline["live_allowed_promotion_statuses"], ["PROMOTED"])
         self.assertTrue(pipeline["production_replay_audit_enabled"])
         self.assertEqual(pipeline["production_replay_audit_mode"], "apply")
@@ -220,10 +225,9 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         # the old JSON count and scope-power knob did not affect DSR/PBO gates.
         self.assertNotIn("false_discovery_symbol_count", pipeline)
         self.assertNotIn("false_discovery_scope_power", pipeline)
-        # The 7.36 GB deployment host stays sequential until the calibrated
-        # memory governor is integrated end-to-end. This is a throughput
-        # constraint, not a change to scoring or candidate mathematics.
-        self.assertEqual(pipeline["optimization_max_workers"], 1)
+        # Zero selects all OS logical CPUs at config materialization. Production
+        # schedulers add no hidden worker ceiling or RAM admission policy.
+        self.assertEqual(pipeline["optimization_max_workers"], 0)
         self.assertNotIn("optimization_min_m5_bars", pipeline)
         self.assertNotIn("historical_fetch_retry_attempts", pipeline)
         self.assertNotIn("historical_fetch_deep_backfill_enabled", pipeline)

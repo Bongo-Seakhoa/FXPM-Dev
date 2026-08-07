@@ -12,8 +12,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import re
+import secrets
+import threading
+from collections import OrderedDict
+from contextvars import ContextVar, Token
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -22,6 +30,7 @@ import pandas as pd
 from pm_evidence import TIMEFRAME_EVIDENCE_CONTRACT_VERSION
 from pm_native_consensus import (
     CONSENSUS_POLICY,
+    CONSENSUS_SCHEMA_VERSION,
     EVIDENCE_PASS,
     EVIDENCE_PENDING,
     EVIDENCE_SEMANTIC_FAIL,
@@ -31,23 +40,60 @@ from pm_native_consensus import (
     REQUIRED_AUDIT_WINDOWS,
     build_consensus_envelope,
     build_edge_report,
+    canonical_json_bytes,
     expected_reference_timeframes,
     validate_consensus_envelope,
 )
 from pm_native_parity import (
+    CROSS_RESOLUTION_COMPATIBILITY_CURRENT,
+    CROSS_RESOLUTION_COMPATIBILITY_FROZEN_PRE_SEQ2307,
     ParityThresholds,
-    audit_native_cross_resolution,
+    audit_normalized_native_cross_resolution,
     normalize_ohlc_frame,
 )
 from pm_native_resolution import (
     RESOLUTION_AUDIT_SCHEMA_VERSION,
     audit_native_resolution,
 )
-from pm_native_request_contract import PRODUCTION_SYMBOL_ORDER
+from pm_native_request_contract import (
+    COMMON_REQUEST_KEYS,
+    PRODUCTION_SYMBOL_ORDER,
+    NativeRequestContractError,
+    validate_v5_terminal_technical_cell,
+)
 
 
 ACTIVE_POINTER_SCHEMA = "fxpm-native-active-pointer-v1"
 ACTIVATION_MANIFEST_SCHEMA = "fxpm-native-activation-v1"
+TERMINAL_PROMOTION_RECEIPT_SCHEMA = "fxpm-native-terminal-promotion-v2"
+TERMINAL_PROMOTION_TRANSITION = "failed_complete_terminal_grid_to_active_view"
+_SAFE_ACTIVATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+ACTIVE_POINTER_FIELDS = frozenset(
+    {
+        "schema_version",
+        "activation_id",
+        "manifest_relative_path",
+        "manifest_sha256",
+        "activated_at_utc",
+        "production_authoritative",
+    }
+)
+TERMINAL_PROMOTION_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "activation_id",
+        "run_id",
+        "source_manifest_relative_path",
+        "source_manifest_sha256",
+        "promoted_manifest_relative_path",
+        "promoted_manifest_sha256",
+        "previous_active_pointer_sha256",
+        "counts",
+        "transition",
+        "data_reacquired",
+        "cell_evidence_replayed",
+    }
+)
 NATIVE_RUN_MANIFEST_SCHEMA = "fxpm.native_history_run_manifest.v1"
 NATIVE_BARS_SCHEMA = "fxpm-native-bars-v1"
 NATIVE_PARITY_SCHEMA = "fxpm-native-m5-parity-v1"
@@ -70,7 +116,11 @@ NATIVE_SOURCE_UNAVAILABLE = "source_unavailable"
 NATIVE_TECHNICAL_ERROR = "technical_error"
 NATIVE_PENDING = "pending"
 NATIVE_TERMINAL_AUTHENTICITY_STATES = frozenset(
-    {NATIVE_EVIDENCE_CANDIDATE, NATIVE_SOURCE_UNAVAILABLE}
+    {
+        NATIVE_EVIDENCE_CANDIDATE,
+        NATIVE_SOURCE_UNAVAILABLE,
+        NATIVE_TECHNICAL_ERROR,
+    }
 )
 NATIVE_ALL_AUTHENTICITY_STATES = frozenset(
     {
@@ -115,6 +165,13 @@ NATIVE_PRODUCTION_TIMEFRAMES: Tuple[str, ...] = (
     "D1",
 )
 NATIVE_PRODUCTION_SYMBOLS: Tuple[str, ...] = tuple(PRODUCTION_SYMBOL_ORDER)
+PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA = (
+    "fxpm.production_native_authority_verification_scope.v1"
+)
+_MAX_ACTIVE_POINTER_BYTES = 64 * 1024
+_MAX_V5_BARS_BYTES = 256 * 1024 * 1024
+_MAX_V5_NORMALIZED_FRAME_CACHE_FRAMES = 6
+_MAX_V5_NORMALIZED_FRAME_CACHE_BYTES = 512 * 1024 * 1024
 NATIVE_AVAILABILITY_EXCLUSION_FAILURES = frozenset(
     {
         "partial_history",
@@ -325,6 +382,7 @@ def classify_native_availability_cell(
     status: Any,
     failure_status: Any,
     rows: Any,
+    resume_disposition: Any = None,
 ) -> Tuple[str, Optional[str]]:
     """Classify one acquisition result using availability facts only.
 
@@ -341,6 +399,7 @@ def classify_native_availability_cell(
     """
     normalized_status = str(status or "").strip().lower()
     failure = str(failure_status or "").strip().lower()
+    disposition = str(resume_disposition or "").strip().lower()
     if isinstance(rows, bool):
         return "invalid", "ROWS_BOOLEAN"
     try:
@@ -376,6 +435,13 @@ def classify_native_availability_cell(
             return "invalid", f"{failure.upper()}_WITH_PUBLISHED_ROWS"
         return "unavailable", None
 
+    if failure == "technical_history_gap" and disposition == "terminal_technical":
+        if normalized_status != "failed":
+            return "invalid", "TERMINAL_TECHNICAL_STATUS_MISMATCH"
+        if published_rows != 0:
+            return "invalid", "TERMINAL_TECHNICAL_WITH_PUBLISHED_ROWS"
+        return "terminal_technical", None
+
     return (
         "invalid",
         f"NON_AVAILABILITY_FAILURE:{failure or normalized_status or 'unknown'}",
@@ -390,11 +456,156 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_json_file_bytes(value: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+
 def _is_sha256(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return len(text) == 64 and all(
         character in "0123456789abcdef" for character in text
     )
+
+
+def validate_terminal_promotion_view(
+    native_root: Path,
+    *,
+    activation_id: str,
+    view_path: Path,
+    view_sha256: str,
+) -> List[str]:
+    """Authenticate the sole immutable failed-to-active manifest view.
+
+    This helper never grants authority from a receipt alone.  It requires the
+    exact canonical source bytes, a canonical view that differs only by the
+    ``status`` transition, and a canonical receipt binding both byte streams to
+    the source manifest's predecessor-pointer commitment.
+    """
+
+    errors: List[str] = []
+    root = Path(native_root).resolve()
+    identity = str(activation_id or "").strip()
+    if _SAFE_ACTIVATION_ID.fullmatch(identity) is None:
+        return ["NATIVE_TERMINAL_PROMOTION_ACTIVATION_ID_INVALID"]
+    source_relative = f"activations/{identity}.json"
+    promoted_relative = f"activations/promoted/{identity}.json"
+    source_path = _contained_path(root, source_relative)
+    expected_view_path = _contained_path(root, promoted_relative)
+    receipt_path = _contained_path(
+        root,
+        f"transition_receipts/{identity}.json",
+    )
+    try:
+        supplied_view_path = Path(view_path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        supplied_view_path = Path(view_path)
+    if expected_view_path is None or supplied_view_path != expected_view_path:
+        return ["NATIVE_TERMINAL_PROMOTION_VIEW_PATH_IDENTITY_MISMATCH"]
+    if source_path is None or receipt_path is None:
+        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_MISSING_OR_UNSAFE"]
+    if (
+        not source_path.is_file()
+        or source_path.is_symlink()
+        or not expected_view_path.is_file()
+        or expected_view_path.is_symlink()
+        or not receipt_path.is_file()
+        or receipt_path.is_symlink()
+    ):
+        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_MISSING_OR_UNSAFE"]
+
+    try:
+        source_bytes = source_path.read_bytes()
+        promoted_bytes = expected_view_path.read_bytes()
+        receipt_bytes = receipt_path.read_bytes()
+        source = json.loads(source_bytes.decode("utf-8"))
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except Exception:
+        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_INVALID_JSON"]
+    if not isinstance(source, Mapping) or not isinstance(receipt, Mapping):
+        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_NOT_OBJECT"]
+    source = dict(source)
+    receipt = dict(receipt)
+    try:
+        canonical_source_bytes = _canonical_json_file_bytes(source)
+        canonical_receipt_bytes = _canonical_json_file_bytes(receipt)
+    except (TypeError, ValueError, OverflowError):
+        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_NOT_CANONICAL"]
+    if source_bytes != canonical_source_bytes:
+        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_NOT_CANONICAL")
+    if receipt_bytes != canonical_receipt_bytes:
+        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_NOT_CANONICAL")
+    if set(receipt) != set(TERMINAL_PROMOTION_RECEIPT_FIELDS):
+        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_FIELDS_INVALID")
+    if str(receipt.get("schema_version") or "") != TERMINAL_PROMOTION_RECEIPT_SCHEMA:
+        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_SCHEMA_INVALID")
+    if str(receipt.get("transition") or "") != TERMINAL_PROMOTION_TRANSITION:
+        errors.append("NATIVE_TERMINAL_PROMOTION_TRANSITION_INVALID")
+
+    observed_source_sha = hashlib.sha256(source_bytes).hexdigest()
+    observed_promoted_sha = hashlib.sha256(promoted_bytes).hexdigest()
+    declared_view_sha = str(view_sha256 or "").strip().lower()
+    for value, label in (
+        (receipt.get("source_manifest_sha256"), "SOURCE"),
+        (receipt.get("promoted_manifest_sha256"), "PROMOTED"),
+        (receipt.get("previous_active_pointer_sha256"), "PREDECESSOR_POINTER"),
+        (declared_view_sha, "POINTER_PROMOTED"),
+    ):
+        if not _is_sha256(value):
+            errors.append(f"NATIVE_TERMINAL_PROMOTION_{label}_SHA256_INVALID")
+    if str(receipt.get("source_manifest_relative_path") or "") != source_relative:
+        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_PATH_MISMATCH")
+    if str(receipt.get("promoted_manifest_relative_path") or "") != promoted_relative:
+        errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_PATH_MISMATCH")
+    if str(receipt.get("source_manifest_sha256") or "").lower() != (
+        observed_source_sha
+    ):
+        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_SHA256_MISMATCH")
+    if (
+        str(receipt.get("promoted_manifest_sha256") or "").lower()
+        != observed_promoted_sha
+        or declared_view_sha != observed_promoted_sha
+    ):
+        errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_SHA256_MISMATCH")
+
+    if str(source.get("schema_version") or "") != ACTIVATION_MANIFEST_SCHEMA:
+        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_SCHEMA_INVALID")
+    if str(source.get("status") or "").lower() != "failed":
+        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_STATUS_INVALID")
+    if str(source.get("activation_id") or "") != identity:
+        errors.append("NATIVE_TERMINAL_PROMOTION_ACTIVATION_ID_MISMATCH")
+    run_id = str(source.get("run_id") or "")
+    if not run_id or str(receipt.get("run_id") or "") != run_id:
+        errors.append("NATIVE_TERMINAL_PROMOTION_RUN_ID_MISMATCH")
+    if str(receipt.get("activation_id") or "") != identity:
+        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_ACTIVATION_ID_MISMATCH")
+    if not isinstance(source.get("counts"), Mapping) or receipt.get("counts") != (
+        source.get("counts")
+    ):
+        errors.append("NATIVE_TERMINAL_PROMOTION_COUNTS_MISMATCH")
+    predecessor_sha = str(source.get("previous_active_pointer_sha256") or "").lower()
+    if (
+        not _is_sha256(predecessor_sha)
+        or str(receipt.get("previous_active_pointer_sha256") or "").lower()
+        != predecessor_sha
+    ):
+        errors.append("NATIVE_TERMINAL_PROMOTION_PREDECESSOR_POINTER_MISMATCH")
+    if receipt.get("data_reacquired") is not False:
+        errors.append("NATIVE_TERMINAL_PROMOTION_REACQUIRE_FLAG_INVALID")
+    if receipt.get("cell_evidence_replayed") is not False:
+        errors.append("NATIVE_TERMINAL_PROMOTION_REPLAY_FLAG_INVALID")
+
+    promoted = dict(source)
+    promoted["status"] = "active"
+    try:
+        expected_promoted_bytes = _canonical_json_file_bytes(promoted)
+    except (TypeError, ValueError, OverflowError):
+        errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_NOT_CANONICAL")
+    else:
+        if promoted_bytes != expected_promoted_bytes:
+            errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_CONTENT_MISMATCH")
+    return list(dict.fromkeys(errors))
 
 
 def _contained_path(root: Path, relative: Any) -> Optional[Path]:
@@ -976,6 +1187,54 @@ def _v5_interval(value: Any) -> Optional[Tuple[datetime, datetime]]:
     return start, end
 
 
+def _v5_scored_resolution_frames(
+    provenance: Mapping[str, Any],
+    frame: Optional[pd.DataFrame],
+    daily_frame: Optional[pd.DataFrame],
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[str]]:
+    """Independently project cadence evidence onto scored partitions."""
+
+    request = provenance.get("request")
+    boundaries = (
+        request.get("cell_calendar_boundaries")
+        if isinstance(request, Mapping)
+        else None
+    )
+    if not isinstance(boundaries, Mapping) or set(boundaries) != set(
+        NATIVE_EVIDENCE_PARTITIONS
+    ):
+        return None, None, "SCORED_EVIDENCE_INTERVALS_INVALID"
+    intervals: List[Tuple[datetime, datetime]] = []
+    for partition in NATIVE_EVIDENCE_PARTITIONS:
+        boundary = boundaries.get(partition)
+        interval = _v5_interval(
+            {
+                "start_utc": boundary.get("start_ts"),
+                "end_exclusive_utc": boundary.get("end_ts"),
+            }
+            if isinstance(boundary, Mapping)
+            else None
+        )
+        if interval is None:
+            return None, None, "SCORED_EVIDENCE_INTERVALS_INVALID"
+        intervals.append(interval)
+    intervals.sort(key=lambda value: (value[0], value[1]))
+
+    def _slice(value: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        if value is None:
+            return None
+        pieces = []
+        for start, end in intervals:
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+            left = int(value.index.searchsorted(start_ts, side="left"))
+            right = int(value.index.searchsorted(end_ts, side="left"))
+            pieces.append(value.iloc[left:right])
+        return pd.concat(pieces, axis=0, copy=False)
+
+    return _slice(frame), _slice(daily_frame), None
+
+
 def _v5_pair_states(report: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
     partitions = report.get("partitions")
     states: Dict[str, Dict[str, Any]] = {}
@@ -1000,6 +1259,103 @@ def _v5_pair_states(report: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
             ),
         }
     return states
+
+
+def _v5_receipt_byte_exact(left: Any, right: Any) -> bool:
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    try:
+        return canonical_json_bytes(left) == canonical_json_bytes(right)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _v5_legacy_edge_no_more_permissive(
+    legacy_edge: Mapping[str, Any],
+    current_edge: Mapping[str, Any],
+) -> bool:
+    """Enforce the frozen-receipt subset relation window by window.
+
+    A legacy PASS must also PASS under current semantics.  Legacy PENDING may
+    remain only when current semantics are PASS or PENDING.  A legacy FAIL is
+    conservative against any current evidence state.  Integrity ERROR is also
+    conservative, while legacy integrity PASS may not override a current ERROR.
+    """
+
+    legacy_windows = legacy_edge.get("windows")
+    current_windows = current_edge.get("windows")
+    if (
+        not isinstance(legacy_windows, Mapping)
+        or not isinstance(current_windows, Mapping)
+        or set(legacy_windows) != set(REQUIRED_AUDIT_WINDOWS)
+        or set(current_windows) != set(REQUIRED_AUDIT_WINDOWS)
+    ):
+        return False
+    valid_integrity = {INTEGRITY_PASS, INTEGRITY_ERROR}
+    valid_evidence = {
+        EVIDENCE_PASS,
+        EVIDENCE_PENDING,
+        EVIDENCE_SEMANTIC_FAIL,
+        EVIDENCE_TERMINAL_UNAVAILABLE,
+    }
+    for window in REQUIRED_AUDIT_WINDOWS:
+        legacy = legacy_windows.get(window)
+        current = current_windows.get(window)
+        if not isinstance(legacy, Mapping) or not isinstance(current, Mapping):
+            return False
+        legacy_integrity = str(legacy.get("integrity_state") or "").upper()
+        current_integrity = str(current.get("integrity_state") or "").upper()
+        legacy_evidence = str(legacy.get("evidence_state") or "").upper()
+        current_evidence = str(current.get("evidence_state") or "").upper()
+        if (
+            legacy_integrity not in valid_integrity
+            or current_integrity not in valid_integrity
+            or legacy_evidence not in valid_evidence
+            or current_evidence not in valid_evidence
+        ):
+            return False
+        if legacy_integrity == INTEGRITY_PASS and current_integrity != INTEGRITY_PASS:
+            return False
+        if legacy_evidence == EVIDENCE_PASS and current_evidence != EVIDENCE_PASS:
+            return False
+        if legacy_evidence == EVIDENCE_PENDING and current_evidence not in {
+            EVIDENCE_PASS,
+            EVIDENCE_PENDING,
+        }:
+            return False
+    return True
+
+
+def _v5_select_compatible_edge_receipt(
+    stored_edge: Any,
+    current_edge: Mapping[str, Any],
+    *,
+    frozen_pre_seq2307_edge: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Optional[Mapping[str, Any]], Optional[str]]:
+    """Select only an exactly reproduced, semantically admissible edge.
+
+    Current receipts always take the current path.  A frozen receipt is
+    accepted only when its canonical bytes reproduce exactly and every legacy
+    window is no more permissive than the independently recomputed current
+    window.  Returning ``None`` leaves the caller on the fail-closed mismatch
+    path; this helper never rewrites stored evidence.
+    """
+
+    if _v5_receipt_byte_exact(stored_edge, current_edge):
+        return current_edge, CROSS_RESOLUTION_COMPATIBILITY_CURRENT
+    if (
+        frozen_pre_seq2307_edge is not None
+        and _v5_receipt_byte_exact(stored_edge, frozen_pre_seq2307_edge)
+        and _v5_legacy_edge_no_more_permissive(
+            frozen_pre_seq2307_edge,
+            current_edge,
+        )
+    ):
+        return (
+            frozen_pre_seq2307_edge,
+            CROSS_RESOLUTION_COMPATIBILITY_FROZEN_PRE_SEQ2307,
+        )
+    return None, None
 
 
 def scope_native_pair_window_states(
@@ -1075,6 +1431,272 @@ def _v5_terminal_states(reasons: Sequence[str]) -> Dict[str, Dict[str, Any]]:
     }
 
 
+def _v5_pending_states(reasons: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    return {
+        window: {
+            "integrity_state": INTEGRITY_PASS,
+            "evidence_state": EVIDENCE_PENDING,
+            "reason_codes": list(reasons),
+        }
+        for window in REQUIRED_AUDIT_WINDOWS
+    }
+
+
+def _v5_authenticated_reference_resolution_audit(
+    native_root: Path,
+    *,
+    activation_id: str,
+    run_id: str,
+    symbol: str,
+    timeframe: str,
+    reference_entry: Any,
+    run_manifest_relative_path: Any,
+    run_manifest_sha256: Any,
+    bars_sha256: Any,
+    provenance_sha256: Any,
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """Open the pinned reference receipts before using resolution as a fact.
+
+    A stored target-edge reason is not authority for omitting raw pair evidence.
+    The reference cell's canonical sidecar and parity bytes must both be pinned
+    by the same activation entry and bound back to the authenticated run source.
+    Callers additionally recompute any claimed ``FAIL`` from bars before using
+    that fact to derive ``AUDIT_REFERENCE_RESOLUTION_EXCLUDED``.
+    """
+
+    cell_id = f"{symbol}|{timeframe}"
+    prefix = f"NATIVE_V5_REFERENCE_AUDIT:{cell_id}"
+    errors: List[str] = []
+    if not isinstance(reference_entry, Mapping):
+        return None, [f"{prefix}:ENTRY_MISSING"]
+
+    expected_leaf = f"{symbol}/{timeframe}"
+    expected_bars_relative = f"runs/{run_id}/{expected_leaf}/bars.csv"
+    expected_provenance_relative = f"runs/{run_id}/{expected_leaf}/provenance.json"
+    expected_sidecar_relative = f"audits/{activation_id}/{expected_leaf}/bars.meta.json"
+    expected_parity_relative = f"audits/{activation_id}/{expected_leaf}/parity.json"
+    for field_name, expected in (
+        ("symbol", symbol),
+        ("timeframe", timeframe),
+        ("run_id", run_id),
+        ("bars_relative_path", expected_bars_relative),
+        ("sidecar_relative_path", expected_sidecar_relative),
+        ("parity_relative_path", expected_parity_relative),
+    ):
+        if str(reference_entry.get(field_name) or "") != expected:
+            errors.append(f"{prefix}:ENTRY_{field_name.upper()}_MISMATCH")
+    if (
+        str(reference_entry.get("bars_sha256") or "").lower()
+        != str(bars_sha256 or "").lower()
+    ):
+        errors.append(f"{prefix}:ENTRY_BARS_SHA256_MISMATCH")
+    if (
+        str(reference_entry.get("run_manifest_sha256") or "").lower()
+        != str(run_manifest_sha256 or "").lower()
+    ):
+        errors.append(f"{prefix}:ENTRY_RUN_MANIFEST_SHA256_MISMATCH")
+
+    sidecar_path, file_errors = _verify_pinned_file(
+        native_root,
+        reference_entry.get("sidecar_relative_path"),
+        reference_entry.get("sidecar_sha256"),
+        error_prefix=f"{prefix}:SIDECAR",
+    )
+    errors.extend(file_errors)
+    parity_path, file_errors = _verify_pinned_file(
+        native_root,
+        reference_entry.get("parity_relative_path"),
+        reference_entry.get("parity_sha256"),
+        error_prefix=f"{prefix}:PARITY",
+    )
+    errors.extend(file_errors)
+    if errors:
+        return None, list(dict.fromkeys(errors))
+
+    sidecar, object_errors = _read_evidence_object(
+        sidecar_path,
+        error_prefix=f"{prefix}:SIDECAR",
+    )
+    errors.extend(object_errors)
+    parity, object_errors = _read_evidence_object(
+        parity_path,
+        error_prefix=f"{prefix}:PARITY",
+    )
+    errors.extend(object_errors)
+    if not isinstance(sidecar, Mapping) or not isinstance(parity, Mapping):
+        if not errors:
+            errors.append(f"{prefix}:RECEIPT_MISSING")
+        return None, list(dict.fromkeys(errors))
+
+    for payload, label, expected_schema in (
+        (sidecar, "SIDECAR", NATIVE_BARS_SCHEMA),
+        (parity, "PARITY", CONSENSUS_SCHEMA_VERSION),
+    ):
+        if str(payload.get("schema_version") or "") != expected_schema:
+            errors.append(f"{prefix}:{label}_SCHEMA_INVALID")
+        for field_name, expected in (
+            ("activation_id", activation_id),
+            ("run_id", run_id),
+            ("symbol", symbol),
+            ("timeframe", timeframe),
+            ("run_manifest_relative_path", str(run_manifest_relative_path or "")),
+        ):
+            observed = str(payload.get(field_name) or "")
+            mismatch = (
+                observed.upper() != str(expected).upper()
+                if field_name == "symbol"
+                else observed != expected
+            )
+            if mismatch:
+                errors.append(f"{prefix}:{label}_{field_name.upper()}_MISMATCH")
+        if (
+            str(payload.get("run_manifest_sha256") or "").lower()
+            != str(run_manifest_sha256 or "").lower()
+        ):
+            errors.append(f"{prefix}:{label}_RUN_MANIFEST_SHA256_MISMATCH")
+
+    expected_bars_sha = str(bars_sha256 or "").lower()
+    expected_provenance_sha = str(provenance_sha256 or "").lower()
+    if str(sidecar.get("audited_sidecar_contract") or "") != (AUDITED_SIDECAR_CONTRACT):
+        errors.append(f"{prefix}:SIDECAR_CONTRACT_INVALID")
+    if str(sidecar.get("sha256") or "").lower() != expected_bars_sha:
+        errors.append(f"{prefix}:SIDECAR_BARS_SHA256_MISMATCH")
+    if str(sidecar.get("source_provenance_relative_path") or "") != (
+        expected_provenance_relative
+    ):
+        errors.append(f"{prefix}:SIDECAR_PROVENANCE_PATH_MISMATCH")
+    if str(sidecar.get("source_provenance_sha256") or "").lower() != (
+        expected_provenance_sha
+    ):
+        errors.append(f"{prefix}:SIDECAR_PROVENANCE_SHA256_MISMATCH")
+
+    expected_source_binding = {
+        "availability_state": "AVAILABLE",
+        "bars_sha256": bars_sha256,
+        "provenance_sha256": provenance_sha256,
+    }
+    if str(parity.get("source_bars_sha256") or "").lower() != expected_bars_sha:
+        errors.append(f"{prefix}:PARITY_BARS_SHA256_MISMATCH")
+    if str(parity.get("source_provenance_sha256") or "").lower() != (
+        expected_provenance_sha
+    ):
+        errors.append(f"{prefix}:PARITY_PROVENANCE_SHA256_MISMATCH")
+    if parity.get("source_binding") != expected_source_binding:
+        errors.append(f"{prefix}:PARITY_SOURCE_BINDING_MISMATCH")
+    declared_consensus_sha = str(parity.get("consensus_sha256") or "").lower()
+    expected_consensus_sha = _canonical_json_sha256(
+        {key: value for key, value in parity.items() if key != "consensus_sha256"}
+    )
+    if not _is_sha256(declared_consensus_sha) or declared_consensus_sha != (
+        expected_consensus_sha
+    ):
+        errors.append(f"{prefix}:PARITY_CONSENSUS_SHA256_MISMATCH")
+
+    resolution = sidecar.get("resolution_audit")
+    resolution_fields = {
+        "schema_version",
+        "symbol",
+        "timeframe",
+        "status",
+        "reason_codes",
+        "rows",
+        "active_sessions",
+        "median_bars_per_active_session",
+        "nominal_or_faster_spacing_ratio",
+        "daily_identity_overlap_rows",
+        "daily_timestamp_identity_ratio",
+        "daily_ohlc_identity_ratio",
+        "yearly_diagnostics",
+    }
+    if not isinstance(resolution, Mapping) or set(resolution) != resolution_fields:
+        errors.append(f"{prefix}:RESOLUTION_OBJECT_INVALID")
+        return None, list(dict.fromkeys(errors))
+    if str(resolution.get("schema_version") or "") != (RESOLUTION_AUDIT_SCHEMA_VERSION):
+        errors.append(f"{prefix}:RESOLUTION_SCHEMA_INVALID")
+    if str(resolution.get("symbol") or "").upper() != symbol.upper():
+        errors.append(f"{prefix}:RESOLUTION_SYMBOL_MISMATCH")
+    if str(resolution.get("timeframe") or "") != timeframe:
+        errors.append(f"{prefix}:RESOLUTION_TIMEFRAME_MISMATCH")
+    resolution_status = str(resolution.get("status") or "")
+    if resolution_status not in {"PASS", "FAIL", "PENDING"}:
+        errors.append(f"{prefix}:RESOLUTION_STATUS_INVALID")
+    raw_reasons = resolution.get("reason_codes")
+    if (
+        not isinstance(raw_reasons, list)
+        or any(not isinstance(value, str) or not value for value in raw_reasons)
+        or len(raw_reasons) != len(set(raw_reasons))
+    ):
+        errors.append(f"{prefix}:RESOLUTION_REASONS_INVALID")
+        resolution_reasons: List[str] = []
+    else:
+        resolution_reasons = list(raw_reasons)
+    for field_name in ("rows", "active_sessions", "daily_identity_overlap_rows"):
+        value = resolution.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"{prefix}:RESOLUTION_{field_name.upper()}_INVALID")
+    for field_name, upper_bound in (
+        ("median_bars_per_active_session", None),
+        ("nominal_or_faster_spacing_ratio", 1.0),
+        ("daily_timestamp_identity_ratio", 1.0),
+        ("daily_ohlc_identity_ratio", 1.0),
+    ):
+        value = resolution.get(field_name)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            numeric = float("nan")
+        if (
+            isinstance(value, bool)
+            or not math.isfinite(numeric)
+            or numeric < 0.0
+            or (upper_bound is not None and numeric > upper_bound)
+        ):
+            errors.append(f"{prefix}:RESOLUTION_{field_name.upper()}_INVALID")
+    if not isinstance(resolution.get("yearly_diagnostics"), Mapping):
+        errors.append(f"{prefix}:RESOLUTION_YEARLY_DIAGNOSTICS_INVALID")
+    if str(reference_entry.get("resolution_status") or "") != resolution_status:
+        errors.append(f"{prefix}:ENTRY_RESOLUTION_STATUS_MISMATCH")
+    if list(reference_entry.get("resolution_reason_codes") or []) != (
+        resolution_reasons
+    ):
+        errors.append(f"{prefix}:ENTRY_RESOLUTION_REASONS_MISMATCH")
+    expected_resolution_reasons = [
+        f"RESOLUTION:{value}" for value in resolution_reasons
+    ]
+    for payload, label, reason_field in (
+        (sidecar, "SIDECAR", "activation_reason_codes"),
+        (parity, "PARITY", "cell_reason_codes"),
+    ):
+        raw_payload_reasons = payload.get(reason_field)
+        if not isinstance(raw_payload_reasons, list):
+            errors.append(f"{prefix}:{label}_CELL_REASONS_INVALID")
+            continue
+        recorded_resolution_reasons = [
+            value
+            for value in raw_payload_reasons
+            if isinstance(value, str) and value.startswith("RESOLUTION:")
+        ]
+        if recorded_resolution_reasons != expected_resolution_reasons:
+            errors.append(f"{prefix}:{label}_RESOLUTION_REASONS_MISMATCH")
+
+    if errors:
+        return None, list(dict.fromkeys(errors))
+    return dict(resolution), []
+
+
+def _v5_terminal_technical_binding(provenance_sha256: Any) -> Dict[str, Any]:
+    """Bind a proven technical leaf without pretending that bars exist."""
+
+    digest = str(provenance_sha256 or "").strip().lower()
+    return {
+        "availability_state": "TECHNICAL_TERMINAL",
+        "bars_sha256": None,
+        "provenance_sha256": digest,
+    }
+
+
 def _v5_tolerance(provenance: Mapping[str, Any]) -> Optional[float]:
     instrument = provenance.get("instrument")
     try:
@@ -1095,6 +1717,271 @@ def _v5_read_frame(path: Optional[Path]) -> Optional[pd.DataFrame]:
         return normalize_ohlc_frame(pd.read_csv(path))
     except Exception:
         return None
+
+
+@dataclass(frozen=True)
+class _V5NormalizedFrameCacheEntry:
+    expected_sha256: str
+    file_identity: Tuple[int, int, int, int]
+    frame: pd.DataFrame
+    memory_bytes: int
+
+
+class _V5NormalizedFrameCache:
+    """Bounded normalized-frame reuse within exactly one symbol replay.
+
+    Cached frames are never byte authority. Every lookup still opens, streams
+    and SHA-256 hashes the complete file before returning a deep copy. The
+    cache only avoids repeated CSV parsing and OHLC normalization.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        *,
+        max_frames: int = _MAX_V5_NORMALIZED_FRAME_CACHE_FRAMES,
+        max_bytes: int = _MAX_V5_NORMALIZED_FRAME_CACHE_BYTES,
+    ) -> None:
+        canonical_symbol = str(symbol or "").strip()
+        if not canonical_symbol:
+            raise ValueError("NATIVE_V5_FRAME_CACHE_SYMBOL_INVALID")
+        if (
+            isinstance(max_frames, bool)
+            or not isinstance(max_frames, int)
+            or not 1 <= max_frames <= _MAX_V5_NORMALIZED_FRAME_CACHE_FRAMES
+        ):
+            raise ValueError("NATIVE_V5_FRAME_CACHE_FRAME_BOUND_INVALID")
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= _MAX_V5_NORMALIZED_FRAME_CACHE_BYTES
+        ):
+            raise ValueError("NATIVE_V5_FRAME_CACHE_BYTE_BOUND_INVALID")
+        self.symbol = canonical_symbol
+        self.max_frames = max_frames
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[str, _V5NormalizedFrameCacheEntry] = OrderedDict()
+        self._memory_bytes = 0
+
+    @staticmethod
+    def _key(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+    def _assert_symbol_path(self, path: Path) -> None:
+        # V5 bars have the immutable .../<symbol>/<timeframe>/bars.csv geometry.
+        if path.name != "bars.csv" or path.parent.parent.name != self.symbol:
+            raise ValueError("NATIVE_V5_FRAME_CACHE_SYMBOL_SCOPE_MISMATCH")
+
+    def _drop_key(self, key: str) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._memory_bytes -= entry.memory_bytes
+
+    def evict(self, path: Path) -> None:
+        self._drop_key(self._key(path))
+
+    def lookup(
+        self,
+        path: Path,
+        expected_sha256: str,
+        file_identity: Tuple[int, int, int, int],
+    ) -> Tuple[Optional[_V5NormalizedFrameCacheEntry], Optional[str]]:
+        self._assert_symbol_path(path)
+        key = self._key(path)
+        entry = self._entries.get(key)
+        if entry is None:
+            return None, None
+        if entry.expected_sha256 != expected_sha256:
+            self._drop_key(key)
+            return None, "NATIVE_V5_FRAME_CACHE_SHA256_IDENTITY_MISMATCH"
+        if entry.file_identity != file_identity:
+            self._drop_key(key)
+            return None, "NATIVE_V5_FRAME_CACHE_FILE_IDENTITY_MISMATCH"
+        self._entries.move_to_end(key)
+        return entry, None
+
+    def store(
+        self,
+        path: Path,
+        expected_sha256: str,
+        file_identity: Tuple[int, int, int, int],
+        frame: pd.DataFrame,
+    ) -> bool:
+        self._assert_symbol_path(path)
+        memory_bytes = int(frame.memory_usage(index=True, deep=True).sum())
+        if memory_bytes < 0:
+            raise ValueError("NATIVE_V5_FRAME_CACHE_MEMORY_SIZE_INVALID")
+        key = self._key(path)
+        self._drop_key(key)
+        if memory_bytes > self.max_bytes:
+            return False
+        while self._entries and (
+            len(self._entries) >= self.max_frames
+            or self._memory_bytes + memory_bytes > self.max_bytes
+        ):
+            oldest_key = next(iter(self._entries))
+            self._drop_key(oldest_key)
+        entry = _V5NormalizedFrameCacheEntry(
+            expected_sha256=expected_sha256,
+            file_identity=file_identity,
+            frame=frame,
+            memory_bytes=memory_bytes,
+        )
+        self._entries[key] = entry
+        self._memory_bytes += memory_bytes
+        return True
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._memory_bytes = 0
+
+    def stats(self) -> Dict[str, int]:
+        return {
+            "frame_count": len(self._entries),
+            "memory_bytes": self._memory_bytes,
+            "max_frames": self.max_frames,
+            "max_bytes": self.max_bytes,
+        }
+
+
+def _v5_file_identity(stat_result: os.stat_result) -> Tuple[int, int, int, int]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_size),
+        int(stat_result.st_mtime_ns),
+    )
+
+
+def _v5_read_hashed_frame(
+    path: Optional[Path],
+    expected_sha256: Any,
+    *,
+    parse_on_hash_mismatch: bool,
+    frame_cache: Optional[_V5NormalizedFrameCache] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Read one bounded CSV, verify its digest, then parse those exact bytes.
+
+    At most one CSV byte buffer exists and is released before return.  No bytes
+    reach pandas before the full payload matches its pinned SHA-256 unless a
+    diagnostic caller explicitly requests the legacy mismatch parse behavior.
+    """
+
+    if path is None or not path.is_file():
+        return None, None
+    expected = str(expected_sha256 or "").strip().lower()
+    digest = hashlib.sha256()
+    raw_frame: Optional[pd.DataFrame] = None
+    payload: Optional[BytesIO] = None
+    cached_entry: Optional[_V5NormalizedFrameCacheEntry] = None
+    cache_rejection: Optional[str] = None
+    file_identity: Optional[Tuple[int, int, int, int]] = None
+    try:
+        with path.open("rb", buffering=0) as handle:
+            initial_identity = _v5_file_identity(os.fstat(handle.fileno()))
+            if initial_identity[2] > _MAX_V5_BARS_BYTES:
+                if frame_cache is not None:
+                    frame_cache.evict(path)
+                raise ValueError("NATIVE_V5_BARS_SIZE_LIMIT_EXCEEDED")
+            if frame_cache is not None and not parse_on_hash_mismatch:
+                cached_entry, cache_rejection = frame_cache.lookup(
+                    path,
+                    expected,
+                    initial_identity,
+                )
+            if cached_entry is None and cache_rejection is None:
+                payload = BytesIO()
+            total_bytes = 0
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                total_bytes += len(chunk)
+                if total_bytes > _MAX_V5_BARS_BYTES:
+                    if frame_cache is not None:
+                        frame_cache.evict(path)
+                    raise ValueError("NATIVE_V5_BARS_SIZE_LIMIT_EXCEEDED")
+                digest.update(chunk)
+                if payload is not None:
+                    payload.write(chunk)
+            final_identity = _v5_file_identity(os.fstat(handle.fileno()))
+            file_identity = initial_identity
+            if final_identity != initial_identity or total_bytes != initial_identity[2]:
+                if frame_cache is not None:
+                    frame_cache.evict(path)
+                raise ValueError("NATIVE_V5_BARS_CHANGED_DURING_READ")
+            observed_sha256 = digest.hexdigest()
+            if observed_sha256 != expected and not parse_on_hash_mismatch:
+                if frame_cache is not None:
+                    frame_cache.evict(path)
+                return None, observed_sha256
+            if payload is not None:
+                payload.seek(0)
+                try:
+                    raw_frame = pd.read_csv(payload)
+                except Exception:
+                    raw_frame = None
+        try:
+            path_identity_after = _v5_file_identity(path.stat())
+        except OSError as exc:
+            if frame_cache is not None:
+                frame_cache.evict(path)
+            raise ValueError("NATIVE_V5_BARS_PATH_IDENTITY_LOST") from exc
+        if file_identity is None or path_identity_after != file_identity:
+            if frame_cache is not None:
+                frame_cache.evict(path)
+            raise ValueError("NATIVE_V5_BARS_PATH_IDENTITY_CHANGED")
+    finally:
+        if payload is not None:
+            payload.close()
+    if cache_rejection is not None:
+        raise ValueError(cache_rejection)
+    if cached_entry is not None:
+        return cached_entry.frame.copy(deep=True), observed_sha256
+    if raw_frame is None:
+        return None, observed_sha256
+    try:
+        frame = normalize_ohlc_frame(raw_frame)
+    except Exception:
+        frame = None
+    if frame is not None and frame_cache is not None and observed_sha256 == expected:
+        if file_identity is None:
+            if frame_cache is not None:
+                frame_cache.evict(path)
+            raise ValueError("NATIVE_V5_FRAME_CACHE_FILE_IDENTITY_MISSING")
+        frame_cache.store(
+            path,
+            expected,
+            file_identity,
+            frame,
+        )
+        return frame.copy(deep=True), observed_sha256
+    return frame, observed_sha256
+
+
+def _v5_read_pinned_frame(
+    root: Path,
+    relative: Any,
+    expected_sha256: Any,
+    *,
+    error_prefix: str,
+    frame_cache: Optional[_V5NormalizedFrameCache] = None,
+) -> Tuple[Optional[Path], Optional[pd.DataFrame], Optional[str], List[str]]:
+    """Preserve pinned-file diagnostics while avoiding a second CSV read."""
+
+    path = _contained_path(root, relative)
+    if path is None:
+        return None, None, None, [f"{error_prefix}_PATH_UNSAFE"]
+    if not path.is_file() or path.is_symlink():
+        return path, None, None, [f"{error_prefix}_MISSING_OR_UNSAFE"]
+    expected = str(expected_sha256 or "").strip().lower()
+    if not _is_sha256(expected):
+        return path, None, None, [f"{error_prefix}_SHA256_INVALID"]
+    frame, observed_sha256 = _v5_read_hashed_frame(
+        path,
+        expected,
+        parse_on_hash_mismatch=False,
+        frame_cache=frame_cache,
+    )
+    errors = [f"{error_prefix}_SHA256_MISMATCH"] if observed_sha256 != expected else []
+    return path, frame, observed_sha256, errors
 
 
 def _v5_expected_coverage(
@@ -1179,6 +2066,56 @@ def _v5_expected_disagreement(envelope: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _v5_has_unopposed_semantic_failure(envelope: Mapping[str, Any]) -> bool:
+    """Match the V5 writer's unresolved-contradiction classification.
+
+    A semantic failure can be isolated when another exact reference passes the
+    same scored window.  A failure opposed only by pending or unavailable
+    evidence has no passing witness, so the target remains a terminal technical
+    cell even when the aggregate consensus is ``PENDING``.
+    """
+
+    windows = envelope.get("windows")
+    if not isinstance(windows, Mapping):
+        return False
+    for window in REQUIRED_AUDIT_WINDOWS:
+        detail = windows.get(window)
+        edge_states = detail.get("edge_states") if isinstance(detail, Mapping) else None
+        if not isinstance(edge_states, Mapping):
+            continue
+        evidence_states = {
+            str(state.get("evidence_state") or "").strip().upper()
+            for state in edge_states.values()
+            if isinstance(state, Mapping)
+        }
+        if (
+            EVIDENCE_SEMANTIC_FAIL in evidence_states
+            and EVIDENCE_PASS not in evidence_states
+        ):
+            return True
+    return False
+
+
+def _v5_derive_recomputed_authenticity_state(
+    envelope: Mapping[str, Any],
+    *,
+    resolution_status: str,
+) -> str:
+    """Derive a verified-success cell state with writer-identical semantics."""
+
+    resolution = str(resolution_status or "PENDING").strip().upper()
+    consensus = str(envelope.get("status") or "ERROR").strip().upper()
+    if resolution == "PENDING":
+        return NATIVE_PENDING
+    if resolution != "PASS":
+        return NATIVE_TECHNICAL_ERROR
+    if consensus not in {"PASS", "PENDING"} or _v5_has_unopposed_semantic_failure(
+        envelope
+    ):
+        return NATIVE_TECHNICAL_ERROR
+    return NATIVE_EVIDENCE_CANDIDATE
+
+
 def _verify_v5_activation_cell_evidence(
     native_root: Path,
     *,
@@ -1193,9 +2130,14 @@ def _verify_v5_activation_cell_evidence(
     run_manifest_relative_path: Any,
     run_manifest_sha256: Any,
     run_request: Mapping[str, Any],
+    run_source_environment: Mapping[str, Any],
+    run_acquisition_started_utc: Any,
+    run_acquisition_completed_utc: Any,
     contract_minimum: float,
     parity_thresholds: Mapping[str, Any],
     symbol_run_cells: Mapping[str, Mapping[str, Any]],
+    symbol_activation_entries: Mapping[str, Mapping[str, Any]],
+    frame_cache: Optional[_V5NormalizedFrameCache] = None,
 ) -> List[str]:
     """Recompute V5 pair evidence from pinned CSVs; never trust stored PASS."""
 
@@ -1284,6 +2226,7 @@ def _verify_v5_activation_cell_evidence(
         run_cell.get("status"),
         run_cell.get("failure_status"),
         run_cell.get("rows"),
+        run_cell.get("resume_disposition"),
     )
     if classification == "invalid":
         errors.append(
@@ -1419,6 +2362,114 @@ def _verify_v5_activation_cell_evidence(
     normalized_expected = str(expected_cell_status or "").lower()
     if normalized_expected == "eligible":
         normalized_expected = "active"
+    if classification == "terminal_technical":
+        try:
+            validate_v5_terminal_technical_cell(
+                provenance,
+                run_cell,
+                {
+                    key: run_request[key]
+                    for key in COMMON_REQUEST_KEYS
+                    if key in run_request
+                },
+                symbol=symbol,
+                timeframe=timeframe,
+                run_id=run_id,
+                manifest_source_environment=run_source_environment,
+                expected_retries=run_request.get("retries"),
+                manifest_acquisition_started_utc=run_acquisition_started_utc,
+                manifest_acquisition_completed_utc=(run_acquisition_completed_utc),
+            )
+        except NativeRequestContractError as exc:
+            errors.extend(
+                f"NATIVE_V5_TERMINAL_TECHNICAL_INVALID:{cell_id}:{code}"
+                for code in exc.errors
+            )
+        expected_source_binding = _v5_terminal_technical_binding(
+            sidecar.get("source_provenance_sha256")
+        )
+        reference_bindings = consensus.get("reference_bindings")
+        if not isinstance(reference_bindings, Mapping):
+            reference_bindings = {}
+            errors.append(
+                f"NATIVE_V5_TERMINAL_TECHNICAL_REFERENCE_BINDINGS_INVALID:{cell_id}"
+            )
+        errors.extend(
+            f"NATIVE_V5_{value}:{cell_id}"
+            for value in validate_consensus_envelope(
+                consensus,
+                symbol=symbol,
+                target_timeframe=timeframe,
+                source_binding=expected_source_binding,
+                reference_bindings=reference_bindings,
+            )
+        )
+        edges = consensus.get("edges")
+        if not isinstance(edges, Mapping) or set(edges) != set(references):
+            errors.append(f"NATIVE_V5_TERMINAL_TECHNICAL_EDGE_GRID_INVALID:{cell_id}")
+            edges = {}
+        for reference in references:
+            report = (
+                (edges.get(reference) or {}).get("report")
+                if isinstance(edges.get(reference), Mapping)
+                else None
+            )
+            windows = report.get("windows") if isinstance(report, Mapping) else None
+            for window in REQUIRED_AUDIT_WINDOWS:
+                state = windows.get(window) if isinstance(windows, Mapping) else None
+                if (
+                    not isinstance(state, Mapping)
+                    or state.get("integrity_state") != INTEGRITY_PASS
+                    or state.get("evidence_state") != EVIDENCE_PENDING
+                    or state.get("pair_report_sha256") is not None
+                ):
+                    errors.append(
+                        "NATIVE_V5_TERMINAL_TECHNICAL_EDGE_STATE_INVALID:"
+                        f"{cell_id}:{reference}:{window}"
+                    )
+        bars_path = _contained_path(native_root, entry.get("bars_relative_path"))
+        if bars_path is None or bars_path.exists():
+            errors.append(f"NATIVE_V5_TERMINAL_TECHNICAL_BARS_STATE_INVALID:{cell_id}")
+        if (
+            normalized_expected != NATIVE_TECHNICAL_ERROR
+            or str(entry.get("status") or "").lower() != NATIVE_TECHNICAL_ERROR
+            or str(entry.get("universe_eligibility_status") or "").lower()
+            != NATIVE_TECHNICAL_ERROR
+            or str(entry.get("audit_status") or "").upper() != "PASS"
+            or entry.get("bars_sha256") is not None
+            or str(consensus.get("status") or "").upper() != "PENDING"
+            or str(sidecar.get("activation_status") or "").upper() != "PASS"
+            or str(sidecar.get("data_state") or "").lower() != NATIVE_TECHNICAL_ERROR
+            or str(sidecar.get("parity_status") or "").upper() != "PENDING"
+            or str(entry.get("consensus_status") or "").upper() != "PENDING"
+            or str(entry.get("resolution_status") or "").upper() != "PENDING"
+            or str(entry.get("coverage_method") or "") != NATIVE_SESSION_COVERAGE_METHOD
+            or entry.get("expected_session_coverage_by_partition")
+            != {partition: None for partition in NATIVE_EVIDENCE_PARTITIONS}
+            or str(consensus.get("cell_activation_status") or "").upper() != "PASS"
+            or consensus.get("source_bars_sha256") is not None
+            or consensus.get("source_provenance_sha256")
+            != sidecar.get("source_provenance_sha256")
+            or consensus.get("expected_session_coverage_by_partition")
+            != {partition: None for partition in NATIVE_EVIDENCE_PARTITIONS}
+            or str(consensus.get("coverage_method") or "")
+            != NATIVE_SESSION_COVERAGE_METHOD
+            or sidecar.get("expected_session_coverage_by_partition")
+            != {partition: None for partition in NATIVE_EVIDENCE_PARTITIONS}
+            or str(sidecar.get("coverage_method") or "")
+            != NATIVE_SESSION_COVERAGE_METHOD
+            or sidecar.get("complete") is not True
+            or sidecar.get("tradeable") is not False
+            or sidecar.get("statistical_sufficiency_receipt_required") is not True
+        ):
+            errors.append(f"NATIVE_V5_TERMINAL_TECHNICAL_AUDIT_STATE_INVALID:{cell_id}")
+        if entry.get("cross_resolution_reference_bindings") != reference_bindings:
+            errors.append(
+                f"NATIVE_V5_TERMINAL_TECHNICAL_REFERENCE_BINDING_MISMATCH:{cell_id}"
+            )
+        if entry.get("evidence_metadata") != sidecar.get("evidence_metadata"):
+            errors.append(f"NATIVE_V5_TERMINAL_TECHNICAL_METADATA_MISMATCH:{cell_id}")
+        return list(dict.fromkeys(errors))
     if classification == "unavailable":
         if normalized_expected != NATIVE_SOURCE_UNAVAILABLE:
             errors.append(f"NATIVE_V5_UNAVAILABLE_STATUS_MISMATCH:{cell_id}")
@@ -1451,14 +2502,16 @@ def _verify_v5_activation_cell_evidence(
     if classification != "success":
         return list(dict.fromkeys(errors))
 
-    bars_path, file_errors = _verify_pinned_file(
-        native_root,
-        entry.get("bars_relative_path"),
-        entry.get("bars_sha256"),
-        error_prefix=f"NATIVE_V5_BARS:{cell_id}",
+    bars_path, target_frame, target_bars_observed_sha256, file_errors = (
+        _v5_read_pinned_frame(
+            native_root,
+            entry.get("bars_relative_path"),
+            entry.get("bars_sha256"),
+            error_prefix=f"NATIVE_V5_BARS:{cell_id}",
+            frame_cache=frame_cache,
+        )
     )
     errors.extend(file_errors)
-    target_frame = _v5_read_frame(bars_path)
     tolerance = _v5_tolerance(provenance)
     if target_frame is None or tolerance is None:
         errors.append(f"NATIVE_V5_TARGET_FRAME_OR_TOLERANCE_INVALID:{cell_id}")
@@ -1495,7 +2548,32 @@ def _verify_v5_activation_cell_evidence(
     expected_reference_bindings: Dict[str, Dict[str, Any]] = {}
     expected_edges: Dict[str, Dict[str, Any]] = {}
     pair_reports: Dict[str, Optional[Mapping[str, Any]]] = {}
+    stored_edges = consensus.get("edges")
+    d1_cell = symbol_run_cells.get("D1")
+    d1_path = native_root / "runs" / run_id / symbol / "D1" / "bars.csv"
+    d1_frame: Optional[pd.DataFrame] = None
+    d1_classification, _d1_classification_error = classify_native_availability_cell(
+        d1_cell.get("status") if isinstance(d1_cell, Mapping) else None,
+        d1_cell.get("failure_status") if isinstance(d1_cell, Mapping) else None,
+        d1_cell.get("rows") if isinstance(d1_cell, Mapping) else None,
+        (d1_cell.get("resume_disposition") if isinstance(d1_cell, Mapping) else None),
+    )
+    if isinstance(d1_cell, Mapping) and d1_classification == "success":
+        expected_d1_sha256 = str(d1_cell.get("sha256") or "").lower()
+        if timeframe == "D1":
+            if target_bars_observed_sha256 == expected_d1_sha256:
+                d1_frame = target_frame
+        elif d1_path.is_file():
+            candidate_d1_frame, observed_d1_sha256 = _v5_read_hashed_frame(
+                d1_path,
+                expected_d1_sha256,
+                parse_on_hash_mismatch=False,
+                frame_cache=frame_cache,
+            )
+            if observed_d1_sha256 == expected_d1_sha256:
+                d1_frame = candidate_d1_frame
     for reference in references:
+        reference_resolution_status: Optional[str] = None
         reference_cell = symbol_run_cells.get(reference)
         reference_class, reference_error = classify_native_availability_cell(
             reference_cell.get("status")
@@ -1505,6 +2583,11 @@ def _verify_v5_activation_cell_evidence(
             if isinstance(reference_cell, Mapping)
             else None,
             reference_cell.get("rows") if isinstance(reference_cell, Mapping) else None,
+            (
+                reference_cell.get("resume_disposition")
+                if isinstance(reference_cell, Mapping)
+                else None
+            ),
         )
         if reference_class == "unavailable":
             failure = str(reference_cell.get("failure_status") or "").upper()
@@ -1517,6 +2600,20 @@ def _verify_v5_activation_cell_evidence(
                 [f"AUDIT_REFERENCE_UNAVAILABLE:{reference}:{failure or 'UNSPECIFIED'}"]
             )
             pair_reports[reference] = None
+        elif reference_class == "terminal_technical":
+            reference_provenance = (
+                native_root / "runs" / run_id / symbol / reference / "provenance.json"
+            )
+            if not reference_provenance.is_file():
+                errors.append(
+                    f"NATIVE_V5_REFERENCE_PROVENANCE_MISSING:{cell_id}:{reference}"
+                )
+                continue
+            binding = _v5_terminal_technical_binding(sha256_file(reference_provenance))
+            states = _v5_pending_states(
+                [f"AUDIT_REFERENCE_TERMINAL_TECHNICAL:{reference}"]
+            )
+            pair_reports[reference] = None
         elif reference_class == "success":
             reference_bars = (
                 native_root / "runs" / run_id / symbol / reference / "bars.csv"
@@ -1524,11 +2621,16 @@ def _verify_v5_activation_cell_evidence(
             reference_provenance = (
                 native_root / "runs" / run_id / symbol / reference / "provenance.json"
             )
-            if (
-                not reference_bars.is_file()
-                or sha256_file(reference_bars).lower()
-                != str(reference_cell.get("sha256") or "").lower()
-            ):
+            expected_reference_bars_sha256 = str(
+                reference_cell.get("sha256") or ""
+            ).lower()
+            reference_frame, observed_reference_bars_sha256 = _v5_read_hashed_frame(
+                reference_bars,
+                expected_reference_bars_sha256,
+                parse_on_hash_mismatch=False,
+                frame_cache=frame_cache,
+            )
+            if observed_reference_bars_sha256 != expected_reference_bars_sha256:
                 errors.append(f"NATIVE_V5_REFERENCE_BARS_INVALID:{cell_id}:{reference}")
                 continue
             if not reference_provenance.is_file():
@@ -1551,7 +2653,6 @@ def _verify_v5_activation_cell_evidence(
                 if isinstance(reference_provenance_payload, Mapping)
                 else None
             )
-            reference_frame = _v5_read_frame(reference_bars)
             if reference_frame is None or reference_tolerance is None:
                 errors.append(
                     f"NATIVE_V5_REFERENCE_FRAME_OR_TOLERANCE_INVALID:{cell_id}:{reference}"
@@ -1562,47 +2663,105 @@ def _verify_v5_activation_cell_evidence(
                 "bars_sha256": reference_cell.get("sha256"),
                 "provenance_sha256": reference_provenance_sha,
             }
-            if (
-                NATIVE_TIMEFRAME_SECONDS[reference]
-                < NATIVE_TIMEFRAME_SECONDS[timeframe]
-            ):
-                fine_tf, fine_frame = reference, reference_frame
-                coarse_tf, coarse_frame = timeframe, target_frame
-            else:
-                fine_tf, fine_frame = timeframe, target_frame
-                coarse_tf, coarse_frame = reference, reference_frame
-            raw_report = audit_native_cross_resolution(
-                fine_frame,
-                coarse_frame,
-                symbol=symbol,
-                fine_timeframe=fine_tf,
-                coarse_timeframe=coarse_tf,
-                activation_target_timeframe=timeframe,
-                tick_tolerance=min(tolerance, reference_tolerance),
-                partition_windows=windows,
-                thresholds=thresholds,
-            )
-            raw_report = dict(raw_report)
-            raw_report["reference_timeframe"] = reference
-            pair_reports[reference] = raw_report
-            states = scope_native_pair_window_states(
-                _v5_pair_states(raw_report),
-                target_frame=target_frame,
-                reference_frame=reference_frame,
-                partition_windows=windows,
-                boundary_tolerance_seconds=float(
-                    run_request.get("boundary_tolerance_days", 0.0)
+            reference_resolution, reference_resolution_errors = (
+                _v5_authenticated_reference_resolution_audit(
+                    native_root,
+                    activation_id=activation_id,
+                    run_id=run_id,
+                    symbol=symbol,
+                    timeframe=reference,
+                    reference_entry=symbol_activation_entries.get(reference),
+                    run_manifest_relative_path=run_manifest_relative_path,
+                    run_manifest_sha256=run_manifest_sha256,
+                    bars_sha256=reference_cell.get("sha256"),
+                    provenance_sha256=reference_provenance_sha,
                 )
-                * 86_400.0,
             )
-            del reference_frame
+            errors.extend(reference_resolution_errors)
+            if reference_resolution is None:
+                continue
+            reference_resolution_status = str(reference_resolution.get("status") or "")
+            if reference_resolution_status == "FAIL":
+                (
+                    reference_resolution_frame,
+                    reference_resolution_daily_frame,
+                    reference_resolution_interval_error,
+                ) = _v5_scored_resolution_frames(
+                    reference_provenance_payload,
+                    reference_frame,
+                    d1_frame,
+                )
+                if reference_resolution_interval_error is not None:
+                    errors.append(
+                        "NATIVE_V5_REFERENCE_"
+                        f"{reference_resolution_interval_error}:{cell_id}:{reference}"
+                    )
+                    continue
+                recomputed_reference_resolution = audit_native_resolution(
+                    reference_resolution_frame,
+                    symbol=symbol,
+                    timeframe=reference,
+                    daily_frame=reference_resolution_daily_frame,
+                    tick_tolerance=reference_tolerance,
+                ).to_dict()
+                recomputed_reference_resolution = json.loads(
+                    json.dumps(
+                        recomputed_reference_resolution,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                )
+                if recomputed_reference_resolution != reference_resolution:
+                    errors.append(
+                        "NATIVE_V5_REFERENCE_RESOLUTION_RECOMPUTATION_MISMATCH:"
+                        f"{cell_id}:{reference}"
+                    )
+                    continue
+                states = _v5_pending_states(
+                    [f"AUDIT_REFERENCE_RESOLUTION_EXCLUDED:{reference}"]
+                )
+                pair_reports[reference] = None
+            else:
+                if (
+                    NATIVE_TIMEFRAME_SECONDS[reference]
+                    < NATIVE_TIMEFRAME_SECONDS[timeframe]
+                ):
+                    fine_tf, fine_frame = reference, reference_frame
+                    coarse_tf, coarse_frame = timeframe, target_frame
+                else:
+                    fine_tf, fine_frame = timeframe, target_frame
+                    coarse_tf, coarse_frame = reference, reference_frame
+                raw_report = audit_normalized_native_cross_resolution(
+                    fine_frame,
+                    coarse_frame,
+                    symbol=symbol,
+                    fine_timeframe=fine_tf,
+                    coarse_timeframe=coarse_tf,
+                    activation_target_timeframe=timeframe,
+                    tick_tolerance=min(tolerance, reference_tolerance),
+                    partition_windows=windows,
+                    thresholds=thresholds,
+                )
+                raw_report = dict(raw_report)
+                raw_report["reference_timeframe"] = reference
+                pair_reports[reference] = raw_report
+                states = scope_native_pair_window_states(
+                    _v5_pair_states(raw_report),
+                    target_frame=target_frame,
+                    reference_frame=reference_frame,
+                    partition_windows=windows,
+                    boundary_tolerance_seconds=float(
+                        run_request.get("boundary_tolerance_days", 0.0)
+                    )
+                    * 86_400.0,
+                )
         else:
             errors.append(
                 f"NATIVE_V5_REFERENCE_RUN_CELL_INVALID:{cell_id}:{reference}:{reference_error or 'unknown'}"
             )
             continue
         expected_reference_bindings[reference] = binding
-        expected_edges[reference] = build_edge_report(
+        current_edge = build_edge_report(
             symbol=symbol,
             target_timeframe=timeframe,
             reference_timeframe=reference,
@@ -1615,6 +2774,71 @@ def _verify_v5_activation_cell_evidence(
                 else None
             ),
         )
+        stored_report = (
+            (stored_edges.get(reference) or {}).get("report")
+            if isinstance(stored_edges, Mapping)
+            else None
+        )
+        selected_edge, selected_profile = _v5_select_compatible_edge_receipt(
+            stored_report,
+            current_edge,
+        )
+        if reference_class == "success":
+            if selected_edge is None:
+                if reference_resolution_status != "FAIL":
+                    legacy_report = audit_normalized_native_cross_resolution(
+                        fine_frame,
+                        coarse_frame,
+                        symbol=symbol,
+                        fine_timeframe=fine_tf,
+                        coarse_timeframe=coarse_tf,
+                        activation_target_timeframe=timeframe,
+                        tick_tolerance=min(tolerance, reference_tolerance),
+                        partition_windows=windows,
+                        thresholds=thresholds,
+                        compatibility_profile=(
+                            CROSS_RESOLUTION_COMPATIBILITY_FROZEN_PRE_SEQ2307
+                        ),
+                    )
+                    legacy_report = dict(legacy_report)
+                    legacy_report["reference_timeframe"] = reference
+                    legacy_states = scope_native_pair_window_states(
+                        _v5_pair_states(legacy_report),
+                        target_frame=target_frame,
+                        reference_frame=reference_frame,
+                        partition_windows=windows,
+                        boundary_tolerance_seconds=float(
+                            run_request.get("boundary_tolerance_days", 0.0)
+                        )
+                        * 86_400.0,
+                    )
+                    legacy_edge = build_edge_report(
+                        symbol=symbol,
+                        target_timeframe=timeframe,
+                        reference_timeframe=reference,
+                        source_binding=source_binding,
+                        reference_binding=binding,
+                        window_states=legacy_states,
+                        pair_reports={
+                            window: legacy_report for window in REQUIRED_AUDIT_WINDOWS
+                        },
+                    )
+                    selected_edge, selected_profile = (
+                        _v5_select_compatible_edge_receipt(
+                            stored_report,
+                            current_edge,
+                            frozen_pre_seq2307_edge=legacy_edge,
+                        )
+                    )
+                    if (
+                        selected_profile
+                        == CROSS_RESOLUTION_COMPATIBILITY_FROZEN_PRE_SEQ2307
+                    ):
+                        pair_reports[reference] = legacy_report
+            del reference_frame
+        if selected_edge is None:
+            selected_edge = current_edge
+        expected_edges[reference] = selected_edge
     if set(expected_edges) != set(references):
         return list(dict.fromkeys(errors))
     expected_envelope = build_consensus_envelope(
@@ -1650,14 +2874,13 @@ def _verify_v5_activation_cell_evidence(
             reference_bindings=expected_reference_bindings,
         )
     )
-    stored_edges = consensus.get("edges")
     for reference in references:
         stored_report = (
             (stored_edges.get(reference) or {}).get("report")
             if isinstance(stored_edges, Mapping)
             else None
         )
-        if stored_report != expected_edges[reference]:
+        if not _v5_receipt_byte_exact(stored_report, expected_edges[reference]):
             errors.append(
                 f"NATIVE_V5_RAW_PAIR_RECOMPUTATION_MISMATCH:{cell_id}:{reference}"
             )
@@ -1731,27 +2954,18 @@ def _verify_v5_activation_cell_evidence(
             errors.append(f"NATIVE_V5_{label}_COVERAGE_MISMATCH:{cell_id}")
 
     # Resolution is independently recomputed before any consensus decision is
-    # allowed to activate the cell. D1 is loaded only for this calculation and
-    # released before returning; pair references were processed sequentially.
-    d1_cell = symbol_run_cells.get("D1")
-    d1_path = native_root / "runs" / run_id / symbol / "D1" / "bars.csv"
-    d1_frame: Optional[pd.DataFrame] = None
-    d1_classification, _d1_classification_error = classify_native_availability_cell(
-        d1_cell.get("status") if isinstance(d1_cell, Mapping) else None,
-        d1_cell.get("failure_status") if isinstance(d1_cell, Mapping) else None,
-        d1_cell.get("rows") if isinstance(d1_cell, Mapping) else None,
+    # allowed to activate the cell. The authenticated D1 frame cached above is
+    # shared with the narrow reference-FAIL check and released on return.
+    resolution_frame, resolution_daily_frame, resolution_interval_error = (
+        _v5_scored_resolution_frames(provenance, target_frame, d1_frame)
     )
-    if isinstance(d1_cell, Mapping) and d1_classification == "success":
-        if (
-            d1_path.is_file()
-            and sha256_file(d1_path).lower() == str(d1_cell.get("sha256") or "").lower()
-        ):
-            d1_frame = target_frame if timeframe == "D1" else _v5_read_frame(d1_path)
+    if resolution_interval_error is not None:
+        errors.append(f"NATIVE_V5_{resolution_interval_error}:{cell_id}")
     resolution = audit_native_resolution(
-        target_frame,
+        resolution_frame,
         symbol=symbol,
         timeframe=timeframe,
-        daily_frame=d1_frame,
+        daily_frame=resolution_daily_frame,
         tick_tolerance=tolerance,
     ).to_dict()
     serialized_resolution = json.loads(
@@ -1766,12 +2980,9 @@ def _verify_v5_activation_cell_evidence(
             expected_coverage
         )
         errors.extend(f"NATIVE_V5_{value}:{cell_id}" for value in diagnostic_errors)
-    derived = (
-        NATIVE_EVIDENCE_CANDIDATE
-        if consensus_status in {"PASS", "PENDING"} and resolution_status == "PASS"
-        else NATIVE_PENDING
-        if resolution_status == "PENDING"
-        else NATIVE_TECHNICAL_ERROR
+    derived = _v5_derive_recomputed_authenticity_state(
+        expected_envelope,
+        resolution_status=resolution_status,
     )
     if derived != normalized_expected:
         errors.append(
@@ -1856,8 +3067,13 @@ def _verify_activation_cell_evidence(
     expected_coverage_method: str,
     require_resolution_audit: bool,
     reference_run_cell: Any,
+    run_source_environment: Optional[Mapping[str, Any]] = None,
+    run_acquisition_started_utc: Any = None,
+    run_acquisition_completed_utc: Any = None,
     parity_thresholds: Optional[Mapping[str, Any]] = None,
     symbol_run_cells: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    symbol_activation_entries: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    v5_frame_cache: Optional[_V5NormalizedFrameCache] = None,
 ) -> List[str]:
     """Bind one manifest decision to the immutable acquisition/audit bytes.
 
@@ -1884,9 +3100,14 @@ def _verify_activation_cell_evidence(
             run_manifest_relative_path=run_manifest_relative_path,
             run_manifest_sha256=run_manifest_sha256,
             run_request=run_request,
+            run_source_environment=run_source_environment or {},
+            run_acquisition_started_utc=run_acquisition_started_utc,
+            run_acquisition_completed_utc=run_acquisition_completed_utc,
             contract_minimum=contract_minimum,
             parity_thresholds=parity_thresholds or {},
             symbol_run_cells=symbol_run_cells or {},
+            symbol_activation_entries=symbol_activation_entries or {},
+            frame_cache=v5_frame_cache,
         )
 
     cell_id = f"{symbol}|{timeframe}"
@@ -1942,6 +3163,7 @@ def _verify_activation_cell_evidence(
         run_cell.get("status"),
         run_cell.get("failure_status"),
         run_cell.get("rows"),
+        run_cell.get("resume_disposition"),
     )
     if classification == "invalid":
         errors.append(
@@ -2549,6 +3771,11 @@ def _verify_activation_cell_evidence(
                     reference_run_cell.get("rows")
                     if isinstance(reference_run_cell, Mapping)
                     else None,
+                    (
+                        reference_run_cell.get("resume_disposition")
+                        if isinstance(reference_run_cell, Mapping)
+                        else None
+                    ),
                 )
             )
             reference_failure = (
@@ -2818,14 +4045,25 @@ def _load_active_manifest(
     if str(pointer.get("schema_version")) != ACTIVE_POINTER_SCHEMA:
         errors.append("NATIVE_ACTIVE_POINTER_SCHEMA_INVALID")
     pointer_activation_id = str(pointer.get("activation_id") or "")
-    expected_manifest_relative = (
+    canonical_manifest_relative = (
         f"activations/{pointer_activation_id}.json" if pointer_activation_id else ""
     )
-    if (
-        str(pointer.get("manifest_relative_path") or "").replace("\\", "/")
-        != expected_manifest_relative
-    ):
+    promoted_manifest_relative = (
+        f"activations/promoted/{pointer_activation_id}.json"
+        if pointer_activation_id
+        else ""
+    )
+    observed_manifest_relative = str(
+        pointer.get("manifest_relative_path") or ""
+    ).replace("\\", "/")
+    promoted_view = observed_manifest_relative == promoted_manifest_relative
+    if observed_manifest_relative not in {
+        canonical_manifest_relative,
+        promoted_manifest_relative,
+    }:
         errors.append("NATIVE_ACTIVE_MANIFEST_PATH_IDENTITY_MISMATCH")
+    if promoted_view and set(pointer) != set(ACTIVE_POINTER_FIELDS):
+        errors.append("NATIVE_ACTIVE_POINTER_FIELDS_INVALID")
     manifest_path = _contained_path(native_root, pointer.get("manifest_relative_path"))
     if manifest_path is None:
         return None, None, None, errors + ["NATIVE_ACTIVE_MANIFEST_PATH_UNSAFE"]
@@ -2838,6 +4076,15 @@ def _load_active_manifest(
             manifest_path,
             observed_sha,
             errors + ["NATIVE_ACTIVE_MANIFEST_SHA256_MISMATCH"],
+        )
+    if promoted_view:
+        errors.extend(
+            validate_terminal_promotion_view(
+                native_root,
+                activation_id=pointer_activation_id,
+                view_path=manifest_path,
+                view_sha256=observed_sha,
+            )
         )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2870,13 +4117,291 @@ def _load_active_manifest(
     return manifest, manifest_path, observed_sha, list(dict.fromkeys(errors))
 
 
-def resolve_active_native_universe(
+@dataclass(frozen=True)
+class _ActiveAuthorityIdentity:
+    data_dir: Path
+    active_pointer_bytes: bytes
+    active_pointer_sha256: str
+    activation_manifest_sha256: str
+
+
+def _read_active_authority_identity(data_dir: Path) -> _ActiveAuthorityIdentity:
+    """Read the bounded pointer bytes and hash the manifest they name."""
+
+    resolved_data_dir = Path(data_dir).resolve()
+    native_root = (resolved_data_dir / "native").resolve()
+    pointer_path = native_root / "ACTIVE.json"
+    try:
+        pointer_size = pointer_path.stat().st_size
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_READ_FAILED") from exc
+    if pointer_size <= 0 or pointer_size > _MAX_ACTIVE_POINTER_BYTES:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_SIZE_INVALID")
+    try:
+        with pointer_path.open("rb") as handle:
+            pointer_bytes = handle.read(_MAX_ACTIVE_POINTER_BYTES + 1)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_READ_FAILED") from exc
+    if (
+        len(pointer_bytes) != pointer_size
+        or len(pointer_bytes) > _MAX_ACTIVE_POINTER_BYTES
+    ):
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_UNSTABLE")
+    try:
+        pointer = json.loads(pointer_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_INVALID") from exc
+    if not isinstance(pointer, Mapping):
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_INVALID")
+    manifest_path = _contained_path(native_root, pointer.get("manifest_relative_path"))
+    declared_manifest_sha = str(pointer.get("manifest_sha256") or "").lower()
+    if manifest_path is None or not _is_sha256(declared_manifest_sha):
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_INVALID")
+    try:
+        observed_manifest_sha = sha256_file(manifest_path).lower()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_MANIFEST_READ_FAILED") from exc
+    if observed_manifest_sha != declared_manifest_sha:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_MANIFEST_SHA256_MISMATCH")
+    return _ActiveAuthorityIdentity(
+        data_dir=resolved_data_dir,
+        active_pointer_bytes=pointer_bytes,
+        active_pointer_sha256=hashlib.sha256(pointer_bytes).hexdigest(),
+        activation_manifest_sha256=observed_manifest_sha,
+    )
+
+
+_PRODUCTION_NATIVE_AUTHORITY_SCOPE: ContextVar[
+    Optional["ProductionNativeAuthorityVerificationScope"]
+] = ContextVar("fxpm_production_native_authority_verification_scope", default=None)
+
+
+class ProductionNativeAuthorityVerificationScope:
+    """One lexical, process-local reuse boundary for a verified 100x6 authority."""
+
+    def __init__(self) -> None:
+        self._scope = secrets.token_hex(32)
+        self._pid: Optional[int] = None
+        self._thread_id: Optional[int] = None
+        self._token: Optional[
+            Token[Optional["ProductionNativeAuthorityVerificationScope"]]
+        ] = None
+        self._entered = False
+        self._closed = False
+        self._poisoned = False
+        self._poison_reason = ""
+        self._full_verification_count = 0
+        self._identity_revalidation_attempt_count = 0
+        self._identity_revalidation_count = 0
+        self._identity_revalidation_failure_count = 0
+        self._data_dir: Optional[Path] = None
+        self._active_pointer_bytes: Optional[bytes] = None
+        self._active_pointer_sha256 = ""
+        self._activation_manifest_sha256 = ""
+        self._universe: Optional[ActiveNativeUniverse] = None
+
+    def __enter__(self) -> "ProductionNativeAuthorityVerificationScope":
+        if self._entered or self._closed:
+            raise RuntimeError("NATIVE_AUTHORITY_VERIFICATION_SCOPE_NOT_REUSABLE")
+        if _PRODUCTION_NATIVE_AUTHORITY_SCOPE.get() is not None:
+            raise RuntimeError("NATIVE_AUTHORITY_VERIFICATION_SCOPE_NESTED")
+        self._pid = os.getpid()
+        self._thread_id = threading.get_ident()
+        self._token = _PRODUCTION_NATIVE_AUTHORITY_SCOPE.set(self)
+        self._entered = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        if exc_type is not None:
+            self._poison(f"SCOPE_BODY_EXCEPTION:{exc_type.__name__}")
+        self.close()
+        return False
+
+    def _poison(self, reason: str) -> None:
+        self._poisoned = True
+        if not self._poison_reason:
+            self._poison_reason = str(reason or "NATIVE_AUTHORITY_SCOPE_POISONED")
+
+    def _assert_live_owner(self) -> None:
+        if self._closed or not self._entered:
+            self._poison("SCOPE_NOT_ACTIVE")
+            raise RuntimeError("NATIVE_AUTHORITY_VERIFICATION_SCOPE_NOT_ACTIVE")
+        if self._poisoned:
+            raise RuntimeError(
+                f"NATIVE_AUTHORITY_VERIFICATION_SCOPE_POISONED:{self._poison_reason}"
+            )
+        if (
+            os.getpid() != self._pid
+            or threading.get_ident() != self._thread_id
+            or _PRODUCTION_NATIVE_AUTHORITY_SCOPE.get() is not self
+        ):
+            self._poison("SCOPE_EXECUTION_IDENTITY_MISMATCH")
+            raise RuntimeError(
+                "NATIVE_AUTHORITY_VERIFICATION_SCOPE_EXECUTION_IDENTITY_MISMATCH"
+            )
+
+    def _identity_failure(
+        self, reason: str, exc: Optional[BaseException] = None
+    ) -> None:
+        self._identity_revalidation_failure_count += 1
+        self._poison(reason)
+        error = RuntimeError(f"NATIVE_AUTHORITY_IDENTITY_REVALIDATION_FAILED:{reason}")
+        if exc is None:
+            raise error
+        raise error from exc
+
+    def _same_sealed_identity(self, identity: _ActiveAuthorityIdentity) -> bool:
+        return (
+            identity.data_dir == self._data_dir
+            and identity.active_pointer_bytes == self._active_pointer_bytes
+            and identity.active_pointer_sha256 == self._active_pointer_sha256
+            and identity.activation_manifest_sha256 == self._activation_manifest_sha256
+        )
+
+    def _resolve(
+        self,
+        data_dir: Path,
+        configured_symbols: Optional[Iterable[str]],
+        *,
+        required_timeframes: Sequence[str],
+        verify_exclusion_evidence: bool,
+        production_contract_required: bool,
+    ) -> ActiveNativeUniverse:
+        try:
+            self._assert_live_owner()
+        except BaseException:
+            if self._universe is not None:
+                self._identity_revalidation_attempt_count += 1
+                self._identity_revalidation_failure_count += 1
+            raise
+        if self._universe is None:
+            try:
+                identity_before = _read_active_authority_identity(data_dir)
+            except BaseException as exc:
+                self._poison("INITIAL_IDENTITY_READ_FAILED")
+                raise RuntimeError(
+                    "NATIVE_AUTHORITY_INITIAL_IDENTITY_READ_FAILED"
+                ) from exc
+            self._full_verification_count += 1
+            try:
+                universe = _resolve_active_native_universe_uncached(
+                    data_dir,
+                    configured_symbols,
+                    required_timeframes=required_timeframes,
+                    verify_exclusion_evidence=verify_exclusion_evidence,
+                    production_contract_required=production_contract_required,
+                )
+            except BaseException:
+                self._poison("FULL_VERIFICATION_EXCEPTION")
+                raise
+            try:
+                identity_after = _read_active_authority_identity(data_dir)
+            except BaseException as exc:
+                self._poison("INITIAL_IDENTITY_REREAD_FAILED")
+                raise RuntimeError(
+                    "NATIVE_AUTHORITY_INITIAL_IDENTITY_REREAD_FAILED"
+                ) from exc
+            if identity_before != identity_after:
+                self._poison("IDENTITY_CHANGED_DURING_FULL_VERIFICATION")
+                raise RuntimeError(
+                    "NATIVE_AUTHORITY_IDENTITY_CHANGED_DURING_FULL_VERIFICATION"
+                )
+            if (
+                not universe.valid
+                or str(universe.activation_manifest_sha256 or "").lower()
+                != identity_after.activation_manifest_sha256
+            ):
+                self._poison("FULL_VERIFICATION_RESULT_IDENTITY_INVALID")
+                return deepcopy(universe)
+            try:
+                sealed = deepcopy(universe)
+                returned = deepcopy(sealed)
+            except BaseException:
+                self._poison("FULL_VERIFICATION_COPY_FAILED")
+                raise
+            self._data_dir = identity_after.data_dir
+            self._active_pointer_bytes = bytes(identity_after.active_pointer_bytes)
+            self._active_pointer_sha256 = identity_after.active_pointer_sha256
+            self._activation_manifest_sha256 = identity_after.activation_manifest_sha256
+            self._universe = sealed
+            return returned
+
+        self._identity_revalidation_attempt_count += 1
+        try:
+            identity_before = _read_active_authority_identity(data_dir)
+            if not self._same_sealed_identity(identity_before):
+                self._identity_failure("IDENTITY_BEFORE_MISMATCH")
+            returned = deepcopy(self._universe)
+            identity_after = _read_active_authority_identity(data_dir)
+            if identity_before != identity_after or not self._same_sealed_identity(
+                identity_after
+            ):
+                self._identity_failure("IDENTITY_AFTER_MISMATCH")
+        except RuntimeError as exc:
+            if str(exc).startswith("NATIVE_AUTHORITY_IDENTITY_REVALIDATION_FAILED:"):
+                raise
+            self._identity_failure("IDENTITY_READ_OR_COPY_FAILED", exc)
+        except BaseException as exc:
+            self._identity_failure("IDENTITY_READ_OR_COPY_FAILED", exc)
+        self._identity_revalidation_count += 1
+        return returned
+
+    def close(self) -> None:
+        """Close immediately; the surrounding context-manager exit is idempotent."""
+
+        if self._closed:
+            return
+        token = self._token
+        try:
+            if token is not None:
+                _PRODUCTION_NATIVE_AUTHORITY_SCOPE.reset(token)
+        finally:
+            self._token = None
+            self._active_pointer_bytes = None
+            self._universe = None
+            self._data_dir = None
+            self._closed = True
+
+    def stats(self) -> Dict[str, Any]:
+        """Return a non-authoritative copy of bounded reuse observability."""
+
+        return {
+            "schema_version": (PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA),
+            "scope": self._scope,
+            "full_verification_count": self._full_verification_count,
+            "identity_revalidation_attempt_count": (
+                self._identity_revalidation_attempt_count
+            ),
+            "identity_revalidation_count": self._identity_revalidation_count,
+            "identity_revalidation_failure_count": (
+                self._identity_revalidation_failure_count
+            ),
+            "active_pointer_sha256": self._active_pointer_sha256,
+            "activation_manifest_sha256": self._activation_manifest_sha256,
+            "pid": self._pid,
+            "thread_id": self._thread_id,
+            "closed": self._closed,
+            "poisoned": self._poisoned,
+            "poison_reason": self._poison_reason or None,
+        }
+
+
+def production_native_authority_verification_scope() -> (
+    ProductionNativeAuthorityVerificationScope
+):
+    """Create an explicit lexical same-run authority verification scope."""
+
+    return ProductionNativeAuthorityVerificationScope()
+
+
+def _resolve_active_native_universe_uncached(
     data_dir: Path,
     configured_symbols: Optional[Iterable[str]] = None,
     *,
     required_timeframes: Sequence[str] = NATIVE_PRODUCTION_TIMEFRAMES,
     verify_exclusion_evidence: bool = True,
     production_contract_required: bool = False,
+    _v5_frame_cache_enabled: bool = True,
 ) -> ActiveNativeUniverse:
     """Resolve the availability-only eligible/excluded symbol roster.
 
@@ -3328,16 +4853,32 @@ def resolve_active_native_universe(
                 result.errors.append("NATIVE_AUTHENTICITY_TRADING_VERDICT_FLAG_INVALID")
             if contract.get("coverage_is_diagnostic_only") is not True:
                 result.errors.append("NATIVE_AUTHENTICITY_COVERAGE_ROLE_INVALID")
-            if list(contract.get("terminal_states") or []) != [
+            declared_terminal_states = list(contract.get("terminal_states") or [])
+            declared_nonterminal_states = list(contract.get("nonterminal_states") or [])
+            current_terminal_states = [
                 NATIVE_EVIDENCE_CANDIDATE,
                 NATIVE_SOURCE_UNAVAILABLE,
-            ]:
-                result.errors.append("NATIVE_AUTHENTICITY_TERMINAL_STATES_INVALID")
-            if list(contract.get("nonterminal_states") or []) != [
                 NATIVE_TECHNICAL_ERROR,
-                NATIVE_PENDING,
-            ]:
+            ]
+            legacy_terminal_states = [
+                NATIVE_EVIDENCE_CANDIDATE,
+                NATIVE_SOURCE_UNAVAILABLE,
+            ]
+            if tuple(declared_terminal_states) not in {
+                tuple(current_terminal_states),
+                tuple(legacy_terminal_states),
+            }:
+                result.errors.append("NATIVE_AUTHENTICITY_TERMINAL_STATES_INVALID")
+            if (
+                declared_terminal_states == current_terminal_states
+                and declared_nonterminal_states != [NATIVE_PENDING]
+            ) or (
+                declared_terminal_states == legacy_terminal_states
+                and declared_nonterminal_states
+                != [NATIVE_TECHNICAL_ERROR, NATIVE_PENDING]
+            ):
                 result.errors.append("NATIVE_AUTHENTICITY_NONTERMINAL_STATES_INVALID")
+            published_terminal_states = frozenset(declared_terminal_states)
             if str(contract.get("statistical_sufficiency_authority") or "") != (
                 "authenticated_horizon_ess_trade_power_and_multiplicity_v1"
             ):
@@ -3389,7 +4930,7 @@ def resolve_active_native_universe(
                 for timeframe in expected_timeframes:
                     cell_id = f"{symbol}|{timeframe}"
                     state = str(raw_grid.get(timeframe) or "").strip().lower()
-                    if state not in NATIVE_TERMINAL_AUTHENTICITY_STATES:
+                    if state not in published_terminal_states:
                         result.errors.append(
                             f"NATIVE_AUTHENTICITY_NONTERMINAL_PUBLISHED:{cell_id}:{state or 'missing'}"
                         )
@@ -3507,37 +5048,81 @@ def resolve_active_native_universe(
                         ), candidate_cell in run_cells.items()
                         if candidate_symbol == symbol
                     }
-                    for timeframe in expected_timeframes:
-                        result.errors.extend(
-                            _verify_activation_cell_evidence(
-                                native_root,
-                                symbol=symbol,
-                                timeframe=timeframe,
-                                entry=symbol_entries.get(timeframe),
-                                run_cell=run_cells.get((symbol, timeframe)),
-                                audited_cell=None,
-                                expected_cell_status=parsed_statuses[symbol][timeframe],
-                                activation_id=str(result.activation_id or ""),
-                                run_id=str(manifest.get("run_id") or ""),
-                                run_manifest_relative_path=manifest.get(
-                                    "run_manifest_relative_path"
-                                ),
-                                run_manifest_sha256=manifest.get("run_manifest_sha256"),
-                                run_request=verified_run_request,
-                                contract_minimum=NATIVE_MINIMUM_SESSION_COVERAGE,
-                                expected_coverage_method=contract_method,
-                                require_resolution_audit=True,
-                                reference_run_cell=None,
-                                parity_thresholds=(
-                                    manifest.get("parity_thresholds")
-                                    if isinstance(
-                                        manifest.get("parity_thresholds"), Mapping
-                                    )
-                                    else {}
-                                ),
-                                symbol_run_cells=symbol_run_cells,
+                    frame_cache = (
+                        _V5NormalizedFrameCache(symbol)
+                        if _v5_frame_cache_enabled
+                        else None
+                    )
+                    try:
+                        for timeframe in expected_timeframes:
+                            result.errors.extend(
+                                _verify_activation_cell_evidence(
+                                    native_root,
+                                    symbol=symbol,
+                                    timeframe=timeframe,
+                                    entry=symbol_entries.get(timeframe),
+                                    run_cell=run_cells.get((symbol, timeframe)),
+                                    audited_cell=None,
+                                    expected_cell_status=parsed_statuses[symbol][
+                                        timeframe
+                                    ],
+                                    activation_id=str(result.activation_id or ""),
+                                    run_id=str(manifest.get("run_id") or ""),
+                                    run_manifest_relative_path=manifest.get(
+                                        "run_manifest_relative_path"
+                                    ),
+                                    run_manifest_sha256=manifest.get(
+                                        "run_manifest_sha256"
+                                    ),
+                                    run_request=verified_run_request,
+                                    run_source_environment=(
+                                        verified_run_manifest.get("source_environment")
+                                        if isinstance(verified_run_manifest, Mapping)
+                                        and isinstance(
+                                            verified_run_manifest.get(
+                                                "source_environment"
+                                            ),
+                                            Mapping,
+                                        )
+                                        else {}
+                                    ),
+                                    run_acquisition_started_utc=(
+                                        verified_run_manifest.get(
+                                            "acquisition_started_utc"
+                                        )
+                                        if isinstance(verified_run_manifest, Mapping)
+                                        else None
+                                    ),
+                                    run_acquisition_completed_utc=(
+                                        verified_run_manifest.get(
+                                            "acquisition_completed_utc"
+                                        )
+                                        if isinstance(verified_run_manifest, Mapping)
+                                        else None
+                                    ),
+                                    contract_minimum=NATIVE_MINIMUM_SESSION_COVERAGE,
+                                    expected_coverage_method=contract_method,
+                                    require_resolution_audit=True,
+                                    reference_run_cell=None,
+                                    parity_thresholds=(
+                                        manifest.get("parity_thresholds")
+                                        if isinstance(
+                                            manifest.get("parity_thresholds"), Mapping
+                                        )
+                                        else {}
+                                    ),
+                                    symbol_run_cells=symbol_run_cells,
+                                    symbol_activation_entries=(
+                                        symbol_entries
+                                        if isinstance(symbol_entries, Mapping)
+                                        else {}
+                                    ),
+                                    v5_frame_cache=frame_cache,
+                                )
                             )
-                        )
+                    finally:
+                        if frame_cache is not None:
+                            frame_cache.clear()
 
             raw_counts = manifest.get("counts")
             if not isinstance(raw_counts, Mapping):
@@ -3560,7 +5145,7 @@ def resolve_active_native_universe(
                     {
                         "total": len(requested) * len(expected_timeframes),
                         "terminal": sum(
-                            value in NATIVE_TERMINAL_AUTHENTICITY_STATES
+                            value in published_terminal_states
                             for grid in parsed_statuses.values()
                             for value in grid.values()
                         ),
@@ -3670,6 +5255,7 @@ def resolve_active_native_universe(
                     cell.get("status"),
                     failure,
                     cell.get("rows"),
+                    cell.get("resume_disposition"),
                 )
                 if classification == "unavailable":
                     unavailable_count += 1
@@ -3804,6 +5390,11 @@ def resolve_active_native_universe(
                             reference_cell.get("rows")
                             if isinstance(reference_cell, Mapping)
                             else None,
+                            (
+                                reference_cell.get("resume_disposition")
+                                if isinstance(reference_cell, Mapping)
+                                else None
+                            ),
                         )
                     )
                     parity_status_valid = reference_classification == "unavailable"
@@ -4166,6 +5757,11 @@ def resolve_active_native_universe(
                         if isinstance(run_cell, Mapping)
                         else None,
                         run_cell.get("rows") if isinstance(run_cell, Mapping) else None,
+                        (
+                            run_cell.get("resume_disposition")
+                            if isinstance(run_cell, Mapping)
+                            else None
+                        ),
                     )
                 )
                 if run_classification != "success":
@@ -4285,6 +5881,25 @@ def resolve_active_native_universe(
                         ),
                         run_manifest_sha256=manifest.get("run_manifest_sha256"),
                         run_request=verified_run_request,
+                        run_source_environment=(
+                            verified_run_manifest.get("source_environment")
+                            if isinstance(verified_run_manifest, Mapping)
+                            and isinstance(
+                                verified_run_manifest.get("source_environment"),
+                                Mapping,
+                            )
+                            else {}
+                        ),
+                        run_acquisition_started_utc=(
+                            verified_run_manifest.get("acquisition_started_utc")
+                            if isinstance(verified_run_manifest, Mapping)
+                            else None
+                        ),
+                        run_acquisition_completed_utc=(
+                            verified_run_manifest.get("acquisition_completed_utc")
+                            if isinstance(verified_run_manifest, Mapping)
+                            else None
+                        ),
                         contract_minimum=contract_minimum,
                         expected_coverage_method=contract_method,
                         require_resolution_audit=cell_contract,
@@ -4315,6 +5930,11 @@ def resolve_active_native_universe(
                             ), candidate_cell in run_cells.items()
                             if candidate_symbol == symbol
                         },
+                        symbol_activation_entries=(
+                            symbol_entries
+                            if isinstance(symbol_entries, Mapping)
+                            else {}
+                        ),
                     )
                 )
 
@@ -4370,6 +5990,51 @@ def resolve_active_native_universe(
             if observed_status_counts["pending"] or observed_status_counts["failed"]:
                 result.errors.append("NATIVE_ACTIVE_MANIFEST_CONTAINS_NONFINAL_CELLS")
     return result
+
+
+def resolve_active_native_universe(
+    data_dir: Path,
+    configured_symbols: Optional[Iterable[str]] = None,
+    *,
+    required_timeframes: Sequence[str] = NATIVE_PRODUCTION_TIMEFRAMES,
+    verify_exclusion_evidence: bool = True,
+    production_contract_required: bool = False,
+) -> ActiveNativeUniverse:
+    """Resolve an active universe, reusing only one exact scoped production grid."""
+
+    scope = _PRODUCTION_NATIVE_AUTHORITY_SCOPE.get()
+    if scope is None:
+        return _resolve_active_native_universe_uncached(
+            data_dir,
+            configured_symbols,
+            required_timeframes=required_timeframes,
+            verify_exclusion_evidence=verify_exclusion_evidence,
+            production_contract_required=production_contract_required,
+        )
+
+    scoped_timeframes = tuple(required_timeframes)
+    scoped_symbols = None if configured_symbols is None else tuple(configured_symbols)
+    exact_production_grid = (
+        production_contract_required is True
+        and verify_exclusion_evidence is True
+        and scoped_timeframes == NATIVE_PRODUCTION_TIMEFRAMES
+        and (scoped_symbols is None or scoped_symbols == NATIVE_PRODUCTION_SYMBOLS)
+    )
+    if not exact_production_grid:
+        return _resolve_active_native_universe_uncached(
+            data_dir,
+            scoped_symbols,
+            required_timeframes=scoped_timeframes,
+            verify_exclusion_evidence=verify_exclusion_evidence,
+            production_contract_required=production_contract_required,
+        )
+    return scope._resolve(
+        data_dir,
+        scoped_symbols,
+        required_timeframes=scoped_timeframes,
+        verify_exclusion_evidence=verify_exclusion_evidence,
+        production_contract_required=production_contract_required,
+    )
 
 
 def validate_native_exclusion_no_trade_grid(
@@ -4563,68 +6228,20 @@ def resolve_active_native_artifact(
     result = ActiveNativeResolution(symbol=canonical_symbol, timeframe=tf)
     evidence_verified = False
     native_root = (Path(data_dir) / "native").resolve()
-    pointer_path = native_root / "ACTIVE.json"
-    if not pointer_path.exists():
-        result.errors.append("NATIVE_ACTIVE_POINTER_MISSING")
-        return result
-    try:
-        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    except Exception:
-        result.errors.append("NATIVE_ACTIVE_POINTER_INVALID_JSON")
-        return result
-    if not isinstance(pointer, Mapping):
-        result.errors.append("NATIVE_ACTIVE_POINTER_NOT_OBJECT")
-        return result
-    if str(pointer.get("schema_version")) != ACTIVE_POINTER_SCHEMA:
-        result.errors.append("NATIVE_ACTIVE_POINTER_SCHEMA_INVALID")
-    pointer_activation_id = str(pointer.get("activation_id") or "")
-    expected_manifest_relative = (
-        f"activations/{pointer_activation_id}.json" if pointer_activation_id else ""
+    manifest, manifest_path, manifest_sha, manifest_errors = _load_active_manifest(
+        data_dir
     )
-    if (
-        str(pointer.get("manifest_relative_path") or "").replace("\\", "/")
-        != expected_manifest_relative
-    ):
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_PATH_IDENTITY_MISMATCH")
-
-    manifest_path = _contained_path(native_root, pointer.get("manifest_relative_path"))
-    if manifest_path is None:
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_PATH_UNSAFE")
-        return result
     result.activation_manifest_path = manifest_path
-    if not manifest_path.exists():
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_MISSING")
+    result.activation_manifest_sha256 = manifest_sha
+    result.errors.extend(manifest_errors)
+    if manifest is None:
         return result
-    observed_manifest_sha = sha256_file(manifest_path)
-    declared_manifest_sha = str(pointer.get("manifest_sha256") or "").lower()
-    result.activation_manifest_sha256 = observed_manifest_sha
-    if observed_manifest_sha.lower() != declared_manifest_sha:
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_SHA256_MISMATCH")
-        return result
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_INVALID_JSON")
-        return result
-    if not isinstance(manifest, Mapping):
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_NOT_OBJECT")
-        return result
-    if str(manifest.get("schema_version")) != ACTIVATION_MANIFEST_SCHEMA:
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_SCHEMA_INVALID")
-    if str(manifest.get("status", "")).lower() != "active":
-        result.errors.append("NATIVE_ACTIVE_MANIFEST_NOT_ACTIVE")
-    if pointer.get("production_authoritative") is not manifest.get(
-        "production_authoritative"
-    ):
-        result.errors.append("NATIVE_ACTIVE_PRODUCTION_AUTHORITY_MARKER_MISMATCH")
     if (
         production_contract_required
         and manifest.get("production_authoritative") is not True
     ):
         result.errors.append("NATIVE_ACTIVE_PRODUCTION_AUTHORITY_REQUIRED")
     result.activation_id = str(manifest.get("activation_id") or "") or None
-    if result.activation_id != str(pointer.get("activation_id") or ""):
-        result.errors.append("NATIVE_ACTIVE_ACTIVATION_ID_MISMATCH")
 
     universe = manifest.get("universe_eligibility")
     if isinstance(universe, Mapping):
@@ -4689,6 +6306,10 @@ def resolve_active_native_artifact(
                 )
             if result.errors:
                 return result
+        cell_data_state = semantic_universe.cell_status(canonical_symbol, tf)
+        if cell_data_state == NATIVE_TECHNICAL_ERROR:
+            result.errors.append("NATIVE_ACTIVE_CELL_TERMINAL_TECHNICAL")
+            return result
         if canonical_symbol in semantic_universe.excluded_symbols:
             result.errors.append("NATIVE_ACTIVE_SYMBOL_EXCLUDED_NO_TRADE")
             return result
@@ -4698,7 +6319,6 @@ def resolve_active_native_artifact(
         if semantic_universe.cell_status(canonical_symbol, tf) == "excluded_no_trade":
             result.errors.append("NATIVE_ACTIVE_CELL_EXCLUDED_NO_TRADE")
             return result
-        cell_data_state = semantic_universe.cell_status(canonical_symbol, tf)
         if cell_data_state == NATIVE_SOURCE_UNAVAILABLE:
             result.errors.append("NATIVE_ACTIVE_CELL_SOURCE_UNAVAILABLE")
             return result
@@ -4804,42 +6424,76 @@ def resolve_active_native_artifact(
         if not authenticity_contract and not math.isfinite(contract_minimum):
             result.errors.append("NATIVE_ACTIVE_SESSION_COVERAGE_POLICY_INVALID")
         else:
-            result.errors.extend(
-                _verify_activation_cell_evidence(
-                    native_root,
-                    symbol=canonical_symbol,
-                    timeframe=tf,
-                    entry=entry,
-                    run_cell=run_cell,
-                    audited_cell=None,
-                    expected_cell_status=expected_entry_state,
-                    activation_id=str(result.activation_id or ""),
-                    run_id=str(manifest.get("run_id") or ""),
-                    run_manifest_relative_path=manifest.get(
-                        "run_manifest_relative_path"
-                    ),
-                    run_manifest_sha256=manifest.get("run_manifest_sha256"),
-                    run_request=run_request,
-                    contract_minimum=contract_minimum,
-                    expected_coverage_method=str(
-                        universe.get("session_coverage_method") or ""
-                    ),
-                    require_resolution_audit=(
-                        str(universe.get("schema_version") or "")
-                        in {
-                            UNIVERSE_ELIGIBILITY_SCHEMA,
-                            UNIVERSE_AUTHENTICITY_SCHEMA,
-                        }
-                    ),
-                    reference_run_cell=reference_run_cell,
-                    parity_thresholds=(
-                        manifest.get("parity_thresholds")
-                        if isinstance(manifest.get("parity_thresholds"), Mapping)
-                        else {}
-                    ),
-                    symbol_run_cells=run_cells_for_symbol,
-                )
+            frame_cache = (
+                _V5NormalizedFrameCache(canonical_symbol)
+                if str(run_request.get("timeframe_request_map_schema_version") or "")
+                == TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION
+                else None
             )
+            try:
+                result.errors.extend(
+                    _verify_activation_cell_evidence(
+                        native_root,
+                        symbol=canonical_symbol,
+                        timeframe=tf,
+                        entry=entry,
+                        run_cell=run_cell,
+                        audited_cell=None,
+                        expected_cell_status=expected_entry_state,
+                        activation_id=str(result.activation_id or ""),
+                        run_id=str(manifest.get("run_id") or ""),
+                        run_manifest_relative_path=manifest.get(
+                            "run_manifest_relative_path"
+                        ),
+                        run_manifest_sha256=manifest.get("run_manifest_sha256"),
+                        run_request=run_request,
+                        run_source_environment=(
+                            run_manifest.get("source_environment")
+                            if isinstance(run_manifest, Mapping)
+                            and isinstance(
+                                run_manifest.get("source_environment"), Mapping
+                            )
+                            else {}
+                        ),
+                        run_acquisition_started_utc=(
+                            run_manifest.get("acquisition_started_utc")
+                            if isinstance(run_manifest, Mapping)
+                            else None
+                        ),
+                        run_acquisition_completed_utc=(
+                            run_manifest.get("acquisition_completed_utc")
+                            if isinstance(run_manifest, Mapping)
+                            else None
+                        ),
+                        contract_minimum=contract_minimum,
+                        expected_coverage_method=str(
+                            universe.get("session_coverage_method") or ""
+                        ),
+                        require_resolution_audit=(
+                            str(universe.get("schema_version") or "")
+                            in {
+                                UNIVERSE_ELIGIBILITY_SCHEMA,
+                                UNIVERSE_AUTHENTICITY_SCHEMA,
+                            }
+                        ),
+                        reference_run_cell=reference_run_cell,
+                        parity_thresholds=(
+                            manifest.get("parity_thresholds")
+                            if isinstance(manifest.get("parity_thresholds"), Mapping)
+                            else {}
+                        ),
+                        symbol_run_cells=run_cells_for_symbol,
+                        symbol_activation_entries=(
+                            symbol_entries
+                            if isinstance(symbol_entries, Mapping)
+                            else {}
+                        ),
+                        v5_frame_cache=frame_cache,
+                    )
+                )
+            finally:
+                if frame_cache is not None:
+                    frame_cache.clear()
         if result.errors:
             return result
         evidence_verified = True

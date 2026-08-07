@@ -23,6 +23,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -69,6 +70,7 @@ PREFIX_TERMINAL_RECEIPT_SCHEMA: Final = (
 PREFIX_CUTOFF_TERMINAL_RECEIPT_SCHEMA: Final = (
     "fxpm.activated-native-prefix-cutoff-terminal-receipt.v1"
 )
+PREFIX_CANDIDATE_SCHEMA: Final = "fxpm.activated-native-prefix-candidate.v1"
 PREFIX_AUTHORITY_SCOPE: Final = (
     "NATIVE_CUTOFF_PREFIX_MECHANICAL_EVIDENCE_ONLY_NO_TRADING_AUTHORITY"
 )
@@ -82,8 +84,11 @@ NATIVE_SOURCE_BINDING_ATTR: Final = "_fxpm_native_source_binding_v1"
 AVAILABLE: Final = "AVAILABLE"
 SOURCE_UNAVAILABLE: Final = "SOURCE_UNAVAILABLE"
 SOURCE_UNAVAILABLE_AT_CUTOFF: Final = "SOURCE_UNAVAILABLE_AT_CUTOFF"
+TECHNICAL_TERMINAL: Final = "TECHNICAL_TERMINAL"
 TECHNICAL_FAILURE: Final = "TECHNICAL_FAILURE"
-SOURCE_STATES: Final = frozenset((AVAILABLE, SOURCE_UNAVAILABLE, TECHNICAL_FAILURE))
+SOURCE_STATES: Final = frozenset(
+    (AVAILABLE, SOURCE_UNAVAILABLE, TECHNICAL_TERMINAL, TECHNICAL_FAILURE)
+)
 
 CSV_HEADER: Final[tuple[str, ...]] = ("time", *PRODUCTION_ARTIFACT_COLUMNS)
 MAX_SOURCE_BYTES: Final = 64 * 1024**3
@@ -100,6 +105,7 @@ IO_CHUNK_BYTES: Final = 1024 * 1024
 MAX_OPEN_FRAME_ROWS: Final = 10_000_000
 MAX_OPEN_FRAME_BYTES: Final = 4 * 1024**3
 _PRODUCT_SEAL: Final = object()
+_BATCH_CANCELLATION_CHECK_ROWS: Final = 1024
 
 _SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _SYMBOL_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", re.ASCII)
@@ -299,6 +305,15 @@ class _PrefixFacts:
     gap_count: int
     segment_sha256: str
     segment_bytes: int
+
+
+@dataclass(frozen=True)
+class _BatchAvailableEvidence:
+    source: _SourceBinding
+    facts: _PrefixFacts
+    content_descriptor: Mapping[str, Any]
+    segments_descriptor: Mapping[str, Any]
+    boundary_status: str
 
 
 def _fail(code: str) -> None:
@@ -777,7 +792,7 @@ def _source_binding(
         _fail("PREFIX_SOURCE_INSTRUMENT_SNAPSHOT_INVALID")
     if (
         instrument.get("status") != "available"
-        or str(instrument.get("symbol") or "").upper() != symbol
+        or str(instrument.get("symbol") or "") != str(symbol)
         or type(instrument.get("asset_class")) is not str
         or not instrument["asset_class"]
         or type(instrument.get("path")) is not str
@@ -794,10 +809,12 @@ def _source_binding(
         "trade_tick_value",
     ):
         value = instrument.get(name)
+        zero_is_unavailable = name == "trade_tick_value" and value == 0
         if (
             type(value) not in {int, float}
             or not math.isfinite(float(value))
-            or value <= 0
+            or value < 0
+            or (value == 0 and not zero_is_unavailable)
         ):
             _fail(f"PREFIX_SOURCE_INSTRUMENT_VALUE_INVALID:{name}")
 
@@ -1031,6 +1048,11 @@ def _available_history_boundary_required(
         return expected_first.opened > strategy_start
     if pagination.get("available_history_boundary") is not None:
         return True
+    if _complete_ledger_oldest_page_truncation(
+        source,
+        expected_first=expected_first,
+    ):
+        return False
     terminal_pages = pagination.get("terminal_prefix_unresolved_pages")
     coverage = source.provenance.get("coverage")
     terminal_marker = (
@@ -1072,6 +1094,226 @@ def _available_history_boundary_required(
             return True
         return terminal_end > strategy_start
     return expected_first.opened > strategy_start
+
+
+def _complete_ledger_oldest_page_truncation(
+    source: _SourceBinding,
+    *,
+    expected_first: _FirstSourceBar,
+) -> bool:
+    """Recognize one authenticated, non-terminal left-truncated page ledger.
+
+    This is deliberately narrower than ``boundary_history_shortfall``.  It
+    admits only a complete data-page ledger whose sole truncation is the
+    oldest requested page and whose recorded first bar is the first pinned CSV
+    bar.  Failed, empty, internal, terminal, or structurally ambiguous
+    evidence therefore continues through the fail-closed boundary-proof path.
+    """
+
+    provenance = source.provenance
+    run_cell = source.run_cell
+    if (
+        provenance.get("status") != "partial"
+        or provenance.get("failure_status") != "boundary_history_shortfall"
+        or provenance.get("complete") is not False
+        or run_cell.get("status") != "partial"
+        or run_cell.get("failure_status") != "boundary_history_shortfall"
+    ):
+        return False
+    pagination = provenance.get("pagination")
+    coverage = provenance.get("coverage")
+    if not isinstance(pagination, Mapping) or not isinstance(coverage, Mapping):
+        return False
+    if (
+        pagination.get("contract_version")
+        != "fxpm.native_history.pagination.v3"
+        or pagination.get("request_order") != "newest_to_oldest"
+        or pagination.get("stop_reason") is not None
+        or pagination.get("available_history_boundary") is not None
+        or pagination.get("unrequested_prefix") is not None
+    ):
+        return False
+    for name in (
+        "empty_pages",
+        "failed_pages",
+        "terminal_prefix_unresolved_pages",
+    ):
+        if pagination.get(name) != []:
+            return False
+    truncated_pages = pagination.get("truncated_pages")
+    attempts = pagination.get("page_attempts")
+    if (
+        not isinstance(truncated_pages, list)
+        or len(truncated_pages) != 1
+        or not isinstance(truncated_pages[0], Mapping)
+        or not isinstance(attempts, list)
+        or not attempts
+        or any(not isinstance(page, Mapping) for page in attempts)
+        or pagination.get("attempts_total") != len(attempts)
+        or pagination.get("pages_requested") != len(attempts)
+        or pagination.get("pages_with_data") != len(attempts)
+    ):
+        return False
+    expected_coverage = {
+        "status": "partial_requested_span",
+        "technical_integrity_status": "complete_page_ledger",
+        "internal_empty_page_count": 0,
+        "truncated_page_count": 1,
+        "internal_truncated_page_count": 0,
+        "boundary_truncated_page_count": 1,
+        "failed_page_count": 0,
+        "terminal_prefix_unresolved_page_count": 0,
+    }
+    if any(
+        coverage.get(key) != value
+        or type(coverage.get(key)) is not type(value)
+        for key, value in expected_coverage.items()
+    ):
+        return False
+
+    request = provenance.get("request")
+    source_interval = (
+        request.get("source_request_interval")
+        if isinstance(request, Mapping)
+        else None
+    )
+    if not isinstance(source_interval, Mapping):
+        return False
+    truncated = truncated_pages[0]
+    try:
+        source_start = _csv_utc(
+            source_interval.get("start_utc"),
+            "PREFIX_COMPLETE_LEDGER_SOURCE_START_INVALID",
+        )
+        source_end = _csv_utc(
+            source_interval.get("end_exclusive_utc"),
+            "PREFIX_COMPLETE_LEDGER_SOURCE_END_INVALID",
+        )
+        truncated_start = _csv_utc(
+            truncated.get("start_utc"),
+            "PREFIX_COMPLETE_LEDGER_TRUNCATED_START_INVALID",
+        )
+        truncated_end = _csv_utc(
+            truncated.get("end_exclusive_utc"),
+            "PREFIX_COMPLETE_LEDGER_TRUNCATED_END_INVALID",
+        )
+        actual_first = _csv_utc(
+            truncated.get("actual_first_open_utc"),
+            "PREFIX_COMPLETE_LEDGER_FIRST_OPEN_INVALID",
+        )
+        actual_last = _csv_utc(
+            truncated.get("actual_last_open_utc"),
+            "PREFIX_COMPLETE_LEDGER_LAST_OPEN_INVALID",
+        )
+        attempt_intervals = [
+            (
+                _csv_utc(
+                    page.get("start_utc"),
+                    "PREFIX_COMPLETE_LEDGER_PAGE_START_INVALID",
+                ),
+                _csv_utc(
+                    page.get("end_exclusive_utc"),
+                    "PREFIX_COMPLETE_LEDGER_PAGE_END_INVALID",
+                ),
+            )
+            for page in attempts
+        ]
+    except NativePrefixError:
+        return False
+    if (
+        not source_start < source_end
+        or truncated_start != source_start
+        or actual_first != expected_first.opened
+        or not truncated_start < actual_first <= actual_last < truncated_end
+        or len(set(attempt_intervals)) != len(attempt_intervals)
+    ):
+        return False
+    ordered_intervals = sorted(attempt_intervals)
+    if (
+        any(not start < end for start, end in ordered_intervals)
+        or ordered_intervals[0][0] != source_start
+        or ordered_intervals[-1][1] != source_end
+        or any(
+            older[1] != newer[0]
+            for older, newer in zip(
+                ordered_intervals,
+                ordered_intervals[1:],
+            )
+        )
+    ):
+        return False
+    request_sequences = [page.get("request_sequence") for page in attempts]
+    if (
+        any(type(sequence) is not int for sequence in request_sequences)
+        or set(request_sequences) != set(range(1, len(attempts) + 1))
+    ):
+        return False
+    matching_attempts = [
+        page
+        for page, interval in zip(attempts, attempt_intervals, strict=True)
+        if interval == (truncated_start, truncated_end)
+    ]
+    if (
+        len(matching_attempts) != 1
+        or matching_attempts[0].get("request_sequence")
+        != truncated.get("request_sequence")
+    ):
+        return False
+    matching_attempt = matching_attempts[0]
+    if (
+        any(
+            key not in truncated or truncated.get(key) != value
+            for key, value in matching_attempt.items()
+        )
+        or set(truncated) - set(matching_attempt)
+        != {
+            "actual_first_open_utc",
+            "actual_last_open_utc",
+            "start_delay_seconds",
+            "end_lag_seconds",
+        }
+    ):
+        return False
+    start_delay = truncated.get("start_delay_seconds")
+    end_lag = truncated.get("end_lag_seconds")
+    timeframe_seconds = provenance.get("timeframe_seconds")
+    if (
+        type(start_delay) not in {int, float}
+        or not math.isfinite(float(start_delay))
+        or float(start_delay) <= 0.0
+        or float(start_delay)
+        != (actual_first - truncated_start).total_seconds()
+        or type(end_lag) not in {int, float}
+        or not math.isfinite(float(end_lag))
+        or float(end_lag) < 0.0
+        or type(timeframe_seconds) is not int
+        or timeframe_seconds <= 0
+        or float(end_lag)
+        != max(
+            0.0,
+            (
+                truncated_end
+                - timedelta(seconds=timeframe_seconds)
+                - actual_last
+            ).total_seconds(),
+        )
+    ):
+        return False
+    return True
+
+
+def _available_boundary_status(
+    source: _SourceBinding,
+    *,
+    expected_first: _FirstSourceBar,
+    available_boundary: _AvailableHistoryBoundary | None,
+) -> str:
+    if available_boundary is not None or _complete_ledger_oldest_page_truncation(
+        source,
+        expected_first=expected_first,
+    ):
+        return "LEFT_TRUNCATED"
+    return "COMPLETE"
 
 
 def _available_history_boundary(
@@ -1222,10 +1464,12 @@ class _PrefixStream:
         source: _SourceBinding,
         cutoff: datetime,
         segment_path: Path,
+        reservation: Any | None = None,
     ) -> None:
         self.source = source
         self.cutoff = cutoff
         self.segment_path = segment_path
+        self.reservation = reservation
         self.facts: _PrefixFacts | None = None
 
     def chunks(self) -> Iterator[bytes]:
@@ -1308,7 +1552,11 @@ class _PrefixStream:
                             segment_first_row,
                             prefix_rows - 1,
                         )
+                        if self.reservation is not None:
+                            self.reservation.consume(len(segment))
                         segment_file.write(segment)
+                        if self.reservation is not None:
+                            self.reservation.materialize(len(segment))
                         segment_digest.update(segment)
                         segment_bytes += len(segment)
                         segment_start_open = opened
@@ -1338,7 +1586,11 @@ class _PrefixStream:
                 segment_first_row,
                 prefix_rows,
             )
+            if self.reservation is not None:
+                self.reservation.consume(len(segment))
             segment_file.write(segment)
+            if self.reservation is not None:
+                self.reservation.materialize(len(segment))
             segment_digest.update(segment)
             segment_bytes += len(segment)
             segment_file.flush()
@@ -1374,6 +1626,300 @@ class _PrefixStream:
             source_handle.close()
 
 
+class _BatchPrefixTarget:
+    """One cutoff accumulator fed by a shared authenticated source scan."""
+
+    __slots__ = (
+        "content_bytes",
+        "content_digest",
+        "content_handle",
+        "content_identity",
+        "content_path",
+        "cutoff",
+        "facts",
+        "first_open",
+        "gap_count",
+        "last_close",
+        "last_open",
+        "prefix_rows",
+        "previous_prefix_close",
+        "reservation",
+        "segment_bytes",
+        "segment_count",
+        "segment_digest",
+        "segment_file",
+        "segment_first_row",
+        "segment_last_close",
+        "segment_last_open",
+        "segment_path",
+        "segment_start_open",
+    )
+
+    def __init__(
+        self,
+        *,
+        cutoff: datetime,
+        content_path: Path,
+        segment_path: Path | None,
+        compare_existing: bool,
+        reservation: Any | None = None,
+    ) -> None:
+        self.cutoff = cutoff
+        self.content_path = content_path
+        self.segment_path = segment_path
+        self.reservation = reservation
+        self.content_identity: _FileIdentity | None = None
+        if compare_existing:
+            self.content_handle, self.content_identity = _open_regular(
+                content_path,
+                maximum_bytes=MAX_SOURCE_BYTES,
+                code="PREFIX_CONTENT",
+            )
+        else:
+            self.content_handle = content_path.open(
+                "xb",
+                buffering=IO_CHUNK_BYTES,
+            )
+        self.segment_file = (
+            segment_path.open("xb", buffering=IO_CHUNK_BYTES)
+            if segment_path is not None
+            else None
+        )
+        self.facts: _PrefixFacts | None = None
+        self.content_digest = hashlib.sha256()
+        self.content_bytes = 0
+        self.prefix_rows = 0
+        self.first_open: datetime | None = None
+        self.last_open: datetime | None = None
+        self.last_close: datetime | None = None
+        self.previous_prefix_close: datetime | None = None
+        self.segment_start_open: datetime | None = None
+        self.segment_last_open: datetime | None = None
+        self.segment_last_close: datetime | None = None
+        self.segment_first_row = 0
+        self.segment_count = 0
+        self.gap_count = 0
+        self.segment_digest = hashlib.sha256()
+        self.segment_bytes = 0
+
+    def _content(self, raw: bytes) -> None:
+        if self.content_identity is None:
+            self.content_handle.write(raw)
+        else:
+            observed = self.content_handle.read(len(raw))
+            if observed != raw:
+                _fail("PREFIX_CONTENT_NOT_EXACT_SOURCE_PREFIX")
+        self.content_digest.update(raw)
+        self.content_bytes += len(raw)
+
+    def header(self, raw: bytes) -> None:
+        self._content(raw)
+
+    def row(self, raw: bytes, opened: datetime, closed: datetime) -> None:
+        if closed > self.cutoff:
+            return
+        self.prefix_rows += 1
+        if self.first_open is None:
+            self.first_open = opened
+            self.segment_start_open = opened
+            self.segment_first_row = 1
+        if self.previous_prefix_close is not None:
+            if opened < self.previous_prefix_close:
+                _fail("PREFIX_SOURCE_BAR_OVERLAP")
+            if opened > self.previous_prefix_close:
+                assert (
+                    self.segment_start_open is not None
+                    and self.segment_last_open is not None
+                    and self.segment_last_close is not None
+                )
+                self.segment_count += 1
+                self.gap_count += 1
+                self._segment(
+                    _segment_line(
+                        self.segment_count,
+                        self.segment_start_open,
+                        self.segment_last_open,
+                        self.segment_last_close,
+                        self.segment_first_row,
+                        self.prefix_rows - 1,
+                    )
+                )
+                self.segment_start_open = opened
+                self.segment_first_row = self.prefix_rows
+        self.last_open = opened
+        self.last_close = closed
+        self.previous_prefix_close = closed
+        self.segment_last_open = opened
+        self.segment_last_close = closed
+        self._content(raw)
+
+    def _segment(self, raw: bytes) -> None:
+        if self.segment_file is not None:
+            if self.reservation is not None:
+                self.reservation.consume(len(raw))
+            self.segment_file.write(raw)
+            if self.reservation is not None:
+                self.reservation.materialize(len(raw))
+        self.segment_digest.update(raw)
+        self.segment_bytes += len(raw)
+
+    def finish(
+        self,
+        *,
+        source_sha256: str,
+        source_bytes: int,
+        source_rows: int,
+    ) -> None:
+        if self.prefix_rows <= 0:
+            _fail("PREFIX_NO_CLOSED_ROWS_AT_CUTOFF")
+        assert (
+            self.first_open is not None
+            and self.last_open is not None
+            and self.last_close is not None
+            and self.segment_start_open is not None
+            and self.segment_last_open is not None
+            and self.segment_last_close is not None
+        )
+        self.segment_count += 1
+        self._segment(
+            _segment_line(
+                self.segment_count,
+                self.segment_start_open,
+                self.segment_last_open,
+                self.segment_last_close,
+                self.segment_first_row,
+                self.prefix_rows,
+            )
+        )
+        if self.content_identity is None:
+            self.content_handle.flush()
+            os.fsync(self.content_handle.fileno())
+        else:
+            if self.content_handle.read(1):
+                _fail("PREFIX_CONTENT_HAS_EXTRA_BYTES")
+            _verify_open_identity(
+                self.content_path,
+                self.content_handle,
+                self.content_identity,
+                "PREFIX_CONTENT_CHANGED",
+            )
+        if self.segment_file is not None:
+            self.segment_file.flush()
+            os.fsync(self.segment_file.fileno())
+        self.facts = _PrefixFacts(
+            source_sha256=source_sha256,
+            source_bytes=source_bytes,
+            source_rows=source_rows,
+            prefix_rows=self.prefix_rows,
+            first_open_utc=_iso(self.first_open),
+            last_open_utc=_iso(self.last_open),
+            last_close_utc=_iso(self.last_close),
+            segment_count=self.segment_count,
+            gap_count=self.gap_count,
+            segment_sha256=self.segment_digest.hexdigest(),
+            segment_bytes=self.segment_bytes,
+        )
+
+    def close(self) -> None:
+        try:
+            self.content_handle.close()
+        finally:
+            if self.segment_file is not None:
+                self.segment_file.close()
+
+
+def _scan_prefix_targets(
+    source: _SourceBinding,
+    targets: Sequence[_BatchPrefixTarget],
+    *,
+    cancellation_event: threading.Event | None = None,
+) -> tuple[_PrefixFacts, ...]:
+    """Feed every requested cutoff from one complete source-file pass."""
+
+    if not targets:
+        _fail("PREFIX_BATCH_TARGETS_EMPTY")
+    if cancellation_event is not None and cancellation_event.is_set():
+        _fail("PREFIX_BATCH_CANCELLED")
+    source_handle, source_identity = _open_regular(
+        source.bars_path,
+        maximum_bytes=MAX_SOURCE_BYTES,
+        code="PREFIX_SOURCE_BARS",
+    )
+    source_digest = hashlib.sha256()
+    source_bytes = 0
+    source_rows = 0
+    previous_source_open: datetime | None = None
+    try:
+        header = source_handle.readline(MAX_LINE_BYTES + 1)
+        source_digest.update(header)
+        source_bytes += len(header)
+        try:
+            decoded_header = next(
+                csv.reader([header.decode("utf-8", errors="strict")])
+            )
+        except (UnicodeDecodeError, csv.Error, StopIteration) as exc:
+            raise NativePrefixError("PREFIX_SOURCE_HEADER_INVALID") from exc
+        if tuple(decoded_header) != CSV_HEADER:
+            _fail("PREFIX_SOURCE_HEADER_INVALID")
+        for target in targets:
+            target.header(header)
+        line_number = 1
+        while True:
+            raw = source_handle.readline(MAX_LINE_BYTES + 1)
+            if not raw:
+                break
+            line_number += 1
+            source_digest.update(raw)
+            source_bytes += len(raw)
+            if source_bytes > MAX_SOURCE_BYTES:
+                _fail("PREFIX_SOURCE_SIZE_EXCEEDED")
+            _row, opened, closed = _parse_csv_line(raw, line_number)
+            source_rows += 1
+            if source_rows > MAX_SOURCE_ROWS:
+                _fail("PREFIX_SOURCE_ROWS_EXCEEDED")
+            if previous_source_open is not None and opened <= previous_source_open:
+                _fail(f"PREFIX_SOURCE_ROW_ORDER_INVALID:{line_number}")
+            previous_source_open = opened
+            for target in targets:
+                target.row(raw, opened, closed)
+            if (
+                cancellation_event is not None
+                and source_rows % _BATCH_CANCELLATION_CHECK_ROWS == 0
+                and cancellation_event.is_set()
+            ):
+                _fail("PREFIX_BATCH_CANCELLED")
+        _verify_open_identity(
+            source.bars_path,
+            source_handle,
+            source_identity,
+            "PREFIX_SOURCE_CHANGED_DURING_SCAN",
+        )
+        observed_sha = source_digest.hexdigest()
+        if observed_sha != source.bars_sha256:
+            _fail("PREFIX_SOURCE_BARS_SHA_MISMATCH")
+        if (
+            source_bytes != source.bars_bytes
+            or source_rows != source.bars_rows
+        ):
+            _fail("PREFIX_SOURCE_BARS_SIZE_OR_ROWS_MISMATCH")
+        for target in targets:
+            target.finish(
+                source_sha256=observed_sha,
+                source_bytes=source_bytes,
+                source_rows=source_rows,
+            )
+        if cancellation_event is not None and cancellation_event.is_set():
+            _fail("PREFIX_BATCH_CANCELLED")
+        facts = tuple(target.facts for target in targets)
+        if any(value is None for value in facts):
+            _fail("PREFIX_BATCH_SCAN_DID_NOT_COMPLETE")
+        return tuple(value for value in facts if value is not None)
+    finally:
+        source_handle.close()
+        for target in targets:
+            target.close()
+
+
 def _file_chunks(path: Path) -> Iterator[bytes]:
     handle, identity = _open_regular(
         path, maximum_bytes=MAX_SOURCE_BYTES, code="PREFIX_TEMPORARY_OBJECT"
@@ -1387,6 +1933,63 @@ def _file_chunks(path: Path) -> Iterator[bytes]:
         _verify_open_identity(path, handle, identity, "PREFIX_TEMPORARY_OBJECT_CHANGED")
     finally:
         handle.close()
+
+
+def _publish_staged_opaque(
+    context: authority_spool.GenerationSpoolContext,
+    path: Path,
+    *,
+    format_name: str,
+    expected_sha256: str,
+    expected_size_bytes: int,
+) -> tuple[dict[str, Any], int]:
+    """Publish a reserved staged inode without opening a nested quota lease."""
+
+    relative_path = authority_spool._content_relative_path(  # noqa: SLF001
+        expected_sha256,
+        format_name,
+    )
+    target = authority_spool._local_path(  # noqa: SLF001
+        context.root,
+        relative_path,
+    )
+    new_unique_bytes = 0
+    if target.exists():
+        if not authority_spool._files_match(  # noqa: SLF001
+            context.root,
+            relative_path,
+            expected_sha256,
+            expected_size_bytes,
+            context.limits.stream_chunk_bytes,
+        ):
+            _fail("PREFIX_STAGED_ARTIFACT_CONTENT_ADDRESS_CONFLICT")
+    else:
+        try:
+            authority_spool._publish_temp_exclusive(  # noqa: SLF001
+                context.root,
+                path,
+                relative_path,
+            )
+            new_unique_bytes = expected_size_bytes
+        except FileExistsError:
+            if not authority_spool._files_match(  # noqa: SLF001
+                context.root,
+                relative_path,
+                expected_sha256,
+                expected_size_bytes,
+                context.limits.stream_chunk_bytes,
+            ):
+                _fail("PREFIX_STAGED_ARTIFACT_CONTENT_ADDRESS_CONFLICT")
+    return (
+        {
+            "schema_version": authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
+            "relative_path": relative_path,
+            "sha256": expected_sha256,
+            "size_bytes": expected_size_bytes,
+            "format": format_name,
+        },
+        new_unique_bytes,
+    )
 
 
 def _source_mapping(source: _SourceBinding) -> dict[str, Any]:
@@ -1504,7 +2107,451 @@ def _temp_path(root: Path) -> Path:
     return path
 
 
-def produce_activated_native_prefix(
+def _write_available_prefix_index(
+    *,
+    context: authority_spool.GenerationSpoolContext,
+    source: _SourceBinding,
+    symbol: str,
+    timeframe: str,
+    cutoff_utc: str,
+    source_accessed_at_utc: str,
+    boundary_status: str,
+    schema_descriptor: Mapping[str, Any],
+    content_descriptor: Mapping[str, Any],
+    segments_descriptor: Mapping[str, Any],
+    facts: _PrefixFacts,
+) -> dict[str, Any]:
+    """Publish the unchanged v1 policy, continuity receipt, and prefix index."""
+
+    policy = {
+        "schema_version": PREFIX_CONTINUITY_POLICY_SCHEMA,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "cutoff_utc": cutoff_utc,
+        "activation_manifest_sha256": source.activation_manifest_sha256,
+        "activation_entry_sha256": source.activation_entry_sha256,
+        "source_artifact_sha256": source.bars_sha256,
+        "source_provenance_sha256": source.provenance_sha256,
+        "source_identity_sha256": source.source_identity_sha256,
+        "request_map_sha256": source.request_map_sha256,
+        "prefix_schema_sha256": schema_descriptor["sha256"],
+        "prefix_content_sha256": content_descriptor["sha256"],
+        "prefix_rows": facts.prefix_rows,
+        "nominal_timeframe_seconds": TIMEFRAME_SECONDS[timeframe],
+        "overlap_allowed": False,
+        "resampling_allowed": False,
+    }
+    policy_descriptor = authority_spool.write_canonical_json_artifact(context, policy)
+    geometry = {
+        "schema_version": PREFIX_CONTINUITY_RECEIPT_SCHEMA,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "prefix_content_sha256": content_descriptor["sha256"],
+        "prefix_rows": facts.prefix_rows,
+        "first_open_utc": facts.first_open_utc,
+        "last_open_utc": facts.last_open_utc,
+        "last_close_utc": facts.last_close_utc,
+        "segment_count": facts.segment_count,
+        "gap_count": facts.gap_count,
+        "segments_sha256": segments_descriptor["sha256"],
+    }
+    geometry_sha = _sha_json(geometry)
+    internal = (
+        "CONTINUOUS"
+        if facts.gap_count == 0
+        else "EXPECTED_AUTHENTICATED_DISCONTINUITIES"
+    )
+    continuity_receipt = {
+        **geometry,
+        "policy_sha256": policy_descriptor["sha256"],
+        "geometry_sha256": geometry_sha,
+        "internal_status": internal,
+        "boundary_status": boundary_status,
+        "unexplained_discontinuity_count": 0,
+        "requires_preserved_segment_ledger": facts.gap_count > 0,
+        "source_activation_authenticated": True,
+        "grants_search_authority": False,
+        "grants_trading_authority": False,
+    }
+    receipt_descriptor = authority_spool.write_canonical_json_artifact(
+        context,
+        continuity_receipt,
+    )
+    index = {
+        "schema_version": PREFIX_INDEX_SCHEMA,
+        "authority_scope": PREFIX_AUTHORITY_SCOPE,
+        "source_state": AVAILABLE,
+        "source_reason": None,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "cutoff_utc": cutoff_utc,
+        "source_accessed_at_utc": source_accessed_at_utc,
+        "activation": _activation_mapping(source),
+        "source": _source_mapping(source),
+        "prefix": {
+            "schema": dict(schema_descriptor),
+            "content": dict(content_descriptor),
+            "segments": dict(segments_descriptor),
+            "prefix_rows": facts.prefix_rows,
+            "prefix_start_utc": facts.first_open_utc,
+            "prefix_end_exclusive_utc": facts.last_close_utc,
+            "prefix_first_open_utc": facts.first_open_utc,
+            "prefix_last_open_utc": facts.last_open_utc,
+            "prefix_last_close_utc": facts.last_close_utc,
+        },
+        "continuity": {
+            "policy": policy_descriptor,
+            "receipt": receipt_descriptor,
+            "geometry_sha256": geometry_sha,
+            "internal_status": internal,
+            "boundary_status": boundary_status,
+            "unexplained_discontinuity_count": 0,
+            "segment_count": facts.segment_count,
+            "gap_count": facts.gap_count,
+            "requires_preserved_segment_ledger": facts.gap_count > 0,
+        },
+        "terminal_receipt": None,
+        "grants_search_authority": False,
+        "grants_trading_authority": False,
+    }
+    return authority_spool.write_canonical_json_artifact(context, index)
+
+
+def _candidate_from_product(product: NativePrefixProduct) -> dict[str, Any]:
+    index = dict(product.index)
+    activation = index.get("activation")
+    if type(activation) is not dict:
+        _fail("PREFIX_CANDIDATE_PRODUCT_INVALID")
+    return {
+        "schema_version": PREFIX_CANDIDATE_SCHEMA,
+        "symbol": index["symbol"],
+        "timeframe": index["timeframe"],
+        "cutoff_utc": index["cutoff_utc"],
+        "source_state": index["source_state"],
+        "index_descriptor": dict(product.index_descriptor),
+        "index_sha256": product.index_sha256,
+        "activation_manifest_sha256": activation["manifest_sha256"],
+    }
+
+
+def _candidate_from_descriptor(
+    *,
+    symbol: str,
+    timeframe: str,
+    cutoff_utc: str,
+    source_state: str,
+    index_descriptor: Mapping[str, Any],
+    activation_manifest_sha256: str,
+) -> dict[str, Any]:
+    descriptor = dict(index_descriptor)
+    return {
+        "schema_version": PREFIX_CANDIDATE_SCHEMA,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "cutoff_utc": cutoff_utc,
+        "source_state": source_state,
+        "index_descriptor": descriptor,
+        "index_sha256": descriptor["sha256"],
+        "activation_manifest_sha256": activation_manifest_sha256,
+    }
+
+
+def _batch_requests(
+    values: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[datetime, datetime], ...]:
+    if type(values) not in {list, tuple} or not 1 <= len(values) <= 16:
+        _fail("PREFIX_BATCH_REQUESTS_INVALID")
+    normalized: list[tuple[datetime, datetime]] = []
+    cutoffs: set[str] = set()
+    for value in values:
+        if type(value) is not dict or set(value) != {
+            "cutoff_utc",
+            "source_accessed_at_utc",
+        }:
+            _fail("PREFIX_BATCH_REQUEST_INVALID")
+        cutoff = _parse_utc(value["cutoff_utc"], "PREFIX_CUTOFF_INVALID")
+        accessed = _parse_utc(
+            value["source_accessed_at_utc"],
+            "PREFIX_SOURCE_ACCESSED_INVALID",
+        )
+        if accessed > datetime.now(tz=UTC) + timedelta(minutes=5):
+            _fail("PREFIX_SOURCE_ACCESSED_IN_FUTURE")
+        canonical_cutoff = _iso(cutoff)
+        if canonical_cutoff in cutoffs:
+            _fail("PREFIX_BATCH_CUTOFF_DUPLICATED")
+        cutoffs.add(canonical_cutoff)
+        normalized.append((cutoff, accessed))
+    return tuple(normalized)
+
+
+def _resolved_source_state(resolution: ActiveNativeResolution) -> str:
+    if resolution.valid:
+        return AVAILABLE
+    if resolution.errors == ["NATIVE_ACTIVE_CELL_SOURCE_UNAVAILABLE"]:
+        return SOURCE_UNAVAILABLE
+    if resolution.errors == ["NATIVE_ACTIVE_CELL_TERMINAL_TECHNICAL"]:
+        return TECHNICAL_TERMINAL
+    return TECHNICAL_FAILURE
+
+
+def _batch_checkpoint(
+    cancellation_event: threading.Event | None,
+) -> None:
+    if cancellation_event is not None and cancellation_event.is_set():
+        _fail("PREFIX_BATCH_CANCELLED")
+
+
+def stage_activated_native_prefixes(
+    *,
+    data_dir: Path,
+    context: authority_spool.GenerationSpoolContext,
+    symbol: str,
+    timeframe: str,
+    requests: Sequence[Mapping[str, Any]],
+    production_contract_required: bool = True,
+    cancellation_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Stage exact v1 prefix artifacts; returned candidates grant no authority."""
+
+    canonical_symbol = _symbol(symbol)
+    canonical_timeframe = _timeframe(timeframe)
+    normalized = _batch_requests(requests)
+    if type(context) is not authority_spool.GenerationSpoolContext:
+        _fail("PREFIX_SPOOL_CONTEXT_REQUIRED")
+    _batch_checkpoint(cancellation_event)
+    try:
+        resolution = resolve_active_native_artifact(
+            Path(data_dir),
+            canonical_symbol,
+            canonical_timeframe,
+            production_contract_required=production_contract_required,
+        )
+    except Exception as exc:
+        raise NativePrefixError("PREFIX_ACTIVATION_RESOLUTION_EXCEPTION") from exc
+    if not resolution.valid:
+        source_state = _resolved_source_state(resolution)
+        terminal_candidates: list[dict[str, Any]] = []
+        for cutoff, accessed in normalized:
+            _batch_checkpoint(cancellation_event)
+            terminal_candidates.append(
+                _stage_terminal_prefix(
+                    data_dir=Path(data_dir),
+                    context=context,
+                    resolution=resolution,
+                    symbol=canonical_symbol,
+                    timeframe=canonical_timeframe,
+                    cutoff_utc=_iso(cutoff),
+                    source_accessed_at_utc=_iso(accessed),
+                    source_state=source_state,
+                )
+            )
+            _batch_checkpoint(cancellation_event)
+        return tuple(terminal_candidates)
+    source = _source_binding(
+        Path(data_dir),
+        resolution,
+        canonical_symbol,
+        canonical_timeframe,
+    )
+    request_start = _parse_utc(
+        source.request_start_utc,
+        "PREFIX_SOURCE_REQUEST_START_INVALID",
+    )
+    request_end = _parse_utc(
+        source.request_end_exclusive_utc,
+        "PREFIX_SOURCE_REQUEST_END_INVALID",
+    )
+    for cutoff, _accessed in normalized:
+        if not request_start < cutoff <= request_end:
+            _fail("PREFIX_CUTOFF_OUTSIDE_AUTHENTICATED_REQUEST")
+    first_source_bar = _first_source_bar(source)
+    available_boundary: _AvailableHistoryBoundary | None = None
+    if (
+        any(cutoff < first_source_bar.closed for cutoff, _ in normalized)
+        or _available_history_boundary_required(source, expected_first=first_source_bar)
+    ):
+        available_boundary = _available_history_boundary(
+            source,
+            symbol=canonical_symbol,
+            timeframe=canonical_timeframe,
+            expected_first=first_source_bar,
+        )
+    boundary_status = _available_boundary_status(
+        source,
+        expected_first=first_source_bar,
+        available_boundary=available_boundary,
+    )
+    results: list[dict[str, Any] | None] = [None] * len(normalized)
+    available: list[tuple[int, datetime, datetime]] = []
+    for ordinal, (cutoff, accessed) in enumerate(normalized):
+        if cutoff < first_source_bar.closed:
+            assert available_boundary is not None
+            results[ordinal] = _stage_cutoff_unavailable_prefix(
+                context=context,
+                source=source,
+                symbol=canonical_symbol,
+                timeframe=canonical_timeframe,
+                cutoff_utc=_iso(cutoff),
+                source_accessed_at_utc=_iso(accessed),
+                boundary=available_boundary,
+            )
+        else:
+            available.append((ordinal, cutoff, accessed))
+    if available:
+        schema_descriptor = authority_spool.write_canonical_json_artifact(
+            context,
+            _source_schema_payload(),
+        )
+        content_paths = [_temp_path(Path(context.root)) for _ in available]
+        segment_paths = [_temp_path(Path(context.root)) for _ in available]
+        targets: list[_BatchPrefixTarget] = []
+        published: list[
+            tuple[dict[str, Any], dict[str, Any], _PrefixFacts]
+        ] = []
+        try:
+            with authority_spool.reserve_transient_publication(
+                context
+            ) as staging_lease:
+                committed = False
+                new_unique_bytes = 0
+                try:
+                    staging_lease.consume(
+                        len(available) * source.bars_bytes
+                    )
+                    targets = [
+                        _BatchPrefixTarget(
+                            cutoff=cutoff,
+                            content_path=content_path,
+                            segment_path=segment_path,
+                            compare_existing=False,
+                            reservation=staging_lease,
+                        )
+                        for (
+                            _ordinal,
+                            cutoff,
+                            _accessed,
+                        ), content_path, segment_path in zip(
+                            available,
+                            content_paths,
+                            segment_paths,
+                            strict=True,
+                        )
+                    ]
+                    facts_values = _scan_prefix_targets(
+                        source,
+                        targets,
+                    )
+                    staging_lease.materialize(
+                        sum(
+                            target.content_bytes for target in targets
+                        )
+                    )
+                    for (
+                        (_ordinal, _cutoff, _accessed),
+                        content_path,
+                        segment_path,
+                        target,
+                        facts,
+                    ) in zip(
+                        available,
+                        content_paths,
+                        segment_paths,
+                        targets,
+                        facts_values,
+                        strict=True,
+                    ):
+                        (
+                            content_descriptor,
+                            content_unique_bytes,
+                        ) = _publish_staged_opaque(
+                            context,
+                            content_path,
+                            format_name="csv",
+                            expected_sha256=target.content_digest.hexdigest(),
+                            expected_size_bytes=target.content_bytes,
+                        )
+                        new_unique_bytes += content_unique_bytes
+                        content_path.unlink()
+                        (
+                            segments_descriptor,
+                            segment_unique_bytes,
+                        ) = _publish_staged_opaque(
+                            context,
+                            segment_path,
+                            format_name="jsonl",
+                            expected_sha256=facts.segment_sha256,
+                            expected_size_bytes=facts.segment_bytes,
+                        )
+                        new_unique_bytes += segment_unique_bytes
+                        segment_path.unlink()
+                        published.append(
+                            (
+                                content_descriptor,
+                                segments_descriptor,
+                                facts,
+                            )
+                        )
+                    staging_lease.commit(new_unique_bytes)
+                    committed = True
+                finally:
+                    cleanup_error: OSError | None = None
+                    for path in (*content_paths, *segment_paths):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            cleanup_error = exc
+                    if cleanup_error is not None:
+                        raise NativePrefixError(
+                            "PREFIX_BATCH_STAGING_CLEANUP_FAILED"
+                        ) from cleanup_error
+                    if not committed:
+                        if new_unique_bytes:
+                            staging_lease.commit(new_unique_bytes)
+                        else:
+                            staging_lease.cancel_after_cleanup()
+            for (
+                (ordinal, cutoff, accessed),
+                (
+                    content_descriptor,
+                    segments_descriptor,
+                    facts,
+                ),
+            ) in zip(available, published, strict=True):
+                index_descriptor = _write_available_prefix_index(
+                    context=context,
+                    source=source,
+                    symbol=canonical_symbol,
+                    timeframe=canonical_timeframe,
+                    cutoff_utc=_iso(cutoff),
+                    source_accessed_at_utc=_iso(accessed),
+                    boundary_status=boundary_status,
+                    schema_descriptor=schema_descriptor,
+                    content_descriptor=content_descriptor,
+                    segments_descriptor=segments_descriptor,
+                    facts=facts,
+                )
+                results[ordinal] = _candidate_from_descriptor(
+                    symbol=canonical_symbol,
+                    timeframe=canonical_timeframe,
+                    cutoff_utc=_iso(cutoff),
+                    source_state=AVAILABLE,
+                    index_descriptor=index_descriptor,
+                    activation_manifest_sha256=source.activation_manifest_sha256,
+                )
+        except authority_spool.AuthoritySpoolError as exc:
+            raise NativePrefixError(f"PREFIX_SPOOL_FAILURE:{exc}") from exc
+        finally:
+            for path in (*content_paths, *segment_paths):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    if any(value is None for value in results):
+        _fail("PREFIX_BATCH_STAGE_INCOMPLETE")
+    return tuple(value for value in results if value is not None)
+
+
+def _produce_activated_native_prefix_single(
     *,
     data_dir: Path,
     context: authority_spool.GenerationSpoolContext,
@@ -1534,11 +2581,7 @@ def produce_activated_native_prefix(
     except Exception as exc:
         raise NativePrefixError("PREFIX_ACTIVATION_RESOLUTION_EXCEPTION") from exc
     if not resolution.valid:
-        state = (
-            SOURCE_UNAVAILABLE
-            if resolution.errors == ["NATIVE_ACTIVE_CELL_SOURCE_UNAVAILABLE"]
-            else TECHNICAL_FAILURE
-        )
+        state = _resolved_source_state(resolution)
         return _produce_terminal_prefix(
             data_dir=Path(data_dir),
             context=context,
@@ -1586,128 +2629,66 @@ def produce_activated_native_prefix(
             boundary=available_boundary,
             production_contract_required=production_contract_required,
         )
-    boundary_status = "LEFT_TRUNCATED" if available_boundary is not None else "COMPLETE"
+    boundary_status = _available_boundary_status(
+        source,
+        expected_first=first_source_bar,
+        available_boundary=available_boundary,
+    )
 
     schema_descriptor = authority_spool.write_canonical_json_artifact(
         context, _source_schema_payload()
     )
     segment_temp = _temp_path(Path(context.root))
-    stream = _PrefixStream(source, cutoff, segment_temp)
     try:
-        content_descriptor = authority_spool.write_opaque_artifact(
-            context, stream.chunks(), format="csv"
-        )
-        facts = stream.facts
-        if facts is None:
-            _fail("PREFIX_SCAN_DID_NOT_COMPLETE")
-        segments_descriptor = authority_spool.write_opaque_artifact(
-            context, _file_chunks(segment_temp), format="jsonl"
-        )
+        with authority_spool.reserve_transient_publication(
+            context
+        ) as transient:
+            try:
+                stream = _PrefixStream(
+                    source,
+                    cutoff,
+                    segment_temp,
+                    transient,
+                )
+                content_descriptor = authority_spool.write_opaque_artifact(
+                    context, stream.chunks(), format="csv"
+                )
+                facts = stream.facts
+                if facts is None:
+                    _fail("PREFIX_SCAN_DID_NOT_COMPLETE")
+                segments_descriptor = authority_spool.write_opaque_artifact(
+                    context, _file_chunks(segment_temp), format="jsonl"
+                )
+            finally:
+                try:
+                    segment_temp.unlink(missing_ok=True)
+                except OSError as exc:
+                    raise NativePrefixError(
+                        "PREFIX_SEGMENT_TEMP_CLEANUP_FAILED"
+                    ) from exc
+                transient.cancel_after_cleanup()
     except authority_spool.AuthoritySpoolError as exc:
         raise NativePrefixError(f"PREFIX_SPOOL_FAILURE:{exc}") from exc
-    finally:
-        try:
-            segment_temp.unlink(missing_ok=True)
-        except OSError:
-            pass
     if (
         segments_descriptor["sha256"] != facts.segment_sha256
         or segments_descriptor["size_bytes"] != facts.segment_bytes
     ):
         _fail("PREFIX_SEGMENT_DESCRIPTOR_MISMATCH")
 
-    policy = {
-        "schema_version": PREFIX_CONTINUITY_POLICY_SCHEMA,
-        "symbol": canonical_symbol,
-        "timeframe": canonical_timeframe,
-        "cutoff_utc": _iso(cutoff),
-        "activation_manifest_sha256": source.activation_manifest_sha256,
-        "activation_entry_sha256": source.activation_entry_sha256,
-        "source_artifact_sha256": source.bars_sha256,
-        "source_provenance_sha256": source.provenance_sha256,
-        "source_identity_sha256": source.source_identity_sha256,
-        "request_map_sha256": source.request_map_sha256,
-        "prefix_schema_sha256": schema_descriptor["sha256"],
-        "prefix_content_sha256": content_descriptor["sha256"],
-        "prefix_rows": facts.prefix_rows,
-        "nominal_timeframe_seconds": TIMEFRAME_SECONDS[canonical_timeframe],
-        "overlap_allowed": False,
-        "resampling_allowed": False,
-    }
-    policy_descriptor = authority_spool.write_canonical_json_artifact(context, policy)
-    geometry = {
-        "schema_version": PREFIX_CONTINUITY_RECEIPT_SCHEMA,
-        "symbol": canonical_symbol,
-        "timeframe": canonical_timeframe,
-        "prefix_content_sha256": content_descriptor["sha256"],
-        "prefix_rows": facts.prefix_rows,
-        "first_open_utc": facts.first_open_utc,
-        "last_open_utc": facts.last_open_utc,
-        "last_close_utc": facts.last_close_utc,
-        "segment_count": facts.segment_count,
-        "gap_count": facts.gap_count,
-        "segments_sha256": segments_descriptor["sha256"],
-    }
-    geometry_sha = _sha_json(geometry)
-    internal = (
-        "CONTINUOUS"
-        if facts.gap_count == 0
-        else "EXPECTED_AUTHENTICATED_DISCONTINUITIES"
+    index_descriptor = _write_available_prefix_index(
+        context=context,
+        source=source,
+        symbol=canonical_symbol,
+        timeframe=canonical_timeframe,
+        cutoff_utc=_iso(cutoff),
+        source_accessed_at_utc=_iso(accessed),
+        boundary_status=boundary_status,
+        schema_descriptor=schema_descriptor,
+        content_descriptor=content_descriptor,
+        segments_descriptor=segments_descriptor,
+        facts=facts,
     )
-    continuity_receipt = {
-        **geometry,
-        "policy_sha256": policy_descriptor["sha256"],
-        "geometry_sha256": geometry_sha,
-        "internal_status": internal,
-        "boundary_status": boundary_status,
-        "unexplained_discontinuity_count": 0,
-        "requires_preserved_segment_ledger": facts.gap_count > 0,
-        "source_activation_authenticated": True,
-        "grants_search_authority": False,
-        "grants_trading_authority": False,
-    }
-    receipt_descriptor = authority_spool.write_canonical_json_artifact(
-        context, continuity_receipt
-    )
-    index = {
-        "schema_version": PREFIX_INDEX_SCHEMA,
-        "authority_scope": PREFIX_AUTHORITY_SCOPE,
-        "source_state": AVAILABLE,
-        "source_reason": None,
-        "symbol": canonical_symbol,
-        "timeframe": canonical_timeframe,
-        "cutoff_utc": _iso(cutoff),
-        "source_accessed_at_utc": _iso(accessed),
-        "activation": _activation_mapping(source),
-        "source": _source_mapping(source),
-        "prefix": {
-            "schema": schema_descriptor,
-            "content": content_descriptor,
-            "segments": segments_descriptor,
-            "prefix_rows": facts.prefix_rows,
-            "prefix_start_utc": facts.first_open_utc,
-            "prefix_end_exclusive_utc": facts.last_close_utc,
-            "prefix_first_open_utc": facts.first_open_utc,
-            "prefix_last_open_utc": facts.last_open_utc,
-            "prefix_last_close_utc": facts.last_close_utc,
-        },
-        "continuity": {
-            "policy": policy_descriptor,
-            "receipt": receipt_descriptor,
-            "geometry_sha256": geometry_sha,
-            "internal_status": internal,
-            "boundary_status": boundary_status,
-            "unexplained_discontinuity_count": 0,
-            "segment_count": facts.segment_count,
-            "gap_count": facts.gap_count,
-            "requires_preserved_segment_ledger": facts.gap_count > 0,
-        },
-        "terminal_receipt": None,
-        "grants_search_authority": False,
-        "grants_trading_authority": False,
-    }
-    index_descriptor = authority_spool.write_canonical_json_artifact(context, index)
-    return verify_activated_native_prefix(
+    return _verify_activated_native_prefix_single(
         data_dir=Path(data_dir),
         context=context,
         index_descriptor=index_descriptor,
@@ -1736,11 +2717,15 @@ def _terminal_seed(
         "timeframe": timeframe,
         "cutoff_utc": cutoff_utc,
         "resolver_errors": list(errors),
-        "binding_mode": "FAIL_CLOSED_DERIVED_SENTINELS_NOT_SOURCE_ASSERTIONS",
+        "binding_mode": (
+            "AUTHENTICATED_ACTIVATION_TERMINAL_TECHNICAL"
+            if state == TECHNICAL_TERMINAL
+            else "FAIL_CLOSED_DERIVED_SENTINELS_NOT_SOURCE_ASSERTIONS"
+        ),
     }
 
 
-def _produce_terminal_prefix(
+def _stage_terminal_prefix(
     *,
     data_dir: Path,
     context: authority_spool.GenerationSpoolContext,
@@ -1750,9 +2735,12 @@ def _produce_terminal_prefix(
     cutoff_utc: str,
     source_accessed_at_utc: str,
     source_state: str,
-    production_contract_required: bool,
-) -> NativePrefixProduct:
-    if source_state not in {SOURCE_UNAVAILABLE, TECHNICAL_FAILURE}:
+) -> dict[str, Any]:
+    if source_state not in {
+        SOURCE_UNAVAILABLE,
+        TECHNICAL_TERMINAL,
+        TECHNICAL_FAILURE,
+    }:
         _fail("PREFIX_TERMINAL_STATE_INVALID")
     errors = tuple(str(value) for value in resolution.errors) or (
         "NATIVE_ACTIVE_RESOLUTION_EMPTY_FAILURE",
@@ -1765,6 +2753,9 @@ def _produce_terminal_prefix(
         errors=errors,
     )
     seed_sha = _sha_json(seed)
+    authenticated_terminal_technical = source_state == TECHNICAL_TERMINAL
+    if authenticated_terminal_technical and not resolution.activation_id:
+        _fail("PREFIX_TECHNICAL_TERMINAL_ACTIVATION_ID_MISSING")
     activation_id = str(
         resolution.activation_id or f"technical-unbound-{seed_sha[:16]}"
     )
@@ -1801,17 +2792,28 @@ def _produce_terminal_prefix(
                 if isinstance(symbol_entries, Mapping)
                 else None
             )
-            if observed_manifest_sha == manifest_sha and isinstance(entry, Mapping):
+            if observed_manifest_sha != manifest_sha:
+                _fail("PREFIX_TERMINAL_ACTIVATION_MANIFEST_SHA_MISMATCH")
+            if isinstance(entry, Mapping):
                 entry_sha = _sha_json(dict(entry))
+            elif authenticated_terminal_technical:
+                _fail("PREFIX_TECHNICAL_TERMINAL_ACTIVATION_ENTRY_MISSING")
+            if authenticated_terminal_technical and (
+                str(manifest.get("activation_id") or "") != activation_id
+                or str((entry or {}).get("status") or "").lower() != "technical_error"
+            ):
+                _fail("PREFIX_TECHNICAL_TERMINAL_ACTIVATION_BINDING_INVALID")
             raw_run_relative = manifest.get("run_manifest_relative_path")
             raw_run_sha = manifest.get("run_manifest_sha256")
             if isinstance(raw_run_relative, str) and _is_sha(raw_run_sha):
                 run_manifest_relative = raw_run_relative
                 run_manifest_sha = str(raw_run_sha)
         except NativePrefixError:
-            if source_state == SOURCE_UNAVAILABLE:
+            if source_state in {SOURCE_UNAVAILABLE, TECHNICAL_TERMINAL}:
                 raise
             manifest_relative = None
+    elif authenticated_terminal_technical:
+        _fail("PREFIX_TECHNICAL_TERMINAL_ACTIVATION_MANIFEST_MISSING")
     request_end = _parse_utc(cutoff_utc, "PREFIX_CUTOFF_INVALID")
     request_start = request_end - timedelta(seconds=TIMEFRAME_SECONDS[timeframe])
     request_map_sha = _sha_json({"domain": "terminal-request-map", "seed": seed})
@@ -1934,15 +2936,49 @@ def _produce_terminal_prefix(
         "grants_trading_authority": False,
     }
     index_descriptor = authority_spool.write_canonical_json_artifact(context, index)
-    return verify_activated_native_prefix(
+    return _candidate_from_descriptor(
+        symbol=symbol,
+        timeframe=timeframe,
+        cutoff_utc=cutoff_utc,
+        source_state=source_state,
+        index_descriptor=index_descriptor,
+        activation_manifest_sha256=manifest_sha,
+    )
+
+
+def _produce_terminal_prefix(
+    *,
+    data_dir: Path,
+    context: authority_spool.GenerationSpoolContext,
+    resolution: ActiveNativeResolution,
+    symbol: str,
+    timeframe: str,
+    cutoff_utc: str,
+    source_accessed_at_utc: str,
+    source_state: str,
+    production_contract_required: bool,
+) -> NativePrefixProduct:
+    candidate = _stage_terminal_prefix(
         data_dir=data_dir,
         context=context,
-        index_descriptor=index_descriptor,
-        expected_index_sha256=index_descriptor["sha256"],
+        resolution=resolution,
+        symbol=symbol,
+        timeframe=timeframe,
+        cutoff_utc=cutoff_utc,
+        source_accessed_at_utc=source_accessed_at_utc,
+        source_state=source_state,
+    )
+    return _verify_activated_native_prefix_single(
+        data_dir=data_dir,
+        context=context,
+        index_descriptor=candidate["index_descriptor"],
+        expected_index_sha256=candidate["index_sha256"],
         expected_symbol=symbol,
         expected_timeframe=timeframe,
         expected_cutoff_utc=cutoff_utc,
-        expected_activation_manifest_sha256=manifest_sha,
+        expected_activation_manifest_sha256=candidate[
+            "activation_manifest_sha256"
+        ],
         production_contract_required=production_contract_required,
         require_current_activation=True,
     )
@@ -1993,9 +3029,8 @@ def _cutoff_terminal_seed(
     }
 
 
-def _produce_cutoff_unavailable_prefix(
+def _stage_cutoff_unavailable_prefix(
     *,
-    data_dir: Path,
     context: authority_spool.GenerationSpoolContext,
     source: _SourceBinding,
     symbol: str,
@@ -2003,8 +3038,7 @@ def _produce_cutoff_unavailable_prefix(
     cutoff_utc: str,
     source_accessed_at_utc: str,
     boundary: _AvailableHistoryBoundary,
-    production_contract_required: bool,
-) -> NativePrefixProduct:
+) -> dict[str, Any]:
     """Seal a source-bound no-closed-row state for a pre-boundary cutoff."""
 
     cutoff = _parse_utc(cutoff_utc, "PREFIX_CUTOFF_INVALID")
@@ -2112,11 +3146,42 @@ def _produce_cutoff_unavailable_prefix(
         "grants_trading_authority": False,
     }
     index_descriptor = authority_spool.write_canonical_json_artifact(context, index)
-    return verify_activated_native_prefix(
+    return _candidate_from_descriptor(
+        symbol=symbol,
+        timeframe=timeframe,
+        cutoff_utc=cutoff_utc,
+        source_state=SOURCE_UNAVAILABLE,
+        index_descriptor=index_descriptor,
+        activation_manifest_sha256=source.activation_manifest_sha256,
+    )
+
+
+def _produce_cutoff_unavailable_prefix(
+    *,
+    data_dir: Path,
+    context: authority_spool.GenerationSpoolContext,
+    source: _SourceBinding,
+    symbol: str,
+    timeframe: str,
+    cutoff_utc: str,
+    source_accessed_at_utc: str,
+    boundary: _AvailableHistoryBoundary,
+    production_contract_required: bool,
+) -> NativePrefixProduct:
+    candidate = _stage_cutoff_unavailable_prefix(
+        context=context,
+        source=source,
+        symbol=symbol,
+        timeframe=timeframe,
+        cutoff_utc=cutoff_utc,
+        source_accessed_at_utc=source_accessed_at_utc,
+        boundary=boundary,
+    )
+    return _verify_activated_native_prefix_single(
         data_dir=data_dir,
         context=context,
-        index_descriptor=index_descriptor,
-        expected_index_sha256=index_descriptor["sha256"],
+        index_descriptor=candidate["index_descriptor"],
+        expected_index_sha256=candidate["index_sha256"],
         expected_symbol=symbol,
         expected_timeframe=timeframe,
         expected_cutoff_utc=cutoff_utc,
@@ -2161,52 +3226,28 @@ def _compare_available_prefix(
     cutoff: datetime,
     segments_descriptor: Mapping[str, Any],
 ) -> _PrefixFacts:
-    segment_temp = _temp_path(content_path.parent)
-    # Reuse the exact source scanner and compare its yielded prefix bytes to
-    # the persisted content rather than trusting producer counters.
-    stream = _PrefixStream(source, cutoff, segment_temp)
-    prefix_handle, prefix_identity = _open_regular(
-        content_path, maximum_bytes=MAX_SOURCE_BYTES, code="PREFIX_CONTENT"
+    target = _BatchPrefixTarget(
+        cutoff=cutoff,
+        content_path=content_path,
+        segment_path=None,
+        compare_existing=True,
     )
-    prefix_digest = hashlib.sha256()
-    prefix_bytes = 0
-    try:
-        for expected in stream.chunks():
-            observed = prefix_handle.read(len(expected))
-            if observed != expected:
-                _fail("PREFIX_CONTENT_NOT_EXACT_SOURCE_PREFIX")
-            prefix_digest.update(observed)
-            prefix_bytes += len(observed)
-        if prefix_handle.read(1):
-            _fail("PREFIX_CONTENT_HAS_EXTRA_BYTES")
-        _verify_open_identity(
-            content_path, prefix_handle, prefix_identity, "PREFIX_CONTENT_CHANGED"
-        )
-    finally:
-        prefix_handle.close()
-    facts = stream.facts
-    if facts is None:
-        _fail("PREFIX_VERIFY_SCAN_DID_NOT_COMPLETE")
+    facts = _scan_prefix_targets(
+        source,
+        (target,),
+    )[0]
     normalized_segments = _descriptor(
         dict(segments_descriptor), expected_format="jsonl"
     )
-    try:
-        raw, segment_sha = _read_regular(
-            segment_temp,
-            maximum_bytes=MAX_SOURCE_BYTES,
-            code="PREFIX_RECOMPUTED_SEGMENTS",
-        )
-        if (
-            segment_sha != normalized_segments["sha256"]
-            or len(raw) != normalized_segments["size_bytes"]
-        ):
-            _fail("PREFIX_SEGMENT_LEDGER_RECOMPUTATION_MISMATCH")
-    finally:
-        segment_temp.unlink(missing_ok=True)
+    if (
+        facts.segment_sha256 != normalized_segments["sha256"]
+        or facts.segment_bytes != normalized_segments["size_bytes"]
+    ):
+        _fail("PREFIX_SEGMENT_LEDGER_RECOMPUTATION_MISMATCH")
     return facts
 
 
-def verify_activated_native_prefix(
+def _verify_activated_native_prefix_single(
     *,
     data_dir: Path,
     context: authority_spool.GenerationSpoolContext,
@@ -2218,6 +3259,9 @@ def verify_activated_native_prefix(
     expected_activation_manifest_sha256: str,
     production_contract_required: bool = True,
     require_current_activation: bool = False,
+    _batch_available_evidence: _BatchAvailableEvidence | None = None,
+    _batch_terminal_resolution: ActiveNativeResolution | None = None,
+    _batch_cutoff_terminal_resolution: ActiveNativeResolution | None = None,
 ) -> NativePrefixProduct:
     """Reopen and independently verify a native-prefix product from bytes."""
 
@@ -2256,63 +3300,80 @@ def verify_activated_native_prefix(
     verified_prefix_descriptor: Mapping[str, Any] | None = None
     if state == AVAILABLE:
         if (
+            _batch_terminal_resolution is not None
+            or _batch_cutoff_terminal_resolution is not None
+        ):
+            _fail("PREFIX_BATCH_TERMINAL_EVIDENCE_STATE_MISMATCH")
+        if (
             index.get("source_reason") is not None
             or index.get("terminal_receipt") is not None
         ):
             _fail("PREFIX_AVAILABLE_TERMINAL_FIELDS_INVALID")
-        resolution = resolve_active_native_artifact(
-            Path(data_dir),
-            symbol,
-            timeframe,
-            production_contract_required=production_contract_required,
-        )
-        if require_current_activation and not resolution.valid:
-            _fail("PREFIX_CURRENT_ACTIVATION_INVALID")
-        if not resolution.valid:
-            # Pinned historical activations remain verifiable after ACTIVE.json
-            # advances only when their exact manifest and leaf bytes remain.
-            resolution = ActiveNativeResolution(
-                symbol=symbol,
-                timeframe=timeframe,
-                data_path=(
-                    Path(data_dir) / "native" / index["source"]["bars_relative_path"]
-                ),
-                sidecar_path=(
-                    Path(data_dir)
-                    / "native"
-                    / index["source"]["audit_sidecar_relative_path"]
-                ),
-                activation_id=activation["activation_id"],
-                activation_manifest_path=(
-                    Path(data_dir) / "native" / activation["manifest_relative_path"]
-                ),
-                activation_manifest_sha256=activation["manifest_sha256"],
-                entry={},
+        if _batch_available_evidence is None:
+            resolution = resolve_active_native_artifact(
+                Path(data_dir),
+                symbol,
+                timeframe,
+                production_contract_required=production_contract_required,
             )
-        source = _source_binding(Path(data_dir), resolution, symbol, timeframe)
+            if require_current_activation and not resolution.valid:
+                _fail("PREFIX_CURRENT_ACTIVATION_INVALID")
+            if not resolution.valid:
+                # Pinned historical activations remain verifiable after ACTIVE.json
+                # advances only when their exact manifest and leaf bytes remain.
+                resolution = ActiveNativeResolution(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    data_path=(
+                        Path(data_dir)
+                        / "native"
+                        / index["source"]["bars_relative_path"]
+                    ),
+                    sidecar_path=(
+                        Path(data_dir)
+                        / "native"
+                        / index["source"]["audit_sidecar_relative_path"]
+                    ),
+                    activation_id=activation["activation_id"],
+                    activation_manifest_path=(
+                        Path(data_dir)
+                        / "native"
+                        / activation["manifest_relative_path"]
+                    ),
+                    activation_manifest_sha256=activation["manifest_sha256"],
+                    entry={},
+                )
+            source = _source_binding(Path(data_dir), resolution, symbol, timeframe)
+        else:
+            source = _batch_available_evidence.source
         instrument_snapshot = dict(source.instrument_snapshot)
         if (
             _activation_mapping(source) != activation
             or _source_mapping(source) != index["source"]
         ):
             _fail("PREFIX_INDEX_SOURCE_BINDING_MISMATCH")
-        first_source_bar = _first_source_bar(source)
-        if cutoff < first_source_bar.closed:
-            _fail("PREFIX_AVAILABLE_BEFORE_FIRST_AUTHENTICATED_BAR_CLOSE")
-        available_boundary: _AvailableHistoryBoundary | None = None
-        if _available_history_boundary_required(
-            source,
-            expected_first=first_source_bar,
-        ):
-            available_boundary = _available_history_boundary(
+        if _batch_available_evidence is None:
+            first_source_bar = _first_source_bar(source)
+            if cutoff < first_source_bar.closed:
+                _fail("PREFIX_AVAILABLE_BEFORE_FIRST_AUTHENTICATED_BAR_CLOSE")
+            available_boundary: _AvailableHistoryBoundary | None = None
+            if _available_history_boundary_required(
                 source,
-                symbol=symbol,
-                timeframe=timeframe,
                 expected_first=first_source_bar,
+            ):
+                available_boundary = _available_history_boundary(
+                    source,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    expected_first=first_source_bar,
+                )
+            boundary_status = _available_boundary_status(
+                source,
+                expected_first=first_source_bar,
+                available_boundary=available_boundary,
             )
-        boundary_status = (
-            "LEFT_TRUNCATED" if available_boundary is not None else "COMPLETE"
-        )
+        else:
+            boundary_status = _batch_available_evidence.boundary_status
         prefix = index["prefix"]
         schema_descriptor, schema_raw = _read_spool_descriptor(
             context,
@@ -2335,12 +3396,22 @@ def verify_activated_native_prefix(
         )
         verified_prefix_path = content_path
         verified_prefix_descriptor = content_descriptor
-        facts = _compare_available_prefix(
-            source=source,
-            content_path=content_path,
-            cutoff=cutoff,
-            segments_descriptor=segments_descriptor,
-        )
+        if _batch_available_evidence is None:
+            facts = _compare_available_prefix(
+                source=source,
+                content_path=content_path,
+                cutoff=cutoff,
+                segments_descriptor=segments_descriptor,
+            )
+        else:
+            if (
+                content_descriptor
+                != dict(_batch_available_evidence.content_descriptor)
+                or segments_descriptor
+                != dict(_batch_available_evidence.segments_descriptor)
+            ):
+                _fail("PREFIX_BATCH_EVIDENCE_DESCRIPTOR_MISMATCH")
+            facts = _batch_available_evidence.facts
         if facts.prefix_rows != prefix["prefix_rows"] or (
             facts.first_open_utc,
             facts.last_open_utc,
@@ -2455,6 +3526,8 @@ def verify_activated_native_prefix(
             )
         )
     else:
+        if _batch_available_evidence is not None:
+            _fail("PREFIX_BATCH_EVIDENCE_STATE_MISMATCH")
         if type(index.get("source_reason")) is not str or not index["source_reason"]:
             _fail("PREFIX_TERMINAL_REASON_INVALID")
         segments_descriptor, segments_raw = _read_spool_descriptor(
@@ -2491,23 +3564,28 @@ def verify_activated_native_prefix(
             terminal_raw, maximum_bytes=MAX_INDEX_BYTES, canonical=True
         )
         if terminal.get("schema_version") == PREFIX_CUTOFF_TERMINAL_RECEIPT_SCHEMA:
-            try:
-                observed_resolution = resolve_active_native_artifact(
-                    Path(data_dir),
-                    symbol,
-                    timeframe,
-                    production_contract_required=production_contract_required,
-                )
-            except Exception as exc:
-                if require_current_activation:
-                    raise NativePrefixError(
-                        "PREFIX_CUTOFF_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
-                    ) from exc
-                observed_resolution = ActiveNativeResolution(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    errors=["PINNED_ACTIVATION_REOPEN_REQUIRED"],
-                )
+            if _batch_terminal_resolution is not None:
+                _fail("PREFIX_BATCH_TERMINAL_EVIDENCE_KIND_MISMATCH")
+            if _batch_cutoff_terminal_resolution is None:
+                try:
+                    observed_resolution = resolve_active_native_artifact(
+                        Path(data_dir),
+                        symbol,
+                        timeframe,
+                        production_contract_required=production_contract_required,
+                    )
+                except Exception as exc:
+                    if require_current_activation:
+                        raise NativePrefixError(
+                            "PREFIX_CUTOFF_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
+                        ) from exc
+                    observed_resolution = ActiveNativeResolution(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        errors=["PINNED_ACTIVATION_REOPEN_REQUIRED"],
+                    )
+            else:
+                observed_resolution = _batch_cutoff_terminal_resolution
             if require_current_activation and not observed_resolution.valid:
                 _fail("PREFIX_CUTOFF_TERMINAL_CURRENT_ACTIVATION_INVALID")
             if not observed_resolution.valid or (
@@ -2680,28 +3758,24 @@ def verify_activated_native_prefix(
                 _data_dir=Path(data_dir).resolve(strict=False),
                 _production_contract_required=production_contract_required,
             )
-        if require_current_activation:
-            try:
-                observed_resolution = resolve_active_native_artifact(
-                    Path(data_dir),
-                    symbol,
-                    timeframe,
-                    production_contract_required=production_contract_required,
-                )
-            except Exception as exc:
-                raise NativePrefixError(
-                    "PREFIX_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
-                ) from exc
-            observed_state = (
-                AVAILABLE
-                if observed_resolution.valid
-                else (
-                    SOURCE_UNAVAILABLE
-                    if observed_resolution.errors
-                    == ["NATIVE_ACTIVE_CELL_SOURCE_UNAVAILABLE"]
-                    else TECHNICAL_FAILURE
-                )
-            )
+        if _batch_cutoff_terminal_resolution is not None:
+            _fail("PREFIX_BATCH_TERMINAL_EVIDENCE_KIND_MISMATCH")
+        if require_current_activation or _batch_terminal_resolution is not None:
+            if _batch_terminal_resolution is None:
+                try:
+                    observed_resolution = resolve_active_native_artifact(
+                        Path(data_dir),
+                        symbol,
+                        timeframe,
+                        production_contract_required=production_contract_required,
+                    )
+                except Exception as exc:
+                    raise NativePrefixError(
+                        "PREFIX_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
+                    ) from exc
+            else:
+                observed_resolution = _batch_terminal_resolution
+            observed_state = _resolved_source_state(observed_resolution)
             if observed_state != state or list(observed_resolution.errors) != list(
                 terminal.get("resolver_errors") or []
             ):
@@ -2804,7 +3878,11 @@ def verify_activated_native_prefix(
             "timeframe": timeframe,
             "cutoff_utc": _iso(cutoff),
             "resolver_errors": terminal.get("resolver_errors"),
-            "binding_mode": "FAIL_CLOSED_DERIVED_SENTINELS_NOT_SOURCE_ASSERTIONS",
+            "binding_mode": (
+                "AUTHENTICATED_ACTIVATION_TERMINAL_TECHNICAL"
+                if state == TECHNICAL_TERMINAL
+                else "FAIL_CLOSED_DERIVED_SENTINELS_NOT_SOURCE_ASSERTIONS"
+            ),
         }
         for key, value in expected_terminal_subset.items():
             if terminal.get(key) != value:
@@ -2854,6 +3932,434 @@ def verify_activated_native_prefix(
     )
 
 
+def _normalized_candidate(value: Mapping[str, Any]) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != {
+        "schema_version",
+        "symbol",
+        "timeframe",
+        "cutoff_utc",
+        "source_state",
+        "index_descriptor",
+        "index_sha256",
+        "activation_manifest_sha256",
+    }:
+        _fail("PREFIX_CANDIDATE_INVALID")
+    owned = json.loads(_canonical_bytes(value).decode("ascii"))
+    if (
+        owned.get("schema_version") != PREFIX_CANDIDATE_SCHEMA
+        or owned.get("source_state") not in SOURCE_STATES
+        or dict(owned.get("index_descriptor") or {}).get("sha256")
+        != owned.get("index_sha256")
+    ):
+        _fail("PREFIX_CANDIDATE_INVALID")
+    _symbol(owned.get("symbol"))
+    _timeframe(owned.get("timeframe"))
+    _parse_utc(owned.get("cutoff_utc"), "PREFIX_CANDIDATE_CUTOFF_INVALID")
+    _digest(owned.get("index_sha256"), "PREFIX_CANDIDATE_INDEX_INVALID")
+    _digest(
+        owned.get("activation_manifest_sha256"),
+        "PREFIX_CANDIDATE_ACTIVATION_INVALID",
+    )
+    return owned
+
+
+def verify_activated_native_prefix_candidates(
+    *,
+    data_dir: Path,
+    context: authority_spool.GenerationSpoolContext,
+    symbol: str,
+    timeframe: str,
+    candidates: Sequence[Mapping[str, Any]],
+    production_contract_required: bool = True,
+    require_current_activation: bool = False,
+    cancellation_event: threading.Event | None = None,
+) -> tuple[NativePrefixProduct, ...]:
+    """Independently replay all AVAILABLE candidates in one source pass."""
+
+    canonical_symbol = _symbol(symbol)
+    canonical_timeframe = _timeframe(timeframe)
+    if type(candidates) not in {list, tuple} or not 1 <= len(candidates) <= 16:
+        _fail("PREFIX_CANDIDATE_BATCH_INVALID")
+    owned = tuple(_normalized_candidate(value) for value in candidates)
+    if any(
+        value["symbol"] != canonical_symbol
+        or value["timeframe"] != canonical_timeframe
+        for value in owned
+    ):
+        _fail("PREFIX_CANDIDATE_BATCH_CELL_MISMATCH")
+    _batch_checkpoint(cancellation_event)
+
+    indexes: list[dict[str, Any]] = []
+    for value in owned:
+        _batch_checkpoint(cancellation_event)
+        normalized_index, raw = _read_spool_descriptor(
+            context,
+            value["index_descriptor"],
+            expected_format=authority_spool.CANONICAL_JSON_FORMAT,
+            collect=True,
+        )
+        if (
+            normalized_index["sha256"] != value["index_sha256"]
+            or raw is None
+        ):
+            _fail("PREFIX_CANDIDATE_INDEX_MISMATCH")
+        index = _strict_json(raw, maximum_bytes=MAX_INDEX_BYTES, canonical=True)
+        _validate_index_shape(index)
+        if (
+            index.get("symbol") != canonical_symbol
+            or index.get("timeframe") != canonical_timeframe
+            or index.get("cutoff_utc") != value["cutoff_utc"]
+            or index.get("source_state") != value["source_state"]
+            or index["activation"].get("manifest_sha256")
+            != value["activation_manifest_sha256"]
+        ):
+            _fail("PREFIX_CANDIDATE_INDEX_BINDING_MISMATCH")
+        indexes.append(index)
+        _batch_checkpoint(cancellation_event)
+
+    available_ordinals = [
+        ordinal
+        for ordinal, index in enumerate(indexes)
+        if index["source_state"] == AVAILABLE
+    ]
+    generic_terminal_ordinals = {
+        ordinal
+        for ordinal, index in enumerate(indexes)
+        if index["source_state"] != AVAILABLE
+        and index["source"]["bars_relative_path"] is None
+    }
+    cutoff_terminal_ordinals = {
+        ordinal
+        for ordinal, index in enumerate(indexes)
+        if index["source_state"] != AVAILABLE
+        and index["source"]["bars_relative_path"] is not None
+    }
+    terminal_resolution: ActiveNativeResolution | None = None
+    if generic_terminal_ordinals and require_current_activation:
+        _batch_checkpoint(cancellation_event)
+        try:
+            terminal_resolution = resolve_active_native_artifact(
+                Path(data_dir),
+                canonical_symbol,
+                canonical_timeframe,
+                production_contract_required=production_contract_required,
+            )
+        except Exception as exc:
+            raise NativePrefixError(
+                "PREFIX_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
+            ) from exc
+        _batch_checkpoint(cancellation_event)
+    evidence: dict[int, _BatchAvailableEvidence] = {}
+    cutoff_terminal_resolution: ActiveNativeResolution | None = None
+    if available_ordinals:
+        first_index = indexes[available_ordinals[0]]
+        activation = first_index["activation"]
+        _batch_checkpoint(cancellation_event)
+        resolution = resolve_active_native_artifact(
+            Path(data_dir),
+            canonical_symbol,
+            canonical_timeframe,
+            production_contract_required=production_contract_required,
+        )
+        _batch_checkpoint(cancellation_event)
+        if require_current_activation and not resolution.valid:
+            _fail("PREFIX_CURRENT_ACTIVATION_INVALID")
+        if not resolution.valid:
+            resolution = ActiveNativeResolution(
+                symbol=canonical_symbol,
+                timeframe=canonical_timeframe,
+                data_path=(
+                    Path(data_dir)
+                    / "native"
+                    / first_index["source"]["bars_relative_path"]
+                ),
+                sidecar_path=(
+                    Path(data_dir)
+                    / "native"
+                    / first_index["source"]["audit_sidecar_relative_path"]
+                ),
+                activation_id=activation["activation_id"],
+                activation_manifest_path=(
+                    Path(data_dir) / "native" / activation["manifest_relative_path"]
+                ),
+                activation_manifest_sha256=activation["manifest_sha256"],
+                entry={},
+            )
+        source = _source_binding(
+            Path(data_dir),
+            resolution,
+            canonical_symbol,
+            canonical_timeframe,
+        )
+        cutoff_terminal_resolution = resolution
+        first_source_bar = _first_source_bar(source)
+        available_boundary: _AvailableHistoryBoundary | None = None
+        if _available_history_boundary_required(
+            source,
+            expected_first=first_source_bar,
+        ):
+            available_boundary = _available_history_boundary(
+                source,
+                symbol=canonical_symbol,
+                timeframe=canonical_timeframe,
+                expected_first=first_source_bar,
+            )
+        boundary_status = _available_boundary_status(
+            source,
+            expected_first=first_source_bar,
+            available_boundary=available_boundary,
+        )
+        targets: list[_BatchPrefixTarget] = []
+        descriptors: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        try:
+            for ordinal in available_ordinals:
+                index = indexes[ordinal]
+                if (
+                    _activation_mapping(source) != index["activation"]
+                    or _source_mapping(source) != index["source"]
+                ):
+                    _fail("PREFIX_INDEX_SOURCE_BINDING_MISMATCH")
+                cutoff = _parse_utc(
+                    index["cutoff_utc"],
+                    "PREFIX_EXPECTED_CUTOFF_INVALID",
+                )
+                if cutoff < first_source_bar.closed:
+                    _fail("PREFIX_AVAILABLE_BEFORE_FIRST_AUTHENTICATED_BAR_CLOSE")
+                content_descriptor, _ = _read_spool_descriptor(
+                    context,
+                    index["prefix"]["content"],
+                    expected_format="csv",
+                    collect=False,
+                )
+                segments_descriptor, _ = _read_spool_descriptor(
+                    context,
+                    index["prefix"]["segments"],
+                    expected_format="jsonl",
+                    collect=False,
+                )
+                _, content_path = _safe_relative(
+                    Path(context.root),
+                    content_descriptor["relative_path"],
+                    "PREFIX_CONTENT_PATH_INVALID",
+                )
+                targets.append(
+                    _BatchPrefixTarget(
+                        cutoff=cutoff,
+                        content_path=content_path,
+                        segment_path=None,
+                        compare_existing=True,
+                    )
+                )
+                descriptors.append((content_descriptor, segments_descriptor))
+            facts_values = _scan_prefix_targets(
+                source,
+                targets,
+                cancellation_event=cancellation_event,
+            )
+        except Exception:
+            for target in targets:
+                try:
+                    target.close()
+                except Exception:
+                    pass
+            raise
+        for ordinal, facts, pair in zip(
+            available_ordinals,
+            facts_values,
+            descriptors,
+            strict=True,
+        ):
+            content_descriptor, segments_descriptor = pair
+            if (
+                facts.segment_sha256 != segments_descriptor["sha256"]
+                or facts.segment_bytes != segments_descriptor["size_bytes"]
+            ):
+                _fail("PREFIX_SEGMENT_LEDGER_RECOMPUTATION_MISMATCH")
+            evidence[ordinal] = _BatchAvailableEvidence(
+                source=source,
+                facts=facts,
+                content_descriptor=content_descriptor,
+                segments_descriptor=segments_descriptor,
+                boundary_status=boundary_status,
+            )
+    if cutoff_terminal_ordinals and cutoff_terminal_resolution is None:
+        _batch_checkpoint(cancellation_event)
+        try:
+            cutoff_terminal_resolution = resolve_active_native_artifact(
+                Path(data_dir),
+                canonical_symbol,
+                canonical_timeframe,
+                production_contract_required=production_contract_required,
+            )
+        except Exception as exc:
+            if require_current_activation:
+                raise NativePrefixError(
+                    "PREFIX_CUTOFF_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
+                ) from exc
+            cutoff_terminal_resolution = ActiveNativeResolution(
+                symbol=canonical_symbol,
+                timeframe=canonical_timeframe,
+                errors=["PINNED_ACTIVATION_REOPEN_REQUIRED"],
+            )
+        _batch_checkpoint(cancellation_event)
+
+    products: list[NativePrefixProduct] = []
+    for ordinal, value in enumerate(owned):
+        _batch_checkpoint(cancellation_event)
+        products.append(
+            _verify_activated_native_prefix_single(
+                data_dir=Path(data_dir),
+                context=context,
+                index_descriptor=value["index_descriptor"],
+                expected_index_sha256=value["index_sha256"],
+                expected_symbol=canonical_symbol,
+                expected_timeframe=canonical_timeframe,
+                expected_cutoff_utc=value["cutoff_utc"],
+                expected_activation_manifest_sha256=value[
+                    "activation_manifest_sha256"
+                ],
+                production_contract_required=production_contract_required,
+                require_current_activation=require_current_activation,
+                _batch_available_evidence=evidence.get(ordinal),
+                _batch_terminal_resolution=(
+                    terminal_resolution
+                    if ordinal in generic_terminal_ordinals
+                    else None
+                ),
+                _batch_cutoff_terminal_resolution=(
+                    cutoff_terminal_resolution
+                    if ordinal in cutoff_terminal_ordinals
+                    else None
+                ),
+            )
+        )
+        _batch_checkpoint(cancellation_event)
+    return tuple(products)
+
+
+def produce_activated_native_prefixes(
+    *,
+    data_dir: Path,
+    context: authority_spool.GenerationSpoolContext,
+    symbol: str,
+    timeframe: str,
+    requests: Sequence[Mapping[str, Any]],
+    production_contract_required: bool = True,
+    cancellation_event: threading.Event | None = None,
+) -> tuple[NativePrefixProduct, ...]:
+    """Produce and independently verify many cutoffs with two source passes."""
+
+    candidates = stage_activated_native_prefixes(
+        data_dir=data_dir,
+        context=context,
+        symbol=symbol,
+        timeframe=timeframe,
+        requests=requests,
+        production_contract_required=production_contract_required,
+        cancellation_event=cancellation_event,
+    )
+    return verify_activated_native_prefix_candidates(
+        data_dir=data_dir,
+        context=context,
+        symbol=symbol,
+        timeframe=timeframe,
+        candidates=candidates,
+        production_contract_required=production_contract_required,
+        require_current_activation=True,
+        cancellation_event=cancellation_event,
+    )
+
+
+def produce_activated_native_prefix(
+    *,
+    data_dir: Path,
+    context: authority_spool.GenerationSpoolContext,
+    symbol: str,
+    timeframe: str,
+    cutoff_utc: str,
+    source_accessed_at_utc: str,
+    production_contract_required: bool = True,
+    cancellation_event: threading.Event | None = None,
+) -> NativePrefixProduct:
+    """Compatibility adapter over the canonical one-cutoff batch."""
+
+    return produce_activated_native_prefixes(
+        data_dir=data_dir,
+        context=context,
+        symbol=symbol,
+        timeframe=timeframe,
+        requests=(
+            {
+                "cutoff_utc": cutoff_utc,
+                "source_accessed_at_utc": source_accessed_at_utc,
+            },
+        ),
+        production_contract_required=production_contract_required,
+        cancellation_event=cancellation_event,
+    )[0]
+
+
+def verify_activated_native_prefix(
+    *,
+    data_dir: Path,
+    context: authority_spool.GenerationSpoolContext,
+    index_descriptor: Mapping[str, Any],
+    expected_index_sha256: str,
+    expected_symbol: str,
+    expected_timeframe: str,
+    expected_cutoff_utc: str,
+    expected_activation_manifest_sha256: str,
+    production_contract_required: bool = True,
+    require_current_activation: bool = False,
+    cancellation_event: threading.Event | None = None,
+) -> NativePrefixProduct:
+    """Compatibility adapter over the canonical one-candidate verifier."""
+
+    return verify_activated_native_prefix_candidates(
+        data_dir=data_dir,
+        context=context,
+        symbol=expected_symbol,
+        timeframe=expected_timeframe,
+        candidates=(
+            {
+                "schema_version": PREFIX_CANDIDATE_SCHEMA,
+                "symbol": expected_symbol,
+                "timeframe": expected_timeframe,
+                "cutoff_utc": expected_cutoff_utc,
+                "source_state": _candidate_source_state(
+                    context,
+                    index_descriptor,
+                    expected_index_sha256,
+                ),
+                "index_descriptor": dict(index_descriptor),
+                "index_sha256": expected_index_sha256,
+                "activation_manifest_sha256": expected_activation_manifest_sha256,
+            },
+        ),
+        production_contract_required=production_contract_required,
+        require_current_activation=require_current_activation,
+        cancellation_event=cancellation_event,
+    )[0]
+
+
+def _candidate_source_state(
+    context: authority_spool.GenerationSpoolContext,
+    descriptor: Mapping[str, Any],
+    expected_sha256: str,
+) -> str:
+    normalized, raw = _read_spool_descriptor(
+        context,
+        dict(descriptor),
+        expected_format=authority_spool.CANONICAL_JSON_FORMAT,
+        collect=True,
+    )
+    if normalized["sha256"] != expected_sha256 or raw is None:
+        _fail("PREFIX_INDEX_SHA_MISMATCH")
+    index = _strict_json(raw, maximum_bytes=MAX_INDEX_BYTES, canonical=True)
+    _validate_index_shape(index)
+    return str(index["source_state"])
+
+
 def reverify_activated_native_prefix_product(
     product: NativePrefixProduct,
     context: authority_spool.GenerationSpoolContext,
@@ -2899,7 +4405,7 @@ def reverify_activated_native_prefix_product(
         != _native_prefix_from_index(index, product.index_sha256)
     ):
         _fail("PREFIX_PRODUCT_INDEX_REPLAY_MISMATCH")
-    return verify_activated_native_prefix(
+    return _verify_activated_native_prefix_single(
         data_dir=product._data_dir,
         context=context,
         index_descriptor=product.index_descriptor,
@@ -3078,7 +4584,7 @@ def open_verified_prefix_frame(product: NativePrefixProduct) -> pd.DataFrame:
     activation = index["activation"]
     source = index["source"]
     result.attrs[NATIVE_SOURCE_BINDING_ATTR] = {
-        "symbol": str(index["symbol"]).upper(),
+        "symbol": str(index["symbol"]),
         "timeframe": str(index["timeframe"]).upper(),
         "activation_id": str(activation["activation_id"]),
         "activation_manifest_sha256": str(activation["manifest_sha256"]).lower(),
@@ -3091,16 +4597,21 @@ def open_verified_prefix_frame(product: NativePrefixProduct) -> pd.DataFrame:
 __all__ = [
     "AVAILABLE",
     "NATIVE_SOURCE_BINDING_ATTR",
+    "PREFIX_CANDIDATE_SCHEMA",
     "PREFIX_CUTOFF_TERMINAL_RECEIPT_SCHEMA",
     "PREFIX_INDEX_SCHEMA",
     "PREFIX_SCHEMA_VERSION",
     "SOURCE_UNAVAILABLE",
     "SOURCE_UNAVAILABLE_AT_CUTOFF",
+    "TECHNICAL_TERMINAL",
     "TECHNICAL_FAILURE",
     "NativePrefixError",
     "NativePrefixProduct",
     "open_verified_prefix_frame",
     "produce_activated_native_prefix",
+    "produce_activated_native_prefixes",
     "reverify_activated_native_prefix_product",
+    "stage_activated_native_prefixes",
     "verify_activated_native_prefix",
+    "verify_activated_native_prefix_candidates",
 ]

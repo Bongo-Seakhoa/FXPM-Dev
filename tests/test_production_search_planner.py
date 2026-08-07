@@ -43,9 +43,7 @@ def test_process_freeze_reopens_exact_100_strategy_domain(tmp_path) -> None:
         "d4d8ae2deee050989bdc8e93b21d779c8d68ddb4666668a9c34c5d65177803e3"
     )
     assert body["semantics"]["strategy_domain_count"] == 100
-    assert body["semantics"]["attempt_policy"][
-        "attempt_count_per_observed_cell"
-    ] == 128
+    assert body["semantics"]["attempt_policy"]["attempt_count_per_observed_cell"] == 128
     assert body["semantics"]["all_100_strategies_represented"] is True
 
 
@@ -89,9 +87,7 @@ def test_pre_evidence_and_post_precommit_requests_build_identical_anchor_body(
         symbol: authority_spool.open_symbol_sink(context, symbol)
         for symbol in planner.book.PINNED_SYMBOL_ORDER
     }
-    release_sha256 = (
-        planner.historical_adapter.HISTORICAL_PRODUCER_RELEASE_SHA256
-    )
+    release_sha256 = planner.historical_adapter.HISTORICAL_PRODUCER_RELEASE_SHA256
     planning_request = historical.issue_historical_pre_evidence_planning_request(
         context,
         run_id="planner-pre-evidence-run",
@@ -182,7 +178,9 @@ def test_attempt_roster_contains_every_default_and_28_real_grid_variants() -> No
         parameters = item["parameters"]
         changed = False
         for axis, choices in strategy.get_param_grid().items():
-            assert any(parameter_values_equal(parameters[axis], value) for value in choices)
+            assert any(
+                parameter_values_equal(parameters[axis], value) for value in choices
+            )
             changed = changed or not parameter_values_equal(
                 parameters[axis], strategy.get_default_params()[axis]
             )
@@ -228,8 +226,114 @@ def test_dependency_purge_includes_execution_delay_and_holding_horizon() -> None
     ]["H1"]
 
     assert payload["execution_delay_bars"] == 1
+    assert geometry["left_purge_bars"] == max(
+        payload["label_lookahead_bars"],
+        payload["execution_delay_bars"] + payload["max_holding_bars"],
+    )
     assert geometry["left_purge_seconds"] == holding_days * 86_400 + 3_600
     assert geometry["right_purge_seconds"] >= geometry["left_purge_seconds"]
+
+
+def test_available_prefix_anchor_binding_uses_authenticated_requested_cutoff() -> None:
+    source_accessed_at = "2026-07-22T18:00:46Z"
+    cutoff = "2024-06-09T00:00:00Z"
+    native = {
+        "symbol": "EURUSD",
+        "timeframe": "D1",
+        "activation_id": "activation-1",
+        "activation_manifest_sha256": "a" * 64,
+        "source_accessed_at_utc": source_accessed_at,
+        # Friday's D1 bar closes on Saturday; Sunday has no bar.
+        "prefix_end_exclusive_utc": "2024-06-08T00:00:00Z",
+    }
+    prefix_index = {"cutoff_utc": cutoff}
+    anchor = {
+        "selection_cutoff_utc": cutoff,
+        "evidence_accessed_at_utc": source_accessed_at,
+    }
+    request = {
+        "symbol": "EURUSD",
+        "timeframe": "D1",
+        "activation_id": "activation-1",
+        "activation_manifest_sha256": "a" * 64,
+        "anchor": {"selection_cutoff_utc": cutoff},
+    }
+
+    planner._validate_available_prefix_anchor_binding(
+        native=native,
+        prefix_index=prefix_index,
+        anchor=anchor,
+        canary_request_body=request,
+    )
+
+    for field, replacement in {
+        "symbol": "GBPUSD",
+        "timeframe": "H1",
+        "activation_id": "activation-2",
+        "activation_manifest_sha256": "b" * 64,
+    }.items():
+        changed = dict(native)
+        changed[field] = replacement
+        with pytest.raises(
+            planner.ProductionSearchPlannerError,
+            match="CANARY_NATIVE_PREFIX_BINDING_INVALID",
+        ):
+            planner._validate_available_prefix_anchor_binding(
+                native=changed,
+                prefix_index=prefix_index,
+                anchor=anchor,
+                canary_request_body=request,
+            )
+
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="CANARY_NATIVE_PREFIX_BINDING_INVALID",
+    ):
+        planner._validate_available_prefix_anchor_binding(
+            native=native,
+            prefix_index={"cutoff_utc": native["prefix_end_exclusive_utc"]},
+            anchor=anchor,
+            canary_request_body=request,
+        )
+
+    changed_request = dict(request)
+    changed_request["anchor"] = {
+        "selection_cutoff_utc": native["prefix_end_exclusive_utc"]
+    }
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="CANARY_NATIVE_PREFIX_BINDING_INVALID",
+    ):
+        planner._validate_available_prefix_anchor_binding(
+            native=native,
+            prefix_index=prefix_index,
+            anchor=anchor,
+            canary_request_body=changed_request,
+        )
+
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="NATIVE_PREFIX_NOT_EXACT_ANCHOR_CUTOFF",
+    ):
+        planner._validate_available_prefix_anchor_binding(
+            native=native,
+            prefix_index={"cutoff_utc": native["prefix_end_exclusive_utc"]},
+            anchor=anchor,
+            canary_request_body=None,
+        )
+
+    late_native = dict(native)
+    late_native["source_accessed_at_utc"] = "2026-07-22T18:00:47Z"
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="NATIVE_PREFIX_NOT_EXACT_ANCHOR_CUTOFF",
+    ):
+        planner._validate_available_prefix_anchor_binding(
+            native=late_native,
+            prefix_index=prefix_index,
+            anchor=anchor,
+            canary_request_body=request,
+        )
 
 
 def test_largest_feasible_calendar_depth_is_selected_from_frozen_ladder() -> None:
@@ -310,6 +414,7 @@ def test_current_refit_window_replays_depth_at_cutoff_not_discovery_span() -> No
         fit_end=fit_end,
         depth_days=depth_days,
         state_context_bars=10,
+        boundary_limited=False,
     )
 
     target = fit_end - pd.Timedelta(days=depth_days)
@@ -319,6 +424,471 @@ def test_current_refit_window_replays_depth_at_cutoff_not_discovery_span() -> No
     assert source_count == int(
         ((opens >= fit_start) & (opens < fit_end) & (closes <= fit_end)).sum()
     )
+
+
+def test_boundary_limited_current_window_does_not_require_evaluation_state() -> None:
+    opens = pd.bdate_range(
+        end="2024-06-07T00:00:00Z",
+        periods=3_981,
+    )
+    closes = opens + pd.Timedelta(days=1)
+    fit_end = closes[-1]
+    state_context_bars = 3_882
+    native = {
+        "prefix_start_utc": planner._utc_text(opens[0]),
+        "prefix_end_exclusive_utc": planner._utc_text(fit_end),
+        "prefix_content_sha256": "c" * 64,
+    }
+    payload = planner._dependency_payload(
+        "D1",
+        feature_lookback_bars=state_context_bars,
+        regime_warmup_bars=10,
+    )
+    depth_days, candidate_start, folds, boundary_limited = planner._build_causal_folds(
+        frame=pd.DataFrame(index=opens),
+        native=native,
+        opens=opens,
+        closes=closes,
+        timeframe="D1",
+        geometry=planner._derived_dependency_geometry("D1", payload),
+        state_context_bars=state_context_bars,
+    )
+
+    assert depth_days == planner.FIT_CALENDAR_DAY_LADDERS["D1"][0]
+    assert candidate_start == opens[0] - timedelta(days=1)
+    assert folds == []
+    assert boundary_limited is True
+
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="CURRENT_REFIT_STATE_CONTEXT_UNAVAILABLE",
+    ):
+        planner._cutoff_anchored_refit_window(
+            opens=opens,
+            closes=closes,
+            fit_end=fit_end,
+            depth_days=depth_days,
+            state_context_bars=state_context_bars,
+            boundary_limited=False,
+        )
+
+    fit_start, source_count = planner._cutoff_anchored_refit_window(
+        opens=opens,
+        closes=closes,
+        fit_end=fit_end,
+        depth_days=depth_days,
+        state_context_bars=state_context_bars,
+        boundary_limited=boundary_limited,
+    )
+
+    fit_start_index = int(opens.get_indexer([fit_start])[0])
+    assert fit_start_index < state_context_bars
+    assert source_count >= 50
+    assert source_count == int(
+        ((opens >= fit_start) & (opens < fit_end) & (closes <= fit_end)).sum()
+    )
+
+
+def test_d1_selects_largest_feasible_common_context_and_rejects_only_excess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opens = pd.bdate_range(
+        end="2024-06-07T00:00:00Z",
+        periods=3_981,
+    )
+    closes = opens + pd.Timedelta(days=1)
+    frame = pd.DataFrame(
+        {
+            "Open": 1.0,
+            "High": 1.1,
+            "Low": 0.9,
+            "Close": 1.0,
+            "_BAR_CLOSE_TS": closes,
+            "REGIME_LIVE": "TREND",
+        },
+        index=opens,
+    )
+    native = {
+        "prefix_start_utc": planner._utc_text(opens[0]),
+        "prefix_end_exclusive_utc": planner._utc_text(closes[-1]),
+        "prefix_content_sha256": "c" * 64,
+    }
+    requirements = []
+    for ordinal, context in enumerate((3_882, 1_629, 1_515, 943, 545, 20)):
+        body = {
+            "strategy_id": f"strategy-{ordinal}",
+            "parameters_sha256": f"{ordinal + 1:064x}",
+            "bounded_context_bars": context,
+        }
+        requirements.append({**body, "requirement_sha256": planner._sha(body)})
+
+    shared_fit_calls: list[tuple[int, int, int]] = []
+    shared_fit_rows = planner.search_execution.minimum_fold_fit_rows
+
+    def audited_fit_rows(
+        *,
+        recipe_warmup_bars: int,
+        dependency_warmup_bars: int,
+    ) -> int:
+        required = shared_fit_rows(
+            recipe_warmup_bars=recipe_warmup_bars,
+            dependency_warmup_bars=dependency_warmup_bars,
+        )
+        shared_fit_calls.append((recipe_warmup_bars, dependency_warmup_bars, required))
+        return required
+
+    monkeypatch.setattr(
+        planner.search_execution,
+        "minimum_fold_fit_rows",
+        audited_fit_rows,
+    )
+    selected = planner._select_feasible_common_state_context(
+        frame=frame,
+        native=native,
+        opens=opens,
+        closes=closes,
+        timeframe="D1",
+        state_requirements=requirements,
+        regime_warmup_bars=100,
+    )
+    assert selected["selected_common_context_bars"] == 545
+    assert selected["boundary_limited"] is False
+    assert len(selected["folds"]) == planner.CAUSAL_FOLD_COUNT
+    assert selected["dependency_geometry"]["warmup_bars"] == 545
+    assert (50, 943, 1_890) in shared_fit_calls
+    assert (50, 545, 1_094) in shared_fit_calls
+    minimum_fit_rows = shared_fit_rows(
+        recipe_warmup_bars=50,
+        dependency_warmup_bars=selected["dependency_geometry"]["warmup_bars"],
+    )
+    assert all(fold["fit_rows"] >= minimum_fit_rows for fold in selected["folds"])
+
+    planner_fit_call_count = len(shared_fit_calls)
+    attempt = planner.search_execution._VerifiedAttempt(
+        ordinal=0,
+        plan_attempt={"status": "PLANNED"},
+        candidate={},
+        trial={},
+        artifacts=SimpleNamespace(
+            refit_recipe={"data_requirements": {"warmup_bars": 50}}
+        ),
+    )
+    for fold in selected["folds"]:
+        partitions = planner.search_execution._fold_partitions(
+            frame=frame,
+            fold=fold,
+            attempt=attempt,
+            dependency_warmup_bars=selected["dependency_geometry"]["warmup_bars"],
+        )
+        assert all(
+            partition.geometry_receipt["scored_bars"]
+            >= planner.search_execution.MIN_PARTITION_SCORED_BARS
+            for partition in partitions
+        )
+    assert len(shared_fit_calls) == planner_fit_call_count + len(selected["folds"])
+
+    candidate = planner._candidate(
+        symbol="EURUSD",
+        timeframe="D1",
+        regime="TREND",
+        depth_days=selected["depth_days"],
+        candidate_start=selected["candidate_start"],
+        folds=selected["folds"],
+    )
+    dispositions = planner._state_context_dispositions(
+        requirements,
+        candidate=candidate,
+        selected_common_context_bars=545,
+    )
+    assert [item["status"] for item in dispositions] == [
+        "PROCESS_REJECTED",
+        "PROCESS_REJECTED",
+        "PROCESS_REJECTED",
+        "PROCESS_REJECTED",
+        "PLANNED",
+        "PLANNED",
+    ]
+    assert {
+        item["reason_code"]
+        for item in dispositions
+        if item["status"] == "PROCESS_REJECTED"
+    } == {"STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"}
+
+
+def test_short_d1_prefix_keeps_low_context_trials_searchable() -> None:
+    opens = pd.bdate_range(
+        end="2024-06-07T00:00:00Z",
+        periods=705,
+    )
+    closes = opens + pd.Timedelta(days=1)
+    native = {
+        "prefix_start_utc": planner._utc_text(opens[0]),
+        "prefix_end_exclusive_utc": planner._utc_text(closes[-1]),
+        "prefix_content_sha256": "c" * 64,
+    }
+    requirements = []
+    for ordinal, context in enumerate((943, 100, 20)):
+        body = {
+            "strategy_id": f"tonusd-strategy-{ordinal}",
+            "parameters_sha256": f"{ordinal + 1:064x}",
+            "bounded_context_bars": context,
+        }
+        requirements.append({**body, "requirement_sha256": planner._sha(body)})
+
+    selected = planner._select_feasible_common_state_context(
+        frame=pd.DataFrame(index=opens),
+        native=native,
+        opens=opens,
+        closes=closes,
+        timeframe="D1",
+        state_requirements=requirements,
+        regime_warmup_bars=100,
+    )
+    assert selected["selected_common_context_bars"] == 100
+    assert selected["boundary_limited"] is False
+    assert len(selected["folds"]) == planner.CAUSAL_FOLD_COUNT
+
+    candidate = planner._candidate(
+        symbol="TONUSD",
+        timeframe="D1",
+        regime="TREND",
+        depth_days=selected["depth_days"],
+        candidate_start=selected["candidate_start"],
+        folds=selected["folds"],
+    )
+    dispositions = planner._state_context_dispositions(
+        requirements,
+        candidate=candidate,
+        selected_common_context_bars=100,
+    )
+    assert [item["status"] for item in dispositions] == [
+        "PROCESS_REJECTED",
+        "PLANNED",
+        "PLANNED",
+    ]
+
+
+def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> None:
+    payload = planner._dependency_payload(
+        "D1",
+        feature_lookback_bars=4,
+        regime_warmup_bars=4,
+    )
+    geometry = planner._derived_dependency_geometry("D1", payload)
+    assert geometry["left_purge_bars"] == 31
+    candidate_body = {
+        "candidate_id": "DEPTH-D1-365-binding",
+        "lookback_kind": "CALENDAR_INTERVAL",
+        "lookback_value": 365,
+        "realized_start_utc": "2023-12-31T00:00:00Z",
+    }
+    candidate = {
+        **candidate_body,
+        "candidate_definition_sha256": planner._sha(candidate_body),
+        "folds": [],
+    }
+    state_body = {
+        "schema_version": "fxpm.production-attempt-state-requirement.v1",
+        "strategy_id": "ExampleStrategy",
+        "parameters_sha256": planner._sha({"period": 10}),
+        "bounded_context_bars": 4,
+        "state_evidence": [],
+        "execution_rule": (
+            "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
+        ),
+    }
+    state = {
+        **state_body,
+        "requirement_sha256": planner._sha(state_body),
+    }
+    disposition = planner._state_context_dispositions(
+        [state],
+        candidate=candidate,
+        selected_common_context_bars=4,
+    )[0]
+    trial_body = {
+        "trial_id": "TRIAL-000-binding",
+        "strategy_id": "ExampleStrategy",
+        "strategy_release_sha256": "a" * 64,
+        "parameter_set_sha256": planner._sha({"period": 10}),
+        "state_context_disposition": disposition,
+    }
+    trial = {
+        **trial_body,
+        "trial_definition_sha256": planner._sha(trial_body),
+    }
+    _, native, _, _ = _unobserved_fitted_timeframe()
+    native = {
+        **native,
+        "timeframe": "D1",
+        "request_start_utc": "2024-01-01T00:00:00Z",
+        "request_end_exclusive_utc": "2025-01-01T00:00:00Z",
+        "prefix_start_utc": "2024-01-01T00:00:00Z",
+        "prefix_end_exclusive_utc": "2025-01-01T00:00:00Z",
+        "prefix_first_open_utc": "2024-01-01T00:00:00Z",
+        "prefix_last_open_utc": "2024-12-31T00:00:00Z",
+        "prefix_last_close_utc": "2025-01-01T00:00:00Z",
+        "artifact_rows": 366,
+        "prefix_rows": 366,
+    }
+    payload_sha256 = planner._sha(payload)
+    plan = planner.training_horizon.build_historical_horizon_plan(
+        {
+            "schema_version": "fxpm.historical-horizon-request.v1",
+            "run_id": "state-context-geometry-binding",
+            "anchor": {
+                "anchor_id": "ANCHOR-01",
+                "ordinal": 0,
+                "selection_cutoff_utc": "2025-01-01T00:00:00Z",
+                "forward_start_utc": "2025-02-05T00:00:00Z",
+                "forward_end_exclusive_utc": "2026-02-05T00:00:00Z",
+                "evidence_accessed_at_utc": "2025-01-02T00:00:00Z",
+                "process_precommit_receipt_sha256": "f" * 64,
+            },
+            "cell": {
+                "symbol": "EURUSD",
+                "timeframe": "D1",
+                "regime": "TREND",
+            },
+            "native_prefix": native,
+            "dependency_policy": {
+                "schema_version": "fxpm.historical-dependency-policy.v1",
+                "authority_key_id": "state-context-geometry-binding",
+                "signed_policy_receipt_sha256": "b" * 64,
+                "payload_sha256": payload_sha256,
+                "payload": payload,
+            },
+            "horizon_policy": {
+                "schema_version": "fxpm.historical-horizon-policy.v1",
+                "policy_id": "state-context-geometry-binding",
+                "policy_release_sha256": "c" * 64,
+                "cost_contract_sha256": "d" * 64,
+                "cost_stress_contract_sha256": "e" * 64,
+                "evaluator_release_sha256": "a" * 64,
+            },
+            "candidates": [candidate],
+            "trials": [trial],
+        }
+    )
+    plan_body = plan.to_dict()
+    assert plan_body["derived_dependency_geometry"] == geometry
+    assert plan_body["attempts"][0]["status"] == "PROCESS_REJECTED"
+    assert plan_body["attempts"][0]["reason_code"] == "SOURCE_BOUNDARY_SHORTFALL"
+    receipt = {
+        "candidate": candidate,
+        "dependency_payload": payload,
+        "dependency_geometry": geometry,
+        "state_context_selection": planner._state_context_selection_receipt(
+            [state],
+            [disposition],
+            selected_common_context_bars=4,
+            boundary_limited=True,
+        ),
+    }
+    artifact = {
+        "winner_process": {"strategy_id": "ExampleStrategy"},
+        "trial_definition": {"parameters": {"period": 10}},
+    }
+
+    planner._verify_state_context_plan_binding(
+        receipt=receipt,
+        attempts=[artifact],
+        states=[state],
+        horizon_plan=plan,
+        boundary_limited=True,
+        timeframe="D1",
+    )
+
+    changed_geometry = {
+        **receipt,
+        "dependency_geometry": {**geometry, "left_purge_bars": 30},
+    }
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_CONTEXT_GEOMETRY_BINDING_INVALID",
+    ):
+        planner._verify_state_context_plan_binding(
+            receipt=changed_geometry,
+            attempts=[artifact],
+            states=[state],
+            horizon_plan=plan,
+            boundary_limited=True,
+            timeframe="D1",
+        )
+
+    tampered = dict(state)
+    tampered["bounded_context_bars"] = 3
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_REQUIREMENT_REPLAY_INVALID",
+    ):
+        planner._verify_state_context_plan_binding(
+            receipt=receipt,
+            attempts=[artifact],
+            states=[tampered],
+            horizon_plan=plan,
+            boundary_limited=True,
+            timeframe="D1",
+        )
+
+
+def test_current_refit_window_delegates_one_shared_realizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opens = pd.date_range("2024-01-01T00:00:00Z", periods=10, freq="D")
+    closes = opens + pd.Timedelta(days=1)
+    fit_end = closes[-1]
+    observed: dict[str, object] = {}
+
+    def realize(**kwargs):
+        observed.update(kwargs)
+        return opens[3], 6
+
+    monkeypatch.setattr(
+        planner.search_execution,
+        "_realize_cutoff_refit_window",
+        realize,
+    )
+    assert planner._cutoff_anchored_refit_window(
+        opens=opens,
+        closes=closes,
+        fit_end=fit_end,
+        depth_days=365,
+        state_context_bars=7,
+        boundary_limited=True,
+    ) == (opens[3], 6)
+    assert observed.pop("opens") is opens
+    assert observed.pop("closes") is closes
+    assert observed == {
+        "fit_end": fit_end,
+        "lookback_kind": "CALENDAR_INTERVAL",
+        "lookback_value": 365,
+        "state_context_bars": 7,
+        "boundary_limited": True,
+    }
+
+    def reject(**_kwargs):
+        raise planner.search_execution.AuthoritativeSearchExecutionError(
+            "CURRENT_REFIT_WINDOW_UNAVAILABLE"
+        )
+
+    monkeypatch.setattr(
+        planner.search_execution,
+        "_realize_cutoff_refit_window",
+        reject,
+    )
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="CURRENT_REFIT_WINDOW_UNAVAILABLE",
+    ):
+        planner._cutoff_anchored_refit_window(
+            opens=opens,
+            closes=closes,
+            fit_end=fit_end,
+            depth_days=365,
+            state_context_bars=7,
+            boundary_limited=True,
+        )
 
 
 def test_current_source_is_prebound_to_strict_raw_executor_before_attempt_identity(
@@ -538,6 +1108,25 @@ def _terminal_native_product() -> planner.native_prefix.NativePrefixProduct:
     )
 
 
+def _terminal_technical_native_product() -> planner.native_prefix.NativePrefixProduct:
+    product = _terminal_native_product()
+    native = dict(product.native_prefix)
+    native.update(
+        {
+            "source_state": planner.native_prefix.TECHNICAL_TERMINAL,
+            "source_reason": "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL",
+        }
+    )
+    index = dict(product.index)
+    index["source_state"] = planner.native_prefix.TECHNICAL_TERMINAL
+    return replace(
+        product,
+        source_state=planner.native_prefix.TECHNICAL_TERMINAL,
+        index=index,
+        native_prefix=native,
+    )
+
+
 def _terminal_context(tmp_path: Path):
     return authority_spool.freeze_generation_context(
         (tmp_path / "terminal-reverify-spool").resolve(),
@@ -676,6 +1265,66 @@ def test_terminal_plan_is_zero_attempt_and_not_a_market_verdict(
     )
 
 
+def test_authenticated_terminal_technical_plan_is_zero_attempt_abstention(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = authority_spool.freeze_generation_context(
+        (tmp_path / "terminal-technical-spool").resolve(),
+        generation_id="terminal-technical-generation",
+        native_universe_sha256="a" * 64,
+        config_sha256="b" * 64,
+    )
+    process = planner.FrozenProductionSearchProcess(
+        planner._canonical_bytes({"run_id": "terminal-run"}),
+        planner._canonical_bytes({"unused": True}),
+        planner._PROCESS_SEAL,
+    )
+    product = _terminal_technical_native_product()
+    monkeypatch.setattr(
+        planner,
+        "verify_frozen_production_search_process",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        planner,
+        "_reverify_terminal_product",
+        lambda _context, *, product, anchor: product,
+    )
+    sink = authority_spool.open_symbol_sink(context, "EURUSD")
+    anchor = {
+        "anchor_id": "ANCHOR-01",
+        "ordinal": 0,
+        "selection_cutoff_utc": "2025-01-01T00:00:00Z",
+        "forward_start_utc": "2025-02-05T00:00:00Z",
+        "forward_end_exclusive_utc": "2026-02-05T00:00:00Z",
+        "evidence_accessed_at_utc": "2026-02-05T00:00:00Z",
+        "process_precommit_receipt_sha256": "f" * 64,
+    }
+
+    plan = planner._build_terminal_cell_plan(
+        context,
+        process=process,
+        product=product,
+        regime="TREND",
+        anchor=anchor,
+        run_id="terminal-run",
+        causal_precommit_receipt_sha256="f" * 64,
+        namespace="historical-anchor/terminal-run/ANCHOR-01",
+        sink=sink,
+    )
+
+    assert plan.mode == "TERMINAL"
+    assert plan.attempt_count == 0
+    assert plan.horizon_plan.to_dict()["plan_status"] == (
+        "HISTORICAL_TERMINAL_TECHNICAL"
+    )
+    assert plan.cell_receipt["terminal_source_is_market_no_trade_verdict"] is False
+    assert plan.cell_receipt["technical_failure_requires_generation_abort"] is False
+    assert planner.verify_production_cell_search_plan(
+        context, process=process, sink=sink, plan=plan
+    )
+
+
 def _unobserved_fitted_timeframe():
     native = {
         "source_state": planner.native_prefix.AVAILABLE,
@@ -714,7 +1363,7 @@ def _unobserved_fitted_timeframe():
     }
     product = planner.native_prefix.NativePrefixProduct(
         source_state=planner.native_prefix.AVAILABLE,
-        index={},
+        index={"cutoff_utc": "2025-01-01T00:00:00Z"},
         index_descriptor={
             "format": "canonical_json",
             "relative_path": "sha256/available.json",
@@ -881,6 +1530,11 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         "historical_horizon_plan_binding",
         lambda _plan: binding,
     )
+    monkeypatch.setattr(
+        planner,
+        "_verify_state_context_plan_binding",
+        lambda **_kwargs: None,
+    )
     native = {
         "symbol": "EURUSD",
         "timeframe": "H1",
@@ -917,6 +1571,7 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         dependency_geometry={"geometry": True},
         attempt_artifacts=attempts,
         state_requirements=states,
+        state_context_selection={},
         boundary_limited=False,
     )
     plan = planner.ProductionCellSearchPlan(
@@ -939,12 +1594,15 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         _seal=planner._CELL_PLAN_SEAL,
     )
 
-    assert planner.verify_production_cell_search_plan(
-        context,
-        process=process,
-        sink=sink,
-        plan=plan,
-    ) is True
+    assert (
+        planner.verify_production_cell_search_plan(
+            context,
+            process=process,
+            sink=sink,
+            plan=plan,
+        )
+        is True
+    )
 
     changed = list(plan._attempt_artifacts_json)
     changed[0] = planner._canonical_bytes({"ordinal": 999})

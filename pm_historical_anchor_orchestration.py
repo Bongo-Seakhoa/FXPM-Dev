@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import threading
 from typing import Any, Final, Sequence
 
 import pm_authority_spool as authority_spool
@@ -36,10 +37,11 @@ BOUNDED_RAW_WINNER_CANARY_SCOPE: Final = "BOUNDED_CANARY_NONAUTHORIZING"
 BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE: Final = (
     "FIRST_EMPIRICALLY_OBSERVED_IN_PINNED_ORDER"
 )
-BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX: Final = (
-    "raw-winner-canary-nonauthorizing"
-)
+BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX: Final = "raw-winner-canary-nonauthorizing"
 BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT: Final = 128
+PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA: Final = (
+    "fxpm.production_native_authority_verification_scope.v1"
+)
 SYMBOL_OUTPUT_SCHEMA: Final = "fxpm.historical-anchor-symbol-output.v1"
 RUN_RECEIPT_SCHEMA: Final = "fxpm.historical-anchor-orchestration-receipt.v1"
 HORIZON_BINDING_SCHEMA: Final = "fxpm.historical-horizon-plan-binding.v1"
@@ -52,6 +54,10 @@ _ADAPTER_CROSS_BINDING_SCHEMA: Final = "fxpm.historical-horizon-winner-cross-bin
 _ADAPTER_ASCII_JSON_FORMAT: Final = "fxpm-ascii-json-v1"
 _ADAPTER_CAPTURE_CONTRACT: Final = "fxpm.historical-search-capture.v2"
 _BOOK_ARTIFACT_TYPE: Final = "historical_book_multiplicity_v11"
+_TERMINAL_TECHNICAL_REASON_CODE: Final = (
+    "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
+)
+_WORKER_REQUEST_REOPEN_SEAL: Final = object()
 
 _HORIZON_PLAN_SCHEMA: Final = "fxpm.historical-horizon-plan.v1"
 _HORIZON_SCOPE: Final = "HISTORICAL_ANCHOR_LOCAL_HORIZON_EVIDENCE_ONLY"
@@ -175,6 +181,7 @@ _HORIZON_PLAN_STATUSES: Final = frozenset(
     {
         "READY_FOR_HISTORICAL_EVIDENCE",
         "HISTORICAL_SOURCE_UNAVAILABLE",
+        "HISTORICAL_TERMINAL_TECHNICAL",
         "HISTORICAL_TECHNICAL_INCOMPLETE",
         "HISTORICAL_BOUNDARY_LIMITED",
         "HISTORICAL_REGIME_UNOBSERVED",
@@ -216,6 +223,7 @@ _CANARY_REQUEST_FIELDS: Final = frozenset(
         "anchor",
         "search_process_receipt_sha256",
         "causal_precommit_receipt_sha256",
+        "native_authority_verification",
         "causal_evidence_access_deadline_utc",
         "production_symbols",
         "production_timeframes",
@@ -238,6 +246,23 @@ _CANARY_REQUEST_FIELDS: Final = frozenset(
         "configuration_mutation_authorized",
         "order_authorized",
         "profitability_claimed",
+    }
+)
+_NATIVE_AUTHORITY_VERIFICATION_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "scope",
+        "full_verification_count",
+        "identity_revalidation_attempt_count",
+        "identity_revalidation_count",
+        "identity_revalidation_failure_count",
+        "active_pointer_sha256",
+        "activation_manifest_sha256",
+        "pid",
+        "thread_id",
+        "poison_reason",
+        "closed",
+        "poisoned",
     }
 )
 _ADAPTER_PAYLOAD_FIELDS: Final = frozenset(
@@ -434,6 +459,8 @@ class HistoricalAnchorPrecommit:
 class AnchorProducerRequest:
     _body_json: bytes
     _symbol_sinks: Mapping[str, authority_spool.SymbolAuthoritySink] | None = None
+    _worker_symbol: str | None = None
+    _worker_reopen_seal: object | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return json.loads(self._body_json.decode("utf-8"))
@@ -447,6 +474,17 @@ class AnchorProducerRequest:
 
         if type(symbol) is not str or symbol not in book.PINNED_SYMBOL_ORDER:
             _fail("PRODUCER_REQUEST_SYMBOL_INVALID")
+        if self._worker_reopen_seal is _WORKER_REQUEST_REOPEN_SEAL:
+            if (
+                self._worker_symbol != symbol
+                or type(self._symbol_sinks) is not dict
+                or set(self._symbol_sinks) != {symbol}
+            ):
+                _fail("PRODUCER_WORKER_SYMBOL_SINK_UNAVAILABLE")
+            sink = self._symbol_sinks.get(symbol)
+            if type(sink) is not authority_spool.SymbolAuthoritySink:
+                _fail("PRODUCER_REQUEST_SYMBOL_SINK_INVALID")
+            return sink
         if type(self._symbol_sinks) is not dict or set(self._symbol_sinks) != set(
             book.PINNED_SYMBOL_ORDER
         ):
@@ -455,6 +493,84 @@ class AnchorProducerRequest:
         if type(sink) is not authority_spool.SymbolAuthoritySink:
             _fail("PRODUCER_REQUEST_SYMBOL_SINK_INVALID")
         return sink
+
+
+def reopen_anchor_producer_request_for_symbol(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    request_body_bytes: bytes,
+    expected_receipt_sha256: str,
+    symbol: str,
+    sink: authority_spool.SymbolAuthoritySink,
+) -> AnchorProducerRequest:
+    """Reopen exact issuer bytes with one worker-local symbol sink.
+
+    The restricted sink capability is process-local routing state.  It neither
+    changes the canonical request bytes nor permits a worker to access another
+    symbol's sink.
+    """
+
+    if (
+        type(context) is not authority_spool.GenerationSpoolContext
+        or type(request_body_bytes) is not bytes
+        or not request_body_bytes
+        or len(request_body_bytes) > 256 * 1024
+        or type(symbol) is not str
+        or symbol not in book.PINNED_SYMBOL_ORDER
+        or type(sink) is not authority_spool.SymbolAuthoritySink
+        or sink.symbol != symbol
+        or sink.context is not context
+        or sink.context.context_sha256 != context.context_sha256
+    ):
+        _fail("PRODUCER_WORKER_REQUEST_INPUT_INVALID")
+    expected_receipt = _hex(
+        expected_receipt_sha256,
+        "PRODUCER_WORKER_REQUEST_RECEIPT_INVALID",
+    )
+    if hashlib.sha256(request_body_bytes).hexdigest() != expected_receipt:
+        _fail("PRODUCER_WORKER_REQUEST_RECEIPT_MISMATCH")
+    try:
+        body = json.loads(request_body_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "PRODUCER_WORKER_REQUEST_JSON_INVALID"
+        ) from exc
+    if (
+        type(body) is not dict
+        or _canonical_bytes(body, 256 * 1024) != request_body_bytes
+        or body.get("schema_version")
+        not in {
+            PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA,
+            PRODUCER_REQUEST_SCHEMA,
+        }
+        or body.get("generation_id") != context.generation_id
+        or body.get("symbols") != list(book.PINNED_SYMBOL_ORDER)
+        or body.get("timeframes") != list(book.TIMEFRAME_ORDER)
+        or body.get("regimes") != list(book.REGIME_ORDER)
+        or body.get("requires_exact_sparse_state_roster") is not True
+        or body.get("possible_regime_slots_are_forced_observations") is not False
+        or body.get("confers_causal_or_current_authority") is not False
+    ):
+        _fail("PRODUCER_WORKER_REQUEST_CONTRACT_INVALID")
+    if body["schema_version"] == PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA:
+        context_body = _context_body(context)
+        if (
+            any(body.get(name) != value for name, value in context_body.items())
+            or body.get("historical_anchor_precommit_pending") is not True
+            or body.get("planning_access_limited_to_native_prefix_and_process_design")
+            is not True
+            or body.get("return_or_winner_evidence_access_authorized") is not False
+        ):
+            _fail("PRODUCER_WORKER_PLANNING_REQUEST_INVALID")
+    request = AnchorProducerRequest(
+        request_body_bytes,
+        {symbol: sink},
+        symbol,
+        _WORKER_REQUEST_REOPEN_SEAL,
+    )
+    if request.receipt_sha256 != expected_receipt or request.symbol_sink(symbol) is not sink:
+        _fail("PRODUCER_WORKER_REQUEST_REOPEN_FAILED")
+    return request
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,8 +649,10 @@ def _context_body(context: authority_spool.GenerationSpoolContext) -> dict[str, 
 def _utc_seconds(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() != timedelta(0):
         _fail("TRUSTED_UTC_CLOCK_INVALID")
-    return value.astimezone(timezone.utc).replace(microsecond=0).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
+    return (
+        value.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
     )
 
 
@@ -581,6 +699,94 @@ def _verified_canary_causal_precommit(
     return body, body_json
 
 
+def _normalized_native_authority_verification(
+    value: Any,
+    *,
+    expected_activation_manifest_sha256: str,
+    allow_none: bool,
+) -> dict[str, Any] | None:
+    """Validate the closed process-local authority-verification accounting."""
+
+    if value is None:
+        if allow_none:
+            return None
+        _fail("CANARY_NATIVE_AUTHORITY_VERIFICATION_MISSING")
+    if type(value) is not dict or set(value) != _NATIVE_AUTHORITY_VERIFICATION_FIELDS:
+        _fail("CANARY_NATIVE_AUTHORITY_VERIFICATION_FIELDS_INVALID")
+    normalized = json.loads(_canonical_bytes(value, 64 * 1024).decode("utf-8"))
+    if (
+        normalized.get("schema_version")
+        != PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA
+    ):
+        _fail("CANARY_NATIVE_AUTHORITY_VERIFICATION_SCHEMA_INVALID")
+    _hex(normalized.get("scope"), "CANARY_NATIVE_AUTHORITY_SCOPE_ID_INVALID")
+    _hex(
+        normalized.get("active_pointer_sha256"),
+        "CANARY_NATIVE_AUTHORITY_POINTER_SHA256_INVALID",
+    )
+    activation_sha = _hex(
+        normalized.get("activation_manifest_sha256"),
+        "CANARY_NATIVE_AUTHORITY_MANIFEST_SHA256_INVALID",
+    )
+    if activation_sha != expected_activation_manifest_sha256:
+        _fail("CANARY_NATIVE_AUTHORITY_MANIFEST_MISMATCH")
+    expected_counts = {
+        "full_verification_count": 1,
+        "identity_revalidation_attempt_count": 5,
+        "identity_revalidation_count": 5,
+        "identity_revalidation_failure_count": 0,
+    }
+    if any(
+        type(normalized.get(field)) is not int
+        or normalized.get(field) != expected
+        for field, expected in expected_counts.items()
+    ):
+        _fail("CANARY_NATIVE_AUTHORITY_VERIFICATION_COUNTS_INVALID")
+    if (
+        type(normalized.get("pid")) is not int
+        or normalized.get("pid") <= 0
+        or type(normalized.get("thread_id")) is not int
+        or normalized.get("thread_id") <= 0
+        or normalized.get("poison_reason") is not None
+        or normalized.get("closed") is not True
+        or normalized.get("poisoned") is not False
+    ):
+        _fail("CANARY_NATIVE_AUTHORITY_VERIFICATION_STATE_INVALID")
+    return normalized
+
+
+def _close_and_snapshot_native_authority_verification(
+    value: Any,
+    *,
+    expected_activation_manifest_sha256: str,
+) -> dict[str, Any] | None:
+    """Close the genuine reuse scope after call six, then freeze its counters."""
+
+    if value is None:
+        # Retained solely for existing isolated issuer fixtures.  The CLI
+        # always supplies a genuine scope and refuses mechanical success when
+        # this field is absent.
+        return None
+    try:
+        import pm_native_activation as native_activation
+
+        if type(value) is not native_activation.ProductionNativeAuthorityVerificationScope:
+            _fail("CANARY_NATIVE_AUTHORITY_VERIFICATION_SCOPE_INVALID")
+        value.close()
+        stats = value.stats()
+    except HistoricalAnchorOrchestrationError:
+        raise
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError(
+            "CANARY_NATIVE_AUTHORITY_VERIFICATION_SCOPE_INVALID"
+        ) from exc
+    return _normalized_native_authority_verification(
+        stats,
+        expected_activation_manifest_sha256=expected_activation_manifest_sha256,
+        allow_none=False,
+    )
+
+
 def _build_bounded_raw_winner_canary_request_components(
     context: authority_spool.GenerationSpoolContext,
     *,
@@ -590,6 +796,7 @@ def _build_bounded_raw_winner_canary_request_components(
     causal_precommit: Any,
     symbol: str,
     timeframe: str,
+    native_authority_verification_scope: Any | None = None,
 ) -> tuple[bytes, authority_spool.SymbolAuthoritySink]:
     """Issue one non-authorizing raw-Winner canary before source access.
 
@@ -605,9 +812,7 @@ def _build_bounded_raw_winner_canary_request_components(
         import pm_portfolio_replay as portfolio_replay
 
         context_body = _context_body(context)
-        search_planner.verify_frozen_production_search_process(
-            context, search_process
-        )
+        search_planner.verify_frozen_production_search_process(context, search_process)
         process_body = search_process.to_dict()
         verified_plan = production_anchor_plan.verify_production_anchor_plan_receipt(
             Path(data_dir).resolve(strict=True), anchor_plan_receipt
@@ -626,6 +831,16 @@ def _build_bounded_raw_winner_canary_request_components(
             "CANARY_ISSUANCE_PREREQUISITE_REVERIFY_FAILED"
         ) from exc
 
+    native_authority_verification = (
+        _close_and_snapshot_native_authority_verification(
+            native_authority_verification_scope,
+            expected_activation_manifest_sha256=_hex(
+                verified_plan.get("activation_manifest_sha256"),
+                "CANARY_ACTIVATION_MANIFEST_INVALID",
+            ),
+        )
+    )
+
     run_id = process_body.get("run_id")
     generation_id = context_body["generation_id"]
     if (
@@ -641,19 +856,16 @@ def _build_bounded_raw_winner_canary_request_components(
         native_errors
         or portfolio_replay.canonical_json_sha256(native_contract)
         != context.native_universe_sha256
-        or native_contract.get("activation_id")
-        != verified_plan.get("activation_id")
+        or native_contract.get("activation_id") != verified_plan.get("activation_id")
         or native_contract.get("activation_manifest_sha256")
         != verified_plan.get("activation_manifest_sha256")
-        or native_contract.get("symbols")
-        != sorted(book.PINNED_SYMBOL_ORDER)
+        or native_contract.get("symbols") != list(book.PINNED_SYMBOL_ORDER)
         or native_contract.get("timeframes") != list(book.TIMEFRAME_ORDER)
     ):
         _fail("CANARY_ACTIVE_NATIVE_UNIVERSE_CONTEXT_MISMATCH")
-    if (
-        verified_plan.get("symbol_roster") != list(book.PINNED_SYMBOL_ORDER)
-        or verified_plan.get("timeframe_roster") != list(book.TIMEFRAME_ORDER)
-    ):
+    if verified_plan.get("symbol_roster") != list(
+        book.PINNED_SYMBOL_ORDER
+    ) or verified_plan.get("timeframe_roster") != list(book.TIMEFRAME_ORDER):
         _fail("CANARY_PRODUCTION_GRID_MISMATCH")
     anchors = verified_plan.get("anchor_plan")
     if (
@@ -734,6 +946,7 @@ def _build_bounded_raw_winner_canary_request_components(
             causal_precommit.receipt_sha256,
             "CANARY_CAUSAL_PRECOMMIT_RECEIPT_INVALID",
         ),
+        "native_authority_verification": native_authority_verification,
         "causal_evidence_access_deadline_utc": deadline,
         "production_symbols": list(book.PINNED_SYMBOL_ORDER),
         "production_timeframes": list(book.TIMEFRAME_ORDER),
@@ -790,9 +1003,8 @@ def verify_bounded_raw_winner_canary_request(
     for key, expected in context_body.items():
         if body.get(key) != expected:
             _fail("CANARY_REQUEST_CONTEXT_MISMATCH")
-    if (
-        body["run_id"] != body["generation_id"]
-        or not body["run_id"].startswith(BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX)
+    if body["run_id"] != body["generation_id"] or not body["run_id"].startswith(
+        BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX
     ):
         _fail("CANARY_REQUEST_RUN_IDENTITY_INVALID")
     _safe_id(body["request_nonce"], "CANARY_REQUEST_NONCE_INVALID")
@@ -820,6 +1032,11 @@ def verify_bounded_raw_winner_canary_request(
         "causal_precommit_receipt_sha256",
     ):
         _hex(body[key], f"CANARY_REQUEST_{key.upper()}_INVALID")
+    _normalized_native_authority_verification(
+        body["native_authority_verification"],
+        expected_activation_manifest_sha256=body["activation_manifest_sha256"],
+        allow_none=True,
+    )
     _safe_id(body["activation_id"], "CANARY_REQUEST_ACTIVATION_ID_INVALID")
     if (
         body["production_symbols"] != list(book.PINNED_SYMBOL_ORDER)
@@ -833,10 +1050,8 @@ def verify_bounded_raw_winner_canary_request(
         _fail("CANARY_REQUEST_ANCHOR_COUNT_INVALID")
     _normalize_anchor_geometry(body["anchor"])
     if (
-        body["regime_selection_rule"]
-        != BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE
-        or body["attempt_count_exact"]
-        != BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+        body["regime_selection_rule"] != BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE
+        or body["attempt_count_exact"] != BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
         or body["one_symbol_timeframe_regime_only"] is not True
         or body["source_access_must_follow_request"] is not True
         or body["planning_request_schema_accepted"] is not False
@@ -940,6 +1155,7 @@ def _make_bounded_raw_winner_canary_issuer(issue_builder: Callable[..., Any]):
         causal_precommit: Any,
         symbol: str,
         timeframe: str,
+        native_authority_verification_scope: Any | None = None,
     ) -> BoundedRawWinnerCanaryRequest:
         body_json, sink = issue_builder(
             context,
@@ -949,6 +1165,9 @@ def _make_bounded_raw_winner_canary_issuer(issue_builder: Callable[..., Any]):
             causal_precommit=causal_precommit,
             symbol=symbol,
             timeframe=timeframe,
+            native_authority_verification_scope=(
+                native_authority_verification_scope
+            ),
         )
         request = BoundedRawWinnerCanaryRequest(
             body_json,
@@ -957,12 +1176,38 @@ def _make_bounded_raw_winner_canary_issuer(issue_builder: Callable[..., Any]):
         )
         verify_bounded_raw_winner_canary_request(context, request)
         return request
-    return issue, verify_request
+
+    consumed_receipts: set[str] = set()
+    consumption_lock = threading.Lock()
+
+    def consume(
+        context: authority_spool.GenerationSpoolContext,
+        request: Any,
+    ) -> tuple[dict[str, Any], authority_spool.SymbolAuthoritySink]:
+        """One-shot consumption gate: a canary request authorizes one attempt.
+
+        Consumption is keyed by the issuance-unique receipt (every issued body
+        carries a fresh nonce), held in closure state so no caller can reset
+        it. Re-consumption fails closed even for a byte-identical request.
+        """
+
+        body = verify_bounded_raw_winner_canary_request(context, request)
+        receipt = request.receipt_sha256
+        with consumption_lock:
+            if receipt in consumed_receipts:
+                _fail("CANARY_REQUEST_ALREADY_CONSUMED")
+            # Burn the request before the executor opens any source. A failed
+            # partial canary must never be replayed inside the same process.
+            consumed_receipts.add(receipt)
+        return body, request.symbol_sink()
+
+    return issue, verify_request, consume
 
 
 (
     issue_bounded_raw_winner_canary_request,
     _verify_canary_request_issuance,
+    consume_bounded_raw_winner_canary_request,
 ) = _make_bounded_raw_winner_canary_issuer(
     _build_bounded_raw_winner_canary_request_components
 )
@@ -998,9 +1243,7 @@ def _normalize_anchor(value: Any) -> dict[str, Any]:
     if type(value) is not dict or set(value) != _ANCHOR_FIELDS:
         _fail("ANCHOR_FIELDS_INVALID")
     anchor = json.loads(_canonical_bytes(value, 64 * 1024).decode("utf-8"))
-    _normalize_anchor_geometry(
-        {name: anchor[name] for name in _ANCHOR_GEOMETRY_FIELDS}
-    )
+    _normalize_anchor_geometry({name: anchor[name] for name in _ANCHOR_GEOMETRY_FIELDS})
     if anchor["horizon_binding_count"] != book.FAMILY_SIZE:
         _fail("HORIZON_BINDING_COUNT_INCOMPLETE")
     _hex(
@@ -1471,6 +1714,7 @@ def _historical_evidence_state(
     state = evidence.process_state_decision.state_kind
     if state not in {
         book.TERMINAL_SOURCE_ABSENCE,
+        book.TERMINAL_TECHNICAL,
         book.TECHNICAL_FAILURE,
         book.UNSEARCHED,
         book.REGIME_UNOBSERVED,
@@ -1491,6 +1735,10 @@ def _assert_horizon_evidence_consistency(
     if plan_status == "HISTORICAL_SOURCE_UNAVAILABLE":
         if state != book.TERMINAL_SOURCE_ABSENCE:
             _fail("HORIZON_SOURCE_UNAVAILABLE_EVIDENCE_MISMATCH")
+        return
+    if plan_status == "HISTORICAL_TERMINAL_TECHNICAL":
+        if state != book.TERMINAL_TECHNICAL:
+            _fail("HORIZON_TERMINAL_TECHNICAL_EVIDENCE_MISMATCH")
         return
     if plan_status == "HISTORICAL_REGIME_UNOBSERVED":
         if state != book.REGIME_UNOBSERVED:
@@ -1709,7 +1957,9 @@ def _verify_graph_roster(
     raw_entries = body.get("artifacts")
     if type(raw_entries) is not list:
         _fail(code)
-    entries = [_manifest_entry(value, code=code) for value in raw_entries]
+    entries: list[dict[str, Any]] = []
+    for value in raw_entries:
+        entries.append(_manifest_entry(value, code=code))
     ids = [entry["artifact_id"] for entry in entries]
     if (
         entries != sorted(entries, key=lambda item: item["artifact_id"])
@@ -1984,6 +2234,129 @@ def _verify_adapter_manifest_graph(
         or len(cell_records) != _CELLS_PER_SYMBOL
     ):
         _fail("ADAPTER_PRODUCTION_INDEX_ROSTER_INVALID")
+    empty_roster_sha256 = _canonical_sha256([])
+    terminal_record_fields = {
+        "symbol",
+        "timeframe",
+        "regime",
+        "historical_state",
+        "attempted_trials_exact",
+        "process_state_receipt_sha256",
+        "winner_request_sha256",
+        "winner_decision_sha256",
+        "insufficient_evidence_binding",
+        "insufficient_horizon_plan_receipt_sha256",
+        "process_rejection_request_sha256",
+        "process_rejection_decision_sha256",
+        "raw_artifact_namespace",
+        "frozen_plan_receipt",
+        "frozen_descriptor_graph",
+        "horizon_winner_cross_binding",
+        "raw_production_receipt",
+        "production_descriptor_graph",
+        "technical_failure_artifact",
+    }
+    terminal_null_record_fields = terminal_record_fields - {
+        "symbol",
+        "timeframe",
+        "regime",
+        "historical_state",
+        "attempted_trials_exact",
+        "process_state_receipt_sha256",
+    }
+    for timeframe in book.TIMEFRAME_ORDER:
+        source = source_by_timeframe[timeframe]
+        fit = fit_by_timeframe[timeframe]
+        for regime in book.REGIME_ORDER:
+            binding = binding_by_cell[(timeframe, regime)]
+            record = cell_records[(timeframe, regime)]
+            terminal_flags = (
+                binding.get("plan_status") == "HISTORICAL_TERMINAL_TECHNICAL",
+                source.get("availability") == book.TERMINAL_TECHNICAL,
+                fit.get("fit_state") == book.REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
+                record.get("historical_state") == book.TERMINAL_TECHNICAL,
+            )
+            if any(terminal_flags) and not all(terminal_flags):
+                _fail("ADAPTER_TERMINAL_TECHNICAL_BIJECTION_INVALID")
+            if not all(terminal_flags):
+                continue
+            if (
+                binding.get("source_prefix_receipt_sha256") is not None
+                or any(
+                    binding.get(name) != empty_roster_sha256
+                    for name in (
+                        "candidate_registry_sha256",
+                        "trial_registry_sha256",
+                        "attempt_roster_sha256",
+                        "evidence_roster_sha256",
+                    )
+                )
+                or source.get("reason_code") != _TERMINAL_TECHNICAL_REASON_CODE
+                or fit.get("reason_code") != _TERMINAL_TECHNICAL_REASON_CODE
+                or source.get("native_source_sha256") is not None
+                or source.get("acquisition_attempts_exact") != 1
+                or type(source.get("activation_id")) is not str
+                or not source["activation_id"]
+                or record.get("symbol") != symbol
+                or record.get("timeframe") != timeframe
+                or record.get("regime") != regime
+                or set(record) != terminal_record_fields
+                or record.get("attempted_trials_exact") != 0
+                or any(
+                    record.get(name) is not None for name in terminal_null_record_fields
+                )
+            ):
+                _fail("ADAPTER_TERMINAL_TECHNICAL_SEMANTICS_INVALID")
+            for name in (
+                "source_contract_sha256",
+                "source_group_evidence_sha256",
+                "activation_manifest_sha256",
+                "activation_entry_sha256",
+                "terminal_proof_sha256",
+                "receipt_sha256",
+            ):
+                _hex(source.get(name), "ADAPTER_TERMINAL_TECHNICAL_SOURCE_INVALID")
+            rebuilt_source = book.create_historical_source_group_decision(
+                symbol=symbol,
+                timeframe=timeframe,
+                availability=book.TERMINAL_TECHNICAL,
+                reason_code=_TERMINAL_TECHNICAL_REASON_CODE,
+                source_contract_sha256=source["source_contract_sha256"],
+                source_group_evidence_sha256=source["source_group_evidence_sha256"],
+                acquisition_attempts_exact=1,
+                activation_id=source["activation_id"],
+                activation_manifest_sha256=source["activation_manifest_sha256"],
+                activation_entry_sha256=source["activation_entry_sha256"],
+                terminal_proof_sha256=source["terminal_proof_sha256"],
+            )
+            if rebuilt_source is None or rebuilt_source.to_dict() != source:
+                _fail("ADAPTER_TERMINAL_TECHNICAL_SOURCE_REPLAY_INVALID")
+            _hex(
+                fit.get("regime_fit_policy_sha256"),
+                "ADAPTER_TERMINAL_TECHNICAL_FIT_INVALID",
+            )
+            rebuilt_fit = book.create_regime_fit_decision(
+                source_group_decision=rebuilt_source,
+                fit_state=book.REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL,
+                reason_code=_TERMINAL_TECHNICAL_REASON_CODE,
+                regime_fit_policy_sha256=fit["regime_fit_policy_sha256"],
+            )
+            if rebuilt_fit is None or rebuilt_fit.to_dict() != fit:
+                _fail("ADAPTER_TERMINAL_TECHNICAL_FIT_REPLAY_INVALID")
+            rebuilt_process = book.create_historical_process_state_decision(
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                state_kind=book.TERMINAL_TECHNICAL,
+                reason_code=_TERMINAL_TECHNICAL_REASON_CODE,
+                source_group_decision=rebuilt_source,
+                regime_fit_decision=rebuilt_fit,
+                attempted_trials_exact=0,
+            )
+            if rebuilt_process is None or rebuilt_process.receipt_sha256 != record.get(
+                "process_state_receipt_sha256"
+            ):
+                _fail("ADAPTER_TERMINAL_TECHNICAL_PROCESS_REPLAY_INVALID")
     for (timeframe, regime), observed in cross_by_cell.items():
         cross = observed["body"]
         record = cell_records.get((timeframe, regime))
@@ -2181,7 +2554,11 @@ def execute_historical_anchor_run(
         _fail("SPOOL_ARTIFACT_COUNT_BOUND_TOO_SMALL")
 
     sinks = {
-        symbol: authority_spool.open_symbol_sink(context, symbol)
+        symbol: authority_spool.open_symbol_sink(
+            context,
+            symbol,
+            manifest_domain=authority_spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN,
+        )
         for symbol in book.PINNED_SYMBOL_ORDER
     }
     precommit_descriptor = precommit.artifact_descriptor
@@ -2236,7 +2613,9 @@ def execute_historical_anchor_run(
             }
         )
 
-    symbol_receipts = [sinks[symbol].seal() for symbol in book.PINNED_SYMBOL_ORDER]
+    symbol_receipts: list[dict[str, Any]] = []
+    for symbol in book.PINNED_SYMBOL_ORDER:
+        symbol_receipts.append(sinks[symbol].seal())
     body = {
         "schema_version": RUN_RECEIPT_SCHEMA,
         "authority_scope": AUTHORITY_SCOPE,
@@ -2345,6 +2724,7 @@ def verify_historical_anchor_run_receipt(
                     "WINNER",
                     "NO_WINNER",
                     "SOURCE_UNAVAILABLE",
+                    book.TERMINAL_TECHNICAL,
                     book.TECHNICAL_FAILURE,
                     book.UNSEARCHED,
                     book.REGIME_UNOBSERVED,
@@ -2383,6 +2763,9 @@ def verify_historical_anchor_run_receipt(
         horizon_hashers = {
             identifier: _CanonicalListHasher() for identifier in results_by_anchor
         }
+        terminal_binding_cells_by_anchor: dict[str, set[tuple[str, str, str]]] = {
+            identifier: set() for identifier in results_by_anchor
+        }
         book_artifacts: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         precommit_descriptor = _descriptor(precommit.artifact_descriptor)
         for symbol, symbol_receipt in zip(
@@ -2395,6 +2778,9 @@ def verify_historical_anchor_run_receipt(
                 expected_symbol=symbol,
                 expected_native_universe_sha256=context.native_universe_sha256,
                 expected_config_sha256=context.config_sha256,
+                expected_manifest_domain=(
+                    authority_spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN
+                ),
             )
             artifacts = {item["artifact_id"]: item for item in manifest["artifacts"]}
             if not expected_ids.issubset(artifacts):
@@ -2458,6 +2844,8 @@ def verify_historical_anchor_run_receipt(
                             "process_precommit_receipt_sha256"
                         ],
                     )
+                    if binding["plan_status"] == "HISTORICAL_TERMINAL_TECHNICAL":
+                        terminal_binding_cells_by_anchor[anchor_id].add(expected_cell)
                     symbol_hasher.add(binding)
                     horizon_hashers[anchor_id].add(binding)
                 _, symbol_horizon_sha = symbol_hasher.finish()
@@ -2520,6 +2908,38 @@ def verify_historical_anchor_run_receipt(
                 return False
             _, decision_payload = book_artifacts[anchor_id]
             decision = _reopen_verified_book_decision(decision_payload)
+            terminal_book_cells = {
+                (cell.get("symbol"), cell.get("timeframe"), cell.get("regime"))
+                for cell in decision_payload.get("cells", [])
+                if type(cell) is dict
+                and cell.get("historical_state") == book.TERMINAL_TECHNICAL
+            }
+            terminal_book_groups = {(cell[0], cell[1]) for cell in terminal_book_cells}
+            terminal_source_groups = {
+                (
+                    item.get("payload", {}).get("symbol"),
+                    item.get("payload", {}).get("timeframe"),
+                )
+                for item in decision_payload.get("source_groups", [])
+                if type(item) is dict
+                and type(item.get("payload")) is dict
+                and item["payload"].get("availability") == book.TERMINAL_TECHNICAL
+                and item["payload"].get("reason_code")
+                == _TERMINAL_TECHNICAL_REASON_CODE
+            }
+            terminal_fit_groups = {
+                (
+                    item.get("payload", {}).get("symbol"),
+                    item.get("payload", {}).get("timeframe"),
+                )
+                for item in decision_payload.get("regime_fits", [])
+                if type(item) is dict
+                and type(item.get("payload")) is dict
+                and item["payload"].get("fit_state")
+                == book.REGIME_NOT_APPLICABLE_TECHNICAL_TERMINAL
+                and item["payload"].get("reason_code")
+                == _TERMINAL_TECHNICAL_REASON_CODE
+            }
             if (
                 decision.receipt_sha256 != result["book_decision_sha256"]
                 or decision_payload.get("contract_version")
@@ -2534,6 +2954,15 @@ def verify_historical_anchor_run_receipt(
                 != result["source_group_count"]
                 or decision_payload.get("family_size")
                 != result["accounting_slot_count"]
+                or terminal_book_cells != terminal_binding_cells_by_anchor[anchor_id]
+                or terminal_source_groups != terminal_book_groups
+                or terminal_fit_groups != terminal_book_groups
+                or any(
+                    cell.get("state_reason") != _TERMINAL_TECHNICAL_REASON_CODE
+                    for cell in decision_payload.get("cells", [])
+                    if type(cell) is dict
+                    and cell.get("historical_state") == book.TERMINAL_TECHNICAL
+                )
             ):
                 return False
         descriptor = _descriptor(receipt.artifact_descriptor)
@@ -2555,6 +2984,7 @@ __all__ = [
     "BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX",
     "BOUNDED_RAW_WINNER_CANARY_SCOPE",
     "BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE",
+    "PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA",
     "BoundedRawWinnerCanaryRequest",
     "HORIZON_BINDING_SCHEMA",
     "HistoricalAnchorOrchestrationError",
@@ -2569,8 +2999,10 @@ __all__ = [
     "historical_horizon_binding_roster_sha256",
     "historical_horizon_plan_binding",
     "issue_historical_pre_evidence_planning_request",
+    "consume_bounded_raw_winner_canary_request",
     "issue_bounded_raw_winner_canary_request",
     "precommit_historical_anchor_run",
+    "reopen_anchor_producer_request_for_symbol",
     "verify_bounded_raw_winner_canary_request",
     "verify_historical_anchor_run_receipt",
 ]

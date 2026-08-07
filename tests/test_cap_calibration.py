@@ -373,6 +373,19 @@ def _authorization_evidence(
     }
 
 
+def _authorization_times(
+    artifact: dict[str, object],
+) -> tuple[datetime, datetime, datetime, datetime]:
+    generated = datetime.fromisoformat(
+        str(artifact["generated_at_utc"]).replace("Z", "+00:00")
+    )
+    issued = generated + timedelta(minutes=1)
+    current = issued + timedelta(hours=12)
+    expires = issued + timedelta(days=2)
+    expired = expires + timedelta(seconds=1)
+    return issued, current, expires, expired
+
+
 def _resign_replay(bundle: dict[str, object]) -> None:
     body = bundle["replay"]["body"]
     bundle["replay"] = _sign(
@@ -603,11 +616,12 @@ def test_joint_gap_and_margin_reconciliation_fail_closed() -> None:
 def test_numeric_selection_requires_fresh_external_authorization() -> None:
     bundle = _bundle()
     pending = _calibrate(bundle)
+    issued, current, expires, expired = _authorization_times(pending)
     errors = cap.validate_cap_calibration_artifact(
         pending,
         expected_lineage=bundle["lineage"],
         expected_selected_cap_pct=20.0,
-        validation_time_utc="2026-08-01T00:00:00Z",
+        validation_time_utc=current,
     )
     assert "CAP_CALIBRATION_EXTERNAL_AUTHORIZATION_REQUIRED" in errors
 
@@ -640,8 +654,8 @@ def test_numeric_selection_requires_fresh_external_authorization() -> None:
         authority_key_id="risk-committee",
         selected_policy_point_id="high",
         selected_cap_pct=20.0,
-        issued_at_utc="2026-07-15T00:00:00Z",
-        expires_at_utc="2026-09-01T00:00:00Z",
+        issued_at_utc=issued,
+        expires_at_utc=expires,
         expected_deployment_lineage=bundle["lineage"],
         expected_constraints=bundle["constraints"],
         **_authorization_evidence(bundle),
@@ -656,7 +670,7 @@ def test_numeric_selection_requires_fresh_external_authorization() -> None:
         pending,
         receipt,
         trusted_public_keys={"risk-committee": public},
-        validation_time_utc="2026-08-01T00:00:00Z",
+        validation_time_utc=current,
         expected_deployment_lineage=bundle["lineage"],
         expected_constraints=bundle["constraints"],
         **_authorization_evidence(bundle),
@@ -669,21 +683,21 @@ def test_numeric_selection_requires_fresh_external_authorization() -> None:
         expected_selected_policy_point_id="high",
         expected_constraints=bundle["constraints"],
         trusted_authority_public_keys={"risk-committee": public},
-        validation_time_utc="2026-08-01T00:00:00Z",
+        validation_time_utc=current,
     ) == []
     assert cap.validate_cap_calibration_artifact(
         authorized,
         expected_lineage=bundle["lineage"],
         expected_selected_cap_pct=None,
         trusted_authority_public_keys={"risk-committee": public},
-        validation_time_utc="2026-08-01T00:00:00Z",
+        validation_time_utc=current,
     ) == []
     expired = cap.validate_cap_calibration_artifact(
         authorized,
         expected_lineage=bundle["lineage"],
         expected_selected_cap_pct=None,
         trusted_authority_public_keys={"risk-committee": public},
-        validation_time_utc="2026-10-01T00:00:00Z",
+        validation_time_utc=expired,
     )
     assert "CAP_CALIBRATION_EXTERNAL_AUTHORIZATION_INVALID" in expired
 
@@ -721,12 +735,13 @@ def test_none_cap_cannot_bypass_auth_or_raw_reverification() -> None:
 def test_authorization_tamper_and_expiry_are_rejected() -> None:
     bundle = _bundle()
     pending = _calibrate(bundle)
+    issued, current, expires, expired = _authorization_times(pending)
     private, public = _private_key()
     body = cap.build_capital_envelope_authorization_body(
         pending,
         authority_key_id="risk",
-        issued_at_utc="2026-07-15T00:00:00Z",
-        expires_at_utc="2026-07-16T00:00:00Z",
+        issued_at_utc=issued,
+        expires_at_utc=expires,
         **_authorization_evidence(bundle),
     )
     receipt = _sign(private, "risk", cap.AUTHORIZATION_SIGNATURE_KIND, body)
@@ -735,7 +750,7 @@ def test_authorization_tamper_and_expiry_are_rejected() -> None:
             pending,
             receipt,
             trusted_public_keys={"risk": public},
-            validation_time_utc="2026-07-17T00:00:00Z",
+            validation_time_utc=expired,
             **_authorization_evidence(bundle),
         )
     receipt["body"]["selected_max_total_stop_risk_pct"] = 90.0
@@ -744,7 +759,7 @@ def test_authorization_tamper_and_expiry_are_rejected() -> None:
             pending,
             receipt,
             trusted_public_keys={"risk": public},
-            validation_time_utc="2026-07-15T12:00:00Z",
+            validation_time_utc=current,
             **_authorization_evidence(bundle),
         )
 
@@ -752,6 +767,7 @@ def test_authorization_tamper_and_expiry_are_rejected() -> None:
 def test_human_authorization_builder_recomputes_signed_evidence() -> None:
     bundle = _bundle()
     pending = _calibrate(bundle)
+    issued, _current, expires, _expired = _authorization_times(pending)
     forged = deepcopy(pending)
     forged.pop("content_seal")
     forged["selection"]["selected_max_total_stop_risk_pct"] = 90.0
@@ -767,8 +783,8 @@ def test_human_authorization_builder_recomputes_signed_evidence() -> None:
         cap.build_capital_envelope_authorization_body(
             forged,
             authority_key_id="risk",
-            issued_at_utc="2026-07-15T00:00:00Z",
-            expires_at_utc="2026-07-16T00:00:00Z",
+            issued_at_utc=issued,
+            expires_at_utc=expires,
             **_authorization_evidence(bundle),
         )
 
@@ -817,12 +833,13 @@ def test_artifact_tamper_and_immutable_writer(tmp_path: Path) -> None:
 def test_authorization_binds_window_and_authority_scope() -> None:
     bundle = _bundle()
     pending = _calibrate(bundle)
+    issued, current, expires, _expired = _authorization_times(pending)
     private, public = _private_key()
     body = cap.build_capital_envelope_authorization_body(
         pending,
         authority_key_id="risk",
-        issued_at_utc="2026-07-15T00:00:00Z",
-        expires_at_utc="2026-07-16T00:00:00Z",
+        issued_at_utc=issued,
+        expires_at_utc=expires,
         **_authorization_evidence(bundle),
     )
     receipt = _sign(private, "risk", cap.AUTHORIZATION_SIGNATURE_KIND, body)
@@ -830,7 +847,7 @@ def test_authorization_binds_window_and_authority_scope() -> None:
         pending,
         receipt,
         trusted_public_keys={"risk": public},
-        validation_time_utc="2026-07-15T12:00:00Z",
+        validation_time_utc=current,
         **_authorization_evidence(bundle),
     )
 
@@ -843,7 +860,7 @@ def test_authorization_binds_window_and_authority_scope() -> None:
         expected_lineage=bundle["lineage"],
         expected_selected_cap_pct=20.0,
         trusted_authority_public_keys={"risk": public},
-        validation_time_utc="2026-07-15T12:00:00Z",
+        validation_time_utc=current,
     )
     assert "CAP_CALIBRATION_DECISION_SHA256_INVALID" in errors
     assert "CAP_CALIBRATION_EXTERNAL_AUTHORIZATION_INVALID" in errors

@@ -113,9 +113,7 @@ def _planning_request(context, *, run_id, anchor, symbol_sinks, **kwargs):
         "run_id": run_id,
         "generation_id": context.generation_id,
         "anchor": dict(anchor),
-        "process_precommit_receipt_sha256": kwargs[
-            "process_precommit_receipt_sha256"
-        ],
+        "process_precommit_receipt_sha256": kwargs["process_precommit_receipt_sha256"],
     }
     return historical.AnchorProducerRequest(_canonical(body), symbol_sinks)
 
@@ -128,15 +126,13 @@ def _production_request(context, planned, sinks):
         "run_id": "historical-run",
         "generation_id": context.generation_id,
         "precommit_receipt_sha256": "f" * 64,
-        "process_precommit_receipt_sha256": (
-            planned.causal_precommit_payload_sha256
-        ),
+        "process_precommit_receipt_sha256": (planned.causal_precommit_payload_sha256),
         "optimizer_producer_release_sha256": (
             producer.historical_adapter.HISTORICAL_PRODUCER_RELEASE_SHA256
         ),
         "anchor": anchor,
-        "symbols": ["EURUSD"],
-        "timeframes": ["M5"],
+        "symbols": list(producer._SYMBOLS),
+        "timeframes": list(producer._TIMEFRAMES),
         "regimes": list(producer._REGIMES),
         "requires_exact_sparse_state_roster": True,
         "possible_regime_slots_are_forced_observations": False,
@@ -174,7 +170,61 @@ def bounded_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         producer.native_prefix,
         "produce_activated_native_prefix",
-        lambda **kwargs: _Product(kwargs["symbol"], kwargs["timeframe"]),
+        lambda **kwargs: _Product(
+            kwargs["symbol"],
+            kwargs["timeframe"],
+            native_prefix={
+                "source_reason": None,
+                "cutoff_utc": kwargs["cutoff_utc"],
+            },
+        ),
+    )
+
+    def produce_prefixes(**kwargs):
+        return tuple(
+            _Product(
+                kwargs["symbol"],
+                kwargs["timeframe"],
+                native_prefix={
+                    "source_reason": None,
+                    "cutoff_utc": request["cutoff_utc"],
+                },
+            )
+            for request in kwargs["requests"]
+        )
+
+    monkeypatch.setattr(
+        producer.native_prefix,
+        "produce_activated_native_prefixes",
+        produce_prefixes,
+    )
+
+    monkeypatch.setattr(
+        producer.native_prefix,
+        "stage_activated_native_prefixes",
+        lambda **kwargs: tuple(
+            {
+                "symbol": kwargs["symbol"],
+                "timeframe": kwargs["timeframe"],
+                "cutoff_utc": request["cutoff_utc"],
+            }
+            for request in kwargs["requests"]
+        ),
+    )
+    monkeypatch.setattr(
+        producer.native_prefix,
+        "verify_activated_native_prefix_candidates",
+        lambda **kwargs: tuple(
+            _Product(
+                kwargs["symbol"],
+                kwargs["timeframe"],
+                native_prefix={
+                    "source_reason": None,
+                    "cutoff_utc": candidate["cutoff_utc"],
+                },
+            )
+            for candidate in kwargs["candidates"]
+        ),
     )
 
     def binding(value):
@@ -201,8 +251,165 @@ def bounded_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         lambda values: _sha(list(values)),
     )
     releases = []
-    monkeypatch.setattr(producer, "_release_timeframe_state", lambda: releases.append(1))
-    return data_dir, context, releases
+    monkeypatch.setattr(
+        producer, "_release_timeframe_state", lambda: releases.append(1)
+    )
+    active_config_path = (tmp_path / "config.json").resolve()
+    effective_config_sha256 = "e" * 64
+
+    class FrozenConfigBinding:
+        def __init__(self, supplied_config):
+            self.active_config_path = active_config_path
+            self.effective_config_sha256 = effective_config_sha256
+            self._supplied_config = supplied_config
+            self._supplied_config.data_dir = data_dir
+
+        def materialize(self, observed_context):
+            assert observed_context is context
+            return self._supplied_config
+
+    monkeypatch.setattr(
+        producer.config_binding,
+        "load_effective_pipeline_config",
+        lambda observed_path: (
+            (
+                {}
+                if Path(observed_path) == active_config_path
+                else pytest.fail("active config path changed")
+            ),
+            pm_core.PipelineConfig(),
+        ),
+    )
+
+    def freeze_config(
+        observed_context,
+        *,
+        active_config_path: Path,
+        config_payload,
+        supplied_config,
+    ):
+        assert observed_context is context
+        assert Path(active_config_path) == (tmp_path / "config.json").resolve()
+        assert config_payload == {}
+        return FrozenConfigBinding(supplied_config)
+
+    monkeypatch.setattr(
+        producer.config_binding,
+        "freeze_production_pipeline_config",
+        freeze_config,
+    )
+
+    def worker_authority(contract, symbol, *, phase):
+        assert contract["phase"] == phase
+        request = historical.AnchorProducerRequest(
+            contract["request_json"].encode("ascii"),
+            {symbol: spool.open_symbol_sink(context, symbol)},
+        )
+        return (
+            dict(contract),
+            context,
+            _fake_process(contract["run_id"]),
+            request,
+            pm_core.PipelineConfig(data_dir=data_dir),
+            data_dir,
+            dict(contract["causal_precommit_payload"]),
+        )
+
+    monkeypatch.setattr(producer, "_worker_authority", worker_authority)
+    monkeypatch.setattr(
+        producer,
+        "_prefix_route",
+        lambda product: {
+            "symbol": product.symbol,
+            "timeframe": product.timeframe,
+            "cutoff_utc": product.native_prefix["cutoff_utc"],
+            "source_state": product.source_state,
+        },
+    )
+
+    def reopen_prefix(*, route, symbol, timeframe, **_kwargs):
+        assert route["symbol"] == symbol
+        assert route["timeframe"] == timeframe
+        return _Product(
+            symbol,
+            timeframe,
+            source_state=route["source_state"],
+            native_prefix={
+                "source_reason": None,
+                "cutoff_utc": route["cutoff_utc"],
+            },
+        )
+
+    monkeypatch.setattr(producer, "_reopen_prefix_route", reopen_prefix)
+
+    bridge_products = {}
+
+    def spool_bundle(capture):
+        product = capture.finish()
+        descriptor = spool.write_canonical_json_artifact(
+            context,
+            {
+                "schema_version": "fxpm.fixture-historical-worker-bundle.v1",
+                "symbol": product.symbol,
+                "ordinal": len(bridge_products),
+            },
+        )
+        bridge_products[descriptor["sha256"]] = product
+        return descriptor
+
+    def reopen_bundle(
+        observed_context,
+        _request,
+        descriptor,
+    ):
+        assert observed_context is context
+        return bridge_products[descriptor["sha256"]]
+
+    monkeypatch.setattr(
+        producer.historical_adapter,
+        "spool_historical_symbol_worker_bundle",
+        spool_bundle,
+    )
+    monkeypatch.setattr(
+        producer.historical_adapter,
+        "reopen_historical_symbol_worker_bundle",
+        reopen_bundle,
+    )
+
+    scheduler_calls = []
+
+    def run_scheduler(
+        worker,
+        *,
+        contract,
+        symbols,
+        requested_workers,
+        phase,
+    ):
+        assert requested_workers == scheduler.requested_workers
+        scheduler_calls.append(
+            {
+                "phase": phase,
+                "contract_phase": contract["phase"],
+            }
+        )
+        # Reverse completion order deliberately; the production caller must
+        # still consume the result mapping in its frozen symbol order.
+        return {
+            symbol: worker(contract, symbol)
+            for symbol in reversed(tuple(symbols))
+        }
+
+    monkeypatch.setattr(
+        producer.historical_scheduler,
+        "run_symbol_scheduler",
+        run_scheduler,
+    )
+    scheduler = producer.HistoricalSymbolSchedulerInputs(
+        active_config_path=active_config_path,
+        requested_workers=1,
+    )
+    return data_dir, context, releases, scheduler, scheduler_calls
 
 
 def _install_sparse_planner(monkeypatch, *, drift: bool = False):
@@ -251,15 +458,16 @@ def test_preplan_never_executes_returns_and_callback_replays_exact_sparse_roster
     bounded_environment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, context, releases = bounded_environment
+    data_dir, context, releases, scheduler, scheduler_calls = bounded_environment
     _install_sparse_planner(monkeypatch)
     captures = []
     executions = []
     monkeypatch.setattr(
         producer.historical_adapter,
         "open_historical_symbol_capture",
-        lambda _context, request, symbol: captures.append(_Capture(request, symbol))
-        or captures[-1],
+        lambda _context, request, symbol: (
+            captures.append(_Capture(request, symbol)) or captures[-1]
+        ),
     )
 
     def execute(**kwargs):
@@ -284,9 +492,16 @@ def test_preplan_never_executes_returns_and_callback_replays_exact_sparse_roster
         causal_precommit_payload=_causal_payload(),
         run_id="historical-run",
         anchors=[ANCHOR],
+        symbol_scheduler=scheduler,
     )
 
     assert executions == []
+    assert scheduler_calls == [
+        {
+            "phase": "historical_preplan",
+            "contract_phase": "PREPLAN_BATCH",
+        }
+    ]
     assert planned.anchors[0]["horizon_binding_count"] == 4
     assert len(planned.anchors[0]["horizon_binding_roster_sha256"]) == 64
     sinks = {"EURUSD": spool.open_symbol_sink(context, "EURUSD")}
@@ -297,10 +512,22 @@ def test_preplan_never_executes_returns_and_callback_replays_exact_sparse_roster
     assert [value.symbol for value in products] == ["EURUSD"]
     assert len(executions) == 1
     assert executions[0]["regime"] == "TREND"
+    assert executions[0]["cell_plan"].horizon_plan is captures[0].bound[0][1][
+        "horizon_plans"
+    ][0]
+    assert executions[0]["search_process"].receipt_sha256 == (
+        planned._process.receipt_sha256
+    )
+    assert "horizon_plan" not in executions[0]
+    assert "attempt_artifacts" not in executions[0]
     assert len(captures) == 1
     assert len(captures[0].bound) == 1
     assert len(captures[0].bound[0][1]["horizon_plans"]) == 4
     assert len(releases) == 2  # preplanning and canonical callback
+    assert [call["phase"] for call in scheduler_calls] == [
+        "historical_preplan",
+        "historical_execute",
+    ]
     with pytest.raises(
         producer.HistoricalSearchProducerError,
         match="ANCHOR_PRODUCER_ALREADY_CONSUMED",
@@ -308,11 +535,215 @@ def test_preplan_never_executes_returns_and_callback_replays_exact_sparse_roster
         callback(request)
 
 
+def test_scheduler_parallel_completion_has_byte_identical_assembled_evidence(
+    bounded_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, context, _releases, base_scheduler, _scheduler_calls = (
+        bounded_environment
+    )
+    symbols = ("EURUSD", "GBPUSD", "USDJPY")
+    monkeypatch.setattr(producer, "_SYMBOLS", symbols)
+    monkeypatch.setattr(producer, "_GROUPS_PER_ANCHOR", len(symbols))
+    monkeypatch.setattr(
+        producer,
+        "_CELLS_PER_ANCHOR",
+        len(symbols) * len(producer._TIMEFRAMES) * len(producer._REGIMES),
+    )
+    _install_sparse_planner(monkeypatch)
+
+    class DeterministicCapture(_Capture):
+        def finish(self):
+            anchor_id = self.request.to_dict()["anchor"]["anchor_id"]
+            horizon_plans = tuple(
+                {
+                    "anchor_id": anchor_id,
+                    "symbol": self.symbol,
+                    "timeframe": timeframe,
+                }
+                for timeframe, _kwargs in self.bound
+            )
+            book_evidence = tuple(
+                {
+                    "schema_version": "fxpm.fixture-historical-book-cell.v1",
+                    "anchor_id": anchor_id,
+                    "symbol": self.symbol,
+                    "timeframe": timeframe,
+                    "evidence_sha256": _sha(
+                        [anchor_id, self.symbol, timeframe]
+                    ),
+                }
+                for timeframe, _kwargs in self.bound
+            )
+            return historical.AnchorSymbolProduct(
+                symbol=self.symbol,
+                horizon_plans=horizon_plans,
+                book_evidence=book_evidence,
+                optimizer_payload={
+                    "anchor_id": anchor_id,
+                    "symbol": self.symbol,
+                    "captured": True,
+                },
+            )
+
+    monkeypatch.setattr(
+        producer.historical_adapter,
+        "open_historical_symbol_capture",
+        lambda _context, request, symbol: DeterministicCapture(request, symbol),
+    )
+    monkeypatch.setattr(
+        producer.search_execution,
+        "execute_historical_observed_cell",
+        lambda **_kwargs: search_execution.HistoricalObservedCellExecution(
+            status="WINNER_RAW_EVIDENCE_COMPLETE",
+            attempted_trials_exact=1,
+            production=None,
+            failure_code=None,
+        ),
+    )
+
+    active_run = ""
+    completion_orders = {
+        "serial": {"historical_preplan": [], "historical_execute": []},
+        "parallel": {"historical_preplan": [], "historical_execute": []},
+    }
+
+    def run_scheduler(
+        worker,
+        *,
+        contract,
+        symbols,
+        requested_workers,
+        phase,
+    ):
+        ordered = list(symbols)
+        if requested_workers > 1:
+            ordered = [ordered[0], *reversed(ordered[1:])]
+        completed = {}
+        for symbol in ordered:
+            completed[symbol] = worker(contract, symbol)
+            completion_orders[active_run][phase].append(symbol)
+        return completed
+
+    monkeypatch.setattr(
+        producer.historical_scheduler,
+        "run_symbol_scheduler",
+        run_scheduler,
+    )
+
+    assembled: dict[str, tuple[bytes, str]] = {}
+    for run_name, requested_workers in (("serial", 1), ("parallel", 3)):
+        active_run = run_name
+        scheduler = producer.HistoricalSymbolSchedulerInputs(
+            active_config_path=base_scheduler.active_config_path,
+            requested_workers=requested_workers,
+        )
+        planned = producer.preplan_historical_search(
+            data_dir=data_dir,
+            context=context,
+            config=pm_core.PipelineConfig(),
+            process=_fake_process(),
+            causal_precommit_payload=_causal_payload(),
+            run_id="historical-run",
+            anchors=[ANCHOR],
+            symbol_scheduler=scheduler,
+        )
+        sinks = {
+            symbol: spool.open_symbol_sink(context, symbol)
+            for symbol in symbols
+        }
+        request = _production_request(context, planned, sinks)
+        products = list(planned.anchor_producers()["A1"](request))
+        payload = {
+            "anchors": list(planned.anchors),
+            "symbol_products": [
+                {
+                    "symbol": product.symbol,
+                    "horizon_plans": list(product.horizon_plans),
+                    "book_evidence": list(product.book_evidence),
+                    "optimizer_payload": product.optimizer_payload,
+                }
+                for product in products
+            ],
+        }
+        raw = _canonical(payload)
+        assembled[run_name] = (raw, hashlib.sha256(raw).hexdigest())
+
+    serial_order = list(symbols)
+    parallel_order = ["EURUSD", "USDJPY", "GBPUSD"]
+    assert completion_orders["serial"]["historical_preplan"] == serial_order
+    assert completion_orders["serial"]["historical_execute"] == serial_order
+    assert completion_orders["parallel"]["historical_preplan"] == parallel_order
+    assert completion_orders["parallel"]["historical_execute"] == parallel_order
+    assert completion_orders["serial"] != completion_orders["parallel"]
+    assert assembled["serial"] == assembled["parallel"]
+
+
+def test_four_anchor_preplan_uses_one_symbol_wave_and_one_cutoff_batch(
+    bounded_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, context, _releases, scheduler, scheduler_calls = bounded_environment
+    _install_sparse_planner(monkeypatch)
+    anchors = [
+        {
+            **ANCHOR,
+            "anchor_id": f"A{ordinal + 1}",
+            "selection_cutoff_utc": f"202{ordinal + 4}-01-01T00:00:00Z",
+            "forward_start_date": f"202{ordinal + 4}-02-05",
+            "forward_end_date": f"202{ordinal + 5}-02-03",
+        }
+        for ordinal in range(4)
+    ]
+    observed_batches = []
+
+    def produce_batch(**kwargs):
+        observed_batches.append(kwargs)
+        return tuple(
+            _Product(
+                kwargs["symbol"],
+                kwargs["timeframe"],
+                native_prefix={
+                    "source_reason": None,
+                    "cutoff_utc": request["cutoff_utc"],
+                },
+            )
+            for request in kwargs["requests"]
+        )
+
+    monkeypatch.setattr(
+        producer.native_prefix,
+        "produce_activated_native_prefixes",
+        produce_batch,
+    )
+    planned = producer.preplan_historical_search(
+        data_dir=data_dir,
+        context=context,
+        config=pm_core.PipelineConfig(),
+        process=_fake_process(),
+        causal_precommit_payload={
+            **_causal_payload(),
+            "process_definition": {"anchor_plan": anchors},
+        },
+        run_id="historical-run",
+        anchors=anchors,
+        symbol_scheduler=scheduler,
+    )
+
+    assert len(planned.anchors) == 4
+    assert [call["phase"] for call in scheduler_calls] == ["historical_preplan"]
+    assert len(observed_batches) == 1
+    assert [
+        request["cutoff_utc"]
+        for request in observed_batches[0]["requests"]
+    ] == [anchor["selection_cutoff_utc"] for anchor in anchors]
+
+
 def test_canonical_callback_rejects_any_preplanned_horizon_drift(
     bounded_environment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, context, _ = bounded_environment
+    data_dir, context, _, scheduler, scheduler_calls = bounded_environment
     _install_sparse_planner(monkeypatch, drift=True)
     monkeypatch.setattr(
         producer.historical_adapter,
@@ -332,6 +763,7 @@ def test_canonical_callback_rejects_any_preplanned_horizon_drift(
         causal_precommit_payload=_causal_payload(),
         run_id="historical-run",
         anchors=[ANCHOR],
+        symbol_scheduler=scheduler,
     )
     request = _production_request(
         context,
@@ -386,6 +818,110 @@ def test_terminal_source_absence_builds_four_zero_evaluation_plans(
         product=product,
         config=pm_core.PipelineConfig(),
     )
+    assert authority is terminal
+    assert observed == plans
+    assert [name for name, _ in calls] == ["fit", "plans"]
+
+
+def test_all_zero_regime_support_builds_four_unobserved_plans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = _Product("XAUGBP", "D1")
+    fitted = SimpleNamespace(
+        train_regime_support={
+            "counts": {regime: 0 for regime in producer._REGIMES}
+        }
+    )
+    calls = []
+    monkeypatch.setattr(
+        producer.search_execution,
+        "fit_native_timeframe_for_search",
+        lambda **kwargs: calls.append(("fit", kwargs)) or fitted,
+    )
+
+    def unobserved(*_args, **kwargs):
+        regime = kwargs["regime"]
+        calls.append(("unobserved", regime))
+        return _Plan(
+            _Horizon("XAUGBP", "D1", regime, "HISTORICAL_REGIME_UNOBSERVED")
+        )
+
+    monkeypatch.setattr(
+        producer.search_planner,
+        "build_historical_unobserved_cell_plan",
+        unobserved,
+    )
+    monkeypatch.setattr(
+        producer.search_planner,
+        "build_historical_observed_cell_plan",
+        lambda *_args, **_kwargs: pytest.fail("zero-support regime was searched"),
+    )
+
+    authority, plans = producer._timeframe_plans(
+        context=object(),
+        process=object(),
+        request=object(),
+        causal_precommit_payload={},
+        anchor_ordinal=1,
+        product=product,
+        config=pm_core.PipelineConfig(),
+    )
+
+    assert authority is fitted
+    assert [plan.horizon_plan.status for plan in plans] == [
+        "HISTORICAL_REGIME_UNOBSERVED"
+    ] * len(producer._REGIMES)
+    assert calls[0][0] == "fit"
+    assert calls[1:] == [
+        ("unobserved", regime) for regime in producer._REGIMES
+    ]
+
+
+def test_authenticated_terminal_technical_builds_four_abstention_plans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = _Product(
+        "EURUSD",
+        "M5",
+        source_state=native_prefix.TECHNICAL_TERMINAL,
+    )
+    terminal = SimpleNamespace(
+        source_group_decision=object(),
+        regime_fit_decision=object(),
+    )
+    calls = []
+    monkeypatch.setattr(
+        producer.search_execution,
+        "fit_terminal_native_timeframe",
+        lambda **kwargs: calls.append(("fit", kwargs)) or terminal,
+    )
+    plans = tuple(
+        _Plan(
+            _Horizon(
+                "EURUSD",
+                "M5",
+                regime,
+                "HISTORICAL_TERMINAL_TECHNICAL",
+            )
+        )
+        for regime in producer._REGIMES
+    )
+    monkeypatch.setattr(
+        producer.search_planner,
+        "build_historical_terminal_timeframe_plans",
+        lambda *_args, **kwargs: calls.append(("plans", kwargs)) or plans,
+    )
+
+    authority, observed = producer._timeframe_plans(
+        context=object(),
+        process=object(),
+        request=object(),
+        causal_precommit_payload={},
+        anchor_ordinal=0,
+        product=product,
+        config=pm_core.PipelineConfig(),
+    )
+
     assert authority is terminal
     assert observed == plans
     assert [name for name, _ in calls] == ["fit", "plans"]
@@ -447,9 +983,7 @@ def _forward_request(planned, *, execution=None, valuation=None):
         "config_sha256": planned.context.config_sha256,
         "historical_precommit_receipt_sha256": "c" * 64,
         "historical_run_receipt_sha256": "d" * 64,
-        "causal_precommit_payload_sha256": (
-            planned.causal_precommit_payload_sha256
-        ),
+        "causal_precommit_payload_sha256": (planned.causal_precommit_payload_sha256),
         "anchor_count": 1,
         "anchors": rows,
         "required_roster_sha256": _sha(rows),
@@ -464,7 +998,7 @@ def test_forward_resolver_materializes_only_issuer_requested_winner_keys(
     bounded_environment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, context, _ = bounded_environment
+    data_dir, context, _, scheduler, scheduler_calls = bounded_environment
     _install_sparse_planner(monkeypatch)
     planned = producer.preplan_historical_search(
         data_dir=data_dir,
@@ -474,6 +1008,7 @@ def test_forward_resolver_materializes_only_issuer_requested_winner_keys(
         causal_precommit_payload=_causal_payload(),
         run_id="historical-run",
         anchors=[ANCHOR],
+        symbol_scheduler=scheduler,
     )
     monkeypatch.setattr(
         producer.historical_adapter,
@@ -503,20 +1038,31 @@ def test_forward_resolver_materializes_only_issuer_requested_winner_keys(
     )
     calls = []
 
-    def native_product(**kwargs):
+    def stage_products(**kwargs):
         calls.append(kwargs)
-        return _Product(kwargs["symbol"], kwargs["timeframe"])
+        return tuple(
+            {
+                "symbol": kwargs["symbol"],
+                "timeframe": kwargs["timeframe"],
+                "cutoff_utc": request["cutoff_utc"],
+            }
+            for request in kwargs["requests"]
+        )
 
     monkeypatch.setattr(
         producer.native_prefix,
-        "produce_activated_native_prefix",
-        native_product,
+        "stage_activated_native_prefixes",
+        stage_products,
     )
     resolution = planned(_forward_request(planned))
 
     assert len(calls) == 1  # M5 execution and valuation share one sealed product
-    assert calls[0]["cutoff_utc"] == "2025-02-04T00:00:00Z"
+    assert calls[0]["requests"][0]["cutoff_utc"] == "2025-02-04T00:00:00Z"
     assert calls[0]["production_contract_required"] is True
+    assert scheduler_calls[-1] == {
+        "phase": "historical_forward_stage",
+        "contract_phase": "FORWARD_STAGE",
+    }
     assert type(resolution) is causal_evidence.ForwardNativeProductResolution
     execution = resolution.execution_products_by_anchor["A1"]["EURUSD|M5"]
     valuation = resolution.valuation_products_by_anchor["A1"]["EURUSD|M5"]
@@ -532,7 +1078,7 @@ def test_forward_resolver_rejects_roster_or_context_tamper_before_source_access(
     bounded_environment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, context, _ = bounded_environment
+    data_dir, context, _, scheduler, _scheduler_calls = bounded_environment
     _install_sparse_planner(monkeypatch)
     planned = producer.preplan_historical_search(
         data_dir=data_dir,
@@ -542,10 +1088,11 @@ def test_forward_resolver_rejects_roster_or_context_tamper_before_source_access(
         causal_precommit_payload=_causal_payload(),
         run_id="historical-run",
         anchors=[ANCHOR],
+        symbol_scheduler=scheduler,
     )
     monkeypatch.setattr(
         producer.native_prefix,
-        "produce_activated_native_prefix",
+        "stage_activated_native_prefixes",
         lambda **_kwargs: pytest.fail("tampered request reached source access"),
     )
     request = _forward_request(planned)
@@ -563,7 +1110,7 @@ def test_canonical_causal_factory_consumes_preplanned_resolver_after_book_close(
     bounded_environment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, context, _ = bounded_environment
+    data_dir, context, _, scheduler, _scheduler_calls = bounded_environment
     _install_sparse_planner(monkeypatch)
     payload = _causal_payload()
     planned = producer.preplan_historical_search(
@@ -574,6 +1121,7 @@ def test_canonical_causal_factory_consumes_preplanned_resolver_after_book_close(
         causal_precommit_payload=payload,
         run_id="historical-run",
         anchors=[ANCHOR],
+        symbol_scheduler=scheduler,
     )
     monkeypatch.setattr(
         producer.historical_adapter,
@@ -606,17 +1154,19 @@ def test_canonical_causal_factory_consumes_preplanned_resolver_after_book_close(
     monkeypatch.setattr(
         causal_evidence.capital_bootstrap,
         "verify_capital_forward_phase_binding",
-        lambda observed_context, _binding: {
-            "bootstrap_identity_sha256": "e" * 64,
-            "bootstrap_identity": {
-                "process_precommitment_sha256": producer.causal.canonical_sha256(
-                    payload
-                ),
-                "process_definition_sha256": None,
-            },
-        }
-        if observed_context is context
-        else pytest.fail("generation context changed"),
+        lambda observed_context, _binding: (
+            {
+                "bootstrap_identity_sha256": "e" * 64,
+                "bootstrap_identity": {
+                    "process_precommitment_sha256": producer.causal.canonical_sha256(
+                        payload
+                    ),
+                    "process_definition_sha256": None,
+                },
+            }
+            if observed_context is context
+            else pytest.fail("generation context changed")
+        ),
     )
     monkeypatch.setattr(
         forward_replay,
@@ -636,9 +1186,18 @@ def test_canonical_causal_factory_consumes_preplanned_resolver_after_book_close(
     prefix_calls = []
     monkeypatch.setattr(
         producer.native_prefix,
-        "produce_activated_native_prefix",
-        lambda **kwargs: prefix_calls.append(kwargs)
-        or _Product(kwargs["symbol"], kwargs["timeframe"]),
+        "stage_activated_native_prefixes",
+        lambda **kwargs: (
+            prefix_calls.append(kwargs)
+            or tuple(
+                {
+                    "symbol": kwargs["symbol"],
+                    "timeframe": kwargs["timeframe"],
+                    "cutoff_utc": request["cutoff_utc"],
+                }
+                for request in kwargs["requests"]
+            )
+        ),
     )
     forward_precommit = object()
     forward_product = object()
@@ -669,9 +1228,11 @@ def test_canonical_causal_factory_consumes_preplanned_resolver_after_book_close(
     monkeypatch.setattr(
         forward_replay,
         "verify_forward_oos_replay_product",
-        lambda observed_context, value: observed.append("verify")
-        if observed_context is context and value is forward_product
-        else pytest.fail("forward product changed"),
+        lambda observed_context, value: (
+            observed.append("verify")
+            if observed_context is context and value is forward_product
+            else pytest.fail("forward product changed")
+        ),
     )
     factory = causal_evidence.BoundedCausalEvidenceFactory(
         context=context,
@@ -696,8 +1257,14 @@ def test_contract_explicitly_denies_downstream_authority() -> None:
     assert body["preplanning_return_or_winner_evidence_access"] is False
     assert body["technical_failure_aborts_generation"] is True
     assert body["unobserved_regimes_are_explicit"] is True
+    assert body["ram_admission_gate"] is False
     assert (
-        body["confers_causal_current_capital_publication_or_trading_authority"]
-        is False
+        body["symbol_scheduler_worker_source"]
+        == "PIPELINE_OPTIMIZATION_WORKERS"
+    )
+    assert "symbol_scheduler_max_workers" not in body
+    assert "symbol_scheduler_reserve_bytes" not in body
+    assert (
+        body["confers_causal_current_capital_publication_or_trading_authority"] is False
     )
     assert len(producer.HISTORICAL_SEARCH_PRODUCER_RELEASE_SHA256) == 64

@@ -53,6 +53,42 @@ def _context(tmp_path: Path, payload: dict):
     )
 
 
+def test_public_loader_reproduces_complete_effective_config(tmp_path: Path) -> None:
+    payload = _payload(tmp_path)
+    payload["pipeline"].pop("false_discovery_symbol_count")
+    payload["symbols"] = ["EURUSD", "GBPUSD"]
+    payload["position"] = {
+        "regime_tp_multipliers": {
+            "TREND": 1.2,
+            "BREAKOUT": 1.1,
+            "RANGE": 0.9,
+            "CHOP": 0.8,
+        }
+    }
+    path = tmp_path / "config.json"
+    _write(path, payload)
+
+    owned, effective = binding.load_effective_pipeline_config(path)
+
+    assert owned == payload
+    assert effective._deployment_config_path == str(path.resolve())
+    assert effective.data_dir == (tmp_path / "data").resolve()
+    assert effective.false_discovery_symbol_count == 2
+    assert (
+        effective.regime_tp_multipliers == payload["position"]["regime_tp_multipliers"]
+    )
+    assert effective._funded_live_execution is False
+
+    context = _context(tmp_path, payload)
+    frozen = binding.freeze_production_pipeline_config(
+        context,
+        active_config_path=path,
+        config_payload=owned,
+        supplied_config=effective,
+    )
+    assert frozen.materialize(context).data_dir == (tmp_path / "data").resolve()
+
+
 def test_binding_owns_effective_config_and_ignores_caller_mutation(
     tmp_path: Path,
 ) -> None:

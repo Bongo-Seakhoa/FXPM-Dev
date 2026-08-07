@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quant Methodology Audit</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --paper: #ffffff;
+  --ink: #111827;
+  --muted: #4b5563;
+  --line: #d9dee8;
+  --soft: #f8fafc;
+  --accent: #1f6feb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", Inter, Arial, sans-serif;
+  line-height: 1.58;
+}
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+article {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 34px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: auto;
+}
+h1, h2, h3, h4 {
+  line-height: 1.22;
+  margin: 1.5em 0 0.55em;
+}
+h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.1em;
+  font-size: 1.45rem;
+}
+h3 {
+  font-size: 1.13rem;
+}
+p {
+  margin: 0.75em 0;
+}
+ul, ol {
+  padding-left: 1.45rem;
+}
+li + li {
+  margin-top: 0.25rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.35rem;
+  font-size: 0.91rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #eef3f8;
+  font-weight: 650;
+}
+tr:nth-child(even) td {
+  background: var(--soft);
+}
+code {
+  background: #edf2f7;
+  border: 1px solid #d8e0ea;
+  border-radius: 4px;
+  padding: 0.08rem 0.28rem;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.92em;
+}
+pre {
+  overflow-x: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+a {
+  color: var(--accent);
+}
+blockquote {
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+</style>
+</head>
+<body>
+<main>
+<article>
+<h1>Quant Methodology Audit</h1>
+<h2>Evidence Base</h2>
+<ul>
+<li><code>agent_audit/data/audit_evidence_summary.json</code></li>
+<li><code>agent_audit/data/ledger_tradeable_cells.csv</code></li>
+<li><code>agent_audit/data/oos_manifest_summary.csv</code></li>
+<li><code>pm_core.py</code>, <code>pm_pipeline.py</code>, <code>pm_dashboard/analytics.py</code>, <code>tools/benchmark.py</code></li>
+</ul>
+<h2>Metric Formula Review</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Implementation</th>
+<th>Audit verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Profit factor</td>
+<td><code>pm_core.py:5924</code>, gross wins divided by gross losses</td>
+<td>Correct, with <code>inf</code> if wins and no losses</td>
+</tr>
+<tr>
+<td>Win rate</td>
+<td>wins divided by total closed trades</td>
+<td>Correct; breakevens remain in denominator</td>
+</tr>
+<tr>
+<td>Expectancy</td>
+<td>average win/loss in pips</td>
+<td>Correct per symbol, but not directly dollar-comparable across symbols</td>
+</tr>
+<tr>
+<td>Sharpe</td>
+<td>per-bar equity returns annualized by timeframe</td>
+<td>Useful, but vulnerable to sparse/flat-bar inflation</td>
+</tr>
+<tr>
+<td>Sortino</td>
+<td>downside version of per-bar annualized return</td>
+<td>Same caveat plus degenerate <code>inf</code> cases</td>
+</tr>
+<tr>
+<td>Calmar</td>
+<td>cumulative return divided by max drawdown</td>
+<td>Mislabeled if interpreted as textbook annualized Calmar</td>
+</tr>
+<tr>
+<td>Drawdown</td>
+<td>floating-aware equity at bar close</td>
+<td>Good for account DD, but no per-trade MAE/MFE</td>
+</tr>
+<tr>
+<td>Toronto</td>
+<td>no explicit metric found</td>
+<td>Not implemented</td>
+</tr>
+</tbody>
+</table>
+<h2>Winner Ledger Observations</h2>
+<ul>
+<li>157 tradeable cells across 45 symbols.</li>
+<li>75 tradeable cells have fewer than 20 validation trades.</li>
+<li>147 tradeable cells have validation Sharpe above 10.</li>
+<li>All 157 tradeable cells have <code>pbo_status=not_available</code>.</li>
+<li>Deflated Sharpe is present but mostly saturated near 1.0, so it does not by itself resolve small-sample/model-selection risk.</li>
+</ul>
+<h2>OOS and Search-Surface Observations</h2>
+<p>Across scanned OOS manifest metrics, the broad candidate surface is weak:</p>
+<ul>
+<li>Median profit factor: 0.86.</li>
+<li>Median total return: -0.17%.</li>
+<li>Median Sharpe ratio: -0.05.</li>
+<li>Median total trades: 7.</li>
+</ul>
+<p>This does not invalidate the selected winners, but it means selection discipline matters. The profitable edge appears concentrated in selected cells, not broad across the search space.</p>
+<h2>Overfitting and Robustness Risks</h2>
+<p>F002 is the central methodology finding. The current promotion system can allow very high validation Sharpe with low trade counts while PBO is unavailable. The production split is intentionally bleeding-edge, which improves freshness but raises regime-decay risk.</p>
+<p>Recommended controls:</p>
+<ol>
+<li>Require stronger minimum validation trade counts before Sharpe can override robustness.</li>
+<li>Set <code>specialist_spokes_v2_max_validation_sharpe</code> above zero and treat excessive Sharpe with unavailable PBO as severe.</li>
+<li>Use OOS/PBO manifests as a veto or penalty, not only as documentation.</li>
+<li>Add a measurement-only pristine-OOS decay report.</li>
+<li>Recompute representative Sharpe/Sortino on per-trade or in-market returns before trusting extreme annualized values.</li>
+</ol>
+<h2>Interpretation of Aggressiveness</h2>
+<p>The strategy is intentionally aggressive and should not be rejected merely for high growth or high activity. The audit question is whether the aggression is rewarded, controlled, repeatable, and recoverable. Current evidence says:</p>
+<ul>
+<li>Rewarded on demo: plausible.</li>
+<li>Controlled at $22: weak, because min-lot risk dominates.</li>
+<li>Repeatable: uncertain, because validation/PBO evidence is fragile.</li>
+<li>Recoverable: weak without lower caps, absolute-dollar breakers, and MAE/MFE evidence.</li>
+</ul>
+</article>
+</main>
+</body>
+</html>

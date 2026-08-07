@@ -4,6 +4,7 @@ import copy
 import csv
 import hashlib
 import json
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -92,11 +93,14 @@ def _write_activation(
     data_dir: Path,
     timeframe: str,
     *,
+    symbol: str = SYMBOL,
+    instrument_symbol: str | None = None,
     provenance_login: int = 42,
     run_login: int = 42,
+    native_tick_value: object = 1.0,
 ) -> dict[str, str]:
     native = data_dir / "native"
-    leaf = native / "runs" / "run-prefix" / SYMBOL / timeframe
+    leaf = native / "runs" / "run-prefix" / symbol / timeframe
     leaf.mkdir(parents=True)
     cadence = TIMEFRAME_SECONDS[timeframe]
     start = datetime(2026, 1, 1, tzinfo=UTC)
@@ -135,8 +139,8 @@ def _write_activation(
         "acquisition_contract_version": ACQUISITION_CONTRACT_VERSION,
         "immutable_record": True,
         "run_id": "run-prefix",
-        "symbol": SYMBOL,
-        "canonical_symbol": SYMBOL,
+        "symbol": symbol,
+        "canonical_symbol": symbol,
         "timeframe": timeframe,
         "timeframe_seconds": cadence,
         "source_kind": "broker_native",
@@ -160,13 +164,13 @@ def _write_activation(
             "asset_class": "fx",
             "digits": 5,
             "parity_tick_tolerance": 0.00001,
-            "path": f"Forex\\Main\\{SYMBOL}",
+            "path": f"Forex\\Main\\{symbol}",
             "point": 0.00001,
             "status": "available",
-            "symbol": SYMBOL,
+            "symbol": instrument_symbol or symbol,
             "trade_contract_size": 100_000.0,
             "trade_tick_size": 0.00001,
-            "trade_tick_value": 1.0,
+            "trade_tick_value": native_tick_value,
         },
         "source_environment": _source_environment(login=provenance_login),
         "request": {
@@ -184,12 +188,12 @@ def _write_activation(
         "schema_version": "fxpm-native-bars-v1",
         "activation_id": ACTIVATION_ID,
         "source_provenance_relative_path": (
-            f"runs/run-prefix/{SYMBOL}/{timeframe}/provenance.json"
+            f"runs/run-prefix/{symbol}/{timeframe}/provenance.json"
         ),
         "source_provenance_sha256": provenance_sha,
     }
     sidecar_path = (
-        native / "audits" / ACTIVATION_ID / SYMBOL / timeframe / "sidecar.json"
+        native / "audits" / ACTIVATION_ID / symbol / timeframe / "sidecar.json"
     )
     sidecar_sha = _write_json(sidecar_path, sidecar)
     run_manifest = {
@@ -201,7 +205,7 @@ def _write_activation(
         "source_environment": _source_environment(login=run_login),
         "results": [
             {
-                "symbol": SYMBOL,
+                "symbol": symbol,
                 "timeframe": timeframe,
                 "status": "success",
                 "failure_status": None,
@@ -214,12 +218,12 @@ def _write_activation(
     run_manifest_sha = _write_json(run_manifest_path, run_manifest)
     entry = {
         "status": "active",
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "timeframe": timeframe,
-        "bars_relative_path": f"runs/run-prefix/{SYMBOL}/{timeframe}/bars.csv",
+        "bars_relative_path": f"runs/run-prefix/{symbol}/{timeframe}/bars.csv",
         "bars_sha256": bars_sha,
         "sidecar_relative_path": (
-            f"audits/{ACTIVATION_ID}/{SYMBOL}/{timeframe}/sidecar.json"
+            f"audits/{ACTIVATION_ID}/{symbol}/{timeframe}/sidecar.json"
         ),
         "sidecar_sha256": sidecar_sha,
     }
@@ -230,7 +234,7 @@ def _write_activation(
         "production_authoritative": False,
         "run_manifest_relative_path": "runs/run-prefix/run_manifest.json",
         "run_manifest_sha256": run_manifest_sha,
-        "entries": {SYMBOL: {timeframe: entry}},
+        "entries": {symbol: {timeframe: entry}},
     }
     manifest_relative = f"activations/{ACTIVATION_ID}.json"
     manifest_path = native / manifest_relative
@@ -249,6 +253,153 @@ def _write_activation(
         "activation_sha": activation_sha,
         "bars_path": str(bars),
     }
+
+
+def _write_complete_ledger_boundary_truncation_activation(
+    data_dir: Path,
+    timeframe: str = "D1",
+) -> dict[str, object]:
+    """Turn the small hash-pinned fixture into an oldest-data-page shortfall."""
+
+    facts = _write_activation(data_dir, timeframe)
+    cadence = TIMEFRAME_SECONDS[timeframe]
+    first_open = datetime(2026, 1, 1, tzinfo=UTC)
+    first_close = first_open + timedelta(seconds=cadence)
+    request_start = first_open - timedelta(seconds=cadence)
+    request_end = first_open + timedelta(seconds=5 * cadence)
+    provenance_path = (
+        data_dir
+        / "native"
+        / "runs"
+        / "run-prefix"
+        / SYMBOL
+        / timeframe
+        / "provenance.json"
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance.update(
+        {
+            "status": "partial",
+            "failure_status": "boundary_history_shortfall",
+            "complete": False,
+        }
+    )
+    provenance["request"]["source_request_interval"] = {
+        "start_utc": _iso(request_start),
+        "end_exclusive_utc": _iso(request_end),
+    }
+    provenance["request"]["strategy_evidence_interval"] = {
+        "start_utc": _iso(request_start),
+        "end_exclusive_utc": _iso(request_end),
+    }
+    page = {
+        "request_sequence": 1,
+        "start_utc": _iso(request_start),
+        "end_exclusive_utc": _iso(request_end),
+    }
+    provenance["pagination"] = {
+        "contract_version": "fxpm.native_history.pagination.v3",
+        "request_order": "newest_to_oldest",
+        "retries_per_page": 1,
+        "pages_requested": 1,
+        "pages_with_data": 1,
+        "page_attempts": [copy.deepcopy(page)],
+        "empty_pages": [],
+        "failed_pages": [],
+        "truncated_pages": [
+            {
+                **copy.deepcopy(page),
+                "actual_first_open_utc": _iso(first_open),
+                "actual_last_open_utc": _iso(
+                    request_end - timedelta(seconds=cadence)
+                ),
+                "start_delay_seconds": float(cadence),
+                "end_lag_seconds": 0.0,
+            }
+        ],
+        "terminal_prefix_unresolved_pages": [],
+        "stop_reason": None,
+        "unrequested_prefix": None,
+        "attempts_total": 1,
+        "copy_rates_range_attempts_total": 1,
+        "available_history_boundary": None,
+    }
+    provenance["coverage"] = {
+        "status": "partial_requested_span",
+        "technical_integrity_status": "complete_page_ledger",
+        "internal_empty_page_count": 0,
+        "truncated_page_count": 1,
+        "internal_truncated_page_count": 0,
+        "boundary_truncated_page_count": 1,
+        "failed_page_count": 0,
+        "terminal_prefix_unresolved_page_count": 0,
+    }
+    provenance_sha = _write_json(provenance_path, provenance)
+
+    sidecar_path = (
+        data_dir
+        / "native"
+        / "audits"
+        / ACTIVATION_ID
+        / SYMBOL
+        / timeframe
+        / "sidecar.json"
+    )
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["source_provenance_sha256"] = provenance_sha
+    sidecar_sha = _write_json(sidecar_path, sidecar)
+
+    run_manifest_path = (
+        data_dir / "native" / "runs" / "run-prefix" / "run_manifest.json"
+    )
+    run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    run_cell = run_manifest["results"][0]
+    run_cell["status"] = "partial"
+    run_cell["failure_status"] = "boundary_history_shortfall"
+    run_manifest_sha = _write_json(run_manifest_path, run_manifest)
+
+    activation_path = data_dir / "native" / "activations" / f"{ACTIVATION_ID}.json"
+    activation = json.loads(activation_path.read_text(encoding="utf-8"))
+    activation["run_manifest_sha256"] = run_manifest_sha
+    activation["entries"][SYMBOL][timeframe]["sidecar_sha256"] = sidecar_sha
+    activation_sha = _write_json(activation_path, activation)
+
+    pointer_path = data_dir / "native" / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["manifest_sha256"] = activation_sha
+    _write_json(pointer_path, pointer)
+    return {
+        **facts,
+        "activation_path": activation_path,
+        "boundary_open": first_open,
+        "first_close": first_close,
+        "pointer_path": pointer_path,
+        "provenance_path": provenance_path,
+        "sidecar_path": sidecar_path,
+        "timeframe": timeframe,
+    }
+
+
+def _reseal_complete_ledger_provenance(
+    facts: dict[str, object],
+    mutate,
+) -> None:
+    provenance_path = facts["provenance_path"]
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    mutate(provenance)
+    provenance_sha = _write_json(provenance_path, provenance)
+    sidecar_path = facts["sidecar_path"]
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["source_provenance_sha256"] = provenance_sha
+    sidecar_sha = _write_json(sidecar_path, sidecar)
+    activation_path = facts["activation_path"]
+    activation = json.loads(activation_path.read_text(encoding="utf-8"))
+    activation["entries"][SYMBOL][facts["timeframe"]]["sidecar_sha256"] = sidecar_sha
+    activation_sha = _write_json(activation_path, activation)
+    pointer_path = facts["pointer_path"]
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["manifest_sha256"] = activation_sha
+    _write_json(pointer_path, pointer)
 
 
 @lru_cache(maxsize=1)
@@ -594,14 +745,27 @@ def _read_index(
     return json.loads(_object_path(context, dict(product.index_descriptor)).read_text())
 
 
-def _produce(tmp_path: Path, timeframe: str = "M5"):
+def _produce(
+    tmp_path: Path,
+    timeframe: str = "M5",
+    *,
+    symbol: str = SYMBOL,
+    instrument_symbol: str | None = None,
+    native_tick_value: object = 1.0,
+):
     data_dir = tmp_path / "data"
-    facts = _write_activation(data_dir, timeframe)
+    facts = _write_activation(
+        data_dir,
+        timeframe,
+        symbol=symbol,
+        instrument_symbol=instrument_symbol,
+        native_tick_value=native_tick_value,
+    )
     context = _context(tmp_path)
     product = prefix.produce_activated_native_prefix(
         data_dir=data_dir,
         context=context,
-        symbol=SYMBOL,
+        symbol=symbol,
         timeframe=timeframe,
         cutoff_utc=facts["cutoff"],
         source_accessed_at_utc=SOURCE_ACCESSED,
@@ -671,6 +835,248 @@ def test_all_six_native_timeframes_produce_exact_horizon_prefix(tmp_path, timefr
     assert reopened.native_prefix == product.native_prefix
 
 
+def test_mixed_case_pinned_symbol_passes_instrument_identity(tmp_path):
+    data_dir = tmp_path / "data"
+    facts = _write_activation(
+        data_dir,
+        "H4",
+        symbol="Platinum",
+    )
+    resolution = ActiveNativeResolution(
+        symbol="Platinum",
+        timeframe="H4",
+        data_path=Path(facts["bars_path"]),
+        sidecar_path=(
+            data_dir
+            / "native"
+            / "audits"
+            / ACTIVATION_ID
+            / "Platinum"
+            / "H4"
+            / "sidecar.json"
+        ),
+        activation_id=ACTIVATION_ID,
+        activation_manifest_path=(
+            data_dir / "native" / "activations" / f"{ACTIVATION_ID}.json"
+        ),
+        activation_manifest_sha256=facts["activation_sha"],
+    )
+
+    source = prefix._source_binding(
+        data_dir,
+        resolution,
+        "Platinum",
+        "H4",
+    )
+
+    assert source.instrument_snapshot["symbol"] == "Platinum"
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_open_frame_binding_preserves_exact_mt5_symbol(
+    tmp_path: Path,
+    symbol: str,
+) -> None:
+    _data_dir, _facts, _context_value, product = _produce(
+        tmp_path,
+        "H4",
+    )
+    exact_index = copy.deepcopy(product.index)
+    exact_index["symbol"] = symbol
+    exact_index_raw = prefix._canonical_bytes(exact_index)
+    exact_index_sha = hashlib.sha256(exact_index_raw).hexdigest()
+    exact_descriptor = {
+        **product.index_descriptor,
+        "sha256": exact_index_sha,
+        "size_bytes": len(exact_index_raw),
+        "relative_path": (
+            f"objects/sha256/{exact_index_sha[:2]}/"
+            f"{exact_index_sha}.canonical-json"
+        ),
+    }
+    exact_product = replace(
+        product,
+        index=exact_index,
+        index_descriptor=exact_descriptor,
+        index_sha256=exact_index_sha,
+        native_prefix=prefix._native_prefix_from_index(
+            exact_index,
+            exact_index_sha,
+        ),
+        artifact_descriptors=tuple(
+            exact_descriptor
+            if dict(descriptor) == dict(product.index_descriptor)
+            else descriptor
+            for descriptor in product.artifact_descriptors
+        ),
+    )
+
+    frame = prefix.open_verified_prefix_frame(exact_product)
+
+    assert frame.attrs[pm_core.NATIVE_SOURCE_BINDING_ATTR]["symbol"] == symbol
+
+
+def test_genuinely_different_instrument_symbol_remains_fail_closed(tmp_path):
+    data_dir = tmp_path / "data"
+    facts = _write_activation(
+        data_dir,
+        "H4",
+        symbol="Platinum",
+        instrument_symbol="Palladium",
+    )
+    resolution = ActiveNativeResolution(
+        symbol="Platinum",
+        timeframe="H4",
+        data_path=Path(facts["bars_path"]),
+        sidecar_path=(
+            data_dir
+            / "native"
+            / "audits"
+            / ACTIVATION_ID
+            / "Platinum"
+            / "H4"
+            / "sidecar.json"
+        ),
+        activation_id=ACTIVATION_ID,
+        activation_manifest_path=(
+            data_dir / "native" / "activations" / f"{ACTIVATION_ID}.json"
+        ),
+        activation_manifest_sha256=facts["activation_sha"],
+    )
+
+    with pytest.raises(
+        prefix.NativePrefixError,
+        match="PREFIX_SOURCE_INSTRUMENT_IDENTITY_INVALID",
+    ):
+        prefix._source_binding(
+            data_dir,
+            resolution,
+            "Platinum",
+            "H4",
+        )
+
+
+@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
+def test_instrument_snapshot_rejects_wrong_case_mt5_symbol(
+    tmp_path: Path,
+    wrong_case: str,
+) -> None:
+    data_dir = tmp_path / "data"
+    facts = _write_activation(
+        data_dir,
+        "H4",
+        symbol="Platinum",
+        instrument_symbol=wrong_case,
+    )
+    resolution = ActiveNativeResolution(
+        symbol="Platinum",
+        timeframe="H4",
+        data_path=Path(facts["bars_path"]),
+        sidecar_path=(
+            data_dir
+            / "native"
+            / "audits"
+            / ACTIVATION_ID
+            / "Platinum"
+            / "H4"
+            / "sidecar.json"
+        ),
+        activation_id=ACTIVATION_ID,
+        activation_manifest_path=(
+            data_dir / "native" / "activations" / f"{ACTIVATION_ID}.json"
+        ),
+        activation_manifest_sha256=facts["activation_sha"],
+    )
+
+    with pytest.raises(
+        prefix.NativePrefixError,
+        match="PREFIX_SOURCE_INSTRUMENT_IDENTITY_INVALID",
+    ):
+        prefix._source_binding(
+            data_dir,
+            resolution,
+            "Platinum",
+            "H4",
+        )
+
+
+def test_four_cutoffs_share_two_source_passes_and_preserve_exact_v1_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    data_dir = tmp_path / "data"
+    facts = _write_activation(data_dir, "M5")
+    with Path(facts["bars_path"]).open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as stream:
+        cutoffs = [
+            row["_BAR_CLOSE_TS"] for row in csv.DictReader(stream)
+        ][:4]
+    requests = tuple(
+        {
+            "cutoff_utc": cutoff,
+            "source_accessed_at_utc": SOURCE_ACCESSED,
+        }
+        for cutoff in cutoffs
+    )
+    baseline_context = spool.freeze_generation_context(
+        tmp_path / "baseline-spool",
+        generation_id="native-prefix-generation",
+        native_universe_sha256="a" * 64,
+        config_sha256="b" * 64,
+    )
+    baseline = tuple(
+        prefix._produce_activated_native_prefix_single(
+            data_dir=data_dir,
+            context=baseline_context,
+            symbol=SYMBOL,
+            timeframe="M5",
+            cutoff_utc=request["cutoff_utc"],
+            source_accessed_at_utc=SOURCE_ACCESSED,
+            production_contract_required=False,
+        )
+        for request in requests
+    )
+    observed_scans = []
+    real_scan = prefix._scan_prefix_targets
+
+    def counted_scan(source, targets, **kwargs):
+        observed_scans.append((source.bars_sha256, len(targets)))
+        return real_scan(source, targets, **kwargs)
+
+    monkeypatch.setattr(prefix, "_scan_prefix_targets", counted_scan)
+    batch_root = tmp_path / "batch"
+    batch_root.mkdir()
+    batch_context = _context(batch_root)
+    products = prefix.produce_activated_native_prefixes(
+        data_dir=data_dir,
+        context=batch_context,
+        symbol=SYMBOL,
+        timeframe="M5",
+        requests=requests,
+        production_contract_required=False,
+    )
+
+    assert [count for _sha256, count in observed_scans] == [4, 4]
+    assert len(products) == len(baseline) == 4
+    quota_state = json.loads(
+        (batch_context.root / ".generation-quota.json").read_text(
+            encoding="ascii"
+        )
+    )
+    assert quota_state["reservations"] == []
+    for expected, observed in zip(baseline, products, strict=True):
+        assert observed.index == expected.index
+        assert observed.index_sha256 == expected.index_sha256
+        assert observed.prefix_descriptor == expected.prefix_descriptor
+        assert (
+            observed.index["prefix"]["segments"]
+            == expected.index["prefix"]["segments"]
+        )
+
+
 def test_open_frame_requires_sealed_product_and_rederives_source_binding(tmp_path):
     _data_dir, _facts, _context_value, product = _produce(tmp_path)
     frame = prefix.open_verified_prefix_frame(product)
@@ -703,6 +1109,7 @@ def test_open_frame_binding_drives_backtester_terms_overlay(tmp_path, monkeypatc
     pointer.parent.mkdir(parents=True, exist_ok=True)
     pointer.write_text("{}", encoding="ascii")
     resolved = {
+        "terms_active_pointer_sha256": "9" * 64,
         "price_activation_id": binding["activation_id"],
         "price_activation_manifest_sha256": binding["activation_manifest_sha256"],
         "target_bars_sha256": binding["bars_sha256"],
@@ -735,13 +1142,19 @@ def test_open_frame_binding_drives_backtester_terms_overlay(tmp_path, monkeypatc
         backtester._resolve_broker_swap_projection(hostile, spec, "M5")
 
 
-def _execution_config(tmp_path: Path, *, tick_size: float = 0.00001) -> Path:
+def _execution_config(
+    tmp_path: Path,
+    *,
+    symbol: str = SYMBOL,
+    tick_size: float = 0.00001,
+    broker_overrides: dict[str, object] | None = None,
+) -> Path:
     broker = {
-        SYMBOL: {
-            "symbol": SYMBOL,
-            "broker_symbol": SYMBOL,
+        symbol: {
+            "symbol": symbol,
+            "broker_symbol": symbol,
             "asset_class": "fx",
-            "path": f"Forex\\Main\\{SYMBOL}",
+            "path": f"Forex\\Main\\{symbol}",
             "digits": 5,
             "point": 0.00001,
             "tick_size": tick_size,
@@ -759,12 +1172,13 @@ def _execution_config(tmp_path: Path, *, tick_size: float = 0.00001) -> Path:
             "pip_size": 0.0001,
         }
     }
+    broker[symbol].update(broker_overrides or {})
     _write_json(tmp_path / "broker_specs.json", broker)
     config = {
         "_meta": {"scope": "funded_live_v1"},
         "broker_specs_path": "broker_specs.json",
         "instrument_spec_defaults": {"commission_per_lot": 7.0},
-        "instrument_specs": {SYMBOL: {"commission_per_lot": 7.0}},
+        "instrument_specs": {symbol: {"commission_per_lot": 7.0}},
     }
     path = tmp_path / "config.json"
     _write_json(path, config)
@@ -802,7 +1216,116 @@ def test_execution_spec_is_derived_from_frozen_native_config_and_broker_bytes(
     )
 
 
-def test_execution_spec_rejects_caller_override_and_structural_broker_splice(
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_execution_spec_preserves_exact_mt5_symbol(
+    tmp_path: Path,
+    symbol: str,
+) -> None:
+    _data_dir, _facts, _context_value, base_product = _produce(
+        tmp_path / "native",
+        "H4",
+    )
+    native = dict(base_product.native_prefix)
+    native["symbol"] = symbol
+    instrument = dict(base_product.instrument_snapshot)
+    instrument.update(
+        {
+            "symbol": symbol,
+            "path": f"Forex\\Main\\{symbol}",
+        }
+    )
+    index = copy.deepcopy(base_product.index)
+    index["symbol"] = symbol
+    index["source"]["instrument_snapshot"] = instrument
+    product = replace(
+        base_product,
+        index=index,
+        native_prefix=native,
+        instrument_snapshot=instrument,
+    )
+    config = pm_core.PipelineConfig(research_mode=True)
+    config._deployment_config_path = str(
+        _execution_config(tmp_path, symbol=symbol)
+    )
+
+    spec, receipt = execution._freeze_bound_execution_spec(
+        product=product,
+        config=config,
+    )
+
+    assert spec.symbol == symbol
+    assert receipt["symbol"] == symbol
+    assert receipt["instrument_spec"]["symbol"] == symbol
+
+
+def test_zero_native_tick_value_uses_bound_broker_value_and_labels_receipt(
+    tmp_path,
+):
+    _data_dir, _facts, _context_value, product = _produce(
+        tmp_path / "native",
+        native_tick_value=0.0,
+    )
+    config_path = _execution_config(tmp_path)
+    config = pm_core.PipelineConfig(research_mode=True)
+    config._deployment_config_path = str(config_path)
+
+    spec, receipt = execution._freeze_bound_execution_spec(
+        product=product,
+        config=config,
+    )
+
+    assert product.instrument_snapshot["trade_tick_value"] == 0.0
+    assert spec.tick_value == pytest.approx(1.25)
+    assert (
+        receipt["tick_value_source"]
+        == "FROZEN_BROKER_SPECS_RECORD_NATIVE_ZERO_UNAVAILABLE"
+    )
+    assert receipt["broker_record_sha256"] == execution._sha256(
+        json.loads((tmp_path / "broker_specs.json").read_text())[SYMBOL]
+    )
+    assert receipt["instrument_spec"]["tick_value"] == pytest.approx(1.25)
+    assert receipt["receipt_sha256"] == execution._sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+
+
+@pytest.mark.parametrize("native_tick_value", (-1.0, "0"))
+def test_invalid_nonzero_native_tick_value_remains_fail_closed(
+    tmp_path,
+    native_tick_value,
+):
+    with pytest.raises(
+        prefix.NativePrefixError,
+        match="PREFIX_SOURCE_INSTRUMENT_VALUE_INVALID:trade_tick_value",
+    ):
+        _produce(tmp_path, native_tick_value=native_tick_value)
+
+
+@pytest.mark.parametrize("broker_tick_value", (0.0, -1.0, "invalid", None))
+def test_zero_native_tick_value_requires_positive_finite_bound_broker_value(
+    tmp_path,
+    broker_tick_value,
+):
+    _data_dir, _facts, _context_value, product = _produce(
+        tmp_path / "native",
+        native_tick_value=0.0,
+    )
+    config_path = _execution_config(tmp_path)
+    broker_path = tmp_path / "broker_specs.json"
+    broker = json.loads(broker_path.read_text())
+    broker[SYMBOL]["tick_value"] = broker_tick_value
+    _write_json(broker_path, broker)
+    config = pm_core.PipelineConfig(research_mode=True)
+    config._deployment_config_path = str(config_path)
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="EXECUTION_SPEC_BROKER_TICK_VALUE_INVALID",
+    ):
+        execution._freeze_bound_execution_spec(product=product, config=config)
+
+
+def test_execution_spec_rejects_caller_override_but_uses_native_structural_terms(
     tmp_path,
 ):
     _data_dir, _facts, _context_value, product = _produce(tmp_path / "native")
@@ -822,10 +1345,75 @@ def test_execution_spec_rejects_caller_override_and_structural_broker_splice(
             ),
         )
 
-    config._deployment_config_path = str(_execution_config(tmp_path, tick_size=0.00002))
+    config._deployment_config_path = str(
+        _execution_config(
+            tmp_path,
+            broker_overrides={
+                "path": f"Forex\\Exotics\\{SYMBOL}",
+                "digits": 3,
+                "point": 0.001,
+                "tick_size": 0.001,
+                "contract_size": 1_000.0,
+                "pip_size": 0.01,
+            },
+        )
+    )
+    spec, receipt = execution._freeze_bound_execution_spec(
+        product=product,
+        config=config,
+    )
+
+    assert spec.digits == 5
+    assert spec.point == pytest.approx(0.00001)
+    assert spec.tick_size == pytest.approx(0.00001)
+    assert spec.contract_size == pytest.approx(100_000.0)
+    assert spec.pip_value == pytest.approx(10.0)
+    assert receipt["tick_value_source"] == "ACTIVATED_ACQUISITION_INSTRUMENT_SNAPSHOT"
+
+
+@pytest.mark.parametrize(
+    "broker_overrides,expected_error",
+    (
+        ({"digits": 3}, "NATIVE_BROKER_IDENTITY_MISMATCH"),
+        ({"point": 0.001}, "NATIVE_BROKER_STRUCTURAL_MISMATCH"),
+        ({"tick_size": 0.001}, "NATIVE_BROKER_STRUCTURAL_MISMATCH"),
+        ({"contract_size": 1_000.0}, "NATIVE_BROKER_STRUCTURAL_MISMATCH"),
+    ),
+)
+def test_zero_native_tick_value_requires_structurally_matching_broker_fallback(
+    tmp_path,
+    broker_overrides,
+    expected_error,
+):
+    _data_dir, _facts, _context_value, product = _produce(
+        tmp_path / "native",
+        native_tick_value=0.0,
+    )
+    config = pm_core.PipelineConfig(research_mode=True)
+    config._deployment_config_path = str(
+        _execution_config(tmp_path, broker_overrides=broker_overrides)
+    )
+
     with pytest.raises(
         execution.AuthoritativeSearchExecutionError,
-        match="NATIVE_BROKER_STRUCTURAL_MISMATCH",
+        match=expected_error,
+    ):
+        execution._freeze_bound_execution_spec(product=product, config=config)
+
+
+def test_execution_spec_rejects_genuinely_different_broker_symbol(tmp_path):
+    _data_dir, _facts, _context_value, product = _produce(tmp_path / "native")
+    config = pm_core.PipelineConfig(research_mode=True)
+    config._deployment_config_path = str(
+        _execution_config(
+            tmp_path,
+            broker_overrides={"symbol": "EURGBP"},
+        )
+    )
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="NATIVE_BROKER_IDENTITY_MISMATCH",
     ):
         execution._freeze_bound_execution_spec(product=product, config=config)
 
@@ -945,6 +1533,270 @@ def test_missing_activation_is_typed_technical_not_no_trade(tmp_path):
     assert product.native_prefix["artifact_sha256"] is None
     assert product.native_prefix["source_reason"].startswith("TECHNICAL_FAILURE:")
     assert "NO_TRADE" not in product.native_prefix["source_reason"]
+
+
+def test_four_terminal_cutoffs_resolve_once_per_independent_phase(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "missing-data"
+    requests = tuple(
+        {
+            "cutoff_utc": f"2026-01-01T00:{minute:02d}:00Z",
+            "source_accessed_at_utc": SOURCE_ACCESSED,
+        }
+        for minute in (5, 10, 15, 20)
+    )
+    resolution_calls: list[tuple[str, str]] = []
+
+    def terminal_resolution(_data_dir, symbol, timeframe, **_kwargs):
+        resolution_calls.append((symbol, timeframe))
+        return ActiveNativeResolution(
+            symbol=symbol,
+            timeframe=timeframe,
+            errors=["NATIVE_ACTIVE_POINTER_MISSING"],
+        )
+
+    monkeypatch.setattr(
+        prefix,
+        "resolve_active_native_artifact",
+        terminal_resolution,
+    )
+    baseline_root = tmp_path / "baseline"
+    baseline_root.mkdir()
+    baseline_context = _context(baseline_root)
+    baseline = tuple(
+        prefix._produce_activated_native_prefix_single(
+            data_dir=data_dir,
+            context=baseline_context,
+            symbol=SYMBOL,
+            timeframe="M5",
+            cutoff_utc=request["cutoff_utc"],
+            source_accessed_at_utc=request["source_accessed_at_utc"],
+            production_contract_required=False,
+        )
+        for request in requests
+    )
+    resolution_calls.clear()
+    batch_root = tmp_path / "batch-terminal"
+    batch_root.mkdir()
+    batch_context = _context(batch_root)
+    candidates = prefix.stage_activated_native_prefixes(
+        data_dir=data_dir,
+        context=batch_context,
+        symbol=SYMBOL,
+        timeframe="M5",
+        requests=requests,
+        production_contract_required=False,
+    )
+    assert resolution_calls == [(SYMBOL, "M5")]
+    assert all(
+        candidate["source_state"] == prefix.TECHNICAL_FAILURE
+        for candidate in candidates
+    )
+    assert all(
+        _read_index(
+            batch_context,
+            SimpleNamespace(index_descriptor=candidate["index_descriptor"]),
+        )["source"]["bars_relative_path"]
+        is None
+        for candidate in candidates
+    )
+    observed = prefix.verify_activated_native_prefix_candidates(
+        data_dir=data_dir,
+        context=batch_context,
+        symbol=SYMBOL,
+        timeframe="M5",
+        candidates=candidates,
+        production_contract_required=False,
+        require_current_activation=True,
+    )
+
+    assert resolution_calls == [(SYMBOL, "M5"), (SYMBOL, "M5")]
+    assert len(observed) == len(baseline) == 4
+    for scalar, batched in zip(baseline, observed, strict=True):
+        assert batched.index == scalar.index
+        assert batched.index_sha256 == scalar.index_sha256
+        assert batched.native_prefix == scalar.native_prefix
+        assert batched.artifact_descriptors == scalar.artifact_descriptors
+        for descriptor in batched.artifact_descriptors:
+            assert _object_path(batch_context, dict(descriptor)).read_bytes() == (
+                _object_path(baseline_context, dict(descriptor)).read_bytes()
+            )
+
+
+def test_terminal_batch_stops_between_candidates_on_cancel(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "missing-data"
+    requests = tuple(
+        {
+            "cutoff_utc": f"2026-01-01T00:{minute:02d}:00Z",
+            "source_accessed_at_utc": SOURCE_ACCESSED,
+        }
+        for minute in (5, 10, 15, 20)
+    )
+
+    def terminal_resolution(_data_dir, symbol, timeframe, **_kwargs):
+        return ActiveNativeResolution(
+            symbol=symbol,
+            timeframe=timeframe,
+            errors=["NATIVE_ACTIVE_POINTER_MISSING"],
+        )
+
+    monkeypatch.setattr(
+        prefix,
+        "resolve_active_native_artifact",
+        terminal_resolution,
+    )
+    cancel_root = tmp_path / "cancel"
+    cancel_root.mkdir()
+    cancel_context = _context(cancel_root)
+    candidates = prefix.stage_activated_native_prefixes(
+        data_dir=data_dir,
+        context=cancel_context,
+        symbol=SYMBOL,
+        timeframe="M5",
+        requests=requests,
+        production_contract_required=False,
+    )
+    cancellation_event = threading.Event()
+    verified_cutoffs: list[str] = []
+    real_verify = prefix._verify_activated_native_prefix_single
+
+    def cancel_after_first_verify(**kwargs):
+        product = real_verify(**kwargs)
+        verified_cutoffs.append(kwargs["expected_cutoff_utc"])
+        cancellation_event.set()
+        return product
+
+    monkeypatch.setattr(
+        prefix,
+        "_verify_activated_native_prefix_single",
+        cancel_after_first_verify,
+    )
+    with pytest.raises(prefix.NativePrefixError, match="PREFIX_BATCH_CANCELLED"):
+        prefix.verify_activated_native_prefix_candidates(
+            data_dir=data_dir,
+            context=cancel_context,
+            symbol=SYMBOL,
+            timeframe="M5",
+            candidates=candidates,
+            production_contract_required=False,
+            require_current_activation=True,
+            cancellation_event=cancellation_event,
+        )
+    assert verified_cutoffs == ["2026-01-01T00:05:00Z"]
+
+
+def test_mixed_cutoff_terminal_and_available_share_two_resolutions(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "data"
+    facts = _write_authenticated_suffix_activation(data_dir)
+    with facts["bars_path"].open("r", encoding="utf-8", newline="") as stream:
+        available_cutoffs = [
+            row["_BAR_CLOSE_TS"] for row in csv.DictReader(stream)
+        ][:3]
+    cutoffs = (_iso(facts["boundary_open"]), *available_cutoffs)
+    requests = tuple(
+        {
+            "cutoff_utc": cutoff,
+            "source_accessed_at_utc": "2026-07-14T00:00:00Z",
+        }
+        for cutoff in cutoffs
+    )
+    real_resolve = prefix.resolve_active_native_artifact
+    resolution_calls: list[tuple[str, str]] = []
+
+    def counted_resolution(data_dir_arg, symbol, timeframe, **kwargs):
+        resolution_calls.append((symbol, timeframe))
+        return real_resolve(data_dir_arg, symbol, timeframe, **kwargs)
+
+    monkeypatch.setattr(
+        prefix,
+        "resolve_active_native_artifact",
+        counted_resolution,
+    )
+    context = _context(tmp_path)
+    products = prefix.produce_activated_native_prefixes(
+        data_dir=data_dir,
+        context=context,
+        symbol=SYMBOL,
+        timeframe="D1",
+        requests=requests,
+        production_contract_required=False,
+    )
+
+    assert resolution_calls == [(SYMBOL, "D1"), (SYMBOL, "D1")]
+    assert products[0].source_state == prefix.SOURCE_UNAVAILABLE
+    assert all(product.source_state == prefix.AVAILABLE for product in products[1:])
+    terminal_receipt = json.loads(
+        _object_path(
+            context,
+            dict(products[0].index["terminal_receipt"]),
+        ).read_text(encoding="ascii")
+    )
+    assert terminal_receipt["schema_version"] == (
+        prefix.PREFIX_CUTOFF_TERMINAL_RECEIPT_SCHEMA
+    )
+
+
+def test_authenticated_terminal_technical_preserves_activation_lineage(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "data"
+    manifest_path = data_dir / "native" / "activations" / "terminal.json"
+    manifest_path.parent.mkdir(parents=True)
+    entry = {
+        "symbol": SYMBOL,
+        "timeframe": "M5",
+        "status": "technical_error",
+        "source_provenance_sha256": "7" * 64,
+    }
+    manifest = {
+        "activation_id": "terminal-activation",
+        "entries": {SYMBOL: {"M5": entry}},
+        "run_manifest_relative_path": "runs/terminal/run_manifest.json",
+        "run_manifest_sha256": "8" * 64,
+    }
+    manifest_path.write_bytes(_canonical(manifest))
+    manifest_sha = _sha(manifest_path.read_bytes())
+
+    def terminal_resolution(*args, **kwargs):
+        return ActiveNativeResolution(
+            symbol=SYMBOL,
+            timeframe="M5",
+            activation_id="terminal-activation",
+            activation_manifest_path=manifest_path,
+            activation_manifest_sha256=manifest_sha,
+            errors=["NATIVE_ACTIVE_CELL_TERMINAL_TECHNICAL"],
+        )
+
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", terminal_resolution)
+    context = _context(tmp_path)
+    product = prefix.produce_activated_native_prefix(
+        data_dir=data_dir,
+        context=context,
+        symbol=SYMBOL,
+        timeframe="M5",
+        cutoff_utc="2026-01-01T00:05:00Z",
+        source_accessed_at_utc=SOURCE_ACCESSED,
+        production_contract_required=False,
+    )
+
+    assert product.source_state == prefix.TECHNICAL_TERMINAL
+    assert product.native_prefix["activation_id"] == "terminal-activation"
+    assert product.native_prefix["activation_manifest_sha256"] == manifest_sha
+    assert product.native_prefix["activation_entry_sha256"] == prefix._sha_json(entry)
+    assert product.native_prefix["artifact_sha256"] is None
+    terminal = json.loads(
+        _object_path(context, product.index["terminal_receipt"]).read_text(
+            encoding="ascii"
+        )
+    )
+    assert terminal["binding_mode"] == ("AUTHENTICATED_ACTIVATION_TERMINAL_TECHNICAL")
+    assert terminal["activation_entry_sha256"] == prefix._sha_json(entry)
+    assert terminal["grants_no_trade_authority"] is False
 
 
 def test_authenticated_source_unavailable_is_distinct_and_sparse_sibling_survives(
@@ -1124,6 +1976,112 @@ def test_missing_pagination_shortfall_only_requires_proof_inside_strategy_interv
         source,
         expected_first=strategy_gap_first,
     )
+
+
+def test_complete_ledger_oldest_page_truncation_is_available_across_entrypoints(
+    tmp_path,
+):
+    data_dir = tmp_path / "data"
+    facts = _write_complete_ledger_boundary_truncation_activation(data_dir)
+    context = _context(tmp_path)
+
+    scalar = prefix.produce_activated_native_prefix(
+        data_dir=data_dir,
+        context=context,
+        symbol=SYMBOL,
+        timeframe="D1",
+        cutoff_utc=facts["cutoff"],
+        source_accessed_at_utc=SOURCE_ACCESSED,
+        production_contract_required=False,
+    )
+    assert scalar.source_state == prefix.AVAILABLE
+    assert scalar.native_prefix["boundary_status"] == "LEFT_TRUNCATED"
+    reopened_scalar = prefix.reverify_activated_native_prefix_product(
+        scalar,
+        context,
+    )
+    assert reopened_scalar.index_sha256 == scalar.index_sha256
+    assert reopened_scalar.native_prefix["boundary_status"] == "LEFT_TRUNCATED"
+
+    batched = prefix.produce_activated_native_prefixes(
+        data_dir=data_dir,
+        context=context,
+        symbol=SYMBOL,
+        timeframe="D1",
+        requests=(
+            {
+                "cutoff_utc": _iso(facts["first_close"]),
+                "source_accessed_at_utc": SOURCE_ACCESSED,
+            },
+            {
+                "cutoff_utc": facts["later_cutoff"],
+                "source_accessed_at_utc": SOURCE_ACCESSED,
+            },
+        ),
+        production_contract_required=False,
+    )
+    assert len(batched) == 2
+    assert all(product.source_state == prefix.AVAILABLE for product in batched)
+    assert all(
+        product.native_prefix["boundary_status"] == "LEFT_TRUNCATED"
+        for product in batched
+    )
+    for product in batched:
+        reopened = prefix.reverify_activated_native_prefix_product(product, context)
+        assert reopened.index_sha256 == product.index_sha256
+        assert reopened.native_prefix["boundary_status"] == "LEFT_TRUNCATED"
+
+
+def test_complete_ledger_truncation_before_first_close_fails_closed(tmp_path):
+    data_dir = tmp_path / "data"
+    facts = _write_complete_ledger_boundary_truncation_activation(data_dir)
+
+    with pytest.raises(
+        prefix.NativePrefixError,
+        match="PREFIX_AVAILABLE_HISTORY_BOUNDARY",
+    ):
+        prefix.produce_activated_native_prefix(
+            data_dir=data_dir,
+            context=_context(tmp_path),
+            symbol=SYMBOL,
+            timeframe="D1",
+            cutoff_utc=_iso(facts["boundary_open"]),
+            source_accessed_at_utc=SOURCE_ACCESSED,
+            production_contract_required=False,
+        )
+
+
+@pytest.mark.parametrize("ambiguity", ["internal", "failed", "terminal"])
+def test_complete_ledger_truncation_ambiguity_fails_closed(tmp_path, ambiguity):
+    data_dir = tmp_path / "data"
+    facts = _write_complete_ledger_boundary_truncation_activation(data_dir)
+
+    def mutate(provenance):
+        if ambiguity == "internal":
+            provenance["coverage"]["internal_truncated_page_count"] = 1
+        elif ambiguity == "failed":
+            provenance["pagination"]["failed_pages"] = [
+                copy.deepcopy(provenance["pagination"]["page_attempts"][0])
+            ]
+        else:
+            provenance["pagination"]["terminal_prefix_unresolved_pages"] = [
+                copy.deepcopy(provenance["pagination"]["page_attempts"][0])
+            ]
+
+    _reseal_complete_ledger_provenance(facts, mutate)
+    with pytest.raises(
+        prefix.NativePrefixError,
+        match="PREFIX_AVAILABLE_HISTORY_BOUNDARY",
+    ):
+        prefix.produce_activated_native_prefix(
+            data_dir=data_dir,
+            context=_context(tmp_path),
+            symbol=SYMBOL,
+            timeframe="D1",
+            cutoff_utc=facts["cutoff"],
+            source_accessed_at_utc=SOURCE_ACCESSED,
+            production_contract_required=False,
+        )
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,1943 @@
+diff --git a/pm_winner_selection.py b/pm_winner_selection.py
+new file mode 100644
+index 0000000..8fbd4fe
+--- /dev/null
++++ b/pm_winner_selection.py
+@@ -0,0 +1,1937 @@
++"""Authenticated, score-free specialist winner selection.
++
++This module is deliberately standalone.  It does not optimize parameters, size
++capital, mutate a winner book, or authorize live trading.  Its single job is to
++turn a precommitted, complete within-cell search and exact causal-fold evidence
++into a deterministic process-level winner (or an explicit no-winner result).
++
++The result is an offline book-selection calculation, not a live-trading
++authority.  The evaluator consumes only three domain-separated Ed25519 input
++envelopes: the precommitment, immutable all-attempt ledger, and exact post-cost
++evidence ledger.  Those signatures bind input provenance; they do not make a
++Python result object tamper-proof.  The declared deployment threat model is a
++single-user isolated process, so this module deliberately contains no runtime
++closure/code-integrity theatre and no output signer.  Book multiplicity,
++historical process validation, current refit, promotion, and capital controls
++remain separate downstream gates.
++"""
++
++from __future__ import annotations
++
++from base64 import b64decode
++from dataclasses import dataclass
++from datetime import date, datetime, timedelta, timezone
++import hashlib
++import json
++import math
++import re
++from statistics import NormalDist
++from types import MappingProxyType
++from typing import Any, Final
++
++try:
++    from cryptography.exceptions import InvalidSignature
++    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
++except Exception:  # pragma: no cover - fail-closed path.
++    InvalidSignature = Exception  # type: ignore[assignment,misc]
++    Ed25519PublicKey = None  # type: ignore[assignment,misc]
++
++
++WINNER_SELECTION_CONTRACT_VERSION: Final = "fxpm.winner-selection.v5"
++WINNER_SELECTION_SCOPE: Final = "OFFLINE_BOOK_SELECTION"
++PRECOMMITMENT_VERSION: Final = "fxpm.winner-precommitment.v1"
++ATTEMPT_LEDGER_VERSION: Final = "fxpm.winner-attempt-ledger.v1"
++EVIDENCE_LEDGER_VERSION: Final = "fxpm.winner-evidence-ledger.v1"
++
++PRECOMMITMENT_SIGNATURE_DOMAIN: Final = b"fxpm.winner-precommitment.v1\x00"
++ATTEMPT_SIGNATURE_DOMAIN: Final = b"fxpm.winner-attempt-ledger.v1\x00"
++EVIDENCE_SIGNATURE_DOMAIN: Final = b"fxpm.winner-evidence-ledger.v1\x00"
++
++TIMEFRAMES: Final = ("M5", "M15", "M30", "H1", "H4", "D1")
++REGIMES: Final = ("TREND", "RANGE", "BREAKOUT", "CHOP")
++
++MAX_REQUEST_BYTES: Final = 16 * 1024 * 1024
++MAX_DECISION_BYTES: Final = 20 * 1024 * 1024
++MAX_JSON_NODES: Final = 550_000
++MAX_JSON_DEPTH: Final = 28
++MAX_CONTAINER_ITEMS: Final = 4_096
++MAX_STRING_CHARS: Final = 2 * 1024 * 1024
++MAX_ATTEMPTS: Final = 128
++MAX_FOLDS: Final = 12
++MAX_DAYS_PER_FOLD: Final = 1_024
++MAX_TRADES_PER_FOLD: Final = 20_000
++MAX_TOTAL_DAILY_POINTS: Final = 262_144
++MAX_TOTAL_TRADES: Final = 500_000
++MAX_ABS_DAILY_R: Final = 50.0
++MAX_ABS_TRADE_R: Final = 100.0
++
++PINNED_SELECTION_POLICY: Final = MappingProxyType(
++    {
++        "policy_version": "fxpm.winner-statistical-policy.v3",
++        "daily_axis": "COMPLETE_UTC_CALENDAR_DAY_AXIS",
++        "daily_evidence": "POST_COST_NET_MTM",
++        "daily_unit": "INITIAL_STOP_R",
++        "inference": "FOLD_SEPARATE_CONSERVATIVE_NEWEY_WEST_DSR_V1",
++        "within_cell_alpha": 0.05,
++        "paired_alpha": 0.05,
++        "min_causal_folds": 4,
++        "min_days_per_fold": 63,
++        "min_total_days": 252,
++        "min_hac_effective_days": 126.0,
++        "min_completed_trades": 40,
++        "min_completed_trades_per_fold": 5,
++        "min_hac_effective_completed_trades": 20.0,
++        "tail_fraction": 0.05,
++        "overall_mean_must_be_positive": True,
++        "stochastic_sampling_support_required": True,
++        "worst_fold_mean_must_be_positive": True,
++        "newest_fold_mean_must_be_positive": True,
++        "cost_stress_mean_must_be_positive": True,
++        "cost_stress_worst_fold_must_be_positive": True,
++        "cost_stress_newest_fold_must_be_positive": True,
++        # A lower confidence bound for each individual fold is useful evidence
++        # about instability, but requiring four simultaneous fold-level
++        # significance tests destroys power and is not a multiple-testing
++        # correction.  Overall attempt-aware DSR is the inferential gate; fold
++        # means are the precommitted robustness gates.
++        "per_fold_hac_lcb_gate": False,
++        # Tail and drawdown remain exact selection evidence and Pareto dimensions,
++        # but a universal numeric veto here would be an unauthenticated risk oracle.
++        # Synchronized portfolio replay and the separate capital authority own the
++        # eventual economic limit; this historical cell selector owns no sizing.
++        "diagnostic_only_fields": (
++            "worst_fold_hac_lcb_daily_r",
++            "newest_fold_hac_lcb_daily_r",
++            "cost_stress_worst_fold_hac_lcb_daily_r",
++            "cost_stress_newest_fold_hac_lcb_daily_r",
++            "tail_cvar_daily_r",
++            "max_path_drawdown_r",
++            "cost_stress_tail_cvar_daily_r",
++            "cost_stress_max_path_drawdown_r",
++        ),
++        "candidate_admissibility_gate_codes": (
++            "INSUFFICIENT_DAILY_OBSERVATIONS",
++            "INSUFFICIENT_HAC_EFFECTIVE_DAYS",
++            "INSUFFICIENT_COMPLETED_TRADES",
++            "INSUFFICIENT_COMPLETED_TRADE_HAC_POWER",
++            "NO_STOCHASTIC_SAMPLING_SUPPORT",
++            "NONPOSITIVE_MEAN",
++            "NONPOSITIVE_WORST_FOLD",
++            "NONPOSITIVE_NEWEST_FOLD",
++            "COST_STRESS_NONPOSITIVE_MEAN",
++            "COST_STRESS_NONPOSITIVE_WORST_FOLD",
++            "COST_STRESS_NONPOSITIVE_NEWEST_FOLD",
++        ),
++        "selection_admissibility_gate_codes": ("WITHIN_CELL_ATTEMPT_AWARE_DSR_FAILED",),
++        "failed_or_rejected_attempt_p_value": 1.0,
++        "attempt_multiplicity": "EXACT_ATTEMPT_COUNT_DEFLATED_SHARPE",
++        "winner_rule": (
++            "ADMISSIBLE_THEN_PAIRED_STATISTICAL_NONDOMINANCE_THEN_"
++            "UNRESOLVED_DIFFERENCE_GUARD_THEN_DETERMINISTIC_SIMPLICITY"
++        ),
++        "parameter_evidence_inherited": False,
++    }
++)
++
++_BOOK_P_VALUE_CONTRACT = {
++    "evidence_scope": "PROCESS_LEVEL_ONLY",
++    "marginal_p_value": "ONE_SIDED_SUPERIORITY",
++    "method": "DEFLATED_SHARPE_ONE_SIDED_ATTEMPT_AWARE",
++    "parameter_evidence_inherited": False,
++    "within_cell_multiplicity_adjusted": True,
++}
++
++_HEX40 = re.compile(r"[0-9a-f]{40}\Z")
++_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
++_SAFE_ID = re.compile(r"[A-Za-z0-9_.:/-]{1,128}\Z")
++_SAFE_SYMBOL = re.compile(r"[A-Za-z0-9_.-]{1,32}\Z")
++
++
++def _canonical_bytes(value: Any) -> bytes:
++    return json.dumps(
++        value,
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=True,
++        allow_nan=False,
++    ).encode("ascii")
++
++
++def _sha256_bytes(value: bytes) -> str:
++    return hashlib.sha256(value).hexdigest()
++
++
++def _sha256_json(value: Any) -> str:
++    return _sha256_bytes(_canonical_bytes(value))
++
++
++PINNED_SELECTION_POLICY_SHA256: Final = _sha256_json(dict(PINNED_SELECTION_POLICY))
++PINNED_BOOK_P_VALUE_CONTRACT_SHA256: Final = _sha256_json(_BOOK_P_VALUE_CONTRACT)
++
++
++class _ContractError(ValueError):
++    pass
++
++
++@dataclass(frozen=True, slots=True)
++class WinnerSelectionTrustBundle:
++    """Public keys that authenticate the three historical input ledgers."""
++
++    precommitment_key_id: str
++    precommitment_public_key: bytes
++    attempt_key_id: str
++    attempt_public_key: bytes
++    evidence_key_id: str
++    evidence_public_key: bytes
++    trust_bundle_sha256: str
++
++
++def _trust_payload(
++    precommitment_key_id: str,
++    precommitment_public_key: bytes,
++    attempt_key_id: str,
++    attempt_public_key: bytes,
++    evidence_key_id: str,
++    evidence_public_key: bytes,
++) -> dict[str, Any]:
++    from base64 import b64encode
++
++    return {
++        "contract": "fxpm.winner-selection-historical-trust-bundle.v2",
++        "precommitment": {
++            "key_id": precommitment_key_id,
++            "public_key_base64": b64encode(precommitment_public_key).decode("ascii"),
++        },
++        "attempt_ledger": {
++            "key_id": attempt_key_id,
++            "public_key_base64": b64encode(attempt_public_key).decode("ascii"),
++        },
++        "evidence_ledger": {
++            "key_id": evidence_key_id,
++            "public_key_base64": b64encode(evidence_public_key).decode("ascii"),
++        },
++    }
++
++
++def create_trust_bundle(
++    *,
++    precommitment_key_id: Any,
++    precommitment_public_key_base64: Any,
++    attempt_key_id: Any,
++    attempt_public_key_base64: Any,
++    evidence_key_id: Any,
++    evidence_public_key_base64: Any,
++    current_refit_key_id: Any = None,
++    current_refit_public_key_base64: Any = None,
++) -> WinnerSelectionTrustBundle | None:
++    """Build historical public trust; legacy refit arguments fail closed."""
++
++    try:
++        if (
++            current_refit_key_id is not None
++            or current_refit_public_key_base64 is not None
++        ):
++            return None
++        ids = (precommitment_key_id, attempt_key_id, evidence_key_id)
++        texts = (
++            precommitment_public_key_base64,
++            attempt_public_key_base64,
++            evidence_public_key_base64,
++        )
++        if any(
++            type(value) is not str or _SAFE_ID.fullmatch(value) is None for value in ids
++        ):
++            return None
++        if len(set(ids)) != 3:
++            return None
++        if any(type(value) is not str or len(value) != 44 for value in texts):
++            return None
++        try:
++            keys = tuple(b64decode(value, validate=True) for value in texts)
++        except (TypeError, ValueError):
++            return None
++        if any(len(value) != 32 for value in keys) or len(set(keys)) != 3:
++            return None
++        payload = _trust_payload(ids[0], keys[0], ids[1], keys[1], ids[2], keys[2])
++        return WinnerSelectionTrustBundle(
++            ids[0],
++            keys[0],
++            ids[1],
++            keys[1],
++            ids[2],
++            keys[2],
++            _sha256_json(payload),
++        )
++    except Exception:
++        return None
++
++
++def _trust_bundle_valid(bundle: Any) -> bool:
++    if type(bundle) is not WinnerSelectionTrustBundle:
++        return False
++    fields = (
++        (bundle.precommitment_key_id, bundle.precommitment_public_key),
++        (bundle.attempt_key_id, bundle.attempt_public_key),
++        (bundle.evidence_key_id, bundle.evidence_public_key),
++    )
++    if any(
++        type(key_id) is not str
++        or _SAFE_ID.fullmatch(key_id) is None
++        or type(key) is not bytes
++        or len(key) != 32
++        for key_id, key in fields
++    ):
++        return False
++    if (
++        len({key_id for key_id, _ in fields}) != 3
++        or len({key for _, key in fields}) != 3
++    ):
++        return False
++    expected = _sha256_json(
++        _trust_payload(
++            fields[0][0],
++            fields[0][1],
++            fields[1][0],
++            fields[1][1],
++            fields[2][0],
++            fields[2][1],
++        )
++    )
++    return (
++        type(bundle.trust_bundle_sha256) is str
++        and bundle.trust_bundle_sha256 == expected
++    )
++
++
++def _owned_json(value: Any, byte_limit: int = MAX_REQUEST_BYTES) -> Any:
++    """Iteratively reject cycles, aliases, depth bombs, and oversized JSON."""
++
++    seen: set[int] = set()
++    nodes = 0
++    chars = 0
++    stack: list[tuple[Any, int]] = [(value, 0)]
++    while stack:
++        current, depth = stack.pop()
++        nodes += 1
++        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
++            raise _ContractError("INPUT_STRUCTURE_LIMIT_EXCEEDED")
++        current_type = type(current)
++        if current_type is dict:
++            identity = id(current)
++            if identity in seen:
++                raise _ContractError("CYCLIC_OR_ALIASED_CONTAINER")
++            seen.add(identity)
++            if len(current) > MAX_CONTAINER_ITEMS:
++                raise _ContractError("INPUT_CONTAINER_WIDTH_EXCEEDED")
++            for key, item in current.items():
++                if type(key) is not str:
++                    raise _ContractError("NON_JSON_DICTIONARY_KEY")
++                if len(key) > 256:
++                    raise _ContractError("INPUT_STRING_LIMIT_EXCEEDED")
++                chars += len(key)
++                stack.append((item, depth + 1))
++        elif current_type is list:
++            identity = id(current)
++            if identity in seen:
++                raise _ContractError("CYCLIC_OR_ALIASED_CONTAINER")
++            seen.add(identity)
++            if len(current) > MAX_CONTAINER_ITEMS:
++                raise _ContractError("INPUT_CONTAINER_WIDTH_EXCEEDED")
++            stack.extend((item, depth + 1) for item in current)
++        elif current_type is str:
++            if len(current) > MAX_STRING_CHARS:
++                raise _ContractError("INPUT_STRING_LIMIT_EXCEEDED")
++            chars += len(current)
++        elif current_type is int:
++            if abs(current) > 9_007_199_254_740_991:
++                raise _ContractError("INTEGER_OUT_OF_CANONICAL_RANGE")
++        elif current_type is float:
++            if not math.isfinite(current):
++                raise _ContractError("NON_FINITE_JSON_NUMBER")
++        elif current_type not in (bool, type(None)):
++            raise _ContractError("NON_CANONICAL_JSON_TYPE")
++        if chars > byte_limit:
++            raise _ContractError("INPUT_STRING_BUDGET_EXCEEDED")
++    try:
++        encoded = _canonical_bytes(value)
++    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
++        raise _ContractError("INPUT_CANONICALIZATION_FAILED") from exc
++    if len(encoded) > byte_limit:
++        raise _ContractError("INPUT_BYTE_LIMIT_EXCEEDED")
++    return json.loads(encoded.decode("ascii"))
++
++
++def _exact_dict(value: Any, keys: frozenset[str], code: str) -> dict[str, Any]:
++    if type(value) is not dict or frozenset(value) != keys:
++        raise _ContractError(code)
++    return value
++
++
++def _hex(value: Any, matcher: re.Pattern[str], code: str) -> str:
++    if type(value) is not str or matcher.fullmatch(value) is None:
++        raise _ContractError(code)
++    return value
++
++
++def _safe_id(value: Any, code: str) -> str:
++    if type(value) is not str or _SAFE_ID.fullmatch(value) is None:
++        raise _ContractError(code)
++    return value
++
++
++def _exact_int(value: Any, low: int, high: int, code: str) -> int:
++    if type(value) is not int or not low <= value <= high:
++        raise _ContractError(code)
++    return value
++
++
++def _finite_float(value: Any, low: float, high: float, code: str) -> float:
++    if type(value) is not float or not math.isfinite(value) or not low <= value <= high:
++        raise _ContractError(code)
++    return value
++
++
++def _timestamp(value: Any, code: str) -> datetime:
++    if (
++        type(value) is not str
++        or len(value) < 20
++        or len(value) > 32
++        or not value.endswith("Z")
++    ):
++        raise _ContractError(code)
++    try:
++        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
++    except ValueError as exc:
++        raise _ContractError(code) from exc
++    if parsed.tzinfo != timezone.utc or parsed.microsecond != 0:
++        raise _ContractError(code)
++    canonical = parsed.isoformat(timespec="seconds").replace("+00:00", "Z")
++    if value != canonical:
++        raise _ContractError(code)
++    return parsed
++
++
++def _day(value: Any, code: str) -> date:
++    if type(value) is not str or len(value) != 10:
++        raise _ContractError(code)
++    try:
++        parsed = date.fromisoformat(value)
++    except ValueError as exc:
++        raise _ContractError(code) from exc
++    if parsed.isoformat() != value:
++        raise _ContractError(code)
++    return parsed
++
++
++def compute_cell_id(symbol: Any, timeframe: Any, regime: Any) -> str | None:
++    try:
++        if (
++            type(symbol) is not str
++            or _SAFE_SYMBOL.fullmatch(symbol) is None
++            or type(timeframe) is not str
++            or timeframe not in TIMEFRAMES
++            or type(regime) is not str
++            or regime not in REGIMES
++        ):
++            return None
++        return _sha256_json(
++            {"regime": regime, "symbol": symbol, "timeframe": timeframe}
++        )
++    except Exception:
++        return None
++
++
++_ENVELOPE_KEYS = frozenset({"key_id", "payload", "payload_sha256", "signature_base64"})
++
++
++def _verify_envelope(
++    envelope: Any,
++    *,
++    expected_key_id: str,
++    public_key: bytes,
++    domain: bytes,
++    schema_code: str,
++) -> tuple[dict[str, Any], str, str]:
++    value = _exact_dict(envelope, _ENVELOPE_KEYS, schema_code)
++    if type(value["key_id"]) is not str or value["key_id"] != expected_key_id:
++        raise _ContractError(schema_code + "_KEY_ID_MISMATCH")
++    payload = value["payload"]
++    if type(payload) is not dict:
++        raise _ContractError(schema_code + "_PAYLOAD_TYPE_INVALID")
++    payload_bytes = _canonical_bytes(payload)
++    payload_sha = _sha256_bytes(payload_bytes)
++    if (
++        type(value["payload_sha256"]) is not str
++        or value["payload_sha256"] != payload_sha
++    ):
++        raise _ContractError(schema_code + "_PAYLOAD_HASH_MISMATCH")
++    signature_text = value["signature_base64"]
++    if type(signature_text) is not str or len(signature_text) != 88:
++        raise _ContractError(schema_code + "_SIGNATURE_INVALID")
++    try:
++        signature = b64decode(signature_text, validate=True)
++    except (TypeError, ValueError) as exc:
++        raise _ContractError(schema_code + "_SIGNATURE_INVALID") from exc
++    if len(signature) != 64 or len(public_key) != 32 or Ed25519PublicKey is None:
++        raise _ContractError(schema_code + "_SIGNATURE_INVALID")
++    try:
++        Ed25519PublicKey.from_public_bytes(public_key).verify(
++            signature, domain + payload_bytes
++        )
++    except (InvalidSignature, TypeError, ValueError) as exc:
++        raise _ContractError(schema_code + "_SIGNATURE_INVALID") from exc
++    return payload, payload_sha, _sha256_json(value)
++
++
++_REQUEST_KEYS = frozenset(
++    {
++        "precommitment_envelope",
++        "attempt_ledger_envelope",
++        "evidence_ledger_envelope",
++    }
++)
++_PRECOMMITMENT_KEYS = frozenset(
++    {
++        "contract_version",
++        "run_id",
++        "precommitted_at_utc",
++        "cell_id",
++        "symbol",
++        "timeframe",
++        "regime",
++        "selection_policy_sha256",
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "process_registry_sha256",
++        "horizon_registry_sha256",
++        "trial_registry_sha256",
++        "planned_attempt_count",
++    }
++)
++_ATTEMPT_LEDGER_KEYS = frozenset(
++    {
++        "contract_version",
++        "run_id",
++        "frozen_at_utc",
++        "precommitment_payload_sha256",
++        "cell_id",
++        "symbol",
++        "timeframe",
++        "regime",
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "process_registry_sha256",
++        "horizon_registry_sha256",
++        "trial_registry_sha256",
++        "attempt_count",
++        "attempts_sha256",
++        "attempts",
++    }
++)
++_ATTEMPT_KEYS = frozenset(
++    {
++        "ordinal",
++        "attempt_id",
++        "process_candidate_id",
++        "strategy_family",
++        "strategy_id",
++        "parameter_count",
++        "process_sha256",
++        "horizon_process_sha256",
++        "trial_definition_sha256",
++        "refit_recipe_sha256",
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++    }
++)
++_EVIDENCE_LEDGER_KEYS = frozenset(
++    {
++        "contract_version",
++        "run_id",
++        "generated_at_utc",
++        "precommitment_payload_sha256",
++        "attempt_ledger_payload_sha256",
++        "cell_id",
++        "symbol",
++        "timeframe",
++        "regime",
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "process_registry_sha256",
++        "horizon_registry_sha256",
++        "trial_registry_sha256",
++        "attempt_count",
++        "entries_sha256",
++        "entries",
++        "evidence_scope",
++        "parameter_evidence_inherited",
++    }
++)
++_EVIDENCE_ENTRY_KEYS = frozenset(
++    {
++        "ordinal",
++        "attempt_id",
++        "process_candidate_id",
++        "process_sha256",
++        "horizon_process_sha256",
++        "trial_definition_sha256",
++        "refit_recipe_sha256",
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "evidence_status",
++        "status_reason",
++        "fold_count",
++        "folds_sha256",
++        "folds",
++    }
++)
++_FOLD_KEYS = frozenset(
++    {
++        "fold_ordinal",
++        "fold_id",
++        "anchor_as_of_utc",
++        "oos_start_date_utc",
++        "oos_end_date_utc",
++        "anchor_selection_receipt_sha256",
++        "anchor_horizon_decision_sha256",
++        "anchor_trial_ledger_sha256",
++        "anchor_selected_trial_sha256",
++        "anchor_refit_receipt_sha256",
++        "oos_source_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "daily_axis_kind",
++        "daily_evidence_kind",
++        "daily_unit",
++        "daily_dates_utc",
++        "daily_net_mtm_r",
++        "daily_net_mtm_r_cost_stress",
++        "daily_vector_sha256",
++        "completed_trade_close_utc",
++        "completed_trade_net_mtm_r",
++        "trade_vector_sha256",
++    }
++)
++
++
++def _cell_fields(value: dict[str, Any], prefix: str) -> tuple[str, str, str, str]:
++    symbol = value["symbol"]
++    timeframe = value["timeframe"]
++    regime = value["regime"]
++    if type(symbol) is not str or _SAFE_SYMBOL.fullmatch(symbol) is None:
++        raise _ContractError(prefix + "SYMBOL_INVALID")
++    if type(timeframe) is not str or timeframe not in TIMEFRAMES:
++        raise _ContractError(prefix + "TIMEFRAME_INVALID")
++    if type(regime) is not str or regime not in REGIMES:
++        raise _ContractError(prefix + "REGIME_INVALID")
++    expected_cell = compute_cell_id(symbol, timeframe, regime)
++    if type(value["cell_id"]) is not str or value["cell_id"] != expected_cell:
++        raise _ContractError(prefix + "CELL_ID_MISMATCH")
++    return value["cell_id"], symbol, timeframe, regime
++
++
++def _require_same_cell(
++    value: dict[str, Any], expected: tuple[str, str, str, str], prefix: str
++) -> None:
++    for field, wanted in zip(
++        ("cell_id", "symbol", "timeframe", "regime"), expected, strict=True
++    ):
++        if type(value[field]) is not str or value[field] != wanted:
++            raise _ContractError(prefix + field.upper() + "_MISMATCH")
++
++
++def _validate_precommitment(
++    payload: dict[str, Any],
++) -> tuple[datetime, tuple[str, str, str, str], int]:
++    value = _exact_dict(payload, _PRECOMMITMENT_KEYS, "PRECOMMITMENT_SCHEMA_INVALID")
++    if value["contract_version"] != PRECOMMITMENT_VERSION:
++        raise _ContractError("PRECOMMITMENT_VERSION_INVALID")
++    _hex(value["run_id"], _HEX64, "RUN_ID_INVALID")
++    precommitted_at = _timestamp(
++        value["precommitted_at_utc"], "PRECOMMITMENT_TIME_INVALID"
++    )
++    cell = _cell_fields(value, "PRECOMMITMENT_")
++    if value["selection_policy_sha256"] != PINNED_SELECTION_POLICY_SHA256:
++        raise _ContractError("SELECTION_POLICY_MISMATCH")
++    for field in (
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "process_registry_sha256",
++        "horizon_registry_sha256",
++        "trial_registry_sha256",
++    ):
++        _hex(value[field], _HEX64, field.upper() + "_INVALID")
++    attempts = _exact_int(
++        value["planned_attempt_count"], 1, MAX_ATTEMPTS, "PLANNED_ATTEMPT_COUNT_INVALID"
++    )
++    return precommitted_at, cell, attempts
++
++
++def _process_registry(attempts: list[dict[str, Any]]) -> str:
++    return _sha256_json(
++        {
++            "processes": [
++                {
++                    "attempt_id": value["attempt_id"],
++                    "process_candidate_id": value["process_candidate_id"],
++                    "process_sha256": value["process_sha256"],
++                    "strategy_family": value["strategy_family"],
++                    "strategy_id": value["strategy_id"],
++                }
++                for value in attempts
++            ]
++        }
++    )
++
++
++def _horizon_registry(attempts: list[dict[str, Any]]) -> str:
++    return _sha256_json(
++        {
++            "horizons": [
++                {
++                    "attempt_id": value["attempt_id"],
++                    "horizon_process_sha256": value["horizon_process_sha256"],
++                    "refit_recipe_sha256": value["refit_recipe_sha256"],
++                }
++                for value in attempts
++            ]
++        }
++    )
++
++
++def _trial_registry(attempts: list[dict[str, Any]]) -> str:
++    return _sha256_json(
++        {
++            "trials": [
++                {
++                    "attempt_id": value["attempt_id"],
++                    "trial_definition_sha256": value["trial_definition_sha256"],
++                    "parameter_count": value["parameter_count"],
++                }
++                for value in attempts
++            ]
++        }
++    )
++
++
++def _validate_attempt_ledger(
++    payload: dict[str, Any],
++    policy: dict[str, Any],
++    policy_sha: str,
++    policy_time: datetime,
++    cell: tuple[str, str, str, str],
++    planned_attempts: int,
++) -> tuple[datetime, list[dict[str, Any]]]:
++    value = _exact_dict(payload, _ATTEMPT_LEDGER_KEYS, "ATTEMPT_LEDGER_SCHEMA_INVALID")
++    if value["contract_version"] != ATTEMPT_LEDGER_VERSION:
++        raise _ContractError("ATTEMPT_LEDGER_VERSION_INVALID")
++    if value["run_id"] != policy["run_id"]:
++        raise _ContractError("ATTEMPT_LEDGER_RUN_MISMATCH")
++    frozen_at = _timestamp(value["frozen_at_utc"], "ATTEMPT_LEDGER_TIME_INVALID")
++    if frozen_at <= policy_time:
++        raise _ContractError("ATTEMPT_LEDGER_NOT_AFTER_PRECOMMITMENT")
++    if value["precommitment_payload_sha256"] != policy_sha:
++        raise _ContractError("ATTEMPT_LEDGER_PRECOMMITMENT_BINDING_INVALID")
++    _require_same_cell(value, cell, "ATTEMPT_LEDGER_")
++    for field in (
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "process_registry_sha256",
++        "horizon_registry_sha256",
++        "trial_registry_sha256",
++    ):
++        if value[field] != policy[field]:
++            raise _ContractError("ATTEMPT_LEDGER_" + field.upper() + "_MISMATCH")
++    if (
++        type(value["attempt_count"]) is not int
++        or value["attempt_count"] != planned_attempts
++    ):
++        raise _ContractError("ATTEMPT_LEDGER_COUNT_MISMATCH")
++    attempts = value["attempts"]
++    if type(attempts) is not list or len(attempts) != planned_attempts:
++        raise _ContractError("ATTEMPT_LEDGER_INCOMPLETE")
++    if value["attempts_sha256"] != _sha256_json(attempts):
++        raise _ContractError("ATTEMPT_LEDGER_HASH_MISMATCH")
++    seen_attempts: set[str] = set()
++    seen_candidates: set[str] = set()
++    for ordinal, raw in enumerate(attempts):
++        prefix = f"ATTEMPT_{ordinal:04d}_"
++        attempt = _exact_dict(raw, _ATTEMPT_KEYS, prefix + "SCHEMA_INVALID")
++        if type(attempt["ordinal"]) is not int or attempt["ordinal"] != ordinal:
++            raise _ContractError(prefix + "ORDINAL_INVALID")
++        attempt_id = _hex(attempt["attempt_id"], _HEX40, prefix + "ID_INVALID")
++        candidate_id = _hex(
++            attempt["process_candidate_id"], _HEX40, prefix + "CANDIDATE_INVALID"
++        )
++        if attempt_id in seen_attempts or candidate_id in seen_candidates:
++            raise _ContractError(prefix + "DUPLICATE_IDENTITY")
++        seen_attempts.add(attempt_id)
++        seen_candidates.add(candidate_id)
++        _safe_id(attempt["strategy_family"], prefix + "STRATEGY_FAMILY_INVALID")
++        _safe_id(attempt["strategy_id"], prefix + "STRATEGY_ID_INVALID")
++        _exact_int(
++            attempt["parameter_count"], 0, 100_000, prefix + "PARAMETER_COUNT_INVALID"
++        )
++        for field in (
++            "process_sha256",
++            "horizon_process_sha256",
++            "trial_definition_sha256",
++            "refit_recipe_sha256",
++            "source_contract_sha256",
++            "cost_contract_sha256",
++            "cost_stress_contract_sha256",
++        ):
++            _hex(attempt[field], _HEX64, prefix + field.upper() + "_INVALID")
++        for field in (
++            "source_contract_sha256",
++            "cost_contract_sha256",
++            "cost_stress_contract_sha256",
++        ):
++            if attempt[field] != policy[field]:
++                raise _ContractError(prefix + field.upper() + "_MISMATCH")
++    if _process_registry(attempts) != policy["process_registry_sha256"]:
++        raise _ContractError("PROCESS_REGISTRY_RECOMPUTATION_MISMATCH")
++    if _horizon_registry(attempts) != policy["horizon_registry_sha256"]:
++        raise _ContractError("HORIZON_REGISTRY_RECOMPUTATION_MISMATCH")
++    if _trial_registry(attempts) != policy["trial_registry_sha256"]:
++        raise _ContractError("TRIAL_REGISTRY_RECOMPUTATION_MISMATCH")
++    return frozen_at, attempts
++
++
++def _same_attempt_identity(
++    entry: dict[str, Any], attempt: dict[str, Any], prefix: str
++) -> None:
++    for field in (
++        "ordinal",
++        "attempt_id",
++        "process_candidate_id",
++        "process_sha256",
++        "horizon_process_sha256",
++        "trial_definition_sha256",
++        "refit_recipe_sha256",
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++    ):
++        if (
++            type(entry[field]) is not type(attempt[field])
++            or entry[field] != attempt[field]
++        ):
++            raise _ContractError(prefix + field.upper() + "_MISMATCH")
++
++
++def _validate_fold(
++    raw: Any,
++    *,
++    ordinal: int,
++    evidence_time: datetime,
++    policy: dict[str, Any],
++) -> dict[str, Any]:
++    prefix = f"FOLD_{ordinal:03d}_"
++    fold = _exact_dict(raw, _FOLD_KEYS, prefix + "SCHEMA_INVALID")
++    if type(fold["fold_ordinal"]) is not int or fold["fold_ordinal"] != ordinal:
++        raise _ContractError(prefix + "ORDINAL_INVALID")
++    _hex(fold["fold_id"], _HEX40, prefix + "ID_INVALID")
++    anchor = _timestamp(fold["anchor_as_of_utc"], prefix + "ANCHOR_TIME_INVALID")
++    if anchor >= evidence_time:
++        raise _ContractError(prefix + "ANCHOR_NOT_CAUSAL")
++    start = _day(fold["oos_start_date_utc"], prefix + "START_DATE_INVALID")
++    end = _day(fold["oos_end_date_utc"], prefix + "END_DATE_INVALID")
++    if end < start:
++        raise _ContractError(prefix + "DATE_ORDER_INVALID")
++    start_utc = datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
++    end_exclusive_utc = datetime.combine(
++        end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
++    )
++    if anchor >= start_utc:
++        raise _ContractError(prefix + "ANCHOR_OVERLAPS_OOS")
++    if end_exclusive_utc > evidence_time:
++        raise _ContractError(prefix + "OOS_EXTENDS_BEYOND_EVIDENCE_TIME")
++    for field in (
++        "anchor_selection_receipt_sha256",
++        "anchor_horizon_decision_sha256",
++        "anchor_trial_ledger_sha256",
++        "anchor_selected_trial_sha256",
++        "anchor_refit_receipt_sha256",
++        "oos_source_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "daily_vector_sha256",
++        "trade_vector_sha256",
++    ):
++        _hex(fold[field], _HEX64, prefix + field.upper() + "_INVALID")
++    if fold["cost_contract_sha256"] != policy["cost_contract_sha256"]:
++        raise _ContractError(prefix + "COST_CONTRACT_MISMATCH")
++    if fold["cost_stress_contract_sha256"] != policy["cost_stress_contract_sha256"]:
++        raise _ContractError(prefix + "COST_STRESS_CONTRACT_MISMATCH")
++    if fold["daily_axis_kind"] != PINNED_SELECTION_POLICY["daily_axis"]:
++        raise _ContractError(prefix + "DAILY_AXIS_INVALID")
++    if fold["daily_evidence_kind"] != PINNED_SELECTION_POLICY["daily_evidence"]:
++        raise _ContractError(prefix + "DAILY_EVIDENCE_KIND_INVALID")
++    if fold["daily_unit"] != PINNED_SELECTION_POLICY["daily_unit"]:
++        raise _ContractError(prefix + "DAILY_UNIT_INVALID")
++
++    dates = fold["daily_dates_utc"]
++    base = fold["daily_net_mtm_r"]
++    stress = fold["daily_net_mtm_r_cost_stress"]
++    if (
++        type(dates) is not list
++        or type(base) is not list
++        or type(stress) is not list
++        or not (len(dates) == len(base) == len(stress))
++        or not int(PINNED_SELECTION_POLICY["min_days_per_fold"])
++        <= len(dates)
++        <= MAX_DAYS_PER_FOLD
++    ):
++        raise _ContractError(prefix + "DAILY_VECTOR_LENGTH_INVALID")
++    if len(dates) != (end - start).days + 1:
++        raise _ContractError(prefix + "DAILY_AXIS_NOT_COMPLETE")
++    parsed_dates: list[date] = []
++    for index, raw_day in enumerate(dates):
++        parsed = _day(raw_day, prefix + "DAILY_DATE_INVALID")
++        if parsed != start + timedelta(days=index):
++            raise _ContractError(prefix + "DAILY_AXIS_NOT_CONSECUTIVE")
++        parsed_dates.append(parsed)
++    for index, (base_value, stress_value) in enumerate(zip(base, stress, strict=True)):
++        base_number = _finite_float(
++            base_value, -MAX_ABS_DAILY_R, MAX_ABS_DAILY_R, prefix + "BASE_R_INVALID"
++        )
++        stress_number = _finite_float(
++            stress_value, -MAX_ABS_DAILY_R, MAX_ABS_DAILY_R, prefix + "STRESS_R_INVALID"
++        )
++        if stress_number > base_number + 1e-12:
++            raise _ContractError(prefix + f"COST_STRESS_IMPROVES_RETURN_{index:04d}")
++    expected_daily_sha = _sha256_json(
++        {
++            "daily_dates_utc": dates,
++            "daily_net_mtm_r": base,
++            "daily_net_mtm_r_cost_stress": stress,
++        }
++    )
++    if fold["daily_vector_sha256"] != expected_daily_sha:
++        raise _ContractError(prefix + "DAILY_VECTOR_HASH_MISMATCH")
++
++    trade_times = fold["completed_trade_close_utc"]
++    trade_values = fold["completed_trade_net_mtm_r"]
++    if (
++        type(trade_times) is not list
++        or type(trade_values) is not list
++        or len(trade_times) != len(trade_values)
++    ):
++        raise _ContractError(prefix + "TRADE_VECTOR_LENGTH_INVALID")
++    if (
++        not int(PINNED_SELECTION_POLICY["min_completed_trades_per_fold"])
++        <= len(trade_times)
++        <= MAX_TRADES_PER_FOLD
++    ):
++        raise _ContractError(prefix + "TRADE_COUNT_INVALID")
++    prior_close: datetime | None = None
++    oos_end_exclusive = end_exclusive_utc
++    for trade_time, trade_value in zip(trade_times, trade_values, strict=True):
++        close = _timestamp(trade_time, prefix + "TRADE_TIME_INVALID")
++        if (
++            close < start_utc
++            or close >= oos_end_exclusive
++            or (prior_close is not None and close < prior_close)
++        ):
++            raise _ContractError(prefix + "TRADE_TIME_ORDER_INVALID")
++        prior_close = close
++        _finite_float(
++            trade_value, -MAX_ABS_TRADE_R, MAX_ABS_TRADE_R, prefix + "TRADE_R_INVALID"
++        )
++    expected_trade_sha = _sha256_json(
++        {
++            "completed_trade_close_utc": trade_times,
++            "completed_trade_net_mtm_r": trade_values,
++        }
++    )
++    if fold["trade_vector_sha256"] != expected_trade_sha:
++        raise _ContractError(prefix + "TRADE_VECTOR_HASH_MISMATCH")
++    return fold
++
++
++def _validate_evidence_ledger(
++    payload: dict[str, Any],
++    policy: dict[str, Any],
++    policy_sha: str,
++    attempt_payload_sha: str,
++    frozen_at: datetime,
++    cell: tuple[str, str, str, str],
++    attempts: list[dict[str, Any]],
++) -> tuple[datetime, list[dict[str, Any]]]:
++    value = _exact_dict(
++        payload, _EVIDENCE_LEDGER_KEYS, "EVIDENCE_LEDGER_SCHEMA_INVALID"
++    )
++    if value["contract_version"] != EVIDENCE_LEDGER_VERSION:
++        raise _ContractError("EVIDENCE_LEDGER_VERSION_INVALID")
++    if value["run_id"] != policy["run_id"]:
++        raise _ContractError("EVIDENCE_RUN_MISMATCH")
++    generated_at = _timestamp(value["generated_at_utc"], "EVIDENCE_TIME_INVALID")
++    if generated_at <= frozen_at:
++        raise _ContractError("EVIDENCE_NOT_AFTER_ATTEMPT_FREEZE")
++    if value["precommitment_payload_sha256"] != policy_sha:
++        raise _ContractError("EVIDENCE_PRECOMMITMENT_BINDING_INVALID")
++    if value["attempt_ledger_payload_sha256"] != attempt_payload_sha:
++        raise _ContractError("EVIDENCE_ATTEMPT_BINDING_INVALID")
++    _require_same_cell(value, cell, "EVIDENCE_")
++    for field in (
++        "source_contract_sha256",
++        "cost_contract_sha256",
++        "cost_stress_contract_sha256",
++        "process_registry_sha256",
++        "horizon_registry_sha256",
++        "trial_registry_sha256",
++    ):
++        if value[field] != policy[field]:
++            raise _ContractError("EVIDENCE_" + field.upper() + "_MISMATCH")
++    if (
++        value["evidence_scope"] != "PROCESS_LEVEL_ONLY"
++        or value["parameter_evidence_inherited"] is not False
++    ):
++        raise _ContractError("EVIDENCE_SCOPE_OR_PARAMETER_INHERITANCE_INVALID")
++    if type(value["attempt_count"]) is not int or value["attempt_count"] != len(
++        attempts
++    ):
++        raise _ContractError("EVIDENCE_ATTEMPT_COUNT_MISMATCH")
++    entries = value["entries"]
++    if type(entries) is not list or len(entries) != len(attempts):
++        raise _ContractError("EVIDENCE_ATTEMPT_ROSTER_INCOMPLETE")
++    if value["entries_sha256"] != _sha256_json(entries):
++        raise _ContractError("EVIDENCE_ENTRIES_HASH_MISMATCH")
++    total_days = 0
++    total_trades = 0
++    common_fold_axes: (
++        tuple[tuple[str, str, str, str, str, tuple[str, ...]], ...] | None
++    ) = None
++    for ordinal, (raw, attempt) in enumerate(zip(entries, attempts, strict=True)):
++        prefix = f"EVIDENCE_{ordinal:04d}_"
++        entry = _exact_dict(raw, _EVIDENCE_ENTRY_KEYS, prefix + "SCHEMA_INVALID")
++        _same_attempt_identity(entry, attempt, prefix)
++        status = entry["evidence_status"]
++        if status not in {"AUTHENTICATED", "PROCESS_REJECTED", "TECHNICAL_FAILURE"}:
++            raise _ContractError(prefix + "STATUS_INVALID")
++        folds = entry["folds"]
++        if type(folds) is not list or len(folds) > MAX_FOLDS:
++            raise _ContractError(prefix + "FOLDS_INVALID")
++        if type(entry["fold_count"]) is not int or entry["fold_count"] != len(folds):
++            raise _ContractError(prefix + "FOLD_COUNT_MISMATCH")
++        if entry["folds_sha256"] != _sha256_json(folds):
++            raise _ContractError(prefix + "FOLDS_HASH_MISMATCH")
++        if status == "AUTHENTICATED":
++            if entry["status_reason"] is not None:
++                raise _ContractError(prefix + "AUTHENTICATED_REASON_MUST_BE_NULL")
++            if len(folds) < int(PINNED_SELECTION_POLICY["min_causal_folds"]):
++                raise _ContractError(prefix + "INSUFFICIENT_FOLD_ROSTER")
++            validated: list[dict[str, Any]] = []
++            seen_fold_ids: set[str] = set()
++            previous_end: date | None = None
++            previous_anchor: datetime | None = None
++            for fold_ordinal, fold_raw in enumerate(folds):
++                fold = _validate_fold(
++                    fold_raw,
++                    ordinal=fold_ordinal,
++                    evidence_time=generated_at,
++                    policy=policy,
++                )
++                if fold["fold_id"] in seen_fold_ids:
++                    raise _ContractError(prefix + "DUPLICATE_FOLD_ID")
++                seen_fold_ids.add(fold["fold_id"])
++                anchor = _timestamp(fold["anchor_as_of_utc"], prefix + "ANCHOR_INVALID")
++                start = _day(fold["oos_start_date_utc"], prefix + "START_INVALID")
++                end = _day(fold["oos_end_date_utc"], prefix + "END_INVALID")
++                if anchor <= frozen_at:
++                    raise _ContractError(prefix + "ANCHOR_NOT_AFTER_ATTEMPT_FREEZE")
++                if previous_anchor is not None and anchor <= previous_anchor:
++                    raise _ContractError(prefix + "ANCHORS_NOT_STRICTLY_ORDERED")
++                if previous_end is not None and start <= previous_end:
++                    raise _ContractError(prefix + "OOS_FOLDS_OVERLAP")
++                previous_anchor = anchor
++                previous_end = end
++                validated.append(fold)
++                total_days += len(fold["daily_dates_utc"])
++                total_trades += len(fold["completed_trade_close_utc"])
++                if (
++                    total_days > MAX_TOTAL_DAILY_POINTS
++                    or total_trades > MAX_TOTAL_TRADES
++                ):
++                    raise _ContractError("EVIDENCE_GLOBAL_VECTOR_LIMIT_EXCEEDED")
++            axes = tuple(
++                (
++                    fold["fold_id"],
++                    fold["anchor_as_of_utc"],
++                    fold["oos_source_sha256"],
++                    fold["cost_contract_sha256"],
++                    fold["cost_stress_contract_sha256"],
++                    tuple(fold["daily_dates_utc"]),
++                )
++                for fold in validated
++            )
++            if common_fold_axes is None:
++                common_fold_axes = axes
++            elif axes != common_fold_axes:
++                raise _ContractError("PAIRED_CAUSAL_FOLD_AXIS_MISMATCH")
++        else:
++            if folds or entry["fold_count"] != 0:
++                raise _ContractError(prefix + "NON_AUTHENTICATED_FOLDS_MUST_BE_EMPTY")
++            allowed_reason = (
++                {"PREREGISTERED_PROCESS_SCREEN_REJECTED"}
++                if status == "PROCESS_REJECTED"
++                else {"EVALUATOR_TECHNICAL_FAILURE", "SOURCE_TECHNICAL_FAILURE"}
++            )
++            if (
++                type(entry["status_reason"]) is not str
++                or entry["status_reason"] not in allowed_reason
++            ):
++                raise _ContractError(prefix + "STATUS_REASON_INVALID")
++    if any(entry["evidence_status"] == "TECHNICAL_FAILURE" for entry in entries):
++        raise _ContractError("ATTEMPT_EVIDENCE_INCOMPLETE_TECHNICAL_FAILURE")
++    return generated_at, entries
++
++
++def _mean(values: list[float]) -> float:
++    return math.fsum(values) / len(values)
++
++
++def _sample_variance(values: list[float], center: float | None = None) -> float:
++    if len(values) < 2:
++        return 0.0
++    mean_value = _mean(values) if center is None else center
++    return math.fsum((value - mean_value) ** 2 for value in values) / (len(values) - 1)
++
++
++def _newey_west_lrv(values: list[float]) -> tuple[float, float]:
++    """Conservative Bartlett LRV and ESS; negative dependence cannot boost ESS."""
++
++    count = len(values)
++    center = _mean(values)
++    centered = [value - center for value in values]
++    gamma0 = math.fsum(value * value for value in centered) / count
++    if gamma0 <= 0.0 or not math.isfinite(gamma0):
++        return 0.0, 0.0
++    lag_limit = min(20, max(1, int(math.floor(4.0 * (count / 100.0) ** (2.0 / 9.0)))))
++    lrv = gamma0
++    for lag in range(1, min(lag_limit, count - 1) + 1):
++        covariance = (
++            math.fsum(
++                centered[index] * centered[index - lag] for index in range(lag, count)
++            )
++            / count
++        )
++        weight = 1.0 - lag / (lag_limit + 1.0)
++        lrv += 2.0 * weight * covariance
++    lrv = max(
++        gamma0, lrv
++    )  # do not claim extra power from estimated negative autocorrelation.
++    ess = min(float(count), max(1.0, count * gamma0 / lrv))
++    return lrv, ess
++
++
++def _fold_aware_inference(fold_values: list[list[float]]) -> dict[str, float]:
++    total = sum(len(values) for values in fold_values)
++    all_values = [value for values in fold_values for value in values]
++    mean_value = math.fsum(all_values) / total
++    variance_sum = 0.0
++    ess = 0.0
++    for values in fold_values:
++        lrv, fold_ess = _newey_west_lrv(values)
++        if lrv <= 0.0:
++            return {"mean": mean_value, "se": math.inf, "z": -math.inf, "ess": 0.0}
++        variance_sum += len(values) * lrv
++        ess += fold_ess
++    se = math.sqrt(variance_sum) / total
++    z_value = mean_value / se if se > 0.0 and math.isfinite(se) else -math.inf
++    return {"mean": mean_value, "se": se, "z": z_value, "ess": min(float(total), ess)}
++
++
++def _expected_max_standard_normal(trials: int) -> float:
++    if trials <= 1:
++        return 0.0
++    gamma = 0.5772156649015329
++    distribution = NormalDist()
++    first = distribution.inv_cdf(1.0 - 1.0 / trials)
++    second = distribution.inv_cdf(1.0 - 1.0 / (trials * math.e))
++    return max(0.0, (1.0 - gamma) * first + gamma * second)
++
++
++def _one_sided_dsr_p(
++    values: list[float], effective_observations: float, trials: int
++) -> float:
++    """Dependence-adjusted Deflated Sharpe probability, returned as a p-value."""
++
++    if len(values) < 4 or effective_observations <= 1.0:
++        return 1.0
++    center = _mean(values)
++    centered = [value - center for value in values]
++    second = math.fsum(value**2 for value in centered) / len(values)
++    if second <= 0.0 or not math.isfinite(second):
++        return 1.0
++    standard_deviation = math.sqrt(second)
++    sharpe = center / standard_deviation
++    skew = (math.fsum(value**3 for value in centered) / len(values)) / (second**1.5)
++    kurtosis = (math.fsum(value**4 for value in centered) / len(values)) / (second**2)
++    denominator_squared = 1.0 - skew * sharpe + ((kurtosis - 1.0) / 4.0) * sharpe**2
++    if denominator_squared <= 0.0 or not math.isfinite(denominator_squared):
++        return 1.0
++    root_effective = math.sqrt(effective_observations - 1.0)
++    deflated_sharpe_threshold = _expected_max_standard_normal(trials) / root_effective
++    deflated_z = (
++        (sharpe - deflated_sharpe_threshold)
++        * root_effective
++        / math.sqrt(denominator_squared)
++    )
++    return min(1.0, max(0.0, 0.5 * math.erfc(deflated_z / math.sqrt(2.0))))
++
++
++def _holm_adjust(raw_p_values: list[float]) -> list[float]:
++    count = len(raw_p_values)
++    order = sorted(range(count), key=lambda index: (raw_p_values[index], index))
++    adjusted = [1.0] * count
++    running = 0.0
++    for rank, index in enumerate(order):
++        candidate = min(1.0, (count - rank) * raw_p_values[index])
++        running = max(running, candidate)
++        adjusted[index] = running
++    return adjusted
++
++
++def _tail_cvar(values: list[float], fraction: float) -> float:
++    tail_count = max(1, int(math.ceil(len(values) * fraction)))
++    return math.fsum(sorted(values)[:tail_count]) / tail_count
++
++
++def _max_drawdown(values: list[float]) -> float:
++    cumulative = 0.0
++    peak = 0.0
++    drawdown = 0.0
++    for value in values:
++        cumulative += value
++        peak = max(peak, cumulative)
++        drawdown = max(drawdown, peak - cumulative)
++    return drawdown
++
++
++def _candidate_statistics(
++    attempt: dict[str, Any],
++    entry: dict[str, Any],
++    attempted_trials: int,
++) -> dict[str, Any]:
++    base_result: dict[str, Any] = {
++        "ordinal": attempt["ordinal"],
++        "attempt_id": attempt["attempt_id"],
++        "process_candidate_id": attempt["process_candidate_id"],
++        "strategy_family": attempt["strategy_family"],
++        "strategy_id": attempt["strategy_id"],
++        "parameter_count": attempt["parameter_count"],
++        "process_sha256": attempt["process_sha256"],
++        "horizon_process_sha256": attempt["horizon_process_sha256"],
++        "trial_definition_sha256": attempt["trial_definition_sha256"],
++        "refit_recipe_sha256": attempt["refit_recipe_sha256"],
++        "evidence_status": entry["evidence_status"],
++        "admissible": False,
++        "admissibility_failures": [],
++        "attempt_aware_dsr_p_value": 1.0,
++        "within_cell_adjusted_p_value": 1.0,
++        "daily_count": 0,
++        "completed_trade_count": 0,
++        "completed_trade_hac_effective_count": 0.0,
++        "hac_effective_days": 0.0,
++        "mean_daily_r": None,
++        "worst_fold_mean_daily_r": None,
++        "newest_fold_mean_daily_r": None,
++        "worst_fold_hac_lcb_daily_r": None,
++        "newest_fold_hac_lcb_daily_r": None,
++        "tail_cvar_daily_r": None,
++        "max_path_drawdown_r": None,
++        "cost_stress_mean_daily_r": None,
++        "cost_stress_worst_fold_mean_daily_r": None,
++        "cost_stress_newest_fold_mean_daily_r": None,
++        "cost_stress_worst_fold_hac_lcb_daily_r": None,
++        "cost_stress_newest_fold_hac_lcb_daily_r": None,
++        "cost_stress_tail_cvar_daily_r": None,
++        "cost_stress_max_path_drawdown_r": None,
++    }
++    if entry["evidence_status"] != "AUTHENTICATED":
++        base_result["admissibility_failures"] = ["PROCESS_NOT_AUTHENTICATED"]
++        return base_result
++    base_folds = [
++        [float(value) for value in fold["daily_net_mtm_r"]] for fold in entry["folds"]
++    ]
++    stress_folds = [
++        [float(value) for value in fold["daily_net_mtm_r_cost_stress"]]
++        for fold in entry["folds"]
++    ]
++    base = [value for fold in base_folds for value in fold]
++    stress = [value for fold in stress_folds for value in fold]
++    trade_folds = [
++        [float(value) for value in fold["completed_trade_net_mtm_r"]]
++        for fold in entry["folds"]
++    ]
++    completed_trades = sum(len(values) for values in trade_folds)
++    inference = _fold_aware_inference(base_folds)
++    stress_inference = _fold_aware_inference(stress_folds)
++    trade_inference = _fold_aware_inference(trade_folds)
++    fold_means = [_mean(values) for values in base_folds]
++    stress_fold_means = [_mean(values) for values in stress_folds]
++    fold_lcbs = []
++    for result in (_fold_aware_inference([values]) for values in base_folds):
++        fold_lcbs.append(
++            result["mean"] - 1.6448536269514722 * result["se"]
++            if math.isfinite(result["se"])
++            else -MAX_ABS_DAILY_R
++        )
++    stress_fold_lcbs = []
++    for result in (_fold_aware_inference([values]) for values in stress_folds):
++        stress_fold_lcbs.append(
++            result["mean"] - 1.6448536269514722 * result["se"]
++            if math.isfinite(result["se"])
++            else -MAX_ABS_DAILY_R
++        )
++    raw_p = _one_sided_dsr_p(base, inference["ess"], attempted_trials)
++    base_result.update(
++        {
++            "attempt_aware_dsr_p_value": raw_p,
++            "daily_count": len(base),
++            "completed_trade_count": completed_trades,
++            "completed_trade_hac_effective_count": trade_inference["ess"],
++            "hac_effective_days": inference["ess"],
++            "mean_daily_r": inference["mean"],
++            "worst_fold_mean_daily_r": min(fold_means),
++            "newest_fold_mean_daily_r": fold_means[-1],
++            "worst_fold_hac_lcb_daily_r": min(fold_lcbs),
++            "newest_fold_hac_lcb_daily_r": fold_lcbs[-1],
++            "tail_cvar_daily_r": _tail_cvar(
++                base, float(PINNED_SELECTION_POLICY["tail_fraction"])
++            ),
++            "max_path_drawdown_r": _max_drawdown(base),
++            "cost_stress_mean_daily_r": stress_inference["mean"],
++            "cost_stress_worst_fold_mean_daily_r": min(stress_fold_means),
++            "cost_stress_newest_fold_mean_daily_r": stress_fold_means[-1],
++            "cost_stress_worst_fold_hac_lcb_daily_r": min(stress_fold_lcbs),
++            "cost_stress_newest_fold_hac_lcb_daily_r": stress_fold_lcbs[-1],
++            "cost_stress_tail_cvar_daily_r": _tail_cvar(
++                stress, float(PINNED_SELECTION_POLICY["tail_fraction"])
++            ),
++            "cost_stress_max_path_drawdown_r": _max_drawdown(stress),
++        }
++    )
++    gate_results = {
++        "INSUFFICIENT_DAILY_OBSERVATIONS": len(base)
++        < int(PINNED_SELECTION_POLICY["min_total_days"]),
++        "INSUFFICIENT_HAC_EFFECTIVE_DAYS": inference["ess"]
++        < float(PINNED_SELECTION_POLICY["min_hac_effective_days"]),
++        "INSUFFICIENT_COMPLETED_TRADES": completed_trades
++        < int(PINNED_SELECTION_POLICY["min_completed_trades"]),
++        "INSUFFICIENT_COMPLETED_TRADE_HAC_POWER": trade_inference["ess"]
++        < float(PINNED_SELECTION_POLICY["min_hac_effective_completed_trades"]),
++        "NO_STOCHASTIC_SAMPLING_SUPPORT": bool(
++            PINNED_SELECTION_POLICY["stochastic_sampling_support_required"]
++        )
++        and (not math.isfinite(inference["se"]) or inference["se"] <= 0.0),
++        "NONPOSITIVE_MEAN": bool(
++            PINNED_SELECTION_POLICY["overall_mean_must_be_positive"]
++        )
++        and inference["mean"] <= 0.0,
++        "NONPOSITIVE_WORST_FOLD": bool(
++            PINNED_SELECTION_POLICY["worst_fold_mean_must_be_positive"]
++        )
++        and min(fold_means) <= 0.0,
++        "NONPOSITIVE_NEWEST_FOLD": bool(
++            PINNED_SELECTION_POLICY["newest_fold_mean_must_be_positive"]
++        )
++        and fold_means[-1] <= 0.0,
++        "COST_STRESS_NONPOSITIVE_MEAN": bool(
++            PINNED_SELECTION_POLICY["cost_stress_mean_must_be_positive"]
++        )
++        and stress_inference["mean"] <= 0.0,
++        "COST_STRESS_NONPOSITIVE_WORST_FOLD": bool(
++            PINNED_SELECTION_POLICY["cost_stress_worst_fold_must_be_positive"]
++        )
++        and min(stress_fold_means) <= 0.0,
++        "COST_STRESS_NONPOSITIVE_NEWEST_FOLD": bool(
++            PINNED_SELECTION_POLICY["cost_stress_newest_fold_must_be_positive"]
++        )
++        and stress_fold_means[-1] <= 0.0,
++    }
++    declared_gate_codes = tuple(
++        PINNED_SELECTION_POLICY["candidate_admissibility_gate_codes"]
++    )
++    if tuple(gate_results) != declared_gate_codes:
++        raise _ContractError("CANDIDATE_GATE_POLICY_IMPLEMENTATION_MISMATCH")
++    if PINNED_SELECTION_POLICY["per_fold_hac_lcb_gate"] is not False:
++        raise _ContractError("PER_FOLD_HAC_LCB_POLICY_INVALID")
++    failures = [code for code, failed in gate_results.items() if failed]
++    base_result["admissibility_failures"] = failures
++    return base_result
++
++
++def _pair_inference(
++    left: dict[str, Any], right: dict[str, Any], entries: list[dict[str, Any]]
++) -> dict[str, float]:
++    left_folds = entries[left["ordinal"]]["folds"]
++    right_folds = entries[right["ordinal"]]["folds"]
++    differences: list[list[float]] = []
++    for left_fold, right_fold in zip(left_folds, right_folds, strict=True):
++        differences.append(
++            [
++                float(left_value) - float(right_value)
++                for left_value, right_value in zip(
++                    left_fold["daily_net_mtm_r"],
++                    right_fold["daily_net_mtm_r"],
++                    strict=True,
++                )
++            ]
++        )
++    inference = _fold_aware_inference(differences)
++    if not math.isfinite(inference["z"]):
++        if inference["mean"] > 0.0:
++            one_sided = 0.0
++        elif inference["mean"] < 0.0:
++            one_sided = 1.0
++        else:
++            one_sided = 0.5
++    else:
++        one_sided = min(1.0, max(0.0, 0.5 * math.erfc(inference["z"] / math.sqrt(2.0))))
++    two_sided = min(1.0, 2.0 * min(one_sided, 1.0 - one_sided))
++    return {
++        "paired_mean_difference_daily_r": inference["mean"],
++        "paired_hac_effective_days": inference["ess"],
++        "raw_one_sided_left_superior_p": one_sided,
++        "raw_two_sided_difference_p": two_sided,
++    }
++
++
++_PARETO_HIGHER_FIELDS = (
++    "mean_daily_r",
++    "worst_fold_mean_daily_r",
++    "newest_fold_mean_daily_r",
++    "worst_fold_hac_lcb_daily_r",
++    "newest_fold_hac_lcb_daily_r",
++    "tail_cvar_daily_r",
++    "cost_stress_mean_daily_r",
++    "cost_stress_worst_fold_mean_daily_r",
++    "cost_stress_newest_fold_mean_daily_r",
++    "cost_stress_worst_fold_hac_lcb_daily_r",
++    "cost_stress_newest_fold_hac_lcb_daily_r",
++    "cost_stress_tail_cvar_daily_r",
++)
++_PARETO_LOWER_FIELDS = ("max_path_drawdown_r", "cost_stress_max_path_drawdown_r")
++
++
++def _metric_pareto_better(left: dict[str, Any], right: dict[str, Any]) -> bool:
++    weak = all(
++        float(left[field]) >= float(right[field]) for field in _PARETO_HIGHER_FIELDS
++    )
++    weak = weak and all(
++        float(left[field]) <= float(right[field]) for field in _PARETO_LOWER_FIELDS
++    )
++    strict = any(
++        float(left[field]) > float(right[field]) for field in _PARETO_HIGHER_FIELDS
++    )
++    strict = strict or any(
++        float(left[field]) < float(right[field]) for field in _PARETO_LOWER_FIELDS
++    )
++    return weak and strict
++
++
++def _simplicity_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
++    return (
++        candidate["parameter_count"],
++        candidate["strategy_family"],
++        candidate["strategy_id"],
++        candidate["process_candidate_id"],
++    )
++
++
++def _select_process(
++    attempts: list[dict[str, Any]], entries: list[dict[str, Any]]
++) -> tuple[
++    str,
++    list[str],
++    dict[str, Any] | None,
++    dict[str, Any],
++    list[dict[str, Any]],
++    list[dict[str, Any]],
++]:
++    summaries = [
++        _candidate_statistics(attempt, entry, len(attempts))
++        for attempt, entry in zip(attempts, entries, strict=True)
++    ]
++    # The DSR benchmark already uses the exact immutable attempt count.  A
++    # second Holm pass here would double-penalize the same search.  Holm remains
++    # appropriate below for the distinct family of paired comparisons.
++    for summary in summaries:
++        adjusted = float(summary["attempt_aware_dsr_p_value"])
++        summary["within_cell_adjusted_p_value"] = adjusted
++        selection_gate_codes = tuple(
++            PINNED_SELECTION_POLICY["selection_admissibility_gate_codes"]
++        )
++        if selection_gate_codes != ("WITHIN_CELL_ATTEMPT_AWARE_DSR_FAILED",):
++            raise _ContractError("SELECTION_GATE_POLICY_IMPLEMENTATION_MISMATCH")
++        if adjusted > float(PINNED_SELECTION_POLICY["within_cell_alpha"]):
++            summary["admissibility_failures"].append(selection_gate_codes[0])
++        summary["admissibility_failures"] = sorted(
++            set(summary["admissibility_failures"])
++        )
++        summary["admissible"] = not summary["admissibility_failures"]
++
++    authenticated = [
++        summary
++        for summary in summaries
++        if summary["evidence_status"] == "AUTHENTICATED"
++    ]
++    reporting = min(
++        authenticated or summaries,
++        key=lambda value: (
++            value["within_cell_adjusted_p_value"],
++            _simplicity_key(value),
++        ),
++    )
++    admissible = [summary for summary in summaries if summary["admissible"]]
++    if not admissible:
++        return (
++            "NO_PROCESS_WINNER",
++            ["NO_ADMISSIBLE_PROCESS_CANDIDATE"],
++            None,
++            reporting,
++            summaries,
++            [],
++        )
++
++    unordered_pairs: list[tuple[dict[str, Any], dict[str, Any], dict[str, float]]] = []
++    for left_index, left in enumerate(admissible):
++        for right in admissible[left_index + 1 :]:
++            unordered_pairs.append((left, right, _pair_inference(left, right, entries)))
++    two_sided_adjusted = (
++        _holm_adjust(
++            [pair[2]["raw_two_sided_difference_p"] for pair in unordered_pairs]
++        )
++        if unordered_pairs
++        else []
++    )
++    directional_raw: list[float] = []
++    for _, _, pair in unordered_pairs:
++        directional_raw.extend(
++            [
++                pair["raw_one_sided_left_superior_p"],
++                1.0 - pair["raw_one_sided_left_superior_p"],
++            ]
++        )
++    directional_adjusted = _holm_adjust(directional_raw) if directional_raw else []
++    comparisons: list[dict[str, Any]] = []
++    dominated: set[str] = set()
++    directional_cursor = 0
++    for pair_index, (left, right, pair) in enumerate(unordered_pairs):
++        left_p = directional_adjusted[directional_cursor]
++        right_p = directional_adjusted[directional_cursor + 1]
++        directional_cursor += 2
++        left_dominates = _metric_pareto_better(left, right) and left_p <= float(
++            PINNED_SELECTION_POLICY["paired_alpha"]
++        )
++        right_dominates = _metric_pareto_better(right, left) and right_p <= float(
++            PINNED_SELECTION_POLICY["paired_alpha"]
++        )
++        if left_dominates:
++            dominated.add(right["process_candidate_id"])
++        if right_dominates:
++            dominated.add(left["process_candidate_id"])
++        comparisons.append(
++            {
++                "left_process_candidate_id": left["process_candidate_id"],
++                "right_process_candidate_id": right["process_candidate_id"],
++                **pair,
++                "holm_adjusted_two_sided_difference_p": two_sided_adjusted[pair_index],
++                "holm_adjusted_left_superior_p": left_p,
++                "holm_adjusted_right_superior_p": right_p,
++                "left_pareto_dominates": left_dominates,
++                "right_pareto_dominates": right_dominates,
++            }
++        )
++    nondominated = [
++        candidate
++        for candidate in admissible
++        if candidate["process_candidate_id"] not in dominated
++    ]
++    if len(nondominated) == 1:
++        winner = nondominated[0]
++        return (
++            "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY",
++            ["UNIQUE_PAIRED_NONDOMINATED_PROCESS"],
++            winner,
++            winner,
++            summaries,
++            comparisons,
++        )
++
++    survivor_ids = {candidate["process_candidate_id"] for candidate in nondominated}
++    unresolved_difference = any(
++        comparison["left_process_candidate_id"] in survivor_ids
++        and comparison["right_process_candidate_id"] in survivor_ids
++        and comparison["holm_adjusted_two_sided_difference_p"]
++        <= float(PINNED_SELECTION_POLICY["paired_alpha"])
++        for comparison in comparisons
++    )
++    if unresolved_difference:
++        reporting = min(
++            nondominated,
++            key=lambda value: (
++                value["within_cell_adjusted_p_value"],
++                _simplicity_key(value),
++            ),
++        )
++        return (
++            "UNRESOLVED_NONDOMINATED_SET",
++            ["STATISTICALLY_DIFFERENT_NONDOMINATED_TRADEOFF_NO_ARBITRARY_SCORE"],
++            None,
++            reporting,
++            summaries,
++            comparisons,
++        )
++    winner = min(nondominated, key=_simplicity_key)
++    return (
++        "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY",
++        ["PAIRED_DIFFERENCE_UNRESOLVED_DETERMINISTIC_SIMPLICITY_TIEBREAK"],
++        winner,
++        winner,
++        summaries,
++        comparisons,
++    )
++
++
++@dataclass(frozen=True, slots=True)
++class WinnerSelectionDecision:
++    """Deterministic local result for offline Book selection.
++
++    ``receipt_sha256`` is a reproducibility checksum, not a signature or a
++    standalone promotion capability.  The frozen dataclass prevents accidental
++    mutation in normal code; it is not claimed as an adversarial Python trust
++    boundary.
++    """
++
++    _body_json: bytes
++    _receipt_sha256: str
++
++    def _body(self) -> dict[str, Any]:
++        return json.loads(self._body_json.decode("ascii"))
++
++    @property
++    def status(self) -> str:
++        return self._body()["status"]
++
++    @property
++    def reason_codes(self) -> tuple[str, ...]:
++        return tuple(self._body()["reason_codes"])
++
++    @property
++    def receipt_sha256(self) -> str:
++        return self._receipt_sha256
++
++    @property
++    def selection_scope(self) -> str:
++        return self._body()["selection_scope"]
++
++    @property
++    def winner_process_candidate_id(self) -> str | None:
++        winner = self._body().get("winner")
++        return winner.get("process_candidate_id") if type(winner) is dict else None
++
++    def to_dict(self) -> dict[str, Any]:
++        body = self._body()
++        body["receipt_sha256"] = self._receipt_sha256
++        return body
++
++
++def _make_decision(body: dict[str, Any]) -> WinnerSelectionDecision:
++    """Construct the canonical local result and reproducibility checksum."""
++
++    encoded = _canonical_bytes(body)
++    if len(encoded) > MAX_DECISION_BYTES:
++        raise _ContractError("DECISION_BYTE_LIMIT_EXCEEDED")
++    return WinnerSelectionDecision(encoded, _sha256_bytes(encoded))
++
++
++def _rejected(
++    reason: str,
++    trust_sha: str | None = None,
++) -> WinnerSelectionDecision:
++    safe_reason = (
++        reason
++        if type(reason) is str and _SAFE_ID.fullmatch(reason) is not None
++        else "UNCLASSIFIED_REJECTION"
++    )
++    return _make_decision(
++        {
++            "contract_version": WINNER_SELECTION_CONTRACT_VERSION,
++            "selection_scope": WINNER_SELECTION_SCOPE,
++            "status": "REJECTED",
++            "validated": False,
++            "reason_codes": [safe_reason],
++            "trust_bundle_sha256": trust_sha,
++            "authenticated_request": None,
++            "request_sha256": None,
++            "precommitment_envelope_sha256": None,
++            "attempt_ledger_envelope_sha256": None,
++            "evidence_ledger_envelope_sha256": None,
++            "historical_verdict_at_utc": None,
++            "cell": None,
++            "attempted_trials_exact": 0,
++            "effective_trials": 0.0,
++            "winner": None,
++            "reporting_candidate": None,
++            "candidate_summaries": [],
++            "paired_comparisons": [],
++            "historical_book_marginal_receipt": None,
++            "evidence_scope": "PROCESS_LEVEL_ONLY",
++            "parameter_evidence_inherited": False,
++            "live_authorized": False,
++            "capital_sizing_authorized": False,
++            "profitability_claimed": False,
++            "production_integrated": False,
++        }
++    )
++
++
++def _evaluate_body(
++    request: dict[str, Any], trust: WinnerSelectionTrustBundle
++) -> dict[str, Any]:
++    value = _exact_dict(request, _REQUEST_KEYS, "REQUEST_SCHEMA_INVALID")
++    policy, policy_sha, policy_envelope_sha = _verify_envelope(
++        value["precommitment_envelope"],
++        expected_key_id=trust.precommitment_key_id,
++        public_key=trust.precommitment_public_key,
++        domain=PRECOMMITMENT_SIGNATURE_DOMAIN,
++        schema_code="PRECOMMITMENT_ENVELOPE",
++    )
++    policy_time, cell, planned_attempts = _validate_precommitment(policy)
++    attempt_payload, attempt_sha, attempt_envelope_sha = _verify_envelope(
++        value["attempt_ledger_envelope"],
++        expected_key_id=trust.attempt_key_id,
++        public_key=trust.attempt_public_key,
++        domain=ATTEMPT_SIGNATURE_DOMAIN,
++        schema_code="ATTEMPT_ENVELOPE",
++    )
++    frozen_at, attempts = _validate_attempt_ledger(
++        attempt_payload, policy, policy_sha, policy_time, cell, planned_attempts
++    )
++    evidence_payload, evidence_sha, evidence_envelope_sha = _verify_envelope(
++        value["evidence_ledger_envelope"],
++        expected_key_id=trust.evidence_key_id,
++        public_key=trust.evidence_public_key,
++        domain=EVIDENCE_SIGNATURE_DOMAIN,
++        schema_code="EVIDENCE_ENVELOPE",
++    )
++    evidence_time, entries = _validate_evidence_ledger(
++        evidence_payload, policy, policy_sha, attempt_sha, frozen_at, cell, attempts
++    )
++    status, reasons, winner, reporting, summaries, comparisons = _select_process(
++        attempts, entries
++    )
++    marginal_p = (
++        float(winner["within_cell_adjusted_p_value"])
++        if winner is not None and status == "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY"
++        else 1.0
++    )
++    marginal = {
++        "cell_id": cell[0],
++        "p_value_contract_sha256": PINNED_BOOK_P_VALUE_CONTRACT_SHA256,
++        "process_sha256": reporting["process_sha256"],
++        "evidence_candidate_id": reporting["process_candidate_id"],
++        "source_evidence_sha256": evidence_sha,
++        "marginal_p_value": marginal_p,
++        "p_value_kind": "ONE_SIDED_SUPERIORITY",
++        "within_cell_multiplicity_adjusted": True,
++        "within_cell_attempted_trials_exact": len(attempts),
++        "effective_trials": float(len(attempts)),
++        "evidence_scope": "PROCESS_LEVEL_ONLY",
++        "parameter_evidence_inherited": False,
++        "local_admissibility_passed": winner is not None,
++    }
++    request_sha = _sha256_json(value)
++    return {
++        "contract_version": WINNER_SELECTION_CONTRACT_VERSION,
++        "selection_scope": WINNER_SELECTION_SCOPE,
++        "status": status,
++        "validated": True,
++        "reason_codes": reasons,
++        "trust_bundle_sha256": trust.trust_bundle_sha256,
++        "authenticated_request": value,
++        "request_sha256": request_sha,
++        "precommitment_envelope_sha256": policy_envelope_sha,
++        "attempt_ledger_envelope_sha256": attempt_envelope_sha,
++        "evidence_ledger_envelope_sha256": evidence_envelope_sha,
++        "historical_verdict_at_utc": evidence_time.isoformat(
++            timespec="seconds"
++        ).replace("+00:00", "Z"),
++        "cell": {
++            "cell_id": cell[0],
++            "symbol": cell[1],
++            "timeframe": cell[2],
++            "regime": cell[3],
++        },
++        "attempted_trials_exact": len(attempts),
++        "effective_trials": float(len(attempts)),
++        "winner": winner,
++        "reporting_candidate": reporting,
++        "candidate_summaries": summaries,
++        "paired_comparisons": comparisons,
++        "historical_book_marginal_receipt": marginal,
++        "evidence_scope": "PROCESS_LEVEL_ONLY",
++        "parameter_evidence_inherited": False,
++        "live_authorized": False,
++        "capital_sizing_authorized": False,
++        "profitability_claimed": False,
++        "production_integrated": False,
++    }
++
++
++def _verify_historical_decision_core(
++    decision: Any,
++    trust: WinnerSelectionTrustBundle,
++) -> bool:
++    try:
++        if (
++            not _trust_bundle_valid(trust)
++            or type(decision) is not WinnerSelectionDecision
++        ):
++            return False
++        body_bytes = decision._body_json
++        if type(body_bytes) is not bytes or len(body_bytes) > MAX_DECISION_BYTES:
++            return False
++        if type(
++            decision._receipt_sha256
++        ) is not str or decision._receipt_sha256 != _sha256_bytes(body_bytes):
++            return False
++        body = _owned_json(json.loads(body_bytes.decode("ascii")), MAX_DECISION_BYTES)
++        if body.get("status") == "REJECTED" or body.get("validated") is not True:
++            return False
++        if body.get("selection_scope") != WINNER_SELECTION_SCOPE:
++            return False
++        if any(
++            body.get(field) is not False
++            for field in (
++                "live_authorized",
++                "capital_sizing_authorized",
++                "profitability_claimed",
++                "production_integrated",
++            )
++        ):
++            return False
++        if body.get("trust_bundle_sha256") != trust.trust_bundle_sha256:
++            return False
++        request = body.get("authenticated_request")
++        if type(request) is not dict or body.get("request_sha256") != _sha256_json(
++            request
++        ):
++            return False
++        return _canonical_bytes(_evaluate_body(request, trust)) == body_bytes
++    except Exception:
++        return False
++
++
++def evaluate_historical_cell_winner(
++    request: Any, trust_bundle: Any
++) -> WinnerSelectionDecision:
++    """Calculate a historical cell result for offline Book selection only."""
++
++    trust_sha = (
++        trust_bundle.trust_bundle_sha256
++        if type(trust_bundle) is WinnerSelectionTrustBundle
++        and type(getattr(trust_bundle, "trust_bundle_sha256", None)) is str
++        else None
++    )
++    try:
++        if not _trust_bundle_valid(trust_bundle):
++            return _rejected("TRUST_BUNDLE_INVALID", trust_sha)
++        owned = _owned_json(request, MAX_REQUEST_BYTES)
++        return _make_decision(_evaluate_body(owned, trust_bundle))
++    except _ContractError as exc:
++        return _rejected(str(exc), trust_sha)
++    except Exception:
++        return _rejected("EVALUATION_FAILED_CLOSED", trust_sha)
++
++
++def verify_historical_cell_winner_decision(decision: Any, trust_bundle: Any) -> bool:
++    """Replay a local result against its exact authenticated input evidence."""
++
++    return _verify_historical_decision_core(decision, trust_bundle)
++
++
++def evaluate_cell_winner(request: Any, trust_bundle: Any) -> WinnerSelectionDecision:
++    """Disabled V1 entry point retained only as an explicit rejection."""
++
++    del request, trust_bundle
++    return _rejected("LEGACY_NONCAUSAL_API_DISABLED", None)
++
++
++def book_marginal_receipt(decision: Any, trust_bundle: Any) -> dict[str, Any] | None:
++    """Adapt a replay-consistent local result into the historical Book input."""
++
++    try:
++        if not _verify_historical_decision_core(decision, trust_bundle):
++            return None
++        body = _owned_json(
++            json.loads(decision._body_json.decode("ascii")),
++            MAX_DECISION_BYTES,
++        )
++        marginal = body["historical_book_marginal_receipt"]
++        return {
++            **marginal,
++            "upstream_evidence_receipt_sha256": decision._receipt_sha256,
++        }
++    except Exception:
++        return None
++
++
++def historical_book_marginal_receipt(
++    decision: Any, trust_bundle: Any
++) -> dict[str, Any] | None:
++    """Historical-only Book adapter; it grants no live or capital authority."""
++
++    return book_marginal_receipt(decision, trust_bundle)
++
++
++def verify_winner_selection_decision(decision: Any, trust_bundle: Any) -> bool:
++    """Disabled V1 verifier; callers must use the explicit historical verifier."""
++
++    del decision, trust_bundle
++    return False
++
++
++def pinned_policy_snapshot() -> dict[str, Any]:
++    try:
++        return json.loads(
++            _canonical_bytes(dict(PINNED_SELECTION_POLICY)).decode("ascii")
++        )
++    except Exception:
++        return {}
++
++
++__all__ = [
++    "ATTEMPT_LEDGER_VERSION",
++    "ATTEMPT_SIGNATURE_DOMAIN",
++    "EVIDENCE_LEDGER_VERSION",
++    "EVIDENCE_SIGNATURE_DOMAIN",
++    "PINNED_BOOK_P_VALUE_CONTRACT_SHA256",
++    "PINNED_SELECTION_POLICY_SHA256",
++    "PRECOMMITMENT_SIGNATURE_DOMAIN",
++    "PRECOMMITMENT_VERSION",
++    "WinnerSelectionDecision",
++    "WinnerSelectionTrustBundle",
++    "WINNER_SELECTION_CONTRACT_VERSION",
++    "WINNER_SELECTION_SCOPE",
++    "book_marginal_receipt",
++    "compute_cell_id",
++    "create_trust_bundle",
++    "evaluate_cell_winner",
++    "evaluate_historical_cell_winner",
++    "historical_book_marginal_receipt",
++    "pinned_policy_snapshot",
++    "verify_historical_cell_winner_decision",
++    "verify_winner_selection_decision",
++]

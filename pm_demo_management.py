@@ -144,6 +144,7 @@ _AUTHORITY_RESULT_FIELDS = {
     "source_unavailable_cell_ids",
     "regime_unobserved_cell_ids",
     "no_local_winner_cell_ids",
+    "insufficient_evidence_cell_ids",
     "technical_cell_ids",
     "unsearched_cell_ids",
     "missing_observed_cell_ids",
@@ -635,7 +636,7 @@ def _successful_authority(
     selected = authority.get("selected_cell_ids")
     if (
         set(authority) != _AUTHORITY_RESULT_FIELDS
-        or authority.get("schema_version") != "fxpm.live-readiness-authority-result.v1"
+        or authority.get("schema_version") != "fxpm.live-readiness-authority-result.v2"
         or authority.get("status") != "DEMO_PROBATION_AUTHORIZED"
         or authority.get("errors") != []
         or type(raw) is not dict
@@ -1913,7 +1914,7 @@ def _load_capsule(
     raw = authority.get("raw_reverification")
     if (
         set(authority) != _AUTHORITY_RESULT_FIELDS
-        or authority.get("schema_version") != "fxpm.live-readiness-authority-result.v1"
+        or authority.get("schema_version") != "fxpm.live-readiness-authority-result.v2"
         or authority.get("status") != "DEMO_PROBATION_AUTHORIZED"
         or authority.get("errors") != []
         or type(raw) is not dict

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
-SPARSE_AUTHORITY_RESULT_SCHEMA = "fxpm.live-readiness-authority-result.v1"
+SPARSE_AUTHORITY_RESULT_SCHEMA = "fxpm.live-readiness-authority-result.v2"
 SPARSE_AUTHORITY_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 SPARSE_WINNER_LEDGER_MAX_BYTES = 512 * 1024 * 1024
 SPARSE_AUTHORITY_INDEX_MAX_BYTES = 64 * 1024 * 1024
@@ -216,7 +216,9 @@ def _resolve_sparse_authority_indexes(
     return resolved, list(dict.fromkeys(errors))
 
 
-def _ledger_symbol_payloads(ledger: Any) -> Tuple[Dict[str, Mapping[str, Any]], List[str]]:
+def _ledger_symbol_payloads(
+    ledger: Any,
+) -> Tuple[Dict[str, Mapping[str, Any]], List[str]]:
     if not isinstance(ledger, Mapping):
         return {}, ["LEDGER_NOT_OBJECT"]
     root: Any = ledger
@@ -264,7 +266,9 @@ def _sparse_current_refit_projection(
             continue
         for raw_timeframe, timeframe_payload in grid.items():
             timeframe = str(raw_timeframe or "").strip().upper()
-            if timeframe not in timeframes or not isinstance(timeframe_payload, Mapping):
+            if timeframe not in timeframes or not isinstance(
+                timeframe_payload, Mapping
+            ):
                 errors.append(f"LEDGER_TIMEFRAME_INVALID:{symbol}|{timeframe}")
                 continue
             for raw_regime, cell in timeframe_payload.items():
@@ -288,7 +292,9 @@ def _sparse_current_refit_projection(
                     continue
                 status = str(cell.get("promotion_status") or "").strip().upper()
                 if status != "PROCESS_VALIDATED_CURRENT_REFIT":
-                    errors.append(f"LEDGER_CURRENT_REFIT_STATUS_INVALID:{cell_id}:{status or 'MISSING'}")
+                    errors.append(
+                        f"LEDGER_CURRENT_REFIT_STATUS_INVALID:{cell_id}:{status or 'MISSING'}"
+                    )
                     continue
                 binding = artifact.get("current_refit_binding")
                 if (
@@ -413,6 +419,7 @@ def _verify_sparse_live_authority(
         "source_unavailable_cell_ids",
         "regime_unobserved_cell_ids",
         "no_local_winner_cell_ids",
+        "insufficient_evidence_cell_ids",
         "technical_cell_ids",
         "unsearched_cell_ids",
         "missing_observed_cell_ids",
@@ -430,9 +437,8 @@ def _verify_sparse_live_authority(
     if normalized.get("schema_version") != SPARSE_AUTHORITY_RESULT_SCHEMA:
         errors.append("LIVE_AUTHORITY_CHAIN_RESULT_VERSION_INVALID")
     reported_errors = normalized.get("errors")
-    if (
-        not isinstance(reported_errors, list)
-        or any(not isinstance(value, str) or not value for value in reported_errors)
+    if not isinstance(reported_errors, list) or any(
+        not isinstance(value, str) or not value for value in reported_errors
     ):
         errors.append("LIVE_AUTHORITY_CHAIN_ERROR_LIST_INVALID")
     else:
@@ -441,10 +447,15 @@ def _verify_sparse_live_authority(
     if (
         not isinstance(raw, Mapping)
         or set(raw) != set(SPARSE_AUTHORITY_RAW_REVERIFICATION)
-        or any(raw.get(name) is not True for name in SPARSE_AUTHORITY_RAW_REVERIFICATION)
+        or any(
+            raw.get(name) is not True for name in SPARSE_AUTHORITY_RAW_REVERIFICATION
+        )
     ):
         errors.append("LIVE_AUTHORITY_RAW_REVERIFICATION_INCOMPLETE")
-        if not isinstance(raw, Mapping) or raw.get("current_refit_execution") is not True:
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("current_refit_execution") is not True
+        ):
             errors.append("CURRENT_REFIT_RAW_EXECUTION_UNVERIFIED")
 
     expected_slots = len(requested_symbols) * 6 * 4
@@ -472,13 +483,12 @@ def _verify_sparse_live_authority(
         if reported_selected_set != selected_cells:
             errors.append("LIVE_AUTHORITY_SELECTED_CURRENT_REFIT_ROSTER_MISMATCH")
         if not reported_selected_set.issubset(possible_cells):
-            errors.append(
-                "LIVE_AUTHORITY_CELL_OUTSIDE_POSSIBLE_BOOK:selected_cell_ids"
-            )
+            errors.append("LIVE_AUTHORITY_CELL_OUTSIDE_POSSIBLE_BOOK:selected_cell_ids")
     for roster_field in (
         "source_unavailable_cell_ids",
         "regime_unobserved_cell_ids",
         "no_local_winner_cell_ids",
+        "insufficient_evidence_cell_ids",
         "technical_cell_ids",
         "unsearched_cell_ids",
         "missing_observed_cell_ids",
@@ -504,6 +514,7 @@ def _verify_sparse_live_authority(
         "source_unavailable_cell_ids",
         "regime_unobserved_cell_ids",
         "no_local_winner_cell_ids",
+        "insufficient_evidence_cell_ids",
         "technical_cell_ids",
         "unsearched_cell_ids",
         "missing_observed_cell_ids",
@@ -516,15 +527,30 @@ def _verify_sparse_live_authority(
         seen.update(partition[name])
     if seen != possible_cells:
         errors.append("LIVE_AUTHORITY_CELL_PARTITION_INCOMPLETE")
+    # A valid authority result can only place the exact activation-authenticated
+    # terminal-technical roster here.  Those cells made zero search attempts and
+    # are complete non-economic abstentions; they must not veto valid sibling
+    # cells.  Reconcile the roster again at this final boundary so a forged
+    # authority result cannot relabel an ordinary technical failure.
+    try:
+        expected_terminal_technical = {
+            f"{symbol}|{timeframe}|{regime}"
+            for symbol in requested_symbols
+            for timeframe in ("M5", "M15", "M30", "H1", "H4", "D1")
+            if native_universe.cell_status(symbol, timeframe) == "technical_error"
+            for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
+        }
+    except Exception:
+        expected_terminal_technical = set()
+        errors.append("LIVE_AUTHORITY_NATIVE_TERMINAL_TECHNICAL_ROSTER_UNAVAILABLE")
+    if partition["technical_cell_ids"] != expected_terminal_technical:
+        errors.append("LIVE_AUTHORITY_NATIVE_TERMINAL_TECHNICAL_ROSTER_MISMATCH")
     for roster_field in (
-        "technical_cell_ids",
         "unsearched_cell_ids",
         "missing_observed_cell_ids",
     ):
         if normalized.get(roster_field):
-            errors.append(
-                f"LIVE_AUTHORITY_BLOCKING_CELLS_PRESENT:{roster_field}"
-            )
+            errors.append(f"LIVE_AUTHORITY_BLOCKING_CELLS_PRESENT:{roster_field}")
     if normalized.get("native_activation_id") != getattr(
         native_universe, "activation_id", None
     ) or normalized.get("native_activation_manifest_sha256") != getattr(
@@ -586,7 +612,9 @@ def _broker_specs_by_symbol(specs: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return mapping
 
 
-def _broker_spec_field_issues(specs: Dict[str, Any], symbols: Iterable[str]) -> List[str]:
+def _broker_spec_field_issues(
+    specs: Dict[str, Any], symbols: Iterable[str]
+) -> List[str]:
     required_positive = (
         "point",
         "tick_size",
@@ -624,7 +652,9 @@ def _broker_spec_field_issues(specs: Dict[str, Any], symbols: Iterable[str]) -> 
             except Exception:
                 value = 0.0
             if value <= 0.0:
-                issues.append(f"{symbol}: invalid {field_name}={payload.get(field_name)}")
+                issues.append(
+                    f"{symbol}: invalid {field_name}={payload.get(field_name)}"
+                )
     return issues
 
 
@@ -633,7 +663,11 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         out = float(value)
     except Exception:
         return float(default)
-    return out if out == out and out not in (float("inf"), float("-inf")) else float(default)
+    return (
+        out
+        if out == out and out not in (float("inf"), float("-inf"))
+        else float(default)
+    )
 
 
 def _pip_size_from_broker_spec(payload: Dict[str, Any]) -> float:
@@ -649,7 +683,9 @@ def _pip_size_from_broker_spec(payload: Dict[str, Any]) -> float:
 
 
 def _extract_static_stop_pips(payload: Dict[str, Any]) -> Optional[float]:
-    params = payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {}
+    params = (
+        payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {}
+    )
     candidates = (
         "sl_pips",
         "stop_pips",
@@ -667,7 +703,11 @@ def _extract_static_stop_pips(payload: Dict[str, Any]) -> Optional[float]:
             value = _to_float(payload.get(key), 0.0)
             if value > 0.0:
                 return value
-    metrics = payload.get("val_metrics") if isinstance(payload.get("val_metrics"), dict) else {}
+    metrics = (
+        payload.get("val_metrics")
+        if isinstance(payload.get("val_metrics"), dict)
+        else {}
+    )
     value = _to_float(metrics.get("avg_loss_pips"), 0.0)
     return abs(value) if value else None
 
@@ -701,7 +741,11 @@ def _iter_tradeable_cell_payloads(ledger: Any) -> Iterable[Dict[str, Any]]:
 
     def _tradeable(payload: Dict[str, Any]) -> bool:
         name = str(payload.get("strategy_name", "") or "").upper()
-        meta = payload.get("artifact_meta") if isinstance(payload.get("artifact_meta"), dict) else {}
+        meta = (
+            payload.get("artifact_meta")
+            if isinstance(payload.get("artifact_meta"), dict)
+            else {}
+        )
         status = str(payload.get("promotion_status", "BLOCKED") or "BLOCKED").upper()
         return bool(
             name
@@ -730,8 +774,12 @@ def _iter_tradeable_cell_payloads(ledger: Any) -> Iterable[Dict[str, Any]]:
         if _tradeable(symbol_payload):
             row = dict(symbol_payload)
             row["symbol"] = symbol
-            row["timeframe"] = str(symbol_payload.get("timeframe", "") or "LEGACY").strip().upper()
-            row["regime"] = str(symbol_payload.get("regime", "") or "LEGACY").strip().upper()
+            row["timeframe"] = (
+                str(symbol_payload.get("timeframe", "") or "LEGACY").strip().upper()
+            )
+            row["regime"] = (
+                str(symbol_payload.get("regime", "") or "LEGACY").strip().upper()
+            )
             yield row
 
 
@@ -760,13 +808,24 @@ def _iter_symbol_configs(ledger: Any) -> Iterable[Dict[str, Any]]:
 def _config_has_tradeable_winner(config: Dict[str, Any]) -> bool:
     def _tradeable(payload: Dict[str, Any]) -> bool:
         name = str(payload.get("strategy_name", "") or "").upper()
-        meta = payload.get("artifact_meta") if isinstance(payload.get("artifact_meta"), dict) else {}
+        meta = (
+            payload.get("artifact_meta")
+            if isinstance(payload.get("artifact_meta"), dict)
+            else {}
+        )
         status = str(payload.get("promotion_status", "BLOCKED") or "BLOCKED").upper()
         non_live_statuses = {"NO_TRADE", "BLOCKED", "PAPER_ONLY"}
-        return bool(name and name != "NO_TRADE" and not meta.get("no_trade") and status not in non_live_statuses)
+        return bool(
+            name
+            and name != "NO_TRADE"
+            and not meta.get("no_trade")
+            and status not in non_live_statuses
+        )
 
     has_nested_configs = False
-    if isinstance(config.get("default_config"), dict) and _tradeable(config["default_config"]):
+    if isinstance(config.get("default_config"), dict) and _tradeable(
+        config["default_config"]
+    ):
         return True
     if isinstance(config.get("default_config"), dict):
         has_nested_configs = True
@@ -789,7 +848,11 @@ def _tradeable_cell_ids_from_ledger(ledger: Any) -> Set[str]:
 
     def _tradeable(payload: Dict[str, Any]) -> bool:
         name = str(payload.get("strategy_name", "") or "").upper()
-        meta = payload.get("artifact_meta") if isinstance(payload.get("artifact_meta"), dict) else {}
+        meta = (
+            payload.get("artifact_meta")
+            if isinstance(payload.get("artifact_meta"), dict)
+            else {}
+        )
         status = str(payload.get("promotion_status", "BLOCKED") or "BLOCKED").upper()
         return bool(
             name
@@ -815,12 +878,17 @@ def _tradeable_cell_ids_from_ledger(ledger: Any) -> Set[str]:
                         cells.add(f"{symbol}|{tf}|{rg}")
             continue
         if _tradeable(symbol_payload):
-            tf = str(symbol_payload.get("timeframe", "") or "").strip().upper() or "LEGACY"
+            tf = (
+                str(symbol_payload.get("timeframe", "") or "").strip().upper()
+                or "LEGACY"
+            )
             cells.add(f"{symbol}|{tf}|LEGACY")
     return cells
 
 
-def _cells_missing_tuned_regime_params(cells: Iterable[str], regime_params_file: str) -> Set[str]:
+def _cells_missing_tuned_regime_params(
+    cells: Iterable[str], regime_params_file: str
+) -> Set[str]:
     """Return deployable regime cells that lack explicit tuned regime params."""
     try:
         from pm_regime import has_tuned_regime_params
@@ -858,7 +926,9 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return None
 
 
-def _ledger_live_expiry_issues(ledger: Any, now: datetime, grace_minutes: int = 0) -> List[str]:
+def _ledger_live_expiry_issues(
+    ledger: Any, now: datetime, grace_minutes: int = 0
+) -> List[str]:
     issues: List[str] = []
     grace = timedelta(minutes=max(0, int(grace_minutes or 0)))
     for symbol_payload in _iter_symbol_configs(ledger):
@@ -869,6 +939,32 @@ def _ledger_live_expiry_issues(ledger: Any, now: datetime, grace_minutes: int = 
         if valid_until is None:
             issues.append(f"{symbol}: no expiry date")
             continue
+        selected_cells = tuple(
+            _iter_tradeable_cell_payloads({symbol: symbol_payload})
+        )
+        if selected_cells and (
+            valid_until.tzinfo is None or valid_until.utcoffset() != timedelta(0)
+        ):
+            issues.append(f"{symbol}: expiry is not aware UTC")
+            continue
+        for cell in selected_cells:
+            cell_id = "|".join(
+                (
+                    symbol,
+                    str(cell.get("timeframe") or "").upper(),
+                    str(cell.get("regime") or "").upper(),
+                )
+            )
+            cell_valid_until = _parse_iso_datetime(cell.get("valid_until"))
+            if cell_valid_until is None:
+                issues.append(f"{cell_id}: no expiry date")
+            elif (
+                cell_valid_until.tzinfo is None
+                or cell_valid_until.utcoffset() != timedelta(0)
+            ):
+                issues.append(f"{cell_id}: expiry is not aware UTC")
+            elif cell_valid_until != valid_until:
+                issues.append(f"{cell_id}: expiry does not match symbol deadline")
         probe = now
         if valid_until.tzinfo is not None and probe.tzinfo is None:
             # Interpret a naive runtime clock in the host's local timezone,
@@ -879,7 +975,9 @@ def _ledger_live_expiry_issues(ledger: Any, now: datetime, grace_minutes: int = 
             # historical convention without raising on mixed datetime types.
             probe = probe.replace(tzinfo=None)
         if probe >= valid_until + grace:
-            issues.append(f"{symbol}: expired at {valid_until.strftime('%Y-%m-%d %H:%M')}")
+            issues.append(
+                f"{symbol}: expired at {valid_until.strftime('%Y-%m-%d %H:%M')}"
+            )
     return issues
 
 
@@ -954,11 +1052,7 @@ def _capital_stop_risk_config_issues(
         )
 
     factor_units = _quarter_percent_units(factor_stop_cap)
-    if (
-        factor_units is None
-        or total_units is None
-        or factor_units > total_units
-    ):
+    if factor_units is None or total_units is None or factor_units > total_units:
         findings.append(
             ReadinessFinding(
                 severity="error",
@@ -995,8 +1089,7 @@ def _capital_numeric_authority_available() -> bool:
             "required_inputs",
         }
         and contract["schema_version"] == CURRENT_BOOK_ADAPTER_CONTRACT_VERSION
-        and contract["implementation_status"]
-        == "AVAILABLE_AT_SIGNED_V8_BOUNDARY"
+        and contract["implementation_status"] == "AVAILABLE_AT_SIGNED_V8_BOUNDARY"
         and contract["numeric_cap_authority"] is True
         and contract["required_inputs"]
         == [
@@ -1009,14 +1102,16 @@ def _capital_numeric_authority_available() -> bool:
     )
 
 
-def _validate_legacy_live_readiness(config: Any,
-                            *,
-                            symbols: Iterable[str],
-                            config_path: str = "config.json",
-                            winner_ledger_path: Optional[str] = None,
-                            mt5_config: Optional[Any] = None,
-                            account_info: Optional[Any] = None,
-                            position_config: Optional[Any] = None) -> ReadinessReport:
+def _validate_legacy_live_readiness(
+    config: Any,
+    *,
+    symbols: Iterable[str],
+    config_path: str = "config.json",
+    winner_ledger_path: Optional[str] = None,
+    mt5_config: Optional[Any] = None,
+    account_info: Optional[Any] = None,
+    position_config: Optional[Any] = None,
+) -> ReadinessReport:
     findings: List[ReadinessFinding] = []
     synchronized_portfolio_evidence_valid = False
 
@@ -1098,7 +1193,10 @@ def _validate_legacy_live_readiness(config: Any,
         "final_lockbox": 2,
     }
     require(
-        all(int(window_years.get(name, 0) or 0) >= years for name, years in required_windows.items()),
+        all(
+            int(window_years.get(name, 0) or 0) >= years
+            for name, years in required_windows.items()
+        ),
         "calendar_window_contract_too_short",
         f"evidence_window_years must meet or exceed {required_windows}",
     )
@@ -1169,7 +1267,12 @@ def _validate_legacy_live_readiness(config: Any,
         "execution_cost_survival_required",
         "execution-cost survival evidence must be enabled",
     )
-    for field_name in ("use_spread", "use_commission", "use_slippage", "swap_model_enabled"):
+    for field_name in (
+        "use_spread",
+        "use_commission",
+        "use_slippage",
+        "swap_model_enabled",
+    ):
         require(
             bool(getattr(config, field_name, False)),
             f"{field_name}_required",
@@ -1233,7 +1336,8 @@ def _validate_legacy_live_readiness(config: Any,
         "live_allow_partial_symbol_ledger must be false",
     )
     require(
-        str(getattr(config, "hard_block_reopen_mode", "") or "").lower() == "when_clear",
+        str(getattr(config, "hard_block_reopen_mode", "") or "").lower()
+        == "when_clear",
         "automatic_safety_reopen_not_live",
         "funded hard breakers must rearm only after fresh loss/drawdown metrics clear",
     )
@@ -1313,9 +1417,7 @@ def _validate_legacy_live_readiness(config: Any,
     )
     total_stop_cap = getattr(config, "max_total_open_risk_pct", None)
     factor_stop_cap = getattr(config, "max_factor_group_open_risk_pct", None)
-    findings.extend(
-        _capital_stop_risk_config_issues(total_stop_cap, factor_stop_cap)
-    )
+    findings.extend(_capital_stop_risk_config_issues(total_stop_cap, factor_stop_cap))
     require(
         number("max_new_entries_when_total_open_risk_above_pct") == 0.0
         and str(getattr(config, "open_risk_action", "") or "").lower() == "observe",
@@ -1347,13 +1449,22 @@ def _validate_legacy_live_readiness(config: Any,
         )
         require(
             set(tp_multipliers) == {"TREND", "RANGE", "BREAKOUT", "CHOP"}
-            and all(abs(float(value) - 1.0) <= 1e-12 for value in tp_multipliers.values()),
+            and all(
+                abs(float(value) - 1.0) <= 1e-12 for value in tp_multipliers.values()
+            ),
             "regime_tp_overlay_unproven",
             "regime TP multipliers must remain neutral (1.0) until lockbox-tested",
         )
 
-    if str(getattr(config, "live_artifact_drift_policy", "block") or "").lower() != "block":
-        add("error", "artifact_drift_not_blocking", "live_artifact_drift_policy must be 'block' for live trading")
+    if (
+        str(getattr(config, "live_artifact_drift_policy", "block") or "").lower()
+        != "block"
+    ):
+        add(
+            "error",
+            "artifact_drift_not_blocking",
+            "live_artifact_drift_policy must be 'block' for live trading",
+        )
 
     manual_entries = bool(getattr(config, "manual_new_entries_enabled", True))
     if not manual_entries:
@@ -1370,7 +1481,16 @@ def _validate_legacy_live_readiness(config: Any,
                 content = manual_path.read_text(encoding="utf-8").strip().lower()
             except Exception:
                 content = "unreadable"
-            if content in {"0", "false", "off", "block", "blocked", "pause", "paused", "kill"}:
+            if content in {
+                "0",
+                "false",
+                "off",
+                "block",
+                "blocked",
+                "pause",
+                "paused",
+                "kill",
+            }:
                 add(
                     "error",
                     "manual_kill_switch_active",
@@ -1383,7 +1503,9 @@ def _validate_legacy_live_readiness(config: Any,
         except (TypeError, ValueError, OverflowError):
             expected_login = 0
         expected_server = str(getattr(mt5_config, "expected_server", "") or "").strip()
-        expected_currency = str(getattr(mt5_config, "expected_currency", "") or "").strip()
+        expected_currency = str(
+            getattr(mt5_config, "expected_currency", "") or ""
+        ).strip()
         identity_fully_pinned = bool(
             expected_login > 0 and expected_server and expected_currency
         )
@@ -1404,7 +1526,9 @@ def _validate_legacy_live_readiness(config: Any,
             else:
                 actual_login = int(getattr(account_info, "login", 0) or 0)
                 actual_server = str(getattr(account_info, "server", "") or "").strip()
-                actual_currency = str(getattr(account_info, "currency", "") or "").strip()
+                actual_currency = str(
+                    getattr(account_info, "currency", "") or ""
+                ).strip()
                 if actual_login != expected_login:
                     add(
                         "error",
@@ -1426,7 +1550,9 @@ def _validate_legacy_live_readiness(config: Any,
 
     min_account_equity = 0.0
     try:
-        min_account_equity = float(getattr(config, "live_min_account_equity", 0.0) or 0.0)
+        min_account_equity = float(
+            getattr(config, "live_min_account_equity", 0.0) or 0.0
+        )
     except (TypeError, ValueError, OverflowError):
         min_account_equity = 0.0
     if min_account_equity > 0.0:
@@ -1447,9 +1573,15 @@ def _validate_legacy_live_readiness(config: Any,
                     "account_equity_below_live_minimum",
                     f"connected MT5 equity {actual_equity:.2f} is below live_min_account_equity {min_account_equity:.2f}",
                 )
-            min_currency = str(getattr(config, "live_min_account_equity_currency", "") or "").strip()
+            min_currency = str(
+                getattr(config, "live_min_account_equity_currency", "") or ""
+            ).strip()
             actual_currency = str(getattr(account_info, "currency", "") or "").strip()
-            if min_currency and actual_currency and actual_currency.upper() != min_currency.upper():
+            if (
+                min_currency
+                and actual_currency
+                and actual_currency.upper() != min_currency.upper()
+            ):
                 add(
                     "error",
                     "account_equity_currency_mismatch",
@@ -1485,7 +1617,9 @@ def _validate_legacy_live_readiness(config: Any,
         # the supervisor's manual_or_next_cycle reopen semantics.
         try:
             raw_log_dir = getattr(config, "log_dir", "logs")
-            log_dir = Path(raw_log_dir if isinstance(raw_log_dir, (str, Path)) else "logs")
+            log_dir = Path(
+                raw_log_dir if isinstance(raw_log_dir, (str, Path)) else "logs"
+            )
             if not log_dir.is_absolute():
                 log_dir = Path(config_path).resolve().parent / log_dir
             supervisor_state_path = log_dir / "institutional_supervisor_state.json"
@@ -1499,12 +1633,21 @@ def _validate_legacy_live_readiness(config: Any,
                     )
                     state = {}
                 if bool(state.get("active_block")):
-                    reopen_mode = str(
-                        getattr(config, "hard_block_reopen_mode", "manual_or_next_cycle") or ""
-                    ).strip().lower()
+                    reopen_mode = (
+                        str(
+                            getattr(
+                                config, "hard_block_reopen_mode", "manual_or_next_cycle"
+                            )
+                            or ""
+                        )
+                        .strip()
+                        .lower()
+                    )
                     blocked_cycle = str(state.get("cycle_id", "") or "")
                     try:
-                        current_cycle = str(config.get_last_retrain_slot(datetime.now()).isoformat())
+                        current_cycle = str(
+                            config.get_last_retrain_slot(datetime.now()).isoformat()
+                        )
                     except Exception:
                         current_cycle = ""
                     next_cycle_reopens = (
@@ -1521,7 +1664,10 @@ def _validate_legacy_live_readiness(config: Any,
                         reopen_mode == "when_clear"
                         and bool(state_reasons)
                         and all(
-                            ("total_open_risk" in reason or "existing_open_risk" in reason)
+                            (
+                                "total_open_risk" in reason
+                                or "existing_open_risk" in reason
+                            )
                             for reason in state_reasons
                         )
                     )
@@ -1538,7 +1684,12 @@ def _validate_legacy_live_readiness(config: Any,
                             "institutional supervisor latch belongs to a previous cycle; supervisor will reopen on evaluation",
                         )
                     else:
-                        reasons = ", ".join(str(r) for r in (state.get("block_reasons") or [])) or "unknown"
+                        reasons = (
+                            ", ".join(
+                                str(r) for r in (state.get("block_reasons") or [])
+                            )
+                            or "unknown"
+                        )
                         add(
                             "error",
                             "supervisor_latched_from_previous_run",
@@ -1552,10 +1703,15 @@ def _validate_legacy_live_readiness(config: Any,
                 f"{type(exc).__name__}: {exc}",
             )
     if not bool(getattr(config, "walk_forward_audit_enabled", False)):
-        add("error", "walk_forward_disabled", "walk-forward audit is disabled; funded promotion cannot fall back to weaker evidence")
-    if str(
-        getattr(config, "walk_forward_promotion_policy", "") or ""
-    ).strip().lower() != "promotion_gate":
+        add(
+            "error",
+            "walk_forward_disabled",
+            "walk-forward audit is disabled; funded promotion cannot fall back to weaker evidence",
+        )
+    if (
+        str(getattr(config, "walk_forward_promotion_policy", "") or "").strip().lower()
+        != "promotion_gate"
+    ):
         add(
             "error",
             "walk_forward_promotion_policy_weakened",
@@ -1571,7 +1727,9 @@ def _validate_legacy_live_readiness(config: Any,
         raw_log_dir = getattr(config, "log_dir", "logs")
         log_dir = Path(raw_log_dir if isinstance(raw_log_dir, (str, Path)) else "logs")
         drift_state_path = log_dir / "cycle_drift_state.json"
-        if drift_state_path.exists() and not isinstance(_load_json_file(drift_state_path), dict):
+        if drift_state_path.exists() and not isinstance(
+            _load_json_file(drift_state_path), dict
+        ):
             add(
                 "error",
                 "cycle_drift_state_unreadable",
@@ -1593,7 +1751,7 @@ def _validate_legacy_live_readiness(config: Any,
         if storage_floor > 0.0:
             try:
                 check_root = Path(config_path).resolve().parent
-                free_gb = shutil.disk_usage(check_root).free / (1024 ** 3)
+                free_gb = shutil.disk_usage(check_root).free / (1024**3)
                 if free_gb < storage_floor:
                     add(
                         "warning",
@@ -1608,13 +1766,19 @@ def _validate_legacy_live_readiness(config: Any,
                 )
 
     regime_params_file = str(getattr(config, "regime_params_file", "") or "")
-    regime_params_missing = bool(regime_params_file and not Path(regime_params_file).exists())
+    regime_params_missing = bool(
+        regime_params_file and not Path(regime_params_file).exists()
+    )
 
-    requested_symbols = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+    requested_symbols = sorted(
+        {str(symbol).upper() for symbol in symbols if str(symbol).strip()}
+    )
     broker_specs: Optional[Dict[str, Any]] = None
     symbol_pool_target = 0
     try:
-        symbol_pool_target = int(getattr(config, "production_symbol_pool_target_count", 0) or 0)
+        symbol_pool_target = int(
+            getattr(config, "production_symbol_pool_target_count", 0) or 0
+        )
     except (TypeError, ValueError, OverflowError):
         symbol_pool_target = 0
     if symbol_pool_target > 0 and len(requested_symbols) != symbol_pool_target:
@@ -1624,7 +1788,11 @@ def _validate_legacy_live_readiness(config: Any,
             f"configured symbol pool has {len(requested_symbols)} symbols, expected {symbol_pool_target}",
         )
     config_payload = _load_json_file(Path(config_path)) or {}
-    broker_specs_raw = config_payload.get("broker_specs_path") if isinstance(config_payload, dict) else None
+    broker_specs_raw = (
+        config_payload.get("broker_specs_path")
+        if isinstance(config_payload, dict)
+        else None
+    )
     if not broker_specs_raw:
         add(
             "warning",
@@ -1654,25 +1822,47 @@ def _validate_legacy_live_readiness(config: Any,
                 preview = "; ".join(field_issues[:8])
                 if len(field_issues) > 8:
                     preview += f"; +{len(field_issues) - 8} more"
-                add("error", "broker_specs_invalid_fields", f"broker specs contain invalid execution fields: {preview}")
+                add(
+                    "error",
+                    "broker_specs_invalid_fields",
+                    f"broker specs contain invalid execution fields: {preview}",
+                )
 
-    ledger_raw = winner_ledger_path or getattr(config, "winner_ledger_path", "pm_configs.json")
+    ledger_raw = winner_ledger_path or getattr(
+        config, "winner_ledger_path", "pm_configs.json"
+    )
     ledger_path = Path(str(ledger_raw))
     if not ledger_path.is_absolute():
         ledger_path = Path(config_path).resolve().parent / ledger_path
     ledger = _load_json_file(ledger_path)
     if ledger is None:
-        add("error", "winner_ledger_unreadable", f"winner ledger is missing or unreadable: {ledger_path}")
+        add(
+            "error",
+            "winner_ledger_unreadable",
+            f"winner ledger is missing or unreadable: {ledger_path}",
+        )
     else:
         symbol_configs = list(_iter_symbol_configs(ledger))
         if not symbol_configs:
-            add("error", "winner_ledger_empty", f"winner ledger has no symbol configs: {ledger_path}")
-        elif not any(_config_has_tradeable_winner(payload) for payload in symbol_configs):
-            add("error", "winner_ledger_no_tradeable_winners", "winner ledger contains no tradeable winners")
+            add(
+                "error",
+                "winner_ledger_empty",
+                f"winner ledger has no symbol configs: {ledger_path}",
+            )
+        elif not any(
+            _config_has_tradeable_winner(payload) for payload in symbol_configs
+        ):
+            add(
+                "error",
+                "winner_ledger_no_tradeable_winners",
+                "winner ledger contains no tradeable winners",
+            )
         expiry_issues = _ledger_live_expiry_issues(
             ledger,
             datetime.now(),
-            grace_minutes=int(getattr(config, "live_config_expiry_grace_minutes", 0) or 0),
+            grace_minutes=int(
+                getattr(config, "live_config_expiry_grace_minutes", 0) or 0
+            ),
         )
         if expiry_issues:
             preview = "; ".join(expiry_issues[:8])
@@ -1690,13 +1880,25 @@ def _validate_legacy_live_readiness(config: Any,
         }
         missing = sorted(set(requested_symbols) - ledger_symbols)
         if missing:
-            allow_partial_live = bool(getattr(config, "live_allow_partial_symbol_ledger", False))
+            allow_partial_live = bool(
+                getattr(config, "live_allow_partial_symbol_ledger", False)
+            )
             severity = (
                 "warning"
                 if allow_partial_live
-                else ("error" if bool(getattr(config, "production_require_full_symbol_ledger", False)) else "warning")
+                else (
+                    "error"
+                    if bool(
+                        getattr(config, "production_require_full_symbol_ledger", False)
+                    )
+                    else "warning"
+                )
             )
-            code = "production_symbol_ledger_incomplete" if severity == "error" else "symbols_missing_from_ledger"
+            code = (
+                "production_symbol_ledger_incomplete"
+                if severity == "error"
+                else "symbols_missing_from_ledger"
+            )
             preview = ", ".join(missing[:20])
             if len(missing) > 20:
                 preview += f", +{len(missing) - 20} more"
@@ -1771,13 +1973,21 @@ def _validate_legacy_live_readiness(config: Any,
                     for challenger_tf, challenger_regimes in challenger_grid.items():
                         if not isinstance(challenger_regimes, dict):
                             continue
-                        for challenger_regime, challenger_cell in challenger_regimes.items():
+                        for (
+                            challenger_regime,
+                            challenger_cell,
+                        ) in challenger_regimes.items():
                             if not isinstance(challenger_cell, dict):
                                 continue
                             challenger_status = str(
-                                challenger_cell.get("promotion_status", "BLOCKED") or "BLOCKED"
+                                challenger_cell.get("promotion_status", "BLOCKED")
+                                or "BLOCKED"
                             ).upper()
-                            if challenger_status not in {"BLOCKED", "PAPER_ONLY", "NO_TRADE"}:
+                            if challenger_status not in {
+                                "BLOCKED",
+                                "PAPER_ONLY",
+                                "NO_TRADE",
+                            }:
                                 challenger_leakage.append(
                                     f"{symbol}|{challenger_tf}|{challenger_regime}|{challenger_status}"
                                 )
@@ -1806,9 +2016,9 @@ def _validate_legacy_live_readiness(config: Any,
                         invalid_cells.append(cell_id)
                         continue
                     if strategy_name in {"NO_LOCAL_WINNER", "NO_TRADE", "NO_WINNER"}:
-                        no_winner_status = str(
-                            cell.get("promotion_status", "") or ""
-                        ).strip().upper()
+                        no_winner_status = (
+                            str(cell.get("promotion_status", "") or "").strip().upper()
+                        )
                         if no_winner_status not in {
                             "NO_LOCAL_WINNER",
                             "NO_TRADE",
@@ -1819,9 +2029,7 @@ def _validate_legacy_live_readiness(config: Any,
                     if strategy_name in _NON_WINNER_STRATEGY_NAMES:
                         invalid_cells.append(cell_id)
                         continue
-                    if not str(
-                        cell.get("promotion_status", "") or ""
-                    ).strip():
+                    if not str(cell.get("promotion_status", "") or "").strip():
                         missing_statuses.append(cell_id)
                     if (
                         native_universe is not None
@@ -1834,7 +2042,9 @@ def _validate_legacy_live_readiness(config: Any,
                         try:
                             from pm_position import TradeTagEncoder
 
-                            magic = TradeTagEncoder.encode_magic(symbol, timeframe, regime)
+                            magic = TradeTagEncoder.encode_magic(
+                                symbol, timeframe, regime
+                            )
                             prior_owner = magic_owners.get(magic)
                             if prior_owner is not None and prior_owner != cell_id:
                                 magic_collisions.append(
@@ -1853,13 +2063,19 @@ def _validate_legacy_live_readiness(config: Any,
                             else None
                         )
                         role = str(
-                            temporal.get("book_role", "") if isinstance(temporal, dict) else ""
+                            temporal.get("book_role", "")
+                            if isinstance(temporal, dict)
+                            else ""
                         ).upper()
                         status = str(
-                            temporal.get("contract_status", "") if isinstance(temporal, dict) else ""
+                            temporal.get("contract_status", "")
+                            if isinstance(temporal, dict)
+                            else ""
                         ).upper()
                         frozen = bool(
-                            temporal.get("parameters_frozen_during_final_lockbox", False)
+                            temporal.get(
+                                "parameters_frozen_during_final_lockbox", False
+                            )
                             if isinstance(temporal, dict)
                             else False
                         )
@@ -1918,9 +2134,10 @@ def _validate_legacy_live_readiness(config: Any,
             deployment_contract = dict(
                 current_artifact_meta.get("deployment_contract", {}) or {}
             )
-            if deployment_contract.get("contract") == "funded_live_deployment_v1" and str(
-                deployment_contract.get("status", "") or ""
-            ).upper() != "PASS":
+            if (
+                deployment_contract.get("contract") == "funded_live_deployment_v1"
+                and str(deployment_contract.get("status", "") or "").upper() != "PASS"
+            ):
                 add(
                     "error",
                     "deployment_contract_unavailable",
@@ -1931,12 +2148,23 @@ def _validate_legacy_live_readiness(config: Any,
             for idx, payload in enumerate(symbol_configs):
                 if not _config_has_tradeable_winner(payload):
                     continue
-                stored_artifact = payload.get("artifact_meta") if isinstance(payload.get("artifact_meta"), dict) else {}
-                if not artifact_contract_matches(stored_artifact, current_artifact_meta):
-                    drifted_symbols.append(_symbol_label(payload, fallback=f"entry_{idx}"))
+                stored_artifact = (
+                    payload.get("artifact_meta")
+                    if isinstance(payload.get("artifact_meta"), dict)
+                    else {}
+                )
+                if not artifact_contract_matches(
+                    stored_artifact, current_artifact_meta
+                ):
+                    drifted_symbols.append(
+                        _symbol_label(payload, fallback=f"entry_{idx}")
+                    )
                 stored_regime = stored_artifact.get("regime_params")
                 if regime_params_missing and isinstance(stored_regime, dict):
-                    if stored_regime.get("mtime_ns") is not None or stored_regime.get("size") is not None:
+                    if (
+                        stored_regime.get("mtime_ns") is not None
+                        or stored_regime.get("size") is not None
+                    ):
                         regime_missing_matches_artifact = False
                 elif regime_params_missing:
                     regime_missing_matches_artifact = False
@@ -1950,7 +2178,11 @@ def _validate_legacy_live_readiness(config: Any,
                     f"winner ledger artifacts do not match the current optimization/cost contract: {preview}",
                 )
             if regime_params_missing and not regime_missing_matches_artifact:
-                add("warning", "regime_params_missing", f"regime params file not found: {regime_params_file}")
+                add(
+                    "warning",
+                    "regime_params_missing",
+                    f"regime params file not found: {regime_params_file}",
+                )
         except Exception as exc:
             add(
                 "error",
@@ -1958,7 +2190,11 @@ def _validate_legacy_live_readiness(config: Any,
                 f"could not verify winner ledger artifact contract: {type(exc).__name__}: {exc}",
             )
             if regime_params_missing:
-                add("warning", "regime_params_missing", f"regime params file not found: {regime_params_file}")
+                add(
+                    "warning",
+                    "regime_params_missing",
+                    f"regime params file not found: {regime_params_file}",
+                )
 
     # Phase A is a complete global roster frozen before any final outcome is
     # observed.  Both tuning cap selection and the joint one-shot Phase B
@@ -2011,9 +2247,7 @@ def _validate_legacy_live_readiness(config: Any,
             "native_activation_roster_sha256": pre_native.get(
                 "activation_roster_sha256"
             ),
-            "native_bars_sha256_by_source": pre_native.get(
-                "bars_sha256_by_source"
-            ),
+            "native_bars_sha256_by_source": pre_native.get("bars_sha256_by_source"),
             "native_sidecar_sha256_by_source": pre_native.get(
                 "sidecar_sha256_by_source"
             ),
@@ -2073,8 +2307,7 @@ def _validate_legacy_live_readiness(config: Any,
         add(
             "error",
             "prelockbox_roster_check_failed",
-            "could not verify the sealed Phase-A roster: "
-            f"{type(exc).__name__}: {exc}",
+            f"could not verify the sealed Phase-A roster: {type(exc).__name__}: {exc}",
         )
 
     # The funded total stop-risk cap is not a discretionary constant.  It must
@@ -2102,9 +2335,11 @@ def _validate_legacy_live_readiness(config: Any,
             cap_calibration_path_raw, config_path
         )
         cap_calibration = _load_json_file(cap_calibration_path)
-        configured_cap_sha = str(
-            getattr(config, "production_cap_calibration_sha256", "") or ""
-        ).strip().lower()
+        configured_cap_sha = (
+            str(getattr(config, "production_cap_calibration_sha256", "") or "")
+            .strip()
+            .lower()
+        )
         cap_calibration_file_sha = _sha256_file(cap_calibration_path)
         if not isinstance(cap_calibration, dict):
             add(
@@ -2112,7 +2347,10 @@ def _validate_legacy_live_readiness(config: Any,
                 "capital_cap_calibration_unreadable",
                 f"sealed tuning cap calibration is missing or unreadable: {cap_calibration_path}",
             )
-        elif len(configured_cap_sha) != 64 or cap_calibration_file_sha != configured_cap_sha:
+        elif (
+            len(configured_cap_sha) != 64
+            or cap_calibration_file_sha != configured_cap_sha
+        ):
             add(
                 "error",
                 "capital_cap_calibration_hash_mismatch",
@@ -2141,11 +2379,13 @@ def _validate_legacy_live_readiness(config: Any,
                     )
                     or []
                 )
-                calibration_balances = sorted({
-                    _to_float(value, 0.0)
-                    for value in raw_balances
-                    if _to_float(value, 0.0) > 0.0
-                })
+                calibration_balances = sorted(
+                    {
+                        _to_float(value, 0.0)
+                        for value in raw_balances
+                        if _to_float(value, 0.0) > 0.0
+                    }
+                )
                 calibration_policies = {
                     balance: prelockbox_evidence_policy_from_config_payload(
                         config_payload, balance
@@ -2173,15 +2413,11 @@ def _validate_legacy_live_readiness(config: Any,
                         config_payload
                     ),
                     "prelockbox_roster_sha256": (
-                        (prelockbox_artifact.get("roster") or {}).get(
-                            "roster_sha256"
-                        )
+                        (prelockbox_artifact.get("roster") or {}).get("roster_sha256")
                     ),
                     "prelockbox_artifact_file_sha256": prelockbox_artifact_file_sha,
                     "prelockbox_artifact_seal_sha256": (
-                        (prelockbox_artifact.get("content_seal") or {}).get(
-                            "sha256"
-                        )
+                        (prelockbox_artifact.get("content_seal") or {}).get("sha256")
                     ),
                     "critical_module_code_contract_sha256": prelockbox_code_contract_sha,
                     "broker_specs_sha256": calibration_broker_sha,
@@ -2210,9 +2446,7 @@ def _validate_legacy_live_readiness(config: Any,
                     validate_cap_calibration_artifact(
                         cap_calibration,
                         expected_lineage=calibration_expected_lineage,
-                        expected_selected_cap_pct=number(
-                            "max_total_open_risk_pct"
-                        ),
+                        expected_selected_cap_pct=number("max_total_open_risk_pct"),
                     )
                 )
                 if calibration_errors:
@@ -2284,8 +2518,14 @@ def _validate_legacy_live_readiness(config: Any,
                     validate_global_final_lockbox_access,
                 )
 
-                if not str(getattr(config, "_deployment_config_path", "") or "").strip():
-                    setattr(config, "_deployment_config_path", str(Path(config_path).resolve()))
+                if not str(
+                    getattr(config, "_deployment_config_path", "") or ""
+                ).strip():
+                    setattr(
+                        config,
+                        "_deployment_config_path",
+                        str(Path(config_path).resolve()),
+                    )
                 current_artifact_meta = build_artifact_meta(config)
                 deployment_contract = dict(
                     current_artifact_meta.get("deployment_contract", {}) or {}
@@ -2346,7 +2586,9 @@ def _validate_legacy_live_readiness(config: Any,
 
                 broker_sha = None
                 if broker_specs_raw:
-                    broker_path = _resolve_relative_to_config(broker_specs_raw, config_path)
+                    broker_path = _resolve_relative_to_config(
+                        broker_specs_raw, config_path
+                    )
                     broker_sha = _sha256_file(broker_path)
                 expected_lineage = {
                     "artifact_contract_sha256": canonical_json_sha256(
@@ -2356,17 +2598,13 @@ def _validate_legacy_live_readiness(config: Any,
                         deployment_contract
                     ),
                     "prelockbox_roster_sha256": (
-                        (prelockbox_artifact.get("roster") or {}).get(
-                            "roster_sha256"
-                        )
+                        (prelockbox_artifact.get("roster") or {}).get("roster_sha256")
                         if isinstance(prelockbox_artifact, dict)
                         else None
                     ),
                     "prelockbox_artifact_file_sha256": prelockbox_artifact_file_sha,
                     "prelockbox_artifact_seal_sha256": (
-                        (prelockbox_artifact.get("content_seal") or {}).get(
-                            "sha256"
-                        )
+                        (prelockbox_artifact.get("content_seal") or {}).get("sha256")
                         if isinstance(prelockbox_artifact, dict)
                         else None
                     ),
@@ -2457,30 +2695,32 @@ def _validate_legacy_live_readiness(config: Any,
                         "production_portfolio_replay_max_drawdown_pct"
                     ),
                     require_mtm=bool(
-                        getattr(config, "production_portfolio_replay_require_mtm", False)
+                        getattr(
+                            config, "production_portfolio_replay_require_mtm", False
+                        )
                     ),
                     maximum_bootstrap_ruin_upper_95pct=_to_float(
-                        (
-                            cap_calibration.get("constraints") or {}
-                        ).get("maximum_bootstrap_ruin_upper_95pct")
+                        (cap_calibration.get("constraints") or {}).get(
+                            "maximum_bootstrap_ruin_upper_95pct"
+                        )
                         if isinstance(cap_calibration, dict)
                         and isinstance(cap_calibration.get("constraints"), dict)
                         else None,
                         float("nan"),
                     ),
                     maximum_bootstrap_p95_drawdown_pct=_to_float(
-                        (
-                            cap_calibration.get("constraints") or {}
-                        ).get("maximum_bootstrap_p95_drawdown_pct")
+                        (cap_calibration.get("constraints") or {}).get(
+                            "maximum_bootstrap_p95_drawdown_pct"
+                        )
                         if isinstance(cap_calibration, dict)
                         and isinstance(cap_calibration.get("constraints"), dict)
                         else None,
                         float("nan"),
                     ),
                     minimum_bootstrap_daily_return_observations=_to_float(
-                        (
-                            cap_calibration.get("constraints") or {}
-                        ).get("minimum_bootstrap_daily_return_observations")
+                        (cap_calibration.get("constraints") or {}).get(
+                            "minimum_bootstrap_daily_return_observations"
+                        )
                         if isinstance(cap_calibration, dict)
                         and isinstance(cap_calibration.get("constraints"), dict)
                         else None,
@@ -2548,7 +2788,9 @@ def _validate_legacy_live_readiness(config: Any,
         "matching the current replay schema and exact funded policy",
     )
 
-    tradeable_cells = _tradeable_cell_ids_from_ledger(ledger) if ledger is not None else set()
+    tradeable_cells = (
+        _tradeable_cell_ids_from_ledger(ledger) if ledger is not None else set()
+    )
     if (
         ledger is not None
         and isinstance(broker_specs, dict)
@@ -2557,7 +2799,9 @@ def _validate_legacy_live_readiness(config: Any,
         and position_config is not None
     ):
         equity = _to_float(getattr(account_info, "equity", 0.0), 0.0)
-        target_risk_pct = _to_float(getattr(position_config, "risk_per_trade_pct", 0.0), 0.0)
+        target_risk_pct = _to_float(
+            getattr(position_config, "risk_per_trade_pct", 0.0), 0.0
+        )
         hard_cap_pct = _to_float(getattr(position_config, "max_risk_pct", 0.0), 0.0)
         spec_by_symbol = _broker_specs_by_symbol(broker_specs)
         unpriced_cells: List[str] = []
@@ -2582,9 +2826,13 @@ def _validate_legacy_live_readiness(config: Any,
                 unpriced_cells.append(label)
                 continue
             if hard_cap_pct > 0.0 and min_lot_risk_pct > hard_cap_pct + 1e-9:
-                hard_cap_excess.append(f"{label} min_lot_risk={min_lot_risk_pct:.2f}% > hard_cap={hard_cap_pct:.2f}%")
+                hard_cap_excess.append(
+                    f"{label} min_lot_risk={min_lot_risk_pct:.2f}% > hard_cap={hard_cap_pct:.2f}%"
+                )
             elif target_risk_pct > 0.0 and min_lot_risk_pct > target_risk_pct + 1e-9:
-                target_excess.append(f"{label} min_lot_risk={min_lot_risk_pct:.2f}% > target={target_risk_pct:.2f}%")
+                target_excess.append(
+                    f"{label} min_lot_risk={min_lot_risk_pct:.2f}% > target={target_risk_pct:.2f}%"
+                )
         if hard_cap_excess:
             add(
                 "error",
@@ -2606,26 +2854,48 @@ def _validate_legacy_live_readiness(config: Any,
                 "could not pre-price min-lot risk for live tradeable cells lacking static stop/avg-loss evidence: "
                 f"{_preview_set(unpriced_cells)}",
             )
-    if bool(getattr(config, "live_require_tuned_regime_params", False)) and tradeable_cells:
-        missing_tuned_params = _cells_missing_tuned_regime_params(tradeable_cells, regime_params_file)
+    if (
+        bool(getattr(config, "live_require_tuned_regime_params", False))
+        and tradeable_cells
+    ):
+        missing_tuned_params = _cells_missing_tuned_regime_params(
+            tradeable_cells, regime_params_file
+        )
         if missing_tuned_params:
             add(
                 "error",
                 "live_tuned_regime_params_missing",
                 "live entries require explicitly tuned regime params; missing tuned entries for "
                 f"{_preview_set(missing_tuned_params)}"
-                + (f" in {regime_params_file}" if regime_params_file else " because regime_params_file is empty"),
+                + (
+                    f" in {regime_params_file}"
+                    if regime_params_file
+                    else " because regime_params_file is empty"
+                ),
             )
 
     if bool(getattr(config, "production_require_promotion_gate", False)):
-        gate_mode = str(getattr(config, "production_promotion_gate_mode", "external_review_exact") or "").strip().lower()
+        gate_mode = (
+            str(
+                getattr(
+                    config, "production_promotion_gate_mode", "external_review_exact"
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+        )
         if gate_mode in {"immutable", "authorization", "authorization_exact"}:
             gate_mode = "immutable_exact"
         elif gate_mode in {"ledger", "current_ledger", "ledger_authoritative"}:
             gate_mode = "ledger_status"
         elif gate_mode in {"external", "exact", "review", "review_exact"}:
             gate_mode = "external_review_exact"
-        if gate_mode not in {"immutable_exact", "external_review_exact", "ledger_status"}:
+        if gate_mode not in {
+            "immutable_exact",
+            "external_review_exact",
+            "ledger_status",
+        }:
             add(
                 "error",
                 "production_promotion_gate_mode_invalid",
@@ -2649,7 +2919,9 @@ def _validate_legacy_live_readiness(config: Any,
                 )
             else:
                 try:
-                    from pm_promotion_authorization import verify_promotion_authorization
+                    from pm_promotion_authorization import (
+                        verify_promotion_authorization,
+                    )
 
                     authorization = verify_promotion_authorization(
                         config,
@@ -2667,14 +2939,17 @@ def _validate_legacy_live_readiness(config: Any,
                 else:
                     for reason in authorization.errors:
                         reason_code = "".join(
-                            ch.lower() if ch.isalnum() else "_" for ch in str(reason).split(":", 1)[0]
+                            ch.lower() if ch.isalnum() else "_"
+                            for ch in str(reason).split(":", 1)[0]
                         ).strip("_")
                         add(
                             "error",
                             f"production_{reason_code or 'promotion_authorization_invalid'}",
                             f"immutable promotion authorization rejected: {reason}",
                         )
-            return ReadinessReport(ok=not any(f.severity == "error" for f in findings), findings=findings)
+            return ReadinessReport(
+                ok=not any(f.severity == "error" for f in findings), findings=findings
+            )
 
         if gate_mode == "ledger_status":
             if ledger is not None and not tradeable_cells:
@@ -2683,11 +2958,19 @@ def _validate_legacy_live_readiness(config: Any,
                     "production_promotion_ledger_no_tradeable_cells",
                     "production promotion gate uses ledger_status but the winner ledger has no tradeable promoted cells",
                 )
-            return ReadinessReport(ok=not any(f.severity == "error" for f in findings), findings=findings)
+            return ReadinessReport(
+                ok=not any(f.severity == "error" for f in findings), findings=findings
+            )
 
-        review_raw = str(getattr(config, "production_promotion_review_path", "") or "").strip()
-        safety_raw = str(getattr(config, "production_promotion_cell_safety_path", "") or "").strip()
-        marker_raw = str(getattr(config, "production_completion_marker_path", "") or "").strip()
+        review_raw = str(
+            getattr(config, "production_promotion_review_path", "") or ""
+        ).strip()
+        safety_raw = str(
+            getattr(config, "production_promotion_cell_safety_path", "") or ""
+        ).strip()
+        marker_raw = str(
+            getattr(config, "production_completion_marker_path", "") or ""
+        ).strip()
 
         if not review_raw:
             add(
@@ -2758,7 +3041,11 @@ def _validate_legacy_live_readiness(config: Any,
                     else None
                 )
                 if summary is None:
-                    summary = safety_payload.get("summary") if isinstance(safety_payload.get("summary"), dict) else safety_payload
+                    summary = (
+                        safety_payload.get("summary")
+                        if isinstance(safety_payload.get("summary"), dict)
+                        else safety_payload
+                    )
 
                 def _safety_count(name: str) -> int:
                     value = summary.get(name, safety_payload.get(name, 0))
@@ -2806,9 +3093,17 @@ def _validate_legacy_live_readiness(config: Any,
                         "completion marker is not marked review_ready",
                     )
                 if bool(marker_payload.get("stale")):
-                    add("error", "production_completion_marker_stale", "completion marker is marked stale")
+                    add(
+                        "error",
+                        "production_completion_marker_stale",
+                        "completion marker is marked stale",
+                    )
                 if bool(marker_payload.get("pid_alive")):
-                    add("error", "production_completion_marker_active_pid", "completion marker still reports pid_alive=true")
+                    add(
+                        "error",
+                        "production_completion_marker_active_pid",
+                        "completion marker still reports pid_alive=true",
+                    )
                 if "CELL_SAFE" not in verdict:
                     add(
                         "error",
@@ -2816,7 +3111,9 @@ def _validate_legacy_live_readiness(config: Any,
                         f"completion marker verdict is not cell-safe: {marker_payload.get('verdict')}",
                     )
 
-    return ReadinessReport(ok=not any(f.severity == "error" for f in findings), findings=findings)
+    return ReadinessReport(
+        ok=not any(f.severity == "error" for f in findings), findings=findings
+    )
 
 
 def validate_live_readiness(
@@ -2850,9 +3147,7 @@ def validate_live_readiness(
 
     requested_symbols = list(
         dict.fromkeys(
-            str(symbol).strip().upper()
-            for symbol in symbols
-            if str(symbol).strip()
+            str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()
         )
     )
     required_timeframes = ("M5", "M15", "M30", "H1", "H4", "D1")
@@ -2990,9 +3285,7 @@ def validate_live_readiness(
         "repeated historical process validation must be enabled",
     )
     require(
-        str(getattr(config, "walk_forward_promotion_policy", "") or "")
-        .strip()
-        .lower()
+        str(getattr(config, "walk_forward_promotion_policy", "") or "").strip().lower()
         == "promotion_gate",
         "walk_forward_promotion_policy_weakened",
         "historical process validation must remain promotion-gating",
@@ -3044,8 +3337,7 @@ def validate_live_readiness(
     )
     require(
         number("max_new_entries_when_total_open_risk_above_pct") == 0.0
-        and str(getattr(config, "open_risk_action", "") or "").lower()
-        == "observe",
+        and str(getattr(config, "open_risk_action", "") or "").lower() == "observe",
         "soft_open_risk_gate_not_neutral",
         "only the evidence-selected hard capital envelope may gate open risk",
     )
@@ -3129,12 +3421,8 @@ def validate_live_readiness(
             "min_lot_risk_clamp_not_live",
             "unsafe minimum lots must be skipped",
         )
-        risk_pct = _to_float(
-            getattr(position_config, "risk_per_trade_pct", None), 0.0
-        )
-        hard_risk_pct = _to_float(
-            getattr(position_config, "max_risk_pct", None), 0.0
-        )
+        risk_pct = _to_float(getattr(position_config, "risk_per_trade_pct", None), 0.0)
+        hard_risk_pct = _to_float(getattr(position_config, "max_risk_pct", None), 0.0)
         require(
             risk_pct > 0.0 and hard_risk_pct > 0.0 and risk_pct <= hard_risk_pct,
             "risk_pct_exceeds_hard_cap",
@@ -3147,7 +3435,11 @@ def validate_live_readiness(
     )
     if not isinstance(config_payload, Mapping):
         config_payload = {}
-        add("error", "deployment_config_unreadable", f"config is unreadable: {config_file}")
+        add(
+            "error",
+            "deployment_config_unreadable",
+            f"config is unreadable: {config_file}",
+        )
 
     broker_specs: Optional[Dict[str, Any]] = None
     broker_specs_raw = config_payload.get("broker_specs_path")
@@ -3159,7 +3451,11 @@ def validate_live_readiness(
             broker_specs_path, SPARSE_AUTHORITY_INDEX_MAX_BYTES
         )
         if not isinstance(broker_specs, dict) or not broker_specs:
-            add("error", "broker_specs_unreadable", f"broker specs are unreadable: {broker_specs_path}")
+            add(
+                "error",
+                "broker_specs_unreadable",
+                f"broker specs are unreadable: {broker_specs_path}",
+            )
         else:
             missing_specs = sorted(
                 set(requested_symbols) - set(_broker_specs_by_symbol(broker_specs))
@@ -3186,7 +3482,11 @@ def validate_live_readiness(
     selected_cells: Set[str] = set()
     legacy_tradeable_cells: Set[str] = set()
     if not isinstance(ledger, Mapping):
-        add("error", "winner_ledger_unreadable", f"winner ledger is unreadable: {ledger_path}")
+        add(
+            "error",
+            "winner_ledger_unreadable",
+            f"winner ledger is unreadable: {ledger_path}",
+        )
     else:
         selected_cells, ledger_errors = _sparse_current_refit_projection(
             ledger, requested_symbols
@@ -3202,9 +3502,7 @@ def validate_live_readiness(
                 "winner ledger contains no selected executable specialists",
             )
         ledger_symbols = {
-            str(symbol).strip().upper()
-            for symbol in ledger
-            if str(symbol).strip()
+            str(symbol).strip().upper() for symbol in ledger if str(symbol).strip()
         }
         missing_symbol_entries = sorted(set(requested_symbols) - ledger_symbols)
         if missing_symbol_entries:
@@ -3265,9 +3563,9 @@ def validate_live_readiness(
                 current_artifact = build_artifact_meta(config)
                 drifted = []
                 for symbol, payload in ledger.items():
-                    if not isinstance(payload, Mapping) or not _config_has_tradeable_winner(
-                        dict(payload)
-                    ):
+                    if not isinstance(
+                        payload, Mapping
+                    ) or not _config_has_tradeable_winner(dict(payload)):
                         continue
                     stored = payload.get("artifact_meta")
                     if not artifact_contract_matches(
@@ -3317,6 +3615,7 @@ def validate_live_readiness(
             "active",
             NATIVE_EVIDENCE_CANDIDATE,
             NATIVE_SOURCE_UNAVAILABLE,
+            "technical_error",
         }
         bad_states = [
             f"{symbol}|{timeframe}:{native_universe.cell_status(symbol, timeframe)}"
@@ -3332,7 +3631,10 @@ def validate_live_readiness(
             )
         for cell_id in sorted(selected_cells):
             symbol, timeframe, _regime = cell_id.split("|")
-            if native_universe.cell_status(symbol, timeframe) == NATIVE_SOURCE_UNAVAILABLE:
+            if (
+                native_universe.cell_status(symbol, timeframe)
+                == NATIVE_SOURCE_UNAVAILABLE
+            ):
                 add(
                     "error",
                     "winner_uses_source_unavailable_cell",
@@ -3413,9 +3715,7 @@ def validate_live_readiness(
         target_risk_pct = _to_float(
             getattr(position_config, "risk_per_trade_pct", 0.0), 0.0
         )
-        hard_cap_pct = _to_float(
-            getattr(position_config, "max_risk_pct", 0.0), 0.0
-        )
+        hard_cap_pct = _to_float(getattr(position_config, "max_risk_pct", 0.0), 0.0)
         specs = _broker_specs_by_symbol(broker_specs)
         unpriced: List[str] = []
         target_excess: List[str] = []
@@ -3471,7 +3771,11 @@ def validate_live_readiness(
             "kill",
             "unreadable",
         }:
-            add("error", "manual_kill_switch_active", f"kill switch blocks: {switch_path}")
+            add(
+                "error",
+                "manual_kill_switch_active",
+                f"kill switch blocks: {switch_path}",
+            )
 
     if mt5_config is not None:
         try:
@@ -3489,21 +3793,41 @@ def validate_live_readiness(
             "MT5 login, server, and currency must be pinned",
         )
         if pinned and account_info is None:
-            add("error", "mt5_account_identity_unverified", "MT5 account is unavailable")
+            add(
+                "error", "mt5_account_identity_unverified", "MT5 account is unavailable"
+            )
         elif pinned:
             if int(getattr(account_info, "login", 0) or 0) != expected_login:
                 add("error", "mt5_account_login_mismatch", "MT5 login differs from pin")
-            if str(getattr(account_info, "server", "") or "").lower() != expected_server.lower():
-                add("error", "mt5_account_server_mismatch", "MT5 server differs from pin")
-            if str(getattr(account_info, "currency", "") or "").upper() != expected_currency.upper():
-                add("error", "mt5_account_currency_mismatch", "MT5 currency differs from pin")
+            if (
+                str(getattr(account_info, "server", "") or "").lower()
+                != expected_server.lower()
+            ):
+                add(
+                    "error",
+                    "mt5_account_server_mismatch",
+                    "MT5 server differs from pin",
+                )
+            if (
+                str(getattr(account_info, "currency", "") or "").upper()
+                != expected_currency.upper()
+            ):
+                add(
+                    "error",
+                    "mt5_account_currency_mismatch",
+                    "MT5 currency differs from pin",
+                )
 
     minimum_equity = number("live_min_account_equity")
     if minimum_equity > 0:
         if account_info is None:
             add("error", "account_equity_unverified", "account equity is unavailable")
         elif _to_float(getattr(account_info, "equity", 0.0), 0.0) < minimum_equity:
-            add("error", "account_equity_below_live_minimum", "account equity is below the live minimum")
+            add(
+                "error",
+                "account_equity_below_live_minimum",
+                "account equity is below the live minimum",
+            )
 
     log_dir = Path(getattr(config, "log_dir", "logs") or "logs")
     if not log_dir.is_absolute():
@@ -3559,9 +3883,7 @@ def validate_live_readiness(
             add("warning", "storage_free_space_check_failed", "free space check failed")
 
     if bool(getattr(config, "production_require_promotion_gate", False)):
-        mode = str(
-            getattr(config, "production_promotion_gate_mode", "") or ""
-        ).lower()
+        mode = str(getattr(config, "production_promotion_gate_mode", "") or "").lower()
         if mode in {"immutable", "authorization", "authorization_exact"}:
             mode = "immutable_exact"
         require(
@@ -3593,7 +3915,9 @@ def validate_live_readiness(
                     f"promotion authorization failed: {type(exc).__name__}",
                 )
 
-    return ReadinessReport(not any(item.severity == "error" for item in findings), findings)
+    return ReadinessReport(
+        not any(item.severity == "error" for item in findings), findings
+    )
 
 
 def log_readiness_report(logger: Any, report: ReadinessReport) -> None:

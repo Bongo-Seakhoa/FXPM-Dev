@@ -1,4 +1,5 @@
 import copy
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ from pm_search_outcomes import (
     SearchStage,
 )
 from pm_trade_power import (
+    REQUIRED_TRADE_RECORD_SCHEMA,
     TRADE_POWER_DECISION_SCHEMA_VERSION,
     TradePowerDecision,
     build_numerical_execution_cost_attestation,
@@ -33,23 +35,42 @@ class _Strategy:
         return {}
 
 
-def _authenticated_result(*, observations: int, seed: int):
+def _authenticated_result(*, observations: int, seed: int, start_utc: str):
     rng = np.random.default_rng(seed)
     values = rng.normal(loc=0.30, scale=0.70, size=observations)
-    start = pd.Timestamp("2020-01-01", tz="UTC")
+    start = pd.Timestamp(start_utc, tz="UTC")
     trades = []
     for index, value in enumerate(values):
         entry = start + pd.Timedelta(hours=3 * index)
         trades.append({
+            "position_id": f"fixture-{start.value}-{index:04d}",
+            "entry_event_order": index * 2,
+            "exit_event_order": index * 2 + 1,
             "pnl_dollars": float(value * 100.0),
             "risk_amount": 100.0,
             "entry_time": entry,
             "exit_time": entry + pd.Timedelta(hours=1),
-            "trade_record_schema_version": "2026-06-18-mae-mfe-v1",
+            "trade_record_schema_version": REQUIRED_TRADE_RECORD_SCHEMA,
         })
+    end = start + pd.Timedelta(hours=max(3 * observations, 3))
     return {
         "total_trades": len(trades),
         "trades": trades,
+        "trade_power_partition_axis": {
+            "start_utc": start.isoformat(),
+            "end_utc": end.isoformat(),
+            "horizon_receipt_sha256": hashlib.sha256(
+                f"search-outcome:horizon:{start.isoformat()}:{end.isoformat()}".encode(
+                    "ascii"
+                )
+            ).hexdigest(),
+            "event_axis_sha256": hashlib.sha256(
+                "|".join(
+                    f"{trade['position_id']}:{trade['entry_time']}:{trade['exit_time']}"
+                    for trade in trades
+                ).encode("ascii")
+            ).hexdigest(),
+        },
         "execution_cost_timing_contract": {
             "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
@@ -84,15 +105,22 @@ def _authenticated_result(*, observations: int, seed: int):
             "target_bars_sha256": "5" * 64,
             "target_sidecar_sha256": "6" * 64,
             "projection_contract": "fxpm-swap-preopen-close-projection-v1",
-            "projection_sha256": "b" * 64,
+            "projection_sha256": hashlib.sha256(
+                f"search-outcome:{start.isoformat()}".encode("ascii")
+            ).hexdigest(),
         },
     }
 
 
 def _persisted_power_pair(*, train_observations: int, val_observations: int, seed: int):
     optimizer = RegimeOptimizer.__new__(RegimeOptimizer)
+    optimizer._trade_power_multiplicity_cache = {}
     train = optimizer._calibrate_train_power_result(
-        _authenticated_result(observations=train_observations, seed=seed),
+        _authenticated_result(
+            observations=train_observations,
+            seed=seed,
+            start_utc="2020-01-01",
+        ),
         effective_trials=1,
         symbol="EURUSD",
         timeframe="H1",
@@ -105,6 +133,7 @@ def _persisted_power_pair(*, train_observations: int, val_observations: int, see
         _authenticated_result(
             observations=val_observations,
             seed=seed + 1,
+            start_utc="2022-01-01",
         ),
         frozen_requirement=train.frozen_requirement,
         symbol="EURUSD",

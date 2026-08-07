@@ -826,7 +826,59 @@ def test_activation_bound_stress_projection_is_promotion_admissible(monkeypatch)
     assert contract["stress_policy_explicitly_approved"] is True
     assert contract["stress_policy_immutable"] is True
     assert contract["historical_rates_authenticated"] is False
+    assert contract["price_activation_id"] == "price-a1"
+    assert contract["price_activation_manifest_sha256"] == "b" * 64
+    assert contract["terms_activation_id"] == "terms-a1"
+    assert contract["terms_activation_manifest_sha256"] == "c" * 64
+    assert contract["terms_snapshot_sha256"] == "d" * 64
+    assert contract["schedule_sha256"] == "e" * 64
+    assert contract["target_bars_sha256"] == "f" * 64
+    assert contract["target_sidecar_sha256"] == "1" * 64
     assert contract["projection_sha256"] == "a" * 64
+
+
+def test_broker_terms_pointer_race_rejects_before_cache(tmp_path, monkeypatch):
+    frame = _flat_daily_frame(rows=2)
+    frame.attrs[pm_core.NATIVE_SOURCE_BINDING_ATTR] = {
+        "symbol": "ZZZUSD",
+        "timeframe": "D1",
+        "activation_id": "price-a1",
+        "activation_manifest_sha256": "c" * 64,
+        "bars_sha256": "d" * 64,
+        "sidecar_sha256": "e" * 64,
+    }
+    pointer_path = tmp_path / "native" / "terms" / "ACTIVE.json"
+    pointer_path.parent.mkdir(parents=True)
+    pointer_path.write_text("{}", encoding="ascii")
+    observed_pointer_sha = "a" * 64
+    resolved_pointer_sha = "b" * 64
+    monkeypatch.setattr(
+        pm_core,
+        "broker_terms_sha256_file",
+        lambda _path: observed_pointer_sha,
+    )
+    monkeypatch.setattr(
+        pm_core,
+        "resolve_active_swap_contract",
+        lambda *_args: {
+            "terms_active_pointer_sha256": resolved_pointer_sha,
+        },
+    )
+    backtester = Backtester(
+        PipelineConfig(data_dir=tmp_path, research_mode=True)
+    )
+
+    with pytest.raises(
+        pm_core.BrokerTermsError,
+        match="changed during swap contract resolution",
+    ):
+        backtester._resolve_broker_swap_projection(
+            frame,
+            _fx_spec(),
+            "D1",
+        )
+
+    assert backtester._swap_contract_cache == {}
 
 
 def test_new_post_gap_entry_does_not_pay_pre_entry_carry_in_both_engines(

@@ -798,8 +798,9 @@ def _feature_contracts() -> list[StateContract]:
         contracts.append(StateContract(f"feature:ATR_{period}", StateKind.FINITE_WINDOW, dependencies=("feature:OHLCV",), finite_rule=FiniteWindowRule(period + 1)))
     for period in (5, 8, 10, 13, 20, 21, 30, 50, 100, 200):
         contracts.append(StateContract(f"feature:SMA_{period}", StateKind.FINITE_WINDOW, dependencies=("feature:OHLCV",), finite_rule=FiniteWindowRule(period)))
+    for period in (5, 8, 10, 13, 15, 20, 21, 25, 26, 30, 35, 40, 50, 100, 150, 200):
         contracts.append(StateContract(f"feature:EMA_{period}", StateKind.RECURSIVE_CONTRACTIVE, dependencies=("feature:OHLCV",), recursive_rule=RecursiveRule((_ema_term(fixed=(period,), required=True),))))
-    for period in (2, 7, 14, 21):
+    for period in (2, 3, 4, 7, 14, 21):
         contracts.append(StateContract(f"feature:RSI_{period}", StateKind.RECURSIVE_CONTRACTIVE, dependencies=("feature:OHLCV",), finite_rule=FiniteWindowRule(period + 1), recursive_rule=RecursiveRule((_wilder_term(fixed=(period,), required=True),))))
     for name in ("BB_MID_20", "BB_UPPER_20", "BB_LOWER_20"):
         contracts.append(StateContract(f"feature:{name}", StateKind.FINITE_WINDOW, dependencies=("feature:OHLCV",), finite_rule=FiniteWindowRule(20)))

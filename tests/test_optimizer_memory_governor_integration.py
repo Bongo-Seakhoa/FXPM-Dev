@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -22,9 +22,7 @@ from pm_pipeline import (
     _atomic_write_optimizer_receipt,
     _consume_optimizer_receipt,
     _governed_optimize_symbol_worker,
-    _optimizer_peak_estimate_bytes,
     _optimizer_receipt_path,
-    _ordered_optimizer_memory_work,
     _pipeline_config_to_dict,
     _pipeline_runtime_bindings,
     _restore_pipeline_runtime_bindings,
@@ -103,46 +101,6 @@ def _receipt_pointer(
         "sha256": digest,
         "bytes": byte_count,
     }
-
-
-class _Universe:
-    explicit_contract = True
-
-    def __init__(self, entries: Mapping[str, Any]):
-        self.entries = dict(entries)
-
-    def active_timeframes(self, symbol: str):
-        return tuple(
-            timeframe
-            for timeframe, entry in self.entries[symbol].items()
-            if entry["status"] == "active"
-        )
-
-
-def test_estimates_are_monotone_input_derived_and_heaviest_first(tmp_path: Path) -> None:
-    cfg = _pipeline_config(tmp_path)
-    native = cfg.data_dir / "native"
-    small = native / "runs" / "r1" / "SMALL" / "M5" / "bars.csv"
-    large = native / "runs" / "r1" / "LARGE" / "M5" / "bars.csv"
-    small.parent.mkdir(parents=True)
-    large.parent.mkdir(parents=True)
-    small.write_bytes(b"x" * 1024)
-    large.write_bytes(b"x" * 8192)
-    universe = _Universe(
-        {
-            "SMALL": {"M5": {"status": "active", "bars_relative_path": str(small.relative_to(native))}},
-            "LARGE": {"M5": {"status": "active", "bars_relative_path": str(large.relative_to(native))}},
-        }
-    )
-
-    small_estimate = _optimizer_peak_estimate_bytes(cfg, "SMALL", universe)
-    large_estimate = _optimizer_peak_estimate_bytes(cfg, "LARGE", universe)
-
-    assert large_estimate > small_estimate
-    assert _ordered_optimizer_memory_work(cfg, ["SMALL", "LARGE"], universe) == [
-        ("LARGE", large_estimate),
-        ("SMALL", small_estimate),
-    ]
 
 
 def test_spawn_runtime_bindings_preserve_deployment_artifact_contract(
@@ -287,6 +245,7 @@ class _FakeGovernor:
         self.worker = worker
         for task in tasks:
             self.tasks.append(task)
+            assert not hasattr(task, "estimated_peak_bytes")
             assert not any(isinstance(value, pd.DataFrame) for value in task.args)
             config_dict, runtime_bindings, symbol, generation_id, receipt_value = task.args
             del config_dict, runtime_bindings
@@ -311,7 +270,7 @@ class _FakeGovernor:
                     error_type="InjectedFailure",
                     error_message="injected scheduler failure",
                     technical_failure=True,
-                    memory_failure=self.mode in {"FAILED_MEMORY", "FAILED_MEMORY_BUDGET"},
+                    memory_failure=self.mode == "FAILED_MEMORY",
                 )
 
 
@@ -341,7 +300,7 @@ def _run_manager_with_fake_governor(
     return manager, results, before
 
 
-def test_workers_one_still_uses_governed_spawn_worker_and_semantic_success(
+def test_workers_one_still_uses_isolated_spawn_worker_and_semantic_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -368,8 +327,6 @@ def test_workers_one_still_uses_governed_spawn_worker_and_semantic_success(
     [
         "FAILED_MEMORY",
         "FAILED_TECHNICAL",
-        "FAILED_TIMEOUT_TASK",
-        "FAILED_MEMORY_BUDGET",
         "invalid_receipt",
     ],
 )

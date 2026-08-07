@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -20,6 +20,7 @@ from pm_current_refit_parameters import (
 from pm_strategies import StrategyRegistry
 from pm_authority_spool import (
     CANONICAL_JSON_FORMAT,
+    CURRENT_REFIT_MANIFEST_DOMAIN,
     AuthoritySpoolError,
     SymbolAuthoritySink,
     verify_symbol_receipt,
@@ -35,6 +36,7 @@ from pm_model_lifecycle import (
 CAPTURE_CONTRACT_VERSION = "fxpm.current-refit-production-capture.v1"
 CANDIDATE_LEDGER_VERSION = "fxpm.current-refit-candidate-source-ledger.v1"
 PORTFOLIO_SOURCE_LEDGER_VERSION = "fxpm.current-refit-portfolio-source-ledger.v1"
+SCHEDULE_DEFAULT_VALIDITY_BASIS = "CONFIG_RETRAIN_SCHEDULE_DEFAULT"
 
 ART_CURRENT_BOOK = "current_refit_book_v9_decision"
 ART_ACCEPTED_BOOK = "accepted_current_process_book_generation"
@@ -208,6 +210,7 @@ class ProductionCaptureInputs:
     generation_id: str
     native_universe_sha256: str
     config_sha256: str
+    required_valid_until_utc: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +263,16 @@ def _fail(code: str, *details: str) -> None:
 
 def _is_sha(value: Any) -> bool:
     return type(value) is str and len(value) == 64 and all(c in _SHA for c in value)
+
+
+def _required_aware_utc_deadline(value: Any) -> datetime:
+    if (
+        type(value) is not datetime
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+    ):
+        _fail("PHYSICAL_LEDGER_VALID_UNTIL_NOT_AWARE_UTC")
+    return value.astimezone(timezone.utc)
 
 
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -447,7 +460,7 @@ def _selected_book_cells(book_body: Mapping[str, Any]) -> dict[str, dict[str, An
             continue
         slot = "|".join(
             (
-                str(raw.get("symbol") or "").upper(),
+                str(raw.get("symbol") or ""),
                 str(raw.get("timeframe") or "").upper(),
                 str(raw.get("regime") or "").upper(),
             )
@@ -474,6 +487,7 @@ def _build_physical_current_refit_ledger_payload(
     refit_receipt_sha256: str,
     raw_manifest: Mapping[str, Any],
     artifact_root: Path,
+    required_valid_until_utc: datetime,
 ) -> dict[str, Any]:
     """Derive the sparse physical book solely from raw-reverified winners."""
 
@@ -518,7 +532,7 @@ def _build_physical_current_refit_ledger_payload(
     refit_slots = [
         "|".join(
             (
-                str(cell.get("symbol") or "").upper(),
+                str(cell.get("symbol") or ""),
                 str(cell.get("timeframe") or "").upper(),
                 str(cell.get("regime") or "").upper(),
             )
@@ -540,10 +554,16 @@ def _build_physical_current_refit_ledger_payload(
         trained_at = datetime.fromisoformat(
             completed_at[:-1] + "+00:00" if completed_at.endswith("Z") else completed_at
         )
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise CurrentRefitProductionCaptureError(
             "PHYSICAL_LEDGER_REFIT_TIME_INVALID"
         ) from exc
+    if trained_at.tzinfo is None or trained_at.utcoffset() != timedelta(0):
+        _fail("PHYSICAL_LEDGER_REFIT_TIME_NOT_AWARE_UTC")
+    trained_at = trained_at.astimezone(timezone.utc)
+    valid_until = _required_aware_utc_deadline(required_valid_until_utc)
+    if valid_until <= trained_at:
+        _fail("PHYSICAL_LEDGER_VALID_UNTIL_NOT_AFTER_REFIT")
     request_by_id: dict[str, Mapping[str, Any]] = {}
     for raw in requests:
         if not isinstance(raw, Mapping):
@@ -557,7 +577,7 @@ def _build_physical_current_refit_ledger_payload(
     for cell in cells:
         if not isinstance(cell, Mapping):
             _fail("PHYSICAL_LEDGER_REFIT_CELL_INVALID")
-        symbol = str(cell.get("symbol") or "").upper()
+        symbol = str(cell.get("symbol") or "")
         timeframe = str(cell.get("timeframe") or "").upper()
         regime = str(cell.get("regime") or "").upper()
         slot = f"{symbol}|{timeframe}|{regime}"
@@ -645,12 +665,15 @@ def _build_physical_current_refit_ledger_payload(
                 "selected_winner_roster_sha256"
             ),
             "parameter_level_oos_evidence_claimed": False,
+            "valid_until_basis": SCHEDULE_DEFAULT_VALIDITY_BASIS,
+            "evidence_led_validity_horizon_claimed": False,
         }
         regime_config = RegimeConfig(
             strategy_name=str(cell["strategy_id"]),
             parameters=wire_parameters,
             quality_score=0.0,
             trained_at=trained_at,
+            valid_until=valid_until,
             artifact_meta=artifact_meta,
             validation_evidence={
                 "book_role": "PROCESS_VALIDATED_CURRENT_REFIT",
@@ -671,6 +694,7 @@ def _build_physical_current_refit_ledger_payload(
                 is_validated=True,
                 validation_reason="PROCESS_VALIDATED_CURRENT_REFIT_PROBATION",
                 optimized_at=trained_at,
+                valid_until=valid_until,
                 artifact_meta={
                     "artifact_version": CAPTURE_CONTRACT_VERSION,
                     "book_role": "PROCESS_VALIDATED_CURRENT_REFIT",
@@ -682,6 +706,8 @@ def _build_physical_current_refit_ledger_payload(
                         "execution_sha256"
                     ),
                     "current_refit_output_book_sha256": run.get("output_book_sha256"),
+                    "valid_until_basis": SCHEDULE_DEFAULT_VALIDITY_BASIS,
+                    "evidence_led_validity_horizon_claimed": False,
                 },
             ),
         )
@@ -710,6 +736,7 @@ def derive_physical_current_refit_ledger(
     raw_manifest_path: Path,
     artifact_root: Path,
     output_root: Path,
+    required_valid_until_utc: datetime,
 ) -> DerivedPhysicalCurrentLedger:
     """Raw-reverify and materialize one immutable sparse current ledger."""
 
@@ -745,6 +772,7 @@ def derive_physical_current_refit_ledger(
         refit_receipt_sha256=refit_sha,
         raw_manifest=manifest,
         artifact_root=Path(artifact_root).resolve(strict=True),
+        required_valid_until_utc=required_valid_until_utc,
     )
     encoded = _canonical_bytes(payload)
     content_sha = hashlib.sha256(encoded).hexdigest()
@@ -855,6 +883,7 @@ def _verified_artifacts(
                 expected_symbol=symbol,
                 expected_native_universe_sha256=inputs.native_universe_sha256,
                 expected_config_sha256=inputs.config_sha256,
+                expected_manifest_domain=CURRENT_REFIT_MANIFEST_DOMAIN,
             )
         except AuthoritySpoolError as exc:
             raise CurrentRefitProductionCaptureError(
@@ -1675,6 +1704,7 @@ class CurrentRefitProductionAdapter:
             raw_manifest_path=manifest_path,
             artifact_root=root,
             output_root=self.inputs.output_root,
+            required_valid_until_utc=self.inputs.required_valid_until_utc,
         )
         frozen_ledger, observed_ledger, physical_sha = _freeze_staged_ledger(
             derived_ledger.path

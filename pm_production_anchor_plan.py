@@ -28,10 +28,12 @@ from pm_native_activation import (
     NATIVE_PRODUCTION_TIMEFRAMES,
     NATIVE_RUN_MANIFEST_SCHEMA,
     NATIVE_SOURCE_UNAVAILABLE,
+    NATIVE_TECHNICAL_ERROR,
     TIMEFRAME_REQUEST_MAP_SCHEMA_VERSION,
     UNIVERSE_AUTHENTICITY_SCHEMA,
     ActiveNativeUniverse,
     resolve_active_native_universe,
+    validate_terminal_promotion_view,
 )
 from pm_native_request_contract import (
     COMMON_REQUEST_KEYS,
@@ -315,7 +317,11 @@ def _validate_universe(universe: Any) -> ActiveNativeUniverse:
         _fail("NATIVE_UNIVERSE_EXCLUDED_NO_TRADE_AUTHORITY_FORBIDDEN")
     if set(universe.cell_statuses) != set(NATIVE_PRODUCTION_SYMBOLS):
         _fail("NATIVE_UNIVERSE_CELL_SYMBOL_GRID_MISMATCH")
-    allowed = {NATIVE_EVIDENCE_CANDIDATE, NATIVE_SOURCE_UNAVAILABLE}
+    allowed = {
+        NATIVE_EVIDENCE_CANDIDATE,
+        NATIVE_SOURCE_UNAVAILABLE,
+        NATIVE_TECHNICAL_ERROR,
+    }
     for symbol in NATIVE_PRODUCTION_SYMBOLS:
         grid = universe.cell_statuses.get(symbol)
         if not isinstance(grid, Mapping) or set(grid) != set(
@@ -337,6 +343,19 @@ def _validate_universe(universe: Any) -> ActiveNativeUniverse:
                     timeframe,
                     status,
                 )
+    expected_eligible = tuple(
+        symbol
+        for symbol in NATIVE_PRODUCTION_SYMBOLS
+        if any(
+            universe.cell_statuses[symbol][timeframe] == NATIVE_EVIDENCE_CANDIDATE
+            for timeframe in NATIVE_PRODUCTION_TIMEFRAMES
+        )
+    )
+    if (
+        tuple(universe.eligible_symbols) != expected_eligible
+        or tuple(universe.symbols_with_active_cells) != expected_eligible
+    ):
+        _fail("NATIVE_UNIVERSE_EVIDENCE_CANDIDATE_PROJECTION_MISMATCH")
     return universe
 
 
@@ -372,6 +391,9 @@ def _load_verified_v5_common(
     )
     pointer_path = native_root / "ACTIVE.json"
     pointer, pointer_before = _read_json_bounded(pointer_path, "ACTIVE_POINTER")
+    canonical_relative = f"activations/{activation_id}.json"
+    promoted_relative = f"activations/promoted/{activation_id}.json"
+    manifest_relative = pointer.get("manifest_relative_path")
     if (
         set(pointer)
         != {
@@ -384,14 +406,12 @@ def _load_verified_v5_common(
         }
         or pointer.get("schema_version") != ACTIVE_POINTER_SCHEMA
         or pointer.get("activation_id") != activation_id
-        or pointer.get("manifest_relative_path") != f"activations/{activation_id}.json"
+        or manifest_relative not in (canonical_relative, promoted_relative)
         or pointer.get("manifest_sha256") != expected_activation_sha
         or pointer.get("production_authoritative") is not True
     ):
         _fail("ACTIVE_POINTER_AUTHORITY_MISMATCH")
-    expected_activation = (
-        native_root / "activations" / f"{activation_id}.json"
-    ).resolve()
+    expected_activation = (native_root / manifest_relative).resolve()
     try:
         expected_activation.relative_to(native_root)
     except ValueError as exc:
@@ -402,6 +422,18 @@ def _load_verified_v5_common(
         or observed_activation.resolve() != expected_activation
     ):
         _fail("ACTIVATION_MANIFEST_PATH_MISMATCH")
+    if manifest_relative == promoted_relative:
+        promotion_errors = validate_terminal_promotion_view(
+            native_root,
+            activation_id=activation_id,
+            view_path=expected_activation,
+            view_sha256=expected_activation_sha,
+        )
+        if promotion_errors:
+            raise ProductionAnchorPlanError(
+                "TERMINAL_PROMOTION_VIEW_INVALID",
+                tuple(str(value) for value in promotion_errors),
+            )
     activation, activation_raw = _read_json_bounded(
         expected_activation, "ACTIVATION_MANIFEST"
     )
@@ -764,8 +796,6 @@ def _history_proofs(
             "source_request_end_exclusive_utc": _iso(source_end),
             "authenticated_optimizer_train_depth_retained": minimum_days == 0,
         }
-    if any(additional_days.values()):
-        raise ProductionAnchorPlanInsufficientHistory(additional_days)
     return proofs, additional_days
 
 

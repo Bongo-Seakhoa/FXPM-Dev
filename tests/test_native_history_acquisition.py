@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ if str(PATCH_ROOT) not in sys.path:
     sys.path.insert(0, str(PATCH_ROOT))
 
 import tools.acquire_native_history as native_acquisition  # noqa: E402
+import pm_native_request_contract as request_contract  # noqa: E402
 
 from pm_native_consensus import CONSENSUS_POLICY, REFERENCE_GRAPH  # noqa: E402
 from pm_native_intervals import native_source_interval  # noqa: E402
@@ -29,7 +31,9 @@ from pm_native_request_contract import (  # noqa: E402
     PRODUCTION_SYMBOL_ORDER,
     _fixture_mt5_v4_empty_diagnostics,
     _fixture_mt5_v4_page_diagnostics,
+    build_valid_v5_contract_fixture,
     canonical_source_identity,
+    validate_v5_terminal_technical_cell,
     validate_v5_source_quality_omission,
 )
 from pm_native_csv_validation import NativeCsvValidationError  # noqa: E402
@@ -257,6 +261,104 @@ def _latest_attempt_record(run_root, symbol, timeframe):
     assert envelope["retryable"] is True
     assert envelope["retention_status"] == "full"
     return envelope["record"]
+
+
+def _terminal_writer_attempt_fixture(run_id, *, attempt_number=1):
+    cutoff = datetime(2026, 7, 13, 9, 3, 17, tzinfo=UTC)
+    fixture = build_valid_v5_contract_fixture(requested_information_cutoff_utc=cutoff)
+    source = fixture["provenance"]
+    pagination = deepcopy(source["pagination"])
+    internal = deepcopy(
+        pagination["page_attempts"][len(pagination["page_attempts"]) // 2]
+    )
+    internal["copy_rates_range_attempts"] = 2
+    internal["connector_diagnostics"] = _fixture_mt5_v4_empty_diagnostics(
+        symbol="EURUSD",
+        timeframe="M5",
+        start=datetime.fromisoformat(internal["start_utc"].replace("Z", "+00:00")),
+        end=datetime.fromisoformat(
+            internal["end_exclusive_utc"].replace("Z", "+00:00")
+        ),
+    )
+    pagination["empty_pages"] = [internal]
+    pagination["pages_with_data"] -= 1
+    for page in pagination["page_attempts"]:
+        if page["request_sequence"] == internal["request_sequence"]:
+            page.update(deepcopy(internal))
+            break
+    pagination["copy_rates_range_attempts_total"] += 1
+    attempt_fields = (
+        request_contract._FAILED_PROVENANCE_BASE_FIELDS
+        | request_contract._FAILED_PROVENANCE_FETCH_FIELDS
+    )
+    attempt = {key: deepcopy(source[key]) for key in attempt_fields if key in source}
+    manifest_started = datetime.fromisoformat(
+        fixture["manifest"]["acquisition_started_utc"].replace("Z", "+00:00")
+    )
+    attempt_started = manifest_started + timedelta(seconds=2 * (attempt_number - 1))
+    attempt_completed = attempt_started + timedelta(seconds=1)
+    attempt.update(
+        {
+            "run_id": run_id,
+            "status": "partial",
+            "failure_status": "technical_history_gap",
+            "eligible_for_optimization": False,
+            "eligible_for_downstream_validation": False,
+            "statistical_sufficiency_assessed": False,
+            "artifact": None,
+            "sha256": None,
+            "rows": 0,
+            "start_ts": None,
+            "end_ts": None,
+            "complete": False,
+            "instrument": {},
+            "pagination": pagination,
+            "acquisition_started_utc": attempt_started.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "acquisition_completed_utc": attempt_completed.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "error": {
+                "type": "TechnicalHistoryGap",
+                "message": f"independent technical gap attempt {attempt_number}",
+            },
+        }
+    )
+    attempt["request"]["last_fully_closed_bar_open_utc"] = None
+    attempt["output_storage_resource_snapshot"].update(
+        {"estimated_cell_bytes": 0, "sample_rows": 0}
+    )
+    return fixture, attempt
+
+
+def _prepare_terminal_writer_receipts(store, *, duplicate=False):
+    fixture, first = _terminal_writer_attempt_fixture(store.run_id, attempt_number=1)
+    started = datetime.fromisoformat(
+        fixture["manifest"]["acquisition_started_utc"].replace("Z", "+00:00")
+    )
+    store.ensure_resume_contract(
+        fixture["common_request"],
+        fixture["source_environment"],
+        started,
+        symbols=("EURUSD",),
+        timeframes=("M5",),
+        production_authoritative=False,
+    )
+    store.commit_retryable_attempt("EURUSD", "M5", first)
+    _fixture, second = _terminal_writer_attempt_fixture(
+        store.run_id,
+        attempt_number=(1 if duplicate else 2),
+    )
+    store.commit_retryable_attempt(
+        "EURUSD",
+        "M5",
+        first if duplicate else second,
+    )
+    fixture["manifest"]["acquisition_completed_utc"] = (
+        (started + timedelta(seconds=4)).isoformat().replace("+00:00", "Z")
+    )
+    return fixture
 
 
 class _RangeConnector:
@@ -5868,6 +5970,296 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                     sys.modules.pop("pm_mt5", None)
                 else:
                     sys.modules["pm_mt5"] = sentinel
+
+    def test_production_deep_gate_never_subtracts_terminal_cells(self):
+        terminal_cell = (PRODUCTION_SYMBOL_ORDER[0], DEFAULT_TIMEFRAMES[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run"
+            for symbol in PRODUCTION_SYMBOL_ORDER:
+                for timeframe in DEFAULT_TIMEFRAMES:
+                    leaf = run_root / symbol / timeframe
+                    leaf.mkdir(parents=True)
+                    if (symbol, timeframe) == terminal_cell:
+                        (leaf / "provenance.json").write_text(
+                            '{"status":"failed"}\n', encoding="utf-8"
+                        )
+            discovered = native_acquisition._discover_native_leaves(
+                run_root,
+                symbols=PRODUCTION_SYMBOL_ORDER,
+                timeframes=DEFAULT_TIMEFRAMES,
+            )
+            native_acquisition._assert_exact_production_leaf_roster(discovered)
+
+            terminal_leaf = run_root / terminal_cell[0] / terminal_cell[1]
+            (terminal_leaf / "provenance.json").unlink()
+            terminal_leaf.rmdir()
+            discovered = native_acquisition._discover_native_leaves(
+                run_root,
+                symbols=PRODUCTION_SYMBOL_ORDER,
+                timeframes=DEFAULT_TIMEFRAMES,
+            )
+            with self.assertRaisesRegex(ResumeValidationError, "exact 600-cell"):
+                native_acquisition._assert_exact_production_leaf_roster(discovered)
+
+    def test_terminal_technical_leaf_freezes_two_full_receipts_and_validates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native_root = Path(tmp) / "data" / "native"
+            store = NativeHistoryStore(native_root, "terminal-two-full")
+            try:
+                fixture = _prepare_terminal_writer_receipts(store)
+                completed = datetime.fromisoformat(
+                    fixture["manifest"]["acquisition_completed_utc"].replace(
+                        "Z", "+00:00"
+                    )
+                )
+                started = datetime.fromisoformat(
+                    fixture["manifest"]["acquisition_started_utc"].replace(
+                        "Z", "+00:00"
+                    )
+                )
+                record = store.commit_terminal_technical_leaf(
+                    "EURUSD",
+                    "M5",
+                    expected_broker_symbol="EURUSD.a",
+                    common_request=fixture["common_request"],
+                    source_environment=fixture["source_environment"],
+                    expected_retries=1,
+                    manifest_acquisition_started_utc=started,
+                    manifest_acquisition_completed_utc=completed,
+                )
+                self.assertIsNotNone(record)
+                leaf = store.leaf_path("EURUSD", "M5")
+                self.assertEqual(
+                    {path.name for path in leaf.iterdir()}, {"provenance.json"}
+                )
+                self.assertFalse((store.run_root / "_attempts").exists())
+                evidence = record["terminal_technical_evidence"]
+                self.assertEqual(len(evidence["receipts"]), 2)
+                self.assertTrue(
+                    all(
+                        receipt["envelope"]["retention_status"] == "full"
+                        for receipt in evidence["receipts"]
+                    )
+                )
+                result = store._terminal_manifest_result("EURUSD", "M5", record)
+                self.assertEqual(
+                    validate_v5_terminal_technical_cell(
+                        record,
+                        result,
+                        fixture["common_request"],
+                        symbol="EURUSD",
+                        timeframe="M5",
+                        run_id=store.run_id,
+                        manifest_source_environment=fixture["source_environment"],
+                        expected_retries=1,
+                        manifest_acquisition_started_utc=started,
+                        manifest_acquisition_completed_utc=completed,
+                    ),
+                    "technical_history_gap",
+                )
+                discovered = native_acquisition._discover_native_leaves(
+                    store.run_root,
+                    symbols=("EURUSD",),
+                    timeframes=("M5",),
+                )
+                self.assertEqual(set(discovered), {("EURUSD", "M5")})
+            finally:
+                store.close()
+
+    def test_terminal_technical_publish_crash_retains_receipts_for_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native_root = Path(tmp) / "data" / "native"
+            store = NativeHistoryStore(native_root, "terminal-post-publish-crash")
+            fixture = _prepare_terminal_writer_receipts(store)
+            started = fixture["manifest"]["acquisition_started_utc"]
+            completed = fixture["manifest"]["acquisition_completed_utc"]
+            with patch.object(
+                store,
+                "_clear_attempt_receipts_for_cell",
+                side_effect=RuntimeError("simulated crash after publish"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "after publish"):
+                    store.commit_terminal_technical_leaf(
+                        "EURUSD",
+                        "M5",
+                        expected_broker_symbol="EURUSD.a",
+                        common_request=fixture["common_request"],
+                        source_environment=fixture["source_environment"],
+                        expected_retries=1,
+                        manifest_acquisition_started_utc=started,
+                        manifest_acquisition_completed_utc=completed,
+                    )
+            self.assertTrue(store.leaf_path("EURUSD", "M5").is_dir())
+            self.assertTrue((store.run_root / "_attempts" / "EURUSD" / "M5").is_dir())
+            store.close()
+            resumed = NativeHistoryStore(
+                native_root,
+                "terminal-post-publish-crash",
+                resume=True,
+            )
+            try:
+                record = resumed._validate_existing_terminal_technical_leaf(
+                    "EURUSD",
+                    "M5",
+                    common_request=fixture["common_request"],
+                    source_environment=fixture["source_environment"],
+                    expected_retries=1,
+                    manifest_acquisition_started_utc=started,
+                    manifest_acquisition_completed_utc=completed,
+                )
+                self.assertEqual(record["status"], "failed")
+                resumed._clear_attempt_receipts_for_cell("EURUSD", "M5")
+                self.assertFalse((resumed.run_root / "_attempts").exists())
+            finally:
+                resumed.close()
+
+    def test_terminal_technical_prepublication_crash_keeps_retry_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native_root = Path(tmp) / "data" / "native"
+
+            def fail_replace(_source, _destination):
+                raise OSError("simulated atomic publish failure")
+
+            store = NativeHistoryStore(
+                native_root,
+                "terminal-prepublish-crash",
+                replace_fn=fail_replace,
+                publish_retry_delays=(),
+            )
+            try:
+                fixture = _prepare_terminal_writer_receipts(store)
+                with self.assertRaisesRegex(OSError, "atomic publish failure"):
+                    store.commit_terminal_technical_leaf(
+                        "EURUSD",
+                        "M5",
+                        expected_broker_symbol="EURUSD.a",
+                        common_request=fixture["common_request"],
+                        source_environment=fixture["source_environment"],
+                        expected_retries=1,
+                        manifest_acquisition_started_utc=fixture["manifest"][
+                            "acquisition_started_utc"
+                        ],
+                        manifest_acquisition_completed_utc=fixture["manifest"][
+                            "acquisition_completed_utc"
+                        ],
+                    )
+                self.assertFalse(store.leaf_path("EURUSD", "M5").exists())
+                self.assertEqual(
+                    len(
+                        list(
+                            (store.run_root / "_attempts" / "EURUSD" / "M5").glob(
+                                "attempt-*.json"
+                            )
+                        )
+                    ),
+                    2,
+                )
+            finally:
+                store.close()
+
+    def test_terminal_technical_rejects_tamper_duplicate_and_summary(self):
+        def attempt_terminalization(store, fixture):
+            return store.commit_terminal_technical_leaf(
+                "EURUSD",
+                "M5",
+                expected_broker_symbol="EURUSD.a",
+                common_request=fixture["common_request"],
+                source_environment=fixture["source_environment"],
+                expected_retries=1,
+                manifest_acquisition_started_utc=fixture["manifest"][
+                    "acquisition_started_utc"
+                ],
+                manifest_acquisition_completed_utc=fixture["manifest"][
+                    "acquisition_completed_utc"
+                ],
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            native_root = Path(tmp) / "data" / "native"
+            store = NativeHistoryStore(native_root, "terminal-tamper")
+            try:
+                fixture = _prepare_terminal_writer_receipts(store)
+                path = next(
+                    (store.run_root / "_attempts" / "EURUSD" / "M5").glob(
+                        "attempt-*.json"
+                    )
+                )
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+                envelope["record"]["error"]["message"] = "tampered"
+                path.write_bytes(
+                    json.dumps(
+                        envelope,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                with self.assertRaises(ResumeValidationError):
+                    attempt_terminalization(store, fixture)
+                self.assertFalse(store.leaf_path("EURUSD", "M5").exists())
+            finally:
+                store.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            native_root = Path(tmp) / "data" / "native"
+            store = NativeHistoryStore(native_root, "terminal-duplicate")
+            try:
+                fixture = _prepare_terminal_writer_receipts(store, duplicate=True)
+                with self.assertRaises(ResumeValidationError):
+                    attempt_terminalization(store, fixture)
+                self.assertFalse(store.leaf_path("EURUSD", "M5").exists())
+            finally:
+                store.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            native_root = Path(tmp) / "data" / "native"
+            store = NativeHistoryStore(native_root, "terminal-summary")
+            try:
+                fixture = _prepare_terminal_writer_receipts(store)
+                path = next(
+                    (store.run_root / "_attempts" / "EURUSD" / "M5").glob(
+                        "attempt-*.json"
+                    )
+                )
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+                envelope["retention_status"] = "summary_only"
+                envelope["record"] = {
+                    "status": "partial",
+                    "failure_status": "technical_history_gap",
+                }
+                path.write_bytes(
+                    json.dumps(
+                        envelope,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                with self.assertRaises(ResumeValidationError):
+                    attempt_terminalization(store, fixture)
+                self.assertFalse(store.leaf_path("EURUSD", "M5").exists())
+            finally:
+                store.close()
+
+    def test_broker_session_close_helper_uses_regular_successor_only(self):
+        nominal = 24 * 60 * 60 * 1_000_000_000
+        friday = pd.Timestamp("2026-03-27T21:00:00Z").value
+        regular_next = pd.Timestamp("2026-03-28T21:00:00Z").value
+        monday = pd.Timestamp("2026-03-30T21:00:00Z").value
+        regular = native_acquisition._successor_aware_broker_close_ns(
+            np.asarray([friday], dtype="int64"),
+            nominal_ns=nominal,
+            next_successor_ns=regular_next,
+        )
+        weekend = native_acquisition._successor_aware_broker_close_ns(
+            np.asarray([friday], dtype="int64"),
+            nominal_ns=nominal,
+            next_successor_ns=monday,
+        )
+        self.assertEqual(int(regular[0]), regular_next)
+        self.assertEqual(int(weekend[0]), friday + nominal)
 
 
 if __name__ == "__main__":

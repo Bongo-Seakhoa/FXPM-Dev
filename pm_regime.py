@@ -515,7 +515,7 @@ def recompute_train_regime_support_digest(
         warmup = warmup.astype(bool)
         eligible = (~warmup) & (~warmup.shift(1, fill_value=True))
         surface = surface_frame.loc[eligible, "REGIME_LIVE"]
-        if surface.empty or surface.isna().any():
+        if surface.isna().any():
             return None
         counts = {label: 0 for label in _REGIME_LABEL_ORDER}
         digest = hashlib.sha256()
@@ -530,8 +530,12 @@ def recompute_train_regime_support_digest(
             "counts": counts,
             "eligible_rows": int(len(surface)),
             "vector_sha256": digest.hexdigest(),
-            "first_ts": pd.Timestamp(surface.index[0]).isoformat(),
-            "last_ts": pd.Timestamp(surface.index[-1]).isoformat(),
+            "first_ts": (
+                None if surface.empty else pd.Timestamp(surface.index[0]).isoformat()
+            ),
+            "last_ts": (
+                None if surface.empty else pd.Timestamp(surface.index[-1]).isoformat()
+            ),
         }
     except Exception:
         return None
@@ -590,7 +594,7 @@ def _validated_train_regime_support(
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return None
     eligible = support.get("eligible_rows")
-    if isinstance(eligible, bool) or not isinstance(eligible, int) or eligible < 1:
+    if isinstance(eligible, bool) or not isinstance(eligible, int) or eligible < 0:
         return None
     if sum(counts.values()) != eligible:
         return None
@@ -611,9 +615,13 @@ def _validated_train_regime_support(
         return None
     if support.get("vector_encoding") != "fxpm.regime-live-labels-nul/v1":
         return None
-    for ts_key in ("first_ts", "last_ts"):
-        if not isinstance(support.get(ts_key), str) or not support[ts_key]:
+    if eligible == 0:
+        if support.get("first_ts") is not None or support.get("last_ts") is not None:
             return None
+    else:
+        for ts_key in ("first_ts", "last_ts"):
+            if not isinstance(support.get(ts_key), str) or not support[ts_key]:
+                return None
     vector_sha = str(support.get("vector_sha256") or "").lower()
     if len(vector_sha) != 64 or any(c not in "0123456789abcdef" for c in vector_sha):
         return None

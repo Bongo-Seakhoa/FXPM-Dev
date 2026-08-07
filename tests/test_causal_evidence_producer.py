@@ -142,9 +142,7 @@ def _anchor_native_prefixes(
 
     start = datetime(2016, 1, 1, tzinfo=timezone.utc)
     last_cutoff = max(
-        datetime.fromisoformat(
-            anchor["selection_cutoff_utc"].replace("Z", "+00:00")
-        )
+        datetime.fromisoformat(anchor["selection_cutoff_utc"].replace("Z", "+00:00"))
         for anchor in anchors
     )
     cadence = TIMEFRAME_SECONDS[adapter_fixture.OBSERVED_TIMEFRAME]
@@ -204,9 +202,7 @@ def _anchor_native_prefixes(
         "start_utc": rows[0][0],
         "end_exclusive_utc": request_end_utc,
     }
-    provenance_sha256 = native_prefix_fixture._write_json(
-        provenance_path, provenance
-    )
+    provenance_sha256 = native_prefix_fixture._write_json(provenance_path, provenance)
 
     sidecar_path = (
         native_root
@@ -234,9 +230,7 @@ def _anchor_native_prefixes(
     activation["entries"][symbol][adapter_fixture.OBSERVED_TIMEFRAME].update(
         {"bars_sha256": bars_sha256, "sidecar_sha256": sidecar_sha256}
     )
-    activation_sha256 = native_prefix_fixture._write_json(
-        activation_path, activation
-    )
+    activation_sha256 = native_prefix_fixture._write_json(activation_path, activation)
     active_path = native_root / "ACTIVE.json"
     active = json.loads(active_path.read_text(encoding="utf-8"))
     active["manifest_sha256"] = activation_sha256
@@ -278,8 +272,7 @@ def _verified_pbo_winner(
         for fold_index, fold in enumerate(entry["folds"]):
             base = [
                 round(
-                    daily_mean
-                    + 0.04 * math.sin((fold_index * 63 + day_index) * 1.70),
+                    daily_mean + 0.04 * math.sin((fold_index * 63 + day_index) * 1.70),
                     12,
                 )
                 for day_index in range(63)
@@ -291,9 +284,7 @@ def _verified_pbo_winner(
             fixture._refresh_fold_accounting(fold)
         entry["fold_count"] = len(entry["folds"])
         entry["folds_sha256"] = fixture._sha_json(entry["folds"])
-        entry["pbo_folds"] = [
-            fixture._pbo_projection(fold) for fold in entry["folds"]
-        ]
+        entry["pbo_folds"] = [fixture._pbo_projection(fold) for fold in entry["folds"]]
         entry["pbo_fold_count"] = len(entry["pbo_folds"])
         entry["pbo_folds_sha256"] = fixture._sha_json(entry["pbo_folds"])
     for entry in entries[2:]:
@@ -308,9 +299,7 @@ def _verified_pbo_winner(
     assert decision.status == "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY", (
         decision.reason_codes
     )
-    assert book_fixture.winner.verify_historical_cell_winner_decision(
-        decision, request
-    )
+    assert book_fixture.winner.verify_historical_cell_winner_decision(decision, request)
     source, fit = book_fixture._source_and_fit(
         symbol,
         timeframe,
@@ -517,9 +506,7 @@ def _adapter_raw_fold_for_attempt(
     mapped_fold = mapped["fold_mapping"][fold_ordinal]
     geometry = adapter_fixture._partition_geometry(fold_ordinal, lanes)
     final_axis = final["trade_power_partition_axis"]
-    signal_values = [0] * (
-        final_axis["warmup_bars"] + final_axis["scored_bars"]
-    )
+    signal_values = [0] * (final_axis["warmup_bars"] + final_axis["scored_bars"])
     signal_sha256 = hashlib.sha256(
         b"".join(struct.pack("<i", value) for value in signal_values)
     ).hexdigest()
@@ -555,9 +542,9 @@ def _adapter_raw_fold_for_attempt(
         "warmup_bars": final_axis["warmup_bars"],
         "partition_axis_sha256": final_axis["horizon_receipt_sha256"],
         "signal_vector_sha256": signal_sha256,
-        "base_cost_attestation_sha256": final[
-            "numerical_execution_cost_attestation"
-        ]["attestation_sha256"],
+        "base_cost_attestation_sha256": final["numerical_execution_cost_attestation"][
+            "attestation_sha256"
+        ],
         "stress_cost_attestation_sha256": stress[
             "numerical_execution_cost_attestation"
         ]["attestation_sha256"],
@@ -589,39 +576,25 @@ def _adapter_raw_fold_for_attempt(
         "anchor_selection_receipt": adapter_fixture._provenance_receipt(
             "anchor_selection_receipt",
             common,
-            process_precommit_receipt_sha256=(
-                process_precommit_receipt_sha256
-            ),
-            horizon_plan_receipt_sha256=cross["horizon_roster"][
-                "plan_receipt_sha256"
-            ],
+            process_precommit_receipt_sha256=(process_precommit_receipt_sha256),
+            horizon_plan_receipt_sha256=cross["horizon_roster"]["plan_receipt_sha256"],
             selection_cutoff_utc=cross["selection_cutoff_utc"],
         ),
         "anchor_horizon_decision": adapter_fixture._provenance_receipt(
             "anchor_horizon_decision",
             common,
             candidate_id=mapped["horizon_candidate_id"],
-            candidate_definition_sha256=mapped[
-                "horizon_candidate_definition_sha256"
-            ],
+            candidate_definition_sha256=mapped["horizon_candidate_definition_sha256"],
             horizon_process_sha256=attempt["horizon_process_sha256"],
-            fold_definition_sha256=mapped_fold[
-                "horizon_fold_definition_sha256"
-            ],
+            fold_definition_sha256=mapped_fold["horizon_fold_definition_sha256"],
             partition_geometry=geometry,
-            partition_geometry_receipts=[
-                item["receipt_sha256"] for item in geometry
-            ],
+            partition_geometry_receipts=[item["receipt_sha256"] for item in geometry],
         ),
         "anchor_trial_ledger": adapter_fixture._provenance_receipt(
             "anchor_trial_ledger",
             common,
-            trial_registry_sha256=cross["horizon_roster"][
-                "trial_registry_sha256"
-            ],
-            attempt_roster_sha256=cross["horizon_roster"][
-                "attempt_roster_sha256"
-            ],
+            trial_registry_sha256=cross["horizon_roster"]["trial_registry_sha256"],
+            attempt_roster_sha256=cross["horizon_roster"]["attempt_roster_sha256"],
             attempted_trials_exact=frozen.attempt_ledger["attempt_count"],
         ),
         "anchor_selected_trial": adapter_fixture._provenance_receipt(
@@ -629,9 +602,7 @@ def _adapter_raw_fold_for_attempt(
             common,
             selection_scope="PRECOMMITTED_ATTEMPT_NOT_POSTHOC_WINNER",
             trial_id=mapped["horizon_trial_id"],
-            trial_definition_sha256=mapped[
-                "horizon_trial_definition_sha256"
-            ],
+            trial_definition_sha256=mapped["horizon_trial_definition_sha256"],
             winner_process_sha256=attempt["process_sha256"],
             executable_trial_sha256=attempt["trial_definition_sha256"],
         ),
@@ -649,8 +620,7 @@ def _adapter_raw_fold_for_attempt(
             "attempt_replay_receipt",
             common,
             lane_sha256={
-                name: adapter_fixture._sha(value)
-                for name, value in lanes.items()
+                name: adapter_fixture._sha(value) for name, value in lanes.items()
             },
             stress_method_receipt_sha256=stress_receipt["receipt_sha256"],
             stress_method_receipt=stress_receipt,
@@ -664,23 +634,17 @@ def _adapter_raw_fold_for_attempt(
             native_prefix_content_sha256=artifacts["horizon_process"][
                 "source_snapshot_sha256"
             ],
-            source_contract_sha256=frozen.precommitment[
-                "source_contract_sha256"
-            ],
+            source_contract_sha256=frozen.precommitment["source_contract_sha256"],
             native_source_sha256=source_binding["target_bars_sha256"],
             activation_manifest_sha256=source_binding[
                 "price_activation_manifest_sha256"
             ],
-            source_group_decision_sha256=cross[
-                "source_group_decision_sha256"
-            ],
+            source_group_decision_sha256=cross["source_group_decision_sha256"],
             regime_fit_decision_sha256=cross["regime_fit_decision_sha256"],
             execution_spec_receipt=adapter_fixture._execution_spec_receipt(
                 frozen, cross
             ),
-            partition_frame_sha256=[
-                item["frame_sha256"] for item in geometry
-            ],
+            partition_frame_sha256=[item["frame_sha256"] for item in geometry],
         ),
     }
     return {
@@ -901,9 +865,7 @@ def _sealed_horizon_plan(
             else "HISTORICAL_SOURCE_UNAVAILABLE"
         ),
     }
-    return training_horizon._HistoricalHorizonPlan(
-        body, training_horizon._PLAN_SEAL
-    )
+    return training_horizon._HistoricalHorizonPlan(body, training_horizon._PLAN_SEAL)
 
 
 def _decompose_activity(
@@ -1311,11 +1273,14 @@ def test_historical_cross_binding_ascii_reader_is_exact_and_format_scoped(
         format=adapter_fixture.raw_winner.ASCII_JSON_FORMAT,
     )
     descriptor = ascii_entry["descriptor"]
-    assert historical._read_ascii_descriptor_json(
-        context,
-        descriptor,
-        maximum_bytes=context.limits.max_json_bytes,
-    ) == body
+    assert (
+        historical._read_ascii_descriptor_json(
+            context,
+            descriptor,
+            maximum_bytes=context.limits.max_json_bytes,
+        )
+        == body
+    )
     with pytest.raises(
         historical.HistoricalAnchorOrchestrationError,
         match="VERIFIED_ARTIFACT_FORMAT_OR_BOUND_INVALID",
@@ -1364,8 +1329,7 @@ def test_causal_factory_builds_forward_product_only_after_historical_close(
 ) -> None:
     payload = causal_fixture._build_corpus().precommit_payload
     anchor_ids = [
-        plan["anchor_id"]
-        for plan in payload["process_definition"]["anchor_plan"]
+        plan["anchor_id"] for plan in payload["process_definition"]["anchor_plan"]
     ]
     context = spool.freeze_generation_context(
         (tmp_path / "causal-factory").resolve(),
@@ -1384,17 +1348,17 @@ def test_causal_factory_builds_forward_product_only_after_historical_close(
     monkeypatch.setattr(
         producer.capital_bootstrap,
         "verify_capital_forward_phase_binding",
-        lambda observed_context, observed_binding: {
-            "bootstrap_identity_sha256": "c" * 64,
-            "bootstrap_identity": {
-                "process_precommitment_sha256": causal.canonical_sha256(payload),
-                "process_definition_sha256": payload[
-                    "process_definition_sha256"
-                ],
+        lambda observed_context, observed_binding: (
+            {
+                "bootstrap_identity_sha256": "c" * 64,
+                "bootstrap_identity": {
+                    "process_precommitment_sha256": causal.canonical_sha256(payload),
+                    "process_definition_sha256": payload["process_definition_sha256"],
+                },
             }
-        }
-        if observed_context is context and observed_binding is capital_phase_binding
-        else pytest.fail("capital phase binding was substituted"),
+            if observed_context is context and observed_binding is capital_phase_binding
+            else pytest.fail("capital phase binding was substituted")
+        ),
     )
     factory = producer.BoundedCausalEvidenceFactory(
         context=context,
@@ -1417,12 +1381,14 @@ def test_causal_factory_builds_forward_product_only_after_historical_close(
         calls.append("precommit")
         assert kwargs["historical_precommit"] is historical_precommit
         assert kwargs["historical_run_receipt"] is historical_run
-        assert kwargs["execution_products_by_anchor"][anchor_ids[0]][
-            "EURUSD|M5"
-        ] is execution_product
-        assert kwargs["valuation_products_by_anchor"][anchor_ids[0]][
-            "EURUSD|M5"
-        ] is valuation_product
+        assert (
+            kwargs["execution_products_by_anchor"][anchor_ids[0]]["EURUSD|M5"]
+            is execution_product
+        )
+        assert (
+            kwargs["valuation_products_by_anchor"][anchor_ids[0]]["EURUSD|M5"]
+            is valuation_product
+        )
         assert kwargs["capital_phase_binding"] is capital_phase_binding
         assert kwargs["config"] is config
         return replay_precommit
@@ -1430,9 +1396,10 @@ def test_causal_factory_builds_forward_product_only_after_historical_close(
     def produce(**kwargs):
         calls.append("produce")
         assert kwargs["replay_precommit"] is replay_precommit
-        assert kwargs["native_products_by_anchor"][anchor_ids[0]][
-            "EURUSD|M5"
-        ] is execution_product
+        assert (
+            kwargs["native_products_by_anchor"][anchor_ids[0]]["EURUSD|M5"]
+            is execution_product
+        )
         return forward_product
 
     def verify(observed_context, observed_product):
@@ -1477,8 +1444,7 @@ def _resolver_factory_inputs(
 ]:
     payload = copy.deepcopy(causal_fixture._build_corpus().precommit_payload)
     anchor_ids = [
-        plan["anchor_id"]
-        for plan in payload["process_definition"]["anchor_plan"]
+        plan["anchor_id"] for plan in payload["process_definition"]["anchor_plan"]
     ]
     context = spool.freeze_generation_context(
         (tmp_path / f"causal-resolver-{suffix}").resolve(),
@@ -1490,7 +1456,10 @@ def _resolver_factory_inputs(
     config = object()
 
     def verify_capital_binding(observed_context, observed_binding):
-        if observed_context is not context or observed_binding is not capital_phase_binding:
+        if (
+            observed_context is not context
+            or observed_binding is not capital_phase_binding
+        ):
             pytest.fail("capital phase binding was substituted")
         return {
             "bootstrap_identity_sha256": "c" * 64,
@@ -1850,7 +1819,7 @@ def test_insufficient_evidence_projection_preserves_authenticated_abstention(
         projected_cell["attempt_count"]
         == (expected_binding["process_rejected_attempt_count"])
     )
-    assert projected_decision["schema"] == "fxpm-anchor-local-cell-decision-v5"
+    assert projected_decision["schema"] == "fxpm-anchor-local-cell-decision-v6"
     assert projected_decision["insufficient_evidence_binding"] == expected_binding
     assert projected_decision["horizon_receipt_sha256"] == (horizon_plan.receipt_sha256)
     assert (
@@ -1859,6 +1828,80 @@ def test_insufficient_evidence_projection_preserves_authenticated_abstention(
     )
     assert projected_decision["winner_request_sha256"] is None
     assert projected_decision["anchor_refit_receipt_sha256"] is None
+
+
+def test_terminal_technical_projection_is_complete_non_economic_abstention() -> None:
+    technical_group = {
+        ordinal: book_fixture._technical_terminal_cell(ordinal)  # noqa: SLF001
+        for ordinal in range(len(book.REGIME_ORDER))
+    }
+    decision = book.evaluate_historical_book_multiplicity(
+        book_fixture._family(overrides=technical_group)  # noqa: SLF001
+    )
+    assert decision.valid
+    book_body = decision.to_dict()
+    anchor = {
+        "anchor_id": "terminal-technical-anchor",
+        "selection_cutoff_utc": "2026-01-01T00:00:00Z",
+    }
+    bindings = [
+        {
+            "cell": {
+                "symbol": raw_cell["symbol"],
+                "timeframe": raw_cell["timeframe"],
+                "regime": raw_cell["regime"],
+            },
+            "plan_status": (
+                "HISTORICAL_TERMINAL_TECHNICAL"
+                if raw_cell["historical_state"] == book.TERMINAL_TECHNICAL
+                else "HISTORICAL_SOURCE_UNAVAILABLE"
+            ),
+            "plan_receipt_sha256": _tag_sha(f"terminal-plan:{ordinal}"),
+        }
+        for ordinal, raw_cell in enumerate(book_body["cells"])
+    ]
+
+    projected, supports, detectors, _ = producer._causal_book_projection(
+        anchor=anchor,
+        book_body=book_body,
+        horizon_bindings=bindings,
+        specialists={},
+    )
+    technical = projected[: len(book.REGIME_ORDER)]
+    assert {cell["status"] for cell in technical} == {causal.TERMINAL_TECHNICAL}
+    assert all(cell["attempt_count"] == 0 for cell in technical)
+    assert all(cell["technical_failure"] is False for cell in technical)
+    assert all(cell["terminal_source_unavailable"] is False for cell in technical)
+    assert all(
+        cell["cell_decision"]["source_state"] == causal.TERMINAL_TECHNICAL_SOURCE_STATE
+        for cell in technical
+    )
+    assert all(
+        cell["cell_decision"]["source_terminal_reason"]
+        == causal.TERMINAL_TECHNICAL_REASON
+        for cell in technical
+    )
+    assert all(
+        cell["cell_decision"][key] is None
+        for cell in technical
+        for key in (
+            "train_regime_support_receipt_sha256",
+            "horizon_receipt_sha256",
+            "full_attempt_ledger_sha256",
+            "winner_request_sha256",
+            "strategy_code_sha256",
+            "parameters_sha256",
+            "anchor_refit_receipt_sha256",
+        )
+    )
+    causal._validate_cell_book(  # noqa: SLF001
+        projected,
+        supports,
+        detectors,
+        anchor["selection_cutoff_utc"],
+        anchor["anchor_id"],
+        causal._EvidenceIdentityRegistry(),  # noqa: SLF001
+    )
 
 
 def test_anchor_evidence_binds_exact_2400_cell_book_component() -> None:
@@ -2007,8 +2050,7 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
                         first_fold_start + timedelta(days=63 * ordinal)
                     ).isoformat(),
                     "oos_end_date_utc": (
-                        first_fold_start
-                        + timedelta(days=63 * ordinal + 62)
+                        first_fold_start + timedelta(days=63 * ordinal + 62)
                     ).isoformat(),
                 }
                 for ordinal in range(4)
@@ -2016,10 +2058,8 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
             seed_result = adapter_fixture._raw_fold(0, fold_plan[0])["lanes"][
                 "optimizer_train_base"
             ]
-            source_seed = (
-                adapter_fixture.raw_winner.build_trade_source_contract_from_backtester_result(
-                    seed_result
-                )
+            source_seed = adapter_fixture.raw_winner.build_trade_source_contract_from_backtester_result(
+                seed_result
             )
             sample = adapter_fixture.build_trade_sample_evidence(
                 [],
@@ -2031,9 +2071,7 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
             source, fit = _adapter_available_authority(
                 anchor=plan,
                 symbol=winner_symbol,
-                source_contract_sha256=(
-                    sample.source_contract.source_contract_sha256
-                ),
+                source_contract_sha256=(sample.source_contract.source_contract_sha256),
                 native_product=native_product,
             )
             attempts = (
@@ -2108,9 +2146,7 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
                     **plan,
                     "horizon_binding_count": book.FAMILY_SIZE,
                     "horizon_binding_roster_sha256": (
-                        historical.historical_horizon_binding_roster_sha256(
-                            bindings
-                        )
+                        historical.historical_horizon_binding_roster_sha256(bindings)
                     ),
                 }
             )
@@ -2182,40 +2218,34 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
                         handle,
                         attempt_evidence=[
                             {
-                                "attempt_id": handle.frozen.attempt_ledger[
-                                    "attempts"
-                                ][attempt_ordinal]["attempt_id"],
+                                "attempt_id": handle.frozen.attempt_ledger["attempts"][
+                                    attempt_ordinal
+                                ]["attempt_id"],
                                 "folds": [
                                     _adapter_raw_fold_for_attempt(
                                         handle=handle,
                                         attempt_ordinal=attempt_ordinal,
                                         fold_ordinal=fold_ordinal,
                                         planned=planned,
-                                        process_precommit_receipt_sha256=(
-                                            process_sha
-                                        ),
+                                        process_precommit_receipt_sha256=(process_sha),
                                     )
                                     for fold_ordinal, planned in enumerate(
                                         observed["fold_plan"]
                                     )
                                 ],
                             }
-                            for attempt_ordinal in range(
-                                len(observed["attempts"])
-                            )
+                            for attempt_ordinal in range(len(observed["attempts"]))
                         ],
-                        evidence_access_started_at_utc=(
-                            "2026-07-13T09:01:02Z"
-                        ),
-                        evidence_access_completed_at_utc=(
-                            "2026-07-13T09:01:03Z"
-                        ),
+                        evidence_access_started_at_utc=("2026-07-13T09:01:02Z"),
+                        evidence_access_completed_at_utc=("2026-07-13T09:01:03Z"),
                     )
                 yield capture.finish()
 
         callbacks[anchor_id] = callback
     run_receipt = historical.execute_historical_anchor_run(
-        context, historical_precommit, callbacks
+        context,
+        historical_precommit,
+        callbacks,
     )
     assert historical.verify_historical_anchor_run_receipt(
         context, historical_precommit, run_receipt
@@ -2264,7 +2294,10 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
             exposure_ledger=descriptors["EXPOSURE_LEDGER"],
             margin_ledger=descriptors["MARGIN_LEDGER"],
         )
-    anchor_ids = [plan["anchor_id"] for plan in precommit_payload["process_definition"]["anchor_plan"]]
+    anchor_ids = [
+        plan["anchor_id"]
+        for plan in precommit_payload["process_definition"]["anchor_plan"]
+    ]
     code_identity = forward._replay_code_identity(precommit_payload)
     pipeline_identity = {
         "schema_version": "fxpm.forward-oos-pipeline-config-identity.v1",
@@ -2309,9 +2342,7 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
             "timeframe": adapter_fixture.OBSERVED_TIMEFRAME,
             **shared_activation,
             "source_bars_sha256": _tag_sha(f"{anchor_id}:D1:bars"),
-            "source_audit_sidecar_sha256": _tag_sha(
-                f"{anchor_id}:D1:sidecar"
-            ),
+            "source_audit_sidecar_sha256": _tag_sha(f"{anchor_id}:D1:sidecar"),
             "index_sha256": _tag_sha(f"{anchor_id}:D1:index"),
         }
         valuation_identity = {
@@ -2319,9 +2350,7 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
             "timeframe": "M5",
             **shared_activation,
             "source_bars_sha256": _tag_sha(f"{anchor_id}:M5:bars"),
-            "source_audit_sidecar_sha256": _tag_sha(
-                f"{anchor_id}:M5:sidecar"
-            ),
+            "source_audit_sidecar_sha256": _tag_sha(f"{anchor_id}:M5:sidecar"),
             "index_sha256": _tag_sha(f"{anchor_id}:M5:index"),
         }
         execution_products = [execution_identity]
@@ -2330,9 +2359,10 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
             {
                 "anchor_id": anchor_id,
                 "forward_end_exclusive_utc": (
-                    datetime.fromisoformat(plan["forward_end_date"])
-                    + timedelta(days=1)
-                ).date().isoformat()
+                    datetime.fromisoformat(plan["forward_end_date"]) + timedelta(days=1)
+                )
+                .date()
+                .isoformat()
                 + "T00:00:00Z",
                 "execution_products": execution_products,
                 "valuation_m5_products": valuation_products,
@@ -2392,9 +2422,7 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
         precommit_issuer(forward_precommit_raw, forward_precommit_descriptor),
     )
     run_anchors = {value["anchor_id"]: value for value in run_body["anchors"]}
-    precommit_anchors = {
-        value["anchor_id"]: value for value in product_identities
-    }
+    precommit_anchors = {value["anchor_id"]: value for value in product_identities}
     phase_manifests: dict[str, dict[str, Any]] = {}
     for plan, winner_symbol in zip(
         precommit_payload["process_definition"]["anchor_plan"],
@@ -2506,9 +2534,7 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
         "confers_causal_process_current_refit_capital_readiness_publication_or_trading_authority": False,
     }
     receipt_descriptor = spool.write_canonical_json_artifact(context, receipt_body)
-    anchor_rows = tuple(
-        (anchor_id, replay_sets[anchor_id]) for anchor_id in anchor_ids
-    )
+    anchor_rows = tuple((anchor_id, replay_sets[anchor_id]) for anchor_id in anchor_ids)
     receipt_raw = _canonical(receipt_body)
     # White-box fixture only: production callers receive products solely from
     # produce_forward_oos_replay_artifacts.  Hostile forward tests prove that

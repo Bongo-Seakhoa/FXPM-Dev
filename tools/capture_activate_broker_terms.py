@@ -117,6 +117,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Explicitly activate the versioned debit-only stress policy")
     parser.add_argument("--activation-id", default="")
     parser.add_argument("--no-pointer-update", action="store_true")
+    parser.add_argument(
+        "--prune-after-publication",
+        action="store_true",
+        help=(
+            "Explicitly prune unreferenced terms artifacts after publishing the "
+            "new pointer; disabled by default so the predecessor remains available "
+            "through canary verification"
+        ),
+    )
     parser.add_argument("--max-snapshots", type=int, default=16)
     parser.add_argument("--max-terms-bytes", type=int, default=64 * 1024 * 1024)
     return parser
@@ -126,6 +135,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.max_age_seconds <= 0 or args.max_terms_bytes <= 0 or args.max_snapshots < 1:
         _print_status("INVALID", reason="positive freshness and storage bounds are required")
+        return 2
+    if args.no_pointer_update and args.prune_after_publication:
+        _print_status(
+            "INVALID",
+            reason="staged activation cannot be combined with post-publication pruning",
+        )
         return 2
     try:
         roster = load_roster(args.roster_json)
@@ -203,12 +218,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             snapshot,
             activation_id=args.activation_id or None,
             update_pointer=not args.no_pointer_update,
+            max_snapshot_age_seconds=args.max_age_seconds,
         )
-        retention = prune_terms_store(
-            args.native_root,
-            max_snapshots=args.max_snapshots,
-            max_total_bytes=args.max_terms_bytes,
-        )
+        if args.no_pointer_update:
+            retention: Dict[str, Any] = {
+                "status": "SKIPPED",
+                "reason": "staged activation artifacts retained",
+            }
+        elif not args.prune_after_publication:
+            retention = {
+                "status": "SKIPPED",
+                "reason": "predecessor retained pending explicit post-canary pruning",
+            }
+        else:
+            try:
+                retention = {
+                    "status": "COMPLETE",
+                    **prune_terms_store(
+                        args.native_root,
+                        max_snapshots=args.max_snapshots,
+                        max_total_bytes=args.max_terms_bytes,
+                    ),
+                }
+            except Exception as exc:  # Pointer publication has already succeeded.
+                retention = {
+                    "status": "WARNING",
+                    "reason": (
+                        "post-publication retention failed; the published pointer "
+                        "remains authoritative"
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
         state.update({
             "phase": "COMPLETE",
             "completed_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -216,7 +257,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "terms_activation_manifest_sha256": activated["manifest_sha256"],
             "export_schema": TERMS_EXPORT_SCHEMA,
         })
-        _atomic_state(state_path, state)
+        try:
+            _atomic_state(state_path, state)
+            capture_state = {"status": "COMPLETE", "path": str(state_path)}
+        except Exception as exc:  # Publication/staging has already completed.
+            capture_state = {
+                "status": "WARNING",
+                "path": str(state_path),
+                "reason": (
+                    "capture-state persistence failed after terms activation; "
+                    "the activation result remains authoritative"
+                ),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
         _print_status(
             "COMPLETE",
             activation_id=activated["activation_id"],
@@ -224,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pointer_updated=activated["pointer_updated"],
             active_symbols=activated["active_symbols"],
             retention=retention,
+            capture_state=capture_state,
         )
         return 0
     except BrokerTermsError as exc:

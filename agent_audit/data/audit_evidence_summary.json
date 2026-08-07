@@ -1,0 +1,1576 @@
+{
+  "config": {
+    "mt5": {
+      "expected_currency": "USD",
+      "expected_login": 28829971,
+      "expected_server": "FBS-Real",
+      "login_is_blank": true,
+      "password_is_blank": true,
+      "server_is_blank": true
+    },
+    "pipeline": {
+      "active_stage2_pct": 50.0,
+      "active_universe_bars": 250000,
+      "clean_holdout_pct": 0.0,
+      "daily_loss_hard_block_pct": 50.0,
+      "exceptional_val_profit_factor": 1.5,
+      "fx_val_max_drawdown": 12.0,
+      "live_allow_partial_symbol_ledger": true,
+      "live_artifact_drift_policy": "block",
+      "live_min_account_equity": 20.0,
+      "live_risk_scalars_mode": null,
+      "local_governance_live_mode": "shadow",
+      "margin_entry_block_level": 60.0,
+      "max_new_entries_when_total_open_risk_above_pct": 50.0,
+      "max_total_open_risk_pct": 75.0,
+      "open_drawdown_hard_block_pct": 50.0,
+      "production_promotion_gate_mode": "ledger_status",
+      "production_require_full_symbol_ledger": true,
+      "production_split_mode": "bleeding_edge",
+      "regime_min_val_profit_factor": 1.05,
+      "regime_min_val_return_dd_ratio": null,
+      "regime_min_val_return_pct": 5.0,
+      "risk_per_trade_pct": 1.5,
+      "secondary_trade_max_risk_pct": 50.0,
+      "train_max_drawdown": 20.0,
+      "train_min_profit_factor": 0.8,
+      "walk_forward_validation_bars": 50000,
+      "weekly_loss_hard_block_pct": 60.0
+    },
+    "position": {
+      "allow_min_lot_risk_clamp": true,
+      "auto_widen_sl": true,
+      "max_position_size": 0.0,
+      "max_risk_pct": 25.0,
+      "min_position_size": 0.01,
+      "risk_basis": "equity",
+      "risk_per_trade_pct": 0.5,
+      "risk_tolerance_pct": 25.0
+    },
+    "source": "config.json",
+    "symbol_count": 100
+  },
+  "cycle_drift_state": {
+    "available": true,
+    "nested_counts": {
+      "AUDJPY|H1|CHOP|ADXDIStrengthStrategy": 8,
+      "BCHUSD|M30|TREND|EMAPullbackContinuationStrategy": 8,
+      "BTCETH|H4|TREND|EMAPullbackContinuationStrategy": 8,
+      "BTCUSD|H1|RANGE|EMAPullbackContinuationStrategy": 8,
+      "BTCUSD|H1|TREND|EMAPullbackContinuationStrategy": 8,
+      "BTCUSD|M15|TREND|DayOfWeekBiasStrategy": 8,
+      "CADJPY|M30|TREND|GapFadeStrategy": 8,
+      "DE30|H4|CHOP|EMAPullbackContinuationStrategy": 8,
+      "DE30|M15|CHOP|DayOfWeekBiasStrategy": 8,
+      "ETHUSD|H1|CHOP|DayOfWeekBiasStrategy": 8,
+      "ETHUSD|H1|RANGE|MomentumBurstStrategy": 8,
+      "ETHUSD|H1|TREND|FlagPullbackContinuationStrategy": 8,
+      "EURAUD|H1|RANGE|EMAPullbackContinuationStrategy": 8,
+      "EURAUD|H4|CHOP|TimeOfDayMomentumStrategy": 8,
+      "EURCHF|H4|CHOP|EMAPullbackContinuationStrategy": 8,
+      "EURJPY|H1|CHOP|EMAPullbackContinuationStrategy": 8,
+      "EURJPY|H1|RANGE|EMAPullbackContinuationStrategy": 8,
+      "EURJPY|M30|TREND|TimeOfDayMomentumStrategy": 8,
+      "EURUSD|M30|TREND|PercentileChannelReversionStrategy": 8,
+      "GBPCAD|H4|CHOP|TimeOfDayMomentumStrategy": 8,
+      "GBPCAD|H4|TREND|TimeOfDayMomentumStrategy": 8,
+      "GBPUSD|D1|CHOP|EMAPullbackContinuationStrategy": 8,
+      "GBPUSD|H1|CHOP|EMAPullbackContinuationStrategy": 8,
+      "GBPUSD|H1|TREND|EMAPullbackContinuationStrategy": 8,
+      "JP225|M30|RANGE|TimeOfDayMomentumStrategy": 8,
+      "NZDCAD|H4|CHOP|ZScoreVWAPReversionStrategy": 8,
+      "PEPSICO|D1|TREND|DayOfWeekBiasStrategy": 8,
+      "PLATINUM|H4|TREND|RSIExtremesStrategy": 8,
+      "TESLA|H4|CHOP|DarvasBoxBreakoutStrategy": 8,
+      "US100|D1|TREND|EMAPullbackContinuationStrategy": 8,
+      "US100|H1|CHOP|ADXDIStrengthStrategy": 8,
+      "US100|M15|RANGE|DayOfWeekBiasStrategy": 8,
+      "US100|M30|CHOP|DayOfWeekBiasStrategy": 8,
+      "US100|M30|RANGE|DayOfWeekBiasStrategy": 8,
+      "US100|M5|CHOP|DayOfWeekBiasStrategy": 8,
+      "US100|M5|RANGE|DayOfWeekBiasStrategy": 8,
+      "US100|M5|TREND|DayOfWeekBiasStrategy": 8,
+      "US30|D1|CHOP|EMAPullbackContinuationStrategy": 8,
+      "US30|H1|TREND|DayOfWeekBiasStrategy": 8,
+      "US30|M15|CHOP|ChoppinessCompressionBreakoutStrategy": 8,
+      "US30|M15|RANGE|HullMATrendStrategy": 8,
+      "US500|M15|CHOP|DayOfWeekBiasStrategy": 8,
+      "US500|M30|CHOP|EMAPullbackContinuationStrategy": 8,
+      "US500|M5|RANGE|DayOfWeekBiasStrategy": 8,
+      "USDJPY|H1|CHOP|KeltnerPullbackStrategy": 8,
+      "XAUEUR|H4|CHOP|TimeOfDayMomentumStrategy": 8,
+      "XAUEUR|M15|TREND|ADRExpansionBreakoutStrategy": 8,
+      "XAUEUR|M30|CHOP|ZScoreVWAPReversionStrategy": 8,
+      "XAUGBP|M30|CHOP|EMAPullbackContinuationStrategy": 8,
+      "XAUGBP|M30|TREND|EMAPullbackContinuationStrategy": 8,
+      "XAUUSD|H4|TREND|MarubozuMomentumStrategy": 8,
+      "XBRUSD|H1|TREND|WeeklyMonthlyLevelRejectionStrategy": 8,
+      "XRPUSD|H4|TREND|EMAPullbackContinuationStrategy": 8,
+      "XRPUSD|M30|CHOP|MomentumBurstStrategy": 8,
+      "XRPUSD|M30|TREND|EMAPullbackContinuationStrategy": 8,
+      "XRPUSD|||": 8
+    },
+    "source": "logs/production_live/cycle_drift_state.json",
+    "top_level_keys": [
+      "AUDJPY|H1|CHOP|ADXDIStrengthStrategy",
+      "BCHUSD|M30|TREND|EMAPullbackContinuationStrategy",
+      "BTCETH|H4|TREND|EMAPullbackContinuationStrategy",
+      "BTCUSD|H1|RANGE|EMAPullbackContinuationStrategy",
+      "BTCUSD|H1|TREND|EMAPullbackContinuationStrategy",
+      "BTCUSD|M15|TREND|DayOfWeekBiasStrategy",
+      "CADJPY|M30|TREND|GapFadeStrategy",
+      "DE30|H4|CHOP|EMAPullbackContinuationStrategy",
+      "DE30|M15|CHOP|DayOfWeekBiasStrategy",
+      "ETHUSD|H1|CHOP|DayOfWeekBiasStrategy",
+      "ETHUSD|H1|RANGE|MomentumBurstStrategy",
+      "ETHUSD|H1|TREND|FlagPullbackContinuationStrategy",
+      "EURAUD|H1|RANGE|EMAPullbackContinuationStrategy",
+      "EURAUD|H4|CHOP|TimeOfDayMomentumStrategy",
+      "EURCHF|H4|CHOP|EMAPullbackContinuationStrategy",
+      "EURJPY|H1|CHOP|EMAPullbackContinuationStrategy",
+      "EURJPY|H1|RANGE|EMAPullbackContinuationStrategy",
+      "EURJPY|M30|TREND|TimeOfDayMomentumStrategy",
+      "EURUSD|M30|TREND|PercentileChannelReversionStrategy",
+      "GBPCAD|H4|CHOP|TimeOfDayMomentumStrategy",
+      "GBPCAD|H4|TREND|TimeOfDayMomentumStrategy",
+      "GBPUSD|D1|CHOP|EMAPullbackContinuationStrategy",
+      "GBPUSD|H1|CHOP|EMAPullbackContinuationStrategy",
+      "GBPUSD|H1|TREND|EMAPullbackContinuationStrategy",
+      "JP225|M30|RANGE|TimeOfDayMomentumStrategy",
+      "NZDCAD|H4|CHOP|ZScoreVWAPReversionStrategy",
+      "PEPSICO|D1|TREND|DayOfWeekBiasStrategy",
+      "PLATINUM|H4|TREND|RSIExtremesStrategy",
+      "TESLA|H4|CHOP|DarvasBoxBreakoutStrategy",
+      "US100|D1|TREND|EMAPullbackContinuationStrategy",
+      "US100|H1|CHOP|ADXDIStrengthStrategy",
+      "US100|M15|RANGE|DayOfWeekBiasStrategy",
+      "US100|M30|CHOP|DayOfWeekBiasStrategy",
+      "US100|M30|RANGE|DayOfWeekBiasStrategy",
+      "US100|M5|CHOP|DayOfWeekBiasStrategy",
+      "US100|M5|RANGE|DayOfWeekBiasStrategy",
+      "US100|M5|TREND|DayOfWeekBiasStrategy",
+      "US30|D1|CHOP|EMAPullbackContinuationStrategy",
+      "US30|H1|TREND|DayOfWeekBiasStrategy",
+      "US30|M15|CHOP|ChoppinessCompressionBreakoutStrategy",
+      "US30|M15|RANGE|HullMATrendStrategy",
+      "US500|M15|CHOP|DayOfWeekBiasStrategy",
+      "US500|M30|CHOP|EMAPullbackContinuationStrategy",
+      "US500|M5|RANGE|DayOfWeekBiasStrategy",
+      "USDJPY|H1|CHOP|KeltnerPullbackStrategy",
+      "XAUEUR|H4|CHOP|TimeOfDayMomentumStrategy",
+      "XAUEUR|M15|TREND|ADRExpansionBreakoutStrategy",
+      "XAUEUR|M30|CHOP|ZScoreVWAPReversionStrategy",
+      "XAUGBP|M30|CHOP|EMAPullbackContinuationStrategy",
+      "XAUGBP|M30|TREND|EMAPullbackContinuationStrategy"
+    ],
+    "top_level_type": "dict"
+  },
+  "generated_at": "2026-06-17T13:30:40.720243",
+  "git": {
+    "diff_stat": "config.json     |   4 +-\n pm_configs.json | 143 +++++++++++++++++---------------------------------------\n 2 files changed, 44 insertions(+), 103 deletions(-)",
+    "status_short": "M config.json\n M pm_configs.json\n?? agent_audit/"
+  },
+  "last_actionable_log": {
+    "action_counts": {
+      "BLOCKED_CYCLE_DRIFT": 1,
+      "BLOCKED_INSTITUTIONAL_SUPERVISOR": 2,
+      "BLOCKED_MIN_LOT_EXCEEDS_CAP": 9,
+      "BLOCKED_SPREAD_FILTER": 4,
+      "BLOCKED_SYMBOL_RISK_CAP": 1,
+      "BLOCK_LATCHED": 1,
+      "DERATE": 1,
+      "EXECUTED": 42,
+      "FAILED_10018": 1,
+      "PAUSE_CONTEXT": 1
+    },
+    "available": true,
+    "source": "last_actionable_log.json",
+    "top_level_count": 60,
+    "top_level_type": "dict",
+    "top_symbols": [
+      [
+        "XAGUSD",
+        1
+      ],
+      [
+        "TONUSD",
+        1
+      ],
+      [
+        "EURGBP",
+        1
+      ],
+      [
+        "EURJPY",
+        1
+      ],
+      [
+        "AUDJPY",
+        1
+      ],
+      [
+        "XAUUSD",
+        1
+      ],
+      [
+        "GBPUSD",
+        1
+      ],
+      [
+        "EURUSD",
+        1
+      ],
+      [
+        "EURCAD",
+        1
+      ],
+      [
+        "ETHUSD",
+        1
+      ],
+      [
+        "GBPCAD",
+        1
+      ],
+      [
+        "XRPUSD",
+        1
+      ],
+      [
+        "BTCETH",
+        1
+      ],
+      [
+        "US30",
+        1
+      ],
+      [
+        "USDJPY",
+        1
+      ],
+      [
+        "DE30",
+        1
+      ],
+      [
+        "EURNZD",
+        1
+      ],
+      [
+        "NZDJPY",
+        1
+      ],
+      [
+        "JP225",
+        1
+      ],
+      [
+        "UK100",
+        1
+      ]
+    ]
+  },
+  "last_trade_log": {
+    "action_counts": {
+      "EXECUTED": 4,
+      "NO_ACTIONABLE_WINNER_SIGNAL": 28,
+      "SKIPPED_RISK_CAP": 2
+    },
+    "available": true,
+    "source": "last_trade_log.json",
+    "top_level_count": 34,
+    "top_level_type": "dict",
+    "top_symbols": [
+      [
+        "DE30",
+        1
+      ],
+      [
+        "ETHUSD",
+        1
+      ],
+      [
+        "NZDCAD",
+        1
+      ],
+      [
+        "CADJPY",
+        1
+      ],
+      [
+        "PLATINUM",
+        1
+      ],
+      [
+        "ALIBABA",
+        1
+      ],
+      [
+        "IBM",
+        1
+      ],
+      [
+        "JPM",
+        1
+      ],
+      [
+        "MICROSOFT",
+        1
+      ],
+      [
+        "PEPSICO",
+        1
+      ],
+      [
+        "TESLA",
+        1
+      ],
+      [
+        "US30",
+        1
+      ],
+      [
+        "US100",
+        1
+      ],
+      [
+        "XAUUSD",
+        1
+      ],
+      [
+        "XRPUSD",
+        1
+      ],
+      [
+        "USDJPY",
+        1
+      ],
+      [
+        "COCA-COLA",
+        1
+      ],
+      [
+        "AUDJPY",
+        1
+      ],
+      [
+        "PALLADIUM",
+        1
+      ],
+      [
+        "XTIUSD",
+        1
+      ]
+    ]
+  },
+  "ledger": {
+    "artifact_contract_counts": {
+      "2026-04-29-neutral-discovery-exit-surface|2026-06-09-bleeding-edge-production-split": 100
+    },
+    "metric_distributions": {
+      "deflated_sharpe": {
+        "count": 157,
+        "max": 1.0,
+        "mean": 0.994315,
+        "median": 1.0,
+        "min": 0.693363,
+        "p25": 1.0,
+        "p75": 1.0
+      },
+      "live_trade_count": {
+        "count": 29,
+        "max": 11.0,
+        "mean": 3.275862,
+        "median": 2.0,
+        "min": 1.0,
+        "p25": 1.0,
+        "p75": 4.0
+      },
+      "live_win_rate": {
+        "count": 29,
+        "max": 100.0,
+        "mean": 57.261283,
+        "median": 55.555556,
+        "min": 0.0,
+        "p25": 33.333333,
+        "p75": 100.0
+      },
+      "val_calmar": {
+        "count": 157,
+        "max": 27.15,
+        "mean": 8.317771,
+        "median": 7.29,
+        "min": 0.0,
+        "p25": 4.35,
+        "p75": 11.23
+      },
+      "val_drawdown_pct": {
+        "count": 157,
+        "max": 5.45,
+        "mean": 1.620573,
+        "median": 1.08,
+        "min": 0.0,
+        "p25": 1.0,
+        "p75": 2.09
+      },
+      "val_profit_factor": {
+        "count": 151,
+        "max": 26.24,
+        "mean": 4.22596,
+        "median": 3.08,
+        "min": 1.2,
+        "p25": 2.18,
+        "p75": 5.1
+      },
+      "val_return_pct": {
+        "count": 157,
+        "max": 54.29,
+        "mean": 11.448981,
+        "median": 8.97,
+        "min": 5.01,
+        "p25": 6.48,
+        "p75": 14.22
+      },
+      "val_sharpe": {
+        "count": 157,
+        "max": 208.97,
+        "mean": 49.164777,
+        "median": 38.23,
+        "min": 4.58,
+        "p25": 19.87,
+        "p75": 65.81
+      },
+      "val_trades": {
+        "count": 157,
+        "max": 140.0,
+        "mean": 28.152866,
+        "median": 21.0,
+        "min": 15.0,
+        "p25": 16.0,
+        "p75": 30.0
+      },
+      "val_win_rate": {
+        "count": 157,
+        "max": 100.0,
+        "mean": 77.45465,
+        "median": 80.0,
+        "min": 43.75,
+        "p25": 68.75,
+        "p75": 87.5
+      }
+    },
+    "risk_flags": {
+      "cells_with_live_drift_observations": 29,
+      "extreme_val_sharpe_cells_gt_10": 147,
+      "low_validation_trade_cells_lt_20": 75,
+      "missing_pbo_status_cells": 0
+    },
+    "source": "pm_configs.json",
+    "status_counts": {
+      "BLOCKED": 196,
+      "NO_TRADE": 2072,
+      "PROMOTED": 95,
+      "PROMOTE_SMALL": 37
+    },
+    "symbol_count": 100,
+    "top_non_tradeable_reasons": [
+      [
+        "Optimization failed or produced no live-safe winner: No validated regime winners (24 candidates failed validation). Live trading disabled for this symbol.",
+        20
+      ],
+      [
+        "1 validated winners (23 rejected) across 6 timeframes",
+        14
+      ],
+      [
+        "2 validated winners (22 rejected) across 6 timeframes",
+        7
+      ],
+      [
+        "3 validated winners (21 rejected) across 6 timeframes",
+        6
+      ],
+      [
+        "Insufficient M5 history after 3 fetch attempt(s): 242666 bars available; required 255000. Live trading disabled for this symbol.",
+        1
+      ],
+      [
+        "Insufficient M5 history after 3 fetch attempt(s): 243138 bars available; required 255000. Live trading disabled for this symbol.",
+        1
+      ],
+      [
+        "Insufficient M5 history after 3 fetch attempt(s): 248615 bars available; required 255000. Live trading disabled for this symbol.",
+        1
+      ],
+      [
+        "Insufficient M5 history after 3 fetch attempt(s): 192947 bars available; required 255000. Live trading disabled for this symbol.",
+        1
+      ],
+      [
+        "Insufficient M5 history after 3 fetch attempt(s): 242099 bars available; required 255000. Live trading disabled for this symbol.",
+        1
+      ],
+      [
+        "Insufficient M5 history after 3 fetch attempt(s): 205916 bars available; required 255000. Live trading disabled for this symbol.",
+        1
+      ],
+      [
+        "4 validated winners (20 rejected) across 6 timeframes",
+        1
+      ],
+      [
+        "Insufficient M5 history after 3 fetch attempt(s): 124259 bars available; required 255000. Live trading disabled for this symbol.",
+        1
+      ]
+    ],
+    "tradeable_cell_count": 157,
+    "tradeable_symbol_count": 45
+  },
+  "logs": {
+    "available": true,
+    "event_totals": {
+      "connected_mt5": 200,
+      "error": 64,
+      "live_block": 1751,
+      "margin": 29,
+      "risk_cap": 3,
+      "trading_enabled": 22,
+      "warning": 17273
+    },
+    "file_count": 49,
+    "files": [
+      {
+        "connected_mt5": 2,
+        "error": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_005716.err.log",
+        "warning": 63
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_010116.err.log",
+        "warning": 330
+      },
+      {
+        "connected_mt5": 2,
+        "error": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_012215.err.log",
+        "warning": 339
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_104109.err.log",
+        "warning": 330
+      },
+      {
+        "connected_mt5": 2,
+        "error": 4,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_110346.err.log",
+        "warning": 337
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/live_trade_20260608_124046.err.log",
+        "live_block": 85,
+        "risk_cap": 1,
+        "trading_enabled": 1,
+        "warning": 89
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/live_trade_20260608_124352.err.log",
+        "live_block": 85,
+        "trading_enabled": 1,
+        "warning": 86
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/live_trade_20260608_145123.err.log",
+        "live_block": 85,
+        "trading_enabled": 1,
+        "warning": 90
+      },
+      {
+        "connected_mt5": 2,
+        "error": 5,
+        "file": "logs/production_live/live_trade_20260608_191455.err.log",
+        "live_block": 85,
+        "trading_enabled": 1,
+        "warning": 590
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_20260607_202037.err.log",
+        "warning": 97
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_deep_20260608_042334.err.log",
+        "warning": 330
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_failclosed_20260608_050917.err.log",
+        "warning": 343
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_notrade_20260608_043815.err.log",
+        "warning": 332
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_strict_20260607_203755.err.log",
+        "warning": 294
+      },
+      {
+        "connected_mt5": 24,
+        "file": "logs/production_live/pm_20260607.log",
+        "warning": 391
+      },
+      {
+        "connected_mt5": 60,
+        "error": 11,
+        "file": "logs/production_live/pm_20260608.log",
+        "live_block": 566,
+        "risk_cap": 1,
+        "trading_enabled": 7,
+        "warning": 2099
+      },
+      {
+        "connected_mt5": 32,
+        "error": 17,
+        "file": "logs/production_live/pm_20260609.log",
+        "live_block": 87,
+        "margin": 1,
+        "warning": 2264
+      },
+      {
+        "connected_mt5": 19,
+        "error": 10,
+        "file": "logs/production_live/pm_20260610.log",
+        "live_block": 198,
+        "margin": 8,
+        "trading_enabled": 3,
+        "warning": 299
+      },
+      {
+        "connected_mt5": 4,
+        "file": "logs/production_live/pm_20260611.log",
+        "live_block": 110,
+        "margin": 9,
+        "trading_enabled": 2,
+        "warning": 4706
+      },
+      {
+        "connected_mt5": 3,
+        "file": "logs/production_live/pm_20260614.log",
+        "live_block": 55,
+        "margin": 8,
+        "trading_enabled": 1,
+        "warning": 150
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/pm_20260617.log",
+        "live_block": 55,
+        "margin": 3,
+        "trading_enabled": 1,
+        "warning": 64
+      },
+      {
+        "connected_mt5": 2,
+        "error": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_005716.err.log",
+        "warning": 63
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_010116.err.log",
+        "warning": 330
+      },
+      {
+        "connected_mt5": 2,
+        "error": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_012215.err.log",
+        "warning": 339
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_104109.err.log",
+        "warning": 330
+      },
+      {
+        "connected_mt5": 2,
+        "error": 4,
+        "file": "logs/production_live/bleeding_edge_retrain_20260609_110346.err.log",
+        "warning": 337
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/live_trade_20260608_124046.err.log",
+        "live_block": 85,
+        "risk_cap": 1,
+        "trading_enabled": 1,
+        "warning": 89
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/live_trade_20260608_124352.err.log",
+        "live_block": 85,
+        "trading_enabled": 1,
+        "warning": 86
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/live_trade_20260608_145123.err.log",
+        "live_block": 85,
+        "trading_enabled": 1,
+        "warning": 90
+      },
+      {
+        "connected_mt5": 2,
+        "error": 5,
+        "file": "logs/production_live/live_trade_20260608_191455.err.log",
+        "live_block": 85,
+        "trading_enabled": 1,
+        "warning": 590
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_20260607_202037.err.log",
+        "warning": 97
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_deep_20260608_042334.err.log",
+        "warning": 330
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_failclosed_20260608_050917.err.log",
+        "warning": 343
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_notrade_20260608_043815.err.log",
+        "warning": 332
+      },
+      {
+        "connected_mt5": 2,
+        "file": "logs/production_live/optimize_100_strict_20260607_203755.err.log",
+        "warning": 294
+      }
+    ],
+    "source": "logs/production_live",
+    "top_live_block_reasons": [
+      [
+        "no tradeable regime winners",
+        582
+      ],
+      [
+        "invalid (No M5 history returned after 3 fetch attempt(s) and deep backfill. Live trading disabled for this symbol.)",
+        570
+      ],
+      [
+        "invalid (Optimization failed or produced no live-safe winner: No validated regime winners (24 candidates failed validation). Live trading disabled for this symbol.)",
+        321
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 10000 bars available; required 300000. Live trading disabled for this symbol.)",
+        107
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 36118 bars available; required 300000. Live trading disabled for this symbol.)",
+        15
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 266658 bars available; required 300000. Live trading disabled for this symbol.)",
+        15
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 241489 bars available; required 300000. Live trading disabled for this symbol.)",
+        15
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 96331 bars available; required 300000. Live trading disabled for this symbol.)",
+        15
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 241458 bars available; required 300000. Live trading disabled for this symbol.)",
+        15
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 247403 bars available; required 300000. Live trading disabled for this symbol.)",
+        15
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 190069 bars available; required 300000. Live trading disabled for this symbol.)",
+        15
+      ],
+      [
+        "artifact fingerprint changed",
+        9
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 205916 bars available; required 255000. Live trading disabled for this symbol.)",
+        7
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 242666 bars available; required 255000. Live trading disabled for this symbol.)",
+        7
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 243138 bars available; required 255000. Live trading disabled for this symbol.)",
+        7
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 124259 bars available; required 255000. Live trading disabled for this symbol.)",
+        7
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 248615 bars available; required 255000. Live trading disabled for this symbol.)",
+        7
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 192947 bars available; required 255000. Live trading disabled for this symbol.)",
+        7
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 242099 bars available; required 255000. Live trading disabled for this symbol.)",
+        7
+      ],
+      [
+        "invalid (Insufficient M5 history after 3 fetch attempt(s): 205838 bars available; required 255000. Live trading disabled for this symbol.)",
+        1
+      ]
+    ]
+  },
+  "oos_manifests": {
+    "available": true,
+    "manifest_count_scanned": 93,
+    "metric_distributions": {
+      "calmar_ratio": {
+        "count": 178130,
+        "max": 1124.67,
+        "mean": 0.342852,
+        "median": -0.09,
+        "min": -1.03,
+        "p25": -0.7,
+        "p75": 0.51
+      },
+      "expectancy_pips": {
+        "count": 25824,
+        "max": 33460714.29,
+        "mean": 24234.565838,
+        "median": 2.55,
+        "min": -25493571.93,
+        "p25": -37.22,
+        "p75": 143.85
+      },
+      "max_drawdown_pct": {
+        "count": 228737,
+        "max": 5999.258282,
+        "mean": 5.410987,
+        "median": 3.0,
+        "min": 0.0,
+        "p25": 1.13,
+        "p75": 6.38
+      },
+      "mean_r": {
+        "count": 202913,
+        "max": 34.671,
+        "mean": -0.003885,
+        "median": -0.013,
+        "min": -153.797,
+        "p25": -0.179,
+        "p75": 0.169
+      },
+      "median_r": {
+        "count": 202913,
+        "max": 7.018,
+        "mean": 0.026863,
+        "median": 0.225,
+        "min": -4.8,
+        "p25": -0.915,
+        "p75": 0.842
+      },
+      "profit_factor": {
+        "count": 202799,
+        "max": 1122.89,
+        "mean": 1.041698,
+        "median": 0.86,
+        "min": 0.0,
+        "p25": 0.47,
+        "p75": 1.19
+      },
+      "sharpe_approx": {
+        "count": 152306,
+        "max": 52532548.9,
+        "mean": 259.130833,
+        "median": 0.0,
+        "min": -27219138.53,
+        "p25": -5.77,
+        "p75": 4.45
+      },
+      "sharpe_ratio": {
+        "count": 25824,
+        "max": 5.46,
+        "mean": -0.100582,
+        "median": -0.05,
+        "min": -9.58,
+        "p25": -0.48,
+        "p75": 0.34
+      },
+      "sortino_approx": {
+        "count": 152306,
+        "max": 1870946.53,
+        "mean": -337.88754,
+        "median": 0.0,
+        "min": -27219138.53,
+        "p25": -54.36,
+        "p75": 14.74
+      },
+      "sortino_ratio": {
+        "count": 25824,
+        "max": 22.89,
+        "mean": -0.063498,
+        "median": -0.03,
+        "min": -12.06,
+        "p25": -0.37,
+        "p75": 0.23
+      },
+      "total_pnl": {
+        "count": 178130,
+        "max": 99173.6,
+        "mean": -87.981785,
+        "median": -17.575,
+        "min": -38894.67,
+        "p25": -256.38,
+        "p75": 169.78
+      },
+      "total_return_pct": {
+        "count": 203954,
+        "max": 991.73,
+        "mean": -0.987958,
+        "median": -0.17,
+        "min": -389.4,
+        "p25": -2.68,
+        "p75": 1.74
+      },
+      "total_trades": {
+        "count": 258240,
+        "max": 34403.0,
+        "mean": 48.647831,
+        "median": 7.0,
+        "min": 0.0,
+        "p25": 1.0,
+        "p75": 31.0
+      },
+      "win_rate": {
+        "count": 203954,
+        "max": 100.0,
+        "mean": 53.009507,
+        "median": 50.78,
+        "min": 0.0,
+        "p25": 41.94,
+        "p75": 66.67
+      },
+      "worst_5pct_r": {
+        "count": 178130,
+        "max": 7.018,
+        "mean": -0.891474,
+        "median": -1.01,
+        "min": -191.5,
+        "p25": -1.073,
+        "p75": -0.977
+      }
+    },
+    "parse_error_count": 0,
+    "source": "pm_outputs/production_live/oos_evidence"
+  },
+  "optimization_summary": {
+    "available": true,
+    "row_count": 40,
+    "score": {
+      "count": 40,
+      "max": 86.75339,
+      "mean": 72.108518,
+      "median": 74.091293,
+      "min": 43.052873,
+      "p25": 66.13941,
+      "p75": 78.512982
+    },
+    "source": "pm_outputs/production_live/optimization_summary.csv",
+    "top_scores": [
+      {
+        "score": 86.75339011835591,
+        "strategy": "EMAPullbackContinuationStrategy",
+        "symbol": "XAUUSD",
+        "timeframe": "H4",
+        "val_trades": 25.0,
+        "val_win_rate": 96.0
+      },
+      {
+        "score": 84.55602362072597,
+        "strategy": "DarvasBoxBreakoutStrategy",
+        "symbol": "XAUAUD",
+        "timeframe": "H4",
+        "val_trades": 29.0,
+        "val_win_rate": 96.55
+      },
+      {
+        "score": 81.21909357521591,
+        "strategy": "DayOfWeekBiasStrategy",
+        "symbol": "ALIBABA",
+        "timeframe": "D1",
+        "val_trades": 24.0,
+        "val_win_rate": 100.0
+      },
+      {
+        "score": 81.05792982259923,
+        "strategy": "VWAPTrendContinuationStrategy",
+        "symbol": "APPLE",
+        "timeframe": "D1",
+        "val_trades": 16.0,
+        "val_win_rate": 100.0
+      },
+      {
+        "score": 80.79378569772976,
+        "strategy": "StochasticReversalStrategy",
+        "symbol": "COCA-COLA",
+        "timeframe": "D1",
+        "val_trades": 17.0,
+        "val_win_rate": 100.0
+      },
+      {
+        "score": 80.57815971696671,
+        "strategy": "EfficiencyRatioTrendStrategy",
+        "symbol": "NIKE",
+        "timeframe": "H4",
+        "val_trades": 15.0,
+        "val_win_rate": 100.0
+      },
+      {
+        "score": 80.3513705280747,
+        "strategy": "DayOfWeekBiasStrategy",
+        "symbol": "XAUEUR",
+        "timeframe": "M30",
+        "val_trades": 18.0,
+        "val_win_rate": 94.44
+      },
+      {
+        "score": 80.30758332970458,
+        "strategy": "TriangleCompressionBreakoutStrategy",
+        "symbol": "BAC",
+        "timeframe": "H4",
+        "val_trades": 16.0,
+        "val_win_rate": 100.0
+      },
+      {
+        "score": 78.95492679016515,
+        "strategy": "PivotBreakoutStrategy",
+        "symbol": "XAUGBP",
+        "timeframe": "H4",
+        "val_trades": 27.0,
+        "val_win_rate": 88.89
+      },
+      {
+        "score": 78.51309406849612,
+        "strategy": "RSITrendFilteredMRStrategy",
+        "symbol": "XRPUSD",
+        "timeframe": "H1",
+        "val_trades": 19.0,
+        "val_win_rate": 94.74
+      },
+      {
+        "score": 78.51298151281645,
+        "strategy": "ADXDIStrengthStrategy",
+        "symbol": "IBM",
+        "timeframe": "H1",
+        "val_trades": 18.0,
+        "val_win_rate": 83.33
+      },
+      {
+        "score": 77.97962044907361,
+        "strategy": "TurnOfMonthStrategy",
+        "symbol": "MCDONALDS",
+        "timeframe": "H4",
+        "val_trades": 15.0,
+        "val_win_rate": 93.33
+      },
+      {
+        "score": 76.61242376089575,
+        "strategy": "MorningStarEveningStarStrategy",
+        "symbol": "AIG",
+        "timeframe": "H4",
+        "val_trades": 15.0,
+        "val_win_rate": 80.0
+      },
+      {
+        "score": 75.92047343363696,
+        "strategy": "EMACrossoverStrategy",
+        "symbol": "PEPSICO",
+        "timeframe": "H4",
+        "val_trades": 17.0,
+        "val_win_rate": 94.12
+      },
+      {
+        "score": 75.76573868132073,
+        "strategy": "DayOfWeekBiasStrategy",
+        "symbol": "CITIGROUP",
+        "timeframe": "D1",
+        "val_trades": 28.0,
+        "val_win_rate": 96.43
+      },
+      {
+        "score": 75.03325063130127,
+        "strategy": "VIDYABandTrendStrategy",
+        "symbol": "ATT",
+        "timeframe": "H4",
+        "val_trades": 17.0,
+        "val_win_rate": 88.24
+      },
+      {
+        "score": 74.81202259186736,
+        "strategy": "ZScoreVWAPReversionStrategy",
+        "symbol": "MASTERCARD",
+        "timeframe": "H4",
+        "val_trades": 15.0,
+        "val_win_rate": 73.33
+      },
+      {
+        "score": 74.66566662569774,
+        "strategy": "HullMATrendStrategy",
+        "symbol": "JPM",
+        "timeframe": "D1",
+        "val_trades": 15.0,
+        "val_win_rate": 86.67
+      },
+      {
+        "score": 74.46333540124921,
+        "strategy": "DarvasBoxBreakoutStrategy",
+        "symbol": "TESLA",
+        "timeframe": "H1",
+        "val_trades": 18.0,
+        "val_win_rate": 83.33
+      },
+      {
+        "score": 74.16650053117954,
+        "strategy": "HeikinAshiTrendStrategy",
+        "symbol": "EBAY",
+        "timeframe": "D1",
+        "val_trades": 18.0,
+        "val_win_rate": 94.44
+      }
+    ],
+    "val_trades": {
+      "count": 40,
+      "max": 30.0,
+      "mean": 19.45,
+      "median": 18.0,
+      "min": 15.0,
+      "p25": 15.0,
+      "p75": 24.0
+    },
+    "val_win_rate": {
+      "count": 40,
+      "max": 100.0,
+      "mean": 84.4355,
+      "median": 86.67,
+      "min": 66.67,
+      "p25": 73.33,
+      "p75": 94.44
+    },
+    "validated_count": 40
+  },
+  "repo": "C:\\Users\\Bongo\\OneDrive\\Desktop\\FxPM-Dev",
+  "risk_cap_sensitivity": [
+    {
+      "cap_pct": 3,
+      "executed_with_actual_risk": 67,
+      "would_allow_count": 22,
+      "would_block_count": 45,
+      "would_block_pct": 67.164
+    },
+    {
+      "cap_pct": 5,
+      "executed_with_actual_risk": 67,
+      "would_allow_count": 32,
+      "would_block_count": 35,
+      "would_block_pct": 52.239
+    },
+    {
+      "cap_pct": 8,
+      "executed_with_actual_risk": 67,
+      "would_allow_count": 41,
+      "would_block_count": 26,
+      "would_block_pct": 38.806
+    },
+    {
+      "cap_pct": 10,
+      "executed_with_actual_risk": 67,
+      "would_allow_count": 48,
+      "would_block_count": 19,
+      "would_block_pct": 28.358
+    },
+    {
+      "cap_pct": 15,
+      "executed_with_actual_risk": 67,
+      "would_allow_count": 55,
+      "would_block_count": 12,
+      "would_block_pct": 17.91
+    },
+    {
+      "cap_pct": 20,
+      "executed_with_actual_risk": 67,
+      "would_allow_count": 61,
+      "would_block_count": 6,
+      "would_block_pct": 8.955
+    },
+    {
+      "cap_pct": 25,
+      "executed_with_actual_risk": 67,
+      "would_allow_count": 67,
+      "would_block_count": 0,
+      "would_block_pct": 0.0
+    }
+  ],
+  "risk_event_action_summary": [
+    {
+      "action": "BLOCKED_MIN_LOT_EXCEEDS_CAP",
+      "actual_gt_10_pct": 83,
+      "actual_gt_10x_target": 83,
+      "actual_gt_20_pct": 83,
+      "actual_gt_20x_target": 81,
+      "actual_gt_25_pct": 82,
+      "actual_gt_2x_target": 83,
+      "actual_gt_5_pct": 83,
+      "actual_gt_5x_target": 83,
+      "actual_risk_pct_count": 83,
+      "actual_risk_pct_max": 362.059621,
+      "actual_risk_pct_mean": 54.929699,
+      "actual_risk_pct_median": 37.670638,
+      "actual_risk_pct_min": 22.425249,
+      "actual_risk_pct_p25": 32.469205,
+      "actual_risk_pct_p75": 50.0,
+      "actual_to_target_ratio_count": 83,
+      "actual_to_target_ratio_max": 419.763883,
+      "actual_to_target_ratio_mean": 133.836764,
+      "actual_to_target_ratio_median": 129.876822,
+      "actual_to_target_ratio_min": 14.950166,
+      "actual_to_target_ratio_p25": 64.047189,
+      "actual_to_target_ratio_p75": 163.358154,
+      "rows": 83,
+      "target_risk_pct_count": 83,
+      "target_risk_pct_max": 2.5,
+      "target_risk_pct_mean": 0.548193,
+      "target_risk_pct_median": 0.5,
+      "target_risk_pct_min": 0.25,
+      "target_risk_pct_p25": 0.25,
+      "target_risk_pct_p75": 0.5
+    },
+    {
+      "action": "BLOCKED_SYMBOL_RISK_CAP",
+      "actual_gt_10_pct": 1,
+      "actual_gt_10x_target": 1,
+      "actual_gt_20_pct": 1,
+      "actual_gt_20x_target": 0,
+      "actual_gt_25_pct": 1,
+      "actual_gt_2x_target": 1,
+      "actual_gt_5_pct": 1,
+      "actual_gt_5x_target": 1,
+      "actual_risk_pct_count": 1,
+      "actual_risk_pct_max": 50.0,
+      "actual_risk_pct_mean": 50.0,
+      "actual_risk_pct_median": 50.0,
+      "actual_risk_pct_min": 50.0,
+      "actual_risk_pct_p25": 50.0,
+      "actual_risk_pct_p75": 50.0,
+      "actual_to_target_ratio_count": 1,
+      "actual_to_target_ratio_max": 20.0,
+      "actual_to_target_ratio_mean": 20.0,
+      "actual_to_target_ratio_median": 20.0,
+      "actual_to_target_ratio_min": 20.0,
+      "actual_to_target_ratio_p25": 20.0,
+      "actual_to_target_ratio_p75": 20.0,
+      "rows": 1,
+      "target_risk_pct_count": 1,
+      "target_risk_pct_max": 2.5,
+      "target_risk_pct_mean": 2.5,
+      "target_risk_pct_median": 2.5,
+      "target_risk_pct_min": 2.5,
+      "target_risk_pct_p25": 2.5,
+      "target_risk_pct_p75": 2.5
+    },
+    {
+      "action": "EXECUTED",
+      "actual_gt_10_pct": 19,
+      "actual_gt_10x_target": 34,
+      "actual_gt_20_pct": 6,
+      "actual_gt_20x_target": 19,
+      "actual_gt_25_pct": 0,
+      "actual_gt_2x_target": 57,
+      "actual_gt_5_pct": 35,
+      "actual_gt_5x_target": 47,
+      "actual_risk_pct_count": 67,
+      "actual_risk_pct_max": 24.667885,
+      "actual_risk_pct_mean": 7.576299,
+      "actual_risk_pct_median": 5.348894,
+      "actual_risk_pct_min": 0.455245,
+      "actual_risk_pct_p25": 2.465709,
+      "actual_risk_pct_p75": 10.48957,
+      "actual_to_target_ratio_count": 67,
+      "actual_to_target_ratio_max": 98.671542,
+      "actual_to_target_ratio_mean": 15.412367,
+      "actual_to_target_ratio_median": 10.167589,
+      "actual_to_target_ratio_min": 0.703485,
+      "actual_to_target_ratio_p25": 3.004247,
+      "actual_to_target_ratio_p75": 21.097322,
+      "rows": 67,
+      "target_risk_pct_count": 67,
+      "target_risk_pct_max": 1.5,
+      "target_risk_pct_mean": 0.641375,
+      "target_risk_pct_median": 0.5,
+      "target_risk_pct_min": 0.243466,
+      "target_risk_pct_p25": 0.5,
+      "target_risk_pct_p75": 0.5
+    }
+  ],
+  "signal_ledger": {
+    "action_counts": {
+      "BLOCKED_CYCLE_DRIFT": 33,
+      "BLOCKED_INSTITUTIONAL_SUPERVISOR": 65,
+      "BLOCKED_MANUAL_KILL_SWITCH": 1,
+      "BLOCKED_MIN_LOT_EXCEEDS_CAP": 83,
+      "BLOCKED_SPREAD_FILTER": 13,
+      "BLOCKED_SYMBOL_RISK_CAP": 1,
+      "EXECUTED": 67,
+      "FAILED_10018": 1,
+      "PAPER": 31,
+      "SKIPPED_STORAGE_PRESSURE": 2
+    },
+    "available": true,
+    "earliest_action_time": "2026-06-08T08:06:41.389010",
+    "latest_action_time": "2026-06-17T13:16:11.364830",
+    "risk_event_count": 151,
+    "row_count": 297,
+    "source": "pm_outputs/production_live/signal_ledger_202606.jsonl",
+    "timeframe_counts": {
+      "D1": 9,
+      "H1": 47,
+      "H4": 26,
+      "M15": 40,
+      "M30": 134,
+      "M5": 41
+    },
+    "top_strategies": [
+      [
+        "EMAPullbackContinuationStrategy",
+        142
+      ],
+      [
+        "DayOfWeekBiasStrategy",
+        97
+      ],
+      [
+        "TimeOfDayMomentumStrategy",
+        29
+      ],
+      [
+        "HullMATrendStrategy",
+        4
+      ],
+      [
+        "KeltnerPullbackStrategy",
+        3
+      ],
+      [
+        "ADRExpansionBreakoutStrategy",
+        3
+      ],
+      [
+        "ADXDIStrengthStrategy",
+        3
+      ],
+      [
+        "RSIExtremesStrategy",
+        2
+      ],
+      [
+        "MarubozuMomentumStrategy",
+        2
+      ],
+      [
+        "ZScoreVWAPReversionStrategy",
+        2
+      ],
+      [
+        "MomentumBurstStrategy",
+        2
+      ],
+      [
+        "GapFadeStrategy",
+        2
+      ],
+      [
+        "DoubleEMATrendStrategy",
+        1
+      ],
+      [
+        "DarvasBoxBreakoutStrategy",
+        1
+      ],
+      [
+        "ChoppinessCompressionBreakoutStrategy",
+        1
+      ],
+      [
+        "PercentileChannelReversionStrategy",
+        1
+      ],
+      [
+        "WeeklyMonthlyLevelRejectionStrategy",
+        1
+      ],
+      [
+        "FlagPullbackContinuationStrategy",
+        1
+      ]
+    ],
+    "top_symbols": [
+      [
+        "US100",
+        49
+      ],
+      [
+        "XRPUSD",
+        45
+      ],
+      [
+        "XAUGBP",
+        42
+      ],
+      [
+        "DE30",
+        33
+      ],
+      [
+        "EURJPY",
+        18
+      ],
+      [
+        "US30",
+        15
+      ],
+      [
+        "ETHUSD",
+        12
+      ],
+      [
+        "BCHUSD",
+        11
+      ],
+      [
+        "BTCUSD",
+        11
+      ],
+      [
+        "GBPUSD",
+        10
+      ],
+      [
+        "US500",
+        10
+      ],
+      [
+        "EURAUD",
+        6
+      ],
+      [
+        "GBPCAD",
+        5
+      ],
+      [
+        "XAUEUR",
+        5
+      ],
+      [
+        "JP225",
+        5
+      ],
+      [
+        "USDJPY",
+        4
+      ],
+      [
+        "BTCETH",
+        2
+      ],
+      [
+        "EURCHF",
+        2
+      ],
+      [
+        "PLATINUM",
+        2
+      ],
+      [
+        "XAUUSD",
+        2
+      ]
+    ]
+  },
+  "storage_state": {
+    "available": true,
+    "last_optimization_at": "2026-06-08T12:35:23.110974",
+    "nested_counts": {
+      "freshness": 7,
+      "last_housekeeping": 7,
+      "last_sweep": 6,
+      "order_governance": 0
+    },
+    "pressure_level": "normal",
+    "source": "pm_outputs/production_live/storage_state.json",
+    "state_updated_at": "2026-06-17T13:26:14.002777",
+    "top_level_keys": [
+      "freshness",
+      "last_free_gb",
+      "last_housekeeping",
+      "last_optimization_at",
+      "last_sweep",
+      "next_housekeep_at",
+      "next_measure_at",
+      "next_metaquotes_review_at",
+      "order_governance",
+      "pressure_level",
+      "state_updated_at"
+    ],
+    "top_level_type": "dict"
+  },
+  "supervisor_state": {
+    "available": true,
+    "block_reasons": [
+      "total_open_risk 3.50% > 3.00%"
+    ],
+    "nested_counts": {
+      "block_reasons": 1
+    },
+    "source": "logs/institutional_supervisor_state.json",
+    "top_level_keys": [
+      "active_block",
+      "block_reasons",
+      "blocked_at",
+      "cycle_id",
+      "regime",
+      "strategy_name",
+      "symbol",
+      "timeframe"
+    ],
+    "top_level_type": "dict"
+  },
+  "toronto_metric_search": {
+    "conclusion": "No explicit Toronto metric found",
+    "match_count": 0,
+    "matches": []
+  }
+}

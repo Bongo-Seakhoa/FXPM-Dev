@@ -142,24 +142,24 @@ def _forward_lineage(plans: list[dict], precommit_sha256: str) -> dict:
     }
 
 
-def test_forward_oos_lineage_replays_nonlexicographic_anchor_order_and_exact_roles() -> None:
+def test_forward_oos_lineage_replays_nonlexicographic_anchor_order_and_exact_roles() -> (
+    None
+):
     plans = [
-        {"anchor_id": value}
-        for value in ("z-first", "a-second", "m-third", "b-fourth")
+        {"anchor_id": value} for value in ("z-first", "a-second", "m-third", "b-fourth")
     ]
     precommit_sha = _h("nonlex-causal-precommit")
     lineage = _forward_lineage(plans, precommit_sha)
     reloaded = json.loads(_canonical(lineage).decode("utf-8"))
-    assert process._validate_forward_oos_replay_lineage(
-        reloaded, plans, precommit_sha
-    ) == reloaded
+    assert (
+        process._validate_forward_oos_replay_lineage(reloaded, plans, precommit_sha)
+        == reloaded
+    )
 
     attacked = copy.deepcopy(reloaded)
     del attacked["anchor_ledger_descriptors_by_id"]["a-second"]["COST_LEDGER"]
     with pytest.raises(process.ProcessVerificationError):
-        process._validate_forward_oos_replay_lineage(
-            attacked, plans, precommit_sha
-        )
+        process._validate_forward_oos_replay_lineage(attacked, plans, precommit_sha)
 
 
 def _detector_parameters() -> dict[str, int | float]:
@@ -328,6 +328,7 @@ def _train_support(
     counts: dict[str, int],
     cutoff: str,
 ) -> dict:
+    eligible_rows = sum(counts.values())
     observed = [regime for regime in process.REGIMES if counts[regime] > 0]
     unobserved = [regime for regime in process.REGIMES if counts[regime] == 0]
     body = {
@@ -337,7 +338,7 @@ def _train_support(
         "surface": "REGIME_LIVE",
         "warmup_policy": process.REGIME_TRAIN_SUPPORT_WARMUP_POLICY,
         "label_order": list(process.REGIMES),
-        "eligible_rows": sum(counts.values()),
+        "eligible_rows": eligible_rows,
         "counts": counts,
         "observed_regimes": observed,
         "unobserved_regimes": unobserved,
@@ -345,11 +346,17 @@ def _train_support(
             regime: "EMPIRICALLY_OBSERVED" if counts[regime] > 0 else "UNOBSERVED"
             for regime in process.REGIMES
         },
-        "first_ts": "2018-01-01T00:00:00+00:00",
-        "last_ts": datetime.fromisoformat(cutoff.replace("Z", "+00:00")).isoformat(),
+        "first_ts": None if eligible_rows == 0 else "2018-01-01T00:00:00+00:00",
+        "last_ts": (
+            None
+            if eligible_rows == 0
+            else datetime.fromisoformat(cutoff.replace("Z", "+00:00")).isoformat()
+        ),
         "vector_encoding": process.REGIME_TRAIN_SUPPORT_VECTOR_ENCODING,
-        "vector_sha256": _h(
-            f"{anchor_id}:{symbol}:{timeframe}:REGIME_LIVE-vector:{counts}"
+        "vector_sha256": (
+            hashlib.sha256(b"fxpm.regime-live-labels-nul/v1\x00").hexdigest()
+            if eligible_rows == 0
+            else _h(f"{anchor_id}:{symbol}:{timeframe}:REGIME_LIVE-vector:{counts}")
         ),
         "bindings": {
             "symbol": symbol,
@@ -448,7 +455,7 @@ def _cell(anchor_id: str, cutoff: str, index: int) -> dict:
         train_support,
     )
     decision = {
-        "schema": "fxpm-anchor-local-cell-decision-v5",
+        "schema": "fxpm-anchor-local-cell-decision-v6",
         "anchor_id": anchor_id,
         "symbol": symbol,
         "timeframe": timeframe,
@@ -539,6 +546,43 @@ def _set_group_regime_support(
     _set_activity_ledger_from_vectors(anchor)
 
 
+def _set_terminal_technical_group(anchor: dict, offset: int) -> None:
+    group = anchor["book_cells"][offset : offset + len(process.REGIMES)]
+    anchor["train_regime_supports"][offset // len(process.REGIMES)] = None
+    anchor["regime_detector_records"][offset // len(process.REGIMES)] = None
+    for cell in group:
+        cell["status"] = process.TERMINAL_TECHNICAL
+        cell["technical_failure"] = False
+        cell["terminal_source_unavailable"] = False
+        cell["attempt_count"] = 0
+        cell["market_data_end_utc"] = None
+        decision = cell["cell_decision"]
+        decision["status"] = process.TERMINAL_TECHNICAL
+        decision["source_state"] = process.TERMINAL_TECHNICAL_SOURCE_STATE
+        decision["source_terminal_reason"] = process.TERMINAL_TECHNICAL_REASON
+        decision["regime_detector_ledger_record_sha256"] = None
+        decision["train_regime_support_receipt_sha256"] = None
+        decision["training_feature_end_utc"] = None
+        decision["training_label_end_utc"] = None
+        decision["refit_market_data_end_utc"] = None
+        decision["insufficient_evidence_binding"] = None
+        for key in (
+            "horizon_receipt_sha256",
+            "full_attempt_ledger_sha256",
+            "strategy_code_sha256",
+            "trial_definition_sha256",
+            "parameters_sha256",
+            "winner_request_sha256",
+            "winner_evidence_ledger_payload_sha256",
+            "winner_decision_receipt_sha256",
+            "anchor_refit_receipt_sha256",
+        ):
+            decision[key] = None
+        decision["winner_selection_contract_version"] = None
+        decision["winner_evidence_ledger_contract_version"] = None
+        cell["cell_decision_sha256"] = _sha(decision)
+
+
 def _set_insufficient_cell(anchor: dict, index: int, *, postsearch: bool) -> None:
     cell = anchor["book_cells"][index]
     decision = cell["cell_decision"]
@@ -607,19 +651,13 @@ def _set_insufficient_cell(anchor: dict, index: int, *, postsearch: bool) -> Non
             else None
         ),
         "horizon_winner_cross_binding_schema_version": (
-            process.HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION
-            if postsearch
-            else None
+            process.HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION if postsearch else None
         ),
         "horizon_winner_cross_binding_content_sha256": (
-            _h(f"{anchor['anchor_id']}:{index}:cross-binding")
-            if postsearch
-            else None
+            _h(f"{anchor['anchor_id']}:{index}:cross-binding") if postsearch else None
         ),
         "horizon_winner_cross_binding_mapping_sha256": (
-            _h(f"{anchor['anchor_id']}:{index}:cross-mapping")
-            if postsearch
-            else None
+            _h(f"{anchor['anchor_id']}:{index}:cross-mapping") if postsearch else None
         ),
         "winner_raw_production_schema_version": (
             process.WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION
@@ -627,9 +665,7 @@ def _set_insufficient_cell(anchor: dict, index: int, *, postsearch: bool) -> Non
             else None
         ),
         "winner_raw_production_receipt_sha256": (
-            _h(f"{anchor['anchor_id']}:{index}:raw-production")
-            if postsearch
-            else None
+            _h(f"{anchor['anchor_id']}:{index}:raw-production") if postsearch else None
         ),
     }
     cell["status"] = process.INSUFFICIENT_EVIDENCE
@@ -1064,9 +1100,7 @@ def _anchor(plan: dict, index: int, forward_lineage: dict) -> dict:
         "forward_start_date": plan["forward_start_date"],
         "forward_end_date": plan["forward_end_date"],
         "forward_oos_replay_anchor_lineage_sha256": (
-            process._forward_oos_anchor_lineage_sha256(
-                forward_lineage, anchor_id
-            )
+            process._forward_oos_anchor_lineage_sha256(forward_lineage, anchor_id)
         ),
         "historical_selection_mode": "ANCHOR_LOCAL_AS_OF_ONLY",
         "cutoff_locality": {key: cutoff for key in process.CUTOFF_LOCALITY_KEYS},
@@ -1288,8 +1322,7 @@ def _build_corpus() -> Corpus:
         "execution_completed_at_utc": "2026-07-13T10:20:00Z",
         "forward_oos_replay_lineage": forward_lineage,
         "anchors": [
-            _anchor(plan, index, forward_lineage)
-            for index, plan in enumerate(plans)
+            _anchor(plan, index, forward_lineage) for index, plan in enumerate(plans)
         ],
     }
     reconciliation_payload = {
@@ -1366,13 +1399,13 @@ def test_plain_exported_payloads_construct_and_2026_clocks_govern_old_cutoffs(
     assert body["evaluated_at_utc"].startswith("2026-")
     policy = process.pinned_process_policy()
     assert policy["book_multiplicity_contract_version"] == (
-        "fxpm.book-multiplicity.v12"
+        "fxpm.book-multiplicity.v13"
     )
     assert policy["winner_selection_contract_version"] == ("fxpm.winner-selection.v13")
     assert policy["winner_evidence_ledger_version"] == (
         "fxpm.winner-evidence-ledger.v4"
     )
-    assert policy["regime_fit_contract_version"] == "fxpm.historical-regime-fit.v3"
+    assert policy["regime_fit_contract_version"] == "fxpm.historical-regime-fit.v4"
     assert policy["regime_detector_record_schema_version"] == (
         "fxpm.regime-detector-record/v1"
     )
@@ -1486,9 +1519,7 @@ def test_phase_reversal_and_future_market_anchor_are_rejected(valid_corpus) -> N
         future_market.precommit_payload["process_definition"]
     )
     future_precommit_sha = _sha(future_market.precommit_payload)
-    future_market.evidence_payload["precommit_payload_sha256"] = (
-        future_precommit_sha
-    )
+    future_market.evidence_payload["precommit_payload_sha256"] = future_precommit_sha
     future_market.evidence_payload["forward_oos_replay_lineage"][
         "causal_precommit_payload_sha256"
     ] = future_precommit_sha
@@ -1566,6 +1597,36 @@ def test_terminal_source_unavailable_is_valid_but_technical_partial_is_not(
     technical.refresh_reconciliation()
     with pytest.raises(process.ProcessVerificationError, match="technical"):
         _evaluate(technical)
+
+
+def test_authenticated_terminal_technical_group_is_valid_distinct_lineage(
+    valid_corpus,
+) -> None:
+    corpus = _owned(valid_corpus)
+    anchor = corpus.evidence_payload["anchors"][0]
+    _set_terminal_technical_group(anchor, 4)
+    _refresh_anchor_hashes(anchor)
+    corpus.refresh_reconciliation()
+
+    decision = _evaluate(corpus)
+    assert decision.body()["decision"] == "OFFLINE_PROCESS_VALIDATION_PASS"
+    group = anchor["book_cells"][4:8]
+    assert {cell["status"] for cell in group} == {process.TERMINAL_TECHNICAL}
+    assert {cell["cell_decision"]["source_state"] for cell in group} == {
+        process.TERMINAL_TECHNICAL_SOURCE_STATE
+    }
+    assert all(cell["technical_failure"] is False for cell in group)
+    assert all(cell["terminal_source_unavailable"] is False for cell in group)
+
+    relabeled = _owned(corpus)
+    hostile = relabeled.evidence_payload["anchors"][0]
+    for cell in hostile["book_cells"][4:8]:
+        cell["cell_decision"]["source_state"] = "AUTHENTIC_TERMINAL_UNAVAILABLE"
+        cell["cell_decision_sha256"] = _sha(cell["cell_decision"])
+    _refresh_anchor_hashes(hostile)
+    relabeled.refresh_reconciliation()
+    with pytest.raises(process.ProcessVerificationError, match="terminal-technical"):
+        _evaluate(relabeled)
 
 
 @pytest.mark.parametrize(
@@ -2161,6 +2222,43 @@ def test_exact_zero_train_labels_create_complete_unobserved_possible_slot(
         absent["cell_decision"]["regime_detector_ledger_record_sha256"]
         == (anchor["regime_detector_records"][0]["ledger_record_sha256"])
     )
+
+
+def test_all_zero_train_support_is_a_complete_unobserved_group(valid_corpus) -> None:
+    anchor = _owned(valid_corpus).evidence_payload["anchors"][0]
+    _set_group_regime_support(
+        anchor,
+        0,
+        {"TREND": 0, "RANGE": 0, "BREAKOUT": 0, "CHOP": 0},
+    )
+
+    assert len(_validate_anchor_book_only(anchor)) == 64
+    support = anchor["train_regime_supports"][0]
+    assert support["eligible_rows"] == 0
+    assert support["observed_regimes"] == []
+    assert support["first_ts"] is None
+    assert support["last_ts"] is None
+    assert support["vector_sha256"] == hashlib.sha256(
+        b"fxpm.regime-live-labels-nul/v1\x00"
+    ).hexdigest()
+    group = anchor["book_cells"][: len(process.REGIMES)]
+    assert all(cell["status"] == process.REGIME_UNOBSERVED for cell in group)
+    assert all(cell["attempt_count"] == 0 for cell in group)
+    assert all(
+        cell["cell_decision"]["winner_request_sha256"] is None
+        and cell["cell_decision"]["winner_decision_receipt_sha256"] is None
+        and cell["cell_decision"]["anchor_refit_receipt_sha256"] is None
+        for cell in group
+    )
+
+    support["first_ts"] = anchor["selection_cutoff_utc"]
+    support.pop("receipt_sha256")
+    support["receipt_sha256"] = _sha(support)
+    with pytest.raises(
+        process.ProcessVerificationError,
+        match="empty train regime support timestamps",
+    ):
+        _validate_anchor_book_only(anchor)
 
 
 def test_unobserved_slot_requires_exact_support_and_cannot_be_omitted(

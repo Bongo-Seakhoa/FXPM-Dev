@@ -549,15 +549,16 @@ def _forward_oos_replay_lineage(
         or type(required) is not dict
         or set(required) != set(anchor_ids)
         or type(product_identities) is not list
-        or [row.get("anchor_id") if type(row) is dict else None for row in product_identities]
+        or [
+            row.get("anchor_id") if type(row) is dict else None
+            for row in product_identities
+        ]
         != anchor_ids
         or receipt.get("ordered_anchor_ids") != anchor_ids
     ):
         _fail("FORWARD_OOS_ANCHOR_ROSTER_MISMATCH")
     try:
-        code_identity = forward._validate_replay_code_identity(
-            receipt["code_identity"]
-        )
+        code_identity = forward._validate_replay_code_identity(receipt["code_identity"])
     except Exception as exc:
         raise CausalEvidenceProductionError(
             "FORWARD_OOS_CODE_IDENTITY_INVALID"
@@ -565,21 +566,16 @@ def _forward_oos_replay_lineage(
     causal_component = code_identity.get(
         "causal_synchronized_replay_component_identity_sha256"
     )
-    causal_manifest = code_identity.get(
-        "causal_synchronized_replay_component_manifest"
-    )
+    causal_manifest = code_identity.get("causal_synchronized_replay_component_manifest")
     producer_identity = code_identity.get(
         "forward_oos_replay_producer_source_identity_sha256"
     )
-    producer_manifest = code_identity.get(
-        "forward_oos_replay_producer_source_manifest"
-    )
+    producer_manifest = code_identity.get("forward_oos_replay_producer_source_manifest")
     process = causal_precommit_payload["process_definition"]
     components = process.get("component_identities")
     if (
         type(components) is not dict
-        or causal_component
-        != components.get("synchronized_replay_code_sha256")
+        or causal_component != components.get("synchronized_replay_code_sha256")
         or _sha(causal_manifest) != causal_component
         or _sha(producer_manifest) != producer_identity
         or code_identity.get("forward_producer_in_causal_component_manifest")
@@ -587,7 +583,9 @@ def _forward_oos_replay_lineage(
         or code_identity.get("causal_binding_followup_required") is not True
     ):
         _fail("FORWARD_OOS_CODE_IDENTITY_BINDING_MISMATCH")
-    causal_files = causal_manifest.get("files") if type(causal_manifest) is dict else None
+    causal_files = (
+        causal_manifest.get("files") if type(causal_manifest) is dict else None
+    )
     producer_files = (
         producer_manifest.get("files") if type(producer_manifest) is dict else None
     )
@@ -596,8 +594,7 @@ def _forward_oos_replay_lineage(
         or type(producer_files) is not list
         or len(producer_files) != 1
         or producer_files[0] not in causal_files
-        or producer_files[0].get("relative_path")
-        != "pm_forward_oos_replay_producer.py"
+        or producer_files[0].get("relative_path") != "pm_forward_oos_replay_producer.py"
     ):
         _fail("FORWARD_OOS_PRODUCER_NOT_IN_CAUSAL_COMPONENT")
     expected_context = {
@@ -637,8 +634,7 @@ def _forward_oos_replay_lineage(
         != "EXACT_FORWARD_END_EXCLUSIVE_NO_LATER_ROWS"
         or receipt.get("valuation_event_order")
         != "close_existing_then_mark_existing_then_admit"
-        or receipt.get("full_round_trip_commission_in_every_candidate_mark")
-        is not True
+        or receipt.get("full_round_trip_commission_in_every_candidate_mark") is not True
         or receipt.get("stop_risk_includes_adverse_configured_stop_slippage")
         is not True
         or receipt.get("candidate_marks_thinned_or_sampled") is not False
@@ -659,11 +655,21 @@ def _forward_oos_replay_lineage(
     ):
         _fail("FORWARD_OOS_PRODUCT_PRECOMMIT_BINDING_MISMATCH")
     clocks = (
-        _forward_utc(forward_precommit["created_at_utc"], "FORWARD_PRECOMMIT_TIME_INVALID"),
-        _forward_utc(receipt["evidence_access_started_at_utc"], "FORWARD_ACCESS_TIME_INVALID"),
-        _forward_utc(receipt["execution_started_at_utc"], "FORWARD_EXECUTION_START_INVALID"),
-        _forward_utc(receipt["execution_completed_at_utc"], "FORWARD_EXECUTION_END_INVALID"),
-        _forward_utc(receipt["reconciled_at_utc"], "FORWARD_RECONCILIATION_TIME_INVALID"),
+        _forward_utc(
+            forward_precommit["created_at_utc"], "FORWARD_PRECOMMIT_TIME_INVALID"
+        ),
+        _forward_utc(
+            receipt["evidence_access_started_at_utc"], "FORWARD_ACCESS_TIME_INVALID"
+        ),
+        _forward_utc(
+            receipt["execution_started_at_utc"], "FORWARD_EXECUTION_START_INVALID"
+        ),
+        _forward_utc(
+            receipt["execution_completed_at_utc"], "FORWARD_EXECUTION_END_INVALID"
+        ),
+        _forward_utc(
+            receipt["reconciled_at_utc"], "FORWARD_RECONCILIATION_TIME_INVALID"
+        ),
     )
     if list(clocks) != sorted(clocks):
         _fail("FORWARD_OOS_PROCESS_CLOCKS_REVERSED")
@@ -685,9 +691,7 @@ def _forward_oos_replay_lineage(
         if type(row) is not dict or set(row) != set(ledger_roles):
             _fail("FORWARD_OOS_LEDGER_ROLE_ROSTER_INVALID")
         normalized = {
-            role: _descriptor(
-                row[role], "FORWARD_OOS_LEDGER_DESCRIPTOR_INVALID"
-            )
+            role: _descriptor(row[role], "FORWARD_OOS_LEDGER_DESCRIPTOR_INVALID")
             for role in ledger_roles
         }
         lineage_descriptor_rows[anchor_id] = normalized
@@ -749,9 +753,7 @@ def _forward_oos_replay_lineage(
         "causal_precommit_payload_sha256": precommit_sha,
         "code_identity_sha256": _sha(code_identity),
         "deployment_binding_sha256": _sha(receipt["deployment_binding"]),
-        "evidence_access_started_at_utc": receipt[
-            "evidence_access_started_at_utc"
-        ],
+        "evidence_access_started_at_utc": receipt["evidence_access_started_at_utc"],
         "execution_started_at_utc": receipt["execution_started_at_utc"],
         "execution_completed_at_utc": receipt["execution_completed_at_utc"],
         "reconciled_at_utc": receipt["reconciled_at_utc"],
@@ -761,9 +763,7 @@ def _forward_oos_replay_lineage(
         "anchor_ledger_descriptors_by_id": lineage_descriptor_rows,
         "ordered_anchor_production_metadata_roster_sha256": _sha(metadata_rows),
         "anchor_production_metadata_sha256_by_id": metadata_sha,
-        "anchor_production_metadata_by_id": _copy_json(
-            metadata, 16 * 1024 * 1024
-        ),
+        "anchor_production_metadata_by_id": _copy_json(metadata, 16 * 1024 * 1024),
         "causal_binding_followup_completed": True,
         "confers_current_refit_capital_readiness_publication_or_trading_authority": False,
     }
@@ -1558,12 +1558,21 @@ def _causal_book_projection(
             book.REGIME_UNOBSERVED: causal.REGIME_UNOBSERVED,
             book.INSUFFICIENT_EVIDENCE: causal.INSUFFICIENT_EVIDENCE,
             "SOURCE_UNAVAILABLE": "SOURCE_UNAVAILABLE",
+            book.TERMINAL_TECHNICAL: causal.TERMINAL_TECHNICAL,
         }.get(raw_state)
         if status is None:
             _fail("BOOK_TECHNICAL_OR_UNSEARCHED_CELL")
-        available = source_payload["availability"] == book.AVAILABLE
-        if available is (status == "SOURCE_UNAVAILABLE"):
+        expected_source_availability = (
+            book.TERMINAL_UNAVAILABLE
+            if status == "SOURCE_UNAVAILABLE"
+            else book.TERMINAL_TECHNICAL
+            if status == causal.TERMINAL_TECHNICAL
+            else book.AVAILABLE
+        )
+        if source_payload["availability"] != expected_source_availability:
             _fail("BOOK_SOURCE_STATE_CONTRADICTION")
+        available = expected_source_availability == book.AVAILABLE
+        terminal_technical = status == causal.TERMINAL_TECHNICAL
         searched = status in {"WINNER", causal.NO_LOCAL_WINNER}
         unobserved = status == causal.REGIME_UNOBSERVED
         insufficient = status == causal.INSUFFICIENT_EVIDENCE
@@ -1612,6 +1621,10 @@ def _causal_book_projection(
             "HISTORICAL_SOURCE_UNAVAILABLE"
         ):
             _fail("BOOK_HORIZON_STATUS_MISMATCH")
+        if terminal_technical and binding.get("plan_status") != (
+            "HISTORICAL_TERMINAL_TECHNICAL"
+        ):
+            _fail("BOOK_HORIZON_STATUS_MISMATCH")
 
         specialist = specialists.get(raw_cell["cell_id"])
         if status == "WINNER":
@@ -1656,7 +1669,7 @@ def _causal_book_projection(
         detector = detectors[group]
         support = supports[group]
         decision = {
-            "schema": "fxpm-anchor-local-cell-decision-v5",
+            "schema": "fxpm-anchor-local-cell-decision-v6",
             "anchor_id": anchor["anchor_id"],
             "symbol": raw_cell["symbol"],
             "timeframe": raw_cell["timeframe"],
@@ -1664,10 +1677,18 @@ def _causal_book_projection(
             "selection_cutoff_utc": cutoff,
             "status": status,
             "source_state": (
-                "AVAILABLE" if available else "AUTHENTIC_TERMINAL_UNAVAILABLE"
+                "AVAILABLE"
+                if available
+                else causal.TERMINAL_TECHNICAL_SOURCE_STATE
+                if terminal_technical
+                else "AUTHENTIC_TERMINAL_UNAVAILABLE"
             ),
             "source_terminal_reason": (
-                None if available else "BROKER_HISTORY_TERMINAL_ABSENCE"
+                None
+                if available
+                else causal.TERMINAL_TECHNICAL_REASON
+                if terminal_technical
+                else "BROKER_HISTORY_TERMINAL_ABSENCE"
             ),
             "source_receipt_sha256": source["receipt_sha256"],
             "regime_receipt_sha256": fit["receipt_sha256"],
@@ -1707,7 +1728,7 @@ def _causal_book_projection(
             "search_complete": True,
             "attempts_terminal": True,
             "technical_failure": False,
-            "terminal_source_unavailable": not available,
+            "terminal_source_unavailable": status == "SOURCE_UNAVAILABLE",
             "attempt_count": (
                 raw_cell["within_cell_attempted_trials_exact"]
                 if searched or insufficient
@@ -2623,9 +2644,7 @@ class BoundedCausalEvidenceFactory:
             return tuple(rows)
 
         self.context = context
-        self._causal_precommit_json = _canonical_bytes(
-            payload, 16 * 1024 * 1024
-        )
+        self._causal_precommit_json = _canonical_bytes(payload, 16 * 1024 * 1024)
         try:
             capital_binding_body = (
                 capital_bootstrap.verify_capital_forward_phase_binding(
@@ -2887,14 +2906,12 @@ class BoundedCausalEvidenceProducer:
                 replay_artifacts_by_anchor,
                 capital_candidates_by_phase,
                 capital_lineages_by_phase,
-            ) = (
-                _forward_oos_replay_lineage(
-                    context=self.context,
-                    product=self.forward_replay_product,
-                    historical_precommit=self.historical_precommit,
-                    historical_run_receipt=self.historical_run_receipt,
-                    causal_precommit_payload=precommit_payload,
-                )
+            ) = _forward_oos_replay_lineage(
+                context=self.context,
+                product=self.forward_replay_product,
+                historical_precommit=self.historical_precommit,
+                historical_run_receipt=self.historical_run_receipt,
+                causal_precommit_payload=precommit_payload,
             )
             artifacts = _reopen_historical_artifacts(
                 self.context,
@@ -3026,9 +3043,7 @@ class BoundedCausalEvidenceProducer:
                 evidence_payload=evidence,
                 reconciliation_payload=reconciliation,
                 historical_book_decision=artifacts.book_by_anchor[latest_id],
-                capital_replay_candidates_by_phase=(
-                    capital_candidates_by_phase
-                ),
+                capital_replay_candidates_by_phase=(capital_candidates_by_phase),
                 capital_lineage_by_phase=capital_lineages_by_phase,
             )
         except CausalEvidenceProductionError:

@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
-import shutil
-from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import pm_book_multiplicity as book
-import pm_cap_calibration as cap
-import pm_causal_process as causal
 import pm_optimization_authority as authority
 from pm_book_multiplicity import (
     AVAILABLE,
@@ -29,32 +24,19 @@ from pm_book_multiplicity import (
     verify_historical_book_multiplicity_decision,
 )
 from pm_current_refit_execution import build_current_regime_params_bundle
-from pm_model_lifecycle import build_process_validated_current_refit_lineage
-from pm_portfolio_replay import (
-    PORTFOLIO_REPLAY_CANDIDATE_SCHEMA_VERSION,
-    PORTFOLIO_REPLAY_SCHEMA_VERSION,
-    CandidateTrade,
-    ExitLeg,
-    MarkPoint,
-    build_current_refit_replay_successor,
-    build_current_refit_replay_roster,
-    portfolio_cost_contract,
-    portfolio_mark_cost_contract,
-    portfolio_policy_from_config_payload,
-    seal_portfolio_replay_evidence,
+from tests.test_book_multiplicity import (
+    _available_state_cell,
+    _family,
+    _terminal_family,
+    _verified_winner,
 )
-from tests.test_book_multiplicity import _terminal_family
-from tests.test_cap_calibration import _bundle as _capital_bundle
-from tests.test_cap_calibration import _calibrate as _calibrate_capital
-from tests.test_cap_calibration import _resign_replay
-from tests.test_causal_process import _build_corpus, _evaluate
 from tests.test_model_lifecycle import _process_refit_receipts
 from tests.test_model_lifecycle import (
     _detector_parameters,
     _digest,
     _train_support,
 )
-from tests.test_pipeline_current_refit_executor import _production_fixture
+from pm_model_lifecycle import canonical_receipt_sha256
 
 
 def _write(path: Path, value) -> bytes:
@@ -117,9 +99,7 @@ def _fixture(tmp_path: Path):
             "artifact_root_relative_path": "refit",
         },
         "synchronized_portfolio_replay": {
-            "schema_version": authority.INDEX_SCHEMAS[
-                "synchronized_portfolio_replay"
-            ],
+            "schema_version": authority.INDEX_SCHEMAS["synchronized_portfolio_replay"],
             "evidence": {},
             "expected_lineage": {},
             "expected_policies": {"10000": {}},
@@ -236,7 +216,7 @@ def _fixture(tmp_path: Path):
     }
 
 
-def _management_fixture(tmp_path: Path):
+def _management_fixture(tmp_path: Path, *, technical_timeframe: str | None = None):
     source = (tmp_path / "source").resolve()
     native = source / "data" / "native"
     activation_id = "activation-captured"
@@ -253,25 +233,35 @@ def _management_fixture(tmp_path: Path):
     statuses = {}
     for timeframe in authority.TIMEFRAMES:
         selected = timeframe == selected_tf
+        technical = timeframe == technical_timeframe
+        status = "technical_error" if technical else "evidence_candidate"
         entries[timeframe] = {
             "symbol": "EURUSD",
             "timeframe": timeframe,
-            "status": "evidence_candidate",
-            "universe_eligibility_status": "evidence_candidate",
+            "status": status,
+            "audit_status": "PASS",
+            "universe_eligibility_status": status,
             "tradeable": False,
             "statistical_sufficiency_receipt_required": True,
             "bars_relative_path": f"runs/run-1/EURUSD/{timeframe}/bars.csv",
-            "sidecar_relative_path": (
-                f"runs/run-1/EURUSD/{timeframe}/provenance.json"
-            ),
-            "bars_sha256": bars_sha if selected else hashlib.sha256(
-                f"bars:{timeframe}".encode()
-            ).hexdigest(),
-            "sidecar_sha256": sidecar_sha if selected else hashlib.sha256(
-                f"sidecar:{timeframe}".encode()
-            ).hexdigest(),
+            "sidecar_relative_path": (f"runs/run-1/EURUSD/{timeframe}/provenance.json"),
+            "bars_sha256": None
+            if technical
+            else bars_sha
+            if selected
+            else hashlib.sha256(f"bars:{timeframe}".encode()).hexdigest(),
+            "sidecar_sha256": sidecar_sha
+            if selected
+            else hashlib.sha256(f"sidecar:{timeframe}".encode()).hexdigest(),
+            "consensus_status": "PENDING" if technical else "PASS",
+            "resolution_status": "PENDING" if technical else "PASS",
         }
-        statuses[timeframe] = "evidence_candidate"
+        statuses[timeframe] = status
+    candidate_timeframes = [
+        timeframe
+        for timeframe in authority.TIMEFRAMES
+        if timeframe != technical_timeframe
+    ]
     activation = {
         "schema_version": "fxpm-native-activation-v1",
         "status": "active",
@@ -297,11 +287,17 @@ def _management_fixture(tmp_path: Path):
             "requested_symbols": ["EURUSD"],
             "required_timeframes": list(authority.TIMEFRAMES),
             "cell_statuses": {"EURUSD": statuses},
-            "terminal_states": ["evidence_candidate", "source_unavailable"],
-            "nonterminal_states": ["technical_error", "pending"],
-            "evidence_candidate_timeframes_by_symbol": {
-                "EURUSD": list(authority.TIMEFRAMES)
-            },
+            "terminal_states": [
+                "evidence_candidate",
+                "source_unavailable",
+                *(["technical_error"] if technical_timeframe is not None else []),
+            ],
+            "nonterminal_states": (
+                ["pending"]
+                if technical_timeframe is not None
+                else ["technical_error", "pending"]
+            ),
+            "evidence_candidate_timeframes_by_symbol": {"EURUSD": candidate_timeframes},
             "source_unavailable_timeframes_by_symbol": {"EURUSD": []},
             "symbols_with_evidence_candidates": ["EURUSD"],
             "eligible_symbols": ["EURUSD"],
@@ -339,9 +335,7 @@ def _management_fixture(tmp_path: Path):
     native_binding = {
         "activation_id": activation_id,
         "activation_manifest_sha256": activation_sha,
-        "bars_logical_relative_path": (
-            "data/native/runs/run-1/EURUSD/H1/bars.csv"
-        ),
+        "bars_logical_relative_path": ("data/native/runs/run-1/EURUSD/H1/bars.csv"),
         "bars_size_bytes": bars.stat().st_size,
         "bars_sha256": bars_sha,
         "sidecar_logical_relative_path": (
@@ -393,7 +387,10 @@ def _management_fixture(tmp_path: Path):
     manifest_path.write_text("{}", encoding="utf-8")
     _write(capsule_root / "capsule.json", {**capsule_body, "capsule_id": capsule_id})
     closure_context = {
-        closure_id: {**body, "absolute_path": str(source / body["logical_relative_path"])}
+        closure_id: {
+            **body,
+            "absolute_path": str(source / body["logical_relative_path"]),
+        }
         for closure_id, body in closure_values.items()
     }
     context = {
@@ -564,12 +561,16 @@ def _management_book_decision(
         [cell["marginal_p_value"] for cell in body["cells"]]
     )
     assert q_values is not None
-    for ordinal, (cell, q_value) in enumerate(zip(body["cells"], q_values, strict=True)):
+    for ordinal, (cell, q_value) in enumerate(
+        zip(body["cells"], q_values, strict=True)
+    ):
         winner = ordinal in winner_ordinals
         cell["adjusted_q_value"] = q_value
         cell["by_qualified"] = winner and q_value <= book.TARGET_FDR
         cell["historical_local_candidate_pending_causal"] = winner
-    candidate_ids = [body["cells"][ordinal]["cell_id"] for ordinal in sorted(winner_ordinals)]
+    candidate_ids = [
+        body["cells"][ordinal]["cell_id"] for ordinal in sorted(winner_ordinals)
+    ]
     body.update(
         status="HISTORICAL_LOCAL_CANDIDATES_AVAILABLE",
         valid=True,
@@ -588,8 +589,7 @@ def _management_book_decision(
         },
         regime_fit_counts={
             state: sum(
-                item["payload"]["fit_state"] == state
-                for item in body["regime_fits"]
+                item["payload"]["fit_state"] == state for item in body["regime_fits"]
             )
             for state in body["regime_fit_counts"]
         },
@@ -708,8 +708,8 @@ def test_snapshot_rejects_pre_open_file_swap(tmp_path: Path, monkeypatch):
 def test_management_context_rehashes_capsule_manifest_and_selected_native_files(
     tmp_path: Path,
 ):
-    context, manifest_path, _bars, activation_id, activation_sha = (
-        _management_fixture(tmp_path)
+    context, manifest_path, _bars, activation_id, activation_sha = _management_fixture(
+        tmp_path
     )
     state, errors = authority._management_context(
         context,
@@ -731,9 +731,168 @@ def test_management_context_rehashes_capsule_manifest_and_selected_native_files(
     state["closure"].verify_all()
 
 
+def test_management_context_preserves_terminal_technical_without_laundering(
+    tmp_path: Path,
+):
+    context, manifest_path, _bars, activation_id, activation_sha = _management_fixture(
+        tmp_path, technical_timeframe="M5"
+    )
+    state, errors = authority._management_context(
+        context,
+        manifest_path=manifest_path,
+        requested_symbols=("EURUSD",),
+    )
+    assert errors == []
+
+    universe, errors = authority._management_native_reverify(
+        state=state,
+        requested_symbols=("EURUSD",),
+        supplied_universe=SimpleNamespace(
+            activation_id=activation_id,
+            activation_manifest_sha256=activation_sha,
+        ),
+    )
+
+    assert errors == []
+    assert universe.cell_status("EURUSD", "M5") == "technical_error"
+    assert universe.cell_status("EURUSD", "H1") == "evidence_candidate"
+    assert universe.eligible_symbols == ("EURUSD",)
+    state["closure"].require_complete()
+    state["closure"].verify_all()
+
+
+def test_regime_support_does_not_require_detector_for_terminal_technical_cell():
+    native = SimpleNamespace(
+        activation_id="activation-terminal",
+        activation_manifest_sha256="a" * 64,
+        entries={"EURUSD": {}},
+        cell_status=lambda _symbol, timeframe: (
+            "technical_error" if timeframe == "M5" else "source_unavailable"
+        ),
+    )
+    bindings, errors = authority._regime_support_reverify(
+        index_value={
+            "schema_version": authority.INDEX_SCHEMAS["regime_support"],
+            "current_book_multiplicity_receipt_sha256": "b" * 64,
+            "native_activation_id": native.activation_id,
+            "native_activation_manifest_sha256": (native.activation_manifest_sha256),
+            "detector_ledger_records": [],
+        },
+        current_book_body={"regime_fits": []},
+        current_book_receipt="b" * 64,
+        requested_symbols=("EURUSD",),
+        native_universe=native,
+    )
+
+    assert errors == []
+    assert bindings == {}
+
+
+def test_book_partition_accepts_only_distinct_terminal_technical_state():
+    cells = [
+        {
+            "symbol": "EURUSD",
+            "timeframe": timeframe,
+            "regime": regime,
+            "historical_state": (
+                book.TERMINAL_TECHNICAL
+                if timeframe == "M5"
+                else book.INSUFFICIENT_EVIDENCE
+                if timeframe == "M15"
+                else "SOURCE_UNAVAILABLE"
+            ),
+        }
+        for timeframe in authority.TIMEFRAMES
+        for regime in authority.REGIMES
+    ]
+    partition, errors = authority._book_partition(  # noqa: SLF001
+        {
+            "valid": True,
+            "optimization_run_complete": True,
+            "cells": cells,
+        },
+        ("EURUSD",),
+    )
+    assert errors == []
+    assert partition["technical_cell_ids"] == {
+        f"EURUSD|M5|{regime}" for regime in authority.REGIMES
+    }
+    assert partition["insufficient_evidence_cell_ids"] == {
+        f"EURUSD|M15|{regime}" for regime in authority.REGIMES
+    }
+
+    cells[0]["historical_state"] = book.TECHNICAL_FAILURE
+    _, errors = authority._book_partition(  # noqa: SLF001
+        {
+            "valid": True,
+            "optimization_run_complete": True,
+            "cells": cells,
+        },
+        ("EURUSD",),
+    )
+    assert any("CURRENT_BOOK_CELL_STATE_INVALID" in error for error in errors)
+
+
+def test_incomplete_current_book_with_winner_and_unsearched_cannot_authorize():
+    unsearched = _available_state_cell(1, book.UNSEARCHED, attempts=0)
+    decision = evaluate_historical_book_multiplicity(
+        _family(
+            available_groups=(0,),
+            overrides={0: _verified_winner(), 1: unsearched},
+        )
+    )
+    assert verify_historical_book_multiplicity_decision(decision)
+    body = decision.to_dict()
+    assert body["valid"] is False
+    assert body["optimization_run_complete"] is False
+
+    partition, errors = authority._book_partition(  # noqa: SLF001
+        body,
+        ("AUDUSD",),
+    )
+    assert partition["selected_cell_ids"] == {"AUDUSD|M5|TREND"}
+    assert partition["unsearched_cell_ids"] == {"AUDUSD|M5|RANGE"}
+    assert "CURRENT_BOOK_NOT_COMPLETE_VALID" in errors
+    assert "CURRENT_BOOK_UNSEARCHED_CELLS_PRESENT" in errors
+
+
+def test_current_book_raw_reverify_rejects_self_consistent_incomplete_book():
+    unsearched = _available_state_cell(1, book.UNSEARCHED, attempts=0)
+    decision = evaluate_historical_book_multiplicity(
+        _family(
+            available_groups=(0,),
+            overrides={0: _verified_winner(), 1: unsearched},
+        )
+    )
+    body = decision.to_dict()
+
+    def bind_book(payload):
+        payload["book_multiplicity_receipt_sha256"] = body["receipt_sha256"]
+        payload["full_cell_outcome_roster_sha256"] = body["book_generation_sha256"]
+        payload["selected_winner_count"] = sum(
+            cell["historical_state"] == "WINNER" for cell in body["cells"]
+        )
+        payload["precommitted_cell_count"] = len(body["cells"])
+
+    process, accepted, _ = _process_refit_receipts(book_change=bind_book)
+    _, verified_body, _, errors = authority._current_book_reverify(  # noqa: SLF001
+        {
+            "schema_version": authority.INDEX_SCHEMAS["current_process_book"],
+            "accepted_book_generation_receipt": accepted,
+            "current_book_decision": body,
+            "historical_process_decision_sha256": canonical_receipt_sha256(process),
+        },
+        causal_decision=process,
+    )
+
+    assert verified_body["valid"] is False
+    assert verified_body["optimization_run_complete"] is False
+    assert "CURRENT_BOOK_NOT_COMPLETE_VALID" in errors
+
+
 def test_management_context_rejects_external_file_change(tmp_path: Path):
-    context, manifest_path, bars, _activation_id, _activation_sha = (
-        _management_fixture(tmp_path)
+    context, manifest_path, bars, _activation_id, _activation_sha = _management_fixture(
+        tmp_path
     )
     bars.write_bytes(b"changed")
 
@@ -758,9 +917,14 @@ def test_management_context_rejects_extra_or_escaped_closure(tmp_path: Path):
         "size_bytes": 1,
         "sha256": "a" * 64,
     }
-    context["external_closure"][authority._canonical_sha(
-        {key: escaped[key] for key in ("role", "logical_relative_path", "size_bytes", "sha256")}
-    )] = escaped
+    context["external_closure"][
+        authority._canonical_sha(
+            {
+                key: escaped[key]
+                for key in ("role", "logical_relative_path", "size_bytes", "sha256")
+            }
+        )
+    ] = escaped
 
     state, errors = authority._management_context(
         context,

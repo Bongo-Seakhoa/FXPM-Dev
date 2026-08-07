@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Risk and Recovery Audit</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --paper: #ffffff;
+  --ink: #111827;
+  --muted: #4b5563;
+  --line: #d9dee8;
+  --soft: #f8fafc;
+  --accent: #1f6feb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", Inter, Arial, sans-serif;
+  line-height: 1.58;
+}
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+article {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 34px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: auto;
+}
+h1, h2, h3, h4 {
+  line-height: 1.22;
+  margin: 1.5em 0 0.55em;
+}
+h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.1em;
+  font-size: 1.45rem;
+}
+h3 {
+  font-size: 1.13rem;
+}
+p {
+  margin: 0.75em 0;
+}
+ul, ol {
+  padding-left: 1.45rem;
+}
+li + li {
+  margin-top: 0.25rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.35rem;
+  font-size: 0.91rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #eef3f8;
+  font-weight: 650;
+}
+tr:nth-child(even) td {
+  background: var(--soft);
+}
+code {
+  background: #edf2f7;
+  border: 1px solid #d8e0ea;
+  border-radius: 4px;
+  padding: 0.08rem 0.28rem;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.92em;
+}
+pre {
+  overflow-x: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+a {
+  color: var(--accent);
+}
+blockquote {
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+</style>
+</head>
+<body>
+<main>
+<article>
+<h1>Risk and Recovery Audit</h1>
+<h2>Evidence Base</h2>
+<ul>
+<li><code>agent_audit/data/signal_risk_events.csv</code></li>
+<li><code>agent_audit/data/signal_risk_action_summary.csv</code></li>
+<li><code>agent_audit/data/risk_cap_sensitivity.csv</code></li>
+<li><code>agent_audit/data/signal_risk_symbol_action_summary.csv</code></li>
+<li><code>config.json</code>, <code>pm_position.py</code>, <code>pm_main.py</code>, <code>pm_institutional_supervisor.py</code></li>
+</ul>
+<h2>Live Risk Reality</h2>
+<p>The configured target risk is often 0.5%, but the live signal ledger shows actual post-normalization risk is much higher:</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">Rows</th>
+<th style="text-align: right;">Actual risk median</th>
+<th style="text-align: right;">Actual risk mean</th>
+<th style="text-align: right;">Actual risk max</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EXECUTED</td>
+<td style="text-align: right;">67</td>
+<td style="text-align: right;">5.35%</td>
+<td style="text-align: right;">7.58%</td>
+<td style="text-align: right;">24.67%</td>
+</tr>
+<tr>
+<td>BLOCKED_MIN_LOT_EXCEEDS_CAP</td>
+<td style="text-align: right;">83</td>
+<td style="text-align: right;">37.67%</td>
+<td style="text-align: right;">54.93%</td>
+<td style="text-align: right;">362.06%</td>
+</tr>
+</tbody>
+</table>
+<p>Of the 67 executed rows, 57 exceeded 2x target, 47 exceeded 5x target, 34 exceeded 10x target, and 19 exceeded 20x target. This is not just "aggressive strategy"; it is broker min-lot mechanics overwhelming the target risk.</p>
+<h2>Risk Cap Sensitivity</h2>
+<p>The current 25% cap allows all 67 executed rows in the audited ledger. Candidate alternatives:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Cap</th>
+<th style="text-align: right;">Would allow</th>
+<th style="text-align: right;">Would block</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">5%</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">35</td>
+</tr>
+<tr>
+<td style="text-align: right;">8%</td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">26</td>
+</tr>
+<tr>
+<td style="text-align: right;">10%</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">19</td>
+</tr>
+<tr>
+<td style="text-align: right;">15%</td>
+<td style="text-align: right;">55</td>
+<td style="text-align: right;">12</td>
+</tr>
+<tr>
+<td style="text-align: right;">20%</td>
+<td style="text-align: right;">61</td>
+<td style="text-align: right;">6</td>
+</tr>
+<tr>
+<td style="text-align: right;">25%</td>
+<td style="text-align: right;">67</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+<p>A 10% cap is a useful first experiment: it keeps most flow while removing the riskiest tail.</p>
+<h2>Symbol and Universe Risk</h2>
+<p>Min-lot blocks concentrate in symbols that are structurally too large for the account:</p>
+<ul>
+<li>XAUGBP: 35 blocked min-lot rows, median actual risk 39.15%.</li>
+<li>US100: 23 blocked rows, median 33.11%.</li>
+<li>DE30: 12 blocked rows, median 56.47%, max 362.06%.</li>
+<li>US30, XAUEUR, PLATINUM, XAUUSD, TESLA also show severe min-lot risk.</li>
+</ul>
+<p>At $22, the effective universe is much smaller than the configured 100 symbols. This reduces diversification and creates log/signal noise.</p>
+<h2>Supervisor and Recovery</h2>
+<p>The institutional supervisor and cycle drift controls are active:</p>
+<ul>
+<li>65 <code>BLOCKED_INSTITUTIONAL_SUPERVISOR</code> rows.</li>
+<li>33 <code>BLOCKED_CYCLE_DRIFT</code> rows.</li>
+</ul>
+<p>These are useful protection layers, but current hard thresholds are very wide for a $22 account. A block that triggers after 40-75% risk/drawdown does not provide much recovery headroom.</p>
+<h2>Recovery Recommendations</h2>
+<ol>
+<li>Add a balance-aware universe filter before live eligibility.</li>
+<li>Lower <code>position.max_risk_pct</code> to 8-10% for preservation mode; leave 25% only for explicit lottery mode.</li>
+<li>Convert micro-account breaker limits to absolute dollars or add absolute-dollar overlays.</li>
+<li>Add a startup summary: current equity, expected account, tradeable symbols at min-lot, and breaker headroom.</li>
+<li>Add MAE/MFE capture so high-drawdown winners are not accidentally removed before they are understood.</li>
+</ol>
+</article>
+</main>
+</body>
+</html>

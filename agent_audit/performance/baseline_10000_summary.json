@@ -1,0 +1,44 @@
+{
+  "balance_sweep_performed": false,
+  "canonical_starting_balance_usd": 10000.0,
+  "config_initial_capital": 10000.0,
+  "config_sha256": "6b57106d7a88f7b9353d3ad24b842125820d9e704edf85c23baa663c52417db1",
+  "config_starting_balance": null,
+  "cost_settings": {
+    "backtest_spread_mode": "conservative_max",
+    "use_commission": true,
+    "use_slippage": true,
+    "use_spread": true
+  },
+  "created_at": "2026-06-20T00:03:07.272873",
+  "current_ledger_inventory_sha256": "cdeb1f0947165a50baefbb026af44a61894cd8af89d9a6d0893ef8afcdbdf4b6",
+  "current_logical_promoted_cell_count": 117,
+  "full_optimizer_run_performed": false,
+  "git_head": null,
+  "historical_ledger_tradeable_cells_sha256": "6b8954196f1d0c74e3bad5f3cb84e79afffd33ff3171828ae699e5275b55fe92",
+  "live_trade_performed": false,
+  "mt5_identity": {
+    "account_id": null,
+    "server": ""
+  },
+  "numba_status": "available in tests when pm_core.NUMBA_AVAILABLE is true; parity test executed conditionally",
+  "optuna_settings": {
+    "pruner": null,
+    "sampler": null,
+    "seed": null,
+    "study_name": null,
+    "trial_budget": null
+  },
+  "pm_configs_sha256": "4daeea906ac979e2d6eca8b7670b0acea9a0b8a84c1fcd95293279e6dc88e58e",
+  "pm_configs_top_level_count": 100,
+  "pm_configs_type": "dict",
+  "regime_params_sha256": "23d40107cc92ab70da018c4c6c67b6bbcbb5ba5e2665ccf5ab573b27454c54d8",
+  "risk_settings": {
+    "pipeline_discovery_risk_per_trade_pct": 1,
+    "pipeline_max_combined_risk_pct": 50.0,
+    "position_max_risk_pct": 25.0,
+    "position_risk_per_trade_pct": 0.5
+  },
+  "source_note": "USD 10,000 is the canonical comparison baseline. This script fingerprints current artifacts and does not execute strategy optimization. Historical ledger_tradeable_cells evidence is not the current live-book count after the 2026-06-18 pm_configs.json rewrite.",
+  "working_tree_status": null
+}

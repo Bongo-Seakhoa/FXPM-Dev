@@ -93,6 +93,45 @@ def _trial(
     return {**definition, "trial_definition_sha256": _hash(definition)}
 
 
+def _with_state_context(
+    trial: dict[str, str],
+    *,
+    candidate: dict[str, object],
+    required: int,
+    selected: int,
+) -> dict[str, object]:
+    disposition_body = {
+        "schema_version": "fxpm.production-trial-state-context-disposition.v1",
+        "candidate_id": candidate["candidate_id"],
+        "candidate_definition_sha256": candidate[
+            "candidate_definition_sha256"
+        ],
+        "state_requirement_sha256": f"{required + 1:064x}",
+        "required_context_bars": required,
+        "selected_context_bars": selected,
+        "status": "PLANNED" if required <= selected else "PROCESS_REJECTED",
+        "reason_code": (
+            None
+            if required <= selected
+            else "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+        ),
+    }
+    disposition = {
+        **disposition_body,
+        "disposition_sha256": _hash(disposition_body),
+    }
+    definition = {
+        key: value
+        for key, value in trial.items()
+        if key != "trial_definition_sha256"
+    }
+    definition["state_context_disposition"] = disposition
+    return {
+        **definition,
+        "trial_definition_sha256": _hash(definition),
+    }
+
+
 def _request() -> dict[str, object]:
     dependency_payload = {
         "schema_version": "fxpm.historical-dependency-policy-payload.v1",
@@ -322,7 +361,7 @@ def _shards(plan: object) -> list[dict[str, object]]:
             closes: list[str] = []
             trades: list[str] = []
             status = "PROCESS_REJECTED"
-            reason = "SOURCE_BOUNDARY_SHORTFALL"
+            reason = expected["expected_reason_code"]
         else:
             validation_start = _utc(expected["validation_start_utc"])
             observation_time = validation_start + timedelta(days=1)
@@ -464,7 +503,19 @@ def test_plan_binds_prefix_and_builds_complete_cartesian_roster(
     assert body["trial_registry_sha256"] == _hash(body["trial_registry"])
     assert body["attempt_roster_sha256"] == _hash(body["attempts"])
     assert body["evidence_roster_sha256"] == _hash(body["expected_evaluations"])
-    assert body["resource_contract"]["expected_evaluation_ceiling"] == 100_000
+    resource_contract = body["resource_contract"]
+    assert resource_contract["expected_evaluation_ceiling"] == 100_000
+    assert all(
+        "timeout" not in key.lower() and "deadline" not in key.lower()
+        for key in resource_contract
+    )
+    assert horizon._TECHNICAL_REASONS == frozenset(  # noqa: SLF001
+        {
+            "EVALUATOR_OOM",
+            "SOURCE_INTEGRITY_FAILURE",
+            "EVALUATOR_EXCEPTION",
+        }
+    )
 
 
 def test_dependency_geometry_is_derived_from_bound_policy(valid_plan: object) -> None:
@@ -812,6 +863,135 @@ def test_boundary_shortfall_is_local_and_does_not_veto_siblings(
     assert independent.receipt_sha256 == valid_plan.receipt_sha256
 
 
+def _mixed_state_context_request() -> dict[str, object]:
+    request = _request()
+    candidate = request["candidates"][0]
+    request["candidates"] = [candidate]
+    request["trials"] = [
+        _with_state_context(
+            request["trials"][0],
+            candidate=candidate,
+            required=4,
+            selected=4,
+        ),
+        _with_state_context(
+            request["trials"][1],
+            candidate=candidate,
+            required=5,
+            selected=4,
+        ),
+    ]
+    return request
+
+
+def test_state_context_shortfall_is_trial_local_and_evidence_reason_is_exact() -> None:
+    plan = horizon.build_historical_horizon_plan(
+        _mixed_state_context_request()
+    )
+    body = plan.to_dict()
+
+    assert body["plan_status"] == "READY_FOR_HISTORICAL_EVIDENCE"
+    assert [item["status"] for item in body["attempts"]] == [
+        "PLANNED",
+        "PROCESS_REJECTED",
+    ]
+    assert body["attempts"][1]["reason_code"] == (
+        "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+    )
+    assert len(body["expected_evaluations"]) == 3
+    terminal = [
+        item
+        for item in body["expected_evaluations"]
+        if item["expected_status"] == "PROCESS_REJECTED"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["expected_reason_code"] == (
+        "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+    )
+    assert all(
+        "state_context_disposition_sha256" in item
+        for item in body["trial_registry"]
+    )
+
+    evidence = horizon.evaluate_historical_horizon_plan(
+        plan,
+        _shards(plan),
+    )
+    assert horizon.verify_historical_horizon_evidence(plan, evidence) is True
+
+
+def test_state_context_disposition_roster_and_inequality_fail_closed() -> None:
+    missing = _mixed_state_context_request()
+    legacy = _trial(
+        "trial-beta",
+        "breakout",
+        "d" * 64,
+        "e" * 64,
+    )
+    missing["trials"][1] = legacy
+    with pytest.raises(ValueError, match="exact trial roster"):
+        horizon.build_historical_horizon_plan(missing)
+
+    invalid = _mixed_state_context_request()
+    trial = invalid["trials"][1]
+    disposition = trial["state_context_disposition"]
+    disposition["status"] = "PLANNED"
+    disposition["reason_code"] = None
+    disposition["disposition_sha256"] = _hash(
+        {
+            key: value
+            for key, value in disposition.items()
+            if key != "disposition_sha256"
+        }
+    )
+    trial["trial_definition_sha256"] = _hash(
+        {
+            key: value
+            for key, value in trial.items()
+            if key != "trial_definition_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="inequality mismatch"):
+        horizon.build_historical_horizon_plan(invalid)
+
+
+def test_state_context_disposition_must_bind_dependency_and_candidate() -> None:
+    for field, value, match in (
+        ("selected_context_bars", 3, "candidate or dependency mismatch"),
+        ("candidate_definition_sha256", "0" * 64, "candidate or dependency mismatch"),
+    ):
+        request = _mixed_state_context_request()
+        for trial in request["trials"]:
+            disposition = trial["state_context_disposition"]
+            disposition[field] = value
+            required = disposition["required_context_bars"]
+            selected = disposition["selected_context_bars"]
+            disposition["status"] = (
+                "PLANNED" if required <= selected else "PROCESS_REJECTED"
+            )
+            disposition["reason_code"] = (
+                None
+                if required <= selected
+                else "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+            )
+            disposition["disposition_sha256"] = _hash(
+                {
+                    key: item
+                    for key, item in disposition.items()
+                    if key != "disposition_sha256"
+                }
+            )
+            trial["trial_definition_sha256"] = _hash(
+                {
+                    key: item
+                    for key, item in trial.items()
+                    if key != "trial_definition_sha256"
+                }
+            )
+        with pytest.raises(ValueError, match=match):
+            horizon.build_historical_horizon_plan(request)
+
+
 def test_authenticated_unobserved_regime_has_exact_zero_work_roster() -> None:
     request = _unobserved_request()
     plan = horizon.build_historical_horizon_plan(request)
@@ -844,6 +1024,49 @@ def test_authenticated_unobserved_regime_has_exact_zero_work_roster() -> None:
     assert horizon.verify_historical_horizon_evidence(plan, evidence) is True
     with pytest.raises(ValueError, match="unobserved.*cannot accept"):
         horizon.evaluate_historical_horizon_plan(plan, [{}])
+
+
+def test_all_zero_regime_support_has_exact_zero_work_roster() -> None:
+    request = _unobserved_request()
+    binding = request["regime_support_binding"]
+    support = binding["train_regime_support"]
+    support["eligible_rows"] = 0
+    support["counts"] = {
+        "TREND": 0,
+        "RANGE": 0,
+        "BREAKOUT": 0,
+        "CHOP": 0,
+    }
+    support["observed_regimes"] = []
+    support["unobserved_regimes"] = ["TREND", "RANGE", "BREAKOUT", "CHOP"]
+    support["support_state_by_regime"] = {
+        regime: "UNOBSERVED" for regime in support["label_order"]
+    }
+    support["first_ts"] = None
+    support["last_ts"] = None
+    _reseal_unobserved_support(request)
+
+    plan = horizon.build_historical_horizon_plan(request)
+    body = plan.to_dict()
+
+    assert body["plan_status"] == "HISTORICAL_REGIME_UNOBSERVED"
+    assert body["candidates"] == []
+    assert body["trials"] == []
+    assert body["attempts"] == []
+    assert body["expected_evaluations"] == []
+    assert body["regime_support_binding"] == binding
+
+    forged = _unobserved_request()
+    forged_binding = forged["regime_support_binding"]
+    forged_support = forged_binding["train_regime_support"]
+    forged_support.update(support)
+    forged_support["first_ts"] = "2022-01-24T00:00:00+00:00"
+    _reseal_unobserved_support(forged)
+    with pytest.raises(
+        ValueError,
+        match="empty regime support must not claim a label time range",
+    ):
+        horizon.build_historical_horizon_plan(forged)
 
 
 def test_unobserved_regime_rejects_support_count_and_partition_tampering() -> None:
@@ -935,6 +1158,27 @@ def test_technical_source_integrity_cannot_be_laundered_as_process_rejection(
     )
     assert unavailable.to_dict()["plan_status"] == "HISTORICAL_SOURCE_UNAVAILABLE"
     assert technical.to_dict()["plan_status"] == "HISTORICAL_TECHNICAL_INCOMPLETE"
+
+
+def test_authenticated_terminal_technical_is_distinct_complete_zero_work_plan() -> None:
+    request = _terminal_source_request("TECHNICAL_TERMINAL")
+    request["native_prefix"]["source_reason"] = (
+        "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
+    )
+    plan = horizon.build_historical_horizon_plan(request)
+    body = plan.to_dict()
+
+    assert body["plan_status"] == "HISTORICAL_TERMINAL_TECHNICAL"
+    assert body["native_prefix"]["source_state"] == "TECHNICAL_TERMINAL"
+    assert body["candidates"] == []
+    assert body["trials"] == []
+    assert body["attempts"] == []
+    assert body["expected_evaluations"] == []
+    assert body["confers_trading_or_capital_authority"] is False
+
+    evidence = horizon.evaluate_historical_horizon_plan(plan, [])
+    assert evidence.to_dict()["evidence_status"] == ("HISTORICAL_TERMINAL_TECHNICAL")
+    assert horizon.verify_historical_horizon_evidence(plan, evidence) is True
 
 
 def test_exact_evidence_is_complete_replayable_and_non_decisional(

@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM-Dev\tools\acquire_native_history.py", line 4414, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM-Dev\tools\acquire_native_history.py", line 4036, in main
+    return _main_with_args(args, preheld_lock=preheld_lock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM-Dev\tools\acquire_native_history.py", line 4300, in _main_with_args
+    request = NativeHistoryRequest(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 17, in __init__
+  File "C:\Users\Bongo\OneDrive\Desktop\FxPM-Dev\tools\acquire_native_history.py", line 1024, in __post_init__
+    raise ValueError(
+ValueError: the V5 timeframe evidence contract requires the exact six-timeframe roster ['M5', 'M15', 'M30', 'H1', 'H4', 'D1']

@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import inspect
+import io
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,6 +14,7 @@ import pandas as pd
 import pytest
 
 import pm_broker_terms as terms
+import tools.capture_activate_broker_terms as capture_cli
 from tools.capture_activate_broker_terms import main as capture_main
 
 
@@ -83,6 +86,55 @@ def _parse_snapshot(tmp_path: Path, symbols=("EURUSD",), now=None):
         now_utc=now,
     )
     return snapshot
+
+
+def test_terms_export_hashes_and_parses_the_same_bounded_payload(
+    tmp_path,
+    monkeypatch,
+):
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    nonce = "d" * 48
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=terms.EXPORT_COLUMNS)
+    writer.writeheader()
+    writer.writerow(_export_row("EURUSD", nonce, now - timedelta(minutes=2)))
+    payload = buffer.getvalue().encode("utf-8")
+    missing_path = tmp_path / "already-replaced-export.csv"
+    bounded_reads = []
+    parsed_payloads = []
+    real_dict_reader = csv.DictReader
+
+    def bounded_read(path, max_bytes):
+        bounded_reads.append((Path(path), max_bytes))
+        return payload
+
+    def dict_reader_from_memory(source, *args, **kwargs):
+        assert isinstance(source, io.StringIO)
+        parsed_payloads.append(source.getvalue().encode("utf-8"))
+        return real_dict_reader(source, *args, **kwargs)
+
+    monkeypatch.setattr(terms, "_read_bounded", bounded_read)
+    monkeypatch.setattr(terms.csv, "DictReader", dict_reader_from_memory)
+    snapshot = terms.parse_terms_export(
+        missing_path,
+        expected_nonce=nonce,
+        expected_roster={"EURUSD": "EURUSD"},
+        expected_identity={
+            "broker_server": "Broker-Demo",
+            "terminal_company": "Broker Ltd",
+            "account_currency": "USD",
+        },
+        requested_at_utc=now - timedelta(minutes=3),
+        now_utc=now,
+        max_bytes=len(payload),
+    )
+
+    assert bounded_reads == [(missing_path, len(payload))]
+    assert parsed_payloads == [payload]
+    assert snapshot["source_export_sha256"] == hashlib.sha256(
+        parsed_payloads[0]
+    ).hexdigest()
+    assert snapshot["symbols"]["EURUSD"]["swap_long"] == -1.25
 
 
 def test_direct_export_requires_nonce_exact_roster_identity_and_freshness(tmp_path):
@@ -175,9 +227,9 @@ def test_direct_factors_accept_observed_no_triple_day_sentinel(tmp_path):
     assert 3 not in record["weekday_factors"].values()
 
 
-def _write_price_fixture(tmp_path: Path):
+def _write_price_fixture(tmp_path: Path, *, price_symbol: str = "EURUSD"):
     native = tmp_path / "native"
-    bars_root = native / "runs" / "r1" / "EURUSD"
+    bars_root = native / "runs" / "r1" / price_symbol
     bars_root.mkdir(parents=True)
     d1 = pd.DataFrame(
         {
@@ -211,7 +263,7 @@ def _write_price_fixture(tmp_path: Path):
         "activation_id": "price-a1",
         "status": "active",
         "entries": {
-            "EURUSD": {
+            price_symbol: {
                 "D1": {
                     "status": "active",
                     "bars_relative_path": d1_path.relative_to(native).as_posix(),
@@ -240,6 +292,228 @@ def _write_price_fixture(tmp_path: Path):
     }
     (native / "ACTIVE.json").write_text(json.dumps(pointer), encoding="utf-8")
     return native, d1_path, m5_path
+
+
+def _promote_price_fixture(
+    native: Path,
+    *,
+    price_symbol: str = "EURUSD",
+    technical_timeframe: str = "H1",
+) -> None:
+    """Convert the compact legacy fixture into the promoted v4 cell contract."""
+
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cells = manifest["entries"][price_symbol]
+    cells["D1"]["status"] = "evidence_candidate"
+    cells["M5"]["status"] = "evidence_candidate"
+    for timeframe in ("D1", "M5"):
+        cells[timeframe].update(
+            {
+                "symbol": price_symbol,
+                "timeframe": timeframe,
+                "universe_eligibility_status": "evidence_candidate",
+            }
+        )
+    terminal = json.loads(json.dumps(cells["M5"]))
+    terminal["status"] = "technical_error"
+    terminal["timeframe"] = technical_timeframe
+    terminal["universe_eligibility_status"] = "technical_error"
+    cells[technical_timeframe] = terminal
+    manifest["production_authoritative"] = True
+    manifest["native_is_signal_authority"] = True
+    manifest["silent_fallback_allowed"] = False
+    manifest["counts"] = {"pending": 0, "terminal": 3, "total": 3}
+    manifest["universe_eligibility"] = {
+        "schema_version": "fxpm-native-universe-authenticity-v4",
+        "trading_verdicts_emitted": False,
+        "performance_inputs_used": False,
+        "required_timeframes": ["M5", "M15", "M30", "H1", "H4", "D1"],
+        "cell_statuses": {
+            price_symbol: {
+                "D1": "evidence_candidate",
+                "M5": "evidence_candidate",
+                technical_timeframe: "technical_error",
+            }
+        },
+        "evidence_candidate_timeframes_by_symbol": {
+            price_symbol: ["D1", "M5"],
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer["production_authoritative"] = True
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+
+def _promote_intraday_fallback_fixture(
+    native: Path,
+    *,
+    price_symbol: str = "EURUSD",
+    source_timeframe: str = "H4",
+    source_status: str = "success",
+):
+    """Add one promoted intraday source and make native D1 terminal."""
+
+    timeframe = source_timeframe.upper()
+    seconds = {
+        "H4": 4 * 3600,
+        "H1": 3600,
+        "M30": 30 * 60,
+        "M15": 15 * 60,
+        "M5": 5 * 60,
+    }[timeframe]
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cells = manifest["entries"][price_symbol]
+    bars_root = native / "runs" / "r1" / price_symbol
+
+    opens = []
+    # Ordinary session, early close, a completely absent day, another
+    # ordinary session, and one trailing partial session.
+    first_open_offset = seconds if timeframe == "M5" else 0
+    for day, stop_seconds in (
+        ("2026-04-06", 24 * 3600),
+        ("2026-04-07", 20 * 3600),
+        ("2026-04-09", 24 * 3600),
+        ("2026-04-10", 2 * seconds),
+    ):
+        start = pd.Timestamp(f"{day}T00:00:00Z")
+        opens.extend(
+            start + pd.Timedelta(seconds=offset)
+            for offset in range(first_open_offset, stop_seconds, seconds)
+        )
+    closes = [opened + pd.Timedelta(seconds=seconds) for opened in opens]
+    source_path = bars_root / f"{timeframe}.csv"
+    pd.DataFrame(
+        {
+            "time": [value.isoformat() for value in opens],
+            "Open": [1.0] * len(opens),
+            "High": [1.0] * len(opens),
+            "Low": [1.0] * len(opens),
+            "Close": [1.0] * len(opens),
+            "_BAR_CLOSE_TS": [value.isoformat() for value in closes],
+        }
+    ).to_csv(source_path, index=False)
+    source_sidecar = bars_root / f"{timeframe}.meta.json"
+    source_sidecar.write_text("{}", encoding="utf-8")
+
+    cells["D1"].update(
+        {
+            "status": "technical_error",
+            "universe_eligibility_status": "technical_error",
+        }
+    )
+    cells[timeframe] = {
+        "status": "evidence_candidate",
+        "symbol": price_symbol,
+        "timeframe": timeframe,
+        "universe_eligibility_status": "evidence_candidate",
+        "source_status": source_status,
+        "bars_relative_path": source_path.relative_to(native).as_posix(),
+        "bars_sha256": _sha(source_path),
+        "sidecar_relative_path": source_sidecar.relative_to(native).as_posix(),
+        "sidecar_sha256": _sha(source_sidecar),
+    }
+    cells["M5"].update(
+        {
+            "status": "evidence_candidate",
+            "symbol": price_symbol,
+            "timeframe": "M5",
+            "universe_eligibility_status": "evidence_candidate",
+        }
+    )
+    statuses = {
+        name: str(cell["status"])
+        for name, cell in cells.items()
+    }
+    candidates = sorted(
+        name for name, status in statuses.items()
+        if status == "evidence_candidate"
+    )
+    manifest["counts"] = {
+        "pending": 0,
+        "terminal": len(cells),
+        "total": len(cells),
+    }
+    manifest["universe_eligibility"]["cell_statuses"][price_symbol] = statuses
+    manifest["universe_eligibility"][
+        "evidence_candidate_timeframes_by_symbol"
+    ][price_symbol] = candidates
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    return source_path, source_sidecar
+
+
+def test_d1_derivation_hashes_and_parses_the_same_bounded_payload(
+    tmp_path,
+    monkeypatch,
+):
+    payload = (
+        b"time,_BAR_CLOSE_TS\n"
+        b"2026-04-06T00:00:00+00:00,2026-04-07T00:00:00+00:00\n"
+        b"2026-04-07T00:00:00+00:00,2026-04-08T00:00:00+00:00\n"
+    )
+    missing_path = tmp_path / "already-replaced-d1.csv"
+    bounded_reads = []
+    parsed_payloads = []
+    real_read_csv = pd.read_csv
+
+    def bounded_read(path, max_bytes):
+        bounded_reads.append((Path(path), max_bytes))
+        return payload
+
+    def read_csv_from_memory(source, *args, **kwargs):
+        assert isinstance(source, io.BytesIO)
+        parsed_payloads.append(source.getvalue())
+        return real_read_csv(source, *args, **kwargs)
+
+    monkeypatch.setattr(terms, "_read_bounded", bounded_read)
+    monkeypatch.setattr(terms.pd, "read_csv", read_csv_from_memory)
+    events, digest = terms._derive_d1_session_events_hashed(
+        missing_path,
+        symbol_terms={
+            "d1_anchors": [{"open_epoch": 1775433600, "server_weekday": 1}],
+            "weekday_factors": {
+                "sunday": 0,
+                "monday": 1,
+                "tuesday": 1,
+                "wednesday": 3,
+                "thursday": 1,
+                "friday": 1,
+                "saturday": 0,
+            },
+        },
+        max_bytes=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert bounded_reads == [(missing_path, len(payload))]
+    assert parsed_payloads == [payload]
+    assert digest == hashlib.sha256(parsed_payloads[0]).hexdigest()
+    assert events == [
+        {
+            "d1_bar_index": 0,
+            "d1_open_utc": "2026-04-06T00:00:00+00:00",
+            "event_utc": "2026-04-07T00:00:00+00:00",
+            "from_weekday": 1,
+            "from_weekday_name": "monday",
+            "factor": 1,
+        },
+        {
+            "d1_bar_index": 1,
+            "d1_open_utc": "2026-04-07T00:00:00+00:00",
+            "event_utc": "2026-04-08T00:00:00+00:00",
+            "from_weekday": 2,
+            "from_weekday_name": "tuesday",
+            "factor": 1,
+        },
+    ]
 
 
 def test_activation_binds_existing_price_hashes_and_projects_close_and_gap(tmp_path):
@@ -291,7 +565,9 @@ def test_activation_binds_existing_price_hashes_and_projects_close_and_gap(tmp_p
 
     original_m5 = m5_path.read_bytes()
     m5_path.write_bytes(original_m5 + b"\n")
-    with pytest.raises(terms.BrokerTermsError, match="target artifact hash"):
+    with pytest.raises(
+        terms.BrokerTermsError, match="target artifact.*hash mismatch"
+    ):
         terms.resolve_active_swap_contract(native, "EURUSD", "M5")
     m5_path.write_bytes(original_m5)
 
@@ -303,6 +579,478 @@ def test_activation_binds_existing_price_hashes_and_projects_close_and_gap(tmp_p
         terms.resolve_active_swap_contract(native, "EURUSD", "M5")
 
 
+def test_promoted_v4_binds_candidates_and_rejects_terminal_technical_cells(tmp_path):
+    native, _d1_path, m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    activated = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="promoted-terms-a1",
+        now_utc=now,
+    )
+
+    bindings = activated["symbols"]["EURUSD"]["target_bindings"]
+    assert set(bindings) == {"D1", "M5"}
+    assert bindings["M5"]["bars_sha256"] == _sha(m5_path)
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert resolved["target_bars_sha256"] == _sha(m5_path)
+    with pytest.raises(terms.BrokerTermsError):
+        terms.resolve_active_swap_contract(native, "EURUSD", "H1")
+
+
+@pytest.mark.parametrize(
+    ("source_timeframe", "source_status"),
+    [
+        ("H4", "success"),
+        ("H4", "partial"),
+        ("H1", "success"),
+        ("M30", "success"),
+        ("M15", "success"),
+        ("M5", "success"),
+    ],
+)
+def test_promoted_intraday_fallback_builds_one_daily_schedule_from_good_proxy(
+    tmp_path,
+    source_timeframe,
+    source_status,
+):
+    native, _d1_path, m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    source_path, _source_sidecar = _promote_intraday_fallback_fixture(
+        native,
+        source_timeframe=source_timeframe,
+        source_status=source_status,
+    )
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+
+    activated = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id=f"intraday-{source_timeframe.lower()}-{source_status}",
+        now_utc=now,
+    )
+
+    record = activated["symbols"]["EURUSD"]
+    assert record["schedule_source_timeframe"] == source_timeframe
+    assert record["schedule_source_binding"]["bars_sha256"] == _sha(source_path)
+    assert set(record["target_bindings"]) == {source_timeframe, "M5"}
+    schedule = json.loads(
+        (native / record["schedule_relative_path"]).read_text(encoding="utf-8")
+    )
+    assert schedule["schema_version"] == terms.SESSION_SCHEDULE_SCHEMA
+    assert schedule["schedule_source_timeframe"] == source_timeframe
+    assert schedule["schedule_derivation_metadata"]["phase_seconds"] == 0
+    assert schedule["events"] == [
+        ["2026-04-07T00:00:00+00:00", 1],
+        ["2026-04-08T00:00:00+00:00", 1],
+        ["2026-04-10T00:00:00+00:00", 1],
+    ]
+
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert resolved["target_bars_sha256"] == _sha(m5_path)
+    assert resolved["schedule_source_timeframe"] == source_timeframe
+    assert resolved["schedule_source_bars_sha256"] == _sha(source_path)
+    assert resolved["d1_bars_sha256"] is None
+    with pytest.raises(terms.BrokerTermsError):
+        terms.resolve_active_swap_contract(native, "EURUSD", "D1")
+
+
+def test_promoted_d1_remains_preferred_and_keeps_the_v2_record_shape(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    _promote_intraday_fallback_fixture(native, source_timeframe="H4")
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    d1 = manifest["entries"]["EURUSD"]["D1"]
+    d1["status"] = "evidence_candidate"
+    d1["universe_eligibility_status"] = "evidence_candidate"
+    universe = manifest["universe_eligibility"]
+    universe["cell_statuses"]["EURUSD"]["D1"] = "evidence_candidate"
+    universe["evidence_candidate_timeframes_by_symbol"]["EURUSD"] = sorted(
+        set(universe["evidence_candidate_timeframes_by_symbol"]["EURUSD"])
+        | {"D1"}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+
+    activated = terms.activate_broker_terms(native, snapshot, now_utc=now)
+    record = activated["symbols"]["EURUSD"]
+    assert "schedule_source_timeframe" not in record
+    assert "schedule_source_binding" not in record
+    assert "d1_binding" in record
+    schedule = json.loads(
+        (native / record["schedule_relative_path"]).read_text(encoding="utf-8")
+    )
+    assert schedule["schema_version"] == terms.D1_SESSION_SCHEDULE_SCHEMA
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "H4")
+    assert resolved["schedule_source_timeframe"] == "D1"
+    assert resolved["d1_bars_sha256"] == record["d1_bars_sha256"]
+
+
+def test_receipt_backed_generic_schedule_cannot_override_admissible_d1(
+    tmp_path,
+    monkeypatch,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    _promote_intraday_fallback_fixture(native, source_timeframe="H4")
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    activated = terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+    receipt = {
+        "schema_version": terms.SCHEDULE_SOURCE_SELECTION_SCHEMA,
+        "policy": terms.SCHEDULE_SOURCE_POLICY,
+        "rejected_candidates": [],
+        "selected_source_timeframe": "H4",
+        "selected_source_completed_session_count": 3,
+        "selected_source_completed_sessions_sha256": "1" * 64,
+        "target_completed_session_union_count": 1,
+        "target_completed_session_union_sha256": "2" * 64,
+    }
+    terms_pointer_path = native / "terms" / "ACTIVE.json"
+    terms_pointer = json.loads(
+        terms_pointer_path.read_text(encoding="utf-8")
+    )
+    terms_manifest_path = native / terms_pointer["manifest_relative_path"]
+    terms_manifest = json.loads(
+        terms_manifest_path.read_text(encoding="utf-8")
+    )
+    terms_record = terms_manifest["symbols"]["EURUSD"]
+    schedule_path = native / terms_record["schedule_relative_path"]
+    schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    schedule["schedule_source_selection_receipt"] = receipt
+    schedule_path.write_text(json.dumps(schedule), encoding="utf-8")
+    terms_record["schedule_source_selection_receipt"] = receipt
+    terms_record["schedule_sha256"] = _sha(schedule_path)
+    terms_manifest_path.write_text(
+        json.dumps(terms_manifest),
+        encoding="utf-8",
+    )
+    terms_pointer["manifest_sha256"] = _sha(terms_manifest_path)
+    terms_pointer_path.write_text(
+        json.dumps(terms_pointer),
+        encoding="utf-8",
+    )
+
+    price = terms.load_current_price_activation(native)
+    forged_price = dict(price)
+    forged_manifest = json.loads(json.dumps(price["manifest"]))
+    d1 = forged_manifest["entries"]["EURUSD"]["D1"]
+    d1["status"] = "evidence_candidate"
+    d1["universe_eligibility_status"] = "evidence_candidate"
+    universe = forged_manifest["universe_eligibility"]
+    universe["cell_statuses"]["EURUSD"]["D1"] = "evidence_candidate"
+    universe["evidence_candidate_timeframes_by_symbol"]["EURUSD"] = sorted(
+        set(universe["evidence_candidate_timeframes_by_symbol"]["EURUSD"])
+        | {"D1"}
+    )
+    forged_price["manifest"] = forged_manifest
+    monkeypatch.setattr(
+        terms,
+        "load_current_price_activation",
+        lambda _native_root: forged_price,
+    )
+
+    with pytest.raises(
+        terms.BrokerTermsError,
+        match="generic schedule cannot override native D1",
+    ):
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
+@pytest.mark.parametrize("artifact", ["bars", "sidecar"])
+def test_intraday_schedule_source_is_reopened_and_tamper_rejected(
+    tmp_path,
+    artifact,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    source_path, source_sidecar = _promote_intraday_fallback_fixture(native)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+    damaged = source_path if artifact == "bars" else source_sidecar
+    damaged.write_bytes(damaged.read_bytes() + b"\n")
+    with pytest.raises(terms.BrokerTermsError, match="schedule source.*hash mismatch"):
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
+@pytest.mark.parametrize("tamper", ["source_timeframe", "target_binding"])
+def test_intraday_record_splices_remain_fail_closed(tmp_path, tamper):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    _promote_intraday_fallback_fixture(native)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+    pointer_path = native / "terms" / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = manifest["symbols"]["EURUSD"]
+    if tamper == "source_timeframe":
+        record["schedule_source_timeframe"] = "H1"
+    else:
+        record["target_bindings"].pop("M5")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    with pytest.raises(terms.BrokerTermsError):
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
+def test_intraday_schedule_event_axis_contract_splice_remains_fail_closed(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    _promote_intraday_fallback_fixture(native)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+    pointer_path = native / "terms" / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = manifest["symbols"]["EURUSD"]
+    schedule_path = native / record["schedule_relative_path"]
+    schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    schedule["event_axis_contract"] = "unbound-event-axis"
+    schedule_path.write_text(json.dumps(schedule), encoding="utf-8")
+    record["schedule_sha256"] = _sha(schedule_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    with pytest.raises(
+        terms.BrokerTermsError, match="schedule binding/schema mismatch"
+    ):
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
+def test_intraday_fallback_rejects_unbound_anchor_phase(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    _promote_intraday_fallback_fixture(native)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1},
+        {"open_epoch": 1775448000, "server_weekday": 1},
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    with pytest.raises(terms.BrokerTermsError, match="session phase"):
+        terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+
+def test_intraday_fallback_rejects_target_outside_source_coverage(tmp_path):
+    native, _d1_path, m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    _promote_intraday_fallback_fixture(native)
+    target = pd.read_csv(m5_path)
+    target.loc[0, "time"] = "2026-04-05T23:55:00Z"
+    target.loc[0, "_BAR_CLOSE_TS"] = "2026-04-06T00:00:00Z"
+    target.to_csv(m5_path, index=False)
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"]["EURUSD"]["M5"]["bars_sha256"] = _sha(m5_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+
+    with pytest.raises(
+        terms.BrokerTermsError, match="covers all completed target sessions"
+    ):
+        terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+
+def test_intraday_fallback_uses_finer_source_for_missing_interior_session(
+    tmp_path,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    h4_path, _h4_sidecar = _promote_intraday_fallback_fixture(
+        native,
+        source_timeframe="H4",
+    )
+    _h1_path, _h1_sidecar = _promote_intraday_fallback_fixture(
+        native,
+        source_timeframe="H1",
+    )
+    h4 = pd.read_csv(h4_path)
+    h4 = h4[
+        ~h4["time"].astype(str).str.startswith("2026-04-07")
+    ]
+    h4.to_csv(h4_path, index=False)
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"]["EURUSD"]["H4"]["bars_sha256"] = _sha(h4_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    activated = terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+    record = activated["symbols"]["EURUSD"]
+    assert record["schedule_source_timeframe"] == "H1"
+    receipt = record["schedule_source_selection_receipt"]
+    assert receipt["selected_source_timeframe"] == "H1"
+    assert [
+        rejection["timeframe"]
+        for rejection in receipt["rejected_candidates"]
+    ] == ["H4"]
+    assert (
+        receipt["rejected_candidates"][0]["reason"]
+        == "INCOMPLETE_TARGET_SESSION_COVERAGE"
+    )
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert resolved["schedule_source_timeframe"] == "H1"
+
+    terms_pointer_path = native / "terms" / "ACTIVE.json"
+    terms_pointer = json.loads(
+        terms_pointer_path.read_text(encoding="utf-8")
+    )
+    terms_manifest_path = native / terms_pointer["manifest_relative_path"]
+    terms_manifest = json.loads(
+        terms_manifest_path.read_text(encoding="utf-8")
+    )
+    terms_manifest["symbols"]["EURUSD"][
+        "schedule_source_selection_receipt"
+    ][
+        "rejected_candidates"
+    ][0]["binding"]["bars_sha256"] = "0" * 64
+    terms_manifest_path.write_text(
+        json.dumps(terms_manifest),
+        encoding="utf-8",
+    )
+    terms_pointer["manifest_sha256"] = _sha(terms_manifest_path)
+    terms_pointer_path.write_text(
+        json.dumps(terms_pointer),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        terms.BrokerTermsError,
+        match="rejected schedule-source binding mismatch",
+    ):
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
+def test_promoted_v4_casefold_maps_palladium_to_exact_native_identity(tmp_path):
+    native, _d1_path, m5_path = _write_price_fixture(
+        tmp_path,
+        price_symbol="Palladium",
+    )
+    _promote_price_fixture(native, price_symbol="Palladium")
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, symbols=("PALLADIUM",), now=now)
+    snapshot["symbols"]["PALLADIUM"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    activated = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="palladium-terms-a1",
+        now_utc=now,
+    )
+
+    assert activated["active_symbols"] == ["PALLADIUM"]
+    upper = terms.resolve_active_swap_contract(native, "PALLADIUM", "M5")
+    mixed = terms.resolve_active_swap_contract(native, "Palladium", "M5")
+    assert upper["target_bars_sha256"] == mixed["target_bars_sha256"] == _sha(m5_path)
+
+
+def test_promoted_v4_rejects_casefold_colliding_native_symbols(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(
+        tmp_path,
+        price_symbol="Palladium",
+    )
+    _promote_price_fixture(native, price_symbol="Palladium")
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"]["PALLADIUM"] = json.loads(
+        json.dumps(manifest["entries"]["Palladium"])
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, symbols=("PALLADIUM",), now=now)
+
+    with pytest.raises(terms.BrokerTermsError):
+        terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+
+def test_non_d1_resolution_reopens_the_d1_schedule_source_bars(tmp_path):
+    native, d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+    original = d1_path.read_bytes()
+    d1_path.write_bytes(original + b"\n")
+
+    with pytest.raises(terms.BrokerTermsError, match="D1|schedule source"):
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
+def test_non_d1_resolution_reopens_the_d1_schedule_source_sidecar(tmp_path):
+    native, d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+    d1_sidecar = d1_path.with_name("D1.meta.json")
+    d1_sidecar.write_text('{"tampered": true}', encoding="utf-8")
+
+    with pytest.raises(terms.BrokerTermsError, match="D1|schedule source"):
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
 def test_explicit_stress_is_adverse_and_never_implicit(tmp_path):
     snapshot = _parse_snapshot(tmp_path)
     stressed = terms.build_explicit_stress_snapshot(snapshot)
@@ -311,6 +1059,590 @@ def test_explicit_stress_is_adverse_and_never_implicit(tmp_path):
     assert record["swap_long"] == record["swap_short"] == -1.25
     assert set(record["weekday_factors"].values()) == {3}
     assert snapshot["provenance_status"] == terms.AUTHENTICATED
+
+
+@pytest.mark.parametrize("source_status", [terms.INCOMPLETE, terms.LEGACY_UNTRUSTED])
+def test_explicit_stress_rejects_unauthenticated_source_snapshots(
+    tmp_path,
+    source_status,
+):
+    snapshot = _parse_snapshot(tmp_path)
+    snapshot["provenance_status"] = source_status
+    for record in snapshot["symbols"].values():
+        record["provenance_status"] = source_status
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    with pytest.raises(terms.BrokerTermsError):
+        terms.build_explicit_stress_snapshot(snapshot)
+
+
+def test_explicit_stress_rejects_forged_direct_export_provenance(tmp_path):
+    snapshot = _parse_snapshot(tmp_path)
+    snapshot["source_export_sha256"] = "not-a-sha256"
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    with pytest.raises(terms.BrokerTermsError):
+        terms.build_explicit_stress_snapshot(snapshot)
+
+
+def test_activation_rejects_a_non_exact_stress_transform(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    stressed = terms.build_explicit_stress_snapshot(snapshot)
+    assert stressed["symbols"]["EURUSD"]["swap_long"] == -1.25
+    stressed["symbols"]["EURUSD"]["swap_long"] = -0.5
+    stressed.pop("content_sha256")
+    stressed["content_sha256"] = terms.canonical_sha256(stressed)
+
+    with pytest.raises(terms.BrokerTermsError, match="stress"):
+        terms.activate_broker_terms(native, stressed, now_utc=now)
+
+
+def test_price_race_before_publish_preserves_exact_predecessor_terms_pointer(
+    tmp_path,
+    monkeypatch,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="predecessor-terms",
+        now_utc=now,
+    )
+    terms_pointer_path = native / "terms" / "ACTIVE.json"
+    predecessor = terms_pointer_path.read_bytes()
+    real_loader = terms.load_current_price_activation
+    calls = 0
+
+    def raced_price_loader(root):
+        nonlocal calls
+        loaded = real_loader(root)
+        calls += 1
+        if calls == 2:
+            loaded = dict(loaded)
+            loaded["pointer_sha256"] = "f" * 64
+        return loaded
+
+    monkeypatch.setattr(terms, "load_current_price_activation", raced_price_loader)
+    with pytest.raises(terms.BrokerTermsError):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="raced-terms",
+            now_utc=now,
+        )
+
+    assert calls >= 2
+    assert terms_pointer_path.read_bytes() == predecessor
+
+
+@pytest.mark.parametrize(
+    ("staged_artifact", "expected_error"),
+    [
+        ("schedule", "staged D1 session schedule"),
+        ("snapshot", "staged terms snapshot"),
+        ("manifest", "staged terms activation manifest"),
+    ],
+)
+def test_final_validation_rejects_damaged_staged_artifacts_without_publication(
+    tmp_path,
+    monkeypatch,
+    staged_artifact,
+    expected_error,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    predecessor_snapshot = _parse_snapshot(tmp_path, now=now)
+    predecessor_snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    predecessor_snapshot.pop("content_sha256")
+    predecessor_snapshot["content_sha256"] = terms.canonical_sha256(
+        predecessor_snapshot
+    )
+    terms.activate_broker_terms(
+        native,
+        predecessor_snapshot,
+        activation_id="terms-predecessor-artifact-race",
+        now_utc=now,
+    )
+    terms_pointer_path = native / "terms" / "ACTIVE.json"
+    predecessor_pointer_bytes = terms_pointer_path.read_bytes()
+    existing_schedules = {
+        path.resolve()
+        for path in (native / "terms" / "schedules").rglob("EURUSD.json")
+    }
+    existing_snapshots = {
+        path.resolve()
+        for path in (native / "terms" / "snapshots").glob("*.json")
+    }
+
+    successor_snapshot = json.loads(json.dumps(predecessor_snapshot))
+    successor_snapshot["symbols"]["EURUSD"]["swap_long"] = -1.5
+    successor_snapshot.pop("content_sha256")
+    successor_snapshot["content_sha256"] = terms.canonical_sha256(
+        successor_snapshot
+    )
+    real_loader = terms.load_current_price_activation
+    loader_calls = 0
+
+    def damage_before_final_validation(root):
+        nonlocal loader_calls
+        loaded = real_loader(root)
+        loader_calls += 1
+        if loader_calls == 2:
+            if staged_artifact == "schedule":
+                successor_schedules = {
+                    path.resolve()
+                    for path in (native / "terms" / "schedules").rglob(
+                        "EURUSD.json"
+                    )
+                } - existing_schedules
+                assert len(successor_schedules) == 1
+                successor_schedules.pop().unlink()
+            elif staged_artifact == "snapshot":
+                successor_snapshots = {
+                    path.resolve()
+                    for path in (native / "terms" / "snapshots").glob("*.json")
+                } - existing_snapshots
+                assert len(successor_snapshots) == 1
+                successor_snapshots.pop().unlink()
+            else:
+                manifest_path = (
+                    native
+                    / "terms"
+                    / "activations"
+                    / "terms-successor-artifact-race.json"
+                )
+                manifest_path.write_text('{"tampered":true}', encoding="utf-8")
+        return loaded
+
+    monkeypatch.setattr(
+        terms,
+        "load_current_price_activation",
+        damage_before_final_validation,
+    )
+    with pytest.raises(terms.BrokerTermsError, match=expected_error):
+        terms.activate_broker_terms(
+            native,
+            successor_snapshot,
+            activation_id="terms-successor-artifact-race",
+            now_utc=now,
+        )
+
+    assert loader_calls == 2
+    assert terms_pointer_path.read_bytes() == predecessor_pointer_bytes
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert resolved["terms_activation_id"] == "terms-predecessor-artifact-race"
+
+
+def test_public_prune_holds_the_terms_pointer_lock(monkeypatch, tmp_path):
+    native = tmp_path / "native"
+    state = {"held": False}
+    events = []
+
+    @contextmanager
+    def observed_lock(root, *, timeout_seconds=30.0):
+        assert Path(root) == native.resolve()
+        assert timeout_seconds == 30.0
+        assert state["held"] is False
+        state["held"] = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+            state["held"] = False
+
+    def prune_locked(
+        root,
+        *,
+        max_snapshots,
+        max_total_bytes,
+        referenced_sha256,
+    ):
+        assert state["held"] is True
+        events.append("prune")
+        assert Path(root) == native.resolve()
+        assert max_snapshots == 3
+        assert max_total_bytes == 4096
+        assert tuple(referenced_sha256) == ("a" * 64,)
+        return {"deleted": [], "remaining_bytes": 0, "protected_bytes": 0}
+
+    monkeypatch.setattr(terms, "_terms_pointer_lock", observed_lock)
+    monkeypatch.setattr(terms, "_prune_terms_store_locked", prune_locked)
+    result = terms.prune_terms_store(
+        native,
+        max_snapshots=3,
+        max_total_bytes=4096,
+        referenced_sha256=("a" * 64,),
+    )
+
+    assert result == {
+        "deleted": [],
+        "remaining_bytes": 0,
+        "protected_bytes": 0,
+    }
+    assert events == ["enter", "prune", "exit"]
+    assert state["held"] is False
+
+
+def test_price_loader_rejects_torn_active_pointer_collection(tmp_path, monkeypatch):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    pointer_path = (native / "ACTIVE.json").resolve()
+    pointer_bytes = pointer_path.read_bytes()
+    real_read_bounded = terms._read_bounded
+    pointer_reads = 0
+
+    def raced_read(path, max_bytes):
+        nonlocal pointer_reads
+        payload = real_read_bounded(path, max_bytes)
+        if Path(path).resolve() == pointer_path:
+            pointer_reads += 1
+            if pointer_reads == 2:
+                return payload + b"\n"
+        return payload
+
+    monkeypatch.setattr(terms, "_read_bounded", raced_read)
+    with pytest.raises(
+        terms.BrokerTermsError,
+        match="native price pointer changed during activation read",
+    ):
+        terms.load_current_price_activation(native)
+
+    assert pointer_reads == 2
+    assert pointer_path.read_bytes() == pointer_bytes
+
+
+@pytest.mark.parametrize("update_pointer", [True, False])
+def test_snapshot_must_remain_fresh_through_commit_or_staged_return(
+    tmp_path,
+    monkeypatch,
+    update_pointer,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot["capture_started_at_utc"] = (
+        now - timedelta(milliseconds=100)
+    ).isoformat()
+    snapshot["captured_at_utc"] = (now + timedelta(milliseconds=500)).isoformat()
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="freshness-predecessor",
+        now_utc=now,
+    )
+    terms_pointer_path = native / "terms" / "ACTIVE.json"
+    predecessor_pointer_bytes = terms_pointer_path.read_bytes()
+    real_derive = terms._derive_d1_session_events_hashed
+
+    class DerivationClock:
+        value = 100.0
+
+        def monotonic(self):
+            return self.value
+
+        def sleep(self, seconds):
+            self.value += float(seconds)
+
+    clock = DerivationClock()
+
+    def delayed_derivation(*args, **kwargs):
+        result = real_derive(*args, **kwargs)
+        clock.value += 1.2
+        return result
+
+    monkeypatch.setattr(terms, "time", clock)
+    monkeypatch.setattr(
+        terms,
+        "_derive_d1_session_events_hashed",
+        delayed_derivation,
+    )
+    with pytest.raises(terms.BrokerTermsError, match="snapshot is not fresh"):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id=f"expired-at-return-{update_pointer}",
+            now_utc=now,
+            update_pointer=update_pointer,
+            max_snapshot_age_seconds=1,
+        )
+
+    assert terms_pointer_path.read_bytes() == predecessor_pointer_bytes
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert resolved["terms_activation_id"] == "freshness-predecessor"
+
+
+def test_snapshot_expiry_in_pre_replace_callback_preserves_predecessor(
+    tmp_path,
+    monkeypatch,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot["capture_started_at_utc"] = (
+        now - timedelta(milliseconds=100)
+    ).isoformat()
+    snapshot["captured_at_utc"] = (now + timedelta(milliseconds=500)).isoformat()
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="pre-replace-freshness-predecessor",
+        now_utc=now,
+    )
+    terms_pointer_path = native / "terms" / "ACTIVE.json"
+    predecessor_pointer_bytes = terms_pointer_path.read_bytes()
+
+    class ReplaceClock:
+        value = 200.0
+
+        def monotonic(self):
+            return self.value
+
+        def sleep(self, seconds):
+            self.value += float(seconds)
+
+    clock = ReplaceClock()
+    real_atomic_replace = terms._atomic_replace_json
+    callback_events = []
+
+    def delay_after_temp_is_durable(path, value, *, before_replace=None):
+        assert Path(path) == terms_pointer_path
+        assert before_replace is not None
+
+        def expire_then_validate():
+            callback_events.append("before_replace")
+            clock.value += 1.2
+            before_replace()
+
+        return real_atomic_replace(
+            path,
+            value,
+            before_replace=expire_then_validate,
+        )
+
+    monkeypatch.setattr(terms, "time", clock)
+    monkeypatch.setattr(
+        terms,
+        "_atomic_replace_json",
+        delay_after_temp_is_durable,
+    )
+    with pytest.raises(terms.BrokerTermsError, match="snapshot is not fresh"):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="expired-inside-pre-replace-callback",
+            now_utc=now,
+            max_snapshot_age_seconds=1,
+        )
+
+    assert callback_events == ["before_replace"]
+    assert terms_pointer_path.read_bytes() == predecessor_pointer_bytes
+    assert list(terms_pointer_path.parent.glob(".ACTIVE.json.*.tmp")) == []
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert (
+        resolved["terms_activation_id"]
+        == "pre-replace-freshness-predecessor"
+    )
+
+
+def test_update_pointer_false_retains_complete_staged_activation(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    staged = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="staged-terms",
+        now_utc=now,
+        update_pointer=False,
+    )
+
+    assert staged["pointer_updated"] is False
+    assert Path(staged["manifest_path"]).is_file()
+    assert (native / staged["terms_snapshot_relative_path"]).is_file()
+    schedule = native / staged["symbols"]["EURUSD"]["schedule_relative_path"]
+    assert schedule.is_file()
+    assert not (native / "terms" / "ACTIVE.json").exists()
+
+
+def test_exact_staged_activation_can_be_revalidated_and_promoted(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+
+    staged = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="exact-staged-terms",
+        now_utc=now,
+        update_pointer=False,
+    )
+    staged_manifest_bytes = Path(staged["manifest_path"]).read_bytes()
+    promoted = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="exact-staged-terms",
+        now_utc=now + timedelta(minutes=5),
+        update_pointer=True,
+        staged_manifest_created_at_utc=now,
+    )
+
+    assert promoted["pointer_updated"] is True
+    assert promoted["manifest_sha256"] == staged["manifest_sha256"]
+    assert Path(promoted["manifest_path"]).read_bytes() == staged_manifest_bytes
+    pointer = json.loads(
+        (native / "terms" / "ACTIVE.json").read_text(encoding="utf-8")
+    )
+    assert pointer["activated_at_utc"].startswith("2026-04-13T12:05:")
+    assert terms.resolve_active_swap_contract(native, "EURUSD", "M5")[
+        "terms_activation_id"
+    ] == "exact-staged-terms"
+
+
+def test_exact_active_overlay_pin_allows_stale_schedule_repair_only(tmp_path):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    predecessor = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="repair-predecessor",
+        now_utc=now,
+    )
+    pointer_path = native / "terms" / "ACTIVE.json"
+    predecessor_pointer_sha = _sha(pointer_path)
+    later = now + timedelta(days=30)
+
+    with pytest.raises(terms.BrokerTermsError, match="snapshot is not fresh"):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="unbound-stale-repair",
+            now_utc=later,
+        )
+    with pytest.raises(terms.BrokerTermsError, match="pointer pin mismatch"):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="wrong-pin-repair",
+            now_utc=later,
+            repair_source_terms_pointer_sha256="0" * 64,
+        )
+
+    repaired = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="exact-pinned-repair",
+        now_utc=later,
+        repair_source_terms_pointer_sha256=predecessor_pointer_sha,
+    )
+    assert repaired["symbols"]["EURUSD"] == predecessor["symbols"]["EURUSD"]
+    assert (
+        repaired["repair_source_terms_activation_id"]
+        == predecessor["activation_id"]
+    )
+    assert (
+        repaired["repair_source_terms_manifest_sha256"]
+        == predecessor["manifest_sha256"]
+    )
+    assert (
+        repaired["repair_source_terms_pointer_sha256"]
+        == predecessor_pointer_sha
+    )
+    assert terms.resolve_active_swap_contract(native, "EURUSD", "M5")[
+        "terms_activation_id"
+    ] == "exact-pinned-repair"
+
+
+def test_exact_promoted_manifest_terms_schedulability_classification():
+    repository = Path(__file__).resolve().parents[1]
+    manifest_path = (
+        repository
+        / "data"
+        / "native"
+        / "activations"
+        / "promoted"
+        / "20260719T101758Z-e050a26f.json"
+    )
+    if not manifest_path.is_file():
+        pytest.skip("exact promoted production manifest is not present")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidates = {
+        (symbol, timeframe)
+        for symbol, cells in manifest["entries"].items()
+        for timeframe, cell in cells.items()
+        if cell["status"] == "evidence_candidate"
+    }
+    source_by_symbol = {
+        symbol: next(
+            timeframe
+            for timeframe in terms._SCHEDULE_SOURCE_PREFERENCE
+            if (symbol, timeframe) in candidates
+        )
+        for symbol in manifest["entries"]
+    }
+    schedulable_candidates = {
+        cell for cell in candidates if cell[0] in source_by_symbol
+    }
+    unschedulable = candidates - schedulable_candidates
+
+    assert len(source_by_symbol) == 100
+    assert len(candidates) == 418
+    assert len(schedulable_candidates) == 418
+    assert unschedulable == set()
+    assert {
+        symbol: source
+        for symbol, source in source_by_symbol.items()
+        if source != "D1"
+    } == {
+        "Platinum": "H4",
+        "USDMXN": "H4",
+        "USDSGD": "H4",
+        "USDTHB": "H4",
+    }
 
 
 def test_missing_active_d1_schedule_fails_closed_without_price_fetch(tmp_path):
@@ -360,6 +1692,177 @@ def test_capture_command_returns_honest_wait_state_and_has_no_history_api(tmp_pa
     assert output["observed_stale_nonce"] == "f" * 48
     source = inspect.getsource(__import__("tools.capture_activate_broker_terms", fromlist=["main"]))
     assert "copy_" + "rates" not in source
+
+
+def _prepare_mock_capture_publication(tmp_path, monkeypatch):
+    exchange = tmp_path / "exchange"
+    exchange.mkdir()
+    native = tmp_path / "native"
+    roster_path = tmp_path / "roster.json"
+    roster = {"EURUSD": "EURUSD"}
+    roster_path.write_text(json.dumps(roster), encoding="utf-8")
+    nonce = "c" * 48
+    state_path = exchange / capture_cli.STATE_NAME
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fxpm-terms-capture-state-v1",
+                "phase": "WAITING_FOR_MQL5_EXPORT",
+                "nonce": nonce,
+                "requested_at_utc": "2026-04-13T11:57:00+00:00",
+                "roster_sha256": capture_cli.canonical_sha256(roster),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (exchange / capture_cli.RESPONSE_NAME).write_bytes(b"mocked-response")
+    activation_calls = []
+    state_updates = []
+
+    monkeypatch.setattr(capture_cli, "_response_nonce", lambda _path: nonce)
+    monkeypatch.setattr(
+        capture_cli,
+        "parse_terms_export",
+        lambda *_args, **_kwargs: {"snapshot": "mocked"},
+    )
+
+    def activate(native_root, snapshot, **kwargs):
+        activation_calls.append((Path(native_root), snapshot, dict(kwargs)))
+        return {
+            "activation_id": "terms-cli-test",
+            "manifest_sha256": "b" * 64,
+            "pointer_updated": kwargs["update_pointer"],
+            "active_symbols": ["EURUSD"],
+        }
+
+    monkeypatch.setattr(capture_cli, "activate_broker_terms", activate)
+    monkeypatch.setattr(
+        capture_cli,
+        "_atomic_state",
+        lambda path, value: state_updates.append((Path(path), dict(value))),
+    )
+    argv = [
+        "--native-root",
+        str(native),
+        "--exchange-dir",
+        str(exchange),
+        "--roster-json",
+        str(roster_path),
+    ]
+    return argv, native, state_path, activation_calls, state_updates
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_pointer_updated", "expected_reason"),
+    [
+        (
+            (),
+            True,
+            "predecessor retained pending explicit post-canary pruning",
+        ),
+        (
+            ("--no-pointer-update",),
+            False,
+            "staged activation artifacts retained",
+        ),
+    ],
+)
+def test_capture_publication_skips_pruning_by_default_and_when_staged(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    extra_args,
+    expected_pointer_updated,
+    expected_reason,
+):
+    argv, native, state_path, activation_calls, state_updates = (
+        _prepare_mock_capture_publication(tmp_path, monkeypatch)
+    )
+
+    def unexpected_prune(*_args, **_kwargs):
+        pytest.fail("pruning must remain opt-in after publication")
+
+    monkeypatch.setattr(capture_cli, "prune_terms_store", unexpected_prune)
+    code = capture_main([*argv, *extra_args])
+    output = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert output["status"] == "COMPLETE"
+    assert output["pointer_updated"] is expected_pointer_updated
+    assert output["retention"] == {
+        "status": "SKIPPED",
+        "reason": expected_reason,
+    }
+    assert activation_calls == [
+        (
+            native,
+            {"snapshot": "mocked"},
+            {
+                "activation_id": None,
+                "update_pointer": expected_pointer_updated,
+                "max_snapshot_age_seconds": 3600,
+            },
+        )
+    ]
+    assert len(state_updates) == 1
+    assert state_updates[0][0] == state_path
+    assert state_updates[0][1]["phase"] == "COMPLETE"
+
+
+def test_explicit_post_publication_prune_failure_is_a_retention_warning(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    argv, native, state_path, activation_calls, state_updates = (
+        _prepare_mock_capture_publication(tmp_path, monkeypatch)
+    )
+    prune_calls = []
+
+    def failing_prune(native_root, *, max_snapshots, max_total_bytes):
+        prune_calls.append((Path(native_root), max_snapshots, max_total_bytes))
+        raise OSError("simulated prune failure")
+
+    monkeypatch.setattr(capture_cli, "prune_terms_store", failing_prune)
+    code = capture_main(
+        [
+            *argv,
+            "--prune-after-publication",
+            "--max-snapshots",
+            "7",
+            "--max-terms-bytes",
+            "4096",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert output["status"] == "COMPLETE"
+    assert output["pointer_updated"] is True
+    assert output["retention"] == {
+        "status": "WARNING",
+        "reason": (
+            "post-publication retention failed; the published pointer "
+            "remains authoritative"
+        ),
+        "error_type": "OSError",
+        "error": "simulated prune failure",
+    }
+    assert prune_calls == [(native, 7, 4096)]
+    assert activation_calls == [
+        (
+            native,
+            {"snapshot": "mocked"},
+            {
+                "activation_id": None,
+                "update_pointer": True,
+                "max_snapshot_age_seconds": 3600,
+            },
+        )
+    ]
+    assert len(state_updates) == 1
+    assert state_updates[0][0] == state_path
+    assert state_updates[0][1]["phase"] == "COMPLETE"
 
 
 def test_retention_preserves_active_and_referenced_and_enforces_hard_bound(tmp_path):

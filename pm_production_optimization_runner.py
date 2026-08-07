@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import gc
 import hashlib
 import hmac
 import json
+import math
 from pathlib import Path
 import shutil
 import secrets
@@ -28,7 +28,6 @@ import pm_causal_evidence_producer as causal_evidence
 import pm_current_refit_search_producer as current_refit
 import pm_historical_production_adapter as historical_adapter
 import pm_historical_search_producer as historical_search
-import pm_native_prefix_production as native_prefix
 import pm_production_anchor_plan as anchor_plan
 import pm_production_authority_coordinator as coordinator
 import pm_production_capital_bootstrap as capital_bootstrap
@@ -41,6 +40,7 @@ RUNNER_SCHEMA: Final = "fxpm.production-optimization-runner.v1"
 MAX_CONFIG_SNAPSHOT_BYTES: Final = 16 * 1024 * 1024
 MAX_STAGED_LEDGER_BYTES: Final = coordinator.MAX_CURRENT_LEDGER_BYTES
 EVIDENCE_ACCESS_WINDOW_SECONDS: Final = 7 * 24 * 60 * 60
+_BYTES_PER_GIB: Final = 1024**3
 _UTC: Final = timezone.utc
 _RESULT_SEAL: Final = object()
 _CLEANUP_CAPABILITY_KEY: Final = secrets.token_bytes(32)
@@ -49,6 +49,16 @@ _CONCRETE_PATH_TYPE: Final = type(Path("."))
 
 class ProductionOptimizationRunnerError(RuntimeError):
     """Typed technical failure; never a market or ``NO_TRADE`` verdict."""
+
+    def __init__(self, code: str, details: Sequence[Any] = ()) -> None:
+        self.code = str(code)
+        self.details = tuple(str(value) for value in details)
+        suffix = ":" + ":".join(self.details) if self.details else ""
+        super().__init__(self.code + suffix)
+
+
+class ProductionOptimizationNotPromotable(RuntimeError):
+    """Evidence-complete generation that must preserve the last-good ledger."""
 
     def __init__(self, code: str, details: Sequence[Any] = ()) -> None:
         self.code = str(code)
@@ -393,7 +403,7 @@ def discard_unpublished_production_result(
 
 
 class _LazyCurrentRefitProducer:
-    """Build current native products only after the coordinator proves PASS."""
+    """Start the bounded symbol scheduler only after the coordinator proves PASS."""
 
     __slots__ = (
         "_active_config_path",
@@ -449,43 +459,37 @@ class _LazyCurrentRefitProducer:
             # Consume before the first latest-cutoff source access.  Partial
             # current evidence can never be retried inside the generation.
             self._used = True
-        products: dict[str, native_prefix.NativePrefixProduct] = {}
-        try:
-            for symbol in book.PINNED_SYMBOL_ORDER:
-                for timeframe in book.TIMEFRAME_ORDER:
-                    key = f"{symbol}|{timeframe}"
-                    product = native_prefix.produce_activated_native_prefix(
-                        data_dir=self._data_dir,
-                        context=self._context,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        cutoff_utc=self._cutoff_utc,
-                        source_accessed_at_utc=_utc_text(),
-                        production_contract_required=True,
-                    )
-                    if product.source_state == native_prefix.TECHNICAL_FAILURE:
-                        _fail(
-                            "CURRENT_NATIVE_PREFIX_TECHNICAL_FAILURE",
-                            key,
-                            product.native_prefix.get("source_reason"),
-                        )
-                    products[key] = product
-            producer = current_refit.build_current_refit_search_producer(
-                current_refit.CurrentRefitSearchProductionInputs(
-                    context=self._context,
-                    search_process=self._search_process,
+        producer = current_refit.build_current_refit_search_producer(
+            current_refit.CurrentRefitSearchProductionInputs(
+                context=self._context,
+                search_process=self._search_process,
+                active_config_path=self._active_config_path,
+                config_payload=self._config_payload,
+                pipeline_config=self._pipeline_config,
+                native_products={},
+                current_selection_window=self._current_selection_window,
+                output_root=self._output_root,
+                symbol_scheduler=current_refit.CurrentRefitSymbolSchedulerInputs(
                     active_config_path=self._active_config_path,
-                    config_payload=self._config_payload,
-                    pipeline_config=self._pipeline_config,
-                    native_products=products,
-                    current_selection_window=self._current_selection_window,
-                    output_root=self._output_root,
-                )
+                    data_dir=self._data_dir,
+                    cutoff_utc=self._cutoff_utc,
+                    source_accessed_at_utc=_utc_text(),
+                    requested_workers=max(
+                        1,
+                        int(
+                            getattr(
+                                self._pipeline_config,
+                                "optimization_max_workers",
+                                1,
+                            )
+                            or 1
+                        ),
+                    ),
+                ),
             )
-            return producer(request)
-        finally:
-            products.clear()
-            gc.collect()
+        )
+        result = producer(request)
+        return result
 
 
 def _validate_request(
@@ -573,6 +577,64 @@ def _validate_request(
     )
 
 
+def _effective_spool_limits(
+    *,
+    config: PipelineConfig,
+    deployment_root: Path,
+    requested: authority_spool.SpoolLimits | None,
+) -> authority_spool.SpoolLimits:
+    """Bind one exact generation budget to launch-time disk authority.
+
+    Caller-supplied limits may tighten the production policy but can never
+    weaken either the configured critical-free reserve or the live physical
+    capacity.  The resulting immutable limits are embedded in the generation
+    context before any producer starts.
+    """
+
+    base = authority_spool.validate_spool_limits(
+        requested or authority_spool.SpoolLimits()
+    )
+    configured_gib = getattr(config, "storage_critical_free_gb", None)
+    if (
+        isinstance(configured_gib, bool)
+        or not isinstance(configured_gib, (int, float))
+        or not math.isfinite(float(configured_gib))
+        or float(configured_gib) < 0.0
+    ):
+        _fail("PRODUCTION_SPOOL_FREE_RESERVE_INVALID")
+    configured_reserve = int(math.ceil(float(configured_gib) * _BYTES_PER_GIB))
+    reserve = max(configured_reserve, int(base.min_free_bytes))
+    try:
+        free_bytes = int(shutil.disk_usage(deployment_root).free)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ProductionOptimizationRunnerError(
+            "PRODUCTION_SPOOL_FREE_SPACE_UNAVAILABLE",
+            (type(exc).__name__, str(exc)),
+        ) from exc
+    available = free_bytes - reserve
+    maximum = min(int(base.max_generation_bytes), available)
+    if maximum <= 0:
+        _fail(
+            "PRODUCTION_SPOOL_FREE_SPACE_RESERVE_UNAVAILABLE",
+            free_bytes,
+            reserve,
+        )
+    artifact = min(int(base.max_artifact_bytes), maximum)
+    symbol = min(int(base.max_symbol_bytes), maximum)
+    return authority_spool.validate_spool_limits(
+        authority_spool.SpoolLimits(
+            max_artifact_bytes=artifact,
+            max_symbol_bytes=symbol,
+            max_artifacts_per_symbol=base.max_artifacts_per_symbol,
+            max_manifest_bytes=min(base.max_manifest_bytes, artifact),
+            max_json_bytes=min(base.max_json_bytes, artifact),
+            stream_chunk_bytes=min(base.stream_chunk_bytes, artifact),
+            max_generation_bytes=maximum,
+            min_free_bytes=reserve,
+        )
+    )
+
+
 def _read_exact_staged_ledger(
     run: coordinator.ProductionAuthorityRun,
     *,
@@ -619,6 +681,11 @@ def _run_production_optimization_once(
         requested_symbols,
         generation_id,
     ) = _validate_request(request)
+    spool_limits = _effective_spool_limits(
+        config=config,
+        deployment_root=deployment_root,
+        requested=request.spool_limits,
+    )
     digest = hashlib.sha256(generation_id.encode("utf-8")).hexdigest()
     run_id = f"production-run-{digest[:32]}"
     process_id = f"production-process-{digest[:32]}"
@@ -671,7 +738,7 @@ def _run_production_optimization_once(
             generation_id=generation_id,
             native_universe_sha256=environment["native_universe_sha256"],
             config_sha256=environment["config_sha256"],
-            limits=request.spool_limits,
+            limits=spool_limits,
         )
         frozen_config = config_binding.freeze_production_pipeline_config(
             context,
@@ -746,6 +813,20 @@ def _run_production_optimization_once(
             causal_precommit_payload=causal_payload,
             run_id=run_id,
             anchors=plan["anchor_plan"],
+            symbol_scheduler=historical_search.HistoricalSymbolSchedulerInputs(
+                active_config_path=config_path,
+                requested_workers=max(
+                    1,
+                    int(
+                        getattr(
+                            historical_config,
+                            "optimization_max_workers",
+                            1,
+                        )
+                        or 1
+                    ),
+                ),
+            ),
         )
         causal_factory = causal_evidence.BoundedCausalEvidenceFactory(
             context=context,
@@ -795,6 +876,11 @@ def _run_production_optimization_once(
             capital_factory=capital.capital_factory,
             assembly_inputs=assembly_inputs,
         )
+    except current_refit.CurrentRefitSearchNotPromotable as exc:
+        raise ProductionOptimizationNotPromotable(
+            "CURRENT_REFIT_NOT_PROMOTABLE",
+            (exc.code, *exc.details),
+        ) from exc
     except Exception as exc:
         raise ProductionOptimizationRunnerError(
             "PRODUCTION_AUTHORITY_COORDINATION_FAILED",
@@ -887,6 +973,7 @@ __all__ = [
     "EVIDENCE_ACCESS_WINDOW_SECONDS",
     "ProductionOptimizationRequest",
     "ProductionOptimizationResult",
+    "ProductionOptimizationNotPromotable",
     "ProductionOptimizationRunnerError",
     "RUNNER_SCHEMA",
     "discard_unpublished_production_result",

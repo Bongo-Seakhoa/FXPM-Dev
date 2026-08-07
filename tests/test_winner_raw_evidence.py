@@ -12,14 +12,26 @@ import pytest
 
 import pm_authority_spool as spool
 import pm_production_search_planner as planner
-from pm_core import Backtester, InstrumentSpec, PipelineConfig
+import pm_winner_selection as winner
+from pm_core import (
+    BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
+    BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
+    BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
+    Backtester,
+    InstrumentSpec,
+    PipelineConfig,
+)
 from pm_current_refit_artifacts import build_current_refit_search_artifacts_v2
 from pm_strategies import StrategyRegistry
 from pm_search_outcomes import SearchOutcomeKind, SearchStage, TrialOutcome
 from pm_trade_power import build_numerical_execution_cost_attestation
 from pm_winner_raw_evidence import (
+    COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK,
+    COST_STRESS_ADVERSITY_EXPECTED_STRICT,
+    COST_STRESS_ADVERSITY_PLAN_SCHEMA,
     WinnerRawEvidenceError,
     WinnerRawEvidenceIncomplete,
+    _event_vectors,
     build_flat_daily_r_surface,
     build_frozen_numerical_execution_cost_policy,
     build_precommitted_risk_unit_contract,
@@ -250,7 +262,12 @@ def _result(
     }
 
 
-def _attempt_artifact(ordinal: int, strategy_id: str = "EMACrossoverStrategy"):
+def _attempt_artifact(
+    ordinal: int,
+    strategy_id: str = "EMACrossoverStrategy",
+    *,
+    symbol: str = "EURUSD",
+):
     """Build a GENUINE executable attempt via the accepted v2 producer."""
     strategy = StrategyRegistry.get(strategy_id)
     parameters = strategy.get_params()
@@ -258,7 +275,7 @@ def _attempt_artifact(ordinal: int, strategy_id: str = "EMACrossoverStrategy"):
         choices = strategy.get_param_grid()["fast_period"]
         parameters["fast_period"] = choices[ordinal % len(choices)]
     built = build_current_refit_search_artifacts_v2(
-        symbol="EURUSD",
+        symbol=symbol,
         timeframe="H1",
         regime="TREND",
         strategy_id=strategy_id,
@@ -401,7 +418,7 @@ def _production_provenance(*, frozen, attempt_ordinal, fold_ordinal, planned, la
         lanes=lanes,
     )
     stress_body = {
-        "schema_version": "fxpm.backtester-frozen-path-cost-stress.v1",
+        "schema_version": BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
         "symbol": frozen.symbol,
         "timeframe": frozen.timeframe,
         "strategy_name": artifacts["winner_process"]["strategy_id"],
@@ -415,6 +432,12 @@ def _production_provenance(*, frozen, attempt_ordinal, fold_ordinal, planned, la
         "stress_cost_attestation_sha256": stress[
             "numerical_execution_cost_attestation"
         ]["attestation_sha256"],
+        "base_spread_values_sha256": base["numerical_execution_cost_attestation"][
+            "spread_values_sha256"
+        ],
+        "stress_spread_values_sha256": stress[
+            "numerical_execution_cost_attestation"
+        ]["spread_values_sha256"],
         "base_position_roster_sha256": Backtester._cost_attestation_json_sha256(
             {"position_events": base["position_events"]}
         ),
@@ -425,6 +448,25 @@ def _production_provenance(*, frozen, attempt_ordinal, fold_ordinal, planned, la
         "daily_observation_count": len(stress_surface["daily_net_mtm_r"]),
         "path_identity_preserved": True,
         "stress_never_improves": True,
+        "strictly_worse_trade_count": sum(
+            stress_event["pnl_dollars"] < base_event["pnl_dollars"]
+            for base_event, stress_event in zip(
+                base["position_events"],
+                stress["position_events"],
+                strict=True,
+            )
+        ),
+        "strictly_worse_daily_observation_count": sum(
+            stress_value < base_value
+            for base_value, stress_value in zip(
+                base["winner_daily_r_surface"]["daily_net_mtm_r"],
+                stress_surface["daily_net_mtm_r"],
+                strict=True,
+            )
+        ),
+        "realized_adversity_status": (
+            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
+        ),
     }
     stress_receipt = {**stress_body, "receipt_sha256": _sha(stress_body)}
     source_binding = frozen.source_contract_seed["source_binding"]
@@ -565,29 +607,150 @@ def _raw_fold(*, attempt_ordinal: int, fold_ordinal: int, planned, frozen=None):
     }
 
 
-def _context(tmp_path: Path):
+def _context(tmp_path: Path, *, symbol: str = "EURUSD"):
     context = spool.freeze_generation_context(
         tmp_path / "authority",
         generation_id="generation-raw-winner-001",
         native_universe_sha256="b" * 64,
         config_sha256="c" * 64,
     )
-    return context, spool.open_symbol_sink(context, "EURUSD")
+    return context, spool.open_symbol_sink(context, symbol)
+
+
+def _normalized_test_fold_plan(*, symbol: str = "EURUSD"):
+    normalized = []
+    for ordinal, raw in enumerate(_fold_plan()):
+        anchor = (
+            datetime.fromisoformat(
+                raw["anchor_as_of_utc"].replace("Z", "+00:00")
+            )
+            .astimezone(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        body = {
+            "schema_version": "fxpm.winner-fold-identity.v1",
+            "symbol": symbol,
+            "timeframe": "H1",
+            "regime": "TREND",
+            "fold_ordinal": ordinal,
+            "anchor_as_of_utc": anchor,
+            "oos_start_date_utc": raw["oos_start_date_utc"],
+            "oos_end_date_utc": raw["oos_end_date_utc"],
+        }
+        normalized.append(
+            {
+                "fold_ordinal": ordinal,
+                "fold_id": _sha1(body),
+                "anchor_as_of_utc": anchor,
+                "oos_start_date_utc": raw["oos_start_date_utc"],
+                "oos_end_date_utc": raw["oos_end_date_utc"],
+            }
+        )
+    return normalized
+
+
+def _cost_stress_adversity_plan(
+    *,
+    attempts: int,
+    roles,
+    no_shock_pairs=frozenset(),
+    symbol: str = "EURUSD",
+):
+    rows = []
+    normalized_folds = _normalized_test_fold_plan(symbol=symbol)
+    for attempt_ordinal in range(attempts):
+        if roles[attempt_ordinal] != "EVALUATION_REQUIRED":
+            continue
+        for planned in normalized_folds:
+            fold_ordinal = planned["fold_ordinal"]
+            lanes = _raw_fold(
+                attempt_ordinal=attempt_ordinal,
+                fold_ordinal=fold_ordinal,
+                planned=planned,
+            )["lanes"]
+            geometry = _partition_geometry(
+                attempt_ordinal=attempt_ordinal,
+                fold_ordinal=fold_ordinal,
+                lanes=lanes,
+            )[-1]
+            base_cost = lanes["final_lockbox_base"][
+                "numerical_execution_cost_attestation"
+            ]
+            stress_cost = lanes["final_lockbox_stress"][
+                "numerical_execution_cost_attestation"
+            ]
+            if (attempt_ordinal, fold_ordinal) in no_shock_pairs:
+                stress_cost = _rebuilt_cost(
+                    stress_cost,
+                    spread_values_sha256=base_cost["spread_values_sha256"],
+                )
+            equal_vectors = (
+                base_cost["spread_values_sha256"]
+                == stress_cost["spread_values_sha256"]
+            )
+            rows.append(
+                {
+                    "attempt_ordinal": attempt_ordinal,
+                    "horizon_attempt_id": _sha(
+                        f"horizon-attempt:{attempt_ordinal}"
+                    ),
+                    "fold_ordinal": fold_ordinal,
+                    "fold_id": planned["fold_id"],
+                    "final_partition_geometry_receipt_sha256": geometry[
+                        "receipt_sha256"
+                    ],
+                    "final_partition_frame_sha256": geometry["frame_sha256"],
+                    "base_cost_attestation_sha256": base_cost[
+                        "attestation_sha256"
+                    ],
+                    "stress_cost_attestation_sha256": stress_cost[
+                        "attestation_sha256"
+                    ],
+                    "base_spread_values_sha256": base_cost[
+                        "spread_values_sha256"
+                    ],
+                    "stress_spread_values_sha256": stress_cost[
+                        "spread_values_sha256"
+                    ],
+                    "expected_adversity_status": (
+                        COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
+                        if equal_vectors
+                        else COST_STRESS_ADVERSITY_EXPECTED_STRICT
+                    ),
+                }
+            )
+    return {
+        "schema_version": COST_STRESS_ADVERSITY_PLAN_SCHEMA,
+        "symbol": symbol,
+        "timeframe": "H1",
+        "regime": "TREND",
+        "row_count": len(rows),
+        "rows_sha256": _sha(rows),
+        "rows": rows,
+    }
 
 
 def _freeze(
     tmp_path: Path,
     *,
     attempts=1,
+    symbol="EURUSD",
     artifact_namespace=None,
     sink=None,
     context=None,
     base_cost_policy=BASE_COST_POLICY,
     stress_cost_policy=STRESS_COST_POLICY,
     precommitted_evidence_roles=None,
+    no_shock_pairs=frozenset(),
 ):
     if sink is None:
-        context, sink = _context(tmp_path)
+        context, sink = _context(tmp_path, symbol=symbol)
+    roles = (
+        ["EVALUATION_REQUIRED" for _ in range(attempts)]
+        if precommitted_evidence_roles is None
+        else list(precommitted_evidence_roles)
+    )
     first_plan = _fold_plan()[0]
     seed_result = _raw_fold(attempt_ordinal=0, fold_ordinal=0, planned=first_plan)[
         "lanes"
@@ -599,18 +762,16 @@ def _freeze(
     )
     frozen = freeze_winner_search_plan_v3(
         sink,
-        symbol="EURUSD",
+        symbol=symbol,
         timeframe="H1",
         regime="TREND",
         precommitted_at_utc="2020-01-01T00:00:00Z",
         attempts_frozen_at_utc="2020-01-02T00:00:00Z",
         fold_plan=_fold_plan(),
-        attempt_artifacts=[_attempt_artifact(index) for index in range(attempts)],
-        precommitted_evidence_roles=(
-            ["EVALUATION_REQUIRED" for _ in range(attempts)]
-            if precommitted_evidence_roles is None
-            else precommitted_evidence_roles
-        ),
+        attempt_artifacts=[
+            _attempt_artifact(index, symbol=symbol) for index in range(attempts)
+        ],
+        precommitted_evidence_roles=roles,
         horizon_execution_contracts=[
             {
                 "lookback_kind": "NATIVE_OBSERVATIONS",
@@ -625,9 +786,47 @@ def _freeze(
         base_cost_contract=base_cost_policy,
         stress_cost_contract=stress_cost_policy,
         risk_unit_contract=RISK_CONTRACT,
+        cost_stress_adversity_plan=_cost_stress_adversity_plan(
+            attempts=attempts,
+            roles=roles,
+            no_shock_pairs=no_shock_pairs,
+            symbol=symbol,
+        ),
         artifact_namespace=artifact_namespace,
     )
     return context, sink, frozen
+
+
+@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
+def test_frozen_plan_preserves_exact_mt5_symbol(
+    tmp_path: Path,
+    symbol: str,
+) -> None:
+    _context_value, _sink, frozen = _freeze(tmp_path, symbol=symbol)
+
+    assert frozen.symbol == symbol
+    assert frozen.precommitment["symbol"] == symbol
+    assert frozen.attempt_ledger["symbol"] == symbol
+    assert json.loads(frozen.frozen_receipt_bytes)["symbol"] == symbol
+
+
+@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
+def test_frozen_plan_rejects_wrong_case_mt5_symbol(
+    tmp_path: Path,
+    wrong_case: str,
+) -> None:
+    context, sink = _context(tmp_path, symbol="Platinum")
+
+    with pytest.raises(
+        WinnerRawEvidenceError,
+        match="AUTHORITY_SINK_SYMBOL_MISMATCH",
+    ):
+        _freeze(
+            tmp_path,
+            symbol=wrong_case,
+            context=context,
+            sink=sink,
+        )
 
 
 def _attempt_evidence(frozen, ordinal=0):
@@ -806,7 +1005,15 @@ def _current_cross_binding_fixture(frozen):
         "candidate_definition_sha256": row["horizon_candidate_definition_sha256"],
         "lookback_kind": horizon["lookback_kind"],
         "lookback_value": horizon["lookback_value"],
-        "realized_start_utc": horizon["fit_start_utc"],
+        # Historical discovery geometry is intentionally distinct from the
+        # latest-cutoff current-refit interval carried by the artifact.
+        "realized_start_utc": (
+            datetime.fromisoformat(horizon["fit_start_utc"].replace("Z", "+00:00"))
+            - timedelta(days=90)
+        )
+        .astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
         "folds": [
             {
                 "fold_id": fold["horizon_fold_id"],
@@ -1145,6 +1352,11 @@ def test_current_mode_reverifies_sealed_plan_before_evidence_access(
         process=process,
     )
 
+    plan_body = plan.horizon_plan.to_dict()
+    assert (
+        plan_body["candidates"][0]["realized_start_utc"]
+        != frozen.attempt_artifacts_bundle[0]["horizon_process"]["fit_start_utc"]
+    )
     assert events[0][0] == "PLAN_REVERIFIED"
     assert events[1][0] == "EVIDENCE_ACCESSED"
     assert produced.decision.to_dict()["validated"] is True
@@ -1505,6 +1717,42 @@ def test_resealed_execution_spec_cost_identity_substitution_fails_closed(
         _produce(sink, frozen, [raw])
 
 
+def test_resealed_execution_spec_accepts_bound_zero_native_tick_fallback(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path)
+    raw = _copied_attempt_evidence(frozen)
+    source = raw["folds"][0]["provenance"]["oos_source_receipt"]
+    execution_spec = source["execution_spec_receipt"]
+    execution_spec[
+        "tick_value_source"
+    ] = "FROZEN_BROKER_SPECS_RECORD_NATIVE_ZERO_UNAVAILABLE"
+    source["execution_spec_receipt"] = _reseal(execution_spec)
+    raw["folds"][0]["provenance"]["oos_source_receipt"] = _reseal(source)
+
+    product = _produce(sink, frozen, [raw])
+
+    assert product.evidence_ledger["entries"][0]["evidence_status"] == "AUTHENTICATED"
+
+
+def test_resealed_execution_spec_rejects_unknown_tick_value_source(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path)
+    raw = _copied_attempt_evidence(frozen)
+    source = raw["folds"][0]["provenance"]["oos_source_receipt"]
+    execution_spec = source["execution_spec_receipt"]
+    execution_spec["tick_value_source"] = "UNBOUND_FALLBACK"
+    source["execution_spec_receipt"] = _reseal(execution_spec)
+    raw["folds"][0]["provenance"]["oos_source_receipt"] = _reseal(source)
+
+    with pytest.raises(
+        WinnerRawEvidenceIncomplete,
+        match="EXECUTION_SPEC_RECEIPT_BINDING_INVALID",
+    ):
+        _produce(sink, frozen, [raw])
+
+
 def test_postfreeze_horizon_execution_contract_substitution_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -1589,9 +1837,227 @@ def test_label_only_cost_stress_is_rejected_even_when_receipts_are_resealed(
     fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
     with pytest.raises(
         WinnerRawEvidenceIncomplete,
-        match="STRESS_METHOD_NUMERICAL_SHOCK_ABSENT",
+        match="STRESS_METHOD_VECTOR_ADVERSITY_INCONSISTENT",
     ):
         _produce(sink, frozen, [raw])
+
+
+def test_resealed_adversity_status_cannot_relabel_genuine_shock(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path)
+    raw = _copied_attempt_evidence(frozen)
+    replay = raw["folds"][0]["provenance"]["attempt_replay_receipt"]
+    stress_receipt = replay["stress_method_receipt"]
+    stress_receipt["realized_adversity_status"] = (
+        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+    )
+    stress_receipt["strictly_worse_trade_count"] = 0
+    stress_receipt["strictly_worse_daily_observation_count"] = 0
+    stress_receipt = _reseal(stress_receipt)
+    replay["stress_method_receipt"] = stress_receipt
+    replay["stress_method_receipt_sha256"] = stress_receipt["receipt_sha256"]
+    raw["folds"][0]["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+
+    with pytest.raises(
+        WinnerRawEvidenceIncomplete,
+        match="STRESS_METHOD_ADVERSITY_STATUS_MISMATCH",
+    ):
+        _produce(sink, frozen, [raw])
+
+
+def _reseal_first_fold_as_no_numerical_shock(raw):
+    fold = raw["folds"][0]
+    base = fold["lanes"]["final_lockbox_base"]
+    stress = fold["lanes"]["final_lockbox_stress"]
+    stress["position_events"] = json.loads(_canonical(base["position_events"]))
+    stress["winner_daily_r_surface"] = json.loads(
+        _canonical(base["winner_daily_r_surface"])
+    )
+    stress["numerical_execution_cost_attestation"] = _rebuilt_cost(
+        stress["numerical_execution_cost_attestation"],
+        spread_values_sha256=base["numerical_execution_cost_attestation"][
+            "spread_values_sha256"
+        ],
+    )
+    replay = fold["provenance"]["attempt_replay_receipt"]
+    stress_receipt = replay["stress_method_receipt"]
+    stress_receipt["stress_cost_attestation_sha256"] = stress[
+        "numerical_execution_cost_attestation"
+    ]["attestation_sha256"]
+    stress_receipt["stress_spread_values_sha256"] = stress[
+        "numerical_execution_cost_attestation"
+    ]["spread_values_sha256"]
+    stress_receipt["stress_position_roster_sha256"] = (
+        Backtester._cost_attestation_json_sha256(
+            {"position_events": stress["position_events"]}
+        )
+    )
+    stress_receipt["position_count"] = len(stress["position_events"])
+    stress_receipt["daily_observation_count"] = len(
+        stress["winner_daily_r_surface"]["daily_net_mtm_r"]
+    )
+    stress_receipt["strictly_worse_trade_count"] = 0
+    stress_receipt["strictly_worse_daily_observation_count"] = 0
+    stress_receipt["realized_adversity_status"] = (
+        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+    )
+    stress_receipt = _reseal(stress_receipt)
+    replay["stress_method_receipt"] = stress_receipt
+    replay["stress_method_receipt_sha256"] = stress_receipt["receipt_sha256"]
+    replay["lane_sha256"]["final_lockbox_stress"] = _sha(stress)
+    fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+    return raw
+
+
+def _reseal_first_fold_as_zero_trade(raw):
+    raw = _reseal_first_fold_as_no_numerical_shock(raw)
+    fold = raw["folds"][0]
+    train = fold["lanes"]["optimizer_train_base"]
+    base = fold["lanes"]["final_lockbox_base"]
+    stress = fold["lanes"]["final_lockbox_stress"]
+    train_dates = train["winner_daily_r_surface"]["daily_dates_utc"]
+    train_zero_surface = build_flat_daily_r_surface(
+        [],
+        start_date_utc=train_dates[0],
+        end_date_utc=train_dates[-1],
+        risk_unit_contract=RISK_CONTRACT,
+    )
+    final_dates = base["winner_daily_r_surface"]["daily_dates_utc"]
+    final_zero_surface = build_flat_daily_r_surface(
+        [],
+        start_date_utc=final_dates[0],
+        end_date_utc=final_dates[-1],
+        risk_unit_contract=RISK_CONTRACT,
+    )
+    train["position_events"] = []
+    train["winner_daily_r_surface"] = json.loads(_canonical(train_zero_surface))
+    base["position_events"] = []
+    base["winner_daily_r_surface"] = json.loads(_canonical(final_zero_surface))
+    stress["position_events"] = []
+    stress["winner_daily_r_surface"] = json.loads(_canonical(final_zero_surface))
+
+    replay = fold["provenance"]["attempt_replay_receipt"]
+    stress_receipt = replay["stress_method_receipt"]
+    empty_roster_sha256 = Backtester._cost_attestation_json_sha256(
+        {"position_events": []}
+    )
+    stress_receipt["base_position_roster_sha256"] = empty_roster_sha256
+    stress_receipt["stress_position_roster_sha256"] = empty_roster_sha256
+    stress_receipt["position_count"] = 0
+    stress_receipt["daily_observation_count"] = len(
+        final_zero_surface["daily_net_mtm_r"]
+    )
+    stress_receipt["strictly_worse_trade_count"] = 0
+    stress_receipt["strictly_worse_daily_observation_count"] = 0
+    stress_receipt["realized_adversity_status"] = (
+        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+    )
+    stress_receipt = _reseal(stress_receipt)
+    replay["stress_method_receipt"] = stress_receipt
+    replay["stress_method_receipt_sha256"] = stress_receipt["receipt_sha256"]
+    replay["lane_sha256"]["optimizer_train_base"] = _sha(train)
+    replay["lane_sha256"]["final_lockbox_base"] = _sha(base)
+    replay["lane_sha256"]["final_lockbox_stress"] = _sha(stress)
+    fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+    return raw
+
+
+def test_coherent_no_shock_reseal_conflicts_with_frozen_strict_plan(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path)
+    raw = _reseal_first_fold_as_no_numerical_shock(
+        _copied_attempt_evidence(frozen)
+    )
+
+    with pytest.raises(
+        WinnerRawEvidenceIncomplete,
+        match="STRESS_ADVERSITY_PRECOMMITMENT_MISMATCH",
+    ):
+        _produce(sink, frozen, [raw])
+
+
+def test_authenticated_no_numerical_shock_keeps_pbo_and_rejects_attempt(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path, no_shock_pairs={(0, 0)})
+    raw = _reseal_first_fold_as_no_numerical_shock(
+        _copied_attempt_evidence(frozen)
+    )
+
+    produced = _produce(sink, frozen, [raw])
+
+    entry = produced.evidence_ledger["entries"][0]
+    assert entry["evidence_status"] == "PROCESS_REJECTED"
+    assert entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
+    assert produced.decision.to_dict()["validated"] is True
+    assert entry["fold_count"] == 0
+    assert entry["folds"] == []
+    assert entry["pbo_fold_count"] == len(frozen.precommitment["causal_fold_plan"])
+    assert len(entry["pbo_folds"]) == entry["pbo_fold_count"]
+
+
+def test_authenticated_zero_trade_fold_is_process_rejected_with_pbo(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path, no_shock_pairs={(0, 0)})
+    raw = _reseal_first_fold_as_zero_trade(_copied_attempt_evidence(frozen))
+
+    produced = _produce(sink, frozen, [raw])
+
+    entry = produced.evidence_ledger["entries"][0]
+    assert entry["evidence_status"] == "PROCESS_REJECTED"
+    assert entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
+    assert entry["folds"] == []
+    assert entry["pbo_fold_count"] == len(frozen.precommitment["causal_fold_plan"])
+    zero_fold = entry["pbo_folds"][0]
+    assert zero_fold["completed_trade_position_ids"] == []
+    assert zero_fold["completed_trade_net_mtm_r"] == []
+    assert zero_fold["completed_trade_net_mtm_r_cost_stress"] == []
+    assert all(value == 0.0 for value in zero_fold["daily_net_mtm_r"])
+    assert all(value == 0.0 for value in zero_fold["daily_net_mtm_r_cost_stress"])
+
+
+def test_genuine_base_stress_trade_count_mismatch_remains_technical(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path)
+    raw = _copied_attempt_evidence(frozen)
+    raw["folds"][0]["lanes"]["final_lockbox_stress"]["position_events"].pop()
+
+    with pytest.raises(
+        WinnerRawEvidenceIncomplete,
+        match="FINAL_BASE_STRESS_TRADE_COUNT_MISMATCH",
+    ):
+        _produce(sink, frozen, [raw])
+
+
+def test_event_vectors_keep_mismatch_and_trade_count_bounds_fail_closed() -> None:
+    fold_start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    fold_end = datetime(2024, 2, 1, tzinfo=timezone.utc)
+    with pytest.raises(
+        WinnerRawEvidenceError,
+        match="FINAL_BASE_STRESS_TRADE_COUNT_MISMATCH",
+    ):
+        _event_vectors(
+            [],
+            [{}],
+            fold_start=fold_start,
+            fold_end_exclusive=fold_end,
+        )
+
+    oversized = [{}] * (winner.MAX_TRADES_PER_FOLD + 1)
+    with pytest.raises(
+        WinnerRawEvidenceError,
+        match="FINAL_TRADE_COUNT_LIMIT_EXCEEDED",
+    ):
+        _event_vectors(
+            oversized,
+            oversized,
+            fold_start=fold_start,
+            fold_end_exclusive=fold_end,
+        )
 
 
 def test_genuine_partition_cost_vectors_vary_under_one_frozen_policy(
@@ -1782,6 +2248,72 @@ class _OneTradeStrategy:
         return 10.0, 10.0
 
 
+def test_core_returns_authenticated_no_numerical_shock_after_full_replay() -> None:
+    config = PipelineConfig(
+        use_spread=True,
+        use_slippage=False,
+        use_commission=False,
+        swap_model_enabled=False,
+        backtest_spread_mode="conservative_max",
+    )
+    backtester = Backtester(config)
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=4, freq="h")
+    features = pd.DataFrame(
+        {
+            "Open": [100.0, 100.0, 100.0, 100.0],
+            "High": [100.0, 100.2, 100.0, 100.0],
+            "Low": [100.0, 99.95, 100.0, 100.0],
+            "Close": [100.0, 100.1, 100.0, 100.0],
+            "Volume": [100, 100, 100, 100],
+            "Spread": [1.0, 1.0, 1.0, 1.0],
+            "_BAR_CLOSE_TS": index + pd.Timedelta(hours=1),
+        },
+        index=index,
+    )
+    signals = pd.Series([1, 0, 0, 0], index=index)
+    spec = InstrumentSpec(
+        symbol="EURUSD",
+        pip_position=2,
+        pip_value=10.0,
+        spread_avg=1.0,
+    )
+    base = backtester.run(
+        features,
+        signals,
+        "EURUSD",
+        _OneTradeStrategy(),
+        spec=spec,
+        timeframe="H1",
+    )
+    assert base["position_events"]
+
+    stress = backtester.replay_frozen_path_cost_stress(
+        features,
+        signals,
+        "EURUSD",
+        _OneTradeStrategy(),
+        base,
+        stress_mode="stress_p95",
+        spec=spec,
+        timeframe="H1",
+    )
+
+    receipt = stress["cost_stress_frozen_path_receipt"]
+    assert receipt["schema_version"] == (
+        BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION
+    )
+    assert receipt["realized_adversity_status"] == (
+        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+    )
+    assert receipt["base_spread_values_sha256"] == (
+        receipt["stress_spread_values_sha256"]
+    )
+    assert receipt["strictly_worse_trade_count"] == 0
+    assert receipt["strictly_worse_daily_observation_count"] == 0
+    assert stress["position_events"] == base["position_events"]
+    assert stress["winner_daily_r_surface"] == base["winner_daily_r_surface"]
+
+
 def test_real_backtester_position_events_feed_daily_surface() -> None:
     config = PipelineConfig(
         use_spread=False,
@@ -1936,6 +2468,10 @@ def _freeze_single(tmp_path, artifact):
         base_cost_contract=BASE_COST_POLICY,
         stress_cost_contract=STRESS_COST_POLICY,
         risk_unit_contract=RISK_CONTRACT,
+        cost_stress_adversity_plan=_cost_stress_adversity_plan(
+            attempts=1,
+            roles=["EVALUATION_REQUIRED"],
+        ),
     )
 
 
@@ -2041,6 +2577,39 @@ def test_post_freeze_receipt_reseal_conflicts_with_original_sink(
 
     with pytest.raises(spool.AuthoritySpoolError, match="ARTIFACT_ID_CONFLICT"):
         _produce(sink, forged, [_attempt_evidence(forged)])
+
+
+def test_cost_stress_adversity_plan_is_run_bound_and_reopened(
+    tmp_path: Path,
+) -> None:
+    _, sink, frozen = _freeze(tmp_path)
+    plan = frozen.cost_stress_adversity_plan
+    plan_sha256 = _sha(plan)
+    receipt = json.loads(frozen.frozen_receipt_bytes.decode("ascii"))
+    (tmp_path / "alternate").mkdir()
+    _, _, alternate = _freeze(
+        tmp_path / "alternate",
+        no_shock_pairs={(0, 0)},
+    )
+
+    assert alternate.precommitment["run_id"] != frozen.precommitment["run_id"]
+    assert receipt["cost_stress_adversity_plan_sha256"] == plan_sha256
+    assert (
+        receipt["artifact_roster"]["cost_stress_adversity_plan"]["sha256"]
+        == plan_sha256
+    )
+
+    plan["rows"][0]["final_partition_frame_sha256"] = "f" * 64
+    plan["rows_sha256"] = _sha(plan["rows"])
+    forged = replace(
+        frozen,
+        cost_stress_adversity_plan_bytes=_canonical(plan),
+    )
+    with pytest.raises(
+        WinnerRawEvidenceError,
+        match="FROZEN_PLAN_RECEIPT_MISMATCH",
+    ):
+        _produce(sink, forged, [_attempt_evidence(frozen)])
 
 
 def test_namespace_maximum_length_bound(tmp_path: Path) -> None:

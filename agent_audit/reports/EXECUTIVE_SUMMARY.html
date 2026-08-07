@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Executive Summary</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f6f8;
+  --paper: #ffffff;
+  --ink: #111827;
+  --muted: #4b5563;
+  --line: #d9dee8;
+  --soft: #f8fafc;
+  --accent: #1f6feb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", Inter, Arial, sans-serif;
+  line-height: 1.58;
+}
+main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+article {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 34px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: auto;
+}
+h1, h2, h3, h4 {
+  line-height: 1.22;
+  margin: 1.5em 0 0.55em;
+}
+h1 {
+  margin-top: 0;
+  font-size: 2rem;
+}
+h2 {
+  border-top: 1px solid var(--line);
+  padding-top: 1.1em;
+  font-size: 1.45rem;
+}
+h3 {
+  font-size: 1.13rem;
+}
+p {
+  margin: 0.75em 0;
+}
+ul, ol {
+  padding-left: 1.45rem;
+}
+li + li {
+  margin-top: 0.25rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.35rem;
+  font-size: 0.91rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #eef3f8;
+  font-weight: 650;
+}
+tr:nth-child(even) td {
+  background: var(--soft);
+}
+code {
+  background: #edf2f7;
+  border: 1px solid #d8e0ea;
+  border-radius: 4px;
+  padding: 0.08rem 0.28rem;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.92em;
+}
+pre {
+  overflow-x: auto;
+  background: #0f172a;
+  color: #e5e7eb;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+pre code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0;
+}
+a {
+  color: var(--accent);
+}
+blockquote {
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+</style>
+</head>
+<body>
+<main>
+<article>
+<h1>Executive Summary</h1>
+<p>Date: 2026-06-17<br>
+Agents: Codex and Claude Code<br>
+Scope: bounded read-only audit. No live trades, no intentional broker connection, no full optimization, no credential edits.</p>
+<h2>Bottom Line</h2>
+<p>The account switch to FBS Real is implemented as a safe identity pin: <code>config.json</code> now expects account <code>28829971</code> on <code>FBS-Real</code>, and readiness checks should block if the active MT5 terminal is still on demo. It does not log the terminal into the real account because login/password/server remain blank. The operator must ensure the MT5 terminal is already on FBS Real before any live trade run.</p>
+<p>The bigger audit result is that the promising demo/backtest behavior does not transfer cleanly to the approximately $22 live account. At this balance, broker minimum lot size dominates position sizing. The configured target risk is usually 0.5%, but executed live ledger rows show actual risk median 5.35%, mean 7.58%, and max 24.67%. The system is aggressive by design; the problem is that some of the aggression is mechanical min-lot risk rather than rewarded strategy edge.</p>
+<h2>Highest Priority Findings</h2>
+<ol>
+<li>Min-lot risk dominates live sizing: 67 executed rows had median actual risk 5.35% vs 0.5% target; 83 signals were blocked because min-lot risk exceeded caps. See F101 and F003.</li>
+<li>Current hard stops are too wide for a $22 account: daily/session/weekly/open-drawdown and open-risk thresholds are in the 40-75% range. See F102 and F104.</li>
+<li>The 100-symbol universe is not realistically tradeable at $22: indices/metals/stocks are mostly blocked at min-lot. See F103.</li>
+<li>Winner validation is fragile: 75 of 157 tradeable cells have fewer than 20 validation trades; 147 have validation Sharpe above 10; all have <code>pbo_status=not_available</code>. See F002.</li>
+<li>High-drawdown order analysis is blocked by missing MAE/MFE fields. See F107.</li>
+</ol>
+<h2>Account Switch Verdict</h2>
+<p>Pass with operational caveat.</p>
+<ul>
+<li>Correct: expected account pin changed from demo to <code>FBS-Real / 28829971</code>.</li>
+<li>Correct: credentials remain blank, so secrets are not stored.</li>
+<li>Correct: readiness code compares actual account identity to expected identity.</li>
+<li>Caveat: the config does not perform the login. The terminal session controls which account is active.</li>
+<li>Caveat: <code>pm_configs.json</code> also changed ledger/live-observability state, which is not necessary for the account swap.</li>
+</ul>
+<h2>Best Next Actions</h2>
+<p>P0:
+- Choose operating mode for the $22 account: capital preservation, lottery-ticket, or fund-up.
+- Add/use a balance-aware tradeable universe so untradeable symbols do not generate live signals.
+- Replace or supplement percentage breakers with absolute-dollar stops for a micro account.</p>
+<p>P1:
+- Test a lower <code>max_risk_pct</code> such as 8-10%. A 10% cap would have allowed 48 of 67 executed rows and blocked the 19 riskiest.
+- Run a bounded $22-notional replay/backtest for one or two executable symbols.
+- Add MAE/MFE capture for high-drawdown trade classification.</p>
+<p>P2:
+- Enable a severe flag for extreme validation Sharpe when PBO is unavailable.
+- Relabel or annualize <code>calmar_ratio</code>.
+- Add a measurement-only pristine-OOS decay audit beside the bleeding-edge production split.</p>
+<h2>Verification</h2>
+<ul>
+<li>JSON validation passed for <code>config.json</code>, <code>pm_configs.json</code>, and <code>pm_outputs/production_live/signal_ledger_202606.jsonl</code>.</li>
+<li>Focused pytest run passed: 245 tests and 11 subtests.</li>
+<li>Evidence generated under <code>agent_audit/data/</code>.</li>
+</ul>
+</article>
+</main>
+</body>
+</html>

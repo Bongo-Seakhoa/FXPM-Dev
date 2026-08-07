@@ -1,6 +1,6 @@
 import shutil
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -40,6 +40,30 @@ class RetrainScheduleTests(unittest.TestCase):
             cfg.get_next_retrain_at(datetime(2026, 4, 1, 12, 0)),
             datetime(2026, 4, 12, 0, 1),
         )
+
+    def test_utc_retrain_schedule_is_aware_and_preserves_legacy_naive_api(self):
+        cfg = PipelineConfig(
+            data_dir=self.tmp / "utc_data",
+            output_dir=self.tmp / "utc_out",
+            production_retrain_anchor_date="2026-06-07",
+        )
+
+        completed_at = datetime(2026, 7, 22, 15, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            cfg.get_next_retrain_at_utc(completed_at),
+            datetime(2026, 8, 2, 0, 1, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(
+            cfg.get_next_retrain_at(completed_at.replace(tzinfo=None)).tzinfo
+        )
+        self.assertEqual(
+            cfg.get_next_retrain_at_utc(
+                completed_at.astimezone(timezone(timedelta(hours=2)))
+            ),
+            datetime(2026, 8, 2, 0, 1, tzinfo=timezone.utc),
+        )
+        with self.assertRaisesRegex(ValueError, "aware datetime"):
+            cfg.get_next_retrain_at_utc(completed_at.replace(tzinfo=None))
 
     def test_app_uses_pipeline_paths_as_source_of_truth(self):
         cfg = PipelineConfig(
@@ -88,6 +112,7 @@ class RetrainScheduleTests(unittest.TestCase):
             "EURUSD": bool(ledger_changed)
         }
         app.portfolio_manager.last_optimization_generation = SimpleNamespace(
+            promoted=bool(ledger_changed),
             ledger_changed=bool(ledger_changed)
         )
         app.trader = MagicMock()
