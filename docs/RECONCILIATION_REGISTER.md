@@ -417,6 +417,32 @@ test can ever wait 102s on an absent terminal. Semantically identical (a real
 absent terminal also returns `False`), opt out with `@pytest.mark.real_mt5`.
 62 connector, live-loop and regime tests pass with it.
 
+**FIXED 2026-08-08 — `5e76111`.** `_resolve_unscoped_memoized` pins the result to
+the authority identity (ACTIVE.json pointer bytes + manifest sha256), re-checked
+on every hit.
+
+| | Cold | Warm |
+|---|---:|---:|
+| `validate_live_readiness(symbols=[])` | 1711.6 s | **0.451 s** — 3798× |
+
+Verdicts and error codes identical across cold and warm calls. Suite effect:
+**3:29:33 → 0:53:42.** `test_live_readiness_rejects_each_partial_mt5_identity_pin`
+went 4581.94 s → **1.44 s**.
+
+Two cold verifications remain, and both are correct: the first readiness test
+alphabetically pays one for `symbols=[]`, and `test_shipped_config_passes_funded_
+breaker_contract` resolves the full 100-symbol universe, a genuinely different
+key. Down from ~9. Seven tests fix the safety contract — changed authority forces
+re-verification, invalid / sha-mismatched / mid-change universes are never pinned,
+callers cannot mutate what is stored.
+
+**Remaining, and now the floor:** the cold verification itself is ~1600 s for
+12 GB — roughly 7.5 MB/s, so it is dominated by CSV parsing and per-leaf audit
+work, not disk I/O. Making *that* cheaper is the architectural fix: verify the
+manifest and trust its 1,202 recorded leaf hashes, reading leaf bytes only when a
+leaf is consumed. That is the remainder of the activation-vs-resolver boundary and
+it is what a production run pays on every cold start.
+
 ---
 
 ## 3. Questions only the operator can answer
