@@ -308,6 +308,59 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
                         if cell_status == "BLOCKED":
                             self.assertTrue(cfg.get("promotion_reasons"))
 
+    def test_research_only_defaults_pin_production_breadth(self) -> None:
+        """research_only keys resolve from code, so their defaults ARE production.
+
+        Removing a key from config.json hands its value to the PipelineConfig
+        default. That is the intended ownership model, but it means a default
+        that disagrees with the value config.json used to carry changes
+        behaviour silently. max_param_combos did exactly that: config.json
+        carried 200, the key moved to code ownership, and search breadth fell
+        to the 150 default with no test to notice.
+        """
+        _, resolved = load_effective_pipeline_config(self.repo_root / "config.json")
+        self.assertEqual(
+            resolved.max_param_combos,
+            200,
+            "production search breadth must stay at 200 combinations",
+        )
+
+    def test_profitability_gates_sit_above_breakeven(self) -> None:
+        """A profit factor below 1.0 loses money.
+
+        The 2026-06-18 audit traced FORD H4 CHOP (PF 0.66, -23.18% over 166
+        trades) reaching PROMOTED because the historical stress-audit floor was
+        0.60 - beneath breakeven, so incapable of blocking a net loser. Any
+        profit-factor gate that can block promotion must sit above 1.0.
+        """
+        _, resolved = load_effective_pipeline_config(self.repo_root / "config.json")
+        for gate in (
+            "historical_audit_min_profit_factor",
+            "probation_min_profit_factor",
+            "production_portfolio_replay_min_profit_factor",
+            "regime_min_val_profit_factor",
+        ):
+            value = float(getattr(resolved, gate))
+            self.assertGreaterEqual(
+                value,
+                1.0,
+                f"{gate}={value} sits at or below breakeven; it cannot block an unprofitable strategy",
+            )
+
+    def test_historical_audit_sample_and_drawdown_are_meaningful(self) -> None:
+        """Guards the other two halves of the same gate."""
+        _, resolved = load_effective_pipeline_config(self.repo_root / "config.json")
+        self.assertGreaterEqual(
+            int(resolved.historical_audit_min_trades),
+            20,
+            "a handful of trades carries no information about durability",
+        )
+        self.assertLessEqual(
+            float(resolved.historical_audit_max_drawdown),
+            25.0,
+            "the audit found promoted cells at 40-99% drawdown; the cap must exclude them",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

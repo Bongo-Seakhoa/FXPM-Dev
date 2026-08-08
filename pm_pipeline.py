@@ -13256,9 +13256,12 @@ class OptimizationPipeline:
                                         regime_configs: Dict[str, Dict[str, RegimeConfig]],
                                         historical_features_by_tf: Dict[str, pd.DataFrame]) -> None:
         """Evaluate selected winners on the older historical audit window."""
-        min_trades = int(getattr(self.config, "historical_audit_min_trades", 5) or 0)
-        max_dd = float(getattr(self.config, "historical_audit_max_drawdown", 35.0) or 35.0)
-        min_pf = float(getattr(self.config, "historical_audit_min_profit_factor", 0.60) or 0.0)
+        # Fallbacks mirror the PipelineConfig defaults. They must never sit below
+        # breakeven: a getattr default of 0.60 here would silently reinstate the
+        # gate that promoted a net-losing winner in the 2026-06-18 audit.
+        min_trades = int(getattr(self.config, "historical_audit_min_trades", 20) or 0)
+        max_dd = float(getattr(self.config, "historical_audit_max_drawdown", 25.0) or 25.0)
+        min_pf = float(getattr(self.config, "historical_audit_min_profit_factor", 1.10) or 1.10)
         for tf, regimes in regime_configs.items():
             audit_features = historical_features_by_tf.get(tf)
             if audit_features is None or len(audit_features) < 50:

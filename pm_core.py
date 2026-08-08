@@ -1415,7 +1415,11 @@ class PipelineConfig:
     swap_model_min_holding_hours: float = 20.0
     
     # Optimization settings
-    max_param_combos: int = 150
+    # 200 is the production breadth. config.json carried 200 until the key moved
+    # to code ownership as a research_only_key (test_config_json_integrity), at
+    # which point the effective value silently fell to the 150 default. Pinned by
+    # test_config_json_integrity.test_research_only_defaults_pin_production_breadth.
+    max_param_combos: int = 200
     min_trades: int = 25
     optimization_max_workers: int = 0  # <= 0 uses all OS logical CPUs
     feature_cache_max_entries: int = 24  # 0 disables in-memory feature-frame caching
@@ -1662,9 +1666,14 @@ class PipelineConfig:
     # policy is frozen before lockbox evaluation.
     risk_management_optimization_enabled: bool = False
     risk_management_selection_stage: str = "stage3"
-    historical_audit_min_trades: int = 5
-    historical_audit_max_drawdown: float = 35.0
-    historical_audit_min_profit_factor: float = 0.60
+    # Historical stress-audit gate. A profit factor below 1.0 loses money, so a
+    # floor beneath breakeven cannot block an unprofitable strategy: the
+    # 2026-06-18 audit traced FORD H4 CHOP (PF 0.66, -23.18%) reaching PROMOTED
+    # through exactly this gate at 0.60. 1.10 keeps a margin above breakeven.
+    # Trade floor raised from 5 - a five-trade audit carries no information.
+    historical_audit_min_trades: int = 20
+    historical_audit_max_drawdown: float = 25.0
+    historical_audit_min_profit_factor: float = 1.10
     winner_ledger_path: str = "pm_configs.json"
     daily_loss_advisory_pct: float = 0.0
     session_loss_advisory_pct: float = 0.0

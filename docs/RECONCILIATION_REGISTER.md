@@ -68,6 +68,21 @@ more "would make it impossible to cover all 100 strategies."
 then adjudicate an unsearched space.
 **Note:** the ≥300-attempt roster was designed, approved, and parked (seq2294).
 
+**CORRECTION (2026-08-08).** An earlier entry here claimed commit `169f7e6`
+"silently deleted" `max_bars`, `max_param_combos` and related keys from
+`config.json` as collateral damage. **That was wrong.** Those keys are
+`research_only_key`s: their removal from `config.json` is *deliberate and
+test-enforced* by `test_config_json_integrity`, which asserts they are absent so
+that production values are owned by `PipelineConfig` defaults rather than config.
+The ownership model is sound.
+
+The genuine defect was narrower: when `max_param_combos` moved to code ownership,
+the code default (150) disagreed with the value `config.json` had carried (200),
+so effective breadth fell by 25% — and **no test pinned the resolved value**, so
+nothing caught it. Fixed 2026-08-08: default restored to 200 and pinned by
+`test_research_only_defaults_pin_production_breadth`. The 128-attempt ceiling
+above is a separate and far larger constraint, and remains open.
+
 ### E3 — Authority / evidence machinery `DECISION: pending`
 101,050 lines, 46% of the engine. Static reachability: **87% of all modules are
 reachable from `pm_main`** — this is entangled, not detachable. Fan-in ranks
@@ -88,12 +103,58 @@ references in shipping code.** Nothing prunes in production — the mechanical c
 of the 25 GiB `data/native` and the 15.5 GiB unpruned spool.
 Either wire it in or delete it; leaving it is the worst of both.
 
+### E14 — Look-ahead leak: searched, not found `DECISION: pending`
+The operator reports the traded baseline was "a bit leaky and the backtester/WFV
+had issues". Static comparison of both engines, 2026-08-08:
+
+- `_backtest_loop_numba` — academic 372 lines, current 534. Both take
+  `signal = sig_arr[i - 1]` and enter at `entry_prices[i]`. Causal boundary identical.
+- Stop construction — both compute stops at `signal_bar_index = i - 1`
+  (`atr_arr[signal_idx]` in current; `bar_index=signal_bar_index` in academic).
+- `BaseStrategy.calculate_stops` is the **single** implementation all 100 strategies
+  inherit. It reads `.iat[bar_index]` when indexed; the `.iloc[-1]` branch runs only
+  when `bar_index is None`, i.e. the live path where the last bar *is* the current bar.
+  The ATR fallback slices `features.iloc[:bar_index + 1]` first. Clean.
+- No negative `.shift(-n)` anywhere in `pm_core`, `pm_strategies`, `pm_regime` — in
+  **either** version. No bare full-series `.mean()/.std()/.quantile()/.rank()`; the
+  only bare `.min()/.max()` sit inside `.rolling(...)` chains.
+
+**Conclusion: no naive look-ahead found in either engine.** The reproduced failure
+mechanism is *selection bias*, not leakage — FORD promoted on 16 validation trades at
+PF 1.77, inverting to 0.66 over 166. That is an overfitting problem in the gates, not
+a causality problem in the engine, and it is addressed by E6.
+
+**Still open:** WFV split construction (train/validation boundary, embargo) was not
+audited here, and the operator named WFV explicitly. That is the remaining place a
+leak could hide.
+
 ### E6 — Promotion gate floors `DECISION: pending`
 `historical_audit_min_profit_factor` defaults to **0.60** (`pm_core.py:1667`), unset
 in config, read with a `0.60` fallback (`pm_pipeline.py:13261`). PF < 1.0 loses money.
-Named in the June audit as the reason a net loser was promoted; still present.
-Hardened gates *were* added elsewhere (`probation_min_profit_factor` 1.0,
+Named in the June audit as the reason a net loser was promoted. Hardened gates *were*
+added elsewhere (`probation_min_profit_factor` 1.0,
 `production_portfolio_replay_min_profit_factor` 1.05, `fx_val_max_drawdown` 12.0).
+
+**FIXED 2026-08-08** — the one element on this register acted on rather than logged,
+because a gate pointed the wrong way is a live defect, not a design question:
+
+| Setting | Was | Now |
+|---|---:|---:|
+| `historical_audit_min_profit_factor` | 0.60 | **1.10** |
+| `historical_audit_min_trades` | 5 | **20** |
+| `historical_audit_max_drawdown` | 35.0 | **25.0** |
+| `max_param_combos` (see E2) | 150 | **200** |
+
+Applied at `pm_core.py` (the `PipelineConfig` defaults, which *are* the production
+values under the research_only ownership model) and at the `getattr` fallbacks in
+`pm_pipeline._attach_historical_stress_audit`, where a hardcoded `0.60` would have
+reinstated the same trap. Three new tests in `test_config_json_integrity` pin the
+gates above breakeven, pin the sample/drawdown floors, and pin search breadth.
+
+**What this does not do:** it blocks bad promotions; it does not find good ones. On
+the June book these thresholds would have emptied the ledger — which the audit itself
+called the correct outcome. Trading resumes only once the search is wide enough to
+find something that clears them, i.e. after E2.
 
 ### E7 — Optuna config keys `DECISION: pending`
 Seven keys are "functionally dead but contractually LIVE" — read by
