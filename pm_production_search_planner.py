@@ -31,7 +31,7 @@ import inspect
 import json
 import math
 from pathlib import Path
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Final, Mapping, Optional, Sequence, Set
 
 import pandas as pd
 
@@ -112,8 +112,30 @@ FIT_CALENDAR_DAYS: Final = {
 CAUSAL_FOLD_COUNT: Final = 4
 CAUSAL_FOLD_MIN_DAYS: Final = 63
 BASELINE_ATTEMPTS: Final = 100
-VARIANT_ATTEMPTS: Final = 28
+# Every registered strategy receives this many deterministic, outcome-blind
+# non-default grid points, in addition to its registry default.
+#
+# It was formerly a flat 28 points shared across the whole 100-strategy pool, so
+# 72 strategies were never tuned at all and the remaining 28 saw exactly one
+# alternative each. Measured grids: the smallest strategy admits 165 distinct
+# parameter combinations, the median 4,455, the largest 1,267,200. Sampling
+# 0.28 tuned points per strategy against a median space of 4,455 is not a search;
+# it means the DSR/PBO gates adjudicate registry defaults. Every strategy can
+# supply at least 8 distinct non-default points, so 2 is well inside the grids.
+#
+# Widening is statistically safe because deflation scales with the trial count
+# rather than being bounded by it: pm_statistics deflates by
+# effective_independent_trials = min(n, 1 + (n-1)(1 - avg_correlation)), so more
+# attempts automatically raise the bar a winner must clear. The 128 ceiling was
+# never a statistical guard - MAX_ATTEMPTS sits in pm_winner_selection beside
+# MAX_JSON_NODES and MAX_CONTAINER_ITEMS as a payload bound.
+VARIANTS_PER_STRATEGY: Final = 2
+VARIANT_ATTEMPTS: Final = BASELINE_ATTEMPTS * VARIANTS_PER_STRATEGY
 ATTEMPT_COUNT: Final = BASELINE_ATTEMPTS + VARIANT_ATTEMPTS
+# Bounded deterministic retry budget when a variant collides with one already
+# emitted for the same strategy. Fails closed rather than silently emitting a
+# duplicate or collapsing to the registry default.
+_VARIANT_COLLISION_BUDGET: Final = 64
 PARAMETER_DESIGN_SEED: Final = "fxpm-production-space-fill-v1"
 MAX_PROCESS_BYTES: Final = 16 * 1024 * 1024
 STATE_INITIAL_ERROR_FLOOR: Final = 100.0
@@ -1952,7 +1974,18 @@ def _variant_strategy_names(
         return (-family_match, tie)
 
     ordered = sorted(domains, key=order)
-    selected = [str(item["strategy_id"]) for item in ordered[:VARIANT_ATTEMPTS]]
+    names = [str(item["strategy_id"]) for item in ordered]
+    if len(names) != BASELINE_ATTEMPTS or len(names) != len(set(names)):
+        _fail("VARIANT_STRATEGY_ALLOCATION_INVALID")
+    # Every strategy is tuned, VARIANTS_PER_STRATEGY times. Regime-family
+    # affinity still drives the ordering, so the sweep remains deterministic and
+    # reproducible, but affinity no longer decides *whether* a strategy is tuned
+    # at all - only the order in which its variants appear in the plan.
+    selected = [
+        (name, ordinal)
+        for ordinal in range(VARIANTS_PER_STRATEGY)
+        for name in names
+    ]
     if len(selected) != VARIANT_ATTEMPTS or len(selected) != len(set(selected)):
         _fail("VARIANT_STRATEGY_ALLOCATION_INVALID")
     return selected
@@ -1964,48 +1997,76 @@ def _nondefault_parameters(
     symbol: str,
     timeframe: str,
     regime: str,
+    variant_ordinal: int = 0,
+    already_emitted: Optional[Set[str]] = None,
 ) -> dict[str, Any]:
+    """One deterministic, outcome-blind non-default grid point for a strategy.
+
+    ``variant_ordinal`` selects which point, so a strategy can contribute several
+    distinct designs to a cell plan without any of them depending on an outcome.
+    Selection stays a pure function of (seed, symbol, timeframe, regime,
+    strategy, axis, ordinal, salt), which is what keeps the plan reproducible and
+    the multiplicity correction honest.
+
+    ``already_emitted`` carries the canonical parameter hashes this strategy has
+    already produced for this cell. A collision advances a deterministic salt
+    rather than accepting a duplicate; exhausting the budget fails closed.
+    """
     strategy = StrategyRegistry.get(strategy_name)
     defaults = strategy.get_default_params()
     grid = strategy.get_param_grid()
-    runtime = dict(defaults)
-    changed = False
-    for axis_ordinal, (axis_name, choices) in enumerate(grid.items()):
-        digest = _cell_hash(
-            symbol,
-            timeframe,
-            regime,
-            strategy_name,
-            axis_name,
-            str(axis_ordinal),
-        )
-        selected = choices[int(digest[:16], 16) % len(choices)]
-        runtime[axis_name] = selected
-        changed = changed or not parameter_values_equal(selected, defaults[axis_name])
-    if not changed:
-        for axis_name, choices in grid.items():
-            alternatives = [
-                value
-                for value in choices
-                if not parameter_values_equal(value, defaults[axis_name])
-            ]
-            if alternatives:
-                runtime[axis_name] = alternatives[0]
-                changed = True
-                break
-    if not changed:
-        _fail("NONDEFAULT_PARAMETER_POINT_UNAVAILABLE", strategy_name)
-    try:
-        fitted = StrategyRegistry.get(strategy_name, **runtime)
-        normalized = canonicalize_parameter_mapping(fitted.get_params())
-    except Exception as exc:
-        raise ProductionSearchPlannerError(
-            "NONDEFAULT_PARAMETER_MATERIALIZATION_FAILED", (strategy_name,)
-        ) from exc
     baseline = canonicalize_parameter_mapping(strategy.get_params())
-    if normalized == baseline:
-        _fail("NONDEFAULT_PARAMETER_POINT_COLLAPSED", strategy_name)
-    return normalized
+    seen = already_emitted if already_emitted is not None else set()
+
+    for salt in range(_VARIANT_COLLISION_BUDGET):
+        runtime = dict(defaults)
+        changed = False
+        for axis_ordinal, (axis_name, choices) in enumerate(grid.items()):
+            digest = _cell_hash(
+                symbol,
+                timeframe,
+                regime,
+                strategy_name,
+                axis_name,
+                str(axis_ordinal),
+                str(variant_ordinal),
+                str(salt),
+            )
+            selected = choices[int(digest[:16], 16) % len(choices)]
+            runtime[axis_name] = selected
+            changed = changed or not parameter_values_equal(
+                selected, defaults[axis_name]
+            )
+        if not changed:
+            for axis_name, choices in grid.items():
+                alternatives = [
+                    value
+                    for value in choices
+                    if not parameter_values_equal(value, defaults[axis_name])
+                ]
+                if alternatives:
+                    index = (variant_ordinal + salt) % len(alternatives)
+                    runtime[axis_name] = alternatives[index]
+                    changed = True
+                    break
+        if not changed:
+            _fail("NONDEFAULT_PARAMETER_POINT_UNAVAILABLE", strategy_name)
+        try:
+            fitted = StrategyRegistry.get(strategy_name, **runtime)
+            normalized = canonicalize_parameter_mapping(fitted.get_params())
+        except Exception as exc:
+            raise ProductionSearchPlannerError(
+                "NONDEFAULT_PARAMETER_MATERIALIZATION_FAILED", (strategy_name,)
+            ) from exc
+        if normalized == baseline:
+            continue  # collapsed onto the default; advance the salt
+        fingerprint = _sha(normalized)
+        if fingerprint in seen:
+            continue  # duplicate of an earlier variant for this strategy
+        seen.add(fingerprint)
+        return normalized
+
+    _fail("NONDEFAULT_PARAMETER_POINT_COLLAPSED", strategy_name)
 
 
 def _attempt_designs(
@@ -2031,7 +2092,8 @@ def _attempt_designs(
             }
         )
     by_name = {str(item["strategy_id"]): item for item in domains}
-    for name in _variant_strategy_names(
+    emitted_by_strategy: dict[str, Set[str]] = {}
+    for name, variant_ordinal in _variant_strategy_names(
         domains, symbol=symbol, timeframe=timeframe, regime=regime
     ):
         if name not in by_name:
@@ -2045,6 +2107,8 @@ def _attempt_designs(
                     symbol=symbol,
                     timeframe=timeframe,
                     regime=regime,
+                    variant_ordinal=variant_ordinal,
+                    already_emitted=emitted_by_strategy.setdefault(name, set()),
                 ),
             }
         )

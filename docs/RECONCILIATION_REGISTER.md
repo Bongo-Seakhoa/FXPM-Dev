@@ -68,6 +68,45 @@ more "would make it impossible to cover all 100 strategies."
 then adjudicate an unsearched space.
 **Note:** the ≥300-attempt roster was designed, approved, and parked (seq2294).
 
+**FIXED 2026-08-08.** The ceiling is lifted and the budget reallocated.
+
+| | Was | Now |
+|---|---:|---:|
+| Registry defaults per cell | 100 | 100 |
+| Tuned variants per cell | **28 (shared across the pool)** | **200** |
+| Variants **per strategy** | 0.28 | **2** |
+| Strategies ever tuned | **28 of 100** | **100 of 100** |
+| `ATTEMPT_COUNT` / `MAX_ATTEMPTS` | 128 | **300** |
+
+`VARIANTS_PER_STRATEGY` now drives the allocation, and `_nondefault_parameters`
+takes a `variant_ordinal` folded into the same outcome-blind cell hash, so a
+strategy can contribute several distinct points without any of them depending on
+a result. Collisions advance a deterministic salt within a bounded budget and
+fail closed rather than emitting a duplicate or collapsing to the default.
+
+Grounds for the sizing, measured: the smallest strategy grid admits **165**
+distinct combinations, the median **4,455**, the largest **1,267,200**, and every
+strategy can supply at least 8 distinct non-default points. Sampling 0.28 tuned
+points against a median space of 4,455 was not a search.
+
+Payload headroom, measured: a full 300-attempt plan canonicalizes to **67.7 KB**
+against `MAX_REQUEST_BYTES` of 16 MB — **248×** headroom, and 300 sits well under
+`MAX_CONTAINER_ITEMS` of 4,096. The 128 bound was nowhere near any real limit.
+
+Statistically safe because deflation scales *with* trials rather than being
+bounded by them: `pm_statistics` deflates by
+`effective_independent_trials = min(n, 1 + (n-1)(1 - avg_correlation))`, so more
+attempts automatically raise the bar a winner must clear. Correlated variants of
+one strategy cost less deflation than unrelated strategies, which is the right
+incentive — tune deeply rather than broadly.
+
+Verified: 200 variant slots, all distinct; all 100 strategies tuned; 200 distinct
+parameter points; zero collapses and zero duplicates. Tests updated to assert the
+contract (every strategy tuned `VARIANTS_PER_STRATEGY` times, no strategy
+repeating a point) rather than a magic total, and the mirroring test now asserts
+`planner.ATTEMPT_COUNT == winner.MAX_ATTEMPTS` instead of pinning a literal —
+pinning it is how a serialization bound came to read as a design constant.
+
 **CORRECTION (2026-08-08).** An earlier entry here claimed commit `169f7e6`
 "silently deleted" `max_bars`, `max_param_combos` and related keys from
 `config.json` as collateral damage. **That was wrong.** Those keys are

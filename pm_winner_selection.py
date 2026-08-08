@@ -56,7 +56,17 @@ MAX_JSON_NODES: Final = 550_000
 MAX_JSON_DEPTH: Final = 28
 MAX_CONTAINER_ITEMS: Final = 4_096
 MAX_STRING_CHARS: Final = 2 * 1024 * 1024
-MAX_ATTEMPTS: Final = 128
+# Payload bound, not a statistical one - it sits with the JSON/container limits
+# above for a reason. Statistical control over multiplicity lives in
+# pm_statistics, which deflates by effective_independent_trials and therefore
+# tightens automatically as the attempt count rises.
+#
+# It was 128, which forced the planner to spend 100 attempts on registry
+# defaults and share 28 tuned points across the whole strategy pool. That is a
+# ceiling on how much edge the search can find, imposed by a serialization
+# limit. 300 carries 100 defaults plus 2 tuned points per strategy; a 300-attempt
+# plan canonicalizes well under MAX_REQUEST_BYTES and MAX_CONTAINER_ITEMS.
+MAX_ATTEMPTS: Final = 300
 MAX_FOLDS: Final = 12
 MAX_DAYS_PER_FOLD: Final = 1_024
 MAX_TRADES_PER_FOLD: Final = 20_000

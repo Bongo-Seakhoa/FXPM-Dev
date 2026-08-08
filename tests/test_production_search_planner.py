@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 from datetime import date, timedelta
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,7 +45,10 @@ def test_process_freeze_reopens_exact_100_strategy_domain(tmp_path) -> None:
         "d4d8ae2deee050989bdc8e93b21d779c8d68ddb4666668a9c34c5d65177803e3"
     )
     assert body["semantics"]["strategy_domain_count"] == 100
-    assert body["semantics"]["attempt_policy"]["attempt_count_per_observed_cell"] == 128
+    assert (
+        body["semantics"]["attempt_policy"]["attempt_count_per_observed_cell"]
+        == planner.ATTEMPT_COUNT
+    )
     assert body["semantics"]["all_100_strategies_represented"] is True
 
 
@@ -159,7 +164,14 @@ def test_pre_evidence_and_post_precommit_requests_build_identical_anchor_body(
         )
 
 
-def test_attempt_roster_contains_every_default_and_28_real_grid_variants() -> None:
+def test_attempt_roster_tunes_every_strategy_with_real_grid_variants() -> None:
+    """Every strategy is tuned, and every tuned point is a distinct real grid point.
+
+    This used to allocate a flat 28 variants across the whole 100-strategy pool,
+    so 72 strategies were only ever evaluated at their registry defaults and the
+    gates adjudicated an unsearched space. The contract is now per-strategy
+    coverage rather than a magic total.
+    """
     process = _process_body()
     attempts = planner._attempt_designs(
         process,
@@ -171,8 +183,20 @@ def test_attempt_roster_contains_every_default_and_28_real_grid_variants() -> No
     defaults = attempts[: planner.BASELINE_ATTEMPTS]
     variants = attempts[planner.BASELINE_ATTEMPTS :]
     assert [item["strategy_id"] for item in defaults] == StrategyRegistry.list_all()
-    assert len(variants) == planner.VARIANT_ATTEMPTS == 28
-    assert len({item["strategy_id"] for item in variants}) == 28
+    assert len(variants) == planner.VARIANT_ATTEMPTS
+
+    # Every registered strategy is tuned, exactly VARIANTS_PER_STRATEGY times.
+    tuned = Counter(item["strategy_id"] for item in variants)
+    assert set(tuned) == set(StrategyRegistry.list_all())
+    assert set(tuned.values()) == {planner.VARIANTS_PER_STRATEGY}
+
+    # No strategy may contribute the same parameter point twice.
+    identities = [
+        (item["strategy_id"], json.dumps(item["parameters"], sort_keys=True, default=str))
+        for item in variants
+    ]
+    assert len(identities) == len(set(identities))
+
     for item in variants:
         strategy = StrategyRegistry.get(item["strategy_id"])
         parameters = item["parameters"]

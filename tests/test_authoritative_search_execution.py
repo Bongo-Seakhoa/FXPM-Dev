@@ -651,7 +651,15 @@ def test_canary_prefix_binding_uses_requested_cutoff_across_weekend_gap() -> Non
 
 
 def test_winner_resource_boundaries_are_exactly_mirrored() -> None:
-    assert execution.MAX_ATTEMPTS == winner.MAX_ATTEMPTS == 128
+    # The point of this assertion is that the two modules mirror each other and
+    # that the planner's per-cell roster fits exactly, not that the bound holds
+    # any particular value. Pinning the literal made a payload limit read as a
+    # design constant, which is how a 128-attempt serialization bound ended up
+    # capping how much edge the search could find.
+    import pm_production_search_planner as planner
+
+    assert execution.MAX_ATTEMPTS == winner.MAX_ATTEMPTS
+    assert planner.ATTEMPT_COUNT == winner.MAX_ATTEMPTS
     assert execution.MAX_FOLDS == winner.MAX_FOLDS == 12
     assert execution.MIN_FOLDS == winner.PINNED_SELECTION_POLICY["min_causal_folds"]
     assert (

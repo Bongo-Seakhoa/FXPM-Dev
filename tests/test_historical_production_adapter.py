@@ -30,6 +30,7 @@ from pm_trade_power import (
     build_trade_sample_evidence,
 )
 import pm_winner_raw_evidence as raw_winner
+import pm_winner_selection as winner
 from tests import test_training_horizon as horizon_fixture
 from tests import test_native_prefix_production as native_prefix_fixture
 
@@ -466,7 +467,13 @@ def test_canary_failure_v1_artifact_remains_verifiable() -> None:
             },
             "CANARY_FAILURE_EXCEPTION_TYPE_INVALID",
         ),
-        ({"attempt_ordinal": 128}, "CANARY_FAILURE_ATTEMPT_ORDINAL_INVALID"),
+        # Out of bounds is one past the last valid ordinal, whatever the bound
+        # is. Hardcoding 128 tied this to a payload limit rather than to the
+        # contract it is actually asserting.
+        (
+            {"attempt_ordinal": winner.MAX_ATTEMPTS},
+            "CANARY_FAILURE_ATTEMPT_ORDINAL_INVALID",
+        ),
         (
             {"attempt_ordinal": None, "fold_ordinal": 0},
             "CANARY_FAILURE_FOLD_ORDINAL_INVALID",
@@ -503,12 +510,14 @@ def observed_native_prefix(tmp_path_factory):
     root = tmp_path_factory.mktemp("historical-adapter-native-prefix")
     data_dir = root / "data"
     symbol = book.PINNED_SYMBOL_ORDER[0]
-    original_symbol = native_prefix_fixture.SYMBOL
-    native_prefix_fixture.SYMBOL = symbol
-    try:
-        facts = native_prefix_fixture._write_activation(data_dir, OBSERVED_TIMEFRAME)
-    finally:
-        native_prefix_fixture.SYMBOL = original_symbol
+    # Pass the symbol explicitly. _write_activation declares
+    # `symbol: str = SYMBOL`, and Python binds that default once at definition
+    # time, so reassigning the module global here never reached it: the helper
+    # wrote runs/run-prefix/EURUSD/... while this fixture read
+    # runs/run-prefix/AUDUSD/..., and every observed-cell test errored at setup.
+    facts = native_prefix_fixture._write_activation(
+        data_dir, OBSERVED_TIMEFRAME, symbol=symbol
+    )
 
     start = datetime(2018, 1, 1, tzinfo=timezone.utc)
     cadence = TIMEFRAME_SECONDS[OBSERVED_TIMEFRAME]
