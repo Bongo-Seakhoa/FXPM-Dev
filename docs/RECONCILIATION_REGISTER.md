@@ -271,6 +271,62 @@ A third coverage dimension alongside attempts/cell and per-strategy tuning.
 
 ---
 
+### E15 — Runtime: the binding constraint is RAM, not CPU `DECISION: pending`
+Measured 2026-08-08 on the operator's machine.
+
+**Hardware: 7.4 GB total RAM, 0.8 GB free, 6 logical cores.**
+
+| Measurement | Value |
+|---|---|
+| 250k-bar M5 feature frame | **168 MB**, 70 columns |
+| Framework baseline per worker (interpreter + pandas + `pm_core`) | ~118 MB |
+| A symbol's full 6-timeframe feature set | ~270 MB |
+| 6 workers × (baseline + one M5 frame + the `.copy()` on cache read) | **~2.7 GB minimum** |
+
+Scale comparison against the version that ran in 6 hours:
+
+| | Academic (6 h) | Current (3+ d, unfinished) |
+|---|---|---|
+| Symbols | 80 | 100 |
+| `max_bars` | 500,000 | 300,000 |
+| Per-cell search | 200 combos/strategy + Optuna | 128 attempts total |
+| Workers | 4 | **1** during the sprint |
+
+The current engine does a **narrower** search on **less** data and takes **>12×**
+longer. Scope does not explain it.
+
+**What is already recovered.** `optimization_max_workers` was 1 throughout the
+sprint (committed 2026-07-12, still 1 at 2026-07-17). The working tree carried an
+uncommitted `0`, which `resolve_worker_count` maps to all 6 cores; that landed in
+`f891307`. The memory governor is purely worker-count bound — it does not throttle
+on RAM — and `tqdm` progress reporting is present at `pm_pipeline.py:19802`. So
+parallelization and the status bar both exist again.
+
+**What is NOT safe to change blindly.** `feature_cache_max_entries` is `0` in
+config, which `pm_core.py:1425` documents as *disabling in-memory caching* — every
+feature read is a forced miss that falls through to disk. It looks like an obvious
+win to raise it. It is not: at 168 MB per frame, even 2 entries × 6 workers is
+~2 GB on a machine with 0.8 GB free. **Setting it to `0` was most likely a correct
+response to memory pressure, and the 4→1 worker cut may have been too.**
+
+**Consequences worth noting rather than acting on unilaterally:**
+- `_cache_get` returns `.copy()` (`pm_core.py:5634`) — every hit duplicates a
+  168 MB frame. Both a memory spike and a CPU cost.
+- `compute_all` computes all 70 columns. It is called once per (symbol, timeframe),
+  not per attempt — correct design — but the frame is wide.
+- `compute_required` exists and is documented as the narrow path; the optimize path
+  does not use it. Whether that is waste depends on how many of the 70 columns the
+  100-strategy pool collectively needs.
+
+**The honest conclusion: this laptop is the constraint.** 7.4 GB cannot hold 6
+workers × 168 MB frames plus the evidence machinery's own footprint. The academic
+version fit in that budget; the current one, with 70-column frames and the
+attestation layer, does not. Any plan that assumes a 2-3 day completed run must
+either shrink per-worker memory or accept fewer workers — and choosing between
+those is an operator call about hardware, not a code change.
+
+---
+
 ## 3. Questions only the operator can answer
 
 1. **Iteration 4** — what was "FxPM 1.4 - Obtimized"? Only its orphaned data
