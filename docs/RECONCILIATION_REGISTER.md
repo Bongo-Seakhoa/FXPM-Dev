@@ -170,6 +170,46 @@ production engine sheds it and gets its search back.
 
 ---
 
+### E11 — Known defects of the traded baseline `DECISION: pending`
+Operator (2026-08-08): **lot sizing, recovery, order scaling** — "amongst others" —
+but *"the real issue is that it was a bit leaky and the backtester/WFV had issues."*
+
+Two very different classes:
+- **Sizing/recovery/scaling** are localised to execution (`pm_position`, `pm_main`) —
+  ~14% of the engine. Bounded and fixable.
+- **Leakage in the backtester/WFV** invalidates evidence rather than execution. It is
+  the class that makes a strong backtest fail live, which matches a system that came
+  close to a funded challenge and then failed.
+
+**Highest-priority open code question:** current `pm_core.py` is 473 KB against the
+academic artifact's 148 KB, but the backtest loop may share lineage. **Was the leak
+fixed, or inherited?** Nothing found so far answers this.
+
+**Operator's caveat, to be honoured:** *"we made exceptions but I'd argue that the
+exceptions made it better than what they detracted from."* The current engine is the
+over-correction toward scientific purity. Some of the discarded pragmatic exceptions
+may be exactly what made the traded version work. Do not treat purity as the goal.
+
+### E12 — Forward-simulation window `DECISION: pending`
+No broker records survive. Operator's proposal: forward-simulate from the academic
+results' end date, since the academic artifact was substantially the traded system.
+
+Measured, 2026-08-08:
+- Academic analysis generated **2026-03-31** (`historical_results/analysis/export_audit.json`).
+- Authoritative native data `production_native_v5r2_20260714` spans **2016-05-12 → 2026-07-14**.
+- Out-of-sample window **2026-04-01 → 2026-07-14** = **21,334 M5 bars ≈ 74 trading days**.
+
+This is the only honest forward test available anywhere in the project. Its second
+output matters more than its first: the gap between the academic system's *reported*
+backtest performance and its *forward* performance is a direct measurement of the leak.
+
+### E13 — Data depth `DECISION: pending`
+Native EURUSD M5 holds **758,012 bars**. The engine's window is **300,000** (~2.85
+years) — **40% of what is on disk**. The prior engine used 500,000 (~4.75 years, 66%).
+A third coverage dimension alongside attempts/cell and per-strategy tuning.
+
+---
+
 ## 3. Questions only the operator can answer
 
 1. **Iteration 4** — what was "FxPM 1.4 - Obtimized"? Only its orphaned data
