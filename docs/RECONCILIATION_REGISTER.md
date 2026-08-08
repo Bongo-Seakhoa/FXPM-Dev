@@ -327,6 +327,39 @@ those is an operator call about hardware, not a code change.
 
 ---
 
+### E16 — Quantified efficiency defects `DECISION: pending`
+All measured on the operator's machine, 2026-08-08. None of these trade accuracy.
+
+**FIXED — regime labels as object columns.** `REGIME_RAW`/`REGIME`/`REGIME_LIVE`
+held 250k interned Python strings per column. 44.0 MB → 6.4 MB; the 250k-bar M5
+frame drops **168.2 MB → 130.4 MB (22%)**. Verified elementwise-identical against
+HEAD across 250,000 bars; only difference is `REGIME_LIVE[0]`, the `shift(1)`
+sentinel, `None` → `NaN`, which nothing reads. Landed `e999e36`.
+
+**OPEN — full-frame copy on every cache hit** (`pm_core.py:5634`).
+`_cache_get` returns `.copy()`. Measured: **51 ms per 129 MB frame**. At 128
+attempts × 24 cells that is **157 s per symbol of pure copying**, ≈**4.4 hours
+across 100 symbols**. pandas here is 2.2.3, which supports copy-on-write, making
+a protective copy near-free. Requires either enabling CoW globally (a real
+semantics change worth testing) or auditing consumers for mutation. Not changed
+without the profile.
+
+**OPEN — the run's hot path is not where it looks.** Timing three suites:
+
+| Suite | Tests | Wall clock |
+|---|---:|---:|
+| `test_config_source_of_truth` | 41 | **13.5 s** |
+| `test_backtester` | 14 | **8.4 s** |
+| `test_profitability_readiness_blueprint` | 64 | **~3.5 hours** |
+
+119 tests took 3:29:33 and essentially all of it is one suite of live-readiness
+and supervisor tests. Ruled out by measurement: no subprocesses, and the 22.4 MB
+winner ledger parses in 0.23 s. This suite is a *runnable* proxy for the
+production hot path — unlike a 3-day production run — and profiling it is the
+cheapest route to the real multiple. Profile in flight.
+
+---
+
 ## 3. Questions only the operator can answer
 
 1. **Iteration 4** — what was "FxPM 1.4 - Obtimized"? Only its orphaned data
