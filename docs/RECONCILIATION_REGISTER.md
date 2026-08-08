@@ -360,6 +360,65 @@ cheapest route to the real multiple. Profile in flight.
 
 ---
 
+### E17 — The resolver re-verifies 12 GB on every call `DECISION: pending`
+**This is the largest efficiency defect found, and it violates a principle the
+operator already recorded.**
+
+Profiled 2026-08-08. `test_profitability_readiness_blueprint`: **six of 64 tests
+consumed 12,236 of 12,241 seconds — 99.96% of a 3h24m suite.** The other 58 finish
+in under a second combined. Five of the six land within 30s of each other at
+~1,525s, which is the signature of a fixed cost, not computation.
+
+Isolated outside pytest: `validate_live_readiness(cfg, symbols=[])` — an **empty**
+symbol list — runs for **over 8 minutes** before being killed. Stack sampling:
+
+```
+validate_live_readiness                       pm_live_readiness.py:3601
+  resolve_active_native_universe              pm_native_activation.py:6007
+    _resolve_active_native_universe_uncached  pm_native_activation.py:5059
+      _verify_activation_cell_evidence        pm_native_activation.py:3090
+        _verify_v5_activation_cell_evidence   pm_native_activation.py:2627
+          _v5_read_hashed_frame -> normalize_ohlc_frame
+          audit_native_cross_resolution -> _coarse_interval_ends_ns
+```
+
+**Every readiness call re-reads, re-hashes and cross-resolution-audits the entire
+active native universe: 12 GB across 567 `bars.csv` files.**
+
+`resolve_active_native_universe` reuses a prior result *only* when the
+`_PRODUCTION_NATIVE_AUTHORITY_SCOPE` ContextVar is set. Unscoped — as in every
+test, and any caller that does not enter the scope — it falls straight through to
+the uncached path and re-verifies all 12 GB.
+
+This is precisely the boundary the operator recorded in memory as
+`activation-vs-resolver-boundary`: *activation is a one-time semantic evaluation
+over hashed axes; the resolver does cheap hash checks only, never per-call
+semantic replay.* The activation manifest already carries a sha256 for every leaf
+(5.4 MB, 1,202 references). The resolver should verify the manifest and trust
+those recorded hashes, re-reading leaf bytes only when a leaf is actually
+consumed. It currently replays the whole semantic verification instead.
+
+**Open production question:** `validate_live_readiness` is called from
+`pm_main.py:12254` and `:12415`. Scope logging appears at `:12357`, between them,
+so the second call may be scoped and the first may not. If any readiness check on
+the live path runs unscoped, live trading stalls ~25 minutes on it. Not yet traced
+to a verdict.
+
+**Two hypotheses this killed, recorded so they are not re-chased.** The uniform
+~1,525s looked like an MT5 connect-retry loop — `mt5.initialize()` genuinely does
+block 102.5s with no terminal — but the slow tests never touch MT5. It then looked
+like unformatted datetime parsing, since stack samples kept landing in
+`_array_strptime_with_fallback` — but parsing 60k `_BAR_CLOSE_TS` values takes
+0.07s and `format="ISO8601"` buys 1.1×. The samples landed there because it is
+called constantly, not because it is slow.
+
+**Landed regardless:** `tests/conftest.py` now fast-fails `mt5.initialize` so no
+test can ever wait 102s on an absent terminal. Semantically identical (a real
+absent terminal also returns `False`), opt out with `@pytest.mark.real_mt5`.
+62 connector, live-loop and regime tests pass with it.
+
+---
+
 ## 3. Questions only the operator can answer
 
 1. **Iteration 4** — what was "FxPM 1.4 - Obtimized"? Only its orphaned data
