@@ -5992,6 +5992,106 @@ def _resolve_active_native_universe_uncached(
     return result
 
 
+_UNSCOPED_UNIVERSE_MEMO: Dict[
+    Tuple[Any, ...], Tuple["_ActiveAuthorityIdentity", ActiveNativeUniverse]
+] = {}
+_UNSCOPED_UNIVERSE_MEMO_LOCK = threading.Lock()
+_UNSCOPED_UNIVERSE_MEMO_MAX = 8
+
+
+def clear_unscoped_native_universe_memo() -> None:
+    """Drop every memoized unscoped resolution (tests and long-lived processes)."""
+    with _UNSCOPED_UNIVERSE_MEMO_LOCK:
+        _UNSCOPED_UNIVERSE_MEMO.clear()
+
+
+def _resolve_unscoped_memoized(
+    data_dir: Path,
+    configured_symbols: Optional[Iterable[str]],
+    *,
+    required_timeframes: Sequence[str],
+    verify_exclusion_evidence: bool,
+    production_contract_required: bool,
+) -> ActiveNativeUniverse:
+    """Resolve without a lexical scope, reusing results pinned to authority identity.
+
+    Resolution re-reads, re-hashes and cross-resolution-audits every leaf in the
+    active universe. Measured 2026-08-08: 12 GB across 567 ``bars.csv`` files,
+    over eight minutes per call even with an empty symbol list. Callers outside a
+    ``ProductionNativeAuthorityVerificationScope`` previously paid that on every
+    invocation, which is why six live-readiness tests consumed 99.96% of a 3h24m
+    suite.
+
+    The result is a pure function of the authority identity - the ACTIVE.json
+    pointer bytes and the sha256 of the manifest they name - together with the
+    resolution parameters. Both are cheap to read, so this memo re-checks identity
+    on every hit and recomputes the moment ACTIVE.json or the manifest changes.
+    That is the ``activation-vs-resolver`` boundary applied as written: activation
+    performs the one-time semantic evaluation, the resolver does hash checks only.
+
+    Only valid universes whose manifest sha matches the identity are stored, so an
+    invalid or mid-promotion state is never cached and never reused.
+    """
+
+    try:
+        identity_before = _read_active_authority_identity(data_dir)
+    except BaseException:
+        # No readable authority identity means nothing can be pinned; fall back to
+        # the uncached path so the caller still sees the real failure mode.
+        return _resolve_active_native_universe_uncached(
+            data_dir,
+            configured_symbols,
+            required_timeframes=required_timeframes,
+            verify_exclusion_evidence=verify_exclusion_evidence,
+            production_contract_required=production_contract_required,
+        )
+
+    key = (
+        str(Path(data_dir).resolve()),
+        None if configured_symbols is None else tuple(configured_symbols),
+        tuple(required_timeframes),
+        bool(verify_exclusion_evidence),
+        bool(production_contract_required),
+    )
+    with _UNSCOPED_UNIVERSE_MEMO_LOCK:
+        entry = _UNSCOPED_UNIVERSE_MEMO.get(key)
+        if entry is not None and entry[0] == identity_before:
+            return deepcopy(entry[1])
+
+    universe = _resolve_active_native_universe_uncached(
+        data_dir,
+        configured_symbols,
+        required_timeframes=required_timeframes,
+        verify_exclusion_evidence=verify_exclusion_evidence,
+        production_contract_required=production_contract_required,
+    )
+
+    try:
+        identity_after = _read_active_authority_identity(data_dir)
+    except BaseException:
+        return universe
+    if identity_after != identity_before:
+        # The authority moved under us; return what was computed but never pin it.
+        return universe
+    if (
+        not universe.valid
+        or str(universe.activation_manifest_sha256 or "").lower()
+        != identity_after.activation_manifest_sha256
+    ):
+        return universe
+
+    try:
+        sealed = deepcopy(universe)
+        returned = deepcopy(sealed)
+    except BaseException:
+        return universe
+    with _UNSCOPED_UNIVERSE_MEMO_LOCK:
+        if len(_UNSCOPED_UNIVERSE_MEMO) >= _UNSCOPED_UNIVERSE_MEMO_MAX:
+            _UNSCOPED_UNIVERSE_MEMO.pop(next(iter(_UNSCOPED_UNIVERSE_MEMO)), None)
+        _UNSCOPED_UNIVERSE_MEMO[key] = (identity_after, sealed)
+    return returned
+
+
 def resolve_active_native_universe(
     data_dir: Path,
     configured_symbols: Optional[Iterable[str]] = None,
@@ -6004,7 +6104,7 @@ def resolve_active_native_universe(
 
     scope = _PRODUCTION_NATIVE_AUTHORITY_SCOPE.get()
     if scope is None:
-        return _resolve_active_native_universe_uncached(
+        return _resolve_unscoped_memoized(
             data_dir,
             configured_symbols,
             required_timeframes=required_timeframes,
