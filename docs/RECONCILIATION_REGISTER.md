@@ -116,6 +116,60 @@ first money-making step.
 
 ---
 
+### E10 — The traded baseline `DECISION: pending`
+Operator (2026-08-08): the version that inspired the paper **traded a funded broker
+challenge and came very close to completing it**, then failed; severe defects in it
+began the refactor. It is the **only** FxPM iteration with real-money evidence.
+
+The 2026-03-08 academic audit describes that system: a **seven-gate validation
+pipeline**, **five-layer risk control with margin-state escalation**, regime-adaptive
+architecture, Optuna Bayesian optimisation, 18 test modules. Its verdict: *"not a toy
+prototype; a working decision engine with real operational history."*
+
+**No successor has been shown to beat it.** Any candidate design should be measured
+against this baseline, not against the current engine.
+**NEEDS OPERATOR CONTEXT:** what were the severe defects, and do the broker
+statements / trade records from that challenge still exist? Real fills, spreads and
+slippage from a funded account outrank every backtest in this repository.
+
+---
+
+## 2a. Root cause — why the mass went where it went
+
+The 2026-03-08 audit's Section 14 roadmap has four phases: **Research Packaging →
+Data & Replication Control → Experiment Design → Governance Formalisation.** Its
+Section 15 instructs, verbatim, that proceeding "must mean focusing on
+**research-readiness, not further feature growth**", and that "additional strategies,
+new indicators, or dashboard enhancements should be **deferred** until the research
+infrastructure is in place."
+
+Map the roadmap onto what was built:
+
+| Audit deliverable | What it became |
+|---|---|
+| Phase 2 — "frozen benchmark dataset bundles with checksums and provenance metadata" | `data/native`, run manifests, `provenance.json`, activation manifests (M1) |
+| Phase 3 — "experiment manifest schema capturing all parameters of every study run" | `generation-context.json`, canonical-json receipts, the authority spool |
+| Phase 4 — "governance formalisation" | `pm_authority_*`, `pm_promotion_authorization`, the attestation layer |
+| Phase 1 — "artifact release rules and version tagging" | `artifact_meta` and artifact-contract drift checks |
+
+**The 101,050 lines of authority machinery are this roadmap, implemented.** The models
+did not go rogue; they executed a plan faithfully. The plan was written to satisfy a
+doctoral defence committee, and it was applied to the system whose job is to make money.
+It also told them to defer feature growth — which is why search breadth collapsed to
+128 attempts/cell while provenance grew.
+
+**The distinction that was lost** is one the audit itself made, in Section 13:
+
+> "Separation between **operational heuristics (fixed for production)** and
+> **research variables (manipulated for study)**"
+
+That separation was never built. Instead the research instrumentation was built *into*
+the production engine. The cure is the audit's own recommendation applied properly:
+the research artifact carries the provenance machinery for the dissertation; the
+production engine sheds it and gets its search back.
+
+---
+
 ## 3. Questions only the operator can answer
 
 1. **Iteration 4** — what was "FxPM 1.4 - Obtimized"? Only its orphaned data
