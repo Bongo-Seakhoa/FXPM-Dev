@@ -52,6 +52,22 @@ class UnscopedUniverseMemoTests(unittest.TestCase):
         clear_unscoped_native_universe_memo()
         self.addCleanup(clear_unscoped_native_universe_memo)
         self.calls = 0
+        # Capture the real module functions ONCE, before any test patches them,
+        # and restore unconditionally. An earlier version registered its cleanup
+        # with the already-patched value, so the stub survived the test and
+        # every later authority test resolved against it - 7 passing alone, 22
+        # failing downstream. Measured and reported by Codex in CX-013.
+        self._real_identity = activation._read_active_authority_identity
+        self._real_resolve = activation._resolve_active_native_universe_uncached
+        self.addCleanup(
+            setattr, activation, "_read_active_authority_identity", self._real_identity
+        )
+        self.addCleanup(
+            setattr,
+            activation,
+            "_resolve_active_native_universe_uncached",
+            self._real_resolve,
+        )
 
     def _install(self, identities, universe_factory):
         """Patch the identity reader and the expensive resolver."""
@@ -64,14 +80,8 @@ class UnscopedUniverseMemoTests(unittest.TestCase):
             self.calls += 1
             return universe_factory()
 
-        self._orig_identity = activation._read_active_authority_identity
-        self._orig_resolve = activation._resolve_active_native_universe_uncached
         activation._read_active_authority_identity = fake_identity
         activation._resolve_active_native_universe_uncached = fake_resolve
-        self.addCleanup(setattr, activation, "_read_active_authority_identity", self._orig_identity)
-        self.addCleanup(
-            setattr, activation, "_resolve_active_native_universe_uncached", self._orig_resolve
-        )
 
     def _call(self):
         return activation._resolve_unscoped_memoized(
@@ -124,12 +134,10 @@ class UnscopedUniverseMemoTests(unittest.TestCase):
             self.calls += 1
             return _universe()
 
+        # setUp captured the real functions and registered their restoration,
+        # so patching here cannot leak into any later test.
         activation._read_active_authority_identity = drifting_identity
         activation._resolve_active_native_universe_uncached = fake_resolve
-        self.addCleanup(
-            setattr, activation, "_read_active_authority_identity",
-            activation._read_active_authority_identity,
-        )
         self._call()
         self._call()
         self.assertEqual(self.calls, 2, "a universe captured mid-change was cached")
@@ -152,15 +160,49 @@ class UnscopedUniverseMemoTests(unittest.TestCase):
             self.calls += 1
             return _universe()
 
-        orig_i = activation._read_active_authority_identity
-        orig_r = activation._resolve_active_native_universe_uncached
         activation._read_active_authority_identity = boom
         activation._resolve_active_native_universe_uncached = fake_resolve
-        self.addCleanup(setattr, activation, "_read_active_authority_identity", orig_i)
-        self.addCleanup(setattr, activation, "_resolve_active_native_universe_uncached", orig_r)
         self._call()
         self._call()
         self.assertEqual(self.calls, 2, "an unpinnable authority was cached anyway")
+
+    def test_generator_symbols_are_not_consumed_by_key_construction(self) -> None:
+        """configured_symbols is typed Iterable, so a generator is legal.
+
+        Building the memo key used to exhaust it, leaving the resolver an empty
+        iterator and silently resolving an EMPTY symbol universe - a wrong
+        answer with no error. Measured by Codex in CX-013.
+        """
+        seen = []
+
+        def fake_identity(_data_dir):
+            return _identity()
+
+        def fake_resolve(_data_dir, configured_symbols, **_kw):
+            seen.append(None if configured_symbols is None else list(configured_symbols))
+            self.calls += 1
+            return _universe()
+
+        activation._read_active_authority_identity = fake_identity
+        activation._resolve_active_native_universe_uncached = fake_resolve
+
+        def symbols():
+            yield "EURUSD"
+            yield "GBPUSD"
+
+        activation._resolve_unscoped_memoized(
+            Path("."),
+            symbols(),
+            required_timeframes=("M5",),
+            verify_exclusion_evidence=True,
+            production_contract_required=False,
+        )
+        self.assertEqual(
+            seen,
+            [["EURUSD", "GBPUSD"]],
+            "the resolver received an exhausted iterator and would have resolved "
+            "an empty universe",
+        )
 
 
 if __name__ == "__main__":

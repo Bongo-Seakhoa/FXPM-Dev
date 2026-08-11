@@ -6033,6 +6033,14 @@ def _resolve_unscoped_memoized(
     invalid or mid-promotion state is never cached and never reused.
     """
 
+    # Materialize the caller's symbols exactly once. configured_symbols is typed
+    # Iterable, so a generator is legal - and building the memo key from it used
+    # to exhaust it, leaving the resolver an empty iterator and silently
+    # resolving an EMPTY symbol universe. Measured and reported by Codex in
+    # CX-013. Everything below uses this tuple, never the original argument.
+    symbols = None if configured_symbols is None else tuple(configured_symbols)
+    frozen_timeframes = tuple(required_timeframes)
+
     try:
         identity_before = _read_active_authority_identity(data_dir)
     except BaseException:
@@ -6040,28 +6048,40 @@ def _resolve_unscoped_memoized(
         # the uncached path so the caller still sees the real failure mode.
         return _resolve_active_native_universe_uncached(
             data_dir,
-            configured_symbols,
-            required_timeframes=required_timeframes,
+            symbols,
+            required_timeframes=frozen_timeframes,
             verify_exclusion_evidence=verify_exclusion_evidence,
             production_contract_required=production_contract_required,
         )
 
     key = (
         str(Path(data_dir).resolve()),
-        None if configured_symbols is None else tuple(configured_symbols),
-        tuple(required_timeframes),
+        symbols,
+        frozen_timeframes,
         bool(verify_exclusion_evidence),
         bool(production_contract_required),
     )
     with _UNSCOPED_UNIVERSE_MEMO_LOCK:
         entry = _UNSCOPED_UNIVERSE_MEMO.get(key)
-        if entry is not None and entry[0] == identity_before:
-            return deepcopy(entry[1])
+    if entry is not None and entry[0] == identity_before:
+        returned = deepcopy(entry[1])
+        # Post-copy identity re-read, mirroring the scoped path. Copying is not
+        # instantaneous, and a warm hit that skipped this could hand back a
+        # universe pinned to an authority that moved during the copy.
+        try:
+            identity_after_copy = _read_active_authority_identity(data_dir)
+        except BaseException:
+            identity_after_copy = None
+        if identity_after_copy == identity_before:
+            return returned
+        with _UNSCOPED_UNIVERSE_MEMO_LOCK:
+            _UNSCOPED_UNIVERSE_MEMO.pop(key, None)
+        # fall through and re-verify against the authority as it now stands
 
     universe = _resolve_active_native_universe_uncached(
         data_dir,
-        configured_symbols,
-        required_timeframes=required_timeframes,
+        symbols,
+        required_timeframes=frozen_timeframes,
         verify_exclusion_evidence=verify_exclusion_evidence,
         production_contract_required=production_contract_required,
     )

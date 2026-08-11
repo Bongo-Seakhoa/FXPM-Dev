@@ -28,8 +28,18 @@ COMMS_DIR = ROOT / "agent_comms"
 BUS_PATH = COMMS_DIR / "BUS.jsonl"
 LANES_PATH = COMMS_DIR / "LANES.json"
 
-AGENTS = ("claude", "codex")
-AGENT_PREFIX = {"claude": "CC", "codex": "CX"}
+# Implementers and their independent PMs. The PMs are scope guards and evidence
+# arbitrators: they approve, reject and scope, and they never task work into
+# existence. Operator directive 2026-08-11, after two implementers left to
+# self-direct produced 101k lines of authority machinery and a 128-attempt
+# search ceiling that nobody was holding scope against.
+AGENTS = ("claude", "codex", "claude-pm", "codex-pm")
+AGENT_PREFIX = {
+    "claude": "CC",
+    "codex": "CX",
+    "claude-pm": "CPM",
+    "codex-pm": "XPM",
+}
 MESSAGE_TYPES = (
     "claim", "release", "status", "finding", "question", "answer",
     "decision", "veto", "review_request", "review",
