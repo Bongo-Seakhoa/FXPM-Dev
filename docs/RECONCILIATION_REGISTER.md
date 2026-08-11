@@ -342,6 +342,36 @@ This is the only honest forward test available anywhere in the project. Its seco
 output matters more than its first: the gap between the academic system's *reported*
 backtest performance and its *forward* performance is a direct measurement of the leak.
 
+### E18 — The forward window is not out-of-sample `DECISION: pending`
+Verified 2026-08-11, and it invalidates the forward test as previously specified.
+
+With `evidence_as_of_utc` empty, `as_of` derives from the data end (2026-07-14)
+and `build_calendar_boundaries` yields:
+
+| Partition | Window |
+|---|---|
+| `optimizer_train` | 2017-06-30 → 2022-06-30 |
+| `tuning_validation` | 2022-07-07 → 2024-07-07 |
+| `final_lockbox` | **2024-07-14 → 2026-07-14** |
+
+The proposed forward window, **2026-04-01 → 2026-07-14**, sits *entirely inside*
+`final_lockbox` — 104 days of overlap.
+
+That matters because the lockbox is selection data, not merely unfitted data:
+`pm_pipeline.py:12135` defines `"clean_holdout": (lockbox_start, lockbox_end)`,
+and `classify_promotion_status` consumes those holdout metrics at `:2512-2520`
+against `false_discovery_holdout_min_profit_factor` / `_min_return_pct` /
+`_max_drawdown`, returning BLOCKED or PROMOTE_SMALL. **A promoted cell's status
+is a function of its performance inside the window we would be "forward" testing
+on.** The cells reaching the test are exactly those that did well in it.
+
+**There is currently no untouched forward window.** Native data ends 2026-07-14
+and every day of it lies in a fitting or selection partition. Two remedies, both
+open: pin `evidence_as_of_utc` to 2026-04-01 so all partitions close before the
+window (free, costs fit recency, moves the `evidence_as_of_utc == ""` assertion
+in `test_config_json_integrity`), or acquire post-2026-07-14 broker data (costs
+an acquisition run, keeps the fit recent).
+
 ### E13 — Data depth `DECISION: pending`
 Native EURUSD M5 holds **758,012 bars**. The engine's window is **300,000** (~2.85
 years) — **40% of what is on disk**. The prior engine used 500,000 (~4.75 years, 66%).
