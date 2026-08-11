@@ -54,18 +54,35 @@ it is not in scope — however rigorous, provable or elegant it is.
 
 ## Critical path to the objective
 
+**Gate 1 is ANSWERED (2026-08-11).** PBO produced a real verdict on the D1
+canary: `pbo=0.0`, N=224 evaluation-required, T=253 complete calendar days,
+S=8/70, PASS in base and stress. The multiple-testing machinery works. The
+earlier claim that PBO had never returned a verdict was true only of the June
+book, which predates this contract. **Do not reopen this question.**
+
+**D1 is infeasible geometry, not a strict threshold.** No candidate
+authenticated: 782 of 896 final lanes had zero trades, 114 had 1-2, pooled max
+3, against Winner's 5-per-fold and 40-overall. Decisively, recomputing at
+`effective_trials=1` - multiplicity removed entirely - still demands ESS 42-481
+against an observed 4.50-11, so all 17 surviving decisions fail anyway.
+**No gate may be moved toward the observed result.**
+
 | # | Gate | Owner | State |
 |---|---|---|---|
-| 1 | PBO actually produces a verdict per cell | open | **blocking** — it has never once returned one |
-| 2 | Cold native verification cheap (manifest-trust) | Claude | designed, safe, not built |
-| 3 | A run that completes | open | never achieved |
-| 4 | Replay the resulting book, corrected enumerator | open | |
-| 5 | Forward-simulate 2026-04-01 → 07-14 (74 trading days OOS) | open | the only honest forward test available |
-| 6 | Execution defects: lot sizing, recovery, order scaling | open | named by operator as what killed the funded attempt |
-| 7 | Demo shadow, then funded at a size where min-lot geometry is not fighting us | open | |
+| 1 | PBO produces a per-cell verdict | Codex | **DONE** — pbo=0.0, N=224, T=253 |
+| 2 | A timeframe with enough activity to authenticate a candidate | Codex | EURUSD H1 canary, 23.6x D1's rows; abort at first fold if <5 trades/lane |
+| 3 | A full run that completes | open | |
+| 4 | Replay the book, corrected enumerator | open | |
+| 5 | Forward Test A — reject-only falsification | pre-registered | `docs/FORWARD_TEST_A_PREREGISTRATION.md` v2 |
+| 6 | Execution defects | Claude | **DONE** — lot sizing, recovery and order scaling all verified in this engine |
+| 7 | Demo shadow | open | |
+| 8 | Test B — the only certification | blocked on data | first valid day 2026-08-18; 365-day horizon ends 2027-08-17 |
 
-Gate 1 is the one that decides whether any of this is real. A book that cannot
-produce a PBO verdict cannot be trusted at any size.
+Gate 6 closed 2026-08-11: realised risk matches target to 1.00% across six
+instruments; 2,400 magic numbers generated with zero collisions plus a runtime
+collision guard; exact-cell uniqueness with fail-closed on an unavailable
+position snapshot. The three defects the operator named as killing the funded
+attempt are fixed in this engine.
 
 ## Lane protocol
 

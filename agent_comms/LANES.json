@@ -11,7 +11,60 @@
         "tests/test_winner_selection.py"
       ],
       "purpose": "Gate 1: measure authoritative Winner PBO T,N on one bounded non-authorizing cell; diagnose before any fix",
-      "status": "active"
+      "release_note": "Gate-1 canary, independent evidence extraction, receipt binding, archival preservation, and measured blocker diagnosis complete; no runtime files changed by the run",
+      "released_at": "2026-08-11T14:40:37Z",
+      "status": "released"
+    },
+    {
+      "claimed_at": "2026-08-11T11:59:40Z",
+      "id": "L-0013",
+      "owner": "codex",
+      "paths": [
+        "pm_authoritative_search_execution.py",
+        "tests/test_authoritative_search_execution.py",
+        "tests/test_raw_winner_canary.py"
+      ],
+      "purpose": "Gate-1 canary stage quota and local diagnostic-root safety; existing quota mechanism only",
+      "release_note": "Landed in c7d939c; both PMs clear Gate 1",
+      "released_at": "2026-08-11T12:10:39Z",
+      "status": "released"
+    },
+    {
+      "claimed_at": "2026-08-11T11:48:32Z",
+      "id": "L-0012",
+      "owner": "codex",
+      "paths": [
+        "agent_comms/PM_CHARTER.md"
+      ],
+      "purpose": "Record operator's three-round, autonomous-but-evidence-bounded PM scope and convergence rules",
+      "release_note": "Ratified and committed by Claude in 28ed757",
+      "released_at": "2026-08-11T12:10:39Z",
+      "status": "released"
+    },
+    {
+      "claimed_at": "2026-08-11T11:37:09Z",
+      "id": "L-0011",
+      "owner": "codex",
+      "paths": [
+        ".gitignore"
+      ],
+      "purpose": "Ignore the single host-local agent bus writer lock",
+      "release_note": "Landed in c7d939c",
+      "released_at": "2026-08-11T12:10:39Z",
+      "status": "released"
+    },
+    {
+      "claimed_at": "2026-08-11T11:36:17Z",
+      "id": "L-0010",
+      "owner": "codex",
+      "paths": [
+        "tools/agent_bus.py",
+        "tests/test_agent_bus.py"
+      ],
+      "purpose": "Minimal two-writer reliability: one OS-backed critical section plus post/claim race regressions; no ledger or hashing",
+      "release_note": "Landed in c7d939c; Claude reproduced 72/72 combined review suite",
+      "released_at": "2026-08-11T12:10:39Z",
+      "status": "released"
     },
     {
       "claimed_at": "2026-08-11T11:25:17Z",
@@ -25,50 +78,9 @@
         "tests/test_historical_production_adapter.py"
       ],
       "purpose": "Gate 1 unblock: bind canary attempt count to verified production search process and remove stale 128 drift",
-      "status": "active"
-    },
-    {
-      "claimed_at": "2026-08-11T11:36:17Z",
-      "id": "L-0010",
-      "owner": "codex",
-      "paths": [
-        "tools/agent_bus.py",
-        "tests/test_agent_bus.py"
-      ],
-      "purpose": "Minimal two-writer reliability: one OS-backed critical section plus post/claim race regressions; no ledger or hashing",
-      "status": "active"
-    },
-    {
-      "claimed_at": "2026-08-11T11:37:09Z",
-      "id": "L-0011",
-      "owner": "codex",
-      "paths": [
-        ".gitignore"
-      ],
-      "purpose": "Ignore the single host-local agent bus writer lock",
-      "status": "active"
-    },
-    {
-      "claimed_at": "2026-08-11T11:48:32Z",
-      "id": "L-0012",
-      "owner": "codex",
-      "paths": [
-        "agent_comms/PM_CHARTER.md"
-      ],
-      "purpose": "Record operator's three-round, autonomous-but-evidence-bounded PM scope and convergence rules",
-      "status": "active"
-    },
-    {
-      "claimed_at": "2026-08-11T11:59:40Z",
-      "id": "L-0013",
-      "owner": "codex",
-      "paths": [
-        "pm_authoritative_search_execution.py",
-        "tests/test_authoritative_search_execution.py",
-        "tests/test_raw_winner_canary.py"
-      ],
-      "purpose": "Gate-1 canary stage quota and local diagnostic-root safety; existing quota mechanism only",
-      "status": "active"
+      "release_note": "Landed in c7d939c after Claude review; 128/300 drift source removed",
+      "released_at": "2026-08-11T12:10:39Z",
+      "status": "released"
     },
     {
       "claimed_at": "2026-08-11T11:20:57Z",
