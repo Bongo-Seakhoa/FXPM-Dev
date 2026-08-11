@@ -1,17 +1,6 @@
 {
   "lanes": [
     {
-      "claimed_at": "2026-08-11T11:00:45Z",
-      "id": "L-0006",
-      "owner": "claude",
-      "paths": [
-        "pm_native_activation.py",
-        "tests/test_native_universe_memo.py"
-      ],
-      "purpose": "Fix the four defects Codex measured in 5e76111 (CX-013): generator configured_symbols consumed while forming the memo key, missing post-copy identity check on the warm path, test cleanup that restores an already-patched function, and the resulting downstream contamination.",
-      "status": "active"
-    },
-    {
       "claimed_at": "2026-08-11T11:01:04Z",
       "id": "L-0007",
       "owner": "codex",
@@ -23,6 +12,45 @@
       ],
       "purpose": "Gate 1: measure authoritative Winner PBO T,N on one bounded non-authorizing cell; diagnose before any fix",
       "status": "active"
+    },
+    {
+      "claimed_at": "2026-08-11T11:25:17Z",
+      "id": "L-0009",
+      "owner": "codex",
+      "paths": [
+        "pm_historical_anchor_orchestration.py",
+        "pm_production_search_planner.py",
+        "tests/test_historical_anchor_orchestration.py",
+        "tests/test_production_search_planner.py",
+        "tests/test_historical_production_adapter.py"
+      ],
+      "purpose": "Gate 1 unblock: bind canary attempt count to verified production search process and remove stale 128 drift",
+      "status": "active"
+    },
+    {
+      "claimed_at": "2026-08-11T11:20:57Z",
+      "id": "L-0008",
+      "owner": "claude",
+      "paths": [
+        "pm_core.py"
+      ],
+      "purpose": "Task 13 / CPM priority: audit calendar_lockbox_v2 split construction for leakage. Register E14 cleared the backtest loop, stop construction and features of naive look-ahead in both engines but explicitly did NOT audit the WFV split boundary and embargo. Operator named backtester/WFV as leaky in the version that nearly passed a funded challenge. This is the only unexamined mechanism that can let a book clear every gate and still lose money live.",
+      "release_note": "WFV split audit complete, no leak found.",
+      "released_at": "2026-08-11T11:23:24Z",
+      "status": "released"
+    },
+    {
+      "claimed_at": "2026-08-11T11:00:45Z",
+      "id": "L-0006",
+      "owner": "claude",
+      "paths": [
+        "pm_native_activation.py",
+        "tests/test_native_universe_memo.py"
+      ],
+      "purpose": "Fix the four defects Codex measured in 5e76111 (CX-013): generator configured_symbols consumed while forming the memo key, missing post-copy identity check on the warm path, test cleanup that restores an already-patched function, and the resulting downstream contamination.",
+      "release_note": "Three CX-013 defects fixed and pushed; leaf-identity gap left open by design per your verdict, memo stays interim, eager sweep untouched.",
+      "released_at": "2026-08-11T11:20:25Z",
+      "status": "released"
     },
     {
       "claimed_at": "2026-07-14T03:56:10Z",
@@ -99,5 +127,5 @@
       "status": "released"
     }
   ],
-  "next_lane": 8
+  "next_lane": 10
 }

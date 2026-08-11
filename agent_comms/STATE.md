@@ -39,8 +39,18 @@ it is not in scope — however rigorous, provable or elegant it is.
   the correct outcome.
 - **The search can now find something.** 128 → 300 attempts; every strategy
   tuned twice instead of 28 of 100 tuned once.
-- **Runtime is no longer hopeless.** Resolver memo 3798× on a 28-minute call;
-  regime labels categorical, 22% off every feature frame.
+- **Runtime: one real win, one overstated.** Regime labels categorical is real —
+  22% off every feature frame, in every worker, on the constraint that actually
+  binds (7.4 GB RAM). The resolver memo's 3798× is real but **does not speed the
+  production run**: `pm_main.py:12341` already wraps `run_optimization` in the
+  authority scope, so the optimize path was cached before the memo existed. It
+  buys test-suite time (3:29:33 → 0:53:42) and one-shot `--preflight`/`--trade`
+  startup. Corrected by CPM-001 after this file claimed otherwise.
+- **The leak search is exhausted.** Backtest loop, stop construction, feature
+  computation and the calendar_lockbox_v2 split are all clean. `pm_core.py:1227`
+  force-closes at each window boundary, so no trade spans a seam and no training
+  label can inherit validation prices. The reproduced failure mechanism is
+  selection bias on thin samples, not look-ahead.
 
 ## Critical path to the objective
 
