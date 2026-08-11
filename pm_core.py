@@ -8727,20 +8727,27 @@ class Backtester:
 
     @staticmethod
     def _max_drawdown_from_equity_curve(equity_curve: List[float]) -> float:
-        peak = None
-        max_dd = 0.0
-        for raw_value in equity_curve or []:
-            try:
-                value = float(raw_value)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(value):
-                continue
-            if peak is None or value > peak:
-                peak = value
-            if peak and peak > 0.0:
-                max_dd = max(max_dd, (peak - value) / peak * 100.0)
-        return max_dd
+        # Non-finite and unconvertible entries are SKIPPED, not zeroed - they do
+        # not move the running peak. That differs from pm_metrics'
+        # max_drawdown_from_equity, which maps them to 0.0 via safe_float.
+        curve = equity_curve or []
+        try:
+            arr = np.asarray(curve, dtype=np.float64)
+        except (TypeError, ValueError):
+            values = []
+            for raw_value in curve:
+                try:
+                    values.append(float(raw_value))
+                except (TypeError, ValueError):
+                    continue
+            arr = np.asarray(values, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return 0.0
+        peaks = np.maximum.accumulate(arr)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            drawdowns = np.where(peaks > 0.0, (peaks - arr) / peaks * 100.0, 0.0)
+        return float(max(0.0, drawdowns.max()))
 
     @staticmethod
     def _trade_is_long(trade: Dict[str, Any]) -> bool:

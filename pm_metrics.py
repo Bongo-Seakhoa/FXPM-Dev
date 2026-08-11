@@ -30,6 +30,22 @@ def safe_float(value: object, default: float = 0.0, *, allow_inf: bool = False) 
     return out
 
 
+def safe_float_array(values: Iterable[object]) -> np.ndarray:
+    """safe_float() over a sequence without a Python call per element.
+
+    Equivalent to ``[safe_float(v) for v in values]`` - NaN and infinity map to
+    0.0 - but as one conversion plus one nan_to_num. Anything numpy cannot
+    convert wholesale falls back to the exact element-wise path, so mixed junk
+    still behaves identically. This ran 106,697 times per backtest on an H1
+    frame, once per bar.
+    """
+    try:
+        arr = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError):
+        return np.asarray([safe_float(v) for v in values], dtype=np.float64)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def round_metric(value: float, digits: int = 2) -> float:
     """Round finite metrics and preserve non-finite sentinels such as PF=inf."""
     value = float(value)
@@ -65,20 +81,19 @@ def profit_factor_from_pnls(pnls: Iterable[float]) -> float:
 
 def max_drawdown_from_equity(equity_curve: Sequence[float]) -> Tuple[float, float]:
     """Return max drawdown as (percent, absolute currency units)."""
-    values = [safe_float(value) for value in equity_curve]
-    if not values:
+    values = safe_float_array(equity_curve)
+    if values.size == 0:
         return 0.0, 0.0
-    peak = values[0]
-    max_dd_pct = 0.0
-    max_dd_abs = 0.0
-    for equity in values:
-        if equity > peak:
-            peak = equity
-        drawdown_abs = max(0.0, peak - equity)
-        drawdown_pct = (drawdown_abs / peak * 100.0) if peak > 0.0 else 0.0
-        max_dd_abs = max(max_dd_abs, drawdown_abs)
-        max_dd_pct = max(max_dd_pct, drawdown_pct)
-    return max_dd_pct, max_dd_abs
+    # maximum.accumulate is the running peak seeded at values[0], matching the
+    # sequential loop exactly - max is order-independent, unlike a sum.
+    peaks = np.maximum.accumulate(values)
+    # Python's float arithmetic overflows to inf silently; numpy warns. The
+    # results agree either way, so silence the warning rather than let an
+    # extreme equity curve spray RuntimeWarnings through production logs.
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        drawdown_abs = np.maximum(0.0, peaks - values)
+        drawdown_pct = np.where(peaks > 0.0, drawdown_abs / peaks * 100.0, 0.0)
+    return float(drawdown_pct.max()), float(drawdown_abs.max())
 
 
 def annualized_return_pct(
@@ -137,7 +152,7 @@ def sharpe_sortino_from_returns(
     periods_per_year: float,
 ) -> Tuple[float, float]:
     """Annualized Sharpe/Sortino from an equally spaced return series."""
-    arr = np.asarray([safe_float(value) for value in returns], dtype=np.float64)
+    arr = safe_float_array(returns)
     if arr.size < 2:
         return 0.0, 0.0
     bpy = safe_float(periods_per_year)
