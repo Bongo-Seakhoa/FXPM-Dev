@@ -1475,7 +1475,20 @@ class PipelineConfig:
     specialist_spokes_v2_cost_frequency_strength: float = 0.50
     specialist_spokes_v2_default_fallback_enabled: bool = True
     specialist_spokes_v2_allow_promote_small_default: bool = True
-    specialist_spokes_v2_max_validation_sharpe: float = 0.0
+    # Reject a cell whose validation Sharpe is implausible *when PBO could not be
+    # evaluated* (pm_pipeline.py:13862). 0.0 disabled the check entirely, and the
+    # 2026-08-11 audit measured the consequence in the checked-in book: all 157
+    # promoted rows carry pbo_status="not_available", val_sharpe runs to a median
+    # of 38.23 and a maximum of 208.97, 147 of 157 exceed 10, and the deflated
+    # Sharpe saturates at exactly 1.000 for 144 of 157 - so neither
+    # multiple-testing defence discriminated anything.
+    #
+    # 4.0 is the bar a sustained annualized Sharpe would have to clear to be
+    # believable at all. The guard only fires when PBO is unavailable: if the
+    # overfitting check actually ran and passed, a high Sharpe stands on its own
+    # evidence. If it could not run, an unverifiable world-class Sharpe is
+    # exactly the claim that should fail closed.
+    specialist_spokes_v2_max_validation_sharpe: float = 4.0
 
     # Global false-discovery controls are part of the default production
     # contract. Research runs may disable them explicitly, but live readiness

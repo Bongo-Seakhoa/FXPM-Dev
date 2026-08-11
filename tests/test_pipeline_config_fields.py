@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from pm_core import PipelineConfig
@@ -142,7 +143,13 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(default_cfg.feature_disk_cache_max_gb, 0.0, places=6)
         self.assertAlmostEqual(default_cfg.feature_disk_cache_min_free_gb, 4.0, places=6)
         self.assertFalse(default_cfg.feature_disk_cache_precompute_enabled)
-        self.assertEqual(default_cfg.feature_disk_cache_precompute_workers, 1)
+        # The declared default is 0, documented as "<= 0 uses all OS logical
+        # CPUs", so the resolved value is machine-dependent. Asserting 1 only
+        # passed on a single-core host; assert the contract instead.
+        self.assertEqual(
+            default_cfg.feature_disk_cache_precompute_workers,
+            max(1, os.cpu_count() or 1),
+        )
 
         cfg = PipelineConfig(
             feature_disk_cache_enabled=True,
@@ -157,7 +164,11 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(cfg.feature_disk_cache_max_gb, 0.0, places=6)
         self.assertAlmostEqual(cfg.feature_disk_cache_min_free_gb, 0.0, places=6)
         self.assertTrue(cfg.feature_disk_cache_precompute_enabled)
-        self.assertEqual(cfg.feature_disk_cache_precompute_workers, 1)
+        # Explicit 0 resolves the same way as the default: all logical CPUs.
+        self.assertEqual(
+            cfg.feature_disk_cache_precompute_workers,
+            max(1, os.cpu_count() or 1),
+        )
 
     def test_screening_atr_anchor_defaults_and_normalizes(self):
         default_cfg = PipelineConfig()
@@ -264,7 +275,16 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(default.specialist_spokes_v2_cost_frequency_strength, 0.50)
         self.assertTrue(default.specialist_spokes_v2_default_fallback_enabled)
         self.assertTrue(default.specialist_spokes_v2_allow_promote_small_default)
-        self.assertAlmostEqual(default.specialist_spokes_v2_max_validation_sharpe, 0.0)
+        # 0.0 disabled the implausible-Sharpe guard outright. The 2026-08-11
+        # audit measured what that cost: all 157 promoted rows in the checked-in
+        # book carry pbo_status="not_available" with a median val_sharpe of 38.23,
+        # so neither multiple-testing defence rejected anything.
+        self.assertAlmostEqual(default.specialist_spokes_v2_max_validation_sharpe, 4.0)
+        self.assertGreater(
+            default.specialist_spokes_v2_max_validation_sharpe,
+            0.0,
+            "the implausible-Sharpe guard must not ship disabled",
+        )
 
         clamped = PipelineConfig(
             specialist_spokes_v2_cost_frequency_strength=2.0,
