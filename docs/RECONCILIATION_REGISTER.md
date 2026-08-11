@@ -553,6 +553,61 @@ it is what a production run pays on every cold start.
 
 ---
 
+### E19 — Gate 1 answered; D1 is infeasible geometry `DECISION: closed`
+Measured 2026-08-11 on the bounded EURUSD|D1 non-authorizing canary.
+
+**PBO works.** `pbo=0.0`, N=224 evaluation-required, T=253 complete calendar
+days, S=8/70 combinations, PASS in both base and cost-stress lanes. The
+multiple-testing machinery produces real verdicts. The earlier claim that PBO
+had never returned one was true only of the June book, which predates this
+contract. **Closed — do not reopen.**
+
+**No candidate authenticated, and the cause is geometry, not strictness.** Of
+896 final 63-day lanes: 782 had zero trades, 114 had 1–2, pooled max 3 for the
+best candidate — against Winner's 5-per-fold and 40-overall. Decisively,
+recomputing at `effective_trials=1` (multiplicity removed entirely) still
+demands ESS 42–481 against an observed 4.50–11: **all 17 surviving decisions
+fail anyway.** Shrinking the roster or weakening Sidak cannot rescue D1.
+
+Corroborated independently by arithmetic. Scaling D1's observed 2 trades/lane by
+EURUSD source rows:
+
+| TF | rows | ×D1 | pred trades/lane | clears 5/fold | clears 40 overall |
+|---|---:|---:|---:|---|---|
+| D1 | 4,524 | 1.0 | 2.0 | no | no |
+| H4 | 26,790 | 5.9 | 11.8 | yes | yes (1.18× margin) |
+| H1 | 106,697 | 23.6 | 47.2 | yes | yes (4.7× margin) |
+| M30 | 151,399 | 33.5 | 66.9 | yes | yes |
+
+D1's failure is predicted by bar count alone. **No gate may be moved toward the
+observed result.** Excluding D1 from a full run would save only 0.34% of
+row-work — it is the cheapest timeframe — so it is not an efficiency lever;
+those cells simply return honest `NO_TRADE`.
+
+### E20 — Execution defects, all three verified `DECISION: closed`
+The operator named lot sizing, recovery and order scaling as defects in the
+version that nearly passed a funded challenge. All three measured in the current
+engine, 2026-08-11:
+
+- **Lot sizing** — realised risk-at-stop matches the 1.00% target exactly across
+  EURUSD, USDJPY, XAUUSD, BTCUSD, DE30, US100 at $1,000 and $10,000.
+  `_round_volume_numba` floors to step ("risk-safe — never round up"); zero is
+  caught as no-trade at five sites. Already pinned by
+  `test_position_sizing_edge_cases`, including
+  `test_min_lot_clamp_rejects_historical_live_overshoots`. No test added — that
+  would be duplicate validation.
+- **Recovery** — all 2,400 magic numbers generated for the real universe:
+  **zero collisions** (birthday bound put the risk near 0.13%, so it needed
+  measuring). `pm_main.py:4467` fails closed on any future collision.
+- **Order scaling** — exact-cell uniqueness via
+  `BLOCKED_SPECIALIST_CELL_ALREADY_OPEN`, and fail-closed
+  `BLOCKED_POSITION_SNAPSHOT_UNAVAILABLE` rather than assuming no positions.
+
+Side result for the $50 question: at $50 with 1% risk and a 20-pip stop, EURUSD
+and USDJPY are correctly **rejected at zero lots**; only XAUUSD, BTCUSD, DE30 and
+US100 size. A $50 account would trade only the volatile non-FX subset — a
+concentration effect, not a sizing bug.
+
 ## 3. Questions only the operator can answer
 
 1. **Iteration 4** — what was "FxPM 1.4 - Obtimized"? Only its orphaned data
