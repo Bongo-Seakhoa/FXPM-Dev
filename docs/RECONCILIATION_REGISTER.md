@@ -163,9 +163,48 @@ mechanism is *selection bias*, not leakage — FORD promoted on 16 validation tr
 PF 1.77, inverting to 0.66 over 166. That is an overfitting problem in the gates, not
 a causality problem in the engine, and it is addressed by E6.
 
-**Still open:** WFV split construction (train/validation boundary, embargo) was not
-audited here, and the operator named WFV explicitly. That is the remaining place a
-leak could hide.
+**WFV split — audited 2026-08-11, CLEAN.** This was the remaining place a leak
+could hide, and the operator named it explicitly.
+
+`build_calendar_boundaries` (`pm_evidence.py:299`) constructs windows strictly
+backwards from the information cutoff with a purge at *both* seams:
+
+```
+lockbox_end   = as_of
+lockbox_start = lockbox_end   - years(final_lockbox)
+tuning_end    = lockbox_start - purge
+tuning_start  = tuning_end    - years(tuning_validation)
+train_end     = tuning_start  - purge
+train_start   = train_end     - years(optimizer_train)
+```
+
+Negative embargo clamps to zero. Training is entirely *older* than tuning, so
+training cannot see tuning data by construction.
+
+The purge is `max(7 days, 5min × split_embargo_bars)` = **7 days, timeframe-
+agnostic** (`derive_purge_duration`, `pm_evidence.py:187`). That looked like the
+defect: the label horizon is timeframe-*dependent*, and 39 of 132 promoted regime
+cells are H4 with 16 on D1, where a position could plausibly stay open longer than
+seven days and inherit prices from the next window.
+
+**It cannot.** `pm_core.py:1227` — after the bar loop, `if in_position:` force-
+closes at `close_arr[n_bars - 1]` with spread applied and records the trade as
+`EXIT_EOD`. **No trade spans a window seam.** Every label is bounded by its own
+window, so a training outcome can never depend on validation-period prices, and
+the purge does not need to cover holding periods at all.
+
+Features at the start of the tuning window do look back through the purge into
+the training window — that is not leakage, it is how live trading works: the
+history exists at decision time.
+
+Residual, minor, not leakage: force-closing at each window end exits the final
+open position at an arbitrary price rather than its stop or target, a small
+per-window distortion.
+
+**Conclusion: no leak found in the split.** Together with the loop, stop
+construction and feature scan above, the search for the operator's reported
+leakiness is now exhausted in the current engine. The reproduced failure
+mechanism remains selection bias on thin samples, not look-ahead.
 
 ### E6 — Promotion gate floors `DECISION: pending`
 `historical_audit_min_profit_factor` defaults to **0.60** (`pm_core.py:1667`), unset
