@@ -1,68 +1,86 @@
-# Forward Test A — pre-registration
+# Forward Test A — pre-registration (v2)
 
 **Written before the test runs. Any change after seeing a result permanently
-consumes the window.** Agreed CPM-010 / XPM-012, 2026-08-11.
+consumes the window.** Agreed CPM-010 / XPM-012 / XPM-013 / CPM-012, 2026-08-11.
 
-## What A is, and what it is not
+v2 supersedes v1 on two counts, both from XPM-013, both of which invalidated
+what I originally wrote. They are recorded rather than quietly replaced.
 
-A pins `evidence_as_of_utc = 2026-04-01`, so every fitting and selection
-partition closes on or before that date, and replays the resulting book over
-**2026-04-01 → 2026-07-14** (~74 trading days).
+## Correction 1 — a config-only cutoff does not work
 
-**A is a falsification gate. It can reject a book. It can never certify one.**
-Pinning the cutoff blinds the *fitting pipeline* to Apr–Jul 2026. It cannot blind
-the *research process*: this period has already been read, measured, and used
-while tuning gate thresholds. Out-of-sample for the algorithm is not
-out-of-sample for the people who built the algorithm.
+v1 proposed pinning `evidence_as_of_utc = 2026-04-01`. **That is invalid.** The
+active activation and calendar authority override the config value, so the run
+would not actually be blinded. A must instead use **one authenticated
+cutoff-prefix with a matching activation**:
 
-Certification is Test B — a frozen July-14 package replayed on post-2026-07-14
-data nobody has inspected. A is what we run first because it is free.
+| | |
+|---|---|
+| Selection cutoff | **2026-02-25T00:00Z** |
+| Mandatory purge through | **2026-03-31** |
+| Scoring window | **2026-04-01 → 2026-07-14** |
 
-## Hypothesis
+Use the existing authenticated prefix/activation path. **Build no alternate
+pipeline for this.**
 
-> A book selected without contact with Apr–Jul 2026 retains a materially similar
-> edge in that period.
+## Correction 2 — my thresholds were uncalibrated
 
-The interesting outcome is the **decay ratio**: realised PF ÷ the book's own
-backtest PF. Absolute forward PF alone is not the test — a book can post PF 1.1
-forward while its backtest claimed 3.0, and that gap is the leak the operator
-described.
+v1 carried R2 decay < 0.60, R3 drawdown > 2×, R4 single cell > 25%, and a flat
+150-trade floor. **All four are withdrawn.** I could justify their direction and
+not their values, which is the same error I conceded on N ≥ 20 earlier. v2 reuses
+limits the system already calibrates rather than inventing new constants.
 
-## Rejection criteria — any one rejects the book
+## What A is
 
-| # | Condition | Why |
+**A falsification gate. Reject-only.** A clean result means *not falsified* and
+carries no estimate of current profitability.
+
+**Hypothesis:** the frozen 2026-02-25 lineage does not collapse over
+2026-04-01 → 2026-07-14 under unchanged costs and controls.
+
+## Not-falsified requires all of
+
+| # | Condition | Source |
 |---|---|---|
-| R1 | Aggregate realised PF **< 1.00** | The book loses money forward. Nothing else matters. |
-| R2 | Decay ratio **< 0.60** (realised PF ÷ backtest PF) | The engine is measuring something that does not persist. This is the leak test. |
-| R3 | Realised max drawdown **> 2×** the book's backtest max DD | The risk profile does not hold out of period. |
-| R4 | Any single cell loses **> 25%** of its allocated capital | One cell can ruin the account; the June book had cells at −94.9%. |
-| R5 | Fewer than **150** closed trades across the book | Insufficient evidence. **This rejects — it does not trigger a retry.** |
+| 1 | ≥ **100** portfolio positions | existing portfolio-replay minimum |
+| 2 | Every claimed cell ≥ **15** trades | existing validation trade floor |
+| 3 | Absolute PF **non-losing** | breakeven, not an invented bar |
+| 4 | Frozen **20%** drawdown limit respected | existing replay DD limit |
+| 5 | All existing risk limits respected | already configured |
 
-## What A cannot conclude
+**Any insufficiency or gate breach rejects the lineage.** Insufficiency is a
+result, not a reason to retry.
 
-Passing all five does **not** mean the book is profitable. At PF 1.10 the
-per-trade mean R is ≈0.048 with unit SD; detecting mean R > 0 at 95% one-sided
-with 80% power needs ≈2,700 trades. A 74-day window will not supply that. **A
-clean A result means "not yet falsified", and that is all it means.**
+## Strongest contrary evidence, recorded before the run
+
+The cutoff discards **139 days 8 hours** of recency. A is therefore testing a
+*deliberately stale* model, and **can reject a process that is currently
+viable**. A rejection is evidence against this lineage, not proof the approach
+is dead. A cannot authorize or estimate current profitability in either
+direction.
 
 ## Stopping condition
 
-One run. No parameter, threshold, universe or gate change after results are
-seen. If the book is rejected, the *next* book is a new experiment requiring a
-fresh pre-registration — the Apr–Jul window is spent for the rejected lineage
-and cannot be reused to evaluate a tuned successor.
+One run. Once **any** forward metric is observed the window is consumed, and no
+tuned successor may reuse it.
 
-## Failure-to-run conditions
+## Test B — the decisive one, and its real timeline
 
-These abort A without consuming the window, because no result was observed:
-run does not complete; spool or memory bound trips; fewer than 20 cells reach a
-promotion verdict; PBO returns `INSUFFICIENT_EVIDENCE` for the majority of cells.
-An aborted A may be re-run after the cause is fixed.
+B freezes the July-14 lineage **before** acquiring or inspecting later data, then
+scores on data nobody has seen.
+
+| Milestone | Date |
+|---|---|
+| Valid forward days available today | **zero** |
+| First valid day after purge | **2026-08-18** |
+| 63-day preliminary checkpoint | ~**2026-10-19** (preliminary only) |
+| 365-day credible horizon ends | **2027-08-17** |
+
+B cannot start for a week, gives a first preliminary read in about ten weeks, and
+reaches a credible one-year result in August 2027. That is the honest schedule
+for certification, and it is not shortenable by any code change.
 
 ## Recorded before the run
 
-- Config change: `evidence_as_of_utc: "" → "2026-04-01T00:00:00Z"`. This moves
-  the `evidence_as_of_utc == ""` assertion in `test_config_json_integrity`.
-- Everything else frozen at the commit that produces the book.
-- The book, its backtest metrics, and the replay output are all captured before
-  any human or agent reads the forward numbers.
+- The frozen lineage, its backtest metrics, and the replay output are all
+  captured before any human or agent reads the forward numbers.
+- Costs and controls unchanged from the frozen commit.
