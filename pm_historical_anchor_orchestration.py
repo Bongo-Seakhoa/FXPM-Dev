@@ -38,7 +38,6 @@ BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE: Final = (
     "FIRST_EMPIRICALLY_OBSERVED_IN_PINNED_ORDER"
 )
 BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX: Final = "raw-winner-canary-nonauthorizing"
-BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT: Final = 128
 PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA: Final = (
     "fxpm.production_native_authority_verification_scope.v1"
 )
@@ -787,6 +786,20 @@ def _close_and_snapshot_native_authority_verification(
     )
 
 
+def _bounded_canary_process_attempt_count(process_body: Mapping[str, Any]) -> int:
+    """Read the canary roster size from its verified production search process."""
+
+    try:
+        count = process_body["semantics"]["attempt_policy"][
+            "attempt_count_per_observed_cell"
+        ]
+    except (KeyError, TypeError):
+        _fail("CANARY_SEARCH_PROCESS_ATTEMPT_COUNT_INVALID")
+    if type(count) is not int or count <= 0:
+        _fail("CANARY_SEARCH_PROCESS_ATTEMPT_COUNT_INVALID")
+    return count
+
+
 def _build_bounded_raw_winner_canary_request_components(
     context: authority_spool.GenerationSpoolContext,
     *,
@@ -814,6 +827,7 @@ def _build_bounded_raw_winner_canary_request_components(
         context_body = _context_body(context)
         search_planner.verify_frozen_production_search_process(context, search_process)
         process_body = search_process.to_dict()
+        attempt_count_exact = _bounded_canary_process_attempt_count(process_body)
         verified_plan = production_anchor_plan.verify_production_anchor_plan_receipt(
             Path(data_dir).resolve(strict=True), anchor_plan_receipt
         )
@@ -954,7 +968,7 @@ def _build_bounded_raw_winner_canary_request_components(
         "symbol": symbol,
         "timeframe": timeframe,
         "regime_selection_rule": BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE,
-        "attempt_count_exact": BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT,
+        "attempt_count_exact": attempt_count_exact,
         "artifact_namespace": artifact_namespace,
         "one_symbol_timeframe_regime_only": True,
         "source_access_must_follow_request": True,
@@ -1051,7 +1065,8 @@ def verify_bounded_raw_winner_canary_request(
     _normalize_anchor_geometry(body["anchor"])
     if (
         body["regime_selection_rule"] != BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE
-        or body["attempt_count_exact"] != BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+        or type(body["attempt_count_exact"]) is not int
+        or body["attempt_count_exact"] <= 0
         or body["one_symbol_timeframe_regime_only"] is not True
         or body["source_access_must_follow_request"] is not True
         or body["planning_request_schema_accepted"] is not False
@@ -2979,7 +2994,6 @@ __all__ = [
     "AUTHORITY_SCOPE",
     "AnchorProducerRequest",
     "AnchorSymbolProduct",
-    "BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT",
     "BOUNDED_RAW_WINNER_CANARY_REQUEST_SCHEMA",
     "BOUNDED_RAW_WINNER_CANARY_RUN_PREFIX",
     "BOUNDED_RAW_WINNER_CANARY_SCOPE",

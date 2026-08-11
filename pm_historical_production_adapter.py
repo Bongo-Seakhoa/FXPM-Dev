@@ -1081,7 +1081,7 @@ def _bounded_canary_failure_diagnostic(
         type(attempted_trials_exact) is not int
         or not 0
         <= attempted_trials_exact
-        <= orchestration.BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+        <= winner_selection.MAX_ATTEMPTS
     ):
         _fail("CANARY_FAILURE_ATTEMPT_COUNT_INVALID")
     if exception_type is not None:
@@ -4758,7 +4758,7 @@ class BoundedRawWinnerCanaryCapture(HistoricalSymbolSearchCapture):
         )
         if (
             state_context_admission_summary["attempt_count_exact"]
-            != orchestration.BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+            != request_body["attempt_count_exact"]
         ):
             _fail("CANARY_STATE_CONTEXT_ATTEMPT_COUNT_INVALID")
         winner_request_entry = (
@@ -5136,7 +5136,7 @@ def _validated_bounded_raw_winner_canary_capture_inputs(
         plan.mode != "BOUNDED_RAW_WINNER_CANARY"
         or plan.symbol != request_body["symbol"]
         or plan.timeframe != request_body["timeframe"]
-        or plan.attempt_count != orchestration.BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+        or plan.attempt_count != request_body["attempt_count_exact"]
         or plan.search_process_receipt_sha256
         != request_body["search_process_receipt_sha256"]
         or plan.causal_precommit_receipt_sha256
@@ -5412,7 +5412,7 @@ def verify_bounded_raw_winner_canary_receipt(
         or type(body.get("attempted_trials_exact")) is not int
         or not 0
         <= body["attempted_trials_exact"]
-        <= orchestration.BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+        <= request_body["attempt_count_exact"]
         or any(
             body.get(field) is not False
             for field in (
@@ -5553,7 +5553,7 @@ def verify_bounded_raw_winner_canary_receipt(
         or cell_plan_horizon_binding.get("plan_receipt_sha256")
         != body["horizon_plan_receipt_sha256"]
         or cell_plan_receipt.get("attempt_count")
-        != orchestration.BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+        != request_body["attempt_count_exact"]
     ):
         _fail("CANARY_CELL_PLAN_RECEIPT_BINDING_INVALID")
     state_context_admission_summary = _verified_canary_state_context_admission_summary(
@@ -5576,7 +5576,7 @@ def verify_bounded_raw_winner_canary_receipt(
             body["failure_code"] is not None
             or body["standalone_winner_verifier_accepted"] is not True
             or body["attempted_trials_exact"]
-            != orchestration.BOUNDED_RAW_WINNER_CANARY_ATTEMPT_COUNT
+            != request_body["attempt_count_exact"]
             or body["technical_failure_entry"] is not None
             or any(
                 body[field] is None

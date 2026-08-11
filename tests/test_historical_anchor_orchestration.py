@@ -205,7 +205,12 @@ def test_bounded_canary_request_is_issuer_sealed_latest_anchor_and_one_shot(
         orchestration.BOUNDED_RAW_WINNER_CANARY_SELECTION_RULE
     )
     assert "regime" not in body
-    assert body["attempt_count_exact"] == 128
+    assert body["attempt_count_exact"] == (
+        process.to_dict()["semantics"]["attempt_policy"][
+            "attempt_count_per_observed_cell"
+        ]
+    )
+    assert body["attempt_count_exact"] == search_planner.ATTEMPT_COUNT
     assert body["native_authority_verification"] is None
     assert all(
         body[name] is False
@@ -254,6 +259,49 @@ def test_bounded_canary_request_is_issuer_sealed_latest_anchor_and_one_shot(
         match="CANARY_REQUEST_ALREADY_CONSUMED",
     ):
         orchestration.consume_bounded_raw_winner_canary_request(context, request)
+
+
+@pytest.mark.parametrize(
+    "process_body",
+    [
+        {},
+        {"semantics": {}},
+        {"semantics": {"attempt_policy": {}}},
+        {
+            "semantics": {
+                "attempt_policy": {"attempt_count_per_observed_cell": None}
+            }
+        },
+        {
+            "semantics": {
+                "attempt_policy": {"attempt_count_per_observed_cell": True}
+            }
+        },
+        {
+            "semantics": {
+                "attempt_policy": {"attempt_count_per_observed_cell": 0}
+            }
+        },
+        {
+            "semantics": {
+                "attempt_policy": {"attempt_count_per_observed_cell": -1}
+            }
+        },
+        {
+            "semantics": {
+                "attempt_policy": {"attempt_count_per_observed_cell": 1.0}
+            }
+        },
+    ],
+)
+def test_bounded_canary_process_attempt_count_rejects_invalid_contract(
+    process_body: dict[str, object],
+) -> None:
+    with pytest.raises(
+        orchestration.HistoricalAnchorOrchestrationError,
+        match="CANARY_SEARCH_PROCESS_ATTEMPT_COUNT_INVALID",
+    ):
+        orchestration._bounded_canary_process_attempt_count(process_body)
 
 
 def test_bounded_canary_native_authority_metrics_are_exact_and_tamper_evident() -> None:

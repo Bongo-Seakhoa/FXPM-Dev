@@ -156,12 +156,25 @@ def test_content_addressed_attempt_stage_round_trips_and_rejects_tamper(
             }
         ],
     }
+    reservation = SimpleNamespace(
+        consumed=0,
+        materialized=0,
+    )
+    reservation.consume = lambda count: setattr(
+        reservation, "consumed", reservation.consumed + count
+    )
+    reservation.materialize = lambda count: setattr(
+        reservation, "materialized", reservation.materialized + count
+    )
     row = execution._write_staged_attempt(
         stage=stage,
         ordinal=0,
         value=body,
         remaining_cell_bytes=1024 * 1024,
+        reservation=reservation,
     )
+    assert reservation.consumed == row.size_bytes
+    assert reservation.materialized == row.size_bytes
     assert row.sha256 in row.path.name
     assert execution._reopen_staged_attempt(row) == body
 
@@ -179,6 +192,10 @@ def test_content_addressed_attempt_stage_round_trips_and_rejects_tamper(
 def test_stage_byte_bound_fails_without_leaving_partial_file(tmp_path) -> None:
     stage = tmp_path / "stage"
     stage.mkdir()
+    reservation = SimpleNamespace(
+        consume=lambda _count: pytest.fail("oversize write reserved bytes"),
+        materialize=lambda _count: pytest.fail("oversize write materialized bytes"),
+    )
     with pytest.raises(
         execution.AuthoritativeSearchExecutionError,
         match="ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED",
@@ -188,9 +205,64 @@ def test_stage_byte_bound_fails_without_leaving_partial_file(tmp_path) -> None:
             ordinal=3,
             value={"attempt_id": "x", "folds": [{"payload": "too-large"}]},
             remaining_cell_bytes=8,
+            reservation=reservation,
         )
     assert list(stage.iterdir()) == []
     execution._cleanup_stage(stage, [])
+
+
+def test_stage_and_publication_share_one_generation_quota(tmp_path) -> None:
+    limits = execution.authority_spool.SpoolLimits(
+        max_artifact_bytes=4096,
+        max_symbol_bytes=4096,
+        max_artifacts_per_symbol=10,
+        max_manifest_bytes=4096,
+        max_json_bytes=4096,
+        stream_chunk_bytes=128,
+        max_generation_bytes=4096,
+        min_free_bytes=0,
+    )
+    context = execution.authority_spool.freeze_generation_context(
+        (tmp_path / "spool").resolve(),
+        generation_id="stage-quota-test",
+        native_universe_sha256="a" * 64,
+        config_sha256="b" * 64,
+        limits=limits,
+    )
+    stage = context.root / "stage"
+    stage.mkdir()
+    scope = execution.authority_spool.reserve_transient_publication(context)
+    reservation = scope.__enter__()
+    row = execution._write_staged_attempt(
+        stage=stage,
+        ordinal=0,
+        value={"attempt_id": "x", "payload": "a" * 2500},
+        remaining_cell_bytes=4096,
+        reservation=reservation,
+    )
+    with pytest.raises(
+        execution.authority_spool.AuthoritySpoolError,
+        match="SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
+    ):
+        execution.authority_spool.write_opaque_artifact(
+            context,
+            [b"b" * 2500],
+            format="binary-v1",
+        )
+    execution._close_reserved_stage(
+        stage=stage,
+        rows=[row],
+        reservation=reservation,
+        reservation_scope=scope,
+        primary_error=None,
+    )
+    assert not stage.exists()
+    state = execution.json.loads(
+        (context.root / execution.authority_spool.spool_quota.QUOTA_STATE_NAME).read_text(
+            encoding="ascii"
+        )
+    )
+    assert state["reservations"] == []
 
 
 def test_shared_fit_adequacy_preserves_train_tuning_methodological_floor() -> None:

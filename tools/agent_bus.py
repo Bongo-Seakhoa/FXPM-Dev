@@ -16,12 +16,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMS_DIR = ROOT / "agent_comms"
@@ -47,6 +53,31 @@ MESSAGE_TYPES = (
 BUS_MAX_BYTES = 4 * 1024 * 1024
 LANE_HISTORY_MAX = 100
 LANE_HISTORY_KEEP_DAYS = 14
+
+
+@contextmanager
+def _writer_lock():
+    """Serialize writers while ids and lane ownership are decided."""
+
+    COMMS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(COMMS_DIR / ".writer.lock", "a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _now_iso() -> str:
@@ -180,23 +211,24 @@ def _conflicting_lane(paths: List[str], agent: str, payload: Dict[str, Any]) -> 
 
 
 def cmd_post(args: argparse.Namespace) -> int:
-    records = _read_bus_lines()
-    record = {
-        "id": _next_id(args.agent, records),
-        "ts": _now_iso(),
-        "from": args.agent,
-        "to": args.to,
-        "type": args.type,
-        "paths": _normalize_paths(args.paths or []),
-        "refs": list(args.refs or []),
-        "body": args.body,
-    }
-    _append_bus(record)
+    with _writer_lock():
+        records = _read_bus_lines()
+        record = {
+            "id": _next_id(args.agent, records),
+            "ts": _now_iso(),
+            "from": args.agent,
+            "to": args.to,
+            "type": args.type,
+            "paths": _normalize_paths(args.paths or []),
+            "refs": list(args.refs or []),
+            "body": args.body,
+        }
+        _append_bus(record)
     print(record["id"])
     return 0
 
 
-def cmd_claim(args: argparse.Namespace) -> int:
+def _cmd_claim_unlocked(args: argparse.Namespace) -> int:
     payload = _load_lanes()
     paths = _normalize_paths(args.paths)
     if not paths:
@@ -237,7 +269,12 @@ def cmd_claim(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_release(args: argparse.Namespace) -> int:
+def cmd_claim(args: argparse.Namespace) -> int:
+    with _writer_lock():
+        return _cmd_claim_unlocked(args)
+
+
+def _cmd_release_unlocked(args: argparse.Namespace) -> int:
     payload = _load_lanes()
     for lane in payload["lanes"]:
         if lane.get("id") == args.lane and lane.get("status") == "active":
@@ -264,6 +301,11 @@ def cmd_release(args: argparse.Namespace) -> int:
             return 0
     print(f"ERROR: no active lane {args.lane}", file=sys.stderr)
     return 2
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    with _writer_lock():
+        return _cmd_release_unlocked(args)
 
 
 def cmd_tail(args: argparse.Namespace) -> int:

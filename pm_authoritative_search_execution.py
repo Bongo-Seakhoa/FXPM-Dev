@@ -2942,11 +2942,19 @@ def _write_staged_attempt(
     ordinal: int,
     value: Mapping[str, Any],
     remaining_cell_bytes: int,
+    reservation: Any,
 ) -> _StagedAttemptEvidence:
     if type(ordinal) is not int or ordinal < 0 or not isinstance(value, Mapping):
         _fail("STAGE_ATTEMPT_INPUT_INVALID")
     if remaining_cell_bytes <= 0:
         _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
+    expected_sha256, expected_size = _canonical_digest_and_size(value)
+    if (
+        expected_size > MAX_ATTEMPT_EVIDENCE_BYTES
+        or expected_size > remaining_cell_bytes
+    ):
+        _fail("ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED", ordinal)
+    reservation.consume(expected_size)
     encoder = json.JSONEncoder(
         allow_nan=False,
         ensure_ascii=True,
@@ -2985,6 +2993,8 @@ def _write_staged_attempt(
         if size <= 0:
             _fail("STAGE_ATTEMPT_EMPTY", ordinal)
         hexadecimal = digest.hexdigest()
+        if size != expected_size or hexadecimal != expected_sha256:
+            _fail("STAGE_CANONICAL_REPLAY_CHANGED", ordinal)
         final_path = stage / f"{ordinal:06d}-{hexadecimal}.json"
         if final_path.exists() or final_path.is_symlink():
             _fail("STAGE_CONTENT_ADDRESS_COLLISION", ordinal)
@@ -2998,6 +3008,7 @@ def _write_staged_attempt(
             or info.st_size != size
         ):
             _fail("STAGE_FILE_INVALID", ordinal)
+        reservation.materialize(size)
         result = _StagedAttemptEvidence(
             ordinal=ordinal,
             kind="RAW_FOLDS",
@@ -3115,6 +3126,38 @@ def _cleanup_stage(
         errors.append(f"RMDIR:{type(exc).__name__}")
     if errors:
         raise AuthoritativeSearchExecutionError("STAGE_CLEANUP_FAILED", errors)
+
+
+def _close_reserved_stage(
+    *,
+    stage: Path | None,
+    rows: Sequence[_StagedAttemptEvidence],
+    reservation: Any,
+    reservation_scope: Any,
+    primary_error: BaseException | None,
+) -> None:
+    """Remove transient bytes before releasing their generation reservation."""
+
+    close_error: BaseException | None = None
+    try:
+        _cleanup_stage(stage, rows)
+    except BaseException as exc:
+        close_error = exc
+    if close_error is None and reservation is not None:
+        try:
+            reservation.cancel_after_cleanup()
+        except BaseException as exc:
+            close_error = exc
+    if reservation_scope is not None:
+        try:
+            reservation_scope.__exit__(None, None, None)
+        except BaseException as exc:
+            if close_error is None:
+                close_error = exc
+    if close_error is not None:
+        if primary_error is not None:
+            raise close_error from primary_error
+        raise close_error
 
 
 def _infrastructure_failure(
@@ -3412,6 +3455,8 @@ def execute_current_observed_cell(
 
     stage: Path | None = None
     staged: list[_StagedAttemptEvidence] = []
+    stage_reservation: Any = None
+    stage_reservation_scope: Any = None
     primary_error: BaseException | None = None
     try:
         refreshed, receipt, plan_binding = _verified_current_observed_inputs(
@@ -3510,6 +3555,11 @@ def execute_current_observed_cell(
         if now < datetime.fromisoformat(latest_boundary.replace("Z", "+00:00")):
             _fail("EVIDENCE_BOUNDARY_NOT_CLOSED")
         evidence_started = _next_observed_utc_second(attempts_frozen_at)
+        reservation_scope = authority_spool.reserve_transient_publication(
+            sink.context
+        )
+        stage_reservation = reservation_scope.__enter__()
+        stage_reservation_scope = reservation_scope
         stage = _current_stage_directory(
             sink=sink,
             cell_plan=cell_plan,
@@ -3555,6 +3605,7 @@ def execute_current_observed_cell(
                 ordinal=attempt.ordinal,
                 value=body,
                 remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes,
+                reservation=stage_reservation,
             )
             staged.append(row)
             total_bytes += row.size_bytes
@@ -3639,12 +3690,13 @@ def execute_current_observed_cell(
             (type(exc).__name__, str(exc)),
         ) from exc
     finally:
-        try:
-            _cleanup_stage(stage, staged)
-        except Exception as cleanup_exc:
-            if primary_error is not None:
-                raise cleanup_exc from primary_error
-            raise
+        _close_reserved_stage(
+            stage=stage,
+            rows=staged,
+            reservation=stage_reservation,
+            reservation_scope=stage_reservation_scope,
+            primary_error=primary_error,
+        )
 
 
 def _verify_capture_horizon_plan_identity(
@@ -3786,6 +3838,8 @@ def execute_historical_observed_cell(
     handle: historical_adapter.FrozenHistoricalCell | None = None
     stage: Path | None = None
     staged: list[_StagedAttemptEvidence] = []
+    stage_reservation: Any = None
+    stage_reservation_scope: Any = None
     result: HistoricalObservedCellExecution | None = None
     primary_error: BaseException | None = None
     try:
@@ -3850,6 +3904,11 @@ def execute_historical_observed_cell(
         if now < datetime.fromisoformat(latest_boundary.replace("Z", "+00:00")):
             _fail("EVIDENCE_BOUNDARY_NOT_CLOSED")
         evidence_started = _next_observed_utc_second(attempts_frozen_at)
+        reservation_scope = authority_spool.reserve_transient_publication(
+            capture.context
+        )
+        stage_reservation = reservation_scope.__enter__()
+        stage_reservation_scope = reservation_scope
         stage = _stage_directory(capture, handle)
         total_bytes = 0
         plan_receipt_sha256 = _sha256(plan_body)
@@ -3891,6 +3950,7 @@ def execute_historical_observed_cell(
                 ordinal=attempt.ordinal,
                 value=body,
                 remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes,
+                reservation=stage_reservation,
             )
             staged.append(row)
             total_bytes += row.size_bytes
@@ -4010,12 +4070,13 @@ def execute_historical_observed_cell(
                 failure_code=code,
             )
     finally:
-        try:
-            _cleanup_stage(stage, staged)
-        except Exception as cleanup_exc:
-            if primary_error is not None:
-                raise cleanup_exc from primary_error
-            raise
+        _close_reserved_stage(
+            stage=stage,
+            rows=staged,
+            reservation=stage_reservation,
+            reservation_scope=stage_reservation_scope,
+            primary_error=primary_error,
+        )
     if result is None:
         _fail("HISTORICAL_CELL_EXECUTION_TERMINAL_STATE_MISSING")
     return result

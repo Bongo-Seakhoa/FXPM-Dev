@@ -309,8 +309,14 @@ def _mock_cli_dependencies(
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     observed_data_roots: list[Path] = []
+    frozen_context_calls: list[tuple[Path, object]] = []
     native_scope = _FakeNativeAuthorityScope()
     monkeypatch.setattr(canary_cli, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        canary_cli.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path / "host-temp"),
+    )
     monkeypatch.setattr(
         config_binding,
         "load_effective_pipeline_config",
@@ -355,8 +361,13 @@ def _mock_cli_dependencies(
         lambda: native_scope,
     )
     context = SimpleNamespace(config_sha256=cap.canonical_json_sha256({}))
+
+    def freeze_context(root, **kwargs):
+        frozen_context_calls.append((Path(root), kwargs["limits"]))
+        return context
+
     monkeypatch.setattr(
-        authority_spool, "freeze_generation_context", lambda *_args, **_kwargs: context
+        authority_spool, "freeze_generation_context", freeze_context
     )
     process = SimpleNamespace(receipt_sha256="a" * 64)
     monkeypatch.setattr(
@@ -412,7 +423,7 @@ def _mock_cli_dependencies(
             "native_authority_verification": native_scope.stats(),
         },
     )
-    return config_path, observed_data_roots, native_scope
+    return config_path, observed_data_roots, native_scope, frozen_context_calls
 
 
 @pytest.mark.parametrize(
@@ -436,7 +447,7 @@ def test_cli_main_uses_config_data_root_and_verified_receipt_status(
         "standalone_winner_verifier_accepted": successful,
         "failure_code": None if successful else "RAW_EVIDENCE_INCOMPLETE",
     }
-    config_path, observed, native_scope = _mock_cli_dependencies(
+    config_path, observed, native_scope, frozen_context_calls = _mock_cli_dependencies(
         tmp_path, monkeypatch, body
     )
 
@@ -451,6 +462,13 @@ def test_cli_main_uses_config_data_root_and_verified_receipt_status(
     assert native_scope.stats()["identity_revalidation_count"] == 5
     assert native_scope.closed is True
     assert native_scope.exit_called is True
+    assert len(frozen_context_calls) == 1
+    root, limits = frozen_context_calls[0]
+    assert root.parent.parent == tmp_path / "host-temp" / "fxpm-raw-winner-canary"
+    assert limits.max_artifact_bytes == canary_cli.CANARY_SPOOL_MAX_BYTES
+    assert limits.max_symbol_bytes == canary_cli.CANARY_SPOOL_MAX_BYTES
+    assert limits.max_generation_bytes == canary_cli.CANARY_SPOOL_MAX_BYTES
+    assert limits.min_free_bytes == canary_cli.CANARY_SPOOL_MIN_FREE_BYTES
 
 
 def test_cli_rejects_diagnostic_root_outside_bounded_base(
@@ -462,7 +480,7 @@ def test_cli_rejects_diagnostic_root_outside_bounded_base(
         "standalone_winner_verifier_accepted": True,
         "failure_code": None,
     }
-    config_path, _observed, native_scope = _mock_cli_dependencies(
+    config_path, _observed, native_scope, _frozen_context_calls = _mock_cli_dependencies(
         tmp_path, monkeypatch, body
     )
     with pytest.raises(SystemExit) as caught:

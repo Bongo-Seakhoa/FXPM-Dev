@@ -1,12 +1,53 @@
 """Protocol guarantees for the Claude<->Codex agent bus (tools/agent_bus.py)."""
 
 import json
+from concurrent.futures import ProcessPoolExecutor
 import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import tools.agent_bus as bus
+
+
+def _process_post(comms: str, ordinal: int) -> int:
+    from pathlib import Path
+    import tools.agent_bus as process_bus
+
+    process_bus.COMMS_DIR = Path(comms)
+    process_bus.BUS_PATH = process_bus.COMMS_DIR / "BUS.jsonl"
+    process_bus.LANES_PATH = process_bus.COMMS_DIR / "LANES.json"
+    return process_bus.main(
+        [
+            "post",
+            "--from",
+            "codex",
+            "--type",
+            "status",
+            "--body",
+            f"concurrent-{ordinal}",
+        ]
+    )
+
+
+def _process_claim(comms: str, agent: str) -> int:
+    from pathlib import Path
+    import tools.agent_bus as process_bus
+
+    process_bus.COMMS_DIR = Path(comms)
+    process_bus.BUS_PATH = process_bus.COMMS_DIR / "BUS.jsonl"
+    process_bus.LANES_PATH = process_bus.COMMS_DIR / "LANES.json"
+    return process_bus.main(
+        [
+            "claim",
+            "--from",
+            agent,
+            "--paths",
+            "pm_pipeline.py",
+            "--purpose",
+            "concurrent claim",
+        ]
+    )
 
 
 class AgentBusTests(unittest.TestCase):
@@ -120,6 +161,47 @@ class AgentBusTests(unittest.TestCase):
         bus._save_lanes(payload)
         reloaded = bus._load_lanes()
         self.assertLessEqual(len(reloaded["lanes"]), bus.LANE_HISTORY_MAX)
+
+    def test_concurrent_process_posts_keep_every_record_and_unique_id(self):
+        with ProcessPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    _process_post,
+                    [str(self.comms)] * 24,
+                    range(24),
+                )
+            )
+
+        self.assertEqual(results, [0] * 24)
+        records = self._bus_records()
+        self.assertEqual(len(records), 24)
+        ids = [record["id"] for record in records]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(
+            sorted(int(identifier.split("-", 1)[1]) for identifier in ids),
+            list(range(1, 25)),
+        )
+
+    def test_concurrent_process_claims_have_exactly_one_winner(self):
+        with ProcessPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(_process_claim, str(self.comms), agent)
+                for agent in ("claude", "codex")
+            ]
+            results = [future.result() for future in futures]
+
+        self.assertEqual(sorted(results), [0, 3])
+        active = [
+            lane
+            for lane in bus._load_lanes()["lanes"]
+            if lane.get("status") == "active"
+        ]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["paths"], ["pm_pipeline.py"])
+        claims = [
+            record for record in self._bus_records() if record.get("type") == "claim"
+        ]
+        self.assertEqual(len(claims), 1)
 
 
 if __name__ == "__main__":

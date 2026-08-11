@@ -21,6 +21,7 @@ import argparse
 import json
 import secrets
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn, Sequence
@@ -30,6 +31,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 CANARY_PREFIX = "raw-winner-canary-nonauthorizing"
+CANARY_SPOOL_MAX_BYTES = 8 * 1024**3
+CANARY_SPOOL_MIN_FREE_BYTES = 12 * 1024**3
 NATIVE_AUTHORITY_VERIFICATION_SCHEMA = (
     "fxpm.production_native_authority_verification_scope.v1"
 )
@@ -136,7 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--diagnostic-root",
         default="",
         help="Dedicated spool root; defaults to a fresh timestamped directory "
-        "under .pytest-tmp/raw-winner-canary/ (never a production root).",
+        "under the host-local temporary directory (never a production root).",
     )
     args = parser.parse_args(argv)
 
@@ -223,7 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_token = secrets.token_hex(8)
         generation_id = f"{CANARY_PREFIX}-{stamp}-{run_token}"
         diagnostic_base = (
-            PROJECT_ROOT / ".pytest-tmp" / "raw-winner-canary"
+            Path(tempfile.gettempdir()) / "fxpm-raw-winner-canary"
         ).resolve()
         try:
             diag_root = (
@@ -256,6 +259,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 generation_id=generation_id,
                 native_universe_sha256=native_universe_sha256,
                 config_sha256=config_sha256,
+                limits=authority_spool.SpoolLimits(
+                    max_artifact_bytes=CANARY_SPOOL_MAX_BYTES,
+                    max_symbol_bytes=CANARY_SPOOL_MAX_BYTES,
+                    max_generation_bytes=CANARY_SPOOL_MAX_BYTES,
+                    min_free_bytes=CANARY_SPOOL_MIN_FREE_BYTES,
+                ),
             )
             process = search_planner.freeze_production_search_process(
                 context, run_id=generation_id

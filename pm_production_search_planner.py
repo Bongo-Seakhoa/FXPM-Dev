@@ -7,11 +7,10 @@ backtest or choose a winner.  For every empirically observed cell it freezes:
 * the exact 100-strategy registry, defaults, parameter grids, code and feature
   contracts;
 * one timeframe-specific rolling calendar depth (the current Horizon v1 API
-  forms a full depth x trial product, so more than one depth would make it
-  impossible to cover all 100 strategies inside Winner V11's 128-attempt
-  ceiling);
-* all 100 full default parameter maps plus 28 deterministic, outcome-blind
-  non-default grid points; and
+  forms a full depth x trial product, so one source-geometry-selected depth
+  preserves the complete precommitted attempt roster);
+* all 100 full default parameter maps plus two deterministic, outcome-blind
+  non-default grid points per strategy; and
 * four genuine, non-overlapping, whole-UTC-day causal validation folds.
 
 The same cell design is reproduced at every historical anchor and at the
@@ -141,10 +140,10 @@ MAX_PROCESS_BYTES: Final = 16 * 1024 * 1024
 STATE_INITIAL_ERROR_FLOOR: Final = 100.0
 
 # The largest feasible entry is selected from this frozen ladder using source
-# geometry only.  Exactly one depth reaches Horizon, so the 100 registry
-# defaults still fit beside 28 non-default designs under Winner V11's 128
-# attempt ceiling.  Shorter entries prevent ordinary broker-history boundaries
-# from turning an otherwise genuine sparse timeframe into a technical veto.
+# geometry only. Exactly one depth reaches Horizon, so redundant depth
+# candidates never multiply or truncate the complete precommitted attempt
+# roster. Shorter entries prevent ordinary broker-history boundaries from
+# turning an otherwise genuine sparse timeframe into a technical veto.
 FIT_CALENDAR_DAY_LADDERS: Final = {
     "M5": (90, 180, 270, 365),
     "M15": (120, 270, 365, 548),
@@ -524,7 +523,7 @@ def _process_semantics(domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "final_oos_authority": False,
         },
         "one_horizon_candidate_reason": (
-            "HORIZON_V1_CARTESIAN_PRODUCT_AND_WINNER_V11_128_ATTEMPT_BOUND"
+            "HORIZON_V1_SINGLE_DEPTH_PRESERVES_COMPLETE_PRECOMMITTED_ATTEMPT_ROSTER"
         ),
         "source_boundary_policy": (
             "ONE_LARGEST_FEASIBLE_PRECOMMITTED_DEPTH_OR_TYPED_INSUFFICIENT_EVIDENCE"

@@ -18,6 +18,7 @@ _test_tmp/
 coordination/events*.jsonl
 coordination/events*.json
 coordination/events*.lock
+agent_comms/*.lock
 .claude/
 logs/
 runtime/
