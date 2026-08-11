@@ -28,6 +28,49 @@
       "status": "active"
     },
     {
+      "claimed_at": "2026-08-11T11:36:17Z",
+      "id": "L-0010",
+      "owner": "codex",
+      "paths": [
+        "tools/agent_bus.py",
+        "tests/test_agent_bus.py"
+      ],
+      "purpose": "Minimal two-writer reliability: one OS-backed critical section plus post/claim race regressions; no ledger or hashing",
+      "status": "active"
+    },
+    {
+      "claimed_at": "2026-08-11T11:37:09Z",
+      "id": "L-0011",
+      "owner": "codex",
+      "paths": [
+        ".gitignore"
+      ],
+      "purpose": "Ignore the single host-local agent bus writer lock",
+      "status": "active"
+    },
+    {
+      "claimed_at": "2026-08-11T11:48:32Z",
+      "id": "L-0012",
+      "owner": "codex",
+      "paths": [
+        "agent_comms/PM_CHARTER.md"
+      ],
+      "purpose": "Record operator's three-round, autonomous-but-evidence-bounded PM scope and convergence rules",
+      "status": "active"
+    },
+    {
+      "claimed_at": "2026-08-11T11:59:40Z",
+      "id": "L-0013",
+      "owner": "codex",
+      "paths": [
+        "pm_authoritative_search_execution.py",
+        "tests/test_authoritative_search_execution.py",
+        "tests/test_raw_winner_canary.py"
+      ],
+      "purpose": "Gate-1 canary stage quota and local diagnostic-root safety; existing quota mechanism only",
+      "status": "active"
+    },
+    {
       "claimed_at": "2026-08-11T11:20:57Z",
       "id": "L-0008",
       "owner": "claude",
@@ -127,5 +170,5 @@
       "status": "released"
     }
   ],
-  "next_lane": 10
+  "next_lane": 14
 }
