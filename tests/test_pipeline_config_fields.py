@@ -275,16 +275,12 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(default.specialist_spokes_v2_cost_frequency_strength, 0.50)
         self.assertTrue(default.specialist_spokes_v2_default_fallback_enabled)
         self.assertTrue(default.specialist_spokes_v2_allow_promote_small_default)
-        # 0.0 disabled the implausible-Sharpe guard outright. The 2026-08-11
-        # audit measured what that cost: all 157 promoted rows in the checked-in
-        # book carry pbo_status="not_available" with a median val_sharpe of 38.23,
-        # so neither multiple-testing defence rejected anything.
-        self.assertAlmostEqual(default.specialist_spokes_v2_max_validation_sharpe, 4.0)
-        self.assertGreater(
-            default.specialist_spokes_v2_max_validation_sharpe,
-            0.0,
-            "the implausible-Sharpe guard must not ship disabled",
-        )
+        # 0.0 is correct, and briefly was not. This knob only reaches
+        # _v2_default_rejection_reasons under regime_scoring_model =
+        # specialist_spokes_v2; production is "legacy", so it cannot fire. The
+        # protection it appeared to add already exists unconditionally:
+        # classify_promotion_status BLOCKS any cell whose pbo_status != "PASS".
+        self.assertAlmostEqual(default.specialist_spokes_v2_max_validation_sharpe, 0.0)
 
         clamped = PipelineConfig(
             specialist_spokes_v2_cost_frequency_strength=2.0,

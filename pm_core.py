@@ -1483,12 +1483,25 @@ class PipelineConfig:
     # Sharpe saturates at exactly 1.000 for 144 of 157 - so neither
     # multiple-testing defence discriminated anything.
     #
-    # 4.0 is the bar a sustained annualized Sharpe would have to clear to be
-    # believable at all. The guard only fires when PBO is unavailable: if the
-    # overfitting check actually ran and passed, a high Sharpe stands on its own
-    # evidence. If it could not run, an unverifiable world-class Sharpe is
-    # exactly the claim that should fail closed.
-    specialist_spokes_v2_max_validation_sharpe: float = 4.0
+    # REVERTED to 0.0 on 2026-08-11 (CPM-001), and the reasoning above is why the
+    # revert is safe rather than a retreat. The guard's only consumer is
+    # _v2_default_rejection_reasons (pm_pipeline.py:13850), reached solely via
+    # _select_v2_symbol_default, which pm_pipeline.py:15010-15014 gates on
+    # scoring_model == "specialist_spokes_v2". Production resolves
+    # regime_scoring_model = "legacy", so the guard cannot execute at all - and
+    # the "all 157 rows rejected" measurement that justified setting it to 4.0
+    # was an offline replay against a gate that never fires.
+    #
+    # Nothing is lost. classify_promotion_status already appends a
+    # false-discovery reason for any pbo_status != "PASS" (pm_pipeline.py:2443)
+    # and returns BLOCKED on any such reason (:2548), under
+    # false_discovery_control_enabled and the calendar split that pm_core.py:2615
+    # forces for every non-research run - with no scoring-model gate in that
+    # path. A cell without a PBO verdict is already hard-blocked one gate earlier.
+    #
+    # Leaving it at 4.0 would put a value in artifact_meta (pm_pipeline.py:2199)
+    # that looks like a live control and is not one.
+    specialist_spokes_v2_max_validation_sharpe: float = 0.0
 
     # Global false-discovery controls are part of the default production
     # contract. Research runs may disable them explicitly, but live readiness
