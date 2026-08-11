@@ -1,63 +1,73 @@
 # FXPM Program State
 
-Updated: 2026-07-12 late (Claude). Rewrite in place; keep to one page.
+Updated: 2026-08-11 (Claude). One page. Rewritten in place, never appended.
 
-NOTE: coordination authority = tools/agent_coordination.py (OS-locked,
-hash-chained; see coordination/README.md). agent_bus.py remains vetoed.
-AGENT_COMMS.md = operator digest. This STATE.md = shared one-page truth.
+## The only objective
 
-MILESTONE / SCOPE AUTHORITY = docs/PROJECT_MILESTONES.md (created 2026-07-19
-on operator instruction): the dependable M0-M10 tracker that defines "done",
-holds exit criteria + parked scope, and shows how far we are. Update it on
-every ticked milestone. We are at the M2->M3 boundary (promotion imminent).
+**A live-trading system the operator can be as certain as possible is profitable
+and reliable with real money.** Every task, verification, model and artifact is
+justified by that sentence or it does not get built.
 
-Commits landed: c90b7da (coordination protocol), 169f7e6 (v3 evidence +
-bounded journals), 701645a (ATOMIC GENERATION STAGING — contract pt 9 done).
-Claude ledger-compaction lane review-requested (b13cf065): canonical ledger
-months losslessly gzip-archived with sha256 proof, readers transparent.
+Test for any proposed work: *does this change the probability that the book we
+deploy makes money, or that it keeps making money?* If the honest answer is no,
+it is not in scope — however rigorous, provable or elegant it is.
 
-## Objective
-Production-ready FXPM, medium-to-high risk appetite (as calibrated ruin
-tolerance, never weakened evidence), consistently profitable on live
-markets. Demo validation precedes any funded exposure. Operator: Bongo.
+## Operator directives now in force (2026-08-11)
 
-## Phase
-Repair + per-cell rebuild. NOT ready to optimize: regime provenance sidecar
-absent; roster must be rebuilt per-cell (~84 symbols / 287 cells vs old
-35/210).
+1. **The ballooning is a defect, not a side effect.** 218,389 engine lines,
+   136,703 test lines, 4,234 collected tests. Clean up after yourself; delete
+   fluff. Not a hard rule — analysis needed to reach the goal is legitimate —
+   but the default is subtract, not add.
+2. **Stop hashing one pipeline seven ways.** If a single datum flows through a
+   single pipeline with no reasonable prospect of corruption, carry it to the
+   end. Validate hard truths; drop ceremony. The RUN-FIRST-THEN-PRUNE charter of
+   2026-07-22 is superseded: prune as we go.
+3. **No unilateral integration.** The failed experiment was AI deciding its own
+   integration. Reconcile-or-discard decisions go to the operator.
 
-## Landed 2026-07-12
-- Per-cell SYMBOL|TF eligibility contract pts 1,2,5,6,7 (Codex): whole-symbol
-  veto removed, active-TF-only loading, M5-spine removed, provenance
-  preflight before workers, technical failures never overwrite ledger.
-- get_bars_range poll-to-stability + segmented coverage v2 + pm_trade_power +
-  pm_sample_dependence + pm_native_resolution (Codex).
-- Bounded storage: manifest rotation/dedupe, ledger retention (Claude).
-- pm_configs.json restored to HEAD 73-winner book; expired, evidence-only
-  (Claude).
-- docs/EVIDENCE_MINIMUMS_AND_BOUNDARIES_20260712.md (Claude).
-- Agent protocol v1: agent_comms/ + tools/agent_bus.py (Claude).
-- Full suite: 1639 passed / 0 failed / 5 skipped (Claude run, ~18:10).
+## Where the system actually is
 
-## Open (ordered)
-1. Codex L-0002/L-0003: finish per-cell activation contract + active-cell
-   regime tuning/preflight; atomic generation promotion (CX-001: blocking).
-   CC-002 review questions RESOLVED by CX-001.
-2. Memory governor + remaining copy elimination; 8 GB OOM guardrail stands
-   (blunt workers=1 clamp rejected by operator).
-2b. Methodology decisions D1-D4 pending Codex cross-review (screening stage;
-   walk-forward process validation; refit-to-present production book under
-   probation; edge-decay retrain cadence). See AGENT_COMMS 2026-07-12 +
-   docs/SCREENING_AND_BLEEDING_EDGE_METHODOLOGY_20260712.md.
-3. Reacquire/re-activate per-cell roster (~287 cells).
-4. pm_regime_tuner for every active cell (params + provenance sidecar).
-5. One-symbol canary: prove feature computation + strategy search + nonempty
-   artifact + peak-memory measurement.
-6. Full optimization -> synchronized replay -> capital envelope calibration
-   at operator ruin tolerance -> demo shadow.
+- **Nothing is tradeable.** Book optimised 2026-06-09/11, `valid_until`
+  2026-07-05, expired 37 days. No run has completed since.
+- **The last book was noise.** All 157 promoted rows: `pbo_status` =
+  `not_available`, median `val_sharpe` 38.23 (max 208.97), deflated Sharpe
+  saturated at 1.000 for 144/157, median 21 validation trades with 75 rows under
+  20, PF 3.08 at 1.08% drawdown. Both multiple-testing defences were inoperative.
+- **Three gates shipped switched off** and are now on: profit-factor floor
+  (0.60 → 1.10), implausible-Sharpe-without-PBO (0.0 → 4.0), sample and
+  drawdown floors. Against the checked-in book these reject **all 157 rows** —
+  the correct outcome.
+- **The search can now find something.** 128 → 300 attempts; every strategy
+  tuned twice instead of 28 of 100 tuned once.
+- **Runtime is no longer hopeless.** Resolver memo 3798× on a 28-minute call;
+  regime labels categorical, 22% off every feature frame.
 
-## Hard rules in force
-- Funded trading disabled until evidence gates + operator approval.
-- fxpm_academic_research repo untouchable.
-- No arbitrary thresholds; evidence or calibration only.
-- All memory/storage bounded, zero accuracy cost.
+## Critical path to the objective
+
+| # | Gate | Owner | State |
+|---|---|---|---|
+| 1 | PBO actually produces a verdict per cell | open | **blocking** — it has never once returned one |
+| 2 | Cold native verification cheap (manifest-trust) | Claude | designed, safe, not built |
+| 3 | A run that completes | open | never achieved |
+| 4 | Replay the resulting book, corrected enumerator | open | |
+| 5 | Forward-simulate 2026-04-01 → 07-14 (74 trading days OOS) | open | the only honest forward test available |
+| 6 | Execution defects: lot sizing, recovery, order scaling | open | named by operator as what killed the funded attempt |
+| 7 | Demo shadow, then funded at a size where min-lot geometry is not fighting us | open | |
+
+Gate 1 is the one that decides whether any of this is real. A book that cannot
+produce a PBO verdict cannot be trusted at any size.
+
+## Lane protocol
+
+`agent_comms/PROTOCOL.md` v1 stands. Use `python tools/agent_bus.py`
+(post / claim / release / tail / lanes). Claim before editing shared core files.
+
+**Retired 2026-08-11:** `tools/agent_coordination.py` (1,543 lines) and its test
+(437 lines) — an OS-locked, hash-chained event ledger built so two agents could
+prove neither had tampered with the other's notes, on a single laptop with no
+attacker, against the operator's own security-not-a-priority directive. Nothing
+in the engine imported it. The 326-line bus does the same job. The existing
+`coordination/` ledger is preserved read-only as decision history, because
+PROJECT_MILESTONES.md cites its seq numbers as provenance.
+
+That retirement is the template: **capability preserved, ceremony removed.**

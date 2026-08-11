@@ -1,9 +1,26 @@
-# FXPM Agent Coordination Protocol
+# FXPM Agent Coordination Protocol — RETIRED 2026-08-11
 
-`tools/agent_coordination.py` is the single machine-readable coordination
+> **`tools/agent_coordination.py` has been removed.** Live coordination is
+> `agent_comms/PROTOCOL.md` with `python tools/agent_bus.py`
+> (post / claim / release / tail / lanes).
+>
+> The tool was 1,543 lines plus a 437-line test: an OS-locked, hash-chained,
+> append-only event ledger built so two agents could prove neither had tampered
+> with the other's notes — on a single laptop, with no attacker, against the
+> operator's own directive that security is not a priority here. Nothing in the
+> engine imported it. The 326-line bus does the same job.
+>
+> **This directory is preserved read-only as decision history.**
+> `docs/PROJECT_MILESTONES.md` cites its `seq` numbers as provenance, so the
+> ledger itself is evidence and stays. Everything below describes the retired
+> tool and is kept for reading those records, not for running anything.
+
+---
+
+`tools/agent_coordination.py` was the single machine-readable coordination
 authority for Codex, Claude Code, reviewers, and the operator. Human milestone
 summaries may still be written to `AGENT_COMMS.md`, but claims, vetoes, review
-gates, completion, and release are decided only by this transactional ledger.
+gates, completion, and release were decided only by this transactional ledger.
 
 Do not hand-edit the ledger, manifest, or segment files. Do not maintain a
 second live lane registry. Every reader and writer uses the same OS lock.
