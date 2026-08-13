@@ -86,3 +86,4 @@ fail
 *.stackdump
 .rev_diff_tmp.txt
 canon_*.log
+pm_dashboard.html
