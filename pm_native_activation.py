@@ -1358,31 +1358,29 @@ def _v5_select_compatible_edge_receipt(
     return None, None
 
 
-def scope_native_pair_window_states(
+def _v5_frame_extent(
+    frame: pd.DataFrame,
+) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    if frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return None
+    first = pd.Timestamp(frame.index[0])
+    if first.tzinfo is None or "_BAR_CLOSE_TS" not in frame.columns:
+        return None
+    closes = pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+    if closes.isna().any():
+        return None
+    return first.tz_convert("UTC"), pd.Timestamp(closes.iloc[-1]).tz_convert("UTC")
+
+
+def _scope_native_pair_window_states_from_extents(
     states: Mapping[str, Mapping[str, Any]],
     *,
-    target_frame: pd.DataFrame,
-    reference_frame: pd.DataFrame,
+    target_extent: Optional[Tuple[pd.Timestamp, pd.Timestamp]],
+    reference_extent: Optional[Tuple[pd.Timestamp, pd.Timestamp]],
     partition_windows: Mapping[str, Tuple[Any, Any]],
     boundary_tolerance_seconds: float,
 ) -> Dict[str, Dict[str, Any]]:
-    """Keep overlap-only parity from proving an uncovered audit window."""
-
     tolerance = max(0.0, float(boundary_tolerance_seconds))
-
-    def _extent(frame: pd.DataFrame) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
-        if frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
-            return None
-        first = pd.Timestamp(frame.index[0])
-        if first.tzinfo is None or "_BAR_CLOSE_TS" not in frame.columns:
-            return None
-        closes = pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
-        if closes.isna().any():
-            return None
-        return first.tz_convert("UTC"), pd.Timestamp(closes.iloc[-1]).tz_convert("UTC")
-
-    target_extent = _extent(target_frame)
-    reference_extent = _extent(reference_frame)
     result: Dict[str, Dict[str, Any]] = {}
     for window in REQUIRED_AUDIT_WINDOWS:
         state = dict(states.get(window) or {})
@@ -1418,6 +1416,25 @@ def scope_native_pair_window_states(
         state["reason_codes"] = list(dict.fromkeys([*reasons, *pending]))
         result[window] = state
     return result
+
+
+def scope_native_pair_window_states(
+    states: Mapping[str, Mapping[str, Any]],
+    *,
+    target_frame: pd.DataFrame,
+    reference_frame: pd.DataFrame,
+    partition_windows: Mapping[str, Tuple[Any, Any]],
+    boundary_tolerance_seconds: float,
+) -> Dict[str, Dict[str, Any]]:
+    """Keep overlap-only parity from proving an uncovered audit window."""
+
+    return _scope_native_pair_window_states_from_extents(
+        states,
+        target_extent=_v5_frame_extent(target_frame),
+        reference_extent=_v5_frame_extent(reference_frame),
+        partition_windows=partition_windows,
+        boundary_tolerance_seconds=boundary_tolerance_seconds,
+    )
 
 
 def _v5_terminal_states(reasons: Sequence[str]) -> Dict[str, Dict[str, Any]]:
@@ -1719,11 +1736,21 @@ def _v5_read_frame(path: Optional[Path]) -> Optional[pd.DataFrame]:
         return None
 
 
+def _v5_detached_frame_copy(frame: pd.DataFrame) -> pd.DataFrame:
+    """Copy data and both axes so callers cannot mutate cached semantics."""
+
+    detached = frame.copy(deep=True)
+    detached.index = frame.index.copy(deep=True)
+    detached.columns = frame.columns.copy(deep=True)
+    return detached
+
+
 @dataclass(frozen=True)
 class _V5NormalizedFrameCacheEntry:
     expected_sha256: str
     file_identity: Tuple[int, int, int, int]
     frame: pd.DataFrame
+    extent: Optional[Tuple[pd.Timestamp, pd.Timestamp]]
     memory_bytes: int
 
 
@@ -1815,6 +1842,8 @@ class _V5NormalizedFrameCache:
         self._drop_key(key)
         if memory_bytes > self.max_bytes:
             return False
+        cached_frame = _v5_detached_frame_copy(frame)
+        extent = _v5_frame_extent(cached_frame)
         while self._entries and (
             len(self._entries) >= self.max_frames
             or self._memory_bytes + memory_bytes > self.max_bytes
@@ -1824,12 +1853,26 @@ class _V5NormalizedFrameCache:
         entry = _V5NormalizedFrameCacheEntry(
             expected_sha256=expected_sha256,
             file_identity=file_identity,
-            frame=frame,
+            frame=cached_frame,
+            extent=extent,
             memory_bytes=memory_bytes,
         )
         self._entries[key] = entry
         self._memory_bytes += memory_bytes
         return True
+
+    def extent_for_verified_read(
+        self,
+        path: Path,
+        observed_sha256: str,
+    ) -> Tuple[bool, Optional[Tuple[pd.Timestamp, pd.Timestamp]]]:
+        """Return metadata for the entry just authenticated by a full read."""
+
+        self._assert_symbol_path(path)
+        entry = self._entries.get(self._key(path))
+        if entry is None or entry.expected_sha256 != observed_sha256:
+            return False, None
+        return True, entry.extent
 
     def clear(self) -> None:
         self._entries.clear()
@@ -1934,7 +1977,7 @@ def _v5_read_hashed_frame(
     if cache_rejection is not None:
         raise ValueError(cache_rejection)
     if cached_entry is not None:
-        return cached_entry.frame.copy(deep=True), observed_sha256
+        return _v5_detached_frame_copy(cached_entry.frame), observed_sha256
     if raw_frame is None:
         return None, observed_sha256
     try:
@@ -1952,7 +1995,7 @@ def _v5_read_hashed_frame(
             file_identity,
             frame,
         )
-        return frame.copy(deep=True), observed_sha256
+        return frame, observed_sha256
     return frame, observed_sha256
 
 
@@ -1982,6 +2025,24 @@ def _v5_read_pinned_frame(
     )
     errors = [f"{error_prefix}_SHA256_MISMATCH"] if observed_sha256 != expected else []
     return path, frame, observed_sha256, errors
+
+
+def _v5_extent_after_verified_read(
+    *,
+    frame_cache: Optional[_V5NormalizedFrameCache],
+    path: Optional[Path],
+    observed_sha256: Optional[str],
+    frame: Optional[pd.DataFrame],
+) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """Reuse exact-byte-bound extent metadata or compute the same fallback."""
+
+    if frame is None:
+        return None
+    if frame_cache is not None and path is not None and observed_sha256 is not None:
+        found, extent = frame_cache.extent_for_verified_read(path, observed_sha256)
+        if found:
+            return extent
+    return _v5_frame_extent(frame)
 
 
 def _v5_expected_coverage(
@@ -2516,6 +2577,12 @@ def _verify_v5_activation_cell_evidence(
     if target_frame is None or tolerance is None:
         errors.append(f"NATIVE_V5_TARGET_FRAME_OR_TOLERANCE_INVALID:{cell_id}")
         return list(dict.fromkeys(errors))
+    target_extent = _v5_extent_after_verified_read(
+        frame_cache=frame_cache,
+        path=bars_path,
+        observed_sha256=target_bars_observed_sha256,
+        frame=target_frame,
+    )
 
     try:
         thresholds = ParityThresholds(
@@ -2658,6 +2725,12 @@ def _verify_v5_activation_cell_evidence(
                     f"NATIVE_V5_REFERENCE_FRAME_OR_TOLERANCE_INVALID:{cell_id}:{reference}"
                 )
                 continue
+            reference_extent = _v5_extent_after_verified_read(
+                frame_cache=frame_cache,
+                path=reference_bars,
+                observed_sha256=observed_reference_bars_sha256,
+                frame=reference_frame,
+            )
             binding = {
                 "availability_state": "AVAILABLE",
                 "bars_sha256": reference_cell.get("sha256"),
@@ -2745,10 +2818,10 @@ def _verify_v5_activation_cell_evidence(
                 raw_report = dict(raw_report)
                 raw_report["reference_timeframe"] = reference
                 pair_reports[reference] = raw_report
-                states = scope_native_pair_window_states(
+                states = _scope_native_pair_window_states_from_extents(
                     _v5_pair_states(raw_report),
-                    target_frame=target_frame,
-                    reference_frame=reference_frame,
+                    target_extent=target_extent,
+                    reference_extent=reference_extent,
                     partition_windows=windows,
                     boundary_tolerance_seconds=float(
                         run_request.get("boundary_tolerance_days", 0.0)
@@ -2802,10 +2875,10 @@ def _verify_v5_activation_cell_evidence(
                     )
                     legacy_report = dict(legacy_report)
                     legacy_report["reference_timeframe"] = reference
-                    legacy_states = scope_native_pair_window_states(
+                    legacy_states = _scope_native_pair_window_states_from_extents(
                         _v5_pair_states(legacy_report),
-                        target_frame=target_frame,
-                        reference_frame=reference_frame,
+                        target_extent=target_extent,
+                        reference_extent=reference_extent,
                         partition_windows=windows,
                         boundary_tolerance_seconds=float(
                             run_request.get("boundary_tolerance_days", 0.0)

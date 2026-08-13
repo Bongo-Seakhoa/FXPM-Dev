@@ -25,6 +25,18 @@ def _write_bars(path: Path, *, final_close: float = 1.25) -> None:
     )
 
 
+def _write_bars_with_close_axis(path: Path, *, invalid_middle_close: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    middle_close = "not-a-timestamp" if invalid_middle_close else "2026-01-04T00:00:00Z"
+    path.write_text(
+        "Date,Open,High,Low,Close,Volume,_BAR_CLOSE_TS\n"
+        "2026-01-02T00:00:00Z,1.0,1.3,0.9,1.2,10,2026-01-03T00:00:00Z\n"
+        f"2026-01-03T00:00:00Z,1.2,1.4,1.1,1.25,11,{middle_close}\n"
+        "2026-01-04T00:00:00Z,1.25,1.5,1.2,1.4,12,2026-01-05T00:00:00Z\n",
+        encoding="utf-8",
+    )
+
+
 def _normalized_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
     fine_index = pd.date_range("2026-01-02T00:00:00Z", periods=12, freq="5min")
     coarse_index = pd.date_range("2026-01-02T00:00:00Z", periods=4, freq="15min")
@@ -306,6 +318,167 @@ def test_v5_frame_cache_rehashes_every_hit_and_returns_deep_copy(
     cache.clear()
     assert cache.stats()["frame_count"] == 0
     assert cache.stats()["memory_bytes"] == 0
+
+
+def test_v5_frame_cache_detaches_returned_data_index_columns_and_extent(
+    tmp_path: Path,
+) -> None:
+    bars_path = tmp_path / "native" / "runs" / "run-a" / "EURUSD" / "D1" / "bars.csv"
+    _write_bars_with_close_axis(bars_path)
+    expected_sha256 = native.sha256_file(bars_path)
+    cache = native._V5NormalizedFrameCache("EURUSD")
+
+    first, observed_sha256 = native._v5_read_hashed_frame(
+        bars_path,
+        expected_sha256,
+        parse_on_hash_mismatch=False,
+        frame_cache=cache,
+    )
+    assert first is not None
+    assert observed_sha256 == expected_sha256
+    expected = native._v5_detached_frame_copy(first)
+    expected_extent = (
+        pd.Timestamp("2026-01-02T00:00:00Z"),
+        pd.Timestamp("2026-01-05T00:00:00Z"),
+    )
+    assert cache.extent_for_verified_read(bars_path, observed_sha256) == (
+        True,
+        expected_extent,
+    )
+
+    first.iloc[-1, first.columns.get_loc("Close")] = 99.0
+    first.index.values[0] = pd.Timestamp("2030-01-01T00:00:00Z").to_datetime64()
+    first.columns.values[0] = "CORRUPTED"
+
+    second, second_sha256 = native._v5_read_hashed_frame(
+        bars_path,
+        expected_sha256,
+        parse_on_hash_mismatch=False,
+        frame_cache=cache,
+    )
+
+    assert second_sha256 == expected_sha256
+    assert second is not None
+    pd.testing.assert_frame_equal(second, expected)
+    assert cache.extent_for_verified_read(bars_path, second_sha256) == (
+        True,
+        expected_extent,
+    )
+
+
+def test_v5_cached_invalid_extent_is_reused_without_rescanning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bars_path = tmp_path / "native" / "runs" / "run-a" / "EURUSD" / "D1" / "bars.csv"
+    _write_bars_with_close_axis(bars_path, invalid_middle_close=True)
+    expected_sha256 = native.sha256_file(bars_path)
+    cache = native._V5NormalizedFrameCache("EURUSD")
+    frame, observed_sha256 = native._v5_read_hashed_frame(
+        bars_path,
+        expected_sha256,
+        parse_on_hash_mismatch=False,
+        frame_cache=cache,
+    )
+    assert frame is not None
+    assert observed_sha256 == expected_sha256
+    assert cache.extent_for_verified_read(bars_path, observed_sha256) == (True, None)
+
+    monkeypatch.setattr(
+        native,
+        "_v5_frame_extent",
+        lambda _frame: (_ for _ in ()).throw(AssertionError("extent rescanned")),
+    )
+    assert (
+        native._v5_extent_after_verified_read(
+            frame_cache=cache,
+            path=bars_path,
+            observed_sha256=observed_sha256,
+            frame=frame,
+        )
+        is None
+    )
+
+
+def test_v5_cached_extents_match_public_scope_and_reuse_both_profiles(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    paths = [
+        tmp_path / "native" / "runs" / "run-a" / "EURUSD" / timeframe / "bars.csv"
+        for timeframe in ("M5", "M15")
+    ]
+    for path in paths:
+        _write_bars_with_close_axis(path)
+    cache = native._V5NormalizedFrameCache("EURUSD")
+    frames = []
+    observed = []
+    original_extent = native._v5_frame_extent
+    extent_calls = 0
+
+    def counted_extent(frame: pd.DataFrame):
+        nonlocal extent_calls
+        extent_calls += 1
+        return original_extent(frame)
+
+    monkeypatch.setattr(native, "_v5_frame_extent", counted_extent)
+    for path in paths:
+        frame, digest = native._v5_read_hashed_frame(
+            path,
+            native.sha256_file(path),
+            parse_on_hash_mismatch=False,
+            frame_cache=cache,
+        )
+        assert frame is not None and digest is not None
+        frames.append(frame)
+        observed.append(digest)
+    assert extent_calls == 2
+
+    extents = [
+        native._v5_extent_after_verified_read(
+            frame_cache=cache,
+            path=path,
+            observed_sha256=digest,
+            frame=frame,
+        )
+        for path, digest, frame in zip(paths, observed, frames)
+    ]
+    assert extent_calls == 2
+
+    states = {
+        window: {
+            "integrity_state": native.INTEGRITY_PASS,
+            "evidence_state": native.EVIDENCE_PASS,
+            "reason_codes": [],
+        }
+        for window in native.REQUIRED_AUDIT_WINDOWS
+    }
+    windows = {
+        window: (
+            pd.Timestamp("2026-01-02T00:00:00Z"),
+            pd.Timestamp("2026-01-05T00:00:00Z"),
+        )
+        for window in native.REQUIRED_AUDIT_WINDOWS
+    }
+    expected = native.scope_native_pair_window_states(
+        states,
+        target_frame=frames[0],
+        reference_frame=frames[1],
+        partition_windows=windows,
+        boundary_tolerance_seconds=0.0,
+    )
+    assert extent_calls == 4
+
+    for _compatibility_profile in ("current", "frozen"):
+        observed_states = native._scope_native_pair_window_states_from_extents(
+            states,
+            target_extent=extents[0],
+            reference_extent=extents[1],
+            partition_windows=windows,
+            boundary_tolerance_seconds=0.0,
+        )
+        assert observed_states == expected
+    assert extent_calls == 4
 
 
 def test_v5_frame_cache_evicts_and_fails_closed_on_hash_identity_and_size_change(
