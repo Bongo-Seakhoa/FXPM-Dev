@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from decimal import Decimal
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -316,6 +317,29 @@ def test_frozen_path_cost_stress_uses_genuine_arrays_and_preserves_positions() -
             spec=spec,
             timeframe="D1",
         )
+
+
+def test_swap_contract_cache_is_shared_only_with_explicit_sibling() -> None:
+    config = PipelineConfig(research_mode=True)
+    parent = Backtester(config)
+    sibling = Backtester(config)
+    unrelated = Backtester(config)
+    contract = {"terms_active_pointer_sha256": "a" * 64}
+    parent._swap_contract_cache[("a" * 64, "EURUSD", "H1")] = contract
+    parent._swap_terms_pointer_pin = "a" * 64
+
+    parent._share_immutable_swap_cache_with(sibling)
+
+    assert sibling._swap_contract_cache is parent._swap_contract_cache
+    assert sibling._swap_terms_pointer_pin == parent._swap_terms_pointer_pin
+    assert unrelated._swap_contract_cache == {}
+    assert unrelated._swap_contract_cache is not parent._swap_contract_cache
+
+    different_root = Backtester(
+        PipelineConfig(research_mode=True, data_dir=Path("different-data-root"))
+    )
+    with pytest.raises(ValueError, match="one native root"):
+        parent._share_immutable_swap_cache_with(different_root)
 
 
 def test_frozen_path_cost_stress_rejects_base_from_other_signals() -> None:

@@ -6859,6 +6859,31 @@ class Backtester:
         except Exception:
             return 1.0
 
+    def _share_immutable_swap_cache_with(self, other: "Backtester") -> None:
+        """Share only activation-bound broker terms with a sibling helper.
+
+        Backtester has no mutable market-path state.  Its sole runtime cache is
+        a bounded map of verified immutable broker contracts plus the active
+        pointer pin.  Stress replay creates sibling helpers under a different
+        spread policy; sharing this cache avoids reopening the same contract
+        while each use still hashes and checks ``terms/ACTIVE.json``.
+        """
+
+        if not isinstance(other, Backtester):
+            raise TypeError("swap-cache peer must be a Backtester")
+        own_root = (Path(self.config.data_dir) / "native").resolve()
+        peer_root = (Path(other.config.data_dir) / "native").resolve()
+        if own_root != peer_root:
+            raise ValueError("swap-cache peers must use one native root")
+        if other._swap_terms_pointer_pin not in {
+            None,
+            self._swap_terms_pointer_pin,
+        }:
+            raise BrokerTermsError("swap-cache peer has a different terms pin")
+        other._swap_contract_cache = self._swap_contract_cache
+        other._swap_contract_cache_max = self._swap_contract_cache_max
+        other._swap_terms_pointer_pin = self._swap_terms_pointer_pin
+
     @staticmethod
     def _cost_attestation_json_value(value: Any) -> Any:
         """Canonicalize exact numerical inputs without JSON float ambiguity."""
@@ -8284,7 +8309,9 @@ class Backtester:
         # Re-execute the exact supplied inputs before touching the stress lane
         # and bind every result field, not just the position-event projection.
         try:
-            fresh_base_result = Backtester(self.config).run(
+            fresh_base_backtester = Backtester(self.config)
+            self._share_immutable_swap_cache_with(fresh_base_backtester)
+            fresh_base_result = fresh_base_backtester.run(
                 features,
                 signal_numeric,
                 symbol,
@@ -8338,6 +8365,7 @@ class Backtester:
             backtest_spread_mode=normalized_stress_mode,
         )
         stress_backtester = Backtester(stress_config)
+        self._share_immutable_swap_cache_with(stress_backtester)
         stress_entry_spread, stress_intrabar_spread, stress_spread_meta = (
             stress_backtester._build_half_spread_arrays(features, spec)
         )
